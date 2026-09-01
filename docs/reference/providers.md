@@ -237,6 +237,14 @@ destinations. HTTP, HTTPS CONNECT, SOCKS4, SOCKS5, and SOCKS5-with-proxy-DNS
 URLs are supported. Restart Zuno after changing these variables because
 connection pools capture the proxy policy when each client is constructed.
 
+`webfetch` applies the same route without delegating target DNS authority to the
+proxy. For every original URL and redirect, Zuno resolves and validates all
+target addresses locally, then sends an already-validated IP through the
+selected HTTP, HTTPS, SOCKS4, or SOCKS5 route while retaining the original Host
+header and TLS SNI. If the configured proxy is unavailable, the request fails;
+it never silently retries direct. `NO_PROXY` is the only environment-level way
+to select direct routing for a matching public target.
+
 Commands started by shell tools, formatters, language servers, and local MCP
 servers inherit the Zuno process environment. Their explicit environment
 configuration may override individual proxy variables.

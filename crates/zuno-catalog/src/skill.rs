@@ -37,6 +37,7 @@
 //! resolves to null.
 
 pub mod builtin;
+pub mod catalog;
 pub mod discovery;
 pub mod frontmatter;
 mod metadata;
@@ -51,6 +52,7 @@ use std::path::{Path, PathBuf};
 
 use futures::stream::StreamExt;
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use zuno_config::schema::SkillCatalogExposure;
 use zuno_error::{ConfigError, ConfigIssue};
 
@@ -126,6 +128,9 @@ pub struct Skill {
     /// How its `SKILL.md` body is materialized.
     #[serde(skip)]
     document: SkillDocument,
+    /// Exact source-document digest captured for the catalog generation.
+    #[serde(skip)]
+    source_digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +146,7 @@ impl Skill {
     /// Metadata backed by a filesystem `SKILL.md`.
     #[must_use]
     pub fn file(name: String, description: Option<String>, path: PathBuf) -> Self {
+        let source_digest = std::fs::read(&path).ok().map(source_digest);
         Self {
             name,
             description,
@@ -150,6 +156,7 @@ impl Skill {
             metadata_sources: Vec::new(),
             location: path.to_string_lossy().into_owned(),
             document: SkillDocument::File(path),
+            source_digest,
         }
     }
 
@@ -161,6 +168,7 @@ impl Skill {
         location: impl Into<String>,
         content: impl Into<String>,
     ) -> Self {
+        let content = content.into();
         Self {
             name: name.into(),
             description,
@@ -170,9 +178,10 @@ impl Skill {
             metadata_sources: Vec::new(),
             location: location.into(),
             document: SkillDocument::Embedded {
-                content: content.into(),
+                content: content.clone(),
                 resource_root: None,
             },
+            source_digest: Some(source_digest(content.as_bytes())),
         }
     }
 
@@ -185,6 +194,7 @@ impl Skill {
         content: impl Into<String>,
     ) -> Self {
         let resource_root = path.parent().map(Path::to_path_buf);
+        let content = content.into();
         Self {
             name: name.into(),
             description,
@@ -194,10 +204,34 @@ impl Skill {
             metadata_sources: Vec::new(),
             location: path.to_string_lossy().into_owned(),
             document: SkillDocument::Embedded {
-                content: content.into(),
+                content: content.clone(),
                 resource_root,
             },
+            source_digest: Some(source_digest(content.as_bytes())),
         }
+    }
+
+    fn file_from_source(
+        name: String,
+        description: Option<String>,
+        path: PathBuf,
+        source: &str,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            display_name: None,
+            short_description: None,
+            exposure: SkillExposure::Index,
+            metadata_sources: Vec::new(),
+            location: path.to_string_lossy().into_owned(),
+            document: SkillDocument::File(path),
+            source_digest: Some(source_digest(source.as_bytes())),
+        }
+    }
+
+    pub(crate) fn source_digest(&self) -> Option<&[u8; 32]> {
+        self.source_digest.as_ref()
     }
 
     /// Directory against which this skill resolves relative resources.
@@ -327,6 +361,8 @@ pub enum SkillWarningKind {
     PathNotFound,
     /// A root that could not be traversed.
     ScanFailed(io::ErrorKind),
+    /// A live watcher could not be established for a valid discovery root.
+    WatchFailed(String),
     /// A `SKILL.md` that could not be read.
     Unreadable(io::ErrorKind),
     /// Frontmatter that could not be parsed even after the sanitize retry.
@@ -409,6 +445,9 @@ impl fmt::Display for SkillWarning {
             }
             SkillWarningKind::ScanFailed(kind) => {
                 write!(f, "failed to scan skills in {}: {kind}", self.source)
+            }
+            SkillWarningKind::WatchFailed(detail) => {
+                write!(f, "failed to watch skills in {}: {detail}", self.source)
             }
             SkillWarningKind::Unreadable(kind) => {
                 write!(f, "failed to read skill {}: {kind}", self.source)
@@ -860,11 +899,16 @@ fn config_error(path: &Path, rejection: Rejection) -> ConfigError {
 /// The validation half of a load, with no I/O.
 fn parse_source(path: &Path, source: &str) -> Result<Skill, Rejection> {
     let document = parse_document(source)?;
-    Ok(Skill::file(
+    Ok(Skill::file_from_source(
         document.name,
         document.description,
         path.to_path_buf(),
+        source,
     ))
+}
+
+fn source_digest(source: impl AsRef<[u8]>) -> [u8; 32] {
+    Sha256::digest(source.as_ref()).into()
 }
 
 fn parse_document(source: &str) -> Result<ParsedDocument, Rejection> {

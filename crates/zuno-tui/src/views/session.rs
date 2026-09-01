@@ -60,7 +60,9 @@ use crate::views::external::{Clipboard, EditorRequest, ExternalError, SystemClip
 use crate::views::message::{Message, ScrollbarView, StatusView, TranscriptView};
 use crate::views::permission::typed_character;
 use crate::views::scroll::Scroller;
-use crate::views::slash::{CatalogCommand, HostCommand, SlashRouter, SlashSubmission};
+use crate::views::slash::{
+    CatalogCommand, HostCommand, SlashProjection, SlashRouter, SlashSubmission,
+};
 use crate::views::toast::{Toast, ToastLevel};
 use crossterm::event::{
     Event as CrosstermEvent, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind,
@@ -559,6 +561,8 @@ pub struct SessionScreen {
     autocomplete: AutocompleteView,
     autocomplete_area: Option<Rect>,
     slash: SlashRouter,
+    slash_projection: SlashProjection,
+    slash_generation: u64,
     welcome: crate::views::welcome::WelcomeView,
     welcome_enabled: bool,
     sidebar: crate::views::ambient::SidebarView,
@@ -1004,6 +1008,8 @@ impl SessionScreen {
             ),
             autocomplete_area: None,
             slash,
+            slash_projection: SlashProjection::default(),
+            slash_generation: 0,
             shutdown,
             prompts: None,
             mcp_toggles: None,
@@ -1190,14 +1196,24 @@ impl SessionScreen {
 
     /// Install host-projected catalog metadata without importing the catalog crate.
     #[must_use]
-    pub fn with_slash_commands(
-        mut self,
-        commands: impl IntoIterator<Item = CatalogCommand>,
-    ) -> Self {
+    pub fn with_slash_commands(self, commands: impl IntoIterator<Item = CatalogCommand>) -> Self {
+        self.with_slash_projection(SlashProjection::new(commands))
+    }
+
+    /// Install a live host slash catalog shared with the discovery worker.
+    #[must_use]
+    pub fn with_slash_projection(mut self, projection: SlashProjection) -> Self {
+        let (generation, commands) = projection.observe();
+        self.slash_projection = projection;
+        self.slash_generation = generation;
+        self.replace_slash_commands(commands);
+        self
+    }
+
+    fn replace_slash_commands(&mut self, commands: Vec<CatalogCommand>) {
         self.slash = SlashRouter::new(commands);
         self.autocomplete
             .set_source(Box::new(SlashSource::new(self.slash.clone())));
-        self
     }
 
     /// Install the host's `@` candidates without teaching this leaf crate about filesystems.
@@ -2536,6 +2552,7 @@ impl Component for SessionScreen {
             .merge(self.observe_session_materialized(event))
             .merge(self.observe_session_title())
             .merge(self.observe_mcp())
+            .merge(self.observe_slash_commands())
             .merge(self.observe_queued_inputs())
             .merge(self.observe_work_state())
             .merge(self.drain_editor_results())
@@ -3233,6 +3250,16 @@ impl SessionScreen {
         if self.title.generation() == self.title_generation {
             return EventResult::IGNORED;
         }
+        EventResult::REDRAW
+    }
+
+    fn observe_slash_commands(&mut self) -> EventResult {
+        if self.slash_projection.generation() == self.slash_generation {
+            return EventResult::IGNORED;
+        }
+        let (generation, commands) = self.slash_projection.observe();
+        self.slash_generation = generation;
+        self.replace_slash_commands(commands);
         EventResult::REDRAW
     }
 

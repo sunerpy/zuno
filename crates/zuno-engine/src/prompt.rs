@@ -523,6 +523,51 @@ impl PromptAssembly {
         Ok(())
     }
 
+    /// Insert or replace one ordinary section by stable id.
+    ///
+    /// Replacement keeps the section typed and re-sorts by semantic role, so a
+    /// live catalog generation can update its bounded index without duplicating
+    /// prompt blocks or changing authority ordering.
+    pub fn upsert(
+        &mut self,
+        id: impl Into<String>,
+        source: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Result<(), PromptAssemblyError> {
+        let id = id.into();
+        if id.is_empty() || id.contains(['\r', '\n']) {
+            return Err(PromptAssemblyError::InvalidId { id });
+        }
+        let content = content.into();
+        if content.is_empty() {
+            self.remove(&id);
+            return Ok(());
+        }
+        let section = PromptSection {
+            id: id.clone(),
+            source: source.into(),
+            sha256: sha256(&content),
+            content,
+            selected_skill_name: None,
+        };
+        match self
+            .sections
+            .iter()
+            .position(|candidate| candidate.id == id)
+        {
+            Some(at) => self.sections[at] = section,
+            None => self.sections.push(section),
+        }
+        self.sections
+            .sort_by_key(|section| canonical_section_rank(section.semantics().role));
+        Ok(())
+    }
+
+    /// Remove an ordinary section if present.
+    pub fn remove(&mut self, id: &str) {
+        self.sections.retain(|section| section.id != id);
+    }
+
     /// Add one fully selected skill with durable name and source provenance.
     ///
     /// The section id is derived from the exact source locator. This makes loading

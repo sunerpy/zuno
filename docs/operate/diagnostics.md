@@ -80,8 +80,9 @@ Three findings and what they mean:
 | Present but not described | No `description`, so it is hidden from the model-facing catalog |
 | Listed under ambiguous names | Two sources declare the same name, which disables the direct slash form |
 
-Restart before reading, since the output reflects this process's discovery. If the Skill
-appears here but a specific agent does not use it, compare against
+Each debug command performs a fresh discovery, while an existing TUI or ACP session
+subscribes to live catalog generations. If the Skill appears here but a specific agent
+does not use it, compare against
 `zuno debug agent <name>`. See [Authoring Skills](/config/authoring-skills).
 
 ## The model did not follow an instruction file

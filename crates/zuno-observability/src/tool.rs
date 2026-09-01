@@ -109,7 +109,7 @@ pub fn error_kind(error: &ToolError) -> &'static str {
     match error {
         ToolError::Denied { .. } => "denied",
         ToolError::InvalidArgs { .. } => "invalid_args",
-        ToolError::Timeout { .. } => "timeout",
+        ToolError::Timeout { .. } | ToolError::NetworkTimeout { .. } => "timeout",
         ToolError::Transient { .. } => "transient",
         ToolError::NotFound { .. } => "not_found",
         ToolError::Failed { .. } => "failed",

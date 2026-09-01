@@ -188,6 +188,12 @@ zuno
 
 小写别名 `http_proxy`、`https_proxy`、`all_proxy` 和 `no_proxy` 也被接受。特定协议的变量优先于 `ALL_PROXY`；`NO_PROXY` 会让匹配的目标绕过所有已配置的代理。支持 HTTP、HTTPS CONNECT、SOCKS4、SOCKS5 以及带代理侧 DNS 的 SOCKS5 URL。改动这些变量之后请重启 Zuno，因为连接池在每个客户端构造时就捕获了代理策略。
 
+`webfetch` 使用同一条路由，但不会把目标 DNS 的权威交给代理。对原始 URL 与每一跳
+重定向，Zuno 都会在本地解析并校验全部目标地址，再通过选中的 HTTP、HTTPS、
+SOCKS4 或 SOCKS5 路由连接一个已校验 IP，同时保留原始 Host header 与 TLS SNI。
+配置的代理不可用时请求直接失败，不会静默重试直连；`NO_PROXY` 是环境层面对匹配
+公开目标选择直连的唯一方式。
+
 由 shell 工具、格式化器、语言服务器和本地 MCP server 启动的命令会继承 Zuno 的进程环境。它们各自显式的环境配置可以覆盖个别代理变量。
 
 Amazon Bedrock 运行时请求与 AWS SSO 凭据请求使用同一套环境代理策略。这意味着一个只能通过网关访问的 region 不需要 Bedrock 专用的代理选项：

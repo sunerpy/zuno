@@ -902,6 +902,7 @@ fn tool_error_result(
             zuno_error::ToolError::InvalidArgs { .. } => Some(ToolBlockKind::InvalidArguments),
             zuno_error::ToolError::NotFound { .. } => Some(ToolBlockKind::Unavailable),
             zuno_error::ToolError::Timeout { .. }
+            | zuno_error::ToolError::NetworkTimeout { .. }
             | zuno_error::ToolError::Transient { .. }
             | zuno_error::ToolError::Failed { .. }
             | zuno_error::ToolError::Uncertain { .. } => None,

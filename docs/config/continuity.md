@@ -232,8 +232,9 @@ Continuity is separate from the host's durable Plan. This configuration:
 }
 ```
 
-hides the model-facing Plan mutation tool, but the host can still create, persist, project,
-and recover the Plan. It does not turn History or Notes into a replacement Plan store.
+hides the model-facing Plan mutation tool, so the model cannot create or change a strategic
+Plan. Any existing Plan remains persisted, projected, and recoverable. This does not turn
+History or Notes into a replacement Plan store.
 
 ## Verify the effective result
 

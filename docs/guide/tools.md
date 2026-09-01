@@ -53,13 +53,20 @@ Notes never expose a host path. A scope may contain at most 100 documents,
 `call_id`, request digest, and revision make a repeated delivery idempotent while
 rejecting stale concurrent writes.
 
-The host's durable Plan is independent from model tool visibility. Disabling
-`plan_update` hides model mutation but does not disable host Plan creation or
-restart recovery. Its optional `action` is `update` by default. `push` suspends
-the active Plan and installs a focused durable child; `pop` is accepted only
-after every child step completes and restores the exact parent once. The active
-Plan should be updated when work starts, completes, blocks, or changes scope,
-then reconciled before a final answer.
+The host classifier decides whether a request requires a durable strategic Plan,
+but it does not generate visible generic steps. The model uses
+`plan_update action=create` for the first Plan or a genuinely new objective;
+`patch` changes only named step ids, `append` adds host-identified steps, `push`
+opens a focused child, and `pop` restores the exact parent without retransmitting
+the Plan. Every existing-Plan mutation requires the current
+`expected_revision`. `completed` and `superseded` are terminal.
+
+Before successful delivery, a durable reconciliation driver checks Plan, Todo,
+Job, Goal, tool-result, and verification state. Ordinary sessions receive at
+most two reconciliation continuations, then enter typed
+`PlanUnreconciled` human wait instead of claiming completion. Disabling
+`plan_update` prevents model creation or mutation; an existing Plan is still
+persisted, projected, and restored.
 
 See [History and Notes continuity](/config/continuity) for complete enable/disable,
 profile-overlay, permission, revision, and restart guidance.
@@ -70,9 +77,13 @@ path is `apply_patch` plus `write`.
 
 `webfetch` accepts only credential-free HTTP(S) targets. Zuno resolves and
 validates every address, rejects a whole mixed public/private DNS answer, pins
-the validated addresses, bypasses environment proxies, and repeats validation
-for each of at most five redirects. Public cross-origin redirects are allowed
-only after the new target independently passes the same checks.
+the validated addresses, and repeats validation for each of at most five
+redirects. It honors the process `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and
+`NO_PROXY` policy while sending the validated target IP through HTTP, HTTPS,
+SOCKS4, or SOCKS5 proxy routes and preserving the original Host/TLS SNI. A
+configured proxy failure never falls back to direct. The default timeout is 30
+seconds and the per-call maximum is 120 seconds; timeout errors report route,
+phase, and elapsed duration.
 
 `web_search` keeps provider credentials and full wire URLs out of errors and
 logs. Diagnostics identify only provider, scheme, host, path, status, and error

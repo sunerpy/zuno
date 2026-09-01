@@ -68,7 +68,7 @@ fn proxy_probe_child() {
         .expect("test runtime");
     let body = runtime.block_on(async {
         let client = if mode == "direct-policy" {
-            zuno_network::direct_client_builder()
+            zuno_network::direct_client_builder(zuno_network::DirectPurpose::LoopbackControlPlane)
                 .build()
                 .expect("direct client")
         } else {

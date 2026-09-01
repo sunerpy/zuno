@@ -71,8 +71,9 @@ zuno debug skill
 | 存在但没有描述 | 缺少 `description`，因此它对模型可见的目录隐藏 |
 | 被列在有歧义的名称下 | 两个来源声明了同一名称，这会禁用直接的斜杠形式 |
 
-读取之前先重启，因为输出反映的是当前这个进程的发现结果。如果 Skill 出现在这里但某个具体
-Agent 不使用它，就与 `zuno debug agent <name>` 对比。参见
+每次 debug 命令都会重新执行发现，现有 TUI 或 ACP 会话则订阅运行中的 catalog
+generation。如果 Skill 出现在这里但某个具体 Agent 不使用它，就与
+`zuno debug agent <name>` 对比。参见
 [编写 Skill](/zh/config/authoring-skills)。
 
 ## 模型没有遵循某个指令文件

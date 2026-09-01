@@ -20,11 +20,13 @@ zuno-permission = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
+zuno-watch = { workspace = true }
 # Not a workspace pin on purpose: the root manifest ships no YAML parser and task 14
 # was not allowed to edit it. `yaml-rust2` is the YAML 1.2 core-schema parser that
 # matches js-yaml 4 (what gray-matter uses) on the scalar resolutions skill

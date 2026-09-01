@@ -218,7 +218,7 @@ Claw Code is a useful Rust terminal-agent reference for process ergonomics, focu
 | GitHub, Actions, and release delivery guidance | adapt | On-demand `github-delivery` Skill, typed `remoteObserver` background purpose, authoritative run/ref refresh, strict required-job conclusions, least-privilege workflow guidance, and exact artifact/checksum evidence |
 | Durable memory extraction and consolidation | adapt | Per-session delivered-turn cadence, isolated small-model review with the resident snapshot, and audited add/replace/remove candidates instead of direct model-owned file rewrites |
 | Tool replay after failure | adapt | `Never` by default; explicit `Safe` only for read-only/idempotent tools |
-| Public web fetch targets | adapt | Direct/no-proxy `PublicHttpClient`, all-address public validation, DNS pinning, and per-hop manual redirect validation |
+| Public web fetch targets | adapt | Proxy-aware `PublicHttpClient`, all-address public validation, validated-IP proxy routing with original Host/TLS SNI, no proxy-to-direct fallback, and per-hop manual redirect validation |
 | Credential-bearing search endpoints | adapt | Private wire URL, scrubbed diagnostic endpoint, URL-free causes, and sentinel leak tests |
 | Durable normalized image objects | adapt | `zuno-attachment`, content-addressed private objects, admission/request policies, legacy inline read support, and late provider inlining |
 | ACP session MCP | adapt | Validated stdio/HTTP declarations, isolated session `ProfileBundle`, atomic tool publication, and exact reverse teardown |

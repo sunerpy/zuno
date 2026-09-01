@@ -34,9 +34,13 @@ use bounds::{MAX_REDIRECTS, MAX_RESPONSE_BYTES, WebError, resolve_timeout};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use zuno_error::ToolError;
-use zuno_network::{DiagnosticEndpoint, PublicHttpClient, PublicHttpPolicy, PublicTarget};
+use zuno_network::{
+    DiagnosticEndpoint, PublicHttpClient, PublicHttpPolicy, PublicHttpResponse, PublicTarget,
+};
 use zuno_tool::{Attachment, ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy, TypedTool};
 
 /// The wire id, and the permission key.
@@ -129,6 +133,80 @@ enum WebFetchTransport {
     Raw(reqwest::Client),
 }
 
+enum FetchResponse {
+    Public(PublicHttpResponse),
+    Raw(reqwest::Response),
+}
+
+impl FetchResponse {
+    fn status(&self) -> reqwest::StatusCode {
+        match self {
+            Self::Public(response) => response.status(),
+            Self::Raw(response) => response.status(),
+        }
+    }
+
+    fn headers(&self) -> &reqwest::header::HeaderMap {
+        match self {
+            Self::Public(response) => response.headers(),
+            Self::Raw(response) => response.headers(),
+        }
+    }
+
+    fn route(&self) -> &'static str {
+        match self {
+            Self::Public(response) => response.route(),
+            Self::Raw(_) => "direct_test",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FetchProgress {
+    route: Arc<Mutex<String>>,
+    phase: Arc<AtomicU8>,
+}
+
+impl FetchProgress {
+    const RESOLVE_CONNECT: u8 = 0;
+    const RESPONSE_BODY: u8 = 1;
+    const CONVERT: u8 = 2;
+
+    fn new(route: String) -> Self {
+        Self {
+            route: Arc::new(Mutex::new(route)),
+            phase: Arc::new(AtomicU8::new(Self::RESOLVE_CONNECT)),
+        }
+    }
+
+    fn set_route(&self, route: &str) {
+        *self
+            .route
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = route.to_owned();
+    }
+
+    fn set_phase(&self, phase: u8) {
+        self.phase.store(phase, Ordering::Release);
+    }
+
+    fn route(&self) -> String {
+        self.route
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn phase(&self) -> &'static str {
+        match self.phase.load(Ordering::Acquire) {
+            Self::RESOLVE_CONNECT => "resolve_connect",
+            Self::RESPONSE_BODY => "response_body",
+            Self::CONVERT => "convert",
+            _ => "unknown",
+        }
+    }
+}
+
 impl Default for WebFetchTool {
     fn default() -> Self {
         Self::new()
@@ -181,7 +259,7 @@ impl WebFetchTool {
         target: &PublicTarget,
         format: Format,
         ctx: &ToolContext,
-    ) -> Result<reqwest::Response, WebError> {
+    ) -> Result<FetchResponse, WebError> {
         let first = self.get(target, format, BROWSER_USER_AGENT, ctx).await?;
         if is_cloudflare_challenge(&first) {
             return self.get(target, format, HONEST_USER_AGENT, ctx).await;
@@ -195,7 +273,7 @@ impl WebFetchTool {
         format: Format,
         user_agent: &str,
         ctx: &ToolContext,
-    ) -> Result<reqwest::Response, WebError> {
+    ) -> Result<FetchResponse, WebError> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::USER_AGENT,
@@ -215,12 +293,14 @@ impl WebFetchTool {
                 WebFetchTransport::Public(client) => client
                     .get(target.clone(), headers)
                     .await
+                    .map(FetchResponse::Public)
                     .map_err(WebError::from),
                 WebFetchTransport::Raw(client) => client
                     .get(target.url().clone())
                     .headers(headers)
                     .send()
                     .await
+                    .map(FetchResponse::Raw)
                     .map_err(|source| classify_send_error(&target.diagnostic(), source)),
             }
         };
@@ -239,8 +319,10 @@ impl WebFetchTool {
         params: &WebFetchParams,
         target: &PublicTarget,
         ctx: &ToolContext,
+        progress: &FetchProgress,
     ) -> Result<ToolOutput, WebError> {
         let response = self.send(target, params.format, ctx).await?;
+        progress.set_route(response.route());
 
         let status = response.status();
         if !status.is_success() {
@@ -259,7 +341,17 @@ impl WebFetchTool {
             .to_owned();
         let mime = mime_of(&content_type);
 
-        let body = body::read_bounded(response, MAX_RESPONSE_BYTES, ctx.interrupt.as_ref()).await?;
+        progress.set_phase(FetchProgress::RESPONSE_BODY);
+        let body = match response {
+            FetchResponse::Public(response) => {
+                body::read_public_bounded(response, MAX_RESPONSE_BYTES, ctx.interrupt.as_ref())
+                    .await?
+            }
+            FetchResponse::Raw(response) => {
+                body::read_bounded(response, MAX_RESPONSE_BYTES, ctx.interrupt.as_ref()).await?
+            }
+        };
+        progress.set_phase(FetchProgress::CONVERT);
         let title = format!("{} ({content_type})", params.url);
 
         if is_image_attachment(&mime) {
@@ -320,10 +412,20 @@ impl TypedTool for WebFetchTool {
         .await?;
 
         let budget = resolve_timeout(params.timeout);
-        match tokio::time::timeout(budget, self.fetch(&params, &target, &ctx)).await {
+        let initial_route = match &self.transport {
+            WebFetchTransport::Public(client) => client
+                .route_label(&target)
+                .unwrap_or("proxy_configuration")
+                .to_owned(),
+            WebFetchTransport::Raw(_) => "direct_test".to_owned(),
+        };
+        let progress = FetchProgress::new(initial_route);
+        match tokio::time::timeout(budget, self.fetch(&params, &target, &ctx, &progress)).await {
             Ok(result) => result.map_err(failed),
-            Err(_elapsed) => Err(ToolError::Timeout {
+            Err(_elapsed) => Err(ToolError::NetworkTimeout {
                 tool: ID.to_owned(),
+                route: progress.route(),
+                phase: progress.phase(),
                 elapsed: budget,
             }),
         }
@@ -405,7 +507,7 @@ pub fn is_image_attachment(mime: &str) -> bool {
 /// Cloudflare's bot-challenge signature.
 ///
 /// Oracle: `packages/core/src/tool/webfetch.ts:78-79`.
-fn is_cloudflare_challenge(response: &reqwest::Response) -> bool {
+fn is_cloudflare_challenge(response: &FetchResponse) -> bool {
     response.status() == reqwest::StatusCode::FORBIDDEN
         && response
             .headers()

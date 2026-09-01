@@ -1,40 +1,51 @@
 //! Shared outbound HTTP policy.
 //!
-//! Zuno's session-owned HTTP clients use [`ProxyPolicy::Environment`]. Reqwest
+//! Zuno's session-owned HTTP clients use [`SessionNetworkPolicy::ProcessEnvironment`]. Reqwest
 //! resolves `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` (including
 //! their lowercase aliases) when the client is built. Keeping construction
 //! behind this crate makes that behavior a product contract rather than an
 //! accidental property of whichever provider happened to instantiate reqwest.
 //!
-//! [`ProxyPolicy::Direct`] is reserved for local control-plane traffic and
-//! cloud metadata services whose credentials must never be forwarded to an
-//! ambient proxy.
+//! Direct traffic is intentionally not a boolean escape hatch. A caller must
+//! declare the narrow control-plane or metadata purpose that makes bypassing the
+//! process proxy correct.
 
+mod proxy_transport;
 mod public_http;
 
 use reqwest::{Client, ClientBuilder};
 
 pub use public_http::{
     DiagnosticEndpoint, HostResolver, PublicHttpClient, PublicHttpError, PublicHttpPolicy,
-    PublicTarget, SystemHostResolver, is_public_ip,
+    PublicHttpResponse, PublicTarget, SystemHostResolver, is_public_ip,
 };
 
-/// How an outbound HTTP client treats process proxy configuration.
+/// The only supported reasons to bypass process proxy configuration.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ProxyPolicy {
-    /// Honor the standard proxy and bypass environment variables.
+pub enum DirectPurpose {
+    /// Loopback/local control-plane probes owned by the same Zuno process.
     #[default]
-    Environment,
-    /// Never use a proxy, even when proxy variables are present.
-    Direct,
+    LoopbackControlPlane,
+    /// Cloud instance metadata endpoints whose credentials must not reach a proxy.
+    CloudMetadata,
 }
 
-impl ProxyPolicy {
+/// Unified policy for one session-owned HTTP client.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionNetworkPolicy {
+    /// Honor `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`.
+    #[default]
+    ProcessEnvironment,
+    /// Bypass proxies for one explicitly-declared narrow purpose.
+    Direct(DirectPurpose),
+}
+
+impl SessionNetworkPolicy {
     /// Start a reqwest client builder with this policy applied.
     pub fn client_builder(self) -> ClientBuilder {
         match self {
-            Self::Environment => Client::builder(),
-            Self::Direct => Client::builder().no_proxy(),
+            Self::ProcessEnvironment => Client::builder(),
+            Self::Direct(_) => Client::builder().no_proxy(),
         }
     }
 
@@ -46,7 +57,7 @@ impl ProxyPolicy {
 
 /// Start a session-network client builder that honors proxy environment variables.
 pub fn client_builder() -> ClientBuilder {
-    ProxyPolicy::Environment.client_builder()
+    SessionNetworkPolicy::ProcessEnvironment.client_builder()
 }
 
 /// Construct a session-network client that honors proxy environment variables.
@@ -56,14 +67,14 @@ pub fn client_builder() -> ClientBuilder {
 /// intentionally infallible.
 #[must_use]
 pub fn client() -> Client {
-    ProxyPolicy::Environment
+    SessionNetworkPolicy::ProcessEnvironment
         .build_client()
         .expect("session HTTP client must initialize")
 }
 
-/// Start a client builder that cannot use an ambient proxy.
-pub fn direct_client_builder() -> ClientBuilder {
-    ProxyPolicy::Direct.client_builder()
+/// Start a client builder that cannot use an ambient proxy for the declared purpose.
+pub fn direct_client_builder(purpose: DirectPurpose) -> ClientBuilder {
+    SessionNetworkPolicy::Direct(purpose).client_builder()
 }
 
 #[cfg(test)]
@@ -72,7 +83,10 @@ mod tests {
 
     #[test]
     fn default_policy_is_the_session_environment_policy() {
-        assert_eq!(ProxyPolicy::default(), ProxyPolicy::Environment);
+        assert_eq!(
+            SessionNetworkPolicy::default(),
+            SessionNetworkPolicy::ProcessEnvironment
+        );
     }
 
     #[test]

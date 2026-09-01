@@ -34,6 +34,16 @@ ZUNO_DISABLE_EXTERNAL_SKILLS=1 zuno
 这个开关禁用隐式 `.agents` 根目录；Zuno 原生 `.zuno` 根目录、已配置的 Zuno
 根目录与显式 `skills.paths` 仍然启用。
 
+## 运行中变更
+
+一个会话会让 Prompt 发现、required Skill、`skill` 工具、斜杠命令、TUI 与 ACP
+共同读取一份原子发布的 Skill catalog generation。在已经生效的根目录中安装、修改、
+删除或重命名 Skill 后，无需重启会话即可识别。损坏的修改会保留上一份有效条目并公布
+warning，直到文件修复。
+
+若调用方在重命名后仍尝试加载旧的精确来源，Zuno 会强制刷新一次，然后返回
+`CatalogStale` 和当前精确 locator；不会在同名来源之间猜测。
+
 ## 一个 Skill 如何到达模型
 
 提示词拿到的是目录，不是正文：

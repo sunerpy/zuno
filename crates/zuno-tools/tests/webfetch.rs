@@ -138,8 +138,9 @@ async fn run(args: serde_json::Value, ctx: ToolContext) -> Result<ToolOutput, To
             .expect("webfetch test URL"),
     )
     .expect("absolute webfetch test URL");
-    let mut builder = zuno_network::direct_client_builder()
-        .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS));
+    let mut builder =
+        zuno_network::direct_client_builder(zuno_network::DirectPurpose::LoopbackControlPlane)
+            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS));
     if let (Some(host), Some(port)) = (target.host_str(), target.port_or_known_default()) {
         builder = builder.resolve(host, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
     }
@@ -580,11 +581,18 @@ async fn a_hanging_endpoint_fails_at_the_timeout() {
     );
 
     match error {
-        ToolError::Timeout { tool, elapsed } => {
+        ToolError::NetworkTimeout {
+            tool,
+            route,
+            phase,
+            elapsed,
+        } => {
             assert_eq!(tool, "webfetch");
+            assert_eq!(route, "direct_test");
+            assert_eq!(phase, "resolve_connect");
             assert_eq!(elapsed, Duration::from_secs(1));
         }
-        other => panic!("expected a typed Timeout, got {other:?}"),
+        other => panic!("expected a typed NetworkTimeout, got {other:?}"),
     }
 }
 
@@ -610,11 +618,18 @@ async fn the_timeout_covers_the_body_read_not_just_the_headers() {
     .expect_err("a body slower than the budget must fail");
 
     match error {
-        ToolError::Timeout { tool, elapsed } => {
+        ToolError::NetworkTimeout {
+            tool,
+            route,
+            phase,
+            elapsed,
+        } => {
             assert_eq!(tool, "webfetch");
+            assert_eq!(route, "direct_test");
+            assert_eq!(phase, "resolve_connect");
             assert_eq!(elapsed, Duration::from_secs(1));
         }
-        other => panic!("expected a typed Timeout, got {other:?}"),
+        other => panic!("expected a typed NetworkTimeout, got {other:?}"),
     }
 }
 

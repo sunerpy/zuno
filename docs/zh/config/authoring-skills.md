@@ -111,6 +111,26 @@ Zuno 按这个作用域顺序发现 Skill：
 
 在这个较宽的外部开关下，Zuno 原生的 `.zuno` 根目录仍然启用。
 
+## 运行中 catalog generation
+
+每个运行中会话拥有一份不可变的
+`SkillCatalogSnapshot { generation, digest, skills, warnings }`。`zuno-watch`
+监听全部有效的本地 Skill 根目录与远端缓存根；如果合法根目录尚不存在，就监听最近的
+安全已有父目录。相关事件会防抖，watcher overflow 会触发完整重扫，新 generation
+一次性原子发布。
+
+Prompt 元数据、`requiredSkills`、斜杠命令、`skill` 工具、TUI 与 ACP 都读取同一份
+快照。因此新增、修改、删除或重命名 Skill 后，现有会话无需重启即可识别。一个损坏或
+暂时不可读的 `SKILL.md` 会保留上一份有效来源并发布 warning，不会把不完整结果替换
+进整个 catalog。
+
+`load` 与 `read_resource` 收到当前 generation 中不存在的 locator 时，会强制刷新一次。
+来源重新出现则正常加载；已删除或重命名则返回 typed `CatalogStale`，并给出当前可用的
+精确 locator。Zuno 不会扫描调用方任意提供的路径，也不会模糊加载一个同名 Skill。
+
+修改发现配置本身，例如新增一个 `skills.paths` 根目录，仍需重配或重启会话，因为这会
+改变需要监听的目录集合。
+
 ## 配置
 
 | 键 | 类型 | 默认值 | 说明 |
@@ -200,7 +220,10 @@ zuno debug skill
 zuno debug agent build
 ```
 
-`zuno debug skill` 报告原始发现结果：`view.kind: "raw_discovery"`、`agentFiltered: false`、`extensionOverlayApplied: false`、保留了来自不同来源同名条目的 `skills` 数组，以及一个含来源数、有描述数、唯一数和存在歧义名称的 `summary`。读它之前请先重启，因为它反映的是该进程的发现结果。
+`zuno debug skill` 报告原始发现结果：`view.kind: "raw_discovery"`、
+`agentFiltered: false`、`extensionOverlayApplied: false`、保留了来自不同来源同名
+条目的 `skills` 数组，以及一个含来源数、有描述数、唯一数和存在歧义名称的
+`summary`。每次命令都会重新执行发现；运行中的 TUI 或 ACP 会话会自动更新自己的快照。
 
 `zuno debug agent <name>` 给出的是经 Agent 过滤的视图，包括元数据与被选中正文的预算、已渲染/被省略/被截断的覆盖情况，以及一段有界预览。当一个 Skill 确实存在、但某个特定 Agent 看不到它时，用的就是这一条。
 

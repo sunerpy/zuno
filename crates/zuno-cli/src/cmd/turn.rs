@@ -53,8 +53,12 @@ use zuno_engine::dispatch::{AuthorizationPolicy, ToolRegistryDispatcher};
 use zuno_engine::driver::AgentDriver;
 use zuno_engine::r#loop::{
     AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest,
-    ToolConcurrencyLimit, ToolFailureRecovery, TurnContext, TurnError, TurnEvent, TurnEventSender,
-    TurnOutcome, TurnRecovery,
+    ToolConcurrencyLimit, ToolDispatcher as _, ToolFailureRecovery, TurnContext, TurnError,
+    TurnEvent, TurnEventSender, TurnOutcome, TurnRecovery,
+};
+use zuno_engine::plan_driver::{
+    PlanReconciliationDecision, PlanReconciliationDriver, PlanReconciliationInput,
+    PlanWaitingReason,
 };
 use zuno_engine::planning::{
     ExistingPlanState, PlanningContentFacts, PlanningDecision, PlanningInput, PlanningInputSource,
@@ -431,8 +435,10 @@ pub(crate) struct TurnPlan {
     /// load could hand back a body for a name the prompt never advertised, or refuse
     /// one it did.
     skills: Arc<zuno_catalog::skill::Skills>,
-    /// Exact visible Skill sources the active Agent requires on every turn.
-    required_skills: Vec<SelectedSkillIdentity>,
+    /// Live atomic generations used by every Skill-facing session consumer.
+    skill_catalog: Arc<zuno_catalog::skill::catalog::SkillCatalogService>,
+    /// Configured names are re-resolved against each live generation.
+    required_skill_names: Vec<String>,
     /// The `AGENTS.md`-class rule files this session runs under, read once here.
     ///
     /// Loaded during resolution rather than at host construction because the read is
@@ -755,15 +761,16 @@ impl TurnPlan {
             resolve_learning_model(&config, &catalog, &provider_id, env, &mut notes)?;
         let delegation_facts = Arc::new(delegation_facts(&catalog));
         let subagent_model_policy = resolve_subagent_model_policy(&config, &catalog)?;
-        let all_skills =
-            zuno_catalog::skill::load(&zuno_catalog::skill::SkillOptions::from_config(
-                &directory,
-                worktree.as_deref(),
-                env,
-                &config,
-            ))
+        let skill_options = zuno_catalog::skill::SkillOptions::from_config(
+            &directory,
+            worktree.as_deref(),
+            env,
+            &config,
+        );
+        let extension_skills = extensions.skills().to_vec();
+        let all_skills = zuno_catalog::skill::load(&skill_options)
             .await
-            .with_overlay(extensions.skills().iter().cloned());
+            .with_overlay(extension_skills.iter().cloned());
         let capability = Arc::new(orchestration_capability(
             &config,
             extension_revision,
@@ -789,11 +796,22 @@ impl TurnPlan {
                 agent.capabilities().rules(),
             )
         }));
-        let required_skills = resolve_required_skill_identities(
-            agent.name(),
-            definition.required_skills.as_deref(),
-            &skills,
-        )?;
+        let visibility_agent = agent.clone();
+        let skill_catalog = zuno_catalog::skill::catalog::SkillCatalogService::start_with_initial(
+            skill_options,
+            extension_skills,
+            Arc::new(move |skill| {
+                zuno_catalog::skill::builtin::visible_to(
+                    &skill.location,
+                    visibility_agent.name(),
+                    visibility_agent.definition().tools.as_deref(),
+                    visibility_agent.capabilities().rules(),
+                )
+            }),
+            (*skills).clone(),
+        );
+        let required_skill_names = definition.required_skills.clone().unwrap_or_default();
+        resolve_required_skill_identities(agent.name(), Some(&required_skill_names), &skills)?;
         let mut runtime_surface =
             zuno_extension::runtime_surface(&extensions, &directory).map_err(to_string)?;
         let mut extension_tools = zuno_extension::lifecycle_tools(
@@ -861,7 +879,8 @@ impl TurnPlan {
             catalog_models,
             reasoning_efforts,
             skills,
-            required_skills,
+            skill_catalog,
+            required_skill_names,
             instructions,
             delegation_facts,
             subagent_model_policy,
@@ -1019,8 +1038,8 @@ impl TurnPlan {
     }
 
     /// The exact skill set shared by prompt assembly and the `skill` tool.
-    pub(crate) fn skills(&self) -> &zuno_catalog::skill::Skills {
-        &self.skills
+    pub(crate) fn skills(&self) -> Arc<zuno_catalog::skill::Skills> {
+        Arc::clone(self.skill_catalog.snapshot().skills())
     }
 
     /// Build the command catalogue this resolved plan exposes.
@@ -1133,6 +1152,14 @@ impl TurnPlan {
         mcp: Option<&super::mcp_runtime::McpRuntimeDiagnostics>,
     ) -> Value {
         let definition = self.agent.definition();
+        let skill_snapshot = self.skill_catalog.snapshot();
+        let current_skills = skill_snapshot.skills();
+        let current_required_skills = resolve_required_skill_identities(
+            definition.name.as_str(),
+            Some(&self.required_skill_names),
+            current_skills,
+        )
+        .unwrap_or_default();
         let mut dynamic_tool_ids = self
             .configured_extension_tool_ids
             .iter()
@@ -1350,14 +1377,12 @@ impl TurnPlan {
                 })
             })
             .collect::<Vec<_>>();
-        let required_skills = self
-            .required_skills
+        let required_skills = current_required_skills
             .iter()
             .map(|skill| json!({"name": skill.name, "source": skill.source}))
             .collect::<Vec<_>>();
         const SKILL_PREVIEW_LIMIT: usize = 50;
-        let skills = self
-            .skills
+        let skills = current_skills
             .all()
             .iter()
             .take(SKILL_PREVIEW_LIMIT)
@@ -1367,20 +1392,19 @@ impl TurnPlan {
                     "displayName": skill.catalog_display_name(),
                     "source": skill.location,
                     "exposure": skill.exposure,
-                    "required": self.required_skills.iter().any(|required| {
+                    "required": current_required_skills.iter().any(|required| {
                         required.name == skill.name && required.source == skill.location
                     }),
                 })
             })
             .collect::<Vec<_>>();
-        let described_skill_count = self
-            .skills
+        let described_skill_count = current_skills
             .all()
             .iter()
             .filter(|skill| skill.catalog_description().is_some())
             .count();
         let mut skill_name_counts = BTreeMap::<&str, usize>::new();
-        for skill in self.skills.all() {
+        for skill in current_skills.all() {
             *skill_name_counts.entry(&skill.name).or_default() += 1;
         }
         let metadata_enabled = self
@@ -1391,9 +1415,7 @@ impl TurnPlan {
             != Some(false);
         let (metadata_budget, metadata_coverage) = if metadata_enabled {
             let budget = skill_metadata_budget(self.window.context, self.config.skills.as_ref());
-            let metadata = self
-                .skills
-                .render_within(zuno_catalog::skill::Form::Index, budget);
+            let metadata = current_skills.render_within(zuno_catalog::skill::Form::Index, budget);
             (
                 Some(budget),
                 Some(json!({
@@ -1529,9 +1551,16 @@ impl TurnPlan {
                 },
             },
             "skills": {
+                "generation": skill_snapshot.generation(),
+                "digest": skill_snapshot.digest(),
+                "warnings": skill_snapshot
+                    .warnings()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
                 "required": required_skills,
                 "summary": {
-                    "sourceCount": self.skills.all().len(),
+                    "sourceCount": current_skills.all().len(),
                     "describedSourceCount": described_skill_count,
                     "indexedSourceCount": self.skills.indexed_count(),
                     "searchableSourceCount": self.skills.searchable_count(),
@@ -1547,7 +1576,10 @@ impl TurnPlan {
                     "selectedBodyBudgetBytes": selected_body_budget,
                     "selectedBodyBudgetApproxTokens": selected_body_budget / APPROX_BYTES_PER_TOKEN,
                     "previewLimit": SKILL_PREVIEW_LIMIT,
-                    "previewOmitted": self.skills.all().len().saturating_sub(SKILL_PREVIEW_LIMIT),
+                    "previewOmitted": current_skills
+                        .all()
+                        .len()
+                        .saturating_sub(SKILL_PREVIEW_LIMIT),
                 },
                 "available": skills,
                 "parentExpandedBodiesInherited": false,
@@ -1950,10 +1982,11 @@ pub(crate) struct TurnHost {
     /// the moment a failure is printed — see [`without_credential`].
     credential: Option<String>,
     resolver: Resolver,
-    skills: Arc<zuno_catalog::skill::Skills>,
+    skill_catalog: Arc<zuno_catalog::skill::catalog::SkillCatalogService>,
     selected_skills: BTreeSet<SelectedSkillIdentity>,
     selected_skill_prompt_budget: usize,
-    required_skills: Vec<SelectedSkillIdentity>,
+    skill_config: Option<zuno_config::schema::SkillsConfig>,
+    required_skill_names: Vec<String>,
     council_presets: Vec<String>,
     dispatcher: ToolRegistryDispatcher,
     tool_concurrency: ToolConcurrencyLimit,
@@ -1996,6 +2029,7 @@ pub(crate) struct TurnHost {
     goal_store: Arc<GoalStore>,
     goal_projection: GoalProjection,
     goal_continuation: GoalContinuation,
+    plan_reconciliation: PlanReconciliationDriver,
     runs: SessionRunRegistry,
     background_jobs: super::child_turn::BackgroundJobSupervisor,
     background_executions: Arc<zuno_pty::BackgroundExecutionService>,
@@ -2196,6 +2230,12 @@ pub(crate) trait SessionTitleSink: Send + Sync {
 }
 
 impl MemoryObserver for super::child_turn::ChangeNotifier {
+    fn changed(&self) {
+        self.changed();
+    }
+}
+
+impl zuno_tools::WorkStateObserver for super::child_turn::ChangeNotifier {
     fn changed(&self) {
         self.changed();
     }
@@ -3776,9 +3816,10 @@ impl TurnHost {
                 plan.extensions.prompt_section(),
             )?;
             announce_instructions(&mut plan.resolver, &plan.instructions, &mut notes)?;
+            let skill_snapshot = plan.skill_catalog.snapshot();
             announce_skills(
                 &mut plan.resolver,
-                &plan.skills,
+                skill_snapshot.skills(),
                 skill_context_window,
                 skill_config.as_ref(),
             )?;
@@ -3865,12 +3906,14 @@ impl TurnHost {
                     background_executions: Arc::clone(&background_executions),
                     sandbox: None,
                     todo_store,
+                    work_observer: Arc::new(work_changes.clone()),
                     goal_store: Arc::clone(&goal_store),
                     interaction_policy,
                     mcp_loader: mcp.map(|catalog| {
                         Arc::new(catalog.loader()) as Arc<dyn zuno_tools::registry::McpToolLoader>
                     }),
                     skills: Arc::clone(&plan.skills),
+                    skill_catalog: Some(Arc::clone(&plan.skill_catalog)),
                     capability: Arc::clone(&plan.capability),
                     delegation: super::tool_runtime::Delegation {
                         host: Arc::new(child_host.clone()),
@@ -3960,6 +4003,7 @@ impl TurnHost {
                 )
                 .map_err(to_string)?,
             );
+            let plan_reconciliation = PlanReconciliationDriver::new(Arc::clone(&database));
             let mut host = Self {
                 profile_runtime: profile_runtime.clone(),
                 runtime,
@@ -3971,10 +4015,11 @@ impl TurnHost {
                 providers,
                 credential: presented,
                 resolver: plan.resolver,
-                skills: plan.skills,
+                skill_catalog: plan.skill_catalog,
                 selected_skills,
                 selected_skill_prompt_budget,
-                required_skills: plan.required_skills,
+                skill_config,
+                required_skill_names: plan.required_skill_names,
                 council_presets,
                 dispatcher,
                 tool_concurrency,
@@ -4005,6 +4050,7 @@ impl TurnHost {
                 goal_store,
                 goal_projection,
                 goal_continuation,
+                plan_reconciliation,
                 runs,
                 background_jobs,
                 background_executions,
@@ -5970,7 +6016,9 @@ impl TurnHost {
     /// through `/skills` and the typed `skill` tool, but are not exposed as an
     /// ambiguous slash name that could silently pick the wrong instructions.
     pub(crate) fn slash_skills(&self) -> Vec<zuno_catalog::skill::Skill> {
-        self.skills
+        self.skill_catalog
+            .snapshot()
+            .skills()
             .slash_invokable(self.commands().map(|command| command.name.as_str()))
             .into_iter()
             .cloned()
@@ -5999,6 +6047,13 @@ impl TurnHost {
         Arc::clone(&self.database)
     }
 
+    /// Subscribe to atomically published Skill generations.
+    pub(crate) fn skill_catalog_subscription(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Arc<zuno_catalog::skill::catalog::SkillCatalogSnapshot>> {
+        self.skill_catalog.subscribe()
+    }
+
     /// Database-scoped image admission service shared by every client surface.
     pub(crate) fn attachment_store(&self) -> Arc<zuno_attachment::AttachmentStore> {
         Arc::clone(&self.attachments)
@@ -6010,6 +6065,7 @@ impl TurnHost {
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<(), String> {
+        self.skill_catalog.shutdown();
         if let Some(cancel) = self.learning_maintenance_cancel.take() {
             cancel.cancel();
         }
@@ -6597,9 +6653,10 @@ impl TurnHost {
         events: &TurnEventSender,
     ) -> Result<(), String> {
         self.require_active_extension_composition()?;
+        let skills = self.skill_catalog.snapshot();
         if let Some(skill) = preload_selected_skill(
             &mut self.resolver,
-            &self.skills,
+            skills.skills(),
             &mut self.selected_skills,
             name,
             source,
@@ -6637,11 +6694,17 @@ impl TurnHost {
         events: TurnEventSender,
     ) -> Result<(), String> {
         self.require_active_extension_composition()?;
+        let skills = self.skill_catalog.snapshot();
+        let required_skills = resolve_required_skill_identities(
+            &self.agent,
+            Some(&self.required_skill_names),
+            skills.skills(),
+        )?;
         let required = preload_required_skills(
             &mut self.resolver,
-            &self.skills,
+            skills.skills(),
             &mut self.selected_skills,
-            &self.required_skills,
+            &required_skills,
             self.selected_skill_prompt_budget,
         )
         .await?;
@@ -6656,7 +6719,7 @@ impl TurnHost {
         }
         let newly_loaded = preload_explicit_skills(
             &mut self.resolver,
-            &self.skills,
+            skills.skills(),
             &mut self.selected_skills,
             prompt,
             self.selected_skill_prompt_budget,
@@ -6707,11 +6770,12 @@ impl TurnHost {
         self.goal_projection
             .ingest(&self.goal_store)
             .map_err(to_string)?;
-        self.ensure_durable_plan(prompt, options.planning_source, options.content)?;
+        let planning =
+            self.ensure_durable_plan(prompt, options.planning_source, options.content)?;
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
         let result = self
-            .drive_input_unaccounted(guard, options.routing.as_ref(), events.clone())
+            .drive_input_unaccounted(guard, options.routing.as_ref(), &planning, events.clone())
             .await;
         match result {
             Ok(outcome) => {
@@ -6734,7 +6798,7 @@ impl TurnHost {
         prompt: &str,
         source: PlanningInputSource,
         content: Option<&[RequestContentBlock]>,
-    ) -> Result<(), String> {
+    ) -> Result<PlanningDecision, String> {
         let goal_id = self
             .goal_store
             .goal(&self.session_id)
@@ -6749,7 +6813,13 @@ impl TurnHost {
                 prompt,
                 source,
                 content: planning_content_facts(content),
-                plan_available: host_planning_available(&self.runtime),
+                plan_available: host_planning_available(&self.runtime)
+                    && self
+                        .dispatcher
+                        .available_tools()
+                        .definitions
+                        .iter()
+                        .any(|tool| tool.id == zuno_tools::PLAN_UPDATE_TOOL_ID),
                 goal_id,
             },
         )?;
@@ -6762,13 +6832,14 @@ impl TurnHost {
         if outcome.changed {
             self.work_changes.changed();
         }
-        Ok(())
+        Ok(outcome.decision)
     }
 
     async fn drive_input_unaccounted(
         &mut self,
         guard: &SessionRunGuard,
         routing: Option<&PromptRouting>,
+        planning: &PlanningDecision,
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, TurnFailure> {
         let outcome = self.run_prelude().await?;
@@ -6778,9 +6849,18 @@ impl TurnHost {
         if !outcome.continue_turn {
             return Ok(None);
         }
-        let dynamic_context = self.goal_dynamic_context().map_err(TurnFailure::host)?;
-        self.execute_turn_unaccounted(dynamic_context, routing, guard, events)
-            .await
+        let mut dynamic_context = self.goal_dynamic_context().map_err(TurnFailure::host)?;
+        if let Some(instruction) = planning_runtime_instruction(planning) {
+            dynamic_context = dynamic_context.with_runtime_instruction(instruction);
+        }
+        self.execute_turn_unaccounted(
+            dynamic_context,
+            routing,
+            guard,
+            planning_requires_plan(planning),
+            events,
+        )
+        .await
     }
 
     fn persist_user_input(
@@ -6955,18 +7035,141 @@ impl TurnHost {
         report_prelude(&events, &self.notes, &prelude)
             .await
             .map_err(TurnFailure::event_consumer)?;
-        self.execute_turn_unaccounted(dynamic_context, None, prepared.run_guard(), events)
+        self.execute_turn_unaccounted(dynamic_context, None, prepared.run_guard(), true, events)
             .await
     }
 
     async fn execute_turn_unaccounted(
         &mut self,
+        mut dynamic_context: DynamicContext,
+        routing: Option<&PromptRouting>,
+        guard: &SessionRunGuard,
+        plan_required: bool,
+        events: TurnEventSender,
+    ) -> Result<Option<TurnOutcome>, TurnFailure> {
+        let proposed_cycle_id = format!("driver_{}", Uuid::now_v7().simple());
+        let cycle_id = self
+            .plan_reconciliation
+            .begin(&self.session_id, &proposed_cycle_id)
+            .map_err(TurnFailure::host)?;
+        loop {
+            let outcome = self
+                .execute_one_turn_unaccounted(dynamic_context, routing, guard, events.clone())
+                .await?;
+            let TurnOutcome::Completed {
+                assistant_message_id,
+                steps,
+                ..
+            } = &outcome
+            else {
+                return Ok(Some(outcome));
+            };
+            let input = self
+                .plan_reconciliation_input(plan_required)
+                .map_err(TurnFailure::host)?;
+            match self
+                .plan_reconciliation
+                .reconcile(&self.session_id, &cycle_id, input)
+                .map_err(TurnFailure::host)?
+            {
+                PlanReconciliationDecision::Finish | PlanReconciliationDecision::ContinueGoal => {
+                    self.cancel_reconciled_plan_requests(&cycle_id)
+                        .map_err(TurnFailure::host)?;
+                    events
+                        .publish(TurnEvent::TurnCompleted {
+                            assistant_message_id: assistant_message_id.clone(),
+                            steps: *steps,
+                        })
+                        .await
+                        .map_err(TurnFailure::event_consumer)?;
+                    return Ok(Some(outcome));
+                }
+                PlanReconciliationDecision::ContinueOrdinary { attempt } => {
+                    dynamic_context = self
+                        .goal_dynamic_context()
+                        .map_err(TurnFailure::host)?
+                        .with_runtime_instruction(format!(
+                            "Durable work reconciliation attempt {attempt}/2: the current \
+                             Plan, Todo, or Job state is not terminal. Inspect it through the \
+                             typed tools, perform any remaining work, and commit only the \
+                             necessary operation-based state changes. Do not infer completion \
+                             from prior assistant prose."
+                        ));
+                }
+                PlanReconciliationDecision::WaitForHuman { reason } => {
+                    let request_id = format!("que_{}", Uuid::now_v7().simple());
+                    self.goal_store
+                        .human_requests()
+                        .create(plan_unreconciled_request(
+                            &self.session_id,
+                            request_id.clone(),
+                            assistant_message_id,
+                            &cycle_id,
+                            reason,
+                        ))
+                        .map_err(TurnFailure::host)?;
+                    events
+                        .publish(TurnEvent::TurnWaitingForHuman {
+                            assistant_message_id: assistant_message_id.clone(),
+                            steps: *steps,
+                            request_id: request_id.clone(),
+                        })
+                        .await
+                        .map_err(TurnFailure::event_consumer)?;
+                    return Ok(Some(TurnOutcome::WaitingForHuman {
+                        assistant_message_id: assistant_message_id.clone(),
+                        steps: *steps,
+                        request_id,
+                    }));
+                }
+            }
+        }
+    }
+
+    fn cancel_reconciled_plan_requests(&self, cycle_id: &str) -> Result<(), String> {
+        let requests = self
+            .goal_store
+            .human_requests()
+            .pending(Some(&self.session_id))
+            .map_err(to_string)?;
+        let now = zuno_db::message::now_millis();
+        for request in requests {
+            if request.payload.get("source").and_then(Value::as_str) != Some("plan_reconciliation")
+            {
+                continue;
+            }
+            self.goal_store
+                .human_requests()
+                .resolve(
+                    &request.id,
+                    zuno_db::human_request::HumanRequestState::Cancelled,
+                    Some(&json!({
+                        "outcome": "durable_state_reconciled",
+                        "cycleId": cycle_id,
+                    })),
+                    now,
+                )
+                .map_err(to_string)?;
+        }
+        Ok(())
+    }
+
+    async fn execute_one_turn_unaccounted(
+        &mut self,
         dynamic_context: DynamicContext,
         routing: Option<&PromptRouting>,
         guard: &SessionRunGuard,
         events: TurnEventSender,
-    ) -> Result<Option<TurnOutcome>, TurnFailure> {
+    ) -> Result<TurnOutcome, TurnFailure> {
         let mut resolver = self.resolver.clone();
+        let skills = self.skill_catalog.snapshot();
+        announce_skills(
+            &mut resolver,
+            skills.skills(),
+            self.window.context,
+            self.skill_config.as_ref(),
+        )
+        .map_err(TurnFailure::host)?;
         if let Some(routing) = routing {
             resolver
                 .append_prompt_section(routing.id, routing.source, routing.content.clone())
@@ -7005,12 +7208,78 @@ impl TurnHost {
                     Uuid::new_v4().simple().to_string(),
                     dynamic_context,
                 )
-                .with_context_limit(self.window.context),
+                .with_context_limit(self.window.context)
+                .with_deferred_success_terminal_event(true),
                 context,
                 events.clone(),
             )
             .await;
-        outcome.map(Some).map_err(TurnFailure::Engine)
+        outcome.map_err(TurnFailure::Engine)
+    }
+
+    fn plan_reconciliation_input(
+        &self,
+        plan_required: bool,
+    ) -> Result<PlanReconciliationInput, String> {
+        let work = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
+            .snapshot(&self.session_id)
+            .map_err(to_string)?;
+        let plan_exists = work.plan.is_some();
+        let plan_terminal = work
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.steps.iter().all(|step| step.status.is_terminal()));
+        let active_todo = work.items.iter().any(|item| {
+            !matches!(
+                item.status,
+                zuno_tools::WorkItemStatus::Completed | zuno_tools::WorkItemStatus::Cancelled
+            )
+        });
+        let jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&self.database))
+            .list_for_parent(&self.session_id)
+            .map_err(to_string)?;
+        let mut active_job = false;
+        for job in jobs {
+            if matches!(
+                job.status,
+                zuno_db::job::JobStatus::Queued
+                    | zuno_db::job::JobStatus::Running
+                    | zuno_db::job::JobStatus::Uncertain
+            ) {
+                active_job = true;
+                break;
+            }
+            if let Some(input_id) = job.report_input_id.as_deref() {
+                let report = self
+                    .inbox
+                    .get(&self.session_id, input_id)
+                    .map_err(to_string)?;
+                if report.is_none_or(|report| {
+                    matches!(
+                        report.state,
+                        zuno_db::inbox::SubmissionState::Queued
+                            | zuno_db::inbox::SubmissionState::Steering
+                            | zuno_db::inbox::SubmissionState::Promoted
+                    )
+                }) {
+                    active_job = true;
+                    break;
+                }
+            }
+        }
+        let goal_active = self
+            .goal_store
+            .goal(&self.session_id)
+            .map_err(to_string)?
+            .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active);
+        Ok(PlanReconciliationInput {
+            plan_required,
+            plan_exists,
+            plan_terminal,
+            active_todo,
+            active_job,
+            goal_active,
+        })
     }
 
     async fn recover_goal_context(&mut self) -> Result<(), TurnFailure> {
@@ -7381,6 +7650,14 @@ impl TurnHost {
             })?;
         match disposition {
             GoalFailureDisposition::RetryScheduled(retry) => {
+                self.plan_reconciliation
+                    .waiting_retry_for_active_cycle(&self.session_id, retry.reason.as_str())
+                    .map_err(|driver_error| {
+                        format!(
+                            "{rendered}; additionally failed to record waiting_retry driver \
+                             phase: {driver_error}"
+                        )
+                    })?;
                 self.last_turn_completed = true;
                 report_goal_retry(events, &retry, &rendered).await?;
                 Ok(true)
@@ -7924,23 +8201,10 @@ struct HostPlanningOutcome {
     changed: bool,
 }
 
-const SUPERSEDED_PLAN_STEP_PREFIX: &str = "Superseded: ";
-
 fn host_planning_available(runtime: &HarnessRuntime) -> bool {
     runtime
         .service::<zuno_harness::HostPlanningCapability>()
         .is_some()
-}
-
-fn supersede_incomplete_plan_steps(steps: &mut [zuno_tools::PlanStep]) {
-    for step in steps {
-        if !step.status.is_terminal() {
-            step.status = zuno_tools::PlanStepStatus::Completed;
-            if !step.title.starts_with(SUPERSEDED_PLAN_STEP_PREFIX) {
-                step.title = format!("{SUPERSEDED_PLAN_STEP_PREFIX}{}", step.title);
-            }
-        }
-    }
 }
 
 fn ensure_host_plan(
@@ -7972,75 +8236,62 @@ fn ensure_host_plan(
             .with_content(content)
             .with_plan_available(plan_available),
     );
-    let PlanningDecision::Create(seed) = &decision else {
-        let Some(existing) = existing.as_ref() else {
-            return Ok(HostPlanningOutcome {
-                decision,
-                changed: false,
-            });
-        };
-        let goal_replaced = source == PlanningInputSource::GoalObjective
-            && existing_state == ExistingPlanState::Active;
-        let should_bind_goal = goal_id.is_some()
-            && existing.goal_id.is_none()
-            && existing_state == ExistingPlanState::Active;
-        if !goal_replaced && !should_bind_goal {
-            return Ok(HostPlanningOutcome {
-                decision,
-                changed: false,
-            });
-        }
-        let mut steps = existing.steps.clone();
-        if goal_replaced {
-            supersede_incomplete_plan_steps(&mut steps);
-        }
-        let params = zuno_tools::PlanUpdateParams {
-            expected_revision: Some(existing.revision),
-            goal_id,
-            title: existing.title.clone(),
-            steps,
-        };
-        if source == PlanningInputSource::GoalObjective {
-            store.update_plan_for_goal_boundary(session_id, params)
-        } else {
-            store.update_plan(session_id, params)
-        }
-        .map_err(to_string)?;
+    let Some(existing) = existing.as_ref() else {
         return Ok(HostPlanningOutcome {
             decision,
-            changed: true,
+            changed: false,
         });
     };
-    let steps = seed
-        .steps()
-        .iter()
-        .enumerate()
-        .map(|(index, step)| zuno_tools::PlanStep {
-            id: step.id().to_owned(),
-            title: step.title().to_owned(),
-            status: if index == 0 {
-                zuno_tools::PlanStepStatus::InProgress
-            } else {
-                zuno_tools::PlanStepStatus::Pending
-            },
-        })
-        .collect();
-    let params = zuno_tools::PlanUpdateParams {
-        expected_revision: existing.as_ref().map(|plan| plan.revision),
-        goal_id,
-        title: seed.title().to_owned(),
-        steps,
-    };
-    if existing.is_some() {
-        store.replace_plan_for_objective(session_id, params)
-    } else {
-        store.update_plan(session_id, params)
+    let should_bind_goal = goal_id.is_some()
+        && existing.goal_id.as_deref() != goal_id.as_deref()
+        && existing_state == ExistingPlanState::Active;
+    if !should_bind_goal {
+        return Ok(HostPlanningOutcome {
+            decision,
+            changed: false,
+        });
     }
-    .map_err(to_string)?;
+    store
+        .update_plan(
+            session_id,
+            zuno_tools::PlanUpdateParams {
+                expected_revision: Some(existing.revision),
+                goal_id,
+                title: existing.title.clone(),
+                steps: existing.steps.clone(),
+            },
+        )
+        .map_err(to_string)?;
     Ok(HostPlanningOutcome {
         decision,
         changed: true,
     })
+}
+
+fn planning_requires_plan(decision: &PlanningDecision) -> bool {
+    matches!(
+        decision,
+        PlanningDecision::Required(_) | PlanningDecision::Maintain(_)
+    )
+}
+
+fn planning_runtime_instruction(decision: &PlanningDecision) -> Option<String> {
+    match decision {
+        PlanningDecision::Required(_) => Some(
+            "This request requires a durable strategic Plan. Read the current Plan first. If none \
+             exists, create it; if it belongs to a prior objective, replace it with create plus \
+             the current expected_revision. The host assigns step ids. Keep strategic Plan steps \
+             distinct from dynamic Todo detail, and reconcile typed Plan/Todo/Job state before \
+             finishing."
+                .to_owned(),
+        ),
+        PlanningDecision::Maintain(_) => Some(
+            "Keep the existing durable Plan current through operation-based patches. Reconcile \
+             typed Plan/Todo/Job state before finishing; assistant prose is not execution state."
+                .to_owned(),
+        ),
+        PlanningDecision::Atomic(_) | PlanningDecision::Unavailable(_) => None,
+    }
 }
 
 fn planning_content_facts(content: Option<&[RequestContentBlock]>) -> PlanningContentFacts {
@@ -8124,6 +8375,50 @@ fn planning_context_marker(value: &str) -> bool {
     ]
     .iter()
     .any(|marker| lower.contains(marker))
+}
+
+fn plan_unreconciled_request(
+    session_id: &str,
+    request_id: String,
+    assistant_message_id: &str,
+    cycle_id: &str,
+    reason: PlanWaitingReason,
+) -> zuno_db::human_request::NewHumanRequest {
+    use zuno_tools::question::{QuestionOption, QuestionRequest};
+
+    let questions = vec![QuestionRequest {
+        question: "The durable Plan, Todo, or Job state is still unfinished after two automatic \
+                   reconciliation attempts. How should Zuno proceed?"
+            .to_owned(),
+        header: "Plan state".to_owned(),
+        options: vec![
+            QuestionOption::new(
+                "Continue reconciliation",
+                "Resume work from the authoritative durable state.",
+            ),
+            QuestionOption::new(
+                "Change the plan",
+                "Provide new direction before Zuno continues.",
+            ),
+        ],
+        multiple: None,
+        custom: Some(true),
+    }];
+    zuno_db::human_request::NewHumanRequest {
+        id: request_id,
+        session_id: session_id.to_owned(),
+        goal_id: None,
+        kind: zuno_db::human_request::HumanRequestKind::Input,
+        payload: json!({
+            "source": "plan_reconciliation",
+            "reason": reason.as_str(),
+            "cycleId": cycle_id,
+            "questions": questions,
+        }),
+        message_id: Some(assistant_message_id.to_owned()),
+        call_id: None,
+        time_created: zuno_db::message::now_millis(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -8515,11 +8810,15 @@ fn announce_skills(
     config: Option<&zuno_config::schema::SkillsConfig>,
 ) -> Result<(), String> {
     if config.and_then(|settings| settings.include_instructions) == Some(false) {
+        resolver.remove_prompt_section("skills.policy");
+        resolver.remove_prompt_section("skills.index");
         return Ok(());
     }
     let indexed = skills.indexed_count();
     let searchable = skills.searchable_count();
     if searchable == 0 {
+        resolver.remove_prompt_section("skills.policy");
+        resolver.remove_prompt_section("skills.index");
         return Ok(());
     }
     let search_only = searchable.saturating_sub(indexed);
@@ -8558,12 +8857,12 @@ fn announce_skills(
              index and remain available through action `search` or paged action `list`."
         ));
     };
-    resolver.append_prompt_section(
+    resolver.upsert_prompt_section(
         "skills.policy",
         "zuno skill trigger policy",
         SKILL_USAGE_POLICY,
     )?;
-    resolver.append_prompt_section("skills.index", "discovered skill index", index)
+    resolver.upsert_prompt_section("skills.index", "discovered skill index", index)
 }
 
 fn skill_metadata_budget(
@@ -10161,6 +10460,30 @@ impl Resolver {
             self.system_prompt.push_str(&content);
         }
         Ok(())
+    }
+
+    fn upsert_prompt_section(
+        &mut self,
+        id: impl Into<String>,
+        source: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Result<(), String> {
+        let id = id.into();
+        let source = source.into();
+        let content = content.into();
+        if let Some(assembly) = &mut self.prompt_assembly {
+            assembly.upsert(id, source, content).map_err(to_string)?;
+            self.system_prompt = assembly.render();
+            return Ok(());
+        }
+        self.append_prompt_section(id, source, content)
+    }
+
+    fn remove_prompt_section(&mut self, id: &str) {
+        if let Some(assembly) = &mut self.prompt_assembly {
+            assembly.remove(id);
+            self.system_prompt = assembly.render();
+        }
     }
 }
 

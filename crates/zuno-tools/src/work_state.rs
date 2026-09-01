@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::Arc;
 use zuno_db::Pool;
 use zuno_error::{DbError, ToolError};
@@ -102,6 +103,7 @@ pub enum PlanStepStatus {
     Pending,
     InProgress,
     Completed,
+    Superseded,
 }
 
 impl PlanStepStatus {
@@ -111,12 +113,13 @@ impl PlanStepStatus {
             Self::Pending => "pending",
             Self::InProgress => "in_progress",
             Self::Completed => "completed",
+            Self::Superseded => "superseded",
         }
     }
 
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed)
+        matches!(self, Self::Completed | Self::Superseded)
     }
 }
 
@@ -193,15 +196,44 @@ impl WorkStateError {
     }
 }
 
-#[derive(Debug, Clone)]
+pub trait WorkStateObserver: Send + Sync {
+    fn changed(&self);
+}
+
+#[derive(Clone)]
 pub struct WorkStateStore {
     pool: Arc<Pool>,
+    observer: Option<Arc<dyn WorkStateObserver>>,
+}
+
+impl fmt::Debug for WorkStateStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkStateStore")
+            .field("observer", &self.observer.as_ref().map(|_| "configured"))
+            .finish_non_exhaustive()
+    }
 }
 
 impl WorkStateStore {
     #[must_use]
     pub fn new(pool: Arc<Pool>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            observer: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn WorkStateObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    fn notify_changed(&self) {
+        if let Some(observer) = &self.observer {
+            observer.changed();
+        }
     }
 
     pub fn snapshot(&self, session_id: &str) -> Result<WorkStateSnapshot, WorkStateError> {
@@ -235,6 +267,176 @@ impl WorkStateStore {
         params: PlanUpdateParams,
     ) -> Result<WorkPlan, WorkStateError> {
         self.update_plan_with_policy(session_id, params, false)
+    }
+
+    /// Apply one model-facing Plan operation without requiring a full snapshot.
+    ///
+    /// Reads are followed by revision-guarded writes, so a concurrent commit cannot
+    /// turn a locally-derived patch into a lost update.
+    pub fn mutate_plan(
+        &self,
+        session_id: &str,
+        mutation: PlanMutationParams,
+    ) -> Result<WorkPlan, WorkStateError> {
+        let result = match mutation {
+            PlanMutationParams::Create {
+                expected_revision,
+                goal_id,
+                title,
+                steps,
+            } => {
+                let current = self.plan(session_id)?;
+                let steps = materialize_plan_steps(steps)?;
+                let params = PlanUpdateParams {
+                    expected_revision,
+                    goal_id: goal_id.or_else(|| {
+                        current
+                            .as_ref()
+                            .and_then(|plan| plan.goal_id.as_ref())
+                            .cloned()
+                    }),
+                    title,
+                    steps,
+                };
+                if current.is_some() {
+                    self.replace_plan_for_objective(session_id, params)
+                } else {
+                    self.update_plan(session_id, params)
+                }
+            }
+            PlanMutationParams::Patch {
+                expected_revision,
+                title,
+                steps,
+            } => {
+                if title.is_none() && steps.is_empty() {
+                    return Err(WorkStateError::Invalid(
+                        "patch must change the plan title or at least one step".to_owned(),
+                    ));
+                }
+                let current = self.plan_at_revision(session_id, expected_revision)?;
+                let mut candidate = current.steps.clone();
+                let mut patched_ids = BTreeSet::new();
+                for patch in steps {
+                    if patch.title.is_none() && patch.status.is_none() {
+                        return Err(WorkStateError::Invalid(format!(
+                            "plan step patch `{}` must change title or status",
+                            patch.id
+                        )));
+                    }
+                    if !patched_ids.insert(patch.id.clone()) {
+                        return Err(WorkStateError::Invalid(format!(
+                            "duplicate plan step patch `{}`",
+                            patch.id
+                        )));
+                    }
+                    let step = candidate
+                        .iter_mut()
+                        .find(|step| step.id == patch.id)
+                        .ok_or_else(|| WorkStateError::NotFound {
+                            kind: "plan step",
+                            id: patch.id.clone(),
+                        })?;
+                    if let Some(title) = patch.title {
+                        step.title = title;
+                    }
+                    if let Some(status) = patch.status {
+                        step.status = status;
+                    }
+                }
+                let title = title.unwrap_or_else(|| current.title.clone());
+                if title == current.title && candidate == current.steps {
+                    return Err(WorkStateError::Invalid(
+                        "patch does not change the durable plan".to_owned(),
+                    ));
+                }
+                self.update_plan(
+                    session_id,
+                    PlanUpdateParams {
+                        expected_revision: Some(expected_revision),
+                        goal_id: current.goal_id,
+                        title,
+                        steps: candidate,
+                    },
+                )
+            }
+            PlanMutationParams::Append {
+                expected_revision,
+                steps,
+            } => {
+                let current = self.plan_at_revision(session_id, expected_revision)?;
+                let mut candidate = current.steps.clone();
+                candidate.extend(materialize_plan_steps(steps)?);
+                self.update_plan(
+                    session_id,
+                    PlanUpdateParams {
+                        expected_revision: Some(expected_revision),
+                        goal_id: current.goal_id,
+                        title: current.title,
+                        steps: candidate,
+                    },
+                )
+            }
+            PlanMutationParams::Push {
+                expected_revision,
+                title,
+                steps,
+            } => {
+                let current = self.plan_at_revision(session_id, expected_revision)?;
+                self.push_plan(
+                    session_id,
+                    PlanUpdateParams {
+                        expected_revision: Some(expected_revision),
+                        goal_id: current.goal_id,
+                        title,
+                        steps: materialize_plan_steps(steps)?,
+                    },
+                )
+            }
+            PlanMutationParams::Pop { expected_revision } => {
+                let current = self.plan_at_revision(session_id, expected_revision)?;
+                self.complete_subplan(
+                    session_id,
+                    PlanUpdateParams {
+                        expected_revision: Some(expected_revision),
+                        goal_id: current.goal_id,
+                        title: current.title,
+                        steps: current.steps,
+                    },
+                )
+            }
+        };
+        if result.is_ok() {
+            self.notify_changed();
+        }
+        result
+    }
+
+    fn plan_at_revision(
+        &self,
+        session_id: &str,
+        expected_revision: i64,
+    ) -> Result<WorkPlan, WorkStateError> {
+        if expected_revision <= 0 {
+            return Err(WorkStateError::Invalid(
+                "expected_revision must be positive".to_owned(),
+            ));
+        }
+        let current = self
+            .plan(session_id)?
+            .ok_or_else(|| WorkStateError::NotFound {
+                kind: "plan",
+                id: session_id.to_owned(),
+            })?;
+        if current.revision != expected_revision {
+            return Err(WorkStateError::RevisionConflict {
+                kind: "plan",
+                id: current.id,
+                expected: expected_revision,
+                actual: current.revision,
+            });
+        }
+        Ok(current)
     }
 
     /// Suspend the active Plan and install a focused child Plan atomically.
@@ -640,46 +842,69 @@ pub struct PlanUpdateParams {
     pub steps: Vec<PlanStep>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanMutationAction {
-    /// Update the active Plan in place.
-    #[default]
-    Update,
-    /// Suspend the active Plan and install these fields as a child Plan.
-    Push,
-    /// Complete the active child with these fields and restore its parent.
-    Pop,
-}
-
-/// Model-facing Plan mutation envelope.
-///
-/// Internal host callers keep using [`PlanUpdateParams`] directly while the one public
-/// `plan_update` permission continues to govern update, push, and pop.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct PlanMutationParams {
-    #[serde(default)]
-    pub action: PlanMutationAction,
-    #[serde(default)]
-    pub expected_revision: Option<i64>,
-    #[serde(default)]
-    pub goal_id: Option<String>,
+pub struct PlanStepInput {
     pub title: String,
-    pub steps: Vec<PlanStep>,
+    pub status: PlanStepStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanStepPatch {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub status: Option<PlanStepStatus>,
+}
+
+/// Model-facing operation interface for durable Plans.
+///
+/// Internal host callers keep using [`PlanUpdateParams`] for atomic objective-boundary
+/// transactions. Model calls never replace an existing snapshot: they name only the
+/// fields or steps that changed, while the host owns newly-created step identifiers.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PlanMutationParams {
+    Create {
+        #[serde(default)]
+        expected_revision: Option<i64>,
+        #[serde(default)]
+        goal_id: Option<String>,
+        title: String,
+        steps: Vec<PlanStepInput>,
+    },
+    Patch {
+        expected_revision: i64,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        steps: Vec<PlanStepPatch>,
+    },
+    Append {
+        expected_revision: i64,
+        steps: Vec<PlanStepInput>,
+    },
+    Push {
+        expected_revision: i64,
+        title: String,
+        steps: Vec<PlanStepInput>,
+    },
+    Pop {
+        expected_revision: i64,
+    },
 }
 
 impl PlanMutationParams {
-    fn into_parts(self) -> (PlanMutationAction, PlanUpdateParams) {
-        (
-            self.action,
-            PlanUpdateParams {
-                expected_revision: self.expected_revision,
-                goal_id: self.goal_id,
-                title: self.title,
-                steps: self.steps,
-            },
-        )
+    const fn result_title(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "Plan created",
+            Self::Patch { .. } => "Plan patched",
+            Self::Append { .. } => "Plan steps appended",
+            Self::Push { .. } => "Subplan opened",
+            Self::Pop { .. } => "Parent plan restored",
+        }
     }
 }
 
@@ -742,6 +967,22 @@ pub struct TodoUpdateParams {
 #[serde(deny_unknown_fields)]
 pub struct WorkStateGetParams {}
 
+fn materialize_plan_steps(inputs: Vec<PlanStepInput>) -> Result<Vec<PlanStep>, WorkStateError> {
+    if inputs.is_empty() {
+        return Err(WorkStateError::Invalid(
+            "plan operation must include at least one step".to_owned(),
+        ));
+    }
+    Ok(inputs
+        .into_iter()
+        .map(|input| PlanStep {
+            id: format!("step_{}", uuid::Uuid::new_v4().simple()),
+            title: input.title,
+            status: input.status,
+        })
+        .collect())
+}
+
 fn validate_plan(params: &PlanUpdateParams) -> Result<(), WorkStateError> {
     if params.title.trim().is_empty() {
         return Err(WorkStateError::Invalid(
@@ -777,7 +1018,7 @@ fn validate_plan(params: &PlanUpdateParams) -> Result<(), WorkStateError> {
         match step.status {
             PlanStepStatus::Pending => pending += 1,
             PlanStepStatus::InProgress => in_progress += 1,
-            PlanStepStatus::Completed => {}
+            PlanStepStatus::Completed | PlanStepStatus::Superseded => {}
         }
     }
     if in_progress > 1 {
@@ -1587,20 +1828,11 @@ impl TypedTool for PlanUpdateTool {
         authorize(&ctx, PLAN_UPDATE_TOOL_ID).await?;
         let store = self.0.clone();
         let session_id = ctx.session_id;
-        let (action, plan_params) = params.into_parts();
-        let plan = tokio::task::spawn_blocking(move || match action {
-            PlanMutationAction::Update => store.update_plan(&session_id, plan_params),
-            PlanMutationAction::Push => store.push_plan(&session_id, plan_params),
-            PlanMutationAction::Pop => store.complete_subplan(&session_id, plan_params),
-        })
-        .await
-        .map_err(|error| failed(PLAN_UPDATE_TOOL_ID, error))?
-        .map_err(|error| map_error(PLAN_UPDATE_TOOL_ID, error))?;
-        let title = match action {
-            PlanMutationAction::Update => "Plan updated",
-            PlanMutationAction::Push => "Subplan opened",
-            PlanMutationAction::Pop => "Parent plan restored",
-        };
+        let title = params.result_title();
+        let plan = tokio::task::spawn_blocking(move || store.mutate_plan(&session_id, params))
+            .await
+            .map_err(|error| failed(PLAN_UPDATE_TOOL_ID, error))?
+            .map_err(|error| map_error(PLAN_UPDATE_TOOL_ID, error))?;
         output(PLAN_UPDATE_TOOL_ID, title, "plan", Some(plan))
     }
 }
@@ -1670,7 +1902,17 @@ impl TypedTool for TodoUpdateTool {
 }
 
 pub fn work_state_tools(pool: Arc<Pool>) -> Vec<Arc<dyn Tool>> {
-    let store = WorkStateStore::new(pool);
+    work_state_tools_from_store(WorkStateStore::new(pool))
+}
+
+pub fn work_state_tools_with_observer(
+    pool: Arc<Pool>,
+    observer: Arc<dyn WorkStateObserver>,
+) -> Vec<Arc<dyn Tool>> {
+    work_state_tools_from_store(WorkStateStore::new(pool).with_observer(observer))
+}
+
+fn work_state_tools_from_store(store: WorkStateStore) -> Vec<Arc<dyn Tool>> {
     vec![
         erase(PlanGetTool::new(store.clone())),
         erase(PlanUpdateTool::new(store.clone())),
@@ -2094,6 +2336,148 @@ mod tests {
     }
 
     #[test]
+    fn plan_patch_changes_only_named_steps_without_retransmitting_integrate() {
+        let store = store();
+        let created = store
+            .mutate_plan(
+                "ses",
+                PlanMutationParams::Create {
+                    expected_revision: None,
+                    goal_id: None,
+                    title: "Ship the change".to_owned(),
+                    steps: vec![
+                        PlanStepInput {
+                            title: "Execute".to_owned(),
+                            status: PlanStepStatus::InProgress,
+                        },
+                        PlanStepInput {
+                            title: "Integrate".to_owned(),
+                            status: PlanStepStatus::Pending,
+                        },
+                    ],
+                },
+            )
+            .expect("create operation");
+        let execute_id = created.steps[0].id.clone();
+        let integrate = created.steps[1].clone();
+
+        let patched = store
+            .mutate_plan(
+                "ses",
+                PlanMutationParams::Patch {
+                    expected_revision: created.revision,
+                    title: None,
+                    steps: vec![PlanStepPatch {
+                        id: execute_id.clone(),
+                        title: None,
+                        status: Some(PlanStepStatus::Completed),
+                    }],
+                },
+            )
+            .expect_err("pending integrate still requires an active step");
+        assert!(matches!(
+            patched,
+            WorkStateError::Invalid(message)
+                if message.contains("pending plan steps require exactly one in_progress step")
+        ));
+
+        let patched = store
+            .mutate_plan(
+                "ses",
+                PlanMutationParams::Patch {
+                    expected_revision: created.revision,
+                    title: None,
+                    steps: vec![
+                        PlanStepPatch {
+                            id: execute_id,
+                            title: None,
+                            status: Some(PlanStepStatus::Completed),
+                        },
+                        PlanStepPatch {
+                            id: integrate.id.clone(),
+                            title: None,
+                            status: Some(PlanStepStatus::InProgress),
+                        },
+                    ],
+                },
+            )
+            .expect("patch only changed steps");
+        assert_eq!(patched.steps[1].id, integrate.id);
+        assert_eq!(patched.steps[1].title, integrate.title);
+        assert_eq!(patched.steps[1].status, PlanStepStatus::InProgress);
+    }
+
+    #[test]
+    fn plan_append_assigns_host_ids_and_pop_requires_only_the_revision() {
+        let store = store();
+        let parent = store
+            .mutate_plan(
+                "ses",
+                PlanMutationParams::Create {
+                    expected_revision: None,
+                    goal_id: Some("goal".to_owned()),
+                    title: "Parent".to_owned(),
+                    steps: vec![PlanStepInput {
+                        title: "Parent work".to_owned(),
+                        status: PlanStepStatus::InProgress,
+                    }],
+                },
+            )
+            .expect("create parent");
+        let appended = store
+            .mutate_plan(
+                "ses",
+                PlanMutationParams::Append {
+                    expected_revision: parent.revision,
+                    steps: vec![PlanStepInput {
+                        title: "Verify".to_owned(),
+                        status: PlanStepStatus::Pending,
+                    }],
+                },
+            )
+            .expect("append step");
+        assert!(appended.steps[1].id.starts_with("step_"));
+        assert_ne!(appended.steps[0].id, appended.steps[1].id);
+
+        let child = store
+            .mutate_plan(
+                "ses",
+                PlanMutationParams::Push {
+                    expected_revision: appended.revision,
+                    title: "Focused repair".to_owned(),
+                    steps: vec![PlanStepInput {
+                        title: "Repair".to_owned(),
+                        status: PlanStepStatus::InProgress,
+                    }],
+                },
+            )
+            .expect("push child");
+        let child = store
+            .mutate_plan(
+                "ses",
+                PlanMutationParams::Patch {
+                    expected_revision: child.revision,
+                    title: None,
+                    steps: vec![PlanStepPatch {
+                        id: child.steps[0].id.clone(),
+                        title: None,
+                        status: Some(PlanStepStatus::Completed),
+                    }],
+                },
+            )
+            .expect("complete child");
+        let restored = store
+            .mutate_plan(
+                "ses",
+                PlanMutationParams::Pop {
+                    expected_revision: child.revision,
+                },
+            )
+            .expect("pop using revision only");
+        assert_eq!(restored, appended);
+    }
+
+    #[test]
     fn plan_steps_cannot_complete_before_linked_jobs_are_reconciled() {
         let store = store();
         let first = store
@@ -2485,12 +2869,14 @@ mod tests {
             "changed artifacts require a new immutable verification gate"
         );
         assert!(
-            PLAN_UPDATE_DESCRIPTION.contains("Do not complete a step while a linked Job"),
+            PLAN_UPDATE_DESCRIPTION
+                .contains("Do not complete or supersede a step while a linked Job"),
             "the model must reconcile durable child work before closing its Plan step"
         );
         assert!(
-            PLAN_UPDATE_DESCRIPTION.contains("Use push")
-                && PLAN_UPDATE_DESCRIPTION.contains("Use pop")
+            PLAN_UPDATE_DESCRIPTION.contains("action=push")
+                && PLAN_UPDATE_DESCRIPTION.contains("action=pop")
+                && PLAN_UPDATE_DESCRIPTION.contains("host generates stable step ids")
                 && PLAN_UPDATE_DESCRIPTION.contains("Before a final answer"),
             "the model must know how focused subplans restore their parent and when to reconcile"
         );

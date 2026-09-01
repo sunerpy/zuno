@@ -103,10 +103,12 @@ pub(crate) struct ToolSelection<'a> {
     /// survives the final Agent capability intersection.
     pub(crate) sandbox: Option<Arc<dyn SandboxResolver>>,
     pub(crate) todo_store: Arc<zuno_db::pool::Pool>,
+    pub(crate) work_observer: Arc<dyn zuno_tools::WorkStateObserver>,
     pub(crate) goal_store: Arc<zuno_goal::GoalStore>,
     pub(crate) interaction_policy: zuno_goal::InteractionPolicy,
     pub(crate) mcp_loader: Option<Arc<dyn McpToolLoader>>,
     pub(crate) skills: Arc<zuno_catalog::skill::Skills>,
+    pub(crate) skill_catalog: Option<Arc<zuno_catalog::skill::catalog::SkillCatalogService>>,
     pub(crate) capability: Arc<CapabilitySnapshot>,
     pub(crate) delegation: Delegation,
     pub(crate) product_agents: Arc<dyn zuno_tools::product_agent::ProductAgentHost>,
@@ -398,7 +400,10 @@ pub(crate) fn assemble(
         ),
         (
             BuiltinSlot::Skill,
-            erase(zuno_tools::SkillTool::new(Arc::clone(&selection.skills))),
+            match &selection.skill_catalog {
+                Some(catalog) => erase(zuno_tools::SkillTool::with_catalog(Arc::clone(catalog))),
+                None => erase(zuno_tools::SkillTool::new(Arc::clone(&selection.skills))),
+            },
         ),
     ] {
         if selection.manifest.contains(slot) {
@@ -462,7 +467,10 @@ pub(crate) fn assemble(
             Arc::clone(&selection.goal_store),
         )));
     }
-    for tool in zuno_tools::work_state_tools(Arc::clone(&selection.todo_store)) {
+    for tool in zuno_tools::work_state_tools_with_observer(
+        Arc::clone(&selection.todo_store),
+        Arc::clone(&selection.work_observer),
+    ) {
         builder.register_configured_builtin(tool);
     }
 

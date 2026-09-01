@@ -7,6 +7,7 @@ pub mod driver;
 pub mod hooks;
 pub mod interrupt;
 pub mod r#loop;
+pub mod plan_driver;
 pub mod planning;
 pub mod prelude;
 pub mod prompt;

@@ -2,17 +2,21 @@
 //!
 //! The security boundary is deliberately below individual tools. A caller supplies a
 //! syntactically validated [`PublicTarget`]; this service resolves every hop, rejects the
-//! whole answer set when any address is non-public, pins the accepted addresses into a
-//! direct reqwest client, and performs redirects itself so every target is revalidated.
+//! whole answer set when any address is non-public, pins accepted direct connections, honors
+//! the process proxy policy, and performs redirects itself so every target is revalidated.
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use http_body_util::BodyExt as _;
+use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, COOKIE, HeaderMap, LOCATION, PROXY_AUTHORIZATION};
-use reqwest::{Response, StatusCode};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use url::{Host, Url};
+
+use crate::proxy_transport::{RouteKind, SessionTransport};
 
 const IPV4ONLY_ARPA: &str = "ipv4only.arpa";
 const RFC_6052_PREFIX_LENGTHS: [usize; 6] = [32, 40, 48, 56, 64, 96];
@@ -148,11 +152,12 @@ impl HostResolver for SystemHostResolver {
     }
 }
 
-/// A direct, redirect-aware public HTTP client.
+/// A redirect-aware public HTTP client using the session network policy.
 #[derive(Clone)]
 pub struct PublicHttpClient {
     resolver: Arc<dyn HostResolver>,
     policy: PublicHttpPolicy,
+    transport: SessionTransport,
     #[cfg(test)]
     connector_addresses: Option<Vec<SocketAddr>>,
 }
@@ -185,9 +190,21 @@ impl PublicHttpClient {
         Self {
             resolver,
             policy,
+            transport: SessionTransport::from_process(),
             #[cfg(test)]
             connector_addresses: None,
         }
+    }
+
+    /// The credential-free route currently selected for `target`.
+    pub fn route_label(&self, target: &PublicTarget) -> Result<&'static str, PublicHttpError> {
+        self.transport
+            .route_label(target)
+            .map(RouteKind::as_str)
+            .map_err(|source| PublicHttpError::ProxyConfiguration {
+                endpoint: target.diagnostic(),
+                source,
+            })
     }
 
     /// Perform one bounded-redirect GET.
@@ -195,7 +212,7 @@ impl PublicHttpClient {
         &self,
         target: PublicTarget,
         mut headers: HeaderMap,
-    ) -> Result<Response, PublicHttpError> {
+    ) -> Result<PublicHttpResponse, PublicHttpError> {
         let mut current = target;
         for followed in 0..=self.policy.max_redirects {
             let response = self.get_once(&current, headers.clone()).await?;
@@ -237,7 +254,7 @@ impl PublicHttpClient {
         &self,
         target: &PublicTarget,
         headers: HeaderMap,
-    ) -> Result<Response, PublicHttpError> {
+    ) -> Result<PublicHttpResponse, PublicHttpError> {
         let endpoint = target.diagnostic();
         let host = target.url.host_str().ok_or(PublicHttpError::MissingHost)?;
         let port = target
@@ -287,23 +304,26 @@ impl PublicHttpClient {
         let connector_addresses = self.connector_addresses.as_deref().unwrap_or(&addresses);
         #[cfg(not(test))]
         let connector_addresses = addresses.as_slice();
-        let client = crate::ProxyPolicy::Direct
-            .client_builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(host, connector_addresses)
-            .build()
-            .map_err(|source| PublicHttpError::Client {
-                source: source.without_url(),
-            })?;
-        client
-            .get(target.url.clone())
-            .headers(headers)
-            .send()
+        let route = self.transport.route_label(target).map_err(|source| {
+            PublicHttpError::ProxyConfiguration {
+                endpoint: target.diagnostic(),
+                source,
+            }
+        })?;
+        let (response, route) = self
+            .transport
+            .get(target, headers, &addresses, connector_addresses)
             .await
             .map_err(|source| PublicHttpError::Transport {
                 endpoint: target.diagnostic(),
-                source: source.without_url(),
-            })
+                route: route.as_str(),
+                source,
+            })?;
+        Ok(PublicHttpResponse {
+            response,
+            endpoint: target.diagnostic(),
+            route,
+        })
     }
 
     async fn discover_nat64_prefixes(&self) -> Result<Vec<Nat64Prefix>, PublicHttpError> {
@@ -314,6 +334,63 @@ impl PublicHttpClient {
             .await
             .map_err(|source| PublicHttpError::Resolve { endpoint, source })?;
         Ok(nat64_prefixes(&discovered))
+    }
+}
+
+/// Streaming response from the SSRF-safe public transport.
+pub struct PublicHttpResponse {
+    response: http::Response<hyper::body::Incoming>,
+    endpoint: DiagnosticEndpoint,
+    route: RouteKind,
+}
+
+impl fmt::Debug for PublicHttpResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicHttpResponse")
+            .field("status", &self.status())
+            .field("endpoint", &self.endpoint)
+            .field("route", &self.route.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PublicHttpResponse {
+    /// HTTP response status.
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        self.response.status()
+    }
+
+    /// HTTP response headers.
+    #[must_use]
+    pub fn headers(&self) -> &HeaderMap {
+        self.response.headers()
+    }
+
+    /// Credential-free endpoint for body diagnostics.
+    #[must_use]
+    pub fn endpoint(&self) -> &DiagnosticEndpoint {
+        &self.endpoint
+    }
+
+    /// Credential-free route selected for this response.
+    #[must_use]
+    pub fn route(&self) -> &'static str {
+        self.route.as_str()
+    }
+
+    /// Read the next data frame, skipping trailers.
+    pub async fn chunk(&mut self) -> Result<Option<Bytes>, io::Error> {
+        loop {
+            let Some(frame) = self.response.body_mut().frame().await else {
+                return Ok(None);
+            };
+            let frame = frame.map_err(io::Error::other)?;
+            if let Ok(data) = frame.into_data() {
+                return Ok(Some(data));
+            }
+        }
     }
 }
 
@@ -380,21 +457,25 @@ pub enum PublicHttpError {
         /// Embedded IPv4 destination.
         translated: Ipv4Addr,
     },
-    /// Building the pinned client failed.
-    #[error("could not initialize the public HTTP client")]
-    Client {
-        /// Reqwest failure stripped of any URL.
+    /// Proxy environment selected an invalid route.
+    #[error("could not select the process proxy route for {endpoint}")]
+    ProxyConfiguration {
+        /// Redacted endpoint.
+        endpoint: DiagnosticEndpoint,
+        /// Malformed or unsupported proxy configuration.
         #[source]
-        source: reqwest::Error,
+        source: io::Error,
     },
     /// Sending the request failed.
-    #[error("request to {endpoint} failed")]
+    #[error("request to {endpoint} failed through {route}")]
     Transport {
         /// Redacted endpoint.
         endpoint: DiagnosticEndpoint,
-        /// Reqwest failure stripped of any URL.
+        /// Credential-free route label.
+        route: &'static str,
+        /// Socket, proxy, TLS, or HTTP failure.
         #[source]
-        source: reqwest::Error,
+        source: io::Error,
     },
     /// Redirect response omitted Location.
     #[error("redirect from {endpoint} omitted a valid Location header")]
@@ -420,10 +501,7 @@ impl PublicHttpError {
     /// Whether repeating the same target may succeed later.
     #[must_use]
     pub const fn is_transient(&self) -> bool {
-        matches!(
-            self,
-            Self::Resolve { .. } | Self::Client { .. } | Self::Transport { .. }
-        )
+        matches!(self, Self::Resolve { .. } | Self::Transport { .. })
     }
 }
 
@@ -710,6 +788,7 @@ mod tests {
         connector_address: SocketAddr,
     ) -> PublicHttpClient {
         let mut client = PublicHttpClient::with_resolver(resolver, PublicHttpPolicy::default());
+        client.transport = SessionTransport::direct_for_tests();
         client.connector_addresses = Some(vec![connector_address]);
         client
     }
@@ -864,14 +943,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_transport_ignores_ambient_proxy_configuration() {
+    async fn public_transport_uses_ambient_proxy_without_falling_back_direct() {
         let server = MockServer::start().await;
         let port = server.address().port();
-        Mock::given(method("GET"))
-            .and(path("/direct"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
-            .mount(&server)
-            .await;
         let executable = std::env::current_exe().expect("test executable");
         let output = tokio::task::spawn_blocking(move || {
             std::process::Command::new(executable)
@@ -899,6 +973,14 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("origin requests")
+                .is_empty(),
+            "a failed selected proxy must never fall back to the origin"
+        );
     }
 
     #[test]
@@ -915,18 +997,24 @@ mod tests {
             .build()
             .expect("test runtime");
         runtime.block_on(async move {
-            let client = test_client(
+            let client = PublicHttpClient::with_resolver(
                 Arc::new(FixedResolver(vec![public_address(port)])),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                PublicHttpPolicy::default(),
             );
-            let response = client
+            let error = client
                 .get(
                     PublicTarget::parse(&format!("http://public.example:{port}/direct")).unwrap(),
                     HeaderMap::new(),
                 )
                 .await
-                .expect("Direct must not use process proxy variables");
-            assert_eq!(response.status(), StatusCode::OK);
+                .expect_err("the selected proxy is unreachable");
+            assert!(matches!(
+                error,
+                PublicHttpError::Transport {
+                    route: "http_proxy",
+                    ..
+                }
+            ));
         });
     }
 

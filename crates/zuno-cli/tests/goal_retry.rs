@@ -141,13 +141,13 @@ async fn active_goal_survives_request_retry_exhaustion_and_completes_automatical
             "complete-plan",
             "plan_update",
             json!({
-                "expected_revision": 1,
+                "action": "create",
                 "title": "Complete durable recovery probe",
                 "steps": [
-                    {"id":"investigate","title":"Inspect the recovery state","status":"completed"},
-                    {"id":"execute","title":"Run the recovery attempt","status":"completed"},
-                    {"id":"integrate","title":"Reconcile the durable state","status":"completed"},
-                    {"id":"verify","title":"Verify automatic completion","status":"completed"}
+                    {
+                        "title": "Verify automatic recovery after the transient outage",
+                        "status": "completed"
+                    }
                 ]
             }),
         ))

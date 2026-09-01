@@ -1020,14 +1020,14 @@ fn latest_goal_objective(env: &ScriptedEnv) -> Result<Option<String>, std::io::E
         .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
-fn goal_has_bound_plan(env: &ScriptedEnv, objective: &str) -> Result<bool, std::io::Error> {
+fn goal_has_no_bound_plan(env: &ScriptedEnv, objective: &str) -> Result<bool, std::io::Error> {
     let pool = session_picker_pool(env);
     let connection = pool
         .open_connection()
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     connection
         .query_row(
-            "SELECT EXISTS( \
+            "SELECT NOT EXISTS( \
                  SELECT 1 FROM goal AS g \
                  JOIN work_plan AS p \
                    ON p.session_id = g.session_id AND p.goal_id = g.goal_id \
@@ -1097,7 +1097,7 @@ fn run_direct_goal_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io::E
 
         if command_typed_at.is_some()
             && latest_goal_objective(env)?.as_deref() == Some(DIRECT_GOAL_OBJECTIVE)
-            && goal_has_bound_plan(env, DIRECT_GOAL_OBJECTIVE)?
+            && goal_has_no_bound_plan(env, DIRECT_GOAL_OBJECTIVE)?
         {
             objective_seen = true;
         }
@@ -1146,7 +1146,7 @@ fn run_direct_goal_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io::E
     let saw_wanted = objective_seen
         && graceful_exit
         && latest_goal_objective(env)?.as_deref() == Some(DIRECT_GOAL_OBJECTIVE)
-        && goal_has_bound_plan(env, DIRECT_GOAL_OBJECTIVE)?;
+        && goal_has_no_bound_plan(env, DIRECT_GOAL_OBJECTIVE)?;
     Ok(Transcript { text, saw_wanted })
 }
 
@@ -1905,7 +1905,7 @@ fn slash_new_is_lazy_until_the_first_prompt_and_then_creates_exactly_one_session
 }
 
 #[test]
-fn a_bare_goal_objective_is_persisted_through_the_real_tui() {
+fn a_bare_goal_objective_is_persisted_without_a_host_authored_plan() {
     let env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::TempFile);
@@ -1915,7 +1915,8 @@ fn a_bare_goal_objective_is_persisted_through_the_real_tui() {
 
     assert!(
         transcript.saw_wanted,
-        "`/goal <objective>` did not persist and bind a Plan through the TUI host-command path\ntranscript:\n{}",
+        "`/goal <objective>` did not persist independently, or the host invented a visible Plan \
+         before the model created strategic steps\ntranscript:\n{}",
         transcript.text
     );
 }

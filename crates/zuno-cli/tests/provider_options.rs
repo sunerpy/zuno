@@ -161,7 +161,12 @@ fn variables(env: &ScriptedEnv, config: String, stored: Option<&str>) -> BTreeMa
 async fn run_prompt(env: &ScriptedEnv, config: String, stored: Option<&str>) -> Output {
     let mut command = tokio::process::Command::new(binary());
     command
-        .args(["run", "--model", "test/test-model", "hello"])
+        .args([
+            "run",
+            "--model",
+            "test/test-model",
+            "Which request options are selected?",
+        ])
         .current_dir(env.working_dir())
         .env_clear()
         .envs(variables(env, config, stored));

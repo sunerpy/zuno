@@ -64,6 +64,17 @@ fn test_sandbox() -> Option<Arc<dyn zuno_sandbox::SandboxResolver>> {
 }
 
 #[derive(Debug)]
+struct NoopWorkStateObserver;
+
+impl zuno_tools::WorkStateObserver for NoopWorkStateObserver {
+    fn changed(&self) {}
+}
+
+fn test_work_observer() -> Arc<dyn zuno_tools::WorkStateObserver> {
+    Arc::new(NoopWorkStateObserver)
+}
+
+#[derive(Debug)]
 struct UnavailableTestSandbox;
 
 impl zuno_sandbox::SandboxResolver for UnavailableTestSandbox {
@@ -190,7 +201,7 @@ fn resolver_step_limit_is_opt_in() {
 }
 
 #[test]
-fn host_planning_classifier_persists_multi_stage_work_before_the_provider() {
+fn host_planning_classifier_requires_multi_stage_work_without_seeding_visible_steps() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
     );
@@ -222,21 +233,16 @@ fn host_planning_classifier_persists_multi_stage_work_before_the_provider() {
             goal_id: None,
         },
     )
-    .expect("classify and persist multi-stage work");
-    assert!(matches!(outcome.decision, PlanningDecision::Create(_)));
-    assert!(outcome.changed);
-    let plan = zuno_tools::WorkStateStore::new(Arc::clone(&pool))
-        .plan("ses-plan-policy")
-        .expect("read plan")
-        .expect("host-created plan");
-    assert_eq!(
-        plan.steps
-            .iter()
-            .map(|step| step.id.as_str())
-            .collect::<Vec<_>>(),
-        ["investigate", "implement", "verify"]
+    .expect("classify multi-stage work");
+    assert!(matches!(outcome.decision, PlanningDecision::Required(_)));
+    assert!(!outcome.changed);
+    assert!(
+        zuno_tools::WorkStateStore::new(Arc::clone(&pool))
+            .plan("ses-plan-policy")
+            .expect("read plan")
+            .is_none(),
+        "machine planning classification must not create user-visible generic steps"
     );
-    assert_eq!(plan.steps[0].status, zuno_tools::PlanStepStatus::InProgress);
 
     let atomic = ensure_host_plan(
         &pool,
@@ -262,7 +268,7 @@ fn host_planning_classifier_persists_multi_stage_work_before_the_provider() {
 }
 
 #[tokio::test]
-async fn hiding_plan_update_does_not_disable_host_plan_creation_or_recovery() {
+async fn hiding_plan_update_does_not_create_a_private_host_plan() {
     let directory = tempfile::TempDir::new().expect("temporary workspace");
     let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
     let config_root = tempfile::TempDir::new().expect("temporary config root");
@@ -305,11 +311,13 @@ async fn hiding_plan_update_does_not_disable_host_plan_creation_or_recovery() {
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
+            work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            skill_catalog: None,
             capability: test_capability(),
             delegation: test_delegation(),
             product_agents: test_product_agents(),
@@ -364,12 +372,19 @@ async fn hiding_plan_update_does_not_disable_host_plan_creation_or_recovery() {
             prompt: "Investigate the failure, implement the fix, and verify the result.",
             source: PlanningInputSource::User,
             content: PlanningContentFacts::empty(),
-            plan_available: host_planning_available(&session_runtime),
+            plan_available: false,
             goal_id: None,
         },
     )
-    .expect("host creates plan with the model tool hidden");
-    assert!(outcome.changed);
+    .expect("classify with the model tool hidden");
+    assert!(matches!(outcome.decision, PlanningDecision::Unavailable(_)));
+    assert!(!outcome.changed);
+    assert!(
+        zuno_tools::WorkStateStore::new(Arc::clone(&pool))
+            .plan("ses-hidden-plan")
+            .expect("read plan")
+            .is_none()
+    );
     drop(pool);
     profile_runtime.shutdown().await.expect("shutdown profile");
 
@@ -383,15 +398,10 @@ async fn hiding_plan_update_does_not_disable_host_plan_creation_or_recovery() {
     let reopened = Arc::new(zuno_db::Pool::open(&location).expect("reopen file database"));
     let recovered = zuno_tools::WorkStateStore::new(reopened)
         .plan("ses-hidden-plan")
-        .expect("read recovered plan")
-        .expect("persisted host plan");
-    assert_eq!(
-        recovered
-            .steps
-            .iter()
-            .map(|step| step.id.as_str())
-            .collect::<Vec<_>>(),
-        ["investigate", "implement", "verify"]
+        .expect("read recovered plan");
+    assert!(
+        recovered.is_none(),
+        "a restart must not reveal a host-private generic Plan"
     );
     restarted_profile
         .shutdown()
@@ -400,7 +410,7 @@ async fn hiding_plan_update_does_not_disable_host_plan_creation_or_recovery() {
 }
 
 #[test]
-fn host_planning_classifier_replaces_terminal_work_without_duplicate_steps() {
+fn model_create_replaces_terminal_work_after_host_classification() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
     );
@@ -447,23 +457,51 @@ fn host_planning_classifier_replaces_terminal_work_without_duplicate_steps() {
             goal_id: None,
         },
     )
-    .expect("replace terminal plan");
+    .expect("classify the new objective");
 
-    assert!(matches!(outcome.decision, PlanningDecision::Create(_)));
-    assert!(outcome.changed);
+    assert!(matches!(outcome.decision, PlanningDecision::Required(_)));
+    assert!(!outcome.changed);
+    assert_eq!(
+        store
+            .plan("ses-plan-epoch")
+            .expect("read unchanged plan")
+            .expect("terminal plan")
+            .id,
+        first.id
+    );
+
     let updated = store
+        .mutate_plan(
+            "ses-plan-epoch",
+            zuno_tools::PlanMutationParams::Create {
+                expected_revision: Some(first.revision),
+                goal_id: None,
+                title: "Fix the new bug".to_owned(),
+                steps: vec![
+                    zuno_tools::PlanStepInput {
+                        title: "Diagnose the new failure".to_owned(),
+                        status: zuno_tools::PlanStepStatus::InProgress,
+                    },
+                    zuno_tools::PlanStepInput {
+                        title: "Verify the fix".to_owned(),
+                        status: zuno_tools::PlanStepStatus::Pending,
+                    },
+                ],
+            },
+        )
+        .expect("model creates the replacement plan");
+    let reread = store
         .plan("ses-plan-epoch")
         .expect("read plan")
         .expect("updated plan");
+    assert_eq!(reread, updated);
     assert_ne!(updated.id, first.id);
     assert_eq!(updated.revision, 1);
-    assert_eq!(
+    assert!(
         updated
             .steps
             .iter()
-            .map(|step| step.id.as_str())
-            .collect::<Vec<_>>(),
-        ["investigate", "implement", "verify"]
+            .all(|step| step.id.starts_with("step_"))
     );
     let connection = pool.get().expect("open archive connection");
     assert_eq!(
@@ -479,7 +517,7 @@ fn host_planning_classifier_replaces_terminal_work_without_duplicate_steps() {
 }
 
 #[test]
-fn host_planning_classifier_preempts_active_ordinary_work_for_a_new_user_objective() {
+fn model_create_preempts_active_ordinary_work_for_a_new_user_objective() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
     );
@@ -533,24 +571,44 @@ fn host_planning_classifier_preempts_active_ordinary_work_for_a_new_user_objecti
             goal_id: None,
         },
     )
-    .expect("replace the active plan");
+    .expect("classify the new objective");
 
-    assert!(matches!(outcome.decision, PlanningDecision::Create(_)));
+    assert!(matches!(outcome.decision, PlanningDecision::Required(_)));
     assert_eq!(outcome.decision.rationale().code(), "active_plan_replaced");
-    assert!(outcome.changed);
-    let updated = store
+    assert!(!outcome.changed);
+    let unchanged = store
         .plan("ses-plan-preempt")
         .expect("read plan")
-        .expect("updated plan");
+        .expect("active plan");
+    assert_eq!(unchanged.id, first.id);
+
+    let updated = store
+        .mutate_plan(
+            "ses-plan-preempt",
+            zuno_tools::PlanMutationParams::Create {
+                expected_revision: Some(first.revision),
+                goal_id: None,
+                title: "Repair the release pipeline".to_owned(),
+                steps: vec![
+                    zuno_tools::PlanStepInput {
+                        title: "Diagnose the workflow failure".to_owned(),
+                        status: zuno_tools::PlanStepStatus::InProgress,
+                    },
+                    zuno_tools::PlanStepInput {
+                        title: "Verify the repaired pipeline".to_owned(),
+                        status: zuno_tools::PlanStepStatus::Pending,
+                    },
+                ],
+            },
+        )
+        .expect("replace the active plan");
     assert_ne!(updated.id, first.id);
     assert_eq!(updated.revision, 1);
-    assert_eq!(
+    assert!(
         updated
             .steps
             .iter()
-            .map(|step| step.id.as_str())
-            .collect::<Vec<_>>(),
-        ["investigate", "execute", "integrate", "verify"]
+            .all(|step| step.id.starts_with("step_"))
     );
     assert_eq!(
         updated.steps[0].status,
@@ -640,7 +698,7 @@ fn host_planning_classifier_keeps_an_explicit_continuation_on_the_active_plan() 
 }
 
 #[test]
-fn goal_objective_replaces_the_active_plan_and_binds_the_new_root() {
+fn goal_objective_binding_precedes_model_owned_plan_replacement() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
     );
@@ -711,23 +769,40 @@ fn goal_objective_replaces_the_active_plan_and_binds_the_new_root() {
             goal_id: Some("goal-current".to_owned()),
         },
     )
-    .expect("replace plan for the Goal objective");
+    .expect("classify plan for the Goal objective");
 
-    assert!(matches!(outcome.decision, PlanningDecision::Create(_)));
+    assert!(matches!(outcome.decision, PlanningDecision::Required(_)));
     assert!(outcome.changed);
-    let plan = store
+    let bound = store
         .plan("ses-goal-plan")
         .expect("read plan")
-        .expect("updated plan");
+        .expect("goal-bound existing plan");
+    assert_eq!(bound.id, stale.id);
+    assert_eq!(bound.goal_id.as_deref(), Some("goal-current"));
+    assert_eq!(bound.steps, stale.steps);
+
+    let plan = store
+        .mutate_plan(
+            "ses-goal-plan",
+            zuno_tools::PlanMutationParams::Create {
+                expected_revision: Some(bound.revision),
+                goal_id: None,
+                title: "Audit the complete release contract".to_owned(),
+                steps: vec![
+                    zuno_tools::PlanStepInput {
+                        title: "Identify the release root cause".to_owned(),
+                        status: zuno_tools::PlanStepStatus::InProgress,
+                    },
+                    zuno_tools::PlanStepInput {
+                        title: "Verify the repaired release contract".to_owned(),
+                        status: zuno_tools::PlanStepStatus::Pending,
+                    },
+                ],
+            },
+        )
+        .expect("replace plan through the model operation");
     assert_eq!(plan.goal_id.as_deref(), Some("goal-current"));
-    assert_eq!(
-        plan.steps
-            .iter()
-            .map(|step| step.id.as_str())
-            .collect::<Vec<_>>(),
-        ["investigate", "execute", "integrate", "verify"]
-    );
-    assert_eq!(plan.steps[0].status, zuno_tools::PlanStepStatus::InProgress);
+    assert!(plan.steps.iter().all(|step| step.id.starts_with("step_")));
     let connection = pool.get().expect("open archive connection");
     assert_eq!(
         connection
@@ -747,7 +822,7 @@ fn goal_objective_replaces_the_active_plan_and_binds_the_new_root() {
 }
 
 #[test]
-fn atomic_goal_objective_supersedes_a_stale_active_plan_without_seeding_work() {
+fn atomic_goal_objective_rebinds_without_falsely_completing_active_work() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
     );
@@ -801,10 +876,10 @@ fn atomic_goal_objective_supersedes_a_stale_active_plan_without_seeding_work() {
     let plan = store
         .plan("ses-atomic-goal")
         .expect("read plan")
-        .expect("terminal historical plan");
+        .expect("active plan");
     assert_eq!(plan.goal_id.as_deref(), Some("goal-current"));
-    assert_eq!(plan.steps[0].status, zuno_tools::PlanStepStatus::Completed);
-    assert_eq!(plan.steps[0].title, "Superseded: Old work");
+    assert_eq!(plan.steps[0].status, zuno_tools::PlanStepStatus::InProgress);
+    assert_eq!(plan.steps[0].title, "Old work");
 }
 
 #[test]
@@ -924,10 +999,10 @@ fn production_turn_runs_the_host_planning_classifier_after_input_is_durable() {
         .find("self.persist_user_input(&message, &parts)?")
         .expect("input persistence call");
     let classified = turn
-        .find("self.ensure_durable_plan(prompt, options.planning_source, options.content)?;")
+        .find("self.ensure_durable_plan(prompt, options.planning_source, options.content)?")
         .expect("host planning classifier call");
     let provider = turn
-        .find(".drive_input_unaccounted(guard, options.routing.as_ref(), events.clone())")
+        .find(".drive_input_unaccounted(")
         .expect("provider turn call");
 
     assert!(
@@ -1245,6 +1320,31 @@ fn test_job_controller() -> Arc<dyn zuno_tools::job_cancel::JobController> {
     Arc::new(NoJobController)
 }
 
+#[test]
+fn plan_unreconciled_waiting_creates_a_typed_recoverable_human_request() {
+    let request = plan_unreconciled_request(
+        "ses_plan_wait",
+        "que_plan_wait".to_owned(),
+        "msg_plan_wait",
+        "driver_plan_wait",
+        PlanWaitingReason::PlanUnreconciled,
+    );
+
+    assert_eq!(
+        request.kind,
+        zuno_db::human_request::HumanRequestKind::Input
+    );
+    assert_eq!(request.payload["source"], "plan_reconciliation");
+    assert_eq!(request.payload["reason"], "plan_unreconciled");
+    assert_eq!(request.payload["cycleId"], "driver_plan_wait");
+    let questions = serde_json::from_value::<Vec<zuno_tools::question::QuestionRequest>>(
+        request.payload["questions"].clone(),
+    )
+    .expect("recovery clients can decode the durable question");
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].header, "Plan state");
+}
+
 fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
     let directory = PathBuf::from(directory);
     let auth_store = zuno_auth::AuthStore::new(directory.join(".zuno-test-auth.json"));
@@ -1258,6 +1358,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
     let config = zuno_config::schema::Config::default();
     let profile = agent_profile(agent.clone(), &directory, &config);
     let extension_scope = zuno_extension::Scope::new(&directory);
+    let skills = Arc::new(zuno_catalog::skill::Skills::default());
     TurnPlan {
         profile: zuno_harness::default_profile(),
         resolver: Resolver {
@@ -1276,8 +1377,9 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         catalog_models: Vec::new(),
         reasoning_efforts: std::collections::BTreeMap::new(),
         subagent_model_policy: zuno_tools::task::SubagentModelPolicy::default(),
-        skills: Arc::new(zuno_catalog::skill::Skills::default()),
-        required_skills: Vec::new(),
+        skills: Arc::clone(&skills),
+        skill_catalog: zuno_catalog::skill::catalog::SkillCatalogService::fixed(skills),
+        required_skill_names: Vec::new(),
         capability: test_capability(),
         tool_authority: None,
         agents: vec![agent.clone()],
@@ -4553,11 +4655,13 @@ fn production_registry_exposes_all_three_goal_tools() {
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
+            work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            skill_catalog: None,
             capability: test_capability(),
             delegation: test_delegation(),
             product_agents: test_product_agents(),
@@ -4620,11 +4724,13 @@ fn interaction_tool_ids(
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
+            work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            skill_catalog: None,
             capability: test_capability(),
             delegation: test_delegation(),
             product_agents: test_product_agents(),
@@ -4731,11 +4837,13 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
+            work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            skill_catalog: None,
             capability: test_capability(),
             delegation: test_delegation(),
             product_agents: test_product_agents(),
@@ -4807,11 +4915,13 @@ async fn explicit_full_access_uses_the_native_backend_and_retains_managed_lifecy
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
+            work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            skill_catalog: None,
             capability: test_capability(),
             delegation: test_delegation(),
             product_agents: test_product_agents(),
@@ -4908,11 +5018,13 @@ async fn unavailable_fallback_is_visible_and_keeps_managed_shell_guards_and_auth
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
+            work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            skill_catalog: None,
             capability: test_capability(),
             delegation: test_delegation(),
             product_agents: test_product_agents(),
@@ -5082,11 +5194,13 @@ fn read_only_agent_refuses_unavailable_fallback_even_when_trusted_config_allows_
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
+            work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            skill_catalog: None,
             capability: test_capability(),
             delegation: test_delegation(),
             product_agents: test_product_agents(),
@@ -5202,11 +5316,13 @@ async fn a_read_only_agent_contract_narrows_a_full_access_invocation() {
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
+            work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            skill_catalog: None,
             capability: test_capability(),
             delegation: test_delegation(),
             product_agents: test_product_agents(),
@@ -5270,12 +5386,14 @@ fn production_registry_exposes_council_only_to_a_delegating_profile() {
                     zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
                         .expect("in-memory todo store"),
                 ),
+                work_observer: test_work_observer(),
                 goal_store: Arc::new(
                     GoalStore::open_memory(goal_spill.path().to_owned())
                         .expect("in-memory goal store"),
                 ),
                 mcp_loader: None,
                 skills: Arc::new(zuno_catalog::skill::Skills::default()),
+                skill_catalog: None,
                 capability: test_capability_with_council(),
                 delegation: test_delegation(),
                 product_agents: test_product_agents(),
@@ -5374,11 +5492,13 @@ fn production_registry_uses_the_frozen_profile_rules() {
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
+            work_observer: test_work_observer(),
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            skill_catalog: None,
             capability: test_capability(),
             delegation: test_delegation(),
             product_agents: test_product_agents(),
@@ -6689,12 +6809,14 @@ mod production_registry {
                     zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
                         .expect("in-memory todo store"),
                 ),
+                work_observer: test_work_observer(),
                 goal_store: Arc::new(
                     GoalStore::open_memory(goal_spill.path().to_owned())
                         .expect("in-memory goal store"),
                 ),
                 mcp_loader,
                 skills: Arc::new(skills),
+                skill_catalog: None,
                 capability: test_capability(),
                 delegation: test_delegation(),
                 product_agents: test_product_agents(),
@@ -7177,12 +7299,14 @@ mod production_registry {
                     zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
                         .expect("in-memory todo store"),
                 ),
+                work_observer: test_work_observer(),
                 goal_store: Arc::new(
                     GoalStore::open_memory(goal_spill.path().to_owned())
                         .expect("in-memory goal store"),
                 ),
                 mcp_loader: None,
                 skills: Arc::new(skills),
+                skill_catalog: None,
                 capability: test_capability(),
                 delegation: test_delegation(),
                 product_agents: test_product_agents(),
@@ -8259,14 +8383,15 @@ fn the_headless_surfaces_wire_every_capability_the_tui_has() {
     let turn = read("turn.rs");
     assert!(
         turn.contains("announce_skills(")
-            && turn.contains("&mut plan.resolver,\n                &plan.skills,"),
+            && turn.contains("let skill_snapshot = plan.skill_catalog.snapshot();")
+            && turn.contains("&mut plan.resolver,\n                skill_snapshot.skills(),"),
         "`turn.rs` no longer injects the skill catalogue into the system prompt, so \
          discovery runs and the model is told about none of it"
     );
     assert!(
-        turn.contains("skills: Arc::clone(&plan.skills)"),
-        "`turn.rs` no longer hands the loaded skills to the tool assembly, so the \
-         `skill` tool would answer from a different set than the prompt advertised"
+        turn.contains("skill_catalog: Some(Arc::clone(&plan.skill_catalog))"),
+        "`turn.rs` no longer hands the shared live Skill catalog to tool assembly, so \
+         the `skill` tool could answer from a different generation than the prompt"
     );
     assert!(
         turn.contains("delegation: super::tool_runtime::Delegation {"),
@@ -8313,7 +8438,9 @@ fn every_extension_contribution_reaches_its_native_consumer() {
         "zuno_extension::resolve_active",
         "zuno_extension::resolve_desired",
         "extensions.agents()",
-        "with_overlay(extensions.skills().iter().cloned())",
+        "let extension_skills = extensions.skills().to_vec()",
+        ".with_overlay(extension_skills.iter().cloned())",
+        "SkillCatalogService::start_with_initial",
         "zuno_extension::lifecycle_tools",
         "default_profile_with_tools",
         "orchestration_capabilities_bundle",

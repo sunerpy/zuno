@@ -1011,6 +1011,7 @@ pub struct RunTurnRequest {
     pub dynamic_context: DynamicContext,
     /// Model context ceiling used to interpret the latest prompt occupancy.
     pub context_limit: Option<u64>,
+    defer_success_terminal_event: bool,
 }
 
 impl RunTurnRequest {
@@ -1026,6 +1027,7 @@ impl RunTurnRequest {
             turn_id: turn_id.into(),
             dynamic_context,
             context_limit: None,
+            defer_success_terminal_event: false,
         }
     }
 
@@ -1033,6 +1035,13 @@ impl RunTurnRequest {
     #[must_use]
     pub fn with_context_limit(mut self, context_limit: u64) -> Self {
         self.context_limit = (context_limit > 0).then_some(context_limit);
+        self
+    }
+
+    /// Let a host reconcile durable work before exposing a successful terminal event.
+    #[must_use]
+    pub fn with_deferred_success_terminal_event(mut self, defer: bool) -> Self {
+        self.defer_success_terminal_event = defer;
         self
     }
 }
@@ -2541,12 +2550,14 @@ async fn run_turn_in_span(
         }
 
         if yield_until_input {
-            events
-                .send(TurnEvent::TurnCompleted {
-                    assistant_message_id: assistant_id.clone(),
-                    steps,
-                })
-                .await?;
+            if !request.defer_success_terminal_event {
+                events
+                    .send(TurnEvent::TurnCompleted {
+                        assistant_message_id: assistant_id.clone(),
+                        steps,
+                    })
+                    .await?;
+            }
             return Ok(TurnOutcome::Completed {
                 assistant_message_id: assistant_id,
                 steps,
@@ -2558,12 +2569,14 @@ async fn run_turn_in_span(
             continue;
         }
 
-        events
-            .send(TurnEvent::TurnCompleted {
-                assistant_message_id: assistant_id.clone(),
-                steps,
-            })
-            .await?;
+        if !request.defer_success_terminal_event {
+            events
+                .send(TurnEvent::TurnCompleted {
+                    assistant_message_id: assistant_id.clone(),
+                    steps,
+                })
+                .await?;
+        }
         return Ok(TurnOutcome::Completed {
             assistant_message_id: assistant_id,
             steps,
