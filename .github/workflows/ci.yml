@@ -6,11 +6,12 @@
 # CodeConnection, or privileged self-hosted runner is exposed to submitted code.
 #
 # GitHub creates pull_request workflow runs for GITHUB_TOKEN-authored PRs in an
-# approval-required state. A maintainer must review and approve that exact run;
-# the project deliberately does not bypass it with skip markers, pull_request_target,
-# or a privileged automation token. After approval, the classify job routes only
-# the exact same-repository release-please PR shape away from duplicate build jobs.
-# release-candidate.yml owns that head's real zuno/pr-gate status.
+# approval-required state when GitHub's native policy asks for it. A maintainer
+# reviews and approves that run; the project deliberately does not bypass it with
+# skip markers, pull_request_target, or a privileged automation token. Once GitHub
+# admits a run, the classify job routes only the exact same-repository
+# release-please PR shape away from duplicate build jobs. release-candidate.yml
+# owns that head's real zuno/pr-gate status.
 
 name: CI
 
@@ -48,20 +49,20 @@ jobs:
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
-          ACTOR: ${{ github.actor }}
           PR_USER: ${{ github.event.pull_request.user.login }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_REF: ${{ github.head_ref }}
           BASE_REF: ${{ github.base_ref }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
           set -euo pipefail
           release_pr=false
           if [ "$EVENT_NAME" = pull_request ] \
-            && [ "$ACTOR" = 'github-actions[bot]' ] \
             && [ "$PR_USER" = 'github-actions[bot]' ] \
             && [ "$HEAD_REPOSITORY" = "$GITHUB_REPOSITORY" ] \
             && [ "$BASE_REF" = main ] \
-            && [[ "$HEAD_REF" == release-please--branches--main--* ]]
+            && [[ "$HEAD_REF" == release-please--branches--main--* ]] \
+            && jq -e 'index("autorelease: pending") != null' <<<"$PR_LABELS" >/dev/null
           then
             release_pr=true
           fi
