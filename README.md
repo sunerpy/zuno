@@ -156,6 +156,8 @@ profile lifecycle. The assembled model request is persisted as
 
 Read [Harness Runtime](./docs/harness-runtime.md) for the component model and
 [Plugins and extensions](./docs/plugins.md) for package formats and capability grants.
+Use [Developing agents and extensions](./docs/guide/extension-development.md) for
+complete declarative Agent, WASI guest, and native Rust implementation paths.
 The design record is in
 [Harness comparison](./docs/design/harness-comparison.md), and shared client ownership
 is described in
@@ -173,6 +175,8 @@ source is in [`docs/`](./docs/README.md). Common starting points:
 - [Attachments](./docs/reference/attachments.md) — images and `@file` input
 - [Export and import](./docs/reference/portable-bundles.md) — portable config bundles
 - [Zed ACP](./docs/reference/zed-acp.md) — editors and other ACP clients
+- [Agent and extension development](./docs/guide/extension-development.md) — WASI and native Rust interfaces
+- [Documentation coverage](./docs/design/documentation-coverage.md) — canonical ownership map
 - [FAQ](./docs/faq.md) — troubleshooting
 
 ## Development

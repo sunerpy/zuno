@@ -10,6 +10,9 @@ Zuno 只有一种扩展包格式，以及三个执行层级。包清单始终是
 
 已编译的第一方或部署方拥有的 Rust 行为，仍然是 `ProfileBundle` 中的原生 `Component`、类型化服务或 `AgentDriver`。Zuno 不加载 Rust 动态库：Rust 没有稳定的插件 ABI，而卸载一个库无法证明它的线程、回调或借用值都已消失。
 
+从声明式 Agent、完整 Rust WASI guest 到原生 `Component`、`ProfileBundle` 与
+`AgentDriver` 的端到端实现见[开发 Agent 与扩展](/zh/guide/extension-development)。
+
 内置的 `/develop-zuno` Skill 帮助选择这个扩展层级，并链接到当前的编写参考。它只是指导：加载它不会授予插件能力、工具、文件系统访问或权限旁路。
 
 ## 安装与检查包

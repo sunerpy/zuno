@@ -389,6 +389,58 @@ fn plugin_guide_documents_capabilities_protocols_and_examples() {
 }
 
 #[test]
+fn extension_development_docs_pin_supported_boundaries_and_ownership() {
+    contains_all(
+        "docs/guide/extension-development.md",
+        &[
+            "zuno.extension/v1",
+            "zuno.plugin/1",
+            "wasm32-wasip2",
+            "wit-bindgen",
+            "workspace.read",
+            "host.full",
+            "Component::prepare",
+            "PrepareContext",
+            "ProfileBundle",
+            "HarnessProfile",
+            "AgentDriver",
+            "ToolReplayPolicy",
+            "Uncertain",
+            "scripts/check-plugin-examples.sh",
+            "crates/zuno-extension/src/host/wasi.rs",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/extension-development.md",
+        &[
+            "zuno.extension/v1",
+            "zuno.plugin/1",
+            "wasm32-wasip2",
+            "Component::prepare",
+            "ProfileBundle",
+            "HarnessProfile",
+            "AgentDriver",
+            "Uncertain",
+            "文档架构与覆盖地图",
+        ],
+    );
+    for relative in [
+        "docs/design/documentation-coverage.md",
+        "docs/zh/operate/documentation-coverage.md",
+    ] {
+        contains_all(
+            relative,
+            &[
+                ".github/workflows/publish-docs.yml",
+                "docs/scripts/sync-zuno-docs.sh",
+                "zuno.firlab.app",
+                "cargo test -p zuno --test docs",
+            ],
+        );
+    }
+}
+
+#[test]
 fn architecture_documents_pin_the_native_harness_decisions() {
     contains_all(
         "AGENTS.md",
@@ -499,6 +551,8 @@ fn readmes_document_extension_examples_and_do_not_advertise_compatibility() {
             "design/harness-comparison.md",
             "design/client-interfaces.md",
             "plugins.md",
+            "guide/extension-development.md",
+            "design/documentation-coverage.md",
         ] {
             assert!(
                 text.contains(required),

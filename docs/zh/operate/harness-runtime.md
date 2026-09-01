@@ -36,7 +36,8 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 
 扩展要么是显式 WASI 授权下的 WebAssembly 组件，要么是使用行分隔 JSON-RPC 的受限子进程。能力必须声明，不会被默认赋予。
 
-详见 [插件与扩展](/zh/guide/plugins)。
+详见 [插件与扩展](/zh/guide/plugins)；完整 WASI guest 与原生 Rust 实现路径见
+[开发 Agent 与扩展](/zh/guide/extension-development)。
 
 ## 提示词溯源
 

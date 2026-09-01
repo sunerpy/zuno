@@ -94,6 +94,8 @@ zuno agent create --path .zuno/agent/reviewer.md --mode subagent \
 ```
 
 一个配置或扩展提供的 Agent，只要它的 mode 是 `subagent` 或 `all`，就可以加入委派阵容。仅为 `primary` 的 Agent 不能作为委派目标。完整字段清单见[自定义 Agent](/zh/config/custom-agents)，委派机制见[编排](/zh/guide/orchestration)。
+需要把 Agent 与 Skill 或工具打包，或实现 WASI/原生行为时，见
+[开发 Agent 与扩展](/zh/guide/extension-development)。
 
 ## 参见
 
@@ -101,3 +103,4 @@ zuno agent create --path .zuno/agent/reviewer.md --mode subagent \
 - [工具](/zh/guide/tools)
 - [权限与沙箱](/zh/guide/permissions)
 - [编排](/zh/guide/orchestration)
+- [开发 Agent 与扩展](/zh/guide/extension-development)
