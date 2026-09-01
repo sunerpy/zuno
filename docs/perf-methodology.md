@@ -482,6 +482,13 @@ nextest worker pool while each startup case runs. Native Windows uses the same
 quiet-host boundary in `scripts/test-parallel.sh`. The 100 ms Linux budget is
 not loosened to absorb unrelated load.
 
+Each startup path has one wall-clock gate. Before timing `session list`, the
+test asserts through the real parser that this command is watchdog-protected;
+the resulting sample therefore includes watchdog creation, guard acquisition,
+and shutdown. A second timing test over the identical command cannot isolate
+the watchdog's incremental cost. Watchdog classification and false-stall
+behavior remain separate untimed assertions.
+
 Nine runs per invocation, first run discarded (it pays for faulting the binary's
 pages in), isolated `XDG_CONFIG_HOME` and `XDG_DATA_HOME`, debug profile:
 
@@ -511,7 +518,7 @@ runner where a timing budget would have to be loosened.
 mold) and §10.1 requires re-measuring it here. Re-measured on 2026-08-18 against
 this workspace's `zuno` binary (203,921,136 bytes, 84,452,158 bytes of `.text`),
 five interleaved runs of `touch crates/zuno-cli/src/main.rs && cargo rustc
---offline -p zuno-cli --bin zuno`:
+--offline -p zuno --bin zuno`:
 
 | linker | five runs (s) | min / median / max | max/min |
 | --- | --- | --- | --- |
@@ -973,6 +980,23 @@ was sharing the runner with unrelated test processes. The repository-level
 nextest override described in *Startup budget* now gives Linux the same
 isolate-one/run-the-rest-concurrently topology already used on Windows.
 
+Windows CI run `33505110778` exposed a different duplicate-gate defect. The
+primary startup-budget case passed, but a later test timed the same watchdog-active
+`session list` path again and observed a 252.3702 ms median against the 200 ms
+ceiling. Native Windows on the exact commit (`db91241b`) then produced ten
+no-rebuild medians of 67.0095–78.765 ms, while the first run immediately after a
+fresh relink later measured 257.3835 ms and the following ten returned to
+65.4487–67.9079 ms. A second fresh-link probe outside the Rust harness confirmed
+the boundary: the first launch took 2.469 seconds and the next nineteen stayed at
+243–258 ms until that build-step process exited; a new process returned to the
+normal range. Zuno's own profile attributed only about 13–14 ms to stable
+in-process work. The budget was not loosened. The duplicate watchdog gate was
+removed, and native Windows treats only a first-process failure whose sole failed
+test is the startup budget as provisional. The scheduler exits that process and
+confirms once in a fresh process; the confirmation result is final. Timeouts,
+functional failures, additional failed tests, non-Windows runs, and a second
+over-budget result are never retried.
+
 Native Windows run `33384920656` supplied the missing negative evidence. Its
 nextest step started at `11:06:31Z` and was still running at `11:34:09Z`, at least
 27 minutes 38 seconds later, so the run was cancelled instead of consuming the
@@ -985,7 +1009,11 @@ benchmark under a quiet host, then keeps four functional binaries in flight
 while using one harness thread inside each binary. ACP and ConPTY lifecycle
 suites stay in that concurrent pool; there is no functional serial tail. Its
 timeout path kills the complete process tree so a stalled harness cannot leave
-`conhost` or child-agent processes behind.
+`conhost` or child-agent processes behind. If and only if the first freshly
+linked Windows process reports the startup budget as its sole failure, the
+scheduler confirms that suite once in a new process before opening the worker
+pool. This is a process-boundary confirmation for observed post-link host
+overhead, not a generic test retry.
 
 The in-tree scheduler was therefore revalidated in an environment that permits
 loopback binds. The first two warm-target runs built 204 test binaries, observed

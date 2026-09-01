@@ -25,7 +25,7 @@
 
 CARGO       := cargo
 OXFMT      ?= oxfmt
-CLI_CRATE   := zuno-cli
+CLI_CRATE   := zuno
 BINARY_NAME := zuno
 TARGET_DIR  := target
 DIST_DIR    := dist
@@ -53,14 +53,13 @@ TARGET ?=
 # them next to the command that builds one; the authoritative matrix lives in
 # `.github/workflows/release-candidate.yml` and
 # `crates/zuno-cli/tests/release_surface.rs` asserts the two agree.
-# `aarch64-pc-windows-msvc` is absent deliberately — see the release pipeline
-# design record.
 RELEASE_TARGETS := \
   x86_64-unknown-linux-musl \
   aarch64-unknown-linux-musl \
   x86_64-apple-darwin \
   aarch64-apple-darwin \
-  x86_64-pc-windows-msvc
+  x86_64-pc-windows-msvc \
+  aarch64-pc-windows-msvc
 
 all: build
 

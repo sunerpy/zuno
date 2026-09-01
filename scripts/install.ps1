@@ -22,13 +22,10 @@ function Die($Message) {
   exit 1
 }
 
-# Only x86_64 is published. `aarch64-pc-windows-msvc` is deliberately absent from
-# the release matrix because no available runner can execute that artifact, and the
-# pipeline does not publish a binary it never ran. Fail clearly rather than
-# downloading an archive that cannot exist.
 switch ($env:PROCESSOR_ARCHITECTURE) {
   "AMD64" { $Arch = "x86_64" }
-  default { Die "unsupported architecture: $env:PROCESSOR_ARCHITECTURE (only AMD64 is published)" }
+  "ARM64" { $Arch = "aarch64" }
+  default { Die "unsupported architecture: $env:PROCESSOR_ARCHITECTURE (AMD64 and ARM64 are published)" }
 }
 
 if ($env:ZUNO_VERSION) {
@@ -59,7 +56,7 @@ try {
   Invoke-WebRequest -Uri "$BaseUrl/$Asset" -OutFile $Archive
   Invoke-WebRequest -Uri "$BaseUrl/$ChecksumFile" -OutFile $Checksums
 
-  # Anchor on the exact asset name so a checksum file listing five archives
+  # Anchor on the exact asset name so a checksum file listing several archives
   # cannot end up verifying a different one.
   $EscapedAsset = [Regex]::Escape($Asset)
   $Line = Get-Content $Checksums |

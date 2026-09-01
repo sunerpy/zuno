@@ -6,7 +6,7 @@
 //! 2.0s with mold) and §10.1 requires it be re-measured here rather than adopted.
 //! Re-measured on 2026-08-18 against this workspace's `zuno` binary
 //! (203,921,136 bytes, 84,452,158 bytes of `.text`), five interleaved runs of
-//! `touch crates/zuno-cli/src/main.rs && cargo rustc --offline -p zuno-cli --bin
+//! `touch crates/zuno-cli/src/main.rs && cargo rustc --offline -p zuno --bin
 //! zuno`:
 //!
 //! | linker | five runs (s) | min / median / max | max/min |

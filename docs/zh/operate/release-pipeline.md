@@ -7,12 +7,22 @@ Zuno 的发布产物只构建一次。release-please PR 会在其精确 head com
 
 - `ci.yml` 是普通贡献 PR 的必需门禁。它使用标准 GitHub-hosted Linux 与 Windows runner；
   public fork 只获得只读权限，不会得到仓库 secrets。
-- `release.yml` 负责 release-please、精确候选调度、发布身份校验和最终发布；它不安装 Rust，
-  也不编译二进制。
-- `release-candidate.yml` 负责完整测试和五个发布目标。每个目标在同一 job 中共同构建
+- `release.yml` 负责 release-please、精确候选调度、发布身份校验和 GitHub 资产发布。
+  候选晋级路径不安装 Rust，也不重新编译二进制；crates.io 发布会在 GitHub Release
+  公开后转交独立工作流。
+- `release-candidate.yml` 负责完整测试和六个发布目标。每个目标在同一 job 中共同构建
   `zuno` 与 `zuno-smoke`，打包并解包归档，校验精确可执行架构并运行归档内二进制，生成
   provenance，最后才上传产物。Linux、Windows 和 arm64 macOS 原生执行；
-  x86_64 macOS 在 `macos-15` Arm64 runner 上通过 Rosetta 2 执行。
+  x86_64 macOS 在 `macos-15` Arm64 runner 上通过 Rosetta 2 执行。Windows x86_64
+  使用 `windows-2022`，Windows ARM64 使用标准 `windows-11-arm` hosted runner。
+
+GitHub 会把由 `GITHUB_TOKEN` 创建的 PR 对应的 `pull_request` workflow 置于等待批准
+状态。因此仓库将 `actions/permissions/fork-pr-contributor-approval` 保持为
+`first_time_contributors_new_to_github`：GitHub 新账号仍须人工批准，已有身份的
+`github-actions[bot]` 则可以进入 workflow 路由。`ci.yml` 只有在 actor、PR 作者、
+同仓库 head、`main` base 和 release-please 分支前缀全部匹配时，才接受轻量路由；
+这条路由使用非受保护 check 名称，并跳过所有构建 job。精确 head 的候选工作流仍是
+`zuno/pr-gate` 的唯一所有者。普通 PR 与 fork PR 继续执行完整 CI 矩阵。
 
 Linux 源码门禁安装固定版本的 `cargo-nextest`。Linux 的 Clippy 与测试在同一 job 内复用
 本地 target；原生 Windows 的 Clippy 与测试拆成两个并行 job，避免在测试执行前形成全局
@@ -83,7 +93,7 @@ head 后手动合并已认证的 PR，用户身份产生的 merge push 会自然
 ## 候选身份
 
 封存后的 `release-candidate` Actions artifact 保留七天，只能通过 workflow run ID 访问。
-其中包含五个归档、`SHA256SUMS`、逐目标证据和 `candidate-manifest.json`。Manifest 绑定：
+其中包含六个归档、`SHA256SUMS`、逐目标证据和 `candidate-manifest.json`。Manifest 绑定：
 
 - 仓库、签名 workflow ref 与 workflow commit；
 - run ID 与 attempt；
@@ -100,12 +110,33 @@ tag commit 可以与 PR head commit 不同，但两者 Git tree 必须逐字节�
 release-please 创建 tag 和 draft release。晋级过程只在 draft 状态上传资产；重新读取并确认
 完整资产集合后才转为公开发布。任何不匹配都会让 draft 保持未发布。
 
+GitHub 发布完成后，`.github/workflows/publish-crates.yml` 会按拓扑顺序打包完整的
+第一方 crates.io 依赖闭包。每个本地依赖必须保留明确的 registry 版本，归一化后的
+`.crate` manifest 不得包含 path 依赖；已经存在的版本只有在 crates.io 返回的 checksum
+与本地预期完全一致时才会跳过。checksum 不一致属于永久失败；同一 tag 的部分发布可安全续跑。
+
+第一次发布到 crates.io 必须显式 bootstrap：
+
+1. 创建受保护的 `crates-io` GitHub environment，并把 crates.io API token 保存为
+   `CRATES_IO_TOKEN`；
+2. 对已经公开的 release tag 手动调度 `publish-crates.yml`，选择
+   `auth_mode=bootstrap`；
+3. 为每个已发布的 Zuno crate 注册 Trusted Publisher，绑定本仓库、
+   `.github/workflows/publish-crates.yml` 与 `crates-io` environment；
+4. 设置仓库变量 `CRATES_IO_TRUSTED_PUBLISHING=true`。
+
+后续发布通过 GitHub OIDC 换取短期 crates.io token，不再使用长期 bootstrap token。
+仓库变量缺失或为 false 时，GitHub Release 仍可正常工作，crates.io 则保持显式禁用。
+
 自动失败绝不会回退到重新编译。恢复必须显式执行：
 
 1. 在精确 release tag 上以 `mode=backfill` 调度 `release-candidate.yml`；
 2. 记录成功的 run ID；
 3. 以 `mode=promote` 调度 `release.yml`，传入该 run ID、已合并 release PR、候选源 SHA 和
    现有 tag。
+
+只恢复 crates.io 时，针对同一个公开 tag 重新运行 `publish-crates.yml`。不可变版本与
+checksum 校验会续传缺失包，并拒绝覆盖不同字节。
 
 这样正常路径始终只有一条，同时允许运维者从 artifact 过期或最终发布中断中恢复，而不降低
 身份校验强度。

@@ -52,16 +52,13 @@ const REQUIRED_TLS_CRATES: &[&str] = &["reqwest", "rustls", "rustls-webpki"];
 
 /// The targets the release pipeline builds, smoke-tests, and publishes.
 ///
-/// `aarch64-pc-windows-msvc` remains absent because the public installers and
-/// release contract have never advertised it. Adding a target is an explicit
-/// product decision and requires a native execute-and-smoke leg in the candidate
-/// matrix, not merely a compiler that can emit its bytes.
-const RELEASE_TARGETS: [&str; 5] = [
+const RELEASE_TARGETS: [&str; 6] = [
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
 ];
 
 /// The one cassette the artifact smoke test replays.
@@ -181,22 +178,22 @@ fn inverted_path(package: &str) -> String {
 
 #[test]
 fn the_shipped_binary_pulls_in_no_openssl() {
-    let graph = default_graph(&["-p", "zuno-cli"]);
+    let graph = default_graph(&["-p", "zuno"]);
     assert!(
         graph.len() >= MINIMUM_GRAPH_PACKAGES,
-        "the graph for zuno-cli has only {} packages; cargo tree returned something \
+        "the graph for zuno has only {} packages; cargo tree returned something \
          unexpected and this assertion would pass vacuously",
         graph.len()
     );
     assert!(
-        contains_package(&graph, "zuno-cli"),
-        "cargo tree did not report zuno-cli itself; the graph is not the one intended"
+        contains_package(&graph, "zuno"),
+        "cargo tree did not report zuno itself; the graph is not the one intended"
     );
 
     let offenders = exact_matches(&graph, OPENSSL_CRATES);
     assert!(
         offenders.is_empty(),
-        "the default zuno-cli graph contains OpenSSL: {offenders:?}\n\
+        "the default zuno graph contains OpenSSL: {offenders:?}\n\
          TLS in this workspace is rustls only (plan todo 1: reqwest carries \
          `default-features = false` and the `rustls` feature).\n\
          How each one got in:\n{}",
@@ -215,7 +212,7 @@ fn the_shipped_binary_pulls_in_no_openssl() {
     for required in REQUIRED_TLS_CRATES {
         assert!(
             contains_package(&graph, required),
-            "the default zuno-cli graph has no `{required}`; the no-OpenSSL result \
+            "the default zuno graph has no `{required}`; the no-OpenSSL result \
              above would then be meaningless, because there would be no TLS stack \
              at all"
         );
@@ -237,10 +234,10 @@ fn explain(offenders: &[&String]) -> String {
 
 #[test]
 fn the_shipped_binary_contains_the_wasi_component_host() {
-    let graph = default_graph(&["-p", "zuno-cli"]);
+    let graph = default_graph(&["-p", "zuno"]);
     assert!(
         graph.len() >= MINIMUM_GRAPH_PACKAGES,
-        "the graph for zuno-cli has only {} packages; this assertion would pass vacuously",
+        "the graph for zuno has only {} packages; this assertion would pass vacuously",
         graph.len()
     );
     for required in ["wasmtime", "wasmtime-wasi"] {
@@ -258,10 +255,10 @@ fn the_shipped_binary_contains_the_wasi_component_host() {
 
 #[test]
 fn the_shipped_binary_has_no_legacy_plugin_runtime() {
-    let graph = default_graph(&["-p", "zuno-cli"]);
+    let graph = default_graph(&["-p", "zuno"]);
     assert!(
         graph.len() >= MINIMUM_GRAPH_PACKAGES,
-        "the graph for zuno-cli has only {} packages; this assertion would pass vacuously",
+        "the graph for zuno has only {} packages; this assertion would pass vacuously",
         graph.len()
     );
     for legacy in ["zuno-plugin", "zuno-plugin-sdk"] {
@@ -276,7 +273,7 @@ fn the_shipped_binary_has_no_legacy_plugin_runtime() {
 
 #[test]
 fn the_shipped_binary_has_no_native_dynamic_plugin_loader() {
-    let graph = default_graph(&["-p", "zuno-cli"]);
+    let graph = default_graph(&["-p", "zuno"]);
     let offenders = exact_matches(&graph, DYNAMIC_PLUGIN_LOADER_CRATES);
     assert!(
         offenders.is_empty(),
@@ -786,6 +783,136 @@ fn matrix_entry<'a>(text: &'a str, job: &str, target: &str) -> Vec<&'a str> {
     entry
 }
 
+fn workspace_metadata() -> serde_json::Value {
+    let output = Command::new(env!("CARGO"))
+        .current_dir(workspace_root())
+        .env("CARGO_NET_OFFLINE", "true")
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--no-deps",
+            "--format-version",
+            "1",
+        ])
+        .output()
+        .expect("cargo metadata must be runnable");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("cargo metadata emits JSON")
+}
+
+#[test]
+fn crates_io_surface_is_complete_versioned_and_installs_as_zuno() {
+    let metadata = workspace_metadata();
+    let packages = metadata["packages"]
+        .as_array()
+        .expect("cargo metadata lists packages");
+    let internal_names = packages
+        .iter()
+        .map(|package| {
+            package["name"]
+                .as_str()
+                .expect("workspace package has a name")
+        })
+        .collect::<BTreeSet<_>>();
+    let publishable = packages
+        .iter()
+        .filter(|package| {
+            package["publish"]
+                .as_array()
+                .is_some_and(|registries| !registries.is_empty())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        publishable.len() >= 40,
+        "only {} workspace packages are publishable; the registry dependency closure is \
+         incomplete",
+        publishable.len()
+    );
+
+    let versions = publishable
+        .iter()
+        .map(|package| package["version"].as_str().expect("package version"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        versions.len(),
+        1,
+        "publishable first-party crates must move in one release version: {versions:?}"
+    );
+
+    let zuno = publishable
+        .iter()
+        .find(|package| package["name"] == "zuno")
+        .expect("the installable crates.io package is named zuno");
+    assert!(
+        packages.iter().all(|package| package["name"] != "zuno-cli"),
+        "the old package name zuno-cli is still present in cargo metadata"
+    );
+    assert!(
+        zuno["targets"].as_array().is_some_and(|targets| {
+            targets.iter().any(|target| {
+                target["name"] == "zuno"
+                    && target["kind"]
+                        .as_array()
+                        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+            })
+        }),
+        "the crates.io package zuno does not expose the zuno binary"
+    );
+
+    for package in &publishable {
+        let package_name = package["name"].as_str().expect("package name");
+        for dependency in package["dependencies"]
+            .as_array()
+            .expect("package dependencies")
+        {
+            let dependency_name = dependency["name"].as_str().expect("dependency name");
+            if dependency["kind"] == "dev" || !internal_names.contains(dependency_name) {
+                continue;
+            }
+            assert_ne!(
+                dependency["req"].as_str(),
+                Some("*"),
+                "{package_name} has no registry version for first-party dependency \
+                 {dependency_name}"
+            );
+        }
+    }
+
+    for private in ["zuno-testkit", "zuno-reaping-fixture"] {
+        let package = packages
+            .iter()
+            .find(|package| package["name"] == private)
+            .unwrap_or_else(|| panic!("workspace package {private} is missing"));
+        assert_eq!(
+            package["publish"],
+            serde_json::json!([]),
+            "{private} is a test-only package and must not be published"
+        );
+    }
+
+    let manifest =
+        std::fs::read_to_string(workspace_root().join("Cargo.toml")).expect("root manifest");
+    assert_eq!(
+        manifest.matches("# x-release-please-version").count(),
+        publishable.len(),
+        "release-please must update the workspace version and every publishable first-party \
+         dependency in one change"
+    );
+    let release_please =
+        std::fs::read_to_string(workspace_root().join("release-please-config.json"))
+            .expect("release-please config");
+    assert!(
+        release_please.contains("\"type\": \"generic\"")
+            && release_please.contains("\"path\": \"Cargo.toml\""),
+        "release-please is not configured to update all annotated Cargo.toml versions"
+    );
+}
+
 #[test]
 fn the_release_matrix_builds_every_target_the_project_ships() {
     let text = workflow("release-candidate.yml");
@@ -793,7 +920,136 @@ fn the_release_matrix_builds_every_target_the_project_ships() {
     let expected: BTreeSet<String> = RELEASE_TARGETS.iter().map(|t| (*t).to_owned()).collect();
     assert_eq!(
         built, expected,
-        "release-candidate.yml's artifact matrix does not name exactly the five shipped targets"
+        "release-candidate.yml's artifact matrix does not name exactly the six shipped targets"
+    );
+}
+
+#[test]
+fn windows_arm64_is_installed_and_updated_from_the_native_msvc_asset() {
+    let installer =
+        std::fs::read_to_string(workspace_root().join("scripts/install.ps1")).expect("installer");
+    for required in [
+        "\"AMD64\" { $Arch = \"x86_64\" }",
+        "\"ARM64\" { $Arch = \"aarch64\" }",
+        "$Target = \"$Arch-pc-windows-msvc\"",
+    ] {
+        assert!(
+            installer.contains(required),
+            "the Windows installer is missing architecture mapping {required:?}"
+        );
+    }
+
+    let self_update =
+        std::fs::read_to_string(workspace_root().join("crates/zuno-cli/src/cmd/self_update.rs"))
+            .expect("self-update source");
+    assert!(
+        self_update.contains(
+            "(\"windows\", \"aarch64\") => Ok(Self {\n                target: \
+             \"aarch64-pc-windows-msvc\""
+        ),
+        "self-update does not select the Windows ARM64 release asset"
+    );
+}
+
+#[test]
+fn crates_io_publish_uses_bootstrap_once_then_short_lived_oidc() {
+    let publish = workflow("publish-crates.yml");
+    let jobs = job_names(&publish);
+    for required in ["validate", "bootstrap", "trusted"] {
+        assert!(
+            jobs.contains(required),
+            "publish-crates.yml is missing the {required} job"
+        );
+    }
+
+    let validate = job_body(&publish, "validate").join("\n");
+    for required in [
+        "ref: ${{ inputs.tag }}",
+        "gh release view \"$TAG\"",
+        "--json isDraft,tagName",
+        "python .github/scripts/publish-crates.py --mode check",
+    ] {
+        assert!(
+            validate.contains(required),
+            "crates.io validation lost release identity check {required:?}"
+        );
+    }
+
+    let bootstrap = job_body(&publish, "bootstrap").join("\n");
+    for required in [
+        "if: inputs.auth_mode == 'bootstrap'",
+        "environment: crates-io",
+        "CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}",
+        "python .github/scripts/publish-crates.py --mode publish",
+    ] {
+        assert!(
+            bootstrap.contains(required),
+            "the one-time crates.io bootstrap path is missing {required:?}"
+        );
+    }
+    assert!(
+        !bootstrap.contains("crates-io-auth-action@"),
+        "the initial publication cannot use trusted publishing before the crates exist"
+    );
+
+    let trusted = job_body(&publish, "trusted").join("\n");
+    for required in [
+        "if: inputs.auth_mode == 'trusted'",
+        "id-token: write",
+        "environment: crates-io",
+        "rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5",
+        "CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}",
+    ] {
+        assert!(
+            trusted.contains(required),
+            "trusted crates.io publication is missing {required:?}"
+        );
+    }
+    assert!(
+        !trusted.contains("secrets.CRATES_IO_TOKEN"),
+        "routine publication still depends on the long-lived bootstrap token"
+    );
+
+    let release = workflow("release.yml");
+    let publish_job = job_body(&release, "publish_crates").join("\n");
+    for required in [
+        "needs: [resolve_release, promote]",
+        "needs.promote.result == 'success'",
+        "vars.CRATES_IO_TRUSTED_PUBLISHING == 'true'",
+        "uses: ./.github/workflows/publish-crates.yml",
+        "auth_mode: trusted",
+    ] {
+        assert!(
+            publish_job.contains(required),
+            "release-to-crates.io handoff is missing {required:?}"
+        );
+    }
+}
+
+#[test]
+fn crates_io_publication_is_dependency_ordered_and_checksum_idempotent() {
+    let script =
+        std::fs::read_to_string(workspace_root().join(".github/scripts/publish-crates.py"))
+            .expect("publish script");
+    for required in [
+        "publishable workspace dependency cycle",
+        "the installable `zuno` package is not the final dependency-ordered crate",
+        "still contains path dependency",
+        "already exists with checksum",
+        "identical crate already published",
+        "publish command failed after registry commit",
+        "wait_for_published_checksum(name, version, expected_checksum, 30)",
+        "did not become visible within 180 seconds",
+        "CARGO_REGISTRY_TOKEN is required for publish mode",
+    ] {
+        assert!(
+            script.contains(required),
+            "crates.io publication lost safety contract {required:?}"
+        );
+    }
+    assert!(
+        !script.contains("latest"),
+        "crates.io publication must never select a package or version by recency"
     );
 }
 
@@ -850,7 +1106,7 @@ fn release_binary_and_smoke_driver_share_one_cargo_invocation() {
         let tail = &artifact[start..];
         let end = tail.find("\n\n").unwrap_or(tail.len());
         let invocation = &tail[..end];
-        for required in ["-p zuno-cli --bin zuno", "-p zuno-testkit --bin zuno-smoke"] {
+        for required in ["-p zuno --bin zuno", "-p zuno-testkit --bin zuno-smoke"] {
             assert!(
                 invocation.contains(required),
                 "{command} does not build both release binaries together:\n{invocation}"
@@ -901,23 +1157,25 @@ fn release_workflows_pin_the_verified_node24_artifact_actions() {
 
 #[test]
 fn release_pipeline_docs_keep_the_verified_twenty_minute_slo() {
-    for (path, twenty, fifteen, identity) in [
+    for (path, twenty, fifteen, identity, targets) in [
         (
             "docs/operate/release-pipeline.md",
             "within 20 minutes",
             "within 15 minutes",
             "candidate-byte identity",
+            "six release targets",
         ),
         (
             "docs/zh/operate/release-pipeline.md",
             "20 分钟",
             "15 分钟",
             "候选字节身份",
+            "六个发布目标",
         ),
     ] {
         let docs = std::fs::read_to_string(workspace_root().join(path))
             .unwrap_or_else(|error| panic!("read {path}: {error}"));
-        for required in [twenty, "Rosetta 2", identity] {
+        for required in [twenty, "Rosetta 2", identity, targets, "crates.io"] {
             assert!(
                 docs.contains(required),
                 "{path} lost the release timing or verification contract {required:?}"
@@ -988,6 +1246,7 @@ fn public_workflows_use_only_standard_github_hosted_runners() {
         ("release.yml", workflow("release.yml")),
         ("release-candidate.yml", workflow("release-candidate.yml")),
         ("publish-docs.yml", workflow("publish-docs.yml")),
+        ("publish-crates.yml", workflow("publish-crates.yml")),
     ];
     for (name, text) in &workflows {
         let code = text
@@ -1011,6 +1270,7 @@ fn public_workflows_use_only_standard_github_hosted_runners() {
         ("x86_64-apple-darwin", "runner: macos-15"),
         ("aarch64-apple-darwin", "runner: macos-15"),
         ("x86_64-pc-windows-msvc", "runner: windows-2022"),
+        ("aarch64-pc-windows-msvc", "runner: windows-11-arm"),
     ] {
         let entry = matrix_entry(candidate, "artifact", target).join("\n");
         assert!(
@@ -1090,14 +1350,52 @@ fn ci_runs_before_the_protected_merge_without_a_duplicate_push_run() {
             "the consolidated test job lost the supply-chain gate {required:?}"
         );
     }
-    for forbidden in [
-        "HOSTED_RUNNERS",
-        "head.repo.full_name == github.repository",
-        "codebuild-",
-    ] {
+    for forbidden in ["HOSTED_RUNNERS", "codebuild-"] {
         assert!(
             !text.contains(forbidden),
             "public-repository CI still carries the obsolete restriction {forbidden:?}"
+        );
+    }
+    let classify = job_body(&text, "classify").join("\n");
+    for required in [
+        "ACTOR: ${{ github.actor }}",
+        "PR_USER: ${{ github.event.pull_request.user.login }}",
+        "HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}",
+        "[ \"$ACTOR\" = 'github-actions[bot]' ]",
+        "[ \"$PR_USER\" = 'github-actions[bot]' ]",
+        "[ \"$HEAD_REPOSITORY\" = \"$GITHUB_REPOSITORY\" ]",
+        "[[ \"$HEAD_REF\" == release-please--branches--main--* ]]",
+        "echo \"release_pr=${release_pr}\" >> \"$GITHUB_OUTPUT\"",
+    ] {
+        assert!(
+            classify.contains(required),
+            "release PR classification lost fail-closed identity check {required:?}"
+        );
+    }
+    for job in ["test", "artifact", "windows-clippy", "windows-test"] {
+        let body = job_body(&text, job).join("\n");
+        for required in [
+            "needs: classify",
+            "if: needs.classify.outputs.release_pr != 'true'",
+        ] {
+            assert!(
+                body.contains(required),
+                "{job} does not delegate the exact release-please PR to candidate CI; \
+                 missing {required:?}"
+            );
+        }
+    }
+    let gate = job_body(&text, "ci-success").join("\n");
+    for required in [
+        "Release PR routed to candidate",
+        "needs: [classify, test, artifact, windows-clippy, windows-test]",
+        "RELEASE_PR: ${{ needs.classify.outputs.release_pr }}",
+        "elif $release_pr == \"true\" then",
+        "release-please PR is delegated to release-candidate.yml",
+    ] {
+        assert!(
+            gate.contains(required),
+            "CI routing gate lost release-please handling {required:?}"
         );
     }
     for job in ["windows-clippy", "windows-test"] {
@@ -1633,9 +1931,32 @@ fn nextest_globally_isolates_the_startup_budget() {
         ),
         "the Linux session-list startup budget changed instead of isolating its measurement"
     );
+    assert!(
+        !startup.contains(r#"measure("watchdog-cost""#),
+        "the watchdog-active session-list path is already covered by the primary startup \
+         budget; a second wall-clock measurement recreates the hosted-runner flake without \
+         measuring incremental watchdog cost"
+    );
+    let scheduler_path = workspace_root().join("scripts/test-parallel.sh");
+    let scheduler = std::fs::read_to_string(&scheduler_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", scheduler_path.display()));
+    for required in [
+        "def is_windows_startup_budget_only_failure(target, code, output):",
+        "if os.name != 'nt' or target != 'startup' or code != 101:",
+        "'startup regressed past its budget:' in normalized",
+        "startup_medians_are_inside_their_budgets",
+        r"r'test result: FAILED\. \d+ passed; 1 failed;'",
+        "retry_code, retry_output, retry_elapsed = run_once(",
+        "code = retry_code",
+    ] {
+        assert!(
+            scheduler.contains(required),
+            "the Windows startup confirmation lost its fail-closed condition {required:?}"
+        );
+    }
 }
 
-/// The five targets the plan names, plus the ones CI invokes by name. A workflow
+/// The shared gate targets the plan names, plus the ones CI invokes by name. A workflow
 /// step calling a make target that does not exist fails only when that workflow
 /// runs, which for the release path could be months later.
 #[test]
@@ -1652,7 +1973,7 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
         .collect();
 
     for required in [
-        // The plan's five.
+        // The plan's shared gates.
         "fmt",
         "lint",
         "lint-windows-cross",
@@ -1939,6 +2260,7 @@ fn ci_limits_target_caches_to_target_isolated_macos_candidate_legs() {
         "x86_64-unknown-linux-musl",
         "aarch64-unknown-linux-musl",
         "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc",
     ] {
         assert!(
             matrix_entry(&candidate, "artifact", target)

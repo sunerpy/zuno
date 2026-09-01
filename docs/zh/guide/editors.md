@@ -345,5 +345,5 @@ dev: open acp logs
 
 ```sh
 cargo test -p zuno-acp
-cargo test -p zuno-cli --test acp_stdio
+cargo test -p zuno --test acp_stdio
 ```

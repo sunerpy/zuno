@@ -1770,33 +1770,67 @@ pub fn theme_picker(context: ViewContext, registry: &ThemeRegistry, mode: Mode) 
         })
 }
 
-/// Six swatch rows summarising a palette, the theme picker's preview.
+/// A compact transcript preview for the theme under the cursor.
 ///
-/// A subset of [`crate::theme::PaletteSampleView`]'s fifty-odd rows: a picker has
-/// eight rows to spare, and these six are the ones a user judges a theme by.
+/// Colour swatches proved little about the screen users actually read: a palette can
+/// have attractive isolated colours while its prompt, answer, reasoning, tool, and
+/// warning roles collapse into one visual weight. These rows exercise that hierarchy
+/// directly and still fit the picker's eight-row preview budget.
 #[must_use]
-pub fn preview_lines(resolved: &Resolved, context: &ViewContext) -> Vec<Line<'static>> {
+pub fn preview_lines(resolved: &Resolved, _context: &ViewContext) -> Vec<Line<'static>> {
     let palette = &resolved.palette;
-    let swatch = |label: &str, color: crate::theme::Rgba| {
-        Span::styled(
-            format!(" {label} "),
-            ratatui::style::Style::new()
-                .fg(crate::theme::selected_foreground(palette, Some(color)).into())
-                .bg(color.into()),
-        )
+    let style = |foreground: crate::theme::Rgba, background: crate::theme::Rgba| {
+        ratatui::style::Style::new()
+            .fg(foreground.into())
+            .bg(background.into())
     };
     vec![
         Line::from(vec![Span::styled(
             format!(" {} ({:?})", resolved.name, resolved.mode),
-            context.title(),
+            style(palette.text, palette.background).add_modifier(ratatui::style::Modifier::BOLD),
         )]),
         Line::from(vec![
-            swatch("primary", palette.primary),
-            swatch("accent", palette.accent),
-            swatch("error", palette.error),
-            swatch("warning", palette.warning),
-            swatch("success", palette.success),
-            swatch("info", palette.info),
+            Span::styled(
+                "› ",
+                style(palette.border_active, palette.background_element),
+            ),
+            Span::styled(
+                "Your prompt is a distinct surface",
+                style(palette.text, palette.background_element),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("• ", style(palette.text_muted, palette.background)),
+            Span::styled(
+                "Assistant prose stays primary",
+                style(palette.text, palette.background),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            "  ◇ Reasoning is quieter",
+            style(palette.text_muted, palette.background)
+                .add_modifier(ratatui::style::Modifier::DIM | ratatui::style::Modifier::ITALIC),
+        )]),
+        Line::from(vec![
+            Span::styled("  ✓ ", style(palette.success, palette.background)),
+            Span::styled(
+                "Tool completed · read src/main.rs",
+                style(palette.text, palette.background),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  ! ", style(palette.warning, palette.background)),
+            Span::styled(
+                "Retry scheduled in 2s",
+                style(palette.text, palette.background),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "- removed ",
+                style(palette.diff_removed, palette.diff_removed_bg),
+            ),
+            Span::styled("+ added", style(palette.diff_added, palette.diff_added_bg)),
         ]),
     ]
 }

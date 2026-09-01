@@ -32,6 +32,18 @@ write-capable `workspace-write` request encounters a typed, eligible backend-ava
 failure. `read-only` never falls back and continues to fail closed. See
 [Permissions and sandboxing](/guide/permissions).
 
+## Cargo installation
+
+Install the released `zuno` binary crate from crates.io:
+
+```sh
+cargo install zuno --locked
+```
+
+This compiles Zuno for the current host and therefore requires Rust 1.98 plus the native
+build prerequisites listed under [Build from source](#build-from-source). Use a release
+installer below when you prefer a prebuilt, platform-certified archive.
+
 ## Release installers
 
 The installers download the release archive and `SHA256SUMS`, select the line for that
@@ -60,8 +72,8 @@ unpinned command above resolves the latest published release.
 
 ### Windows
 
-Run the Windows installer from Windows PowerShell 5.1 or PowerShell 7. It publishes
-only the x86_64 MSVC target and installs to
+Run the Windows installer from Windows PowerShell 5.1 or PowerShell 7. It selects the
+x86_64 or ARM64 MSVC archive from the native process architecture and installs to
 `$env:LOCALAPPDATA\Programs\zuno` by default:
 
 ```powershell
@@ -88,8 +100,9 @@ Open a new terminal after changing the user `PATH`.
 | macOS x86_64 | `x86_64-apple-darwin` | `.tar.gz` |
 | macOS aarch64 | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | `.zip` |
 
-Linux uses the static musl artifact. There is no published Windows aarch64 artifact.
+Linux uses the static musl artifact.
 
 ## Manual download and checksum verification
 
@@ -109,11 +122,16 @@ tar -xzf "$asset"
 install -m 755 zuno "$HOME/.local/bin/zuno"
 ```
 
-On Windows x86_64:
+On Windows, select the target from the native process architecture:
 
 ```powershell
 $version = "X.Y.Z"
-$asset = "zuno-$version-x86_64-pc-windows-msvc.zip"
+$target = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) {
+  "X64"   { "x86_64-pc-windows-msvc" }
+  "Arm64" { "aarch64-pc-windows-msvc" }
+  default { throw "unsupported Windows architecture: $_" }
+}
+$asset = "zuno-$version-$target.zip"
 $base = "https://github.com/sunerpy/zuno/releases/download/v$version"
 
 Invoke-WebRequest "$base/$asset" -OutFile $asset
@@ -180,14 +198,14 @@ source-compilation prerequisites.
 rustup toolchain install 1.98.0 --component rustfmt clippy
 git clone https://github.com/sunerpy/zuno.git
 cd zuno
-cargo build --locked -p zuno-cli --bin zuno
-cargo test -p zuno-cli --test docs
+cargo build --locked -p zuno --bin zuno
+cargo test -p zuno --test docs
 ```
 
-For a direct Cargo installation:
+For an unreleased Git checkout through Cargo:
 
 ```sh
-cargo install --git https://github.com/sunerpy/zuno zuno-cli --locked
+cargo install --git https://github.com/sunerpy/zuno zuno --locked
 ```
 
 A source build has channel `local` and normally opens `zuno-local.db`; a published

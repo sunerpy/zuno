@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish.workspace = true
+publish = false
 
 # ---------------------------------------------------------------------------
 # THE LOAD-BEARING ABSENCE: there is no HTTP *client* here.

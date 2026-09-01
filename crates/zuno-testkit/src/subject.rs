@@ -1,7 +1,7 @@
 //! The subject: this project's Rust binary, run under the same scripted world.
 //!
 //! Discovery is deliberately explicit. `cargo test -p zuno-testkit` does not build
-//! `zuno-cli`'s binary, so a naive harness would either silently skip the
+//! the `zuno` package's binary, so a naive harness would either silently skip the
 //! differential or report a confusing spawn failure. [`Subject::discover`]
 //! therefore fails with the exact `cargo` command that would fix it, and
 //! [`Subject::discover_or_build`] runs that command for the caller.
@@ -14,10 +14,10 @@ use crate::error::{Result, TestkitError};
 use crate::oracle::ensure_executable;
 use crate::run::{Provenance, RunOutcome, SubjectSource, run_process};
 
-/// The binary `zuno-cli` produces, and the name Zuno is invoked by.
+/// The binary the `zuno` package produces, and the name Zuno is invoked by.
 pub const SUBJECT_BIN: &str = "zuno";
 /// The cargo package that builds it.
-pub const SUBJECT_PACKAGE: &str = "zuno-cli";
+pub const SUBJECT_PACKAGE: &str = "zuno";
 /// Override the discovered subject binary with an explicit path.
 pub const ENV_SUBJECT_BINARY: &str = "ZUNO_TESTKIT_SUBJECT";
 
@@ -275,7 +275,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("cargo build -p zuno-cli --bin zuno"),
+            rendered.contains("cargo build -p zuno --bin zuno"),
             "{rendered}"
         );
     }

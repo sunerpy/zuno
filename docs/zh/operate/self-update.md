@@ -28,6 +28,7 @@ zuno self-update --tag v0.0.1 --force --yes
 | macOS x86_64 | `x86_64-apple-darwin` | `.tar.gz` |
 | macOS aarch64 | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | `.zip` |
 
 Linux 始终选择静态 musl 产物，即使当前运行的二进制文件是本地针对 GNU 目标构建的。资产
 选择是精确匹配：`zuno-<version>-<target>.<archive>`。子串匹配和重复资产都会被拒绝。

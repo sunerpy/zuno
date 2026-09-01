@@ -892,17 +892,17 @@ fn markdown_reaches_the_transcript_frame_at_every_width_the_plan_names() {
         let drawn = frame(SAMPLE, width, 40);
         let out = drawn.join("\n");
         assert!(
-            out.contains("Assistant"),
+            out.contains(Role::Assistant.marker()),
             "the transcript did not render at {width}:\n{out}"
         );
         // The row carrying the bullet is located by content, so this cannot pass by
         // asserting against a row something else is covering.
         let bullet = drawn
             .iter()
-            .find(|row| row.contains('•'))
+            .find(|row| row.contains("views/diff.rs"))
             .unwrap_or_else(|| panic!("no bullet on screen at {width}:\n{out}"));
         assert!(
-            bullet.contains("views/diff.rs"),
+            bullet.matches('•').count() >= 2,
             "the bullet row is not the list item at {width}: {bullet:?}"
         );
         assert!(
@@ -936,21 +936,16 @@ fn markdown_survives_the_degenerate_frame() {
     let drawn = frame(SAMPLE, 20, 10);
     assert_eq!(drawn.len(), 10);
     let out = drawn.join("\n");
-    // Asserted on the rows rather than on the frame, because at 20 columns this reply is
-    // far taller than ten rows and the viewport rests on its *newest* row. The header is
-    // the first row of the message, so a frame that showed it would be one that had not
-    // scrolled — which is the truncation
-    // `message_tests::views_transcript_follows_the_newest_row_as_a_reply_streams_in`
-    // exists to forbid. What §11.6 wants here is that the header survives the degenerate
-    // width, and that is a property of the rows.
+    // Asserted on the produced rows as well as the frame because at 20 columns this reply
+    // is taller than ten rows and the viewport rests on its newest content.
     let produced = transcript(SAMPLE).lines(20);
     assert!(
         produced.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|span| span.content.contains("Assistant"))
+            line.spans.first().is_some_and(|span| {
+                span.content.as_ref() == format!("{} ", Role::Assistant.marker())
+            })
         }),
-        "the role header was lost at width 20:\n{produced:?}"
+        "the compact assistant gutter was lost at width 20:\n{produced:?}"
     );
     assert!(
         !out.trim().is_empty(),
@@ -971,10 +966,7 @@ fn markdown_survives_the_degenerate_frame() {
 }
 
 #[test]
-fn markdown_leaves_the_left_rule_and_the_role_header_alone() {
-    // §11.2 keeps three designs: the rule runs down every row, the header prints only on
-    // a change of speaker, and the roles differ by colour. Routing prose through the
-    // markdown renderer must not disturb any of them.
+fn markdown_preserves_compact_role_gutters_without_reintroducing_headers() {
     let mut view = TranscriptView::new(ViewContext::defaults());
     view.transcript_mut()
         .push(Message::user("**not** reinterpreted"));
@@ -989,31 +981,35 @@ fn markdown_leaves_the_left_rule_and_the_role_header_alone() {
     let out = drawn.join("\n");
     assert_eq!(
         out.matches("Assistant").count(),
-        1,
-        "a two-step turn printed its header twice:\n{out}"
+        0,
+        "role headers returned to the compact transcript:\n{out}"
     );
     assert!(
         out.contains("not reinterpreted") && !out.contains("**not**"),
         "the user's CommonMark was not rendered consistently with the assistant:\n{out}"
     );
-    // `Role::marker` draws the user's turn with `▌` and the assistant's with `│`, and the
-    // rule runs down every row of a turn rather than only its header.
-    let user = drawn.iter().filter(|row| row.starts_with('▌')).count();
-    let assistant = drawn.iter().filter(|row| row.starts_with('│')).count();
+    let user = drawn
+        .iter()
+        .filter(|row| row.starts_with(Role::User.marker()))
+        .count();
+    let assistant = drawn
+        .iter()
+        .filter(|row| row.starts_with(Role::Assistant.marker()))
+        .count();
     assert!(
-        user >= 2,
-        "the user's rule is missing ({user} rows):\n{out}"
+        user >= 1,
+        "the user's gutter is missing ({user} rows):\n{out}"
     );
     assert!(
         assistant >= 6,
-        "the assistant's rule does not run down the turn ({assistant} rows):\n{out}"
+        "the assistant's gutter is missing from rendered rows ({assistant} rows):\n{out}"
     );
     let bullet = drawn
         .iter()
-        .find(|row| row.contains('•'))
+        .find(|row| row.contains("did a thing"))
         .expect("the assistant's list did not render");
     assert!(
-        bullet.starts_with('│'),
+        bullet.starts_with(Role::Assistant.marker()),
         "a markdown row escaped the role gutter: {bullet:?}"
     );
 }

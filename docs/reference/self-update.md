@@ -32,6 +32,7 @@ The updater supports exactly the targets certified by
 | macOS x86_64 | `x86_64-apple-darwin` | `.tar.gz` |
 | macOS aarch64 | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | `.zip` |
 
 Linux always selects the static musl artifact, even when the currently running
 binary was built locally for a GNU target. Asset selection is exact:

@@ -14,6 +14,7 @@ set -euo pipefail
 
 readonly targets=(
   aarch64-apple-darwin
+  aarch64-pc-windows-msvc
   aarch64-unknown-linux-musl
   x86_64-apple-darwin
   x86_64-pc-windows-msvc
@@ -52,7 +53,7 @@ jq -e \
     and .tag == $tag
     and (.mode == "automatic" or .mode == "backfill")
     and .test_conclusion == "success"
-    and (.targets | length == 5)
+    and (.targets | length == 6)
   ' "$manifest" >/dev/null
 
 mode=$(jq -er '.mode' "$manifest")
@@ -107,7 +108,7 @@ for target in "${targets[@]}"; do
     echo "::error title=Candidate verification::${target} lacks an attestation ID"
     exit 1
   fi
-  if [ "$target" = x86_64-pc-windows-msvc ]; then
+  if [[ "$target" == *-pc-windows-msvc ]]; then
     expected_archive="zuno-${EXPECTED_VERSION}-${target}.zip"
   else
     expected_archive="zuno-${EXPECTED_VERSION}-${target}.tar.gz"

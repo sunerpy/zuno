@@ -5,7 +5,7 @@ use crate::app::{TerminalEvent, render_offscreen, terminal_event_channel};
 use crate::keybind::{KeyDispatcher, Keymap};
 use crate::views::dialog::DialogHost;
 use crate::views::editor::Position;
-use crate::views::message::{Role, USER_BOX_RIGHT, USER_BOX_RULE};
+use crate::views::message::Role;
 use crate::views::testkit::{action, press, rows};
 use crate::views::toast::ToastLevel;
 use zuno_engine::r#loop::TurnEvent;
@@ -4458,13 +4458,13 @@ fn row_backgrounds(
         .collect()
 }
 
-/// A theme's panel background, as a ratatui colour.
-fn panel_of(theme: &str, mode: crate::theme::Mode) -> ratatui::style::Color {
+/// A theme's inset-element background, used by user prompts.
+fn element_of(theme: &str, mode: crate::theme::Mode) -> ratatui::style::Color {
     ratatui::style::Color::from(
         crate::theme::ThemeRegistry::new()
             .resolve(theme, mode)
             .palette
-            .background_panel,
+            .background_element,
     )
 }
 
@@ -4476,8 +4476,8 @@ fn session_theme_switch_repaints_the_transcript_and_not_only_the_picker() {
     // worse than no switching at all.
     let (screen, context, _shutdown) = themed_screen();
     let mode = context.theme().mode;
-    let starting_panel = panel_of(&context.theme().name, mode);
-    let other_panel = panel_of(OTHER_THEME, mode);
+    let starting_panel = element_of(&context.theme().name, mode);
+    let other_panel = element_of(OTHER_THEME, mode);
     assert_ne!(
         starting_panel, other_panel,
         "the two themes share a panel background, so this test could not tell them apart"
@@ -4956,7 +4956,7 @@ fn prompt_band_rows(screen: &mut SessionScreen, width: u16, height: u16) -> usiz
     let rendered = rows(&render_offscreen(screen, width, height).expect("infallible"));
     let first = rendered
         .iter()
-        .position(|row| row.contains(PROMPT_MARKER))
+        .position(|row| row.starts_with(&format!("▌{PROMPT_MARKER}")))
         .expect("the prompt paints its gutter marker at every width these tests use");
     // Every band below the prompt is subtracted — the welcome tail and `INFO_ROWS`.
     // The reply identity is above the prompt and therefore does not enter this measure.
@@ -5524,7 +5524,15 @@ fn session_a_click_on_a_sidebar_section_heading_collapses_it_through_the_event_l
 
     // A click on the transcript side is now claimed by pane-bounded selection, but it must
     // not reach the panel.
-    let elsewhere = click_at(&mut screen, 2, heading);
+    let transcript_row = rendered
+        .iter()
+        .position(|row| row.contains("so the panel has a transcript"))
+        .expect("the transcript row is visible");
+    let elsewhere = click_at(
+        &mut screen,
+        2,
+        u16::try_from(transcript_row).expect("a 30-row frame"),
+    );
     assert!(
         elsewhere.handled,
         "the transcript did not claim the click for pane-bounded selection"
@@ -5548,7 +5556,7 @@ fn session_a_click_where_the_sidebar_used_to_be_does_nothing_once_it_is_hidden()
         .transcript_mut()
         .push(Message::user("so the panel has a transcript to sit beside"));
     let rendered = rows(&render_offscreen(&mut screen, 130, 30).expect("infallible"));
-    let heading = u16::try_from(
+    let _heading = u16::try_from(
         rendered
             .iter()
             .position(|row| row.contains("MCP"))
@@ -5556,13 +5564,21 @@ fn session_a_click_where_the_sidebar_used_to_be_does_nothing_once_it_is_hidden()
     )
     .expect("a 30-row frame");
     let inside = 130 - crate::views::ambient::SIDEBAR_WIDTH + 4;
+    let transcript_row = rendered
+        .iter()
+        .position(|row| row.contains("so the panel has a transcript"))
+        .expect("the transcript row is visible");
     let before = screen.sidebar.expanded();
 
     screen.handle_action(action("sidebar_toggle"), &press_none());
     assert!(!screen.sidebar_visible(), "the sidebar is still visible");
     let _ = render_offscreen(&mut screen, 130, 30).expect("infallible");
 
-    let outcome = click_at(&mut screen, inside, heading);
+    let outcome = click_at(
+        &mut screen,
+        inside,
+        u16::try_from(transcript_row).expect("a 30-row frame"),
+    );
     assert!(
         outcome.handled,
         "the widened transcript did not claim the old panel coordinate"
@@ -6417,7 +6433,7 @@ fn notice_body(rendered: &[String]) -> Vec<String> {
 /// silently return no rows for a success and every assertion over it would be about nothing —
 /// which is the failure mode this helper's own docs already warn about.
 fn notice_body_at(rendered: &[String], level: ToastLevel) -> Vec<String> {
-    let prefix = format!("▲ {} ", level.glyph());
+    let prefix = format!("{} {} ", Role::System.marker(), level.glyph());
     rendered
         .iter()
         .filter(|row| row.starts_with(&prefix))
@@ -6526,7 +6542,8 @@ fn a_notice_never_reaches_the_sidebar_column_with_or_without_the_panel() {
     let rule_column =
         usize::from(crate::views::SIDEBAR_MIN_WIDTH - crate::views::ambient::SIDEBAR_WIDTH);
     let mut inspected = 0;
-    for row in with_panel.iter().filter(|row| row.starts_with("▲ ! ")) {
+    let prefix = format!("{} ! ", Role::System.marker());
+    for row in with_panel.iter().filter(|row| row.starts_with(&prefix)) {
         inspected += 1;
         let columns: Vec<char> = row.chars().collect();
         assert_eq!(
@@ -7949,7 +7966,7 @@ fn the_agent_identity_follows_a_short_reply_then_sticks_above_the_composer() {
         text: (1..=40)
             .map(|line| format!("reply line {line}"))
             .collect::<Vec<_>>()
-            .join("\n"),
+            .join("\n\n"),
     });
     long.transcript_mut().transcript_mut().push(answer);
     let long_rows = rows(&render_offscreen(&mut long, 100, 18).expect("infallible"));
@@ -8154,26 +8171,14 @@ fn the_composer_stays_inside_the_body_and_gains_an_info_row() {
     }
 }
 
-/// Defect 3: the user's prompt is wrapped in a bordered container and the reply is not.
-///
-/// # Both sides, because a renderer that framed everything is the same failure in reverse
-///
-/// The complaint was that the two were indistinguishable. So the prompt's row must open with
-/// the user's rule *and* close with the box's right edge, and the reply's rows must do neither.
-/// Checking only the prompt would pass a renderer that framed the assistant too, leaving the
-/// two as alike as before.
-///
-/// The heading is asserted on the top rule rather than on a row of its own, which is where it
-/// now rides — see `TranscriptView::push_boxed`.
+/// Defect 3: prompt and reply remain visibly distinct without spending rows on frames.
 #[test]
-fn the_users_prompt_is_framed_and_the_reply_is_not() {
+fn the_users_prompt_and_reply_use_distinct_compact_gutters_without_role_headers() {
     for width in [120u16, 80] {
         let (mut screen, _shutdown) = conversing();
         let rendered = rows(&render_offscreen(&mut screen, width, 32).expect("infallible"));
-        // Sliced to the body's own columns, because at 120 the panel is drawn *on the same
-        // rows*: a whole frame row carries `▌ You ───▐ │   Context`, so an `ends_with` against
-        // the frame would be asserting about the sidebar rather than about the box. This is the
-        // same subtraction `content_bounds` performs, taken from the production predicate.
+        // Slice to the body's own columns because at 120 the sidebar is painted on the
+        // same terminal rows.
         let content = if sidebar_drawn(screen.sidebar_visible(), false, width) {
             usize::from(width)
                 - usize::from(crate::views::ambient::SIDEBAR_WIDTH)
@@ -8188,39 +8193,16 @@ fn the_users_prompt_is_framed_and_the_reply_is_not() {
             .collect();
         let joined = rendered.join("\n");
 
-        let top = rendered
-            .iter()
-            .position(|row| row.contains("You"))
-            .unwrap_or_else(|| panic!("at {width} columns the prompt has no heading:\n{joined}"));
-        assert!(
-            rendered[top].starts_with(Role::User.marker())
-                && rendered[top].trim_end().ends_with(USER_BOX_RIGHT),
-            "at {width} columns the prompt's top rule is not closed on both sides: {:?}",
-            rendered[top]
-        );
-        let body = rendered
+        let prompt = rendered
             .iter()
             .position(|row| row.contains("summarise the plan"))
             .unwrap_or_else(|| panic!("at {width} columns the prompt is missing:\n{joined}"));
         assert!(
-            rendered[body].starts_with(Role::User.marker())
-                && rendered[body].trim_end().ends_with(USER_BOX_RIGHT),
-            "at {width} columns the prompt's own text is not inside the box: {:?}",
-            rendered[body]
-        );
-        // The closing rule, which is what makes it a container rather than a header with a
-        // right edge. Located as the first row after the body that carries no text of its own.
-        assert!(
-            rendered[body + 1..]
-                .iter()
-                .take(2)
-                .any(|row| row.starts_with(Role::User.marker())
-                    && row.contains(USER_BOX_RULE)
-                    && row.trim_end().ends_with(USER_BOX_RIGHT)),
-            "at {width} columns the prompt's box is never closed:\n{joined}"
+            rendered[prompt].starts_with(Role::User.marker()),
+            "at {width} columns the prompt lost its compact gutter: {:?}",
+            rendered[prompt]
         );
 
-        // And the reply is bare prose: its own rule, no frame.
         let reply = rendered
             .iter()
             .position(|row| row.contains("Here is the summary"))
@@ -8231,10 +8213,8 @@ fn the_users_prompt_is_framed_and_the_reply_is_not() {
             rendered[reply]
         );
         assert!(
-            !rendered[reply].trim_end().ends_with(USER_BOX_RIGHT),
-            "at {width} columns the reply is framed too, so the two sides are as alike as \
-             before: {:?}",
-            rendered[reply]
+            !joined.contains("You") && !joined.contains("Assistant"),
+            "at {width} columns role headings returned to the compact transcript:\n{joined}"
         );
     }
 }

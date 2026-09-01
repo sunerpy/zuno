@@ -80,7 +80,7 @@ download "${base_url}/${asset}" "$tmp/$asset" \
 download "${base_url}/${checksum_file}" "$tmp/$checksum_file" \
   || fail "download failed: ${base_url}/${checksum_file}"
 
-# The line for THIS asset, so a checksum file listing five archives cannot end up
+# The line for THIS asset, so a checksum file listing several archives cannot end up
 # verifying a different one. `sub` strips the `*` a binary-mode digest emits.
 expected=$(awk -v name="$asset" '{
   file = $2

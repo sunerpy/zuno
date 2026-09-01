@@ -43,7 +43,7 @@ env:
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: sccache
   BINARY_NAME: zuno
-  CLI_CRATE: zuno-cli
+  CLI_CRATE: zuno
 
 jobs:
   prepare:
@@ -292,6 +292,12 @@ jobs:
             use_zigbuild: false
             cache_target: false
             archive: zip
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            platform: windows
+            use_zigbuild: false
+            cache_target: false
+            archive: zip
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -344,7 +350,7 @@ jobs:
         shell: bash
         run: |
           cargo zigbuild --locked --release --target "${{ matrix.target }}" \
-            -p zuno-cli --bin zuno \
+            -p zuno --bin zuno \
             -p zuno-testkit --bin zuno-smoke
 
       - name: Build release binary and smoke driver (Rust)
@@ -352,7 +358,7 @@ jobs:
         shell: bash
         run: |
           cargo build --locked --release --target "${{ matrix.target }}" \
-            -p zuno-cli --bin zuno \
+            -p zuno --bin zuno \
             -p zuno-testkit --bin zuno-smoke
 
       - name: Package and unpack (tar.gz)
@@ -511,7 +517,7 @@ jobs:
         run: |
           set -euo pipefail
           state=success
-          description="five targets built, smoked, attested, and sealed"
+          description="six targets built, smoked, attested, and sealed"
           while IFS=$'\t' read -r job result; do
             printf '%-12s %s\n' "$job" "$result"
             if [ "$result" != success ]; then
