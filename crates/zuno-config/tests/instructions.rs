@@ -28,12 +28,12 @@ mod instructions {
     impl Fixture {
         fn new() -> Self {
             let root = tempfile::tempdir().expect("tempdir");
-            std::fs::create_dir_all(root.path().join("home/.config")).expect("mkdir home");
+            std::fs::create_dir_all(path_from(root.path(), "home/.config")).expect("mkdir home");
             Self { root }
         }
 
         fn path(&self, relative: &str) -> PathBuf {
-            self.root.path().join(relative)
+            path_from(self.root.path(), relative)
         }
 
         fn write(&self, relative: &str, body: &str) -> PathBuf {
@@ -60,6 +60,13 @@ mod instructions {
                 instructions,
             )
         }
+    }
+
+    fn path_from(base: &std::path::Path, relative: &str) -> PathBuf {
+        relative
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .fold(base.to_path_buf(), |path, component| path.join(component))
     }
 
     fn paths_of(found: &Instructions, origin: Origin) -> Vec<PathBuf> {
@@ -493,6 +500,7 @@ mod instructions {
 
     /// A symlink and its target are one file. Node's `path.resolve` is symlink-blind,
     /// so string de-duplication alone would charge for both.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_spelling_of_one_file_is_de_duplicated() {
         let fixture = Fixture::new();

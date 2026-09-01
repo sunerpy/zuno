@@ -92,7 +92,17 @@ const BUDGET_HELP: Duration = Duration::from_millis(30);
 /// runs (min 15.196, max 18.327, max/min 1.2061x); budget 100 ms, 6.4x headroom —
 /// the same multiple as the fast paths, so no invocation is held to a looser
 /// standard than the rest.
+#[cfg(not(windows))]
 const BUDGET_SESSION_LIST: Duration = Duration::from_millis(100);
+
+/// Windows pays the native process-creation, DLL loader and SQLite startup cost.
+///
+/// Measured on the hosted `windows-2022` runner at 133.1934 ms median
+/// (126.2972 ms min, 153.7779 ms max). A 200 ms ceiling keeps 1.5x median
+/// headroom while retaining the structural no-reexec/no-log assertions above as
+/// the platform-independent regression gate.
+#[cfg(windows)]
+const BUDGET_SESSION_LIST: Duration = Duration::from_millis(200);
 
 /// The subject binary, built by cargo for this integration test.
 fn binary() -> PathBuf {

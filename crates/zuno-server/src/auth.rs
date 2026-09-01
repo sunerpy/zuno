@@ -59,6 +59,13 @@ impl AuthConfig {
         if !self.required() {
             return true;
         }
+        self.authorizes_basic(headers)
+    }
+
+    pub(crate) fn authorizes_basic(&self, headers: &HeaderMap) -> bool {
+        if !self.required() {
+            return false;
+        }
         let Some((username, password)) = basic_credentials(headers) else {
             return false;
         };

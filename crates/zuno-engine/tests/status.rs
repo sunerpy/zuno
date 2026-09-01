@@ -307,6 +307,7 @@ fn status_soft_interrupt_injects_at_safe_point_without_cancelling() {
         input_id: None,
         content: "Please include the latest benchmark.".to_owned(),
         images: vec![("image/png".to_owned(), "aW1hZ2U=".to_owned())],
+        attachments: Vec::new(),
         urgent: false,
         source: SoftInterruptSource::User,
     };
@@ -352,6 +353,7 @@ fn status_cancel_soft_interrupt_removes_only_the_named_durable_input() {
                 input_id: Some(id.to_owned()),
                 content: content.to_owned(),
                 images: Vec::new(),
+                attachments: Vec::new(),
                 urgent: false,
                 source: SoftInterruptSource::User,
             })
@@ -384,6 +386,7 @@ fn status_urgent_soft_interrupt_skips_remaining_tools_in_event_sequence() {
             input_id: None,
             content: "Stop the remaining tools and use this correction.".to_owned(),
             images: Vec::new(),
+            attachments: Vec::new(),
             urgent: true,
             source: SoftInterruptSource::System,
         })

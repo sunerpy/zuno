@@ -189,11 +189,14 @@ async fn file_read_permission_escalates_only_for_paths_outside_the_workspace() {
     assert_eq!(inside_permission.permissions(), vec!["read"]);
     assert_eq!(inside_permission.asks()[0].patterns, vec!["inside.txt"]);
 
+    let outside_root = tempfile::tempdir().expect("temporary external directory");
+    let outside = outside_root.path().join("outside.txt");
+    std::fs::write(&outside, "outside\n").expect("outside fixture");
     let outside_permission = Arc::new(RecordingPermission::default());
     tools
         .read
         .execute(
-            json!({ "filePath": "/etc/hosts" }),
+            json!({ "filePath": outside }),
             normal_context(outside_permission.clone()),
         )
         .await
@@ -204,11 +207,20 @@ async fn file_read_permission_escalates_only_for_paths_outside_the_workspace() {
         vec!["external_directory", "read"]
     );
     let asks = outside_permission.asks();
-    assert_eq!(asks[0].patterns, vec!["/etc/*"]);
-    assert_eq!(asks[0].always, vec!["/etc/*"]);
-    assert_eq!(asks[0].metadata["filepath"], "/etc/hosts");
-    assert_eq!(asks[0].metadata["parentDir"], "/etc");
-    assert_eq!(asks[1].patterns, vec!["/etc/hosts"]);
+    let outside = outside.canonicalize().expect("canonical test executable");
+    let outside_parent = outside.parent().expect("test executable parent");
+    let outside_pattern = format!("{}/*", zuno_paths::wire_path(outside_parent));
+    assert_eq!(asks[0].patterns, vec![outside_pattern.clone()]);
+    assert_eq!(asks[0].always, vec![outside_pattern]);
+    assert_eq!(
+        asks[0].metadata["filepath"],
+        zuno_paths::wire_path(&outside)
+    );
+    assert_eq!(
+        asks[0].metadata["parentDir"],
+        zuno_paths::wire_path(outside_parent)
+    );
+    assert_eq!(asks[1].patterns, vec![zuno_paths::wire_path(&outside)]);
 }
 
 #[tokio::test]
@@ -236,7 +248,7 @@ async fn file_edit_without_a_prior_read_is_refused_with_an_actionable_message() 
         source_message(&error),
         format!(
             "File must be read before editing. Use the read tool on {}, then retry the edit.",
-            path.display()
+            slash(&path)
         )
     );
     assert_eq!(
@@ -283,7 +295,10 @@ async fn file_edit_unique_match_succeeds_and_exercises_the_formatter_seam() {
     );
     assert_eq!(output.output, "Edit applied successfully.");
     assert_eq!(output.metadata["replacements"], 1);
-    assert_eq!(formatter.paths(), vec![path]);
+    assert_eq!(
+        formatter.paths(),
+        vec![path.canonicalize().expect("canonical formatted path")]
+    );
 }
 
 #[tokio::test]
@@ -838,7 +853,13 @@ async fn file_every_writing_tool_a_model_can_see_reports_the_paths_it_wrote() {
 
 /// A path spelled the way the tools spell one in metadata.
 fn slash(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    let canonical = path.canonicalize().unwrap_or_else(|_| {
+        path.parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| path.to_owned())
+    });
+    zuno_paths::wire_path(&canonical)
 }
 
 #[tokio::test]

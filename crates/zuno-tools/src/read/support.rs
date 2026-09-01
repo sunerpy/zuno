@@ -75,13 +75,13 @@ impl FileAccessState {
         let Some(expected) = expected else {
             return Err(format!(
                 "File must be read before editing. Use the read tool on {}, then retry the edit.",
-                path.display()
+                slash(path)
             ));
         };
         if expected != FileStamp::from_bytes(bytes) {
             return Err(format!(
                 "File changed after it was read. Read {} again, then retry the edit.",
-                path.display()
+                slash(path)
             ));
         }
         Ok(())
@@ -396,7 +396,7 @@ pub(crate) fn check_interrupt(tool: &str, ctx: &ToolContext) -> Result<(), ToolE
 }
 
 pub(crate) fn slash(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    zuno_paths::wire_path(path)
 }
 
 fn normalize_absolute(path: &Path) -> PathBuf {

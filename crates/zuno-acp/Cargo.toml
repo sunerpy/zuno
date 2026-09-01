@@ -11,11 +11,15 @@ publish.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+sha2 = { workspace = true }
 zuno-db = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-error = { workspace = true }
 zuno-goal = { workspace = true }
 zuno-llm = { workspace = true }
+zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
 zuno-tool = { workspace = true }
 zuno-tools = { workspace = true }

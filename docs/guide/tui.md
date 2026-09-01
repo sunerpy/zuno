@@ -128,6 +128,8 @@ cannot shadow a runtime control.
 | `/new` | Open an empty conversation shell |
 | `/subagent` | Inspect seat and node progress |
 | `/memory` | Review, edit, approve, reject, remove, and undo durable memory changes |
+| `/learn [action]` | Inspect or manage Experience, feedback, patterns, and reviewed Skill candidates |
+| `/reflect [turn\|session]` | Run the durable no-tools learning extractor manually |
 
 The direct `/goal <objective>` form is handled by the same durable host command as ACP.
 It creates a new goal when none exists or the previous one is complete or cancelled;

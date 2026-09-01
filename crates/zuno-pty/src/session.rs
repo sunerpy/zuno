@@ -22,11 +22,20 @@
 //! waiter's own schedule therefore truncates the tail of every short-lived command
 //! — `ls` in a terminal showing nothing at all, intermittently.
 //!
-//! The waiter closes the gap by waiting for the reader to reach end-of-output before
-//! it marks the session exited. The reader raises [`DrainGate`] only after its final
-//! `ingest` has returned, so observing that flag means every chunk is already queued
-//! ahead of anything sent later. The wait is bounded by [`DRAIN_GRACE`] because the
-//! pty can outlive the child — see that constant.
+//! The waiter closes the gap by first closing Zuno's writable and master handles,
+//! then waiting for the reader to reach end-of-output before it marks the session
+//! exited. Closing those handles is load-bearing on Windows: ConPTY does not produce
+//! EOF while a master or writer is still alive, so waiting for the reader before
+//! closing them is a circular wait. The reader raises [`DrainGate`] only after its
+//! final `ingest` has returned, so observing that flag means every chunk is already
+//! queued ahead of anything sent later. The wait is bounded by [`DRAIN_GRACE`]
+//! because the pty can outlive the child — see that constant.
+//!
+//! ConPTY also starts a pseudoconsole created with inherited-cursor support by
+//! asking the host terminal for its cursor position (`ESC[6n`). Zuno is the host,
+//! not a terminal emulator, so the reader consumes that one startup query and
+//! answers `ESC[1;1R` on the input side before exposing output. Without the reply,
+//! `cmd.exe` and PowerShell can remain blocked before processing the first command.
 //!
 //! # Why output is dropped rather than queued
 //!
@@ -90,6 +99,69 @@ const TERM_VALUE: &str = "xterm-256color";
 
 /// Marks a shell as running inside Zuno.
 const TERMINAL_MARKER_ENV: &str = "ZUNO_TERMINAL";
+
+#[cfg(any(windows, test))]
+const STARTUP_CURSOR_QUERY: &[u8] = b"\x1b[6n";
+
+#[cfg(windows)]
+const STARTUP_CURSOR_RESPONSE: &[u8] = b"\x1b[1;1R";
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Default)]
+struct StartupCursorNegotiation {
+    pending: Vec<u8>,
+    complete: bool,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+struct StartupCursorOutput {
+    visible: Vec<u8>,
+    query_offset: Option<usize>,
+}
+
+#[cfg(any(windows, test))]
+impl StartupCursorNegotiation {
+    fn push(&mut self, chunk: &[u8]) -> StartupCursorOutput {
+        if self.complete {
+            return StartupCursorOutput {
+                visible: chunk.to_vec(),
+                query_offset: None,
+            };
+        }
+
+        self.pending.extend_from_slice(chunk);
+        if let Some(query_offset) = self
+            .pending
+            .windows(STARTUP_CURSOR_QUERY.len())
+            .position(|window| window == STARTUP_CURSOR_QUERY)
+        {
+            let mut visible = Vec::with_capacity(self.pending.len() - STARTUP_CURSOR_QUERY.len());
+            visible.extend_from_slice(&self.pending[..query_offset]);
+            visible.extend_from_slice(&self.pending[query_offset + STARTUP_CURSOR_QUERY.len()..]);
+            self.pending.clear();
+            self.complete = true;
+            return StartupCursorOutput {
+                visible,
+                query_offset: Some(query_offset),
+            };
+        }
+
+        let retained = (1..STARTUP_CURSOR_QUERY.len())
+            .rev()
+            .find(|length| self.pending.ends_with(&STARTUP_CURSOR_QUERY[..*length]))
+            .unwrap_or(0);
+        let flush = self.pending.len().saturating_sub(retained);
+        StartupCursorOutput {
+            visible: self.pending.drain(..flush).collect(),
+            query_offset: None,
+        }
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
+}
 
 /// A PTY session identifier, `pty_`-prefixed as `packages/schema/src/pty.ts:9`.
 #[derive(
@@ -645,14 +717,103 @@ fn deliver(subscriber: &mut Subscriber, chunk: &[u8], chunk_start: u64) {
 
 /// A running session's operable handle.
 ///
-/// Every field a caller can act on sits behind its own mutex, so a resize does not
-/// wait on a write and neither waits on the reader thread appending output.
+/// Every I/O field a caller can act on sits behind its own mutex, so a resize does
+/// not wait on a write and neither waits on the reader thread appending output.
 pub(crate) struct SessionHandle {
     id: PtyId,
     shared: Arc<SessionShared>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    io: Arc<SessionIo>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+}
+
+/// The two host-side handles whose lifetime controls end-of-output.
+///
+/// `portable-pty` documents this lifetime requirement through its Windows support:
+/// a ConPTY reader does not observe EOF while writable/master handles remain alive.
+/// The child waiter therefore shares this object with [`SessionHandle`] and closes
+/// it after `child.wait()` returns. Keeping the two handles in `Option`s makes that
+/// close atomic with respect to later writes/resizes and, importantly, gives the
+/// waiter ownership of the drop instead of leaving it to registry eviction.
+struct SessionIo {
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    last_size: Mutex<TerminalSize>,
+}
+
+impl std::fmt::Debug for SessionIo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SessionIo").finish_non_exhaustive()
+    }
+}
+
+impl SessionIo {
+    fn close_writer(&self) {
+        self.writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
+    /// Closes input before the master, matching the PTY backend's EOF contract.
+    fn close(&self) {
+        self.close_writer();
+        self.master
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
+    fn write(&self, data: &[u8]) -> std::io::Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(writer) = writer.as_mut() else {
+            return Ok(());
+        };
+        writer.write_all(data).and_then(|()| writer.flush())
+    }
+
+    fn resize(&self, size: TerminalSize) -> Result<(), BoxSource> {
+        let master = self
+            .master
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(master) = master.as_ref() else {
+            return Ok(());
+        };
+        master
+            .resize(PtySize::from(size))
+            .map_err(BoxSource::from)?;
+        *self
+            .last_size
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = size;
+        Ok(())
+    }
+
+    fn size(&self) -> Result<TerminalSize, BoxSource> {
+        let master = self
+            .master
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(master) = master.as_ref() else {
+            return Ok(*self
+                .last_size
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner));
+        };
+        let size = master.get_size().map_err(BoxSource::from)?;
+        let size = TerminalSize {
+            rows: size.rows,
+            cols: size.cols,
+        };
+        *self
+            .last_size
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = size;
+        Ok(size)
+    }
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -697,7 +858,8 @@ impl SessionHandle {
             .filter(|cwd| !cwd.is_empty())
             .map_or_else(|| options.default_cwd.clone(), PathBuf::from);
 
-        let size = PtySize::from(input.size.unwrap_or_default());
+        let terminal_size = input.size.unwrap_or_default();
+        let size = PtySize::from(terminal_size);
         let pair = native_pty_system()
             .openpty(size)
             .map_err(|source| PtyError::Open {
@@ -705,7 +867,8 @@ impl SessionHandle {
                 source: BoxSource::from(source),
             })?;
 
-        let (guarded_program, guarded_arguments) = zuno_process::guarded_argv(&command, &args);
+        let (guarded_program, guarded_arguments) =
+            zuno_process::guarded_terminal_argv(&command, &args);
         let mut builder = CommandBuilder::new(guarded_program);
         builder.args(guarded_arguments);
         builder.cwd(&cwd);
@@ -782,17 +945,21 @@ impl SessionHandle {
                 detached: false,
             }),
         });
+        let io = Arc::new(SessionIo {
+            writer: Mutex::new(Some(writer)),
+            master: Mutex::new(Some(pair.master)),
+            last_size: Mutex::new(terminal_size),
+        });
 
         // Reader first: the waiter awaits its drain latch, so it must exist (or have
         // failed to start, which releases the latch) before the waiter can observe it.
-        spawn_reader(&id, &shared, reader);
-        spawn_waiter(&id, Arc::clone(&shared), child, on_exit);
+        spawn_reader(&id, &shared, Arc::clone(&io), reader);
+        spawn_waiter(&id, Arc::clone(&shared), Arc::clone(&io), child, on_exit);
 
         Ok(Arc::new(Self {
             id,
             shared,
-            master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
+            io,
             killer: Mutex::new(killer),
         }))
     }
@@ -830,17 +997,10 @@ impl SessionHandle {
         if self.shared.info().status == PtyStatus::Exited {
             return Ok(());
         }
-        let mut writer = self
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        writer
-            .write_all(data)
-            .and_then(|()| writer.flush())
-            .map_err(|source| PtyError::Write {
-                id: self.id.clone(),
-                source,
-            })
+        self.io.write(data).map_err(|source| PtyError::Write {
+            id: self.id.clone(),
+            source,
+        })
     }
 
     /// Updates the kernel's winsize, which signals `SIGWINCH` to the child.
@@ -851,16 +1011,10 @@ impl SessionHandle {
         if self.shared.info().status == PtyStatus::Exited {
             return Ok(());
         }
-        let master = self
-            .master
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        master
-            .resize(PtySize::from(size))
-            .map_err(|source| PtyError::Resize {
-                id: self.id.clone(),
-                source: BoxSource::from(source),
-            })
+        self.io.resize(size).map_err(|source| PtyError::Resize {
+            id: self.id.clone(),
+            source,
+        })
     }
 
     /// The size the kernel currently reports, for verifying a resize landed.
@@ -869,20 +1023,10 @@ impl SessionHandle {
     ///
     /// [`PtyError::Resize`] when the platform cannot report the size.
     pub(crate) fn size(&self) -> Result<TerminalSize, PtyError> {
-        let master = self
-            .master
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        master
-            .get_size()
-            .map(|size| TerminalSize {
-                rows: size.rows,
-                cols: size.cols,
-            })
-            .map_err(|source| PtyError::Resize {
-                id: self.id.clone(),
-                source: BoxSource::from(source),
-            })
+        self.io.size().map_err(|source| PtyError::Resize {
+            id: self.id.clone(),
+            source,
+        })
     }
 
     /// Requests shutdown from a still-running child and ends every subscription.
@@ -904,23 +1048,68 @@ impl SessionHandle {
                 let _outcome = killer.kill();
             }
         }
+        // A writer kept alive after shutdown prevents ConPTY's output reader from
+        // observing EOF. The waiter owns the master close after `child.wait()`, so
+        // teardown stays non-blocking while still releasing the writable handle now.
+        self.io.close_writer();
         self.shared.detach_all();
     }
 }
 
-fn spawn_reader(id: &PtyId, shared: &Arc<SessionShared>, mut reader: Box<dyn Read + Send>) {
+fn spawn_reader(
+    id: &PtyId,
+    shared: &Arc<SessionShared>,
+    io: Arc<SessionIo>,
+    mut reader: Box<dyn Read + Send>,
+) {
     let name = format!("zuno-pty-read-{id}");
     let owned = Arc::clone(shared);
+    #[cfg(windows)]
+    let reader_id = id.clone();
     let thread = std::thread::Builder::new().name(name).spawn(move || {
         let mut chunk = vec![0u8; READ_CHUNK];
+        #[cfg(windows)]
+        let mut startup_cursor = StartupCursorNegotiation::default();
+        #[cfg(not(windows))]
+        let _ = &io;
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(read) => owned.ingest(&chunk[..read]),
+                Ok(read) => {
+                    #[cfg(windows)]
+                    {
+                        let mut output = startup_cursor.push(&chunk[..read]);
+                        if let Some(query_offset) = output.query_offset
+                            && let Err(error) = io.write(STARTUP_CURSOR_RESPONSE)
+                        {
+                            output.visible.splice(
+                                query_offset..query_offset,
+                                STARTUP_CURSOR_QUERY.iter().copied(),
+                            );
+                            tracing::warn!(
+                                id = %reader_id,
+                                %error,
+                                "could not answer ConPTY's startup cursor query; retaining it as terminal output"
+                            );
+                        }
+                        if !output.visible.is_empty() {
+                            owned.ingest(&output.visible);
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    owned.ingest(&chunk[..read]);
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 // A closed pty reports EIO on Linux rather than EOF, so any other
                 // error is the end of output and not a condition to report.
                 Err(_) => break,
+            }
+        }
+        #[cfg(windows)]
+        {
+            let trailing = startup_cursor.finish();
+            if !trailing.is_empty() {
+                owned.ingest(&trailing);
             }
         }
         // After the loop, so the latch means "every chunk is queued". Both exits
@@ -939,6 +1128,7 @@ fn spawn_reader(id: &PtyId, shared: &Arc<SessionShared>, mut reader: Box<dyn Rea
 fn spawn_waiter(
     id: &PtyId,
     shared: Arc<SessionShared>,
+    io: Arc<SessionIo>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     on_exit: Arc<dyn ExitObserver>,
 ) {
@@ -950,6 +1140,13 @@ fn spawn_waiter(
         // lingering in the process table. It stays *ahead* of the drain wait below,
         // so a slow drain can never delay reaping.
         let exit_code = child.wait().ok().map(|status| status.exit_code());
+
+        // ConPTY does not produce EOF merely because the child exited. Every
+        // host-side writer and the master itself must be closed first; otherwise the
+        // reader blocks forever and this waiter's drain ordering becomes a deadlock.
+        // Writer-before-master also avoids keeping the console input side alive while
+        // the backend is being closed.
+        io.close();
 
         // The ordering contract (see the module docs): the child being dead does not
         // mean its output has been read. Hold `Ended` until the reader has drained
@@ -978,6 +1175,83 @@ fn spawn_waiter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_complete_startup_cursor_query_is_answered_but_not_exposed() {
+        let mut negotiation = StartupCursorNegotiation::default();
+
+        let output = negotiation.push(b"before\x1b[6nafter");
+
+        assert_eq!(
+            output,
+            StartupCursorOutput {
+                visible: b"beforeafter".to_vec(),
+                query_offset: Some(6),
+            }
+        );
+        assert_eq!(
+            negotiation.push(b"\x1b[6n"),
+            StartupCursorOutput {
+                visible: b"\x1b[6n".to_vec(),
+                query_offset: None,
+            },
+            "only the inherited-cursor startup query is consumed"
+        );
+    }
+
+    #[test]
+    fn a_startup_cursor_query_may_span_reader_chunks() {
+        let mut negotiation = StartupCursorNegotiation::default();
+
+        assert_eq!(
+            negotiation.push(b"prefix\x1b["),
+            StartupCursorOutput {
+                visible: b"prefix".to_vec(),
+                query_offset: None,
+            }
+        );
+        assert_eq!(
+            negotiation.push(b"6nsuffix"),
+            StartupCursorOutput {
+                visible: b"suffix".to_vec(),
+                query_offset: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn a_non_query_prefix_is_released_as_soon_as_it_cannot_match() {
+        let mut negotiation = StartupCursorNegotiation::default();
+
+        assert_eq!(
+            negotiation.push(b"visible\x1b["),
+            StartupCursorOutput {
+                visible: b"visible".to_vec(),
+                query_offset: None,
+            }
+        );
+        assert_eq!(
+            negotiation.push(b"5mred"),
+            StartupCursorOutput {
+                visible: b"\x1b[5mred".to_vec(),
+                query_offset: None,
+            }
+        );
+    }
+
+    #[test]
+    fn an_unfinished_query_prefix_is_visible_when_the_pty_closes() {
+        let mut negotiation = StartupCursorNegotiation::default();
+
+        assert_eq!(
+            negotiation.push(b"before\x1b["),
+            StartupCursorOutput {
+                visible: b"before".to_vec(),
+                query_offset: None,
+            }
+        );
+        assert_eq!(negotiation.finish(), b"\x1b[");
+    }
 
     #[test]
     fn minted_ids_carry_the_oracle_shape_and_strictly_ascend() {

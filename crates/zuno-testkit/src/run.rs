@@ -355,21 +355,51 @@ mod tests {
 
     #[test]
     fn running_a_process_captures_streams_and_the_exact_environment() {
+        #[cfg(unix)]
         let env: BTreeMap<String, String> = [("ZUNO_TESTKIT_PROBE".to_owned(), "yes".to_owned())]
             .into_iter()
             .collect();
+        #[cfg(windows)]
+        let mut env: BTreeMap<String, String> =
+            [("ZUNO_TESTKIT_PROBE".to_owned(), "yes".to_owned())]
+                .into_iter()
+                .collect();
+        #[cfg(unix)]
+        let (program, args, working_dir) = (
+            PathBuf::from("/usr/bin/env"),
+            Vec::<String>::new(),
+            PathBuf::from("/"),
+        );
+        #[cfg(windows)]
+        let (program, args, working_dir) = {
+            for key in ["SystemRoot", "SystemDrive", "windir", "ComSpec"] {
+                if let Ok(value) = std::env::var(key) {
+                    env.insert(key.to_owned(), value);
+                }
+            }
+            (
+                PathBuf::from(std::env::var_os("ComSpec").expect("Windows command processor")),
+                vec![
+                    "/D".to_owned(),
+                    "/Q".to_owned(),
+                    "/C".to_owned(),
+                    "set".to_owned(),
+                ],
+                std::env::temp_dir(),
+            )
+        };
         let outcome = run_process(
             Provenance::Subject {
-                program: PathBuf::from("/usr/bin/env"),
+                program: program.clone(),
                 source: SubjectSource::ExplicitPath,
                 reported_version: None,
             },
-            Path::new("/usr/bin/env"),
-            &[],
-            Path::new("/"),
+            &program,
+            &args,
+            &working_dir,
             &env,
         )
-        .expect("env(1) should run");
+        .expect("the platform environment printer should run");
         assert!(outcome.is_success());
         assert!(
             outcome.stdout.contains("ZUNO_TESTKIT_PROBE=yes"),

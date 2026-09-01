@@ -209,7 +209,7 @@ fn deepwork_declares_every_durable_state_reader_and_writer_it_uses() {
 fn focused_workflow_skills_stay_within_their_prompt_budgets() {
     for (name, minimum, maximum) in [
         ("deepwork", 80, 110),
-        ("git-workflow", 120, 155),
+        ("git-workflow", 165, 195),
         ("github-delivery", 180, 245),
         ("verification-planning", 80, 105),
     ] {
@@ -249,6 +249,24 @@ fn git_workflow_batches_commit_preparation_instead_of_rechecking_every_hunk() {
         "Do not re-read unchanged diffs",
         "Run shared repository gates once",
         "Verify each staged commit with one staged-diff review",
+    ] {
+        assert!(
+            workflow.content.contains(clause),
+            "git-workflow is missing `{clause}`:\n{}",
+            workflow.content
+        );
+    }
+}
+
+#[test]
+fn git_workflow_uses_an_overridable_command_scoped_default_identity() {
+    let workflow = skill("git-workflow").expect("git-workflow descriptor");
+    for clause in [
+        "explicit current-user, repository, and selected",
+        "`git -c user.name=zuno-agent -c user.email=zuno-agent@firlab.app commit ...`",
+        "never modify Git configuration merely for attribution",
+        "preserve the existing author unless reset is explicitly requested",
+        "`git show --no-patch --format=fuller HEAD`",
     ] {
         assert!(
             workflow.content.contains(clause),

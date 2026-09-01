@@ -150,7 +150,7 @@ impl ToolDispatcher for ToolRegistryDispatcher {
                     .any(|definition| definition.id == request.call.name)
             })
             .map_or(ToolConcurrencyPolicy::Exclusive, |tool| {
-                tool.concurrency_policy()
+                tool.concurrency_policy_for(&request.call.input)
             })
     }
 
@@ -171,7 +171,7 @@ impl ToolDispatcher for ToolRegistryDispatcher {
                 unknown_tool_result(&requested_name, &available),
             );
         };
-        let replay_policy = tool.replay_policy();
+        let scheduled_concurrency = tool.concurrency_policy_for(&request.call.input);
         let interrupt = request.interrupt.clone();
         if interrupt.is_set() {
             return observed_ready(
@@ -234,6 +234,21 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             );
         }
 
+        let effective_concurrency = tool.concurrency_policy_for(&request.call.input);
+        if effective_concurrency != scheduled_concurrency {
+            return observed_ready(
+                observation,
+                blocked_result(
+                    resolved_name,
+                    format!(
+                        "Arguments for tool `{resolved_name}` changed its concurrency policy \
+                         after scheduling; the call was refused before execution."
+                    ),
+                    ToolBlockKind::InvalidArguments,
+                ),
+            );
+        }
+        let replay_policy = tool.replay_policy_for(&request.call.input);
         let ask = permission_ask(resolved_name, &request.call.input)
             .with_tool_effect(tool.effect(&request.call.input));
         let permission = Arc::new(RulePermissionAsker::new(
@@ -604,10 +619,11 @@ pub fn permission_patterns(tool: &str, args: &Value) -> Vec<String> {
         "web_search" => strings_at(args, &["queries"]),
         "task" => strings_at(args, &["subagent_type", "subagentType"]),
         "skill" => strings_at(args, &["name"]),
+        "notes" => strings_at(args, &["name", "prefix"]),
         "read_mcp_resource" => strings_at(args, &["uri", "resource_name", "server"]),
         "list_mcp_resources" | "list_mcp_resource_templates" => strings_at(args, &["server"]),
         "plan_get" | "plan_update" | "todo_get" | "todo_update" | "question" | "invalid"
-        | "plan_exit" | "lsp" | "execute" => {
+        | "plan_exit" | "history" | "lsp" | "execute" => {
             vec!["*".to_owned()]
         }
         _ => strings_at(

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! The exited-session retention cap, proven against real processes.
 //!
 //! The acceptance criterion is 30 sessions created, all exited, at most 25

@@ -1,0 +1,602 @@
+# Build each release artifact once, execute the packaged binary on the same
+# architecture, and retain the resulting bytes for promotion after the
+# release-please PR is merged.
+#
+# This workflow is deliberately dispatch-only. release-please uses GITHUB_TOKEN,
+# so its pull_request event cannot start CI; release.yml dispatches this workflow
+# explicitly on the release PR's exact branch and passes the immutable head SHA.
+
+name: Release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_pr_number:
+        description: "Pull request whose source tree is being certified"
+        required: true
+        type: string
+      expected_head_sha:
+        description: "Exact source commit; the workflow fails if the dispatched ref moved"
+        required: true
+        type: string
+      mode:
+        description: "automatic merges after success; dry-run and backfill never merge"
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - automatic
+          - dry-run
+          - backfill
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-candidate-${{ inputs.release_pr_number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+  BINARY_NAME: zuno
+  CLI_CRATE: zuno-cli
+
+jobs:
+  prepare:
+    name: Validate candidate identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      tree_sha: ${{ steps.identity.outputs.tree_sha }}
+      pr_head_sha: ${{ steps.identity.outputs.pr_head_sha }}
+      head_branch: ${{ steps.identity.outputs.head_branch }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.expected_head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate ref, pull request, tree, and version
+        id: identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.release_pr_number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Candidate identity::expected_head_sha is not a full commit SHA"
+            exit 1
+          fi
+          if [ "$GITHUB_SHA" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "::error title=Candidate identity::dispatched ref resolved to ${GITHUB_SHA}, expected ${EXPECTED_HEAD_SHA}"
+            exit 1
+          fi
+          if ! [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error title=Candidate identity::release_pr_number is invalid"
+            exit 1
+          fi
+
+          pr=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
+          base=$(jq -r '.base.ref' <<<"$pr")
+          state=$(jq -r '.state' <<<"$pr")
+          merged_at=$(jq -r '.merged_at // empty' <<<"$pr")
+          head_sha=$(jq -r '.head.sha' <<<"$pr")
+          head_branch=$(jq -r '.head.ref' <<<"$pr")
+          head_repo=$(jq -r '.head.repo.full_name' <<<"$pr")
+
+          if [ "$base" != main ] || [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
+            echo "::error title=Candidate identity::candidate PR must target main from this repository"
+            exit 1
+          fi
+          case "$MODE" in
+            automatic)
+              if [ "$state" != open ] || [ "$head_sha" != "$EXPECTED_HEAD_SHA" ]; then
+                echo "::error title=Candidate identity::automatic candidate requires the current open PR head"
+                exit 1
+              fi
+              if [[ "$head_branch" != release-please--branches--main--* ]]; then
+                echo "::error title=Candidate identity::automatic mode accepts only the release-please branch"
+                exit 1
+              fi
+              if ! jq -e '[.labels[].name] | index("autorelease: pending") != null' <<<"$pr" >/dev/null; then
+                echo "::error title=Candidate identity::release PR lacks the autorelease: pending label"
+                exit 1
+              fi
+              ;;
+            dry-run)
+              if [ "$state" != open ] || [ "$head_sha" != "$EXPECTED_HEAD_SHA" ]; then
+                echo "::error title=Candidate identity::dry-run requires the current open PR head"
+                exit 1
+              fi
+              ;;
+            backfill)
+              if [ -z "$merged_at" ]; then
+                echo "::error title=Candidate identity::backfill requires a merged release PR"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error title=Candidate identity::unsupported mode ${MODE}"
+              exit 1
+              ;;
+          esac
+
+          version=$(
+            awk '
+              /^\[workspace\.package\][[:space:]]*$/ { in_workspace_package = 1; next }
+              /^\[/ { in_workspace_package = 0 }
+              in_workspace_package && /^[[:space:]]*version[[:space:]]*=/ {
+                value = $0
+                sub(/^[^=]*=[[:space:]]*"/, "", value)
+                sub(/".*$/, "", value)
+                print value
+                exit
+              }
+            ' Cargo.toml
+          )
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error title=Candidate identity::invalid workspace version ${version:-<missing>}"
+            exit 1
+          fi
+
+          {
+            echo "version=${version}"
+            echo "tree_sha=$(git rev-parse 'HEAD^{tree}')"
+            echo "pr_head_sha=${head_sha}"
+            echo "head_branch=${head_branch}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Mark automatic candidate pending
+        if: inputs.mode == 'automatic'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${EXPECTED_HEAD_SHA}" \
+            -f state=pending \
+            -f context='zuno/release-candidate' \
+            -f description='candidate build, smoke, and test gates are running' \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            >/dev/null
+
+  test:
+    name: Candidate tests
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.expected_head_sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.98.0"
+          components: rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
+          cache-targets: false
+
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.16.0"
+
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest@0.9.103
+
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-deny
+
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: ripgrep
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Install CI tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global oxfmt@0.59.0
+          oxfmt --version
+          rg --version
+
+      - name: Install and verify sandbox backend
+        shell: bash
+        run: .github/scripts/setup-linux-sandbox.sh
+
+      - name: Populate the cargo registry
+        run: cargo fetch --locked
+
+      - name: Verify lock file and supply chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /dev/null
+          cargo deny --all-features check
+
+      - name: Repository gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          make fmt-check
+          make lint
+          make test-nextest
+
+  artifact:
+    name: Build and smoke ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            platform: linux
+            use_zigbuild: true
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            platform: linux
+            use_zigbuild: true
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            platform: macos
+            use_zigbuild: false
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            platform: macos
+            use_zigbuild: false
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            platform: windows
+            use_zigbuild: false
+            archive: zip
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.expected_head_sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.98.0"
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
+          cache-targets: false
+
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.16.0"
+
+      - name: Install Zig
+        if: matrix.use_zigbuild
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-zigbuild
+
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: ripgrep
+
+      - name: Verify native build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          rg --version
+
+      - name: Build release binary and smoke driver (zigbuild)
+        if: matrix.use_zigbuild
+        shell: bash
+        run: |
+          cargo zigbuild --locked --release --target "${{ matrix.target }}" \
+            -p zuno-cli --bin zuno \
+            -p zuno-testkit --bin zuno-smoke
+
+      - name: Build release binary and smoke driver (native)
+        if: ${{ !matrix.use_zigbuild }}
+        shell: bash
+        run: |
+          cargo build --locked --release --target "${{ matrix.target }}" \
+            -p zuno-cli --bin zuno \
+            -p zuno-testkit --bin zuno-smoke
+
+      - name: Package and unpack (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="zuno-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.tar.gz"
+          mkdir -p dist unpacked
+          tar -czf "dist/${archive}" -C "target/${{ matrix.target }}/release" zuno
+          tar -xzf "dist/${archive}" -C unpacked
+          chmod +x unpacked/zuno "target/${{ matrix.target }}/release/zuno-smoke"
+          file unpacked/zuno || true
+
+      - name: Package and unpack (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $archive = "zuno-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.zip"
+          New-Item -ItemType Directory -Force -Path dist,unpacked | Out-Null
+          Compress-Archive `
+            -Path "target/${{ matrix.target }}/release/zuno.exe" `
+            -DestinationPath "dist/$archive"
+          Expand-Archive -Path "dist/$archive" -DestinationPath unpacked -Force
+
+      - name: Install Linux sandbox backend
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: .github/scripts/setup-linux-sandbox.sh
+
+      - name: Smoke packaged artifact (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          "target/${{ matrix.target }}/release/zuno-smoke" \
+            --binary unpacked/zuno \
+            --cassette-root "$GITHUB_WORKSPACE/packaging/smoke/cassettes" \
+            --models "$GITHUB_WORKSPACE/crates/zuno-llm/tests/fixtures/models-dev-pinned.json"
+
+      - name: Smoke packaged artifact (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          "target/${{ matrix.target }}/release/zuno-smoke" \
+            --binary unpacked/zuno \
+            --cassette-root "$GITHUB_WORKSPACE/packaging/smoke/cassettes" \
+            --models "$GITHUB_WORKSPACE/crates/zuno-llm/tests/fixtures/models-dev-pinned.json"
+
+      - name: Smoke packaged artifact (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          & "target/${{ matrix.target }}/release/zuno-smoke.exe" `
+            --binary "unpacked/zuno.exe" `
+            --cassette-root "$env:GITHUB_WORKSPACE/packaging/smoke/cassettes" `
+            --models "$env:GITHUB_WORKSPACE/crates/zuno-llm/tests/fixtures/models-dev-pinned.json"
+
+      - name: Attest packaged artifact
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/zuno-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+
+      - name: Stage immutable candidate evidence
+        shell: bash
+        env:
+          ARCHIVE: dist/zuno-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+          ATTESTATION_ID: ${{ steps.attest.outputs.attestation-id }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          set -euo pipefail
+          mkdir -p candidate/evidence
+          cp "$ARCHIVE" candidate/
+          python .github/scripts/write-release-evidence.py \
+            --target "${{ matrix.target }}" \
+            --archive "$ARCHIVE" \
+            --runner "${{ matrix.runner }}" \
+            --attestation-id "$ATTESTATION_ID" \
+            --attestation-url "$ATTESTATION_URL" \
+            --output "candidate/evidence/${{ matrix.target }}.json"
+
+      - name: Upload smoked target
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: candidate-${{ matrix.target }}
+          path: candidate
+          if-no-files-found: error
+          retention-days: 7
+
+  aggregate:
+    name: Seal release candidate
+    needs: [prepare, test, artifact]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.expected_head_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: candidate-*
+          path: candidate
+          merge-multiple: true
+
+      - name: Assemble manifest and checksums
+        env:
+          CANDIDATE_ROOT: candidate
+          CANDIDATE_REPOSITORY: ${{ github.repository }}
+          CANDIDATE_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CANDIDATE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CANDIDATE_RUN_ID: ${{ github.run_id }}
+          CANDIDATE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CANDIDATE_PR_NUMBER: ${{ inputs.release_pr_number }}
+          CANDIDATE_MODE: ${{ inputs.mode }}
+          CANDIDATE_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          CANDIDATE_PR_HEAD_SHA: ${{ needs.prepare.outputs.pr_head_sha }}
+          CANDIDATE_TREE_SHA: ${{ needs.prepare.outputs.tree_sha }}
+          CANDIDATE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: .github/scripts/assemble-release-candidate.sh
+
+      - name: Upload sealed release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-candidate
+          path: candidate
+          if-no-files-found: error
+          retention-days: 7
+
+  gate:
+    name: zuno/pr-gate
+    if: always()
+    needs: [prepare, test, artifact, aggregate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Record candidate result
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          MODE: ${{ inputs.mode }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          set -euo pipefail
+          state=success
+          description="five targets built, smoked, attested, and sealed"
+          while IFS=$'\t' read -r job result; do
+            printf '%-12s %s\n' "$job" "$result"
+            if [ "$result" != success ]; then
+              state=failure
+              description="candidate gate failed: ${job} concluded ${result}"
+            fi
+          done < <(jq -r 'to_entries | sort_by(.key)[] | "\(.key)\t\(.value.result // "<missing>")"' <<<"$NEEDS_JSON")
+
+          if [ "$MODE" = automatic ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${EXPECTED_HEAD_SHA}" \
+              -f state="$state" \
+              -f context='zuno/release-candidate' \
+              -f description="$description" \
+              -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              >/dev/null
+          fi
+          if [ "$state" != success ]; then
+            echo "::error title=Candidate gate::${description}"
+            exit 1
+          fi
+
+  merge:
+    name: Merge certified release PR
+    if: inputs.mode == 'automatic' && vars.RELEASE_CANDIDATE_AUTOMATION == 'true'
+    needs: [prepare, gate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Require the protected candidate gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh api "repos/${GITHUB_REPOSITORY}/rules/branches/main" \
+            --jq 'any(.[];
+              .type == "required_status_checks"
+              and .parameters.strict_required_status_checks_policy == true
+              and any(.parameters.required_status_checks[]?; .context == "zuno/pr-gate")
+            )' | grep -qx true
+          then
+            echo "::error title=Release governance::main is not protected by a strict zuno/pr-gate rule"
+            exit 1
+          fi
+
+      - name: Revalidate and enable squash auto-merge
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.release_pr_number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          set -euo pipefail
+          actual=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,state --jq '.headRefOid + "\t" + .state')
+          if [ "$actual" != "${EXPECTED_HEAD_SHA}"$'\t'OPEN ]; then
+            echo "::error title=Release merge::release PR moved or closed after certification: ${actual}"
+            exit 1
+          fi
+          gh pr merge "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --squash \
+            --auto \
+            --match-head-commit "$EXPECTED_HEAD_SHA"
+
+      - name: Wait for merge and dispatch release finalization explicitly
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.release_pr_number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          set -euo pipefail
+          merged=
+          for _ in $(seq 1 60); do
+            pr=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid,mergedAt,state)
+            if [ "$(jq -r '.headRefOid' <<<"$pr")" != "$EXPECTED_HEAD_SHA" ]; then
+              echo "::error title=Release merge::release PR head changed while auto-merge was pending"
+              exit 1
+            fi
+            merged=$(jq -r '.mergedAt // empty' <<<"$pr")
+            if [ -n "$merged" ]; then
+              break
+            fi
+            if [ "$(jq -r '.state' <<<"$pr")" != OPEN ]; then
+              echo "::error title=Release merge::release PR closed without merging"
+              exit 1
+            fi
+            sleep 5
+          done
+          if [ -z "$merged" ]; then
+            echo "::error title=Release merge::squash auto-merge did not complete within five minutes"
+            exit 1
+          fi
+          gh workflow run release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f mode=orchestrate \
+            -f candidate_run_id="$GITHUB_RUN_ID" \
+            -f release_pr_number="$PR_NUMBER" \
+            -f candidate_head_sha="$EXPECTED_HEAD_SHA"

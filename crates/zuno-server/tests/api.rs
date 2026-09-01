@@ -21,6 +21,7 @@ use zuno_db::session::SessionCreate;
 use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, TurnEventSender};
 use zuno_engine::status::{AbortDisposition, SessionStatus};
+use zuno_llm::event::RequestContentBlock;
 use zuno_paths::DbLocation;
 use zuno_permission::ReplyKind;
 use zuno_pty::{CreateInput, PtyId, TicketScope};
@@ -48,6 +49,24 @@ fn api_app_with_services(state: ApiState) -> (Router, ServerServices) {
 
 fn api_cancel() -> HardInterruptRequest {
     HardInterruptRequest::new(HardInterruptSource::Api, HardInterruptReason::UserCancel)
+}
+
+#[cfg(windows)]
+fn native_pty_command(script: &str) -> (String, Vec<String>) {
+    (
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned()),
+        vec![
+            "/D".to_owned(),
+            "/S".to_owned(),
+            "/C".to_owned(),
+            script.to_owned(),
+        ],
+    )
+}
+
+#[cfg(not(windows))]
+fn native_pty_command(script: &str) -> (String, Vec<String>) {
+    ("sh".to_owned(), vec!["-c".to_owned(), script.to_owned()])
 }
 
 #[derive(Debug, Default)]
@@ -466,7 +485,7 @@ fn fixture_operations(document: &Value) -> BTreeSet<(String, String)> {
 fn api_openapi_contains_only_registered_zuno_operations() {
     let generated = api::openapi();
     let actual = fixture_operations(&generated);
-    assert_eq!(actual.len(), 50, "the registered Zuno API surface changed");
+    assert_eq!(actual.len(), 51, "the registered Zuno API surface changed");
     for operation in [
         ("/api/integration/{integrationID}/connect/key", "post"),
         ("/api/integration/{integrationID}/connect/oauth", "post"),
@@ -629,6 +648,45 @@ async fn api_session_response_validates_against_its_published_openapi_binding() 
     assert!(
         errors.is_empty(),
         "GET /api/session/ses_schema returned a body rejected by its own published schema: {errors:?}; body={body}"
+    );
+}
+
+#[tokio::test]
+async fn api_session_learning_returns_the_shared_durable_projection_shape() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    state
+        .sessions()
+        .create(&SessionCreate::new(
+            "ses_learning",
+            "learning-slug",
+            "global",
+            "/repo",
+            "/repo",
+            "learning projection",
+            "test",
+        ))
+        .expect("learning fixture session inserts");
+
+    let response = api_app(state)
+        .oneshot(request(
+            Method::GET,
+            "/api/session/ses_learning/learning",
+            None,
+        ))
+        .await
+        .expect("learning projection route responds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "data": {
+                "feedback": [],
+                "experiences": [],
+                "patterns": [],
+                "skillCandidates": [],
+            }
+        })
     );
 }
 
@@ -1313,9 +1371,93 @@ async fn api_prompt_wait_and_interrupt_share_one_live_turn_signal() {
             directory: "/repo".into(),
             message_id: "msg_http".to_owned(),
             prompt: "hello".to_owned(),
+            content: Vec::new(),
             agent: None,
             model: None,
         }]
+    );
+}
+
+#[tokio::test]
+async fn api_image_prompt_persists_only_an_attachment_reference() {
+    let fixture = MutationApiFixture::new("ses_image");
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+    let source = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DAAAAEAQEARwbK3gAAAABJRU5ErkJggg==";
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_image/prompt",
+            Some(json!({
+                "id": "msg_image",
+                "prompt": {
+                    "text": "inspect the image",
+                    "files": [{
+                        "filename": "pixel.png",
+                        "mimeType": "image/png",
+                        "data": source
+                    }],
+                    "agents": []
+                },
+                "delivery": "steer"
+            })),
+        ))
+        .await
+        .expect("image prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["data"]["prompt"]["files"][0]["type"], "image");
+    assert!(
+        body["data"]["prompt"]["files"][0].get("data").is_none(),
+        "the HTTP response must not echo durable base64"
+    );
+    let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(
+        body["data"]["prompt"]["files"][0]["attachment"].clone(),
+    )
+    .expect("response contains a typed attachment reference");
+
+    executor.wait_until_prompt_started().await;
+    let requests = executor.prompts();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].content,
+        vec![
+            RequestContentBlock::Text {
+                text: "inspect the image".to_owned(),
+            },
+            RequestContentBlock::ImageAttachment {
+                reference: reference.clone(),
+            },
+        ]
+    );
+
+    let stored = SessionInbox::new(Arc::clone(&fixture.pool))
+        .promote_id("ses_image", "msg_image")
+        .expect("durable image input can be inspected");
+    assert!(
+        stored.is_none(),
+        "the active driver already promoted the admitted image"
+    );
+    let connection = fixture.pool.get().expect("inspection connection");
+    let persisted: String = connection
+        .query_row(
+            "SELECT prompt FROM session_input WHERE session_id = ?1 AND id = ?2",
+            rusqlite::params!["ses_image", "msg_image"],
+            |row| row.get(0),
+        )
+        .expect("persisted prompt reads");
+    assert!(persisted.contains(&reference.id.to_string()));
+    assert!(!persisted.contains(source));
+    assert!(!persisted.contains("\"data\""));
+
+    assert_eq!(
+        services.runs.abort("ses_image", api_cancel()),
+        AbortDisposition::Active
     );
 }
 
@@ -1923,27 +2065,35 @@ async fn api_pty_list_and_create_use_the_real_pty_service() {
     assert_eq!(empty.status(), StatusCode::OK);
     assert_eq!(response_json(empty).await["data"], json!([]));
 
+    let script = if cfg!(windows) { "exit /B 0" } else { "exit 0" };
+    let (command, args) = native_pty_command(script);
     let created = app
         .oneshot(request(
             Method::POST,
             "/api/pty",
-            Some(json!({"command":"sh","args":["-c","exit 0"]})),
+            Some(json!({"command": &command, "args": &args})),
         ))
         .await
         .expect("PTY create responds");
     assert_eq!(created.status(), StatusCode::OK);
     let body = response_json(created).await;
-    assert_eq!(body["data"]["command"], "sh");
+    assert_eq!(body["data"]["command"], command);
 }
 
 #[tokio::test]
 async fn api_pty_connect_requires_a_single_use_unexpired_ticket_without_echoing_it() {
     let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    let script = if cfg!(windows) {
+        "ping -n 31 127.0.0.1 >NUL"
+    } else {
+        "sleep 30"
+    };
+    let (command, args) = native_pty_command(script);
     let info = state
         .pty()
         .create(CreateInput {
-            command: Some("sh".to_owned()),
-            args: Some(vec!["-c".to_owned(), "sleep 30".to_owned()]),
+            command: Some(command),
+            args: Some(args),
             ..CreateInput::default()
         })
         .expect("fixture PTY starts");
@@ -2116,11 +2266,23 @@ async fn api_pty_websocket_ticket_streams_real_terminal_input_and_output() {
     let directory = tempfile::tempdir().expect("temporary PTY directory");
     let state = ApiState::memory(directory.path().to_string_lossy())
         .expect("in-memory API state initializes");
+    #[cfg(unix)]
+    let (command, args, input) = (
+        "/bin/sh".to_owned(),
+        vec!["-i".to_owned()],
+        "printf 'WS-READY\\n'\n",
+    );
+    #[cfg(windows)]
+    let (command, args, input) = (
+        std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_owned()),
+        vec!["/D".to_owned(), "/Q".to_owned()],
+        "echo WS-READY\r\n",
+    );
     let info = state
         .pty()
         .create(CreateInput {
-            command: Some("/bin/sh".to_owned()),
-            args: Some(vec!["-i".to_owned()]),
+            command: Some(command),
+            args: Some(args),
             ..CreateInput::default()
         })
         .expect("interactive fixture PTY starts");
@@ -2173,7 +2335,7 @@ async fn api_pty_websocket_ticket_streams_real_terminal_input_and_output() {
         "upgrade response: {head}"
     );
 
-    write_masked_text_frame(&mut socket, "printf 'WS-READY\\n'\n").await;
+    write_masked_text_frame(&mut socket, input).await;
     let output = tokio::time::timeout(Duration::from_secs(5), async {
         let mut output = Vec::new();
         loop {

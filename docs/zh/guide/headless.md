@@ -47,6 +47,14 @@ zuno run --format json "summarize the diff"
 
 `default` 是给人读的文本；`json` 是给解析用的。脚本中请用 `json`，而不是去抓取格式化输出，因为格式化后的形态属于展示层。
 
+Provider 可见的推理进度需要显式启用：
+
+```sh
+zuno run --show-reasoning "summarize the failure" > answer.txt 2> reasoning.txt
+```
+
+最终答案只留在 stdout。stderr 只接收 provider 明确提供的 reasoning delta，并放在 `<<<zuno:reasoning>>>` 与 `<<<zuno:end-reasoning>>>` 之间；signed thinking 与 encrypted reasoning 永不显示。若 provider 缺少 start 事件，Zuno 会等首个 delta 再打开区块，并在 provider 错误或流结束时保证闭合。`--show-reasoning --format json` 会被拒绝，因为 JSON 模式已经输出结构化事件。
+
 日志绝不会写到 stdout。诊断时把它们镜像到 stderr：
 
 ```sh
@@ -55,7 +63,7 @@ zuno run --print-logs --log-level DEBUG "summarize the build failure"
 
 ## 附加文件
 
-`-f`/`--file` 可重复使用，`--attach` 携带一个附件。受支持的图像会成为一个类型化的图像块，受 20 MiB 图像上限约束；任何其他引用必须是 UTF-8 文本，且在 51,200 字节与 2,000 行以内，插入时带显式的起止标记。不受支持的二进制文件，包括 PDF，不会被静默转换。参见[图像与文件引用](/zh/guide/attachments)。
+`-f`/`--file` 可重复使用，`--attach` 携带一个附件。受支持的图像会在写入 inbox 前完成规范化，并接纳到当前数据库专属的持久对象存储；默认源上限是 20 MiB，规范化编码上限是 5 MiB。任何其他引用必须是 UTF-8 文本，且在 51,200 字节与 2,000 行以内，插入时带显式的起止标记。不受支持的二进制文件，包括 PDF，不会被静默转换。参见[图像与文件引用](/zh/guide/attachments)。
 
 ## 脚本中的约束
 
@@ -145,7 +153,7 @@ zuno serve --port 4096
 zuno acp --check
 ```
 
-Server 不会替你添加任何认证。绑定到 `0.0.0.0` 或通过 mDNS 广播会把它暴露到本机之外，所以请把绑定地址和 CORS 来源限制到部署实际需要的范围。对 ACP 来说，stdout 承载协议分帧，因此请用 `--print-logs` 把诊断信息送到 stderr。参见[编辑器与 ACP](/zh/guide/editors)。
+Server 支持通过 `ZUNO_SERVER_PASSWORD` 启用 Basic Auth，也支持显式的回环专用 `--browser-auth` bootstrap。浏览器认证只打印一次启动 URI，token 只能消费一次，随后签发绑定 authority 的签名 Cookie；它绝不会让非回环监听变得可接受。对 ACP 来说，stdout 承载协议分帧，因此请用 `--print-logs` 把诊断信息送到 stderr。参见[编辑器与 ACP](/zh/guide/editors)。
 
 ## 参见
 

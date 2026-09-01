@@ -63,6 +63,7 @@ fn message(id: &str) -> SoftInterruptMessage {
         input_id: Some(id.to_owned()),
         content: format!("report {id}"),
         images: Vec::new(),
+        attachments: Vec::new(),
         urgent: false,
         source: SoftInterruptSource::BackgroundTask,
     }

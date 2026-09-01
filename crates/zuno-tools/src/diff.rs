@@ -164,13 +164,16 @@ mod tests {
 
     #[test]
     fn native_file_diff_preserves_creation_vs_empty_existing_file() {
-        let created = file_diff_bytes(Path::new("/work/new.txt"), None, b"")
+        let directory = tempfile::tempdir().expect("temporary absolute path");
+        let created_path = directory.path().join("new.txt");
+        let existing_path = directory.path().join("existing.txt");
+        let created = file_diff_bytes(&created_path, None, b"")
             .expect("creating an empty file is still a filesystem change");
         assert_eq!(created.old_text(), None);
         assert_eq!(created.new_text(), "");
 
         assert_eq!(
-            file_diff_bytes(Path::new("/work/existing.txt"), Some(b""), b""),
+            file_diff_bytes(&existing_path, Some(b""), b""),
             None,
             "an unchanged existing empty file is not a diff"
         );

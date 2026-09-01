@@ -648,24 +648,32 @@ mod tests {
         let (address, server) =
             spawn_chunked_server(vec![(Duration::ZERO, b"PARTIAL_")], false).await;
         let transport = ReqwestTransport::new("stalled-fixture");
+        let idle_timeout = if cfg!(windows) {
+            // The hosted Windows scheduler has a coarser timer quantum and this
+            // test runs beside other test binaries. The contract is ordering
+            // (deliver the received chunk, then time out), not a 75 ms benchmark.
+            Duration::from_millis(500)
+        } else {
+            Duration::from_millis(75)
+        };
         let mut chunks = transport
             .send(HttpRequest {
                 url: format!("http://{address}/chat/completions"),
                 headers: BTreeMap::new(),
                 body: serde_json::json!({}),
-                timeouts: HttpTimeouts::new(None, None, Some(Duration::from_millis(75))),
+                timeouts: HttpTimeouts::new(None, None, Some(idle_timeout)),
             })
             .await
             .expect("response headers should arrive");
 
-        let partial = tokio::time::timeout(Duration::from_secs(1), chunks.next())
+        let partial = tokio::time::timeout(Duration::from_secs(2), chunks.next())
             .await
             .expect("the first response chunk should arrive")
             .expect("the stream should contain the partial chunk")
             .expect("the partial chunk should be successful");
         assert_eq!(partial, b"PARTIAL_");
 
-        let error = tokio::time::timeout(Duration::from_secs(1), chunks.next())
+        let error = tokio::time::timeout(Duration::from_secs(2), chunks.next())
             .await
             .expect("the stalled read must be bounded")
             .expect("the idle timeout must be a stream item")

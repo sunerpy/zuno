@@ -758,6 +758,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_alias_is_one_canonical_source() {
         let fixture = Fixture::new();

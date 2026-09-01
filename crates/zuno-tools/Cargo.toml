@@ -31,6 +31,7 @@ zuno-error = { workspace = true }
 # facts so it can refuse an effort the resolved provider cannot honour, instead of
 # inventing a second effort vocabulary here.
 zuno-llm = { workspace = true }
+zuno-learning = { workspace = true }
 zuno-memory = { workspace = true }
 zuno-network = { workspace = true }
 zuno-orchestration = { workspace = true }

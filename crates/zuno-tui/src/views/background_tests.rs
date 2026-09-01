@@ -14,9 +14,23 @@ use zuno_sandbox::{
 };
 
 fn prepared(directory: &Path, command: &str) -> PreparedCommand {
-    let arguments = vec![OsString::from("-c"), OsString::from(command)];
+    #[cfg(unix)]
+    let (program, arguments) = (
+        OsString::from("/bin/sh"),
+        vec![OsString::from("-c"), OsString::from(command)],
+    );
+    #[cfg(windows)]
+    let (program, arguments) = (
+        std::env::var_os("ComSpec").unwrap_or_else(|| OsString::from("cmd.exe")),
+        vec![
+            OsString::from("/D"),
+            OsString::from("/Q"),
+            OsString::from("/C"),
+            OsString::from(command),
+        ],
+    );
     let request = PrepareRequest {
-        program: OsString::from("/bin/sh"),
+        program: program.clone(),
         arguments: arguments.clone(),
         cwd: directory.to_owned(),
         environment: std::env::vars_os().collect::<BTreeMap<_, _>>(),
@@ -29,11 +43,11 @@ fn prepared(directory: &Path, command: &str) -> PreparedCommand {
     };
     PreparedCommand::from_backend(
         request,
-        OsString::from("/bin/sh"),
+        program.clone(),
         arguments,
         &SandboxCapabilities {
             backend: "test_direct".to_owned(),
-            executable: Some("/bin/sh".into()),
+            executable: Some(program.into()),
             read_only: true,
             workspace_write: true,
             danger_full_access: false,
@@ -54,12 +68,16 @@ fn running() -> (
         BackgroundExecutionService::open(directory.path().join("background"))
             .expect("background service"),
     );
+    #[cfg(unix)]
+    let command = "printf ready; sleep 30";
+    #[cfg(windows)]
+    let command = "echo ready & ping -n 31 127.0.0.1 >NUL";
     let info = service
         .start(BackgroundExecutionInput {
-            prepared: prepared(directory.path(), "printf ready; sleep 30"),
+            prepared: prepared(directory.path(), command),
             session_id: "session-a".to_owned(),
             title: "preview server".to_owned(),
-            command: "printf ready; sleep 30".to_owned(),
+            command: command.to_owned(),
             purpose: BackgroundExecutionPurpose::Command,
             hard_ceiling: Duration::from_secs(60),
             retention: BackgroundExecutionRetention::Durable,

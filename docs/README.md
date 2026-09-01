@@ -37,6 +37,7 @@ configuration, not here.
 
 - [Troubleshooting and FAQ](faq.md)
 - [Self-update](reference/self-update.md)
+- [Release pipeline](operate/release-pipeline.md)
 - [Portable environment bundles](reference/portable-bundles.md)
 - [Operational logging](logging.md)
 - [Session retention](session-retention.md)
@@ -47,8 +48,10 @@ configuration, not here.
 ## Design records
 
 - [Harness comparison](design/harness-comparison.md)
+- [DSH alpha.2 adoption ledger](design/dsh-alpha2-adoption-ledger.md)
 - [Client interfaces](design/client-interfaces.md)
 - [Provider authentication](design/provider-authentication.md)
 - [Product agents](design/product-agents.md)
 - [Zed ACP integration](design/zed-acp-integration.md)
-- [Memory learning](design/memory-learning.md)
+- [Resident memory](design/memory-learning.md)
+- [User learning flywheel](design/user-learning-flywheel.md)

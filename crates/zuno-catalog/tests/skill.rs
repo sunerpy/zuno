@@ -27,7 +27,11 @@ impl Tree {
     }
 
     fn at(&self, relative: &str) -> PathBuf {
-        self.dir.path().join(relative)
+        relative
+            .split('/')
+            .fold(self.dir.path().to_path_buf(), |path, component| {
+                path.join(component)
+            })
     }
 
     fn home(&self) -> PathBuf {
@@ -254,6 +258,7 @@ async fn path_dedup_and_name_dedup_are_different_mechanisms() {
     assert!(clash.warnings().is_empty());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_symlink_alias_is_one_canonical_source() {
     let tree = Tree::new();

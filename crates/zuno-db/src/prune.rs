@@ -11,14 +11,20 @@ use crate::session::Tokens;
 
 const SSE_AGGREGATE_PREFIX: &str = "sse:";
 
-/// The fourteen schema tables whose rows belong to a selected session set.
+/// Core and additive schema tables whose rows belong to a selected session set.
 ///
 /// `memory_candidate` is deliberately absent: its source-session foreign key uses
 /// `ON DELETE SET NULL` so reviewed or applied long-term memory survives transcript
-/// retention while losing only the deleted provenance pointer.
-pub const PRUNE_TABLES: [&str; 14] = [
+/// retention while losing only the deleted provenance pointer. `experience_record`
+/// follows the same policy so retained learning can be reviewed independently of
+/// transcript retention.
+pub const PRUNE_TABLES: [&str; 18] = [
+    "session_note_operation",
+    "session_note",
     "memory_reflection_job",
     "memory_reflection_delivery",
+    "learning_job",
+    "message_feedback",
     "agent_job",
     "work_item",
     "work_plan",
@@ -39,7 +45,7 @@ pub const PRUNE_TABLES: [&str; 14] = [
 /// which foreign-key cascades happen to exist in one schema revision. Dependants
 /// precede their owners (`memory_reflection_job` before its delivery row and
 /// `agent_job` before its optional report input).
-pub const DELETE_ORDER: [&str; 14] = PRUNE_TABLES;
+pub const DELETE_ORDER: [&str; 18] = PRUNE_TABLES;
 
 /// A reversible change to `session.time_archived`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,32 +351,23 @@ pub fn preview(
     let session_ids = selected_ids(selection);
     let selected_json = ids_json(&session_ids)?;
     let aggregate_json = ids_json(&event_aggregate_ids(&session_ids))?;
-    let mut tables = Vec::with_capacity(TABLE_SPECS.len());
+    let mut tables = Vec::with_capacity(PRUNE_TABLES.len());
 
+    for spec in OPTIONAL_TABLE_SPECS {
+        if crate::continuity::table_exists(connection, spec.name)? {
+            let (predicate, binding) =
+                relation_filter(spec.relation, &selected_json, &aggregate_json);
+            tables.push(table_impact(connection, spec, predicate, binding)?);
+        } else {
+            tables.push(TableImpact {
+                table: spec.name,
+                rows: 0,
+                bytes: 0,
+            });
+        }
+    }
     for spec in TABLE_SPECS {
-        let (predicate, binding) = match spec.relation {
-            Relation::SessionId => (
-                "session_id IN (SELECT value FROM json_each(?1))",
-                selected_json.as_str(),
-            ),
-            Relation::ParentSessionId => (
-                "parent_session_id IN (SELECT value FROM json_each(?1))",
-                selected_json.as_str(),
-            ),
-            Relation::SessionPrimaryKey => (
-                "id IN (SELECT value FROM json_each(?1))",
-                selected_json.as_str(),
-            ),
-            Relation::PartWithOrphanSweep => (
-                "session_id IN (SELECT value FROM json_each(?1)) OR NOT EXISTS \
-                 (SELECT 1 FROM session WHERE session.id = part.session_id)",
-                selected_json.as_str(),
-            ),
-            Relation::Aggregate => (
-                "aggregate_id IN (SELECT value FROM json_each(?1))",
-                aggregate_json.as_str(),
-            ),
-        };
+        let (predicate, binding) = relation_filter(spec.relation, &selected_json, &aggregate_json);
         tables.push(table_impact(connection, spec, predicate, binding)?);
     }
 
@@ -456,25 +453,20 @@ pub fn delete_in_transaction(
     }
 
     let mut changed_sessions = 0;
+    for spec in OPTIONAL_TABLE_SPECS {
+        if !crate::continuity::table_exists(transaction, spec.name)? {
+            continue;
+        }
+        let (predicate, binding) =
+            delete_relation_filter(spec.relation, &selected_json, &aggregate_json);
+        let sql = format!("DELETE FROM {} WHERE {predicate}", spec.name);
+        transaction
+            .execute(&sql, [binding])
+            .map_err(open::map_error)?;
+    }
     for spec in TABLE_SPECS {
-        let (predicate, binding) = match spec.relation {
-            Relation::SessionId | Relation::PartWithOrphanSweep => (
-                "session_id IN (SELECT value FROM json_each(?1))",
-                selected_json.as_str(),
-            ),
-            Relation::ParentSessionId => (
-                "parent_session_id IN (SELECT value FROM json_each(?1))",
-                selected_json.as_str(),
-            ),
-            Relation::SessionPrimaryKey => (
-                "id IN (SELECT value FROM json_each(?1))",
-                selected_json.as_str(),
-            ),
-            Relation::Aggregate => (
-                "aggregate_id IN (SELECT value FROM json_each(?1))",
-                aggregate_json.as_str(),
-            ),
-        };
+        let (predicate, binding) =
+            delete_relation_filter(spec.relation, &selected_json, &aggregate_json);
         let sql = format!("DELETE FROM {} WHERE {predicate}", spec.name);
         let changed = transaction
             .execute(&sql, [binding])
@@ -498,6 +490,55 @@ pub fn delete_in_transaction(
         changed_sessions,
         warnings,
     })
+}
+
+fn relation_filter<'a>(
+    relation: Relation,
+    selected_json: &'a str,
+    aggregate_json: &'a str,
+) -> (&'static str, &'a str) {
+    match relation {
+        Relation::SessionId => (
+            "session_id IN (SELECT value FROM json_each(?1))",
+            selected_json,
+        ),
+        Relation::ParentSessionId => (
+            "parent_session_id IN (SELECT value FROM json_each(?1))",
+            selected_json,
+        ),
+        Relation::SessionPrimaryKey => ("id IN (SELECT value FROM json_each(?1))", selected_json),
+        Relation::PartWithOrphanSweep => (
+            "session_id IN (SELECT value FROM json_each(?1)) OR NOT EXISTS \
+             (SELECT 1 FROM session WHERE session.id = part.session_id)",
+            selected_json,
+        ),
+        Relation::Aggregate => (
+            "aggregate_id IN (SELECT value FROM json_each(?1))",
+            aggregate_json,
+        ),
+    }
+}
+
+fn delete_relation_filter<'a>(
+    relation: Relation,
+    selected_json: &'a str,
+    aggregate_json: &'a str,
+) -> (&'static str, &'a str) {
+    match relation {
+        Relation::SessionId | Relation::PartWithOrphanSweep => (
+            "session_id IN (SELECT value FROM json_each(?1))",
+            selected_json,
+        ),
+        Relation::ParentSessionId => (
+            "parent_session_id IN (SELECT value FROM json_each(?1))",
+            selected_json,
+        ),
+        Relation::SessionPrimaryKey => ("id IN (SELECT value FROM json_each(?1))", selected_json),
+        Relation::Aggregate => (
+            "aggregate_id IN (SELECT value FROM json_each(?1))",
+            aggregate_json,
+        ),
+    }
 }
 
 fn archive_in_transaction(
@@ -635,7 +676,39 @@ struct TableSpec {
     columns: &'static [&'static str],
 }
 
-const TABLE_SPECS: [TableSpec; 14] = [
+const OPTIONAL_TABLE_SPECS: [TableSpec; 2] = [
+    TableSpec {
+        name: "session_note_operation",
+        relation: Relation::SessionId,
+        columns: &[
+            "session_id",
+            "agent",
+            "call_id",
+            "request_sha256",
+            "action",
+            "name",
+            "result_revision",
+            "result_content_sha256",
+            "time_created",
+        ],
+    },
+    TableSpec {
+        name: "session_note",
+        relation: Relation::SessionId,
+        columns: &[
+            "session_id",
+            "agent",
+            "name",
+            "revision",
+            "content",
+            "content_sha256",
+            "time_created",
+            "time_updated",
+        ],
+    },
+];
+
+const TABLE_SPECS: [TableSpec; 16] = [
     TableSpec {
         name: "memory_reflection_job",
         relation: Relation::SessionId,
@@ -663,6 +736,43 @@ const TABLE_SPECS: [TableSpec; 14] = [
             "recovered",
             "negative_learning",
             "time_created",
+        ],
+    },
+    TableSpec {
+        name: "learning_job",
+        relation: Relation::SessionId,
+        columns: &[
+            "id",
+            "project_id",
+            "session_id",
+            "source_message_id",
+            "kind",
+            "extractor_version",
+            "idempotency_key",
+            "status",
+            "attempt",
+            "owner_id",
+            "lease_expires",
+            "scheduled_at",
+            "payload",
+            "result",
+            "error",
+            "time_created",
+            "time_updated",
+            "time_completed",
+        ],
+    },
+    TableSpec {
+        name: "message_feedback",
+        relation: Relation::SessionId,
+        columns: &[
+            "message_id",
+            "session_id",
+            "rating",
+            "note",
+            "revision",
+            "time_created",
+            "time_updated",
         ],
     },
     TableSpec {

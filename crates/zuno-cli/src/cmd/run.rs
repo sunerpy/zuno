@@ -159,7 +159,7 @@ pub(super) fn execute(
                 drop(sender);
                 turn
             },
-            render_events(receiver, args.format, progress)
+            render_events(receiver, args.format, args.show_reasoning, progress)
         )
     });
     report_progress(progress);
@@ -204,6 +204,12 @@ fn validate_flags(args: &RunArgs) -> Result<(), String> {
     }
     if args.r#continue && args.session.is_some() {
         return Err("--continue and --session cannot be used together".to_owned());
+    }
+    if args.show_reasoning && args.format == RunFormat::Json {
+        return Err(
+            "--show-reasoning cannot be combined with --format json; JSON mode already emits structured reasoning events"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -304,6 +310,7 @@ fn file_attachment_content(
 async fn render_events(
     receiver: tokio::sync::mpsc::Receiver<TurnEvent>,
     format: RunFormat,
+    show_reasoning: bool,
     progress: ProgressPulse<'_>,
 ) -> Result<(), String> {
     let stderr_is_terminal = std::io::stderr().is_terminal();
@@ -312,6 +319,7 @@ async fn render_events(
     render_events_to(
         receiver,
         format,
+        show_reasoning,
         &mut stdout,
         &mut stderr,
         stderr_is_terminal,
@@ -323,6 +331,7 @@ async fn render_events(
 async fn render_events_to<Stdout, Stderr>(
     mut receiver: tokio::sync::mpsc::Receiver<TurnEvent>,
     format: RunFormat,
+    show_reasoning: bool,
     stdout: &mut Stdout,
     stderr: &mut Stderr,
     stderr_is_terminal: bool,
@@ -333,6 +342,7 @@ where
     Stderr: Write,
 {
     let mut wrote_text = false;
+    let mut reasoning_open = false;
     while let Some(event) = receiver.recv().await {
         report_progress(progress);
         match format {
@@ -346,14 +356,44 @@ where
                     wrote_text = true;
                 }
                 TurnEvent::Provider {
+                    event: StreamEvent::ReasoningStart,
+                    ..
+                } if show_reasoning => {
+                    open_reasoning(stderr, &mut reasoning_open).map_err(to_string)?;
+                }
+                TurnEvent::Provider {
+                    event: StreamEvent::ReasoningDelta(text),
+                    ..
+                } if show_reasoning => {
+                    open_reasoning(stderr, &mut reasoning_open).map_err(to_string)?;
+                    write!(stderr, "{text}").map_err(to_string)?;
+                    stderr.flush().map_err(to_string)?;
+                }
+                TurnEvent::Provider {
+                    event: StreamEvent::ReasoningEnd,
+                    ..
+                } if show_reasoning => {
+                    close_reasoning(stderr, &mut reasoning_open).map_err(to_string)?;
+                }
+                TurnEvent::Provider {
                     event: StreamEvent::Error { message, .. },
                     ..
-                } => writeln!(stderr, "{message}").map_err(to_string)?,
+                } => {
+                    close_reasoning(stderr, &mut reasoning_open).map_err(to_string)?;
+                    writeln!(stderr, "{message}").map_err(to_string)?;
+                }
                 TurnEvent::Provider {
                     event: StreamEvent::RetryRollback { attempt, max },
                     ..
-                } => write_retry_notice(stderr, attempt, max, stderr_is_terminal)
-                    .map_err(to_string)?,
+                } => {
+                    close_reasoning(stderr, &mut reasoning_open).map_err(to_string)?;
+                    write_retry_notice(stderr, attempt, max, stderr_is_terminal)
+                        .map_err(to_string)?;
+                }
+                TurnEvent::Provider {
+                    event: StreamEvent::MessageEnd { .. },
+                    ..
+                } => close_reasoning(stderr, &mut reasoning_open).map_err(to_string)?,
                 // Status details were only ever rendered by `--json`, so anything the
                 // prelude reported — a suppressed tool, a skipped internal — was
                 // invisible to a plain run. stderr, because stdout is the model's
@@ -412,8 +452,29 @@ where
             RunFormat::Json => writeln!(stdout, "{}", event_json(event)).map_err(to_string)?,
         }
     }
+    close_reasoning(stderr, &mut reasoning_open).map_err(to_string)?;
     if format == RunFormat::Default && wrote_text {
         writeln!(stdout).map_err(to_string)?;
+    }
+    Ok(())
+}
+
+const REASONING_START_MARKER: &str = "<<<zuno:reasoning>>>";
+const REASONING_END_MARKER: &str = "<<<zuno:end-reasoning>>>";
+
+fn open_reasoning(writer: &mut impl Write, reasoning_open: &mut bool) -> std::io::Result<()> {
+    if !*reasoning_open {
+        writeln!(writer, "{REASONING_START_MARKER}")?;
+        *reasoning_open = true;
+    }
+    Ok(())
+}
+
+fn close_reasoning(writer: &mut impl Write, reasoning_open: &mut bool) -> std::io::Result<()> {
+    if *reasoning_open {
+        writeln!(writer)?;
+        writeln!(writer, "{REASONING_END_MARKER}")?;
+        *reasoning_open = false;
     }
     Ok(())
 }
@@ -786,6 +847,7 @@ mod tests {
             model: None,
             agent: None,
             format: RunFormat::Default,
+            show_reasoning: false,
             file: Vec::new(),
             title: None,
             attach: None,
@@ -817,6 +879,13 @@ mod tests {
         args.variant = None;
         args.thinking = true;
         validate_flags(&args).expect("--thinking reaches turn resolution");
+
+        args.show_reasoning = true;
+        validate_flags(&args).expect("--show-reasoning reaches the renderer");
+
+        args.format = RunFormat::Json;
+        let error = validate_flags(&args).expect_err("JSON reasoning is already structured");
+        assert!(error.contains("--show-reasoning"));
     }
 
     #[test]
@@ -877,8 +946,10 @@ mod tests {
         });
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async move {
-            let (produced, rendered) =
-                tokio::join!(producer, render_events(receiver, RunFormat::Default, None));
+            let (produced, rendered) = tokio::join!(
+                producer,
+                render_events(receiver, RunFormat::Default, false, None)
+            );
             produced.expect("producer task");
             rendered.expect("render events");
         })
@@ -922,6 +993,7 @@ mod tests {
                 render_events_to(
                     receiver,
                     RunFormat::Default,
+                    false,
                     &mut stdout,
                     &mut stderr,
                     false,
@@ -956,6 +1028,7 @@ mod tests {
         render_events_to(
             receiver,
             RunFormat::Default,
+            false,
             &mut stdout,
             &mut stderr,
             stderr_is_terminal,
@@ -982,6 +1055,99 @@ mod tests {
             !pipe_stderr.contains(&0x1b),
             "non-TTY retry output contains an escape sequence: {pipe_stderr:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn show_reasoning_is_stderr_only_and_closes_each_block() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        for event in [
+            StreamEvent::ReasoningStart,
+            StreamEvent::ReasoningDelta("first".to_owned()),
+            StreamEvent::ReasoningEnd,
+            // A provider is allowed to omit the start event; the first delta opens it.
+            StreamEvent::ReasoningDelta("second".to_owned()),
+            StreamEvent::MessageEnd { stop_reason: None },
+            StreamEvent::TextDelta("answer".to_owned()),
+        ] {
+            sender
+                .send(TurnEvent::Provider { step: 1, event })
+                .await
+                .expect("renderer remains connected");
+        }
+        drop(sender);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        render_events_to(
+            receiver,
+            RunFormat::Default,
+            true,
+            &mut stdout,
+            &mut stderr,
+            false,
+            None,
+        )
+        .await
+        .expect("reasoning renders");
+
+        assert_eq!(stdout, b"answer\n");
+        assert_eq!(
+            String::from_utf8(stderr).expect("utf8"),
+            concat!(
+                "<<<zuno:reasoning>>>\n",
+                "first\n",
+                "<<<zuno:end-reasoning>>>\n",
+                "<<<zuno:reasoning>>>\n",
+                "second\n",
+                "<<<zuno:end-reasoning>>>\n",
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn show_reasoning_closes_on_provider_error_without_leaking_signed_material() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        for event in [
+            StreamEvent::ReasoningDelta("visible".to_owned()),
+            StreamEvent::ReasoningSignatureDelta("secret-signature".to_owned()),
+            StreamEvent::ProviderReasoningItem {
+                id: "reasoning".to_owned(),
+                summary: vec!["secret-summary".to_owned()],
+                encrypted_content: Some("secret-ciphertext".to_owned()),
+                status: None,
+            },
+            StreamEvent::Error {
+                message: "failed".to_owned(),
+                retry_after: None,
+            },
+        ] {
+            sender
+                .send(TurnEvent::Provider { step: 1, event })
+                .await
+                .expect("renderer remains connected");
+        }
+        drop(sender);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        render_events_to(
+            receiver,
+            RunFormat::Default,
+            true,
+            &mut stdout,
+            &mut stderr,
+            false,
+            None,
+        )
+        .await
+        .expect("reasoning renders");
+
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).expect("utf8");
+        assert!(stderr.contains("visible"));
+        assert!(stderr.contains("<<<zuno:end-reasoning>>>"));
+        assert!(stderr.contains("failed"));
+        assert!(!stderr.contains("secret-signature"));
+        assert!(!stderr.contains("secret-summary"));
+        assert!(!stderr.contains("secret-ciphertext"));
     }
 
     #[test]

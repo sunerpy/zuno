@@ -1,16 +1,24 @@
+#[cfg(unix)]
 mod support;
 
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
+#[cfg(unix)]
 use zuno_pty::{
     BackgroundExecutionId, BackgroundExecutionPurpose, BackgroundExecutionService,
     BackgroundExecutionStatus,
 };
+#[cfg(unix)]
 use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
+#[cfg(unix)]
 use zuno_tools::shell::ShellParams;
 use zuno_tools::timeout::{MAX_FOREGROUND_TIMEOUT_MS, normalize_foreground_timeout};
 
+#[cfg(unix)]
 fn context() -> ToolContext {
     ToolContext::new(
         "ses_timeout",
@@ -22,6 +30,7 @@ fn context() -> ToolContext {
     )
 }
 
+#[cfg(unix)]
 fn params(command: impl Into<String>, timeout: Option<u64>) -> ShellParams {
     ShellParams {
         command: command.into(),
@@ -110,9 +119,13 @@ async fn timeout_policy_hard_ceiling_still_terminates_the_process_group() {
     let command = format!("printf '%s' \"$$\" > '{}'; sleep 30", pid_file.display());
     let tool = support::sandbox::shell_tool(workspace.path())
         .with_background_executions(service.clone())
-        .with_hard_ceiling(Duration::from_millis(120));
+        .with_hard_ceiling(Duration::from_secs(3));
     let started = Instant::now();
 
+    // The foreground timeout tests promotion, while the much wider hard
+    // ceiling tests eventual termination. Keeping those clocks separated
+    // prevents hosted-runner scheduler latency from winning before the child
+    // has written the PID that proves a real process was later reaped.
     let error = tool
         .run(params(command, Some(30)), context())
         .await
@@ -134,7 +147,7 @@ async fn timeout_policy_hard_ceiling_still_terminates_the_process_group() {
         "{:?}",
         failed.error
     );
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_secs(4));
     wait_for_process_exit(pid).await;
 }
 
@@ -170,7 +183,7 @@ async fn wait_for_task(
     service: &BackgroundExecutionService,
     task_id: &BackgroundExecutionId,
 ) -> zuno_pty::BackgroundExecutionInfo {
-    tokio::time::timeout(Duration::from_secs(2), service.wait(task_id, None))
+    tokio::time::timeout(Duration::from_secs(4), service.wait(task_id, None))
         .await
         .expect("background task must settle")
         .expect("registered task")
@@ -181,7 +194,7 @@ async fn wait_for_task(
 /// the path to exist can observe a created-but-empty file and parse `""`.
 #[cfg(unix)]
 async fn wait_for_pid(path: &Path) -> u32 {
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Ok(contents) = std::fs::read_to_string(path)
                 && let Ok(pid) = contents.trim().parse::<u32>()

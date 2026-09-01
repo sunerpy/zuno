@@ -9,9 +9,9 @@ use zuno_error::ToolError;
 use zuno_permission::ReplyKind;
 use zuno_server::api::{self, ApiState};
 use zuno_server::{
-    AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventFanout, EventService, PermissionRequest,
-    QuestionDecision, QuestionRequest, QuestionToolCall, RequestBroker, ServerBuilder,
-    ServerConfig, ServerServices, SessionCompactExecution, SessionMutationExecutor,
+    AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventFanout, EventService, NewEvent,
+    PermissionRequest, QuestionDecision, QuestionRequest, QuestionToolCall, RequestBroker,
+    ServerBuilder, ServerConfig, ServerServices, SessionCompactExecution, SessionMutationExecutor,
     SessionMutationFuture, SessionPromptExecution, events_router,
 };
 use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin};
@@ -33,7 +33,7 @@ struct ServerSessionMutationExecutor {
     /// serialized so a request cannot acquire the old revision after a candidate has
     /// reserved it and before that candidate commits.
     composition_gate: Arc<tokio::sync::Mutex<()>>,
-    detached_observer: Arc<dyn DetachedTurnObserver>,
+    detached_observer: Arc<ServerDetachedTurnObserver>,
     /// The one MCP catalog every session on this server shares.
     ///
     /// A host is built per request here, so building a *catalog* per request would
@@ -89,7 +89,9 @@ impl ServerSessionMutationExecutor {
                 runs: self.runs.clone(),
                 mcp: self.mcp.clone(),
                 child_observer: None,
-                detached_observer: Some(Arc::clone(&self.detached_observer)),
+                detached_observer: Some(
+                    Arc::clone(&self.detached_observer) as Arc<dyn DetachedTurnObserver>
+                ),
             },
         )
         .await?;
@@ -104,6 +106,24 @@ impl ServerSessionMutationExecutor {
         }
         host.activate_background_notifications(&tokio::runtime::Handle::current());
         Ok(host)
+    }
+
+    fn final_work_state(
+        &self,
+        host: &TurnHost,
+        session_id: &str,
+    ) -> Option<zuno_types::WorkStateProjection> {
+        match host.work_state() {
+            Ok(work) => Some(work),
+            Err(error) => {
+                tracing::debug!(
+                    session_id,
+                    %error,
+                    "failed to read final server turn work state for projection"
+                );
+                None
+            }
+        }
     }
 
     /// Publish a staged extension mutation once all request hosts on the old revision
@@ -300,6 +320,45 @@ impl DetachedTurnObserver for ServerDetachedTurnObserver {
             .forward_engine_event(session_id, &self.fanout, event.clone())
             .await;
     }
+
+    async fn work_state(&self, session_id: &str, work: &zuno_types::WorkStateProjection) {
+        let properties = match serde_json::to_value(&work.learning) {
+            Ok(serde_json::Value::Object(properties)) => properties,
+            Ok(_) => {
+                tracing::debug!(
+                    session_id,
+                    "learning work-state projection did not serialize as an object"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    session_id,
+                    %error,
+                    "failed to serialize final server learning projection"
+                );
+                return;
+            }
+        };
+        let event = match NewEvent::new("learning.state.changed", properties) {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::debug!(
+                    session_id,
+                    %error,
+                    "failed to construct durable server learning projection event"
+                );
+                return;
+            }
+        };
+        if let Err(error) = self.events.publish(session_id, event).await {
+            tracing::debug!(
+                session_id,
+                %error,
+                "failed to publish durable server learning projection event"
+            );
+        }
+    }
 }
 
 impl SessionMutationExecutor for ServerSessionMutationExecutor {
@@ -319,13 +378,24 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
             };
             let mut host = executor.open_active(&spec).await?;
             let outcome = async {
-                host.drive_with_message_id_and_guard(
-                    &request.prompt,
-                    Some(&request.message_id),
-                    guard,
-                    events.clone(),
-                )
-                .await?;
+                if request.content.is_empty() {
+                    host.drive_promoted_with_guard(
+                        &request.prompt,
+                        &request.message_id,
+                        guard,
+                        events.clone(),
+                    )
+                    .await?;
+                } else {
+                    host.drive_promoted_content_with_guard(
+                        &request.prompt,
+                        &request.content,
+                        &request.message_id,
+                        guard,
+                        events.clone(),
+                    )
+                    .await?;
+                }
                 while host
                     .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
                     .await?
@@ -333,6 +403,13 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 Ok(())
             }
             .await;
+            let work = executor.final_work_state(&host, &spec.session_id);
+            if let Some(work) = work {
+                executor
+                    .detached_observer
+                    .work_state(&spec.session_id, &work)
+                    .await;
+            }
             let extension_scope = host.extension_scope().clone();
             let shutdown = host.shutdown().await;
             let reconciliation = if shutdown.is_ok() {
@@ -369,6 +446,13 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 Ok(())
             }
             .await;
+            let work = executor.final_work_state(&host, &spec.session_id);
+            if let Some(work) = work {
+                executor
+                    .detached_observer
+                    .work_state(&spec.session_id, &work)
+                    .await;
+            }
             let extension_scope = host.extension_scope().clone();
             let shutdown = host.shutdown().await;
             let reconciliation = if shutdown.is_ok() {
@@ -445,14 +529,42 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             .map_err(|error| format!("invalid shell configuration: {error}"))?;
         let pool = Arc::new(zuno_db::Pool::open_default().map_err(|error| error.to_string())?);
         let events = EventService::new(Arc::clone(&pool), DEFAULT_EVENT_SUBSCRIBER_CAPACITY);
+        let image = harness_config
+            .attachment
+            .as_ref()
+            .and_then(|attachment| attachment.image.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let attachments = Arc::new(
+            zuno_attachment::AttachmentStore::new(
+                zuno_paths::data(),
+                &zuno_attachment::AttachmentStore::database_identity(pool.target()),
+                zuno_attachment::ImageAdmissionPolicy {
+                    auto_resize: image.resolved_auto_resize(),
+                    max_source_bytes: image.resolved_max_source_bytes(),
+                    max_width: image.resolved_max_width(),
+                    max_height: image.resolved_max_height(),
+                    max_pixels: image.resolved_max_pixels(),
+                    max_encoded_bytes: image.resolved_max_encoded_bytes(),
+                },
+            )
+            .map_err(|error| error.to_string())?,
+        );
         let server_config = ServerConfig::default()
             .with_hostname(&args.hostname)
             .with_port(args.port)
             .with_auth(auth)
             .with_default_directory(&directory);
+        let server_config = if args.browser_auth {
+            server_config
+                .with_browser_auth(zuno_paths::data().join("server").join("browser-auth.key"))
+        } else {
+            server_config
+        };
         let state = ApiState::open_default(&directory)
             .map_err(|error| error.to_string())?
             .with_configured_shell(harness_config.shell.clone())
+            .with_attachment_store(attachments)
             .with_events(events.clone());
         let goals = Arc::new(
             zuno_goal::GoalStore::from_pool(Arc::clone(&pool), zuno_goal::default_spill_dir())
@@ -482,13 +594,16 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             services.events.clone(),
         ));
         let services = services.with_mutations(mutations);
-        let server = ServerBuilder::new(server_config)
+        let mut server = ServerBuilder::new(server_config)
             .with_services(services)
             .with_routes(api::router(state.clone()).merge(events_router(events)))
             .bind()
             .await
             .map_err(|error| error.to_string())?;
         println!("{}", server_readiness_message(server.local_addr()));
+        if let Some(uri) = server.take_browser_bootstrap_uri() {
+            println!("Browser authentication: {uri}");
+        }
         std::io::stdout()
             .flush()
             .map_err(|error| error.to_string())?;

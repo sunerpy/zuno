@@ -16,7 +16,7 @@ use zuno_llm::event::{FinishReason, RequestContentBlock};
 use zuno_tool::PermissionAsker;
 
 use super::child_turn::{ChildTurnObserver, DetachedTurnObserver};
-use super::mcp_runtime::McpRuntime;
+use super::mcp_runtime::{McpRuntime, RequiredMcpServers};
 use super::turn::{
     CatalogModelChoice, ExtensionComposition, SessionChoice, SessionCommandError, TurnHost,
     TurnHostRuntimeDependencies, TurnOptions, TurnPlan, persisted_session_agent,
@@ -29,8 +29,6 @@ const ACP_PROTOCOL_VERSION: u64 = 1;
 const ACP_SCHEMA_VERSION: &str = "1.21.0";
 const ACP_TEXT_RESOURCE_MAX_BYTES: usize = 50 * 1_024;
 const ACP_TEXT_RESOURCE_MAX_LINES: usize = 2_000;
-const ACP_IMAGE_MAX_BYTES: usize = 5 * 1_024 * 1_024;
-const ACP_IMAGE_MAX_BASE64_BYTES: usize = (ACP_IMAGE_MAX_BYTES / 3 + 1) * 4;
 const MAX_OPEN_ACP_SESSIONS: usize = 32;
 
 pub(super) fn execute(args: &AcpArgs, environment: &StartupEnvironment) -> Result<(), String> {
@@ -149,7 +147,8 @@ fn initialize(params: &Value) -> Result<Value, zuno_acp::RpcError> {
                 "embeddedContext": true,
             },
             "mcpCapabilities": {
-                "http": false,
+                "stdio": true,
+                "http": true,
                 "sse": false,
             },
             "sessionCapabilities": {
@@ -215,7 +214,9 @@ impl ProductionAcpAgent {
         client: zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
         let cwd = lifecycle_directory(params)?;
-        require_empty_roots_and_client_mcp(params)?;
+        require_empty_additional_directories(params)?;
+        let mcp_servers = zuno_acp::parse_mcp_servers(params.get("mcpServers"))
+            .map_err(|error| zuno_acp::RpcError::invalid_params(error.to_string()))?;
         let options = TurnOptions {
             directory: Some(cwd),
             model: None,
@@ -231,7 +232,7 @@ impl ProductionAcpAgent {
         };
         let session_slot = self.reserve_session_slot()?;
         let session = self
-            .open_session(options, client.clone(), session_slot)
+            .open_session(options, client.clone(), session_slot, mcp_servers, true)
             .await?;
         let session_id = session.id.clone();
         let response = session.lifecycle_response().await?;
@@ -269,7 +270,9 @@ impl ProductionAcpAgent {
     ) -> Result<Value, zuno_acp::RpcError> {
         let session_id = required_string(params, "sessionId")?;
         let cwd = lifecycle_directory(params)?;
-        require_empty_roots_and_client_mcp(params)?;
+        require_empty_additional_directories(params)?;
+        let mcp_servers = zuno_acp::parse_mcp_servers(params.get("mcpServers"))
+            .map_err(|error| zuno_acp::RpcError::invalid_params(error.to_string()))?;
         let pool = durable_pool()?;
         let stored = zuno_db::session::Store::new(&pool)
             .get(&session_id)
@@ -282,54 +285,65 @@ impl ProductionAcpAgent {
             )));
         }
 
-        let existing = self.state.sessions.lock().await.get(&session_id).cloned();
-        let session = if let Some(session) = existing {
-            session
-        } else {
-            let choice = SessionChoice::Existing(session_id.clone());
-            let options = TurnOptions {
-                directory: Some(cwd),
-                model: None,
-                agent: persisted_session_agent(&choice),
-                preset: None,
-                session: choice,
-                title: None,
-                effort: None,
-                variant: None,
-                thinking: false,
-                tool_authority: None,
-                extension_composition: ExtensionComposition::Active,
-            };
-            match self.reserve_session_slot() {
-                Ok(session_slot) => {
-                    let session = self.open_dormant_session(options, session_slot).await?;
-                    let mut sessions = self.state.sessions.lock().await;
-                    if let Some(existing) = sessions.get(&session_id).cloned() {
-                        existing
-                    } else {
-                        sessions.insert(session_id.clone(), Arc::clone(&session));
-                        session
-                    }
-                }
-                Err(error) => self
-                    .state
-                    .sessions
-                    .lock()
-                    .await
-                    .get(&session_id)
-                    .cloned()
-                    .ok_or(error)?,
-            }
+        let previous = self.state.sessions.lock().await.remove(&session_id);
+        if let Some(previous) = previous {
+            previous
+                .shutdown()
+                .await
+                .map_err(zuno_acp::RpcError::internal)?;
         };
+        let choice = SessionChoice::Existing(session_id.clone());
+        let options = TurnOptions {
+            directory: Some(cwd),
+            model: None,
+            agent: persisted_session_agent(&choice),
+            preset: None,
+            session: choice,
+            title: None,
+            effort: None,
+            variant: None,
+            thinking: false,
+            tool_authority: None,
+            extension_composition: ExtensionComposition::Active,
+        };
+        let session_slot = self.reserve_session_slot()?;
+        let session = self
+            .open_dormant_session(options, session_slot, mcp_servers)
+            .await?;
+        if let Err(error) = session.ensure_active(&self.state, client.clone()).await {
+            let _shutdown = session.shutdown().await;
+            return Err(error);
+        }
+        self.state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), Arc::clone(&session));
         if replay {
-            session
+            if let Err(error) = session
                 .replay(&client, self.state.native_subagents.load(Ordering::Acquire))
-                .await?;
+                .await
+            {
+                self.state.sessions.lock().await.remove(&session_id);
+                let _shutdown = session.shutdown().await;
+                return Err(error);
+            }
         } else {
             session.mark_replay_satisfied().await?;
         }
-        session.defer_available_commands(&client).await?;
-        session.lifecycle_response().await
+        if let Err(error) = session.defer_available_commands(&client).await {
+            self.state.sessions.lock().await.remove(&session_id);
+            let _shutdown = session.shutdown().await;
+            return Err(error);
+        }
+        match session.lifecycle_response().await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                self.state.sessions.lock().await.remove(&session_id);
+                let _shutdown = session.shutdown().await;
+                Err(error)
+            }
+        }
     }
 
     fn list_sessions(&self, params: &Value) -> Result<Value, zuno_acp::RpcError> {
@@ -445,12 +459,36 @@ impl ProductionAcpAgent {
 
     async fn delete_session(&self, params: &Value) -> Result<Value, zuno_acp::RpcError> {
         let session_id = required_string(params, "sessionId")?;
-        self.close_session(params).await?;
-        let pool = durable_pool()?;
-        zuno_db::session::Store::new(&pool)
-            .remove(&session_id)
-            .map_err(|error| map_session_lookup(&session_id, error))?;
-        Ok(json!({}))
+        let cleanup_derived_experiences = required_bool(params, "cleanupDerivedExperiences")?;
+        let session = self.state.sessions.lock().await.get(&session_id).cloned();
+        let outcome = match session.as_ref() {
+            Some(session) => session.delete_durable(cleanup_derived_experiences).await?,
+            None if cleanup_derived_experiences => {
+                return Err(zuno_acp::RpcError::invalid_params(format!(
+                    "session {session_id} must be open to prepare Memory and Skill revocation candidates"
+                )));
+            }
+            None => {
+                let pool = durable_pool()?;
+                super::turn::SessionDeleteOutcome {
+                    deleted_session_ids: zuno_db::session::Store::new(&pool)
+                        .remove(&session_id)
+                        .map_err(|error| map_session_lookup(&session_id, error))?,
+                    ..super::turn::SessionDeleteOutcome::default()
+                }
+            }
+        };
+        if session.is_some() {
+            self.close_session(params).await?;
+        }
+        Ok(json!({
+            "deletedSessionIds": outcome.deleted_session_ids,
+            "forgottenExperienceIds": outcome.forgotten_experience_ids,
+            "memoryRevocationCandidateIds": outcome.memory_revocation_candidate_ids,
+            "skillRevocationCandidateIds": outcome.skill_revocation_candidate_ids,
+            "rejectedMemoryCandidateIds": outcome.rejected_memory_candidate_ids,
+            "rejectedSkillCandidateIds": outcome.rejected_skill_candidate_ids,
+        }))
     }
 
     async fn session(&self, session_id: &str) -> Result<Arc<AcpSession>, zuno_acp::RpcError> {
@@ -478,6 +516,8 @@ impl ProductionAcpAgent {
         options: TurnOptions,
         client: zuno_acp::ClientConnection,
         session_slot: OwnedSemaphorePermit,
+        mcp_servers: Vec<zuno_acp::AcpMcpServer>,
+        replayed: bool,
     ) -> Result<Arc<AcpSession>, zuno_acp::RpcError> {
         let _composition = self.state.composition_gate.lock().await;
         let plan = TurnPlan::resolve(&options, &self.state.environment)
@@ -495,6 +535,7 @@ impl ProductionAcpAgent {
             self.state.runs.clone(),
             AcpSurfaceContext::from_state(self.state.as_ref(), client),
             None,
+            &mcp_servers,
         )
         .await
         .map_err(zuno_acp::RpcError::internal)?;
@@ -504,7 +545,7 @@ impl ProductionAcpAgent {
             id,
             control,
             prompt_active: AtomicBool::new(false),
-            replayed: AtomicBool::new(true),
+            replayed: AtomicBool::new(replayed),
             closed: AtomicBool::new(false),
             replay_gate: Mutex::new(()),
             mount_gate: Mutex::new(()),
@@ -512,6 +553,7 @@ impl ProductionAcpAgent {
             background_notification_directory,
             background_notifications,
             _session_slot: session_slot,
+            mcp_servers: Arc::from(mcp_servers),
             dormant: Mutex::new(None),
             resources: Mutex::new(Some(resources)),
         }))
@@ -521,6 +563,7 @@ impl ProductionAcpAgent {
         &self,
         options: TurnOptions,
         session_slot: OwnedSemaphorePermit,
+        mcp_servers: Vec<zuno_acp::AcpMcpServer>,
     ) -> Result<Arc<AcpSession>, zuno_acp::RpcError> {
         let session_id = match &options.session {
             SessionChoice::Existing(session_id) => session_id.clone(),
@@ -556,6 +599,7 @@ impl ProductionAcpAgent {
             background_notification_directory,
             background_notifications,
             _session_slot: session_slot,
+            mcp_servers: Arc::from(mcp_servers),
             dormant: Mutex::new(Some(DormantSession {
                 options,
                 configuration,
@@ -594,6 +638,7 @@ struct AcpSession {
     background_notification_directory: PathBuf,
     background_notifications: super::background_notification::BackgroundNotificationRegistry,
     _session_slot: OwnedSemaphorePermit,
+    mcp_servers: Arc<[zuno_acp::AcpMcpServer]>,
     dormant: Mutex<Option<DormantSession>>,
     resources: Mutex<Option<SessionResources>>,
 }
@@ -681,15 +726,15 @@ impl DetachedTurnObserver for AcpDetachedTurnObserver {
         {
             return;
         }
-        let Some(update) = zuno_acp::durable_plan_update(work) else {
-            return;
-        };
-        if let Err(error) = self.client.session_update(session_id, update).await {
-            tracing::debug!(
-                session_id,
-                %error,
-                "detached root turn outlived its final ACP plan projection"
-            );
+        for update in zuno_acp::durable_work_updates(work) {
+            if let Err(error) = self.client.session_update(session_id, update).await {
+                tracing::debug!(
+                    session_id,
+                    %error,
+                    "detached root turn outlived its final ACP work-state projection"
+                );
+                break;
+            }
         }
     }
 }
@@ -705,12 +750,59 @@ impl AcpSurfaceContext {
     }
 }
 
+fn required_mcp_servers(
+    servers: &[zuno_acp::AcpMcpServer],
+    workspace: &std::path::Path,
+) -> RequiredMcpServers {
+    use zuno_config::schema::mcp::{
+        LocalKind, McpLocal, McpOauth, McpRemote, McpServerConfig, RemoteKind,
+    };
+    use zuno_config::schema::ordered::False;
+
+    let workspace = workspace.to_string_lossy().into_owned();
+    let entries = servers
+        .iter()
+        .map(|server| match server {
+            zuno_acp::AcpMcpServer::Stdio(server) => {
+                let mut command = Vec::with_capacity(1 + server.args().len());
+                command.push(server.command().to_string_lossy().into_owned());
+                command.extend(server.args().iter().cloned());
+                (
+                    server.name().to_owned(),
+                    McpServerConfig::Local(McpLocal {
+                        kind: LocalKind::Local,
+                        command,
+                        cwd: Some(workspace.clone()),
+                        environment: Some(server.environment().clone()),
+                        enabled: Some(true),
+                        timeout: None,
+                    }),
+                )
+            }
+            zuno_acp::AcpMcpServer::Http(server) => (
+                server.name().to_owned(),
+                McpServerConfig::Remote(McpRemote {
+                    kind: RemoteKind::Remote,
+                    url: server.url().as_str().to_owned(),
+                    enabled: Some(true),
+                    headers: Some(server.headers().clone()),
+                    oauth: Some(McpOauth::Disabled(False)),
+                    timeout: None,
+                    streamable_http_only: true,
+                }),
+            ),
+        })
+        .collect();
+    RequiredMcpServers::new(entries)
+}
+
 async fn open_session_resources(
     plan: TurnPlan,
     environment: &StartupEnvironment,
     runs: SessionRunRegistry,
     surface: AcpSurfaceContext,
     build_agent: Option<&str>,
+    client_mcp: &[zuno_acp::AcpMcpServer],
 ) -> Result<SessionResources, String> {
     let AcpSurfaceContext {
         client,
@@ -723,9 +815,18 @@ async fn open_session_resources(
         .worktree()
         .unwrap_or_else(|| plan.directory())
         .to_path_buf();
-    let mut mcp = McpRuntime::from_config(plan.config(), &workspace);
+    let required_mcp = required_mcp_servers(client_mcp, plan.directory());
+    let mut mcp = McpRuntime::from_config_with_required(plan.config(), &workspace, required_mcp)?;
     let notes = match mcp.as_ref() {
-        Some(mcp) => mcp.connect().await,
+        Some(runtime) => match runtime.connect_required().await {
+            Ok(notes) => notes,
+            Err(error) => {
+                if let Some(runtime) = mcp.take() {
+                    runtime.shutdown().await;
+                }
+                return Err(error);
+            }
+        },
         None => Vec::new(),
     };
     let session_route = Arc::new(zuno_acp::AcpSessionRoute::new(native_subagents));
@@ -792,6 +893,23 @@ async fn open_session_resources(
             }));
         }
     };
+    if let Some(bridge) = subagents.as_ref()
+        && let Err(error) = bridge.bind_attachment_store(host.attachment_store())
+    {
+        let shutdown = host.shutdown().await;
+        if let Some(mcp) = mcp.take() {
+            mcp.shutdown().await;
+        }
+        let bridge = shutdown_subagent_bridge(&mut subagents).await;
+        let shutdown = shutdown
+            .err()
+            .map(|shutdown| format!("; candidate ACP host shutdown failed: {shutdown}"))
+            .unwrap_or_default();
+        let bridge = bridge
+            .map(|bridge| format!("; ACP subagent projector shutdown failed: {bridge}"))
+            .unwrap_or_default();
+        return Err(format!("{error}{shutdown}{bridge}"));
+    }
     if let Err(error) = session_route.bind_root(host.session_id()) {
         let shutdown = host.shutdown().await;
         if let Some(mcp) = mcp.take() {
@@ -888,10 +1006,10 @@ async fn open_session_resources(
 
 async fn shutdown_session_resources(mut resources: SessionResources) -> Result<(), String> {
     let host = resources.host.shutdown().await;
+    let subagents = shutdown_subagent_bridge(&mut resources.subagents).await;
     if let Some(mcp) = resources.mcp.take() {
         mcp.shutdown().await;
     }
-    let subagents = shutdown_subagent_bridge(&mut resources.subagents).await;
     match (host, subagents) {
         (Ok(()), None) => Ok(()),
         (Err(host), None) => Err(host),
@@ -908,51 +1026,6 @@ async fn shutdown_subagent_bridge(
     match bridge.take() {
         Some(bridge) => bridge.shutdown().await.err(),
         None => None,
-    }
-}
-
-async fn restore_session_after_failure(
-    slot: &mut Option<SessionResources>,
-    session_id: &str,
-    options: TurnOptions,
-    state: &AcpState,
-    client: zuno_acp::ClientConnection,
-    build_agent: &str,
-    cause: String,
-) -> zuno_acp::RpcError {
-    let rollback = async {
-        let plan = TurnPlan::resolve(&options, &state.environment).await?;
-        let resources = open_session_resources(
-            plan,
-            &state.environment,
-            state.runs.clone(),
-            AcpSurfaceContext::from_state(state, client),
-            Some(build_agent),
-        )
-        .await?;
-        if resources.host.session_id() == session_id {
-            return Ok(resources);
-        }
-        let actual = resources.host.session_id().to_owned();
-        let cleanup = shutdown_session_resources(resources).await;
-        Err(match cleanup {
-            Ok(()) => format!(
-                "rollback produced ACP session {actual}, expected {session_id}"
-            ),
-            Err(cleanup) => format!(
-                "rollback produced ACP session {actual}, expected {session_id}; rollback cleanup failed: {cleanup}"
-            ),
-        })
-    }
-    .await;
-    match rollback {
-        Ok(resources) => {
-            *slot = Some(resources);
-            zuno_acp::RpcError::internal(cause)
-        }
-        Err(rollback) => zuno_acp::RpcError::internal(format!(
-            "{cause}; rollback failed and session {session_id} is closed: {rollback}"
-        )),
     }
 }
 
@@ -996,12 +1069,99 @@ fn persist_dormant_configuration(
 }
 
 impl AcpSession {
+    async fn delete_durable(
+        &self,
+        cleanup_derived_experiences: bool,
+    ) -> Result<super::turn::SessionDeleteOutcome, zuno_acp::RpcError> {
+        let _mount = self.mount_gate.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(self.closed_error());
+        }
+        if self.prompt_active.load(Ordering::Acquire) {
+            return Err(zuno_acp::RpcError::invalid_params(format!(
+                "session {} has an active prompt and cannot be deleted",
+                self.id
+            )));
+        }
+        let resources = self.resources.lock().await;
+        match resources.as_ref() {
+            Some(resources) => resources
+                .host
+                .delete_session(&self.id, cleanup_derived_experiences)
+                .map_err(zuno_acp::RpcError::internal),
+            None if cleanup_derived_experiences => {
+                Err(zuno_acp::RpcError::invalid_params(format!(
+                    "session {} is dormant; load it before choosing derived-learning cleanup",
+                    self.id
+                )))
+            }
+            None => {
+                let pool = durable_pool()?;
+                Ok(super::turn::SessionDeleteOutcome {
+                    deleted_session_ids: zuno_db::session::Store::new(&pool)
+                        .remove(&self.id)
+                        .map_err(|error| map_session_lookup(&self.id, error))?,
+                    ..super::turn::SessionDeleteOutcome::default()
+                })
+            }
+        }
+    }
+
     async fn lifecycle_response(&self) -> Result<Value, zuno_acp::RpcError> {
         Ok(self.current_configuration().await?.lifecycle_response())
     }
 
     fn closed_error(&self) -> zuno_acp::RpcError {
         zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
+    }
+
+    async fn restore_after_reconfiguration_failure(
+        &self,
+        slot: &mut Option<SessionResources>,
+        options: TurnOptions,
+        state: &AcpState,
+        client: zuno_acp::ClientConnection,
+        build_agent: &str,
+        cause: String,
+    ) -> zuno_acp::RpcError {
+        let rollback = async {
+            let plan = TurnPlan::resolve(&options, &state.environment).await?;
+            let resources = open_session_resources(
+                plan,
+                &state.environment,
+                state.runs.clone(),
+                AcpSurfaceContext::from_state(state, client),
+                Some(build_agent),
+                &self.mcp_servers,
+            )
+            .await?;
+            if resources.host.session_id() == self.id {
+                return Ok(resources);
+            }
+            let actual = resources.host.session_id().to_owned();
+            let cleanup = shutdown_session_resources(resources).await;
+            Err(match cleanup {
+                Ok(()) => format!(
+                    "rollback produced ACP session {actual}, expected {}",
+                    self.id
+                ),
+                Err(cleanup) => format!(
+                    "rollback produced ACP session {actual}, expected {}; rollback cleanup failed: {cleanup}",
+                    self.id
+                ),
+            })
+        }
+        .await;
+        match rollback {
+            Ok(resources) => {
+                *slot = Some(resources);
+                zuno_acp::RpcError::internal(cause)
+            }
+            Err(rollback) => zuno_acp::RpcError::internal(format!(
+                "{cause}; rollback failed and session {} is closed: {rollback}",
+                self.id
+            )),
+        }
     }
 
     async fn current_configuration(&self) -> Result<SessionConfiguration, zuno_acp::RpcError> {
@@ -1131,21 +1291,22 @@ impl AcpSession {
             state.runs.clone(),
             AcpSurfaceContext::from_state(state, client.clone()),
             Some(&build_agent),
+            &self.mcp_servers,
         )
         .await
         {
             Ok(candidate) => candidate,
             Err(error) => {
-                return Err(restore_session_after_failure(
-                    &mut slot,
-                    &self.id,
-                    rollback_options,
-                    state,
-                    client,
-                    &build_agent,
-                    format!("ACP session reconfiguration failed: {error}"),
-                )
-                .await);
+                return Err(self
+                    .restore_after_reconfiguration_failure(
+                        &mut slot,
+                        rollback_options,
+                        state,
+                        client,
+                        &build_agent,
+                        format!("ACP session reconfiguration failed: {error}"),
+                    )
+                    .await);
             }
         };
         if candidate.host.session_id() != self.id {
@@ -1161,16 +1322,16 @@ impl AcpSession {
                     self.id
                 ),
             };
-            return Err(restore_session_after_failure(
-                &mut slot,
-                &self.id,
-                rollback_options,
-                state,
-                client,
-                &build_agent,
-                cause,
-            )
-            .await);
+            return Err(self
+                .restore_after_reconfiguration_failure(
+                    &mut slot,
+                    rollback_options,
+                    state,
+                    client,
+                    &build_agent,
+                    cause,
+                )
+                .await);
         }
         let persistence = match prepared.persistence {
             ConfigurationPersistence::None => Ok(()),
@@ -1185,16 +1346,16 @@ impl AcpSession {
                     "could not persist ACP session configuration: {error}; candidate cleanup failed: {cleanup}"
                 ),
             };
-            return Err(restore_session_after_failure(
-                &mut slot,
-                &self.id,
-                rollback_options,
-                state,
-                client,
-                &build_agent,
-                cause,
-            )
-            .await);
+            return Err(self
+                .restore_after_reconfiguration_failure(
+                    &mut slot,
+                    rollback_options,
+                    state,
+                    client,
+                    &build_agent,
+                    cause,
+                )
+                .await);
         }
         let configuration = candidate.configuration.clone();
         *slot = Some(candidate);
@@ -1236,7 +1397,7 @@ impl AcpSession {
 
     async fn prompt(
         &self,
-        prompt: AcpPrompt,
+        mut prompt: AcpPrompt,
         state: &AcpState,
         client: zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
@@ -1254,6 +1415,11 @@ impl AcpSession {
         let activated = self.ensure_active(state, client.clone()).await?;
         if activated {
             self.defer_available_commands(&client).await?;
+        }
+        {
+            let resources = self.resources.lock().await;
+            let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
+            prompt.admit_images(resources.host.attachment_store().as_ref())?;
         }
         self.recover_pending_human_requests(&client).await?;
         let (context_size, invocation) = {
@@ -1287,7 +1453,10 @@ impl AcpSession {
             let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
             let outcome = match &invocation {
                 Some(SlashInvocation::Session { command, arguments }) => match command {
-                    SessionCommand::Compact | SessionCommand::Goal => resources
+                    SessionCommand::Compact
+                    | SessionCommand::Goal
+                    | SessionCommand::Learn
+                    | SessionCommand::Reflect => resources
                         .host
                         .execute_session_command(*command, arguments, events.clone())
                         .await
@@ -1326,7 +1495,7 @@ impl AcpSession {
         let (driven, projected) = tokio::join!(drive, projection);
         let projected = projected?;
         self.flush_subagents().await?;
-        self.project_plan(&client).await?;
+        self.project_work_state(&client).await?;
         let mut driven = driven;
         let mut projected = projected;
         loop {
@@ -1557,7 +1726,10 @@ impl AcpSession {
             SessionCommand::Plan if current.mode == "plan" => "build",
             SessionCommand::Plan | SessionCommand::StartPlan => "plan",
             SessionCommand::StartWork => "build",
-            SessionCommand::Compact | SessionCommand::Goal => {
+            SessionCommand::Compact
+            | SessionCommand::Goal
+            | SessionCommand::Learn
+            | SessionCommand::Reflect => {
                 return Err(zuno_acp::RpcError::internal(format!(
                     "/{} is not a mode control",
                     command.name()
@@ -1637,6 +1809,7 @@ impl AcpSession {
             state.runs.clone(),
             AcpSurfaceContext::from_state(state, client),
             Some(&dormant.configuration.build_agent),
+            &self.mcp_servers,
         )
         .await
         {
@@ -1666,20 +1839,20 @@ impl AcpSession {
         Ok(true)
     }
 
-    async fn project_plan(
+    async fn project_work_state(
         &self,
         client: &zuno_acp::ClientConnection,
     ) -> Result<(), zuno_acp::RpcError> {
-        let update = {
+        let updates = {
             let resources = self.resources.lock().await;
             let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
             let work = resources
                 .host
                 .work_state()
                 .map_err(zuno_acp::RpcError::internal)?;
-            zuno_acp::durable_plan_update(&work)
+            zuno_acp::durable_work_updates(&work)
         };
-        if let Some(update) = update {
+        for update in updates {
             client.session_update(&self.id, update).await?;
         }
         Ok(())
@@ -1726,13 +1899,26 @@ impl AcpSession {
         let connection = pool
             .open_connection()
             .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
-        let history = zuno_engine::r#loop::hydrate_retained_history_tail(
+        let mut history = zuno_engine::r#loop::hydrate_retained_history_tail(
             &connection,
             &self.id,
             zuno_acp::REPLAY_MESSAGE_CAP,
             zuno_acp::REPLAY_TRANSCRIPT_BYTE_CAP,
         )
         .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+        let attachments = self
+            .resources
+            .lock()
+            .await
+            .as_ref()
+            .map(|resources| resources.host.attachment_store())
+            .ok_or_else(|| {
+                zuno_acp::RpcError::internal(
+                    "active ACP session has no attachment service for durable replay",
+                )
+            })?;
+        hydrate_replay_attachments(&mut history.messages, attachments.as_ref())
+            .map_err(zuno_acp::RpcError::internal)?;
         let work_state = replay_work_state(Arc::clone(&pool), &self.id)?;
         let context_size = stored
             .usage
@@ -1751,7 +1937,7 @@ impl AcpSession {
             }
             client.session_update(&self.id, update).await?;
         }
-        if let Some(update) = zuno_acp::durable_plan_update(&work_state) {
+        for update in zuno_acp::durable_work_updates(&work_state) {
             if self.closed.load(Ordering::Acquire) {
                 return Err(self.closed_error());
             }
@@ -1772,6 +1958,7 @@ impl AcpSession {
                 &self.id,
                 &self.replay_root,
                 configured_context_size,
+                Arc::clone(&attachments),
             )
             .await?;
         }
@@ -1851,7 +2038,10 @@ fn replay_work_state(
     pool: Arc<zuno_db::pool::Pool>,
     session_id: &str,
 ) -> Result<zuno_types::WorkStateProjection, zuno_acp::RpcError> {
-    let snapshot = zuno_tools::work_state::WorkStateStore::new(pool)
+    let session = zuno_db::session::Store::new(pool.as_ref())
+        .get(session_id)
+        .map_err(|error| map_session_lookup(session_id, error))?;
+    let snapshot = zuno_tools::work_state::WorkStateStore::new(Arc::clone(&pool))
         .snapshot(session_id)
         .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
     let plan = snapshot.plan.map(|plan| zuno_types::PlanProjection {
@@ -1893,9 +2083,13 @@ fn replay_work_state(
             time_updated: item.time_updated,
         })
         .collect();
+    let learning = zuno_learning::LearningProjectionService::new(pool)
+        .snapshot(session_id, &session.project_id)
+        .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
     Ok(zuno_types::WorkStateProjection {
         plan,
         todos,
+        learning,
         ..zuno_types::WorkStateProjection::default()
     })
 }
@@ -1906,6 +2100,7 @@ async fn replay_child_sessions(
     root_session_id: &str,
     replay_root: &std::path::Path,
     default_context_size: u64,
+    attachments: Arc<zuno_attachment::AttachmentStore>,
 ) -> Result<(), zuno_acp::RpcError> {
     let store = zuno_db::session::Store::new(pool.as_ref());
     let mut pending = VecDeque::from([root_session_id.to_owned()]);
@@ -1946,13 +2141,15 @@ async fn replay_child_sessions(
                 }),
             )
             .await?;
-        let history = zuno_engine::r#loop::hydrate_retained_history_tail(
+        let mut history = zuno_engine::r#loop::hydrate_retained_history_tail(
             &connection,
             &child.id,
             zuno_acp::REPLAY_MESSAGE_CAP,
             zuno_acp::REPLAY_TRANSCRIPT_BYTE_CAP,
         )
         .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+        hydrate_replay_attachments(&mut history.messages, attachments.as_ref())
+            .map_err(zuno_acp::RpcError::internal)?;
         let replay = zuno_acp::durable_updates(
             &history.messages,
             &zuno_acp::ReplayPolicy::for_workspace(replay_root),
@@ -1962,7 +2159,7 @@ async fn replay_child_sessions(
             client.session_update(&child.id, update).await?;
         }
         let work_state = replay_work_state(Arc::clone(&pool), &child.id)?;
-        if let Some(update) = zuno_acp::durable_plan_update(&work_state) {
+        for update in zuno_acp::durable_work_updates(&work_state) {
             client.session_update(&child.id, update).await?;
         }
         let context_size = child
@@ -1988,6 +2185,44 @@ async fn replay_child_sessions(
                 }),
             )
             .await?;
+    }
+    Ok(())
+}
+
+pub(super) fn hydrate_replay_attachments(
+    messages: &mut [zuno_db::message::MessageWithParts],
+    store: &zuno_attachment::AttachmentStore,
+) -> Result<(), String> {
+    for message in messages {
+        for part in &mut message.parts {
+            if part.kind != zuno_db::message::PartKind::File {
+                continue;
+            }
+            let Some(reference) = part.data.get("attachment").cloned() else {
+                continue;
+            };
+            let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(
+                reference,
+            )
+            .map_err(|error| {
+                format!(
+                    "durable image part `{}` has an invalid attachment reference: {error}",
+                    part.id
+                )
+            })?;
+            let bytes = store.read(&reference).map_err(|error| {
+                format!(
+                    "durable image part `{}` cannot resolve attachment {}: {error}",
+                    part.id, reference.id
+                )
+            })?;
+            part.data
+                .insert("mime".to_owned(), json!(reference.media_type));
+            part.data.insert(
+                "data".to_owned(),
+                json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            );
+        }
     }
     Ok(())
 }
@@ -2347,6 +2582,40 @@ impl AcpPrompt {
             _ => None,
         }
     }
+
+    fn admit_images(
+        &mut self,
+        store: &zuno_attachment::AttachmentStore,
+    ) -> Result<(), zuno_acp::RpcError> {
+        for block in &mut self.content {
+            match block {
+                RequestContentBlock::Image {
+                    filename,
+                    media_type,
+                    data,
+                } => {
+                    let reference = store
+                        .admit_base64_typed(data, Some(media_type), filename.clone())
+                        .map_err(|error| {
+                            zuno_acp::RpcError::invalid_params(format!(
+                                "image admission failed: {error}"
+                            ))
+                        })?;
+                    *block = RequestContentBlock::ImageAttachment { reference };
+                }
+                RequestContentBlock::ImageAttachment { reference } => {
+                    store.read(reference).map_err(|error| {
+                        zuno_acp::RpcError::invalid_params(format!(
+                            "durable image attachment is invalid: {error}"
+                        ))
+                    })?;
+                }
+                _ => {}
+            }
+        }
+        self.text = render_acp_prompt(&self.content);
+        Ok(())
+    }
 }
 
 fn parse_prompt(params: &Value) -> Result<AcpPrompt, zuno_acp::RpcError> {
@@ -2354,7 +2623,6 @@ fn parse_prompt(params: &Value) -> Result<AcpPrompt, zuno_acp::RpcError> {
         .get("prompt")
         .and_then(Value::as_array)
         .ok_or_else(|| zuno_acp::RpcError::invalid_params("prompt must be an array"))?;
-    let mut rendered = Vec::new();
     let mut content = Vec::new();
     for block in blocks {
         let kind = block.get("type").and_then(Value::as_str).ok_or_else(|| {
@@ -2408,20 +2676,11 @@ fn parse_prompt(params: &Value) -> Result<AcpPrompt, zuno_acp::RpcError> {
                 )));
             }
         };
-        let text = resolved.provider_text().map(|text| text.into_owned());
-        if let Some(text) = text.filter(|text| !text.is_empty()) {
-            rendered.push(text);
-            content.push(resolved);
-        } else if let RequestContentBlock::Image {
-            filename,
-            media_type,
-            ..
-        } = &resolved
+        if resolved
+            .provider_text()
+            .is_some_and(|text| !text.is_empty())
+            || matches!(resolved, RequestContentBlock::Image { .. })
         {
-            rendered.push(filename.as_ref().map_or_else(
-                || format!("Attached image ({media_type})"),
-                |filename| format!("Attached image: {filename} ({media_type})"),
-            ));
             content.push(resolved);
         }
     }
@@ -2431,9 +2690,38 @@ fn parse_prompt(params: &Value) -> Result<AcpPrompt, zuno_acp::RpcError> {
         ));
     }
     Ok(AcpPrompt {
-        text: rendered.join("\n\n"),
+        text: render_acp_prompt(&content),
         content,
     })
+}
+
+fn render_acp_prompt(content: &[RequestContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|block| {
+            if let Some(text) = block.provider_text().filter(|text| !text.is_empty()) {
+                return Some(text.into_owned());
+            }
+            match block {
+                RequestContentBlock::Image {
+                    filename,
+                    media_type,
+                    ..
+                } => Some(filename.as_ref().map_or_else(
+                    || format!("Attached image ({media_type})"),
+                    |filename| format!("Attached image: {filename} ({media_type})"),
+                )),
+                RequestContentBlock::ImageAttachment { reference } => {
+                    Some(reference.filename.as_ref().map_or_else(
+                        || format!("Attached image ({})", reference.media_type),
+                        |filename| format!("Attached image: {filename} ({})", reference.media_type),
+                    ))
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn parse_image_block(block: &Value) -> Result<RequestContentBlock, zuno_acp::RpcError> {
@@ -2530,52 +2818,11 @@ fn validated_image(
             "image block MIME type must start with image/, got {media_type}"
         )));
     }
-    if data.len() > ACP_IMAGE_MAX_BASE64_BYTES {
-        return Err(zuno_acp::RpcError::invalid_params(format!(
-            "image exceeds the {} MiB limit",
-            ACP_IMAGE_MAX_BYTES / (1024 * 1024)
-        )));
-    }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&data)
-        .map_err(|error| {
-            zuno_acp::RpcError::invalid_params(format!("image data is not valid base64: {error}"))
-        })?;
-    if bytes.len() > ACP_IMAGE_MAX_BYTES {
-        return Err(zuno_acp::RpcError::invalid_params(format!(
-            "image exceeds the {} MiB limit",
-            ACP_IMAGE_MAX_BYTES / (1024 * 1024)
-        )));
-    }
-    let detected = image_media_type(&bytes).ok_or_else(|| {
-        zuno_acp::RpcError::invalid_params(
-            "image data is not a supported PNG, JPEG, GIF, or WebP payload",
-        )
-    })?;
-    if detected != media_type {
-        return Err(zuno_acp::RpcError::invalid_params(format!(
-            "image MIME {media_type} does not match detected {detected}"
-        )));
-    }
     Ok(RequestContentBlock::Image {
         filename: uri.and_then(filename_from_uri),
         media_type: media_type.to_owned(),
         data,
     })
-}
-
-fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
 }
 
 fn filename_from_uri(uri: &str) -> Option<String> {
@@ -2832,27 +3079,17 @@ fn lifecycle_directory(params: &Value) -> Result<PathBuf, zuno_acp::RpcError> {
     Ok(cwd)
 }
 
-fn require_empty_roots_and_client_mcp(params: &Value) -> Result<(), zuno_acp::RpcError> {
-    for (field, label) in [
-        ("additionalDirectories", "additional workspace directories"),
-        ("mcpServers", "client-provided MCP servers"),
-    ] {
-        let Some(value) = params.get(field) else {
-            if field == "mcpServers" {
-                return Err(zuno_acp::RpcError::invalid_params(
-                    "mcpServers must be an array",
-                ));
-            }
-            continue;
-        };
-        let values = value.as_array().ok_or_else(|| {
-            zuno_acp::RpcError::invalid_params(format!("{field} must be an array"))
-        })?;
-        if !values.is_empty() {
-            return Err(zuno_acp::RpcError::invalid_params(format!(
-                "{label} are not advertised by this ACP adapter; configure them in Zuno"
-            )));
-        }
+fn require_empty_additional_directories(params: &Value) -> Result<(), zuno_acp::RpcError> {
+    let Some(value) = params.get("additionalDirectories") else {
+        return Ok(());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        zuno_acp::RpcError::invalid_params("additionalDirectories must be an array")
+    })?;
+    if !values.is_empty() {
+        return Err(zuno_acp::RpcError::invalid_params(
+            "additional workspace directories are not advertised by this ACP adapter",
+        ));
     }
     Ok(())
 }
@@ -2917,6 +3154,13 @@ fn required_string(params: &Value, field: &str) -> Result<String, zuno_acp::RpcE
         .ok_or_else(|| {
             zuno_acp::RpcError::invalid_params(format!("{field} must be a non-empty string"))
         })
+}
+
+fn required_bool(params: &Value, field: &str) -> Result<bool, zuno_acp::RpcError> {
+    params
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| zuno_acp::RpcError::invalid_params(format!("missing boolean `{field}`")))
 }
 
 fn optional_u64(params: &Value, field: &str) -> Result<Option<u64>, zuno_acp::RpcError> {
@@ -3119,7 +3363,9 @@ mod tests {
             vec![
                 "compact",
                 "goal",
+                "learn",
                 "plan",
+                "reflect",
                 "start-plan",
                 "start-work",
                 "review",
@@ -3132,7 +3378,12 @@ mod tests {
         );
         assert!(advertised[0].get("input").is_none());
         assert_eq!(advertised[1]["input"]["hint"], "objective | action [value]");
-        assert_eq!(advertised[5]["input"]["hint"], "question");
+        assert_eq!(
+            advertised[2]["input"]["hint"],
+            "remember|issue|solved|forget|promote|feedback ..."
+        );
+        assert_eq!(advertised[4]["input"]["hint"], "turn | session");
+        assert_eq!(advertised[7]["input"]["hint"], "question");
     }
 
     #[test]
@@ -3277,7 +3528,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_parser_accepts_embedded_image_blobs_and_rejects_oversized_images() {
+    fn prompt_parser_defers_embedded_image_limits_to_admission() {
         let parsed = parse_prompt(&json!({
             "prompt": [{
                 "type": "resource",
@@ -3298,15 +3549,31 @@ mod tests {
             } if filename == "pixel.png" && media_type == "image/png"
         ));
 
-        let oversized = "A".repeat(ACP_IMAGE_MAX_BASE64_BYTES + 1);
-        let error = parse_prompt(&json!({
+        let mut oversized = parse_prompt(&json!({
             "prompt": [{
                 "type": "image",
                 "mimeType": "image/png",
-                "data": oversized
+                "data": "AAAA"
             }]
         }))
-        .expect_err("oversized image must be rejected");
-        assert!(error.message.contains("exceeds"));
+        .expect("the parser only validates the ACP shape");
+        let root = tempfile::tempdir().expect("attachment root");
+        let store = zuno_attachment::AttachmentStore::new(
+            root.path(),
+            "database",
+            zuno_attachment::ImageAdmissionPolicy {
+                max_source_bytes: 1,
+                ..zuno_attachment::ImageAdmissionPolicy::default()
+            },
+        )
+        .expect("attachment store");
+        let error = oversized
+            .admit_images(&store)
+            .expect_err("admission must enforce the configured byte limit");
+        assert!(
+            error.message.contains("admission limit"),
+            "unexpected admission error: {}",
+            error.message
+        );
     }
 }

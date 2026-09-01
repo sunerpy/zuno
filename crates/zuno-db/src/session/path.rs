@@ -68,22 +68,43 @@ fn to_posix(value: &str) -> String {
 /// `/`; a relative one that normalizes away becomes `"."`, as Node's does.
 fn resolve(value: &str) -> String {
     let mut resolved = value.to_owned();
-    let mut absolute = value.starts_with('/');
+    let mut absolute = is_absolute(value);
     if !absolute {
         let cwd = std::env::current_dir()
             .map(|path| to_posix(&path.to_string_lossy()))
             .unwrap_or_else(|_| String::from("/"));
-        absolute = cwd.starts_with('/');
+        absolute = is_absolute(&cwd);
         resolved = format!("{cwd}/{resolved}");
     }
+    let root = if resolved.starts_with("//") {
+        "//"
+    } else if resolved.starts_with('/') {
+        "/"
+    } else {
+        ""
+    };
     let normalized = normalize_string(&resolved, !absolute);
-    if absolute {
-        return format!("/{normalized}");
+    if absolute && !root.is_empty() {
+        return format!("{root}{normalized}");
     }
     if normalized.is_empty() {
         return String::from(".");
     }
     normalized
+}
+
+/// Whether a slash-normalized path has a POSIX, drive-letter, or UNC root.
+///
+/// `Path::is_absolute` is deliberately not used after [`to_posix`]: on Windows
+/// it accepts drive paths but the same code is also exercised by cross-platform
+/// lexical fixtures. Recognizing all three shapes here keeps a native
+/// `D:/a/zuno` from being prefixed with the current directory a second time.
+fn is_absolute(value: &str) -> bool {
+    value.starts_with('/')
+        || value
+            .as_bytes()
+            .get(..3)
+            .is_some_and(|prefix| prefix[0].is_ascii_alphabetic() && prefix[1..] == *b":/")
 }
 
 /// Node's `normalizeString`: collapse `.`, `..` and repeated separators.
@@ -126,10 +147,27 @@ fn relative(from: &str, to: &str) -> String {
     let from_segments: Vec<&str> = from.split('/').filter(|part| !part.is_empty()).collect();
     let to_segments: Vec<&str> = to.split('/').filter(|part| !part.is_empty()).collect();
 
+    if cfg!(windows)
+        && from_segments
+            .first()
+            .zip(to_segments.first())
+            .is_some_and(|(left, right)| {
+                left.ends_with(':') && right.ends_with(':') && !left.eq_ignore_ascii_case(right)
+            })
+    {
+        return to.to_owned();
+    }
+
     let shared = from_segments
         .iter()
         .zip(to_segments.iter())
-        .take_while(|(left, right)| left == right)
+        .take_while(|(left, right)| {
+            if cfg!(windows) {
+                left.eq_ignore_ascii_case(right)
+            } else {
+                left == right
+            }
+        })
         .count();
 
     let mut parts: Vec<&str> = Vec::new();
@@ -239,6 +277,21 @@ mod tests {
             session_path(&cwd, &path_of("crates/zuno-db")),
             "crates/zuno-db"
         );
+    }
+
+    #[test]
+    fn drive_letter_paths_are_absolute_and_cross_drive_paths_stay_absolute() {
+        assert_eq!(resolve("C:/work/zuno"), "C:/work/zuno");
+        assert_eq!(
+            resolve("//server/share/work/zuno"),
+            "//server/share/work/zuno"
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                relative(&resolve("C:/work/zuno"), &resolve("D:/other")),
+                "D:/other"
+            );
+        }
     }
 
     #[test]

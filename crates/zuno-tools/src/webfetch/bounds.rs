@@ -24,6 +24,7 @@
 //! failure is this".
 
 use std::time::Duration;
+use zuno_network::DiagnosticEndpoint;
 
 /// The maximum number of body bytes a fetch will accept.
 ///
@@ -51,10 +52,10 @@ pub const MAX_TIMEOUT: Duration = Duration::from_secs(120);
 /// **Not from the oracle.** Upstream never states a hop cap: `HttpClient` inherits
 /// whatever the platform fetch does, which on Node is undici's `maxRedirections`.
 /// Leaving it implicit is how a redirect cycle becomes an unbounded loop, so the
-/// bound is named here and pinned by a test. Ten is undici's and every mainstream
-/// browser's limit, so pinning it changes no reachable page while making the bound
-/// explicit.
-pub const MAX_REDIRECTS: usize = 10;
+/// bound is named here and pinned by a test. Five is enough for legitimate scheme
+/// and canonical-host transitions without letting an attacker turn validation into
+/// an unbounded resolver loop.
+pub const MAX_REDIRECTS: usize = 5;
 
 /// The number of body bytes buffered before the response size is known.
 ///
@@ -83,6 +84,14 @@ pub enum WebError {
         /// The parse failure.
         #[source]
         source: url::ParseError,
+    },
+
+    /// The target failed public-network validation.
+    #[error(transparent)]
+    PublicTarget {
+        /// Typed resolver, address, redirect, or transport failure.
+        #[from]
+        source: zuno_network::PublicHttpError,
     },
 
     /// The response exceeded [`MAX_RESPONSE_BYTES`].
@@ -114,6 +123,18 @@ pub enum WebError {
         source: reqwest::Error,
     },
 
+    /// A search-provider transport failure with a credential-free endpoint.
+    #[error("web search provider `{provider}` request to {endpoint} failed")]
+    SearchTransport {
+        /// Stable provider id.
+        provider: &'static str,
+        /// Scheme, host, port, and path only.
+        endpoint: DiagnosticEndpoint,
+        /// Reqwest failure stripped of its URL.
+        #[source]
+        source: reqwest::Error,
+    },
+
     /// The server answered, but not with success.
     ///
     /// Oracle: upstream runs every fetch through `filterStatusOk`
@@ -126,6 +147,19 @@ pub enum WebError {
         /// The status code returned.
         status: u16,
         /// Delay requested by the server, when it supplied numeric seconds.
+        retry_after: Option<Duration>,
+    },
+
+    /// A search provider answered with a non-success status.
+    #[error("web search provider `{provider}` endpoint {endpoint} returned HTTP {status}")]
+    SearchStatus {
+        /// Stable provider id.
+        provider: &'static str,
+        /// Scheme, host, port, and path only.
+        endpoint: DiagnosticEndpoint,
+        /// HTTP status code.
+        status: u16,
+        /// Delay requested by the provider, when supplied.
         retry_after: Option<Duration>,
     },
 
@@ -166,6 +200,13 @@ pub enum WebError {
         /// The provider whose response failed to parse.
         provider: &'static str,
     },
+
+    /// A configured or test-overridden search endpoint was not an absolute URL.
+    #[error("web search provider `{provider}` has an invalid endpoint")]
+    InvalidSearchEndpoint {
+        /// Stable provider id.
+        provider: &'static str,
+    },
 }
 
 impl WebError {
@@ -173,8 +214,9 @@ impl WebError {
     #[must_use]
     pub const fn is_transient(&self) -> bool {
         match self {
-            Self::Transport { .. } => true,
-            Self::Status { status, .. } => {
+            Self::Transport { .. } | Self::SearchTransport { .. } => true,
+            Self::PublicTarget { source } => source.is_transient(),
+            Self::Status { status, .. } | Self::SearchStatus { status, .. } => {
                 matches!(*status, 408 | 425 | 429) || (*status >= 500 && *status <= 599)
             }
             Self::UnsupportedScheme { .. }
@@ -185,7 +227,8 @@ impl WebError {
             | Self::Interrupted { .. }
             | Self::NoSearchProvider
             | Self::MissingSearchCredential { .. }
-            | Self::MalformedSearchResponse { .. } => false,
+            | Self::MalformedSearchResponse { .. }
+            | Self::InvalidSearchEndpoint { .. } => false,
         }
     }
 
@@ -193,7 +236,9 @@ impl WebError {
     #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::Status { retry_after, .. } => *retry_after,
+            Self::Status { retry_after, .. } | Self::SearchStatus { retry_after, .. } => {
+                *retry_after
+            }
             _ => None,
         }
     }

@@ -180,7 +180,8 @@ fn pair_ids(entries: &[TranscriptEntry]) -> (BTreeSet<String>, BTreeSet<String>)
                 | RequestContentBlock::ResourceLink { .. }
                 | RequestContentBlock::SignedThinking { .. }
                 | RequestContentBlock::ProviderEncryptedReasoning { .. }
-                | RequestContentBlock::Image { .. } => {}
+                | RequestContentBlock::Image { .. }
+                | RequestContentBlock::ImageAttachment { .. } => {}
             }
         }
     }
@@ -473,7 +474,8 @@ async fn compaction_summarizes_two_hundred_messages_with_the_small_model_and_res
             | RequestContentBlock::ProviderEncryptedReasoning { .. }
             | RequestContentBlock::ToolUse { .. }
             | RequestContentBlock::ToolResult { .. }
-            | RequestContentBlock::Image { .. } => None,
+            | RequestContentBlock::Image { .. }
+            | RequestContentBlock::ImageAttachment { .. } => None,
         })
         .expect("text summary prompt");
     for section in [

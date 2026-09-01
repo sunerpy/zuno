@@ -180,6 +180,7 @@ mod tests {
         assert!(found.errors.is_empty(), "{:?}", found.errors);
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_directories_are_followed_and_reported_by_link_path() {
         let dir = TempDir::new().expect("tempdir");

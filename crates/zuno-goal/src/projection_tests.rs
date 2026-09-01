@@ -792,8 +792,9 @@ fn the_render_is_deterministic_so_two_renders_of_one_state_are_identical() {
     assert_ne!(render(&goal, &notes), render(&goal, &Notes::default()));
 }
 
-/// The acceptance criterion: a concurrent reader must never observe a partial
-/// document across 1,000 renders.
+/// The acceptance criterion: the product read boundary must never expose a
+/// partial document or a transient Windows replacement error across 1,000
+/// renders.
 ///
 /// The reader fully parses and validates on every read rather than checking the
 /// file is non-empty, because a length check passes against a file that was
@@ -820,8 +821,12 @@ fn the_render_is_atomic_under_a_concurrent_reader() {
             let started = Instant::now();
             let mut failures = Vec::new();
             while !done.load(Ordering::Acquire) && started.elapsed() < DEADLINE {
-                let raw = match std::fs::read_to_string(&path) {
-                    Ok(raw) => raw,
+                let raw = match read_optional(&path) {
+                    Ok(Some(raw)) => raw,
+                    Ok(None) => {
+                        failures.push("published projection appeared absent".to_owned());
+                        continue;
+                    }
                     Err(error) => {
                         failures.push(format!("read failed: {error}"));
                         continue;

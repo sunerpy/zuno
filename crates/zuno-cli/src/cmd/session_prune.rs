@@ -124,7 +124,9 @@ impl RemoteUnshare for UnavailableRemote {
 
 pub(super) fn run(pool: &Pool, args: &SessionPruneArgs) -> Result<(), String> {
     let confirm_delete = confirm_delete(args, std::io::stdin().is_terminal(), || {
-        eprint!("Delete the selected sessions and artifacts? [y/N] ");
+        eprint!(
+            "Delete the selected sessions and artifacts while retaining project learning? [y/N] "
+        );
         std::io::stderr()
             .flush()
             .map_err(|error| error.to_string())?;

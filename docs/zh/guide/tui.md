@@ -104,6 +104,8 @@ zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 | `/new` | 打开一个空的对话外壳 |
 | `/subagent` | 检查席位与节点进度 |
 | `/memory` | 复核、编辑、批准、拒绝、移除和撤销持久记忆变更 |
+| `/learn [action]` | 查看或管理经验、反馈、模式和待审 Skill 候选 |
+| `/reflect [turn\|session]` | 手动运行持久、无工具权限的学习提取器 |
 
 TUI 的 `/goal <目标>` 与 ACP 使用同一个持久宿主命令。尚无 Goal，或上一条 Goal
 已完成、已取消时，它会创建新 Goal；其他状态下则更新当前 Goal。`/goal show`、

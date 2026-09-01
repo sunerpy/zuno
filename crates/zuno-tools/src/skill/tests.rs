@@ -431,12 +431,18 @@ async fn a_referenced_skill_resource_is_read_without_filesystem_discovery() {
         .expect("resource read");
 
     assert_eq!(output.output, "# CI contract\nPinned actions.\n");
+    let expected_path = zuno_paths::wire_path(
+        &references
+            .join("ci.md")
+            .canonicalize()
+            .expect("canonical reference path"),
+    );
     assert_eq!(
         output
             .metadata
             .get("path")
             .and_then(serde_json::Value::as_str),
-        Some(references.join("ci.md").to_string_lossy().as_ref())
+        Some(expected_path.as_str())
     );
 }
 

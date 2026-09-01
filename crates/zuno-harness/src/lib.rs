@@ -16,8 +16,11 @@ use zuno_tools::registry::{BuiltinSlot, CustomTool, DEFAULT_BUILTINS};
 const CORE_BUNDLE_ID: &str = "zuno.core";
 const ORCHESTRATION_CAPABILITIES_BUNDLE_ID: &str = "zuno.orchestration-capabilities";
 const ORCHESTRATION_CAPABILITIES_COMPONENT_ID: &str = "zuno.orchestration-capabilities";
+const HOST_PLANNING_BUNDLE_ID: &str = "zuno.host-planning";
+const HOST_PLANNING_COMPONENT_ID: &str = "zuno.host-planning";
 const TOOL_MANIFEST_COMPONENT_ID: &str = "zuno.tools";
 const TOOL_CONTRIBUTIONS_COMPONENT_ID: &str = "zuno.tool-contributions";
+const PUBLIC_HTTP_COMPONENT_ID: &str = "zuno.public-http";
 const PRODUCT_CAPABILITY_SCOPE: &str = "profile";
 const PRODUCT_CAPABILITY_VERSION: CapabilityVersion = CapabilityVersion::new(1, 0);
 
@@ -186,6 +189,27 @@ pub enum ToolContributionsError {
     Duplicate(String),
 }
 
+/// Typed marker granting the host permission to maintain durable Plans.
+///
+/// This is independent from the model-visible `plan_update` tool. A profile may
+/// expose that tool without granting host planning, or hide the tool while the
+/// default host continues to classify work and persist recovery state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostPlanningCapability;
+
+struct HostPlanningCapabilityComponent;
+
+#[async_trait]
+impl Component for HostPlanningCapabilityComponent {
+    fn id(&self) -> &str {
+        HOST_PLANNING_COMPONENT_ID
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        context.provide(Arc::new(HostPlanningCapability))
+    }
+}
+
 struct ToolManifestComponent {
     manifest: Arc<ToolManifest>,
 }
@@ -210,12 +234,35 @@ impl Component for ToolManifestComponent {
 }
 
 struct ToolContributionsComponent {
+    id: String,
     contributions: Arc<ToolContributions>,
 }
 
+struct PublicHttpComponent {
+    client: Arc<zuno_network::PublicHttpClient>,
+}
+
+impl PublicHttpComponent {
+    fn new(client: Arc<zuno_network::PublicHttpClient>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl Component for PublicHttpComponent {
+    fn id(&self) -> &str {
+        PUBLIC_HTTP_COMPONENT_ID
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        context.provide(Arc::clone(&self.client))
+    }
+}
+
 impl ToolContributionsComponent {
-    fn new(contributions: ToolContributions) -> Self {
+    fn new(id: impl Into<String>, contributions: ToolContributions) -> Self {
         Self {
+            id: id.into(),
             contributions: Arc::new(contributions),
         }
     }
@@ -224,7 +271,7 @@ impl ToolContributionsComponent {
 #[async_trait]
 impl Component for ToolContributionsComponent {
     fn id(&self) -> &str {
-        TOOL_CONTRIBUTIONS_COMPONENT_ID
+        &self.id
     }
 
     async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
@@ -351,6 +398,21 @@ pub fn orchestration_capabilities_bundle(snapshot: Arc<CapabilitySnapshot>) -> P
         .with_component(OrchestrationCapabilitiesComponent::new(snapshot))
 }
 
+/// Build a profile bundle that publishes one complete native tool snapshot.
+///
+/// A child runtime can mount this bundle to shadow inherited contributions after
+/// adding session-scoped providers. The caller supplies a distinct component id
+/// because component registration, replacement, and disposal are identity based.
+#[must_use]
+pub fn tool_contributions_bundle(
+    bundle_id: impl Into<String>,
+    component_id: impl Into<String>,
+    contributions: ToolContributions,
+) -> ProfileBundle {
+    ProfileBundle::new(bundle_id)
+        .with_component(ToolContributionsComponent::new(component_id, contributions))
+}
+
 /// Build a profile from an arbitrary driver and native tool surface.
 #[must_use]
 pub fn profile(
@@ -369,11 +431,37 @@ pub fn profile_with_tools(
     tools: ToolManifest,
     contributions: ToolContributions,
 ) -> HarnessProfile {
+    profile_with_tools_and_public_http(
+        id,
+        driver,
+        tools,
+        contributions,
+        Arc::new(zuno_network::PublicHttpClient::new()),
+    )
+}
+
+/// Build a profile with an explicitly owned public-internet transport.
+///
+/// This is the injection seam for host-specific DNS resolution and public-target
+/// policy. `webfetch` consumes the activated typed service rather than constructing
+/// a process-global client.
+#[must_use]
+pub fn profile_with_tools_and_public_http(
+    id: impl Into<String>,
+    driver: Arc<dyn AgentDriver>,
+    tools: ToolManifest,
+    contributions: ToolContributions,
+    public_http: Arc<zuno_network::PublicHttpClient>,
+) -> HarnessProfile {
     HarnessProfile::new(id).with_bundle(
         ProfileBundle::new(CORE_BUNDLE_ID)
             .with_component(AgentDriverComponent::new(driver))
             .with_component(ToolManifestComponent::new(tools))
-            .with_component(ToolContributionsComponent::new(contributions)),
+            .with_component(ToolContributionsComponent::new(
+                TOOL_CONTRIBUTIONS_COMPONENT_ID,
+                contributions,
+            ))
+            .with_component(PublicHttpComponent::new(public_http)),
     )
 }
 
@@ -396,5 +484,8 @@ pub fn default_profile_with_tools(contributions: ToolContributions) -> HarnessPr
         Arc::new(DefaultAgentDriver),
         ToolManifest::standard(),
         contributions,
+    )
+    .with_bundle(
+        ProfileBundle::new(HOST_PLANNING_BUNDLE_ID).with_component(HostPlanningCapabilityComponent),
     )
 }

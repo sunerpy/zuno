@@ -313,7 +313,8 @@ mod tests {
         let env = ScriptedEnv::new().expect("scripted env");
         let vars = env.env_vars();
         let root = env.root().to_string_lossy().into_owned();
-        for key in [
+        #[cfg(not(windows))]
+        let rooted_keys = [
             "HOME",
             "XDG_DATA_HOME",
             "XDG_CONFIG_HOME",
@@ -321,22 +322,50 @@ mod tests {
             "XDG_STATE_HOME",
             "TMPDIR",
             "ZUNO_TEST_HOME",
+        ];
+        #[cfg(windows)]
+        let rooted_keys = [
+            "HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "TMPDIR",
             "ZUNO_TEST_HOME",
-        ] {
+            "USERPROFILE",
+            "TEMP",
+            "TMP",
+        ];
+        for key in rooted_keys {
             let value = vars.get(key).unwrap_or_else(|| panic!("{key} must be set"));
             assert!(
                 value.starts_with(&root),
                 "{key}={value} escaped the temp tree"
             );
         }
+        #[cfg(windows)]
+        let os_mandatory = [
+            "ComSpec",
+            "NUMBER_OF_PROCESSORS",
+            "PATHEXT",
+            "PROCESSOR_ARCHITECTURE",
+            "SystemDrive",
+            "SystemRoot",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "windir",
+        ];
+        #[cfg(not(windows))]
+        let os_mandatory: [&str; 0] = [];
         // Nothing from the host except the documented passthrough.
         let unexpected: Vec<&String> = vars
             .keys()
             .filter(|k| {
                 !k.starts_with("XDG_")
                     && !k.starts_with("ZUNO_")
-                    && !k.starts_with("ZUNO_")
                     && !matches!(k.as_str(), "HOME" | "TMPDIR" | "PATH")
+                    && !os_mandatory.contains(&k.as_str())
             })
             .collect();
         assert!(

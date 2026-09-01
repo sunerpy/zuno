@@ -113,6 +113,19 @@ Historical image bytes are excluded from the compaction request. A stable label 
 `[Attached diagram.png (image/png)]` stands in, while the original durable file part is
 untouched for authoritative replay.
 
+## Optional continuity
+
+When `continuity.history` is enabled, the model can inspect normalized evidence from this
+session through successful-compaction windows. The tool never crosses a session boundary
+and excludes reasoning, encrypted content, synthetic internal prompt text, and binary
+attachment bytes.
+
+When `continuity.notes` is enabled, logical working documents are stored by
+`session_id + Agent`. They are part of session lifecycle rather than filesystem state:
+session deletion cascades through them, prune counts and removes them, and session
+export/import preserves both notes and their idempotency ledger. Sanitized exports redact
+note identity and content and remove that ledger.
+
 ## Interruption
 
 A hard interruption is session-scoped and linearizable across turn handoff. If the

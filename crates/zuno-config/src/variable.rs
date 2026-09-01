@@ -482,11 +482,16 @@ mod tests {
         }
 
         fn write(&self, relative: &str, content: &str) {
-            fs::write(self.root.path().join(relative), content).expect("write fixture");
+            fs::write(self.path(relative), content).expect("write fixture");
         }
 
         fn path(&self, relative: &str) -> PathBuf {
-            self.root.path().join(relative)
+            relative
+                .split('/')
+                .filter(|component| !component.is_empty())
+                .fold(self.root.path().to_path_buf(), |path, component| {
+                    path.join(component)
+                })
         }
 
         fn config(&self) -> PathBuf {
@@ -997,12 +1002,19 @@ mod tests {
     fn an_absent_file_is_an_error_naming_the_token_and_the_path() {
         let fixture = Fixture::new();
         let process = Env::empty();
-        let error = at(&fixture, &process)
-            .apply(r#"{"instructions":["{file:/nonexistent/zzz.md}"]}"#)
+        let subject = at(&fixture, &process);
+        let spec = "/nonexistent/zzz.md";
+        let token = format!("{{file:{spec}}}");
+        let expected = subject.resolve_reference(spec);
+        let error = subject
+            .apply(&format!(r#"{{"instructions":["{token}"]}}"#))
             .expect_err("must not be silently empty");
         assert_eq!(
             detail(&error),
-            "bad file reference: \"{file:/nonexistent/zzz.md}\" /nonexistent/zzz.md does not exist"
+            format!(
+                "bad file reference: \"{token}\" {} does not exist",
+                expected.display()
+            )
         );
         assert_eq!(
             error.to_string(),
@@ -1015,14 +1027,16 @@ mod tests {
 
     #[test]
     fn a_read_failure_that_is_not_absence_omits_the_does_not_exist_suffix() {
-        // A directory is readable-but-not-a-file: the oracle's `ENOENT` branch
-        // does not fire. Measured: `file-is-dir`.
+        // An embedded NUL is rejected as an invalid path on every supported
+        // platform. It therefore exercises the non-NotFound branch without
+        // depending on whether that platform permits reading a directory.
         let fixture = Fixture::new();
         let process = Env::empty();
+        let invalid = "{file:\0}";
         let error = at(&fixture, &process)
-            .apply("{file:./}")
-            .expect_err("a directory cannot be read as text");
-        assert_eq!(detail(&error), "bad file reference: \"{file:./}\"");
+            .apply(invalid)
+            .expect_err("an invalid path cannot be read as text");
+        assert_eq!(detail(&error), format!("bad file reference: \"{invalid}\""));
     }
 
     #[test]
@@ -1030,15 +1044,17 @@ mod tests {
         let fixture = Fixture::new();
         let process = Env::empty();
         let subject = at(&fixture, &process).on_missing(Missing::Empty);
+        let spec = "/nonexistent/zzz.md";
+        let token = format!("{{file:{spec}}}");
         assert_eq!(
             subject
-                .apply(r#"{"a":"{file:/nonexistent/zzz.md}"}"#)
+                .apply(&format!(r#"{{"a":"{token}"}}"#))
                 .expect("swallowed"),
             r#"{"a":""}"#
         );
-        // Not just absence: a directory too.
+        // Not just absence: an invalid path too.
         assert_eq!(
-            subject.apply(r#"{"a":"{file:./}"}"#).expect("swallowed"),
+            subject.apply("{\"a\":\"{file:\0}\"}").expect("swallowed"),
             r#"{"a":""}"#
         );
     }

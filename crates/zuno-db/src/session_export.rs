@@ -22,11 +22,15 @@
 //! inserted `ON CONFLICT DO NOTHING`, so importing the same file twice is not a
 //! way to mutate an existing transcript.
 
-use rusqlite::{Connection, Transaction, params};
+use base64::Engine as _;
+use std::collections::BTreeMap;
+
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value};
 use zuno_error::DbError;
 
+use crate::continuity;
 use crate::message::{MessageRecord, MessageStore, PartRecord};
 use crate::open;
 use crate::session_list::{SessionInfo, session_info};
@@ -48,6 +52,33 @@ pub struct ExportMessage {
     pub parts: Vec<Value>,
 }
 
+/// One session-and-Agent scoped working note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportNote {
+    pub agent: String,
+    pub name: String,
+    pub revision: u64,
+    pub content: String,
+    pub content_sha256: String,
+    pub time_created: i64,
+    pub time_updated: i64,
+}
+
+/// One persisted idempotency result for a side-effecting note call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportNoteOperation {
+    pub agent: String,
+    pub call_id: String,
+    pub request_sha256: String,
+    pub action: String,
+    pub name: String,
+    pub result_revision: u64,
+    pub result_content_sha256: String,
+    pub time_created: i64,
+}
+
 /// A whole session as `zuno export` prints it.
 ///
 /// `info` is a bare [`SessionInfo`], not the listing's project wrapper.
@@ -57,6 +88,12 @@ pub struct ExportDocument {
     pub info: SessionInfo,
     /// Every message, oldest first.
     pub messages: Vec<ExportMessage>,
+    /// Current note documents, grouped by the exported session envelope.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<ExportNote>,
+    /// Idempotency rows needed to preserve at-most-once note mutations.
+    #[serde(rename = "noteOperations", skip_serializing_if = "Vec::is_empty")]
+    pub note_operations: Vec<ExportNoteOperation>,
 }
 
 impl ExportDocument {
@@ -131,21 +168,176 @@ fn normalize_numbers(value: &mut Value) {
 /// [`DbError::NotFound`] when no session has this id, and [`DbError::Query`] or
 /// [`DbError::Decode`] if a row cannot be read.
 pub fn export(connection: &Connection, session_id: &str) -> Result<ExportDocument, DbError> {
+    let attachments = attachment_store_for_connection(connection)?;
+    export_inner(connection, session_id, attachments.as_ref())
+}
+
+/// Export using the caller's exact database-scoped attachment store.
+///
+/// Durable image references are converted back to portable inline data URLs so
+/// importing the document never depends on an object store from another database.
+pub fn export_with_attachments(
+    connection: &Connection,
+    session_id: &str,
+    attachments: &zuno_attachment::AttachmentStore,
+) -> Result<ExportDocument, DbError> {
+    export_inner(connection, session_id, Some(attachments))
+}
+
+fn export_inner(
+    connection: &Connection,
+    session_id: &str,
+    attachments: Option<&zuno_attachment::AttachmentStore>,
+) -> Result<ExportDocument, DbError> {
     let session = crate::session::get(connection, session_id)?;
     let hydrated = MessageStore::new(connection).hydrate_session(session_id)?;
+    let mut messages = Vec::with_capacity(hydrated.len());
+    for mut message in hydrated {
+        message.parts.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut parts = Vec::with_capacity(message.parts.len());
+        for part in &message.parts {
+            let mut value = part.to_json();
+            reinline_attachment(&mut value, attachments)?;
+            parts.push(value);
+        }
+        messages.push(ExportMessage {
+            info: message.info.to_json(),
+            parts,
+        });
+    }
     Ok(ExportDocument {
         info: session_info(session),
-        messages: hydrated
-            .into_iter()
-            .map(|mut message| {
-                message.parts.sort_by(|left, right| left.id.cmp(&right.id));
-                ExportMessage {
-                    info: message.info.to_json(),
-                    parts: message.parts.iter().map(PartRecord::to_json).collect(),
-                }
-            })
-            .collect(),
+        messages,
+        notes: export_notes(connection, session_id)?,
+        note_operations: export_note_operations(connection, session_id)?,
     })
+}
+
+fn reinline_attachment(
+    part: &mut Value,
+    attachments: Option<&zuno_attachment::AttachmentStore>,
+) -> Result<(), DbError> {
+    let Some(object) = part.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(reference) = object.get("attachment").cloned() else {
+        return Ok(());
+    };
+    let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(reference)
+        .map_err(|source| DbError::Decode {
+            table: "part".to_owned(),
+            source,
+        })?;
+    let store = attachments.ok_or_else(|| DbError::Query {
+        source: Box::new(zuno_attachment::AttachmentError::StoreUnavailable),
+    })?;
+    let bytes = store.read(&reference).map_err(|source| DbError::Query {
+        source: Box::new(source),
+    })?;
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    object.insert(
+        "mime".to_owned(),
+        Value::String(reference.media_type.clone()),
+    );
+    object.insert("data".to_owned(), Value::String(data.clone()));
+    object.insert(
+        "url".to_owned(),
+        Value::String(format!("data:{};base64,{data}", reference.media_type)),
+    );
+    object.remove("attachment");
+    Ok(())
+}
+
+fn attachment_store_for_connection(
+    connection: &Connection,
+) -> Result<Option<zuno_attachment::AttachmentStore>, DbError> {
+    let mut statement = connection
+        .prepare("PRAGMA database_list")
+        .map_err(open::map_error)?;
+    let mut rows = statement.query([]).map_err(open::map_error)?;
+    let mut target = None;
+    while let Some(row) = rows.next().map_err(open::map_error)? {
+        let name: String = row.get(1).map_err(open::map_error)?;
+        if name == "main" {
+            let path: String = row.get(2).map_err(open::map_error)?;
+            if !path.is_empty() {
+                target = Some(path);
+            }
+            break;
+        }
+    }
+    target
+        .map(|target| {
+            zuno_attachment::AttachmentStore::new(
+                zuno_paths::data(),
+                &zuno_attachment::AttachmentStore::database_identity(target.as_bytes()),
+                zuno_attachment::ImageAdmissionPolicy::default(),
+            )
+            .map_err(|source| DbError::Query {
+                source: Box::new(source),
+            })
+        })
+        .transpose()
+}
+
+fn export_notes(connection: &Connection, session_id: &str) -> Result<Vec<ExportNote>, DbError> {
+    if !continuity::table_exists(connection, continuity::SESSION_NOTE_TABLE)? {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT agent, name, revision, content, content_sha256, time_created, time_updated
+             FROM session_note WHERE session_id = ?1 ORDER BY agent ASC, name ASC",
+        )
+        .map_err(open::map_error)?;
+    let rows = statement
+        .query_map([session_id], |row| {
+            let revision: i64 = row.get(2)?;
+            Ok(ExportNote {
+                agent: row.get(0)?,
+                name: row.get(1)?,
+                revision: u64::try_from(revision).unwrap_or(0),
+                content: row.get(3)?,
+                content_sha256: row.get(4)?,
+                time_created: row.get(5)?,
+                time_updated: row.get(6)?,
+            })
+        })
+        .map_err(open::map_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(open::map_error)
+}
+
+fn export_note_operations(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<ExportNoteOperation>, DbError> {
+    if !continuity::table_exists(connection, continuity::SESSION_NOTE_OPERATION_TABLE)? {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT agent, call_id, request_sha256, action, name, result_revision,
+                    result_content_sha256, time_created
+             FROM session_note_operation
+             WHERE session_id = ?1 ORDER BY agent ASC, time_created ASC, call_id ASC",
+        )
+        .map_err(open::map_error)?;
+    let rows = statement
+        .query_map([session_id], |row| {
+            let revision: i64 = row.get(5)?;
+            Ok(ExportNoteOperation {
+                agent: row.get(0)?,
+                call_id: row.get(1)?,
+                request_sha256: row.get(2)?,
+                action: row.get(3)?,
+                name: row.get(4)?,
+                result_revision: u64::try_from(revision).unwrap_or(0),
+                result_content_sha256: row.get(6)?,
+                time_created: row.get(7)?,
+            })
+        })
+        .map_err(open::map_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(open::map_error)
 }
 
 /// Where an imported session is re-homed.
@@ -172,6 +364,10 @@ pub struct Imported {
     pub messages: usize,
     /// How many parts the document carried.
     pub parts: usize,
+    /// How many note documents the document carried.
+    pub notes: usize,
+    /// How many note idempotency operations the document carried.
+    pub note_operations: usize,
 }
 
 /// Write an exported document into this database, re-homed onto `target`.
@@ -185,6 +381,29 @@ pub fn import(
     transaction: &Transaction<'_>,
     document: &Value,
     target: &ImportTarget,
+) -> Result<Imported, DbError> {
+    let attachments = attachment_store_for_connection(transaction)?;
+    import_inner(transaction, document, target, attachments.as_ref())
+}
+
+/// Import using the caller's exact database-scoped attachment store.
+///
+/// Inline image parts in portable documents are admitted before their rows are
+/// written, so all newly persisted image content uses durable references.
+pub fn import_with_attachments(
+    transaction: &Transaction<'_>,
+    document: &Value,
+    target: &ImportTarget,
+    attachments: &zuno_attachment::AttachmentStore,
+) -> Result<Imported, DbError> {
+    import_inner(transaction, document, target, Some(attachments))
+}
+
+fn import_inner(
+    transaction: &Transaction<'_>,
+    document: &Value,
+    target: &ImportTarget,
+    attachments: Option<&zuno_attachment::AttachmentStore>,
 ) -> Result<Imported, DbError> {
     let root = object(document, DOCUMENT)?;
     let info = root
@@ -214,22 +433,283 @@ pub fn import(
             .and_then(Value::as_array)
             .ok_or_else(|| decode_error("a message has no `parts` array"))?;
         for part in parts {
+            let mut part = part.clone();
+            admit_imported_image(&mut part, attachments)?;
             let created = part
                 .get("time")
                 .and_then(Value::as_object)
                 .and_then(|time| time.get("start").or_else(|| time.get("created")))
                 .and_then(Value::as_i64)
                 .unwrap_or(record.time_created);
-            let record = PartRecord::from_json(rehome(part.clone(), &session_id), created)?;
+            let record = PartRecord::from_json(rehome(part, &session_id), created)?;
             store.insert_part_if_absent(&record)?;
             parts_written += 1;
         }
+    }
+    let notes = match root.get("notes") {
+        None => &[][..],
+        Some(Value::Array(notes)) => notes.as_slice(),
+        Some(_) => return Err(decode_error("export field `notes` must be an array")),
+    };
+    let note_operations = match root.get("noteOperations") {
+        None => &[][..],
+        Some(Value::Array(operations)) => operations.as_slice(),
+        Some(_) => {
+            return Err(decode_error(
+                "export field `noteOperations` must be an array",
+            ));
+        }
+    };
+    if !notes.is_empty() || !note_operations.is_empty() {
+        continuity::ensure_schema(transaction)?;
+    }
+    for note in notes {
+        import_note(transaction, &session_id, note)?;
+    }
+    for operation in note_operations {
+        import_note_operation(transaction, &session_id, operation)?;
     }
     Ok(Imported {
         session_id,
         messages: messages.len(),
         parts: parts_written,
+        notes: notes.len(),
+        note_operations: note_operations.len(),
     })
+}
+
+fn admit_imported_image(
+    part: &mut Value,
+    attachments: Option<&zuno_attachment::AttachmentStore>,
+) -> Result<(), DbError> {
+    let Some(object) = part.as_object_mut() else {
+        return Ok(());
+    };
+    if object.get("type").and_then(Value::as_str) != Some("file") {
+        return Ok(());
+    }
+    if let Some(reference) = object.get("attachment").cloned() {
+        let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(reference)
+            .map_err(|source| DbError::Decode {
+                table: "part".to_owned(),
+                source,
+            })?;
+        let store = attachments.ok_or_else(|| DbError::Query {
+            source: Box::new(zuno_attachment::AttachmentError::StoreUnavailable),
+        })?;
+        store.read(&reference).map_err(|source| DbError::Query {
+            source: Box::new(source),
+        })?;
+        return Ok(());
+    }
+
+    let media_type = object
+        .get("mime")
+        .and_then(Value::as_str)
+        .filter(|media_type| {
+            matches!(
+                *media_type,
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            )
+        })
+        .map(str::to_owned);
+    let Some(media_type) = media_type else {
+        return Ok(());
+    };
+    let data = object
+        .get("data")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            object
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(|url| url.strip_prefix(&format!("data:{media_type};base64,")))
+                .map(str::to_owned)
+        });
+    let Some(data) = data else {
+        return Ok(());
+    };
+    let store = attachments.ok_or_else(|| DbError::Query {
+        source: Box::new(zuno_attachment::AttachmentError::StoreUnavailable),
+    })?;
+    let filename = object
+        .get("filename")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let reference = store
+        .admit_base64_typed(&data, Some(&media_type), filename)
+        .map_err(|source| DbError::Query {
+            source: Box::new(source),
+        })?;
+    match reference.filename.clone() {
+        Some(filename) => {
+            object.insert("filename".to_owned(), Value::String(filename));
+        }
+        None => {
+            object.remove("filename");
+        }
+    }
+    object.insert(
+        "mime".to_owned(),
+        Value::String(reference.media_type.clone()),
+    );
+    object.insert(
+        "attachment".to_owned(),
+        serde_json::to_value(reference).map_err(|source| DbError::Decode {
+            table: "part".to_owned(),
+            source,
+        })?,
+    );
+    object.remove("data");
+    object.remove("url");
+    Ok(())
+}
+
+fn import_note(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    value: &Value,
+) -> Result<(), DbError> {
+    let note = object(value, "export note")?;
+    let agent = string_at(note, "agent", "export note")?;
+    let name = string_at(note, "name", "export note")?;
+    let revision = positive_number(note, "revision", "export note")?;
+    let content = string_at(note, "content", "export note")?;
+    continuity::validate_note_name(&name)
+        .map_err(|error| decode_error(&format!("invalid export note name: {error}")))?;
+    let content_bytes = content.len() as u64;
+    if content_bytes > continuity::MAX_NOTE_DOCUMENT_BYTES {
+        return Err(decode_error(&format!(
+            "export note `{name}` is {content_bytes} bytes; the per-document limit is {}",
+            continuity::MAX_NOTE_DOCUMENT_BYTES
+        )));
+    }
+    let created = required_number(note, "timeCreated", "export note")?;
+    let updated = required_number(note, "timeUpdated", "export note")?;
+    let content_sha256 = zuno_orchestration::sha256_text(&content);
+    let exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM session_note
+               WHERE session_id = ?1 AND agent = ?2 AND name = ?3
+             )",
+            params![session_id, agent, name],
+            |row| row.get(0),
+        )
+        .map_err(open::map_error)?;
+    if !exists {
+        let (document_count, total_bytes): (i64, i64) = transaction
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(CAST(content AS BLOB))), 0)
+                 FROM session_note WHERE session_id = ?1 AND agent = ?2",
+                params![session_id, agent],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(open::map_error)?;
+        if u64::try_from(document_count).unwrap_or(u64::MAX) >= continuity::MAX_NOTE_DOCUMENTS {
+            return Err(decode_error(&format!(
+                "export note scope `{agent}` exceeds the {}-document limit",
+                continuity::MAX_NOTE_DOCUMENTS
+            )));
+        }
+        let aggregate = u64::try_from(total_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(content_bytes);
+        if aggregate > continuity::MAX_NOTE_SCOPE_BYTES {
+            return Err(decode_error(&format!(
+                "export note scope `{agent}` would contain {aggregate} bytes; the aggregate limit is {}",
+                continuity::MAX_NOTE_SCOPE_BYTES
+            )));
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO session_note
+             (session_id, agent, name, revision, content, content_sha256,
+              time_created, time_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (session_id, agent, name) DO NOTHING",
+            params![
+                session_id,
+                agent,
+                name,
+                revision,
+                content,
+                content_sha256,
+                created,
+                updated,
+            ],
+        )
+        .map_err(open::map_error)?;
+    Ok(())
+}
+
+fn import_note_operation(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    value: &Value,
+) -> Result<(), DbError> {
+    let operation = object(value, "export note operation")?;
+    let agent = string_at(operation, "agent", "export note operation")?;
+    let call_id = string_at(operation, "callId", "export note operation")?;
+    let request_sha256 = string_at(operation, "requestSha256", "export note operation")?;
+    let action = string_at(operation, "action", "export note operation")?;
+    if !matches!(action.as_str(), "append" | "write") {
+        return Err(decode_error(
+            "export note operation action must be `append` or `write`",
+        ));
+    }
+    let name = string_at(operation, "name", "export note operation")?;
+    continuity::validate_note_name(&name)
+        .map_err(|error| decode_error(&format!("invalid export note operation name: {error}")))?;
+    let result_revision = positive_number(operation, "resultRevision", "export note operation")?;
+    let result_content_sha256 =
+        string_at(operation, "resultContentSha256", "export note operation")?;
+    let created = required_number(operation, "timeCreated", "export note operation")?;
+    let current_revision: Option<i64> = transaction
+        .query_row(
+            "SELECT revision FROM session_note
+             WHERE session_id = ?1 AND agent = ?2 AND name = ?3",
+            params![session_id, agent, name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(open::map_error)?;
+    match current_revision {
+        Some(current) if result_revision <= current => {}
+        Some(current) => {
+            return Err(decode_error(&format!(
+                "export note operation revision {result_revision} is newer than current note revision {current}"
+            )));
+        }
+        None => {
+            return Err(decode_error(
+                "export note operation does not reference an imported note",
+            ));
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO session_note_operation
+             (session_id, agent, call_id, request_sha256, action, name,
+              result_revision, result_content_sha256, time_created)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT (session_id, agent, call_id) DO NOTHING",
+            params![
+                session_id,
+                agent,
+                call_id,
+                request_sha256,
+                action,
+                name,
+                result_revision,
+                result_content_sha256,
+                created,
+            ],
+        )
+        .map_err(open::map_error)?;
+    Ok(())
 }
 
 /// Point a message or part at the session id the document declares.
@@ -339,6 +819,50 @@ fn string(info: &JsonMap<String, Value>, key: &str) -> Result<String, DbError> {
         .ok_or_else(|| decode_error(&format!("`info.{key}` is missing or not a string")))
 }
 
+fn string_at(
+    object: &JsonMap<String, Value>,
+    key: &str,
+    description: &str,
+) -> Result<String, DbError> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            decode_error(&format!(
+                "{description} field `{key}` is missing, empty, or not a string"
+            ))
+        })
+}
+
+fn required_number(
+    object: &JsonMap<String, Value>,
+    key: &str,
+    description: &str,
+) -> Result<i64, DbError> {
+    object.get(key).and_then(Value::as_i64).ok_or_else(|| {
+        decode_error(&format!(
+            "{description} field `{key}` is missing or not an integer"
+        ))
+    })
+}
+
+fn positive_number(
+    object: &JsonMap<String, Value>,
+    key: &str,
+    description: &str,
+) -> Result<i64, DbError> {
+    let value = required_number(object, key, description)?;
+    if value >= 1 {
+        Ok(value)
+    } else {
+        Err(decode_error(&format!(
+            "{description} field `{key}` must be positive"
+        )))
+    }
+}
+
 fn text<'value>(info: &'value JsonMap<String, Value>, key: &str) -> Option<&'value str> {
     info.get(key).and_then(Value::as_str)
 }
@@ -385,7 +909,48 @@ pub fn sanitize(mut document: Value) -> Value {
             sanitize_message(message);
         }
     }
+    if let Some(notes) = root.get_mut("notes").and_then(Value::as_array_mut) {
+        let mut redacted_agents = BTreeMap::<String, String>::new();
+        for (index, note) in notes.iter_mut().enumerate() {
+            let original_agent = note
+                .as_object()
+                .and_then(|note| note.get("agent"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let next_ordinal = redacted_agents.len() + 1;
+            let redacted_agent = redacted_agents
+                .entry(original_agent)
+                .or_insert_with(|| {
+                    if next_ordinal == 1 {
+                        "redacted-agent".to_owned()
+                    } else {
+                        format!("redacted-agent-{next_ordinal}")
+                    }
+                })
+                .clone();
+            sanitize_note(note, index, &redacted_agent);
+        }
+    }
+    if let Some(operations) = root.get_mut("noteOperations").and_then(Value::as_array_mut) {
+        operations.clear();
+    }
     document
+}
+
+fn sanitize_note(note: &mut Value, index: usize, agent: &str) {
+    let Some(note) = note.as_object_mut() else {
+        return;
+    };
+    let name = format!("redacted-note-{index}.md");
+    let content = format!("[redacted:note-content:{index}]");
+    note.insert("agent".to_owned(), Value::String(agent.to_owned()));
+    note.insert("name".to_owned(), Value::String(name));
+    note.insert("content".to_owned(), Value::String(content.clone()));
+    note.insert(
+        "contentSha256".to_owned(),
+        Value::String(zuno_orchestration::sha256_text(&content)),
+    );
 }
 
 fn sanitize_info(info: &mut JsonMap<String, Value>) {

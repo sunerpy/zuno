@@ -483,6 +483,8 @@ pub struct Expanded {
     pub jobs: bool,
     /// Whether memory candidates and entries are open.
     pub memory: bool,
+    /// Whether learned experiences, patterns, and Skill candidates are open.
+    pub learning: bool,
     /// Whether the LSP list is open.
     pub lsp: bool,
     /// Whether the MCP list is open.
@@ -506,6 +508,7 @@ impl Default for Expanded {
             agents: true,
             jobs: true,
             memory: false,
+            learning: false,
             lsp: true,
             mcp: true,
             skills: false,
@@ -534,6 +537,8 @@ pub enum Section {
     Jobs,
     /// Resident-memory candidates and entries.
     Memory,
+    /// User-learning experiences, patterns, and Skill candidates.
+    Learning,
     /// The language-server list.
     Lsp,
     /// The MCP server list.
@@ -633,6 +638,7 @@ impl SidebarView {
             Section::Agents => self.expanded.agents = !self.expanded.agents,
             Section::Jobs => self.expanded.jobs = !self.expanded.jobs,
             Section::Memory => self.expanded.memory = !self.expanded.memory,
+            Section::Learning => self.expanded.learning = !self.expanded.learning,
             Section::Lsp => self.toggle_lsp(),
             Section::Mcp => self.toggle_mcp(),
             Section::Skills => self.toggle_skills(),
@@ -1579,6 +1585,107 @@ impl SidebarView {
                         &format!("  ✓ {} · {}", entry.scope.as_str(), entry.content),
                         width,
                         self.context.muted(),
+                    ));
+                }
+            }
+        }
+
+        let learning = &self.ambient.work.learning;
+        if !learning.feedback.is_empty()
+            || !learning.experiences.is_empty()
+            || !learning.patterns.is_empty()
+            || !learning.skill_candidates.is_empty()
+        {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Learning));
+            let pattern_review = learning
+                .patterns
+                .iter()
+                .filter(|pattern| pattern.status == zuno_types::LearningPatternStatus::Pending)
+                .count();
+            let skill_review = learning
+                .skill_candidates
+                .iter()
+                .filter(|candidate| {
+                    matches!(
+                        candidate.status,
+                        zuno_types::SkillCandidateStatus::PendingReview
+                            | zuno_types::SkillCandidateStatus::Evaluating
+                            | zuno_types::SkillCandidateStatus::Approved
+                            | zuno_types::SkillCandidateStatus::Failed
+                            | zuno_types::SkillCandidateStatus::Stale
+                            | zuno_types::SkillCandidateStatus::Uncertain
+                    )
+                })
+                .count();
+            lines.push(self.heading(
+                "Learning",
+                &format!(
+                    "{} experiences · {} review · /learn",
+                    learning.experiences.len(),
+                    pattern_review + skill_review
+                ),
+                self.disclosure(self.expanded.learning),
+                width,
+            ));
+            if self.expanded.learning {
+                for experience in learning.experiences.iter().take(4) {
+                    let (glyph, style) =
+                        if experience.kind == zuno_types::ExperienceKind::UnresolvedIssue {
+                            ("!", self.context.warning())
+                        } else if experience.status == zuno_types::ExperienceStatus::Promoted {
+                            ("↑", self.context.accent())
+                        } else {
+                            ("·", self.context.text())
+                        };
+                    lines.push(padded(
+                        &format!(
+                            "  {glyph} {} · {}",
+                            experience.title,
+                            experience.kind.as_str()
+                        ),
+                        width,
+                        style,
+                    ));
+                }
+                for pattern in learning.patterns.iter().take(3) {
+                    let style = match pattern.status {
+                        zuno_types::LearningPatternStatus::Pending => self.context.warning(),
+                        zuno_types::LearningPatternStatus::Promoted => self.context.accent(),
+                        zuno_types::LearningPatternStatus::Rejected
+                        | zuno_types::LearningPatternStatus::Superseded => self.context.muted(),
+                    };
+                    lines.push(padded(
+                        &format!(
+                            "  pattern · {} · {} sessions",
+                            pattern.title, pattern.independent_sessions
+                        ),
+                        width,
+                        style,
+                    ));
+                }
+                for candidate in learning.skill_candidates.iter().take(3) {
+                    let style = match candidate.status {
+                        zuno_types::SkillCandidateStatus::PendingReview
+                        | zuno_types::SkillCandidateStatus::Approved => self.context.warning(),
+                        zuno_types::SkillCandidateStatus::Evaluating
+                        | zuno_types::SkillCandidateStatus::Applying
+                        | zuno_types::SkillCandidateStatus::Undoing => self.context.accent(),
+                        zuno_types::SkillCandidateStatus::Failed
+                        | zuno_types::SkillCandidateStatus::Stale
+                        | zuno_types::SkillCandidateStatus::Uncertain => self.context.error(),
+                        zuno_types::SkillCandidateStatus::Applied => self.context.success(),
+                        zuno_types::SkillCandidateStatus::Rejected
+                        | zuno_types::SkillCandidateStatus::Undone => self.context.muted(),
+                    };
+                    lines.push(padded(
+                        &format!(
+                            "  Skill · {} · {}",
+                            candidate.name,
+                            candidate.status.as_str()
+                        ),
+                        width,
+                        style,
                     ));
                 }
             }

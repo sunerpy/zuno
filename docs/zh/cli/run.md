@@ -36,6 +36,7 @@ zuno run [OPTIONS] [message]...
 | `-m`, `--model <MODEL>` | | |
 | `--agent <AGENT>` | | |
 | `--format <FORMAT>` | 可选值：`default`、`json` | `default` |
+| `--show-reasoning` | 在稳定标记之间把 provider 提供的 reasoning delta 写到 stderr | |
 | `-f`, `--file <FILE>` | | |
 | `--title <TITLE>` | | |
 | `--attach <ATTACH>` | | |
@@ -68,6 +69,14 @@ zuno run --continue "now add tests for the new branch"
 ```sh
 zuno run --format json "list the failing tests" > result.json
 ```
+
+显式显示 provider 可见的推理进度，同时不污染最终答案流。
+
+```sh
+zuno run --show-reasoning "inspect the failure" > answer.txt 2> progress.txt
+```
+
+只显示 provider 明确给出的 reasoning delta；signed thinking 与 encrypted reasoning 永不渲染。每个区块使用 `<<<zuno:reasoning>>>` 与 `<<<zuno:end-reasoning>>>` 标记，即使流以错误结束也会闭合。`--show-reasoning` 不能与 `--format json` 组合；JSON 模式继续使用现有结构化事件流。
 
 用指定的 Agent fork 一个已有 session，同时保持原始 transcript 完好。
 

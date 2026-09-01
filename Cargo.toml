@@ -38,18 +38,23 @@ all = "warn"
 # -- first-party crates (path-only; the workspace is not published) ----------
 zuno-acp = { path = "crates/zuno-acp" }
 zuno-agent = { path = "crates/zuno-agent" }
+zuno-atomic-file = { path = "crates/zuno-atomic-file" }
+zuno-attachment = { path = "crates/zuno-attachment" }
 zuno-auth = { path = "crates/zuno-auth" }
 zuno-catalog = { path = "crates/zuno-catalog" }
 zuno-cli = { path = "crates/zuno-cli" }
 zuno-config = { path = "crates/zuno-config" }
+zuno-continuity = { path = "crates/zuno-continuity" }
 zuno-db = { path = "crates/zuno-db" }
 zuno-engine = { path = "crates/zuno-engine" }
 zuno-error = { path = "crates/zuno-error" }
+zuno-eval = { path = "crates/zuno-eval" }
 zuno-extension = { path = "crates/zuno-extension" }
 zuno-goal = { path = "crates/zuno-goal" }
 zuno-harness = { path = "crates/zuno-harness" }
 zuno-llm = { path = "crates/zuno-llm" }
 zuno-lsp = { path = "crates/zuno-lsp" }
+zuno-learning = { path = "crates/zuno-learning" }
 zuno-mcp = { path = "crates/zuno-mcp" }
 zuno-memory = { path = "crates/zuno-memory" }
 zuno-network = { path = "crates/zuno-network" }
@@ -101,6 +106,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
   "charset",
   "http2",
 ] }
+http = "1.5.0"
 url = "2.5.8"
 
 # -- serialization ----------------------------------------------------------
@@ -118,8 +124,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 # -- allocator ---------------------------------------------------------------
 # Optional at the crate edge so `zuno-cli --no-default-features` remains the
 # system-allocator control used by the memory gates. The shipped/default CLI
-# enables it; MSVC stays on the platform allocator because tikv-jemallocator's
-# supported global-allocator configuration excludes that target environment.
+# enables it on Unix; Windows stays on the platform allocator because
+# tikv-jemallocator does not provide a supported Windows global-allocator build.
 tikv-jemallocator = "=0.7.0"
 
 # -- CLI --------------------------------------------------------------------
@@ -193,6 +199,13 @@ signal-hook = "=0.4.1"
 dirs = "6.0.0"
 globset = "0.4.20"
 ignore = "0.4.33"
+image = { version = "0.25.10", default-features = false, features = [
+  "gif",
+  "jpeg",
+  "png",
+  "webp",
+] }
+kamadak-exif = "0.6.1"
 notify = "8.2.0"
 tree-sitter = "0.26.11"
 tree-sitter-bash = "0.25.1"
@@ -214,6 +227,11 @@ tree-sitter-typescript = "=0.23.2"
 tree-sitter-yaml = "=0.7.2"
 walkdir = "2.5.0"
 which = "8.0.5"
+# Windows replacement is the one filesystem boundary that safe `std` APIs do
+# not express: `std::fs::rename` uses MoveFileEx and can briefly remove an
+# existing destination. `winsafe` keeps the FFI outside first-party crates so
+# the workspace-wide `unsafe_code = "forbid"` guarantee remains intact.
+winsafe = { version = "=0.0.28", default-features = false, features = ["kernel"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 wasmtime = { version = "48.0.0", default-features = false, features = [
   "anyhow",

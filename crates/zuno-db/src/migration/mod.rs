@@ -1,9 +1,9 @@
-//! Atomic current-schema creation and pre-release format validation.
+//! Atomic current-schema creation and guarded format upgrades.
 //!
-//! Zuno is unreleased, so this module deliberately has no incremental migration
-//! chain. An empty database receives the current schema in one transaction. A
-//! non-empty database must carry exactly the current format marker; every older,
-//! newer, or unmarked layout is rejected without mutation and can be rebuilt.
+//! Format 5 is the first historical layout Zuno upgrades in place. The learning
+//! flywheel adds only new tables and indices, so the upgrade can preserve every
+//! existing session, message, and resident-memory row. Other older, newer, or
+//! unmarked pre-release layouts are still rejected without mutation.
 
 use crate::{open, schema};
 use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
@@ -11,9 +11,9 @@ use zuno_error::DbError;
 
 /// Current unreleased database format.
 ///
-/// Bump this whenever [`crate::schema`] changes incompatibly. There is no upgrade
-/// path between values before Zuno's first release.
-pub const CURRENT_FORMAT: u32 = 5;
+/// Bump this whenever [`crate::schema`] changes incompatibly.
+pub const CURRENT_FORMAT: u32 = 6;
+const LEARNING_UPGRADE_FROM: u32 = 5;
 
 const FORMAT_TABLE: &str = "zuno_schema";
 const FORMAT_SQL: &str = "
@@ -24,8 +24,10 @@ CREATE TABLE zuno_schema (
 
 /// Ensure that `connection` uses the current all-at-once schema.
 ///
-/// Empty databases are initialized. Existing databases are only validated; this
-/// function never alters or backfills them.
+/// Empty databases are initialized. Format-5 databases receive the additive
+/// learning schema in one `BEGIN IMMEDIATE` transaction, with the marker changed
+/// only after every new table and index exists. Other existing formats are only
+/// validated or rejected.
 ///
 /// # Errors
 ///
@@ -37,21 +39,25 @@ pub fn apply(connection: &mut Connection) -> Result<(), DbError> {
     if tables.is_empty() {
         return create_current(connection);
     }
-    validate_current(connection, &tables)
-}
-
-fn validate_current(connection: &Connection, tables: &[String]) -> Result<(), DbError> {
-    let observed = observed_format(connection, tables)?;
-    if observed != Some(CURRENT_FORMAT) {
-        return Err(DbError::SchemaMismatch {
+    match observed_format(connection, &tables)? {
+        Some(CURRENT_FORMAT) => validate_current(&tables),
+        Some(LEARNING_UPGRADE_FROM) => migrate_learning(connection),
+        observed => Err(DbError::SchemaMismatch {
             expected: CURRENT_FORMAT,
             observed,
-        });
+        }),
     }
-    if !tables.iter().any(|table| table == "session") {
-        return Err(failure(std::io::Error::other(
-            "current schema marker exists without the required session table",
-        )));
+}
+
+fn validate_current(tables: &[String]) -> Result<(), DbError> {
+    let required = ["session", "message_feedback", "experience_record"];
+    let missing = required
+        .into_iter()
+        .find(|required| !tables.iter().any(|table| table == required));
+    if let Some(missing) = missing {
+        return Err(failure(std::io::Error::other(format!(
+            "current schema marker exists without required table `{missing}`"
+        ))));
     }
     Ok(())
 }
@@ -90,6 +96,39 @@ fn create_current(connection: &mut Connection) -> Result<(), DbError> {
             params![CURRENT_FORMAT],
         )
         .map_err(map_error)?;
+    transaction.commit().map_err(map_error)
+}
+
+/// Add the format-6 learning tables without rewriting any format-5 row.
+fn migrate_learning(connection: &mut Connection) -> Result<(), DbError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_error)?;
+    let tables = transaction_table_names(&transaction)?;
+    let observed = observed_format(&transaction, &tables)?;
+    if observed != Some(LEARNING_UPGRADE_FROM) {
+        return Err(DbError::SchemaMismatch {
+            expected: LEARNING_UPGRADE_FROM,
+            observed,
+        });
+    }
+    if !tables.iter().any(|table| table == "session") {
+        return Err(failure(std::io::Error::other(
+            "format-5 marker exists without the required session table",
+        )));
+    }
+    schema::up_learning(&transaction)?;
+    let changed = transaction
+        .execute(
+            "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
+            params![CURRENT_FORMAT, LEARNING_UPGRADE_FROM],
+        )
+        .map_err(map_error)?;
+    if changed != 1 {
+        return Err(failure(std::io::Error::other(
+            "format-5 marker changed while the learning migration was running",
+        )));
+    }
     transaction.commit().map_err(map_error)
 }
 
@@ -211,6 +250,114 @@ mod tests {
                 observed: Some(99)
             }
         ));
+    }
+
+    #[test]
+    fn format_five_upgrades_without_rewriting_history() {
+        let mut connection = memory();
+        create_current(&mut connection).expect("create format six");
+        connection
+            .execute_batch(
+                "INSERT INTO project \
+                   (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-1', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES ('session-1', 'project-1', 'slug', '/workspace', 'history', '1', 1, 1);
+                 INSERT INTO message \
+                   (id, session_id, time_created, time_updated, data) \
+                 VALUES ('message-1', 'session-1', 1, 1, '{\"role\":\"user\"}');
+                 INSERT INTO memory_candidate (
+                   id, target, target_path, action, content, reason, confidence, source_kind,
+                   source_session_id, source_message_id, status, time_created, time_updated
+                 ) VALUES (
+                   'memory-1', 'project', '/workspace/MEMORY.md', 'add', 'keep history',
+                   'fixture', 9000, 'user', 'session-1', 'message-1', 'pending', 1, 1
+                 );
+                 DROP TABLE skill_candidate;
+                 DROP TABLE evaluation_result;
+                 DROP TABLE evaluation_run;
+                 DROP TABLE evaluation_case;
+                 DROP TABLE evaluation_suite;
+                 DROP TABLE learning_pattern;
+                 DROP TABLE experience_evidence;
+                 DROP TABLE experience_record;
+                 DROP TABLE learning_job;
+                 DROP TABLE message_feedback;
+                 UPDATE zuno_schema SET format = 5 WHERE singleton = 1;",
+            )
+            .expect("construct exact additive format-five shape");
+
+        let session_before: (String, String) = connection
+            .query_row(
+                "SELECT id, title FROM session WHERE id = 'session-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read session before migration");
+        let message_before: String = connection
+            .query_row(
+                "SELECT data FROM message WHERE id = 'message-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read message before migration");
+        let memory_before: String = connection
+            .query_row(
+                "SELECT content FROM memory_candidate WHERE id = 'memory-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read memory before migration");
+
+        apply(&mut connection).expect("upgrade format five");
+
+        let format: u32 = connection
+            .query_row(
+                "SELECT format FROM zuno_schema WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read upgraded format");
+        assert_eq!(format, CURRENT_FORMAT);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT id, title FROM session WHERE id = 'session-1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read session after migration"),
+            session_before
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT data FROM message WHERE id = 'message-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read message after migration"),
+            message_before
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT content FROM memory_candidate WHERE id = 'memory-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read memory after migration"),
+            memory_before
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM experience_record", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("query newly installed table"),
+            0
+        );
     }
 
     #[test]

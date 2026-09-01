@@ -26,18 +26,22 @@ clap_complete = { workspace = true }
 crossterm = { workspace = true }
 futures = { workspace = true }
 zuno-agent = { workspace = true }
+zuno-attachment = { workspace = true }
 zuno-auth = { workspace = true }
 zuno-catalog = { workspace = true }
 zuno-config = { workspace = true }
+zuno-continuity = { workspace = true }
 zuno-db = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-error = { workspace = true }
+zuno-eval = { workspace = true }
 zuno-extension = { workspace = true }
 zuno-goal = { workspace = true }
 zuno-harness = { workspace = true }
 zuno-llm = { workspace = true }
 zuno-memory = { workspace = true }
 zuno-lsp = { workspace = true }
+zuno-learning = { workspace = true }
 zuno-mcp = { workspace = true }
 zuno-network = { workspace = true }
 zuno-observability = { workspace = true }
@@ -80,7 +84,7 @@ uuid = { workspace = true }
 walkdir = { workspace = true }
 zip = { workspace = true }
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
+[target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]

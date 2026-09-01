@@ -111,6 +111,12 @@ observer, required-job conclusions, artifact/checksum evidence, and consumer smo
 It deliberately does not encode a repository's branch, approval, signing, or versioning
 policy.
 
+`git-workflow` owns local repository and commit preparation. It keeps user changes
+separate, verifies the staged diff, and applies Zuno's default
+`zuno-agent <zuno-agent@firlab.app>` identity with command-scoped Git configuration.
+Explicit current-user instructions, repository rules, and selected Skills take
+precedence over that fallback.
+
 ## Skills in delegated turns
 
 Every initial or resumed child host performs discovery independently. Parent-loaded bodies

@@ -82,25 +82,29 @@ remote unshare failed for shared session <id>: <detail>; local rows were deleted
 `crates/zuno-db/tests/prune.rs::prune_delete_order_and_true_related_table_count_are_pinned`
 固定，因为这个顺序正是在事务中途保持外键约束成立的关键。
 
-**14 张表**，按此顺序：
+**18 张表**，按此顺序：
 
 <!-- generated:BEGIN prune-tables -->
 | order | table |
 |---:|---|
-| 1 | `memory_reflection_job` |
-| 2 | `memory_reflection_delivery` |
-| 3 | `agent_job` |
-| 4 | `work_item` |
-| 5 | `work_plan` |
-| 6 | `session_context_epoch` |
-| 7 | `session_input` |
-| 8 | `session_message` |
-| 9 | `part` |
-| 10 | `message` |
-| 11 | `session_share` |
-| 12 | `session` |
-| 13 | `event_sequence` |
-| 14 | `event` |
+| 1 | `session_note_operation` |
+| 2 | `session_note` |
+| 3 | `memory_reflection_job` |
+| 4 | `memory_reflection_delivery` |
+| 5 | `learning_job` |
+| 6 | `message_feedback` |
+| 7 | `agent_job` |
+| 8 | `work_item` |
+| 9 | `work_plan` |
+| 10 | `session_context_epoch` |
+| 11 | `session_input` |
+| 12 | `session_message` |
+| 13 | `part` |
+| 14 | `message` |
+| 15 | `session_share` |
+| 16 | `session` |
+| 17 | `event_sequence` |
+| 18 | `event` |
 <!-- generated:END prune-tables -->
 
 用以下命令重新生成：
@@ -125,6 +129,24 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
 
 如果你确知某个数据库里有 session，而这里的 `n` 是 `0`，那说明你看的是错误的数据库，而不是
 你的 session 丢了。
+
+## 删除单个 session 时的派生学习
+
+交互式删除会明确要求选择：
+
+- **保留学习**：保留派生 Experience；删除对话后，把可空的 session/message 来源指针置空；
+- **清理学习**：先为已应用的 Memory 和 Skill 建立待审撤销候选，拒绝仍在等待审核且引用
+  这些证据的候选，然后把 Experience 标记为 `forgotten`。
+
+清理不会静默移除已应用的 Memory 或 Skill。TUI 会询问该选择；ACP 的
+`session/delete` 必须传入 `cleanupDerivedExperiences: true|false`。独立 CLI
+`zuno session delete <id>` 必须且只能提供
+`--keep-derived-experiences` 或 `--cleanup-derived-experiences` 之一；如果确有派生
+Experience，清理操作需要在已挂载学习 profile 的 TUI 或 ACP 中执行，以便创建待审撤销候选。
+
+`zuno session prune --delete` 是批量保留策略路径。它删除 session 自有的反馈和学习 job，
+但保留项目级 Experience、模式、评测、Memory 和 Skill 候选。这个行为属于删除确认的一部分，
+不会把长期项目学习静默当成对话数据删除。
 
 ## 通过 HTTP
 

@@ -82,9 +82,30 @@ Agent 路由驱动直接与被委派的 Agent 选择。类别是给那些不应�
 1. 当前激活 preset 的类别路由；
 2. 父会话模型。
 
-`general` Agent 的路由刻意不参与类别路由的解析，这样一条宽泛的 Agent 路由就无法悄悄接管 workflow 节点。面向模型的委派工具不接受 `model`、`effort` 或 `category` 覆盖；路由是一个配置决策，不是逐次调用的决策。
+`general` Agent 的路由刻意不参与类别路由的解析，这样一条宽泛的 Agent 路由就无法悄悄接管 workflow 节点。默认情况下，面向模型的委派工具不接受 `model`、`effort` 或 `category` 覆盖。管理员可以显式启用下述独立门控的子模型策略；类别路由仍由宿主持有。
 
 推理设置来自胜出的那条路由，然后是模型或 provider 的默认值。被选中的 preset 会随回合计划一起冻结，因此编辑配置无法改变一次正在进行的尝试。
+
+## 可选的子模型与 effort allowlist
+
+面向模型的子级选择默认关闭：
+
+```json
+{
+  "subagent_model_selection": {
+    "enabled": false,
+    "allowed_models": ["provider/model"]
+  }
+}
+```
+
+关闭时，`task` schema 与现状一致，不包含 `model` 或 `effort`。开启时，`allowed_models` 必须非空、没有重复的确切 `provider/model` 身份，并且 profile 准备期间每一项都必须能在当前模型目录中解析。
+
+Zuno 会排序 allowlist，并把启用状态、列表与 digest 作为 session policy event 持久化。每个 provider Attempt 引用该 digest，子会话继承同一份快照。之后修改宿主配置不会改变已有 session。
+
+显式 `task.model` 必须精确位于持久 allowlist 中。`task.effort` 只能与显式 model 同时提供，并且必须是该模型真实声明的 variant。非法或未授权选择会在创建子会话之前以 `InvalidArgs` 失败。省略 `model` 会保留普通的 Agent/preset 委派路由。
+
+使用 `task_id` 续跑时，可以同时省略两个字段，或与首次冻结的 model 和 effort 完全一致；不能切换值，也不能在子级已经存在后获得另一份策略。
 
 ## 推理级别与 variant
 

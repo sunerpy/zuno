@@ -16,6 +16,7 @@
 
 pub mod api;
 mod auth;
+mod browser_auth;
 mod directory;
 mod discovery;
 mod event;

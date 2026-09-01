@@ -233,7 +233,7 @@ impl Layout {
             if override_value == MEMORY_SENTINEL {
                 return DbLocation::Memory;
             }
-            if node_path::is_absolute(override_value) {
+            if node_path::is_absolute(override_value) || Path::new(override_value).is_absolute() {
                 return DbLocation::File(PathBuf::from(override_value));
             }
             return DbLocation::File(PathBuf::from(node_path::join(&data, override_value)));
@@ -340,10 +340,15 @@ mod tests {
 
     #[test]
     fn db_override_absolute_is_used_verbatim() {
-        let resolved = layout(&[(HOME, "/config"), (ZUNO_DB, "/var/lib/oc/custom.db")]);
+        let absolute = if cfg!(windows) {
+            r"C:\var\lib\oc\custom.db"
+        } else {
+            "/var/lib/oc/custom.db"
+        };
+        let resolved = layout(&[(HOME, "/config"), (ZUNO_DB, absolute)]);
         assert_eq!(
             resolved.db_path_for_channel("latest"),
-            DbLocation::File(PathBuf::from("/var/lib/oc/custom.db"))
+            DbLocation::File(PathBuf::from(absolute))
         );
     }
 

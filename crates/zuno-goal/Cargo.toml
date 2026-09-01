@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+zuno-atomic-file = { workspace = true }
 # `zuno-db` supplies the connection, the pragmas and the `IMMEDIATE` transaction
 # helper. Goal records live in the host session database so Goal, Plan, Todo,
 # Job and message checkpoints share one transactional boundary. See `store.rs`.

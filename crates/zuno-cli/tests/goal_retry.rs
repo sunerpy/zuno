@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use zuno_testkit::{DbChoice, MockProvider, MockResponse, Scenario, ScriptedEnv};
+use zuno_testkit::{
+    DbChoice, MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config,
+};
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -69,7 +71,7 @@ fn transient_failure() -> MockResponse {
 }
 
 fn provider_config(base_url: &str) -> String {
-    json!({
+    trusted_platform_config(json!({
         "formatter": false,
         "lsp": false,
         "model": "test/test-model",
@@ -107,7 +109,7 @@ fn provider_config(base_url: &str) -> String {
                 }
             }
         }
-    })
+    }))
     .to_string()
 }
 

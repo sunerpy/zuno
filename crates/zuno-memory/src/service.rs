@@ -151,6 +151,25 @@ impl MemoryService {
         &self,
         proposal: MemoryProposal,
     ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
+        self.propose_with_policy(proposal, true)
+    }
+
+    /// Insert a validated candidate while deliberately bypassing automatic
+    /// promotion. Cleanup and revocation flows use this because removing learned
+    /// state must remain an explicit human review even when ordinary additions
+    /// may auto-promote.
+    pub fn propose_for_review(
+        &self,
+        proposal: MemoryProposal,
+    ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
+        self.propose_with_policy(proposal, false)
+    }
+
+    fn propose_with_policy(
+        &self,
+        proposal: MemoryProposal,
+        allow_automatic_promotion: bool,
+    ) -> Result<MemoryCandidateRecord, MemoryServiceError> {
         let confidence = confidence_basis_points(proposal.confidence)?;
         let reason = proposal.reason.trim();
         if reason.is_empty() {
@@ -189,10 +208,14 @@ impl MemoryService {
             return Ok(candidate);
         }
         self.notify();
-        if self.promotion.applies(confidence) {
+        if allow_automatic_promotion && self.promotion.applies(confidence) {
             return self.apply(candidate.id());
         }
         Ok(candidate)
+    }
+
+    pub fn candidate(&self, id: &str) -> Result<MemoryCandidateRecord, MemoryServiceError> {
+        self.store.get(id).map_err(Into::into)
     }
 
     pub fn apply(&self, id: &str) -> Result<MemoryCandidateRecord, MemoryServiceError> {

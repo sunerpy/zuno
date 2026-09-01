@@ -81,9 +81,9 @@ instead of asserting a tolerance the machine does not meet.
 
 ## Allocator comparison
 
-M1 measured two release-profile Zuno binaries on 2026-08-18 with the same pinned
-W-real snapshot, workload implementation, 2-second process-tree sampler, windows,
-and five-run aggregation above. The default binary used jemalloc with
+M1 measured two Linux release-profile Zuno binaries on 2026-08-18 with the same
+pinned W-real snapshot, workload implementation, 2-second process-tree sampler,
+windows, and five-run aggregation above. The default Unix binary used jemalloc with
 `dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:4`; the control used
 `--no-default-features`, which selects the Linux GNU fallback
 `MALLOC_ARENA_MAX=4,MALLOC_MMAP_THRESHOLD_=262144`.
@@ -103,6 +103,8 @@ large-session workload is the memory risk this setting addresses. A 1-second
 decay can add `mmap`/`munmap` work and page faults during repeated large
 allocation/free cycles; throughput was not measured here, so the decision is a
 deliberate peak-RSS trade-off, not a throughput improvement claim.
+Windows builds use the platform allocator: tikv-jemallocator is Unix-only and
+is not linked into either GNU or MSVC Windows targets.
 
 The measured binaries had SHA-256
 `acc509815cc2179fd02549e095672aa775954e44d31faebd5d28f0da0dc49796`
@@ -912,15 +914,26 @@ cost is 79,973 `.dwo` sidecar files totalling 0.28 GB — cheap against the 1.46
 removed from the binaries, but it is a large file count, and `cargo clean`
 removes them with everything else.
 
-Release behaviour is untouched: the profile keys are `[profile.dev]` and
-`[profile.test]` only.
+Release behaviour is untouched: Windows CI overrides fields of Cargo's built-in
+test profile through environment variables; it does not alter the checked-in
+release profile.
 
-### Adopted: `make test-par` — run the suites concurrently
+### Adopted: concurrent workspace tests in local and hosted gates
 
-`scripts/test-parallel.sh` builds with `--no-run`, then launches the resulting
-test binaries concurrently, then runs doctests through cargo. It is an **additive
-local fast path**: `make ci` still depends on `make test`, so the gate is
-unchanged and this cannot make CI green by running less.
+`make test-par` is now the workspace gate used by `make ci`. When
+`cargo-nextest` is installed it runs the pinned Linux hosted-CI shape: compile
+the workspace once, schedule tests concurrently, then run doctests through
+Cargo. Developer machines without nextest and native Windows CI use
+`scripts/test-parallel.sh`, which builds with `--no-run`, launches the resulting
+test binaries concurrently. The local fallback also runs doctests; hosted
+Windows explicitly leaves that platform-independent phase to the Linux source
+gate, matching Zed's separate Linux doctest ownership. The Windows binary-level
+choice is deliberate: it starts roughly two hundred harnesses instead of paying
+Windows process startup for more than five thousand individual test cases. This
+is the same build-once/run-many boundary used by Codex's nextest archives,
+adapted to one hosted runner because Zuno's binary execution phase is already
+short. The serial `make test` target remains as a compatibility and diagnosis
+path, not the default CI scheduler.
 
 Matched pair, both measured on the final adopted profile:
 
@@ -930,9 +943,139 @@ Matched pair, both measured on the final adopted profile:
 | `make test-par` | 53.20; 53.15; 53.86 | 53.15 / 53.20 / 53.86 | 1.0134x | 4280 passed / 0 failed / 8 ignored |
 
 **3.69x, with byte-identical test counts** — 224 harness summaries, the same 4280
-passes, 0 failures and 8 ignored in every run. The parallel floor is the 46.9 s
-`representation.rs` suite, which is why the scheduler is longest-first and caches
-per-suite durations in `target/test-parallel-durations.json`.
+passes, 0 failures and 8 ignored in every measured run. These numbers establish
+the in-repository fallback and the decision to parallelize; they predate the
+nextest CI promotion and are not presented as a timing measurement of nextest.
+The fallback's parallel floor is the 46.9 s `representation.rs` suite, which is
+why its scheduler is longest-first and caches per-suite durations in
+`target/test-parallel-durations.json`.
+
+One current-tree validation was then run on 2026-08-31 with the exact hosted
+version, `cargo-nextest 0.9.103`: compilation took 20.58 s, nextest ran 5122
+tests across 204 binaries in 14.47 s (5122 passed, 9 skipped), and
+`make test-nextest` including all doctests completed in 53.33 s. This is local
+Linux evidence from one complete run, not a Windows benchmark.
+
+Native Windows run `33384920656` supplied the missing negative evidence. Its
+nextest step started at `11:06:31Z` and was still running at `11:34:09Z`, at least
+27 minutes 38 seconds later, so the run was cancelled instead of consuming the
+full one-hour job timeout. The log exposed two compounding costs: nextest
+isolated individual test cases into more than five thousand Windows process
+starts, and resource-sensitive ACP, startup timing, and ConPTY lifecycle tests
+were competing inside multi-threaded harnesses. The in-tree scheduler starts one
+process per test binary. Hosted Windows first runs the `startup` wall-clock
+benchmark under a quiet host, then keeps four functional binaries in flight
+while using one harness thread inside each binary. ACP and ConPTY lifecycle
+suites stay in that concurrent pool; there is no functional serial tail. Its
+timeout path kills the complete process tree so a stalled harness cannot leave
+`conhost` or child-agent processes behind.
+
+The in-tree scheduler was therefore revalidated in an environment that permits
+loopback binds. The first two warm-target runs built 204 test binaries, observed
+244 harness summaries, and finished with 5152 passed, 0 failed, and 10 ignored:
+
+| scheduler width | build | suites | doctests | total |
+| --- | ---: | ---: | ---: | ---: |
+| 8 suites x 4 harness threads | 0.53 s | 16.64 s | 18.07 s | 35.99 s |
+| 4 suites x 2 harness threads (previous Windows CI setting) | 0.55 s | 29.90 s | 17.97 s | 49.19 s |
+
+After adding the cross-platform wire-path assertion, the final run for that
+revision used the previous Windows CI setting and a rebuilt test surface:
+204 binaries, 244 summaries, 5153 passed, 0 failed, and 10 ignored.
+Compilation took 29.48 s, environment capture 1.00 s, suite execution 50.20 s,
+doctests 20.91 s, and total wall time 101.60 s. These are local Linux timings,
+not a claimed native-Windows duration. They prove the scheduler and test surface
+before dispatch.
+
+Native Windows run `33393527103` then separated the hosted costs. It built 204
+test binaries in 9 minutes 20.75 seconds, captured the environment in 8.66
+seconds, and launched every binary. Binary execution ended 2 minutes 25.70
+seconds later, including the exclusive `windows_lifecycle` suite at 83.45
+seconds. The job then spent the remaining 8 minutes 20 seconds in a duplicate
+Windows doctest invocation and hit the 20-minute step timeout. The same run also
+exposed that the first Windows environment-capture implementation used Git Bash
+`env` output: most subprocess-heavy suites exited 101 immediately because the
+POSIX-rendered environment was handed back to native Windows processes.
+
+The adopted correction does not enlarge the timeout. Cargo environment capture
+now uses a native Python runner and JSON. Windows keeps the built-in test profile
+and its `target/debug` directory contract, but sets
+`CARGO_PROFILE_TEST_DEBUG=0` and
+`CARGO_PROFILE_TEST_SPLIT_DEBUGINFO=off` to reduce link work; Linux remains the
+single doctest owner. A Codex-style custom `ci-test` profile was evaluated and
+rejected for Zuno: a full local run built and launched all 204 binaries but
+failed three process-reaping tests because their Cargo fixture contract expects
+the standard test output directory, while the custom profile moved helpers to
+`target/ci-test`. The environment override keeps the optimization without
+changing that contract.
+
+The first corrected hosted-Windows shape was then run locally as
+`JOBS=4 THREADS=1 RUN_DOCTESTS=0 SUITE_TIMEOUT=300
+./scripts/test-parallel.sh` on the standard test layout. It launched all 204
+binaries through one bounded pool and observed 204 harness summaries:
+5128 passed, 0 failed, and 9 ignored. A rebuilt target took 25.81 s, environment
+capture 1.35 s, binary execution 52.18 s, and total wall time 79.34 s. This
+proved the profile override, native-JSON environment capture, binary-level
+worker pool, and one-thread harness composition on Linux; it was not presented
+as native Windows timing.
+
+Native Windows run `33406760030` then completed the same binary phase in
+94.40 seconds after a 387.13-second build and 4.70-second environment capture.
+That reduced the former 30-minute nextest stall to 204 process launches, but it
+also supplied a validity correction: the `startup` suite's `session list`
+medians rose to roughly 251-255 ms while three unrelated binaries competed for
+the host, exceeding its 200 ms Windows budget. The budget was not loosened.
+Instead, only that wall-clock benchmark now runs before the worker pool; all 203
+functional binaries remain concurrent.
+
+The final scheduler composition was re-run locally with the same Windows
+overrides. It launched 204 binaries, observed 204 harness summaries, and
+finished with 5128 passed, 0 failed, and 9 ignored. The incremental build took
+8.84 s, environment capture 1.36 s, the isolated `startup` suite 1.07 s, total
+binary execution 47.09 s, and wall time 57.29 s. These are Linux validation
+times, not a native-Windows performance claim; they prove the exact
+isolate-one/run-203-concurrently topology before dispatch.
+
+Failed Windows jobs retain Cargo timings and per-suite logs as artifacts, so a
+native-only regression produces inspectable evidence instead of another blind
+rerun. Run `33412550349` built the 204 binaries in 387.52 s, captured the
+environment in 5.53 s, and executed the suites in 101.60 s. It proved the
+scheduler timing, but correctly failed rather than blessing two Windows-only
+defects: ACP wire paths still carried native separators, and the 1 MiB default
+MSVC PE main-thread stack overflowed during real session construction.
+
+The stack diagnosis was causal, not inferred from the panic. `dumpbin /headers`
+reported `100000 size of stack reserve`; applying
+`editbin /STACK:8388608` to the same binary made the failing ACP lifecycle pass.
+The durable fix is therefore a Windows-MSVC-only
+`cargo::rustc-link-arg-bin=zuno=/STACK:8388608` emitted by
+`crates/zuno-cli/build.rs`. It affects only the shipped binary, so changing this
+executable policy does not invalidate compiler-cache entries for every library
+and test binary. A Cargo rebuild reports `800000 size of stack reserve`.
+
+Native validation on `windows-local` then exposed and removed three sources of
+false local failure: Windows Store Python aliases that existed but were not
+interpreters, PTY fixtures hard-coded to `sh`, and a path-walk fixture that
+could collect the developer's real `$HOME/.opencode`. The scheduler now executes
+a Python import before selection, resolves that interpreter to an absolute
+runner path, uses a Windows short path where Cargo cannot parse quoting, and the
+affected tests use native shells, executable-validated Python, and unique
+fixture markers.
+
+The final native Windows run used the hosted topology exactly:
+`JOBS=4 THREADS=1 RUN_DOCTESTS=0 SUITE_TIMEOUT=300`. It built 204 binaries,
+launched all 204, observed 204 harness summaries, and finished with 4952 passed,
+0 failed, and 8 ignored. Build time was 65.83 s after the fixture changes,
+environment capture 1.73 s, suite execution 107.69 s, and total wall time
+175.31 s. The isolated `startup` suite passed in 5.57 s. This is native local
+Windows evidence, not a hosted-runner SLO claim.
+
+Native Windows Clippy and test execution are separate jobs. They restore the
+same platform-scoped Cargo download cache and use the pinned official sccache
+GitHub Actions backend, but do not serialize on one runner-local `target`
+directory. This trades some possible same-run duplicate cache misses for a
+strictly shorter critical path; repeat runs can reuse compiler outputs without
+persisting or transferring the mutable Cargo target tree.
 
 Concurrency width was swept rather than guessed; all four configurations produced
 4280 / 0 / 8:
@@ -944,8 +1087,11 @@ Concurrency width was swept rather than guessed; all four configurations produce
 | 12 x 4 | 48 | 56.73 |
 | 16 x 2 | 32 | 54.37 |
 
-The default is `JOBS=8 THREADS=4`; both are environment overrides. Returns are
-flat past width 32 because the run is floored by its longest suite.
+The local fallback default is `JOBS=8 THREADS=4`; both are environment
+overrides. Hosted Windows deliberately uses `JOBS=4 THREADS=1`: concurrency is
+between test binaries, while each harness is serial. Returns in the historical
+local sweep are flat past width 32 because the run is floored by its longest
+suite.
 
 **The script captures cargo's environment instead of assuming it**, and this is
 the load-bearing detail. A first version invoked test binaries directly from a
@@ -956,13 +1102,22 @@ shell and subprocess-heavy suites failed even when run alone. The cause was
 outputs, plus `SSL_CERT_FILE` and `SSL_CERT_DIR`. The script
 therefore captures the real environment from a real cargo run through
 `CARGO_TARGET_<TRIPLE>_RUNNER` on every invocation, because `LD_LIBRARY_PATH`
-embeds build-script output hashes that move when a build script reruns.
+embeds build-script output hashes that move when a build script reruns. The
+runner is native Python and writes JSON. This matters on Windows: Git Bash's
+text `env` renders native variables such as `PATH` in POSIX form, which cannot
+be passed unchanged to native test processes. Merely finding `python.exe` is
+also insufficient because Windows Store application aliases look executable
+until invoked. The scheduler validates an import, resolves the interpreter's
+absolute path, and gives Cargo a whitespace-free short path because runner
+environment variables do not perform shell quote parsing.
 
 It also refuses to look successful without evidence: it fails if the number of
 suites that ran differs from the number built, if any suite produced no harness
-summary, or if zero tests passed. Doctests are a separate step for the same
-reason — `--no-run` does not build them and no test binary contains them, so
-omitting them would silently drop 31 tests.
+summary, or if zero tests passed. Doctests are explicit for the same reason:
+`--no-run` does not build them and no test binary contains them. Local fallback
+runs therefore execute them by default; Windows may disable them only through
+`RUN_DOCTESTS=0`, while the workflow contract requires the Linux gate to own
+that surface.
 
 ### Reclaimed: 105 GB of `target/debug`
 
@@ -997,36 +1152,42 @@ Each was measured, and the measurement is why it was rejected.
   default's 29.551 median. If codegen were the bottleneck this would have been
   catastrophic; it is inside the spread. Raising it to 512 gave 40.221 and 28.288
   over two runs — too few to report, and pointless once cgu=1 costs nothing.
-- **Disabling incremental.** `CARGO_INCREMENTAL=0` is genuinely faster cold —
-  L3 of 23.347 / 24.638 / 27.491 against 29.551 — but slower on the edit loop it
-  exists for: L1 median 1.236 s against 1.047 s with it on. The 80 GB was
-  accumulated garbage, not working set, so pruning keeps the edit-loop win without
-  the disk cost. Incremental stays on.
+- **Disabling incremental locally.** `CARGO_INCREMENTAL=0` is genuinely faster
+  cold — L3 of 23.347 / 24.638 / 27.491 against 29.551 — but slower on the edit
+  loop it exists for: L1 median 1.236 s against 1.047 s with it on. The 80 GB was
+  accumulated garbage, not working set, so pruning keeps the edit-loop win
+  without the disk cost. Incremental stays on for local development. Hosted CI
+  has no edit loop and now explicitly sets `CARGO_INCREMENTAL=0`; compiler reuse
+  there is handled by sccache rather than by persisting a Cargo target directory.
 - **Consolidating the 141 integration-test files into fewer binaries.** Bounded
   above at **11.6 s** — the difference between a 29.6 s workspace-cold rebuild of
   everything and a 17.9 s rebuild with no test binaries at all. Since the whole
   cold rebuild is 29.6 s and the test *run* is 196 s, this is the wrong axis, and
   it would mean restructuring 141 files. Not pursued.
-- **`mold`** and **`cargo-nextest`** are both absent from this host. `nextest` is
-  the productised form of `test-parallel.sh` and would be the better answer;
-  installing it was out of scope. `mold`'s status is unchanged from *Linker*
-  above: the toolchain default is already lld.
+- **`mold`.** Its status is unchanged from *Linker* above: the toolchain default
+  is already lld. `cargo-nextest` is no longer in the rejected set: CI installs
+  a pinned version and `make test-par` prefers it, while the measured script
+  remains the no-extra-tool fallback.
 
-### Effect on `make ci`
+### Historical effect on serial `make ci`
 
 | state | runs (s) | min / median / max | max/min |
 | --- | --- | --- | --- |
 | before | 254.167; 220.811; 199.689 | 199.689 / 220.811 / 254.167 | 1.2728x |
 | after | 237.469; 212.111; 198.004 | 198.004 / 212.111 / 237.469 | 1.1993x |
 
-**`make ci` is not measurably faster.** The medians differ by 8.700 s (3.9%),
-which is well inside both spreads, so the honest reading is no measurable change.
-That is expected: `make ci` is ~93% serialised test execution, and
-`split-debuginfo` only touches the build. `make ci` passed on every run in both
-states.
+At the time of that experiment, **serial `make ci` was not measurably faster**.
+The medians differ by 8.700 s (3.9%), inside both spreads, because that gate was
+~93% serialized test execution and `split-debuginfo` only touched the build.
+`make ci` passed on every run in both states.
 
-The local loop is where the win lands: `make test-par` at 53.20 s against
-196.258 s for the same 4280 tests.
+That bottleneck is now removed from the gate topology: `make ci` invokes
+`make test-par`; hosted Linux uses nextest plus a separate doctest step, while
+hosted Windows uses the bounded binary-level scheduler and does not repeat the
+Linux-owned doctest phase. The measured local scheduler remains 53.20 s against
+196.258 s for the same 4280-test snapshot. Fresh hosted timing must come from
+completed CI runs; the historical table above is not silently relabeled as
+evidence for the new workflow.
 
 ## Frozen threshold formulas
 

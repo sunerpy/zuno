@@ -1053,7 +1053,11 @@ pub enum SessionDialogAction {
     /// Open the rename prompt for this session.
     Rename { id: String, title: String },
     /// Delete this session after the list's second-keypress confirmation.
-    Delete { id: String, title: String },
+    Delete {
+        id: String,
+        title: String,
+        cleanup_derived_experiences: bool,
+    },
 }
 
 /// The session picker plus row actions that do not belong on generic lists.
@@ -1094,6 +1098,7 @@ impl SessionDialog {
             SessionDialogAction::Delete {
                 id: item.value.clone(),
                 title: item.label.clone(),
+                cleanup_derived_experiences: false,
             }
         } else {
             SessionDialogAction::Rename {
@@ -1133,7 +1138,7 @@ impl Dialog for SessionDialog {
             && row < lines.len()
         {
             lines[row] = padded(
-                " > Press ctrl+d again to confirm deletion",
+                " > ctrl+d keep learning · ctrl+r clean learning",
                 width,
                 self.select.context.selected(),
             );
@@ -1163,10 +1168,24 @@ impl Dialog for SessionDialog {
 
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> DialogStep {
         match action.name {
-            "session_rename" => match self.selected_action(false) {
-                Some(request) => DialogStep::Resolved(DialogOutcome::Session(request)),
-                None => DialogStep::Ignored,
-            },
+            "session_rename" => {
+                let selected = self.select.selected().cloned();
+                if let Some(item) = selected
+                    && self.delete_confirmation.as_deref() == Some(item.value.as_str())
+                {
+                    self.delete_confirmation = None;
+                    DialogStep::Emitted(DialogOutcome::Session(SessionDialogAction::Delete {
+                        id: item.value,
+                        title: item.label,
+                        cleanup_derived_experiences: true,
+                    }))
+                } else {
+                    match self.selected_action(false) {
+                        Some(request) => DialogStep::Resolved(DialogOutcome::Session(request)),
+                        None => DialogStep::Ignored,
+                    }
+                }
+            }
             "session_delete" => {
                 let Some(item) = self.select.selected().cloned() else {
                     self.delete_confirmation = None;
@@ -1181,6 +1200,7 @@ impl Dialog for SessionDialog {
                     DialogStep::Emitted(DialogOutcome::Session(SessionDialogAction::Delete {
                         id: item.value,
                         title: item.label,
+                        cleanup_derived_experiences: false,
                     }))
                 } else {
                     self.delete_confirmation = Some(item.value);

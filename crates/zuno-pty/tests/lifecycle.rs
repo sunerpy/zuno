@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! The session lifecycle QA scenarios, against real processes.
 //!
 //! Happy path: an interactive command runs, the terminal resizes, the shell exits

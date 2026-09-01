@@ -128,6 +128,13 @@ fn seed(connection: &Connection) {
     {
         let seq = i64::try_from(index).expect("small fixture index");
         let message_id = format!("msg_{session_id}");
+        let project_id: String = connection
+            .query_row(
+                "SELECT project_id FROM session WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .expect("read fixture project");
         connection
             .execute(
                 "INSERT INTO message (id, session_id, time_created, time_updated, data)
@@ -221,6 +228,31 @@ fn seed(connection: &Connection) {
                 rusqlite::params![format!("reflection_{session_id}"), session_id, message_id],
             )
             .expect("insert reflection job");
+        connection
+            .execute(
+                "INSERT INTO learning_job
+                   (id, project_id, session_id, source_message_id, kind, extractor_version,
+                    idempotency_key, status, attempt, scheduled_at, payload, result,
+                    time_created, time_updated, time_completed)
+                 VALUES (?1, ?2, ?3, ?4, 'extraction', 'extractor-v1', ?5,
+                         'completed', 1, 1, '{}', '{}', 1, 1, 1)",
+                rusqlite::params![
+                    format!("learning_{session_id}"),
+                    project_id,
+                    session_id,
+                    message_id,
+                    format!("learning:{session_id}"),
+                ],
+            )
+            .expect("insert learning job");
+        connection
+            .execute(
+                "INSERT INTO message_feedback
+                   (message_id, session_id, rating, note, revision, time_created, time_updated)
+                 VALUES (?1, ?2, 1, 'useful', 1, 1, 1)",
+                rusqlite::params![message_id, session_id],
+            )
+            .expect("insert message feedback");
         connection
             .execute(
                 "INSERT INTO session_context_epoch (session_id, baseline, snapshot, baseline_seq)
@@ -361,7 +393,7 @@ fn prune_default_preview_is_inert_across_every_real_table() {
     assert_eq!(all_table_counts(&connection), before);
     assert!(remote.calls.borrow().is_empty(), "preview never unshares");
     assert_eq!(outcome.preview.tables.len(), PRUNE_TABLES.len());
-    assert_eq!(outcome.preview.total_rows, 48);
+    assert_eq!(outcome.preview.total_rows, 54);
     assert!(outcome.preview.total_bytes > 0);
     assert_eq!(outcome.preview.cost, 7.5);
     assert_eq!(outcome.preview.tokens.input, 6);
@@ -369,6 +401,65 @@ fn prune_default_preview_is_inert_across_every_real_table() {
     assert_eq!(outcome.preview.tokens.reasoning, 18);
     assert_eq!(outcome.preview.tokens.cache_read, 24);
     assert_eq!(outcome.preview.tokens.cache_write, 30);
+}
+
+#[test]
+fn prune_counts_and_deletes_additive_continuity_rows_when_present() {
+    let fixture = Fixture::build();
+    let mut connection = fixture.connection();
+    zuno_db::continuity::ensure_schema(&connection).expect("create continuity tables");
+    for session_id in ["ses_root", "ses_bystander"] {
+        connection
+            .execute(
+                "INSERT INTO session_note
+                   (session_id, agent, name, revision, content, content_sha256,
+                    time_created, time_updated)
+                 VALUES (?1, 'build', 'evidence', 1, ?1, 'sha', 1, 1)",
+                [session_id],
+            )
+            .expect("insert note");
+        connection
+            .execute(
+                "INSERT INTO session_note_operation
+                   (session_id, agent, call_id, request_sha256, action, name,
+                    result_revision, result_content_sha256, time_created)
+                 VALUES (?1, 'build', ?2, 'request-sha', 'write', 'evidence',
+                         1, 'sha', 1)",
+                rusqlite::params![session_id, format!("call_{session_id}")],
+            )
+            .expect("insert note operation");
+    }
+    let expected = preview(&connection, &fixture.selection).expect("preview continuity rows");
+    assert_eq!(
+        expected
+            .tables
+            .iter()
+            .find(|impact| impact.table == "session_note")
+            .expect("note impact")
+            .rows,
+        1
+    );
+    assert_eq!(
+        expected
+            .tables
+            .iter()
+            .find(|impact| impact.table == "session_note_operation")
+            .expect("note operation impact")
+            .rows,
+        1
+    );
+
+    let outcome = execute(
+        &mut connection,
+        &fixture.selection,
+        &PruneRequest::delete().confirmed(),
+        &FakeRemote::default(),
+    )
+    .expect("delete selected continuity rows");
+
+    assert_eq!(outcome.preview, expected);
+    assert_eq!(count(&connection, "session_note"), 1);
+    assert_eq!(count(&connection, "session_note_operation"), 1);
 }
 
 #[test]
@@ -415,7 +506,8 @@ fn prune_preview_counts_exactly_match_the_subsequent_transactional_delete() {
     assert_eq!(outcome.changed_sessions, 3);
     for impact in &expected.tables {
         assert_eq!(
-            before[impact.table] - after[impact.table],
+            before.get(impact.table).copied().unwrap_or(0)
+                - after.get(impact.table).copied().unwrap_or(0),
             impact.rows,
             "preview count for {} must equal rows actually removed",
             impact.table
@@ -427,6 +519,8 @@ fn prune_preview_counts_exactly_match_the_subsequent_transactional_delete() {
     for (table, column) in [
         ("memory_reflection_job", "session_id"),
         ("memory_reflection_delivery", "session_id"),
+        ("learning_job", "session_id"),
+        ("message_feedback", "session_id"),
         ("agent_job", "parent_session_id"),
         ("work_item", "session_id"),
         ("work_plan", "session_id"),
@@ -596,14 +690,18 @@ fn prune_rolled_back_delete_preserves_the_original_preview() {
 fn prune_delete_order_and_true_related_table_count_are_pinned() {
     assert_eq!(
         PRUNE_TABLES.len(),
-        14,
+        18,
         "every session-owned schema table must be explicit"
     );
     assert_eq!(
         DELETE_ORDER,
         [
+            "session_note_operation",
+            "session_note",
             "memory_reflection_job",
             "memory_reflection_delivery",
+            "learning_job",
+            "message_feedback",
             "agent_job",
             "work_item",
             "work_plan",

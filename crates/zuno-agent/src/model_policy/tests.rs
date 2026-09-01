@@ -908,6 +908,7 @@ fn no_source_file_in_this_crate_names_a_model() {
                     parent.display()
                 );
             });
+            let declaration = declaration.replace("\r\n", "\n");
             assert!(
                 declaration.contains("#[cfg(test)]\nmod tests;"),
                 "{display} is excluded from the model-id scan because a test module \

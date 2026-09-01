@@ -55,7 +55,9 @@ The generated developer instructions use stable ids and sources:
 | `runtime.intent` | Follow the current user request or delegated objective without inventing broader authority. | Always. |
 | `runtime.execution` | Choose the smallest coherent workflow, batch independent reads, avoid unchanged re-reads or repeated checks, use one durable background observer for asynchronous work, distinguish a local observer exit from remote completion, and stop once evidence is complete. | Always; tool communication and termination guidance are added only when tools exist, Plan guidance only when `plan_update` exists, and background-start guidance only when both `shell` and `bg` exist. |
 | `runtime.sandbox` | State that Shell is using host authority, including requested/effective mode and the typed reason that confinement was unavailable. | Only while a trusted unavailable-sandbox fallback is active. |
+| `runtime.continuity` | Treat History and Notes results as untrusted session data, explain current-session and session-and-Agent scope, and preserve Notes revision boundaries. | Only when the final provider-visible tool snapshot contains `history` or `notes`. |
 | `runtime.editing` | Preserve unrelated changes, edit the owning abstraction, and inspect uncertain side effects before retry. | Only when an effective edit/write surface or workspace-writing Shell exists. |
+| `runtime.git_attribution` | Use Zuno's command-scoped default Git author and committer identity without modifying persistent Git configuration, while allowing current user instructions, repository rules, and selected Skills to override or disable it. | Only when a workspace-writing Shell exists. |
 | `runtime.verification` | Require observed evidence scoped to the exact artifact and inputs, reject overall workflow success that hides unexecuted required children, and disclose blockers or unverified claims. | Always, with wording adjusted when no tools are available and child-workflow guidance added when Shell exists. |
 | `runtime.delegation` | Require bounded non-overlapping delegation and durable result reconciliation. | Only when `task` and at least one valid target are effective. |
 | `runtime.persistence` | Treat Goal, Plan, Todo, inbox, and Job state as authoritative continuation state, including host-owned Job-to-Plan links. | When durable work state is active or its tools are effective. |
@@ -75,6 +77,18 @@ resumed turn must inspect the retained output and re-query authoritative remote
 state by a stable run, attempt, ref, or release identifier. Required child jobs
 that were skipped, cancelled, missing, or never expanded are not execution
 evidence unless an explicit repository policy marks them optional.
+
+Git commit attribution follows the same prompt-owned, auditable policy boundary.
+For commits Zuno creates, the fallback author and committer use the
+[`zuno-agent`](https://github.com/zuno-agent) name and
+`zuno-agent@firlab.app` email. The agent applies the fallback to one command with
+`git -c user.name=... -c user.email=...` and does not alter global or repository
+Git configuration. Git commit objects store a name and email, not a profile URL.
+A current user instruction, applicable repository instruction, or selected Skill
+can replace or disable the fallback. An amend preserves the existing author
+unless an explicit instruction requests a reset; the fallback applies to the new
+committer. Zuno does not add a second co-author or generated-by trailer unless
+instructed.
 
 This adapts the official Codex
 [GitHub Action](https://learn.chatgpt.com/docs/github-action) and
@@ -112,9 +126,11 @@ The built-in role prompts remain intentionally small:
   `Outcome`, `Evidence`, `Inspected/Changed`, and `Risks/Blocker`; the model is
   not required to invent a JSON or XML report protocol.
 
-Durable planning is host policy rather than model ceremony. Before the first
-provider request for a user or resolved-command input, the host applies one
-deterministic classifier shared by CLI, TUI, ACP, server, and child turns. A
+Durable planning is host policy rather than model ceremony. The default profile
+publishes a typed `HostPlanningCapability`; custom profiles opt in explicitly.
+Before the first provider request for a user or resolved-command input, a host
+with that capability applies one deterministic classifier shared by CLI, TUI,
+ACP, server, and child turns. A
 bounded answer, atomic action, or explicit continuation retains an active Plan.
 A substantial new ordinary user or resolved-command objective preempts the
 current `in_progress` step back to `pending` and appends a new epoch, preserving
@@ -135,9 +151,12 @@ does sufficiently large multi-block text. This makes research â†’ modification â
 verification visible by default and guarantees a Plan for cross-component work,
 delegation, multiple gates, or work that may need compaction or restart recovery.
 
-The model may refine the seed through `plan_update`; it does not decide whether
-the request receives durable execution state. Todo items are optional concrete
-detail beneath Plan steps for ownership, dependency, or recovery tracking. They
+The model may refine the seed through `plan_update` when that tool survives the
+final filters; it does not decide whether the request receives durable execution
+state. Hiding `plan_update` removes only the model-facing mutation surface and
+does not disable host Plan creation, persistence, projection, or restart
+recovery. Todo items are optional concrete detail beneath Plan steps for
+ownership, dependency, or recovery tracking. They
 must not mechanically mirror every Plan step. Refinement preserves existing
 step ids and completed states while updating titles/statuses or appending new
 steps, so concurrent clients and recovery snapshots retain stable identities.
@@ -366,10 +385,20 @@ them and cancels and joins only background jobs owned by the closing root.
 A child resolves through the same configuration, model catalog, MCP catalog,
 Skill discovery roots, permission ceiling, and sandbox configuration as its
 parent composition. In the absence of a per-Agent or preset route, the child
-inherits the parent session model and reasoning choice. The model-facing `task`
-surface cannot override model, effort, category, MCP, Skill, or sandbox policy;
-configured host workflows use the same validated routing layer without adding
-those fields to the model contract.
+inherits the parent session model and reasoning choice. By default the
+model-facing `task` surface cannot override model, effort, category, MCP, Skill,
+or sandbox policy. `subagent_model_selection.enabled` may expose optional
+`model` and `effort` fields under a separate host-global exact allowlist;
+category, MCP, Skill, and sandbox policy remain host-owned.
+
+The enabled state and canonical sorted allowlist are validated against the
+active model catalog and persisted as a durable session policy event with a
+digest. Every Attempt references that digest and each child inherits the same
+snapshot, so later configuration edits cannot change an existing session.
+Explicit effort requires an explicit allowed model and must resolve to a variant
+that model actually declares. A `task_id` continuation may omit both fields or
+repeat the first frozen values exactly; any change is rejected before child
+execution.
 
 A native child does not recompute an independent tool superset from the current
 configuration. The parent Attempt persists the exact provider-visible tool schemas used
@@ -596,7 +625,7 @@ a delegated child uses `ChildTurn` with the child's own durable session id.
 Every continuation in one tool loop reuses that same context, and resuming the
 durable session after a process restart reconstructs the same identity.
 
-Title generation, lifecycle summaries, compaction, memory reflection, and
+Title generation, lifecycle summaries, compaction, learning extraction, and
 Council synthesis use explicit isolated purposes with no foreground-session
 identity. This prevents lifecycle work from joining either the root or a child
 provider conversation.
@@ -682,18 +711,28 @@ gateways should set their own upstream deadline below Zuno's matching phase
 deadline so their typed error reaches Zuno before the client cancels the
 connection.
 
-## Auditable memory and reflection
+## Resident memory and user learning
 
-Resident memory has one mutation boundary: `memory_propose`. Foreground agents
-and the isolated post-delivery reflection fork both use that tool, which validates
-the requested add/replace/remove operation and inserts a durable
-`MemoryCandidate`; it never edits the resident file directly. Candidates retain
-scope, action, reason, confidence, source session/message, timestamps,
-diagnostics, and exact before/after snapshots.
+Resident Memory has one model-visible mutation boundary: `memory_propose`. It
+validates add/replace/remove operations and inserts a durable `MemoryCandidate`;
+it never edits the resident file directly. Candidates retain scope, action,
+reason, confidence, source session/message, timestamps, diagnostics, and exact
+before/after snapshots.
 
-The default promotion policy is `review`. `high_confidence` applies candidates at
-or above the configured threshold, while `automatic` applies every validated
-candidate. All policies use the same durable state machine:
+Goal Markdown projections and promoted Resident Memory files share
+`zuno-atomic-file` for visibility-atomic replacement. The provider writes a
+completed sibling and uses `rename` on Unix or `ReplaceFileW` over an existing
+Windows destination. A successful open sees only a complete old or new version.
+Because Windows can reject a fresh open with `ERROR_FILE_NOT_FOUND` or
+`ERROR_SHARING_VIOLATION` while `ReplaceFileW` holds its handles, the same
+component gives consumers a bounded retry for exactly those two errors. It does
+not hide permissions or other durable failures. This boundary is separate from
+crash durability; authoritative session state remains in SQLite, and each caller
+owns any stronger sync policy.
+
+The default Memory promotion policy is `review`. `high_confidence` applies
+candidates at or above the configured threshold, while `automatic` applies every
+validated candidate. All policies use the same durable state machine:
 
 ```text
 pending -> applying -> applied -> undoing -> undone
@@ -706,29 +745,42 @@ the runtime compares the resident file with both stored snapshots and marks the
 observed result; it never replays the write or undo. Any third state becomes
 `uncertain` and requires user inspection.
 
-Reflection runs only after a final response was delivered and uses an explicitly
-configured reachable `small_model`. Zuno persists the exact review prompt,
-replayed durable turn transcript, current resident-memory snapshot, tool schema,
-model identity, digest, and terminal outcome as `memory.reflection.request` and
-`memory.reflection.outcome`. Stream truncation, malformed arguments, denied tools,
-and proposal failures are durable failed outcomes. The fork can call only
-`memory_propose`; it cannot reach shell, files, normal tools, or foreground
-conversation state.
+User learning is a separate native subsystem. A completed turn with tools,
+artifacts, recovery, correction, or explicit feedback admits an idempotent
+`learning_job` keyed by `(session, message, extractor_version)`. The dedicated
+`learning.extractor_model` receives the replayed durable transcript and a
+structured response schema with no tools, network, filesystem authority, or
+foreground-session identity. Request and terminal outcome are persisted as
+`learning.extraction.request` and `learning.extraction.outcome`.
 
-Periodic cadence is admitted from a durable per-session delivery sequence rather
-than a process-local counter. The source assistant message is counted once across
-host rebuilds and restarts. A selected review owns a leased durable job; process
-loss changes an expired job to `uncertain` and never replays its model request.
-The reviewer compares the supplied resident snapshot before proposing changes,
-prefers replacement to duplicate additions, and can organize memory only through
-the same audited add/replace/remove candidate workflow.
+Extraction settlement atomically stores `ExperienceRecord` rows and evidence.
+Unresolved issues remain searchable but cannot become Memory, patterns, or Skill
+evaluation cases. Only project-scoped Memory proposals at confidence `>= 0.9`
+may auto-apply through the learning path; every other proposal remains
+reviewable.
 
-Candidate validation rejects prompt injection, credential literals, ambiguous
-locators, over-budget results, and external file drift. Automatic learning is
-limited to durable user facts, explicit corrections, repository rules, and
-verified reusable recovery knowledge. It cannot rewrite code, prompts, agents,
-extensions, or skills. `/memory` is the user-owned review and correction surface.
-See [auditable memory and reflection](design/memory-learning.md).
+A host-owned periodic task mines project and cross-project patterns through
+durable interval-bucketed jobs. Automatic Skill candidates require three
+independent sessions. Global patterns require two projects and become a
+project-specific companion only after explicit promotion. Rejected evidence is
+suppressed until its digest changes.
+
+Retrieved experience enters the stable `learning.experiences` prompt section.
+The post-hook prompt receipt stores each source identity, content, and digest, so
+the provider request is reconstructable without consulting current projections.
+`experience_search` provides explicit deeper FTS retrieval.
+
+Every Skill candidate contains complete content, diff, evidence, exact source
+identity, and source digest. Human review runs an immutable offline cassette
+suite with the same `AttemptSnapshot` for baseline and candidate. Passing
+evaluation does not apply the file. Apply is a separate CAS-protected effect;
+source drift becomes `stale`, and restart reconciliation classifies before/after
+snapshots without replaying an uncertain write.
+
+`/memory` remains the resident Memory review surface. `/learn` and `/reflect`
+manage experience, feedback, patterns, Skill candidates, evaluation, and
+reviewed revocation. See [resident memory](design/memory-learning.md) and the
+[user learning flywheel](design/user-learning-flywheel.md).
 
 ## Durable inputs
 
@@ -802,14 +854,22 @@ Commands, Skills, Council requests, and host commands are queued even if their U
 gesture requested immediate delivery. The HTTP prompt API follows the same rule:
 omitting `delivery` means `queue`, while `steer` must be explicit.
 
-User input is typed rich content, not only a rendered string. A local image is
-persisted before execution as a durable file part carrying filename, MIME type,
-data URL, and base64 payload, then reconstructed as a provider-neutral image
-block on replay. Root sessions, attached child sessions, direct sends, queued
-inputs, and steering use the same content path. The visible `[Image #N]` token
-is draft presentation state and is never treated as attachment identity. Bounded
-UTF-8 `@file` and `zuno run --file` inputs become explicit text context; supported
-images remain typed. See [images and file references](reference/attachments.md).
+User input is typed rich content, not only a rendered string. Every new local or
+client-supplied image is admitted before the durable inbox write through the
+profile's `AttachmentStore`. Admission applies source, dimension, pixel, and
+encoded-byte policy; orientation and metadata normalization; and atomic private
+content-addressed publication under the current database identity. The durable
+file part stores only an `ImageAttachmentRef`, never new base64 data.
+
+Provider request assembly resolves and verifies the object late, optionally
+caches a route-policy-derived encoding, and then reconstructs the existing
+provider-neutral inline image block. A missing object or digest/reference
+mismatch is a permanent durable-state failure and never falls back to the source
+path. Historical inline `media_type`/`data` parts remain readable without an
+automatic rewrite. Root sessions, attached children, direct sends, queued
+inputs, steering, TUI, `zuno run --file`, ACP, and server ingress use this same
+path. The visible `[Image #N]` token remains draft presentation state. See
+[images and file references](reference/attachments.md).
 
 A provider stream or provider-retry delay is wakeable for explicit steering:
 Zuno checkpoints any partial assistant output with `finish: steer`, promotes the
@@ -966,6 +1026,36 @@ summary input keeps a stable human label such as
 `[Attached diagram.png (image/png)]`, while the original durable file part
 remains unchanged for authoritative replay.
 
+Optional current-session recovery is a native `zuno-continuity` component, not
+a private client feature. Its interface, SQLite provider, and model-tool
+consumers are separate services mounted through `ProfileBundle` and
+`ToolContributions`, so CLI, TUI, ACP, server, and child turns consume the same
+final registry. The component is disabled by default and contributes `history`
+and `notes` independently.
+
+History reads the durable message store through four actions:
+`list_windows`, `list_items`, `read_item`, and `search_contents`. Only a
+successful compaction creates a new window. Every opaque window, item, and page
+cursor is bound to the current session. Normalization omits reasoning, encrypted
+values, synthetic internal prompt text, tool input, and binary attachment bytes;
+returned evidence is untrusted data rather than prompt authority.
+
+Notes uses logical document names and the trusted `session_id + Agent` identity
+from `ToolContext`. A scope is limited to 100 documents, 256 KiB per document,
+and 1 MiB total. `append_to_file` and `write_file` require the exact
+`expected_revision` (`0` only for creation). The trusted `call_id`, request
+digest, and revision form an idempotency ledger, so duplicate delivery returns
+the committed result while stale concurrent writes fail without mutation.
+Notes reads are `Safe + ParallelSafe + ReadOnly`; Notes writes are
+`Never + Exclusive + SideEffecting`. Missing or unknown actions take the strict
+write policy before typed argument validation.
+
+The component owns additive `session_note` and `session_note_operation` tables;
+database format 5 does not change. Session cascade deletion and prune include
+both tables. Session export/import preserves notes and their operation ledger,
+validates logical names and quotas on import, and sanitized export redacts note
+identity/content while dropping the idempotency ledger.
+
 A hard interruption is a typed `HardInterruptRequest` carrying both source and
 reason. Sources distinguish TUI, ACP, HTTP API, and lifecycle teardown; reasons
 distinguish user cancellation, request cancellation, exit, shutdown, and session
@@ -1104,7 +1194,7 @@ foreground `task` delegation carries the same interrupt through
 `ChildTurnHost`, converts it to the child runner's cancellation token, aborts the
 live child turn, and waits for event drain plus host shutdown before returning.
 
-Tool execution is at-most-once by default. `ToolReplayPolicy::Never` is inherited by every tool unless the implementation explicitly declares `Safe`; current safe tools are read-only or idempotent inspection operations such as file reads, glob, grep, skill lookup, session search, job status, LSP inspection, goal status, and web search/fetch.
+Tool execution is at-most-once by default. `ToolReplayPolicy::Never` is inherited by every tool unless the implementation explicitly declares `Safe`; current safe tools are read-only or idempotent inspection operations such as file reads, glob, grep, skill lookup, current-session History, Notes reads, job status, LSP inspection, goal status, and web search/fetch. Notes writes remain `Never`.
 
 The loop never mechanically replays a call. It persists the failed tool result and gives it to the model in the next step, including timeouts that might have completed an external side effect before their response was lost. A later recovery turn receives a hidden, SQL-derived notice naming the retry attempt. A `Safe` failure may be attempted again after backoff; a `Never` failure requires authoritative inspection of the worktree or external state before the model decides whether another mutation is appropriate.
 
@@ -1285,16 +1375,30 @@ Codex's ordinary MCP topology. They terminate with bounded `SIGTERM` to
 `SIGKILL` escalation. Zuno inserts no `__zuno_child_guard` process in front of
 or beside MCP.
 
+An ACP session may add required stdio or Streamable HTTP MCP servers to its own
+profile bundle. The complete declaration is validated on new/load/resume;
+stdio commands are absolute and use the session directory as cwd, HTTP
+headers are strictly validated, and SSE is unsupported. All required servers
+connect and discover before their tools publish atomically. Partial startup,
+session close, load failure, profile replacement, and ACP process exit dispose
+the exact started set in reverse order. Client commands, environment values,
+and headers remain process-local and redacted rather than durable session data.
+
 Other resident and interactive hosts retain dedicated guards where a surviving
-per-tree owner or terminal foreground transfer is required. The direct child
-returned by `guarded_argv` is the guard, not the payload; owners request
+per-tree owner or Unix terminal foreground transfer is required. The direct
+child returned by `guarded_argv` is the guard, not the payload; owners request
 shutdown through `request_contained_process_shutdown` and reap it only after
 the contained group settles. On Linux the guard uses the parent-death signal and
 waits on the payload pidfd for immediate, race-free natural-exit observation,
-with bounded lifecycle checks when pidfd is unavailable. Direct MCP relies on
-owner close/Drop and therefore does not promise descendant cleanup after an
-uncatchable owner `SIGKILL`. The pinned Codex comparison and the split ownership
-decision are recorded in
+with bounded lifecycle checks when pidfd is unavailable. Windows ConPTY is the
+exception: `guarded_terminal_argv` launches the requested program directly
+because nesting the resident Job Object guard inside ConPTY prevents reliable
+input and natural-exit completion. The PTY owner closes its writer and master,
+answers the backend's one inherited-cursor startup query before forwarding
+terminal output, and explicitly terminates the direct child's tree on shutdown.
+Direct MCP relies on owner close/Drop and therefore does not promise descendant
+cleanup after an uncatchable owner `SIGKILL`. The pinned Codex comparison and the
+split ownership decision are recorded in
 [Resident process containment](design/process-containment.md).
 
 ## Background command execution
@@ -1462,6 +1566,12 @@ The first failed query cancels its siblings and waits for every request to settl
 
 Provider adapters normalize transport output into `SearchResult` and `SearchSource`; they do not own batch scheduling or model-facing presentation.
 
+Credential-bearing provider wire URLs are private implementation data. Search
+diagnostics retain only provider, scheme, host, path, status, and an error
+category. Reqwest errors remove their URL before entering a cause chain, and
+query text, authorization headers, and API keys are forbidden from `Debug`,
+`Display`, `ToolError`, tracing, response bodies, and retry notices.
+
 ## Network egress
 
 `zuno-network` owns the outbound HTTP construction policy shared by providers,
@@ -1477,6 +1587,17 @@ therefore has two transports with separate lifecycles: runtime and SSO traffic
 is proxy-aware, while IMDS and approved local ECS credential endpoints are
 direct. Remote HTTPS container credential endpoints remain on the proxy-aware
 transport.
+
+Public web fetch uses the separate `PublicHttpClient` security capability. It
+accepts only credential-free HTTP(S), disables reqwest auto-redirects, and uses
+direct/no-proxy transport so an environment proxy cannot bypass target
+validation. Each request and each of at most five redirects resolves the host,
+rejects the whole answer if any address is non-public, handles mapped or
+embedded IPv4 forms including NAT64, and pins the validated addresses while
+retaining the original hostname for Host and TLS SNI. Redirect credentials are
+never forwarded. Literal and resolved loopback, private, link-local, CGNAT,
+multicast, unspecified, documentation, and reserved destinations fail before
+the request is sent.
 
 Child processes inherit the process proxy environment unless their typed
 configuration deliberately overrides a variable. The agent loop does not
@@ -1535,5 +1656,21 @@ The headless CLI drains its bounded event channel concurrently with turn executi
 and closes both the detached observer and the producer on success or failure before
 host shutdown. A failed turn therefore cannot leave the renderer waiting forever
 for a sender retained only by the failed producer path.
+
+`zuno run --show-reasoning` is an explicit presentation option. It writes only
+provider `ReasoningDelta` content to stderr between stable start/end markers,
+while final answer text remains on stdout. Signed thinking and encrypted
+reasoning are never rendered. A missing start is opened lazily on the first
+delta, and every error or stream end closes an open block. JSON mode rejects the
+flag and retains the existing structured event output.
+
+`zuno serve --browser-auth` is an explicit loopback-only HTTP surface. Each
+process launch creates one 256-bit token and prints its bootstrap URI exactly
+once outside tracing. Atomic exchange sets an authority-bound 30-day HMAC cookie
+using the private persistent `$DATA/server/browser-auth.key`; the token is then
+unusable. Basic Auth and the cookie compose with OR semantics, but unsafe
+cookie-authorized methods require an exact current-authority Origin. The
+bootstrap query is removed before access logging, and non-loopback resolution
+rejects the mode even when Basic Auth is configured.
 
 The design sources and explicit adopt/adapt/reject decisions are recorded in [the harness comparison](design/harness-comparison.md).

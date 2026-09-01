@@ -3,6 +3,9 @@ use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::time::Instant;
+
 const TEST_CONFIG: &str = r#"{"formatter":false,"lsp":false,"model":"test/test-model","provider":{"test":{"name":"test","id":"test","env":[],"transport":"openai-compatible","models":{"test-model":{"id":"test-model","name":"Test model","attachment":false,"reasoning":false,"temperature":false,"tool_call":true,"release_date":"2025-01-01","limit":{"context":100000,"output":10000},"cost":{"input":0,"output":0},"options":{}}},"options":{"apiKey":"acp-probe","baseURL":"https://example.invalid/v1"}}}}"#;
 
 use serde_json::{Value, json};
@@ -13,28 +16,120 @@ fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_zuno"))
 }
 
+fn acp_stderr() -> Stdio {
+    #[cfg(windows)]
+    {
+        // A session/new crash closes stdout before the request helper can
+        // report a JSON-RPC error. Inherit stderr on native Windows so the
+        // process-level cause is retained in the per-suite CI diagnostic log.
+        Stdio::inherit()
+    }
+    #[cfg(not(windows))]
+    {
+        Stdio::piped()
+    }
+}
+
 fn isolated_command(root: &std::path::Path) -> Command {
     isolated_command_with_config(root, TEST_CONFIG)
 }
 
 fn isolated_command_with_config(root: &std::path::Path, config: &str) -> Command {
+    let config: Value =
+        serde_json::from_str(config).expect("isolated ACP config must be valid JSON");
+    let config = trusted_acp_process_config(config).to_string();
+    let home = root.join("home");
+    let data = root.join("data");
+    let config_home = root.join("config");
+    let cache = root.join("cache");
+    let state = root.join("state");
+    let temp = root.join("temp");
+    for directory in [&home, &data, &config_home, &cache, &state, &temp] {
+        std::fs::create_dir_all(directory).expect("create isolated ACP directory");
+    }
+    #[cfg(windows)]
+    let roaming = root.join("appdata").join("roaming");
+    #[cfg(windows)]
+    let local = root.join("appdata").join("local");
+    #[cfg(windows)]
+    for directory in [&roaming, &local] {
+        std::fs::create_dir_all(directory).expect("create isolated Windows ACP directory");
+    }
+
     let mut command = binary();
     command
         .current_dir(root)
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
-        .env("HOME", root.join("home"))
-        .env("XDG_DATA_HOME", root.join("data"))
-        .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("XDG_CACHE_HOME", root.join("cache"))
-        .env("XDG_STATE_HOME", root.join("state"))
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_STATE_HOME", &state)
+        .env("TMPDIR", &temp)
         .env("ZUNO_DB", root.join("zuno-acp.db"))
         .env("ZUNO_AUTH_CONTENT", "{}")
         .env("ZUNO_CONFIG_CONTENT", config)
         .env("ZUNO_DISABLE_AUTOUPDATE", "true")
         .env("ZUNO_DISABLE_MODELS_FETCH", "true")
         .env("ZUNO_DISABLE_LSP_DOWNLOAD", "true");
+    #[cfg(windows)]
     command
+        .env("USERPROFILE", &home)
+        .env("APPDATA", roaming)
+        .env("LOCALAPPDATA", local)
+        .env("TEMP", &temp)
+        .env("TMP", &temp);
+    command
+}
+
+fn trusted_acp_process_config(config: Value) -> Value {
+    let mut config = zuno_testkit::trusted_platform_config(config);
+    if !cfg!(target_os = "linux") {
+        // These protocol tests already run inside an isolated runner. Keep the
+        // production read-only Agents read-only, but hide Shell from the ones this
+        // suite executes so unsupported hosts can exercise Plan and child-session
+        // protocol behavior without pretending to provide a native read-only OS
+        // sandbox.
+        let object = config
+            .as_object_mut()
+            .expect("isolated ACP config must be an object");
+        let agents = object
+            .entry("agents")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("isolated ACP agents config must be an object");
+        for (name, tools) in [
+            (
+                "plan",
+                json!([
+                    "read",
+                    "glob",
+                    "grep",
+                    "lsp",
+                    "webfetch",
+                    "web_search",
+                    "question",
+                    "plan_exit",
+                    "goal_get",
+                    "plan_get",
+                    "plan_update",
+                    "todo_get",
+                    "todo_update",
+                    "skill"
+                ]),
+            ),
+            ("explorer", json!(["read", "glob", "grep", "lsp", "skill"])),
+        ] {
+            agents
+                .entry(name)
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .unwrap_or_else(|| panic!("isolated ACP {name} config must be an object"))
+                .insert("tools".to_owned(), tools);
+        }
+    }
+    config
 }
 
 fn config_with_second_model(base_url: &str) -> String {
@@ -121,7 +216,16 @@ async fn mount_remote_mcp_fixture(server: &MockServer) {
                 .set_body_json(json!({
                     "jsonrpc": "2.0",
                     "id": body["id"],
-                    "result": {"tools": []}
+                    "result": {
+                        "tools": [{
+                            "name": "ping",
+                            "description": "Return pong.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {}
+                            }
+                        }]
+                    }
                 }))
         })
         .mount(server)
@@ -131,6 +235,138 @@ async fn mount_remote_mcp_fixture(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
+}
+
+const ACP_MCP_SENTINEL: &str = "acp-mcp-sentinel-credential";
+
+#[cfg(unix)]
+fn write_acp_stdio_mcp_server(directory: &std::path::Path) -> std::path::PathBuf {
+    let path = directory.join("acp-mcp-server.sh");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+set -eu
+log=${ACP_MCP_LOG:?}
+printf 'start pid=%s cwd=%s\n' "$$" "$PWD" >> "$log"
+if [ -n "${ACP_MCP_SECRET:-}" ]; then
+  printf 'secret-ok\n' >> "$log"
+else
+  printf 'secret-missing\n' >> "$log"
+fi
+if [ "${ACP_MCP_FAIL:-0}" = "1" ]; then
+  exit 23
+fi
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"acp-stdio-fixture","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping","description":"Return pong.","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"isError":false,"content":[{"type":"text","text":"pong"}]}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+    )
+    .expect("write ACP stdio MCP fixture");
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+        .expect("make ACP stdio MCP fixture executable");
+    path
+}
+
+#[cfg(unix)]
+fn acp_stdio_mcp_declaration(
+    name: &str,
+    script: &std::path::Path,
+    log: &std::path::Path,
+    fail: bool,
+) -> Value {
+    json!({
+        "name": name,
+        "command": "/bin/sh",
+        "args": [script],
+        "env": [
+            {"name": "ACP_MCP_LOG", "value": log},
+            {"name": "ACP_MCP_SECRET", "value": ACP_MCP_SENTINEL},
+            {"name": "ACP_MCP_FAIL", "value": if fail { "1" } else { "0" }}
+        ]
+    })
+}
+
+#[cfg(unix)]
+fn wait_for_occurrences(path: &std::path::Path, needle: &str, expected: usize) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.matches(needle).count() >= expected {
+            return text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected} `{needle}` entries in {}: {text:?}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn started_pids(text: &str) -> Vec<u32> {
+    text.lines()
+        .filter(|line| line.starts_with("start "))
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("pid="))
+        })
+        .map(|pid| pid.parse::<u32>().expect("fixture pid is numeric"))
+        .collect()
+}
+
+#[cfg(unix)]
+fn wait_for_process_exit(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let alive = Command::new("/bin/kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !alive {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "MCP child process {pid} remained alive after disposal"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn assert_file_tree_excludes(root: &std::path::Path, secret: &str) {
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        assert!(
+            !bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "secret was persisted in {}",
+            entry.path().display()
+        );
+    }
 }
 
 fn reasoning_config() -> String {
@@ -509,7 +745,7 @@ fn acp_initialize_uses_stable_v1_without_fake_authentication() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
 
@@ -575,6 +811,10 @@ fn acp_initialize_uses_stable_v1_without_fake_authentication() {
     assert_eq!(
         response["result"]["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
         true
+    );
+    assert_eq!(
+        response["result"]["agentCapabilities"]["mcpCapabilities"],
+        json!({"stdio": true, "http": true, "sse": false})
     );
 }
 
@@ -1422,7 +1662,7 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let cwd = root.path().to_string_lossy().into_owned();
@@ -1556,7 +1796,7 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
         &mut stdout,
         9,
         "session/delete",
-        json!({"sessionId": session_id}),
+        json!({"sessionId": session_id, "cleanupDerivedExperiences": false}),
     );
     let after_delete = request(
         &mut stdin,
@@ -1605,7 +1845,7 @@ async fn acp_compact_is_native_and_persists_a_summary_without_model_prompt_dispa
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -1736,7 +1976,7 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -1765,12 +2005,20 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         .as_array()
         .expect("available commands")
         .iter()
-        .take(5)
+        .take(7)
         .map(|command| command["name"].as_str().expect("command name"))
         .collect::<Vec<_>>();
     assert_eq!(
         native,
-        ["compact", "goal", "plan", "start-plan", "start-work"]
+        [
+            "compact",
+            "goal",
+            "learn",
+            "plan",
+            "reflect",
+            "start-plan",
+            "start-work"
+        ]
     );
     let goal_command = commands["update"]["availableCommands"]
         .as_array()
@@ -1918,7 +2166,7 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn acp_load_is_cold_and_duplicate_load_does_not_replay_again() {
+async fn acp_load_rebuilds_resources_and_replays_for_each_load_request() {
     let mcp = MockServer::start().await;
     mount_remote_mcp_fixture(&mcp).await;
     let provider = MockServer::start().await;
@@ -1939,7 +2187,7 @@ async fn acp_load_is_cold_and_duplicate_load_does_not_replay_again() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2080,17 +2328,16 @@ async fn acp_load_is_cold_and_duplicate_load_does_not_replay_again() {
         "the first session/load must reconstruct durable history"
     );
     assert!(
-        second_replay.is_empty(),
-        "a duplicate session/load on the same ACP connection must be idempotent: \
-         {second_replay:#?}"
+        !second_replay.is_empty(),
+        "each explicit session/load reconstructs durable history for the requesting client"
     );
     assert_eq!(
-        initialize_after_load, 1,
-        "loading durable history must not reconnect configured MCP servers"
+        initialize_after_load, 2,
+        "session/load must reconnect configured MCP before publishing the replacement session"
     );
     assert_eq!(
-        initialize_after_reconfiguration, 1,
-        "restored-session mode changes must remain dormant until a real prompt"
+        initialize_after_reconfiguration, 4,
+        "each transactional profile replacement must rebuild configured MCP resources"
     );
     assert_eq!(prompted["stopReason"], "end_turn");
     assert!(
@@ -2101,8 +2348,8 @@ async fn acp_load_is_cold_and_duplicate_load_does_not_replay_again() {
         "the first prompt after a cold load did not activate and drive the session"
     );
     assert_eq!(
-        initialize_after_prompt, 2,
-        "the first real prompt must activate the dormant session and reconnect MCP exactly once"
+        initialize_after_prompt, 5,
+        "the second load already activated its replacement MCP resources before the prompt"
     );
 }
 
@@ -2115,6 +2362,422 @@ fn is_mcp_initialize(request: &Request) -> bool {
             == Some("initialize")
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_session_stdio_mcp_is_published_atomically_and_closed_exactly() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(TextTurnResponder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP stdio MCP root");
+    let script = write_acp_stdio_mcp_server(root.path());
+    let log = root.path().join("stdio-mcp.log");
+    let declaration = acp_stdio_mcp_declaration("fixture", &script, &log, false);
+    let config = config_with_second_model(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": [declaration]}),
+    );
+    let session_id = created["sessionId"].as_str().expect("session id");
+    let started = wait_for_occurrences(&log, "start ", 1);
+    assert!(started.contains(&format!("cwd={}", root.path().display())));
+    assert!(started.contains("secret-ok"));
+    let pid = started_pids(&started)[0];
+
+    let (completed, _updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type":"text","text":"Use the fixture MCP tool if useful."}]
+        }),
+    );
+    assert_eq!(completed["stopReason"], "end_turn");
+    let provider_requests = provider
+        .received_requests()
+        .await
+        .expect("provider requests");
+    assert!(
+        provider_requests
+            .iter()
+            .any(|request| { String::from_utf8_lossy(&request.body).contains("fixture_ping") }),
+        "the provider request did not receive the session-local stdio MCP schema"
+    );
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/close",
+        json!({"sessionId": session_id}),
+    );
+    wait_for_process_exit(pid);
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .expect("MCP lifecycle log")
+            .matches("start ")
+            .count(),
+        1
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP stdio MCP process");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("ACP stderr")
+        .read_to_string(&mut stderr)
+        .expect("read ACP stderr");
+    assert!(status.success(), "ACP stdio MCP process failed: {stderr}");
+    assert!(!stderr.contains(ACP_MCP_SENTINEL));
+    assert_file_tree_excludes(root.path(), ACP_MCP_SENTINEL);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_session_http_mcp_uses_streamable_http_headers_and_disposes() {
+    let mcp = MockServer::start().await;
+    mount_remote_mcp_fixture(&mcp).await;
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(TextTurnResponder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP HTTP MCP root");
+    let config = config_with_second_model(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({
+            "cwd": root.path(),
+            "mcpServers": [{
+                "type": "http",
+                "name": "web",
+                "url": format!("{}/mcp", mcp.uri()),
+                "headers": [{
+                    "name": "Authorization",
+                    "value": format!("Bearer {ACP_MCP_SENTINEL}")
+                }]
+            }]
+        }),
+    );
+    let session_id = created["sessionId"].as_str().expect("session id");
+    let (completed, _updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type":"text","text":"Use the HTTP MCP tool if useful."}]
+        }),
+    );
+    assert_eq!(completed["stopReason"], "end_turn");
+    assert!(
+        provider
+            .received_requests()
+            .await
+            .expect("provider requests")
+            .iter()
+            .any(|request| String::from_utf8_lossy(&request.body).contains("web_ping")),
+        "the provider request did not receive the session-local HTTP MCP schema"
+    );
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/close",
+        json!({"sessionId": session_id}),
+    );
+    let mcp_requests = mcp.received_requests().await.expect("MCP requests");
+    assert!(mcp_requests.iter().any(|request| {
+        request
+            .headers
+            .get("authorization")
+            .is_some_and(|value| value.to_str().ok() == Some(&format!("Bearer {ACP_MCP_SENTINEL}")))
+    }));
+    assert_eq!(
+        mcp_requests
+            .iter()
+            .filter(|request| request.method.as_str() == "DELETE")
+            .count(),
+        1,
+        "closing the ACP session must close the remote MCP session exactly once"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP HTTP MCP process");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("ACP stderr")
+        .read_to_string(&mut stderr)
+        .expect("read ACP stderr");
+    assert!(status.success(), "ACP HTTP MCP process failed: {stderr}");
+    assert!(!stderr.contains(ACP_MCP_SENTINEL));
+    assert_file_tree_excludes(root.path(), ACP_MCP_SENTINEL);
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_session_mcp_partial_startup_rolls_back_before_publication() {
+    let root = tempfile::tempdir().expect("ACP MCP rollback root");
+    let script = write_acp_stdio_mcp_server(root.path());
+    let good_log = root.path().join("good-mcp.log");
+    let bad_log = root.path().join("bad-mcp.log");
+    let config = config_with_second_model("https://example.invalid");
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let error = request_failure(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({
+            "cwd": root.path(),
+            "mcpServers": [
+                acp_stdio_mcp_declaration("good", &script, &good_log, false),
+                acp_stdio_mcp_declaration("bad", &script, &bad_log, true)
+            ]
+        }),
+    );
+    assert!(error["message"].as_str().is_some_and(|message| {
+        message.contains("ACP MCP server `bad` failed")
+            && !message.contains(ACP_MCP_SENTINEL)
+            && !message.contains(script.to_string_lossy().as_ref())
+    }));
+    let good = wait_for_occurrences(&good_log, "start ", 1);
+    let bad = wait_for_occurrences(&bad_log, "start ", 1);
+    wait_for_process_exit(started_pids(&good)[0]);
+    wait_for_process_exit(started_pids(&bad)[0]);
+    assert_eq!(good.matches("start ").count(), 1);
+    assert_eq!(bad.matches("start ").count(), 1);
+
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"].as_str().expect("session id");
+    request(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/close",
+        json!({"sessionId": session_id}),
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP MCP rollback process");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("ACP stderr")
+        .read_to_string(&mut stderr)
+        .expect("read ACP stderr");
+    assert!(
+        status.success(),
+        "ACP MCP rollback process failed: {stderr}"
+    );
+    assert!(!stderr.contains(ACP_MCP_SENTINEL));
+    assert_file_tree_excludes(root.path(), ACP_MCP_SENTINEL);
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_load_and_resume_recreate_only_the_mcp_list_supplied_by_the_client() {
+    let root = tempfile::tempdir().expect("ACP MCP resume root");
+    let script = write_acp_stdio_mcp_server(root.path());
+    let log = root.path().join("resume-mcp.log");
+    let declaration = acp_stdio_mcp_declaration("fixture", &script, &log, false);
+    let config = config_with_second_model("https://example.invalid");
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": [declaration.clone()]}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let first = wait_for_occurrences(&log, "start ", 1);
+    let first_pid = started_pids(&first)[0];
+    request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    wait_for_process_exit(first_pid);
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/resume",
+        json!({"sessionId": &session_id, "cwd": root.path(), "mcpServers": []}),
+    );
+    request(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    assert_eq!(
+        wait_for_occurrences(&log, "start ", 1)
+            .matches("start ")
+            .count(),
+        1,
+        "an empty resume list must not reuse the prior process"
+    );
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "session/load",
+        json!({
+            "sessionId": &session_id,
+            "cwd": root.path(),
+            "mcpServers": [declaration.clone()]
+        }),
+    );
+    let second = wait_for_occurrences(&log, "start ", 2);
+    let second_pid = *started_pids(&second).last().expect("second MCP pid");
+    request(
+        &mut stdin,
+        &mut stdout,
+        7,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    wait_for_process_exit(second_pid);
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        8,
+        "session/resume",
+        json!({
+            "sessionId": &session_id,
+            "cwd": root.path(),
+            "mcpServers": [declaration]
+        }),
+    );
+    let third = wait_for_occurrences(&log, "start ", 3);
+    let third_pid = *started_pids(&third).last().expect("third MCP pid");
+    request(
+        &mut stdin,
+        &mut stdout,
+        9,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    wait_for_process_exit(third_pid);
+    let lifecycle = std::fs::read_to_string(&log).expect("MCP lifecycle log");
+    assert_eq!(
+        lifecycle.matches("start ").count(),
+        3,
+        "unexpected MCP starts:\n{lifecycle}"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP MCP resume process");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("ACP stderr")
+        .read_to_string(&mut stderr)
+        .expect("read ACP stderr");
+    assert!(status.success(), "ACP MCP resume process failed: {stderr}");
+    assert!(!stderr.contains(ACP_MCP_SENTINEL));
+    assert_file_tree_excludes(root.path(), ACP_MCP_SENTINEL);
+}
+
 #[test]
 fn acp_connection_bounds_open_sessions_and_releases_capacity_on_close() {
     let root = tempfile::tempdir().expect("ACP test root");
@@ -2122,7 +2785,7 @@ fn acp_connection_bounds_open_sessions_and_releases_capacity_on_close() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2205,7 +2868,7 @@ fn acp_reasoning_levels_follow_the_active_models_declared_variants() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2326,7 +2989,7 @@ async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2388,7 +3051,9 @@ async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
     );
     let resource_path = root.path().join("notes.md");
     std::fs::write(&resource_path, "# Design notes\n").expect("write ACP resource link target");
-    let resource_uri = format!("file://{}", resource_path.display());
+    let resource_uri = url::Url::from_file_path(&resource_path)
+        .expect("ACP resource path must convert to a file URI")
+        .to_string();
     let (completed, updates) = request_with_updates(
         &mut stdin,
         &mut stdout,
@@ -2511,7 +3176,7 @@ async fn acp_images_and_embedded_context_reach_the_provider_and_durable_replay()
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2547,7 +3212,7 @@ async fn acp_images_and_embedded_context_reach_the_provider_and_durable_replay()
                 {
                     "type": "image",
                     "mimeType": "image/png",
-                    "data": "iVBORw0KGgo=",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DAAAAEAQEARwbK3gAAAABJRU5ErkJggg==",
                     "uri": "file:///tmp/screenshot.png"
                 },
                 {
@@ -2573,7 +3238,7 @@ async fn acp_images_and_embedded_context_reach_the_provider_and_durable_replay()
         .expect("provider requests");
     assert!(received.iter().any(|request| {
         let body = String::from_utf8_lossy(&request.body);
-        body.contains("data:image/png;base64,iVBORw0KGgo=")
+        body.contains("data:image/png;base64,")
             && body.contains(selection_uri)
             && body.contains("fn selected() {}")
     }));
@@ -2636,7 +3301,7 @@ async fn acp_plan_round_trips_question_tool_through_stable_elicitation() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2772,7 +3437,7 @@ async fn acp_prompt_streams_a_negotiated_foreground_subagent_on_its_child_sessio
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2910,7 +3575,7 @@ async fn acp_fallback_reports_child_blocker_without_synchronous_elicitation() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3007,7 +3672,7 @@ async fn acp_fallback_routes_child_permission_through_the_declared_root_session(
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3102,7 +3767,7 @@ async fn acp_close_cancels_and_joins_its_background_child_without_native_project
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3237,7 +3902,7 @@ async fn acp_detached_parent_projects_final_plan_after_background_child_completi
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3412,7 +4077,7 @@ async fn acp_prompt_projects_the_final_durable_plan_before_responding() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3511,7 +4176,7 @@ async fn acp_write_round_trips_strict_permission_and_native_creation_diff() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3584,13 +4249,16 @@ async fn acp_write_round_trips_strict_permission_and_native_creation_diff() {
         .iter()
         .find(|content| content["type"] == "diff")
         .expect("native creation diff");
-    assert_eq!(diff["path"], target.to_string_lossy().as_ref());
+    let target_wire = zuno_paths::wire_path(
+        &std::fs::canonicalize(&target).expect("created ACP target canonicalizes"),
+    );
+    assert_eq!(diff["path"], target_wire);
     assert_eq!(diff["oldText"], Value::Null);
     assert_eq!(diff["newText"], "created through ACP\n");
     assert!(written["locations"].as_array().is_some_and(|locations| {
         locations
             .iter()
-            .any(|location| location["path"] == target.to_string_lossy().as_ref())
+            .any(|location| location["path"] == target_wire)
     }));
     assert!(updates.iter().any(|update| {
         update["sessionUpdate"] == "agent_message_chunk"
@@ -3627,7 +4295,7 @@ async fn acp_danger_full_access_emits_no_tool_approval_request() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3690,7 +4358,7 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3749,6 +4417,7 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
             "tool_call_update",
             "agent_message_chunk",
             "plan",
+            "session_info_update",
             "usage_update",
         ],
         "session/load must replay every durable client-visible projection in order: {updates:#?}"
@@ -3786,6 +4455,14 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
         .expect("plan replay");
     assert_eq!(plan["entries"][0]["status"], "in_progress");
     assert_eq!(plan["entries"][1]["status"], "pending");
+    let learning = updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "session_info_update")
+        .expect("learning replay");
+    assert_eq!(
+        learning["_meta"]["zuno"]["learning"]["experiences"],
+        json!([])
+    );
     let usage = updates
         .iter()
         .find(|update| update["sessionUpdate"] == "usage_update")
@@ -3828,10 +4505,10 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
             "mcpServers": []
         }),
     );
-    assert!(
-        replay_after_resume.is_empty(),
-        "a resumed client already owns the transcript and a later load must not duplicate it: \
-         {replay_after_resume:#?}"
+    assert_eq!(
+        replay_after_resume, updates,
+        "session/load is an explicit request to reconstruct durable client-visible state even \
+         after a non-replaying session/resume"
     );
 
     drop(stdin);
@@ -3858,7 +4535,7 @@ fn acp_load_replays_negotiated_child_sessions_on_their_own_routes() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3924,25 +4601,35 @@ fn acp_load_replays_negotiated_child_sessions_on_their_own_routes() {
     assert_eq!(
         routes,
         vec![
+            (parent_session_id.as_str(), "session_info_update"),
             (parent_session_id.as_str(), "subagent_spawned"),
             (child_session_id, "user_message_chunk"),
             (child_session_id, "agent_message_chunk"),
+            (child_session_id, "session_info_update"),
             (child_session_id, "usage_update"),
             (parent_session_id.as_str(), "subagent_state_update"),
         ],
         "session/load must rebuild the durable child tree before returning: {routed:#?}"
     );
-    assert_eq!(routed[0]["update"]["subagentSessionId"], child_session_id);
-    assert_eq!(routed[0]["update"]["name"], "explorer");
     assert_eq!(
-        routed[1]["update"]["content"]["text"],
+        routed[0]["update"]["_meta"]["zuno"]["learning"]["experiences"],
+        json!([])
+    );
+    assert_eq!(routed[1]["update"]["subagentSessionId"], child_session_id);
+    assert_eq!(routed[1]["update"]["name"], "explorer");
+    assert_eq!(
+        routed[2]["update"]["content"]["text"],
         "inspect the child tree"
     );
     assert_eq!(
-        routed[2]["update"]["content"]["text"],
+        routed[3]["update"]["content"]["text"],
         "child history restored"
     );
-    assert_eq!(routed[4]["update"]["state"], "disconnected");
+    assert_eq!(
+        routed[4]["update"]["_meta"]["zuno"]["learning"]["experiences"],
+        json!([])
+    );
+    assert_eq!(routed[6]["update"]["state"], "disconnected");
 
     request(
         &mut stdin,

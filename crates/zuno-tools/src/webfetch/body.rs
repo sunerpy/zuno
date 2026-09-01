@@ -38,7 +38,7 @@ pub async fn read_bounded(
     limit: usize,
     interrupt: &dyn InterruptHandle,
 ) -> Result<Vec<u8>, WebError> {
-    let url = response.url().to_string();
+    let url = zuno_network::DiagnosticEndpoint::from_url(response.url()).to_string();
 
     if let Some(declared) = declared_length(&response)
         && declared > limit
@@ -63,7 +63,7 @@ pub async fn read_bounded(
             chunk = response.chunk() => {
                 chunk.map_err(|source| WebError::Transport {
                     url: url.clone(),
-                    source,
+                    source: source.without_url(),
                 })?
             }
         };

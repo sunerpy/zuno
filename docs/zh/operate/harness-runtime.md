@@ -45,13 +45,30 @@ Agent 具有显式的正向职责、负向委派边界、权限以及结构化�
 
 用户提示词、steering 以及子 Agent 报告在执行前进入持久 FIFO 收件箱。`reportDelivery: nextStep` 必须完成子结果结算、准许父级输入并唤醒父级，且不存在轮询竞态。
 
+图像入口在写入 inbox 前统一经过 `AttachmentStore`：规范化方向、像素与编码，原子发布当前数据库身份下的内容寻址对象，持久 part 只保存 `ImageAttachmentRef`。Provider 请求组装时才校验并内联对象；缺失或 digest 不符是永久持久状态失败，不回退原始路径。
+
 ## Plan 与 Work 状态迁移
 
-持久的 Goal、Plan、Todo、收件箱和 job 状态控制续跑，而不是自然语言。「接下来我会……」这类文字不构成进展。
+持久的 Goal、Plan、Todo、收件箱和 job 状态控制续跑，而不是自然语言。「接下来我会……」这类文字不构成进展。默认 profile 发布类型化的宿主 Planning capability；即使最终工具过滤隐藏了 `plan_update`，宿主仍会创建、持久化并在重启后恢复 Plan。隐藏工具只会移除模型修改入口。
 
 ## 原生会话命令、压缩与硬中断
 
 会话命令、上下文压缩与硬中断都是原生能力，不依赖模型配合。
+
+## 原生 History 与 Notes
+
+`zuno-continuity` 是通过 `ProfileBundle` 与 `ToolContributions` 挂载的原生组件，默认关闭。
+`history` 只读取当前会话，并以成功压缩作为窗口边界；reasoning、加密值、合成内部提示
+正文和二进制附件字节不会返回。`notes` 使用逻辑文档名，按 `session_id + Agent` 隔离。
+
+Notes 每个作用域最多 100 个文档，单文档 256 KiB，总计 1 MiB。写入必须带精确
+`expected_revision`，并用可信 `call_id`、请求摘要和 revision 做幂等与并发冲突保护。
+读取采用 `Safe + ParallelSafe + ReadOnly`，写入采用
+`Never + Exclusive + SideEffecting`；非法 action 按最严格策略失败即拒绝。
+
+组件自有的 `session_note` 与 `session_note_operation` 是 format 5 上的增量表。它们随
+session 级联删除，并进入 session export/import、sanitize 与 prune。TUI、server、ACP
+和 child turn 都消费同一套运行时工具快照，不拥有私有连续性逻辑。
 
 ## 持久 Goal 恢复
 
@@ -73,6 +90,12 @@ Shell 执行受 OS 沙箱约束。`read-only` 与 `workspace-write` 都要求一
 
 常驻进程在声明的约束内运行，其生命周期由运行时拥有。
 
+Unix PTY 通过前台守护进程拥有进程组与终端前台切换。Windows ConPTY 则直接启动请求的
+终端程序：不能把常驻 Job Object 守护器嵌入 ConPTY，否则交互输入与自然退出都可能无法
+收敛。PTY 所有者持有直接子进程 PID，先应答并移除后端的一次性继承游标查询，再向客户端
+转发终端输出；关闭 writer/master 后发布退出，显式停止通过 `taskkill /T` 终止完整
+子进程树。
+
 ## 后台命令执行
 
 后台命令有独立的生命周期与输出游标，父会话通过持久状态观察它们，而不是靠轮询。
@@ -83,6 +106,8 @@ Shell 执行受 OS 沙箱约束。`read-only` 与 `workspace-write` 都要求一
 
 副作用附近的超时或响应丢失属于结果不确定。这种情况会被持久化，要求检查权威状态，绝不机械重放调用。
 
+`subagent_model_selection` 默认关闭。开启后，精确 model allowlist 会在 profile 激活时解析，并按 session 持久冻结为带 digest 的策略；`task` 才会出现可选 `model`/`effort`。续跑不能改变首次冻结的模型或强度。
+
 ## 并发网络搜索
 
 `web_search` 接受一批查询，并在单查询 provider 之上拥有并发、取消、稳定排序、限流与 URL 去重。
@@ -90,6 +115,10 @@ Shell 执行受 OS 沙箱约束。`read-only` 与 `workspace-write` 都要求一
 ## 网络出口
 
 网络出口受沙箱的网络授权控制。`deny` 会创建私有网络命名空间并拒绝网络系统调用，而不是一条可被绕过的防火墙规则。
+
+公开网页抓取使用独立 `PublicHttpClient`：只接受无凭据 HTTP(S)，直连且不使用环境代理；每次请求和每次重定向都重新解析、校验全部地址并进行 DNS pinning。公私混合 DNS、回环/私网/链路本地/CGNAT/保留地址，以及 IPv4-mapped IPv6 与 NAT64 中嵌套的非公开地址都会整体拒绝。
+
+WebSearch 的带密钥 wire URL 不进入诊断。错误只保留 provider、scheme、host、path、状态与类别，reqwest cause 在进入错误链前移除 URL。
 
 ## 提示词工作流 V2 验收
 
@@ -104,6 +133,10 @@ Shell 执行受 OS 沙箱约束。`read-only` 与 `workspace-write` 都要求一
 ## 客户端界面
 
 客户端界面消费持久事件、收件箱状态和投影。TUI、server、ACP 以及未来的 GUI 客户端不得获得私有的 Agent 循环行为。
+
+`zuno run --show-reasoning` 只把 provider 明确提供的 reasoning delta 用稳定区块写入 stderr，最终答案继续只写 stdout；signed/encrypted reasoning 永不显示，且不能与 JSON 格式组合。
+
+`zuno serve --browser-auth` 是显式的纯回环模式：单次 256-bit 启动 token 换取绑定 authority 的 30 天签名 Cookie；Basic Auth 与 Cookie 任一有效即可授权，Cookie 的非安全方法还要求精确 Origin。bootstrap query 在访问日志前被脱敏。
 
 ## 参见
 

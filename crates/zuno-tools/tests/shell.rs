@@ -1,29 +1,47 @@
 mod support;
 
+#[cfg(unix)]
 use async_trait::async_trait;
+#[cfg(unix)]
 use serde_json::json;
+#[cfg(unix)]
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
+#[cfg(unix)]
 use tokio::sync::Notify;
+#[cfg(unix)]
 use zuno_error::ToolError;
 use zuno_permission::{PermissionAction, Rule, evaluate};
+#[cfg(unix)]
 use zuno_pty::BackgroundExecutionPurpose;
+use zuno_tool::Tool;
+#[cfg(unix)]
 use zuno_tool::{
-    ACCEPT_LARGE_OUTPUT_KEY, AllowAll, InterruptHandle, NeverInterrupted, Tool, ToolContext,
+    ACCEPT_LARGE_OUTPUT_KEY, AllowAll, InterruptHandle, NeverInterrupted, ToolContext,
 };
+#[cfg(unix)]
 use zuno_tool::{OutputLimits, ToolOutputStore};
-use zuno_tools::shell::{ShellEnvHook, ShellEnvInput, ShellParams, ShellSyntax, analyze_command};
+#[cfg(unix)]
+use zuno_tools::shell::{ShellEnvHook, ShellEnvInput, ShellParams};
+use zuno_tools::shell::{ShellSyntax, analyze_command};
 
+#[cfg(unix)]
 #[derive(Default)]
 struct FirableInterrupt {
     fired: AtomicBool,
     notify: Notify,
 }
 
+#[cfg(unix)]
 impl FirableInterrupt {
     fn fire(&self) {
         self.fired.store(true, Ordering::SeqCst);
@@ -31,6 +49,7 @@ impl FirableInterrupt {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl InterruptHandle for FirableInterrupt {
     fn is_set(&self) -> bool {
@@ -44,6 +63,7 @@ impl InterruptHandle for FirableInterrupt {
     }
 }
 
+#[cfg(unix)]
 fn context(interrupt: Arc<dyn InterruptHandle>) -> ToolContext {
     ToolContext::new(
         "ses_shell",
@@ -55,6 +75,7 @@ fn context(interrupt: Arc<dyn InterruptHandle>) -> ToolContext {
     )
 }
 
+#[cfg(unix)]
 fn params(command: impl Into<String>) -> ShellParams {
     ShellParams {
         command: command.into(),
@@ -66,6 +87,7 @@ fn params(command: impl Into<String>) -> ShellParams {
     }
 }
 
+#[cfg(unix)]
 fn git(workspace: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
@@ -83,6 +105,7 @@ fn git(workspace: &Path, args: &[&str]) -> String {
         .to_owned()
 }
 
+#[cfg(unix)]
 fn initialize_git_repository(workspace: &Path) -> String {
     git(workspace, &["init", "--quiet"]);
     git(workspace, &["config", "user.name", "Zuno Test"]);
@@ -93,10 +116,12 @@ fn initialize_git_repository(workspace: &Path) -> String {
     git(workspace, &["rev-parse", "HEAD"])
 }
 
+#[cfg(unix)]
 struct RedirectGitRepository {
     git_dir: String,
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl ShellEnvHook for RedirectGitRepository {
     async fn env(&self, _input: ShellEnvInput) -> Result<BTreeMap<String, String>, ToolError> {
@@ -310,30 +335,42 @@ async fn shell_cancellation_kills_the_shell_and_its_whole_process_group() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn shell_injected_hard_ceiling_really_terminates_the_process_under_two_seconds() {
+async fn shell_injected_hard_ceiling_really_terminates_the_process_under_four_seconds() {
     let dir = tempfile::tempdir().expect("temp dir");
     let pid_file = dir.path().join("ceiling.pid");
     let command = format!("printf '%s' \"$$\" > '{}'; sleep 30", pid_file.display());
-    let tool =
-        support::sandbox::shell_tool(dir.path()).with_hard_ceiling(Duration::from_millis(100));
+    let tool = support::sandbox::shell_tool(dir.path()).with_hard_ceiling(Duration::from_secs(3));
     let started = Instant::now();
 
-    let error = tool
-        .run(
+    // A saturated workspace test can delay the spawned shell for more than
+    // 100 ms even though this fixture deliberately bypasses the production
+    // sandbox backend. Observe the inner shell before asserting that the hard
+    // ceiling kills it, so scheduler latency is not mistaken for leaked work.
+    let running = tokio::spawn(async move {
+        tool.run(
             params(command),
             context(Arc::new(zuno_tool::NeverInterrupted)),
         )
         .await
+    });
+    wait_for_file(&pid_file).await;
+    let pid = read_pid(&pid_file);
+
+    let error = tokio::time::timeout(Duration::from_secs(4), running)
+        .await
+        .expect("the hard ceiling must settle under four seconds")
+        .expect("shell task joins")
         .expect_err("the hard ceiling must fail the call");
 
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_secs(4));
     assert!(matches!(error, ToolError::Timeout { .. }));
-    wait_for_file(&pid_file).await;
-    wait_for_process_exit(read_pid(&pid_file)).await;
+    wait_for_process_exit(pid).await;
 }
 
+#[cfg(unix)]
 struct InjectEnv;
 
+#[cfg(unix)]
 #[async_trait]
 impl ShellEnvHook for InjectEnv {
     async fn env(&self, input: ShellEnvInput) -> Result<BTreeMap<String, String>, ToolError> {
@@ -469,7 +506,7 @@ async fn shell_oversized_output_is_detected_and_persisted_in_the_shared_store() 
 
 #[cfg(unix)]
 async fn wait_for_file(path: &Path) {
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(2), async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

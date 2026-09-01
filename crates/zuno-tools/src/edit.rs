@@ -150,7 +150,7 @@ impl TypedTool for EditTool {
             report_formatting(
                 report_diff(
                     ToolOutput::text(label.clone(), "Edit applied successfully.")
-                        .with_metadata("filepath", target.canonical.to_string_lossy().into_owned())
+                        .with_metadata("filepath", zuno_paths::wire_path(&target.canonical))
                         .with_metadata("replacements", replacements)
                         .with_metadata("formatted", outcome.changed)
                         .with_written_path(&target.canonical),

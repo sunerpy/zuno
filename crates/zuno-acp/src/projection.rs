@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use serde_json::{Value, json};
 use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, ToolDiff, ToolInterruption, TurnEvent};
@@ -621,7 +622,7 @@ fn text_content(text: &str) -> Value {
 fn file_diff_content(diff: &zuno_tool::FileDiff) -> Value {
     json!({
         "type": "diff",
-        "path": diff.path(),
+        "path": zuno_paths::wire_path(Path::new(diff.path())),
         "oldText": diff.old_text(),
         "newText": diff.new_text(),
     })
@@ -643,14 +644,16 @@ fn tool_locations(paths: &[String], diff: Option<&ToolDiff>) -> Vec<Value> {
     let mut seen = HashSet::new();
     let mut locations = Vec::new();
     for path in paths {
-        if seen.insert(path.as_str()) {
+        let path = zuno_paths::wire_path(Path::new(path));
+        if seen.insert(path.clone()) {
             locations.push(json!({ "path": path }));
         }
     }
     if let Some(diff) = diff {
         for file in diff.files() {
-            if seen.insert(file.path()) {
-                locations.push(json!({ "path": file.path() }));
+            let path = zuno_paths::wire_path(Path::new(file.path()));
+            if seen.insert(path.clone()) {
+                locations.push(json!({ "path": path }));
             }
         }
     }

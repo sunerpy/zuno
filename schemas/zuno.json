@@ -262,6 +262,7 @@
       "type": "object"
     },
     "AttachmentConfig": {
+      "additionalProperties": false,
       "description": "Attachment processing (`config/attachment.ts:22-24`).",
       "properties": {
         "image": {
@@ -471,6 +472,40 @@
       "maximum": 64,
       "minimum": 1,
       "type": "integer"
+    },
+    "ContinuityConfig": {
+      "anyOf": [
+        {
+          "description": "`false` disables both tools; `true` enables both.",
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/ContinuityOptions",
+          "description": "Fine-grained selection. Unspecified fields remain disabled."
+        }
+      ],
+      "description": "Model-facing continuity: a master boolean, or independently selected tools."
+    },
+    "ContinuityOptions": {
+      "additionalProperties": false,
+      "description": "Fine-grained switches under the `continuity` top-level key.",
+      "properties": {
+        "history": {
+          "description": "Expose normalized history from the current session.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "notes": {
+          "description": "Expose session-and-agent scoped working notes.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     },
     "EnterpriseConfig": {
       "description": "Enterprise deployment settings (`config/config.ts:134-136`).",
@@ -699,6 +734,7 @@
       "type": "object"
     },
     "ImageAttachmentConfig": {
+      "additionalProperties": false,
       "description": "Image attachment limits (`config/attachment.ts:6-19`).",
       "properties": {
         "auto_resize": {
@@ -708,9 +744,9 @@
             "null"
           ]
         },
-        "max_base64_bytes": {
-          "description": "Maximum base64 payload in bytes. Defaults to 5242880.",
-          "format": "uint32",
+        "max_encoded_bytes": {
+          "description": "Maximum normalized encoded bytes. Defaults to 5 MiB.",
+          "format": "uint64",
           "minimum": 1,
           "type": [
             "integer",
@@ -720,6 +756,24 @@
         "max_height": {
           "description": "Maximum height before resizing or rejecting. Defaults to 2000.",
           "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_pixels": {
+          "description": "Maximum decoded pixel count. Defaults to 4,000,000.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_source_bytes": {
+          "description": "Maximum source bytes accepted before decoding. Defaults to 20 MiB.",
+          "format": "uint64",
           "minimum": 1,
           "type": [
             "integer",
@@ -766,6 +820,188 @@
       "required": [
         "field"
       ],
+      "type": "object"
+    },
+    "LearningAggregationConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "interval_ms": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_new_records": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LearningConfig": {
+      "additionalProperties": false,
+      "description": "User-experience extraction and reviewed Skill evolution.",
+      "properties": {
+        "aggregation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningAggregationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Project-level pattern mining."
+        },
+        "enabled": {
+          "description": "Master switch. Learning is disabled unless explicitly enabled.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "extractor_model": {
+          "description": "Dedicated model used by the no-tools structured extractor.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "global_promotion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningGlobalPromotionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Cross-project pattern promotion."
+        },
+        "post_turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningPostTurnConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Fast post-turn extraction."
+        },
+        "retrieval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningRetrievalConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Automatic and explicit experience retrieval."
+        },
+        "skill": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningSkillConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Skill-candidate evidence and review thresholds."
+        }
+      },
+      "type": "object"
+    },
+    "LearningGlobalPromotionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "interval_ms": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_projects": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LearningPostTurnConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LearningRetrievalConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_context_tokens": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_items": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LearningSkillConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_learned_rules": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_independent_sessions": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "require_review": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "LocalKind": {
@@ -1106,6 +1342,7 @@
       "description": "Persistent memory: a master boolean, or component settings."
     },
     "MemoryOptions": {
+      "additionalProperties": false,
       "description": "Fine-grained settings under the `memory` top-level key.",
       "properties": {
         "auto_confidence": {
@@ -1123,15 +1360,6 @@
           "description": "Character cap for global agent notes. Defaults to 2200.",
           "format": "uint32",
           "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "nudge_interval": {
-          "description": "Reflect every N delivered turns; zero disables only the periodic trigger.",
-          "format": "uint32",
-          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -1156,13 +1384,6 @@
             }
           ],
           "description": "Candidate promotion policy. Defaults to `review`."
-        },
-        "reflection": {
-          "description": "Run post-response background reflection.",
-          "type": [
-            "boolean",
-            "null"
-          ]
         },
         "resident": {
           "description": "Inject frozen resident blocks into each session's system prompt.",
@@ -2533,6 +2754,26 @@
       },
       "type": "object"
     },
+    "SubagentModelSelectionConfig": {
+      "additionalProperties": false,
+      "description": "Host-global child model selection policy, frozen into each durable session.",
+      "properties": {
+        "allowed_models": {
+          "default": [],
+          "description": "Exact `provider/model` identities the model may select.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Expose optional `model` and `effort` fields on the `task` tool.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "ThemeColor": {
       "description": "A named theme colour (`config/agent.ts:9`).",
       "oneOf": [
@@ -2815,6 +3056,17 @@
       ],
       "description": "Bounded concurrency for independent runtime capabilities."
     },
+    "continuity": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ContinuityConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional model-facing access to durable session history and notes."
+    },
     "default_agent": {
       "description": "Agent to use when none is named. Must be a primary agent.",
       "type": [
@@ -2895,6 +3147,17 @@
         "array",
         "null"
       ]
+    },
+    "learning": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LearningConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "User-experience extraction, retrieval, aggregation, and Skill review."
     },
     "logLevel": {
       "anyOf": [
@@ -3082,6 +3345,17 @@
         "integer",
         "null"
       ]
+    },
+    "subagent_model_selection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SubagentModelSelectionConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Host-owned allowlist for model-facing child model and effort selection."
     },
     "tool_output": {
       "anyOf": [

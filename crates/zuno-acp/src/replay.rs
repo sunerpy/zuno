@@ -214,6 +214,31 @@ pub fn durable_plan_update(work: &WorkStateProjection) -> Option<Value> {
     }))
 }
 
+/// Replays the complete durable learning snapshot through ACP extensibility.
+///
+/// `session_info_update` permits metadata-only patches. Keeping learning under
+/// `_meta.zuno` lets unaware clients ignore it without rendering false chat
+/// content, while capable clients receive the same projection as TUI and Server.
+#[must_use]
+pub fn durable_learning_update(work: &WorkStateProjection) -> Value {
+    json!({
+        "sessionUpdate": "session_info_update",
+        "_meta": {
+            "zuno": {
+                "learning": work.learning,
+            }
+        },
+    })
+}
+
+/// Stable ACP updates for the complete frontend-neutral work snapshot.
+#[must_use]
+pub fn durable_work_updates(work: &WorkStateProjection) -> Vec<Value> {
+    let mut updates = durable_plan_update(work).into_iter().collect::<Vec<_>>();
+    updates.push(durable_learning_update(work));
+    updates
+}
+
 fn plan_step_priority<'a>(work: &'a WorkStateProjection, step_id: &str) -> &'a str {
     let mut resolved = None;
     for item in work
@@ -590,9 +615,10 @@ mod tests {
     #[test]
     fn replay_preserves_content_tools_typed_diffs_attachments_and_order() {
         let root = tempfile::tempdir().expect("replay root");
-        let edited = root.path().join("demo.rs");
-        std::fs::write(&edited, "new\n").expect("write replay target");
-        let edited = edited.to_string_lossy().into_owned();
+        let edited_path = root.path().join("demo.rs");
+        std::fs::write(&edited_path, "new\n").expect("write replay target");
+        let edited = edited_path.to_string_lossy().into_owned();
+        let edited_wire = zuno_paths::wire_path(&edited_path);
         let user = message(
             "msg-user",
             "user",
@@ -680,8 +706,12 @@ mod tests {
         assert_eq!(updates[4]["sessionUpdate"], "tool_call_update");
         assert_eq!(updates[4]["status"], "completed");
         assert_eq!(updates[4]["content"][1]["type"], "diff");
+        assert_eq!(updates[4]["content"][1]["path"], edited_wire);
         assert_eq!(updates[4]["content"][2]["content"]["type"], "image");
-        assert_eq!(updates[4]["locations"], json!([{"path":edited}]));
+        assert_eq!(
+            updates[4]["locations"],
+            json!([{"path":edited_wire.clone()}])
+        );
         assert_eq!(updates[5]["content"]["text"], "done");
         assert_eq!(updates[5]["messageId"], "msg-assistant");
     }
@@ -1129,15 +1159,16 @@ mod tests {
     #[test]
     fn replay_filters_stale_and_external_actionable_paths() {
         let root = tempfile::tempdir().expect("replay root");
-        let inside = root.path().join("inside.rs");
-        std::fs::write(&inside, "inside\n").expect("write inside path");
+        let inside_path = root.path().join("inside.rs");
+        std::fs::write(&inside_path, "inside\n").expect("write inside path");
         let outside_root = tempfile::tempdir().expect("outside root");
-        let outside = outside_root.path().join("outside.rs");
-        std::fs::write(&outside, "outside\n").expect("write outside path");
-        let missing = root.path().join("missing.rs");
-        let inside = inside.to_string_lossy().into_owned();
-        let outside = outside.to_string_lossy().into_owned();
-        let missing = missing.to_string_lossy().into_owned();
+        let outside_path = outside_root.path().join("outside.rs");
+        std::fs::write(&outside_path, "outside\n").expect("write outside path");
+        let missing_path = root.path().join("missing.rs");
+        let inside = inside_path.to_string_lossy().into_owned();
+        let outside = outside_path.to_string_lossy().into_owned();
+        let missing = missing_path.to_string_lossy().into_owned();
+        let inside_wire = zuno_paths::wire_path(&inside_path);
         let assistant = message(
             "msg-assistant",
             "assistant",
@@ -1169,7 +1200,10 @@ mod tests {
         let replay = durable_updates(&[assistant], &ReplayPolicy::for_workspace(root.path()), 0);
         let completed = &replay.updates[1];
 
-        assert_eq!(completed["locations"], json!([{"path":inside}]));
+        assert_eq!(
+            completed["locations"],
+            json!([{"path":inside_wire.clone()}])
+        );
         let diffs = completed["content"]
             .as_array()
             .expect("tool content")
@@ -1177,7 +1211,7 @@ mod tests {
             .filter(|item| item["type"] == "diff")
             .collect::<Vec<_>>();
         assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0]["path"], inside);
+        assert_eq!(diffs[0]["path"], inside_wire);
     }
 
     #[test]
@@ -1481,5 +1515,43 @@ mod tests {
             ..zuno_types::WorkStateProjection::default()
         };
         assert!(durable_plan_update(&work).is_none());
+    }
+
+    #[test]
+    fn replay_learning_uses_metadata_only_session_info_update() {
+        let work = zuno_types::WorkStateProjection {
+            learning: zuno_types::LearningStateProjection {
+                experiences: vec![zuno_types::ExperienceProjection {
+                    id: "exp-1".to_owned(),
+                    project_id: "prj-1".to_owned(),
+                    session_id: Some("ses-1".to_owned()),
+                    source_message_id: Some("msg-1".to_owned()),
+                    kind: zuno_types::ExperienceKind::Procedure,
+                    title: "Verify before applying".to_owned(),
+                    summary: "Run the focused gate first.".to_owned(),
+                    resolution: Some("The focused gate passed.".to_owned()),
+                    confidence: 9_500,
+                    status: zuno_types::ExperienceStatus::Active,
+                    promoted_memory_candidate_id: None,
+                    time_created: 1,
+                    time_updated: 2,
+                }],
+                ..zuno_types::LearningStateProjection::default()
+            },
+            ..zuno_types::WorkStateProjection::default()
+        };
+
+        let update = durable_learning_update(&work);
+
+        assert_eq!(update["sessionUpdate"], "session_info_update");
+        assert!(update.get("title").is_none());
+        assert_eq!(
+            update["_meta"]["zuno"]["learning"]["experiences"][0]["kind"],
+            "procedure"
+        );
+        assert_eq!(
+            update["_meta"]["zuno"]["learning"]["experiences"][0]["sourceMessageId"],
+            "msg-1"
+        );
     }
 }

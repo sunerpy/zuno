@@ -10,6 +10,8 @@
 //! server is a stub, and only so its rejection is deterministic instead of
 //! depending on which MCP servers a machine happens to have installed.
 
+#![cfg(unix)]
+
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};

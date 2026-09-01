@@ -1,1 +1,0 @@
-Search past sessions with local FTS5, scroll around a matched message, or browse recent sessions. No provider or LLM calls are made.

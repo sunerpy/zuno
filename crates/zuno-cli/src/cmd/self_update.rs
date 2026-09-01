@@ -518,6 +518,7 @@ enum UpdateError {
     Extract { asset: String, detail: String },
     #[error("release archive did not produce a non-empty regular executable at {}", path.display())]
     InvalidReplacement { path: PathBuf },
+    #[cfg(unix)]
     #[error("release executable is not marked executable: {}", path.display())]
     ReplacementNotExecutable { path: PathBuf },
     #[error("could not locate the running Zuno executable: {0}")]

@@ -94,6 +94,10 @@ OAuth 块控制整个流程：
 
 对于一个公布了 OAuth 元数据但你不希望使用的 server，设置 `"oauth": false` 来抑制自动探测。对于静态 token，用一个头比走 OAuth 流程更简单，但请把值放在环境变量里，而不是 JSON 文件里。
 
+## ACP session server
+
+ACP 客户端可以在 new/load/resume 时提供完整的 session-local `mcpServers` 列表。这里支持 stdio 与 Streamable HTTP，不支持 SSE。这些 server 不会写进 `zuno.json`：它们是经过校验、只存在于进程内的 effect，全部连接并完成 discovery 后工具才会发布，部分启动按逆序清理。客户端 command、environment 值与 header 永不写入 session 数据库或日志。参见 [zuno acp](/zh/cli/acp)。
+
 ## MCP 工具如何变为可用
 
 注册不等于授权。要让模型调用一个 MCP 工具，四件事必须同时成立：

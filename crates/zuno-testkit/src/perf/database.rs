@@ -30,6 +30,10 @@ fn set_owner_read_write(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::permissions_set_readonly_false,
+    reason = "this branch has no Unix mode bits; clearing the platform read-only attribute is the portable inverse"
+)]
 fn set_owner_read_write(path: &Path) -> std::io::Result<()> {
     let mut permissions = std::fs::metadata(path)?.permissions();
     permissions.set_readonly(false);
@@ -405,14 +409,17 @@ fn session_id_literal(id: &str, path: &Path) -> Result<String> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
+    #[cfg(unix)]
     use std::io::{BufRead as _, BufReader, Write as _};
+    #[cfg(unix)]
     use std::process::Stdio;
 
     use super::*;
 
     /// One session in a fixture database, sized so its totals are exact.
+    #[cfg(unix)]
     struct FixtureSession {
         id: &'static str,
         messages: u64,
@@ -420,6 +427,7 @@ mod tests {
         bytes_per_part: usize,
     }
 
+    #[cfg(unix)]
     impl FixtureSession {
         fn part_count(&self) -> u64 {
             self.messages * self.parts_per_message
@@ -430,6 +438,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn seed_fixture_database(path: &Path, sessions: &[FixtureSession]) {
         let mut script =
             String::from("CREATE TABLE part(session_id TEXT, message_id TEXT, data TEXT);\n");
@@ -466,6 +475,7 @@ mod tests {
     ///
     /// The digest and path are leaked because [`PinnedSubject`] stores `'static`
     /// strings for the committed constant; a test process ends before it matters.
+    #[cfg(unix)]
     fn pin_for(path: &Path, session: &FixtureSession) -> PinnedSubject {
         PinnedSubject {
             session_id: session.id,
@@ -478,6 +488,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn subject() -> FixtureSession {
         FixtureSession {
             id: "ses_pinnedsubject",
@@ -488,6 +499,7 @@ mod tests {
     }
 
     /// Heavier than [`subject`], so "pinned" and "largest" cannot agree.
+    #[cfg(unix)]
     fn heavier_decoy() -> FixtureSession {
         FixtureSession {
             id: "ses_heavierdecoy",
@@ -497,6 +509,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_pinned_session_is_selected_twice_over_a_heavier_one() {
         // Given: a database whose heaviest session is not the pinned session.
@@ -522,6 +535,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_database_missing_the_pinned_session_fails_naming_the_recapture_procedure() {
         // Given: a database that holds only a heavier, unpinned session.
@@ -549,6 +563,7 @@ mod tests {
         assert!(message.contains("benchmarks/ts-baseline.json"), "{message}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_pinned_session_whose_content_drifted_is_not_measured() {
         // Given: a database holding the pinned session with more parts than pinned.
@@ -585,6 +600,7 @@ mod tests {
         assert!(message.contains("W_REAL_SUBJECT"), "{message}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_database_that_is_not_the_pinned_snapshot_is_rejected_before_it_is_copied() {
         // Given: a database that holds the pinned session, and two pins that
@@ -637,6 +653,7 @@ mod tests {
         RealDatabaseSnapshot::capture_pinned(&path, &honest).expect("the honest pin must capture");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_session_id_that_could_rewrite_the_query_is_rejected_rather_than_interpolated() {
         // Given: a fixture database and a pin whose id carries SQL punctuation.
@@ -665,6 +682,7 @@ mod tests {
         assert_eq!(surviving.part_count, 6);
     }
 
+    #[cfg(unix)]
     #[test]
     fn snapshot_contains_wal_rows_without_sidecars() {
         // Given: a live WAL database whose committed row is not checkpointed.

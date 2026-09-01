@@ -21,7 +21,8 @@ zuno self-update --tag v0.0.1 --force --yes
 
 ## Release and integrity contract
 
-The updater supports exactly the targets published by
+The updater supports exactly the targets certified by
+`.github/workflows/release-candidate.yml` and promoted by
 `.github/workflows/release.yml`:
 
 | Host | Release target | Archive |

@@ -664,6 +664,14 @@ fn turn_interruption_projects_typed_provenance_without_a_failure_card() {
 #[test]
 fn completed_tools_project_native_file_diffs_locations_and_json_output() {
     let mut projector = TurnEventProjector::new();
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let source = workspace.path().join("src");
+    let changed = source.join("lib.rs");
+    let created = source.join("new.rs");
+    let deleted = source.join("deleted.rs");
+    let changed_path = zuno_paths::wire_path(&changed);
+    let created_path = zuno_paths::wire_path(&created);
+    let deleted_path = zuno_paths::wire_path(&deleted);
     let patch = concat!(
         "diff --git a/src/lib.rs b/src/lib.rs\n",
         "--- a/src/lib.rs\n",
@@ -683,30 +691,18 @@ fn completed_tools_project_native_file_diffs_locations_and_json_output() {
             diff: ToolDiff::new(
                 Some(patch.to_owned()),
                 vec![
-                    FileDiff::new(
-                        std::path::Path::new("/workspace/src/lib.rs"),
-                        Some("old\n".to_owned()),
-                        "new\n".to_owned(),
-                    )
-                    .expect("changed absolute file"),
-                    FileDiff::new(
-                        std::path::Path::new("/workspace/src/new.rs"),
-                        None,
-                        "created\n".to_owned(),
-                    )
-                    .expect("created absolute file"),
-                    FileDiff::new(
-                        std::path::Path::new("/workspace/src/deleted.rs"),
-                        Some("removed\n".to_owned()),
-                        String::new(),
-                    )
-                    .expect("deleted absolute file"),
+                    FileDiff::new(&changed, Some("old\n".to_owned()), "new\n".to_owned())
+                        .expect("changed absolute file"),
+                    FileDiff::new(&created, None, "created\n".to_owned())
+                        .expect("created absolute file"),
+                    FileDiff::new(&deleted, Some("removed\n".to_owned()), String::new())
+                        .expect("deleted absolute file"),
                 ],
             ),
             written_paths: vec![
-                "/workspace/src/lib.rs".to_owned(),
-                "/workspace/src/new.rs".to_owned(),
-                "/workspace/src/lib.rs".to_owned(),
+                changed_path.clone(),
+                created_path.clone(),
+                changed_path.clone(),
             ],
             is_error: false,
         })
@@ -715,16 +711,16 @@ fn completed_tools_project_native_file_diffs_locations_and_json_output() {
     assert_eq!(
         completed["locations"],
         json!([
-            { "path": "/workspace/src/lib.rs" },
-            { "path": "/workspace/src/new.rs" },
-            { "path": "/workspace/src/deleted.rs" },
+            { "path": changed_path },
+            { "path": created_path },
+            { "path": deleted_path },
         ])
     );
     assert_eq!(
         completed["content"][1],
         json!({
             "type": "diff",
-            "path": "/workspace/src/lib.rs",
+            "path": changed_path,
             "oldText": "old\n",
             "newText": "new\n",
         })
@@ -733,12 +729,12 @@ fn completed_tools_project_native_file_diffs_locations_and_json_output() {
         completed["content"][2],
         json!({
             "type": "diff",
-            "path": "/workspace/src/new.rs",
+            "path": created_path,
             "oldText": null,
             "newText": "created\n",
         })
     );
-    assert_eq!(completed["content"][3]["path"], "/workspace/src/deleted.rs");
+    assert_eq!(completed["content"][3]["path"], deleted_path);
     assert_eq!(completed["content"][3]["newText"], "");
 }
 

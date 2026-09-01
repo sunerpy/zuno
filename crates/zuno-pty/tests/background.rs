@@ -159,7 +159,10 @@ async fn hard_ceiling_is_terminal_and_never_replays_the_command() {
         .start(input(
             directory.path(),
             format!("touch '{}'; sleep 30", marker.display()),
-            Duration::from_millis(50),
+            // This is a terminal-state and replay test, not a process-start
+            // benchmark. Leave enough wall-clock headroom for a saturated
+            // hosted runner to schedule the child before its ceiling.
+            Duration::from_secs(3),
         ))
         .expect("command starts");
 

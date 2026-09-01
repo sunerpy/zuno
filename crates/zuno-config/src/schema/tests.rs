@@ -151,6 +151,40 @@ fn round_trip_is_stable_on_a_second_pass() {
 }
 
 #[test]
+fn image_attachment_policy_uses_the_native_hard_limits_and_rejects_retired_keys() {
+    let config = parse_value(json!({
+        "attachment": {
+            "image": {
+                "auto_resize": false,
+                "max_source_bytes": 20971520,
+                "max_width": 2000,
+                "max_height": 2000,
+                "max_pixels": 4000000,
+                "max_encoded_bytes": 5242880
+            }
+        }
+    }))
+    .expect("native image attachment policy");
+    let image = config
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.image.as_ref())
+        .expect("image policy");
+    assert!(!image.resolved_auto_resize());
+    assert_eq!(image.resolved_max_source_bytes(), 20 * 1024 * 1024);
+    assert_eq!(image.resolved_max_width(), 2_000);
+    assert_eq!(image.resolved_max_height(), 2_000);
+    assert_eq!(image.resolved_max_pixels(), 4_000_000);
+    assert_eq!(image.resolved_max_encoded_bytes(), 5 * 1024 * 1024);
+
+    let error = parse_value(json!({
+        "attachment": {"image": {"max_base64_bytes": 5242880}}
+    }))
+    .expect_err("the retired ambiguous key must not be ignored");
+    assert_eq!(issue_path(&error), "attachment.image.max_base64_bytes");
+}
+
+#[test]
 fn presets_are_structured_ordered_and_use_canonical_reasoning() {
     let config = parse(
         r#"{
@@ -219,12 +253,61 @@ fn memory_false_dominates_every_enabled_default() {
     assert!(!memory.enabled);
     assert!(!memory.resident);
     assert!(!memory.tool);
-    assert!(!memory.reflection);
     assert_eq!(memory.global_char_limit, 2_200);
     assert_eq!(memory.project_char_limit, 3_000);
-    assert_eq!(memory.nudge_interval, 10);
     assert_eq!(memory.promotion, MemoryPromotion::Review);
     assert_eq!(memory.auto_confidence, 0.9);
+}
+
+#[test]
+fn continuity_is_disabled_by_default_and_supports_bool_or_object_selection() {
+    assert_eq!(
+        Config::default().resolved_continuity(),
+        ResolvedContinuityConfig {
+            history: false,
+            notes: false,
+        }
+    );
+    assert_eq!(
+        parse(r#"{"continuity":true}"#)
+            .expect("boolean continuity")
+            .resolved_continuity(),
+        ResolvedContinuityConfig {
+            history: true,
+            notes: true,
+        }
+    );
+    assert_eq!(
+        parse(r#"{"continuity":{"history":true}}"#)
+            .expect("object continuity")
+            .resolved_continuity(),
+        ResolvedContinuityConfig {
+            history: true,
+            notes: false,
+        }
+    );
+    assert_eq!(
+        parse(r#"{"continuity":false}"#)
+            .expect("disabled continuity")
+            .resolved_continuity(),
+        ResolvedContinuityConfig {
+            history: false,
+            notes: false,
+        }
+    );
+}
+
+#[test]
+fn continuity_rejects_unknown_fields_and_non_boolean_values() {
+    let unknown = parse(r#"{"continuity":{"history":true,"recall":true}}"#)
+        .expect_err("unknown continuity fields must fail");
+    assert_eq!(issue_path(&unknown), "continuity.recall");
+
+    for value in [r#""yes""#, "1", "[]"] {
+        let error = parse(&format!(r#"{{"continuity":{value}}}"#))
+            .expect_err("continuity accepts only a boolean or options object");
+        assert_eq!(issue_path(&error), "continuity");
+    }
 }
 
 #[test]
@@ -440,9 +523,9 @@ fn permission_rejects_unknown_policy_keys() {
 }
 
 #[test]
-fn memory_options_resolve_caps_cadence_and_component_flags() {
+fn memory_options_resolve_caps_and_component_flags() {
     let config = parse(
-        r#"{"memory":{"resident":false,"tool":false,"reflection":false,"global_char_limit":1200,"project_char_limit":2400,"nudge_interval":0}}"#,
+        r#"{"memory":{"resident":false,"tool":false,"global_char_limit":1200,"project_char_limit":2400}}"#,
     )
     .expect("memory options parse");
     let memory = config.resolved_memory();
@@ -450,10 +533,93 @@ fn memory_options_resolve_caps_cadence_and_component_flags() {
     assert!(memory.enabled);
     assert!(!memory.resident);
     assert!(!memory.tool);
-    assert!(!memory.reflection);
     assert_eq!(memory.global_char_limit, 1_200);
     assert_eq!(memory.project_char_limit, 2_400);
-    assert_eq!(memory.nudge_interval, 0);
+}
+
+#[test]
+fn learning_is_disabled_by_default_and_resolves_native_thresholds() {
+    let learning = Config::default().resolved_learning();
+    assert!(!learning.enabled);
+    assert_eq!(learning.extractor_model, None);
+    assert!(learning.post_turn_enabled);
+    assert_eq!(learning.aggregation_interval_ms, 86_400_000);
+    assert_eq!(learning.aggregation_min_new_records, 3);
+    assert_eq!(learning.global_promotion_interval_ms, 604_800_000);
+    assert_eq!(learning.global_promotion_min_projects, 2);
+    assert_eq!(learning.retrieval_max_items, 5);
+    assert_eq!(learning.retrieval_max_context_tokens, 1_200);
+    assert_eq!(learning.skill_min_independent_sessions, 3);
+    assert_eq!(learning.skill_max_learned_rules, 15);
+    assert!(learning.skill_require_review);
+}
+
+#[test]
+fn enabled_learning_requires_an_extractor_and_skill_review() {
+    let missing =
+        parse(r#"{"learning":{"enabled":true}}"#).expect_err("enabled learning needs an extractor");
+    assert_eq!(issue_path(&missing), "learning.extractor_model");
+
+    let review = parse(
+        r#"{"learning":{"enabled":true,"extractor_model":"provider/model","skill":{"require_review":false}}}"#,
+    )
+    .expect_err("Skill review cannot be disabled");
+    assert_eq!(issue_path(&review), "learning.skill.require_review");
+}
+
+#[test]
+fn learning_options_resolve_exact_flywheel_limits() {
+    let config = parse(
+        r#"{"learning":{
+          "enabled":true,
+          "extractor_model":"provider/extractor",
+          "post_turn":{"enabled":false},
+          "aggregation":{"interval_ms":1000,"min_new_records":4},
+          "global_promotion":{"interval_ms":2000,"min_projects":3},
+          "retrieval":{"max_items":7,"max_context_tokens":1400},
+          "skill":{"min_independent_sessions":4,"max_learned_rules":12,"require_review":true}
+        }}"#,
+    )
+    .expect("learning options parse");
+    let learning = config.resolved_learning();
+    assert!(learning.enabled);
+    assert_eq!(
+        learning.extractor_model.as_deref(),
+        Some("provider/extractor")
+    );
+    assert!(!learning.post_turn_enabled);
+    assert_eq!(learning.aggregation_interval_ms, 1_000);
+    assert_eq!(learning.aggregation_min_new_records, 4);
+    assert_eq!(learning.global_promotion_interval_ms, 2_000);
+    assert_eq!(learning.global_promotion_min_projects, 3);
+    assert_eq!(learning.retrieval_max_items, 7);
+    assert_eq!(learning.retrieval_max_context_tokens, 1_400);
+    assert_eq!(learning.skill_min_independent_sessions, 4);
+    assert_eq!(learning.skill_max_learned_rules, 12);
+}
+
+#[test]
+fn retired_memory_reflection_fields_are_rejected_instead_of_ignored() {
+    for (document, path) in [
+        (r#"{"memory":{"reflection":true}}"#, "memory.reflection"),
+        (
+            r#"{"memory":{"nudge_interval":10}}"#,
+            "memory.nudge_interval",
+        ),
+    ] {
+        let error =
+            parse(document).expect_err("retired Memory learning fields must not be aliases");
+        assert_eq!(issue_path(&error), path);
+    }
+}
+
+#[test]
+fn learning_rejects_unknown_nested_fields() {
+    let error = parse(
+        r#"{"learning":{"enabled":true,"extractor_model":"provider/model","post_turn":{"nudge_interval":10}}}"#,
+    )
+    .expect_err("post-turn extraction has no legacy cadence alias");
+    assert_eq!(issue_path(&error), "learning.post_turn.nudge_interval");
 }
 
 #[test]
@@ -1156,16 +1322,20 @@ fn legacy_permission_shorthands_are_rejected() {
 
 #[test]
 fn action_only_permissions_reject_per_pattern_rules() {
-    let error = parse_value(json!({
-        "permission": { "rules": { "webfetch": { "*": "allow" } } }
-    }))
-    .expect_err("webfetch takes a bare action");
-    assert_eq!(issue_path(&error), "permission.rules.webfetch");
-    assert!(issue_detail(&error).contains("webfetch"));
-    parse_value(json!({
-        "permission": { "rules": { "shell": { "git push": "ask" } } }
-    }))
-    .expect("shell does take per-pattern rules");
+    for key in ["webfetch", "history"] {
+        let error = parse_value(json!({
+            "permission": { "rules": { (key): { "*": "allow" } } }
+        }))
+        .expect_err("action-only tools take a bare action");
+        assert_eq!(issue_path(&error), format!("permission.rules.{key}"));
+        assert!(issue_detail(&error).contains(key));
+    }
+    for key in ["shell", "notes"] {
+        parse_value(json!({
+            "permission": { "rules": { (key): { "*": "ask" } } }
+        }))
+        .expect("resource-addressed tools take per-pattern rules");
+    }
 }
 
 #[test]

@@ -74,6 +74,10 @@
   },
   "default_agent": "build",
   "subagent_depth": 0,
+  "subagent_model_selection": {
+    "enabled": true,
+    "allowed_models": ["anthropic/claude-sonnet-4-5"]
+  },
   "username": "ada",
   "agents": {
     "build": {
@@ -281,9 +285,11 @@
   "attachment": {
     "image": {
       "auto_resize": true,
+      "max_source_bytes": 20971520,
       "max_width": 2000,
       "max_height": 2000,
-      "max_base64_bytes": 5242880
+      "max_pixels": 4000000,
+      "max_encoded_bytes": 5242880
     }
   },
   "enterprise": { "url": "https://opencode.example.com" },
@@ -311,19 +317,43 @@
     "preserve_recent_tokens": 20000,
     "reserved": 8000
   },
+  "continuity": {
+    "history": true,
+    "notes": true
+  },
   "concurrency": {
     "tool_calls": 8,
     "delegations": 8,
     "mcp_connections": 8,
     "lsp_requests": 4
   },
+  "learning": {
+    "enabled": true,
+    "extractor_model": "anthropic/claude-haiku-4-5",
+    "post_turn": { "enabled": true },
+    "aggregation": {
+      "interval_ms": 86400000,
+      "min_new_records": 3
+    },
+    "global_promotion": {
+      "interval_ms": 604800000,
+      "min_projects": 2
+    },
+    "retrieval": {
+      "max_items": 5,
+      "max_context_tokens": 1200
+    },
+    "skill": {
+      "min_independent_sessions": 3,
+      "max_learned_rules": 15,
+      "require_review": true
+    }
+  },
   "memory": {
     "resident": true,
     "tool": true,
-    "reflection": true,
     "global_char_limit": 2200,
     "project_char_limit": 3000,
-    "nudge_interval": 10,
     "promotion": "review",
     "auto_confidence": 0.9
   },

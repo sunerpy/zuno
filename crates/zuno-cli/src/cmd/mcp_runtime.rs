@@ -32,6 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 use futures::stream::{self, StreamExt as _};
 use serde::Serialize;
@@ -79,11 +80,28 @@ pub(crate) fn enabled(server: &McpServerConfig) -> bool {
     }
 }
 
+/// Process-local MCP declarations that must all connect before a session is published.
+#[derive(Default)]
+pub(crate) struct RequiredMcpServers {
+    configs: BTreeMap<String, McpServerConfig>,
+    order: Vec<String>,
+}
+
+impl RequiredMcpServers {
+    pub(crate) fn new(entries: Vec<(String, McpServerConfig)>) -> Self {
+        let order = entries.iter().map(|(name, _)| name.clone()).collect();
+        let configs = entries.into_iter().collect();
+        Self { configs, order }
+    }
+}
+
 /// A connected MCP catalog and the controller that owns its transports.
 pub(crate) struct McpRuntime {
     catalog: zuno_mcp::Catalog,
     controller: zuno_mcp::McpServerController,
     enabled: Vec<String>,
+    required: Vec<String>,
+    startup_order: Mutex<Vec<String>>,
     concurrency: NonZeroUsize,
 }
 
@@ -94,18 +112,39 @@ impl McpRuntime {
     /// spawns no controller and pays nothing — and so the `mcp` argument the host
     /// takes stays `None` in exactly the case it always was.
     pub(crate) fn from_config(config: &Config, workspace: &Path) -> Option<Self> {
-        let configs: BTreeMap<String, McpServerConfig> = config
+        Self::from_config_with_required(config, workspace, RequiredMcpServers::default())
+            .expect("an empty required MCP set cannot collide with configuration")
+    }
+
+    /// Build a runtime that combines host configuration with session-local
+    /// declarations which must all connect and discover before publication.
+    pub(crate) fn from_config_with_required(
+        config: &Config,
+        workspace: &Path,
+        required: RequiredMcpServers,
+    ) -> Result<Option<Self>, String> {
+        let mut configs: BTreeMap<String, McpServerConfig> = config
             .mcp
-            .as_ref()?
-            .iter()
-            .map(|(name, server)| ((*name).to_owned(), server.clone()))
+            .as_ref()
+            .into_iter()
+            .flat_map(|servers| servers.iter())
+            .map(|(name, server)| (name.to_owned(), server.clone()))
             .collect();
-        if configs.is_empty() {
-            return None;
+        for (name, server) in required.configs {
+            if configs.insert(name.clone(), server).is_some() {
+                return Err(format!(
+                    "ACP MCP server `{name}` conflicts with a host-configured MCP server"
+                ));
+            }
         }
+        if configs.is_empty() {
+            return Ok(None);
+        }
+        let required_names = required.order;
+        let required_set = required_names.iter().collect::<BTreeSet<_>>();
         let enabled = configs
             .iter()
-            .filter(|(_, server)| self::enabled(server))
+            .filter(|(name, server)| self::enabled(server) && !required_set.contains(name))
             .map(|(name, _)| name.clone())
             .collect();
         let catalog = zuno_mcp::Catalog::new(configs.keys().cloned());
@@ -115,15 +154,17 @@ impl McpRuntime {
             configs,
             zuno_mcp::McpLifecycleOptions::default(),
         );
-        Some(Self {
+        Ok(Some(Self {
             catalog,
             controller,
             enabled,
+            required: required_names,
+            startup_order: Mutex::new(Vec::new()),
             concurrency: NonZeroUsize::new(usize::from(
                 config.resolved_concurrency().mcp_connections,
             ))
             .expect("configuration validates MCP concurrency"),
-        })
+        }))
     }
 
     /// Connect every enabled server, returning one note per server that did not.
@@ -143,6 +184,10 @@ impl McpRuntime {
             .into_iter()
             .filter_map(|(server, result)| match result {
                 Ok(snapshot) => match snapshot.state {
+                    zuno_mcp::McpServerState::Connected => {
+                        self.record_started(&server);
+                        None
+                    }
                     zuno_mcp::McpServerState::Failed { error }
                     | zuno_mcp::McpServerState::NeedsClientRegistration { error } => {
                         Some(format!("warning: MCP server `{server}` failed: {error}"))
@@ -151,14 +196,37 @@ impl McpRuntime {
                         "warning: MCP server `{server}` needs authorization completed \
                          before its tools are available; run `zuno mcp` to authorize it"
                     )),
-                    zuno_mcp::McpServerState::Connected
-                    | zuno_mcp::McpServerState::Connecting
+                    zuno_mcp::McpServerState::Connecting
                     | zuno_mcp::McpServerState::Disconnecting
                     | zuno_mcp::McpServerState::Disabled => None,
                 },
                 Err(error) => Some(format!("warning: MCP server `{server}` failed: {error}")),
             })
             .collect()
+    }
+
+    /// Connect all session-local servers strictly, then bring up host-configured
+    /// servers with the existing best-effort diagnostics.
+    pub(crate) async fn connect_required(&self) -> Result<Vec<String>, String> {
+        let mut connected = Vec::new();
+        for server in &self.required {
+            let result = self.controller.set_enabled(server, true).await;
+            let is_connected = result.as_ref().is_ok_and(|snapshot| {
+                matches!(snapshot.state, zuno_mcp::McpServerState::Connected)
+            });
+            if is_connected {
+                self.record_started(server);
+                connected.push(server.clone());
+                continue;
+            }
+            for started in connected.into_iter().rev() {
+                let _cleanup = self.controller.set_enabled(&started, false).await;
+            }
+            return Err(format!(
+                "ACP MCP server `{server}` failed to connect and discover its tools"
+            ));
+        }
+        Ok(self.connect().await)
     }
 
     /// The catalog to hand a host.
@@ -221,45 +289,60 @@ impl McpRuntime {
             .connected_servers()
             .into_iter()
             .collect::<BTreeSet<_>>();
-        stream::iter(self.enabled.into_iter().map(|server| {
-            let controller = self.controller.clone();
-            let was_connected = connected.contains(&server);
-            async move {
-                let result = controller.set_enabled(&server, false).await;
-                (server, was_connected, result)
+        let mut order = lock(&self.startup_order).clone();
+        for server in &connected {
+            if !order.contains(server) {
+                order.push(server.clone());
             }
-        }))
-        .buffered(self.concurrency.get())
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .filter_map(|(server, was_connected, result)| match result {
-            Ok(snapshot) if was_connected => match snapshot.state {
-                zuno_mcp::McpServerState::Failed { error }
-                | zuno_mcp::McpServerState::NeedsClientRegistration { error } => Some(format!(
+        }
+        let mut failures = Vec::new();
+        for server in order.into_iter().rev() {
+            let was_connected = connected.contains(&server);
+            let result = self.controller.set_enabled(&server, false).await;
+            let failure = match result {
+                Ok(snapshot) if was_connected => match snapshot.state {
+                    zuno_mcp::McpServerState::Failed { error }
+                    | zuno_mcp::McpServerState::NeedsClientRegistration { error } => Some(format!(
+                        "warning: MCP server `{server}` cleanup failed: {error}"
+                    )),
+                    zuno_mcp::McpServerState::NeedsAuth => Some(format!(
+                        "warning: MCP server `{server}` entered authorization state during cleanup"
+                    )),
+                    zuno_mcp::McpServerState::Disabled => None,
+                    zuno_mcp::McpServerState::Connecting => Some(format!(
+                        "warning: MCP server `{server}` remained connecting after cleanup"
+                    )),
+                    zuno_mcp::McpServerState::Connected => Some(format!(
+                        "warning: MCP server `{server}` remained connected after cleanup"
+                    )),
+                    zuno_mcp::McpServerState::Disconnecting => Some(format!(
+                        "warning: MCP server `{server}` remained disconnecting after cleanup"
+                    )),
+                },
+                Ok(_) => None,
+                Err(error) => Some(format!(
                     "warning: MCP server `{server}` cleanup failed: {error}"
                 )),
-                zuno_mcp::McpServerState::NeedsAuth => Some(format!(
-                    "warning: MCP server `{server}` entered authorization state during cleanup"
-                )),
-                zuno_mcp::McpServerState::Disabled => None,
-                zuno_mcp::McpServerState::Connecting => Some(format!(
-                    "warning: MCP server `{server}` remained connecting after cleanup"
-                )),
-                zuno_mcp::McpServerState::Connected => Some(format!(
-                    "warning: MCP server `{server}` remained connected after cleanup"
-                )),
-                zuno_mcp::McpServerState::Disconnecting => Some(format!(
-                    "warning: MCP server `{server}` remained disconnecting after cleanup"
-                )),
-            },
-            Ok(_) => None,
-            Err(error) => Some(format!(
-                "warning: MCP server `{server}` cleanup failed: {error}"
-            )),
-        })
-        .collect()
+            };
+            if let Some(failure) = failure {
+                failures.push(failure);
+            }
+        }
+        failures
     }
+
+    fn record_started(&self, server: &str) {
+        let mut order = lock(&self.startup_order);
+        if !order.iter().any(|started| started == server) {
+            order.push(server.to_owned());
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn state_diagnostic(state: &zuno_mcp::McpServerState) -> (&'static str, Option<String>) {

@@ -39,12 +39,13 @@
 //!
 //! # Why the render is atomic, and why it does not `fsync`
 //!
-//! A temporary file in the destination's own directory, then a rename. Same
-//! filesystem, so the rename is atomic, so a concurrent reader always observes
-//! one complete document and no lock is needed. This is the approach
-//! `zuno-memory/src/store.rs` settled on (todo 98) and the reasoning is recorded
-//! with it; the helper there is private to that crate, so this is the same
-//! technique rather than the same function.
+//! [`zuno_atomic_file::replace`] writes a completed temporary sibling and
+//! publishes it with `rename` on Unix or `ReplaceFileW` over an existing
+//! destination on Windows. [`zuno_atomic_file::read_to_string`] absorbs the
+//! bounded `NotFound`/sharing window a fresh Windows open can encounter, so the
+//! projection consumer observes one complete document without a private lock.
+//! `zuno-memory` consumes the same component instead of maintaining a second
+//! platform implementation.
 //!
 //! Neither implementation calls `sync_all`. For a *projection* that is the right
 //! trade: the file is derived state, so a render lost to a power cut is
@@ -676,8 +677,8 @@ impl GoalProjection {
     ///
     /// # Errors
     ///
-    /// [`GoalError::Document`] when the directory, the temporary file or the
-    /// rename fails.
+    /// [`GoalError::Document`] when the directory, temporary write or atomic
+    /// replacement fails.
     pub fn write(&self, goal: &Goal) -> Result<(), GoalError> {
         self.write_notes(goal, &Notes::default())
     }
@@ -889,7 +890,7 @@ fn box_of(state: bool) -> &'static str {
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>, GoalError> {
-    match std::fs::read_to_string(path) {
+    match zuno_atomic_file::read_to_string(path) {
         Ok(raw) => Ok(Some(raw)),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(GoalError::Document {
@@ -900,44 +901,16 @@ fn read_optional(path: &Path) -> Result<Option<String>, GoalError> {
     }
 }
 
-/// Write `body` so a concurrent reader observes either all of it or none of it.
+/// Write `body` so a successful concurrent open observes a complete version.
 ///
-/// Temporary file in the destination's own directory, then rename: same
-/// filesystem, so the rename is atomic and no lock is needed. The same technique
-/// as `zuno-memory/src/store.rs`'s private helper, for the reasons recorded in this
-/// module's docs — including why neither implementation calls `sync_all`.
-///
-/// The temporary name is built with `with_file_name` rather than `with_extension`
-/// so it cannot collide with the target for any session id, and carries nanos so
-/// two concurrent renders cannot collide with each other.
+/// [`zuno_atomic_file::replace`] owns the platform distinction and unique
+/// temporary name. See the module docs for why this projection deliberately
+/// does not request crash durability.
 fn write_atomic(path: &Path, body: &str) -> Result<(), GoalError> {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent).map_err(|source| GoalError::Document {
-        operation: "create directory",
-        path: parent.to_path_buf(),
+    zuno_atomic_file::replace(path, body.as_bytes()).map_err(|source| GoalError::Document {
+        operation: "replace atomically",
+        path: path.to_path_buf(),
         source,
-    })?;
-    let name = path.file_name().map_or_else(
-        || "goal.md".to_owned(),
-        |name| name.to_string_lossy().into(),
-    );
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos());
-    let temporary = path.with_file_name(format!("{name}.tmp.{nanos}"));
-
-    std::fs::write(&temporary, body).map_err(|source| GoalError::Document {
-        operation: "write",
-        path: temporary.clone(),
-        source,
-    })?;
-    std::fs::rename(&temporary, path).map_err(|source| {
-        drop(std::fs::remove_file(&temporary));
-        GoalError::Document {
-            operation: "rename",
-            path: path.to_path_buf(),
-            source,
-        }
     })
 }
 

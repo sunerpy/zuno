@@ -168,7 +168,7 @@ For foreground Responses requests, the engine supplies a private typed routing
 context containing the durable root or child session identity. The official
 OpenAI adapter and the compatible adapter used for a custom OpenAI `baseURL`
 project it as `metadata.zuno_session_id`; tool continuations reuse it, while
-title, summary, compaction, reflection, and Council calls are isolated. The
+title, summary, compaction, learning extraction, and Council calls are isolated. The
 field is reserved against `extraBody` and request-parameter overrides and is
 never copied into model input, instructions, headers, or tool definitions.
 Chat Completions and Messages surfaces ignore this routing context.

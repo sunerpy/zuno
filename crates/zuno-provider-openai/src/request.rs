@@ -310,6 +310,11 @@ fn chat_plain(message: &Message) -> Result<Value, ProviderError> {
             | RequestContentBlock::ProviderEncryptedReasoning { .. }
             | RequestContentBlock::ToolUse { .. }
             | RequestContentBlock::ToolResult { .. } => {}
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
         }
     }
     let content = if has_image {
@@ -347,6 +352,11 @@ fn chat_assistant(message: &Message) -> Result<Value, ProviderError> {
             RequestContentBlock::SignedThinking { .. }
             | RequestContentBlock::ToolResult { .. }
             | RequestContentBlock::Image { .. } => {}
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
         }
     }
     let mut value = Map::new();
@@ -432,6 +442,11 @@ fn responses_assistant(message: &Message) -> Result<Vec<Value>, ProviderError> {
                 return Err(ProviderError::fatal(RequestShapeError::ForeignThinking));
             }
             RequestContentBlock::ToolResult { .. } | RequestContentBlock::Image { .. } => {}
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
         }
     }
     if !output_content.is_empty() {
@@ -451,6 +466,11 @@ fn responses_tool_results(message: &Message) -> Vec<Value> {
                 "type": "input_image",
                 "image_url": format!("data:{media_type};base64,{data}"),
             })),
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -496,6 +516,11 @@ fn responses_content(message: &Message, text_type: &str, image_type: &str) -> Ve
                 "type": image_type,
                 "image_url": format!("data:{media_type};base64,{data}"),
             })),
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
             _ => None,
         })
         .collect()

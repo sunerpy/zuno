@@ -76,6 +76,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "presets",
     "default_agent",
     "subagent_depth",
+    "subagent_model_selection",
     "username",
     "agents",
     "workflows",
@@ -93,7 +94,9 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "goal",
     "tool_output",
     "compaction",
+    "continuity",
     "concurrency",
+    "learning",
     "memory",
     "experimental",
 ];
@@ -166,6 +169,9 @@ pub struct Config {
     /// Maximum subagent nesting depth. Defaults to 1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_depth: Option<u32>,
+    /// Host-owned allowlist for model-facing child model and effort selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_model_selection: Option<SubagentModelSelectionConfig>,
     /// Name to show for the user instead of the system username.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
@@ -222,15 +228,33 @@ pub struct Config {
     /// Context-compaction behaviour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionConfig>,
+    /// Optional model-facing access to durable session history and notes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuity: Option<ContinuityConfig>,
     /// Bounded concurrency for independent runtime capabilities.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<ConcurrencyConfig>,
+    /// User-experience extraction, retrieval, aggregation, and Skill review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub learning: Option<LearningConfig>,
     /// Persistent resident-memory configuration. Absent defaults to enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryConfig>,
     /// Options under active development.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<ExperimentalConfig>,
+}
+
+/// Host-global child model selection policy, frozen into each durable session.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentModelSelectionConfig {
+    /// Expose optional `model` and `effort` fields on the `task` tool.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Exact `provider/model` identities the model may select.
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
 }
 
 impl Config {
@@ -267,12 +291,29 @@ impl Config {
             .map_or_else(ResolvedMemoryConfig::default, MemoryConfig::resolved)
     }
 
+    /// Resolve the user-learning subsystem and all native defaults.
+    #[must_use]
+    pub fn resolved_learning(&self) -> ResolvedLearningConfig {
+        self.learning
+            .as_ref()
+            .map_or_else(ResolvedLearningConfig::default, LearningConfig::resolved)
+    }
+
     /// Resolve bounded runtime concurrency with native defaults.
     #[must_use]
     pub fn resolved_concurrency(&self) -> ResolvedConcurrencyConfig {
         self.concurrency.as_ref().map_or_else(
             ResolvedConcurrencyConfig::default,
             ConcurrencyConfig::resolved,
+        )
+    }
+
+    /// Resolve model-facing continuity tools; absence is deliberately disabled.
+    #[must_use]
+    pub fn resolved_continuity(&self) -> ResolvedContinuityConfig {
+        self.continuity.as_ref().map_or_else(
+            ResolvedContinuityConfig::default,
+            ContinuityConfig::resolved,
         )
     }
 
@@ -430,6 +471,7 @@ pub struct WatcherConfig {
 
 /// Attachment processing (`config/attachment.ts:22-24`).
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttachmentConfig {
     /// Image attachment limits.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -438,19 +480,60 @@ pub struct AttachmentConfig {
 
 /// Image attachment limits (`config/attachment.ts:6-19`).
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageAttachmentConfig {
     /// Resize oversized images instead of rejecting them. Defaults to true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_resize: Option<bool>,
+    /// Maximum source bytes accepted before decoding. Defaults to 20 MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_source_bytes: Option<NonZeroU64>,
     /// Maximum width before resizing or rejecting. Defaults to 2000.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_width: Option<NonZeroU32>,
     /// Maximum height before resizing or rejecting. Defaults to 2000.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_height: Option<NonZeroU32>,
-    /// Maximum base64 payload in bytes. Defaults to 5242880.
+    /// Maximum decoded pixel count. Defaults to 4,000,000.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_base64_bytes: Option<NonZeroU32>,
+    pub max_pixels: Option<NonZeroU64>,
+    /// Maximum normalized encoded bytes. Defaults to 5 MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_encoded_bytes: Option<NonZeroU64>,
+}
+
+impl ImageAttachmentConfig {
+    #[must_use]
+    pub fn resolved_auto_resize(&self) -> bool {
+        self.auto_resize.unwrap_or(true)
+    }
+
+    #[must_use]
+    pub fn resolved_max_source_bytes(&self) -> u64 {
+        self.max_source_bytes
+            .map_or(20 * 1024 * 1024, NonZeroU64::get)
+    }
+
+    #[must_use]
+    pub fn resolved_max_width(&self) -> u32 {
+        self.max_width.map_or(2_000, NonZeroU32::get)
+    }
+
+    #[must_use]
+    pub fn resolved_max_height(&self) -> u32 {
+        self.max_height.map_or(2_000, NonZeroU32::get)
+    }
+
+    #[must_use]
+    pub fn resolved_max_pixels(&self) -> u64 {
+        self.max_pixels.map_or(4_000_000, NonZeroU64::get)
+    }
+
+    #[must_use]
+    pub fn resolved_max_encoded_bytes(&self) -> u64 {
+        self.max_encoded_bytes
+            .map_or(5 * 1024 * 1024, NonZeroU64::get)
+    }
 }
 
 /// Enterprise deployment settings (`config/config.ts:134-136`).
@@ -549,6 +632,54 @@ pub struct CompactionConfig {
     /// Token buffer left free so compaction itself cannot overflow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reserved: Option<u32>,
+}
+
+/// Model-facing continuity: a master boolean, or independently selected tools.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContinuityConfig {
+    /// `false` disables both tools; `true` enables both.
+    Enabled(bool),
+    /// Fine-grained selection. Unspecified fields remain disabled.
+    Options(ContinuityOptions),
+}
+
+impl ContinuityConfig {
+    /// Resolve the master switch and absent object fields.
+    #[must_use]
+    pub fn resolved(&self) -> ResolvedContinuityConfig {
+        match self {
+            Self::Enabled(enabled) => ResolvedContinuityConfig {
+                history: *enabled,
+                notes: *enabled,
+            },
+            Self::Options(options) => ResolvedContinuityConfig {
+                history: options.history.unwrap_or(false),
+                notes: options.notes.unwrap_or(false),
+            },
+        }
+    }
+}
+
+/// Fine-grained switches under the `continuity` top-level key.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContinuityOptions {
+    /// Expose normalized history from the current session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history: Option<bool>,
+    /// Expose session-and-agent scoped working notes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<bool>,
+}
+
+/// Fully defaulted continuity settings consumed by runtime composition roots.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResolvedContinuityConfig {
+    /// Whether the current session's normalized history tool is enabled.
+    pub history: bool,
+    /// Whether the current session-and-agent notes tool is enabled.
+    pub notes: bool,
 }
 
 /// Default percentage of the usable context window consumed before auto compaction.
@@ -687,11 +818,25 @@ pub const DEFAULT_GLOBAL_MEMORY_CHAR_LIMIT: u32 = 2_200;
 /// Default characters available to repository-local rules.
 pub const DEFAULT_PROJECT_MEMORY_CHAR_LIMIT: u32 = 3_000;
 
-/// Default delivered-turn interval for background reflection.
-pub const DEFAULT_MEMORY_NUDGE_INTERVAL: u32 = 10;
-
 /// Confidence threshold used by high-confidence promotion.
 pub const DEFAULT_MEMORY_AUTO_CONFIDENCE: f64 = 0.9;
+
+/// Default project aggregation interval.
+pub const DEFAULT_LEARNING_AGGREGATION_INTERVAL_MS: u64 = 86_400_000;
+/// Default evidence floor for project aggregation.
+pub const DEFAULT_LEARNING_MIN_NEW_RECORDS: u32 = 3;
+/// Default cross-project promotion interval.
+pub const DEFAULT_LEARNING_GLOBAL_PROMOTION_INTERVAL_MS: u64 = 604_800_000;
+/// Default project floor for a global pattern.
+pub const DEFAULT_LEARNING_GLOBAL_MIN_PROJECTS: u32 = 2;
+/// Default maximum number of automatically retrieved experiences.
+pub const DEFAULT_LEARNING_RETRIEVAL_MAX_ITEMS: u32 = 5;
+/// Default prompt budget for retrieved experiences.
+pub const DEFAULT_LEARNING_RETRIEVAL_MAX_CONTEXT_TOKENS: u32 = 1_200;
+/// Default independent-session floor for a Skill candidate.
+pub const DEFAULT_LEARNING_SKILL_MIN_INDEPENDENT_SESSIONS: u32 = 3;
+/// Hard cap for learned rules in one Skill.
+pub const DEFAULT_LEARNING_SKILL_MAX_LEARNED_RULES: u32 = 15;
 
 /// How durable memory candidates become resident entries.
 #[derive(Default, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -734,6 +879,172 @@ impl<'de> Deserialize<'de> for MemoryConfidence {
     }
 }
 
+/// User-experience extraction and reviewed Skill evolution.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningConfig {
+    /// Master switch. Learning is disabled unless explicitly enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Dedicated model used by the no-tools structured extractor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extractor_model: Option<String>,
+    /// Fast post-turn extraction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_turn: Option<LearningPostTurnConfig>,
+    /// Project-level pattern mining.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregation: Option<LearningAggregationConfig>,
+    /// Cross-project pattern promotion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_promotion: Option<LearningGlobalPromotionConfig>,
+    /// Automatic and explicit experience retrieval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<LearningRetrievalConfig>,
+    /// Skill-candidate evidence and review thresholds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill: Option<LearningSkillConfig>,
+}
+
+impl LearningConfig {
+    #[must_use]
+    pub fn resolved(&self) -> ResolvedLearningConfig {
+        let aggregation = self.aggregation.as_ref();
+        let global = self.global_promotion.as_ref();
+        let retrieval = self.retrieval.as_ref();
+        let skill = self.skill.as_ref();
+        ResolvedLearningConfig {
+            enabled: self.enabled.unwrap_or(false),
+            extractor_model: self
+                .extractor_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned),
+            post_turn_enabled: self
+                .post_turn
+                .as_ref()
+                .and_then(|post_turn| post_turn.enabled)
+                .unwrap_or(true),
+            aggregation_interval_ms: aggregation
+                .and_then(|config| config.interval_ms)
+                .map_or(DEFAULT_LEARNING_AGGREGATION_INTERVAL_MS, NonZeroU64::get),
+            aggregation_min_new_records: aggregation
+                .and_then(|config| config.min_new_records)
+                .map_or(DEFAULT_LEARNING_MIN_NEW_RECORDS, NonZeroU32::get),
+            global_promotion_interval_ms: global.and_then(|config| config.interval_ms).map_or(
+                DEFAULT_LEARNING_GLOBAL_PROMOTION_INTERVAL_MS,
+                NonZeroU64::get,
+            ),
+            global_promotion_min_projects: global
+                .and_then(|config| config.min_projects)
+                .map_or(DEFAULT_LEARNING_GLOBAL_MIN_PROJECTS, NonZeroU32::get),
+            retrieval_max_items: retrieval
+                .and_then(|config| config.max_items)
+                .map_or(DEFAULT_LEARNING_RETRIEVAL_MAX_ITEMS, NonZeroU32::get),
+            retrieval_max_context_tokens: retrieval
+                .and_then(|config| config.max_context_tokens)
+                .map_or(
+                    DEFAULT_LEARNING_RETRIEVAL_MAX_CONTEXT_TOKENS,
+                    NonZeroU32::get,
+                ),
+            skill_min_independent_sessions: skill
+                .and_then(|config| config.min_independent_sessions)
+                .map_or(
+                    DEFAULT_LEARNING_SKILL_MIN_INDEPENDENT_SESSIONS,
+                    NonZeroU32::get,
+                ),
+            skill_max_learned_rules: skill
+                .and_then(|config| config.max_learned_rules)
+                .map_or(DEFAULT_LEARNING_SKILL_MAX_LEARNED_RULES, NonZeroU32::get),
+            skill_require_review: skill
+                .and_then(|config| config.require_review)
+                .unwrap_or(true),
+        }
+    }
+}
+
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningPostTurnConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningAggregationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<NonZeroU64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_new_records: Option<NonZeroU32>,
+}
+
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningGlobalPromotionConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<NonZeroU64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_projects: Option<NonZeroU32>,
+}
+
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningRetrievalConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<NonZeroU32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<NonZeroU32>,
+}
+
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LearningSkillConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_independent_sessions: Option<NonZeroU32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_learned_rules: Option<NonZeroU32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_review: Option<bool>,
+}
+
+/// Fully defaulted learning settings consumed by runtime components.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLearningConfig {
+    pub enabled: bool,
+    pub extractor_model: Option<String>,
+    pub post_turn_enabled: bool,
+    pub aggregation_interval_ms: u64,
+    pub aggregation_min_new_records: u32,
+    pub global_promotion_interval_ms: u64,
+    pub global_promotion_min_projects: u32,
+    pub retrieval_max_items: u32,
+    pub retrieval_max_context_tokens: u32,
+    pub skill_min_independent_sessions: u32,
+    pub skill_max_learned_rules: u32,
+    pub skill_require_review: bool,
+}
+
+impl Default for ResolvedLearningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            extractor_model: None,
+            post_turn_enabled: true,
+            aggregation_interval_ms: DEFAULT_LEARNING_AGGREGATION_INTERVAL_MS,
+            aggregation_min_new_records: DEFAULT_LEARNING_MIN_NEW_RECORDS,
+            global_promotion_interval_ms: DEFAULT_LEARNING_GLOBAL_PROMOTION_INTERVAL_MS,
+            global_promotion_min_projects: DEFAULT_LEARNING_GLOBAL_MIN_PROJECTS,
+            retrieval_max_items: DEFAULT_LEARNING_RETRIEVAL_MAX_ITEMS,
+            retrieval_max_context_tokens: DEFAULT_LEARNING_RETRIEVAL_MAX_CONTEXT_TOKENS,
+            skill_min_independent_sessions: DEFAULT_LEARNING_SKILL_MIN_INDEPENDENT_SESSIONS,
+            skill_max_learned_rules: DEFAULT_LEARNING_SKILL_MAX_LEARNED_RULES,
+            skill_require_review: true,
+        }
+    }
+}
+
 /// Persistent memory: a master boolean, or component settings.
 #[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -753,7 +1064,6 @@ impl MemoryConfig {
                 enabled: false,
                 resident: false,
                 tool: false,
-                reflection: false,
                 ..ResolvedMemoryConfig::default()
             },
             Self::Enabled(true) => ResolvedMemoryConfig::default(),
@@ -761,7 +1071,6 @@ impl MemoryConfig {
                 enabled: true,
                 resident: options.resident.unwrap_or(true),
                 tool: options.tool.unwrap_or(true),
-                reflection: options.reflection.unwrap_or(true),
                 global_char_limit: options
                     .global_char_limit
                     .map_or(DEFAULT_GLOBAL_MEMORY_CHAR_LIMIT as usize, |limit| {
@@ -772,10 +1081,6 @@ impl MemoryConfig {
                     .map_or(DEFAULT_PROJECT_MEMORY_CHAR_LIMIT as usize, |limit| {
                         limit.get() as usize
                     }),
-                nudge_interval: options
-                    .nudge_interval
-                    .unwrap_or(DEFAULT_MEMORY_NUDGE_INTERVAL)
-                    as u64,
                 promotion: options.promotion.unwrap_or_default(),
                 auto_confidence: options
                     .auto_confidence
@@ -787,6 +1092,7 @@ impl MemoryConfig {
 
 /// Fine-grained settings under the `memory` top-level key.
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryOptions {
     /// Inject frozen resident blocks into each session's system prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -794,18 +1100,12 @@ pub struct MemoryOptions {
     /// Expose the model-facing `memory` tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<bool>,
-    /// Run post-response background reflection.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reflection: Option<bool>,
     /// Character cap for global agent notes. Defaults to 2200.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub global_char_limit: Option<NonZeroU32>,
     /// Character cap for project rules. Defaults to 3000.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_char_limit: Option<NonZeroU32>,
-    /// Reflect every N delivered turns; zero disables only the periodic trigger.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nudge_interval: Option<u32>,
     /// Candidate promotion policy. Defaults to `review`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promotion: Option<MemoryPromotion>,
@@ -823,14 +1123,10 @@ pub struct ResolvedMemoryConfig {
     pub resident: bool,
     /// Whether the model-facing tool is on.
     pub tool: bool,
-    /// Whether background reflection is on.
-    pub reflection: bool,
     /// Global store cap in Unicode scalar values.
     pub global_char_limit: usize,
     /// Project store cap in Unicode scalar values.
     pub project_char_limit: usize,
-    /// Delivered-turn reflection cadence; zero disables the periodic trigger.
-    pub nudge_interval: u64,
     /// How candidates become resident entries.
     pub promotion: MemoryPromotion,
     /// High-confidence promotion threshold.
@@ -843,10 +1139,8 @@ impl Default for ResolvedMemoryConfig {
             enabled: true,
             resident: true,
             tool: true,
-            reflection: true,
             global_char_limit: DEFAULT_GLOBAL_MEMORY_CHAR_LIMIT as usize,
             project_char_limit: DEFAULT_PROJECT_MEMORY_CHAR_LIMIT as usize,
-            nudge_interval: u64::from(DEFAULT_MEMORY_NUDGE_INTERVAL),
             promotion: MemoryPromotion::Review,
             auto_confidence: DEFAULT_MEMORY_AUTO_CONFIDENCE,
         }

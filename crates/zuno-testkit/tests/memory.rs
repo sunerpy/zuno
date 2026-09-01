@@ -377,6 +377,10 @@ fn two_dispatch_passes_reconstruct_the_public_pair_order() {
     assert_eq!(reconstructed, interleaved_pair_order(5));
 }
 
+// The committed G1/G2 runner is a Unix process-tree measurement: its generated
+// dispatcher is a POSIX executable and the real gate samples `/proc`. Windows
+// CI owns native product behavior, not this Linux baseline fixture.
+#[cfg(unix)]
 #[test]
 fn dispatcher_routes_every_launch_without_a_waiting_window() {
     let root = tempfile::tempdir().expect("temporary dispatcher directory");
@@ -713,6 +717,7 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
+#[cfg(unix)]
 fn write_logging_subject(path: &Path, side: &str, log: &Path) {
     let body = format!(
         "#!/bin/sh\nprintf '%s\\n' {} >> {}\n",
@@ -723,15 +728,15 @@ fn write_logging_subject(path: &Path, side: &str, log: &Path) {
     make_executable(path);
 }
 
-fn make_executable(path: &Path) {
+fn make_executable(_path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let mut permissions = std::fs::metadata(path)
+        let mut permissions = std::fs::metadata(_path)
             .expect("read executable metadata")
             .permissions();
         permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("make file executable");
+        std::fs::set_permissions(_path, permissions).expect("make file executable");
     }
 }
 

@@ -36,6 +36,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
 use zuno_error::ToolError;
+use zuno_network::{DiagnosticEndpoint, PublicHttpClient, PublicHttpPolicy, PublicTarget};
 use zuno_tool::{Attachment, ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy, TypedTool};
 
 /// The wire id, and the permission key.
@@ -120,7 +121,12 @@ pub struct WebFetchParams {
 
 /// Fetches a URL under a time, size and redirect budget.
 pub struct WebFetchTool {
-    client: reqwest::Client,
+    transport: WebFetchTransport,
+}
+
+enum WebFetchTransport {
+    Public(std::sync::Arc<PublicHttpClient>),
+    Raw(reqwest::Client),
 }
 
 impl Default for WebFetchTool {
@@ -130,26 +136,38 @@ impl Default for WebFetchTool {
 }
 
 impl WebFetchTool {
-    /// A tool with a client whose redirect policy is capped at [`MAX_REDIRECTS`].
-    ///
-    /// # Panics
-    /// Never in practice: the only configuration here is the redirect policy, and
-    /// `reqwest`'s builder cannot fail on it. A failure would mean the TLS backend
-    /// did not initialize, which is not a condition a tool can proceed past.
+    /// A tool using the shared public-internet transport.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_client(
-            zuno_network::client_builder()
-                .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
-                .build()
-                .expect("reqwest client with a redirect policy"),
-        )
+        Self {
+            transport: WebFetchTransport::Public(std::sync::Arc::new(
+                PublicHttpClient::with_resolver(
+                    std::sync::Arc::new(zuno_network::SystemHostResolver),
+                    PublicHttpPolicy {
+                        max_redirects: MAX_REDIRECTS,
+                    },
+                ),
+            )),
+        }
     }
 
-    /// A tool over a caller-supplied client, for tests that need a different policy.
+    /// Build the tool from the public transport activated by the current profile.
+    #[must_use]
+    pub fn with_public_client(client: std::sync::Arc<PublicHttpClient>) -> Self {
+        Self {
+            transport: WebFetchTransport::Public(client),
+        }
+    }
+
+    /// A raw-client seam for loopback-only integration tests.
+    ///
+    /// Production profiles assemble [`Self::new`]. A caller using this constructor owns
+    /// target validation and must never expose it as the shipped `webfetch` capability.
     #[must_use]
     pub const fn with_client(client: reqwest::Client) -> Self {
-        Self { client }
+        Self {
+            transport: WebFetchTransport::Raw(client),
+        }
     }
 
     /// Issues the request, retrying once with an honest user agent when Cloudflare
@@ -158,42 +176,76 @@ impl WebFetchTool {
     /// Oracle: `packages/opencode/src/tool/webfetch.ts:78-88`. The retry exists
     /// because the browser user agent does not match this client's TLS fingerprint,
     /// so claiming to be Chrome is what triggers the block.
-    async fn send(&self, url: &str, format: Format) -> Result<reqwest::Response, WebError> {
-        let first = self.get(url, format, BROWSER_USER_AGENT).await?;
+    async fn send(
+        &self,
+        target: &PublicTarget,
+        format: Format,
+        ctx: &ToolContext,
+    ) -> Result<reqwest::Response, WebError> {
+        let first = self.get(target, format, BROWSER_USER_AGENT, ctx).await?;
         if is_cloudflare_challenge(&first) {
-            return self.get(url, format, HONEST_USER_AGENT).await;
+            return self.get(target, format, HONEST_USER_AGENT, ctx).await;
         }
         Ok(first)
     }
 
     async fn get(
         &self,
-        url: &str,
+        target: &PublicTarget,
         format: Format,
         user_agent: &str,
+        ctx: &ToolContext,
     ) -> Result<reqwest::Response, WebError> {
-        self.client
-            .get(url)
-            .header(reqwest::header::USER_AGENT, user_agent)
-            .header(reqwest::header::ACCEPT, format.accept())
-            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
-            .send()
-            .await
-            .map_err(|source| classify_send_error(url, source))
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_str(user_agent)
+                .expect("the static user agent is a valid header"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static(format.accept()),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT_LANGUAGE,
+            reqwest::header::HeaderValue::from_static("en-US,en;q=0.9"),
+        );
+        let request = async {
+            match &self.transport {
+                WebFetchTransport::Public(client) => client
+                    .get(target.clone(), headers)
+                    .await
+                    .map_err(WebError::from),
+                WebFetchTransport::Raw(client) => client
+                    .get(target.url().clone())
+                    .headers(headers)
+                    .send()
+                    .await
+                    .map_err(|source| classify_send_error(&target.diagnostic(), source)),
+            }
+        };
+        tokio::select! {
+            biased;
+            () = ctx.interrupt.notified() => Err(WebError::Interrupted {
+                read: 0,
+            }),
+            result = request => result,
+        }
     }
 
     /// Everything after argument validation and permission, under one time budget.
     async fn fetch(
         &self,
         params: &WebFetchParams,
+        target: &PublicTarget,
         ctx: &ToolContext,
     ) -> Result<ToolOutput, WebError> {
-        let response = self.send(&params.url, params.format).await?;
+        let response = self.send(target, params.format, ctx).await?;
 
         let status = response.status();
         if !status.is_success() {
             return Err(WebError::Status {
-                url: params.url.clone(),
+                url: target.diagnostic().to_string(),
                 status: status.as_u16(),
                 retry_after: bounds::retry_after(response.headers()),
             });
@@ -253,7 +305,7 @@ impl TypedTool for WebFetchTool {
     }
 
     async fn run(&self, params: WebFetchParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        parse_target(&params.url).map_err(invalid_args)?;
+        let target = parse_target(&params.url).map_err(invalid_args)?;
 
         ctx.ask(
             ID,
@@ -268,7 +320,7 @@ impl TypedTool for WebFetchTool {
         .await?;
 
         let budget = resolve_timeout(params.timeout);
-        match tokio::time::timeout(budget, self.fetch(&params, &ctx)).await {
+        match tokio::time::timeout(budget, self.fetch(&params, &target, &ctx)).await {
             Ok(result) => result.map_err(failed),
             Err(_elapsed) => Err(ToolError::Timeout {
                 tool: ID.to_owned(),
@@ -289,17 +341,22 @@ impl TypedTool for WebFetchTool {
 /// # Errors
 /// [`WebError::MalformedUrl`] when the input does not parse, or
 /// [`WebError::UnsupportedScheme`] when it parses to a non-HTTP scheme.
-pub fn parse_target(url: &str) -> Result<url::Url, WebError> {
-    let parsed = url::Url::parse(url).map_err(|source| WebError::MalformedUrl {
-        url: url.to_owned(),
-        source,
-    })?;
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Err(WebError::UnsupportedScheme {
-            url: url.to_owned(),
-        });
+pub fn parse_target(url: &str) -> Result<PublicTarget, WebError> {
+    match PublicTarget::parse(url) {
+        Ok(target) => Ok(target),
+        Err(zuno_network::PublicHttpError::MalformedUrl { source }) => {
+            Err(WebError::MalformedUrl {
+                url: url.to_owned(),
+                source,
+            })
+        }
+        Err(zuno_network::PublicHttpError::UnsupportedScheme { .. }) => {
+            Err(WebError::UnsupportedScheme {
+                url: url.to_owned(),
+            })
+        }
+        Err(source) => Err(WebError::PublicTarget { source }),
     }
-    Ok(parsed)
 }
 
 /// Applies the requested conversion, which only ever engages for HTML.
@@ -362,15 +419,15 @@ fn is_cloudflare_challenge(response: &reqwest::Response) -> bool {
 /// `reqwest` reports an exhausted redirect policy as an ordinary request error, so
 /// without this the hop cap would be indistinguishable from a refused connection and
 /// the abandoned-chain message would never be seen.
-fn classify_send_error(url: &str, source: reqwest::Error) -> WebError {
+fn classify_send_error(endpoint: &DiagnosticEndpoint, source: reqwest::Error) -> WebError {
     if source.is_redirect() {
         return WebError::TooManyRedirects {
             limit: MAX_REDIRECTS,
         };
     }
     WebError::Transport {
-        url: url.to_owned(),
-        source,
+        url: endpoint.to_string(),
+        source: source.without_url(),
     }
 }
 
@@ -469,8 +526,20 @@ mod tests {
         // Upstream's description promises an upgrade that no upstream implementation
         // performs; reproducing the behaviour means the scheme survives untouched.
         let parsed = parse_target("http://example.test/x").expect("http is accepted");
-        assert_eq!(parsed.scheme(), "http");
-        assert_eq!(parsed.as_str(), "http://example.test/x");
+        assert_eq!(parsed.url().scheme(), "http");
+        assert_eq!(parsed.url().as_str(), "http://example.test/x");
+    }
+
+    #[test]
+    fn credentials_and_private_literals_are_refused_before_permission() {
+        assert!(matches!(
+            parse_target("https://user:secret@example.test/path"),
+            Err(WebError::PublicTarget { .. })
+        ));
+        assert!(matches!(
+            parse_target("http://127.0.0.1/private"),
+            Err(WebError::PublicTarget { .. })
+        ));
     }
 
     #[test]

@@ -45,22 +45,37 @@ make test OFFLINE=     # allowed to fetch
 
 ## The gates
 
-`make ci` is the local gate and runs exactly what CI enforces, so "green locally"
-and "green in CI" cannot drift into meaning different things:
+`make ci` is the host-side source gate. Before opening or updating a pull request
+from Linux, run `make pre-ci`: it adds the same packaged host smoke used by CI and
+a Zig-backed Windows GNU Clippy and test-link pass that catches `cfg(windows)`
+and linker failures without waiting for a hosted Windows runner.
 
-| Command          | What it checks                                          |
-| ---------------- | ------------------------------------------------------- |
-| `make fmt`       | Writes `cargo fmt` and oxfmt formatting                 |
-| `make fmt-check` | Verifies formatting without writing                     |
-| `make lint`      | `cargo clippy --workspace --all-targets -- -D warnings` |
-| `make test`      | `cargo test --workspace`                                |
-| `make deny`      | Licence and advisory checks via `cargo-deny`            |
-| `make check`     | `cargo check --workspace --all-targets`                 |
-| `make ci`        | All of the above, in the order CI runs them             |
+| Command          | What it checks                                              |
+| ---------------- | ----------------------------------------------------------- |
+| `make fmt`       | Writes `cargo fmt` and oxfmt formatting                     |
+| `make fmt-check` | Verifies formatting without writing                         |
+| `make lint`      | `cargo clippy --workspace --all-targets -- -D warnings`     |
+| `make test`      | Serial Cargo compatibility path; reports every failed suite |
+| `make test-par`  | Same non-ignored tests, concurrent across test binaries     |
+| `make deny`      | Licence and advisory checks via `cargo-deny`                |
+| `make check`     | `cargo check --workspace --all-targets`                     |
+| `make ci`        | Host metadata, format, lint, parallel tests, supply chain   |
+| `make pre-ci`    | `make ci`, check, packaged smoke, Windows Clippy/test link  |
 
 Run the smallest command that covers your change first — `cargo test -p <crate>` —
-then `make ci` before opening a pull request. Do not report that a workspace-wide
-gate passed unless its command reached successful completion.
+then `make pre-ci` before opening a pull request. Linux CI installs pinned
+nextest. Native Windows CI uses the in-tree binary-level scheduler instead:
+Cargo compiles once, then a bounded worker pool runs test binaries concurrently,
+with progress and per-suite timeouts. ACP stdio, startup timing, and ConPTY
+lifecycle binaries run exclusively with one harness thread; a timeout terminates
+the complete descendant process tree. Windows Clippy and this test job start in
+parallel. Locally `make test-par` uses nextest when available and the same
+measured scheduler otherwise. The cross pass is predictive: native Windows/MSVC
+tests, ConPTY, Job Object, and hosted-runner loopback behavior still require CI.
+Install its one-time prerequisites with `rustup target add
+x86_64-pc-windows-gnu`, a `zig` binary on `PATH`, and `cargo-zigbuild`. Do not
+report that a workspace-wide gate passed unless its command reached successful
+completion.
 
 `make fmt-check` and `make lint` fail closed. A missing formatter is a failure, not
 a skip.
@@ -109,10 +124,12 @@ that breaks one fails `cargo test` rather than reaching a reviewer:
   restate a version. Extra cargo features are added additively alongside the
   inheritance.
 
-The release surface is also asserted from inside the test suite: the build and
-smoke matrices must name the same targets, publication must depend on the smoke
-job, and `CI Success` must require every job in `ci.yml`. If you add a CI job or a
-release target, that suite will tell you what else to update.
+The release surface is also asserted from inside the test suite: every target
+must build, package, execute, attest, and upload in one candidate leg; publication
+must consume one immutable candidate run without compiling; and `zuno/pr-gate`
+must require every job in `ci.yml`. If you add a CI job or release target, that
+suite will tell you what else to update. See
+[`docs/operate/release-pipeline.md`](./docs/operate/release-pipeline.md).
 
 ## Reporting a bug
 

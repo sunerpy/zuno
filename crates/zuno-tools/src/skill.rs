@@ -574,8 +574,8 @@ impl SkillTool {
         )
         .with_metadata("name", skill.name.clone())
         .with_metadata("source", skill.location.clone())
-        .with_metadata("root", canonical_root.to_string_lossy().into_owned())
-        .with_metadata("path", canonical.to_string_lossy().into_owned())
+        .with_metadata("root", zuno_paths::wire_path(&canonical_root))
+        .with_metadata("path", zuno_paths::wire_path(&canonical))
         .with_metadata("resource", requested.to_owned())
         .with_metadata("complete", page.next_cursor.is_none());
         if let Some(next) = page.next_cursor {

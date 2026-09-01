@@ -154,7 +154,7 @@ source is in [`docs/`](./docs/README.md). Common starting points:
 ```sh
 make build
 ./dist/zuno --version --long
-cargo test --workspace
+make test-par
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```

@@ -49,11 +49,6 @@
 //! of the model, provider, runtime flags, Harness contributions, MCP tools, and merged
 //! permission rules. Every source passes through the same visibility rules.
 //!
-//! # Session recall
-//!
-//! [`session_search`] provides FTS5 discovery, anchored scrolling, and recent
-//! session browsing directly over SQLite, with no provider or LLM dependency.
-//!
 //! # Post-edit formatting
 //!
 //! [`format`] is the execution half of the `formatter` config, which [`zuno_catalog`]
@@ -168,15 +163,17 @@ impl FileTools {
     }
 }
 
+pub mod experience_search;
 pub mod glob;
 pub mod grep;
 pub mod search_common;
-pub mod session_search;
 
+pub use crate::experience_search::{
+    ExperienceSearchParams, ExperienceSearchTool, WIRE_ID as EXPERIENCE_SEARCH_WIRE_ID,
+};
 pub use crate::glob::{GlobParams, GlobTool};
 pub use crate::grep::{GrepParams, GrepTool};
 pub use crate::search_common::{RESULT_LIMIT, SearchScope, SearchTooling};
-pub use crate::session_search::{SessionSearchParams, SessionSearchTool};
 
 pub mod webfetch;
 pub mod websearch;

@@ -91,6 +91,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) model_id: &'a str,
     pub(crate) manifest: Arc<zuno_harness::ToolManifest>,
     pub(crate) contributions: Arc<zuno_harness::ToolContributions>,
+    pub(crate) public_http: Arc<zuno_network::PublicHttpClient>,
     pub(crate) question: Option<Arc<dyn QuestionAsker>>,
     pub(crate) background_executions: Arc<zuno_pty::BackgroundExecutionService>,
     /// Test seam for a resolver supplied by the composition root.
@@ -110,6 +111,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) councils: Arc<dyn zuno_tools::council::CouncilHost>,
     pub(crate) job_controller: Arc<dyn zuno_tools::job_cancel::JobController>,
     pub(crate) memory: Option<Arc<dyn Tool>>,
+    pub(crate) experience_search: Option<Arc<dyn Tool>>,
     /// Exact provider-visible tools from the immutable parent Attempt.
     pub(crate) tool_authority: Option<Arc<[ToolSchemaIdentity]>>,
 }
@@ -151,6 +153,8 @@ pub(crate) struct Delegation {
     pub(crate) limits: zuno_tools::task::DelegationLimits,
     /// Whether the catalog holds a vision-capable model, which gates one target.
     pub(crate) vision_available: bool,
+    /// Exact session-frozen authority for model-facing child model selection.
+    pub(crate) subagent_model_policy: zuno_tools::task::SubagentModelPolicy,
 }
 
 /// Assemble the registry for `agent` and project it onto `provider_id`/`model_id`.
@@ -253,6 +257,7 @@ pub(crate) fn assemble(
         presets,
         limits,
         vision_available,
+        subagent_model_policy,
     } = selection.delegation;
     if let Some(delegates) = selected_profile.capabilities().delegation_targets() {
         let allowed = delegates
@@ -290,13 +295,19 @@ pub(crate) fn assemble(
         .with_session_model(session_model)
         .with_presets(presets)
         .with_limits(limits)
-        .with_vision_available(vision_available);
+        .with_vision_available(vision_available)
+        .with_subagent_model_policy(subagent_model_policy.clone());
     for (agent, model) in agent_models {
         task = task.with_agent_override(agent, model);
     }
     if selection.manifest.contains(BuiltinSlot::Task) {
+        let task_tool = if subagent_model_policy.enabled() {
+            erase(task.clone().selectable())
+        } else {
+            erase(task.clone())
+        };
         builder
-            .register_builtin(BuiltinSlot::Task, erase(task.clone()))
+            .register_builtin(BuiltinSlot::Task, task_tool)
             .map_err(|error| error.to_string())?;
     }
     if !selection.capability.workflows.is_empty() {
@@ -348,7 +359,12 @@ pub(crate) fn assemble(
             erase(zuno_tools::GlobTool::new(tooling.clone())),
         ),
         (BuiltinSlot::Grep, erase(zuno_tools::GrepTool::new(tooling))),
-        (BuiltinSlot::Fetch, erase(zuno_tools::WebFetchTool::new())),
+        (
+            BuiltinSlot::Fetch,
+            erase(zuno_tools::WebFetchTool::with_public_client(Arc::clone(
+                &selection.public_http,
+            ))),
+        ),
         (
             BuiltinSlot::Search,
             erase(zuno_tools::WebSearchTool::with_config(search)),
@@ -377,6 +393,9 @@ pub(crate) fn assemble(
 
     if let Some(memory) = selection.memory {
         builder.register_configured_builtin(memory);
+    }
+    if let Some(experience_search) = selection.experience_search {
+        builder.register_configured_builtin(experience_search);
     }
     let mut product_tool_names = BTreeSet::new();
     for (instance, product) in config.product_agent.iter().flatten() {
@@ -582,6 +601,7 @@ fn native_tool_name(name: &str, harness_tool_names: &BTreeSet<String>) -> bool {
             zuno_tools::JOB_CANCEL_WIRE_ID,
             zuno_tools::JOB_RECONCILE_WIRE_ID,
             zuno_tools::memory::MEMORY_TOOL_ID,
+            zuno_tools::EXPERIENCE_SEARCH_WIRE_ID,
             zuno_goal::GET_GOAL_TOOL_ID,
             zuno_goal::CREATE_GOAL_TOOL_ID,
             zuno_goal::UPDATE_GOAL_TOOL_ID,
@@ -591,6 +611,8 @@ fn native_tool_name(name: &str, harness_tool_names: &BTreeSet<String>) -> bool {
             zuno_tools::TODO_UPDATE_TOOL_ID,
             zuno_tools::WORKFLOW_WIRE_ID,
             zuno_tools::COUNCIL_WIRE_ID,
+            zuno_continuity::HISTORY_TOOL_ID,
+            zuno_continuity::NOTES_TOOL_ID,
         ]
         .contains(&name)
         || harness_tool_names.contains(name)
@@ -653,6 +675,8 @@ mod tests {
             "goal_propose",
             "goal_update",
             "council_run",
+            "history",
+            "notes",
             "extension_tool",
         ] {
             assert!(native_tool_name(name, &harness), "{name}");

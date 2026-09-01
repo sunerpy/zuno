@@ -261,6 +261,144 @@ fn host_planning_classifier_persists_multi_stage_work_before_the_provider() {
     );
 }
 
+#[tokio::test]
+async fn hiding_plan_update_does_not_disable_host_plan_creation_or_recovery() {
+    let directory = tempfile::TempDir::new().expect("temporary workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let config_root = tempfile::TempDir::new().expect("temporary config root");
+    let home = config_root.path().join("home");
+    let xdg = config_root.path().join("xdg");
+    std::fs::create_dir_all(&home).expect("create home");
+    std::fs::create_dir_all(&xdg).expect("create XDG root");
+    let config_env = Env::from_pairs([
+        ("HOME".to_owned(), home.display().to_string()),
+        ("XDG_CONFIG_HOME".to_owned(), xdg.display().to_string()),
+        (
+            "ZUNO_CONFIG_CONTENT".to_owned(),
+            r#"{"tools":{"plan_update":false}}"#.to_owned(),
+        ),
+    ]);
+    let config =
+        zuno_config::discovery::discover_with(&zuno_config::discovery::DiscoveryOptions::new(
+            directory.path(),
+            None::<std::path::PathBuf>,
+            config_env,
+        ))
+        .expect("discover hidden plan tool");
+    let selected_agent = agent_profile(agent("build"), directory.path(), &config);
+    let visible = tool_runtime::assemble(
+        directory.path(),
+        None,
+        &Env::empty(),
+        &config,
+        &selected_agent,
+        tool_runtime::ToolSelection {
+            provider_id: "provider",
+            model_id: "model",
+            manifest: Arc::new(zuno_harness::ToolManifest::standard()),
+            contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
+            question: None,
+            interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
+            background_executions: test_background_executions(directory.path()),
+            sandbox: test_sandbox(),
+            todo_store: Arc::new(
+                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
+            ),
+            goal_store: Arc::new(
+                GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
+            ),
+            mcp_loader: None,
+            skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            capability: test_capability(),
+            delegation: test_delegation(),
+            product_agents: test_product_agents(),
+            workflows: test_workflows(),
+            councils: test_councils(),
+            job_controller: test_job_controller(),
+            memory: None,
+            experience_search: None,
+            tool_authority: None,
+        },
+    )
+    .expect("assemble final tool snapshot");
+    assert!(
+        visible
+            .tools
+            .iter()
+            .all(|tool| tool.id() != zuno_tools::PLAN_UPDATE_TOOL_ID),
+        "the model-facing plan mutation tool must be hidden"
+    );
+
+    let profile_runtime = HarnessRuntime::new("host-planning-hidden-tool");
+    profile_runtime
+        .activate_profile(zuno_harness::default_profile())
+        .await
+        .expect("activate default profile");
+    let session_runtime = profile_runtime.child("session");
+    assert!(host_planning_available(&session_runtime));
+
+    let database_path = directory.path().join("host-plan.db");
+    let location = zuno_paths::DbLocation::File(database_path);
+    let pool = Arc::new(zuno_db::Pool::open(&location).expect("open file database"));
+    {
+        let mut connection = pool.get().expect("schema connection");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+                 VALUES ('project-hidden-plan', '/workspace', 1, 1, '[]');
+                 INSERT INTO session
+                   (id, project_id, slug, directory, title, version, time_created, time_updated)
+                 VALUES
+                   ('ses-hidden-plan', 'project-hidden-plan', 'plan', '/workspace',
+                    'plan', '1', 1, 1);",
+            )
+            .expect("seed planning session");
+    }
+    let outcome = ensure_host_plan(
+        &pool,
+        HostPlanningRequest {
+            session_id: "ses-hidden-plan",
+            agent: "build",
+            prompt: "Investigate the failure, implement the fix, and verify the result.",
+            source: PlanningInputSource::User,
+            content: PlanningContentFacts::empty(),
+            plan_available: host_planning_available(&session_runtime),
+            goal_id: None,
+        },
+    )
+    .expect("host creates plan with the model tool hidden");
+    assert!(outcome.changed);
+    drop(pool);
+    profile_runtime.shutdown().await.expect("shutdown profile");
+
+    let restarted_profile = HarnessRuntime::new("host-planning-restarted");
+    restarted_profile
+        .activate_profile(zuno_harness::default_profile())
+        .await
+        .expect("reactivate default profile");
+    let restarted_session = restarted_profile.child("session");
+    assert!(host_planning_available(&restarted_session));
+    let reopened = Arc::new(zuno_db::Pool::open(&location).expect("reopen file database"));
+    let recovered = zuno_tools::WorkStateStore::new(reopened)
+        .plan("ses-hidden-plan")
+        .expect("read recovered plan")
+        .expect("persisted host plan");
+    assert_eq!(
+        recovered
+            .steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        ["investigate", "implement", "verify"]
+    );
+    restarted_profile
+        .shutdown()
+        .await
+        .expect("shutdown restarted profile");
+}
+
 #[test]
 fn host_planning_classifier_appends_a_new_epoch_after_terminal_work() {
     let pool = Arc::new(
@@ -736,7 +874,10 @@ fn child_report_does_not_seed_a_plan_for_an_atomic_parent_session() {
 #[test]
 fn production_turn_runs_the_host_planning_classifier_after_input_is_durable() {
     let turn = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/turn.rs"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("cmd")
+            .join("turn.rs"),
     )
     .expect("turn.rs is readable");
     let persisted = turn
@@ -870,6 +1011,7 @@ fn test_delegation() -> tool_runtime::Delegation {
         presets: zuno_agent::model_policy::PresetLibrary::new(),
         limits: zuno_tools::task::DelegationLimits::default(),
         vision_available: false,
+        subagent_model_policy: zuno_tools::task::SubagentModelPolicy::default(),
     }
 }
 
@@ -1093,6 +1235,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         },
         catalog_models: Vec::new(),
         reasoning_efforts: std::collections::BTreeMap::new(),
+        subagent_model_policy: zuno_tools::task::SubagentModelPolicy::default(),
         skills: Arc::new(zuno_catalog::skill::Skills::default()),
         required_skills: Vec::new(),
         capability: test_capability(),
@@ -1129,7 +1272,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         title: None,
         internals: stub_internals(),
         presets: PresetLibrary::new(),
-        reflection_model: None,
+        learning_model: None,
         window: TokenWindow {
             context: 0,
             max_output: 0,
@@ -1314,6 +1457,7 @@ fn orchestration_seed(capability: &CapabilitySnapshot) -> Arc<AttemptSeed> {
             prompt_policy_sha256: sha256_text("build prompt policy"),
         },
         preset: None,
+        subagent_model_policy_sha256: sha256_text("subagent-model-policy"),
         parent_attempt: None,
         workflow: None,
         workflow_node: None,
@@ -1342,6 +1486,7 @@ fn parent_attempt(capability: CapabilitySnapshot) -> AttemptSnapshot {
             reasoning_sha256: sha256_text("max"),
             preset: None,
         },
+        subagent_model_policy_sha256: sha256_text("subagent-model-policy"),
         selected_skills: Vec::new(),
         prompt: zuno_orchestration::PromptReceiptIdentity {
             event_id: Some("evt-parent".to_owned()),
@@ -1603,6 +1748,13 @@ fn permanent_provider_failure_blocks_the_goal_with_a_typed_reason() {
 #[test]
 fn prepared_user_message_persistence_preserves_database_busy() {
     let directory = tempfile::tempdir().expect("temporary database directory");
+    let attachment_root = tempfile::tempdir().expect("temporary attachment directory");
+    let attachments = zuno_attachment::AttachmentStore::new(
+        attachment_root.path(),
+        "locked",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("attachment store");
     let location = zuno_paths::DbLocation::File(directory.path().join("locked.db"));
     let mut connection = zuno_db::open::open(&location).expect("open primary connection");
     zuno_db::migration::apply(&mut connection).expect("apply schema");
@@ -1624,6 +1776,7 @@ fn prepared_user_message_persistence_preserves_database_busy() {
             now: 1_780_000_000_000,
         },
         None,
+        &attachments,
     )
     .expect("prepare user message");
 
@@ -1649,6 +1802,13 @@ fn stub_internals() -> Internals {
 
 #[test]
 fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
+    let attachment_root = tempfile::tempdir().expect("temporary attachment directory");
+    let attachments = zuno_attachment::AttachmentStore::new(
+        attachment_root.path(),
+        "reference",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("attachment store");
     let input = UserMessageInput {
         session_id: "ses_reference",
         agent: "build",
@@ -1668,11 +1828,11 @@ fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
         RequestContentBlock::Image {
             filename: Some("diagram.png".to_owned()),
             media_type: "image/png".to_owned(),
-            data: "aW1hZ2U=".to_owned(),
+            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_owned(),
         },
     ];
 
-    let parts = request_content_parts(&input, "msg_reference", &content)
+    let parts = request_content_parts(&input, "msg_reference", &content, &attachments)
         .expect("text and image request blocks are valid user content");
 
     assert_eq!(
@@ -1686,17 +1846,28 @@ fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
         .iter()
         .find(|part| part.kind == zuno_db::message::PartKind::File)
         .expect("the image became a stored file part");
-    assert_eq!(image.data["mime"], "image/png");
     assert_eq!(image.data["filename"], "diagram.png");
-    assert_eq!(image.data["data"], "aW1hZ2U=");
+    assert!(
+        image.data.get("data").is_none() && image.data.get("url").is_none(),
+        "new durable image parts must not persist inline base64: {:?}",
+        image.data
+    );
+    let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(
+        image.data["attachment"].clone(),
+    )
+    .expect("durable image reference");
+    assert_eq!(image.data["mime"], reference.media_type);
+    attachments
+        .read(&reference)
+        .expect("the durable object is readable");
 }
 
 #[test]
 fn production_prompt_composition_honours_the_memory_master_switch() {
     let directory = tempfile::TempDir::new().expect("temporary memory paths");
     let paths = zuno_memory::ScopePaths::at(
-        directory.path().join("global/MEMORY.md"),
-        directory.path().join("project/RULES.md"),
+        directory.path().join("global").join("MEMORY.md"),
+        directory.path().join("project").join("RULES.md"),
     );
     let mut seeded = zuno_memory::MemoryStore::open(
         zuno_memory::Scope::Project,
@@ -1733,8 +1904,8 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
     let repo = root.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo");
     let paths = zuno_memory::ScopePaths::at(
-        root.path().join("global/MEMORY.md"),
-        repo.join(".zuno/RULES.md"),
+        root.path().join("global").join("MEMORY.md"),
+        repo.join(".zuno").join("RULES.md"),
     );
     for (scope, marker) in [
         (zuno_memory::Scope::Global, "GLOBAL_MEMORY"),
@@ -1755,7 +1926,8 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
         .with(
             zuno_paths::env::XDG_CONFIG_HOME,
             root.path()
-                .join("home/.config")
+                .join("home")
+                .join(".config")
                 .to_string_lossy()
                 .into_owned(),
         );
@@ -1814,11 +1986,15 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
     );
     assert_eq!(
         assembly.sections()[5].source(),
-        root.path().join("global/MEMORY.md").display().to_string()
+        root.path()
+            .join("global")
+            .join("MEMORY.md")
+            .display()
+            .to_string()
     );
     assert_eq!(
         assembly.sections()[6].source(),
-        repo.join(".zuno/RULES.md").display().to_string()
+        repo.join(".zuno").join("RULES.md").display().to_string()
     );
     assert_eq!(
         assembly.sections()[2].source(),
@@ -2807,6 +2983,44 @@ fn a_config_specified_model_selects_with_no_catalog_at_all() {
     );
 }
 
+#[test]
+fn subagent_model_selection_resolves_every_enabled_allowlist_entry_at_activation() {
+    let mut config = self_specified_config();
+    config.subagent_model_selection = Some(zuno_config::schema::SubagentModelSelectionConfig {
+        enabled: true,
+        allowed_models: vec!["private/house-model".to_owned()],
+    });
+    let catalog = Catalog::resolve(
+        &zuno_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+
+    let policy =
+        resolve_subagent_model_policy(&config, &catalog).expect("configured model resolves");
+    assert!(policy.enabled());
+    assert_eq!(policy.allowed_models(), &["private/house-model".to_owned()]);
+
+    config
+        .subagent_model_selection
+        .as_mut()
+        .expect("selection config")
+        .allowed_models = vec!["private/missing".to_owned()];
+    let unresolved =
+        resolve_subagent_model_policy(&config, &catalog).expect_err("missing model must fail");
+    assert!(unresolved.contains("contains unresolved model `private/missing`"));
+
+    config
+        .subagent_model_selection
+        .as_mut()
+        .expect("selection config")
+        .allowed_models = Vec::new();
+    assert!(
+        resolve_subagent_model_policy(&config, &catalog)
+            .expect_err("enabled empty allowlist must fail")
+            .contains("requires a non-empty allowlist")
+    );
+}
+
 /// The other half: a model nobody defines still fails immediately, and names the fix.
 #[test]
 fn a_model_no_config_defines_fails_immediately_and_names_the_fix() {
@@ -2863,8 +3077,114 @@ fn an_empty_catalog_with_no_request_still_explains_the_policy() {
     );
 }
 
+fn subagent_policy_fixture(session_id: &str) -> Arc<zuno_db::Pool> {
+    let pool =
+        Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
+    let mut connection = pool.open_connection().expect("open connection");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    connection
+        .execute(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+             VALUES ('project_subagent_policy', '/workspace', 1, 1, '[]')",
+            [],
+        )
+        .expect("seed project");
+    connection
+        .execute(
+            "INSERT INTO session (
+                 id, project_id, slug, directory, title, version, time_created, time_updated
+             ) VALUES (?1, 'project_subagent_policy', 'subagent-policy', '/workspace',
+                 'Subagent policy', 'zuno', 1, 1)",
+            [session_id],
+        )
+        .expect("seed session");
+    pool
+}
+
+#[test]
+fn durable_subagent_policy_is_canonical_and_ignores_later_config_choices() {
+    let session_id = "ses_subagent_policy";
+    let pool = subagent_policy_fixture(session_id);
+    let durable = zuno_tools::task::SubagentModelPolicy::new(
+        true,
+        ["provider/z-model".to_owned(), "provider/a-model".to_owned()],
+    )
+    .expect("durable policy");
+    zuno_db::event_log::SessionEventLog::new(Arc::clone(&pool))
+        .append(
+            session_id,
+            subagent_model_policy_event(&durable).expect("policy event"),
+        )
+        .expect("append policy");
+
+    let later_config =
+        zuno_tools::task::SubagentModelPolicy::new(true, ["provider/other-model".to_owned()])
+            .expect("later policy");
+    let restored = load_subagent_model_policy(&pool, session_id)
+        .expect("load durable policy")
+        .expect("policy exists");
+
+    assert_eq!(restored, durable);
+    assert_ne!(restored, later_config);
+    assert_eq!(
+        restored.allowed_models(),
+        &["provider/a-model".to_owned(), "provider/z-model".to_owned()]
+    );
+}
+
+#[test]
+fn corrupt_or_duplicate_durable_subagent_policies_are_permanent_failures() {
+    let corrupt_session = "ses_subagent_policy_corrupt";
+    let corrupt_pool = subagent_policy_fixture(corrupt_session);
+    zuno_db::event_log::SessionEventLog::new(Arc::clone(&corrupt_pool))
+        .append(
+            corrupt_session,
+            zuno_db::event_log::NewSessionEvent::new(
+                SUBAGENT_MODEL_POLICY_EVENT,
+                serde_json::json!({
+                    "policy": {
+                        "enabled": true,
+                        "allowedModels": ["provider/model"],
+                        "digest": "not-the-policy-digest"
+                    }
+                })
+                .as_object()
+                .cloned()
+                .expect("event properties"),
+            )
+            .expect("corrupt event"),
+        )
+        .expect("append corrupt event");
+    let corrupt = load_subagent_model_policy(&corrupt_pool, corrupt_session)
+        .expect_err("a corrupt durable policy must block the session");
+    assert!(corrupt.contains("digest is invalid"), "{corrupt}");
+
+    let duplicate_session = "ses_subagent_policy_duplicate";
+    let duplicate_pool = subagent_policy_fixture(duplicate_session);
+    let policy = zuno_tools::task::SubagentModelPolicy::default();
+    let events = zuno_db::event_log::SessionEventLog::new(Arc::clone(&duplicate_pool));
+    for _ in 0..2 {
+        events
+            .append(
+                duplicate_session,
+                subagent_model_policy_event(&policy).expect("policy event"),
+            )
+            .expect("append duplicate policy event");
+    }
+    let duplicate = load_subagent_model_policy(&duplicate_pool, duplicate_session)
+        .expect_err("multiple immutable policy snapshots must block the session");
+    assert!(duplicate.contains("multiple durable subagent model policies"));
+}
+
 #[test]
 fn new_session_is_lazy_and_first_user_message_commits_with_it() {
+    let attachment_root = tempfile::tempdir().expect("temporary attachment directory");
+    let attachments = zuno_attachment::AttachmentStore::new(
+        attachment_root.path(),
+        "new-session",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("attachment store");
     let mut connection =
         zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
     zuno_db::migration::apply(&mut connection).expect("apply schema");
@@ -2893,6 +3213,7 @@ fn new_session_is_lazy_and_first_user_message_commits_with_it() {
             now,
         },
         None,
+        &attachments,
     )
     .expect("prepare prompt");
     let SessionMaterializer::Pending(mut input) = prepared.materializer else {
@@ -3276,7 +3597,10 @@ fn internal_models_keep_the_responses_surface_selected_by_the_catalog() {
     let config: zuno_config::schema::Config = serde_json::from_str(
         r#"{
           "small_model": "kiro-local/gpt-5.6-sol",
-          "memory": {"reflection": true},
+          "learning": {
+            "enabled": true,
+            "extractor_model": "kiro-local/gpt-5.6-sol"
+          },
           "provider": {
             "kiro-local": {
               "transport": "openai",
@@ -3330,11 +3654,12 @@ fn internal_models_keep_the_responses_surface_selected_by_the_catalog() {
         );
     }
 
-    let reflection = resolve_reflection_model(&config, &catalog, "kiro-local", &env, &mut notes)
-        .expect("reflection resolution succeeds")
-        .expect("reflection is enabled by the explicit small model");
-    assert_eq!(reflection.provider.surface, ApiSurface::Responses);
-    assert_eq!(reflection.surface, ApiSurface::Responses);
+    let learning = resolve_learning_model(&config, &catalog, "kiro-local", &env, &mut notes)
+        .expect("learning resolution succeeds")
+        .expect("learning is enabled by the explicit extractor model");
+    assert_eq!(learning.model.provider.surface, ApiSurface::Responses);
+    assert_eq!(learning.model.surface, ApiSurface::Responses);
+    assert_eq!(learning.max_output_tokens, 2_048);
 }
 
 /// Every name the roster declares internal must resolve here.
@@ -4145,6 +4470,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
@@ -4164,6 +4490,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4210,6 +4537,7 @@ fn interaction_tool_ids(
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question,
             interaction_policy: policy,
             background_executions: test_background_executions(directory.path()),
@@ -4229,6 +4557,7 @@ fn interaction_tool_ids(
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4319,6 +4648,7 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
@@ -4338,6 +4668,7 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4393,6 +4724,7 @@ async fn explicit_full_access_uses_the_native_backend_and_retains_managed_lifecy
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
@@ -4412,6 +4744,7 @@ async fn explicit_full_access_uses_the_native_backend_and_retains_managed_lifecy
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4492,6 +4825,7 @@ async fn unavailable_fallback_is_visible_and_keeps_managed_shell_guards_and_auth
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: Arc::clone(&background_executions),
@@ -4511,6 +4845,7 @@ async fn unavailable_fallback_is_visible_and_keeps_managed_shell_guards_and_auth
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4664,6 +4999,7 @@ fn read_only_agent_refuses_unavailable_fallback_even_when_trusted_config_allows_
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
@@ -4683,6 +5019,7 @@ fn read_only_agent_refuses_unavailable_fallback_even_when_trusted_config_allows_
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4782,6 +5119,7 @@ async fn a_read_only_agent_contract_narrows_a_full_access_invocation() {
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
@@ -4801,6 +5139,7 @@ async fn a_read_only_agent_contract_narrows_a_full_access_invocation() {
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4847,6 +5186,7 @@ fn production_registry_exposes_council_only_to_a_delegating_profile() {
                 model_id: "model",
                 manifest: Arc::new(zuno_harness::ToolManifest::standard()),
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
+                public_http: Arc::new(zuno_network::PublicHttpClient::new()),
                 question: None,
                 interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
                 background_executions: test_background_executions(directory.path()),
@@ -4868,6 +5208,7 @@ fn production_registry_exposes_council_only_to_a_delegating_profile() {
                 councils: test_councils(),
                 job_controller: test_job_controller(),
                 memory: None,
+                experience_search: None,
                 tool_authority: None,
             },
         )
@@ -4950,6 +5291,7 @@ fn production_registry_uses_the_frozen_profile_rules() {
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
@@ -4969,6 +5311,7 @@ fn production_registry_uses_the_frozen_profile_rules() {
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -5436,7 +5779,9 @@ fn failed_provider_request_keeps_confirmed_goal_usage_and_marks_the_turn_unknown
 /// the way they would drift is a second composition root or a direct loop call.
 #[test]
 fn only_this_module_composes_a_turn() {
-    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd");
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("cmd");
     let composition = [
         "ToolRegistryDispatcher::new",
         ".service::<dyn AgentDriver>()",
@@ -5482,8 +5827,11 @@ fn only_this_module_composes_a_turn() {
         directory.display()
     );
 
-    let driver =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../zuno-engine/src/driver.rs");
+    let driver = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("zuno-engine")
+        .join("src")
+        .join("driver.rs");
     let driver = std::fs::read_to_string(&driver).expect("the default driver source is readable");
     assert_eq!(
         driver.matches("run_turn(").count(),
@@ -5585,6 +5933,7 @@ fn every_turn_error() -> Vec<TurnError> {
             elapsed: std::time::Duration::from_secs(180),
         },
         TurnError::Cache(zuno_llm::cache::CacheViolation::StaticPrefixChanged { turn: 2 }),
+        TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable),
     ]
 }
 
@@ -5640,13 +5989,14 @@ fn the_variant_table_covers_the_whole_enum() {
             TurnError::PromptAssembly(_) => "PromptAssembly",
             TurnError::ProviderRetryDeadlineExceeded { .. } => "ProviderRetryDeadlineExceeded",
             TurnError::Cache(_) => "Cache",
+            TurnError::Attachment(_) => "Attachment",
         };
         named.insert(name);
     }
 
     assert_eq!(
         named.len(),
-        20,
+        21,
         "the table covers only {named:?}; every variant needs a value or the rendering \
          claims above are vacuous for the ones missing"
     );
@@ -6235,6 +6585,7 @@ mod production_registry {
                 model_id: "model",
                 manifest: Arc::new(zuno_harness::ToolManifest::standard()),
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
+                public_http: Arc::new(zuno_network::PublicHttpClient::new()),
                 question: None,
                 interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
                 background_executions: test_background_executions(directory.path()),
@@ -6256,6 +6607,7 @@ mod production_registry {
                 councils: test_councils(),
                 job_controller: test_job_controller(),
                 memory: None,
+                experience_search: None,
                 tool_authority,
             },
         )?;
@@ -6636,6 +6988,7 @@ mod production_registry {
                 model_id: "model",
                 manifest: Arc::new(zuno_harness::ToolManifest::standard()),
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
+                public_http: Arc::new(zuno_network::PublicHttpClient::new()),
                 question: None,
                 interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
                 background_executions: test_background_executions(directory.path()),
@@ -6657,6 +7010,7 @@ mod production_registry {
                 councils: test_councils(),
                 job_controller: test_job_controller(),
                 memory: None,
+                experience_search: None,
                 tool_authority: None,
             },
         )
@@ -6717,8 +7071,9 @@ mod skill_prompt {
     #[test]
     fn council_routing_is_typed_and_scoped_to_one_resolver_clone() {
         let resolver = resolver();
-        let routed = resolver
-            .with_prompt_section(
+        let mut routed = resolver.clone();
+        routed
+            .append_prompt_section(
                 "routing.council",
                 "zuno-tui:/council",
                 "Invoke council_run exactly once.",
@@ -7302,6 +7657,13 @@ mod instruction_prompt {
     use super::*;
     use std::path::Path;
 
+    fn fixture_path(base: &Path, relative: &str) -> PathBuf {
+        relative
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .fold(base.to_path_buf(), |path, component| path.join(component))
+    }
+
     fn env_for(root: &Path) -> Env {
         Env::empty()
             .with(
@@ -7310,7 +7672,9 @@ mod instruction_prompt {
             )
             .with(
                 zuno_paths::env::XDG_CONFIG_HOME,
-                root.join("home/.config").to_string_lossy().into_owned(),
+                fixture_path(root, "home/.config")
+                    .to_string_lossy()
+                    .into_owned(),
             )
     }
 
@@ -7347,7 +7711,7 @@ mod instruction_prompt {
     #[tokio::test]
     async fn the_global_rule_file_reaches_the_system_prompt() {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
-        let global = root.path().join("home/.config/zuno/AGENTS.md");
+        let global = fixture_path(root.path(), "home/.config/zuno/AGENTS.md");
         write(&global, "GLOBAL_RULE_MARKER");
         std::fs::create_dir_all(root.path().join("repo")).expect("mkdir repo");
 
@@ -7379,7 +7743,7 @@ mod instruction_prompt {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
         let repo = root.path().join("repo");
         write(&repo.join("AGENTS.md"), "ROOT_RULE_MARKER");
-        write(&repo.join("sub/AGENTS.md"), "SUB_RULE_MARKER");
+        write(&fixture_path(&repo, "sub/AGENTS.md"), "SUB_RULE_MARKER");
 
         let (resolver, notes) = inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
 
@@ -7405,7 +7769,7 @@ mod instruction_prompt {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
         let repo = root.path().join("repo");
         write(&repo.join("AGENTS.md"), "ROOT_RULE_MARKER");
-        write(&repo.join("sub/CLAUDE.md"), "SUB_CLAUDE_MARKER");
+        write(&fixture_path(&repo, "sub/CLAUDE.md"), "SUB_CLAUDE_MARKER");
 
         let (resolver, notes) = inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
 
@@ -7426,9 +7790,12 @@ mod instruction_prompt {
     async fn configured_instruction_entries_reach_the_prompt() {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
         let repo = root.path().join("repo");
-        write(&repo.join("docs/house-style.md"), "CONFIGURED_RULE_MARKER");
         write(
-            &root.path().join("home/tilde-rules.md"),
+            &fixture_path(&repo, "docs/house-style.md"),
+            "CONFIGURED_RULE_MARKER",
+        );
+        write(
+            &fixture_path(root.path(), "home/tilde-rules.md"),
             "TILDE_RULE_MARKER",
         );
 
@@ -7526,7 +7893,10 @@ mod instruction_prompt {
                 "r".repeat(INSTRUCTION_PROMPT_BUDGET)
             ),
         );
-        write(&root.path().join("home/small.md"), "SMALL_RULE_MARKER");
+        write(
+            &fixture_path(root.path(), "home/small.md"),
+            "SMALL_RULE_MARKER",
+        );
 
         let (resolver, notes) =
             inject(&options(root.path(), repo, vec!["~/small.md".to_owned()])).await;
@@ -7578,7 +7948,10 @@ mod instruction_prompt {
 #[test]
 fn instruction_files_are_injected_once_between_memory_and_the_skill_catalogue() {
     let turn = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/turn.rs"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("cmd")
+            .join("turn.rs"),
     )
     .expect("turn.rs is readable");
 
@@ -7629,7 +8002,9 @@ fn instruction_files_are_injected_once_between_memory_and_the_skill_catalogue() 
 /// passes every other test in this workspace.
 #[test]
 fn the_headless_surfaces_wire_every_capability_the_tui_has() {
-    let cmd = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd");
+    let cmd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("cmd");
     let read = |name: &str| {
         std::fs::read_to_string(cmd.join(name)).unwrap_or_else(|_| panic!("{name} is readable"))
     };
@@ -7680,7 +8055,9 @@ fn the_headless_surfaces_wire_every_capability_the_tui_has() {
 
 #[test]
 fn every_extension_contribution_reaches_its_native_consumer() {
-    let cmd = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd");
+    let cmd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("cmd");
     let turn = std::fs::read_to_string(cmd.join("turn.rs")).expect("turn.rs is readable");
     let tui = std::fs::read_to_string(cmd.join("tui.rs")).expect("tui.rs is readable");
 
@@ -8582,7 +8959,10 @@ fn an_unknown_explicit_variant_is_rejected_before_the_provider_request() {
 #[test]
 fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
     let turn = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/turn.rs"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("cmd")
+            .join("turn.rs"),
     )
     .expect("turn.rs is readable");
 
@@ -8611,17 +8991,13 @@ fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
     );
 }
 
-mod reflection_runtime {
+mod learning_runtime {
     use super::*;
     use futures::stream;
     use std::sync::Mutex;
-    use zuno_agent::reflection::{
-        ReflectionMemoryEntry, ReflectionMemoryScope, ReflectionTurn, TranscriptEvent,
-        TurnDelivery, TurnTranscript,
-    };
     use zuno_llm::registry::{Capabilities, ProviderStream};
 
-    const SESSION_ID: &str = "ses_reflection_runtime";
+    const SESSION_ID: &str = "ses_learning_runtime";
 
     #[derive(Debug)]
     struct ScriptedProvider {
@@ -8631,35 +9007,29 @@ mod reflection_runtime {
 
     impl Provider for ScriptedProvider {
         fn id(&self) -> &str {
-            "reflection-provider"
+            "learning-provider"
         }
 
         fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                tool_calls: true,
-                ..Capabilities::text_only()
-            }
+            Capabilities::text_only()
         }
 
         fn stream(&self, request: CompletionRequest) -> ProviderStream<'_> {
             self.requests
                 .lock()
-                .expect("reflection request lock")
+                .expect("learning request lock")
                 .push(request);
             Box::pin(stream::iter(self.events.clone().into_iter().map(Ok)))
         }
     }
 
-    struct Fixture {
-        _directory: tempfile::TempDir,
-        memory: Arc<MemoryService>,
-        events: zuno_db::event_log::SessionEventLog,
-        fork: ReflectionFork,
-        requests: Arc<Mutex<Vec<CompletionRequest>>>,
-    }
-
-    fn fixture(provider_events: Vec<StreamEvent>) -> Fixture {
-        let directory = tempfile::tempdir().expect("temporary memory directory");
+    fn fixture(
+        provider_events: Vec<StreamEvent>,
+    ) -> (
+        ProviderLearningExtractor,
+        zuno_db::event_log::SessionEventLog,
+        Arc<Mutex<Vec<CompletionRequest>>>,
+    ) {
         let pool =
             Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
         let mut connection = pool.open_connection().expect("database connection");
@@ -8671,204 +9041,133 @@ mod reflection_runtime {
                  INSERT INTO session (
                      id, project_id, slug, directory, title, version, time_created, time_updated
                  ) VALUES (
-                     'ses_reflection_runtime', 'project', 'reflection-runtime', '/workspace',
-                     'Reflection runtime', 'zuno', 1, 1
+                     'ses_learning_runtime', 'project', 'learning-runtime', '/workspace',
+                     'Learning runtime', 'zuno', 1, 1
                  );",
             )
-            .expect("seed reflection session");
+            .expect("seed learning session");
         drop(connection);
 
-        let memory = Arc::new(MemoryService::new(
-            Arc::clone(&pool),
-            ScopePaths::at(
-                directory.path().join("global/MEMORY.md"),
-                directory.path().join("project/RULES.md"),
-            ),
-            ScopeLimits::default(),
-            PromotionPolicy::Review,
-        ));
-        let events = zuno_db::event_log::SessionEventLog::new(Arc::clone(&pool));
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let runner = ProviderReflectionRunner {
+        let events = zuno_db::event_log::SessionEventLog::new(Arc::clone(&pool));
+        let extractor = ProviderLearningExtractor {
             provider: Arc::new(ScriptedProvider {
                 events: provider_events,
                 requests: Arc::clone(&requests),
             }),
             model: EngineModel::new(
-                Spec::new("reflection-provider"),
-                "small-model",
+                Spec::new("learning-provider"),
+                "extractor-model",
                 ApiSurface::Chat,
             ),
             events: zuno_db::event_log::SessionEventLog::new(pool),
         };
-        let fork = ReflectionFork::new(
-            Arc::new(runner),
-            erase(zuno_tools::MemoryTool::reflection(Arc::clone(&memory))),
-        );
-        Fixture {
-            _directory: directory,
-            memory,
-            events,
-            fork,
-            requests,
-        }
+        (extractor, events, requests)
     }
 
-    async fn run(fixture: &Fixture) -> Result<(), ReflectionError> {
-        fixture
-            .fork
-            .spawn_after_turn(
-                ReflectionTurn::new(
-                    TurnDelivery::new(true, false),
-                    TurnTranscript::new(vec![
-                        TranscriptEvent::user("remember the verified repository gate"),
-                        TranscriptEvent::assistant("The gate passed and is reusable."),
-                    ]),
-                    ToolContext::new(
-                        SESSION_ID,
-                        "msg_delivered",
-                        "call_reflection",
-                        "build",
-                        Arc::new(AllowAll),
-                        Arc::new(NeverInterrupted),
-                    ),
-                )
-                .with_resident_memory(vec![ReflectionMemoryEntry::new(
-                    ReflectionMemoryScope::Project,
-                    "Use cargo check before the workspace test suite.",
-                )]),
-            )
-            .expect("reflection task")
-            .await
-            .expect("reflection supervisor task")
-    }
-
-    fn tool_events(name: &str, input: &str, with_end: bool) -> Vec<StreamEvent> {
-        let mut events = vec![
-            StreamEvent::ToolUseStart {
-                id: "call_memory".to_owned(),
-                name: name.to_owned(),
-            },
-            StreamEvent::ToolInputDelta {
-                id: "call_memory".to_owned(),
-                delta: input.to_owned(),
-            },
-            StreamEvent::ToolUseEnd {
-                id: "call_memory".to_owned(),
-            },
-        ];
-        if with_end {
-            events.push(StreamEvent::MessageEnd {
-                stop_reason: Some(zuno_llm::event::FinishReason::ToolCalls),
-            });
+    fn request() -> ExtractionRequest {
+        ExtractionRequest {
+            project_id: "project".to_owned(),
+            session_id: SESSION_ID.to_owned(),
+            source_message_id: "msg_delivered".to_owned(),
+            transcript: r#"[{"type":"user","text":"record this outcome"}]"#.to_owned(),
+            had_tool_calls: true,
+            had_artifacts: false,
+            recovered_from_error: false,
+            user_corrected: false,
+            explicit_feedback: false,
         }
-        events
     }
 
     #[tokio::test]
-    async fn provider_reflection_persists_request_outcome_and_pending_candidate() {
-        let fixture = fixture(tool_events(
-            "memory_propose",
-            r#"{"target":"project","action":"add","content":"run cargo test","reason":"verified repository gate","confidence":0.98}"#,
-            true,
-        ));
+    async fn provider_learning_extractor_is_tool_free_and_audited() {
+        let body = r#"{"experiences":[{"kind":"procedure","title":"Repository gate","summary":"The workspace check passed.","resolution":"Run cargo check before publishing.","confidence":0.98,"evidence":[{"kind":"tool","source_id":"msg_delivered","excerpt":"cargo check passed"}]}],"memories":[]}"#;
+        let (extractor, events, requests) = fixture(vec![
+            StreamEvent::TextDelta(body.to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(zuno_llm::event::FinishReason::Stop),
+            },
+        ]);
 
-        run(&fixture).await.expect("reflection review");
-
-        let candidates = fixture.memory.candidates().expect("memory candidates");
-        assert_eq!(candidates.len(), 1);
+        let extraction = extractor.extract(request()).await.expect("extraction");
+        assert_eq!(extraction.experiences.len(), 1);
+        let requests = requests.lock().expect("learning requests");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].tools.is_empty());
         assert_eq!(
-            candidates[0].status,
-            zuno_types::MemoryCandidateStatus::Pending
+            requests[0].request_context(),
+            Some(&ProviderRequestContext::Learning)
         );
-        let events = fixture
-            .events
+        let events = events
             .read_after(SESSION_ID, None)
-            .expect("reflection events");
+            .expect("learning events");
         assert_eq!(
             events
                 .iter()
                 .map(|event| event.event_type.as_str())
                 .collect::<Vec<_>>(),
-            ["memory.reflection.request", "memory.reflection.outcome"]
+            ["learning.extraction.request", "learning.extraction.outcome"]
         );
-        assert_eq!(events[0].properties["tool"]["name"], "memory_propose");
-        assert_eq!(
-            events[0].properties["residentMemory"][0]["scope"],
-            "project"
-        );
-        assert_eq!(
-            events[0].properties["residentMemory"][0]["content"],
-            "Use cargo check before the workspace test suite."
-        );
-        assert!(
-            events[0].properties["prompt"]
-                .as_str()
-                .is_some_and(|prompt| prompt.contains("prefer replace over add"))
-        );
+        assert_eq!(events[0].properties["tools"], json!([]));
         assert_eq!(events[1].properties["status"], "completed");
-        assert_eq!(events[1].properties["toolCalls"], 1);
-        let requests = fixture.requests.lock().expect("reflection requests");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].request_context(),
-            Some(&ProviderRequestContext::Reflection),
-            "reflection must not join the foreground provider conversation"
-        );
     }
 
     #[tokio::test]
-    async fn malformed_denied_and_truncated_reflection_streams_are_durable_failures() {
+    async fn provider_learning_extractor_rejects_tool_calls_and_truncated_streams() {
         for (events, expected) in [
             (
-                tool_events("memory_propose", "{", true),
-                "malformed tool arguments",
+                vec![
+                    StreamEvent::ToolUseStart {
+                        id: "call_forbidden".to_owned(),
+                        name: "shell".to_owned(),
+                    },
+                    StreamEvent::ToolInputDelta {
+                        id: "call_forbidden".to_owned(),
+                        delta: r#"{"command":"echo forbidden"}"#.to_owned(),
+                    },
+                    StreamEvent::ToolUseEnd {
+                        id: "call_forbidden".to_owned(),
+                    },
+                    StreamEvent::MessageEnd {
+                        stop_reason: Some(zuno_llm::event::FinishReason::ToolCalls),
+                    },
+                ],
+                "attempted a tool call",
             ),
             (
-                tool_events("shell", r#"{"command":"echo forbidden"}"#, true),
-                "denied non-whitelisted tool",
-            ),
-            (
-                tool_events(
-                    "memory_propose",
-                    r#"{"target":"project","action":"add","content":"x","reason":"y","confidence":1}"#,
-                    false,
-                ),
+                vec![StreamEvent::TextDelta(
+                    r#"{"experiences":[],"memories":[]}"#.to_owned(),
+                )],
                 "ended before MessageEnd",
             ),
         ] {
-            let fixture = fixture(events);
-            let error = run(&fixture)
+            let (extractor, durable_events, _) = fixture(events);
+            let error = extractor
+                .extract(request())
                 .await
-                .expect_err("invalid reflection stream must fail the durable job");
+                .expect_err("invalid extraction stream must fail");
             assert!(
                 error.to_string().contains(expected),
                 "missing `{expected}` in {error}"
             );
-
-            assert!(
-                fixture.memory.candidates().expect("candidates").is_empty(),
-                "failed reflection wrote a candidate"
-            );
-            let events = fixture
-                .events
+            let events = durable_events
                 .read_after(SESSION_ID, None)
-                .expect("reflection events");
+                .expect("learning events");
             let outcome = events.last().expect("failure outcome");
-            assert_eq!(outcome.event_type, "memory.reflection.outcome");
+            assert_eq!(outcome.event_type, "learning.extraction.outcome");
             assert_eq!(outcome.properties["status"], "failed");
-            assert!(
-                outcome.properties["error"]
-                    .as_str()
-                    .is_some_and(|error| error.contains(expected)),
-                "missing `{expected}` in {}",
-                outcome.properties["error"]
-            );
         }
     }
 
     #[test]
-    fn durable_reflection_transcript_replays_delivered_text_and_terminal_tool_results() {
+    fn durable_learning_turn_replays_text_tools_artifacts_and_corrections() {
+        let attachment_root = tempfile::tempdir().expect("temporary attachment directory");
+        let attachments = zuno_attachment::AttachmentStore::new(
+            attachment_root.path(),
+            "learning",
+            zuno_attachment::ImageAdmissionPolicy::default(),
+        )
+        .expect("attachment store");
         let mut connection =
             zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open database");
         zuno_db::migration::apply(&mut connection).expect("initialize schema");
@@ -8882,47 +9181,46 @@ mod reflection_runtime {
                 agent: "build",
                 provider_id: "provider",
                 model_id: "model",
-                text: "verify the gate",
-                message_id: Some("msg_reflection_user"),
+                text: "不对，我说的是验证并记录这个 gate",
+                message_id: Some("msg_learning_user"),
                 now,
             },
             None,
+            &attachments,
         )
         .expect("prepare user message");
         persist_prepared_user_message(&connection, &user, &user_parts)
             .expect("persist user message");
 
         let assistant = zuno_db::message::MessageRecord::from_json(json!({
-            "id": "msg_reflection_assistant",
+            "id": "msg_learning_assistant",
             "sessionID": session.id,
             "role": "assistant",
-            "time": {"created": now + 1, "completed": now + 2},
+            "time": {"created": now + 1},
             "parentID": user.id,
             "modelID": "model",
             "providerID": "provider",
-            "mode": "build",
             "agent": "build",
             "path": {"cwd": "/workspace", "root": "/workspace"},
             "cost": 0,
             "tokens": {
-                "input": 1,
-                "output": 1,
+                "input": 0,
+                "output": 0,
                 "reasoning": 0,
                 "cache": {"read": 0, "write": 0}
-            },
-            "finish": "stop"
+            }
         }))
         .expect("assistant message");
         let parts = [
             json!({
-                "id": "prt_reflection_text",
+                "id": "prt_learning_text",
                 "sessionID": session.id,
                 "messageID": assistant.id,
                 "type": "text",
                 "text": "I verified the gate."
             }),
             json!({
-                "id": "prt_reflection_failed",
+                "id": "prt_learning_failed",
                 "sessionID": session.id,
                 "messageID": assistant.id,
                 "type": "tool",
@@ -8935,7 +9233,7 @@ mod reflection_runtime {
                 }
             }),
             json!({
-                "id": "prt_reflection_succeeded",
+                "id": "prt_learning_succeeded",
                 "sessionID": session.id,
                 "messageID": assistant.id,
                 "type": "tool",
@@ -8946,6 +9244,14 @@ mod reflection_runtime {
                     "input": {"command": "cargo test"},
                     "output": "all tests passed"
                 }
+            }),
+            json!({
+                "id": "prt_learning_patch",
+                "sessionID": session.id,
+                "messageID": assistant.id,
+                "type": "patch",
+                "hash": "abc123",
+                "files": ["Cargo.toml"]
             }),
         ]
         .into_iter()
@@ -8965,26 +9271,27 @@ mod reflection_runtime {
                 .expect("persist assistant part");
         }
 
-        let transcript =
-            durable_reflection_transcript(&connection, &session.id, "msg_reflection_assistant")
-                .expect("durable transcript");
+        let turn = durable_learning_turn(&connection, &session.id, "msg_learning_assistant")
+            .expect("durable learning turn");
+        assert!(turn.had_artifacts);
+        assert!(turn.user_corrected);
         assert_eq!(
-            transcript,
+            turn.transcript,
             TurnTranscript::new(vec![
-                TranscriptEvent::user("verify the gate"),
+                TranscriptEvent::user("不对，我说的是验证并记录这个 gate"),
                 TranscriptEvent::assistant("I verified the gate."),
                 TranscriptEvent::command(
                     "cargo test",
-                    zuno_agent::reflection::CommandOutcome::failed("first attempt failed"),
+                    CommandOutcome::failed("first attempt failed"),
                 ),
                 TranscriptEvent::command(
                     "cargo test",
-                    zuno_agent::reflection::CommandOutcome::succeeded("all tests passed"),
+                    CommandOutcome::succeeded("all tests passed"),
                 ),
             ])
         );
         assert!(
-            durable_reflection_transcript(&connection, &session.id, "msg_missing")
+            durable_learning_turn(&connection, &session.id, "msg_missing")
                 .expect_err("missing delivered message must fail")
                 .contains("missing from durable history")
         );

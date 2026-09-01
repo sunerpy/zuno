@@ -30,30 +30,40 @@
 //! and the assertions are stronger for it: every stub changes the file's **length**
 //! as well as its content, so "the bytes changed" cannot be true by coincidence.
 
+#[cfg(unix)]
 use async_trait::async_trait;
 use serde_json::json;
+#[cfg(unix)]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
 use tempfile::TempDir;
 use zuno_config::schema::formatter::{FormatterConfig, FormatterEntry};
+#[cfg(unix)]
 use zuno_error::ToolError;
+#[cfg(unix)]
 use zuno_tool::{NeverInterrupted, PermissionAsk, PermissionAsker, ToolContext};
+#[cfg(unix)]
+use zuno_tools::FileTools;
+use zuno_tools::FormatOutcome;
 use zuno_tools::format::{
     Availability, DEFINITIONS, FailureKind, Formatters, ProgramLocator, builtin,
 };
-use zuno_tools::{FileTools, FormatOutcome};
 
 /// The bytes every fixture starts from, and the bytes the stub rewrites them to.
 ///
 /// Different lengths on purpose; see the module docs.
 const BEFORE: &str = "alpha\n";
+#[cfg(unix)]
 const AFTER: &str = "formatted by the stub\n";
 
+#[cfg(unix)]
 #[derive(Default)]
 struct AllowAll;
 
+#[cfg(unix)]
 #[async_trait]
 impl PermissionAsker for AllowAll {
     async fn ask(
@@ -66,6 +76,7 @@ impl PermissionAsker for AllowAll {
     }
 }
 
+#[cfg(unix)]
 fn context() -> ToolContext {
     ToolContext::new(
         "session-format",
@@ -78,9 +89,11 @@ fn context() -> ToolContext {
 }
 
 /// A locator that answers from a fixed table, so no test reads `PATH`.
+#[cfg(unix)]
 #[derive(Debug, Default)]
 struct StubPrograms(BTreeMap<String, PathBuf>);
 
+#[cfg(unix)]
 impl StubPrograms {
     fn with(mut self, program: &str, path: &Path) -> Self {
         self.0.insert(program.to_owned(), path.to_path_buf());
@@ -88,6 +101,7 @@ impl StubPrograms {
     }
 }
 
+#[cfg(unix)]
 impl ProgramLocator for StubPrograms {
     fn locate(&self, program: &str) -> Option<PathBuf> {
         self.0.get(program).cloned()
@@ -106,9 +120,11 @@ impl ProgramLocator for NoPrograms {
 
 /// Resolve the last positional argument, which is where `$FILE` lands in every
 /// built-in command: `clang-format -i $FILE` puts the flag in `$1`, not the file.
+#[cfg(unix)]
 const LAST_ARGUMENT: &str = "for target in \"$@\"; do :; done\n";
 
 /// The argument [`wait_until_executable`] probes a freshly written stub with.
+#[cfg(unix)]
 const PROBE: &str = "--probe-executable";
 
 /// How long a stub's `ETXTBSY` window is allowed to last.
@@ -116,7 +132,9 @@ const PROBE: &str = "--probe-executable";
 /// The window is bounded by how long a concurrently forked child takes to reach
 /// `execve`, which is microseconds. 8 × 5 ms is three orders of magnitude of
 /// headroom; a measured 12-thread run needed at most a single retry per stub.
+#[cfg(unix)]
 const PROBE_ATTEMPTS: usize = 8;
+#[cfg(unix)]
 const PROBE_BACKOFF: Duration = Duration::from_millis(5);
 
 /// Write an executable shell script, returning its path.
@@ -165,6 +183,7 @@ fn script(directory: &Path, name: &str, body: &str) -> PathBuf {
 /// then executes, so it cannot lend out an fd to one. A formatter installed by a
 /// package manager mid-session could in principle hit this, and it is already
 /// reported cleanly as `NotSpawned` with the OS message.
+#[cfg(unix)]
 fn wait_until_executable(path: &Path) {
     for attempt in 0..PROBE_ATTEMPTS {
         let probe = std::process::Command::new(path)
@@ -185,16 +204,19 @@ fn wait_until_executable(path: &Path) {
 }
 
 /// The body that rewrites the file to [`AFTER`].
+#[cfg(unix)]
 fn rewrite_body() -> String {
     format!("{LAST_ARGUMENT}printf '%s' '{AFTER}' > \"$target\"\n")
 }
 
 /// A stub that rewrites the file to [`AFTER`] and succeeds.
+#[cfg(unix)]
 fn rewriting_stub(directory: &Path) -> PathBuf {
     script(directory, "stub-format", &rewrite_body())
 }
 
 /// A stub that leaves the file alone and exits non-zero with a known stderr.
+#[cfg(unix)]
 fn failing_stub(directory: &Path) -> PathBuf {
     script(
         directory,
@@ -205,6 +227,7 @@ fn failing_stub(directory: &Path) -> PathBuf {
 
 /// A stub that truncates the file *and then* fails — the case that decides whether
 /// a formatter can cost an edit.
+#[cfg(unix)]
 fn destructive_stub(directory: &Path) -> PathBuf {
     script(
         directory,
@@ -216,6 +239,7 @@ fn destructive_stub(directory: &Path) -> PathBuf {
 }
 
 /// A stub that records every path it was handed, one per line.
+#[cfg(unix)]
 fn recording_stub(directory: &Path, log: &Path) -> PathBuf {
     script(
         directory,
@@ -228,6 +252,7 @@ fn recording_stub(directory: &Path, log: &Path) -> PathBuf {
 }
 
 /// A stub that never returns, so a ceiling can be observed.
+#[cfg(unix)]
 fn hanging_stub(directory: &Path) -> PathBuf {
     script(directory, "stub-hang", "sleep 600\n")
 }
@@ -413,6 +438,7 @@ fn rust_and_python_are_claimed_by_the_formatters_that_should_claim_them() {
 // The happy path
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_configured_formatter_runs_after_an_edit_and_the_content_is_formatted() {
     let (root, bin, subject) = workspace();
@@ -459,6 +485,7 @@ async fn a_configured_formatter_runs_after_an_edit_and_the_content_is_formatted(
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_configured_formatter_runs_after_a_write_and_after_a_patch() {
     let (root, bin, _subject) = workspace();
@@ -522,6 +549,7 @@ async fn a_configured_formatter_runs_after_a_write_and_after_a_patch() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_configured_command_replaces_the_builtins_and_environment_is_passed_through() {
     let (root, bin, subject) = workspace();
@@ -559,6 +587,7 @@ async fn a_configured_command_replaces_the_builtins_and_environment_is_passed_th
     assert!(runtime.claiming(".txt").any(|name| name == "rustfmt"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_formatter_that_leaves_the_bytes_alone_reports_no_change() {
     let (root, bin, subject) = workspace();
@@ -584,6 +613,7 @@ async fn a_formatter_that_leaves_the_bytes_alone_reports_no_change() {
 // Extension matching
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_formatter_does_not_run_on_a_file_it_does_not_claim() {
     let (root, bin, _subject) = workspace();
@@ -626,6 +656,7 @@ async fn a_formatter_does_not_run_on_a_file_it_does_not_claim() {
     assert_eq!(std::fs::read_to_string(&rust).expect("read back"), AFTER);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_file_with_no_extension_is_never_formatted() {
     let (root, bin, _subject) = workspace();
@@ -670,6 +701,7 @@ fn the_extension_is_the_final_segment_with_a_leading_dot() {
 // disabled
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[tokio::test]
 async fn the_global_switch_off_skips_every_formatter() {
     let (root, bin, subject) = workspace();
@@ -691,6 +723,7 @@ async fn the_global_switch_off_skips_every_formatter() {
     assert!(!log.exists());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_per_formatter_disabled_true_skips_that_formatter_and_leaves_the_others() {
     let (root, bin, subject) = workspace();
@@ -792,6 +825,7 @@ async fn an_absent_formatter_key_disables_formatting_entirely() {
 // Failure: the edit survives, and the stderr is surfaced
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_failing_formatter_is_reported_while_the_edit_persists() {
     let (root, bin, subject) = workspace();
@@ -864,6 +898,7 @@ async fn a_failing_formatter_is_reported_while_the_edit_persists() {
     assert_eq!(output.metadata.get("formatted"), Some(&json!(false)));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_formatter_that_truncates_the_file_before_failing_has_its_damage_undone() {
     let (root, bin, subject) = workspace();
@@ -936,6 +971,7 @@ async fn a_formatter_that_cannot_be_spawned_is_reported_and_the_write_stands() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_hanging_formatter_is_abandoned_at_the_ceiling_and_the_write_stands() {
     let (root, bin, subject) = workspace();
@@ -962,6 +998,7 @@ async fn a_hanging_formatter_is_abandoned_at_the_ceiling_and_the_write_stands() 
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn one_failing_formatter_does_not_stop_the_next_one() {
     let (root, bin, subject) = workspace();
@@ -988,6 +1025,7 @@ async fn one_failing_formatter_does_not_stop_the_next_one() {
     assert_eq!(std::fs::read_to_string(&subject).expect("read back"), AFTER);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_patch_that_hits_a_failing_formatter_still_applies_every_operation() {
     let (root, bin, _subject) = workspace();
@@ -1064,6 +1102,7 @@ async fn a_builtin_whose_program_is_absent_is_skipped() {
     assert_eq!(std::fs::read_to_string(&rust).expect("read back"), BEFORE);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_marker_gated_builtin_runs_only_once_its_marker_exists() {
     let (root, bin, _subject) = workspace();
@@ -1091,6 +1130,7 @@ async fn a_marker_gated_builtin_runs_only_once_its_marker_exists() {
     assert_eq!(std::fs::read_to_string(&source).expect("read back"), AFTER);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn the_experimental_formatter_stays_off_until_its_flag_is_set() {
     let (root, _bin, _subject) = workspace();
@@ -1137,6 +1177,7 @@ async fn the_experimental_formatter_stays_off_until_its_flag_is_set() {
     assert_eq!(std::fs::read_to_string(&source).expect("read back"), AFTER);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_node_hosted_formatter_needs_both_the_declaration_and_the_binary() {
     let (root, _bin, _subject) = workspace();
@@ -1176,6 +1217,7 @@ async fn a_node_hosted_formatter_needs_both_the_declaration_and_the_binary() {
     assert_eq!(std::fs::read_to_string(&source).expect("read back"), AFTER);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn uv_stands_down_when_ruff_is_available() {
     let (root, bin, _subject) = workspace();
@@ -1205,6 +1247,7 @@ async fn uv_stands_down_when_ruff_is_available() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn ruff_needs_a_config_or_a_dependency_that_names_it() {
     let (root, bin, _subject) = workspace();
@@ -1242,6 +1285,7 @@ async fn ruff_needs_a_config_or_a_dependency_that_names_it() {
     assert!(runtime.format_all(&python).await.changed);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn the_help_probe_distinguishes_the_r_formatter_from_a_namesake() {
     let (root, bin, _subject) = workspace();
@@ -1281,6 +1325,7 @@ async fn the_help_probe_distinguishes_the_r_formatter_from_a_namesake() {
 // Reporting shape
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[tokio::test]
 async fn the_failure_report_names_the_formatter_the_command_and_the_reason() {
     let (root, bin, subject) = workspace();

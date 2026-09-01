@@ -67,46 +67,70 @@ impl Config {
 }
 
 fn validate_semantics(path: &Path, config: Config) -> Result<Config, ConfigError> {
-    let Some(sandbox) = &config.sandbox else {
-        return Ok(config);
-    };
-    let mode = sandbox.resolved_mode();
     let mut issues = Vec::new();
-    let has_writable_roots = sandbox
-        .writable_roots
-        .as_ref()
-        .is_some_and(|roots| !roots.is_empty());
-    let has_protected_paths = sandbox
-        .protected_paths
-        .as_ref()
-        .is_some_and(|paths| !paths.is_empty());
+    if let Some(sandbox) = &config.sandbox {
+        let mode = sandbox.resolved_mode();
+        let has_writable_roots = sandbox
+            .writable_roots
+            .as_ref()
+            .is_some_and(|roots| !roots.is_empty());
+        let has_protected_paths = sandbox
+            .protected_paths
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty());
 
-    if mode == SandboxMode::ReadOnly && has_writable_roots {
-        issues.push(ConfigIssue::new(
-            ["sandbox", "writableRoots"],
-            "read-only mode cannot grant writable roots",
-        ));
-    }
-    if mode == SandboxMode::DangerFullAccess {
-        if sandbox.network == Some(SandboxNetworkMode::Deny) {
-            issues.push(ConfigIssue::new(
-                ["sandbox", "network"],
-                "danger-full-access inherits the host network and cannot enforce network deny",
-            ));
-        }
-        if has_writable_roots {
+        if mode == SandboxMode::ReadOnly && has_writable_roots {
             issues.push(ConfigIssue::new(
                 ["sandbox", "writableRoots"],
-                "danger-full-access already has host write authority; writableRoots would be misleading",
+                "read-only mode cannot grant writable roots",
             ));
         }
-        if has_protected_paths {
+        if mode == SandboxMode::DangerFullAccess {
+            if sandbox.network == Some(SandboxNetworkMode::Deny) {
+                issues.push(ConfigIssue::new(
+                    ["sandbox", "network"],
+                    "danger-full-access inherits the host network and cannot enforce network deny",
+                ));
+            }
+            if has_writable_roots {
+                issues.push(ConfigIssue::new(
+                    ["sandbox", "writableRoots"],
+                    "danger-full-access already has host write authority; writableRoots would be misleading",
+                ));
+            }
+            if has_protected_paths {
+                issues.push(ConfigIssue::new(
+                    ["sandbox", "protectedPaths"],
+                    "danger-full-access cannot enforce protectedPaths",
+                ));
+            }
+        }
+    }
+
+    if let Some(learning) = &config.learning {
+        let resolved = learning.resolved();
+        if resolved.enabled && resolved.extractor_model.is_none() {
             issues.push(ConfigIssue::new(
-                ["sandbox", "protectedPaths"],
-                "danger-full-access cannot enforce protectedPaths",
+                ["learning", "extractor_model"],
+                "a non-empty extractor_model is required when learning.enabled is true",
+            ));
+        }
+        if !resolved.skill_require_review {
+            issues.push(ConfigIssue::new(
+                ["learning", "skill", "require_review"],
+                "Skill candidates always require human review",
+            ));
+        }
+        if resolved.skill_max_learned_rules
+            > crate::schema::DEFAULT_LEARNING_SKILL_MAX_LEARNED_RULES
+        {
+            issues.push(ConfigIssue::new(
+                ["learning", "skill", "max_learned_rules"],
+                "a Skill may contain at most 15 learned rules",
             ));
         }
     }
+
     if issues.is_empty() {
         Ok(config)
     } else {

@@ -9,6 +9,31 @@ Because the protocol owns stdout, do not read that stream as human output. Use `
 when you only want to confirm the adapter is present, and `--print-logs` to route
 diagnostics to stderr where they will not corrupt the protocol stream.
 
+## Session MCP servers
+
+Zuno advertises standard ACP MCP support for stdio and Streamable HTTP;
+legacy SSE remains unsupported. `session/new`, `session/load`, and
+`session/resume` must provide the complete `mcpServers` list for that session.
+Load and resume never reuse process resources from an earlier request.
+
+Declarations are validated before the session is published:
+
+- names must match `[A-Za-z0-9_-]{1,32}` or are normalized to a stable slug
+  with an eight-character digest; duplicate normalized names are rejected;
+- a stdio command must be absolute and runs with the session directory as cwd;
+- HTTP endpoints must be absolute HTTP(S) URLs;
+- environment and header entries are strictly validated, including
+  case-insensitive duplicate header names.
+
+Every ACP session owns an isolated profile bundle. All requested servers must
+connect and complete tool discovery before any of their tools are published.
+Partial startup is shut down in reverse order. Session close, load failure,
+process exit, and profile replacement use the same exact disposer path.
+
+Client MCP commands, environment values, and HTTP headers remain process-local:
+they are not written to the session database or diagnostics. Tool schemas and
+actual tool attempts continue through the ordinary durable tool rules.
+
 ## Synopsis
 
 ```sh

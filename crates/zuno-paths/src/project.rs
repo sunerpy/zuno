@@ -274,10 +274,10 @@ fn resolve_git_path(cwd: &str, value: &str) -> String {
         return cwd.to_owned();
     }
     let normalized = node_path::windows_path(trimmed);
-    if node_path::is_absolute(normalized) {
-        return node_path::normalize(normalized);
+    if node_path::is_absolute(&normalized) {
+        return node_path::normalize(&normalized);
     }
-    node_path::resolve(cwd, &[normalized])
+    node_path::resolve(cwd, &[&normalized])
 }
 
 /// Run `git` in `cwd`, returning stdout on success and `None` on any failure —
@@ -302,11 +302,12 @@ mod tests {
     use std::process::Command;
 
     fn run(cwd: &Path, args: &[&str]) {
+        let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
         let status = Command::new(args[0])
             .args(&args[1..])
             .current_dir(cwd)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", null_device)
+            .env("GIT_CONFIG_SYSTEM", null_device)
             .env("GIT_AUTHOR_NAME", "zuno-paths")
             .env("GIT_AUTHOR_EMAIL", "zuno-paths@example.test")
             .env("GIT_COMMITTER_NAME", "zuno-paths")
@@ -330,17 +331,26 @@ mod tests {
         root
     }
 
+    fn assert_same_path(actual: &Path, expected: &Path) {
+        assert_eq!(
+            actual.canonicalize().expect("canonicalize actual path"),
+            expected.canonicalize().expect("canonicalize expected path"),
+            "paths identify different filesystem entries: actual={} expected={}",
+            actual.display(),
+            expected.display()
+        );
+    }
+
     #[test]
     fn discovers_the_worktree_root_from_a_nested_directory() {
         let root = repository();
-        let nested = root.path().join("a/b");
+        let nested = root.path().join("a").join("b");
         fs::create_dir_all(&nested).expect("create nested");
 
         let discovered = discover_repository(&nested).expect("repository");
-        let expected = root.path().canonicalize().expect("canonicalize");
-        assert_eq!(discovered.worktree, expected);
-        assert_eq!(discovered.git_directory, expected.join(".git"));
-        assert_eq!(discovered.common_directory, expected.join(".git"));
+        assert_same_path(&discovered.worktree, root.path());
+        assert_same_path(&discovered.git_directory, &root.path().join(".git"));
+        assert_same_path(&discovered.common_directory, &root.path().join(".git"));
     }
 
     /// In a linked worktree the git directory is per-worktree while the common
@@ -364,19 +374,12 @@ mod tests {
         );
 
         let discovered = discover_repository(&linked).expect("repository");
-        let expected_common = root
-            .path()
-            .canonicalize()
-            .expect("canonicalize")
-            .join(".git");
-        assert_eq!(
-            discovered.worktree,
-            linked.canonicalize().expect("canonicalize")
-        );
-        assert_eq!(discovered.common_directory, expected_common);
-        assert_eq!(
-            discovered.git_directory,
-            expected_common.join("worktrees/linked")
+        let expected_common = root.path().join(".git");
+        assert_same_path(&discovered.worktree, &linked);
+        assert_same_path(&discovered.common_directory, &expected_common);
+        assert_same_path(
+            &discovered.git_directory,
+            &expected_common.join("worktrees").join("linked"),
         );
         assert_ne!(discovered.git_directory, discovered.common_directory);
     }
@@ -386,7 +389,10 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let resolved = resolve_project(root.path());
         assert_eq!(resolved.id, GLOBAL_PROJECT_ID);
-        assert_eq!(resolved.directory, Path::new("/"));
+        assert_eq!(
+            resolved.directory,
+            PathBuf::from(node_path::root(&root.path().to_string_lossy()))
+        );
         assert_eq!(resolved.vcs, None);
         assert_eq!(resolved.previous, None);
     }
@@ -410,16 +416,10 @@ mod tests {
         let head = git(&root.path().to_string_lossy(), &["rev-parse", "HEAD"]).expect("head");
         assert_eq!(resolved.id, head.trim());
         assert_eq!(resolved.previous, None);
-        assert_eq!(
-            resolved.vcs,
-            Some(Vcs::Git {
-                store: root
-                    .path()
-                    .canonicalize()
-                    .expect("canonicalize")
-                    .join(".git")
-            })
-        );
+        let Some(Vcs::Git { store }) = resolved.vcs.as_ref() else {
+            panic!("a repository must expose its Git store");
+        };
+        assert_same_path(store, &root.path().join(".git"));
     }
 
     #[test]
@@ -554,6 +554,19 @@ mod tests {
 
     #[test]
     fn resolve_git_path_honours_absolute_and_relative_output() {
+        if cfg!(windows) {
+            assert_eq!(
+                resolve_git_path(r"C:\repo", "C:/abs/worktree\n"),
+                r"C:\abs\worktree"
+            );
+            assert_eq!(resolve_git_path(r"C:\repo", ".git\n"), r"C:\repo\.git");
+            assert_eq!(resolve_git_path(r"C:\repo", "\n"), r"C:\repo");
+            assert_eq!(
+                resolve_git_path(r"C:\repo", "C:/abs/../other\r\n"),
+                r"C:\other"
+            );
+            return;
+        }
         assert_eq!(
             resolve_git_path("/repo", "/abs/worktree\n"),
             "/abs/worktree"
@@ -569,7 +582,7 @@ mod tests {
     #[test]
     fn find_git_marker_walks_up() {
         let root = repository();
-        let nested = root.path().join("x/y/z");
+        let nested = root.path().join("x").join("y").join("z");
         fs::create_dir_all(&nested).expect("create nested");
         assert_eq!(find_git_marker(&nested), Some(root.path().join(".git")));
         assert_eq!(

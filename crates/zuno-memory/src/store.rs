@@ -249,7 +249,7 @@ impl MemoryStore {
     ///
     /// As [`MemoryStore::discover`].
     pub fn reload(&mut self) -> Result<(), MemoryError> {
-        match read_checked(&self.path)? {
+        match read_checked(&self.path, self.stamp.is_some())? {
             Some((raw, stamp)) => {
                 self.entries = parse(&raw);
                 self.stamp = Some(stamp);
@@ -317,8 +317,9 @@ impl MemoryStore {
     ///    nothing, or two distinct entries, aborts here with the store untouched.
     /// 5. **Check the cap against the candidate, once.** Over the cap fails and
     ///    reports the current entries; nothing is evicted.
-    /// 6. **Write atomically.** Temporary file then rename, so a reader sees either
-    ///    the whole old file or the whole new one and no lock is needed.
+    /// 6. **Write atomically.** The shared platform component publishes a complete
+    ///    sibling and absorbs the bounded Windows open conflict, so a consumer
+    ///    sees either the whole old file or the whole new one.
     ///
     /// # Errors
     ///
@@ -352,7 +353,7 @@ impl MemoryStore {
             validated.push(operation);
         }
 
-        let observed = read_checked(&self.path)?;
+        let observed = read_checked(&self.path, self.stamp.is_some())?;
         if let Some(reason) = self.drift(observed.as_ref()) {
             let raw = observed.map(|(raw, _)| raw).unwrap_or_default();
             let backup = self.snapshot(&raw)?;
@@ -410,7 +411,7 @@ impl MemoryStore {
         expected: &[String],
         replacement: &[String],
     ) -> Result<Usage, MemoryError> {
-        let observed = read_checked(&self.path)?;
+        let observed = read_checked(&self.path, self.stamp.is_some())?;
         if let Some(reason) = self.drift(observed.as_ref()) {
             let raw = observed.map(|(raw, _)| raw).unwrap_or_default();
             let backup = self.snapshot(&raw)?;
@@ -552,9 +553,17 @@ impl MemoryStore {
 /// reads, the stamp is then older than the content, so the next `apply_batch` sees
 /// a fresh stamp that differs and refuses. Reading the content first would give
 /// the opposite and unsafe skew: stale content under a current-looking stamp.
-fn read_checked(path: &Path) -> Result<Option<(String, FileStamp)>, MemoryError> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
+fn read_checked(
+    path: &Path,
+    expected_to_exist: bool,
+) -> Result<Option<(String, FileStamp)>, MemoryError> {
+    let metadata = match if expected_to_exist {
+        zuno_atomic_file::metadata(path).map(Some)
+    } else {
+        zuno_atomic_file::metadata_optional(path)
+    } {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => return Ok(None),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
             return Err(MemoryError::Io {
@@ -568,7 +577,7 @@ fn read_checked(path: &Path) -> Result<Option<(String, FileStamp)>, MemoryError>
         modified: metadata.modified().unwrap_or(UNIX_EPOCH),
         len: metadata.len(),
     };
-    match fs::read_to_string(path) {
+    match zuno_atomic_file::read_to_string(path) {
         Ok(raw) => Ok(Some((raw, stamp))),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(MemoryError::Unreadable {
@@ -590,32 +599,18 @@ fn ensure_parent(path: &Path) -> Result<(), MemoryError> {
 
 /// Write `body` so a concurrent reader sees either all of it or none of it.
 ///
-/// Temporary file in the destination's own directory, then rename. Same
-/// filesystem, so the rename is atomic, which is why this store needs no lock:
-/// a reader always observes one complete version of the file
-/// (`memory_tool.py:762-764`).
+/// [`zuno_atomic_file::replace`] uses `rename` on Unix and `ReplaceFileW` for an
+/// existing Windows destination. Its paired read functions absorb the bounded
+/// Windows open conflict, so this store needs no private lock and observes one
+/// complete version of the file (`memory_tool.py:762-764`).
 fn write_atomic(path: &Path, body: &str) -> Result<FileStamp, MemoryError> {
-    ensure_parent(path)?;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos());
-    let temporary = path.with_extension(format!("tmp.{nanos}"));
-
-    fs::write(&temporary, body).map_err(|source| MemoryError::Io {
-        operation: "write",
-        path: temporary.clone(),
+    zuno_atomic_file::replace(path, body.as_bytes()).map_err(|source| MemoryError::Io {
+        operation: "replace atomically",
+        path: path.to_path_buf(),
         source,
     })?;
-    fs::rename(&temporary, path).map_err(|source| {
-        let _ = fs::remove_file(&temporary);
-        MemoryError::Io {
-            operation: "rename into place",
-            path: path.to_path_buf(),
-            source,
-        }
-    })?;
 
-    let metadata = fs::metadata(path).map_err(|source| MemoryError::Io {
+    let metadata = zuno_atomic_file::metadata(path).map_err(|source| MemoryError::Io {
         operation: "stat after write",
         path: path.to_path_buf(),
         source,

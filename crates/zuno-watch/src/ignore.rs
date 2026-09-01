@@ -621,7 +621,11 @@ mod tests {
 
     #[test]
     fn a_path_outside_the_root_is_reported_rather_than_hidden() {
-        assert!(!filter().is_ignored(Path::new("/elsewhere/node_modules/x"), false));
+        let outside = std::env::temp_dir()
+            .join("zuno-watch-outside")
+            .join("node_modules")
+            .join("x");
+        assert!(!filter().is_ignored(&outside, false));
     }
 
     #[test]

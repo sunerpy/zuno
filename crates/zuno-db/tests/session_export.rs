@@ -19,6 +19,7 @@
 //!   upserting `put_message_at` makes import a silent editor of live history and
 //!   fails here.
 
+use base64::Engine as _;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use zuno_db::message::{MessageRecord, MessageStore, PartRecord};
@@ -28,6 +29,8 @@ use zuno_db::{migration, open};
 const SESSION: &str = "ses_export00000000000000000000ab";
 const USER: &str = "msg_export00000000000000000000us";
 const ASSISTANT: &str = "msg_export00000000000000000000as";
+const PNG_BASE64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
 fn database() -> Connection {
     let mut connection =
@@ -118,6 +121,36 @@ fn seeded() -> Connection {
         json!({ "type": "text", "text": "reading src/lib.rs" }),
         1201,
     );
+    connection
+}
+
+fn seeded_with_notes() -> Connection {
+    let connection = seeded();
+    zuno_db::continuity::ensure_schema(&connection).expect("create continuity tables");
+    let content = "CI evidence: run 41744 passed.";
+    let content_sha256 = zuno_orchestration::sha256_text(content);
+    connection
+        .execute(
+            "INSERT INTO session_note
+               (session_id, agent, name, revision, content, content_sha256,
+                time_created, time_updated)
+             VALUES (?1, 'build', 'release/evidence.md', 2, ?2, ?3, 1300, 1400)",
+            rusqlite::params![SESSION, content, content_sha256],
+        )
+        .expect("seed note");
+    connection
+        .execute_batch(
+            "INSERT INTO session_note_operation
+               (session_id, agent, call_id, request_sha256, action, name,
+                result_revision, result_content_sha256, time_created)
+             VALUES
+               ('ses_export00000000000000000000ab', 'build', 'call-note-1',
+                'request-one', 'write', 'release/evidence.md', 1, 'first-sha', 1300),
+               ('ses_export00000000000000000000ab', 'build', 'call-note-2',
+                'request-two', 'append', 'release/evidence.md', 2,
+                'd59ce4192cf3666eb92f6d7d7f16a244a448347853415c292eae377802c509e1', 1400);",
+        )
+        .expect("seed note operations");
     connection
 }
 
@@ -228,6 +261,148 @@ fn session_export_orders_messages_oldest_first_and_parts_by_id() {
             "prt_export0000000000000000000003",
         ]
     );
+}
+
+#[test]
+fn session_export_reinlines_durable_images_and_leaves_legacy_inline_rows_readable() {
+    let connection = seeded();
+    let root = tempfile::tempdir().expect("attachment root");
+    let attachments = zuno_attachment::AttachmentStore::new(
+        root.path(),
+        "export",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("attachment store");
+    let reference = attachments
+        .admit_base64(PNG_BASE64, Some("pixel.png".to_owned()))
+        .expect("admit image");
+    write_part(
+        &connection,
+        "prt_export0000000000000000000010",
+        USER,
+        json!({
+            "type": "file",
+            "filename": reference.filename,
+            "mime": reference.media_type,
+            "attachment": reference.clone()
+        }),
+        1_110,
+    );
+    write_part(
+        &connection,
+        "prt_export0000000000000000000011",
+        USER,
+        json!({
+            "type": "file",
+            "filename": "legacy.png",
+            "mime": "image/png",
+            "data": "legacy-inline",
+            "url": "data:image/png;base64,legacy-inline"
+        }),
+        1_111,
+    );
+
+    let document = session_export::export_with_attachments(&connection, SESSION, &attachments)
+        .expect("portable export");
+    let parts = document
+        .messages
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .collect::<Vec<_>>();
+    let exported = parts
+        .iter()
+        .find(|part| part["id"] == "prt_export0000000000000000000010")
+        .expect("durable image part");
+    assert!(exported.get("attachment").is_none());
+    assert_eq!(exported["mime"], reference.media_type);
+    let data = exported["data"].as_str().expect("inline base64");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .expect("decode exported image"),
+        attachments.read(&reference).expect("canonical object")
+    );
+    assert_eq!(
+        exported["url"],
+        format!("data:{};base64,{data}", reference.media_type)
+    );
+
+    let legacy = parts
+        .iter()
+        .find(|part| part["id"] == "prt_export0000000000000000000011")
+        .expect("legacy inline part");
+    assert_eq!(legacy["data"], "legacy-inline");
+    assert_eq!(legacy["url"], "data:image/png;base64,legacy-inline");
+}
+
+#[test]
+fn session_export_import_admits_portable_inline_images_before_persistence() {
+    let source = seeded();
+    let source_root = tempfile::tempdir().expect("source attachment root");
+    let source_store = zuno_attachment::AttachmentStore::new(
+        source_root.path(),
+        "source",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("source attachment store");
+    let reference = source_store
+        .admit_base64(PNG_BASE64, Some("pixel.png".to_owned()))
+        .expect("source image");
+    write_part(
+        &source,
+        "prt_export0000000000000000000012",
+        USER,
+        json!({
+            "type": "file",
+            "filename": reference.filename,
+            "mime": reference.media_type,
+            "attachment": reference
+        }),
+        1_112,
+    );
+    let document = session_export::export_with_attachments(&source, SESSION, &source_store)
+        .expect("portable export")
+        .to_json()
+        .expect("encode export");
+
+    let mut target = database();
+    let target_root = tempfile::tempdir().expect("target attachment root");
+    let target_store = zuno_attachment::AttachmentStore::new(
+        target_root.path(),
+        "target",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("target attachment store");
+    let transaction = target.transaction().expect("begin import");
+    session_export::import_with_attachments(
+        &transaction,
+        &document,
+        &ImportTarget {
+            project_id: "prj_export".to_owned(),
+            directory: "/srv/imported".to_owned(),
+            path: String::new(),
+        },
+        &target_store,
+    )
+    .expect("import portable image");
+    transaction.commit().expect("commit import");
+
+    let persisted = MessageStore::new(&target)
+        .hydrate_session(SESSION)
+        .expect("imported transcript")
+        .into_iter()
+        .flat_map(|message| message.parts)
+        .find(|part| part.id == "prt_export0000000000000000000012")
+        .expect("imported image part");
+    assert!(persisted.data.get("data").is_none());
+    assert!(persisted.data.get("url").is_none());
+    let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(
+        persisted.data["attachment"].clone(),
+    )
+    .expect("durable imported reference");
+    target_store
+        .read(&reference)
+        .expect("imported canonical object");
 }
 
 #[test]
@@ -363,7 +538,7 @@ fn session_export_sanitize_covers_every_part_variant_it_names() {
 
 #[test]
 fn session_export_round_trips_through_import() {
-    let source = seeded();
+    let source = seeded_with_notes();
     let document = session_export::export(&source, SESSION)
         .expect("export")
         .to_json()
@@ -386,6 +561,8 @@ fn session_export_round_trips_through_import() {
     assert_eq!(imported.session_id, SESSION);
     assert_eq!(imported.messages, 2);
     assert_eq!(imported.parts, 2);
+    assert_eq!(imported.notes, 1);
+    assert_eq!(imported.note_operations, 2);
 
     let reexported = session_export::export(&target, SESSION)
         .expect("re-export")
@@ -400,6 +577,154 @@ fn session_export_round_trips_through_import() {
     info.insert("directory".to_owned(), json!("/srv/elsewhere"));
     info.insert("path".to_owned(), json!("nested"));
     assert_eq!(reexported, expected);
+}
+
+#[test]
+fn session_export_sanitize_redacts_notes_and_removes_the_idempotency_ledger() {
+    let connection = seeded_with_notes();
+    let document = session_export::export(&connection, SESSION)
+        .expect("export")
+        .to_json()
+        .expect("encode");
+
+    let sanitized = session_export::sanitize(document);
+
+    assert_eq!(sanitized["notes"][0]["agent"], json!("redacted-agent"));
+    assert_eq!(sanitized["notes"][0]["name"], json!("redacted-note-0.md"));
+    assert_eq!(
+        sanitized["notes"][0]["content"],
+        json!("[redacted:note-content:0]")
+    );
+    assert_eq!(
+        sanitized["notes"][0]["contentSha256"],
+        json!(zuno_orchestration::sha256_text("[redacted:note-content:0]"))
+    );
+    assert_eq!(sanitized["noteOperations"], json!([]));
+    assert!(
+        !sanitized.to_string().contains("CI evidence"),
+        "sanitized export leaked note content"
+    );
+}
+
+#[test]
+fn session_export_sanitize_preserves_note_scope_quotas_across_agents() {
+    let source = seeded();
+    let mut document = session_export::export(&source, SESSION)
+        .expect("export")
+        .to_json()
+        .expect("encode");
+    let mut notes = (0..zuno_db::continuity::MAX_NOTE_DOCUMENTS)
+        .map(|index| {
+            json!({
+                "agent": "build",
+                "name": format!("build/{index:03}.md"),
+                "revision": 1,
+                "content": "build secret",
+                "contentSha256": "ignored",
+                "timeCreated": 1,
+                "timeUpdated": 1,
+            })
+        })
+        .collect::<Vec<_>>();
+    notes.push(json!({
+        "agent": "plan",
+        "name": "plan/summary.md",
+        "revision": 1,
+        "content": "plan secret",
+        "contentSha256": "ignored",
+        "timeCreated": 1,
+        "timeUpdated": 1,
+    }));
+    document["notes"] = Value::Array(notes);
+    document["noteOperations"] = json!([]);
+
+    let sanitized = session_export::sanitize(document);
+    let agents = sanitized["notes"]
+        .as_array()
+        .expect("sanitized notes")
+        .iter()
+        .filter_map(|note| note["agent"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(agents.len(), 2, "distinct Agent scopes must stay distinct");
+
+    let mut target = database();
+    let transaction = target.transaction().expect("begin import");
+    let imported = session_export::import(
+        &transaction,
+        &sanitized,
+        &ImportTarget {
+            project_id: String::from("prj_export"),
+            directory: String::from("/srv/sanitized"),
+            path: String::new(),
+        },
+    )
+    .expect("sanitized multi-Agent notes remain importable");
+    transaction.commit().expect("commit import");
+    assert_eq!(imported.notes, 101);
+}
+
+#[test]
+fn session_export_import_rejects_invalid_note_names_and_quota_bypass() {
+    let source = seeded();
+    let mut document = session_export::export(&source, SESSION)
+        .expect("export")
+        .to_json()
+        .expect("encode");
+    document["notes"] = json!("not-an-array");
+    let mut target = database();
+    let transaction = target.transaction().expect("begin");
+    let error = session_export::import(
+        &transaction,
+        &document,
+        &ImportTarget {
+            project_id: String::from("prj_export"),
+            directory: String::from("/srv/export"),
+            path: String::new(),
+        },
+    )
+    .expect_err("a malformed Notes envelope cannot be silently dropped");
+    assert!(matches!(error, zuno_error::DbError::Decode { .. }));
+    transaction.rollback().expect("rollback malformed envelope");
+
+    document["notes"] = json!([{
+        "agent": "build",
+        "name": "../host-path",
+        "revision": 1,
+        "content": "bad",
+        "contentSha256": "ignored",
+        "timeCreated": 1,
+        "timeUpdated": 1
+    }]);
+    let transaction = target.transaction().expect("begin");
+    let error = session_export::import(
+        &transaction,
+        &document,
+        &ImportTarget {
+            project_id: String::from("prj_export"),
+            directory: String::from("/srv/export"),
+            path: String::new(),
+        },
+    )
+    .expect_err("host paths cannot enter the note store through import");
+    assert!(matches!(error, zuno_error::DbError::Decode { .. }));
+    transaction.rollback().expect("rollback invalid name");
+
+    document["notes"][0]["name"] = json!("valid.md");
+    document["notes"][0]["content"] =
+        json!("x".repeat((zuno_db::continuity::MAX_NOTE_DOCUMENT_BYTES + 1) as usize));
+    let transaction = target.transaction().expect("begin");
+    let error = session_export::import(
+        &transaction,
+        &document,
+        &ImportTarget {
+            project_id: String::from("prj_export"),
+            directory: String::from("/srv/export"),
+            path: String::new(),
+        },
+    )
+    .expect_err("imports cannot bypass the document quota");
+    assert!(matches!(error, zuno_error::DbError::Decode { .. }));
+    transaction.rollback().expect("rollback oversized note");
 }
 
 #[test]
