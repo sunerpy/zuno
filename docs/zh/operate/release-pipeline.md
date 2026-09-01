@@ -73,9 +73,12 @@ x86_64 二进制。`aarch64-apple-darwin` leg 则以 `arch -arm64` 校验并执�
 翻译层、架构或 smoke 任一失败都会阻止 attestation 和上传；这项优化不会用静态检查替代执行。
 
 仓库 ruleset 严格要求 `zuno/pr-gate`，并要求分支相对 base 保持最新。缺少这条规则时，候选
-工作流会拒绝合并。验证通过后，它只为精确 PR head 启用 squash auto-merge，等待 GitHub
-确认合并，再显式唤醒发布收尾。`RELEASE_CANDIDATE_AUTOMATION=true` 是上线开关；未启用时
-控制器可以更新 release PR，但不能自动调度或合并。
+工作流会拒绝合并。`RELEASE_CANDIDATE_AUTOMATION=true` 只负责调度候选并认证精确的
+release PR head，认证不等于批准或合并；自动合并由独立的
+`RELEASE_CANDIDATE_AUTO_MERGE=true` 显式开启。未开启第二个开关时，维护者必须重新核对精确
+head 后手动合并已认证的 PR，用户身份产生的 merge push 会自然唤醒发布收尾。只有显式开启
+第二个开关时，候选工作流才为精确 head 启用 squash auto-merge、等待 GitHub 确认合并，并因
+`GITHUB_TOKEN` 合并不会触发新 workflow 而显式调度发布收尾。
 
 ## 候选身份
 

@@ -1160,7 +1160,7 @@ fn release_controller_dispatches_exact_source_and_never_compiles() {
 }
 
 #[test]
-fn candidate_merge_explicitly_wakes_release_finalization() {
+fn candidate_auto_merge_is_separate_from_certification_and_wakes_finalization() {
     let text = workflow("release-candidate.yml");
     let prepare = job_body(&text, "prepare").join("\n");
     for required in [
@@ -1175,6 +1175,16 @@ fn candidate_merge_explicitly_wakes_release_finalization() {
     }
 
     let merge = job_body(&text, "merge").join("\n");
+    assert!(
+        text.contains(
+            "if: inputs.mode == 'automatic' && vars.RELEASE_CANDIDATE_AUTO_MERGE == 'true'"
+        ),
+        "candidate certification must not imply automatic merge"
+    );
+    assert!(
+        !merge.contains("RELEASE_CANDIDATE_AUTOMATION"),
+        "the candidate dispatch switch must not authorize merging"
+    );
     for required in [
         "--match-head-commit \"$EXPECTED_HEAD_SHA\"",
         "--auto",

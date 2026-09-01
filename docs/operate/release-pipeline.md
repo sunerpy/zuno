@@ -97,10 +97,15 @@ optimization never replaces execution with a static inspection.
 
 The repository ruleset requires the `zuno/pr-gate` check with strict base-branch
 freshness. The candidate workflow refuses to merge when that rule is absent.
-After certification it enables squash auto-merge for the exact PR head, waits
-for GitHub to report the merge, and explicitly wakes release finalization.
-`RELEASE_CANDIDATE_AUTOMATION=true` is the rollout switch; without it the
-controller may update the release PR but cannot dispatch or merge automatically.
+`RELEASE_CANDIDATE_AUTOMATION=true` lets the controller dispatch and certify the
+exact release-PR head. Certification does not imply approval or merge:
+`RELEASE_CANDIDATE_AUTO_MERGE=true` is a separate opt-in. When that second switch
+is absent or false, a maintainer must revalidate the exact head and merge the
+certified PR manually. That user-authored merge push wakes release finalization.
+When the second switch is explicitly enabled, the candidate workflow enables
+squash auto-merge for the exact head, waits for GitHub to report the merge, and
+explicitly dispatches finalization because a `GITHUB_TOKEN` merge does not start
+another workflow.
 
 ## Candidate identity
 

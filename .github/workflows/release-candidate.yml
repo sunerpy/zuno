@@ -20,7 +20,7 @@ on:
         required: true
         type: string
       mode:
-        description: "automatic merges after success; dry-run and backfill never merge"
+        description: "automatic publishes the protected gate; a separate repository switch controls merging"
         required: true
         default: dry-run
         type: choice
@@ -533,8 +533,8 @@ jobs:
           fi
 
   merge:
-    name: Merge certified release PR
-    if: inputs.mode == 'automatic' && vars.RELEASE_CANDIDATE_AUTOMATION == 'true'
+    name: Optionally merge certified release PR
+    if: inputs.mode == 'automatic' && vars.RELEASE_CANDIDATE_AUTO_MERGE == 'true'
     needs: [prepare, gate]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
