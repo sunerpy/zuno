@@ -470,7 +470,7 @@ fn skill(context: &Context) -> Result<(), String> {
     let described = skills
         .all()
         .iter()
-        .filter(|skill| skill.description.is_some())
+        .filter(|skill| skill.catalog_description().is_some())
         .count();
     let mut names = std::collections::BTreeMap::<&str, usize>::new();
     for entry in skills.all() {
@@ -496,6 +496,10 @@ fn skill(context: &Context) -> Result<(), String> {
         "summary": {
             "sourceCount": skills.all().len(),
             "describedSourceCount": described,
+            "indexedSourceCount": skills.indexed_count(),
+            "searchableSourceCount": skills.searchable_count(),
+            "explicitSourceCount": skills.explicit_count(),
+            "disabledSourceCount": skills.disabled_sources().len(),
             "uniqueNameCount": names.len(),
             "promptMetadataEnabled": context
                 .config
@@ -512,6 +516,7 @@ fn skill(context: &Context) -> Result<(), String> {
                 })))
                 .collect::<Vec<_>>(),
         },
+        "disabledSources": skills.disabled_sources(),
         "warnings": warnings,
         "skills": skills.all(),
     });

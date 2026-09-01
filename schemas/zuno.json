@@ -2702,10 +2702,79 @@
         }
       ]
     },
+    "SkillCatalogExposure": {
+      "description": "How one enabled Skill participates in model-driven discovery.",
+      "oneOf": [
+        {
+          "const": "index",
+          "description": "Advertise the Skill in the initial bounded index and in search.",
+          "type": "string"
+        },
+        {
+          "const": "search",
+          "description": "Keep it out of the initial index but retain it in `skill search` and `list`.",
+          "type": "string"
+        },
+        {
+          "const": "explicit",
+          "description": "Permit only explicit invocation, such as `/<name>` or `requiredSkills`.",
+          "type": "string"
+        }
+      ]
+    },
+    "SkillPathConfig": {
+      "additionalProperties": false,
+      "description": "One exact or recursive path override under [`SkillsConfig::config`].",
+      "properties": {
+        "enabled": {
+          "description": "Whether matching Skills are loaded. Omitted means enabled.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "exposure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillCatalogExposure"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Override sidecar-derived model-discovery exposure."
+        },
+        "path": {
+          "description": "Skill directory, `SKILL.md`, or subtree root when `recursive` is true.",
+          "type": "string"
+        },
+        "recursive": {
+          "description": "Apply this entry to every Skill below `path`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
     "SkillsConfig": {
       "additionalProperties": false,
       "description": "Skill discovery and model-visible catalog settings.",
       "properties": {
+        "config": {
+          "description": "Per-path Skill enablement and model-discovery overrides.\n\nEntries are evaluated in order and the last matching entry wins.",
+          "items": {
+            "$ref": "#/$defs/SkillPathConfig"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "includeInstructions": {
           "description": "Whether turns receive the skill trigger policy and metadata catalog.",
           "type": [

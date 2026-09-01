@@ -182,11 +182,11 @@ Read normalized, non-sensitive evidence from the current session across compacti
 Manage durable working notes isolated to the current session and Agent. Reads are retryable; append_to_file and write_file require the exact expected_revision (0 creates a new document).
 >>>
 
-## skill | crates/zuno-tools/src/description/skill.txt | 724 bytes | trailing-newline: yes
+## skill | crates/zuno-tools/src/description/skill.txt | 800 bytes | trailing-newline: yes
 <<<
 Discover and read reusable skill instructions through progressive disclosure.
-Use action `list` to page through all model-visible skills, or action `search` with a concise task intent; optional search `limit` is 1-20. Metadata results include the exact `source` needed to distinguish same-named skills.
-Use action `load` with the selected `name` and `source`. Follow `next_cursor` until `complete` before acting; a partial SKILL.md is not usable guidance.
+Use action `list` to page through index and search-only skills, or action `search` with a concise task intent; optional search `limit` is 1-20. Explicit-only skills are intentionally omitted. Metadata results include `source` only when enabled same-named skills require disambiguation.
+Use action `load` with the selected `name` and any advertised `source`. Follow `next_cursor` until `complete` before acting; a partial SKILL.md is not usable guidance.
 Use action `read_resource` with the same `name` and `source`, a relative `path` such as `references/ci.md`, and any returned continuation cursor. Do not use shell, find, glob, or broad filesystem scans to rediscover an advertised skill or locate its referenced files.
 >>>
 

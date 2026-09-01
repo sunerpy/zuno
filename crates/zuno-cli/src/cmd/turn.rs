@@ -1364,7 +1364,9 @@ impl TurnPlan {
             .map(|skill| {
                 json!({
                     "name": skill.name,
+                    "displayName": skill.catalog_display_name(),
                     "source": skill.location,
+                    "exposure": skill.exposure,
                     "required": self.required_skills.iter().any(|required| {
                         required.name == skill.name && required.source == skill.location
                     }),
@@ -1375,7 +1377,7 @@ impl TurnPlan {
             .skills
             .all()
             .iter()
-            .filter(|skill| skill.description.is_some())
+            .filter(|skill| skill.catalog_description().is_some())
             .count();
         let mut skill_name_counts = BTreeMap::<&str, usize>::new();
         for skill in self.skills.all() {
@@ -1531,12 +1533,16 @@ impl TurnPlan {
                 "summary": {
                     "sourceCount": self.skills.all().len(),
                     "describedSourceCount": described_skill_count,
+                    "indexedSourceCount": self.skills.indexed_count(),
+                    "searchableSourceCount": self.skills.searchable_count(),
+                    "explicitSourceCount": self.skills.explicit_count(),
+                    "disabledSourceCount": self.skills.disabled_sources().len(),
                     "uniqueNameCount": skill_name_counts.len(),
                     "ambiguousNameCount": skill_name_counts.values().filter(|count| **count > 1).count(),
                     "metadataEnabled": metadata_enabled,
-                    "metadataBudgetBytes": metadata_budget,
+                    "metadataBudgetCharacters": metadata_budget,
                     "metadataBudgetApproxTokens": metadata_budget
-                        .map(|budget| budget / APPROX_BYTES_PER_TOKEN),
+                        .map(|budget| budget / APPROX_CHARS_PER_TOKEN),
                     "metadataCoverage": metadata_coverage,
                     "selectedBodyBudgetBytes": selected_body_budget,
                     "selectedBodyBudgetApproxTokens": selected_body_budget / APPROX_BYTES_PER_TOKEN,
@@ -8385,8 +8391,7 @@ async fn preload_explicit_skills(
         .all()
         .iter()
         .filter_map(|skill| {
-            first_explicit_skill_mention(prompt, &skill.name)
-                .map(|offset| (offset, skill.name.clone()))
+            first_skill_mention(prompt, skill).map(|offset| (offset, skill.name.clone()))
         })
         .collect::<Vec<_>>();
     mentioned.sort();
@@ -8427,6 +8432,14 @@ async fn report_skill_selected(name: &str, events: &TurnEventSender) -> Result<(
         .map_err(to_string)
 }
 
+fn first_skill_mention(prompt: &str, skill: &zuno_catalog::skill::Skill) -> Option<usize> {
+    if skill.is_explicit_only() {
+        first_dollar_skill_mention(prompt, &skill.name)
+    } else {
+        first_explicit_skill_mention(prompt, &skill.name)
+    }
+}
+
 fn first_explicit_skill_mention(prompt: &str, name: &str) -> Option<usize> {
     if name.is_empty() {
         return None;
@@ -8439,13 +8452,27 @@ fn first_explicit_skill_mention(prompt: &str, name: &str) -> Option<usize> {
     })
 }
 
+fn first_dollar_skill_mention(prompt: &str, name: &str) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    let marker = format!("${name}");
+    prompt.match_indices(&marker).find_map(|(offset, _)| {
+        let before = prompt[..offset].chars().next_back();
+        let after = prompt[offset + marker.len()..].chars().next();
+        (!before.is_some_and(skill_identifier_char) && !after.is_some_and(skill_identifier_char))
+            .then_some(offset)
+    })
+}
+
 fn skill_identifier_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':' | '/')
 }
 
 const DEFAULT_SKILL_METADATA_CHAR_BUDGET: usize = 8_000;
 const MAX_SKILL_METADATA_TOKEN_BUDGET: usize = 10_000;
-const SKILL_METADATA_CONTEXT_PERCENT: u64 = 2;
+const SKILL_METADATA_CONTEXT_WINDOW_PERCENT: u64 = 2;
+const APPROX_CHARS_PER_TOKEN: usize = 4;
 const APPROX_BYTES_PER_TOKEN: usize = 4;
 const DEFAULT_SELECTED_SKILL_TOKEN_BUDGET: usize = 8_000;
 const MIN_SELECTED_SKILL_TOKEN_BUDGET: usize = 2_000;
@@ -8457,11 +8484,14 @@ const SELECTED_SKILL_PROMPT_MAX_BYTES: usize =
 /// System-level trigger rules for progressive skill discovery.
 const SKILL_USAGE_POLICY: &str = "\
 Skills are mandatory trigger rules, not optional suggestions. The `<skill_index>` below lists \
-model-visible names and descriptions. A `source` locator is included only when the same name has \
-multiple installed sources. If the user names a listed skill, or the request clearly matches its \
-description, call `skill` with action `load` and its name; include the exact source when the index \
-shows one. Use action `search` for a capability query and action `list` when the catalog says \
-entries were omitted. A metadata result is not instructions. Read \
+initially indexed names and descriptions. Other model-discoverable Skills may be search-only; \
+Skills marked explicit are intentionally absent and require an exact user or agent reference such \
+as `$name`, `/<name>`, or configured `requiredSkills`. A `source` locator is included only when the \
+same name has multiple installed sources. If the user names a listed skill, or the request clearly \
+matches its description, call `skill` with action `load` and its name; include the exact source \
+when the index shows one. Use action `search` for a capability query and action `list` when the \
+catalog says entries were omitted or search-only entries exist. A metadata result is not \
+instructions. Read \
 every selected SKILL.md completely, following `next_cursor` until complete, then read only the \
 referenced resources required for the task with action `read_resource` and the same name/source. \
 Do not delegate reading or interpreting skill instructions. Prefer bundled scripts, assets, and \
@@ -8487,34 +8517,46 @@ fn announce_skills(
     if config.and_then(|settings| settings.include_instructions) == Some(false) {
         return Ok(());
     }
-    let discoverable = skills
-        .all()
-        .iter()
-        .filter(|skill| skill.description.is_some())
-        .count();
-    if discoverable == 0 {
+    let indexed = skills.indexed_count();
+    let searchable = skills.searchable_count();
+    if searchable == 0 {
         return Ok(());
     }
+    let search_only = searchable.saturating_sub(indexed);
     let budget = skill_metadata_budget(context_window, config);
     let rendered = skills.render_within(zuno_catalog::skill::Form::Index, budget);
-    let index = match (rendered.rendered, rendered.omitted, rendered.truncated) {
-        (_, 0, 0) => rendered.text,
-        (_, 0, truncated) => format!(
-            "{}\n{truncated} skill description(s) were shortened to fit the model-visible \
+    let mut index = if indexed == 0 {
+        format!(
+            "<skill_index listed=\"0\" total=\"0\" />\n\
+             {search_only} search-only Skill source(s) are available through action `search` or \
+             paged action `list`."
+        )
+    } else {
+        match (rendered.rendered, rendered.omitted, rendered.truncated) {
+            (_, 0, 0) => rendered.text,
+            (_, 0, truncated) => format!(
+                "{}\n{truncated} skill description(s) were shortened to fit the model-visible \
              metadata budget; every source identity remains available.",
-            rendered.text
-        ),
-        (0, omitted, _) => format!(
-            "<skill_index listed=\"0\" total=\"{discoverable}\" />\n\
+                rendered.text
+            ),
+            (0, omitted, _) => format!(
+                "<skill_index listed=\"0\" total=\"{indexed}\" />\n\
              The metadata budget omitted {omitted} entries. Action `list` pages through all \
-             {discoverable} described skills, and action `search` queries the same complete set."
-        ),
-        (listed, omitted, truncated) => format!(
-            "{}\nCatalog coverage: {listed} of {discoverable} source identities; {omitted} \
+             {searchable} model-discoverable skills, and action `search` queries the same set."
+            ),
+            (listed, omitted, truncated) => format!(
+                "{}\nCatalog coverage: {listed} of {indexed} indexed source identities; {omitted} \
              omitted entries remain available through action `list` or `search`. \
              {truncated} rendered description(s) were shortened first.",
-            rendered.text,
-        ),
+                rendered.text,
+            ),
+        }
+    };
+    if indexed > 0 && search_only > 0 {
+        index.push_str(&format!(
+            "\n{search_only} additional search-only Skill source(s) are omitted from the initial \
+             index and remain available through action `search` or paged action `list`."
+        ));
     };
     resolver.append_prompt_section(
         "skills.policy",
@@ -8528,25 +8570,24 @@ fn skill_metadata_budget(
     context_window: u64,
     config: Option<&zuno_config::schema::SkillsConfig>,
 ) -> usize {
-    let configured = config
+    if let Some(tokens) = config
         .and_then(|settings| settings.max_context_tokens)
-        .map(|tokens| usize::try_from(tokens.get()).unwrap_or(usize::MAX));
-    let tokens = configured.or_else(|| {
-        (context_window > 0).then(|| {
-            usize::try_from(
-                context_window
-                    .saturating_mul(SKILL_METADATA_CONTEXT_PERCENT)
-                    .saturating_div(100)
-                    .max(1),
-            )
-            .unwrap_or(usize::MAX)
-        })
-    });
-    tokens.map_or(DEFAULT_SKILL_METADATA_CHAR_BUDGET, |tokens| {
-        tokens
+        .map(|tokens| usize::try_from(tokens.get()).unwrap_or(usize::MAX))
+    {
+        return tokens
             .min(MAX_SKILL_METADATA_TOKEN_BUDGET)
-            .saturating_mul(APPROX_BYTES_PER_TOKEN)
-    })
+            .saturating_mul(APPROX_CHARS_PER_TOKEN);
+    }
+    if context_window == 0 {
+        return DEFAULT_SKILL_METADATA_CHAR_BUDGET;
+    }
+    usize::try_from(
+        context_window
+            .saturating_mul(SKILL_METADATA_CONTEXT_WINDOW_PERCENT)
+            .saturating_div(100)
+            .max(1),
+    )
+    .unwrap_or(usize::MAX)
 }
 
 /// Aggregate prompt budget for fully selected Skill bodies.

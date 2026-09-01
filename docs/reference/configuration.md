@@ -838,25 +838,57 @@ from different sources remain independently addressable; no hidden winner is
 selected. Set `ZUNO_DISABLE_EXTERNAL_SKILLS=1` to disable implicit `.agents`
 roots. Zuno-native `.zuno` roots remain enabled by the external switch.
 
-The model prompt receives a bounded catalog rather than every `SKILL.md` body.
-By default its approximate budget is two percent of the model context (8,000
-characters when the context is unknown), capped at 10,000 tokens. Configure it
-under `skills`:
+The model prompt receives a bounded `index` catalog rather than every `SKILL.md`
+body. Search-only metadata stays available through the `skill` tool, while
+explicit-only names are intentionally absent. By default the catalog character
+budget is two percent of a known model context; when the context is unknown,
+Zuno falls back to approximately 8,000 characters. An explicit
+`maxContextTokens` override is converted to an approximate character budget and
+capped at 10,000 tokens. Configure it under `skills`:
 
 ```json
 {
   "skills": {
     "includeInstructions": true,
     "maxContextTokens": 8000,
-    "maxSelectedContextTokens": 16000
+    "maxSelectedContextTokens": 16000,
+    "config": [
+      {
+        "path": "~/.config/zuno/skill/powerapps",
+        "recursive": true,
+        "exposure": "search"
+      }
+    ]
   }
 }
 ```
 
-`includeInstructions: false` removes both the trigger policy and catalog from
-model prompts. The `skill` tool still supports paged `list` and `search`
-discovery. `load` and `read_resource` return content-bound continuation cursors;
-the caller must read through `complete: true` before applying the instructions.
+`maxContextTokens` is an explicit approximate-token override.
+`includeInstructions: false` removes both the trigger policy and initial index
+from model prompts. The `skill` tool still supports paged `list` and `search`
+discovery over `index` and `search` entries. `load` and `read_resource` return
+content-bound continuation cursors; the caller must read through `complete:
+true` before applying the instructions.
+
+An optional `agents/openai.yaml` beside `SKILL.md` can provide
+`interface.display_name`, `interface.short_description`, and
+`policy.allow_implicit_invocation`. `agents/zuno.yaml` overlays that shared file
+field-by-field and may set `policy.exposure` to `index`, `search`, or `explicit`.
+`allow_implicit_invocation: false` maps to `explicit` unless native exposure
+overrides it. User path configuration has final precedence.
+
+`skills.config` is an ordered array. Each entry requires `path` and may set
+`enabled`, `exposure`, and `recursive`. `path` may name a Skill directory, its
+exact `SKILL.md`, or a subtree root when recursive. The last matching entry wins;
+omitting `enabled` means enabled, so a later exact rule can re-enable one Skill
+below a disabled subtree. Existing paths are canonicalized, including symlink
+aliases, while missing paths remain valid for future installs.
+
+| Exposure | Initial prompt | `skill search` / `list` | Exact invocation |
+| --- | --- | --- | --- |
+| `index` | yes | yes | yes |
+| `search` | no | yes | yes |
+| `explicit` | no | no | `$name`, `/<name>`, `requiredSkills`, or exact `load` |
 
 `maxContextTokens` applies only to the compact catalog. Fully selected Skill
 bodies share a separate aggregate prompt budget. Its default is ten percent of
@@ -870,7 +902,7 @@ Use `zuno debug skill` after restarting to inspect raw discovery. Its object
 explicitly reports `view.kind: "raw_discovery"`,
 `agentFiltered: false`, and `extensionOverlayApplied: false`; the `skills` array
 preserves same-name entries from different sources, while `summary` reports
-source/described/unique counts and ambiguous names. Use
+source/indexed/searchable/explicit/disabled/unique counts and ambiguous names. Use
 `zuno debug agent <name>` for the effective Agent-filtered view, including
 metadata and selected-body budgets, rendered/omitted/truncated coverage, and a
 bounded 50-entry preview. A generic prompt such

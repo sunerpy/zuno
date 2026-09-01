@@ -45,11 +45,12 @@ pub const NO_SKILLS: &str = "No skills are currently available.";
 /// [`locale_compare`], and the result has no trailing newline.
 #[must_use]
 pub fn fmt(list: &[Skill], form: Form) -> String {
-    let described = described_sorted(list);
+    let described = described_sorted(list, form);
     if described.is_empty() {
         return NO_SKILLS.to_string();
     }
-    assemble(&described, form)
+    let duplicate_names = duplicate_names_all(list);
+    assemble(&described, form, &duplicate_names)
 }
 
 /// A bounded render and what was shortened or omitted.
@@ -65,20 +66,21 @@ pub struct Budgeted {
     pub truncated: usize,
 }
 
-/// Render at most `budget` bytes of `list`, reporting what did not fit.
+/// Render at most `budget` Unicode scalar values of `list`, reporting what did
+/// not fit.
 ///
 /// [`fmt`] remains unbounded for explicit client-facing lists. The caller that
 /// assembles a model prompt uses this function so a large installed catalog does
 /// not consume the request before a skill is selected.
 ///
 /// Selection is cheapest-first — which fits the most names in — while the output
-/// stays sorted by name, so the bytes are stable across runs. Dropping the
+/// stays sorted by name, so the output is stable across runs. Dropping the
 /// alphabetic tail instead would hide skills for no reason but their initial.
 /// [`Budgeted::omitted`] is returned rather than swallowed because a skill the model
 /// is never told about is indistinguishable from one that does not exist.
 #[must_use]
 pub fn fmt_within(list: &[Skill], form: Form, budget: usize) -> Budgeted {
-    let described = described_sorted(list);
+    let described = described_sorted(list, form);
     if described.is_empty() {
         return Budgeted {
             text: NO_SKILLS.to_string(),
@@ -87,8 +89,9 @@ pub fn fmt_within(list: &[Skill], form: Form, budget: usize) -> Budgeted {
             truncated: 0,
         };
     }
+    let duplicate_names = duplicate_names_all(list);
     if form == Form::Index {
-        return index_within(&described, budget);
+        return index_within(&described, budget, &duplicate_names);
     }
 
     let mut by_cost: Vec<(usize, &Skill)> = described
@@ -121,17 +124,20 @@ pub fn fmt_within(list: &[Skill], form: Form, budget: usize) -> Budgeted {
     kept.sort_by(|left, right| locale_compare(&left.name, &right.name));
 
     Budgeted {
-        text: assemble(&kept, form),
+        text: assemble(&kept, form, &duplicate_names),
         rendered: kept.len(),
         omitted: described.len() - kept.len(),
         truncated: 0,
     }
 }
 
-fn described_sorted(list: &[Skill]) -> Vec<&Skill> {
+fn described_sorted(list: &[Skill], form: Form) -> Vec<&Skill> {
     let mut described: Vec<&Skill> = list
         .iter()
-        .filter(|skill| skill.description.is_some())
+        .filter(|skill| match form {
+            Form::Index => skill.is_indexed(),
+            Form::List | Form::Verbose => skill.is_searchable(),
+        })
         .collect();
     described.sort_by(|left, right| {
         locale_compare(&left.name, &right.name).then_with(|| left.location.cmp(&right.location))
@@ -139,10 +145,9 @@ fn described_sorted(list: &[Skill]) -> Vec<&Skill> {
     described
 }
 
-fn assemble(described: &[&Skill], form: Form) -> String {
+fn assemble(described: &[&Skill], form: Form, duplicate_names: &BTreeSet<&str>) -> String {
     if form == Form::Index {
-        let duplicate_names = duplicate_names(described);
-        return assemble_index(described, INDEX_DESCRIPTION_MAX_BYTES, &duplicate_names);
+        return assemble_index(described, INDEX_DESCRIPTION_MAX_CHARS, duplicate_names);
     }
     let mut lines: Vec<String> = vec![open_line(form).to_string()];
     for skill in described {
@@ -171,7 +176,7 @@ const fn close_line(form: Form) -> Option<&'static str> {
 }
 
 fn entry_lines(skill: &Skill, form: Form) -> Vec<String> {
-    let description = skill.description.as_deref().unwrap_or_default();
+    let description = skill.catalog_description().unwrap_or_default();
     match form {
         Form::Verbose => vec![
             "  <skill>".to_string(),
@@ -181,20 +186,19 @@ fn entry_lines(skill: &Skill, form: Form) -> Vec<String> {
             "  </skill>".to_string(),
         ],
         Form::List => vec![format!("- **{}**: {description}", skill.name)],
-        Form::Index => vec![index_line(skill, INDEX_DESCRIPTION_MAX_BYTES, true)],
+        Form::Index => vec![index_line(skill, INDEX_DESCRIPTION_MAX_CHARS, true)],
     }
 }
 
 /// Maximum metadata detail one skill contributes before the global prompt budget
 /// is considered.
-const INDEX_DESCRIPTION_MAX_BYTES: usize = 1_024;
+const INDEX_DESCRIPTION_MAX_CHARS: usize = 1_024;
 
-fn index_within(described: &[&Skill], budget: usize) -> Budgeted {
-    let duplicate_names = duplicate_names(described);
-    let minimum = assemble_index(described, 0, &duplicate_names);
-    if minimum.len() <= budget {
-        let full = assemble_index(described, INDEX_DESCRIPTION_MAX_BYTES, &duplicate_names);
-        if full.len() <= budget {
+fn index_within(described: &[&Skill], budget: usize, duplicate_names: &BTreeSet<&str>) -> Budgeted {
+    let minimum = assemble_index(described, 0, duplicate_names);
+    if char_len(&minimum) <= budget {
+        let full = assemble_index(described, INDEX_DESCRIPTION_MAX_CHARS, duplicate_names);
+        if char_len(&full) <= budget {
             return Budgeted {
                 text: full,
                 rendered: described.len(),
@@ -204,19 +208,19 @@ fn index_within(described: &[&Skill], budget: usize) -> Budgeted {
         }
 
         let mut low = 0usize;
-        let mut high = INDEX_DESCRIPTION_MAX_BYTES;
+        let mut high = INDEX_DESCRIPTION_MAX_CHARS;
         while low < high {
             let middle = low + (high - low).div_ceil(2);
-            if assemble_index(described, middle, &duplicate_names).len() <= budget {
+            if char_len(&assemble_index(described, middle, duplicate_names)) <= budget {
                 low = middle;
             } else {
                 high = middle - 1;
             }
         }
-        let text = assemble_index(described, low, &duplicate_names);
+        let text = assemble_index(described, low, duplicate_names);
         let truncated = described
             .iter()
-            .filter(|skill| normalized_description(skill).len() > low)
+            .filter(|skill| char_len(&normalized_description(skill)) > low)
             .count();
         return Budgeted {
             text,
@@ -230,7 +234,11 @@ fn index_within(described: &[&Skill], budget: usize) -> Budgeted {
         .iter()
         .map(|skill| {
             (
-                index_line(skill, 0, duplicate_names.contains(skill.name.as_str())).len() + 1,
+                char_len(&index_line(
+                    skill,
+                    0,
+                    duplicate_names.contains(skill.name.as_str()),
+                )) + 1,
                 *skill,
             )
         })
@@ -263,7 +271,7 @@ fn index_within(described: &[&Skill], budget: usize) -> Budgeted {
         locale_compare(&left.name, &right.name).then_with(|| left.location.cmp(&right.location))
     });
     Budgeted {
-        text: assemble_index(&kept, 0, &duplicate_names),
+        text: assemble_index(&kept, 0, duplicate_names),
         rendered: kept.len(),
         omitted: described.len() - kept.len(),
         truncated: kept.len(),
@@ -272,7 +280,7 @@ fn index_within(described: &[&Skill], budget: usize) -> Budgeted {
 
 fn assemble_index(
     described: &[&Skill],
-    description_bytes: usize,
+    description_chars: usize,
     duplicate_names: &BTreeSet<&str>,
 ) -> String {
     let mut lines = Vec::with_capacity(described.len() + 2);
@@ -280,7 +288,7 @@ fn assemble_index(
     lines.extend(described.iter().map(|skill| {
         index_line(
             skill,
-            description_bytes,
+            description_chars,
             duplicate_names.contains(skill.name.as_str()),
         )
     }));
@@ -288,9 +296,9 @@ fn assemble_index(
     lines.join("\n")
 }
 
-fn index_line(skill: &Skill, description_bytes: usize, include_source: bool) -> String {
+fn index_line(skill: &Skill, description_chars: usize, include_source: bool) -> String {
     let name = escape_html(&skill.name);
-    let description = truncate_utf8(&normalized_description(skill), description_bytes);
+    let description = truncate_chars(&normalized_description(skill), description_chars);
     let source = if include_source {
         format!(" source=\"{}\"", escape_html(&skill.location))
     } else {
@@ -306,10 +314,10 @@ fn index_line(skill: &Skill, description_bytes: usize, include_source: bool) -> 
     }
 }
 
-fn duplicate_names<'a>(described: &[&'a Skill]) -> BTreeSet<&'a str> {
+fn duplicate_names_all(list: &[Skill]) -> BTreeSet<&str> {
     let mut seen = BTreeSet::new();
     let mut duplicates = BTreeSet::new();
-    for skill in described {
+    for skill in list {
         if !seen.insert(skill.name.as_str()) {
             duplicates.insert(skill.name.as_str());
         }
@@ -319,45 +327,47 @@ fn duplicate_names<'a>(described: &[&'a Skill]) -> BTreeSet<&'a str> {
 
 fn normalized_description(skill: &Skill) -> String {
     skill
-        .description
-        .as_deref()
+        .catalog_description()
         .unwrap_or_default()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn truncate_utf8(value: &str, maximum: usize) -> String {
+fn truncate_chars(value: &str, maximum: usize) -> String {
     if maximum == 0 {
         return String::new();
     }
-    if value.len() <= maximum {
+    if char_len(value) <= maximum {
         return value.to_owned();
     }
     let suffix = "...";
-    if maximum <= suffix.len() {
+    if maximum <= suffix.chars().count() {
         return ".".repeat(maximum);
     }
-    let mut end = maximum - suffix.len();
-    while !value.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
-    let mut out = value[..end].trim_end().to_owned();
+    let keep = maximum - suffix.chars().count();
+    let mut out = value.chars().take(keep).collect::<String>();
+    out = out.trim_end().to_owned();
     out.push_str(suffix);
     out
 }
 
-/// Bytes one entry adds to [`assemble`]'s output, including its leading newline.
+/// Characters one entry adds to [`assemble`]'s output, including its leading
+/// newline.
 fn entry_cost(skill: &Skill, form: Form) -> usize {
     entry_lines(skill, form)
         .iter()
-        .map(|line| line.len() + 1)
+        .map(|line| char_len(line) + 1)
         .sum()
 }
 
-/// Bytes [`assemble`] spends on the opening and closing lines alone.
+/// Characters [`assemble`] spends on the opening and closing lines alone.
 fn frame_cost(form: Form) -> usize {
-    open_line(form).len() + close_line(form).map_or(0, |close| close.len() + 1)
+    char_len(open_line(form)) + close_line(form).map_or(0, |close| char_len(close) + 1)
+}
+
+fn char_len(value: &str) -> usize {
+    value.chars().count()
 }
 
 /// `escapeHtml` (`packages/opencode/src/util/html.ts`), entity-for-entity.
