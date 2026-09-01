@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/sunerpy/zuno/compare/v0.5.0...v0.6.0) (2026-09-01)
+
+
+### Features
+
+* drive plans, proxies, and live skill catalogs ([#74](https://github.com/sunerpy/zuno/issues/74)) ([bf55319](https://github.com/sunerpy/zuno/commit/bf5531995de8851610d8c928375723abc8771fb4))
+
 ## [0.5.0](https://github.com/sunerpy/zuno/compare/v0.4.0...v0.5.0) (2026-09-01)
 
 
