@@ -163,6 +163,10 @@ Goal/Plan/Todo operations while denying shell and file mutation. Returning to Wo
 requires a durable plan to exist, and the confirmation names its title, revision, and
 completed-step count.
 
+The default host owns Plan creation through a typed planning capability. Disabling the
+model-facing `plan_update` tool does not disable classification, persistence, client
+projection, or restart recovery; it only removes the model's refinement surface.
+
 Entering Plan while a Goal is active atomically records `paused(plan_mode)`. Start Work
 resumes only that exact pause and does so once, even after a process restart. It deliberately
 does not clear pauses owned by authentication repair, a pending human request, permission,

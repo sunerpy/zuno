@@ -467,6 +467,8 @@ fn views_tool_affordance_matches_the_oracle_icons() {
         ("webfetch", "%"),
         ("web_search", "◈"),
         ("task", "#"),
+        ("history", "↶"),
+        ("notes", "≡"),
         ("something_else", "⚙"),
     ] {
         assert_eq!(tool_affordance(name).0, icon, "wrong icon for {name}");

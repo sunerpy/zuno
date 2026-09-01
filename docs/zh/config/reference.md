@@ -145,6 +145,33 @@ Council 让多个隔离的席位各自独立评估同一个问题，然后综合
 | `auto` | boolean | `true` | 接近上限时自动压缩 |
 | `prune` | boolean | `true` | 压缩时裁剪历史 |
 
+## 会话连续性工具
+
+模型读取当前会话旧证据与持久工作笔记的能力默认关闭。同时启用两个工具：
+
+```json
+{
+  "continuity": {
+    "history": true,
+    "notes": true
+  }
+}
+```
+
+`"continuity": true` 是等价简写；缺省或 `false` 会关闭两者。对象形式中未写出的
+字段默认为 `false`，因此也可以只开启其中一个。
+
+- `history` 按成功的压缩边界读取当前会话的规范化消息，不返回 reasoning、加密字段、
+  合成的内部提示正文或二进制附件字节。
+- `notes` 使用逻辑文档名，并按当前 `session_id + Agent` 隔离；它不接受宿主路径。
+
+这里配置的是候选工具。Agent 工具 allowlist、顶层 `tools`、request hook 和
+`permission.rules` 仍拥有最终否决权。启用 Notes 不提升数据库 format 版本，而是在
+首次使用时创建组件自有的增量表。
+
+`"tools": {"plan_update": false}` 只会隐藏模型工具；默认 profile 中类型化的宿主
+Planning capability 仍会创建、持久化并恢复 Plan。
+
 ## 插件包
 
 `plugin` 相关配置声明扩展包。扩展要么是显式 WASI 授权下的 WebAssembly 组件，要么是使用行分隔 JSON-RPC 的受限子进程。能力经过声明与校验，不会被意外继承。

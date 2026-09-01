@@ -606,6 +606,8 @@ fn native_tool_name(name: &str, harness_tool_names: &BTreeSet<String>) -> bool {
             zuno_tools::TODO_UPDATE_TOOL_ID,
             zuno_tools::WORKFLOW_WIRE_ID,
             zuno_tools::COUNCIL_WIRE_ID,
+            zuno_continuity::HISTORY_TOOL_ID,
+            zuno_continuity::NOTES_TOOL_ID,
         ]
         .contains(&name)
         || harness_tool_names.contains(name)
@@ -668,6 +670,8 @@ mod tests {
             "goal_propose",
             "goal_update",
             "council_run",
+            "history",
+            "notes",
             "extension_tool",
         ] {
             assert!(native_tool_name(name, &harness), "{name}");

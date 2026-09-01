@@ -43,6 +43,7 @@ zuno-auth = { path = "crates/zuno-auth" }
 zuno-catalog = { path = "crates/zuno-catalog" }
 zuno-cli = { path = "crates/zuno-cli" }
 zuno-config = { path = "crates/zuno-config" }
+zuno-continuity = { path = "crates/zuno-continuity" }
 zuno-db = { path = "crates/zuno-db" }
 zuno-engine = { path = "crates/zuno-engine" }
 zuno-error = { path = "crates/zuno-error" }

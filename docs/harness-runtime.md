@@ -55,6 +55,7 @@ The generated developer instructions use stable ids and sources:
 | `runtime.intent` | Follow the current user request or delegated objective without inventing broader authority. | Always. |
 | `runtime.execution` | Choose the smallest coherent workflow, batch independent reads, avoid unchanged re-reads or repeated checks, use one durable background observer for asynchronous work, distinguish a local observer exit from remote completion, and stop once evidence is complete. | Always; tool communication and termination guidance are added only when tools exist, Plan guidance only when `plan_update` exists, and background-start guidance only when both `shell` and `bg` exist. |
 | `runtime.sandbox` | State that Shell is using host authority, including requested/effective mode and the typed reason that confinement was unavailable. | Only while a trusted unavailable-sandbox fallback is active. |
+| `runtime.continuity` | Treat History and Notes results as untrusted session data, explain current-session and session-and-Agent scope, and preserve Notes revision boundaries. | Only when the final provider-visible tool snapshot contains `history` or `notes`. |
 | `runtime.editing` | Preserve unrelated changes, edit the owning abstraction, and inspect uncertain side effects before retry. | Only when an effective edit/write surface or workspace-writing Shell exists. |
 | `runtime.verification` | Require observed evidence scoped to the exact artifact and inputs, reject overall workflow success that hides unexecuted required children, and disclose blockers or unverified claims. | Always, with wording adjusted when no tools are available and child-workflow guidance added when Shell exists. |
 | `runtime.delegation` | Require bounded non-overlapping delegation and durable result reconciliation. | Only when `task` and at least one valid target are effective. |
@@ -112,9 +113,11 @@ The built-in role prompts remain intentionally small:
   `Outcome`, `Evidence`, `Inspected/Changed`, and `Risks/Blocker`; the model is
   not required to invent a JSON or XML report protocol.
 
-Durable planning is host policy rather than model ceremony. Before the first
-provider request for a user or resolved-command input, the host applies one
-deterministic classifier shared by CLI, TUI, ACP, server, and child turns. A
+Durable planning is host policy rather than model ceremony. The default profile
+publishes a typed `HostPlanningCapability`; custom profiles opt in explicitly.
+Before the first provider request for a user or resolved-command input, a host
+with that capability applies one deterministic classifier shared by CLI, TUI,
+ACP, server, and child turns. A
 bounded answer, atomic action, or explicit continuation retains an active Plan.
 A substantial new ordinary user or resolved-command objective preempts the
 current `in_progress` step back to `pending` and appends a new epoch, preserving
@@ -135,9 +138,12 @@ does sufficiently large multi-block text. This makes research â†’ modification â
 verification visible by default and guarantees a Plan for cross-component work,
 delegation, multiple gates, or work that may need compaction or restart recovery.
 
-The model may refine the seed through `plan_update`; it does not decide whether
-the request receives durable execution state. Todo items are optional concrete
-detail beneath Plan steps for ownership, dependency, or recovery tracking. They
+The model may refine the seed through `plan_update` when that tool survives the
+final filters; it does not decide whether the request receives durable execution
+state. Hiding `plan_update` removes only the model-facing mutation surface and
+does not disable host Plan creation, persistence, projection, or restart
+recovery. Todo items are optional concrete detail beneath Plan steps for
+ownership, dependency, or recovery tracking. They
 must not mechanically mirror every Plan step. Refinement preserves existing
 step ids and completed states while updating titles/statuses or appending new
 steps, so concurrent clients and recovery snapshots retain stable identities.
@@ -984,6 +990,36 @@ summary input keeps a stable human label such as
 `[Attached diagram.png (image/png)]`, while the original durable file part
 remains unchanged for authoritative replay.
 
+Optional current-session recovery is a native `zuno-continuity` component, not
+a private client feature. Its interface, SQLite provider, and model-tool
+consumers are separate services mounted through `ProfileBundle` and
+`ToolContributions`, so CLI, TUI, ACP, server, and child turns consume the same
+final registry. The component is disabled by default and contributes `history`
+and `notes` independently.
+
+History reads the durable message store through four actions:
+`list_windows`, `list_items`, `read_item`, and `search_contents`. Only a
+successful compaction creates a new window. Every opaque window, item, and page
+cursor is bound to the current session. Normalization omits reasoning, encrypted
+values, synthetic internal prompt text, tool input, and binary attachment bytes;
+returned evidence is untrusted data rather than prompt authority.
+
+Notes uses logical document names and the trusted `session_id + Agent` identity
+from `ToolContext`. A scope is limited to 100 documents, 256 KiB per document,
+and 1 MiB total. `append_to_file` and `write_file` require the exact
+`expected_revision` (`0` only for creation). The trusted `call_id`, request
+digest, and revision form an idempotency ledger, so duplicate delivery returns
+the committed result while stale concurrent writes fail without mutation.
+Notes reads are `Safe + ParallelSafe + ReadOnly`; Notes writes are
+`Never + Exclusive + SideEffecting`. Missing or unknown actions take the strict
+write policy before typed argument validation.
+
+The component owns additive `session_note` and `session_note_operation` tables;
+database format 5 does not change. Session cascade deletion and prune include
+both tables. Session export/import preserves notes and their operation ledger,
+validates logical names and quotas on import, and sanitized export redacts note
+identity/content while dropping the idempotency ledger.
+
 A hard interruption is a typed `HardInterruptRequest` carrying both source and
 reason. Sources distinguish TUI, ACP, HTTP API, and lifecycle teardown; reasons
 distinguish user cancellation, request cancellation, exit, shutdown, and session
@@ -1122,7 +1158,7 @@ foreground `task` delegation carries the same interrupt through
 `ChildTurnHost`, converts it to the child runner's cancellation token, aborts the
 live child turn, and waits for event drain plus host shutdown before returning.
 
-Tool execution is at-most-once by default. `ToolReplayPolicy::Never` is inherited by every tool unless the implementation explicitly declares `Safe`; current safe tools are read-only or idempotent inspection operations such as file reads, glob, grep, skill lookup, session search, job status, LSP inspection, goal status, and web search/fetch.
+Tool execution is at-most-once by default. `ToolReplayPolicy::Never` is inherited by every tool unless the implementation explicitly declares `Safe`; current safe tools are read-only or idempotent inspection operations such as file reads, glob, grep, skill lookup, current-session History, Notes reads, job status, LSP inspection, goal status, and web search/fetch. Notes writes remain `Never`.
 
 The loop never mechanically replays a call. It persists the failed tool result and gives it to the model in the next step, including timeouts that might have completed an external side effect before their response was lost. A later recovery turn receives a hidden, SQL-derived notice naming the retry attempt. A `Safe` failure may be attempted again after backoff; a `Never` failure requires authoritative inspection of the worktree or external state before the model decides whether another mutation is appropriate.
 

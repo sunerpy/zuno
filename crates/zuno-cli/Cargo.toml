@@ -30,6 +30,7 @@ zuno-attachment = { workspace = true }
 zuno-auth = { workspace = true }
 zuno-catalog = { workspace = true }
 zuno-config = { workspace = true }
+zuno-continuity = { workspace = true }
 zuno-db = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-error = { workspace = true }

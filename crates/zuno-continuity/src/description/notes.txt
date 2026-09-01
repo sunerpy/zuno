@@ -1,0 +1,1 @@
+Manage durable working notes isolated to the current session and Agent. Reads are retryable; append_to_file and write_file require the exact expected_revision (0 creates a new document).

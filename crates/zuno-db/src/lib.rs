@@ -41,6 +41,7 @@
 //! ```
 
 pub mod artifact_gc;
+pub mod continuity;
 pub mod event_log;
 pub mod fts;
 pub mod human_request;

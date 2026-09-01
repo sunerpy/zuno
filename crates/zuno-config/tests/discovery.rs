@@ -428,6 +428,30 @@ fn discovery_instructions_keep_earlier_entries_first_and_deduplicate() {
     assert_eq!(instructions(&merged), ["shared", "first", "second"]);
 }
 
+#[test]
+fn discovery_deep_merges_continuity_object_fields() {
+    let first = Config::from_json_str(
+        std::path::Path::new("first.json"),
+        r#"{"continuity":{"history":true}}"#,
+    )
+    .expect("first");
+    let second = Config::from_json_str(
+        std::path::Path::new("second.json"),
+        r#"{"continuity":{"notes":true}}"#,
+    )
+    .expect("second");
+
+    assert_eq!(
+        merge_layers([first, second])
+            .expect("merge")
+            .resolved_continuity(),
+        zuno_config::schema::ResolvedContinuityConfig {
+            history: true,
+            notes: true,
+        }
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         failure_persistence: None,
@@ -641,7 +665,7 @@ fn discovery_applies_permission_after_managed_preferences_and_tools_defaults_fir
         [
             (
                 "ZUNO_CONFIG_CONTENT".to_owned(),
-                r#"{"tools":{"shell":false,"write":true},"permission":{"rules":{"read":"ask"}}}"#
+                r#"{"tools":{"shell":false,"write":true,"history":false,"notes":true},"permission":{"rules":{"read":"ask"}}}"#
                     .to_owned(),
             ),
             (
@@ -662,6 +686,8 @@ fn discovery_applies_permission_after_managed_preferences_and_tools_defaults_fir
         ("edit", PermissionAction::Deny),
         ("read", PermissionAction::Deny),
         ("glob", PermissionAction::Ask),
+        ("history", PermissionAction::Deny),
+        ("notes", PermissionAction::Allow),
     ];
     for (key, action) in expected {
         assert_eq!(

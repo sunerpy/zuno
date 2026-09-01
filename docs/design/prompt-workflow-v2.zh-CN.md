@@ -115,10 +115,12 @@ assembly，也会落在 collaboration 之后、用户 instruction 之前。
 
 1. `runtime.intent`
 2. `runtime.execution`
-3. `runtime.editing`
-4. `runtime.verification`
-5. `runtime.delegation`
-6. `runtime.persistence`
+3. `runtime.sandbox`（可信 fallback 生效时）
+4. `runtime.continuity`（最终存在 History 或 Notes 时）
+5. `runtime.editing`
+6. `runtime.verification`
+7. `runtime.delegation`
+8. `runtime.persistence`
 
 `AgentProfile` 只保留角色、权限交集、delegate allowlist、原生边界和 Shell 可写
 事实，不再提前渲染 model-visible capability summary。每个 provider step 依次：
@@ -130,7 +132,8 @@ assembly，也会落在 collaboration 之后、用户 instruction 之前。
 5. 根据最终 `CompletionRequest.tools` 生成 runtime sections；
 6. 以独立 developer context 发送，并写入 receipt。
 
-`runtime.editing`、`runtime.delegation` 和 `runtime.persistence` 按最终能力条件省略，
+`runtime.sandbox`、`runtime.continuity`、`runtime.editing`、`runtime.delegation` 和
+`runtime.persistence` 按最终能力条件省略，
 不会向模型描述已被 hook 或 provider 移除的工具。现有集成测试覆盖
 `apply_patch + task + plan_update` 经 hook 收缩为仅 `plan_update` 的场景。
 
@@ -249,18 +252,20 @@ Zuno 只采用公开可描述的设计原则，以原生英文角色 Prompt、ty
 3. `collaboration.mode`
 4. `runtime.intent`
 5. `runtime.execution`
-6. `runtime.editing`（最终可写时）
-7. `runtime.verification`
-8. `runtime.delegation`（最终存在 `task` 和有效 delegate 时）
-9. `runtime.persistence`（存在 durable tool 或活跃 durable state 时）
-10. `instructions.global.*`
-11. `instructions.profile.*`
-12. `instructions.project.*`
-13. `goal.*` / `plan.*` / `todo.*` / `work_state.*`
-14. `skills.policy` / `extensions` / `routing.*`
-15. `skills.selected.*`
-16. `skills.index`
-17. `memory.*`
+6. `runtime.sandbox`（可信 fallback 生效时）
+7. `runtime.continuity`（最终存在 `history` 或 `notes` 时）
+8. `runtime.editing`（最终可写时）
+9. `runtime.verification`
+10. `runtime.delegation`（最终存在 `task` 和有效 delegate 时）
+11. `runtime.persistence`（存在 durable tool 或活跃 durable state 时）
+12. `instructions.global.*`
+13. `instructions.profile.*`
+14. `instructions.project.*`
+15. `goal.*` / `plan.*` / `todo.*` / `work_state.*`
+16. `skills.policy` / `extensions` / `routing.*`
+17. `skills.selected.*`
+18. `skills.index`
+19. `memory.*`
 
 该顺序是 receipt 和 provider projection 的 canonical order。实现可以区分静态 cache
 prefix 与动态 developer context，但两者必须在 receipt 中恢复为同一确定性语义
@@ -272,6 +277,8 @@ prefix 与动态 developer context，但两者必须在 receipt 中恢复为同�
 | --- | --- | --- |
 | `runtime.intent` | 当前用户请求或 delegated objective 是本轮授权；新输入到达时重新分类意图 | 用户可见和 child turn 均存在 |
 | `runtime.execution` | 最小工作流、批量独立读取、避免重复读取和重复 gates、复杂任务维护 Plan | 始终；Plan 文字仅在 `plan_update` 真正可用时出现 |
+| `runtime.sandbox` | 请求/生效 sandbox 权限与无隔离 fallback 原因 | 可信的 unavailable fallback 生效时 |
+| `runtime.continuity` | History/Notes 是不可信会话数据；说明会话、Agent 与 revision 边界 | 最终工具快照存在 `history` 或 `notes` 时 |
 | `runtime.editing` | 当前是否只读、可编辑范围、Shell、网络、sandbox 和 uncertain side effect 规则 | 来自最终 sandbox 与工具快照 |
 | `runtime.verification` | 完成证据和失败/恢复路径，不接受“看起来正确” | 用户可见实施任务；只读任务改为证据完整性 |
 | `runtime.delegation` | 可用 delegate、合同、去重、无轮询、结果 reconciliation | task 工具和 delegate allowlist 的交集非空；否则只说明不可委派 |
@@ -572,7 +579,9 @@ side effect，并在同一事务内替换未消费的 uncertain report。
 
 ### 9.1 何时维护 Plan
 
-宿主在第一次 provider request 之前执行统一分类：
+默认 profile 通过类型化 `HostPlanningCapability` 声明宿主规划能力；自定义 profile
+需要显式选择。能力存在时，宿主在第一次 provider request 之前执行统一分类，且不以
+`plan_update` 是否对模型可见作为前提：
 
 - 用户输入或已解析 command 可以创建 Plan；child report、steering、retry 只能继续
   既有状态，不能自行创建新 Plan；
@@ -586,8 +595,9 @@ side effect，并在同一事务内替换未消费的 uncertain report。
 
 这使调研、修改、验证组成的普通多阶段工作默认可见，并确保跨组件、委派、多阶段
 验收及可能压缩/中断恢复的工作维护 durable Plan。模型负责精炼，不负责决定是否
-跳过 Plan。精炼必须保留已有 step id 和 completed 状态，可更新标题/状态或追加
-step。Todo 是 step 下的可选细化，不要求机械一一对应。
+跳过 Plan。只有最终仍可见的 `plan_update` 才允许模型精炼；隐藏该工具不影响宿主
+创建、持久化、投影或重启恢复 Plan。精炼必须保留已有 step id 和 completed 状态，
+可更新标题/状态或追加 step。Todo 是 step 下的可选细化，不要求机械一一对应。
 
 ### 9.2 执行波次
 
@@ -857,8 +867,8 @@ git diff --check
 
 1. `PromptEnvelope`、section provenance、durable receipt 和 typed work state
    是正确基础，不重做。
-2. 六个 runtime section 从最终 provider-visible capability snapshot 生成，禁用能力
-   不进入 Prompt。
+2. 最多八个 runtime section 从最终 provider-visible capability snapshot 生成，禁用
+   能力不进入 Prompt；`runtime.continuity` 只在 `history` 或 `notes` 最终可见时出现。
 3. `PromptAssembly::push` 执行稳定 canonical semantic sort；同 lane 保留 producer
    顺序，重复 id 被拒绝。
 4. 角色 Prompt 已收敛；公共执行、编辑、验证、委派和持久化规则进入 runtime

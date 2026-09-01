@@ -5,6 +5,7 @@ zuno-auth
 zuno-catalog
 zuno-cli
 zuno-config
+zuno-continuity
 zuno-db
 zuno-engine
 zuno-error

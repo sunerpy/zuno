@@ -82,25 +82,27 @@ remote unshare failed for shared session <id>: <detail>; local rows were deleted
 `crates/zuno-db/tests/prune.rs::prune_delete_order_and_true_related_table_count_are_pinned`
 固定，因为这个顺序正是在事务中途保持外键约束成立的关键。
 
-**14 张表**，按此顺序：
+**16 张表**，按此顺序：
 
 <!-- generated:BEGIN prune-tables -->
 | order | table |
 |---:|---|
-| 1 | `memory_reflection_job` |
-| 2 | `memory_reflection_delivery` |
-| 3 | `agent_job` |
-| 4 | `work_item` |
-| 5 | `work_plan` |
-| 6 | `session_context_epoch` |
-| 7 | `session_input` |
-| 8 | `session_message` |
-| 9 | `part` |
-| 10 | `message` |
-| 11 | `session_share` |
-| 12 | `session` |
-| 13 | `event_sequence` |
-| 14 | `event` |
+| 1 | `session_note_operation` |
+| 2 | `session_note` |
+| 3 | `memory_reflection_job` |
+| 4 | `memory_reflection_delivery` |
+| 5 | `agent_job` |
+| 6 | `work_item` |
+| 7 | `work_plan` |
+| 8 | `session_context_epoch` |
+| 9 | `session_input` |
+| 10 | `session_message` |
+| 11 | `part` |
+| 12 | `message` |
+| 13 | `session_share` |
+| 14 | `session` |
+| 15 | `event_sequence` |
+| 16 | `event` |
 <!-- generated:END prune-tables -->
 
 用以下命令重新生成：

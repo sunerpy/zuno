@@ -6406,6 +6406,7 @@ dependencies = [
  "zuno-auth",
  "zuno-catalog",
  "zuno-config",
+ "zuno-continuity",
  "zuno-db",
  "zuno-engine",
  "zuno-error",
@@ -6463,6 +6464,29 @@ dependencies = [
  "zuno-network",
  "zuno-paths",
  "zuno-testkit",
+]
+
+[[package]]
+name = "zuno-continuity"
+version = "0.0.3"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "zuno-db",
+ "zuno-error",
+ "zuno-harness",
+ "zuno-paths",
+ "zuno-runtime",
+ "zuno-tool",
+ "zuno-tools",
 ]
 
 [[package]]

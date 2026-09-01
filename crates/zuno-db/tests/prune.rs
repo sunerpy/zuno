@@ -372,6 +372,65 @@ fn prune_default_preview_is_inert_across_every_real_table() {
 }
 
 #[test]
+fn prune_counts_and_deletes_additive_continuity_rows_when_present() {
+    let fixture = Fixture::build();
+    let mut connection = fixture.connection();
+    zuno_db::continuity::ensure_schema(&connection).expect("create continuity tables");
+    for session_id in ["ses_root", "ses_bystander"] {
+        connection
+            .execute(
+                "INSERT INTO session_note
+                   (session_id, agent, name, revision, content, content_sha256,
+                    time_created, time_updated)
+                 VALUES (?1, 'build', 'evidence', 1, ?1, 'sha', 1, 1)",
+                [session_id],
+            )
+            .expect("insert note");
+        connection
+            .execute(
+                "INSERT INTO session_note_operation
+                   (session_id, agent, call_id, request_sha256, action, name,
+                    result_revision, result_content_sha256, time_created)
+                 VALUES (?1, 'build', ?2, 'request-sha', 'write', 'evidence',
+                         1, 'sha', 1)",
+                rusqlite::params![session_id, format!("call_{session_id}")],
+            )
+            .expect("insert note operation");
+    }
+    let expected = preview(&connection, &fixture.selection).expect("preview continuity rows");
+    assert_eq!(
+        expected
+            .tables
+            .iter()
+            .find(|impact| impact.table == "session_note")
+            .expect("note impact")
+            .rows,
+        1
+    );
+    assert_eq!(
+        expected
+            .tables
+            .iter()
+            .find(|impact| impact.table == "session_note_operation")
+            .expect("note operation impact")
+            .rows,
+        1
+    );
+
+    let outcome = execute(
+        &mut connection,
+        &fixture.selection,
+        &PruneRequest::delete().confirmed(),
+        &FakeRemote::default(),
+    )
+    .expect("delete selected continuity rows");
+
+    assert_eq!(outcome.preview, expected);
+    assert_eq!(count(&connection, "session_note"), 1);
+    assert_eq!(count(&connection, "session_note_operation"), 1);
+}
+
+#[test]
 fn prune_delete_requires_confirmation_before_remote_or_local_side_effects() {
     let fixture = Fixture::build();
     let mut connection = fixture.connection();
@@ -415,7 +474,8 @@ fn prune_preview_counts_exactly_match_the_subsequent_transactional_delete() {
     assert_eq!(outcome.changed_sessions, 3);
     for impact in &expected.tables {
         assert_eq!(
-            before[impact.table] - after[impact.table],
+            before.get(impact.table).copied().unwrap_or(0)
+                - after.get(impact.table).copied().unwrap_or(0),
             impact.rows,
             "preview count for {} must equal rows actually removed",
             impact.table
@@ -596,12 +656,14 @@ fn prune_rolled_back_delete_preserves_the_original_preview() {
 fn prune_delete_order_and_true_related_table_count_are_pinned() {
     assert_eq!(
         PRUNE_TABLES.len(),
-        14,
+        16,
         "every session-owned schema table must be explicit"
     );
     assert_eq!(
         DELETE_ORDER,
         [
+            "session_note_operation",
+            "session_note",
             "memory_reflection_job",
             "memory_reflection_delivery",
             "agent_job",

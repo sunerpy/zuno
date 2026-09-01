@@ -2763,11 +2763,57 @@ impl TurnHost {
                 }
             };
         }
+        let runtime = profile_runtime.child(format!("session:{}", prepared.identity.id()));
+        let continuity = plan.config.resolved_continuity();
+        let continuity_settings = zuno_continuity::ContinuitySettings {
+            history: continuity.history,
+            notes: continuity.notes,
+        };
+        if continuity_settings.enabled() {
+            let overlay = runtime
+                .service::<zuno_harness::ToolContributions>()
+                .ok_or_else(|| "profile did not register tool contributions".to_owned())
+                .and_then(|base| {
+                    zuno_continuity::profile_overlay(
+                        &base,
+                        Arc::clone(&database),
+                        continuity_settings,
+                    )
+                    .map_err(to_string)
+                });
+            let activation = match overlay {
+                Ok(overlay) => runtime.activate_profile(overlay).await.map_err(to_string),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = activation {
+                let shutdown = profile_runtime.shutdown().await;
+                let ownership = extension_ownership
+                    .take()
+                    .expect("extension ownership exists before continuity assembly");
+                return match shutdown {
+                    Ok(()) => match ownership.release_after_clean_failure() {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(format!(
+                            "{error}; extension transition abort also failed: {cleanup}"
+                        )),
+                    },
+                    Err(shutdown) => {
+                        ownership.mark_uncertain(format!(
+                            "continuity activation failed ({error}) and profile cleanup was not \
+                             authoritative ({shutdown})"
+                        ));
+                        Err(format!(
+                            "continuity activation failed: {error}; profile cleanup failed: \
+                             {shutdown}"
+                        ))
+                    }
+                };
+            }
+        }
         let assembled = (|| -> Result<Self, String> {
             let _profile_id = profile_runtime
                 .active_profile_id()
                 .ok_or_else(|| "profile runtime has no active profile".to_owned())?;
-            let runtime = profile_runtime.child(format!("session:{}", prepared.identity.id()));
             let driver = runtime
                 .service::<dyn AgentDriver>()
                 .ok_or_else(|| "profile did not register an agent driver".to_owned())?;
@@ -3578,9 +3624,7 @@ impl TurnHost {
                 prompt: objective,
                 source: PlanningInputSource::GoalObjective,
                 content: PlanningContentFacts::empty(),
-                plan_available: self
-                    .dispatcher
-                    .has_visible_tool(zuno_tools::PLAN_UPDATE_TOOL_ID),
+                plan_available: host_planning_available(&self.runtime),
                 goal_id: Some(goal_id.to_owned()),
             },
         )?;
@@ -4922,9 +4966,7 @@ impl TurnHost {
                 prompt,
                 source,
                 content: planning_content_facts(content),
-                plan_available: self
-                    .dispatcher
-                    .has_visible_tool(zuno_tools::PLAN_UPDATE_TOOL_ID),
+                plan_available: host_planning_available(&self.runtime),
                 goal_id,
             },
         )?;
@@ -6047,6 +6089,12 @@ struct HostPlanningOutcome {
 }
 
 const SUPERSEDED_PLAN_STEP_PREFIX: &str = "Superseded: ";
+
+fn host_planning_available(runtime: &HarnessRuntime) -> bool {
+    runtime
+        .service::<zuno_harness::HostPlanningCapability>()
+        .is_some()
+}
 
 fn supersede_incomplete_plan_steps(steps: &mut [zuno_tools::PlanStep]) {
     for step in steps {

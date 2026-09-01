@@ -473,6 +473,40 @@
       "minimum": 1,
       "type": "integer"
     },
+    "ContinuityConfig": {
+      "anyOf": [
+        {
+          "description": "`false` disables both tools; `true` enables both.",
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/ContinuityOptions",
+          "description": "Fine-grained selection. Unspecified fields remain disabled."
+        }
+      ],
+      "description": "Model-facing continuity: a master boolean, or independently selected tools."
+    },
+    "ContinuityOptions": {
+      "additionalProperties": false,
+      "description": "Fine-grained switches under the `continuity` top-level key.",
+      "properties": {
+        "history": {
+          "description": "Expose normalized history from the current session.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "notes": {
+          "description": "Expose session-and-agent scoped working notes.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "EnterpriseConfig": {
       "description": "Enterprise deployment settings (`config/config.ts:134-136`).",
       "properties": {
@@ -2854,6 +2888,17 @@
         }
       ],
       "description": "Bounded concurrency for independent runtime capabilities."
+    },
+    "continuity": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ContinuityConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional model-facing access to durable session history and notes."
     },
     "default_agent": {
       "description": "Agent to use when none is named. Must be a primary agent.",
