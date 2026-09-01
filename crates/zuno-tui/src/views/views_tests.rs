@@ -404,6 +404,12 @@ fn views_a_permission_prompt_over_a_live_session_resolves_without_disturbing_it(
             message_id: String::from("m"),
         },
     ));
+    host.handle_event(&AppEvent::Engine(
+        zuno_engine::r#loop::TurnEvent::Provider {
+            step: 1,
+            event: zuno_llm::event::StreamEvent::TextDelta(String::from("assistant base")),
+        },
+    ));
     host.open(Box::new(PermissionPrompt::new(
         context,
         zuno_permission::PermissionRequest {
@@ -437,7 +443,7 @@ fn views_a_permission_prompt_over_a_live_session_resolves_without_disturbing_it(
         "the resolved prompt is still drawn:\n{after}"
     );
     assert!(
-        after.contains("Assistant"),
+        after.contains("assistant base"),
         "the session behind the prompt was lost:\n{after}"
     );
 }

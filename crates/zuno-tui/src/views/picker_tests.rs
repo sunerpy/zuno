@@ -398,8 +398,10 @@ fn views_theme_picker_renders_offscreen_with_a_palette_preview() {
         "the default theme is not listed:\n{joined}"
     );
     assert!(
-        joined.contains("primary") && joined.contains("accent"),
-        "the palette preview is missing, so a theme name is all the user sees:\n{joined}"
+        joined.contains("Your prompt")
+            && joined.contains("Assistant prose")
+            && joined.contains("Tool completed"),
+        "the semantic transcript preview is missing, so a theme name is all the user sees:\n{joined}"
     );
 }
 
@@ -409,20 +411,26 @@ fn views_theme_picker_preview_paints_the_theme_it_previews() {
     let context = ViewContext::defaults();
     let resolved = registry.resolve(crate::theme::DEFAULT_THEME, Mode::Dark);
     let lines = preview_lines(&resolved, &context);
-    assert_eq!(lines.len(), 2, "the preview lost a row");
-    let swatch_backgrounds = lines[1]
+    assert_eq!(lines.len(), 7, "the preview lost a semantic row");
+    let prompt_backgrounds = lines[1]
         .spans
         .iter()
         .filter_map(|span| span.style.bg)
         .collect::<Vec<_>>();
     assert!(
-        swatch_backgrounds.contains(&ratatui::style::Color::from(resolved.palette.primary)),
-        "the preview does not paint the theme's own primary colour"
+        prompt_backgrounds.iter().all(|background| *background
+            == ratatui::style::Color::from(resolved.palette.background_element)),
+        "the preview does not paint the prompt on the theme's element surface"
     );
     assert_eq!(
-        swatch_backgrounds.len(),
-        6,
-        "the preview shows a different number of swatches than it documents"
+        lines[2].spans[1].style.bg,
+        Some(ratatui::style::Color::from(resolved.palette.background)),
+        "assistant prose is not previewed on the terminal base"
+    );
+    assert_eq!(
+        lines[4].spans[0].style.fg,
+        Some(ratatui::style::Color::from(resolved.palette.success)),
+        "the tool-completion state does not use the previewed theme"
     );
 }
 

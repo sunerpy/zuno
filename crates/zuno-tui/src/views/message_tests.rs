@@ -99,16 +99,16 @@ fn views_chat_transcript_renders_every_part_kind_offscreen() {
     let rows = draw(&mut view, 48, 16);
     let joined = rows.join("\n");
     assert!(
-        joined.contains("▌ You"),
-        "the user's turn is missing its header:\n{joined}"
+        joined.contains("› summarise the plan"),
+        "the user's turn is missing its compact gutter marker:\n{joined}"
     );
     assert!(
         joined.contains("summarise the plan"),
         "the user's text is missing:\n{joined}"
     );
     assert!(
-        joined.contains("│ Assistant"),
-        "the assistant's turn is missing its header:\n{joined}"
+        joined.contains("• "),
+        "the assistant's turn is missing its compact gutter marker:\n{joined}"
     );
     assert!(
         joined.contains("◇ Thought · 2.5s"),
@@ -149,8 +149,8 @@ fn views_chat_transcript_paints_from_the_palette_not_from_a_literal() {
     let body = &buffer[(2, 0)];
     assert_eq!(
         body.bg,
-        ratatui::style::Color::from(context.palette().background_panel),
-        "the transcript background did not come from the resolved palette"
+        ratatui::style::Color::from(context.palette().background_element),
+        "the user prompt did not use the resolved inset-element surface"
     );
     assert_eq!(
         body.fg,
@@ -176,8 +176,8 @@ fn transcript_copy_uses_semantic_text_without_frames_or_soft_wrap_newlines() {
     view.transcript_mut().push(Message::user(source));
     let rendered = draw(&mut view, 28, 20).join("\n");
     assert!(
-        rendered.contains(USER_BOX_RULE),
-        "fixture did not draw the user frame"
+        rendered.contains(Role::User.marker()),
+        "fixture did not draw the user gutter marker"
     );
     assert!(
         view.begin_selection(0, 0),
@@ -752,7 +752,7 @@ fn views_user_messages_render_commonmark_tables_instead_of_literal_pipes() {
 }
 
 #[test]
-fn views_assistant_markdown_and_header_use_neutral_scan_hierarchy() {
+fn views_assistant_markdown_uses_neutral_scan_hierarchy_on_the_base_surface() {
     let context = ViewContext::defaults();
     let mut view = TranscriptView::new(context.clone());
     view.handle_event(&AppEvent::Engine(started()));
@@ -761,34 +761,23 @@ fn views_assistant_markdown_and_header_use_neutral_scan_hierarchy() {
     ))));
 
     let lines = view.lines(72);
-    let assistant = lines
+    let heading = lines
         .iter()
         .find(|line| {
             line.spans
                 .iter()
-                .any(|span| span.content.as_ref() == "Assistant")
+                .any(|span| span.content.as_ref() == "Approach")
         })
-        .expect("assistant heading");
-    let title = assistant
+        .expect("markdown heading");
+    let title = heading
         .spans
         .iter()
-        .find(|span| span.content.as_ref() == "Assistant")
-        .expect("assistant title span");
+        .find(|span| span.content.as_ref() == "Approach")
+        .expect("markdown heading span");
     assert!(
         title.style.add_modifier.contains(Modifier::BOLD),
-        "the speaker title should be stronger than its body"
+        "the markdown heading should be stronger than its body"
     );
-    let separator = assistant
-        .spans
-        .iter()
-        .find(|span| span.content.contains('─'))
-        .expect("weak separator after the assistant title");
-    assert_eq!(
-        separator.style.fg,
-        context.muted().fg,
-        "the speaker separator should recede instead of becoming an accent bar"
-    );
-
     let heading = lines
         .iter()
         .flat_map(|line| line.spans.iter())
@@ -817,6 +806,11 @@ fn views_assistant_markdown_and_header_use_neutral_scan_hierarchy() {
         body.style.fg,
         context.text().fg,
         "ordinary prose must remain the primary reading layer"
+    );
+    assert_eq!(
+        body.style.bg,
+        Some(ratatui::style::Color::from(context.palette().background)),
+        "assistant prose should use the terminal base rather than a full panel band"
     );
 }
 
@@ -1048,21 +1042,25 @@ fn views_transcript_leaves_a_reader_who_scrolled_away_where_they_left_off() {
     ));
     view.handle_event(&AppEvent::Engine(started()));
     let mut chunks = TABLE_THEN_CODE.split_inclusive('\n');
-    for chunk in chunks.by_ref().take(4) {
+    for chunk in chunks.by_ref().take(6) {
         view.handle_event(&AppEvent::Engine(provider(StreamEvent::TextDelta(
             chunk.to_owned(),
         ))));
-        draw(&mut view, 80, 8);
+        draw(&mut view, 80, 5);
     }
+    assert!(
+        view.content_height() > view.viewport_height(),
+        "the fixture must overflow before the reader scrolls away"
+    );
     // The reader scrolls to the top, which disarms following.
     view.set_offset(0);
     for chunk in chunks {
         view.handle_event(&AppEvent::Engine(provider(StreamEvent::TextDelta(
             chunk.to_owned(),
         ))));
-        draw(&mut view, 80, 8);
+        draw(&mut view, 80, 5);
     }
-    let screen = draw(&mut view, 80, 8).join("\n");
+    let screen = draw(&mut view, 80, 5).join("\n");
     assert_eq!(view.offset(), 0, "a live turn yanked the viewport");
     assert!(
         screen.contains("write a markdown table"),
@@ -1431,9 +1429,7 @@ fn views_attachment_renders_its_mime_when_known() {
 }
 
 #[test]
-fn views_transcript_groups_consecutive_assistant_steps_under_one_header() {
-    // Measured on a real terminal: a five-step turn printed `Assistant` five times for
-    // what the user experienced as a single reply.
+fn views_transcript_groups_consecutive_assistant_steps_without_role_headers() {
     let mut view = view();
     view.transcript_mut().push(Message::user("go"));
     for step in 1..=3 {
@@ -1446,14 +1442,13 @@ fn views_transcript_groups_consecutive_assistant_steps_under_one_header() {
         ))));
     }
     let rendered = draw(&mut view, 60, 30);
-    let headers = rendered
-        .iter()
-        .filter(|row| row.contains("Assistant"))
-        .count();
     assert_eq!(
-        headers,
-        1,
-        "three assistant steps produced {headers} headers:\n{}",
+        rendered
+            .iter()
+            .filter(|row| row.contains("Assistant"))
+            .count(),
+        0,
+        "role labels returned to the compact transcript:\n{}",
         rendered.join("\n")
     );
     let joined = rendered.join("\n");
@@ -1464,8 +1459,8 @@ fn views_transcript_groups_consecutive_assistant_steps_under_one_header() {
         );
     }
     assert!(
-        joined.contains("▌ You"),
-        "grouping also swallowed the user's header:\n{joined}"
+        joined.contains(&format!("{} go", Role::User.marker())),
+        "grouping swallowed the user's marked prompt:\n{joined}"
     );
 }
 
@@ -2100,16 +2095,13 @@ fn views_transcript_keeps_emoji_rows_inside_the_frame() {
     }
 }
 
-/// The left rule runs unbroken through a multi-step turn, and breaks between speakers.
+/// Every message boundary gets one quiet row, independent of the next speaker.
 ///
-/// Both halves matter, and they are the same decision seen from two sides. The header is
-/// deliberately printed only on a change of speaker so that a five-step reply does not say
-/// `Assistant` five times — but the blank row that used to separate two assistant messages
-/// cut the rule into one fragment per step, which is exactly the continuity the suppressed
-/// header was relying on. So a same-role gap carries the rule and a role change does not,
-/// which is also what gives the eye two distinguishable grades of gap.
+/// The role's marker and background surface carry identity now. Keeping markers on blank
+/// separator rows would restore the vertical rules this compact layout deliberately
+/// removes, so both a second assistant step and a speaker change use the terminal base.
 #[test]
-fn views_transcript_rule_survives_a_step_boundary_and_breaks_between_speakers() {
+fn views_transcript_uses_quiet_gaps_for_steps_and_speaker_changes() {
     let mut view = view();
     view.transcript_mut().push(Message::user("go"));
     for event in [
@@ -2142,17 +2134,11 @@ fn views_transcript_rule_survives_a_step_boundary_and_breaks_between_speakers() 
     );
     let step_gap = &rendered[one + 1];
     assert!(
-        step_gap.starts_with(Role::Assistant.marker()),
-        "the gap inside one reply dropped the rule, so the turn reads as two: {step_gap:?}"
-    );
-    assert!(
-        step_gap.trim().len() <= Role::Assistant.marker().len(),
-        "the gap row carries content as well as the rule: {step_gap:?}"
+        step_gap.trim().is_empty(),
+        "the gap inside one reply carries transcript chrome: {step_gap:?}"
     );
 
-    // Located by the notice's own text rather than by a `Session` heading, which no longer
-    // exists. The assertions below are unchanged: what is being checked is the *separator*
-    // above the session's first row, and that row is now the notice itself.
+    // Located by the notice's own text because the compact transcript has no role heading.
     let session = rendered
         .iter()
         .position(|row| row.contains("heads up"))
@@ -2165,7 +2151,7 @@ fn views_transcript_rule_survives_a_step_boundary_and_breaks_between_speakers() 
     assert!(
         !speaker_gap.starts_with(Role::Assistant.marker())
             && !speaker_gap.starts_with(Role::System.marker()),
-        "the change of speaker kept a rule, so it reads like another step: {speaker_gap:?}"
+        "the change of speaker kept transcript chrome: {speaker_gap:?}"
     );
 }
 

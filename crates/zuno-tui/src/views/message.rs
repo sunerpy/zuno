@@ -67,22 +67,18 @@ pub enum Role {
 }
 
 impl Role {
-    /// The rule drawn down the left edge of every row this role owns.
+    /// The compact marker drawn in the transcript gutter.
     ///
-    /// Upstream distinguishes the two sides by drawing the user's turn as a panel
-    /// with a coloured left rule and leaving the assistant's prose unmarked
-    /// (`routes/session/index.tsx:1395-1420`). A rule on all three sides is better
-    /// here for a reason upstream does not have to care about: an off-screen buffer
-    /// assertion can then tell the roles apart *positionally*, at column zero,
-    /// instead of searching for a label that any wrapped body line might also
-    /// contain. Three distinct glyphs rather than one in three colours, because a
-    /// colour is invisible to the row-text assertions every view test is built on.
+    /// Role names and full-width rules made the transcript spend more rows on chrome
+    /// than on short messages. The gutter stays textual so monochrome terminals and
+    /// off-screen tests can still distinguish the three sources, while the message
+    /// surface supplies the stronger visual hierarchy.
     #[must_use]
     pub const fn marker(self) -> &'static str {
         match self {
-            Self::User => "▌",
-            Self::Assistant => "│",
-            Self::System => "▲",
+            Self::User => "›",
+            Self::Assistant => "•",
+            Self::System => "!",
         }
     }
 }
@@ -307,21 +303,8 @@ pub const DIAGNOSTICS_PREVIEW_ROWS: usize = 4;
 /// Diagnostics an expanded report lists.
 pub const DIAGNOSTICS_MAX_ROWS: usize = 200;
 
-/// The glyphs that close the user's message box on the right and along its rules.
-///
-/// `▐` matches [`crate::views::session::COMPOSER_RIGHT_RULE`] rather than the `│` a border
-/// set would give, because `│` is [`Role::Assistant`]'s own marker: a right edge drawn with
-/// it would put the assistant's glyph on the user's rows, which is the one distinction this
-/// box exists to sharpen.
-pub(crate) const USER_BOX_RIGHT: &str = "▐";
-pub(crate) const USER_BOX_RULE: &str = "─";
-
-/// The fewest body columns the user's box keeps before the frame is dropped instead.
-///
-/// The same judgement [`PROMPT_MIN_CONTENT_COLS`](crate::views::session) records for the
-/// composer's chrome: below this the frame costs more columns than the words can spare, and
-/// a prompt wrapped every eight characters is less readable than an unframed one.
-const USER_BOX_MIN_INNER_COLS: u16 = 12;
+/// The neutral rule used inside expandable tool sections.
+const SECTION_RULE: &str = "─";
 
 /// Rows of tool output shown before the collapse notice.
 ///
@@ -1949,7 +1932,7 @@ impl TranscriptView {
         rows
     }
 
-    /// One message's rows: its separator or header, then each of its parts.
+    /// One message's rows: a quiet separator, then each of its parts.
     ///
     /// Factored out of [`Self::lines`] rather than duplicated into the cached path,
     /// because "the two paths produce the same rows" is a property worth having
@@ -1967,45 +1950,12 @@ impl TranscriptView {
         let mut tools = Vec::new();
         let mut reasoning = Vec::new();
         let rule = self.rule_style(message.role);
-        // A multi-step turn opens one assistant message per step, so a header per
-        // message printed `Assistant` five times for what the user experienced as
-        // one reply. The header marks a change of speaker, which is what it was
-        // always for; the left rule already runs down every row of the turn.
-        if previous == Some(message.role) {
-            // The same speaker again, which is the *inside* of one reply rather than a
-            // boundary between two. Its separator carries the rule, because a bare
-            // blank row here cut the rule into one fragment per step and so broke the
-            // very continuity the header was suppressed in order to preserve — the
-            // claim above was false for every multi-step turn.
-            lines.push(self.ruled(message.role, rule, "", self.context.surface(), width));
-        } else if previous.is_some() {
-            // A change of speaker is the one boundary a reader scans for, so it gets
-            // the stronger of the two separators: a row with no rule at all. Two
-            // grades of gap is what lets the eye tell "the other party is talking now"
-            // from "this reply took another step" without reading either row.
-            lines.push(padded("", width, self.context.surface()));
-        }
-        if message.role == Role::User {
-            self.push_boxed(
-                message_index,
-                message,
-                rule,
-                width,
-                &mut lines,
-                &mut reasoning,
-            );
-            let copy = self.copy_rows(message, previous, width, &lines);
-            return MessageRows {
-                lines,
-                tools,
-                reasoning,
-                copy,
-            };
-        }
-        if previous != Some(message.role)
-            && let Some(label) = self.role_label(message.role)
-        {
-            lines.push(self.role_header(message.role, rule, label, width));
+        // The message surface and gutter marker already state the speaker. A single
+        // base-background row is enough separation for both a new speaker and another
+        // step from the same speaker; role headings and framed prompts duplicated that
+        // information and made short exchanges mostly chrome.
+        if previous.is_some() {
+            lines.push(padded("", width, self.transcript_surface()));
         }
         let mut parts = message.parts.iter().enumerate().peekable();
         while let Some((part_index, part)) = parts.next() {
@@ -2078,21 +2028,8 @@ impl TranscriptView {
         let separator_rows = usize::from(previous.is_some());
         let gutter = u16::try_from(display_width(message.role.marker()) + 1).unwrap_or(2);
         let mut first_content = separator_rows;
-        let mut last_content = lines.len();
-        if message.role == Role::User {
-            let edge = u16::try_from(display_width(USER_BOX_RIGHT)).unwrap_or(1);
-            let inner = width.saturating_sub(gutter.saturating_add(edge));
-            if inner >= USER_BOX_MIN_INNER_COLS {
-                first_content = first_content.saturating_add(1);
-                last_content = last_content.saturating_sub(1);
-            } else if self.role_label(Role::User).is_some() {
-                first_content = first_content.saturating_add(1);
-            }
-        } else if previous != Some(message.role) && self.role_label(message.role).is_some() {
-            first_content = first_content.saturating_add(1);
-        }
+        let last_content = lines.len();
         first_content = first_content.min(lines.len());
-        last_content = last_content.max(first_content).min(lines.len());
 
         let mut copy = vec![None; lines.len()];
         let content_indices = (first_content..last_content).collect::<Vec<_>>();
@@ -2107,8 +2044,7 @@ impl TranscriptView {
                     .iter()
                     .map(|span| span.content.as_ref())
                     .collect::<String>();
-                let right = width.saturating_sub(u16::from(message.role == Role::User));
-                slice_columns(&text, gutter, right).trim_end().to_owned()
+                slice_columns(&text, gutter, width).trim_end().to_owned()
             })
             .collect::<Vec<_>>();
 
@@ -2231,129 +2167,6 @@ impl TranscriptView {
         }
     }
 
-    /// The user's message as a closed box: a titled top rule, the body, a closing rule.
-    ///
-    /// # Why the user's turn is framed and the assistant's is not
-    ///
-    /// Both sides used to be a label over flowing text, told apart only by one glyph in
-    /// column zero — `▌` against `│`. Reported: a long conversation was hard to scan,
-    /// because "what I asked" and "what it answered" look the same from a metre away and
-    /// the glyph that distinguishes them is one cell wide. Upstream frames the same side
-    /// and leaves the other unframed (`routes/session/index.tsx:1395-1420`), and a real
-    /// `opencode 1.18.18` pane confirms it: the user's turn carries a rule down its left
-    /// edge while the reply is bare prose.
-    ///
-    /// So only one side is framed, and it is the user's, for two reasons that point the
-    /// same way. The prompt is short and finite, so a frame costs it two rows out of
-    /// three or four rather than two out of forty; and prose the model wrote is the thing
-    /// being *read*, which a box interrupts. Framing both would restore the symmetry this
-    /// exists to break.
-    ///
-    /// # The box's edges are the crate's existing vocabulary, not new glyphs
-    ///
-    /// The left edge is [`Role::marker`]'s own `▌`, unchanged, so every positional
-    /// assertion that reads a user row at column zero still reads one and the accent
-    /// colour still runs down the turn. The right edge is
-    /// [`crate::views::session::COMPOSER_RIGHT_RULE`]'s `▐`, which is already what this
-    /// crate uses to close a region on the right. Nothing here invents a symbol, which is
-    /// why the box reads as part of the same surface family as the composer.
-    ///
-    /// # The heading rides the top rule instead of owning a row
-    ///
-    /// A separate `You` row plus a top rule would spend two rows on chrome before the
-    /// first word. The label sits *in* the rule — `▌ You ─────▐` — so the box costs the
-    /// same two rows the old header-plus-nothing arrangement did, and the top row still
-    /// contains the literal `▌ You` every existing assertion looks for.
-    ///
-    /// The rule is dropped rather than the label when the pane cannot hold both: a
-    /// truncated `Yo` names nobody, while a label with no dashes beside it is still a
-    /// heading.
-    fn push_boxed(
-        &self,
-        message_index: usize,
-        message: &Message,
-        rule: Style,
-        width: u16,
-        out: &mut Vec<Line<'static>>,
-        reasoning: &mut Vec<(usize, ReasoningKey)>,
-    ) {
-        let marker = Role::User.marker();
-        // The columns the frame itself spends: the marker, the space after it, and the
-        // right edge. Everything below is measured against what is left, so a pane too
-        // narrow to hold a body degrades to the unframed rows rather than to a box with
-        // negative width.
-        let gutter = u16::try_from(display_width(marker) + 1).unwrap_or(2);
-        let edge = u16::try_from(display_width(USER_BOX_RIGHT)).unwrap_or(1);
-        let inner = width.saturating_sub(gutter.saturating_add(edge));
-        if inner < USER_BOX_MIN_INNER_COLS {
-            // No frame at all rather than a broken one, the same degradation the composer
-            // rules and the ambient panel make. The header is restored here because the
-            // top rule that would have carried it is what has just been dropped.
-            if let Some(label) = self.role_label(Role::User) {
-                out.push(self.ruled(Role::User, rule, label, self.context.title(), width));
-            }
-            for (part_index, part) in message.parts.iter().enumerate() {
-                let key = ReasoningKey {
-                    message: message_index,
-                    part: part_index,
-                };
-                if matches!(part, MessagePart::Reasoning { .. }) {
-                    reasoning.push((out.len(), key));
-                }
-                self.part_lines(
-                    Role::User,
-                    rule,
-                    part,
-                    self.reasoning_display(key),
-                    width,
-                    out,
-                );
-            }
-            return;
-        }
-        out.push(self.boxed_edge(rule, self.role_label(Role::User), inner));
-        let mut body = Vec::new();
-        for (part_index, part) in message.parts.iter().enumerate() {
-            let key = ReasoningKey {
-                message: message_index,
-                part: part_index,
-            };
-            if matches!(part, MessagePart::Reasoning { .. }) {
-                reasoning.push((out.len() + body.len(), key));
-            }
-            self.part_lines(
-                Role::User,
-                rule,
-                part,
-                self.reasoning_display(key),
-                gutter + inner,
-                &mut body,
-            );
-        }
-        for mut line in body {
-            line.spans
-                .push(Span::styled(USER_BOX_RIGHT.to_owned(), rule));
-            out.push(line);
-        }
-        out.push(self.boxed_edge(rule, None, inner));
-    }
-
-    /// One horizontal rule of the user's box, carrying `label` when it has one.
-    fn boxed_edge(&self, rule: Style, label: Option<&'static str>, inner: u16) -> Line<'static> {
-        let marker = Role::User.marker();
-        let mut spans = vec![Span::styled(format!("{marker} "), rule)];
-        let mut spent = 0usize;
-        if let Some(label) = label {
-            let text = format!("{label} ");
-            spent = display_width(&text);
-            spans.push(Span::styled(text, self.context.title()));
-        }
-        let dashes = usize::from(inner).saturating_sub(spent);
-        spans.push(Span::styled(USER_BOX_RULE.repeat(dashes), rule));
-        spans.push(Span::styled(USER_BOX_RIGHT.to_owned(), rule));
-        Line::from(spans)
-    }
-
     /// One bottom margin separating the reply from the sticky identity row.
     ///
     /// Transient liveness no longer belongs to the transcript. It is rendered in the
@@ -2361,7 +2174,7 @@ impl TranscriptView {
     /// content, or duplicated beside a running tool spinner.
     fn push_margin(&self, lines: &mut Vec<Line<'static>>, any_message: bool, width: u16) {
         if any_message {
-            lines.push(padded("", width, self.context.surface()));
+            lines.push(padded("", width, self.transcript_surface()));
         }
     }
 
@@ -2498,36 +2311,6 @@ impl TranscriptView {
         lines
     }
 
-    /// The heading a change of speaker prints, when the speaker is a party to the
-    /// conversation.
-    ///
-    /// `None` for [`Role::System`], and that absence is the whole change. The session is
-    /// not a speaker: everything it says is already marked as its own by the `▲` rule at
-    /// column zero and by a level glyph — `✓`, `!`, `✗` — that no party's text carries. A
-    /// `Session` heading therefore restated what the row beneath it already said, and it
-    /// restated it *at the top of the frame*: a one-line `model set to … for the next
-    /// turn` opened a fresh conversation with a blank row, a `Session` heading and the
-    /// notice, three rows of which one was content. That was reported, in the owner's
-    /// words, as a session hint that need not be shown at all on a first conversation.
-    ///
-    /// The blank separator above it is deliberately kept — see [`Self::message_rows`] —
-    /// because it is what stops a notice from reading as the tail of the reply above it.
-    /// Only the heading goes.
-    const fn role_label(&self, role: Role) -> Option<&'static str> {
-        match role {
-            Role::User => Some("You"),
-            Role::Assistant => Some("Assistant"),
-            Role::System => None,
-        }
-    }
-
-    /// A speaker title followed by a weak rule, so a new answer is visible without boxing
-    /// the prose or painting a full-width accent stripe.
-    fn role_header(&self, role: Role, rule: Style, label: &str, width: u16) -> Line<'static> {
-        let room = usize::from(width).saturating_sub(display_width(role.marker()) + 1);
-        self.ruled_spans(role, rule, self.title_rule_spans("", label, room), width)
-    }
-
     /// A neutral title plus a weak trailing rule within `room` terminal columns.
     fn title_rule_spans(&self, inset: &str, label: &str, room: usize) -> Vec<Span<'static>> {
         let mut spans = Vec::new();
@@ -2541,7 +2324,7 @@ impl TranscriptView {
             let rule = room.saturating_sub(used).saturating_sub(1);
             if rule > 0 {
                 spans.push(Span::styled(
-                    USER_BOX_RULE.repeat(rule),
+                    SECTION_RULE.repeat(rule),
                     self.context.muted(),
                 ));
             }
@@ -2549,14 +2332,35 @@ impl TranscriptView {
         spans
     }
 
+    /// The terminal base used for assistant prose and gaps between messages.
+    fn transcript_surface(&self) -> Style {
+        let palette = self.context.palette();
+        Style::new()
+            .fg(palette.text.into())
+            .bg(palette.background.into())
+    }
+
+    /// Re-seat semantic text on the role's transcript surface.
+    ///
+    /// User prompts get the inset-element background, while assistant and system rows
+    /// use the terminal base. The foreground and modifiers still come from the semantic
+    /// style, so warning, error, success, reasoning, and syntax colours remain intact.
+    fn on_message_surface(&self, role: Role, style: Style) -> Style {
+        let palette = self.context.palette();
+        let background = match role {
+            Role::User => palette.background_element,
+            Role::Assistant | Role::System => palette.background,
+        };
+        style.bg(background.into())
+    }
+
     fn rule_style(&self, role: Role) -> Style {
-        match role {
+        let style = match role {
             Role::User => self.context.accent(),
-            Role::Assistant => Style::new()
-                .fg(self.context.palette().border_subtle.into())
-                .bg(self.context.palette().background_panel.into()),
+            Role::Assistant => Style::new().fg(self.context.palette().text_muted.into()),
             Role::System => self.context.warning(),
-        }
+        };
+        self.on_message_surface(role, style)
     }
 
     /// One row carrying the role's left rule, then `body` in `style`.
@@ -2588,8 +2392,8 @@ impl TranscriptView {
             text.extend(std::iter::repeat_n(' ', room - used));
         }
         Line::from(vec![
-            Span::styled(format!("{marker} "), rule),
-            Span::styled(text, style),
+            Span::styled(format!("{marker} "), self.on_message_surface(role, rule)),
+            Span::styled(text, self.on_message_surface(role, style)),
         ])
     }
 
@@ -2609,14 +2413,22 @@ impl TranscriptView {
         let marker = role.marker();
         let gutter = display_width(marker) + 1;
         let room = usize::from(width).saturating_sub(gutter);
-        let mut out = vec![Span::styled(format!("{marker} "), rule)];
+        let role_surface = self.on_message_surface(role, self.context.surface());
+        let role_background = role_surface.bg;
+        let panel_background = self.context.surface().bg;
+        let mut out = vec![Span::styled(
+            format!("{marker} "),
+            self.on_message_surface(role, rule),
+        )];
         let mut body = crate::views::markdown::truncate_row(spans, room);
+        for span in &mut body {
+            if span.style.bg.is_none() || span.style.bg == panel_background {
+                span.style.bg = role_background;
+            }
+        }
         let used = crate::views::markdown::row_width(&body);
         if used < room {
-            body.push(Span::styled(
-                " ".repeat(room - used),
-                self.context.surface(),
-            ));
+            body.push(Span::styled(" ".repeat(room - used), role_surface));
         }
         out.append(&mut body);
         Line::from(out)
@@ -3069,7 +2881,7 @@ impl TranscriptView {
             for row in rows.into_iter().take(budget.rows) {
                 let mut spans = vec![Span::styled(
                     format!("{marker} {}", Self::RESULT_INSET),
-                    rule,
+                    self.on_message_surface(role, rule),
                 )];
                 spans.extend(row.spans);
                 out.push(Line::from(spans));

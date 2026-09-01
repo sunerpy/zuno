@@ -373,11 +373,15 @@ fn views_dialog_renders_over_a_live_base() {
         step: 1,
         message_id: String::from("msg"),
     }));
+    host.handle_event(&AppEvent::Engine(TurnEvent::Provider {
+        step: 1,
+        event: zuno_llm::event::StreamEvent::TextDelta(String::from("assistant base")),
+    }));
     let (probe, _) = Probe::new("probe", "dialog body");
     host.open(Box::new(probe));
     let joined = rows(&render_offscreen(&mut host, 40, 12).expect("infallible")).join("\n");
     assert!(
-        joined.contains("Assistant"),
+        joined.contains("assistant base"),
         "the base vanished behind the dialog, so the prompt cannot be judged:\n{joined}"
     );
     assert!(
