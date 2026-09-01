@@ -382,12 +382,20 @@ mod tests {
 
     use super::*;
 
+    fn absolute_test_command() -> String {
+        std::env::current_exe()
+            .expect("the test executable has an absolute path")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
     fn parses_and_redacts_standard_servers() {
+        let command = absolute_test_command();
         let value = json!([
             {
                 "name": "Fancy server!",
-                "command": "/usr/bin/node",
+                "command": command,
                 "args": ["server.js"],
                 "env": [{"name": "TOKEN", "value": "sentinel-secret"}]
             },
@@ -402,7 +410,7 @@ mod tests {
         assert!(servers[0].name().starts_with("Fancy_server_"));
         assert!(servers[1].name().starts_with("server_"));
         let debug = format!("{servers:?}");
-        assert!(!debug.contains("/usr/bin/node"));
+        assert!(!debug.contains(&command));
         assert!(!debug.contains("sentinel-secret"));
         assert!(!debug.contains("password"));
         assert!(!debug.contains("token=secret"));
@@ -448,16 +456,17 @@ mod tests {
 
     #[test]
     fn normalized_names_are_stable_and_collision_checked() {
+        let command = absolute_test_command();
         let value = json!([
             {
                 "name": "same name",
-                "command": "/bin/true",
+                "command": command,
                 "args": [],
                 "env": []
             },
             {
                 "name": "same name",
-                "command": "/bin/true",
+                "command": command,
                 "args": [],
                 "env": []
             }

@@ -38,6 +38,7 @@ all = "warn"
 # -- first-party crates (path-only; the workspace is not published) ----------
 zuno-acp = { path = "crates/zuno-acp" }
 zuno-agent = { path = "crates/zuno-agent" }
+zuno-atomic-file = { path = "crates/zuno-atomic-file" }
 zuno-attachment = { path = "crates/zuno-attachment" }
 zuno-auth = { path = "crates/zuno-auth" }
 zuno-catalog = { path = "crates/zuno-catalog" }
@@ -226,6 +227,11 @@ tree-sitter-typescript = "=0.23.2"
 tree-sitter-yaml = "=0.7.2"
 walkdir = "2.5.0"
 which = "8.0.5"
+# Windows replacement is the one filesystem boundary that safe `std` APIs do
+# not express: `std::fs::rename` uses MoveFileEx and can briefly remove an
+# existing destination. `winsafe` keeps the FFI outside first-party crates so
+# the workspace-wide `unsafe_code = "forbid"` guarantee remains intact.
+winsafe = { version = "=0.0.28", default-features = false, features = ["kernel"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 wasmtime = { version = "48.0.0", default-features = false, features = [
   "anyhow",

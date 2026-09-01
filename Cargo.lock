@@ -5982,6 +5982,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "winsafe"
+version = "0.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d3922ac07e168376bc6799e7896fc737ddb9538be7533ca44bc3463091db1ad"
+
+[[package]]
 name = "winx"
 version = "0.36.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6305,6 +6311,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zuno-atomic-file"
+version = "0.0.3"
+dependencies = [
+ "tempfile",
+ "uuid",
+ "winsafe",
+]
+
+[[package]]
 name = "zuno-attachment"
 version = "0.0.3"
 dependencies = [
@@ -6602,6 +6617,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "uuid",
+ "zuno-atomic-file",
  "zuno-db",
  "zuno-engine",
  "zuno-error",
@@ -6741,6 +6757,7 @@ dependencies = [
  "tracing",
  "uuid",
  "zuno-agent",
+ "zuno-atomic-file",
  "zuno-config",
  "zuno-db",
  "zuno-engine",

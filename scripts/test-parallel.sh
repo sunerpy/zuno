@@ -52,6 +52,11 @@ THREADS=${THREADS:-4}
 SUITE_TIMEOUT=${SUITE_TIMEOUT:-300}
 OFFLINE=${OFFLINE:---offline}
 RUN_DOCTESTS=${RUN_DOCTESTS:-1}
+# Windows commonly starts Python with a legacy console encoding such as GBK.
+# Test names and failure output are UTF-8 data, so one non-ASCII character must
+# not crash the scheduler before it writes codes.tsv and the final verdict.
+export PYTHONUTF8=${PYTHONUTF8:-1}
+export PYTHONIOENCODING=${PYTHONIOENCODING:-utf-8:backslashreplace}
 OFFLINE_ARGS=()
 read -r -a OFFLINE_ARGS <<< "$OFFLINE"
 

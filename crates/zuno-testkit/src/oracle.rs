@@ -792,25 +792,18 @@ mod tests {
     /// [`Oracle::probe_version`]. So the only way to pass is for the declared pin to
     /// equal what the binary says about itself.
     ///
-    /// Absence is skipped and disagreement is fatal, because those are different
-    /// facts: a machine without `opencode` cannot verify anything, while a machine
-    /// with the *wrong* `opencode` will produce artifacts that name a build that
-    /// never ran.
+    /// The external process is run only when [`ENV_ORACLE_BINARY`] explicitly opts
+    /// this test into upstream research. A default workspace test must not acquire a
+    /// dependency on whichever unrelated OpenCode happens to be on the developer's
+    /// `PATH`.
     #[test]
     fn the_declared_pin_equals_the_version_the_resolved_binary_reports() {
-        let oracle = match Oracle::discover() {
-            Ok(oracle) => oracle,
-            Err(TestkitError::BinaryNotFound { .. }) => {
-                eprintln!(
-                    "SKIPPED the_declared_pin_equals_the_version_the_resolved_binary_reports: no \
-                     opencode on PATH and no {ENV_ORACLE_BINARY}; the pin was NOT verified"
-                );
-                return;
-            }
-            Err(other) => {
-                panic!("resolving the oracle failed for a reason other than absence: {other}")
-            }
+        let Some(explicit) = explicitly_configured_oracle(
+            "the_declared_pin_equals_the_version_the_resolved_binary_reports",
+        ) else {
+            return;
         };
+        let oracle = Oracle::at_binary(explicit).expect("run the explicit research oracle");
         assert_eq!(
             oracle.reported_version(),
             PINNED_RELEASE,
@@ -822,9 +815,8 @@ mod tests {
             oracle.reported_version()
         );
 
-        let pinned =
-            Oracle::discover_pinned().expect("the agreeing oracle must also pass the gate");
-        assert_eq!(pinned.reported_version(), PINNED_RELEASE);
+        check_pin(oracle.reported_version(), oracle.program())
+            .expect("the agreeing explicit oracle must pass the pin gate");
     }
 
     /// The screen that replaced nine hard-coded package-manager paths.
@@ -837,26 +829,21 @@ mod tests {
     /// release, which is the mutant that matters: dropping the behavioural screen
     /// makes the first `PATH` hit win and this test go red.
     ///
-    /// Absence is an ordinary skip, the same contract [`pinned_oracle_or_skip`]
-    /// applies. It used to be a failure unless the since-removed
-    /// `OC_TESTKIT_ALLOW_MISSING_ORACLE` was set — that spelling is recorded as it
-    /// was and no longer names anything this crate reads — because measuring nothing
-    /// against a real release was a fact a project
-    /// claiming parity had to declare deliberately. Zuno makes no such claim, so a
-    /// machine without `opencode` is now the normal case rather than an omission
-    /// worth confessing — and demanding the variable only meant this unit test failed
-    /// on every machine that had never installed the other program.
+    /// The process is screened only when [`ENV_ORACLE_BINARY`] is explicit. Zuno
+    /// makes no parity claim, so an ambient package-manager shim is neither a test
+    /// dependency nor evidence that upstream research was requested.
     #[test]
     fn the_resolved_pinned_oracle_reports_the_pin_from_this_working_directory() {
+        if explicitly_configured_oracle(
+            "the_resolved_pinned_oracle_reports_the_pin_from_this_working_directory",
+        )
+        .is_none()
+        {
+            return;
+        }
         let program = match pinned_oracle() {
             PinnedOracle::Found(program) => program.clone(),
-            PinnedOracle::Absent(reason) => {
-                eprintln!(
-                    "SKIPPED the_resolved_pinned_oracle_reports_the_pin_from_this_working_directory: \
-                     {reason}"
-                );
-                return;
-            }
+            PinnedOracle::Absent(reason) => panic!("{reason}"),
             PinnedOracle::Disagrees(reason) => panic!("{reason}"),
         };
 
@@ -878,6 +865,17 @@ mod tests {
                 .display(),
             String::from_utf8_lossy(&output.stderr),
         );
+    }
+
+    fn explicitly_configured_oracle(test: &str) -> Option<PathBuf> {
+        let explicit = std::env::var_os(ENV_ORACLE_BINARY);
+        if explicit.is_none() {
+            eprintln!(
+                "SKIPPED {test}: optional upstream research requires an explicit \
+                 {ENV_ORACLE_BINARY}; ambient PATH installations are ignored"
+            );
+        }
+        explicit.map(PathBuf::from)
     }
 
     /// The route is discovered, not written down.

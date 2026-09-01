@@ -745,28 +745,29 @@ fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<(), AttachmentError
             path: temporary.clone(),
             source,
         })?;
+    // Windows does not permit every rename/read race while the creating handle
+    // is still open. The bytes are durable already, so close that handle before
+    // publishing the content-addressed name.
+    drop(file);
     match fs::rename(&temporary, path) {
         Ok(()) => {
             sync_directory(parent)?;
             Ok(())
         }
-        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = fs::remove_file(&temporary);
-            let existing = fs::read(path).map_err(|source| AttachmentError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-            if existing == bytes {
-                Ok(())
-            } else {
-                Err(AttachmentError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                })
-            }
-        }
         Err(source) => {
             let _ = fs::remove_file(&temporary);
+            // Different platforms report a no-clobber rename collision with
+            // different error kinds. The authoritative fact is whether the
+            // content-addressed destination now contains the same bytes.
+            if path.exists() {
+                let existing = fs::read(path).map_err(|source| AttachmentError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                if existing == bytes {
+                    return Ok(());
+                }
+            }
             Err(AttachmentError::Io {
                 path: path.to_path_buf(),
                 source,
@@ -814,6 +815,7 @@ fn set_private_file(_file: &File, _path: &Path) -> Result<(), AttachmentError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), AttachmentError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -821,6 +823,15 @@ fn sync_directory(path: &Path) -> Result<(), AttachmentError> {
             path: path.to_path_buf(),
             source,
         })
+}
+
+// Rust's portable file API cannot open a Windows directory for FlushFileBuffers.
+// The object file itself is synced before the atomic rename; directory fsync is
+// an additional Unix durability barrier, not a reason to reject a valid object
+// on platforms that do not expose it.
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), AttachmentError> {
+    Ok(())
 }
 
 fn walk_files(root: &Path) -> Result<Vec<PathBuf>, AttachmentError> {

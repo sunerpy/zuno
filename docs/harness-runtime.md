@@ -719,6 +719,17 @@ it never edits the resident file directly. Candidates retain scope, action,
 reason, confidence, source session/message, timestamps, diagnostics, and exact
 before/after snapshots.
 
+Goal Markdown projections and promoted Resident Memory files share
+`zuno-atomic-file` for visibility-atomic replacement. The provider writes a
+completed sibling and uses `rename` on Unix or `ReplaceFileW` over an existing
+Windows destination. A successful open sees only a complete old or new version.
+Because Windows can reject a fresh open with `ERROR_FILE_NOT_FOUND` or
+`ERROR_SHARING_VIOLATION` while `ReplaceFileW` holds its handles, the same
+component gives consumers a bounded retry for exactly those two errors. It does
+not hide permissions or other durable failures. This boundary is separate from
+crash durability; authoritative session state remains in SQLite, and each caller
+owns any stronger sync policy.
+
 The default Memory promotion policy is `review`. `high_confidence` applies
 candidates at or above the configured threshold, while `automatic` applies every
 validated candidate. All policies use the same durable state machine:

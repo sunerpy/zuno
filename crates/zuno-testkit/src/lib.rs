@@ -3,6 +3,12 @@
 //! The crate provides scripted environments, cassette-backed providers, diff
 //! helpers, protocol fixtures, and optional upstream research tools.
 //!
+//! The upstream tools are test-only and opt-in. Normal workspace tests never
+//! require or select an installed OpenCode binary merely because one happens to
+//! be on `PATH`; an operator starts that research surface explicitly with
+//! `ZUNO_TESTKIT_ORACLE` or `ZUNO_TESTKIT_ORACLE_SOURCE`. Zuno product crates
+//! have no normal dependency on this crate.
+//!
 //! # The failure this crate exists to prevent
 //!
 //! A reference Rust agent shipped an MCP stdio client that framed messages with

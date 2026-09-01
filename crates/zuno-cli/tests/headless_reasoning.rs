@@ -6,7 +6,7 @@ use std::process::Output;
 use std::time::Duration;
 
 use serde_json::json;
-use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv};
+use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config};
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 const REASONING: &str = "VISIBLE_PROVIDER_REASONING";
@@ -63,7 +63,7 @@ fn chat_response(reasoning: Option<&str>, text: &str, provenance: &'static str) 
 }
 
 fn config(base_url: &str) -> String {
-    json!({
+    trusted_platform_config(json!({
         "formatter": false,
         "lsp": false,
         "memory": false,
@@ -95,7 +95,7 @@ fn config(base_url: &str) -> String {
                 }
             }
         }
-    })
+    }))
     .to_string()
 }
 

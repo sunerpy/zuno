@@ -1546,6 +1546,8 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
         .expect("the binary-parallel test scheduler is readable");
     for required in [
         "RUN_DOCTESTS=${RUN_DOCTESTS:-1}",
+        "export PYTHONUTF8=${PYTHONUTF8:-1}",
+        "export PYTHONIOENCODING=${PYTHONIOENCODING:-utf-8:backslashreplace}",
         "--no-run",
         "--timings",
         "--message-format=json",
