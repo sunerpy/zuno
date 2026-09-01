@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/sunerpy/zuno/compare/v0.4.0...v0.5.0) (2026-09-01)
+
+
+### Features
+
+* govern progressive skill discovery ([#68](https://github.com/sunerpy/zuno/issues/68)) ([177e542](https://github.com/sunerpy/zuno/commit/177e5426eea54fcb1a8ec4a8cfef2b422e0712d8))
+
 ## [0.4.0](https://github.com/sunerpy/zuno/compare/v0.3.0...v0.4.0) (2026-09-01)
 
 
