@@ -426,7 +426,7 @@ fn extension_development_docs_pin_supported_boundaries_and_ownership() {
     );
     for relative in [
         "docs/design/documentation-coverage.md",
-        "docs/zh/operate/documentation-coverage.md",
+        "docs/zh/design/documentation-coverage.md",
     ] {
         contains_all(
             relative,

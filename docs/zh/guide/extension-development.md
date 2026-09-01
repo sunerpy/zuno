@@ -8,7 +8,7 @@ Agent。覆盖声明式 Agent、WASI Component Model 工具、受信进程工具
 
 - **Agent 定义**选择提示词、模型路由、工具、权限、Skill 与委派目标；
 - **可执行插件**在经过校验的包边界后实现一个或多个工具；
-- **`AgentDriver`**拥有回合驱动算法本身。
+- **AgentDriver** 拥有回合驱动算法本身。
 
 声明式包或 WASI 包可以同时增加 Agent 和工具，但不能替换 Provider 循环、
 凭据权限源、审批服务、持久 inbox 或子回合调度器。这些属于受信的原生 Rust
@@ -603,4 +603,4 @@ OS 所有的凭据与文件系统边界上的原生执行。
 | 可执行示例 | `examples/plugins/` |
 
 其余公共 Zuno 能力由哪一份页面负责，见
-[文档架构与覆盖地图](/zh/operate/documentation-coverage)。
+[文档架构与覆盖地图](/zh/design/documentation-coverage)。

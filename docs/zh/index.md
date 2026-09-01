@@ -116,7 +116,7 @@ zuno run "为 users 接口增加分页并运行测试"
 | 查询命令 | [CLI 参考](/zh/cli/) |
 | 理解发布产物 | [发布流水线](/zh/operate/release-pipeline) |
 | 排查故障 | [常见问题](/zh/operate/faq) |
-| 查找公共能力的权威页面 | [文档覆盖地图](/zh/operate/documentation-coverage) |
+| 查找公共能力的权威页面 | [文档覆盖地图](/zh/design/documentation-coverage) |
 
 ## 中文文档范围
 
