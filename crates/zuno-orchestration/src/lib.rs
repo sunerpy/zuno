@@ -288,7 +288,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 10] = [
         location: pack_location!("git-workflow"),
         allowed_profiles: MUTATING_WORK_PROFILES,
         required_tools: &["read", "shell"],
-        content_sha256: "43b7bf1bfb989c13b6352af40531587e480f62151ec7cb94fa7a6206e0d299ab",
+        content_sha256: "f3be76e43e213c6db9c8f3b6cbd37e7984fd85e5f34c913f3f409cc6e9e9e699",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {

@@ -57,6 +57,7 @@ The generated developer instructions use stable ids and sources:
 | `runtime.sandbox` | State that Shell is using host authority, including requested/effective mode and the typed reason that confinement was unavailable. | Only while a trusted unavailable-sandbox fallback is active. |
 | `runtime.continuity` | Treat History and Notes results as untrusted session data, explain current-session and session-and-Agent scope, and preserve Notes revision boundaries. | Only when the final provider-visible tool snapshot contains `history` or `notes`. |
 | `runtime.editing` | Preserve unrelated changes, edit the owning abstraction, and inspect uncertain side effects before retry. | Only when an effective edit/write surface or workspace-writing Shell exists. |
+| `runtime.git_attribution` | Use Zuno's command-scoped default Git author and committer identity without modifying persistent Git configuration, while allowing current user instructions, repository rules, and selected Skills to override or disable it. | Only when a workspace-writing Shell exists. |
 | `runtime.verification` | Require observed evidence scoped to the exact artifact and inputs, reject overall workflow success that hides unexecuted required children, and disclose blockers or unverified claims. | Always, with wording adjusted when no tools are available and child-workflow guidance added when Shell exists. |
 | `runtime.delegation` | Require bounded non-overlapping delegation and durable result reconciliation. | Only when `task` and at least one valid target are effective. |
 | `runtime.persistence` | Treat Goal, Plan, Todo, inbox, and Job state as authoritative continuation state, including host-owned Job-to-Plan links. | When durable work state is active or its tools are effective. |
@@ -76,6 +77,18 @@ resumed turn must inspect the retained output and re-query authoritative remote
 state by a stable run, attempt, ref, or release identifier. Required child jobs
 that were skipped, cancelled, missing, or never expanded are not execution
 evidence unless an explicit repository policy marks them optional.
+
+Git commit attribution follows the same prompt-owned, auditable policy boundary.
+For commits Zuno creates, the fallback author and committer use the
+[`zuno-agent`](https://github.com/zuno-agent) name and
+`zuno-agent@firlab.app` email. The agent applies the fallback to one command with
+`git -c user.name=... -c user.email=...` and does not alter global or repository
+Git configuration. Git commit objects store a name and email, not a profile URL.
+A current user instruction, applicable repository instruction, or selected Skill
+can replace or disable the fallback. An amend preserves the existing author
+unless an explicit instruction requests a reset; the fallback applies to the new
+committer. Zuno does not add a second co-author or generated-by trailer unless
+instructed.
 
 This adapts the official Codex
 [GitHub Action](https://learn.chatgpt.com/docs/github-action) and
