@@ -62,6 +62,27 @@ pub fn wait_for_exit(service: &PtyService, id: &PtyId) -> PtyInfo {
     observed.expect("the poll above proved the session is present")
 }
 
+/// Blocks until an exited session is recorded in the retention queue.
+///
+/// Exit publication and retention recording are deliberately separate phases:
+/// the waiter marks the session exited while holding its state lock, then records
+/// it after releasing that lock to avoid lock inversion with the registry. Tests
+/// that need an exact exit order must wait for both phases before releasing the
+/// next process.
+///
+/// # Panics
+///
+/// If the session is not retained within [`BUDGET`].
+pub fn wait_for_retained_exit(service: &PtyService, id: &PtyId) {
+    let retained = poll_until(|| service.retained_exited().contains(id));
+    assert!(
+        retained,
+        "session {id} was not recorded in the retention queue within {BUDGET:?}; \
+         retained exits {:?}",
+        service.retained_exited()
+    );
+}
+
 /// Blocks until a session either reports [`PtyStatus::Exited`] or is gone.
 ///
 /// Needed whenever more sessions than the retention cap exit at once: an eviction

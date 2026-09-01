@@ -18,7 +18,7 @@ mod common;
 
 use zuno_pty::{EXITED_LIMIT, PtyId, PtyService, PtyServiceConfig, PtyStatus};
 
-use common::{spawn_script, wait_for_exit, wait_for_exit_or_eviction};
+use common::{spawn_script, wait_for_exit, wait_for_exit_or_eviction, wait_for_retained_exit};
 
 /// Sessions created per pass. Five above the cap, so five must be evicted.
 const CREATED: usize = 30;
@@ -129,7 +129,11 @@ fn thirty_exited_sessions_retain_the_twenty_five_that_exited_last() {
     let mut exit_order = Vec::with_capacity(CREATED);
     for index in (0..CREATED).rev() {
         release(&service, &created[index]);
+        // Status publication and retention recording are separate phases. Waiting
+        // only for `Exited` lets the next child overtake this one before
+        // `record_exit`, so settle both phases before releasing another child.
         wait_for_exit(&service, &created[index]);
+        wait_for_retained_exit(&service, &created[index]);
         exit_order.push(created[index].clone());
     }
 
