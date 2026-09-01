@@ -1350,14 +1350,52 @@ fn ci_runs_before_the_protected_merge_without_a_duplicate_push_run() {
             "the consolidated test job lost the supply-chain gate {required:?}"
         );
     }
-    for forbidden in [
-        "HOSTED_RUNNERS",
-        "head.repo.full_name == github.repository",
-        "codebuild-",
-    ] {
+    for forbidden in ["HOSTED_RUNNERS", "codebuild-"] {
         assert!(
             !text.contains(forbidden),
             "public-repository CI still carries the obsolete restriction {forbidden:?}"
+        );
+    }
+    let classify = job_body(&text, "classify").join("\n");
+    for required in [
+        "ACTOR: ${{ github.actor }}",
+        "PR_USER: ${{ github.event.pull_request.user.login }}",
+        "HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}",
+        "[ \"$ACTOR\" = 'github-actions[bot]' ]",
+        "[ \"$PR_USER\" = 'github-actions[bot]' ]",
+        "[ \"$HEAD_REPOSITORY\" = \"$GITHUB_REPOSITORY\" ]",
+        "[[ \"$HEAD_REF\" == release-please--branches--main--* ]]",
+        "echo \"release_pr=${release_pr}\" >> \"$GITHUB_OUTPUT\"",
+    ] {
+        assert!(
+            classify.contains(required),
+            "release PR classification lost fail-closed identity check {required:?}"
+        );
+    }
+    for job in ["test", "artifact", "windows-clippy", "windows-test"] {
+        let body = job_body(&text, job).join("\n");
+        for required in [
+            "needs: classify",
+            "if: needs.classify.outputs.release_pr != 'true'",
+        ] {
+            assert!(
+                body.contains(required),
+                "{job} does not delegate the exact release-please PR to candidate CI; \
+                 missing {required:?}"
+            );
+        }
+    }
+    let gate = job_body(&text, "ci-success").join("\n");
+    for required in [
+        "Release PR routed to candidate",
+        "needs: [classify, test, artifact, windows-clippy, windows-test]",
+        "RELEASE_PR: ${{ needs.classify.outputs.release_pr }}",
+        "elif $release_pr == \"true\" then",
+        "release-please PR is delegated to release-candidate.yml",
+    ] {
+        assert!(
+            gate.contains(required),
+            "CI routing gate lost release-please handling {required:?}"
         );
     }
     for job in ["windows-clippy", "windows-test"] {

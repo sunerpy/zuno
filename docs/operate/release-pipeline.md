@@ -21,6 +21,17 @@ the release tag has the same Git tree.
   `macos-15` Arm64 runner. Windows x86_64 uses `windows-2022`; Windows ARM64
   uses the standard `windows-11-arm` hosted runner.
 
+GitHub places `pull_request` workflow runs created by `GITHUB_TOKEN` into an
+approval-required state. The repository therefore keeps
+`actions/permissions/fork-pr-contributor-approval` at
+`first_time_contributors_new_to_github`: accounts new to GitHub still require an
+operator approval, while the established `github-actions[bot]` can reach the
+workflow router. `ci.yml` accepts the lightweight route only when the actor, PR
+author, same-repository head, `main` base, and release-please branch prefix all
+match. It gives that route a non-protected check name and skips every build job;
+the exact-head candidate workflow remains the sole owner of `zuno/pr-gate`.
+Ordinary and fork PRs still run the complete CI matrix.
+
 The Linux source gate installs pinned `cargo-nextest`. Linux Clippy and tests
 share one job-local target directory; native Windows Clippy and tests are
 independent jobs so they start in parallel instead of placing a global serial

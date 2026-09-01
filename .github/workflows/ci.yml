@@ -5,9 +5,12 @@
 # job therefore runs for both same-repository and fork pull requests; no AWS role,
 # CodeConnection, or privileged self-hosted runner is exposed to submitted code.
 #
-# release-please PRs are created with GITHUB_TOKEN and do not emit another
-# pull_request workflow. release.yml explicitly dispatches release-candidate.yml
-# for those PRs, whose final check has the same required name: zuno/pr-gate.
+# GitHub creates pull_request workflow runs for GITHUB_TOKEN-authored PRs in an
+# approval-required state. The repository approval policy admits the established
+# github-actions bot while still requiring approval for accounts new to GitHub.
+# The classify job then routes only the exact same-repository release-please PR
+# shape away from these duplicate jobs. release-candidate.yml owns that head's
+# real zuno/pr-gate status.
 
 name: CI
 
@@ -33,8 +36,42 @@ env:
   BINARY_NAME: zuno
 
 jobs:
+  classify:
+    name: Classify pull request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      release_pr: ${{ steps.route.outputs.release_pr }}
+    steps:
+      - name: Route only the trusted release-please PR shape
+        id: route
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          release_pr=false
+          if [ "$EVENT_NAME" = pull_request ] \
+            && [ "$ACTOR" = 'github-actions[bot]' ] \
+            && [ "$PR_USER" = 'github-actions[bot]' ] \
+            && [ "$HEAD_REPOSITORY" = "$GITHUB_REPOSITORY" ] \
+            && [ "$BASE_REF" = main ] \
+            && [[ "$HEAD_REF" == release-please--branches--main--* ]]
+          then
+            release_pr=true
+          fi
+          echo "release_pr=${release_pr}" >> "$GITHUB_OUTPUT"
+          echo "release_pr=${release_pr}"
+
   test:
     name: Test
+    needs: classify
+    if: needs.classify.outputs.release_pr != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -107,6 +144,8 @@ jobs:
 
   artifact:
     name: Artifact smoke (host)
+    needs: classify
+    if: needs.classify.outputs.release_pr != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -145,6 +184,8 @@ jobs:
 
   windows-clippy:
     name: Windows Clippy
+    needs: classify
+    if: needs.classify.outputs.release_pr != 'true'
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
@@ -176,6 +217,8 @@ jobs:
 
   windows-test:
     name: Windows test binaries
+    needs: classify
+    if: needs.classify.outputs.release_pr != 'true'
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
@@ -240,9 +283,9 @@ jobs:
           retention-days: 3
 
   ci-success:
-    name: zuno/pr-gate
+    name: ${{ needs.classify.outputs.release_pr == 'true' && 'Release PR routed to candidate' || 'zuno/pr-gate' }}
     if: always()
-    needs: [test, artifact, windows-clippy, windows-test]
+    needs: [classify, test, artifact, windows-clippy, windows-test]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -250,14 +293,23 @@ jobs:
         shell: bash
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          RELEASE_PR: ${{ needs.classify.outputs.release_pr }}
         run: |
           set -euo pipefail
           mapfile -t failures < <(
-            jq -r '
+            jq -r --arg release_pr "$RELEASE_PR" '
               to_entries
               | sort_by(.key)
               | .[]
-              | select(.value.result != "success")
+              | select(
+                  if .key == "classify" then
+                    .value.result != "success"
+                  elif $release_pr == "true" then
+                    .value.result != "skipped"
+                  else
+                    .value.result != "success"
+                  end
+                )
               | "\(.key)=\(.value.result // "<missing>")"
             ' <<<"$NEEDS_JSON"
           )
@@ -265,4 +317,8 @@ jobs:
             printf 'required CI job failed: %s\n' "${failures[@]}"
             exit 1
           fi
-          echo "all required CI jobs succeeded"
+          if [ "$RELEASE_PR" = true ]; then
+            echo "release-please PR is delegated to release-candidate.yml"
+          else
+            echo "all required CI jobs succeeded"
+          fi
