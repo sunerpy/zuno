@@ -6267,7 +6267,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-acp"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -6294,7 +6294,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-agent"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -6312,7 +6312,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-atomic-file"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "tempfile",
  "uuid",
@@ -6321,7 +6321,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-attachment"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -6335,7 +6335,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-auth"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -6357,7 +6357,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-catalog"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "futures",
  "insta",
@@ -6384,7 +6384,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-cli"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -6462,7 +6462,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-config"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "futures",
  "globset",
@@ -6485,7 +6485,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-continuity"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6508,7 +6508,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-db"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "proptest",
@@ -6530,7 +6530,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-engine"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -6559,7 +6559,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-error"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "serde_json",
  "thiserror 2.0.19",
@@ -6568,7 +6568,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-eval"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -6583,7 +6583,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-extension"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "schemars",
@@ -6606,7 +6606,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-goal"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "rusqlite",
@@ -6629,7 +6629,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-harness"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -6646,7 +6646,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-learning"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -6669,7 +6669,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-llm"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "futures",
  "reqwest",
@@ -6690,7 +6690,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-lsp"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -6712,7 +6712,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-mcp"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6743,7 +6743,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-memory"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -6771,7 +6771,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-network"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -6783,7 +6783,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-observability"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -6799,7 +6799,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-orchestration"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "hex",
  "serde",
@@ -6809,7 +6809,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-paths"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.19",
@@ -6819,7 +6819,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-permission"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "dirs",
  "proptest",
@@ -6831,7 +6831,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-process"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "portable-pty",
  "process-wrap",
@@ -6842,7 +6842,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-product-agent"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -6857,7 +6857,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-provider-anthropic"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "futures",
  "reqwest",
@@ -6875,7 +6875,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-provider-bedrock"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "dirs",
@@ -6898,7 +6898,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-provider-compatible"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "futures",
  "reqwest",
@@ -6915,7 +6915,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-provider-google"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -6934,7 +6934,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-provider-openai"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "futures",
  "reqwest",
@@ -6952,7 +6952,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-pty"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "nix 0.30.1",
  "portable-pty",
@@ -6971,7 +6971,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-reaping-fixture"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "serde_json",
  "tokio",
@@ -6985,7 +6985,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-runtime"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -6995,7 +6995,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-sandbox"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "hex",
  "libc",
@@ -7010,7 +7010,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-search"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7021,7 +7021,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-server"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "axum",
@@ -7061,7 +7061,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-snapshot"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7074,7 +7074,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-testkit"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -7111,7 +7111,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-tool"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "schemars",
@@ -7130,7 +7130,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-tools"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7177,7 +7177,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-tui"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7224,14 +7224,14 @@ dependencies = [
 
 [[package]]
 name = "zuno-types"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "zuno-watch"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "globset",
  "ignore",
