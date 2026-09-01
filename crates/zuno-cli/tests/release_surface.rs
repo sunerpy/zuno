@@ -964,7 +964,8 @@ fn macos_x86_candidate_cross_builds_on_arm_and_smokes_through_rosetta() {
     let artifact = job_body(&text, "artifact").join("\n");
     for required in [
         "EXECUTION_ARCH: ${{ matrix.execution_arch }}",
-        "/usr/bin/lipo -verify_arch \"$EXECUTION_ARCH\" unpacked/zuno",
+        "/usr/bin/lipo unpacked/zuno -verify_arch \"$EXECUTION_ARCH\"",
+        "\"target/${{ matrix.target }}/release/zuno-smoke\" \\\n            -verify_arch \"$EXECUTION_ARCH\"",
         "/usr/bin/arch \"-${EXECUTION_ARCH}\"",
         "\"target/${{ matrix.target }}/release/zuno-smoke\"",
     ] {
@@ -973,6 +974,11 @@ fn macos_x86_candidate_cross_builds_on_arm_and_smokes_through_rosetta() {
             "macOS packaging lost the exact-architecture execution proof {required:?}"
         );
     }
+    assert!(
+        !artifact.contains("/usr/bin/lipo -verify_arch"),
+        "lipo requires each input file before the -verify_arch operation; putting the \
+         operation first makes the file path parse as an architecture name"
+    );
 }
 
 #[test]
