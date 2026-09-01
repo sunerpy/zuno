@@ -1,7 +1,7 @@
-# Keep the wall-clock startup budget meaningful under the workspace-wide
-# parallel runner. Nextest executes each test case in its own process, so the
-# in-process lock in `crates/zuno-cli/tests/startup.rs` cannot isolate this
-# binary from unrelated test binaries.
+# Keep startup telemetry comparable under the workspace-wide parallel runner.
+# Nextest executes each test case in its own process, so the in-process lock in
+# `crates/zuno-cli/tests/startup.rs` cannot isolate this binary from unrelated
+# test binaries. Absolute budgets remain opt-in for stable hosts.
 nextest-version = "0.9.103"
 
 [[profile.default.overrides]]

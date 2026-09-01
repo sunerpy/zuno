@@ -465,24 +465,33 @@ Counted as each `Line`, each `Span` and the bytes of its text. Layout is a
 compile-time constant and the workload is deterministic, so these are exact rather
 than sampled.
 
-## Startup budget
+## Startup measurement and stable-host budget
 
-G1's startup budget is enforced by `crates/zuno-cli/tests/startup.rs`, which
-`make test-nextest` runs in CI's `test` job — the reference implementation has eight
-startup budgets and runs none of them in CI, and §7 records that as the weakness
-rather than the thing to copy. Budgets are re-measured here rather than adopted,
-because this is a different binary with a different startup path.
+G1's startup measurement lives in `crates/zuno-cli/tests/startup.rs`, which
+ordinary Cargo, nextest, and Windows binary-level test runs all execute. The
+reference implementation has eight startup budgets and runs none of them in CI;
+Zuno instead preserves the measurements in every run while separating two
+different guarantees:
 
-The measurement is globally isolated from the concurrent workspace suite.
+- deterministic structural startup regressions fail every test run;
+- absolute wall-clock ceilings fail only when an otherwise-idle stable host opts
+  in with `ZUNO_ENFORCE_STARTUP_BUDGET=1`.
+
+Shared GitHub-hosted runners record the wall-clock values in the job summary but
+do not use them as an admission gate. Isolation can remove competition from
+Zuno's own tests; it cannot stabilize the runner's CPU allocation, filesystem,
+virus scanner, or process-creation latency.
+
+The measurement is globally isolated from the concurrent workspace suite so its
+telemetry remains comparable.
 Nextest launches each test case in a separate process, so the Rust `static
 Mutex` in `startup.rs` can coordinate `cargo test` threads but cannot coordinate
 nextest processes. `.config/nextest.toml` therefore selects `binary(startup)`
 and assigns it `threads-required = "num-test-threads"`, reserving the complete
 nextest worker pool while each startup case runs. Native Windows uses the same
-quiet-host boundary in `scripts/test-parallel.sh`. The 100 ms Linux budget is
-not loosened to absorb unrelated load.
+quiet-repository boundary in `scripts/test-parallel.sh`.
 
-Each startup path has one wall-clock gate. Before timing `session list`, the
+Each startup path has one wall-clock measurement. Before timing `session list`, the
 test asserts through the real parser that this command is watchdog-protected;
 the resulting sample therefore includes watchdog creation, guard acquisition,
 and shutdown. A second timing test over the identical command cannot isolate
@@ -498,6 +507,19 @@ pages in), isolated `XDG_CONFIG_HOME` and `XDG_DATA_HOME`, debug profile:
 | `zuno --version --long` | 3.744 ms | 4.007 ms | 4.432 ms | 1.1839x | 30 ms | 7.5x |
 | `zuno --help` | 4.115 ms | 4.153 ms | 5.012 ms | 1.2181x | 30 ms | 7.2x |
 | `zuno session list` | 14.778 ms | 15.399 ms | 16.230 ms | 1.0983x | 100 ms | 6.5x |
+
+Reproduce the hosted observational run with:
+
+```sh
+cargo test -p zuno --test startup -- --nocapture
+```
+
+Enforce the ceilings only on an otherwise-idle stable host:
+
+```sh
+ZUNO_ENFORCE_STARTUP_BUDGET=1 \
+  cargo test -p zuno --test startup -- --nocapture
+```
 
 Phase attribution comes from `ZUNO_STARTUP_PROFILE=1`, which writes one
 `zuno-startup` line per process to **stderr** — never stdout, for the reason
@@ -977,7 +999,7 @@ full concurrent nextest suite, `zuno session list` measured 137.459 ms median
 and failed its unchanged 100 ms budget, while an immediate isolated rerun on the
 same revision measured 30.292 ms. The product path was not slower; the benchmark
 was sharing the runner with unrelated test processes. The repository-level
-nextest override described in *Startup budget* now gives Linux the same
+nextest override described in *Startup measurement and stable-host budget* now gives Linux the same
 isolate-one/run-the-rest-concurrently topology already used on Windows.
 
 Windows CI run `33505110778` exposed a different duplicate-gate defect. The
@@ -990,12 +1012,21 @@ fresh relink later measured 257.3835 ms and the following ten returned to
 the boundary: the first launch took 2.469 seconds and the next nineteen stayed at
 243–258 ms until that build-step process exited; a new process returned to the
 normal range. Zuno's own profile attributed only about 13–14 ms to stable
-in-process work. The budget was not loosened. The duplicate watchdog gate was
-removed, and native Windows treats only a first-process failure whose sole failed
-test is the startup budget as provisional. The scheduler exits that process and
-confirms once in a fresh process; the confirmation result is final. Timeouts,
-functional failures, additional failed tests, non-Windows runs, and a second
-over-budget result are never retried.
+in-process work. The duplicate watchdog gate was removed. The first response
+kept 200 ms as a blocking hosted ceiling and confirmed a sole startup-budget
+failure once in a fresh process.
+
+Windows CI run `33527454755` proved that confirmation was still the wrong
+boundary. The isolated first process measured `zuno session list` at 226.375 ms
+median, and the fresh-process confirmation measured 253.1264 ms, while
+`--version`, `--version --long`, and `--help` remained at 10–11 ms. All other
+Windows suites passed: 5,108 tests passed, 8 were ignored, and only the two
+wall-clock observations exceeded 200 ms. A shared runner can therefore remain
+slow across process boundaries without a Zuno regression. Hosted CI now runs
+the measurement once, writes it to the job summary, and keeps it observational.
+The fixed ceilings remain available as an explicit stable-host gate through
+`ZUNO_ENFORCE_STARTUP_BUDGET=1`; functional and structural failures are never
+waived or retried.
 
 Native Windows run `33384920656` supplied the missing negative evidence. Its
 nextest step started at `11:06:31Z` and was still running at `11:34:09Z`, at least
@@ -1009,11 +1040,9 @@ benchmark under a quiet host, then keeps four functional binaries in flight
 while using one harness thread inside each binary. ACP and ConPTY lifecycle
 suites stay in that concurrent pool; there is no functional serial tail. Its
 timeout path kills the complete process tree so a stalled harness cannot leave
-`conhost` or child-agent processes behind. If and only if the first freshly
-linked Windows process reports the startup budget as its sole failure, the
-scheduler confirms that suite once in a new process before opening the worker
-pool. This is a process-boundary confirmation for observed post-link host
-overhead, not a generic test retry.
+`conhost` or child-agent processes behind. The startup suite runs once before
+that pool and publishes a stable `startup.log`; standard hosted CI does not
+retry or enforce its absolute wall-clock observations.
 
 The in-tree scheduler was therefore revalidated in an environment that permits
 loopback binds. The first two warm-target runs built 204 test binaries, observed

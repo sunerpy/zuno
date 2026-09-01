@@ -10,7 +10,7 @@ license = "MIT"
 repository = "https://github.com/sunerpy/zuno"
 homepage = "https://zuno.firlab.app"
 authors = ["sunerpy <nkuzhangshn@gmail.com>"]
-publish = ["crates-io"]
+publish = false
 
 # The central safety guarantee of this workspace. Every crate opts in via
 # `[lints] workspace = true`; a crate that omits that key silently loses the
@@ -38,10 +38,11 @@ all = "warn"
 
 # -- first-party crates -------------------------------------------------------
 #
-# Every normal dependency carries a registry version as well as its local path.
-# Cargo uses the path inside this workspace and removes it from the packaged
-# manifest, leaving a crates.io dependency. The versions move in lockstep with
-# the workspace release; release-please updates every annotated line.
+# Every normal dependency carries the exact workspace version as well as its
+# local path. Cargo uses the path inside this workspace, while the version keeps
+# first-party crates in lockstep and catches accidental drift. The workspace is
+# distributed as prebuilt GitHub Release binaries, not as registry packages;
+# release-please still updates every annotated line.
 zuno-acp = { version = "0.4.0", path = "crates/zuno-acp" } # x-release-please-version
 zuno-agent = { version = "0.4.0", path = "crates/zuno-agent" } # x-release-please-version
 zuno-atomic-file = { version = "0.4.0", path = "crates/zuno-atomic-file" } # x-release-please-version

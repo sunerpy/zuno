@@ -25,8 +25,8 @@ mod wasi;
 pub const PLUGIN_PROTOCOL_VERSION: &str = "zuno.plugin/1";
 /// Canonical Component Model interface implemented by WASI plugins.
 ///
-/// The embedded copy lives inside this crate so a crates.io package remains
-/// self-contained. A test keeps it byte-identical to the repository-facing WIT.
+/// The embedded copy keeps release builds independent of repository-relative
+/// runtime files. A test keeps it byte-identical to the repository-facing WIT.
 pub const PLUGIN_WIT: &str = include_str!("plugin.wit");
 
 const RUNTIME_BUNDLE_ID: &str = "zuno.extension-runtime";

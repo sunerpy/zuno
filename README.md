@@ -44,11 +44,6 @@ Release installers download the platform archive and verify it against the relea
 `SHA256SUMS` before extraction.
 
 ```sh
-# Build the published crate for this host
-cargo install zuno --locked
-```
-
-```sh
 # Linux and macOS
 curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.sh | sh
 ```
@@ -58,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.s
 irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | iex
 ```
 
-To build the current Git revision instead of a published crate:
+To build the current Git revision from source:
 
 ```sh
 cargo install --git https://github.com/sunerpy/zuno zuno --locked
