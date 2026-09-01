@@ -399,9 +399,10 @@ jobs:
           EXECUTION_ARCH: ${{ matrix.execution_arch }}
         run: |
           set -euo pipefail
-          /usr/bin/lipo -verify_arch "$EXECUTION_ARCH" unpacked/zuno
-          /usr/bin/lipo -verify_arch "$EXECUTION_ARCH" \
-            "target/${{ matrix.target }}/release/zuno-smoke"
+          /usr/bin/lipo unpacked/zuno -verify_arch "$EXECUTION_ARCH"
+          /usr/bin/lipo \
+            "target/${{ matrix.target }}/release/zuno-smoke" \
+            -verify_arch "$EXECUTION_ARCH"
           /usr/bin/arch "-${EXECUTION_ARCH}" \
             "target/${{ matrix.target }}/release/zuno-smoke" \
             --binary unpacked/zuno \
