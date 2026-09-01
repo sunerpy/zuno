@@ -59,10 +59,16 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 
 持久的 Goal、Plan、Todo、收件箱和 job 状态控制续跑，而不是自然语言。「接下来我会……」
 这类文字不构成进展。默认 profile 发布类型化的宿主 Planning capability；即使最终工具
-过滤隐藏了 `plan_update`，宿主仍会创建、持久化并在重启后恢复 Plan。明确继续会维护
-当前 Plan；新的实质性目标归档旧 Plan 并安装只含新目标步骤的新根 Plan。临时聚焦工作
-通过 `action=push` 暂停父 Plan，子步骤全部完成后由 `action=pop` 精确恢复父 Plan 一次。
-工作状态变化时立即更新，并在最终回复前对账。隐藏工具只会移除模型修改入口。
+过滤隐藏了 `plan_update`，已有 Plan 仍会持久化、投影并在重启后恢复，但模型不能创建
+或修改新的战略步骤。宿主分类器只判断 `Required / Maintain / Atomic / Unavailable`，
+不会生成 `Establish scope / Execute / Integrate / Verify` 一类通用骨架。模型使用
+`create / patch / append / push / pop` 操作维护 Plan，step id 由宿主生成，已有 Plan
+修改都受 `expected_revision` 保护。
+
+机器执行阶段单独持久化为 `DriverPhase`，不进入用户可见 Plan。最终回复前，
+`PlanReconciliationDriver` 只检查 Plan、Todo、Job、Goal、工具结果与验证记录：
+普通会话最多续跑两次对账；仍不一致则进入 typed `PlanUnreconciled` 人工等待，不能
+以成功状态交付。进程重启会继续原对账 cycle，不解析模型自然语言判断“已经完成”。
 
 ## 原生会话命令、压缩与硬中断
 

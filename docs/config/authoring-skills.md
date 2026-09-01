@@ -128,6 +128,32 @@ ambiguous name also disables the direct `/<skill-name>` slash form.
 
 Zuno-native `.zuno` roots stay enabled under the broad external switch.
 
+## Live catalog generations
+
+Each running session owns one immutable
+`SkillCatalogSnapshot { generation, digest, skills, warnings }`. `zuno-watch`
+observes every effective local Skill root and remote-cache root; when a valid
+root does not exist yet, it observes the nearest safe existing parent. Relevant
+events are debounced, watcher overflow forces a complete rescan, and the next
+generation is published atomically.
+
+Prompt metadata, `requiredSkills`, slash commands, the `skill` tool, TUI, and
+ACP all read that same snapshot. Adding, editing, deleting, or renaming a Skill
+therefore becomes visible to an existing session without restarting Zuno. A
+malformed or temporarily unreadable `SKILL.md` keeps the previous valid source
+in the catalog and publishes a warning instead of replacing the whole snapshot
+with partial state.
+
+`load` and `read_resource` force one refresh when given a locator that is absent
+from the current generation. If the source reappeared, it loads normally. If it
+was deleted or renamed, the tool returns typed `CatalogStale` with the currently
+available exact locators. Zuno does not scan an arbitrary caller-supplied path
+or fuzzy-load a same-named Skill.
+
+Changing discovery configuration itself, such as adding a new `skills.paths`
+root, still requires session reconfiguration or restart because that changes
+which directories are watched.
+
 ## Configuration
 
 | Key | Type | Default | Description |
@@ -246,8 +272,8 @@ zuno debug agent build
 `zuno debug skill` reports raw discovery: `view.kind: "raw_discovery"`,
 `agentFiltered: false`, `extensionOverlayApplied: false`, the `skills` array preserving
 same-name entries from different sources, and a `summary` with source, described, and
-unique counts plus ambiguous names. Restart before reading it, since it reflects the
-process's discovery.
+unique counts plus ambiguous names. Each command performs a fresh discovery; a running
+TUI or ACP session updates its own snapshot automatically.
 
 `zuno debug agent <name>` gives the agent-filtered view instead, including metadata and
 selected-body budgets, rendered/omitted/truncated coverage, and a bounded preview.

@@ -144,15 +144,19 @@ Rules that matter in practice:
 - Step ids stay stable across revisions. An update carries the revision returned by the
   last read, and a stale revision is rejected without changing anything.
 - While steps remain pending, exactly one step is in progress.
-- Completed steps are terminal and cannot regress.
+- Completed and superseded steps are terminal and cannot regress.
 - A fully completed plan has no in-progress step.
-- A bounded answer, atomic action, or explicit “continue” keeps the active Plan. A
-  substantial new ordinary objective archives it and installs a new root containing only
-  the new objective, so stale generic steps do not accumulate in the visible progress list.
+- The host classifier decides whether a strategic Plan is required but never installs a
+  generic skeleton. The model creates the first root with `action=create`; a substantial
+  new objective uses `create` plus the current `expected_revision`, archiving the previous
+  root instead of appending generic steps.
+- `patch` sends only changed ids, `append` sends only new step definitions, and the host
+  generates ids for `create`, `append`, and `push`.
 - A focused temporary workflow uses `plan_update` with `action=push`; the parent is
   suspended durably and the child becomes the visible Plan. After every child step is
-  completed, `action=pop` restores the exact parent once. Update the active Plan when work
-  starts, completes, blocks, or changes scope, and reconcile it before the final answer.
+  terminal, `action=pop` carries only `expected_revision` and restores the exact parent
+  once. Update the active Plan when work starts, completes, is superseded, or changes
+  scope, and reconcile it before the final answer.
 - Verification is scoped to the exact commit, build, tag, deployment, configuration, and
   inputs inspected. When any of them changes, append a new gate instead of reusing an older
   completed result.
@@ -166,9 +170,10 @@ Goal/Plan/Todo operations while denying shell and file mutation. Returning to Wo
 requires a durable plan to exist, and the confirmation names its title, revision, and
 completed-step count.
 
-The default host owns Plan creation through a typed planning capability. Disabling the
-model-facing `plan_update` tool does not disable classification, persistence, client
-projection, or restart recovery; it only removes the model's refinement surface.
+The default host owns classification and final reconciliation through typed planning
+services; the model owns strategic step creation through operation-based `plan_update`.
+Disabling that tool prevents new model mutations, while existing Plan persistence, client
+projection, and restart recovery remain intact.
 
 Entering Plan while a Goal is active atomically records `paused(plan_mode)`. Start Work
 resumes only that exact pause and does so once, even after a process restart. It deliberately

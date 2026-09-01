@@ -63,7 +63,8 @@ provider 请求前以 typed error 失败；不会静默截断 AGENTS、历史、
 - 直接回答、一次有界读取、对已经准备好的修改执行一次短小 commit：可作为原子操作；
 - 图片、resource、selection、branch diff 等 typed context，以及足够大的多文本块
   输入：默认进入 planned path；
-- 其他普通工程任务：宿主先写入 Agent 对应的轻量 durable Plan，再把请求交给模型。
+- 其他普通工程任务：宿主把请求分类为 `Required`，但不写入任何通用骨架；模型必须先
+  读取当前 Plan，再通过操作式 `plan_update` 创建战略步骤。
 
 一个活跃步骤需要聚焦临时工作时，使用 `plan_update action=push` 持久暂停父 Plan，
 让子 Plan 暂时成为客户端唯一可见的 Plan；子步骤全部完成后使用 `action=pop`，父
@@ -72,11 +73,13 @@ Plan 只恢复一次。工作开始、完成、阻塞或范围变化时立即更
 
 因此“调研 → 修改 → 验证”通常会有 Plan；跨组件、委派、多个验收 gate，
 以及可能经历压缩或重启恢复的工作必须持续维护 Plan。模型可以通过
-最终仍可见的 `plan_update` 精炼宿主 seed，但不能决定是否完全跳过 durable execution
-state。隐藏 `plan_update` 只移除模型修改入口，不会关闭宿主 Plan 的创建、投影或恢复。
+最终仍可见的 `plan_update` 创建或维护战略 Plan，但不能决定宿主是否要求 durable
+execution state。隐藏 `plan_update` 会阻止模型创建或修改新 Plan；已有 Plan 仍会持久化、
+投影并在重启后恢复。
 Todo 是 Plan step 下可选的具体工作，用于更细的所有权、依赖或恢复跟踪，不要求
-和 Plan step 机械地一一对应。精炼时必须保留宿主已有 step id 和已完成状态；
-可以修改标题/状态或追加新 step，不能把 seed 当成无状态草稿整体替换。
+和 Plan step 机械地一一对应。`create`、`append`、`push` 的 step id 由宿主生成；
+`patch` 只提交发生变化的 id；`pop` 只提交当前 revision。所有已有 Plan 的修改都要
+携带 `expected_revision`，`completed` 与 `superseded` 都是不可回退的终态。
 
 Plan collaboration mode 与“工作任务是否值得维护 Plan”是两件事。`plan` Agent 是只读模式；`build`、`deep` 或 `orchestrator` 也可以在复杂实现中通过 typed Plan 工具维护执行状态。
 
@@ -535,7 +538,8 @@ zuno db --format json \
 
 截至本指南对应代码状态，以下边界仍需在验收报告中明确：
 
-1. 宿主分类器负责创建或维持 Plan；模型仍可能把 Plan 或 Todo 精炼得过细，因此
+1. 宿主分类器只判断是否需要 Plan，模型负责创建或维护战略步骤；模型仍可能把 Plan
+   或 Todo 拆得过细，因此
    GPT/Opus 的 provider call 成本仍应通过真实遥测持续观察。
 2. `debug agent` 现在会主动连接当前配置的 MCP，并检查实时 schema；历史 request
    当时真正发送的最终 schema 仍应从对应 provider request/receipt 取证，不能用

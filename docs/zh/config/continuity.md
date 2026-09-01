@@ -224,8 +224,8 @@ sanitize export 则会脱敏文档身份与正文。
 }
 ```
 
-会隐藏模型侧的 Plan 修改工具，但宿主仍能创建、持久化、投影并恢复 Plan。History 与 Notes
-也不会因此变成 Plan 的替代存储。
+会隐藏模型侧的 Plan 修改工具，因此模型不能创建或修改战略 Plan。已有 Plan 仍会持久化、
+投影并恢复；History 与 Notes 也不会因此变成 Plan 的替代存储。
 
 ## 验证最终结果
 

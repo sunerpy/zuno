@@ -188,18 +188,23 @@ pub fn durable_plan_update(work: &WorkStateProjection) -> Option<Value> {
     let plan = work.plan.as_ref()?;
     let mut entries = Vec::with_capacity(plan.steps.len());
     for step in &plan.steps {
-        let status = match step.status.as_str() {
-            "pending" => "pending",
-            "in_progress" => "in_progress",
-            "completed" => "completed",
+        let (status, outcome) = match step.status.as_str() {
+            "pending" => ("pending", None),
+            "in_progress" => ("in_progress", None),
+            "completed" => ("completed", Some("completed")),
+            "superseded" => ("completed", Some("superseded")),
             _ => return None,
         };
-        entries.push(json!({
+        let mut entry = json!({
             "content": step.title,
             "priority": plan_step_priority(work, &step.id),
             "status": status,
             "_meta": { "zuno": { "stepId": step.id } },
-        }));
+        });
+        if let Some(outcome) = outcome {
+            entry["_meta"]["zuno"]["outcome"] = json!(outcome);
+        }
+        entries.push(entry);
     }
     Some(json!({
         "sessionUpdate": "plan",
@@ -1461,7 +1466,7 @@ mod tests {
                     zuno_types::PlanStepProjection {
                         id: "verify".to_owned(),
                         title: "Verify in Zed".to_owned(),
-                        status: "pending".to_owned(),
+                        status: "superseded".to_owned(),
                     },
                 ],
                 span: zuno_types::ExecutionSpan::default(),
@@ -1492,6 +1497,11 @@ mod tests {
         assert_eq!(update["entries"].as_array().map(Vec::len), Some(2));
         assert_eq!(update["entries"][0]["status"], "in_progress");
         assert_eq!(update["entries"][0]["priority"], "high");
+        assert_eq!(update["entries"][1]["status"], "completed");
+        assert_eq!(
+            update["entries"][1]["_meta"]["zuno"]["outcome"],
+            "superseded"
+        );
         assert_eq!(update["entries"][1]["priority"], "medium");
         assert_eq!(update["_meta"]["zuno"]["planId"], "plan-1");
         assert_eq!(update["_meta"]["zuno"]["revision"], 3);

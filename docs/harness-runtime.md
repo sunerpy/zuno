@@ -130,42 +130,50 @@ Durable planning is host policy rather than model ceremony. The default profile
 publishes a typed `HostPlanningCapability`; custom profiles opt in explicitly.
 Before the first provider request for a user or resolved-command input, a host
 with that capability applies one deterministic classifier shared by CLI, TUI,
-ACP, server, and child turns. A
-bounded answer, atomic action, or explicit continuation retains an active Plan.
-A substantial new ordinary user or resolved-command objective archives the
-current visible Plan and installs one new root Plan containing only the new
-objective's seed steps. A completed Plan is archived as completed; unfinished
-work is archived as superseded. Creating or materially editing a durable Goal
-uses the same objective boundary and binds the replacement Plan to the exact
-`goal_id`. An atomic Goal objective may terminalize stale unfinished work without
-seeding a replacement. Child reports, steering, and retry continuations never
-manufacture a new Plan.
+ACP, server, and child turns. It chooses `Required`, `Maintain`, `Atomic`, or
+`Unavailable`; it never creates user-visible generic steps. A direct answer, one
+bounded read, or one short commit of already-prepared changes may proceed
+atomically. Typed image, resource, selection, or branch-diff context, sufficiently
+large multi-block text, cross-component work, delegation, multiple gates, and
+restart-sensitive work select the planned path.
 
-A direct answer, one bounded read, or one short commit of already-prepared
-changes may proceed atomically. Other ordinary engineering work receives an
-Agent-specific seed Plan before the model sees the request. Typed image,
-resource, selection, or branch-diff context also selects the planned path, as
-does sufficiently large multi-block text. This makes research → modification →
-verification visible by default and guarantees a Plan for cross-component work,
-delegation, multiple gates, or work that may need compaction or restart recovery.
+For `Required`, the runtime tells the model to read the current Plan and use one
+operation-based `plan_update` call:
 
-The model may refine the seed through `plan_update` when that tool survives the
-final filters; it does not decide whether the request receives durable execution
-state. Hiding `plan_update` removes only the model-facing mutation surface and
-does not disable host Plan creation, persistence, projection, or restart
-recovery. Todo items are optional concrete detail beneath Plan steps for
-ownership, dependency, or recovery tracking. They
-must not mechanically mirror every Plan step. Refinement preserves existing
-step ids and completed states while updating titles/statuses or appending new
-steps, so concurrent clients and recovery snapshots retain stable identities.
-When one active step needs a focused temporary workflow, `plan_update` with
-`action=push` atomically suspends the parent and displays a durable child Plan.
-After every child step completes, `action=pop` archives the child and restores
-the exact parent once. The model updates the active Plan when work starts,
-completes, blocks, or changes scope, and reconciles it before a final answer.
-Completed verification steps are immutable historical evidence. If their commit,
-build, tag, deployment, configuration, or other relevant input changes, the
-model appends a new artifact-scoped verification step.
+- `create` creates the first strategic Plan, or replaces the visible root for a
+  genuinely new objective. The host generates every step id. Replacing an
+  existing Plan requires its current `expected_revision`; the old root is
+  archived as completed or superseded.
+- `patch` changes only the title or named step ids.
+- `append` adds new host-identified steps.
+- `push` persists a focused child Plan while suspending the exact parent.
+- `pop` carries only `expected_revision`, archives a terminal child, and restores
+  the exact parent once.
+
+Every mutation of an existing Plan is revision guarded. `completed` and
+`superseded` are terminal states. Todo items are optional dynamic execution
+detail beneath strategic Plan steps; they must not mechanically mirror every
+step. Completed verification remains immutable evidence, so a changed commit,
+build, tag, deployment, configuration, or other relevant input requires a new
+artifact-scoped verification step.
+
+Machine execution state does not leak into the visible Plan. The
+`PlanReconciliationDriver` persists `idle`, `executing`, `reconciling`,
+`waiting_retry`, `waiting_human`, and `terminal` phase events in the existing
+session event log. Before a successful answer is delivered it evaluates only
+typed Plan, Todo, Job, Goal, tool-result, and verification state:
+
+- terminal Plan state with no active Todo or Job may finish;
+- an active Goal owns the next durable continuation;
+- an ordinary session receives at most two durable reconciliation
+  continuations;
+- unresolved work then creates `WaitingForHuman::PlanUnreconciled` and cannot be
+  delivered as successful.
+
+A process restart resumes an interrupted reconciliation cycle and its attempt
+count. Assistant prose is never parsed as evidence that work completed. Hiding
+`plan_update` prevents the model from creating or mutating a new strategic Plan;
+existing Plans remain durable, projected, and recoverable.
 
 Native Task admission also captures the active Plan location in the Job's
 versioned `workContext`: optional Goal id, Plan id, Plan revision, and Plan step
@@ -1615,28 +1623,34 @@ query text, authorization headers, and API keys are forbidden from `Debug`,
 
 `zuno-network` owns the outbound HTTP construction policy shared by providers,
 authentication, catalogs, remote instructions, remote MCP, and web tools.
-Session traffic uses `ProxyPolicy::Environment`, which resolves the standard
-HTTP, HTTPS, all-proxy, and no-proxy environment variables when a connection
-pool is constructed. A capability that constructs reqwest directly bypasses
-this product contract and is incomplete.
+Session traffic uses `SessionNetworkPolicy::ProcessEnvironment`, which resolves
+the standard HTTP, HTTPS, all-proxy, and no-proxy environment variables when a
+connection pool is constructed. A capability that constructs reqwest directly
+bypasses this product contract and is incomplete.
 
-`ProxyPolicy::Direct` is an explicit security boundary, not a fallback. It is
-used only for local control-plane probes and cloud metadata endpoints. Bedrock
-therefore has two transports with separate lifecycles: runtime and SSO traffic
-is proxy-aware, while IMDS and approved local ECS credential endpoints are
-direct. Remote HTTPS container credential endpoints remain on the proxy-aware
-transport.
+`SessionNetworkPolicy::Direct` is an explicit security boundary, not a fallback.
+Its caller must declare `DirectPurpose::LoopbackControlPlane` or
+`DirectPurpose::CloudMetadata`. Bedrock therefore has two transports with
+separate lifecycles: runtime and SSO traffic is proxy-aware, while IMDS and
+approved local ECS credential endpoints are direct. Remote HTTPS container
+credential endpoints remain on the proxy-aware transport.
 
 Public web fetch uses the separate `PublicHttpClient` security capability. It
-accepts only credential-free HTTP(S), disables reqwest auto-redirects, and uses
-direct/no-proxy transport so an environment proxy cannot bypass target
-validation. Each request and each of at most five redirects resolves the host,
-rejects the whole answer if any address is non-public, handles mapped or
-embedded IPv4 forms including NAT64, and pins the validated addresses while
-retaining the original hostname for Host and TLS SNI. Redirect credentials are
-never forwarded. Literal and resolved loopback, private, link-local, CGNAT,
-multicast, unspecified, documentation, and reserved destinations fail before
-the request is sent.
+accepts only credential-free HTTP(S) and disables automatic redirects. Each
+request and each of at most five redirects resolves the origin locally, rejects
+the whole answer if any address is non-public, handles mapped or embedded IPv4
+forms including NAT64, and then connects to an already-validated IP through the
+selected HTTP, HTTPS, SOCKS4, or SOCKS5 route while retaining the original
+hostname for Host and TLS SNI. `NO_PROXY` is the only environment-level direct
+selection when a proxy is configured; proxy connection failure never silently
+falls back to direct. Redirect credentials are never forwarded. Literal and
+resolved loopback, private, link-local, CGNAT, multicast, unspecified,
+documentation, and reserved destinations fail before the request is sent.
+
+`webfetch` keeps the existing 30-second default and clamps a requested timeout
+to 120 seconds. Timeout diagnostics identify the credential-free route, phase,
+and elapsed duration; durable Goal recovery, not a tight tool loop, owns any
+safe replay after backoff.
 
 Child processes inherit the process proxy environment unless their typed
 configuration deliberately overrides a variable. The agent loop does not

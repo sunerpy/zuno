@@ -43,18 +43,28 @@ Notes 从不暴露宿主路径。每个作用域最多 100 个文档，单文档
 1 MiB。两个写 action 都必须携带精确的 `expected_revision`；只有新建文档时使用
 `0`。可信 `call_id`、请求摘要和 revision 让重复投递保持幂等，同时拒绝过期的并发写入。
 
-宿主持久 Plan 不依赖模型工具是否可见。禁用 `plan_update` 只会隐藏模型的修改入口，
-不会关闭宿主创建 Plan 或重启恢复。其可选 `action` 默认为 `update`；`push` 会暂停
-活跃 Plan 并安装一个聚焦的持久子 Plan；只有子步骤全部完成后才允许 `pop`，并且只恢复
-一次精确父 Plan。工作开始、完成、阻塞或范围变化时应立即更新活跃 Plan，并在最终回复
-前对账。
+宿主分类器决定请求是否需要持久战略 Plan，但不会生成用户可见的通用步骤。模型用
+`plan_update action=create` 创建首个 Plan 或替换新目标；`patch` 只修改指定 id，
+`append` 追加由宿主生成 id 的步骤，`push` 打开聚焦子 Plan，`pop` 不重传整份 Plan
+而只恢复精确父 Plan。所有已有 Plan 修改都必须带当前 `expected_revision`；
+`completed` 和 `superseded` 都是终态。
+
+成功交付前，durable reconciliation driver 会检查 Plan、Todo、Job、Goal、工具结果与
+验证记录。普通会话最多执行两次对账续跑，仍不一致则进入 typed `PlanUnreconciled`
+人工等待，而不是声称完成。禁用 `plan_update` 会阻止模型创建或修改；已有 Plan 仍会
+持久化、投影并恢复。
 
 完整的开启/关闭、profile 覆盖、权限、revision 与重启说明见
 [History 与 Notes 连续性配置](/zh/config/continuity)。
 
 `edit`、`execute` 和 `lsp` 作为已注册的槽位存在，但不属于默认工具面。`edit` 仍可供显式构造的 profile 使用；默认的编辑路径是 `apply_patch` 加 `write`。
 
-`webfetch` 只接受无凭据 HTTP(S) 目标。Zuno 会解析并校验全部地址，整体拒绝公私混合 DNS，固定已经校验的地址，绕过环境代理，并在最多五次重定向的每一跳重复校验。跨域跳转只有在新的公开目标独立通过同样检查后才允许。
+`webfetch` 只接受无凭据 HTTP(S) 目标。Zuno 会解析并校验全部地址，整体拒绝公私混合
+DNS，固定已经校验的地址，并在最多五次重定向的每一跳重复校验。它遵循进程级
+`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY`，通过 HTTP、HTTPS、
+SOCKS4 或 SOCKS5 代理连接已经校验的目标 IP，同时保留原始 Host 与 TLS SNI。
+代理失败不会静默改为直连。默认超时 30 秒，单次最大 120 秒；超时错误会报告 route、
+phase 与 elapsed。
 
 `web_search` 不会把 provider 凭据或完整 wire URL 放进错误与日志。诊断只标识 provider、scheme、host、path、状态与错误类别，不包含 API key、认证头或完整 query。
 

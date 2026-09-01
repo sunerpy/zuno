@@ -60,7 +60,7 @@ through the top-level inventory and the material decision groups below.
 
 | Material delta | DSH evidence | Decision | Zuno result |
 | --- | --- | --- | --- |
-| Public web fetch target validation | `b2219bba63`, `c406560452`, `2fbe199a1c` | adapt | `PublicHttpClient` validates literals and every resolved address, rejects mixed public/private DNS answers and nested IPv6 forms, pins validated addresses, uses direct/no-proxy transport, and revalidates up to five manual redirects. Zuno permits a cross-origin redirect only when the new public HTTP(S) target independently passes the same checks. |
+| Public web fetch target validation | `b2219bba63`, `c406560452`, `2fbe199a1c` | adapt | `PublicHttpClient` validates literals and every resolved address, rejects mixed public/private DNS answers and nested IPv6 forms, and revalidates up to five manual redirects. Zuno then routes an already-validated target IP through the process HTTP, HTTPS, SOCKS4, or SOCKS5 proxy policy while preserving the original Host/TLS SNI. `NO_PROXY` is the only environment-level direct choice, and proxy failure never falls back to direct. |
 | Web-search endpoint diagnostics | `f55c676485`, `aa70a737ae` | adapt | Exa keeps its credential-bearing wire URL private and exposes only scheme, host, path, status, and error category in diagnostics. Reqwest causes are stripped with `without_url()` and sentinel tests cover errors and tracing. |
 | Canonical image admission and object lifecycle | `bd4e4173e7`, `558f08780c`, `5c799a9520`, `4863890535`, `30704dc1df` | adapt | `zuno-attachment` normalizes PNG/JPEG/GIF/WebP, applies EXIF orientation, keeps the first animation frame, strips metadata, enforces pixel/byte limits, stores content-addressed private objects, and resolves inline provider blocks only while assembling a request. |
 | Provider Files API fallback | attachment range above | reject | This cycle does not implement any provider Files API. `ImageRequestPolicy` remains the explicit future extension point. |
@@ -77,6 +77,18 @@ through the top-level inventory and the material decision groups below.
 | TypeScript SDK, API proxy, package graph, examples, and Python release surface | residual `packages/`, `examples/`, and `python/` paths | reject | Zuno is a native Rust harness and does not expose DSH package, SDK, Remote, Python, or repository layout compatibility. |
 | Session-event migration and ignorable-event experiments | `2c6ff296af` and the reverted event-vocabulary range | reject | Zuno keeps its own fail-closed durable event vocabulary and migrations. A DSH compatibility reader would weaken that boundary. |
 | Documentation, snapshots, translations, dependency refreshes, and release metadata | `docs-process` and non-runtime inventory groups | reject | They were included in range accounting but are not product capabilities. Zuno adds only documentation and tests for decisions in this ledger. |
+
+## 2026-09-01 targeted driver follow-up
+
+This follow-up used DSH as a design source for one bounded Plan/Goal repair. It
+did not classify every upstream delta after the recorded alpha.2 range, so it
+does not advance the pinned DSH baseline.
+
+| Design question | Decision | Zuno result |
+| --- | --- | --- |
+| Event-driven AgentDriver completion and reconciliation | adapt | Zuno persists a compact `DriverPhase` projection in the existing session event log and runs `PlanReconciliationDriver` before successful delivery. It continues active Goals, gives ordinary sessions at most two durable reconciliation attempts, and then creates typed `PlanUnreconciled` human wait. |
+| Durable service ownership and client-neutral projections | already-covered | Zuno already owns Goal, Plan, Todo, Job, inbox, and client projections through typed Rust services and durable events. The repair composes those services instead of adding prompt-only state or a second loop. |
+| Cordis, Bundle, TypeScript package graph, and DSH wire/runtime compatibility | reject | The useful driver pressure is implemented natively in Rust. Zuno does not import DSH's container, package architecture, or compatibility surface. |
 
 ## Resulting Zuno boundaries
 

@@ -16,6 +16,27 @@ fn tool(skills: Vec<Skill>) -> SkillTool {
     SkillTool::new(Arc::new(Skills::from_loaded(skills)))
 }
 
+fn isolated_env(root: &Path) -> zuno_paths::Env {
+    zuno_paths::Env::empty()
+        .with("HOME", root.join("home").to_string_lossy())
+        .with("XDG_CONFIG_HOME", root.join("config").to_string_lossy())
+        .with("XDG_CACHE_HOME", root.join("cache").to_string_lossy())
+        .with("XDG_DATA_HOME", root.join("data").to_string_lossy())
+        .with("XDG_STATE_HOME", root.join("state").to_string_lossy())
+}
+
+fn write_live_skill(root: &Path, directory: &str, name: &str, body: &str) -> PathBuf {
+    let directory = root.join(".agents/skills").join(directory);
+    std::fs::create_dir_all(&directory).expect("live Skill directory");
+    let source = directory.join("SKILL.md");
+    std::fs::write(
+        &source,
+        format!("---\nname: {name}\ndescription: Handle spreadsheet work.\n---\n{body}\n"),
+    )
+    .expect("live Skill source");
+    source
+}
+
 fn ctx() -> ToolContext {
     ToolContext::new(
         "ses_skill",
@@ -206,6 +227,164 @@ async fn a_filesystem_skill_body_is_read_after_selection_not_cached_at_discovery
 
     assert!(output.output.contains("NEW BODY"), "{}", output.output);
     assert!(!output.output.contains("OLD BODY"), "{}", output.output);
+}
+
+#[tokio::test]
+async fn a_running_live_tool_observes_an_installed_skill_without_reconstruction() {
+    let root = tempfile::tempdir().expect("live catalog root");
+    let service = SkillCatalogService::start(
+        zuno_catalog::skill::SkillOptions::new(
+            root.path(),
+            Some(root.path()),
+            &isolated_env(root.path()),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Vec::new(),
+        Arc::new(|_| true),
+    )
+    .await;
+    let subject = SkillTool::with_catalog(Arc::clone(&service));
+
+    let source = write_live_skill(
+        root.path(),
+        "spreadsheet",
+        "spreadsheet",
+        "Normalize the workbook.",
+    );
+    service.refresh().await;
+
+    let listed = subject
+        .run(
+            SkillParams {
+                action: SkillAction::List,
+                query: None,
+                name: None,
+                source: None,
+                path: None,
+                cursor: None,
+                limit: None,
+            },
+            ctx(),
+        )
+        .await
+        .expect("new Skill appears in list");
+    assert!(listed.output.contains("spreadsheet"), "{}", listed.output);
+    let advertised_source = service
+        .snapshot()
+        .skills()
+        .get("spreadsheet")
+        .expect("installed source")
+        .location
+        .clone();
+    assert_eq!(
+        std::fs::canonicalize(&advertised_source).expect("canonical advertised source"),
+        std::fs::canonicalize(&source).expect("canonical written source")
+    );
+
+    let searched = subject
+        .run(SkillParams::search("spreadsheet", None), ctx())
+        .await
+        .expect("new Skill appears in search");
+    assert!(
+        searched.output.contains("spreadsheet"),
+        "{}",
+        searched.output
+    );
+
+    let loaded = subject
+        .run(SkillParams::load("spreadsheet"), ctx())
+        .await
+        .expect("new Skill loads");
+    assert!(
+        loaded.output.contains("Normalize the workbook."),
+        "{}",
+        loaded.output
+    );
+    assert!(
+        loaded.output.contains(&advertised_source),
+        "{}",
+        loaded.output
+    );
+    service.shutdown();
+}
+
+#[tokio::test]
+async fn a_renamed_live_source_returns_typed_catalog_stale_with_current_locator() {
+    let root = tempfile::tempdir().expect("live catalog root");
+    let old_source = write_live_skill(
+        root.path(),
+        "spreadsheet-old",
+        "spreadsheet",
+        "Old location.",
+    );
+    let service = SkillCatalogService::start(
+        zuno_catalog::skill::SkillOptions::new(
+            root.path(),
+            Some(root.path()),
+            &isolated_env(root.path()),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Vec::new(),
+        Arc::new(|_| true),
+    )
+    .await;
+    let subject = SkillTool::with_catalog(Arc::clone(&service));
+
+    let new_directory = root.path().join(".agents/skills/spreadsheet-new");
+    std::fs::rename(
+        old_source.parent().expect("old Skill directory"),
+        &new_directory,
+    )
+    .expect("rename Skill directory");
+    let new_source = new_directory.join("SKILL.md");
+    service.refresh().await;
+    let advertised_source = service
+        .snapshot()
+        .skills()
+        .get("spreadsheet")
+        .expect("renamed source")
+        .location
+        .clone();
+
+    let error = subject
+        .run(
+            SkillParams {
+                action: SkillAction::Load,
+                query: None,
+                name: Some("spreadsheet".to_owned()),
+                source: Some(old_source.to_string_lossy().into_owned()),
+                path: None,
+                cursor: None,
+                limit: None,
+            },
+            ctx(),
+        )
+        .await
+        .expect_err("the removed locator must not be loaded ambiguously");
+    let rejection = source_of(&error)
+        .downcast_ref::<SkillRejection>()
+        .expect("typed Skill rejection");
+    let SkillRejection::CatalogStale {
+        requested,
+        locator,
+        available,
+    } = rejection
+    else {
+        panic!("{rejection}");
+    };
+    assert_eq!(requested, "spreadsheet");
+    assert_eq!(locator.as_str(), old_source.to_string_lossy().as_ref());
+    assert_eq!(available, &format!("`{advertised_source}`"));
+    let canonical_new_source =
+        std::fs::canonicalize(&new_source).expect("canonical renamed Skill source");
+    assert_eq!(
+        std::fs::canonicalize(&advertised_source).expect("canonical advertised replacement source"),
+        canonical_new_source,
+        "{rejection}",
+    );
+    service.shutdown();
 }
 
 #[tokio::test]

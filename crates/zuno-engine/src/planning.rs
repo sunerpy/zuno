@@ -1,14 +1,13 @@
 //! Host-owned durable planning policy.
 //!
-//! The model may refine a plan, but it does not decide whether ordinary
-//! engineering work receives one. That decision is made here from stable request
-//! facts before the first provider call, so every client surface behaves the same.
+//! The host decides whether work requires a durable, user-visible Plan. It does
+//! not invent generic steps: the model creates strategic steps through the
+//! operation-based Plan tool, while machine execution phases stay in driver state.
 
 /// Facts available before a turn reaches the provider.
 #[derive(Debug, Clone, Copy)]
 pub struct PlanningInput<'a> {
     prompt: &'a str,
-    agent: &'a str,
     source: PlanningInputSource,
     existing_plan: ExistingPlanState,
     content: PlanningContentFacts,
@@ -18,10 +17,9 @@ pub struct PlanningInput<'a> {
 impl<'a> PlanningInput<'a> {
     /// Build an input for a plan-capable Agent with no existing durable plan.
     #[must_use]
-    pub const fn new(prompt: &'a str, agent: &'a str) -> Self {
+    pub const fn new(prompt: &'a str, _agent: &'a str) -> Self {
         Self {
             prompt,
-            agent,
             source: PlanningInputSource::User,
             existing_plan: ExistingPlanState::None,
             content: PlanningContentFacts::empty(),
@@ -158,67 +156,11 @@ impl PlanningRationale {
     }
 }
 
-/// One host-seeded plan step.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanningStepSeed {
-    id: &'static str,
-    title: &'static str,
-}
-
-impl PlanningStepSeed {
-    /// Stable step identity that a later model update must preserve.
-    #[must_use]
-    pub const fn id(&self) -> &'static str {
-        self.id
-    }
-
-    /// Initial human-readable step title.
-    #[must_use]
-    pub const fn title(&self) -> &'static str {
-        self.title
-    }
-}
-
-/// Initial durable plan created by the host.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanningSeed {
-    title: String,
-    steps: Vec<PlanningStepSeed>,
-    rationale: PlanningRationale,
-}
-
-impl PlanningSeed {
-    /// Bounded title derived from the request.
-    #[must_use]
-    pub fn title(&self) -> &str {
-        &self.title
-    }
-
-    /// Stable initial roadmap.
-    #[must_use]
-    pub fn steps(&self) -> &[PlanningStepSeed] {
-        &self.steps
-    }
-
-    /// Why the host created this plan.
-    #[must_use]
-    pub const fn rationale(&self) -> &PlanningRationale {
-        &self.rationale
-    }
-
-    /// Relationship between the durable Plan and optional Todo detail.
-    #[must_use]
-    pub const fn guidance(&self) -> &'static str {
-        "Todo items are optional concrete work beneath plan steps. Use them when finer ownership, \
-         dependency, or recovery tracking helps; avoid a mechanical one-to-one mapping."
-    }
-}
-
 /// Host planning outcome for one input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanningDecision {
-    /// Create a new durable plan before the provider sees the request.
-    Create(PlanningSeed),
+    /// The model must create or replace a strategic Plan through the Plan tool.
+    Required(PlanningRationale),
     /// Keep the existing plan current; never replace it with a generic seed.
     Maintain(PlanningRationale),
     /// A direct answer, single read, or genuinely atomic operation may proceed directly.
@@ -228,22 +170,23 @@ pub enum PlanningDecision {
 }
 
 impl PlanningDecision {
-    /// The new plan seed, when one must be created.
-    #[must_use]
-    pub const fn seed(&self) -> Option<&PlanningSeed> {
-        match self {
-            Self::Create(seed) => Some(seed),
-            Self::Maintain(_) | Self::Atomic(_) | Self::Unavailable(_) => None,
-        }
-    }
-
     /// The rationale attached to every decision.
     #[must_use]
     pub const fn rationale(&self) -> &PlanningRationale {
         match self {
-            Self::Create(seed) => seed.rationale(),
-            Self::Maintain(reason) | Self::Atomic(reason) | Self::Unavailable(reason) => reason,
+            Self::Required(reason)
+            | Self::Maintain(reason)
+            | Self::Atomic(reason)
+            | Self::Unavailable(reason) => reason,
         }
+    }
+
+    /// Relationship between the user-visible Plan and dynamic Todo detail.
+    #[must_use]
+    pub const fn guidance(&self) -> &'static str {
+        "Plan steps are strategic, user-visible outcomes. Todo items are optional concrete work \
+         beneath plan steps and should be used only when finer ownership, dependency, or recovery \
+         tracking helps."
     }
 }
 
@@ -301,16 +244,13 @@ impl PlanningPolicy {
             ));
         }
         if input.content.benefits_from_plan() {
-            return create_plan(
-                input,
-                if input.source == PlanningInputSource::GoalObjective {
-                    "goal_objective_replaced"
-                } else if input.existing_plan == ExistingPlanState::Active {
-                    "active_plan_replaced"
-                } else {
-                    "typed_context"
-                },
-            );
+            return require_plan(if input.source == PlanningInputSource::GoalObjective {
+                "goal_objective_replaced"
+            } else if input.existing_plan == ExistingPlanState::Active {
+                "active_plan_replaced"
+            } else {
+                "typed_context"
+            });
         }
         if direct_answer(prompt) {
             return PlanningDecision::Atomic(reason(
@@ -330,9 +270,14 @@ impl PlanningPolicy {
                 "one bounded commit of already-prepared changes is atomic",
             ));
         }
+        if bounded_atomic_action(prompt) {
+            return PlanningDecision::Atomic(reason(
+                "bounded_atomic_action",
+                "one explicitly bounded tool or operational action is atomic",
+            ));
+        }
 
-        create_plan(
-            input,
+        require_plan(
             if input.existing_plan == ExistingPlanState::Active
                 && input.source != PlanningInputSource::GoalObjective
             {
@@ -348,15 +293,11 @@ impl PlanningPolicy {
     }
 }
 
-fn create_plan(input: PlanningInput<'_>, code: &'static str) -> PlanningDecision {
-    PlanningDecision::Create(PlanningSeed {
-        title: plan_title(input.prompt),
-        steps: plan_steps(input.agent),
-        rationale: reason(
-            code,
-            "the request benefits from progress visibility, dependency management, recovery, or verification",
-        ),
-    })
+fn require_plan(code: &'static str) -> PlanningDecision {
+    PlanningDecision::Required(reason(
+        code,
+        "the request benefits from progress visibility, dependency management, recovery, or verification",
+    ))
 }
 
 const fn reason(code: &'static str, message: &'static str) -> PlanningRationale {
@@ -423,6 +364,24 @@ fn atomic_commit(prompt: &str) -> bool {
             }
         })
         && lower.chars().count() <= 96
+}
+
+fn bounded_atomic_action(prompt: &str) -> bool {
+    let lower = normalized(prompt).to_lowercase();
+    let actions = action_count(prompt);
+    let tool_invocation = ["use ", "please use ", "call ", "invoke ", "使用", "调用"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        && actions == 0;
+    let one_step_operation = [
+        "install ", "restart ", "run ", "execute ", "安装", "重启", "执行",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+        && actions <= 2;
+    (tool_invocation || one_step_operation)
+        && !has_stage_separator(prompt)
+        && lower.chars().count() <= 120
 }
 
 fn active_plan_continuation(prompt: &str) -> bool {
@@ -569,51 +528,6 @@ fn english_words(prompt: &str) -> std::collections::BTreeSet<&str> {
         .collect()
 }
 
-fn plan_title(prompt: &str) -> String {
-    const MAX_CHARS: usize = 80;
-    let normalized = normalized(prompt);
-    let mut title = normalized.chars().take(MAX_CHARS).collect::<String>();
-    if normalized.chars().count() > MAX_CHARS {
-        title.push('…');
-    }
-    if title.is_empty() {
-        "Complete the requested work".to_owned()
-    } else {
-        title
-    }
-}
-
-fn plan_steps(agent: &str) -> Vec<PlanningStepSeed> {
-    let steps: &[(&str, &str)] = match agent {
-        "plan" => &[
-            ("investigate", "Establish the relevant facts"),
-            ("decide", "Resolve the necessary decisions"),
-            ("design", "Produce the implementation and acceptance plan"),
-        ],
-        "deep" => &[
-            ("reproduce", "Reproduce and bound the failure"),
-            ("diagnose", "Test hypotheses and identify the root cause"),
-            ("implement", "Apply the root-cause fix"),
-            ("verify", "Verify behavior and recovery"),
-        ],
-        "orchestrator" => &[
-            ("investigate", "Establish scope and dependencies"),
-            ("execute", "Execute or delegate non-overlapping work"),
-            ("integrate", "Integrate results and reconcile state"),
-            ("verify", "Run acceptance checks and report evidence"),
-        ],
-        _ => &[
-            ("investigate", "Establish the relevant facts"),
-            ("implement", "Implement the scoped change"),
-            ("verify", "Run the relevant verification"),
-        ],
-    };
-    steps
-        .iter()
-        .map(|(id, title)| PlanningStepSeed { id, title })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,7 +539,7 @@ mod tests {
             "build",
         ));
 
-        assert!(matches!(decision, PlanningDecision::Create(_)));
+        assert!(matches!(decision, PlanningDecision::Required(_)));
     }
 
     #[test]
@@ -638,7 +552,7 @@ mod tests {
             assert!(
                 matches!(
                     PlanningPolicy::classify(PlanningInput::new(prompt, "orchestrator")),
-                    PlanningDecision::Create(_)
+                    PlanningDecision::Required(_)
                 ),
                 "{prompt:?} must create a durable plan"
             );
@@ -651,6 +565,9 @@ mod tests {
             "Why does this error happen?",
             "读取 Cargo.toml。",
             "Commit the current staged changes.",
+            "Use get_weather for Paris.",
+            "Install the spreadsheet skill.",
+            "执行 cargo test -p zuno-network。",
         ] {
             assert!(
                 matches!(
@@ -660,6 +577,16 @@ mod tests {
                 "{prompt:?} should remain atomic"
             );
         }
+    }
+
+    #[test]
+    fn a_tool_hint_does_not_hide_substantial_engineering_work() {
+        let decision = PlanningPolicy::classify(PlanningInput::new(
+            "Use Rust to implement the authentication feature.",
+            "build",
+        ));
+
+        assert!(matches!(decision, PlanningDecision::Required(_)));
     }
 
     #[test]
@@ -683,7 +610,7 @@ mod tests {
             .with_existing_plan(ExistingPlanState::Active),
         );
 
-        assert!(matches!(decision, PlanningDecision::Create(_)));
+        assert!(matches!(decision, PlanningDecision::Required(_)));
         assert_eq!(decision.rationale().code(), "active_plan_replaced");
     }
 
@@ -709,7 +636,7 @@ mod tests {
             .with_existing_plan(ExistingPlanState::Active),
         );
 
-        assert!(matches!(decision, PlanningDecision::Create(_)));
+        assert!(matches!(decision, PlanningDecision::Required(_)));
         assert_eq!(decision.rationale().code(), "goal_objective_replaced");
     }
 
@@ -724,7 +651,7 @@ mod tests {
             .with_existing_plan(ExistingPlanState::Active),
         );
 
-        assert!(matches!(decision, PlanningDecision::Create(_)));
+        assert!(matches!(decision, PlanningDecision::Required(_)));
         assert_eq!(decision.rationale().code(), "goal_objective_replaced");
     }
 
@@ -752,7 +679,7 @@ mod tests {
             .with_existing_plan(ExistingPlanState::Terminal),
         );
 
-        assert!(matches!(decision, PlanningDecision::Create(_)));
+        assert!(matches!(decision, PlanningDecision::Required(_)));
         assert_eq!(decision.rationale().code(), "terminal_plan_replaced");
     }
 
@@ -763,7 +690,7 @@ mod tests {
                 .with_content(PlanningContentFacts::new(1, 1, 32_000, true)),
         );
 
-        assert!(matches!(decision, PlanningDecision::Create(_)));
+        assert!(matches!(decision, PlanningDecision::Required(_)));
         assert_eq!(decision.rationale().code(), "typed_context");
     }
 
@@ -774,7 +701,7 @@ mod tests {
             "build",
         ));
 
-        assert!(matches!(decision, PlanningDecision::Create(_)));
+        assert!(matches!(decision, PlanningDecision::Required(_)));
     }
 
     #[test]
@@ -791,19 +718,12 @@ mod tests {
             "Investigate, implement, and verify the runtime change.",
             "build",
         ));
-        let seed = decision.seed().expect("multi-stage work creates a seed");
 
-        assert_eq!(
-            seed.steps()
-                .iter()
-                .map(|step| step.id())
-                .collect::<Vec<_>>(),
-            ["investigate", "implement", "verify"]
-        );
         assert!(
-            seed.guidance()
+            decision
+                .guidance()
                 .contains("Todo items are optional concrete work beneath plan steps")
         );
-        assert!(!seed.guidance().contains("one Todo per Plan step"));
+        assert!(!decision.guidance().contains("one Todo per Plan step"));
     }
 }

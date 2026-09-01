@@ -1,12 +1,13 @@
-Create or update the durable plan for the current session.
-The optional action is update (default), push, or pop.
-Use push when one active step needs a focused temporary subplan. It atomically suspends the current plan and makes the child plan visible; do not append the child's generic steps to the parent.
-Use pop only after every child step is completed. It atomically archives the child and restores the suspended parent, which must then be updated promptly.
-When a plan already exists, expected_revision is required and must equal the revision returned by plan_get. A stale revision is rejected without changing the plan.
-Keep every step id stable across updates. Step ids and titles must be non-empty and unique.
-Pending steps require exactly one in_progress step. Completed steps are terminal and cannot regress. A fully completed plan has no in_progress step.
+Create or mutate the durable plan for the current session with one tagged operation.
+Use action=create to create the first strategic plan, or to replace the visible root for a genuinely new objective. Supply a title and one or more steps; the host generates stable step ids. Replacing an existing plan requires its current expected_revision.
+Use action=patch to change only the plan title or named steps. Each step patch carries the id returned by plan_get and may change its title, status, or both.
+Use action=append to add one or more new steps. The host generates their ids; never invent or resend ids for appended steps.
+Use action=push when one active step needs a focused temporary subplan. It atomically suspends the current plan and creates the visible child plan with host-generated step ids.
+Use action=pop only after every child step is terminal. Pop carries only expected_revision; it atomically archives the child and restores the exact suspended parent.
+Every operation that changes an existing plan requires expected_revision equal to the revision returned by plan_get. A stale revision is rejected without changing the plan.
+Pending steps require exactly one in_progress step. Completed and superseded steps are terminal and cannot regress. A fully terminal plan has no in_progress step.
 If a commit, build, tag, deployment, or other verification input changes after a completed gate, append a new artifact-scoped verification step; never reuse or regress the old completed gate.
-Do not complete a step while a linked Job is queued, running, uncertain, or still has an unconsumed report. Reconcile its durable result first.
-Update the plan immediately when a step starts, completes, blocks, or changes scope. Before a final answer, reconcile the active step so the durable Plan never relies on prose to communicate progress.
-Link the plan to the active goal with goal_id when one exists. Do not rewrite the user's goal or success criteria through this tool.
+Do not complete or supersede a step while a linked Job is queued, running, uncertain, or still has an unconsumed report. Reconcile its durable result first.
+Update the plan immediately when a step starts, completes, is superseded, or changes scope. Before a final answer, reconcile the active step so durable state never relies on prose to communicate progress.
+Link a newly-created plan to the active goal with goal_id when one exists. Do not rewrite the user's goal or success criteria through this tool.
 This tool changes durable state and is never replayed implicitly after an uncertain failure.

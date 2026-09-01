@@ -145,7 +145,7 @@ async fn run_prompt(env: &ScriptedEnv, config: String) -> Output {
             "build",
             "--model",
             "test/test-model",
-            "read the fixture and finish",
+            "Read affinity-fixture.txt.",
         ])
         .current_dir(env.working_dir())
         .env_clear()

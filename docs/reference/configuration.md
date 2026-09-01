@@ -597,8 +597,9 @@ may still hide or deny them. Enabling continuity does not change the database
 format version; Notes creates additive component-owned tables when first used.
 
 Hiding `"tools": {"plan_update": false}` removes only the model-facing Plan
-mutation tool. The default profile's typed host-planning capability still
-creates, persists, and restores durable Plans.
+mutation tool. The typed host-planning capability still classifies work and
+restores existing durable Plans, but it does not manufacture strategic steps
+when the model cannot call the tool.
 
 For profile switching, ACP environment examples, final tool filters, Notes
 revision workflow, and verification commands, see

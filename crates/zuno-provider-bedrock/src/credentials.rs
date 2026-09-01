@@ -332,7 +332,7 @@ impl CredentialResolver {
 }
 
 fn metadata_client() -> reqwest::Result<reqwest::Client> {
-    zuno_network::direct_client_builder()
+    zuno_network::direct_client_builder(zuno_network::DirectPurpose::CloudMetadata)
         .connect_timeout(CREDENTIAL_CONNECT_TIMEOUT)
         .timeout(CREDENTIAL_REQUEST_TIMEOUT)
         .build()
@@ -866,13 +866,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let network_client = reqwest::Client::builder()
+        let network_client = zuno_network::client_builder()
             .proxy(reqwest::Proxy::all("http://127.0.0.1:1").expect("broken proxy URL"))
             .build()
             .expect("network client");
-        let metadata_client = zuno_network::direct_client_builder()
-            .build()
-            .expect("direct metadata client");
+        let metadata_client =
+            zuno_network::direct_client_builder(zuno_network::DirectPurpose::CloudMetadata)
+                .build()
+                .expect("direct metadata client");
         let resolver = CredentialResolver::with_clients(
             CredentialChainConfig {
                 imds_endpoint: Some(Url::parse(&server.uri()).expect("mock IMDS URL")),

@@ -17,6 +17,7 @@
 //! (`packages/core/src/tool/http-body.ts:11-15` then `:20-22`).
 
 use crate::webfetch::bounds::{INITIAL_BODY_CAPACITY, WebError};
+use zuno_network::PublicHttpResponse;
 use zuno_tool::InterruptHandle;
 
 /// Reads `response`'s body, refusing to buffer more than `limit` bytes.
@@ -88,6 +89,58 @@ pub async fn read_bounded(
     Ok(body)
 }
 
+/// The same bounded reader for Zuno's SSRF-safe proxy-aware response.
+pub async fn read_public_bounded(
+    mut response: PublicHttpResponse,
+    limit: usize,
+    interrupt: &dyn InterruptHandle,
+) -> Result<Vec<u8>, WebError> {
+    let url = response.endpoint().to_string();
+
+    if let Some(declared) = declared_length_headers(response.headers())
+        && declared > limit
+    {
+        return Err(WebError::TooLarge { limit, read: 0 });
+    }
+
+    let capacity = declared_length_headers(response.headers())
+        .unwrap_or(INITIAL_BODY_CAPACITY)
+        .min(limit);
+    let mut body = Vec::with_capacity(capacity);
+
+    loop {
+        if interrupt.is_set() {
+            return Err(WebError::Interrupted { read: body.len() });
+        }
+
+        let chunk = tokio::select! {
+            () = interrupt.notified() => {
+                return Err(WebError::Interrupted { read: body.len() });
+            }
+            chunk = response.chunk() => {
+                chunk.map_err(|source| WebError::PublicBody {
+                    url: url.clone(),
+                    source,
+                })?
+            }
+        };
+
+        let Some(chunk) = chunk else { break };
+        if chunk.is_empty() {
+            continue;
+        }
+        if body.len() + chunk.len() > limit {
+            return Err(WebError::TooLarge {
+                limit,
+                read: body.len(),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
 /// The `content-length` header, when it is present and a plausible size.
 ///
 /// A negative, non-numeric or absurd value is treated as absent rather than as an
@@ -95,8 +148,11 @@ pub async fn read_bounded(
 /// streaming cap. Oracle: `packages/core/src/tool/http-body.ts:11-14` applies the
 /// same `Number.isSafeInteger` and non-negative guards.
 fn declared_length(response: &reqwest::Response) -> Option<usize> {
-    response
-        .headers()
+    declared_length_headers(response.headers())
+}
+
+fn declared_length_headers(headers: &reqwest::header::HeaderMap) -> Option<usize> {
+    headers
         .get(reqwest::header::CONTENT_LENGTH)?
         .to_str()
         .ok()?

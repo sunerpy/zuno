@@ -24,6 +24,7 @@
 //! starts with two slashes must be written with three.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, RwLock};
 
 use zuno_engine::session_command::SessionCommand;
 
@@ -82,6 +83,62 @@ pub enum CatalogCommandKind {
         /// Absolute `SKILL.md` path or native source locator.
         source: String,
     },
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProjectedCatalog {
+    generation: u64,
+    commands: Vec<CatalogCommand>,
+}
+
+/// Atomically published host slash catalog.
+///
+/// The TUI owns routing and autocomplete, while the runtime owns commands and
+/// Skills. A generation projection lets a running session refresh both without
+/// teaching this leaf crate how Skill discovery works.
+#[derive(Debug, Clone, Default)]
+pub struct SlashProjection(Arc<RwLock<ProjectedCatalog>>);
+
+impl SlashProjection {
+    #[must_use]
+    pub fn new(commands: impl IntoIterator<Item = CatalogCommand>) -> Self {
+        Self(Arc::new(RwLock::new(ProjectedCatalog {
+            generation: 0,
+            commands: commands.into_iter().collect(),
+        })))
+    }
+
+    /// Publish one complete catalog, advancing only when its contents changed.
+    pub fn replace(&self, commands: impl IntoIterator<Item = CatalogCommand>) -> bool {
+        let commands = commands.into_iter().collect::<Vec<_>>();
+        let mut projected = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if projected.commands == commands {
+            return false;
+        }
+        projected.commands = commands;
+        projected.generation = projected.generation.wrapping_add(1);
+        true
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+    }
+
+    #[must_use]
+    pub fn observe(&self) -> (u64, Vec<CatalogCommand>) {
+        let projected = self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (projected.generation, projected.commands.clone())
+    }
 }
 
 /// What selecting or submitting a slash command does.

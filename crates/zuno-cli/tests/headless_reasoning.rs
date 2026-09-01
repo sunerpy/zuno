@@ -116,7 +116,7 @@ async fn run(env: &ScriptedEnv, config: String, extra_args: &[&str]) -> Output {
     command
         .arg("run")
         .args(extra_args)
-        .arg("answer with the fixture")
+        .arg("What answer does the fixture provide?")
         .current_dir(env.working_dir())
         .env_clear()
         .envs(variables(env, config));

@@ -79,7 +79,7 @@ use zuno_tui::views::session::{
     PromptDelivery, PromptEnvelope, PromptOrigin, PromptSubmission, PromptTarget,
     QueuedInputMutation, SessionScreen, TargetedPromptSubmission, scopes,
 };
-use zuno_tui::views::slash::{CatalogCommand, HostCommand};
+use zuno_tui::views::slash::{CatalogCommand, HostCommand, SlashProjection};
 
 use super::child_turn::{
     ChildSessionOpened, ChildTurnObserver, DetachedTurnObserver, InteractiveChildInput,
@@ -570,15 +570,18 @@ fn execute_once(
     // printed after teardown has to name, and by then the host is gone — a driver task
     // owns it and is aborted, not joined, so nothing survives to be asked.
     let exit_identity = host.session_identity();
-    let mut slash_commands = host
+    let catalog_commands = host
         .commands()
         .map(|command| CatalogCommand::new(command.name.clone(), command.description.clone()))
         .collect::<Vec<_>>();
+    let mut slash_commands = catalog_commands.clone();
     slash_commands.extend(
         host.slash_skills()
             .into_iter()
             .map(|skill| CatalogCommand::skill(skill.name, skill.description, skill.location)),
     );
+    let slash_projection = SlashProjection::new(slash_commands);
+    let skill_catalog_updates = host.skill_catalog_subscription();
     let (cancel_sender, cancel_receiver) = mpsc::channel(CANCEL_CHANNEL_CAPACITY);
     let (selection_sender, selection_receiver) = mpsc::channel(SELECTION_CHANNEL_CAPACITY);
     let (queue_mutation_sender, queue_mutation_receiver) =
@@ -607,7 +610,7 @@ fn execute_once(
     );
     let mut screen = SessionScreen::new(context.clone(), terminal_sender.clone())
         .with_prompt_sink(prompt_sender)
-        .with_slash_commands(slash_commands)
+        .with_slash_projection(slash_projection.clone())
         .with_reference_source(Box::new(reference_source))
         .with_cancel_sink(cancel_sender)
         .with_selection_sink(selection_sender)
@@ -750,6 +753,7 @@ fn execute_once(
     let mcp_wake = terminal_sender.clone();
     let work_wake = terminal_sender.clone();
     let background_wake = terminal_sender.clone();
+    let skill_wake = terminal_sender.clone();
     let queue_wake = terminal_sender.clone();
     let session_shutdown = terminal_sender.clone();
     let remount = CompositionRemount::default();
@@ -800,6 +804,13 @@ fn execute_once(
             background_projection_session,
             background_projection_state,
             background_wake,
+            worker_shutdown_source.clone(),
+        ));
+        let mut skills = tokio::spawn(drive_skill_catalog_projection(
+            skill_catalog_updates,
+            catalog_commands,
+            slash_projection,
+            skill_wake,
             worker_shutdown_source.clone(),
         ));
         let mut mcp = tokio::spawn(drive_mcp_lifecycle(McpLifecycleWorker {
@@ -861,6 +872,7 @@ fn execute_once(
             history_shutdown,
             turn_shutdown,
             background_shutdown,
+            skill_shutdown,
             mcp_shutdown,
             lsp_shutdown,
         ) = tokio::join!(
@@ -870,6 +882,7 @@ fn execute_once(
             await_worker("prompt history", &mut history),
             await_turn_driver(&mut turns),
             await_worker("background projection", &mut background),
+            await_worker("Skill catalog projection", &mut skills),
             await_worker("MCP lifecycle", &mut mcp),
             await_worker("LSP diagnostics", &mut checks),
         );
@@ -882,6 +895,7 @@ fn execute_once(
                 history_shutdown,
                 turn_shutdown,
                 background_shutdown,
+                skill_shutdown,
                 mcp_shutdown,
                 lsp_shutdown,
             ],
@@ -2938,6 +2952,56 @@ async fn drive_background_projection(
     }
 }
 
+async fn drive_skill_catalog_projection(
+    mut changes: watch::Receiver<Arc<zuno_catalog::skill::catalog::SkillCatalogSnapshot>>,
+    commands: Vec<CatalogCommand>,
+    projection: SlashProjection,
+    wake: mpsc::Sender<TerminalEvent>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let snapshot = changes.borrow_and_update().clone();
+                refresh_skill_catalog_projection(&snapshot, &commands, &projection, &wake);
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn refresh_skill_catalog_projection(
+    snapshot: &zuno_catalog::skill::catalog::SkillCatalogSnapshot,
+    commands: &[CatalogCommand],
+    projection: &SlashProjection,
+    wake: &mpsc::Sender<TerminalEvent>,
+) {
+    let mut projected = commands.to_vec();
+    projected.extend(
+        snapshot
+            .skills()
+            .slash_invokable(commands.iter().map(|command| command.name.as_str()))
+            .into_iter()
+            .map(|skill| {
+                CatalogCommand::skill(
+                    skill.name.clone(),
+                    skill.description.clone(),
+                    skill.location.clone(),
+                )
+            }),
+    );
+    if projection.replace(projected) {
+        let _nudged = wake.try_send(TerminalEvent::Wake);
+    }
+}
+
 fn refresh_background_projection(
     service: &zuno_pty::BackgroundExecutionService,
     session_id: &str,
@@ -3872,6 +3936,54 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, ["orchestrator", "build", "plan", "deep"]);
+    }
+
+    #[test]
+    fn live_skill_generation_replaces_tui_slash_routes_and_wakes_the_screen() {
+        let commands = vec![CatalogCommand::new(
+            "review",
+            Some("Review a change".to_owned()),
+        )];
+        let projection = SlashProjection::new(commands.clone());
+        let skills = zuno_catalog::skill::Skills::from_loaded([
+            zuno_catalog::skill::Skill::embedded(
+                "spreadsheet",
+                Some("Work with spreadsheets".to_owned()),
+                "builtin://spreadsheet",
+                "instructions",
+            ),
+            zuno_catalog::skill::Skill::embedded(
+                "review",
+                Some("Must not shadow the command".to_owned()),
+                "builtin://review",
+                "instructions",
+            ),
+        ]);
+        let catalog = zuno_catalog::skill::catalog::SkillCatalogService::fixed(Arc::new(skills));
+        let (wake, mut wakes) = mpsc::channel(1);
+
+        refresh_skill_catalog_projection(&catalog.snapshot(), &commands, &projection, &wake);
+
+        assert!(matches!(wakes.try_recv(), Ok(TerminalEvent::Wake)));
+        let (generation, projected) = projection.observe();
+        assert_eq!(generation, 1);
+        assert_eq!(
+            projected
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            ["review", "spreadsheet"]
+        );
+        assert!(matches!(
+            projected[1].kind,
+            zuno_tui::views::slash::CatalogCommandKind::Skill { .. }
+        ));
+
+        refresh_skill_catalog_projection(&catalog.snapshot(), &commands, &projection, &wake);
+        assert!(
+            wakes.try_recv().is_err(),
+            "unchanged generations must not wake"
+        );
     }
 
     #[test]

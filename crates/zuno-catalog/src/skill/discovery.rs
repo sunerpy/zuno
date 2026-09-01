@@ -61,6 +61,7 @@ pub const ZUNO_DISABLE_EXTERNAL_SKILLS: &str = "ZUNO_DISABLE_EXTERNAL_SKILLS";
 pub struct SkillOptions {
     directory: PathBuf,
     worktree: Option<PathBuf>,
+    env: Env,
     layout: Layout,
     paths: Vec<String>,
     urls: Vec<String>,
@@ -83,6 +84,7 @@ impl SkillOptions {
         Self {
             directory: directory.into(),
             worktree: worktree.map(Into::into),
+            env: env.clone(),
             layout: Layout::resolve(env),
             paths,
             urls,
@@ -172,6 +174,12 @@ impl SkillOptions {
         &self.layout
     }
 
+    /// The environment snapshot that determined discovery and watcher policy.
+    #[must_use]
+    pub fn env(&self) -> &Env {
+        &self.env
+    }
+
     /// Whether implicit shared Agent Skills roots are suppressed.
     #[must_use]
     pub fn external_disabled(&self) -> bool {
@@ -182,6 +190,48 @@ impl SkillOptions {
     #[must_use]
     pub fn urls(&self) -> &[String] {
         &self.urls
+    }
+
+    /// Existing roots, or their nearest existing parent, that can change discovery.
+    ///
+    /// The list is de-duplicated and removes nested roots when an existing parent is
+    /// already watched recursively. It never invents a source outside the standard,
+    /// configured, or remote-cache scopes used by [`SkillSources::discover`].
+    #[must_use]
+    pub fn watch_roots(&self) -> Vec<PathBuf> {
+        let mut candidates = vec![
+            self.worktree
+                .clone()
+                .unwrap_or_else(|| self.directory.clone()),
+            self.layout.config().to_path_buf(),
+            self.layout.home().join(".zuno"),
+            self.layout.home().join(AGENTS_EXTERNAL_DIR),
+            self.remote_cache_root(),
+        ];
+        candidates.extend(
+            self.layout
+                .config_directories(&self.directory, self.worktree.as_deref()),
+        );
+        candidates.extend(self.paths.iter().map(|entry| expand_path(entry, self)));
+        candidates.extend(
+            self.raw_path_config
+                .iter()
+                .map(|entry| expand_path(&entry.path, self)),
+        );
+
+        let mut roots = candidates
+            .into_iter()
+            .filter_map(nearest_existing_watch_root)
+            .collect::<Vec<_>>();
+        roots.sort_by_key(|path| path.components().count());
+        let mut deduplicated = Vec::<PathBuf>::new();
+        for root in roots {
+            if deduplicated.iter().any(|parent| root.starts_with(parent)) {
+                continue;
+            }
+            deduplicated.push(root);
+        }
+        deduplicated
     }
 
     /// Where a pulled remote skill is cached: `$XDG_CACHE_HOME/zuno/skills`.
@@ -244,6 +294,18 @@ impl ResolvedSkillPathConfig {
 struct EffectivePathConfig {
     enabled: bool,
     exposure: Option<SkillCatalogExposure>,
+}
+
+fn nearest_existing_watch_root(mut path: PathBuf) -> Option<PathBuf> {
+    loop {
+        if path.is_dir() {
+            path.parent()?;
+            return Some(std::fs::canonicalize(&path).unwrap_or(path));
+        }
+        if !path.pop() {
+            return None;
+        }
+    }
 }
 
 /// Which root produced a match.
@@ -924,6 +986,40 @@ mod tests {
         assert_eq!(
             options.remote_cache_root(),
             fixture.home().join(".cache/zuno/skills")
+        );
+    }
+
+    #[test]
+    fn path_config_for_a_future_skill_contributes_its_existing_watch_ancestor() {
+        let fixture = Fixture::new();
+        let project = fixture.dir.path().join("project");
+        let external = fixture.dir.path().join("external");
+        let env = fixture.env();
+        for directory in [
+            &project,
+            &external,
+            &fixture.home(),
+            &fixture.home().join(".zuno"),
+            &fixture.home().join(".agents"),
+            &fixture.home().join(".config/zuno"),
+            &fixture.home().join(".cache/zuno/skills"),
+        ] {
+            fs::create_dir_all(directory).expect("watch root");
+        }
+        let future = external.join("future/SKILL.md");
+        let options = SkillOptions::new(&project, Some(&project), &env, Vec::new(), Vec::new())
+            .with_path_config(vec![SkillPathConfig {
+                path: future.to_string_lossy().into_owned(),
+                enabled: Some(true),
+                exposure: Some(SkillCatalogExposure::Search),
+                recursive: None,
+            }]);
+
+        let external = fs::canonicalize(external).expect("canonical external");
+        assert!(
+            options.watch_roots().contains(&external),
+            "{:?}",
+            options.watch_roots()
         );
     }
 }

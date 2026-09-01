@@ -64,10 +64,11 @@ impl LivenessProbe for LocalServerProbe {
 }
 
 async fn probe_urls(urls: &[String]) -> Liveness {
-    let Ok(client) = zuno_network::direct_client_builder()
-        .connect_timeout(PROBE_TIMEOUT)
-        .timeout(PROBE_TIMEOUT)
-        .build()
+    let Ok(client) =
+        zuno_network::direct_client_builder(zuno_network::DirectPurpose::LoopbackControlPlane)
+            .connect_timeout(PROBE_TIMEOUT)
+            .timeout(PROBE_TIMEOUT)
+            .build()
     else {
         return Liveness::Unreachable;
     };

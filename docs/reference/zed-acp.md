@@ -147,16 +147,49 @@ set `ZUNO_CONFIG_DIR` in the custom Agent environment:
 On Windows, use an escaped absolute path. Multiple Zed entries may launch the
 same Zuno binary with different `ZUNO_CONFIG_DIR` overlays.
 
+The `env` object on the Zed custom Agent launches the `zuno acp` process. Proxy
+variables placed there therefore apply to every ordinary in-process session
+request: providers, OAuth, remote MCP, remote catalogs, `webfetch`, and
+`web_search`. For example:
+
+```json
+{
+  "agent_servers": {
+    "Zuno": {
+      "type": "custom",
+      "command": "/absolute/path/to/zuno",
+      "args": ["acp"],
+      "env": {
+        "HTTPS_PROXY": "http://127.0.0.1:1080",
+        "ALL_PROXY": "socks5h://127.0.0.1:1080",
+        "NO_PROXY": "127.0.0.1,localhost,::1"
+      }
+    }
+  }
+}
+```
+
+An `env` object attached to one ACP-provided stdio MCP server belongs only to
+that child process; it does not rewrite Zuno's process environment or other
+session traffic.
+
 ## 4. Select `deep` or another session Agent
 
 A new ACP session resolves Zuno's normal default Agent and model. Zuno then
 publishes these session controls to Zed:
 
 - **Mode**: Build or Plan;
-- **Agent**: the available implementation Agents;
+- **Agent**: `plan` plus the available implementation Agents;
 - **Model**: models from the resolved Zuno provider catalog;
 - **Reasoning**: `Configured default` plus the canonical levels supported by
   the selected model, such as Low, High, Extra High, or Maximum.
+
+The Agent selector includes `plan`. The selected Agent is the authoritative
+state: choosing `plan` switches Mode to Plan, while choosing `build`,
+`orchestrator`, `deep`, or another implementation Agent switches Mode to Build.
+Changing Mode performs the inverse mapping and Zuno sends both
+`current_mode_update` and `config_option_update` so the two Zed selectors stay
+synchronized.
 
 To use the directly selectable `deep` Agent:
 
@@ -166,9 +199,9 @@ To use the directly selectable `deep` Agent:
 4. choose the desired model if the current Zuno profile exposes more than one;
 5. choose a reasoning level when the selected model advertises reasoning.
 
-Plan mode always activates the read-only `plan` Agent. Returning to Build mode
-restores the selected implementation Agent. Agent and model changes are
-session-local and are rejected while a prompt is actively running.
+Plan mode activates the read-only `plan` Agent. Returning to Build restores the
+last selected implementation Agent. Agent and model changes are session-local
+and are rejected while a prompt is actively running.
 
 `zuno acp` does not accept an `--agent` launch argument. Agent selection is an
 ACP session configuration operation, not a second process-level configuration
@@ -178,8 +211,10 @@ surface.
 
 After session creation, loading, resuming, or a successful reconfiguration,
 Zuno publishes native session controls, executable commands from its normal
-command catalog, and unambiguous slash-invokable Skills. Zed then exposes them
-in `/` completion.
+command catalog, and unambiguous slash-invokable Skills. A running session also
+publishes a fresh `available_commands_update` whenever the shared Skill catalog
+generation changes, so installing, editing, deleting, or renaming a Skill does
+not require restarting ACP. Zed then exposes the current set in `/` completion.
 
 The sources are the same as other Zuno surfaces:
 
@@ -216,6 +251,13 @@ durable plan, so an early handoff fails explicitly instead of weakening the
 mode boundary. Successful changes emit ACP `current_mode_update` and
 `config_option_update` notifications, keeping Zed's selectors synchronized.
 None of these native commands is sent to the model.
+
+Every successful durable `plan_update` commit immediately publishes a complete
+ACP `sessionUpdate: "plan"` snapshot. Session load replays the current snapshot,
+and detached Goal continuation publishes one final authoritative snapshot after
+its event stream drains. ACP has no native `superseded` status, so Zuno maps it
+to `completed` and preserves the semantic outcome in
+`_meta.zuno.outcome: "superseded"`.
 
 Executing `/name arguments` uses Zuno's existing command-template or Skill
 driver, including normal permission and durable-session behavior. ACP does not

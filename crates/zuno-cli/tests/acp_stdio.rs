@@ -962,6 +962,49 @@ fn request_with_updates(
     }
 }
 
+fn request_with_all_updates(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> (Value, Vec<Value>) {
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::to_string(&frame).expect("encode ACP request")
+    )
+    .expect("write ACP request");
+    stdin.flush().expect("flush ACP request");
+
+    let mut updates = Vec::new();
+    loop {
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read ACP frame");
+        assert!(!line.is_empty(), "ACP closed before responding to {method}");
+        let response: Value = serde_json::from_str(&line).expect("ACP response JSON");
+        if response.get("id") == Some(&json!(id)) {
+            assert!(
+                response.get("error").is_none(),
+                "ACP request {method} failed: {response}"
+            );
+            return (response["result"].clone(), updates);
+        }
+        assert_eq!(
+            response.get("method").and_then(Value::as_str),
+            Some("session/update"),
+            "unexpected frame while waiting for {method}: {response}"
+        );
+        updates.push(response["params"]["update"].clone());
+    }
+}
+
 fn request_with_routed_updates(
     stdin: &mut ChildStdin,
     stdout: &mut BufReader<ChildStdout>,
@@ -1232,6 +1275,16 @@ fn compatible_tool_response(call_id: &str, name: &str, arguments: Value) -> Resp
         format!("data: {call}\n\ndata: {finish}\n\ndata: [DONE]\n\n"),
         "text/event-stream",
     )
+}
+
+fn tool_result_json(messages: &[Value], call_id: &str) -> Option<Value> {
+    messages
+        .iter()
+        .find(|message| {
+            message["role"] == "tool" && message["tool_call_id"].as_str() == Some(call_id)
+        })
+        .and_then(|message| message["content"].as_str())
+        .and_then(|content| serde_json::from_str(content).ok())
 }
 
 #[derive(Clone)]
@@ -1545,7 +1598,48 @@ impl Respond for CompletingBackgroundSubagentTurnResponder {
             .set_delay(Duration::from_secs(1));
         }
         if transcript.contains("background child completed after the parent turn ended") {
-            return compatible_text_response("parent resumed after background child completion");
+            if messages.iter().any(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == "call_complete_background_plan"
+            }) {
+                return compatible_text_response(
+                    "parent resumed after background child completion",
+                );
+            }
+            let plan = tool_result_json(&messages, "call_background_plan")
+                .expect("background parent must retain its created Plan");
+            let revision = plan["revision"]
+                .as_i64()
+                .expect("created background Plan revision");
+            let step_id = plan["steps"][0]["id"]
+                .as_str()
+                .expect("created background Plan step ID");
+            return compatible_tool_response(
+                "call_complete_background_plan",
+                "plan_update",
+                json!({
+                    "action": "patch",
+                    "expected_revision": revision,
+                    "steps": [{
+                        "id": step_id,
+                        "status": "completed"
+                    }]
+                }),
+            );
+        }
+        if tool_result_json(&messages, "call_background_plan").is_none() {
+            return compatible_tool_response(
+                "call_background_plan",
+                "plan_update",
+                json!({
+                    "action": "create",
+                    "title": "Track background completion",
+                    "steps": [{
+                        "title": "Wait for and integrate the background result",
+                        "status": "in_progress"
+                    }]
+                }),
+            );
         }
         let has_task_result = messages.iter().any(|message| {
             message["role"] == "tool"
@@ -1599,13 +1693,11 @@ impl Respond for PlanTurnResponder {
                 "call_plan",
                 "plan_update",
                 json!({
-                    "expected_revision": 1,
+                    "action": "create",
                     "title": "Verify ACP projection",
                     "steps": [
-                        {"id":"investigate","title":"Inspect ACP plan projection","status":"completed"},
-                        {"id":"execute","title":"Implement plan projection","status":"in_progress"},
-                        {"id":"integrate","title":"Integrate the durable update","status":"pending"},
-                        {"id":"verify","title":"Verify Zed update","status":"pending"}
+                        {"title":"Inspect ACP plan projection","status":"completed"},
+                        {"title":"Verify Zed update","status":"completed"}
                     ]
                 }),
             )
@@ -1694,6 +1786,14 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
             .is_some_and(|options| options.iter().any(|option| option["id"] == "model")),
         "new session must expose its resolved model selector: {created}"
     );
+    assert!(
+        created["configOptions"]
+            .as_array()
+            .and_then(|options| options.iter().find(|option| option["id"] == "agent"))
+            .and_then(|option| option["options"].as_array())
+            .is_some_and(|agents| agents.iter().any(|agent| agent["value"] == "plan")),
+        "new session must expose plan in the Agent selector: {created}"
+    );
     let commands = read_session_update(&mut stdout);
     assert_eq!(commands["sessionId"], session_id);
     let command_update = &commands["update"];
@@ -1721,44 +1821,147 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
         compact[0].get("input").is_none(),
         "native /compact does not accept prompt arguments"
     );
-    let planned = request(
+    let skill_directory = root.path().join(".agents/skills/spreadsheet");
+    std::fs::create_dir_all(&skill_directory).expect("create live Skill directory");
+    std::fs::write(
+        skill_directory.join("SKILL.md"),
+        "---\nname: spreadsheet\ndescription: Edit spreadsheet workbooks.\n---\nHandle sheets.\n",
+    )
+    .expect("install live Skill");
+    let mut projected = None;
+    for id in 100..130 {
+        std::thread::sleep(Duration::from_millis(100));
+        let (_, updates) = request_with_all_updates(
+            &mut stdin,
+            &mut stdout,
+            id,
+            "session/list",
+            json!({"cwd": root.path()}),
+        );
+        projected = updates.into_iter().find(|update| {
+            update["sessionUpdate"] == "available_commands_update"
+                && update["availableCommands"]
+                    .as_array()
+                    .is_some_and(|commands| {
+                        commands
+                            .iter()
+                            .any(|command| command["name"] == "spreadsheet")
+                    })
+        });
+        if projected.is_some() {
+            break;
+        }
+    }
+    assert!(
+        projected.is_some(),
+        "an active ACP session did not project the newly installed Skill"
+    );
+    let selected_plan = request(
         &mut stdin,
         &mut stdout,
         3,
-        "session/set_mode",
-        json!({"sessionId": session_id, "modeId": "plan"}),
+        "session/set_config_option",
+        json!({"sessionId": session_id, "configId": "agent", "value": "plan"}),
     );
-    assert_eq!(planned, json!({}));
-    let building = request(
+    assert!(
+        selected_plan["configOptions"]
+            .as_array()
+            .is_some_and(|options| {
+                options
+                    .iter()
+                    .any(|option| option["id"] == "agent" && option["currentValue"] == "plan")
+            })
+    );
+    let plan_updates = (0..3)
+        .map(|_| read_session_update(&mut stdout)["update"].clone())
+        .collect::<Vec<_>>();
+    assert!(plan_updates.iter().any(|update| {
+        update["sessionUpdate"] == "current_mode_update" && update["currentModeId"] == "plan"
+    }));
+    assert!(plan_updates.iter().any(|update| {
+        update["sessionUpdate"] == "config_option_update"
+            && update["configOptions"].as_array().is_some_and(|options| {
+                options
+                    .iter()
+                    .any(|option| option["id"] == "agent" && option["currentValue"] == "plan")
+            })
+    }));
+
+    let selected_deep = request(
         &mut stdin,
         &mut stdout,
         4,
-        "session/set_mode",
-        json!({"sessionId": session_id, "modeId": "build"}),
-    );
-    assert_eq!(building, json!({}));
-    let configured = request(
-        &mut stdin,
-        &mut stdout,
-        5,
         "session/set_config_option",
         json!({"sessionId": session_id, "configId": "agent", "value": "deep"}),
     );
     assert!(
-        configured["configOptions"]
+        selected_deep["configOptions"]
             .as_array()
             .is_some_and(|options| {
                 options
                     .iter()
                     .any(|option| option["id"] == "agent" && option["currentValue"] == "deep")
-            }),
-        "agent selection did not rebuild the ACP session: {configured}"
+            })
     );
+    let deep_updates = (0..3)
+        .map(|_| read_session_update(&mut stdout)["update"].clone())
+        .collect::<Vec<_>>();
+    assert!(deep_updates.iter().any(|update| {
+        update["sessionUpdate"] == "current_mode_update" && update["currentModeId"] == "build"
+    }));
+    assert!(deep_updates.iter().any(|update| {
+        update["sessionUpdate"] == "config_option_update"
+            && update["configOptions"].as_array().is_some_and(|options| {
+                options
+                    .iter()
+                    .any(|option| option["id"] == "agent" && option["currentValue"] == "deep")
+            })
+    }));
+
+    let planned = request(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/set_mode",
+        json!({"sessionId": session_id, "modeId": "plan"}),
+    );
+    assert_eq!(planned, json!({}));
+    let mode_plan_updates = (0..3)
+        .map(|_| read_session_update(&mut stdout)["update"].clone())
+        .collect::<Vec<_>>();
+    assert!(mode_plan_updates.iter().any(|update| {
+        update["sessionUpdate"] == "config_option_update"
+            && update["configOptions"].as_array().is_some_and(|options| {
+                options
+                    .iter()
+                    .any(|option| option["id"] == "agent" && option["currentValue"] == "plan")
+            })
+    }));
+
+    let building = request(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "session/set_mode",
+        json!({"sessionId": session_id, "modeId": "build"}),
+    );
+    assert_eq!(building, json!({}));
+    let mode_build_updates = (0..3)
+        .map(|_| read_session_update(&mut stdout)["update"].clone())
+        .collect::<Vec<_>>();
+    assert!(mode_build_updates.iter().any(|update| {
+        update["sessionUpdate"] == "config_option_update"
+            && update["configOptions"].as_array().is_some_and(|options| {
+                options
+                    .iter()
+                    .any(|option| option["id"] == "agent" && option["currentValue"] == "deep")
+            })
+    }));
 
     let listed = request(
         &mut stdin,
         &mut stdout,
-        6,
+        7,
         "session/list",
         json!({"cwd": root.path()}),
     );
@@ -1774,7 +1977,7 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
     request(
         &mut stdin,
         &mut stdout,
-        7,
+        8,
         "session/close",
         json!({"sessionId": session_id}),
     );
@@ -2151,16 +2354,10 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
     .expect("persisted ACP goal");
     let plan = zuno_tools::WorkStateStore::new(Arc::clone(&pool))
         .plan(&session_id)
-        .expect("read ACP plan")
-        .expect("Goal objective seeded a plan");
-    assert_eq!(plan.goal_id.as_deref(), Some(goal.goal_id.as_str()));
-    assert_eq!(plan.steps.len(), 4);
-    assert_eq!(plan.steps[0].status, zuno_tools::PlanStepStatus::InProgress);
+        .expect("read ACP plan");
     assert!(
-        plan.steps[1..]
-            .iter()
-            .all(|step| step.status == zuno_tools::PlanStepStatus::Pending),
-        "the edited Goal must expose one fresh root Plan without duplicate generic steps"
+        plan.is_none(),
+        "native Goal edits must not manufacture a user-visible generic Plan"
     );
     let connection = pool.get().expect("open ACP Plan archive");
     assert_eq!(
@@ -2172,9 +2369,10 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
                 |row| row.get::<_, i64>(0),
             )
             .expect("count superseded ACP plans"),
-        1,
-        "the first Goal Plan must remain durable as superseded history"
+        0,
+        "native Goal edits must not manufacture or archive generic Plans"
     );
+    assert_eq!(goal.objective, "进一步移除不必要内容，减少 AI 味并合并");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3358,7 +3556,7 @@ async fn acp_plan_round_trips_question_tool_through_stable_elicitation() {
         "session/prompt",
         json!({
             "sessionId": &session_id,
-            "prompt": [{"type": "text", "text": "Choose the database."}]
+            "prompt": [{"type": "text", "text": "Which database should I choose?"}]
         }),
         &session_id,
     );
@@ -3625,7 +3823,7 @@ async fn acp_fallback_reports_child_blocker_without_synchronous_elicitation() {
         "session/prompt",
         json!({
             "sessionId": &parent_session_id,
-            "prompt": [{"type":"text","text":"Delegate a child question."}]
+            "prompt": [{"type":"text","text":"Can a child choose the database?"}]
         }),
     );
     assert_eq!(completed["stopReason"], "end_turn");
@@ -4046,13 +4244,20 @@ async fn acp_detached_parent_projects_final_plan_after_background_child_completi
         .expect("the final durable plan projection must carry its durable revision");
     let location = zuno_paths::DbLocation::File(root.path().join("zuno-acp.db"));
     let pool = Arc::new(zuno_db::Pool::open(&location).expect("open ACP work-state pool"));
-    let durable_plan = zuno_tools::WorkStateStore::new(pool)
+    let durable_plan = zuno_tools::WorkStateStore::new(Arc::clone(&pool))
         .plan(&parent_session_id)
         .expect("read final durable plan")
         .expect("background continuation must retain its plan");
     assert_eq!(
         projected_revision, durable_plan.revision,
         "ACP must project the final durable plan revision"
+    );
+    assert!(
+        zuno_db::human_request::HumanRequestStore::new(pool)
+            .pending(Some(&parent_session_id))
+            .expect("read pending reconciliation requests")
+            .is_empty(),
+        "authoritative background completion must cancel the stale reconciliation request"
     );
 
     request(
@@ -4128,21 +4333,39 @@ async fn acp_prompt_projects_the_final_durable_plan_before_responding() {
         }),
         "plan tool input was not projected: {updates:#?}"
     );
+    let plan_positions = updates
+        .iter()
+        .enumerate()
+        .filter(|(_, update)| update["sessionUpdate"] == "plan")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert!(
+        plan_positions.len() >= 2,
+        "a durable Plan commit must be projected immediately and again as the terminal \
+         authoritative snapshot: {updates:#?}"
+    );
+    let final_message = updates
+        .iter()
+        .rposition(|update| update["sessionUpdate"] == "agent_message_chunk")
+        .expect("final assistant message projection");
+    assert!(
+        plan_positions[0] < final_message,
+        "the first Plan update must follow the durable tool commit rather than waiting for the \
+         terminal answer: {updates:#?}"
+    );
     let plan = updates
         .iter()
         .rfind(|update| update["sessionUpdate"] == "plan")
         .expect("session/prompt returned without the final durable plan snapshot");
     assert_eq!(
         plan["entries"].as_array().map(Vec::len),
-        Some(4),
+        Some(2),
         "final projected plan did not reflect the successful model refinement: {updates:#?}"
     );
     assert_eq!(plan["entries"][0]["content"], "Inspect ACP plan projection");
     assert_eq!(plan["entries"][0]["status"], "completed");
-    assert_eq!(plan["entries"][1]["content"], "Implement plan projection");
-    assert_eq!(plan["entries"][1]["status"], "in_progress");
-    assert_eq!(plan["entries"][2]["status"], "pending");
-    assert_eq!(plan["entries"][3]["status"], "pending");
+    assert_eq!(plan["entries"][1]["content"], "Verify Zed update");
+    assert_eq!(plan["entries"][1]["status"], "completed");
     assert_eq!(plan["_meta"]["zuno"]["title"], "Verify ACP projection");
 
     let received = provider

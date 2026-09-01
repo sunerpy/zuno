@@ -157,7 +157,12 @@ async fn run_prompt(env: &ScriptedEnv, config: String) -> Output {
 async fn run_prompt_with(env: &ScriptedEnv, config: String, extra: &[(&str, &str)]) -> Output {
     let mut command = tokio::process::Command::new(binary());
     command
-        .args(["run", "--model", "test/test-model", "hello"])
+        .args([
+            "run",
+            "--model",
+            "test/test-model",
+            "What endpoint is selected?",
+        ])
         .current_dir(env.working_dir())
         .env_clear()
         .envs(variables(env, config, extra));

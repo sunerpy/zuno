@@ -94,6 +94,16 @@ pub enum WebError {
         source: zuno_network::PublicHttpError,
     },
 
+    /// The public transport failed while streaming a validated response body.
+    #[error("response body from {url} failed")]
+    PublicBody {
+        /// Credential-free endpoint.
+        url: String,
+        /// Hyper/socket body failure.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The response exceeded [`MAX_RESPONSE_BYTES`].
     ///
     /// Carries how far the read got, so a caller can tell a declared-size rejection
@@ -214,7 +224,7 @@ impl WebError {
     #[must_use]
     pub const fn is_transient(&self) -> bool {
         match self {
-            Self::Transport { .. } | Self::SearchTransport { .. } => true,
+            Self::Transport { .. } | Self::SearchTransport { .. } | Self::PublicBody { .. } => true,
             Self::PublicTarget { source } => source.is_transient(),
             Self::Status { status, .. } | Self::SearchStatus { status, .. } => {
                 matches!(*status, 408 | 425 | 429) || (*status >= 500 && *status <= 599)

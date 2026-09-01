@@ -31,6 +31,7 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use zuno_catalog::skill::catalog::SkillCatalogService;
 use zuno_catalog::skill::{Skill, Skills, locale_compare};
 use zuno_error::ToolError;
 use zuno_tool::{ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy, TypedTool};
@@ -231,6 +232,16 @@ pub enum SkillRejection {
     Ambiguous { requested: String, sources: String },
 
     #[error(
+        "Skill catalog changed while loading `{requested}` from stale source `{locator}`. \
+         Retry with one currently advertised source: {available}"
+    )]
+    CatalogStale {
+        requested: String,
+        locator: String,
+        available: String,
+    },
+
+    #[error(
         "Skill `{requested}` has no source `{locator}`. Use action `list` or `search` and \
          pass one of its advertised source locators."
     )]
@@ -324,14 +335,43 @@ pub enum SkillRejection {
 /// visible, while the declared name is checked against the catalog entry before any
 /// content is returned.
 pub struct SkillTool {
-    skills: Arc<Skills>,
+    catalog: SkillCatalogSource,
+}
+
+enum SkillCatalogSource {
+    Fixed(Arc<Skills>),
+    Live(Arc<SkillCatalogService>),
 }
 
 impl SkillTool {
     /// A tool answering from `skills`.
     #[must_use]
     pub const fn new(skills: Arc<Skills>) -> Self {
-        Self { skills }
+        Self {
+            catalog: SkillCatalogSource::Fixed(skills),
+        }
+    }
+
+    /// A tool reading every operation from the session's live catalog generation.
+    #[must_use]
+    pub fn with_catalog(catalog: Arc<SkillCatalogService>) -> Self {
+        Self {
+            catalog: SkillCatalogSource::Live(catalog),
+        }
+    }
+
+    fn snapshot(&self) -> Arc<Skills> {
+        match &self.catalog {
+            SkillCatalogSource::Fixed(skills) => Arc::clone(skills),
+            SkillCatalogSource::Live(catalog) => Arc::clone(catalog.snapshot().skills()),
+        }
+    }
+
+    async fn refresh(&self) -> Option<Arc<Skills>> {
+        match &self.catalog {
+            SkillCatalogSource::Fixed(_) => None,
+            SkillCatalogSource::Live(catalog) => Some(Arc::clone(catalog.refresh().await.skills())),
+        }
     }
 }
 
@@ -372,7 +412,8 @@ impl TypedTool for SkillTool {
                 reject_unexpected(action, "source", source.as_ref())?;
                 reject_unexpected(action, "path", path.as_ref())?;
                 reject_unexpected(action, "limit", limit.as_ref())?;
-                self.list(cursor.as_deref())
+                let skills = self.snapshot();
+                Self::list(&skills, cursor.as_deref())
             }
             SkillAction::Search => {
                 reject_unexpected(action, "name", name.as_ref())?;
@@ -380,7 +421,8 @@ impl TypedTool for SkillTool {
                 reject_unexpected(action, "path", path.as_ref())?;
                 reject_unexpected(action, "cursor", cursor.as_ref())?;
                 let query = required(action, "query", query)?;
-                self.search(&query, limit)
+                let skills = self.snapshot();
+                Self::search(&skills, &query, limit)
             }
             SkillAction::Load => {
                 reject_unexpected(action, "query", query.as_ref())?;
@@ -408,7 +450,40 @@ impl SkillTool {
         source: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<ToolOutput, ToolError> {
-        let document = load_skill_document(&self.skills, name, source).await?;
+        let mut skills = self.snapshot();
+        let stale = source.is_some_and(|locator| {
+            skills
+                .by_source(locator)
+                .is_none_or(|skill| skill.name != name)
+        }) || (source.is_none() && skills.named(name).is_empty());
+        if stale && let Some(refreshed) = self.refresh().await {
+            skills = refreshed;
+        }
+        if let Some(locator) = source
+            && skills
+                .by_source(locator)
+                .is_none_or(|skill| skill.name != name)
+            && matches!(self.catalog, SkillCatalogSource::Live(_))
+        {
+            return Err(reject(stale_catalog(&skills, name, locator)));
+        }
+        let document = match load_skill_document(&skills, name, source).await {
+            Ok(document) => document,
+            Err(first) => {
+                let Some(refreshed) = self.refresh().await else {
+                    return Err(first);
+                };
+                skills = refreshed;
+                if let Some(locator) = source
+                    && skills
+                        .by_source(locator)
+                        .is_none_or(|skill| skill.name != name)
+                {
+                    return Err(reject(stale_catalog(&skills, name, locator)));
+                }
+                load_skill_document(&skills, name, source).await?
+            }
+        };
         let page = text_page(
             SkillAction::Load,
             &document.source,
@@ -484,7 +559,24 @@ impl SkillTool {
         path: &str,
         cursor: Option<&str>,
     ) -> Result<ToolOutput, ToolError> {
-        let skill = resolve_skill(&self.skills, name, source)?;
+        let mut skills = self.snapshot();
+        if source.is_some_and(|locator| {
+            skills
+                .by_source(locator)
+                .is_none_or(|skill| skill.name != name)
+        }) && let Some(refreshed) = self.refresh().await
+        {
+            skills = refreshed;
+        }
+        if let Some(locator) = source
+            && skills
+                .by_source(locator)
+                .is_none_or(|skill| skill.name != name)
+            && matches!(self.catalog, SkillCatalogSource::Live(_))
+        {
+            return Err(reject(stale_catalog(&skills, name, locator)));
+        }
+        let skill = resolve_skill(&skills, name, source)?;
         let requested = path.trim();
         let relative = Path::new(requested);
         if requested.is_empty()
@@ -584,7 +676,7 @@ impl SkillTool {
         Ok(output)
     }
 
-    fn search(&self, query: &str, limit: Option<usize>) -> Result<ToolOutput, ToolError> {
+    fn search(skills: &Skills, query: &str, limit: Option<usize>) -> Result<ToolOutput, ToolError> {
         let query = query.trim();
         let terms = search_terms(query);
         if query.is_empty() || terms.is_empty() {
@@ -598,8 +690,7 @@ impl SkillTool {
             }));
         }
 
-        let described = self
-            .skills
+        let described = skills
             .all()
             .iter()
             .filter(|skill| skill.is_searchable())
@@ -638,7 +729,7 @@ impl SkillTool {
                 described.len()
             )];
             lines.extend(matches.iter().map(|(_, skill)| {
-                display_catalog_entry(skill, self.skills.named(&skill.name).len() > 1)
+                display_catalog_entry(skill, skills.named(&skill.name).len() > 1)
             }));
             lines.push(
                 "Load the selected instructions with action `load`, its exact `name`, and \
@@ -656,8 +747,8 @@ impl SkillTool {
             .with_metadata("available", count_value(described.len())))
     }
 
-    fn list(&self, cursor: Option<&str>) -> Result<ToolOutput, ToolError> {
-        let listed = self.skills.searchable_sorted();
+    fn list(skills: &Skills, cursor: Option<&str>) -> Result<ToolOutput, ToolError> {
+        let listed = skills.searchable_sorted();
         if listed.is_empty() {
             return Err(reject(SkillRejection::Empty));
         }
@@ -689,9 +780,9 @@ impl SkillTool {
             listed.len()
         )];
         lines.extend(
-            listed[start..end].iter().map(|skill| {
-                display_catalog_entry(skill, self.skills.named(&skill.name).len() > 1)
-            }),
+            listed[start..end]
+                .iter()
+                .map(|skill| display_catalog_entry(skill, skills.named(&skill.name).len() > 1)),
         );
         let next_cursor = (end < listed.len())
             .then(|| encode_cursor(SkillAction::List, end, &identity, &identity));
@@ -707,6 +798,23 @@ impl SkillTool {
             output = output.with_metadata("next_cursor", next);
         }
         Ok(output)
+    }
+}
+
+fn stale_catalog(skills: &Skills, name: &str, locator: &str) -> SkillRejection {
+    let available = skills
+        .named(name)
+        .iter()
+        .map(|skill| format!("`{}`", skill.location))
+        .collect::<Vec<_>>();
+    SkillRejection::CatalogStale {
+        requested: name.to_owned(),
+        locator: locator.to_owned(),
+        available: if available.is_empty() {
+            String::from("<none; use action `list` or `search`>")
+        } else {
+            available.join(", ")
+        },
     }
 }
 

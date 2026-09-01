@@ -36,6 +36,15 @@ pub enum ToolError {
     #[error("tool {tool} timed out after {elapsed:?}")]
     Timeout { tool: String, elapsed: Duration },
 
+    /// A read-only network tool exceeded its budget on a known route and phase.
+    #[error("tool {tool} timed out after {elapsed:?} (route={route}, phase={phase})")]
+    NetworkTimeout {
+        tool: String,
+        route: String,
+        phase: &'static str,
+        elapsed: Duration,
+    },
+
     /// A typed transient failure whose identical request may succeed later.
     ///
     /// Whether replaying the call is safe is deliberately not encoded here. That
@@ -87,6 +96,7 @@ impl ToolError {
             Self::Denied { tool }
             | Self::InvalidArgs { tool, .. }
             | Self::Timeout { tool, .. }
+            | Self::NetworkTimeout { tool, .. }
             | Self::Transient { tool, .. }
             | Self::NotFound { tool }
             | Self::Failed { tool, .. }
@@ -124,6 +134,7 @@ impl ToolError {
             Self::InvalidArgs { .. } | Self::NotFound { .. } => true,
             Self::Denied { .. }
             | Self::Timeout { .. }
+            | Self::NetworkTimeout { .. }
             | Self::Transient { .. }
             | Self::Failed { .. }
             | Self::Uncertain { .. } => false,
@@ -134,7 +145,7 @@ impl ToolError {
 impl Recoverable for ToolError {
     fn recovery(&self) -> Recovery {
         match self {
-            Self::Timeout { .. } => Recovery::Retry { after: None },
+            Self::Timeout { .. } | Self::NetworkTimeout { .. } => Recovery::Retry { after: None },
             Self::Transient { retry_after, .. } => Recovery::Retry {
                 after: *retry_after,
             },
@@ -164,6 +175,12 @@ mod tests {
                 tool: "shell".to_owned(),
                 elapsed: Duration::from_secs(120),
             },
+            ToolError::NetworkTimeout {
+                tool: "webfetch".to_owned(),
+                route: "proxy(http://127.0.0.1:8080/)".to_owned(),
+                phase: "response_body",
+                elapsed: Duration::from_secs(30),
+            },
             ToolError::Transient {
                 tool: "shell".to_owned(),
                 retry_after: Some(Duration::from_secs(3)),
@@ -186,15 +203,25 @@ mod tests {
 
     #[test]
     fn every_variant_names_its_tool() {
-        for e in every_variant() {
-            assert_eq!(e.tool(), "shell", "{e}");
+        let variants = every_variant();
+        let expected = [
+            "shell", "shell", "shell", "webfetch", "shell", "shell", "shell", "shell",
+        ];
+        assert_eq!(variants.len(), expected.len());
+        for (error, expected_tool) in variants.into_iter().zip(expected) {
+            assert_eq!(error.tool(), expected_tool, "{error}");
         }
     }
 
     #[test]
     fn timeout_and_typed_transient_failures_are_retryable() {
         for e in every_variant() {
-            let expected = matches!(e, ToolError::Timeout { .. } | ToolError::Transient { .. });
+            let expected = matches!(
+                e,
+                ToolError::Timeout { .. }
+                    | ToolError::NetworkTimeout { .. }
+                    | ToolError::Transient { .. }
+            );
             assert_eq!(e.is_retryable(), expected, "{e}");
         }
     }

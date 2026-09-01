@@ -397,14 +397,16 @@ impl ProductionAcpAgent {
     ) -> Result<Value, zuno_acp::RpcError> {
         let session_id = required_string(params, "sessionId")?;
         let mode_id = required_string(params, "modeId")?;
-        self.session(&session_id)
+        let configuration = self
+            .session(&session_id)
             .await?
             .reconfigure(
                 SessionReconfiguration::Mode(mode_id),
                 self.state.as_ref(),
-                client,
+                client.clone(),
             )
             .await?;
+        defer_configuration_updates(&client, &session_id, &configuration)?;
         Ok(json!({}))
     }
 
@@ -429,8 +431,9 @@ impl ProductionAcpAgent {
         let configuration = self
             .session(&session_id)
             .await?
-            .reconfigure(change, self.state.as_ref(), client)
+            .reconfigure(change, self.state.as_ref(), client.clone())
             .await?;
+        defer_configuration_updates(&client, &session_id, &configuration)?;
         Ok(json!({ "configOptions": configuration.config_options() }))
     }
 
@@ -651,6 +654,7 @@ struct DormantSession {
 
 struct SessionResources {
     host: TurnHost,
+    skill_updates: Option<tokio::task::JoinHandle<()>>,
     mcp: Option<McpRuntime>,
     subagents: Option<super::acp_subagent::AcpSubagentBridge>,
     subagent_flush: Option<super::acp_subagent::AcpSubagentFlush>,
@@ -990,11 +994,44 @@ async fn open_session_resources(
         question_asker.attach_durable(human_requests, goals);
     }
     host.activate_background_notifications(&tokio::runtime::Handle::current());
+    let skill_updates = {
+        let mut receiver = host.skill_catalog_subscription();
+        let commands = host.commands().cloned().collect::<Vec<_>>();
+        let session_id = host.session_id().to_owned();
+        let client = client.clone();
+        tokio::spawn(async move {
+            while receiver.changed().await.is_ok() {
+                let (generation, update) = {
+                    let snapshot = receiver.borrow_and_update();
+                    let skills = snapshot
+                        .skills()
+                        .slash_invokable(commands.iter().map(|command| command.name.as_str()))
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    (
+                        snapshot.generation(),
+                        available_commands_update(commands.iter(), skills),
+                    )
+                };
+                if let Err(error) = client.session_update(&session_id, update).await {
+                    tracing::debug!(
+                        session_id,
+                        generation,
+                        %error,
+                        "ACP Skill catalog projection outlived its session"
+                    );
+                    break;
+                }
+            }
+        })
+    };
     let subagent_flush = subagents
         .as_ref()
         .map(super::acp_subagent::AcpSubagentBridge::flush_handle);
     Ok(SessionResources {
         host,
+        skill_updates: Some(skill_updates),
         mcp,
         subagents,
         subagent_flush,
@@ -1005,6 +1042,9 @@ async fn open_session_resources(
 }
 
 async fn shutdown_session_resources(mut resources: SessionResources) -> Result<(), String> {
+    if let Some(skill_updates) = resources.skill_updates.take() {
+        skill_updates.abort();
+    }
     let host = resources.host.shutdown().await;
     let subagents = shutdown_subagent_bridge(&mut resources.subagents).await;
     if let Some(mcp) = resources.mcp.take() {
@@ -1567,15 +1607,15 @@ impl AcpSession {
             )
         };
         match request.kind {
-            zuno_db::human_request::HumanRequestKind::Input => question
-                .ok_or_else(|| {
-                    zuno_acp::RpcError::internal(
-                        "ACP client does not advertise form elicitation for pending Goal input",
-                    )
-                })?
-                .answer_pending(request_id)
-                .await
-                .map_err(|error| zuno_acp::RpcError::internal(error.to_string())),
+            zuno_db::human_request::HumanRequestKind::Input => {
+                let Some(question) = question else {
+                    return Ok(false);
+                };
+                question
+                    .answer_pending(request_id)
+                    .await
+                    .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))
+            }
             zuno_db::human_request::HumanRequestKind::Permission => permission
                 .answer_pending(request_id)
                 .await
@@ -1604,7 +1644,7 @@ impl AcpSession {
             if let Some(request_id) = pending_request_id
                 && !self.answer_pending_human_request(&request_id).await?
             {
-                continue;
+                return Ok(());
             }
 
             let Some((driven, projected)) = self.drive_next_durable_input(client).await? else {
@@ -2284,7 +2324,7 @@ impl SessionConfiguration {
         let agents = plan
             .agents()
             .iter()
-            .filter(|agent| agent.hidden != Some(true) && agent.name != "plan")
+            .filter(|agent| agent.hidden != Some(true))
             .map(|agent| AgentChoice {
                 name: agent.name.clone(),
                 description: agent.description.clone(),
@@ -2294,7 +2334,7 @@ impl SessionConfiguration {
             active_agent.clone()
         } else {
             preserved_build_agent
-                .filter(|name| agents.iter().any(|agent| agent.name == *name))
+                .filter(|name| *name != "plan" && agents.iter().any(|agent| agent.name == *name))
                 .map(str::to_owned)
                 .or_else(|| {
                     ["build", "orchestrator"]
@@ -2302,7 +2342,12 @@ impl SessionConfiguration {
                         .find(|name| agents.iter().any(|agent| agent.name == *name))
                         .map(str::to_owned)
                 })
-                .or_else(|| agents.first().map(|agent| agent.name.clone()))
+                .or_else(|| {
+                    agents
+                        .iter()
+                        .find(|agent| agent.name != "plan")
+                        .map(|agent| agent.name.clone())
+                })
                 .unwrap_or_else(|| active_agent.clone())
         };
         let model = plan.qualified_model();
@@ -2359,7 +2404,7 @@ impl SessionConfiguration {
                         "unknown ACP Agent {agent}; available Agents: {available}"
                     )));
                 }
-                if self.mode == "build" && self.active_agent == agent {
+                if self.active_agent == agent {
                     return Ok(None);
                 }
                 options.agent = Some(agent);
@@ -2471,7 +2516,7 @@ impl SessionConfiguration {
                 "name": "Agent",
                 "category": "_agent",
                 "type": "select",
-                "currentValue": self.build_agent,
+                "currentValue": self.active_agent,
                 "options": self.agents.iter().map(|agent| json!({
                     "value": agent.name,
                     "name": agent.name,
@@ -2535,6 +2580,27 @@ impl SessionConfiguration {
             ..self.clone()
         }
     }
+}
+
+fn defer_configuration_updates(
+    client: &zuno_acp::ClientConnection,
+    session_id: &str,
+    configuration: &SessionConfiguration,
+) -> Result<(), zuno_acp::RpcError> {
+    client.session_update_after_response(
+        session_id,
+        json!({
+            "sessionUpdate": "current_mode_update",
+            "currentModeId": configuration.mode,
+        }),
+    )?;
+    client.session_update_after_response(
+        session_id,
+        json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": configuration.config_options(),
+        }),
+    )
 }
 
 const fn reasoning_effort_name(effort: zuno_llm::effort::ReasoningEffort) -> &'static str {
@@ -3012,8 +3078,22 @@ async fn project_turn(
         zuno_acp::AttemptBufferedTurnEventProjector::with_context_size(context_size);
     let mut finish_reason = None;
     while let Some(event) = receiver.recv().await {
+        let plan_committed = matches!(
+            &event,
+            TurnEvent::ToolDispatchCompleted {
+                name,
+                is_error: false,
+                ..
+            } if name == zuno_tools::PLAN_UPDATE_TOOL_ID
+        );
         for update in projector.project(&event) {
             client.session_update(session_id, update).await?;
+        }
+        if plan_committed {
+            let work = replay_work_state(Arc::new(durable_pool()?), session_id)?;
+            if let Some(update) = zuno_acp::durable_plan_update(&work) {
+                client.session_update(session_id, update).await?;
+            }
         }
         match event {
             TurnEvent::StepCompleted {
@@ -3196,10 +3276,16 @@ mod tests {
             context_size: 100_000,
             active_agent: "build".to_owned(),
             build_agent: "build".to_owned(),
-            agents: vec![AgentChoice {
-                name: "build".to_owned(),
-                description: Some("Build".to_owned()),
-            }],
+            agents: vec![
+                AgentChoice {
+                    name: "build".to_owned(),
+                    description: Some("Build".to_owned()),
+                },
+                AgentChoice {
+                    name: "plan".to_owned(),
+                    description: Some("Plan".to_owned()),
+                },
+            ],
             model: "test/reasoning".to_owned(),
             models: vec![
                 CatalogModelChoice {
@@ -3304,6 +3390,51 @@ mod tests {
                 .all(|option| option["id"] != "reasoning_effort"),
             "a non-reasoning model must remove the stale selector"
         );
+    }
+
+    #[test]
+    fn agent_selector_includes_plan_and_tracks_the_active_agent() {
+        let configuration = configuration();
+        let agent = configuration
+            .config_options()
+            .into_iter()
+            .find(|option| option["id"] == "agent")
+            .expect("agent option");
+        assert_eq!(agent["currentValue"], "build");
+        assert!(
+            agent["options"]
+                .as_array()
+                .is_some_and(|options| { options.iter().any(|option| option["value"] == "plan") })
+        );
+
+        let prepared = configuration
+            .prepare_reconfiguration(
+                TurnOptions::default(),
+                configuration.effort_override,
+                SessionReconfiguration::Agent("plan".to_owned()),
+            )
+            .expect("select plan")
+            .expect("configuration changed");
+        assert_eq!(prepared.options.agent.as_deref(), Some("plan"));
+
+        let mut plan = configuration;
+        plan.mode = "plan";
+        plan.active_agent = "plan".to_owned();
+        let agent = plan
+            .config_options()
+            .into_iter()
+            .find(|option| option["id"] == "agent")
+            .expect("agent option");
+        assert_eq!(agent["currentValue"], "plan");
+        let prepared = plan
+            .prepare_reconfiguration(
+                TurnOptions::default(),
+                plan.effort_override,
+                SessionReconfiguration::Agent("build".to_owned()),
+            )
+            .expect("select build")
+            .expect("configuration changed");
+        assert_eq!(prepared.options.agent.as_deref(), Some("build"));
     }
 
     #[test]

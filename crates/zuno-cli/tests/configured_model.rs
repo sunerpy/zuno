@@ -155,7 +155,7 @@ fn variables(env: &ScriptedEnv, config: String) -> BTreeMap<String, String> {
 async fn run_cli(env: &ScriptedEnv, variables: BTreeMap<String, String>) -> Output {
     let mut command = tokio::process::Command::new(binary());
     command
-        .args(["run", "route probe"])
+        .args(["run", "What route is selected?"])
         .current_dir(env.working_dir())
         .env_clear()
         .envs(variables);
@@ -180,7 +180,7 @@ fn run_tui(
         std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
     })?;
     let command = format!(
-        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --prompt 'route probe' --auto",
+        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --prompt 'What route is selected?' --auto",
         shell_quote(&binary().to_string_lossy())
     );
     let mut child = Command::new(script)
