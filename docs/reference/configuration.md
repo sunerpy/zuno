@@ -600,6 +600,10 @@ Hiding `"tools": {"plan_update": false}` removes only the model-facing Plan
 mutation tool. The default profile's typed host-planning capability still
 creates, persists, and restores durable Plans.
 
+For profile switching, ACP environment examples, final tool filters, Notes
+revision workflow, and verification commands, see
+[History and Notes continuity](/config/continuity).
+
 ## Plugin packages
 
 Plugins are package directories, not `zuno.json` fields. Install them globally

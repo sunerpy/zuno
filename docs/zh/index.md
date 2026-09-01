@@ -106,6 +106,7 @@ zuno run "为 users 接口增加分页并运行测试"
 | 理解执行模型 | [Zuno 是什么](/zh/guide/what-is-zuno) |
 | 配置 Provider | [Provider 与凭据](/zh/config/providers) |
 | 查询配置项 | [配置项参考](/zh/config/reference) |
+| 启用或切换 History 与 Notes | [History 与 Notes 连续性配置](/zh/config/continuity) |
 | 选择 Agent | [Agent](/zh/guide/agents) |
 | 配置 Shell 权限 | [权限与沙箱](/zh/guide/permissions) |
 | 在编辑器中使用 | [编辑器与 ACP](/zh/guide/editors) |

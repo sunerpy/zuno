@@ -110,6 +110,7 @@ provider configuration, credentials, and sandbox checks.
 | Understand the execution model | [What is Zuno?](/guide/what-is-zuno) |
 | Configure a provider | [Providers and credentials](/reference/providers) |
 | Look up a setting | [Configuration reference](/reference/configuration) |
+| Enable or switch History and Notes | [History and Notes continuity](/config/continuity) |
 | Choose an agent | [Agents](/guide/agents) |
 | Configure Shell authority | [Permissions and sandboxing](/guide/permissions) |
 | Use Zuno from an editor | [Editors and ACP](/reference/zed-acp) |

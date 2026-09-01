@@ -15,6 +15,7 @@ narrower layer removed.
 | What | File | Page |
 | --- | --- | --- |
 | Runtime, providers, agents, permissions, sandbox | `zuno.json` / `zuno.jsonc` | [Files and precedence](/config/files) |
+| Model-visible session History and Notes | `zuno.json` / `zuno.jsonc` | [History and Notes continuity](/config/continuity) |
 | Theme, keybindings, mouse, prompt size, diff layout, notifications | `tui.json` / `tui.jsonc` | [Themes and keybindings](/config/theming) |
 | Instructions injected into every prompt | `AGENTS.md`, `AGENTS.local.md` | [Instructions and AGENTS.md](/config/instructions) |
 | Reusable guidance with its own identity | `SKILL.md` in a Skill directory | [Authoring Skills](/config/authoring-skills) |
@@ -38,7 +39,7 @@ true of `delegates`, `requiredSkills`, `writableRoots`, and `instructions`.
 
 ## The top-level shape
 
-Forty-one keys exist. Grouped by what they decide:
+Forty-three keys exist. Grouped by what they decide:
 
 | Group | Keys |
 | --- | --- |
@@ -46,7 +47,7 @@ Forty-one keys exist. Grouped by what they decide:
 | Agents and delegation | `agents`, `default_agent`, `subagent_depth`, `subagent_model_selection`, `workflows`, `productAgent` |
 | Authority | `permission`, `sandbox`, `shell` |
 | Instructions, Skills, and learning | `instructions`, `skills`, `command`, `memory`, `learning` |
-| Context | `compaction`, `tool_output`, `attachment`, `references` |
+| Context | `compaction`, `continuity`, `tool_output`, `attachment`, `references` |
 | Integrations | `mcp`, `lsp`, `formatter`, `web_search`, `watcher` |
 | Runtime | `concurrency`, `goal`, `snapshot`, `tools`, `logLevel` |
 | Deployment | `server`, `share`, `autoupdate`, `enterprise`, `experimental` |
@@ -184,6 +185,7 @@ overlay preset instead.
 ## See also
 
 - [Files and precedence](/config/files)
+- [History and Notes continuity](/config/continuity)
 - [Configuration reference](/reference/configuration)
 - [Variables and substitution](/config/variables)
 - [Model routing](/config/models)

@@ -115,6 +115,9 @@ untouched for authoritative replay.
 
 ## Optional continuity
 
+Configuration examples and switching rules are documented in
+[History and Notes continuity](/config/continuity).
+
 When `continuity.history` is enabled, the model can inspect normalized evidence from this
 session through successful-compaction windows. The tool never crosses a session boundary
 and excludes reasoning, encrypted content, synthetic internal prompt text, and binary
@@ -195,6 +198,7 @@ irreversible and has no undo in this binary. Read
 ## See also
 
 - [Goals, plans and todos](/guide/durable-state)
+- [History and Notes continuity](/config/continuity)
 - [Session retention](/session-retention)
 - [zuno session](/cli/session)
 - [Harness runtime](/harness-runtime)

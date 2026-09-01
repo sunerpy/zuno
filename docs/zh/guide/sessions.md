@@ -69,6 +69,9 @@ zuno debug prompt --session ses_1a2b3c --step 2 --show-sensitive
 
 ## 可选连续性
 
+完整的配置示例与切换规则见
+[History 与 Notes 连续性配置](/zh/config/continuity)。
+
 启用 `continuity.history` 后，模型可以按成功压缩窗口检查当前会话的规范化证据。该工具
 不会跨越 session 边界，也不会返回 reasoning、加密内容、合成内部提示正文或二进制
 附件字节。
@@ -130,6 +133,7 @@ zuno session delete ses_1a2b3c
 ## 参见
 
 - [Goal、Plan 与 Todo](/zh/guide/durable-state)
+- [History 与 Notes 连续性配置](/zh/config/continuity)
 - [会话保留](/zh/operate/session-retention)
 - [zuno session](/zh/cli/session)
 - [Harness 运行时](/zh/operate/harness-runtime)

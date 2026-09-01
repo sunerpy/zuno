@@ -236,6 +236,54 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
 }
 
 #[test]
+fn continuity_docs_explain_switching_scope_and_final_tool_filters() {
+    contains_all(
+        "docs/config/continuity.md",
+        &[
+            "\"continuity\": true",
+            "\"history\": false",
+            "\"notes\": true",
+            "ZUNO_CONFIG_DIR",
+            "ZUNO_CONFIG_CONTENT",
+            "zuno acp",
+            "restart a long-running TUI, ACP server, or HTTP server",
+            "top-level `tools` map",
+            "`permission.rules`",
+            "expected_revision",
+            "session_id + Agent",
+            "`runtime.continuity`",
+            "\"plan_update\"",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/continuity.md",
+        &[
+            "\"continuity\": true",
+            "\"history\": false",
+            "\"notes\": true",
+            "ZUNO_CONFIG_DIR",
+            "ZUNO_CONFIG_CONTENT",
+            "zuno acp",
+            "重启长期运行的 TUI",
+            "顶层 `tools` 映射",
+            "`permission.rules`",
+            "expected_revision",
+            "session_id + Agent",
+            "`runtime.continuity`",
+            "\"plan_update\"",
+        ],
+    );
+    contains_all(
+        "docs/config/index.md",
+        &["[History and Notes continuity](/config/continuity)"],
+    );
+    contains_all(
+        "docs/zh/config/index.md",
+        &["[History 与 Notes 连续性配置](/zh/config/continuity)"],
+    );
+}
+
+#[test]
 fn portable_bundle_and_attachment_guides_document_the_public_contracts() {
     contains_all(
         "docs/reference/portable-bundles.md",

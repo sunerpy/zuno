@@ -145,6 +145,7 @@ zuno --sandbox workspace-write --sandbox-on-unavailable run-unconfined
 ## 参见
 
 - [配置总览](/zh/config/)
+- [History 与 Notes 连续性配置](/zh/config/continuity)
 - [变量与替换](/zh/config/variables)
 - [指令与 AGENTS.md](/zh/config/instructions)
 - [配置项参考](/zh/config/reference)

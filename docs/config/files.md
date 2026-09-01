@@ -166,6 +166,7 @@ A source build has no channel define, so it resolves `zuno-local.db`. See
 ## See also
 
 - [Configuration overview](/config/)
+- [History and Notes continuity](/config/continuity)
 - [Variables and substitution](/config/variables)
 - [Instructions and AGENTS.md](/config/instructions)
 - [Configuration reference](/reference/configuration)
