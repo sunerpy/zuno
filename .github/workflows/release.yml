@@ -157,7 +157,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       actions: read
-      contents: read
+      # GitHub hides draft releases from read-only tokens as "not found".
+      # This job must inspect the exact draft before the publish job can run.
+      contents: write
       pull-requests: read
       statuses: read
     outputs:
@@ -175,6 +177,7 @@ jobs:
         id: release_input
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_CREATED: ${{ needs.release_please.outputs.release_created }}
           RELEASE_TAG: ${{ needs.release_please.outputs.tag_name }}
           RELEASE_SHA: ${{ needs.release_please.outputs.sha }}
@@ -249,8 +252,11 @@ jobs:
             echo "::error title=Release identity::tag ${TAG} disagrees with Cargo.toml version ${version}"
             exit 1
           fi
-          release=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
-          if [ "$(jq -r '.draft' <<<"$release")" != true ] || [ "$(jq -r '.tag_name' <<<"$release")" != "$TAG" ]; then
+          # The REST "release by tag" endpoint returns 404 for drafts. The
+          # GitHub CLI resolves authenticated drafts through the releases list,
+          # which is the same behavior used by the publication step below.
+          release=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,tagName)
+          if [ "$(jq -r '.isDraft' <<<"$release")" != true ] || [ "$(jq -r '.tagName' <<<"$release")" != "$TAG" ]; then
             echo "::error title=Release identity::${TAG} is not the expected draft release"
             exit 1
           fi
@@ -313,7 +319,7 @@ jobs:
             target_url=$(
               jq -er '
                 .statuses
-                | map(select(.context == "zuno/release-candidate" and .state == "success"))
+                | map(select(.context == "zuno/pr-gate" and .state == "success"))
                 | first
                 | .target_url
               ' <<<"$status"
