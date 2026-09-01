@@ -47,11 +47,13 @@ zuno-continuity = { path = "crates/zuno-continuity" }
 zuno-db = { path = "crates/zuno-db" }
 zuno-engine = { path = "crates/zuno-engine" }
 zuno-error = { path = "crates/zuno-error" }
+zuno-eval = { path = "crates/zuno-eval" }
 zuno-extension = { path = "crates/zuno-extension" }
 zuno-goal = { path = "crates/zuno-goal" }
 zuno-harness = { path = "crates/zuno-harness" }
 zuno-llm = { path = "crates/zuno-llm" }
 zuno-lsp = { path = "crates/zuno-lsp" }
+zuno-learning = { path = "crates/zuno-learning" }
 zuno-mcp = { path = "crates/zuno-mcp" }
 zuno-memory = { path = "crates/zuno-memory" }
 zuno-network = { path = "crates/zuno-network" }

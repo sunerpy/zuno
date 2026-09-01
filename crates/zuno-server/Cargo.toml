@@ -26,10 +26,12 @@ zuno-engine = { workspace = true }
 zuno-error = { workspace = true }
 zuno-goal = { workspace = true }
 zuno-llm = { workspace = true }
+zuno-learning = { workspace = true }
 zuno-observability = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
 zuno-pty = { workspace = true }
+zuno-types = { workspace = true }
 rusqlite = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }

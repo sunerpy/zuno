@@ -7,6 +7,10 @@ pub enum SessionCommand {
     Compact,
     /// Inspect or mutate the durable top-level goal for this session.
     Goal,
+    /// Inspect or mutate durable experiences, patterns, feedback, and Skill candidates.
+    Learn,
+    /// Run the isolated learning extractor for the latest turn or full session.
+    Reflect,
     /// Enter Plan mode, or resume Work mode when already planning.
     Plan,
     /// Enter the read-only planning Agent immediately.
@@ -17,10 +21,12 @@ pub enum SessionCommand {
 
 impl SessionCommand {
     /// Every native session command clients may advertise.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Compact,
         Self::Goal,
+        Self::Learn,
         Self::Plan,
+        Self::Reflect,
         Self::StartPlan,
         Self::StartWork,
     ];
@@ -31,6 +37,8 @@ impl SessionCommand {
         match self {
             Self::Compact => "compact",
             Self::Goal => "goal",
+            Self::Learn => "learn",
+            Self::Reflect => "reflect",
             Self::Plan => "plan",
             Self::StartPlan => "start-plan",
             Self::StartWork => "start-work",
@@ -43,6 +51,8 @@ impl SessionCommand {
         match self {
             Self::Compact => "Summarize older context and keep the recent turn tail",
             Self::Goal => "Set, view, or manage the durable session goal",
+            Self::Learn => "View or manage durable user experiences and reviewed Skill candidates",
+            Self::Reflect => "Extract learning from the latest turn or the durable session",
             Self::Plan => "Enter Plan mode, or resume Work mode when already planning",
             Self::StartPlan => "Enter read-only Plan mode immediately",
             Self::StartWork => "Resume implementation from the durable plan",
@@ -52,7 +62,7 @@ impl SessionCommand {
     /// Whether the command owns an unparsed argument tail.
     #[must_use]
     pub const fn accepts_arguments(self) -> bool {
-        matches!(self, Self::Goal)
+        matches!(self, Self::Goal | Self::Learn | Self::Reflect)
     }
 
     /// Optional completion hint for clients that render command arguments.
@@ -60,6 +70,8 @@ impl SessionCommand {
     pub const fn input_hint(self) -> Option<&'static str> {
         match self {
             Self::Goal => Some("objective | action [value]"),
+            Self::Learn => Some("remember|issue|solved|forget|promote|feedback ..."),
+            Self::Reflect => Some("turn | session"),
             Self::Compact | Self::Plan | Self::StartPlan | Self::StartWork => None,
         }
     }
@@ -94,7 +106,15 @@ mod tests {
         assert_eq!(names, unique);
         assert_eq!(
             names,
-            ["compact", "goal", "plan", "start-plan", "start-work"]
+            [
+                "compact",
+                "goal",
+                "learn",
+                "plan",
+                "reflect",
+                "start-plan",
+                "start-work"
+            ]
         );
         assert_eq!(
             SessionCommand::from_name("compact"),
@@ -103,6 +123,14 @@ mod tests {
         assert_eq!(
             SessionCommand::from_name("goal"),
             Some(SessionCommand::Goal)
+        );
+        assert_eq!(
+            SessionCommand::from_name("learn"),
+            Some(SessionCommand::Learn)
+        );
+        assert_eq!(
+            SessionCommand::from_name("reflect"),
+            Some(SessionCommand::Reflect)
         );
         assert_eq!(
             SessionCommand::from_name("plan"),
@@ -120,8 +148,10 @@ mod tests {
     }
 
     #[test]
-    fn only_goal_accepts_a_free_form_argument_tail() {
+    fn goal_learning_and_reflection_accept_argument_tails() {
         assert!(SessionCommand::Goal.accepts_arguments());
+        assert!(SessionCommand::Learn.accepts_arguments());
+        assert!(SessionCommand::Reflect.accepts_arguments());
         assert_eq!(
             SessionCommand::Goal.input_hint(),
             Some("objective | action [value]")

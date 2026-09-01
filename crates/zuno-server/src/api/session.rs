@@ -488,6 +488,16 @@ pub async fn get(
     Ok(Json(Data::new(SessionInfo::from(session))))
 }
 
+pub async fn learning(
+    State(state): State<ApiState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Data<zuno_types::LearningStateProjection>>, ApiError> {
+    let session = state.sessions().get(&session_id)?;
+    let projection = zuno_learning::LearningProjectionService::new(state.pool_arc())
+        .snapshot(&session_id, &session.project_id)?;
+    Ok(Json(Data::new(projection)))
+}
+
 pub async fn messages(
     State(state): State<ApiState>,
     Path(session_id): Path<String>,

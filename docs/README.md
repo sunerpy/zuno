@@ -53,4 +53,5 @@ configuration, not here.
 - [Provider authentication](design/provider-authentication.md)
 - [Product agents](design/product-agents.md)
 - [Zed ACP integration](design/zed-acp-integration.md)
-- [Memory learning](design/memory-learning.md)
+- [Resident memory](design/memory-learning.md)
+- [User learning flywheel](design/user-learning-flywheel.md)

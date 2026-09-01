@@ -485,7 +485,7 @@ fn fixture_operations(document: &Value) -> BTreeSet<(String, String)> {
 fn api_openapi_contains_only_registered_zuno_operations() {
     let generated = api::openapi();
     let actual = fixture_operations(&generated);
-    assert_eq!(actual.len(), 50, "the registered Zuno API surface changed");
+    assert_eq!(actual.len(), 51, "the registered Zuno API surface changed");
     for operation in [
         ("/api/integration/{integrationID}/connect/key", "post"),
         ("/api/integration/{integrationID}/connect/oauth", "post"),
@@ -648,6 +648,45 @@ async fn api_session_response_validates_against_its_published_openapi_binding() 
     assert!(
         errors.is_empty(),
         "GET /api/session/ses_schema returned a body rejected by its own published schema: {errors:?}; body={body}"
+    );
+}
+
+#[tokio::test]
+async fn api_session_learning_returns_the_shared_durable_projection_shape() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    state
+        .sessions()
+        .create(&SessionCreate::new(
+            "ses_learning",
+            "learning-slug",
+            "global",
+            "/repo",
+            "/repo",
+            "learning projection",
+            "test",
+        ))
+        .expect("learning fixture session inserts");
+
+    let response = api_app(state)
+        .oneshot(request(
+            Method::GET,
+            "/api/session/ses_learning/learning",
+            None,
+        ))
+        .await
+        .expect("learning projection route responds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "data": {
+                "feedback": [],
+                "experiences": [],
+                "patterns": [],
+                "skillCandidates": [],
+            }
+        })
     );
 }
 

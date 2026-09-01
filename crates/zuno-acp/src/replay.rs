@@ -214,6 +214,31 @@ pub fn durable_plan_update(work: &WorkStateProjection) -> Option<Value> {
     }))
 }
 
+/// Replays the complete durable learning snapshot through ACP extensibility.
+///
+/// `session_info_update` permits metadata-only patches. Keeping learning under
+/// `_meta.zuno` lets unaware clients ignore it without rendering false chat
+/// content, while capable clients receive the same projection as TUI and Server.
+#[must_use]
+pub fn durable_learning_update(work: &WorkStateProjection) -> Value {
+    json!({
+        "sessionUpdate": "session_info_update",
+        "_meta": {
+            "zuno": {
+                "learning": work.learning,
+            }
+        },
+    })
+}
+
+/// Stable ACP updates for the complete frontend-neutral work snapshot.
+#[must_use]
+pub fn durable_work_updates(work: &WorkStateProjection) -> Vec<Value> {
+    let mut updates = durable_plan_update(work).into_iter().collect::<Vec<_>>();
+    updates.push(durable_learning_update(work));
+    updates
+}
+
 fn plan_step_priority<'a>(work: &'a WorkStateProjection, step_id: &str) -> &'a str {
     let mut resolved = None;
     for item in work
@@ -1490,5 +1515,43 @@ mod tests {
             ..zuno_types::WorkStateProjection::default()
         };
         assert!(durable_plan_update(&work).is_none());
+    }
+
+    #[test]
+    fn replay_learning_uses_metadata_only_session_info_update() {
+        let work = zuno_types::WorkStateProjection {
+            learning: zuno_types::LearningStateProjection {
+                experiences: vec![zuno_types::ExperienceProjection {
+                    id: "exp-1".to_owned(),
+                    project_id: "prj-1".to_owned(),
+                    session_id: Some("ses-1".to_owned()),
+                    source_message_id: Some("msg-1".to_owned()),
+                    kind: zuno_types::ExperienceKind::Procedure,
+                    title: "Verify before applying".to_owned(),
+                    summary: "Run the focused gate first.".to_owned(),
+                    resolution: Some("The focused gate passed.".to_owned()),
+                    confidence: 9_500,
+                    status: zuno_types::ExperienceStatus::Active,
+                    promoted_memory_candidate_id: None,
+                    time_created: 1,
+                    time_updated: 2,
+                }],
+                ..zuno_types::LearningStateProjection::default()
+            },
+            ..zuno_types::WorkStateProjection::default()
+        };
+
+        let update = durable_learning_update(&work);
+
+        assert_eq!(update["sessionUpdate"], "session_info_update");
+        assert!(update.get("title").is_none());
+        assert_eq!(
+            update["_meta"]["zuno"]["learning"]["experiences"][0]["kind"],
+            "procedure"
+        );
+        assert_eq!(
+            update["_meta"]["zuno"]["learning"]["experiences"][0]["sourceMessageId"],
+            "msg-1"
+        );
     }
 }

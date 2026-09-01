@@ -87,6 +87,7 @@
 
 mod config;
 mod db;
+mod learning;
 mod lsp;
 mod mcp;
 mod plugin;
@@ -97,6 +98,7 @@ mod tool;
 
 pub use crate::config::{ConfigError, ConfigIssue};
 pub use crate::db::DbError;
+pub use crate::learning::LearningError;
 pub use crate::lsp::LspError;
 pub use crate::mcp::McpError;
 pub use crate::plugin::PluginError;
@@ -135,6 +137,8 @@ pub enum Error {
     Mcp(#[from] McpError),
     #[error(transparent)]
     Lsp(#[from] LspError),
+    #[error(transparent)]
+    Learning(#[from] LearningError),
 }
 
 /// The workspace result type, defaulting to the aggregate [`Error`].
@@ -173,7 +177,8 @@ impl Error {
             | Self::Db(_)
             | Self::Plugin(_)
             | Self::Mcp(_)
-            | Self::Lsp(_) => None,
+            | Self::Lsp(_)
+            | Self::Learning(_) => None,
         }
     }
 }
@@ -188,6 +193,7 @@ impl Recoverable for Error {
             Self::Plugin(e) => Recoverable::recovery(e),
             Self::Mcp(e) => Recoverable::recovery(e),
             Self::Lsp(e) => Recoverable::recovery(e),
+            Self::Learning(e) => Recoverable::recovery(e),
         }
     }
 }

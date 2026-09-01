@@ -50,6 +50,7 @@ pub fn router(state: ApiState) -> Router {
             get(maintenance::preview).post(maintenance::mutate),
         )
         .route("/api/session/{sessionID}", get(session::get))
+        .route("/api/session/{sessionID}/learning", get(session::learning))
         .route("/api/agent", get(catalog::agents))
         .route("/api/command", get(catalog::commands))
         .route("/api/skill", get(catalog::skills))

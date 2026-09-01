@@ -250,6 +250,7 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
             scope: zuno_types::MemoryScope::Global,
             content: "prefer concise explanations".to_owned(),
         }],
+        learning: zuno_types::LearningStateProjection::default(),
     };
     view.toggle(Section::Memory);
     let joined = view
@@ -281,6 +282,94 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
         "1 review · 1 saved",
         "run cargo fmt",
         "prefer concise",
+    ] {
+        assert!(
+            normalized.contains(expected),
+            "missing `{expected}`:\n{joined}"
+        );
+    }
+}
+
+#[test]
+fn views_sidebar_projects_learning_review_state_from_shared_work_state() {
+    let mut view = view();
+    view.ambient_mut().work.learning = zuno_types::LearningStateProjection {
+        feedback: Vec::new(),
+        experiences: vec![zuno_types::ExperienceProjection {
+            id: "exp_1".to_owned(),
+            project_id: "project_1".to_owned(),
+            session_id: Some("ses_1".to_owned()),
+            source_message_id: Some("msg_1".to_owned()),
+            kind: zuno_types::ExperienceKind::UnresolvedIssue,
+            title: "Release still fails".to_owned(),
+            summary: "The remote artifact is missing.".to_owned(),
+            resolution: None,
+            confidence: 9_000,
+            status: zuno_types::ExperienceStatus::Active,
+            promoted_memory_candidate_id: None,
+            time_created: 1,
+            time_updated: 1,
+        }],
+        patterns: vec![zuno_types::LearningPatternProjection {
+            id: "pat_1".to_owned(),
+            project_id: Some("project_1".to_owned()),
+            fingerprint: "fingerprint".to_owned(),
+            title: "Verify remote artifacts".to_owned(),
+            summary: "Repeated release evidence.".to_owned(),
+            learned_rules: vec!["Check the published asset.".to_owned()],
+            independent_sessions: 3,
+            project_count: 1,
+            status: zuno_types::LearningPatternStatus::Pending,
+            evidence_version: 1,
+            time_created: 1,
+            time_updated: 1,
+        }],
+        skill_candidates: vec![zuno_types::SkillCandidateProjection {
+            id: "skc_1".to_owned(),
+            project_id: "project_1".to_owned(),
+            pattern_id: Some("pat_1".to_owned()),
+            name: "learned-release-check".to_owned(),
+            target_source: "learning://pattern/pat_1".to_owned(),
+            target_digest: "empty".to_owned(),
+            proposed_digest: "proposed".to_owned(),
+            diff: "diff".to_owned(),
+            learned_rules: vec!["Check the published asset.".to_owned()],
+            operation: zuno_types::SkillCandidateOperation::Apply,
+            reverts_candidate_id: None,
+            status: zuno_types::SkillCandidateStatus::PendingReview,
+            evaluation_run_id: None,
+            error: None,
+            time_created: 1,
+            time_updated: 1,
+        }],
+    };
+    view.toggle(Section::Learning);
+
+    let joined = view
+        .lines(SIDEBAR_WIDTH)
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let normalized = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        view.ambient().work.learning.experiences[0].kind,
+        zuno_types::ExperienceKind::UnresolvedIssue
+    );
+    assert_eq!(
+        view.ambient().work.learning.patterns[0].independent_sessions,
+        3
+    );
+    assert_eq!(
+        view.ambient().work.learning.skill_candidates[0].status,
+        zuno_types::SkillCandidateStatus::PendingReview
+    );
+    for expected in [
+        "Learning",
+        "1 experiences · 2 review · /learn",
+        "Release still fails · unresolv",
+        "pattern · Verify remote artifact",
+        "Skill · learned-release-check",
     ] {
         assert!(
             normalized.contains(expected),

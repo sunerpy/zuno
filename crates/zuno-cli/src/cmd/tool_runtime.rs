@@ -111,6 +111,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) councils: Arc<dyn zuno_tools::council::CouncilHost>,
     pub(crate) job_controller: Arc<dyn zuno_tools::job_cancel::JobController>,
     pub(crate) memory: Option<Arc<dyn Tool>>,
+    pub(crate) experience_search: Option<Arc<dyn Tool>>,
     /// Exact provider-visible tools from the immutable parent Attempt.
     pub(crate) tool_authority: Option<Arc<[ToolSchemaIdentity]>>,
 }
@@ -393,6 +394,9 @@ pub(crate) fn assemble(
     if let Some(memory) = selection.memory {
         builder.register_configured_builtin(memory);
     }
+    if let Some(experience_search) = selection.experience_search {
+        builder.register_configured_builtin(experience_search);
+    }
     let mut product_tool_names = BTreeSet::new();
     for (instance, product) in config.product_agent.iter().flatten() {
         if !product.is_enabled() {
@@ -597,6 +601,7 @@ fn native_tool_name(name: &str, harness_tool_names: &BTreeSet<String>) -> bool {
             zuno_tools::JOB_CANCEL_WIRE_ID,
             zuno_tools::JOB_RECONCILE_WIRE_ID,
             zuno_tools::memory::MEMORY_TOOL_ID,
+            zuno_tools::EXPERIENCE_SEARCH_WIRE_ID,
             zuno_goal::GET_GOAL_TOOL_ID,
             zuno_goal::CREATE_GOAL_TOOL_ID,
             zuno_goal::UPDATE_GOAL_TOOL_ID,

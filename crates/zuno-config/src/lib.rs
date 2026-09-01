@@ -13,5 +13,8 @@ pub use crate::instructions::{
 pub use crate::schema::sandbox::{
     SandboxConfig, SandboxMode, SandboxNetworkMode, SandboxUnavailableAction,
 };
-pub use crate::schema::{Config, KNOWN_TOP_LEVEL_KEYS, WebSearchBackend, WebSearchConfig};
+pub use crate::schema::{
+    Config, KNOWN_TOP_LEVEL_KEYS, LearningConfig, ResolvedLearningConfig, WebSearchBackend,
+    WebSearchConfig,
+};
 pub use crate::variable::{Missing, Source, Substitution};

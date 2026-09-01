@@ -21,6 +21,30 @@ can set the archive marker but cannot currently clear it.** Reversing an archive
 today means calling `restore_archive` from Rust or clearing the column yourself.
 The reversibility is real, but it is not yet a flag.
 
+## Derived learning when deleting one session
+
+Interactive session deletion makes the learning choice explicit:
+
+- **keep learning** preserves derived Experience records and detaches their
+  nullable session/message provenance when the transcript is removed;
+- **clean learning** first creates pending-review reversals for applied Memory
+  and Skill changes, rejects pending candidates that cite the evidence, then
+  marks the Experience records `forgotten`.
+
+Cleaning never silently removes an applied Memory entry or Skill. The TUI asks
+for the choice. ACP `session/delete` requires
+`cleanupDerivedExperiences: true|false`. Standalone
+`zuno session delete <id>` requires exactly one of
+`--keep-derived-experiences` or `--cleanup-derived-experiences`; cleanup with
+derived rows must run through a live TUI or ACP learning profile so it can
+prepare the review candidates.
+
+`zuno session prune --delete` is the bulk retention path. It retains project
+Experience, patterns, evaluations, Memory, and Skill candidates while deleting
+session-owned feedback and learning jobs. This behavior is included in its
+destructive confirmation and documented here rather than silently treating
+project learning as transcript data.
+
 ## Preview first, always
 
 With neither `--archive` nor `--delete`, the command is a preview and mutates
@@ -88,7 +112,7 @@ Generated from `zuno_db::prune::DELETE_ORDER`. The order is pinned by
 `crates/zuno-db/tests/prune.rs::prune_delete_order_and_true_related_table_count_are_pinned`,
 because the order is what keeps foreign keys satisfied mid-transaction.
 
-**16 tables**, in this order:
+**18 tables**, in this order:
 
 <!-- generated:BEGIN prune-tables -->
 | order | table |
@@ -97,18 +121,20 @@ because the order is what keeps foreign keys satisfied mid-transaction.
 | 2 | `session_note` |
 | 3 | `memory_reflection_job` |
 | 4 | `memory_reflection_delivery` |
-| 5 | `agent_job` |
-| 6 | `work_item` |
-| 7 | `work_plan` |
-| 8 | `session_context_epoch` |
-| 9 | `session_input` |
-| 10 | `session_message` |
-| 11 | `part` |
-| 12 | `message` |
-| 13 | `session_share` |
-| 14 | `session` |
-| 15 | `event_sequence` |
-| 16 | `event` |
+| 5 | `learning_job` |
+| 6 | `message_feedback` |
+| 7 | `agent_job` |
+| 8 | `work_item` |
+| 9 | `work_plan` |
+| 10 | `session_context_epoch` |
+| 11 | `session_input` |
+| 12 | `session_message` |
+| 13 | `part` |
+| 14 | `message` |
+| 15 | `session_share` |
+| 16 | `session` |
+| 17 | `event_sequence` |
+| 18 | `event` |
 <!-- generated:END prune-tables -->
 
 Regenerate with:

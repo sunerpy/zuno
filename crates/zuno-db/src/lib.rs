@@ -42,11 +42,16 @@
 
 pub mod artifact_gc;
 pub mod continuity;
+pub mod evaluation;
 pub mod event_log;
+pub mod experience;
+pub mod feedback;
 pub mod fts;
 pub mod human_request;
 pub mod inbox;
 pub mod job;
+pub mod learning_job;
+pub mod learning_pattern;
 pub mod memory_candidate;
 pub mod memory_reflection;
 pub mod message;
@@ -61,6 +66,7 @@ pub mod session;
 pub mod session_export;
 pub mod session_list;
 pub mod session_prune;
+pub mod skill_candidate;
 pub mod vacuum;
 
 pub use crate::open::{

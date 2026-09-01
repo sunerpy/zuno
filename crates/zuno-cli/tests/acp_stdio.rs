@@ -1793,7 +1793,7 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
         &mut stdout,
         9,
         "session/delete",
-        json!({"sessionId": session_id}),
+        json!({"sessionId": session_id, "cleanupDerivedExperiences": false}),
     );
     let after_delete = request(
         &mut stdin,
@@ -2002,12 +2002,20 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         .as_array()
         .expect("available commands")
         .iter()
-        .take(5)
+        .take(7)
         .map(|command| command["name"].as_str().expect("command name"))
         .collect::<Vec<_>>();
     assert_eq!(
         native,
-        ["compact", "goal", "plan", "start-plan", "start-work"]
+        [
+            "compact",
+            "goal",
+            "learn",
+            "plan",
+            "reflect",
+            "start-plan",
+            "start-work"
+        ]
     );
     let goal_command = commands["update"]["availableCommands"]
         .as_array()
@@ -4406,6 +4414,7 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
             "tool_call_update",
             "agent_message_chunk",
             "plan",
+            "session_info_update",
             "usage_update",
         ],
         "session/load must replay every durable client-visible projection in order: {updates:#?}"
@@ -4443,6 +4452,14 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
         .expect("plan replay");
     assert_eq!(plan["entries"][0]["status"], "in_progress");
     assert_eq!(plan["entries"][1]["status"], "pending");
+    let learning = updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "session_info_update")
+        .expect("learning replay");
+    assert_eq!(
+        learning["_meta"]["zuno"]["learning"]["experiences"],
+        json!([])
+    );
     let usage = updates
         .iter()
         .find(|update| update["sessionUpdate"] == "usage_update")
@@ -4581,25 +4598,35 @@ fn acp_load_replays_negotiated_child_sessions_on_their_own_routes() {
     assert_eq!(
         routes,
         vec![
+            (parent_session_id.as_str(), "session_info_update"),
             (parent_session_id.as_str(), "subagent_spawned"),
             (child_session_id, "user_message_chunk"),
             (child_session_id, "agent_message_chunk"),
+            (child_session_id, "session_info_update"),
             (child_session_id, "usage_update"),
             (parent_session_id.as_str(), "subagent_state_update"),
         ],
         "session/load must rebuild the durable child tree before returning: {routed:#?}"
     );
-    assert_eq!(routed[0]["update"]["subagentSessionId"], child_session_id);
-    assert_eq!(routed[0]["update"]["name"], "explorer");
     assert_eq!(
-        routed[1]["update"]["content"]["text"],
+        routed[0]["update"]["_meta"]["zuno"]["learning"]["experiences"],
+        json!([])
+    );
+    assert_eq!(routed[1]["update"]["subagentSessionId"], child_session_id);
+    assert_eq!(routed[1]["update"]["name"], "explorer");
+    assert_eq!(
+        routed[2]["update"]["content"]["text"],
         "inspect the child tree"
     );
     assert_eq!(
-        routed[2]["update"]["content"]["text"],
+        routed[3]["update"]["content"]["text"],
         "child history restored"
     );
-    assert_eq!(routed[4]["update"]["state"], "disconnected");
+    assert_eq!(
+        routed[4]["update"]["_meta"]["zuno"]["learning"]["experiences"],
+        json!([])
+    );
+    assert_eq!(routed[6]["update"]["state"], "disconnected");
 
     request(
         &mut stdin,

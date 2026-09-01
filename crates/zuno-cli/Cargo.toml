@@ -34,12 +34,14 @@ zuno-continuity = { workspace = true }
 zuno-db = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-error = { workspace = true }
+zuno-eval = { workspace = true }
 zuno-extension = { workspace = true }
 zuno-goal = { workspace = true }
 zuno-harness = { workspace = true }
 zuno-llm = { workspace = true }
 zuno-memory = { workspace = true }
 zuno-lsp = { workspace = true }
+zuno-learning = { workspace = true }
 zuno-mcp = { workspace = true }
 zuno-network = { workspace = true }
 zuno-observability = { workspace = true }

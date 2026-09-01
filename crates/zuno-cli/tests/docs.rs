@@ -529,7 +529,7 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
             "not copied into `auth.json`",
             "metadata.zuno_session_id",
             "durable root or child session identity",
-            "title, summary, compaction, reflection, and Council calls are isolated",
+            "title, summary, compaction, learning extraction, and Council calls are isolated",
         ],
     );
     contains_all(

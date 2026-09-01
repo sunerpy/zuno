@@ -138,7 +138,7 @@ without a non-empty `KIRO_PROVIDER_API_KEYS`, and by default uses its
 the local Bearer key are separate layers: the former authorizes the gateway
 upstream, while the latter protects the loopback HTTP endpoint. The resolved
 Responses surface is also preserved for title, compaction, summary, Council
-synthesis, and memory reflection requests; those internal Agents do not
+synthesis, and learning extraction requests; those internal Agents do not
 silently fall back to Chat Completions.
 
 Set the provider options to:
@@ -203,7 +203,7 @@ Zuno must not add a provider-id special case that silently drops summary.
 For a foreground root or delegated-child turn, Zuno attaches the session's
 durable identity to standard Responses
 `metadata.zuno_session_id`. Tool continuations and a later process resume reuse
-the same identity. Title, summary, compaction, reflection, and Council requests
+the same identity. Title, summary, compaction, learning extraction, and Council requests
 remain explicitly isolated and do not receive foreground affinity.
 `zuno_session_id` is reserved: provider `extraBody` or request parameters may
 add unrelated object-shaped metadata but cannot override that field. A gateway
@@ -933,47 +933,81 @@ generic command host can execute their templates. Zuno does not register a
 built-in `/review`; a user may provide a `review` Skill or command with the exact
 semantics their project needs.
 
-## Memory learning
+## Resident Memory and user learning
 
-Resident memory is enabled by default, but model and reflection writes enter an
-auditable candidate queue first:
+Resident Memory is enabled by default. It remains a compact, audited prompt
+store:
 
 ```json
 {
   "memory": {
     "resident": true,
     "tool": true,
-    "reflection": true,
     "global_char_limit": 2200,
     "project_char_limit": 3000,
-    "nudge_interval": 10,
     "promotion": "review",
     "auto_confidence": 0.9
+  },
+  "learning": {
+    "enabled": true,
+    "extractor_model": "provider/model",
+    "post_turn": {
+      "enabled": true
+    },
+    "aggregation": {
+      "interval_ms": 86400000,
+      "min_new_records": 3
+    },
+    "global_promotion": {
+      "interval_ms": 604800000,
+      "min_projects": 2
+    },
+    "retrieval": {
+      "max_items": 5,
+      "max_context_tokens": 1200
+    },
+    "skill": {
+      "min_independent_sessions": 3,
+      "max_learned_rules": 15,
+      "require_review": true
+    }
   }
 }
 ```
 
 - `resident` injects the frozen global and project memory blocks into prompts.
 - `tool` exposes `memory_propose`; it never grants direct file mutation.
-- `reflection` reviews completed delivered turns with `small_model`. Reflection
-  is disabled with a visible diagnostic when no explicit reachable small model
-  is configured; Zuno does not silently spend the session model.
-- `nudge_interval` triggers periodic review every N durably recorded delivered
-  assistant messages. The count survives host rebuilds and process restarts. A
-  verified recovery can trigger review earlier; zero disables only the periodic
-  trigger.
 - `promotion` is `review` (default), `high_confidence`, or `automatic`.
   `high_confidence` applies only candidates at or above `auto_confidence`.
 - `auto_confidence` is a finite value in `0..=1` and defaults to `0.9`.
+- `learning.enabled` defaults to `false`. When enabled,
+  `learning.extractor_model` is required and resolves independently of
+  `small_model`.
+- `post_turn.enabled` controls fast extraction after eligible completed tasks.
+- project aggregation defaults to one 24-hour bucket and skips below three new
+  records.
+- global aggregation defaults to one seven-day bucket and requires two projects.
+- automatic prompt retrieval is capped at five items and 1,200 context tokens.
+- automatic Skill proposals require three independent sessions and at most 15
+  learned rules.
+- `skill.require_review` must remain `true`; configuration that disables review
+  is rejected.
 
-Each reflection request contains the exact resident-memory snapshot so the
-reviewer can propose audited `replace` or `remove` operations instead of adding
-duplicates. An expired running reflection job becomes `uncertain` and is never
-automatically replayed.
+The extractor receives no tools, network, or filesystem authority. Only
+project-scoped Memory proposals at confidence `>= 0.9` can auto-apply through
+learning. Skill candidates always require explicit review, offline evaluation,
+and a later apply action.
 
-`memory: false` disables resident injection, proposal tools, and reflection.
+`memory: false` disables resident injection and proposal tools. It does not
+disable durable Experience projection; `learning.enabled` controls new
+extraction and aggregation.
+
+The retired `memory.reflection` and `memory.nudge_interval` keys are rejected
+instead of ignored. There are no compatibility aliases under `learning`.
 `/memory` reviews, edits, approves, rejects, removes, and undoes durable changes.
-See [auditable memory and reflection](../design/memory-learning.md).
+`/learn` and `/reflect` manage Experience, feedback, patterns, and Skill
+candidates. See [resident memory](../design/memory-learning.md) and the
+[user learning flywheel](../design/user-learning-flywheel.md).
 
 ## Image attachment admission
 

@@ -459,12 +459,36 @@ impl ProductionAcpAgent {
 
     async fn delete_session(&self, params: &Value) -> Result<Value, zuno_acp::RpcError> {
         let session_id = required_string(params, "sessionId")?;
-        self.close_session(params).await?;
-        let pool = durable_pool()?;
-        zuno_db::session::Store::new(&pool)
-            .remove(&session_id)
-            .map_err(|error| map_session_lookup(&session_id, error))?;
-        Ok(json!({}))
+        let cleanup_derived_experiences = required_bool(params, "cleanupDerivedExperiences")?;
+        let session = self.state.sessions.lock().await.get(&session_id).cloned();
+        let outcome = match session.as_ref() {
+            Some(session) => session.delete_durable(cleanup_derived_experiences).await?,
+            None if cleanup_derived_experiences => {
+                return Err(zuno_acp::RpcError::invalid_params(format!(
+                    "session {session_id} must be open to prepare Memory and Skill revocation candidates"
+                )));
+            }
+            None => {
+                let pool = durable_pool()?;
+                super::turn::SessionDeleteOutcome {
+                    deleted_session_ids: zuno_db::session::Store::new(&pool)
+                        .remove(&session_id)
+                        .map_err(|error| map_session_lookup(&session_id, error))?,
+                    ..super::turn::SessionDeleteOutcome::default()
+                }
+            }
+        };
+        if session.is_some() {
+            self.close_session(params).await?;
+        }
+        Ok(json!({
+            "deletedSessionIds": outcome.deleted_session_ids,
+            "forgottenExperienceIds": outcome.forgotten_experience_ids,
+            "memoryRevocationCandidateIds": outcome.memory_revocation_candidate_ids,
+            "skillRevocationCandidateIds": outcome.skill_revocation_candidate_ids,
+            "rejectedMemoryCandidateIds": outcome.rejected_memory_candidate_ids,
+            "rejectedSkillCandidateIds": outcome.rejected_skill_candidate_ids,
+        }))
     }
 
     async fn session(&self, session_id: &str) -> Result<Arc<AcpSession>, zuno_acp::RpcError> {
@@ -702,15 +726,15 @@ impl DetachedTurnObserver for AcpDetachedTurnObserver {
         {
             return;
         }
-        let Some(update) = zuno_acp::durable_plan_update(work) else {
-            return;
-        };
-        if let Err(error) = self.client.session_update(session_id, update).await {
-            tracing::debug!(
-                session_id,
-                %error,
-                "detached root turn outlived its final ACP plan projection"
-            );
+        for update in zuno_acp::durable_work_updates(work) {
+            if let Err(error) = self.client.session_update(session_id, update).await {
+                tracing::debug!(
+                    session_id,
+                    %error,
+                    "detached root turn outlived its final ACP work-state projection"
+                );
+                break;
+            }
         }
     }
 }
@@ -1045,6 +1069,44 @@ fn persist_dormant_configuration(
 }
 
 impl AcpSession {
+    async fn delete_durable(
+        &self,
+        cleanup_derived_experiences: bool,
+    ) -> Result<super::turn::SessionDeleteOutcome, zuno_acp::RpcError> {
+        let _mount = self.mount_gate.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(self.closed_error());
+        }
+        if self.prompt_active.load(Ordering::Acquire) {
+            return Err(zuno_acp::RpcError::invalid_params(format!(
+                "session {} has an active prompt and cannot be deleted",
+                self.id
+            )));
+        }
+        let resources = self.resources.lock().await;
+        match resources.as_ref() {
+            Some(resources) => resources
+                .host
+                .delete_session(&self.id, cleanup_derived_experiences)
+                .map_err(zuno_acp::RpcError::internal),
+            None if cleanup_derived_experiences => {
+                Err(zuno_acp::RpcError::invalid_params(format!(
+                    "session {} is dormant; load it before choosing derived-learning cleanup",
+                    self.id
+                )))
+            }
+            None => {
+                let pool = durable_pool()?;
+                Ok(super::turn::SessionDeleteOutcome {
+                    deleted_session_ids: zuno_db::session::Store::new(&pool)
+                        .remove(&self.id)
+                        .map_err(|error| map_session_lookup(&self.id, error))?,
+                    ..super::turn::SessionDeleteOutcome::default()
+                })
+            }
+        }
+    }
+
     async fn lifecycle_response(&self) -> Result<Value, zuno_acp::RpcError> {
         Ok(self.current_configuration().await?.lifecycle_response())
     }
@@ -1391,7 +1453,10 @@ impl AcpSession {
             let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
             let outcome = match &invocation {
                 Some(SlashInvocation::Session { command, arguments }) => match command {
-                    SessionCommand::Compact | SessionCommand::Goal => resources
+                    SessionCommand::Compact
+                    | SessionCommand::Goal
+                    | SessionCommand::Learn
+                    | SessionCommand::Reflect => resources
                         .host
                         .execute_session_command(*command, arguments, events.clone())
                         .await
@@ -1430,7 +1495,7 @@ impl AcpSession {
         let (driven, projected) = tokio::join!(drive, projection);
         let projected = projected?;
         self.flush_subagents().await?;
-        self.project_plan(&client).await?;
+        self.project_work_state(&client).await?;
         let mut driven = driven;
         let mut projected = projected;
         loop {
@@ -1661,7 +1726,10 @@ impl AcpSession {
             SessionCommand::Plan if current.mode == "plan" => "build",
             SessionCommand::Plan | SessionCommand::StartPlan => "plan",
             SessionCommand::StartWork => "build",
-            SessionCommand::Compact | SessionCommand::Goal => {
+            SessionCommand::Compact
+            | SessionCommand::Goal
+            | SessionCommand::Learn
+            | SessionCommand::Reflect => {
                 return Err(zuno_acp::RpcError::internal(format!(
                     "/{} is not a mode control",
                     command.name()
@@ -1771,20 +1839,20 @@ impl AcpSession {
         Ok(true)
     }
 
-    async fn project_plan(
+    async fn project_work_state(
         &self,
         client: &zuno_acp::ClientConnection,
     ) -> Result<(), zuno_acp::RpcError> {
-        let update = {
+        let updates = {
             let resources = self.resources.lock().await;
             let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
             let work = resources
                 .host
                 .work_state()
                 .map_err(zuno_acp::RpcError::internal)?;
-            zuno_acp::durable_plan_update(&work)
+            zuno_acp::durable_work_updates(&work)
         };
-        if let Some(update) = update {
+        for update in updates {
             client.session_update(&self.id, update).await?;
         }
         Ok(())
@@ -1869,7 +1937,7 @@ impl AcpSession {
             }
             client.session_update(&self.id, update).await?;
         }
-        if let Some(update) = zuno_acp::durable_plan_update(&work_state) {
+        for update in zuno_acp::durable_work_updates(&work_state) {
             if self.closed.load(Ordering::Acquire) {
                 return Err(self.closed_error());
             }
@@ -1970,7 +2038,10 @@ fn replay_work_state(
     pool: Arc<zuno_db::pool::Pool>,
     session_id: &str,
 ) -> Result<zuno_types::WorkStateProjection, zuno_acp::RpcError> {
-    let snapshot = zuno_tools::work_state::WorkStateStore::new(pool)
+    let session = zuno_db::session::Store::new(pool.as_ref())
+        .get(session_id)
+        .map_err(|error| map_session_lookup(session_id, error))?;
+    let snapshot = zuno_tools::work_state::WorkStateStore::new(Arc::clone(&pool))
         .snapshot(session_id)
         .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
     let plan = snapshot.plan.map(|plan| zuno_types::PlanProjection {
@@ -2012,9 +2083,13 @@ fn replay_work_state(
             time_updated: item.time_updated,
         })
         .collect();
+    let learning = zuno_learning::LearningProjectionService::new(pool)
+        .snapshot(session_id, &session.project_id)
+        .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
     Ok(zuno_types::WorkStateProjection {
         plan,
         todos,
+        learning,
         ..zuno_types::WorkStateProjection::default()
     })
 }
@@ -2084,7 +2159,7 @@ async fn replay_child_sessions(
             client.session_update(&child.id, update).await?;
         }
         let work_state = replay_work_state(Arc::clone(&pool), &child.id)?;
-        if let Some(update) = zuno_acp::durable_plan_update(&work_state) {
+        for update in zuno_acp::durable_work_updates(&work_state) {
             client.session_update(&child.id, update).await?;
         }
         let context_size = child
@@ -3081,6 +3156,13 @@ fn required_string(params: &Value, field: &str) -> Result<String, zuno_acp::RpcE
         })
 }
 
+fn required_bool(params: &Value, field: &str) -> Result<bool, zuno_acp::RpcError> {
+    params
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| zuno_acp::RpcError::invalid_params(format!("missing boolean `{field}`")))
+}
+
 fn optional_u64(params: &Value, field: &str) -> Result<Option<u64>, zuno_acp::RpcError> {
     match params.get(field) {
         None | Some(Value::Null) => Ok(None),
@@ -3281,7 +3363,9 @@ mod tests {
             vec![
                 "compact",
                 "goal",
+                "learn",
                 "plan",
+                "reflect",
                 "start-plan",
                 "start-work",
                 "review",
@@ -3294,7 +3378,12 @@ mod tests {
         );
         assert!(advertised[0].get("input").is_none());
         assert_eq!(advertised[1]["input"]["hint"], "objective | action [value]");
-        assert_eq!(advertised[5]["input"]["hint"], "question");
+        assert_eq!(
+            advertised[2]["input"]["hint"],
+            "remember|issue|solved|forget|promote|feedback ..."
+        );
+        assert_eq!(advertised[4]["input"]["hint"], "turn | session");
+        assert_eq!(advertised[7]["input"]["hint"], "question");
     }
 
     #[test]

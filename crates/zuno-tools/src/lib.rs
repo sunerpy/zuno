@@ -163,10 +163,14 @@ impl FileTools {
     }
 }
 
+pub mod experience_search;
 pub mod glob;
 pub mod grep;
 pub mod search_common;
 
+pub use crate::experience_search::{
+    ExperienceSearchParams, ExperienceSearchTool, WIRE_ID as EXPERIENCE_SEARCH_WIRE_ID,
+};
 pub use crate::glob::{GlobParams, GlobTool};
 pub use crate::grep::{GrepParams, GrepTool};
 pub use crate::search_common::{RESULT_LIMIT, SearchScope, SearchTooling};

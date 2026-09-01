@@ -15,12 +15,16 @@ const SSE_AGGREGATE_PREFIX: &str = "sse:";
 ///
 /// `memory_candidate` is deliberately absent: its source-session foreign key uses
 /// `ON DELETE SET NULL` so reviewed or applied long-term memory survives transcript
-/// retention while losing only the deleted provenance pointer.
-pub const PRUNE_TABLES: [&str; 16] = [
+/// retention while losing only the deleted provenance pointer. `experience_record`
+/// follows the same policy so retained learning can be reviewed independently of
+/// transcript retention.
+pub const PRUNE_TABLES: [&str; 18] = [
     "session_note_operation",
     "session_note",
     "memory_reflection_job",
     "memory_reflection_delivery",
+    "learning_job",
+    "message_feedback",
     "agent_job",
     "work_item",
     "work_plan",
@@ -41,7 +45,7 @@ pub const PRUNE_TABLES: [&str; 16] = [
 /// which foreign-key cascades happen to exist in one schema revision. Dependants
 /// precede their owners (`memory_reflection_job` before its delivery row and
 /// `agent_job` before its optional report input).
-pub const DELETE_ORDER: [&str; 16] = PRUNE_TABLES;
+pub const DELETE_ORDER: [&str; 18] = PRUNE_TABLES;
 
 /// A reversible change to `session.time_archived`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -704,7 +708,7 @@ const OPTIONAL_TABLE_SPECS: [TableSpec; 2] = [
     },
 ];
 
-const TABLE_SPECS: [TableSpec; 14] = [
+const TABLE_SPECS: [TableSpec; 16] = [
     TableSpec {
         name: "memory_reflection_job",
         relation: Relation::SessionId,
@@ -732,6 +736,43 @@ const TABLE_SPECS: [TableSpec; 14] = [
             "recovered",
             "negative_learning",
             "time_created",
+        ],
+    },
+    TableSpec {
+        name: "learning_job",
+        relation: Relation::SessionId,
+        columns: &[
+            "id",
+            "project_id",
+            "session_id",
+            "source_message_id",
+            "kind",
+            "extractor_version",
+            "idempotency_key",
+            "status",
+            "attempt",
+            "owner_id",
+            "lease_expires",
+            "scheduled_at",
+            "payload",
+            "result",
+            "error",
+            "time_created",
+            "time_updated",
+            "time_completed",
+        ],
+    },
+    TableSpec {
+        name: "message_feedback",
+        relation: Relation::SessionId,
+        columns: &[
+            "message_id",
+            "session_id",
+            "rating",
+            "note",
+            "revision",
+            "time_created",
+            "time_updated",
         ],
     },
     TableSpec {

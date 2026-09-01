@@ -312,7 +312,15 @@ pub struct SessionArgs {
 pub enum SessionCommand {
     List(SessionListArgs),
     Prune(SessionPruneArgs),
-    Delete { session_id: String },
+    Delete {
+        session_id: String,
+        /// Keep Experience records and detach them from the deleted session.
+        #[arg(long, conflicts_with = "cleanup_derived_experiences")]
+        keep_derived_experiences: bool,
+        /// Prepare reviewed Memory/Skill revocations and forget derived Experience records.
+        #[arg(long, conflicts_with = "keep_derived_experiences")]
+        cleanup_derived_experiences: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]

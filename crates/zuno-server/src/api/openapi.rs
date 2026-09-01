@@ -49,6 +49,7 @@ pub const OPERATIONS: &[(&str, &str)] = &[
     ("/api/session/prune", "post"),
     ("/api/session/active", "get"),
     ("/api/session/{sessionID}", "get"),
+    ("/api/session/{sessionID}/learning", "get"),
     ("/api/session/{sessionID}/event", "get"),
     ("/api/session/{sessionID}/agent", "post"),
     ("/api/session/{sessionID}/model", "post"),
@@ -189,6 +190,11 @@ const BODY_SCHEMA_GAPS: &[BodySchemaGap] = &[
         "/api/session/{sessionID}/event",
         "get",
         "the successful response is an SSE stream, not a modeled JSON body",
+    ),
+    (
+        "/api/session/{sessionID}/learning",
+        "get",
+        "LearningStateProjection serializes the shared durable projection but does not derive JsonSchema",
     ),
     (
         "/api/session/{sessionID}/agent",
@@ -397,7 +403,7 @@ mod tests {
     fn every_operation_is_bound_bodyless_or_a_reasoned_frozen_gap() {
         assert_eq!(
             BODY_SCHEMA_GAPS.len(),
-            32,
+            33,
             "review and re-freeze every gap change"
         );
         assert_eq!(

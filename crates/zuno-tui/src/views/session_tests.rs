@@ -2452,13 +2452,17 @@ fn session_screen_confirmed_delete_forwards_a_typed_session_delete() {
             crate::views::picker::SessionDialogAction::Delete {
                 id: String::from("ses_old"),
                 title: String::from("old work"),
+                cleanup_derived_experiences: true,
             },
         ),
     );
 
     assert_eq!(
         chosen.try_recv(),
-        Ok(Selection::SessionDelete(String::from("ses_old")))
+        Ok(Selection::SessionDelete {
+            id: String::from("ses_old"),
+            cleanup_derived_experiences: true,
+        })
     );
 }
 

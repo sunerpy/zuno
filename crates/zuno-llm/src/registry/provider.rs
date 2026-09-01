@@ -151,6 +151,10 @@ pub enum RequestPurpose {
     Compaction,
     /// Post-turn durable-memory reflection.
     Reflection,
+    /// Tool-free user-experience extraction.
+    Learning,
+    /// Cassette-only Skill candidate evaluation.
+    Evaluation,
     /// Tool-free Council synthesis.
     Council,
 }
@@ -166,6 +170,8 @@ impl RequestPurpose {
             Self::Summary => "summary",
             Self::Compaction => "compaction",
             Self::Reflection => "reflection",
+            Self::Learning => "learning",
+            Self::Evaluation => "evaluation",
             Self::Council => "council",
         }
     }
@@ -240,6 +246,10 @@ pub enum ProviderRequestContext {
     Compaction,
     /// Post-turn durable-memory reflection.
     Reflection,
+    /// Tool-free user-experience extraction.
+    Learning,
+    /// Cassette-only Skill candidate evaluation.
+    Evaluation,
     /// Tool-free Council synthesis.
     Council,
 }
@@ -255,6 +265,8 @@ impl ProviderRequestContext {
             Self::Summary => RequestPurpose::Summary,
             Self::Compaction => RequestPurpose::Compaction,
             Self::Reflection => RequestPurpose::Reflection,
+            Self::Learning => RequestPurpose::Learning,
+            Self::Evaluation => RequestPurpose::Evaluation,
             Self::Council => RequestPurpose::Council,
         }
     }
@@ -264,9 +276,13 @@ impl ProviderRequestContext {
     pub const fn session_identity(&self) -> Option<&ProviderSessionIdentity> {
         match self {
             Self::MainTurn(identity) | Self::ChildTurn(identity) => Some(identity),
-            Self::Title | Self::Summary | Self::Compaction | Self::Reflection | Self::Council => {
-                None
-            }
+            Self::Title
+            | Self::Summary
+            | Self::Compaction
+            | Self::Reflection
+            | Self::Learning
+            | Self::Evaluation
+            | Self::Council => None,
         }
     }
 }
@@ -537,6 +553,8 @@ mod tests {
             ProviderRequestContext::Summary,
             ProviderRequestContext::Compaction,
             ProviderRequestContext::Reflection,
+            ProviderRequestContext::Learning,
+            ProviderRequestContext::Evaluation,
             ProviderRequestContext::Council,
         ] {
             assert!(

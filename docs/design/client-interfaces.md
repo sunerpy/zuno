@@ -19,6 +19,8 @@ The shared projection vocabulary includes:
   delegations, and other tool activity;
 - `WorkStateProjection` for the active goal, todos, durable jobs, memory
   candidates, and resident entries;
+- `LearningStateProjection` for message feedback, Experience records, mined
+  patterns, and reviewed Skill candidates;
 - `SessionUsage` for cumulative provider-accounted tokens and context-window
   state;
 - `BackgroundExecutionProjection` for process-owned terminal state and bounded
@@ -29,6 +31,12 @@ The server exposes cursor-based replay followed by live delivery. A reconnect se
 The only HTTP event operations are `GET /api/event` for live process-wide notifications and `GET /api/session/{sessionID}/event` for durable session replay plus live delivery. The session operation emits `sessionID:sequence` as the SSE id and accepts that value through `Last-Event-ID` on reconnect. Zuno does not mount an unscoped `/event` adapter or a second event envelope.
 
 Routes and OpenAPI operations exist only when a real handler exists. Optional provider, credential, or client capabilities register their operations with their implementation rather than exposing a permanent placeholder that can only fail.
+
+Learning uses the same rule. `GET /api/session/{sessionID}/learning` reads the
+durable `LearningStateProjection`; `learning.state.changed` announces a committed
+change. ACP carries the same value in `_meta.zuno.learning` during replay and
+live updates. Neither surface invokes extraction or pattern mining while reading
+the projection.
 
 ## Client capabilities
 
@@ -270,11 +278,12 @@ The TUI favors dense, keyboard-first operation:
   projection body scrolls. Foreground transcript-backed delegations appear
   immediately under `Agents`; once a call acquires a matching durable job it yields
   to the richer `Jobs` projection rather than appearing twice. The sidebar also
-  projects goal, todos, pending memory, token usage, LSP, MCP, and skills from
-  shared state rather than polling;
-- `/ps` for process-owned background terminals and `/memory` for auditable
-  candidate review. Both keep their list mounted after an action so several
-  entries can be handled consecutively;
+  projects goal, todos, pending memory, user learning, token usage, LSP, MCP,
+  and skills from shared state rather than polling;
+- `/ps` for process-owned background terminals, `/memory` for resident Memory,
+  and `/learn` for Experience, patterns, feedback, and reviewed Skill
+  candidates. `/reflect` manually admits the same no-tools extraction job used
+  by the post-turn path;
 - the welcome screen owns only a prepared process identity. It creates no durable
   session until the first model-bound submission commits the session and user
   message together. `session.materialized` updates the in-place session catalog,
@@ -318,7 +327,12 @@ The TUI favors dense, keyboard-first operation:
   reopens the refreshed session list on that replacement so users can delete
   several sessions without invoking `/session` again; a refused delete leaves
   the existing list mounted. A current session with background subagents still
-  running is refused rather than deleting state those tasks can still write;
+  running is refused rather than deleting state those tasks can still write.
+  When derived Experience exists, the TUI asks whether to keep it or clean it.
+  Cleaning first creates pending-review Memory and Skill revocations, rejects
+  pending candidates that cite the evidence, and only then marks the Experience
+  forgotten. ACP requires the same choice as the explicit
+  `cleanupDerivedExperiences` field;
 - warning and error notices wrap inside the viewport and remain visible long
   enough to inspect or select. Ephemeral command guidance, such as an unknown
   slash command, is a short-lived toast and does not become durable transcript

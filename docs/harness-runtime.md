@@ -612,7 +612,7 @@ a delegated child uses `ChildTurn` with the child's own durable session id.
 Every continuation in one tool loop reuses that same context, and resuming the
 durable session after a process restart reconstructs the same identity.
 
-Title generation, lifecycle summaries, compaction, memory reflection, and
+Title generation, lifecycle summaries, compaction, learning extraction, and
 Council synthesis use explicit isolated purposes with no foreground-session
 identity. This prevents lifecycle work from joining either the root or a child
 provider conversation.
@@ -698,18 +698,17 @@ gateways should set their own upstream deadline below Zuno's matching phase
 deadline so their typed error reaches Zuno before the client cancels the
 connection.
 
-## Auditable memory and reflection
+## Resident memory and user learning
 
-Resident memory has one mutation boundary: `memory_propose`. Foreground agents
-and the isolated post-delivery reflection fork both use that tool, which validates
-the requested add/replace/remove operation and inserts a durable
-`MemoryCandidate`; it never edits the resident file directly. Candidates retain
-scope, action, reason, confidence, source session/message, timestamps,
-diagnostics, and exact before/after snapshots.
+Resident Memory has one model-visible mutation boundary: `memory_propose`. It
+validates add/replace/remove operations and inserts a durable `MemoryCandidate`;
+it never edits the resident file directly. Candidates retain scope, action,
+reason, confidence, source session/message, timestamps, diagnostics, and exact
+before/after snapshots.
 
-The default promotion policy is `review`. `high_confidence` applies candidates at
-or above the configured threshold, while `automatic` applies every validated
-candidate. All policies use the same durable state machine:
+The default Memory promotion policy is `review`. `high_confidence` applies
+candidates at or above the configured threshold, while `automatic` applies every
+validated candidate. All policies use the same durable state machine:
 
 ```text
 pending -> applying -> applied -> undoing -> undone
@@ -722,29 +721,42 @@ the runtime compares the resident file with both stored snapshots and marks the
 observed result; it never replays the write or undo. Any third state becomes
 `uncertain` and requires user inspection.
 
-Reflection runs only after a final response was delivered and uses an explicitly
-configured reachable `small_model`. Zuno persists the exact review prompt,
-replayed durable turn transcript, current resident-memory snapshot, tool schema,
-model identity, digest, and terminal outcome as `memory.reflection.request` and
-`memory.reflection.outcome`. Stream truncation, malformed arguments, denied tools,
-and proposal failures are durable failed outcomes. The fork can call only
-`memory_propose`; it cannot reach shell, files, normal tools, or foreground
-conversation state.
+User learning is a separate native subsystem. A completed turn with tools,
+artifacts, recovery, correction, or explicit feedback admits an idempotent
+`learning_job` keyed by `(session, message, extractor_version)`. The dedicated
+`learning.extractor_model` receives the replayed durable transcript and a
+structured response schema with no tools, network, filesystem authority, or
+foreground-session identity. Request and terminal outcome are persisted as
+`learning.extraction.request` and `learning.extraction.outcome`.
 
-Periodic cadence is admitted from a durable per-session delivery sequence rather
-than a process-local counter. The source assistant message is counted once across
-host rebuilds and restarts. A selected review owns a leased durable job; process
-loss changes an expired job to `uncertain` and never replays its model request.
-The reviewer compares the supplied resident snapshot before proposing changes,
-prefers replacement to duplicate additions, and can organize memory only through
-the same audited add/replace/remove candidate workflow.
+Extraction settlement atomically stores `ExperienceRecord` rows and evidence.
+Unresolved issues remain searchable but cannot become Memory, patterns, or Skill
+evaluation cases. Only project-scoped Memory proposals at confidence `>= 0.9`
+may auto-apply through the learning path; every other proposal remains
+reviewable.
 
-Candidate validation rejects prompt injection, credential literals, ambiguous
-locators, over-budget results, and external file drift. Automatic learning is
-limited to durable user facts, explicit corrections, repository rules, and
-verified reusable recovery knowledge. It cannot rewrite code, prompts, agents,
-extensions, or skills. `/memory` is the user-owned review and correction surface.
-See [auditable memory and reflection](design/memory-learning.md).
+A host-owned periodic task mines project and cross-project patterns through
+durable interval-bucketed jobs. Automatic Skill candidates require three
+independent sessions. Global patterns require two projects and become a
+project-specific companion only after explicit promotion. Rejected evidence is
+suppressed until its digest changes.
+
+Retrieved experience enters the stable `learning.experiences` prompt section.
+The post-hook prompt receipt stores each source identity, content, and digest, so
+the provider request is reconstructable without consulting current projections.
+`experience_search` provides explicit deeper FTS retrieval.
+
+Every Skill candidate contains complete content, diff, evidence, exact source
+identity, and source digest. Human review runs an immutable offline cassette
+suite with the same `AttemptSnapshot` for baseline and candidate. Passing
+evaluation does not apply the file. Apply is a separate CAS-protected effect;
+source drift becomes `stale`, and restart reconciliation classifies before/after
+snapshots without replaying an uncertain write.
+
+`/memory` remains the resident Memory review surface. `/learn` and `/reflect`
+manage experience, feedback, patterns, Skill candidates, evaluation, and
+reviewed revocation. See [resident memory](design/memory-learning.md) and the
+[user learning flywheel](design/user-learning-flywheel.md).
 
 ## Durable inputs
 

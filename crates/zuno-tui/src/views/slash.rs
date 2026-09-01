@@ -112,6 +112,10 @@ pub enum HostCommand {
     Redo,
     /// Inspect or mutate the durable top-level goal for this session.
     Goal(String),
+    /// Inspect or mutate durable learning state.
+    Learn(String),
+    /// Run isolated learning extraction.
+    Reflect(String),
     /// Select a configured model-team preset, or open the picker when omitted.
     Preset(Option<String>),
     /// Launch a native Council preset, or open the picker when omitted.
@@ -265,6 +269,12 @@ impl SlashRouter {
             ),
             SlashCommandKind::Host(HostCommand::Goal(_)) => {
                 SlashSubmission::Host(HostCommand::Goal(arguments))
+            }
+            SlashCommandKind::Host(HostCommand::Learn(_)) => {
+                SlashSubmission::Host(HostCommand::Learn(arguments))
+            }
+            SlashCommandKind::Host(HostCommand::Reflect(_)) => {
+                SlashSubmission::Host(HostCommand::Reflect(arguments))
             }
             SlashCommandKind::Host(HostCommand::Preset(_)) => SlashSubmission::Host(
                 HostCommand::Preset((!arguments.is_empty()).then_some(arguments)),
@@ -428,6 +438,18 @@ fn ui_commands() -> Vec<SlashCommand> {
                 aliases: Vec::new(),
                 description: SessionCommand::Goal.description().to_owned(),
                 kind: SlashCommandKind::Host(HostCommand::Goal(String::new())),
+            },
+            SlashCommand {
+                name: SessionCommand::Learn.name().to_owned(),
+                aliases: Vec::new(),
+                description: SessionCommand::Learn.description().to_owned(),
+                kind: SlashCommandKind::Host(HostCommand::Learn(String::new())),
+            },
+            SlashCommand {
+                name: SessionCommand::Reflect.name().to_owned(),
+                aliases: Vec::new(),
+                description: SessionCommand::Reflect.description().to_owned(),
+                kind: SlashCommandKind::Host(HostCommand::Reflect(String::new())),
             },
             SlashCommand {
                 name: "preset".to_owned(),

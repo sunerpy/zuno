@@ -253,10 +253,8 @@ fn memory_false_dominates_every_enabled_default() {
     assert!(!memory.enabled);
     assert!(!memory.resident);
     assert!(!memory.tool);
-    assert!(!memory.reflection);
     assert_eq!(memory.global_char_limit, 2_200);
     assert_eq!(memory.project_char_limit, 3_000);
-    assert_eq!(memory.nudge_interval, 10);
     assert_eq!(memory.promotion, MemoryPromotion::Review);
     assert_eq!(memory.auto_confidence, 0.9);
 }
@@ -525,9 +523,9 @@ fn permission_rejects_unknown_policy_keys() {
 }
 
 #[test]
-fn memory_options_resolve_caps_cadence_and_component_flags() {
+fn memory_options_resolve_caps_and_component_flags() {
     let config = parse(
-        r#"{"memory":{"resident":false,"tool":false,"reflection":false,"global_char_limit":1200,"project_char_limit":2400,"nudge_interval":0}}"#,
+        r#"{"memory":{"resident":false,"tool":false,"global_char_limit":1200,"project_char_limit":2400}}"#,
     )
     .expect("memory options parse");
     let memory = config.resolved_memory();
@@ -535,10 +533,93 @@ fn memory_options_resolve_caps_cadence_and_component_flags() {
     assert!(memory.enabled);
     assert!(!memory.resident);
     assert!(!memory.tool);
-    assert!(!memory.reflection);
     assert_eq!(memory.global_char_limit, 1_200);
     assert_eq!(memory.project_char_limit, 2_400);
-    assert_eq!(memory.nudge_interval, 0);
+}
+
+#[test]
+fn learning_is_disabled_by_default_and_resolves_native_thresholds() {
+    let learning = Config::default().resolved_learning();
+    assert!(!learning.enabled);
+    assert_eq!(learning.extractor_model, None);
+    assert!(learning.post_turn_enabled);
+    assert_eq!(learning.aggregation_interval_ms, 86_400_000);
+    assert_eq!(learning.aggregation_min_new_records, 3);
+    assert_eq!(learning.global_promotion_interval_ms, 604_800_000);
+    assert_eq!(learning.global_promotion_min_projects, 2);
+    assert_eq!(learning.retrieval_max_items, 5);
+    assert_eq!(learning.retrieval_max_context_tokens, 1_200);
+    assert_eq!(learning.skill_min_independent_sessions, 3);
+    assert_eq!(learning.skill_max_learned_rules, 15);
+    assert!(learning.skill_require_review);
+}
+
+#[test]
+fn enabled_learning_requires_an_extractor_and_skill_review() {
+    let missing =
+        parse(r#"{"learning":{"enabled":true}}"#).expect_err("enabled learning needs an extractor");
+    assert_eq!(issue_path(&missing), "learning.extractor_model");
+
+    let review = parse(
+        r#"{"learning":{"enabled":true,"extractor_model":"provider/model","skill":{"require_review":false}}}"#,
+    )
+    .expect_err("Skill review cannot be disabled");
+    assert_eq!(issue_path(&review), "learning.skill.require_review");
+}
+
+#[test]
+fn learning_options_resolve_exact_flywheel_limits() {
+    let config = parse(
+        r#"{"learning":{
+          "enabled":true,
+          "extractor_model":"provider/extractor",
+          "post_turn":{"enabled":false},
+          "aggregation":{"interval_ms":1000,"min_new_records":4},
+          "global_promotion":{"interval_ms":2000,"min_projects":3},
+          "retrieval":{"max_items":7,"max_context_tokens":1400},
+          "skill":{"min_independent_sessions":4,"max_learned_rules":12,"require_review":true}
+        }}"#,
+    )
+    .expect("learning options parse");
+    let learning = config.resolved_learning();
+    assert!(learning.enabled);
+    assert_eq!(
+        learning.extractor_model.as_deref(),
+        Some("provider/extractor")
+    );
+    assert!(!learning.post_turn_enabled);
+    assert_eq!(learning.aggregation_interval_ms, 1_000);
+    assert_eq!(learning.aggregation_min_new_records, 4);
+    assert_eq!(learning.global_promotion_interval_ms, 2_000);
+    assert_eq!(learning.global_promotion_min_projects, 3);
+    assert_eq!(learning.retrieval_max_items, 7);
+    assert_eq!(learning.retrieval_max_context_tokens, 1_400);
+    assert_eq!(learning.skill_min_independent_sessions, 4);
+    assert_eq!(learning.skill_max_learned_rules, 12);
+}
+
+#[test]
+fn retired_memory_reflection_fields_are_rejected_instead_of_ignored() {
+    for (document, path) in [
+        (r#"{"memory":{"reflection":true}}"#, "memory.reflection"),
+        (
+            r#"{"memory":{"nudge_interval":10}}"#,
+            "memory.nudge_interval",
+        ),
+    ] {
+        let error =
+            parse(document).expect_err("retired Memory learning fields must not be aliases");
+        assert_eq!(issue_path(&error), path);
+    }
+}
+
+#[test]
+fn learning_rejects_unknown_nested_fields() {
+    let error = parse(
+        r#"{"learning":{"enabled":true,"extractor_model":"provider/model","post_turn":{"nudge_interval":10}}}"#,
+    )
+    .expect_err("post-turn extraction has no legacy cadence alias");
+    assert_eq!(issue_path(&error), "learning.post_turn.nudge_interval");
 }
 
 #[test]

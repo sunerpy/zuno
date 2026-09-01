@@ -9,9 +9,9 @@ use zuno_error::ToolError;
 use zuno_permission::ReplyKind;
 use zuno_server::api::{self, ApiState};
 use zuno_server::{
-    AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventFanout, EventService, PermissionRequest,
-    QuestionDecision, QuestionRequest, QuestionToolCall, RequestBroker, ServerBuilder,
-    ServerConfig, ServerServices, SessionCompactExecution, SessionMutationExecutor,
+    AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventFanout, EventService, NewEvent,
+    PermissionRequest, QuestionDecision, QuestionRequest, QuestionToolCall, RequestBroker,
+    ServerBuilder, ServerConfig, ServerServices, SessionCompactExecution, SessionMutationExecutor,
     SessionMutationFuture, SessionPromptExecution, events_router,
 };
 use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin};
@@ -33,7 +33,7 @@ struct ServerSessionMutationExecutor {
     /// serialized so a request cannot acquire the old revision after a candidate has
     /// reserved it and before that candidate commits.
     composition_gate: Arc<tokio::sync::Mutex<()>>,
-    detached_observer: Arc<dyn DetachedTurnObserver>,
+    detached_observer: Arc<ServerDetachedTurnObserver>,
     /// The one MCP catalog every session on this server shares.
     ///
     /// A host is built per request here, so building a *catalog* per request would
@@ -89,7 +89,9 @@ impl ServerSessionMutationExecutor {
                 runs: self.runs.clone(),
                 mcp: self.mcp.clone(),
                 child_observer: None,
-                detached_observer: Some(Arc::clone(&self.detached_observer)),
+                detached_observer: Some(
+                    Arc::clone(&self.detached_observer) as Arc<dyn DetachedTurnObserver>
+                ),
             },
         )
         .await?;
@@ -104,6 +106,24 @@ impl ServerSessionMutationExecutor {
         }
         host.activate_background_notifications(&tokio::runtime::Handle::current());
         Ok(host)
+    }
+
+    fn final_work_state(
+        &self,
+        host: &TurnHost,
+        session_id: &str,
+    ) -> Option<zuno_types::WorkStateProjection> {
+        match host.work_state() {
+            Ok(work) => Some(work),
+            Err(error) => {
+                tracing::debug!(
+                    session_id,
+                    %error,
+                    "failed to read final server turn work state for projection"
+                );
+                None
+            }
+        }
     }
 
     /// Publish a staged extension mutation once all request hosts on the old revision
@@ -300,6 +320,45 @@ impl DetachedTurnObserver for ServerDetachedTurnObserver {
             .forward_engine_event(session_id, &self.fanout, event.clone())
             .await;
     }
+
+    async fn work_state(&self, session_id: &str, work: &zuno_types::WorkStateProjection) {
+        let properties = match serde_json::to_value(&work.learning) {
+            Ok(serde_json::Value::Object(properties)) => properties,
+            Ok(_) => {
+                tracing::debug!(
+                    session_id,
+                    "learning work-state projection did not serialize as an object"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    session_id,
+                    %error,
+                    "failed to serialize final server learning projection"
+                );
+                return;
+            }
+        };
+        let event = match NewEvent::new("learning.state.changed", properties) {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::debug!(
+                    session_id,
+                    %error,
+                    "failed to construct durable server learning projection event"
+                );
+                return;
+            }
+        };
+        if let Err(error) = self.events.publish(session_id, event).await {
+            tracing::debug!(
+                session_id,
+                %error,
+                "failed to publish durable server learning projection event"
+            );
+        }
+    }
 }
 
 impl SessionMutationExecutor for ServerSessionMutationExecutor {
@@ -344,6 +403,13 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 Ok(())
             }
             .await;
+            let work = executor.final_work_state(&host, &spec.session_id);
+            if let Some(work) = work {
+                executor
+                    .detached_observer
+                    .work_state(&spec.session_id, &work)
+                    .await;
+            }
             let extension_scope = host.extension_scope().clone();
             let shutdown = host.shutdown().await;
             let reconciliation = if shutdown.is_ok() {
@@ -380,6 +446,13 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 Ok(())
             }
             .await;
+            let work = executor.final_work_state(&host, &spec.session_id);
+            if let Some(work) = work {
+                executor
+                    .detached_observer
+                    .work_state(&spec.session_id, &work)
+                    .await;
+            }
             let extension_scope = host.extension_scope().clone();
             let shutdown = host.shutdown().await;
             let reconciliation = if shutdown.is_ok() {
