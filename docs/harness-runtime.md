@@ -288,6 +288,8 @@ Providers, drivers, approvals, and arbitrary typed services remain trusted
 compiled Rust `Component` implementations mounted through a `HarnessProfile`.
 See [plugins, custom agents, and workflows](plugins.md) for manifests,
 capability tables, protocols, and runnable examples.
+See [developing agents and extensions](guide/extension-development.md) for the
+complete WASI guest and native Rust implementation paths.
 
 ## Native agents
 

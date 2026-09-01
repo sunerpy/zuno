@@ -26,6 +26,7 @@ configuration, not here.
 - [Images and file references](reference/attachments.md)
 - [Use Zuno in Zed through ACP](reference/zed-acp.md)
 - [Plugins, custom agents, and workflows](plugins.md)
+- [Developing agents and extensions](guide/extension-development.md)
 
 ## Work state and orchestration
 
@@ -56,3 +57,4 @@ configuration, not here.
 - [Zed ACP integration](design/zed-acp-integration.md)
 - [Resident memory](design/memory-learning.md)
 - [User learning flywheel](design/user-learning-flywheel.md)
+- [Documentation architecture and coverage](design/documentation-coverage.md)

@@ -114,7 +114,9 @@ provider configuration, credentials, and sandbox checks.
 | Look up a setting | [Configuration reference](/reference/configuration) |
 | Enable or switch History and Notes | [History and Notes continuity](/config/continuity) |
 | Choose an agent | [Agents](/guide/agents) |
+| Develop an Agent or extension | [Agent and extension development](/guide/extension-development) |
 | Configure Shell authority | [Permissions and sandboxing](/guide/permissions) |
 | Use Zuno from an editor | [Editors and ACP](/reference/zed-acp) |
 | Look up a command | [CLI reference](/cli/) |
 | Diagnose a failure | [FAQ](/faq) |
+| Find the canonical page for a public surface | [Documentation coverage](/design/documentation-coverage) |

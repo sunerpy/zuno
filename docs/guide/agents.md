@@ -126,6 +126,8 @@ A configured or extension agent whose mode is `subagent` or `all` can join the d
 roster. A `primary`-only agent cannot be delegated to. The complete field list is in
 [Custom agents](/config/custom-agents), and delegation mechanics are in
 [Orchestration](/orchestration).
+To package an Agent with Skills or tools, or to implement WASI/native behavior,
+see [Developing agents and extensions](/guide/extension-development).
 
 ## See also
 
@@ -133,3 +135,4 @@ roster. A `primary`-only agent cannot be delegated to. The complete field list i
 - [Tools](/guide/tools)
 - [Permissions and sandboxing](/guide/permissions)
 - [Orchestration](/orchestration)
+- [Developing agents and extensions](/guide/extension-development)

@@ -129,7 +129,8 @@ Agent、Workflow、Skill、WASI Component 和受控进程工具共用同一套 P
 组装后的模型请求会在发往 Provider 前持久化为 `session.prompt.assembled`。
 
 组件模型见 [Harness Runtime](../harness-runtime.md)，扩展包格式与能力授权见
-[插件与扩展](../plugins.md)。设计取舍记录在
+[插件与扩展](../plugins.md)，声明式 Agent、WASI guest 与原生 Rust 的完整实现路径见
+[开发 Agent 与扩展](../guide/extension-development.md)。设计取舍记录在
 [Harness 对比](../design/harness-comparison.md)与
 [DSH alpha.2 采用分类账](../design/dsh-alpha2-adoption-ledger.md)，客户端共享边界见
 [Client interfaces](../design/client-interfaces.md)。
@@ -145,6 +146,8 @@ Agent、Workflow、Skill、WASI Component 和受控进程工具共用同一套 P
 - [附件](../reference/attachments.md)：图片与 `@file` 输入
 - [导出与导入](../reference/portable-bundles.md)：可移植配置包
 - [Zed ACP](../reference/zed-acp.md)：编辑器与其他 ACP 客户端
+- [Agent 与扩展开发](../guide/extension-development.md)：WASI 与原生 Rust 接口
+- [文档覆盖地图](../design/documentation-coverage.md)：公共能力的权威页面
 - [FAQ](../faq.md)：故障排查
 
 ## 构建与开发
