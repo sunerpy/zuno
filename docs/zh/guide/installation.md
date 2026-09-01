@@ -47,10 +47,12 @@ curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.s
 固定版本或安装目录：
 
 ```sh
-ZUNO_VERSION=v0.1.0 \
+ZUNO_VERSION=vX.Y.Z \
 ZUNO_INSTALL_DIR="$HOME/bin" \
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.sh)"
 ```
+
+将 `X.Y.Z` 替换为准备安装的确切已发布版本。前面的未固定版本命令会解析最新公开版本。
 
 ### Windows
 
@@ -64,7 +66,7 @@ irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | ie
 固定版本或安装目录：
 
 ```powershell
-$env:ZUNO_VERSION = "v0.1.0"
+$env:ZUNO_VERSION = "vX.Y.Z"
 $env:ZUNO_INSTALL_DIR = Join-Path $HOME "bin"
 irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | iex
 ```
@@ -88,7 +90,7 @@ Linux 使用静态 musl 产物。当前没有发布 Windows aarch64 产物。
 如果策略禁止把远程脚本通过管道交给 shell，就手动复现安装器步骤。Linux x86_64：
 
 ```sh
-version=0.1.0
+version=X.Y.Z
 target=x86_64-unknown-linux-musl
 asset="zuno-${version}-${target}.tar.gz"
 base="https://github.com/sunerpy/zuno/releases/download/v${version}"
@@ -103,7 +105,7 @@ install -m 755 zuno "$HOME/.local/bin/zuno"
 Windows x86_64：
 
 ```powershell
-$version = "0.1.0"
+$version = "X.Y.Z"
 $asset = "zuno-$version-x86_64-pc-windows-msvc.zip"
 $base = "https://github.com/sunerpy/zuno/releases/download/v$version"
 
@@ -241,7 +243,7 @@ zuno completion elvish --install
 ```sh
 zuno self-update --check
 zuno self-update
-zuno self-update --tag v0.1.0
+zuno self-update --tag vX.Y.Z
 ```
 
 `self-update` 会先校验确切归档，再原子替换可执行文件。非交互式替换需要 `--yes`。
