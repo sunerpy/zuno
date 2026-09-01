@@ -152,6 +152,28 @@ jobs:
             -f expected_head_sha="$HEAD_SHA" \
             -f mode=automatic
 
+      - name: Record required manual approval
+        if: steps.release_pr.outputs.dispatch == 'true'
+        shell: bash
+        env:
+          PR_NUMBER: ${{ steps.release_pr.outputs.number }}
+          HEAD_SHA: ${{ steps.release_pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Manual release approval required"
+            echo
+            echo "Release PR #${PR_NUMBER} was created by \`GITHUB_TOKEN\` at \`${HEAD_SHA}\`."
+            echo "GitHub intentionally holds its ordinary CI run for maintainer approval."
+            echo
+            echo "1. Review the PR and confirm the exact head SHA above."
+            echo "2. Approve its pending **CI** Actions run."
+            echo "3. Wait for the independently dispatched \`zuno/pr-gate\` candidate to succeed."
+            echo "4. Revalidate the same head before manually merging."
+            echo
+            echo "Do not replace this approval with a skip marker, \`pull_request_target\`, or a privileged bot token."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   resolve_release:
     name: Resolve release and candidate
     needs: release_please
