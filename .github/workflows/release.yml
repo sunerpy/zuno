@@ -109,8 +109,13 @@ jobs:
                 | .number
               ' <<<"$prs"
             )
-            if [ "${#numbers[@]}" -ne 1 ]; then
-              echo "::error title=Release controller::expected exactly one open release PR, found ${#numbers[@]}"
+            if [ "${#numbers[@]}" -eq 0 ]; then
+              echo "::notice title=Release controller::no release PR requires a candidate"
+              echo "dispatch=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "${#numbers[@]}" -gt 1 ]; then
+              echo "::error title=Release controller::expected at most one open release PR, found ${#numbers[@]}"
               exit 1
             fi
             number=${numbers[0]}
@@ -124,12 +129,14 @@ jobs:
             exit 1
           fi
           {
+            echo "dispatch=true"
             echo "number=${number}"
             echo "head_sha=${head_sha}"
             echo "head_ref=${head_ref}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Dispatch exact candidate ref
+        if: steps.release_pr.outputs.dispatch == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
