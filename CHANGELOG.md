@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/sunerpy/zuno/compare/v0.2.2...v0.3.0) (2026-09-01)
+
+
+### Features
+
+* **tui:** make queued input and plans durable ([#59](https://github.com/sunerpy/zuno/issues/59)) ([5f4f650](https://github.com/sunerpy/zuno/commit/5f4f650d1ef7472569bb9ce17c58d226b0cc6f95))
+
 ## [0.2.2](https://github.com/sunerpy/zuno/compare/v0.2.1...v0.2.2) (2026-09-01)
 
 
