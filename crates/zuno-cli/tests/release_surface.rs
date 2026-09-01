@@ -1021,6 +1021,24 @@ fn release_controller_dispatches_exact_source_and_never_compiles() {
             "release controller recompiles during promotion via {forbidden:?}"
         );
     }
+
+    let resolve = job_body(&release, "resolve_release").join("\n");
+    for required in [
+        "id: release_input\n        shell: bash\n        env:\n          GH_TOKEN: ${{ github.token }}",
+        "gh release view \"$TAG\"",
+        "--json isDraft,tagName",
+        ".context == \"zuno/pr-gate\"",
+        "contents: write",
+    ] {
+        assert!(
+            resolve.contains(required),
+            "release recovery lost draft-aware identity check {required:?}"
+        );
+    }
+    assert!(
+        !resolve.contains("releases/tags/${TAG}"),
+        "release recovery uses the REST by-tag endpoint that hides draft releases"
+    );
 }
 
 #[test]
@@ -1029,7 +1047,7 @@ fn candidate_merge_explicitly_wakes_release_finalization() {
     let prepare = job_body(&text, "prepare").join("\n");
     for required in [
         "state=pending",
-        "context='zuno/release-candidate'",
+        "context='zuno/pr-gate'",
         "actions/runs/${GITHUB_RUN_ID}",
     ] {
         assert!(
@@ -1062,6 +1080,10 @@ fn candidate_merge_explicitly_wakes_release_finalization() {
             "automatic merge does not fail closed on repository governance; missing {required:?}"
         );
     }
+    assert!(
+        !text.contains("context='zuno/release-candidate'"),
+        "candidate status context differs from the protected zuno/pr-gate name"
+    );
 }
 
 #[test]
