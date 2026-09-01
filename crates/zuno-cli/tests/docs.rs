@@ -351,7 +351,7 @@ fn zed_acp_guide_documents_cross_platform_setup_and_agent_selection() {
             "never stored in SQLite or logs",
             "dev: open acp logs",
             "stdout",
-            "cargo test -p zuno-cli --test acp_stdio",
+            "cargo test -p zuno --test acp_stdio",
             "https://zed.dev/docs/ai/external-agents",
         ],
     );

@@ -333,7 +333,7 @@ Run targeted gates after every phase and record complete command output before c
 cargo test -p zuno-tools --test websearch
 cargo test -p zuno-tools
 cargo test -p zuno-auth
-cargo test -p zuno-cli
+cargo test -p zuno
 cargo test -p zuno-config
 ```
 

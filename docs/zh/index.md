@@ -63,10 +63,16 @@ irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | ie
 ```
 
 ```sh [Cargo]
-cargo install --git https://github.com/sunerpy/zuno zuno-cli --locked
+cargo install zuno --locked
 ```
 
 :::
+
+如需安装尚未发布的当前 Git revision：
+
+```sh
+cargo install --git https://github.com/sunerpy/zuno zuno --locked
+```
 
 ripgrep 14 或更新版本只是 `glob` 与 `grep` 工具的后端，不是 Zuno 启动或核心运行
 依赖。bubblewrap 0.8.0 或更新版本也只用于 Linux 上受约束的 `read-only` 与

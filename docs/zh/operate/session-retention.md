@@ -111,7 +111,7 @@ remote unshare failed for shared session <id>: <detail>; local rows were deleted
 用以下命令重新生成：
 
 ```sh
-ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
+ZUNO_DOCS_REGENERATE=1 cargo test -p zuno --test docs
 ```
 
 在表删除之后，没有存活 session 的 part 会被清扫，artifact 收集以删除模式运行。

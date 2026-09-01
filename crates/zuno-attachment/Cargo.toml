@@ -1,5 +1,6 @@
 [package]
 name = "zuno-attachment"
+description = "Validated image and file attachments for Zuno model requests."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

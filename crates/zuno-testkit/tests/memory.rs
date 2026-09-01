@@ -591,7 +591,7 @@ fn build_release_subject(
             OsStr::new("build"),
             OsStr::new("--release"),
             OsStr::new("-p"),
-            OsStr::new("zuno-cli"),
+            OsStr::new("zuno"),
             OsStr::new("--bin"),
             OsStr::new("zuno"),
             OsStr::new("--offline"),

@@ -36,8 +36,8 @@
 //! # Reproduce
 //!
 //! ```text
-//! cargo test -p zuno-cli --test startup -- --nocapture
-//! cargo nextest run -p zuno-cli --test startup --no-tests=warn
+//! cargo test -p zuno --test startup -- --nocapture
+//! cargo nextest run -p zuno --test startup --no-tests=warn
 //! ```
 
 use std::collections::BTreeSet;

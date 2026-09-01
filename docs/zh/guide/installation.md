@@ -30,6 +30,18 @@ ACP 与 HTTP 客户端。
 `workspace-write` 请求遇到 typed、符合条件的后端不可用错误时生效。`read-only`
 永不降级，仍然失败即拒绝。参见[权限与沙箱](/zh/guide/permissions)。
 
+## 通过 Cargo 安装
+
+从 crates.io 安装已发布的 `zuno` 二进制 crate：
+
+```sh
+cargo install zuno --locked
+```
+
+这种方式会为当前宿主本机编译，因此需要 Rust 1.98，以及[从源码构建](#从源码构建)
+列出的原生编译前置。希望直接使用经过平台验证的预构建归档时，请使用下面的 Release
+安装器。
+
 ## Release 安装器
 
 安装器会下载发布归档与 `SHA256SUMS`，只选取该确切资产对应的行，比对 SHA-256，
@@ -56,8 +68,8 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/
 
 ### Windows
 
-在 Windows PowerShell 5.1 或 PowerShell 7 中运行。Windows 只发布 x86_64 MSVC
-目标，默认安装到 `$env:LOCALAPPDATA\Programs\zuno`：
+在 Windows PowerShell 5.1 或 PowerShell 7 中运行。安装器会根据原生进程架构选择
+x86_64 或 ARM64 MSVC 归档，默认安装到 `$env:LOCALAPPDATA\Programs\zuno`：
 
 ```powershell
 irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | iex
@@ -82,8 +94,9 @@ irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | ie
 | macOS x86_64 | `x86_64-apple-darwin` | `.tar.gz` |
 | macOS aarch64 | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | `.zip` |
 
-Linux 使用静态 musl 产物。当前没有发布 Windows aarch64 产物。
+Linux 使用静态 musl 产物。
 
 ## 手动下载与 checksum 校验
 
@@ -102,11 +115,16 @@ tar -xzf "$asset"
 install -m 755 zuno "$HOME/.local/bin/zuno"
 ```
 
-Windows x86_64：
+Windows 根据原生进程架构选择目标：
 
 ```powershell
 $version = "X.Y.Z"
-$asset = "zuno-$version-x86_64-pc-windows-msvc.zip"
+$target = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) {
+  "X64"   { "x86_64-pc-windows-msvc" }
+  "Arm64" { "aarch64-pc-windows-msvc" }
+  default { throw "不支持的 Windows 架构：$_" }
+}
+$asset = "zuno-$version-$target.zip"
 $base = "https://github.com/sunerpy/zuno/releases/download/v$version"
 
 Invoke-WebRequest "$base/$asset" -OutFile $asset
@@ -169,14 +187,14 @@ ripgrep 与 bubblewrap 是前述运行时工具/后端依赖，不是源码编�
 rustup toolchain install 1.98.0 --component rustfmt clippy
 git clone https://github.com/sunerpy/zuno.git
 cd zuno
-cargo build --locked -p zuno-cli --bin zuno
-cargo test -p zuno-cli --test docs
+cargo build --locked -p zuno --bin zuno
+cargo test -p zuno --test docs
 ```
 
-直接通过 Cargo 安装：
+通过 Cargo 安装尚未发布的 Git checkout：
 
 ```sh
-cargo install --git https://github.com/sunerpy/zuno zuno-cli --locked
+cargo install --git https://github.com/sunerpy/zuno zuno --locked
 ```
 
 源码构建的 channel 是 `local`，通常打开 `zuno-local.db`；发布版打开 `zuno.db`。

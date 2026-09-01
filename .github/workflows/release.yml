@@ -414,8 +414,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           archives=(candidate/*.tar.gz candidate/*.zip)
-          if [ "${#archives[@]}" -ne 5 ]; then
-            echo "::error title=Provenance::expected five archives, found ${#archives[@]}"
+          if [ "${#archives[@]}" -ne 6 ]; then
+            echo "::error title=Provenance::expected six archives, found ${#archives[@]}"
             exit 1
           fi
           signer="github.com/${GITHUB_REPOSITORY}/.github/workflows/release-candidate.yml"
@@ -467,3 +467,18 @@ jobs:
             exit 1
           fi
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+  publish_crates:
+    name: Publish crates.io packages
+    needs: [resolve_release, promote]
+    if: |
+      !cancelled()
+      && needs.promote.result == 'success'
+      && vars.CRATES_IO_TRUSTED_PUBLISHING == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/publish-crates.yml
+    with:
+      tag: ${{ needs.resolve_release.outputs.tag }}
+      auth_mode: trusted

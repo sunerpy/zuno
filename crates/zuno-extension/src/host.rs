@@ -24,7 +24,10 @@ mod wasi;
 /// Exact protocol negotiated by every executable plugin host.
 pub const PLUGIN_PROTOCOL_VERSION: &str = "zuno.plugin/1";
 /// Canonical Component Model interface implemented by WASI plugins.
-pub const PLUGIN_WIT: &str = include_str!("../../../wit/zuno-plugin/plugin.wit");
+///
+/// The embedded copy lives inside this crate so a crates.io package remains
+/// self-contained. A test keeps it byte-identical to the repository-facing WIT.
+pub const PLUGIN_WIT: &str = include_str!("plugin.wit");
 
 const RUNTIME_BUNDLE_ID: &str = "zuno.extension-runtime";
 const RUNTIME_COMPONENT_ID: &str = "zuno.extension-runtime.hosts";
@@ -494,6 +497,12 @@ impl SecretRedactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_wit_matches_the_repository_contract() {
+        let repository = include_str!("../../../wit/zuno-plugin/plugin.wit");
+        assert_eq!(PLUGIN_WIT, repository);
+    }
 
     #[test]
     fn uncertain_and_timeout_host_failures_reach_typed_tool_recovery() {

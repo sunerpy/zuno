@@ -64,10 +64,16 @@ irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | ie
 ```
 
 ```sh [Cargo]
-cargo install --git https://github.com/sunerpy/zuno zuno-cli --locked
+cargo install zuno --locked
 ```
 
 :::
+
+To install the current Git revision instead of the published crate:
+
+```sh
+cargo install --git https://github.com/sunerpy/zuno zuno --locked
+```
 
 Ripgrep 14 or newer is only the backend for the `glob` and `grep` tools; it is not
 required to start Zuno or use the core runtime. Bubblewrap 0.8.0 or newer is only

@@ -43,7 +43,7 @@ Zuno is a released, fast-moving Rust agent harness. Prefer the correct foundatio
 
 ## Cross-Platform Development
 
-- Keep Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64 MSVC behavior explicit. Do not encode POSIX paths, shell quoting, executable suffixes, or case sensitivity into platform-neutral components.
+- Keep Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64/aarch64 MSVC behavior explicit. Do not encode POSIX paths, shell quoting, executable suffixes, architecture aliases, or case sensitivity into platform-neutral components.
 - `rg` 14 or newer is a backend dependency of the `glob` and `grep` tools only. Missing ripgrep may make those tools unavailable or fail their calls; it must not prevent Zuno startup, configuration, provider access, database access, or other core runtime behavior.
 - `bwrap` 0.8.0 or newer is only the Linux confinement backend for `read-only` and `workspace-write`. `danger-full-access` uses the native backend on every platform. Trusted `run-unconfined` fallback is limited to eligible unavailable-backend failures for write-capable `workspace-write`; `read-only` never falls back.
 - macOS and Windows currently have no confined backend. Keep native execution usable through the explicit full-access path or the eligible trusted fallback, and keep documentation and diagnostics clear that this is not confinement.

@@ -49,10 +49,16 @@ curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.s
 irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | iex
 ```
 
-从源码安装：
+从 crates.io 为当前宿主编译安装：
 
 ```sh
-cargo install --git https://github.com/sunerpy/zuno zuno-cli --locked
+cargo install zuno --locked
+```
+
+安装当前 Git revision：
+
+```sh
+cargo install --git https://github.com/sunerpy/zuno zuno --locked
 ```
 
 `rg`（ripgrep）14 或更新版本只在使用 `glob` 与 `grep` 工具时需要。Linux 上只有

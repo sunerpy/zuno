@@ -511,7 +511,7 @@ runner where a timing budget would have to be loosened.
 mold) and §10.1 requires re-measuring it here. Re-measured on 2026-08-18 against
 this workspace's `zuno` binary (203,921,136 bytes, 84,452,158 bytes of `.text`),
 five interleaved runs of `touch crates/zuno-cli/src/main.rs && cargo rustc
---offline -p zuno-cli --bin zuno`:
+--offline -p zuno --bin zuno`:
 
 | linker | five runs (s) | min / median / max | max/min |
 | --- | --- | --- | --- |

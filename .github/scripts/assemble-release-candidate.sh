@@ -16,6 +16,7 @@ set -euo pipefail
 
 readonly targets=(
   aarch64-apple-darwin
+  aarch64-pc-windows-msvc
   aarch64-unknown-linux-musl
   x86_64-apple-darwin
   x86_64-pc-windows-msvc
@@ -77,7 +78,7 @@ for target in "${targets[@]}"; do
     echo "::error title=Candidate manifest::${target} has no provenance attestation"
     exit 1
   fi
-  if [ "$target" = x86_64-pc-windows-msvc ]; then
+  if [[ "$target" == *-pc-windows-msvc ]]; then
     expected_archive="zuno-${CANDIDATE_VERSION}-${target}.zip"
   else
     expected_archive="zuno-${CANDIDATE_VERSION}-${target}.tar.gz"
@@ -152,6 +153,6 @@ jq -n \
     targets: $targets
   }' > candidate-manifest.json
 
-jq -e '.targets | length == 5' candidate-manifest.json >/dev/null
+jq -e '.targets | length == 6' candidate-manifest.json >/dev/null
 sha256sum --check --strict SHA256SUMS
 cat candidate-manifest.json

@@ -87,8 +87,8 @@ name = "option-ext"
 allow = ["MPL-2.0"]
 
 [licenses.private]
-# The 34 first-party crates are all `publish = false` with `license = "MIT"`.
-# Ignoring them keeps this gate about third-party code.
+# Test fixtures remain private. Published first-party crates declare MIT
+# explicitly and are checked like the rest of the dependency graph.
 ignore = true
 
 [bans]
@@ -97,9 +97,8 @@ ignore = true
 # not fatal — 12 pairs today.
 multiple-versions = "warn"
 # A `*` version requirement on a registry crate is not a reproducible release
-# input. The first-party crates are exempt because a workspace path dependency
-# legitimately carries no version requirement
-# (`zuno-cli = { path = "crates/zuno-cli" }`), and all 34 are `publish = false`.
+# input. Normal first-party dependencies carry both path and registry version;
+# path-only development fixtures are omitted from published manifests.
 wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"

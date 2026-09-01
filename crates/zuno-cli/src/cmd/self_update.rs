@@ -131,6 +131,11 @@ impl ReleasePlatform {
                 extension: "zip",
                 executable: "zuno.exe",
             }),
+            ("windows", "aarch64") => Ok(Self {
+                target: "aarch64-pc-windows-msvc",
+                extension: "zip",
+                executable: "zuno.exe",
+            }),
             _ => Err(UpdateError::UnsupportedPlatform {
                 os: os.to_owned(),
                 arch: arch.to_owned(),
@@ -570,13 +575,13 @@ mod tests {
             ("macos", "x86_64", "x86_64-apple-darwin", "tar.gz"),
             ("macos", "aarch64", "aarch64-apple-darwin", "tar.gz"),
             ("windows", "x86_64", "x86_64-pc-windows-msvc", "zip"),
+            ("windows", "aarch64", "aarch64-pc-windows-msvc", "zip"),
         ];
         for (os, arch, target, extension) in cases {
             let platform = ReleasePlatform::from_parts(os, arch).expect("supported platform");
             assert_eq!(platform.target, target);
             assert_eq!(platform.extension, extension);
         }
-        assert!(ReleasePlatform::from_parts("windows", "aarch64").is_err());
         assert!(ReleasePlatform::from_parts("freebsd", "x86_64").is_err());
     }
 
