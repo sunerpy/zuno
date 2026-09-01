@@ -383,6 +383,9 @@ fn accept(listener: &TcpListener) -> (TcpStream, SocketAddr) {
         match listener.accept() {
             Ok((stream, peer)) => {
                 stream
+                    .set_nonblocking(false)
+                    .expect("blocking proxy stream");
+                stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .expect("proxy read timeout");
                 return (stream, peer);

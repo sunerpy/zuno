@@ -270,14 +270,16 @@ async fn a_running_live_tool_observes_an_installed_skill_without_reconstruction(
         .await
         .expect("new Skill appears in list");
     assert!(listed.output.contains("spreadsheet"), "{}", listed.output);
+    let advertised_source = service
+        .snapshot()
+        .skills()
+        .get("spreadsheet")
+        .expect("installed source")
+        .location
+        .clone();
     assert_eq!(
-        service
-            .snapshot()
-            .skills()
-            .get("spreadsheet")
-            .expect("installed source")
-            .location,
-        source.to_string_lossy()
+        std::fs::canonicalize(&advertised_source).expect("canonical advertised source"),
+        std::fs::canonicalize(&source).expect("canonical written source")
     );
 
     let searched = subject
@@ -300,9 +302,7 @@ async fn a_running_live_tool_observes_an_installed_skill_without_reconstruction(
         loaded.output
     );
     assert!(
-        loaded
-            .output
-            .contains(&source.to_string_lossy().to_string()),
+        loaded.output.contains(&advertised_source),
         "{}",
         loaded.output
     );
@@ -340,6 +340,13 @@ async fn a_renamed_live_source_returns_typed_catalog_stale_with_current_locator(
     .expect("rename Skill directory");
     let new_source = new_directory.join("SKILL.md");
     service.refresh().await;
+    let advertised_source = service
+        .snapshot()
+        .skills()
+        .get("spreadsheet")
+        .expect("renamed source")
+        .location
+        .clone();
 
     let error = subject
         .run(
@@ -359,18 +366,23 @@ async fn a_renamed_live_source_returns_typed_catalog_stale_with_current_locator(
     let rejection = source_of(&error)
         .downcast_ref::<SkillRejection>()
         .expect("typed Skill rejection");
-    assert!(
-        matches!(
-            rejection,
-            SkillRejection::CatalogStale {
-                requested,
-                locator,
-                available,
-            } if requested == "spreadsheet"
-                && locator == &old_source.to_string_lossy()
-                && available.contains(&new_source.to_string_lossy().to_string())
-        ),
-        "{rejection}"
+    let SkillRejection::CatalogStale {
+        requested,
+        locator,
+        available,
+    } = rejection
+    else {
+        panic!("{rejection}");
+    };
+    assert_eq!(requested, "spreadsheet");
+    assert_eq!(locator.as_str(), old_source.to_string_lossy().as_ref());
+    assert_eq!(available, &format!("`{advertised_source}`"));
+    let canonical_new_source =
+        std::fs::canonicalize(&new_source).expect("canonical renamed Skill source");
+    assert_eq!(
+        std::fs::canonicalize(&advertised_source).expect("canonical advertised replacement source"),
+        canonical_new_source,
+        "{rejection}",
     );
     service.shutdown();
 }

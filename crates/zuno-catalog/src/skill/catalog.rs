@@ -546,9 +546,12 @@ mod tests {
             .expect("last valid skill projection");
         assert_eq!(projected.catalog_display_name(), "Sheet Two");
         assert_eq!(projected.exposure, SkillExposure::Explicit);
+        let canonical_metadata =
+            std::fs::canonicalize(&metadata).expect("canonical metadata source");
         assert!(malformed.warnings().iter().any(|warning| {
             matches!(warning.kind(), SkillWarningKind::MetadataMalformed(_))
-                && warning.source() == metadata.to_string_lossy()
+                && std::fs::canonicalize(warning.source()).ok().as_deref()
+                    == Some(canonical_metadata.as_path())
         }));
         service.shutdown();
     }

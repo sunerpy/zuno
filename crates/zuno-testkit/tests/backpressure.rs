@@ -175,6 +175,15 @@ const CHANNELS: &[ChannelGate] = &[
         "guard.requeue(std::iter::once(event).chain(iterator), now)",
     ),
     gate(
+        "skill-catalog-snapshots",
+        "zuno-catalog/src/skill/catalog.rs",
+        "let (sender, _) = watch::channel(Arc::clone(&snapshot));",
+        "latest value",
+        Policy::LatestValue,
+        "zuno-catalog/src/skill/catalog.rs",
+        "self.sender.send_replace(Arc::clone(&next));",
+    ),
+    gate(
         "engine-turn-events",
         "zuno-engine/src/loop.rs",
         "let (sender, receiver) = mpsc::channel(TURN_EVENT_CHANNEL_CAPACITY);",
@@ -434,7 +443,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
         actual, expected,
         "channel registry differs from production source"
     );
-    assert_eq!(CHANNELS.len(), 39);
+    assert_eq!(CHANNELS.len(), 40);
 
     let crates = crates_root();
     for entry in CHANNELS {
@@ -502,6 +511,10 @@ channel_gate!(
 );
 channel_gate!(lsp_client_closed_keeps_latest_value, "lsp-client-closed");
 channel_gate!(watch_events_coalesce_when_full, "watch-events");
+channel_gate!(
+    skill_catalog_snapshots_keep_latest_value,
+    "skill-catalog-snapshots"
+);
 channel_gate!(
     turn_work_state_changes_keep_latest_value,
     "turn-work-state-changes"

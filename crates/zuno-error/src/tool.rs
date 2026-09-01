@@ -203,8 +203,13 @@ mod tests {
 
     #[test]
     fn every_variant_names_its_tool() {
-        for e in every_variant() {
-            assert_eq!(e.tool(), "shell", "{e}");
+        let variants = every_variant();
+        let expected = [
+            "shell", "shell", "shell", "webfetch", "shell", "shell", "shell", "shell",
+        ];
+        assert_eq!(variants.len(), expected.len());
+        for (error, expected_tool) in variants.into_iter().zip(expected) {
+            assert_eq!(error.tool(), expected_tool, "{error}");
         }
     }
 
