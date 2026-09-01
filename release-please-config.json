@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "include-component-in-tag": false,
   "pull-request-title-pattern": "chore: release${component} ${version}",
-  "pull-request-header": "## Manual release approval required\n\nThis automated release PR intentionally requires a maintainer to review its exact head SHA and approve the pending **CI** Actions run. After approval, wait for the independently dispatched `zuno/pr-gate` candidate to succeed, then revalidate the same head before manually merging. Do not bypass this approval with CI skip markers or `pull_request_target`.",
+  "pull-request-header": "## Manual release approval required\n\nThis automated release PR intentionally keeps GitHub's native Actions approval gate. Review its exact head SHA and, when GitHub marks the **CI** run as `action_required`, approve that exact run. Then wait for the independently dispatched `zuno/pr-gate` candidate to succeed, revalidate the same head, and merge manually. Do not bypass approval with CI skip markers or `pull_request_target`.",
   "packages": {
     ".": {
       "release-type": "simple",

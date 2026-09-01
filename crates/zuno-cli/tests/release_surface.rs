@@ -1358,18 +1358,25 @@ fn ci_runs_before_the_protected_merge_without_a_duplicate_push_run() {
     }
     let classify = job_body(&text, "classify").join("\n");
     for required in [
-        "ACTOR: ${{ github.actor }}",
         "PR_USER: ${{ github.event.pull_request.user.login }}",
         "HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}",
-        "[ \"$ACTOR\" = 'github-actions[bot]' ]",
+        "PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}",
         "[ \"$PR_USER\" = 'github-actions[bot]' ]",
         "[ \"$HEAD_REPOSITORY\" = \"$GITHUB_REPOSITORY\" ]",
         "[[ \"$HEAD_REF\" == release-please--branches--main--* ]]",
+        "index(\"autorelease: pending\") != null",
         "echo \"release_pr=${release_pr}\" >> \"$GITHUB_OUTPUT\"",
     ] {
         assert!(
             classify.contains(required),
             "release PR classification lost fail-closed identity check {required:?}"
+        );
+    }
+    for forbidden in ["ACTOR:", "github.actor"] {
+        assert!(
+            !classify.contains(forbidden),
+            "release PR classification treats the workflow initiator as commit identity via \
+             {forbidden:?}"
         );
     }
     for job in ["test", "artifact", "windows-clippy", "windows-test"] {
@@ -1428,9 +1435,10 @@ fn automated_release_prs_keep_the_manual_actions_approval_gate() {
     for required in [
         "Manual release approval required",
         "exact head SHA",
-        "approve the pending **CI** Actions run",
+        "keeps GitHub's native Actions approval gate",
+        "`action_required`",
         "`zuno/pr-gate`",
-        "manually merging",
+        "merge manually",
     ] {
         assert!(
             header.contains(required),
@@ -1456,7 +1464,8 @@ fn automated_release_prs_keep_the_manual_actions_approval_gate() {
     for required in [
         "name: Record required manual approval",
         "Manual release approval required",
-        "Approve its pending **CI** Actions run",
+        "If GitHub marks its ordinary CI run as \\`action_required\\`",
+        "Approve its **CI** Actions run when GitHub requests approval",
         "Wait for the independently dispatched \\`zuno/pr-gate\\` candidate",
         "Do not replace this approval with a skip marker",
     ] {
@@ -1472,6 +1481,11 @@ fn release_controller_dispatches_exact_source_and_never_compiles() {
     let release = workflow("release.yml");
     let dispatch = job_body(&release, "dispatch_candidate").join("\n");
     for required in [
+        "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+        "persist-credentials: false",
+        ".github/scripts/resolve-release-pr-head.sh",
+        "EXPECTED_BASE_SHA: ${{ github.sha }}",
+        "RELEASE_PR_NUMBER=\"$number\"",
         "gh workflow run release-candidate.yml",
         "--ref \"$HEAD_REF\"",
         "-f expected_head_sha=\"$HEAD_SHA\"",
@@ -1519,6 +1533,141 @@ fn release_controller_dispatches_exact_source_and_never_compiles() {
     assert!(
         !resolve.contains("releases/tags/${TAG}"),
         "release recovery uses the REST by-tag endpoint that hides draft releases"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn release_pr_head_resolver_waits_for_a_fresh_stable_head() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const OLD_BASE: &str = "1111111111111111111111111111111111111111";
+    const OLD_HEAD: &str = "2222222222222222222222222222222222222222";
+    const NEW_BASE: &str = "3333333333333333333333333333333333333333";
+    const NEW_HEAD: &str = "4444444444444444444444444444444444444444";
+
+    let fixture = tempfile::tempdir().expect("temporary resolver fixture");
+    let old_pr = fixture.path().join("old-pr.json");
+    let current_pr = fixture.path().join("current-pr.json");
+    let commit = fixture.path().join("commit.json");
+    let fake_gh = fixture.path().join("gh");
+    let state = fixture.path().join("state");
+
+    let pr = |base: &str, head: &str| {
+        serde_json::json!({
+            "state": "open",
+            "user": {"login": "github-actions[bot]"},
+            "base": {"ref": "main", "sha": base},
+            "head": {
+                "repo": {"full_name": "sunerpy/zuno"},
+                "ref": "release-please--branches--main--components--zuno",
+                "sha": head
+            },
+            "labels": [{"name": "autorelease: pending"}]
+        })
+    };
+    std::fs::write(
+        &old_pr,
+        serde_json::to_vec(&pr(OLD_BASE, OLD_HEAD)).expect("encode old PR"),
+    )
+    .expect("write old PR");
+    std::fs::write(
+        &current_pr,
+        serde_json::to_vec(&pr(NEW_BASE, NEW_HEAD)).expect("encode current PR"),
+    )
+    .expect("write current PR");
+    std::fs::write(
+        &commit,
+        serde_json::to_vec(&serde_json::json!({
+            "parents": [{"sha": NEW_BASE}],
+            "author": {"login": "github-actions[bot]"},
+            "commit": {
+                "author": {
+                    "email": "41898282+github-actions[bot]@users.noreply.github.com"
+                },
+                "message": "chore: release 0.4.0"
+            }
+        }))
+        .expect("encode commit"),
+    )
+    .expect("write commit");
+
+    let fake = r#"#!/usr/bin/env bash
+set -euo pipefail
+[ "$1" = api ]
+case "$2" in
+  */pulls/62)
+    count=0
+    if [ -f "$FAKE_STATE" ]; then
+      read -r count < "$FAKE_STATE"
+    fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FAKE_STATE"
+    if [ "${FAKE_NEVER_STABLE:-0}" = 1 ] || [ "$count" -eq 1 ]; then
+      exec cat "$FAKE_OLD_PR"
+    fi
+    exec cat "$FAKE_CURRENT_PR"
+    ;;
+  */commits/"$NEW_HEAD")
+    exec cat "$FAKE_COMMIT"
+    ;;
+  *)
+    echo "unexpected fake gh request: $*" >&2
+    exit 1
+    ;;
+esac
+"#;
+    std::fs::write(&fake_gh, fake).expect("write fake gh");
+    let mut permissions = std::fs::metadata(&fake_gh)
+        .expect("fake gh metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, permissions).expect("make fake gh executable");
+
+    let resolver = workspace_root().join(".github/scripts/resolve-release-pr-head.sh");
+    let run = |state_path: &Path, never_stable: bool| {
+        let mut command = Command::new("bash");
+        command
+            .arg(&resolver)
+            .env("GITHUB_REPOSITORY", "sunerpy/zuno")
+            .env("RELEASE_PR_NUMBER", "62")
+            .env("EXPECTED_BASE_SHA", NEW_BASE)
+            .env("RELEASE_PR_RESOLVE_ATTEMPTS", "3")
+            .env("RELEASE_PR_RESOLVE_DELAY_SECONDS", "0")
+            .env("GH_BIN", &fake_gh)
+            .env("FAKE_STATE", state_path)
+            .env("FAKE_OLD_PR", &old_pr)
+            .env("FAKE_CURRENT_PR", &current_pr)
+            .env("FAKE_COMMIT", &commit)
+            .env("NEW_HEAD", NEW_HEAD);
+        if never_stable {
+            command.env("FAKE_NEVER_STABLE", "1");
+        }
+        command.output().expect("run release PR resolver")
+    };
+
+    let output = run(&state, false);
+    assert!(
+        output.status.success(),
+        "resolver rejected a PR that became current:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let resolved: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("resolver emits JSON");
+    assert_eq!(resolved["number"], 62);
+    assert_eq!(resolved["base_sha"], NEW_BASE);
+    assert_eq!(resolved["head_sha"], NEW_HEAD);
+
+    let stale_state = fixture.path().join("stale-state");
+    let stale = run(&stale_state, true);
+    assert!(
+        !stale.status.success(),
+        "resolver accepted a PR that never reached the triggering main commit"
+    );
+    assert!(
+        String::from_utf8_lossy(&stale.stderr).contains("did not stabilize on main"),
+        "stale failure did not explain the bounded wait:\n{}",
+        String::from_utf8_lossy(&stale.stderr)
     );
 }
 

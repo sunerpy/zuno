@@ -21,23 +21,34 @@ the release tag has the same Git tree.
   `macos-15` Arm64 runner. Windows x86_64 uses `windows-2022`; Windows ARM64
   uses the standard `windows-11-arm` hosted runner.
 
-GitHub places `pull_request` workflow runs created by `GITHUB_TOKEN` into an
-approval-required state. This is an intentional human gate, not a test failure
-and not something the release automation may bypass. The repository keeps
+GitHub may mark the ordinary `pull_request` workflow for a `GITHUB_TOKEN`-authored
+release PR as `action_required` under the repository's native Actions approval
+policy. This is an intentional human gate, not a test failure and not something
+the release automation may bypass. The repository keeps
 `actions/permissions/fork-pr-contributor-approval` at
 `all_external_contributors`; it does not add a CI skip marker, switch to
 `pull_request_target`, or give release-please a privileged token.
 
-After release-please creates or updates its PR, a maintainer reviews the exact
-head SHA and approves the pending `CI` Actions run. `ci.yml` then accepts the
-lightweight route only when the actor, PR author, same-repository head, `main`
-base, and release-please branch prefix all match. It gives that route a
-non-protected check name and skips every duplicate build job; the exact-head
-candidate workflow remains the sole owner of `zuno/pr-gate`. Ordinary and fork
-PRs still run the complete CI matrix. An `action_required` run that has not yet
-been approved is waiting for this operator action and must not be reported as a
-completed release. Leaving it unattended until GitHub expires it produces the
-misleading failed `chore: release ...` history that this procedure prevents.
+After release-please creates or updates its PR, the controller does not trust the
+first mutable PR API response. It waits for the PR base SHA to equal the `main`
+commit that started the controller, verifies that the bot-authored release head
+has exactly that commit as its sole parent, and confirms the same base/head pair
+with a second PR read. A stale API view is retried for a bounded period and is
+never dispatched as the expected candidate SHA.
+
+A maintainer reviews the exact head SHA and, when GitHub marks the ordinary `CI`
+run as `action_required`, approves that exact run. Once GitHub admits the run,
+`ci.yml` deliberately ignores `github.actor`: the initiator may be the
+maintainer who approved or retriggered the run, not the identity that authored
+the PR. The lightweight route instead requires the release-please bot PR author,
+a same-repository head, `main` base, the release-please branch prefix, and the
+`autorelease: pending` label. It uses a non-protected check name and skips every
+duplicate build job; the exact-head candidate workflow remains the sole owner of
+`zuno/pr-gate`. Ordinary and fork PRs still run the complete CI matrix. An
+`action_required` run that has not yet been approved is waiting for operator
+action and must not be reported as a completed release. Leaving it unattended
+until GitHub expires it produces the misleading failed `chore: release ...`
+history that this procedure prevents.
 
 The Linux source gate installs pinned `cargo-nextest`. Linux Clippy and tests
 share one job-local target directory; native Windows Clippy and tests are
