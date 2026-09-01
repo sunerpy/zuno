@@ -740,6 +740,8 @@ pub struct PlanStepProjection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanProjection {
     pub id: String,
+    pub parent_plan_id: Option<String>,
+    pub stack_depth: i64,
     pub goal_id: Option<String>,
     pub revision: i64,
     pub title: String,

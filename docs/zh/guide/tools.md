@@ -39,7 +39,10 @@ Notes 从不暴露宿主路径。每个作用域最多 100 个文档，单文档
 `0`。可信 `call_id`、请求摘要和 revision 让重复投递保持幂等，同时拒绝过期的并发写入。
 
 宿主持久 Plan 不依赖模型工具是否可见。禁用 `plan_update` 只会隐藏模型的修改入口，
-不会关闭宿主创建 Plan 或重启恢复。
+不会关闭宿主创建 Plan 或重启恢复。其可选 `action` 默认为 `update`；`push` 会暂停
+活跃 Plan 并安装一个聚焦的持久子 Plan；只有子步骤全部完成后才允许 `pop`，并且只恢复
+一次精确父 Plan。工作开始、完成、阻塞或范围变化时应立即更新活跃 Plan，并在最终回复
+前对账。
 
 完整的开启/关闭、profile 覆盖、权限、revision 与重启说明见
 [History 与 Notes 连续性配置](/zh/config/continuity)。

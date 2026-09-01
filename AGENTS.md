@@ -17,6 +17,7 @@ Zuno is a released, fast-moving Rust agent harness. Prefer the correct foundatio
 - Prompt assembly uses stable section identifiers, an exact source, ordered content, and a content digest. Persist the actual post-hook prompt before the provider request.
 - User prompts, steering, and subagent reports enter the durable FIFO inbox before execution. `reportDelivery: nextStep` must settle the child result, admit the parent input, and wake the parent without a polling race.
 - Client surfaces consume durable events, inbox state, and projections. TUI, server, ACP, and future GUI clients must not acquire private agent-loop behavior.
+- A durable Plan is reconciled as work changes, not only when a turn ends. Focused temporary work uses a persisted child Plan and restores its parent exactly once; a new objective replaces the visible root instead of appending duplicate generic steps.
 - A database format shipped in a release is durable user state. Every supported older format advances through a guarded, atomic forward migration; never require users to rebuild a supported database.
 - Run schema creation, backfills, index creation, and the format-marker update in one transaction, with the marker updated last. A marker-only edit is corruption, not a migration.
 - Migration tests use exact old-format fixtures and verify preserved rows, not only table presence. At minimum compare representative session, message, and durable-memory values before and after, then verify the new tables, indexes, and marker.
@@ -52,6 +53,7 @@ Zuno is a released, fast-moving Rust agent harness. Prefer the correct foundatio
 ## Research And Change Process
 
 - Use CodeGraph first for repository navigation, call paths, and impact analysis. Start with `codegraph status . --json`.
+- When the index is usable, continue with CodeGraph search, node, and impact queries before opening source. Use `rg` or `sed` only for exact literal verification, non-indexed configuration or documentation, or a file known to be newer than the index; do not make shell text search the primary navigation path.
 - Before adopting DeepSeek Harness behavior, run the project skill `$zuno-dsh-sync`; compare the pinned reference with current upstream tags and record adopt, adapt, or reject.
 - Treat DeepSeek Harness, Codex, oh-my-openagent, pi-agent, OpenCode, and Claw Code as design sources, not compatibility targets.
 - Non-trivial runtime changes update the relevant architecture or design document in the same change.

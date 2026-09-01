@@ -156,6 +156,8 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
         plan: Some(zuno_types::PlanProjection {
             id: "plan_1".to_owned(),
             goal_id: Some("goal_1".to_owned()),
+            parent_plan_id: None,
+            stack_depth: 0,
             revision: 2,
             title: "Release hardening".to_owned(),
             steps: vec![zuno_types::PlanStepProjection {
@@ -265,7 +267,8 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
         "Goal",
         "finish the durable runtime upgrade",
         "Plan",
-        "Release hardening · r2",
+        "Release hardening",
+        "r2 · 21s · 600 tokens",
         "Todos",
         "Running workspace gates",
         "21s · 600 tokens",
@@ -286,6 +289,59 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
         assert!(
             normalized.contains(expected),
             "missing `{expected}`:\n{joined}"
+        );
+    }
+}
+
+#[test]
+fn views_sidebar_shows_the_complete_active_subplan_and_its_parent() {
+    let mut view = view();
+    view.ambient_mut().work.plan = Some(zuno_types::PlanProjection {
+        id: "plan_child".to_owned(),
+        goal_id: Some("goal_1".to_owned()),
+        parent_plan_id: Some("plan_parent_with_a_durable_identifier".to_owned()),
+        stack_depth: 2,
+        revision: 9,
+        title: "Investigate the cross-platform release controller without truncating any words"
+            .to_owned(),
+        steps: vec![
+            zuno_types::PlanStepProjection {
+                id: "diagnose".to_owned(),
+                title: "Reproduce the Windows timeout and preserve every meaningful detail"
+                    .to_owned(),
+                status: "completed".to_owned(),
+            },
+            zuno_types::PlanStepProjection {
+                id: "verify".to_owned(),
+                title: "Return to the parent only after the focused verification succeeds"
+                    .to_owned(),
+                status: "in_progress".to_owned(),
+            },
+        ],
+        span: zuno_types::ExecutionSpan::default(),
+        time_created: 1,
+        time_updated: 2,
+    });
+
+    let body = view
+        .lines(SIDEBAR_WIDTH)
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    for expected in [
+        "subplan 2 · 1/2 complete",
+        "Investigate the cross-platform release controller without truncating any words",
+        "returns to",
+        "plan_parent_with_a_durable_ident",
+        "ifier",
+        "Reproduce the Windows timeout and preserve every meaningful detail",
+        "Return to the parent only after the focused verification succeeds",
+    ] {
+        assert!(
+            normalized.contains(expected),
+            "the active Plan projection truncated `{expected}`:\n{body}"
         );
     }
 }

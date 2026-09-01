@@ -2046,6 +2046,8 @@ fn replay_work_state(
         .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
     let plan = snapshot.plan.map(|plan| zuno_types::PlanProjection {
         id: plan.id,
+        parent_plan_id: plan.parent_plan_id,
+        stack_depth: plan.stack_depth,
         goal_id: plan.goal_id,
         revision: plan.revision,
         title: plan.title,

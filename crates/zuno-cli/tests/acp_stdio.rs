@@ -2149,20 +2149,32 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
     .goal(&session_id)
     .expect("read ACP goal")
     .expect("persisted ACP goal");
-    let plan = zuno_tools::WorkStateStore::new(pool)
+    let plan = zuno_tools::WorkStateStore::new(Arc::clone(&pool))
         .plan(&session_id)
         .expect("read ACP plan")
         .expect("Goal objective seeded a plan");
     assert_eq!(plan.goal_id.as_deref(), Some(goal.goal_id.as_str()));
-    assert_eq!(plan.steps.len(), 8);
+    assert_eq!(plan.steps.len(), 4);
+    assert_eq!(plan.steps[0].status, zuno_tools::PlanStepStatus::InProgress);
     assert!(
-        plan.steps[..4].iter().all(|step| {
-            step.status == zuno_tools::PlanStepStatus::Completed
-                && step.title.starts_with("Superseded: ")
-        }),
-        "the edited Goal must terminalize its stale Plan epoch"
+        plan.steps[1..]
+            .iter()
+            .all(|step| step.status == zuno_tools::PlanStepStatus::Pending),
+        "the edited Goal must expose one fresh root Plan without duplicate generic steps"
     );
-    assert_eq!(plan.steps[4].status, zuno_tools::PlanStepStatus::InProgress);
+    let connection = pool.get().expect("open ACP Plan archive");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM work_plan_archive \
+                 WHERE session_id=?1 AND state='superseded'",
+                [&session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count superseded ACP plans"),
+        1,
+        "the first Goal Plan must remain durable as superseded history"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -71,6 +71,12 @@ input. It does not cancel a side-effecting tool already in flight. A steer that
 misses the final safe point stays durably pending and becomes the next FIFO turn;
 client channel capacity or reconnect timing never decides its fate.
 
+The TUI projects committed pending inputs into a fixed FIFO dock above the root
+composer. Queue admission is not rendered as transcript history. Each row states
+whether it targets the next turn or the active turn, and the footer resolves the
+actual force-submit and queue-manager bindings. Promotion moves the semantic input
+into history; cancellation removes it without inventing a user message.
+
 Human input has priority over an automatic goal retry. The client may show the persisted retry deadline and reason, but cancellation, pause, and resume are explicit commands rather than local timer changes.
 
 Goal-owned questions and permissions are rows, not open sockets or parked client
@@ -164,7 +170,10 @@ The TUI favors dense, keyboard-first operation:
 - a visible transcript scrollbar with wheel and thumb dragging, plus
   application-owned text selection that is clipped to the transcript. Releasing
   a drag copies automatically, right-click copies the retained selection, and
-  success or failure is reported without clearing the highlight.
+  success or failure is reported without clearing the highlight. Transcript
+  clipboard text comes from semantic message content: role chrome, borders,
+  padding, and visual soft wraps are excluded, while explicit source newlines
+  are preserved.
   Root and attached-child composers use the same captured drag selection and
   clipboard path, and render an inverse theme-derived caret on both empty and
   populated input buffers;

@@ -89,10 +89,9 @@ Inspect and manage it with `/goal` in the terminal application:
 the previous goal is complete or cancelled. Otherwise it updates the current objective
 without resetting its status, budget, or accumulated usage. The explicit action forms
 remain available for lifecycle management. Create, edit, and shorthand objective changes
-also reconcile an active Plan: unfinished prior steps become terminal `completed` entries
-titled `Superseded: ...`, a multi-stage objective gets a new epoch, and the active Plan is
-bound to the current `goal_id`. An already terminal historical Plan is not rebound for an
-atomic objective.
+also reconcile an active Plan: a multi-stage objective archives the previous visible Plan
+and installs a new root bound to the current `goal_id`. An atomic objective may terminalize
+stale unfinished work without rebinding an already terminal historical Plan.
 
 Known action names take precedence when they are the first token: `show`, `get`, `status`,
 `history`, `create`, `edit`, `pause`, `resume`, `block`, `complete`, `cancel`, and `help`.
@@ -147,9 +146,13 @@ Rules that matter in practice:
 - While steps remain pending, exactly one step is in progress.
 - Completed steps are terminal and cannot regress.
 - A fully completed plan has no in-progress step.
-- A bounded answer, atomic action, or explicit “continue” keeps the active epoch. A
-  substantial new ordinary objective moves the old active step back to pending and appends
-  a new epoch, so the new request cannot disappear into stale plan state.
+- A bounded answer, atomic action, or explicit “continue” keeps the active Plan. A
+  substantial new ordinary objective archives it and installs a new root containing only
+  the new objective, so stale generic steps do not accumulate in the visible progress list.
+- A focused temporary workflow uses `plan_update` with `action=push`; the parent is
+  suspended durably and the child becomes the visible Plan. After every child step is
+  completed, `action=pop` restores the exact parent once. Update the active Plan when work
+  starts, completes, blocks, or changes scope, and reconcile it before the final answer.
 - Verification is scoped to the exact commit, build, tag, deployment, configuration, and
   inputs inspected. When any of them changes, append a new gate instead of reusing an older
   completed result.

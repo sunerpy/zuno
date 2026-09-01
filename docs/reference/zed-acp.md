@@ -203,10 +203,9 @@ objective without resetting its lifecycle state, budget, or usage. Explicit
 `show`, `history`, `create <objective>`, `edit <objective>`, `pause`, `resume`,
 `block <reason>`, `complete`, and `cancel` actions remain available and take
 precedence when their name is the first token. Objective changes also supersede
-unfinished work in an active prior Plan epoch by completing those steps with a
-`Superseded:` title and binding that Plan to the current Goal; multi-stage work
-seeds a replacement epoch. An atomic objective leaves an already terminal historical
-Plan attached to its original Goal. The command output is projected
+unfinished work by archiving the prior visible Plan and binding a fresh root
+Plan to the current Goal for multi-stage work. An atomic objective leaves an
+already terminal historical Plan attached to its original Goal. The command output is projected
 as an ordinary Agent message rather than as reasoning. Invalid arguments to an
 explicit action are returned as JSON-RPC invalid params, not as an internal
 session error.

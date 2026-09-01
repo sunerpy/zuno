@@ -1608,8 +1608,8 @@ pub fn subtree(connection: &Connection, id: &str) -> Result<Vec<String>, DbError
 ///
 /// 1. `DELETE FROM session`, which cascades `message`, `session_message`,
 ///    `session_input`, `session_context_epoch`, `session_share`, `agent_job`,
-///    `work_plan`, `work_item`, and reflection delivery rows, and reaches `part`
-///    through `message`;
+///    `work_plan`, `work_plan_archive`, `work_item`, and reflection delivery
+///    rows, and reaches `part` through `message`;
 /// 2. `DELETE FROM part WHERE session_id = ?`, the sweep for parts the cascade
 ///    could not see;
 /// 3. `DELETE FROM event_sequence`, then `DELETE FROM event`, keyed by

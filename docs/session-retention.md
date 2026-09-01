@@ -112,7 +112,7 @@ Generated from `zuno_db::prune::DELETE_ORDER`. The order is pinned by
 `crates/zuno-db/tests/prune.rs::prune_delete_order_and_true_related_table_count_are_pinned`,
 because the order is what keeps foreign keys satisfied mid-transaction.
 
-**18 tables**, in this order:
+**19 tables**, in this order:
 
 <!-- generated:BEGIN prune-tables -->
 | order | table |
@@ -126,15 +126,16 @@ because the order is what keeps foreign keys satisfied mid-transaction.
 | 7 | `agent_job` |
 | 8 | `work_item` |
 | 9 | `work_plan` |
-| 10 | `session_context_epoch` |
-| 11 | `session_input` |
-| 12 | `session_message` |
-| 13 | `part` |
-| 14 | `message` |
-| 15 | `session_share` |
-| 16 | `session` |
-| 17 | `event_sequence` |
-| 18 | `event` |
+| 10 | `work_plan_archive` |
+| 11 | `session_context_epoch` |
+| 12 | `session_input` |
+| 13 | `session_message` |
+| 14 | `part` |
+| 15 | `message` |
+| 16 | `session_share` |
+| 17 | `session` |
+| 18 | `event_sequence` |
+| 19 | `event` |
 <!-- generated:END prune-tables -->
 
 Regenerate with:

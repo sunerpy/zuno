@@ -132,6 +132,8 @@ pub struct PlanStep {
 pub struct WorkPlan {
     pub id: String,
     pub session_id: String,
+    pub parent_plan_id: Option<String>,
+    pub stack_depth: i64,
     pub goal_id: Option<String>,
     pub revision: i64,
     pub title: String,
@@ -235,6 +237,172 @@ impl WorkStateStore {
         self.update_plan_with_policy(session_id, params, false)
     }
 
+    /// Suspend the active Plan and install a focused child Plan atomically.
+    ///
+    /// The parent remains durable in `work_plan_archive` and is restored by
+    /// [`Self::complete_subplan`]. A process restart therefore observes the same active
+    /// child and stack depth rather than reconstructing nesting from model prose.
+    pub fn push_plan(
+        &self,
+        session_id: &str,
+        params: PlanUpdateParams,
+    ) -> Result<WorkPlan, WorkStateError> {
+        validate_plan(&params)?;
+        let steps_json = serde_json::to_string(&params.steps)
+            .map_err(|error| WorkStateError::Invalid(error.to_string()))?;
+        let now = zuno_db::message::now_millis();
+        let child_id = format!("plan_{}", uuid::Uuid::new_v4().simple());
+        self.pool.try_transaction(|tx| {
+            let current = plan_in(tx, session_id)?.ok_or_else(|| WorkStateError::NotFound {
+                kind: "plan",
+                id: session_id.to_owned(),
+            })?;
+            require_plan_revision(&current, params.expected_revision)?;
+            archive_plan(tx, &current, ArchivedPlanState::Suspended, now)?;
+            tx.execute("DELETE FROM work_plan WHERE session_id=?1", [session_id])
+                .map_err(zuno_db::map_error)?;
+            tx.execute(
+                "INSERT INTO work_plan \
+                 (session_id,id,parent_plan_id,stack_depth,goal_id,revision,title,steps,\
+                  time_created,time_updated) \
+                 VALUES (?1,?2,?3,?4,?5,1,?6,?7,?8,?8)",
+                params![
+                    session_id,
+                    child_id,
+                    current.id,
+                    current.stack_depth.saturating_add(1),
+                    params.goal_id.or(current.goal_id),
+                    params.title,
+                    steps_json,
+                    now
+                ],
+            )
+            .map_err(zuno_db::map_error)?;
+            Ok(plan_in(tx, session_id)?.expect("child plan was inserted"))
+        })
+    }
+
+    /// Complete the active child Plan and restore its suspended parent atomically.
+    pub fn complete_subplan(
+        &self,
+        session_id: &str,
+        params: PlanUpdateParams,
+    ) -> Result<WorkPlan, WorkStateError> {
+        validate_plan(&params)?;
+        if params.steps.iter().any(|step| !step.status.is_terminal()) {
+            return Err(WorkStateError::Invalid(
+                "a subplan can return to its parent only after every child step is completed"
+                    .to_owned(),
+            ));
+        }
+        let steps_json = serde_json::to_string(&params.steps)
+            .map_err(|error| WorkStateError::Invalid(error.to_string()))?;
+        let now = zuno_db::message::now_millis();
+        self.pool.try_transaction(|tx| {
+            let current = plan_in(tx, session_id)?.ok_or_else(|| WorkStateError::NotFound {
+                kind: "plan",
+                id: session_id.to_owned(),
+            })?;
+            require_plan_revision(&current, params.expected_revision)?;
+            let parent_id = current.parent_plan_id.clone().ok_or_else(|| {
+                WorkStateError::Invalid("the active plan has no suspended parent".to_owned())
+            })?;
+            validate_plan_transition(tx, session_id, &current, &params, false)?;
+            let completed = WorkPlan {
+                revision: current.revision.saturating_add(1),
+                title: params.title,
+                steps: params.steps,
+                goal_id: params.goal_id.or(current.goal_id),
+                time_updated: now,
+                ..current
+            };
+            archive_plan_with_steps(
+                tx,
+                &completed,
+                &steps_json,
+                ArchivedPlanState::Completed,
+                now,
+            )?;
+            let parent = archived_plan_in(tx, session_id, &parent_id)?.ok_or_else(|| {
+                WorkStateError::Invalid(format!("suspended parent plan `{parent_id}` is missing"))
+            })?;
+            tx.execute("DELETE FROM work_plan WHERE session_id=?1", [session_id])
+                .map_err(zuno_db::map_error)?;
+            tx.execute(
+                "DELETE FROM work_plan_archive \
+                 WHERE session_id=?1 AND id=?2 AND state='suspended'",
+                params![session_id, parent_id],
+            )
+            .map_err(zuno_db::map_error)?;
+            insert_active_plan(tx, &parent)?;
+            Ok(plan_in(tx, session_id)?.expect("parent plan was restored"))
+        })
+    }
+
+    /// Archive the current Plan and start a new root Plan without appending old steps.
+    ///
+    /// This host-owned boundary is used for a genuinely new user objective. Suspended
+    /// ancestors are superseded in the same transaction so a stale child stack cannot
+    /// later resurrect work from the previous objective.
+    pub fn replace_plan_for_objective(
+        &self,
+        session_id: &str,
+        params: PlanUpdateParams,
+    ) -> Result<WorkPlan, WorkStateError> {
+        validate_plan(&params)?;
+        let steps_json = serde_json::to_string(&params.steps)
+            .map_err(|error| WorkStateError::Invalid(error.to_string()))?;
+        let now = zuno_db::message::now_millis();
+        let next_id = format!("plan_{}", uuid::Uuid::new_v4().simple());
+        self.pool.try_transaction(|tx| {
+            let Some(current) = plan_in(tx, session_id)? else {
+                if params.expected_revision.is_some() {
+                    return Err(WorkStateError::RevisionConflict {
+                        kind: "plan",
+                        id: next_id.clone(),
+                        expected: params.expected_revision.unwrap_or_default(),
+                        actual: 0,
+                    });
+                }
+                insert_new_root(
+                    tx,
+                    session_id,
+                    &next_id,
+                    params.goal_id.as_deref(),
+                    &params.title,
+                    &steps_json,
+                    now,
+                )?;
+                return Ok(plan_in(tx, session_id)?.expect("root plan was inserted"));
+            };
+            require_plan_revision(&current, params.expected_revision)?;
+            let state = if current.steps.iter().all(|step| step.status.is_terminal()) {
+                ArchivedPlanState::Completed
+            } else {
+                ArchivedPlanState::Superseded
+            };
+            archive_plan(tx, &current, state, now)?;
+            tx.execute(
+                "UPDATE work_plan_archive SET state='superseded',time_archived=?1 \
+                 WHERE session_id=?2 AND state='suspended'",
+                params![now, session_id],
+            )
+            .map_err(zuno_db::map_error)?;
+            tx.execute("DELETE FROM work_plan WHERE session_id=?1", [session_id])
+                .map_err(zuno_db::map_error)?;
+            insert_new_root(
+                tx,
+                session_id,
+                &next_id,
+                params.goal_id.as_deref(),
+                &params.title,
+                &steps_json,
+                now,
+            )?;
+            Ok(plan_in(tx, session_id)?.expect("replacement plan was inserted"))
+        })
+    }
+
     /// Reconcile a Plan after the user established a new durable Goal objective.
     ///
     /// This is the one explicit boundary allowed to supersede unfinished steps that
@@ -273,8 +441,9 @@ impl WorkStateStore {
                     }
                     tx.execute(
                         "INSERT INTO work_plan \
-                         (session_id,id,goal_id,revision,title,steps,time_created,time_updated) \
-                         VALUES (?1,?2,?3,1,?4,?5,?6,?6)",
+                         (session_id,id,parent_plan_id,stack_depth,goal_id,revision,title,steps,\
+                          time_created,time_updated) \
+                         VALUES (?1,?2,NULL,0,?3,1,?4,?5,?6,?6)",
                         params![
                             session_id,
                             candidate_id,
@@ -469,6 +638,49 @@ pub struct PlanUpdateParams {
     pub goal_id: Option<String>,
     pub title: String,
     pub steps: Vec<PlanStep>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanMutationAction {
+    /// Update the active Plan in place.
+    #[default]
+    Update,
+    /// Suspend the active Plan and install these fields as a child Plan.
+    Push,
+    /// Complete the active child with these fields and restore its parent.
+    Pop,
+}
+
+/// Model-facing Plan mutation envelope.
+///
+/// Internal host callers keep using [`PlanUpdateParams`] directly while the one public
+/// `plan_update` permission continues to govern update, push, and pop.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanMutationParams {
+    #[serde(default)]
+    pub action: PlanMutationAction,
+    #[serde(default)]
+    pub expected_revision: Option<i64>,
+    #[serde(default)]
+    pub goal_id: Option<String>,
+    pub title: String,
+    pub steps: Vec<PlanStep>,
+}
+
+impl PlanMutationParams {
+    fn into_parts(self) -> (PlanMutationAction, PlanUpdateParams) {
+        (
+            self.action,
+            PlanUpdateParams {
+                expected_revision: self.expected_revision,
+                goal_id: self.goal_id,
+                title: self.title,
+                steps: self.steps,
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -702,6 +914,133 @@ fn validate_plan_transition(
             )));
         }
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArchivedPlanState {
+    Suspended,
+    Completed,
+    Superseded,
+}
+
+impl ArchivedPlanState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Suspended => "suspended",
+            Self::Completed => "completed",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+fn require_plan_revision(current: &WorkPlan, expected: Option<i64>) -> Result<(), WorkStateError> {
+    let Some(expected) = expected else {
+        return Err(WorkStateError::Invalid(
+            "expected_revision is required when changing an existing plan".to_owned(),
+        ));
+    };
+    if expected != current.revision {
+        return Err(WorkStateError::RevisionConflict {
+            kind: "plan",
+            id: current.id.clone(),
+            expected,
+            actual: current.revision,
+        });
+    }
+    Ok(())
+}
+
+fn archive_plan(
+    transaction: &Transaction<'_>,
+    plan: &WorkPlan,
+    state: ArchivedPlanState,
+    now: i64,
+) -> Result<(), WorkStateError> {
+    let steps = serde_json::to_string(&plan.steps)
+        .map_err(|error| WorkStateError::Invalid(error.to_string()))?;
+    archive_plan_with_steps(transaction, plan, &steps, state, now)
+}
+
+fn archive_plan_with_steps(
+    transaction: &Transaction<'_>,
+    plan: &WorkPlan,
+    steps: &str,
+    state: ArchivedPlanState,
+    now: i64,
+) -> Result<(), WorkStateError> {
+    transaction
+        .execute(
+            "INSERT INTO work_plan_archive \
+             (id,session_id,parent_plan_id,stack_depth,goal_id,revision,title,steps,state,\
+              time_created,time_updated,time_archived) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                plan.id,
+                plan.session_id,
+                plan.parent_plan_id,
+                plan.stack_depth,
+                plan.goal_id,
+                plan.revision,
+                plan.title,
+                steps,
+                state.as_str(),
+                plan.time_created,
+                plan.time_updated,
+                now
+            ],
+        )
+        .map_err(zuno_db::map_error)?;
+    Ok(())
+}
+
+fn insert_active_plan(
+    transaction: &Transaction<'_>,
+    plan: &WorkPlan,
+) -> Result<(), WorkStateError> {
+    let steps = serde_json::to_string(&plan.steps)
+        .map_err(|error| WorkStateError::Invalid(error.to_string()))?;
+    transaction
+        .execute(
+            "INSERT INTO work_plan \
+             (session_id,id,parent_plan_id,stack_depth,goal_id,revision,title,steps,\
+              time_created,time_updated) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                plan.session_id,
+                plan.id,
+                plan.parent_plan_id,
+                plan.stack_depth,
+                plan.goal_id,
+                plan.revision,
+                plan.title,
+                steps,
+                plan.time_created,
+                plan.time_updated
+            ],
+        )
+        .map_err(zuno_db::map_error)?;
+    Ok(())
+}
+
+fn insert_new_root(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    id: &str,
+    goal_id: Option<&str>,
+    title: &str,
+    steps: &str,
+    now: i64,
+) -> Result<(), WorkStateError> {
+    transaction
+        .execute(
+            "INSERT INTO work_plan \
+             (session_id,id,parent_plan_id,stack_depth,goal_id,revision,title,steps,\
+              time_created,time_updated) \
+             VALUES (?1,?2,NULL,0,?3,1,?4,?5,?6,?6)",
+            params![session_id, id, goal_id, title, steps, now],
+        )
+        .map_err(zuno_db::map_error)?;
     Ok(())
 }
 
@@ -1020,7 +1359,8 @@ fn visit_item<'a>(
 fn plan_in(connection: &Connection, session_id: &str) -> Result<Option<WorkPlan>, DbError> {
     let row = connection
         .query_row(
-            "SELECT id,goal_id,revision,title,steps,time_created,time_updated \
+            "SELECT id,parent_plan_id,stack_depth,goal_id,revision,title,steps,\
+                    time_created,time_updated \
              FROM work_plan WHERE session_id=?1",
             [session_id],
             |row| {
@@ -1028,26 +1368,95 @@ fn plan_in(connection: &Connection, session_id: &str) -> Result<Option<WorkPlan>
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             },
         )
         .optional()
         .map_err(zuno_db::map_error)?;
-    let Some((id, goal_id, revision, title, steps, time_created, time_updated)) = row else {
+    let Some((
+        id,
+        parent_plan_id,
+        stack_depth,
+        goal_id,
+        revision,
+        title,
+        steps,
+        time_created,
+        time_updated,
+    )) = row
+    else {
         return Ok(None);
     };
     let steps = serde_json::from_str(&steps).map_err(json_db_error)?;
     Ok(Some(WorkPlan {
         id,
         session_id: session_id.to_owned(),
+        parent_plan_id,
+        stack_depth,
         goal_id,
         revision,
         title,
         steps,
+        time_created,
+        time_updated,
+    }))
+}
+
+fn archived_plan_in(
+    connection: &Connection,
+    session_id: &str,
+    id: &str,
+) -> Result<Option<WorkPlan>, DbError> {
+    let row = connection
+        .query_row(
+            "SELECT parent_plan_id,stack_depth,goal_id,revision,title,steps,\
+                    time_created,time_updated \
+             FROM work_plan_archive \
+             WHERE session_id=?1 AND id=?2 AND state='suspended'",
+            params![session_id, id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(zuno_db::map_error)?;
+    let Some((
+        parent_plan_id,
+        stack_depth,
+        goal_id,
+        revision,
+        title,
+        steps,
+        time_created,
+        time_updated,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    Ok(Some(WorkPlan {
+        id: id.to_owned(),
+        session_id: session_id.to_owned(),
+        parent_plan_id,
+        stack_depth,
+        goal_id,
+        revision,
+        title,
+        steps: serde_json::from_str(&steps).map_err(json_db_error)?,
         time_created,
         time_updated,
     }))
@@ -1164,7 +1573,7 @@ impl TypedTool for PlanGetTool {
 
 #[async_trait]
 impl TypedTool for PlanUpdateTool {
-    type Params = PlanUpdateParams;
+    type Params = PlanMutationParams;
     fn id(&self) -> &str {
         PLAN_UPDATE_TOOL_ID
     }
@@ -1178,11 +1587,21 @@ impl TypedTool for PlanUpdateTool {
         authorize(&ctx, PLAN_UPDATE_TOOL_ID).await?;
         let store = self.0.clone();
         let session_id = ctx.session_id;
-        let plan = tokio::task::spawn_blocking(move || store.update_plan(&session_id, params))
-            .await
-            .map_err(|error| failed(PLAN_UPDATE_TOOL_ID, error))?
-            .map_err(|error| map_error(PLAN_UPDATE_TOOL_ID, error))?;
-        output(PLAN_UPDATE_TOOL_ID, "Plan updated", "plan", Some(plan))
+        let (action, plan_params) = params.into_parts();
+        let plan = tokio::task::spawn_blocking(move || match action {
+            PlanMutationAction::Update => store.update_plan(&session_id, plan_params),
+            PlanMutationAction::Push => store.push_plan(&session_id, plan_params),
+            PlanMutationAction::Pop => store.complete_subplan(&session_id, plan_params),
+        })
+        .await
+        .map_err(|error| failed(PLAN_UPDATE_TOOL_ID, error))?
+        .map_err(|error| map_error(PLAN_UPDATE_TOOL_ID, error))?;
+        let title = match action {
+            PlanMutationAction::Update => "Plan updated",
+            PlanMutationAction::Push => "Subplan opened",
+            PlanMutationAction::Pop => "Parent plan restored",
+        };
+        output(PLAN_UPDATE_TOOL_ID, title, "plan", Some(plan))
     }
 }
 
@@ -1310,9 +1729,8 @@ fn failed(tool: &str, error: impl std::error::Error + Send + Sync + 'static) -> 
 mod tests {
     use super::*;
 
-    fn store() -> WorkStateStore {
-        let pool =
-            Arc::new(Pool::open(&zuno_paths::DbLocation::Memory).expect("open in-memory database"));
+    fn initialize_store(location: &zuno_paths::DbLocation) -> WorkStateStore {
+        let pool = Arc::new(Pool::open(location).expect("open work-state database"));
         let mut connection = pool.open_connection().expect("open connection");
         zuno_db::migration::apply(&mut connection).expect("apply schema");
         connection
@@ -1333,6 +1751,10 @@ mod tests {
             )
             .expect("insert session");
         WorkStateStore::new(pool)
+    }
+
+    fn store() -> WorkStateStore {
+        initialize_store(&zuno_paths::DbLocation::Memory)
     }
 
     fn step(id: &str, status: PlanStepStatus) -> PlanStep {
@@ -1782,6 +2204,205 @@ mod tests {
     }
 
     #[test]
+    fn focused_subplan_survives_restart_and_restores_its_parent_once() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let location = zuno_paths::DbLocation::File(directory.path().join("zuno.db"));
+        let store = initialize_store(&location);
+        let parent = store
+            .update_plan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: None,
+                    goal_id: Some("goal".to_owned()),
+                    title: "Release Zuno".to_owned(),
+                    steps: vec![
+                        step("implement", PlanStepStatus::InProgress),
+                        step("publish", PlanStepStatus::Pending),
+                    ],
+                },
+            )
+            .expect("create parent plan");
+        let child = store
+            .push_plan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: Some(parent.revision),
+                    goal_id: parent.goal_id.clone(),
+                    title: "Repair Windows tests".to_owned(),
+                    steps: vec![
+                        step("diagnose", PlanStepStatus::InProgress),
+                        step("verify", PlanStepStatus::Pending),
+                    ],
+                },
+            )
+            .expect("push child plan");
+        assert_eq!(child.parent_plan_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(child.stack_depth, 1);
+        drop(store);
+
+        let reopened = WorkStateStore::new(Arc::new(
+            Pool::open(&location).expect("reopen work-state database"),
+        ));
+        assert_eq!(
+            reopened.plan("ses").expect("read child after restart"),
+            Some(child.clone()),
+            "restart must not flatten or reconstruct the active child from prose"
+        );
+        let restored = reopened
+            .complete_subplan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: Some(child.revision),
+                    goal_id: child.goal_id.clone(),
+                    title: child.title.clone(),
+                    steps: vec![
+                        step("diagnose", PlanStepStatus::Completed),
+                        step("verify", PlanStepStatus::Completed),
+                    ],
+                },
+            )
+            .expect("complete child and restore parent");
+        assert_eq!(restored, parent);
+        assert!(matches!(
+            reopened.complete_subplan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: Some(restored.revision),
+                    goal_id: restored.goal_id.clone(),
+                    title: restored.title.clone(),
+                    steps: vec![
+                        step("implement", PlanStepStatus::Completed),
+                        step("publish", PlanStepStatus::Completed),
+                    ],
+                }
+            ),
+            Err(WorkStateError::Invalid(message))
+                if message.contains("no suspended parent")
+        ));
+        let connection = reopened.pool.get().expect("open archive connection");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM work_plan_archive \
+                     WHERE session_id='ses' AND state='completed'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count completed child"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM work_plan_archive \
+                     WHERE session_id='ses' AND state='suspended'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count suspended plans"),
+            0
+        );
+    }
+
+    #[test]
+    fn subplan_pop_requires_every_child_step_to_be_completed() {
+        let store = store();
+        let parent = store
+            .update_plan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: None,
+                    goal_id: None,
+                    title: "Parent".to_owned(),
+                    steps: vec![step("parent", PlanStepStatus::InProgress)],
+                },
+            )
+            .expect("create parent");
+        let child = store
+            .push_plan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: Some(parent.revision),
+                    goal_id: None,
+                    title: "Child".to_owned(),
+                    steps: vec![step("child", PlanStepStatus::InProgress)],
+                },
+            )
+            .expect("push child");
+
+        assert!(matches!(
+            store.complete_subplan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: Some(child.revision),
+                    goal_id: None,
+                    title: child.title.clone(),
+                    steps: child.steps.clone(),
+                }
+            ),
+            Err(WorkStateError::Invalid(message))
+                if message.contains("only after every child step is completed")
+        ));
+        assert_eq!(store.plan("ses").expect("read active child"), Some(child));
+    }
+
+    #[test]
+    fn replacing_an_objective_supersedes_the_whole_suspended_stack() {
+        let store = store();
+        let parent = store
+            .update_plan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: None,
+                    goal_id: Some("goal-old".to_owned()),
+                    title: "Old objective".to_owned(),
+                    steps: vec![step("old", PlanStepStatus::InProgress)],
+                },
+            )
+            .expect("create parent");
+        let child = store
+            .push_plan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: Some(parent.revision),
+                    goal_id: parent.goal_id.clone(),
+                    title: "Temporary investigation".to_owned(),
+                    steps: vec![step("investigate", PlanStepStatus::InProgress)],
+                },
+            )
+            .expect("push child");
+
+        let replacement = store
+            .replace_plan_for_objective(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: Some(child.revision),
+                    goal_id: Some("goal-new".to_owned()),
+                    title: "New objective".to_owned(),
+                    steps: vec![step("scope", PlanStepStatus::InProgress)],
+                },
+            )
+            .expect("replace objective");
+        assert_ne!(replacement.id, child.id);
+        assert_eq!(replacement.parent_plan_id, None);
+        assert_eq!(replacement.stack_depth, 0);
+        assert_eq!(replacement.steps.len(), 1);
+        let connection = store.pool.get().expect("open archive connection");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM work_plan_archive \
+                     WHERE session_id='ses' AND state='superseded'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count superseded frames"),
+            2,
+            "both the active child and its suspended parent must be terminalized"
+        );
+    }
+
+    #[test]
     fn work_items_keep_ids_revisions_and_validate_dependencies_atomically() {
         let store = store();
         let added = store
@@ -1866,6 +2487,12 @@ mod tests {
         assert!(
             PLAN_UPDATE_DESCRIPTION.contains("Do not complete a step while a linked Job"),
             "the model must reconcile durable child work before closing its Plan step"
+        );
+        assert!(
+            PLAN_UPDATE_DESCRIPTION.contains("Use push")
+                && PLAN_UPDATE_DESCRIPTION.contains("Use pop")
+                && PLAN_UPDATE_DESCRIPTION.contains("Before a final answer"),
+            "the model must know how focused subplans restore their parent and when to reconcile"
         );
     }
 

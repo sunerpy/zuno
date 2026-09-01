@@ -210,14 +210,18 @@ Returns null when no plan exists. Read it before plan_update so the update can c
 This tool is read-only and safe to call in parallel with other read-only tools.
 >>>
 
-## plan_update | crates/zuno-tools/src/description/plan-update.txt | 1035 bytes | trailing-newline: yes
+## plan_update | crates/zuno-tools/src/description/plan-update.txt | 1631 bytes | trailing-newline: yes
 <<<
 Create or update the durable plan for the current session.
+The optional action is update (default), push, or pop.
+Use push when one active step needs a focused temporary subplan. It atomically suspends the current plan and makes the child plan visible; do not append the child's generic steps to the parent.
+Use pop only after every child step is completed. It atomically archives the child and restores the suspended parent, which must then be updated promptly.
 When a plan already exists, expected_revision is required and must equal the revision returned by plan_get. A stale revision is rejected without changing the plan.
 Keep every step id stable across updates. Step ids and titles must be non-empty and unique.
 Pending steps require exactly one in_progress step. Completed steps are terminal and cannot regress. A fully completed plan has no in_progress step.
-If a commit, build, tag, deployment, or other verification input changes after a completed gate, append a new artifact-scoped verification step or epoch; never reuse or regress the old completed gate.
+If a commit, build, tag, deployment, or other verification input changes after a completed gate, append a new artifact-scoped verification step; never reuse or regress the old completed gate.
 Do not complete a step while a linked Job is queued, running, uncertain, or still has an unconsumed report. Reconcile its durable result first.
+Update the plan immediately when a step starts, completes, blocks, or changes scope. Before a final answer, reconcile the active step so the durable Plan never relies on prose to communicate progress.
 Link the plan to the active goal with goal_id when one exists. Do not rewrite the user's goal or success criteria through this tool.
 This tool changes durable state and is never replayed implicitly after an uncertain failure.
 >>>

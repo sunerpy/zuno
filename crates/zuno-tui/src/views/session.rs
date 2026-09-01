@@ -197,6 +197,10 @@ const INFO_ROWS: u16 = 1;
 const PROMPT_MIN_ROWS: u16 = 2;
 const PROMPT_PREFERRED_ROWS: u16 = 4;
 const PROMPT_MAX_SHARE: u16 = 3;
+/// The durable follow-up dock shows the oldest entries first and keeps one row for
+/// controls. A bounded preview prevents a large queue from consuming the transcript;
+/// the queue manager remains available for the complete list.
+const QUEUED_INPUT_PREVIEW_ROWS: usize = 3;
 
 /// The prompt's own chrome: a marker gutter, a right inset and a bottom spacer.
 ///
@@ -584,6 +588,13 @@ pub struct SessionScreen {
     mcp_generation: u64,
     queued_inputs: crate::views::picker::QueuedInputProjection,
     queued_input_generation: u64,
+    /// Last durable queue snapshot observed by this screen.
+    ///
+    /// A row disappears only after the inbox transaction promoted, consumed, or
+    /// cancelled it. Comparing snapshots therefore lets the transcript promote the
+    /// user's text at the same durable boundary instead of painting an uncommitted
+    /// submission as ordinary history.
+    queued_input_snapshot: Vec<crate::views::picker::QueuedInputEntry>,
     queue_mutations: Option<mpsc::Sender<QueuedInputMutation>>,
     work: crate::views::ambient::WorkState,
     work_generation: u64,
@@ -1002,6 +1013,7 @@ impl SessionScreen {
             mcp_generation: 0,
             queued_inputs: crate::views::picker::QueuedInputProjection::default(),
             queued_input_generation: 0,
+            queued_input_snapshot: Vec::new(),
             queue_mutations: None,
             work: crate::views::ambient::WorkState::default(),
             work_generation: 0,
@@ -1144,6 +1156,7 @@ impl SessionScreen {
         mutations: mpsc::Sender<QueuedInputMutation>,
     ) -> Self {
         self.queued_input_generation = projection.generation();
+        self.queued_input_snapshot = projection.snapshot();
         self.queued_inputs = projection;
         self.queue_mutations = Some(mutations);
         self
@@ -1897,11 +1910,13 @@ impl SessionScreen {
         } else {
             PromptDelivery::Queue
         };
-        let mut message = Message::user(shown.clone());
-        for attachment in attachments {
-            message.attach(attachment.filename, Some(attachment.mime));
+        if delivery == PromptDelivery::Direct {
+            let mut message = Message::user(shown.clone());
+            for attachment in &attachments {
+                message.attach(attachment.filename.clone(), Some(attachment.mime.clone()));
+            }
+            self.transcript.transcript_mut().push(message);
         }
-        self.transcript.transcript_mut().push(message);
         if let Some(prompts) = self.prompts.as_ref() {
             let tracks_model_turn = matches!(
                 submission,
@@ -2270,6 +2285,8 @@ impl Component for SessionScreen {
         }
         let (prompt_band, welcome_tail) = self.prompt_and_tail(content.width, content.height);
         let info_height = info_rows(content.height);
+        let queued_input_height =
+            self.queued_input_dock_height(content.height, prompt_band, info_height);
         let transcript_width = if !empty && self.scrollbar_visible && content.width > 1 {
             content.width - 1
         } else {
@@ -2281,34 +2298,38 @@ impl Component for SessionScreen {
         // reaches zero and the same identity row becomes sticky immediately above the
         // composer. The welcome screen carries the configured launch identity in its head,
         // but does not allocate the sticky reply-identity band before a reply exists.
-        let (body, identity, spacer, prompt, info) = if empty {
-            let [body, prompt, spacer, info] = Layout::vertical([
+        let (body, identity, spacer, queued, prompt, info) = if empty {
+            let [body, queued, prompt, spacer, info] = Layout::vertical([
                 Constraint::Min(1),
+                Constraint::Length(queued_input_height),
                 Constraint::Length(prompt_band),
                 Constraint::Length(welcome_tail),
                 Constraint::Length(info_height),
             ])
             .areas(content);
-            (body, Rect::default(), spacer, prompt, info)
+            (body, Rect::default(), spacer, queued, prompt, info)
         } else {
-            let available = content
-                .height
-                .saturating_sub(prompt_band.saturating_add(info_height));
+            let available = content.height.saturating_sub(
+                prompt_band
+                    .saturating_add(queued_input_height)
+                    .saturating_add(info_height),
+            );
             let identity_rows = u16::from(self.status.has_identity() && available > IDENTITY_ROWS);
             let capacity = available.saturating_sub(identity_rows);
             let measured = u16::try_from(self.transcript.measure_content_height(transcript_width))
                 .unwrap_or(u16::MAX);
             let transcript_rows = measured.max(1).min(capacity);
             let spacer_rows = capacity.saturating_sub(transcript_rows);
-            let [body, identity, spacer, prompt, info] = Layout::vertical([
+            let [body, identity, spacer, queued, prompt, info] = Layout::vertical([
                 Constraint::Length(transcript_rows),
                 Constraint::Length(identity_rows),
                 Constraint::Length(spacer_rows),
+                Constraint::Length(queued_input_height),
                 Constraint::Length(prompt_band),
                 Constraint::Length(info_height),
             ])
             .areas(content);
-            (body, identity, spacer, prompt, info)
+            (body, identity, spacer, queued, prompt, info)
         };
 
         let (main, scrollbar) = if !empty && self.scrollbar_visible && body.width > 1 {
@@ -2425,6 +2446,7 @@ impl Component for SessionScreen {
         // colour seam the centring band's fill exists to avoid, reintroduced sideways.
         crate::views::fill(frame.buffer_mut(), prompt, self.context.surface());
         crate::views::fill(frame.buffer_mut(), identity, self.context.surface());
+        self.render_queued_input_dock(frame, queued);
         let composer = composer_region(prompt, empty);
         // The whole band is painted next, so the spacer row and the right inset carry the
         // prompt's own background rather than whatever the previous frame left there. `element`
@@ -2533,6 +2555,73 @@ impl Component for SessionScreen {
 }
 
 impl SessionScreen {
+    fn queued_input_dock_height(&self, height: u16, prompt: u16, info: u16) -> u16 {
+        let queued = self.queued_inputs.snapshot().len();
+        if queued == 0 {
+            return 0;
+        }
+        let desired = u16::try_from(queued.min(QUEUED_INPUT_PREVIEW_ROWS).saturating_add(1))
+            .unwrap_or(u16::MAX);
+        let available = height.saturating_sub(prompt.saturating_add(info).saturating_add(1));
+        desired.min(available)
+    }
+
+    /// Draw the oldest durable follow-ups immediately above the composer.
+    ///
+    /// The dock is a projection of SQLite state, not optimistic editor state. A prompt
+    /// appears here only after admission commits and leaves only after promotion,
+    /// consumption, or cancellation commits.
+    fn render_queued_input_dock(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        crate::views::fill(frame.buffer_mut(), area, self.context.element());
+        let inputs = self.queued_inputs.snapshot();
+        if inputs.is_empty() {
+            return;
+        }
+        let item_rows = usize::from(area.height.saturating_sub(1))
+            .min(inputs.len())
+            .min(QUEUED_INPUT_PREVIEW_ROWS);
+        let mut lines = inputs
+            .iter()
+            .take(item_rows)
+            .enumerate()
+            .map(|(index, input)| {
+                let delivery = match input.delivery {
+                    crate::views::picker::QueuedInputDelivery::Queue => "next",
+                    crate::views::picker::QueuedInputDelivery::Steer => "steer",
+                };
+                let text = input.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                crate::views::padded(
+                    &format!("  {}. [{delivery}] {text}", index + 1),
+                    area.width,
+                    self.context.text(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let hidden = inputs.len().saturating_sub(item_rows);
+        let force = crate::views::pressable_label("input_force_submit", &self.context)
+            .unwrap_or_else(|| String::from("ctrl+enter"));
+        let manage = crate::views::pressable_label("session_queued_prompts", &self.context)
+            .map_or_else(|| String::from("/queue"), |key| format!("{key} manage"));
+        let count = if hidden == 0 {
+            format!("{} queued", inputs.len())
+        } else {
+            format!("{} queued · +{hidden} hidden", inputs.len())
+        };
+        lines.push(crate::views::padded(
+            &format!("  {count} · {force} send now · {manage}"),
+            area.width,
+            self.context.secondary(),
+        ));
+        ratatui::widgets::Widget::render(
+            ratatui::widgets::Paragraph::new(lines).style(self.context.element()),
+            area,
+            frame.buffer_mut(),
+        );
+    }
+
     fn render_live_session(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let Some(live) = self.live_session.as_mut() else {
             return;
@@ -3148,11 +3237,30 @@ impl SessionScreen {
     }
 
     fn observe_queued_inputs(&mut self) -> EventResult {
-        let (generation, _inputs, notice) = self.queued_inputs.observe();
+        let (generation, inputs, notice) = self.queued_inputs.observe();
         if generation == self.queued_input_generation {
             return EventResult::IGNORED;
         }
         self.queued_input_generation = generation;
+        let withheld_from_history = notice.as_ref().and_then(|notice| {
+            matches!(
+                notice.kind,
+                crate::views::picker::QueuedInputNoticeKind::Cancelled
+                    | crate::views::picker::QueuedInputNoticeKind::Failed(_)
+            )
+            .then_some(notice.input_id.as_str())
+        });
+        for previous in &self.queued_input_snapshot {
+            if inputs.iter().any(|input| input.id == previous.id)
+                || withheld_from_history == Some(previous.id.as_str())
+            {
+                continue;
+            }
+            self.transcript
+                .transcript_mut()
+                .push(Message::user(previous.text.clone()));
+        }
+        self.queued_input_snapshot = inputs;
         if let Some(notice) = notice {
             use crate::views::picker::QueuedInputNoticeKind;
             self.toasts.push(match notice.kind {
@@ -3162,6 +3270,9 @@ impl SessionScreen {
                 QueuedInputNoticeKind::Admitted(
                     crate::views::picker::QueuedInputDelivery::Steer,
                 ) => Toast::info("message queued; it will steer at the next safe point"),
+                QueuedInputNoticeKind::Promoted => {
+                    Toast::info("queued request started in the next turn")
+                }
                 QueuedInputNoticeKind::Edited => {
                     Toast::success(format!("updated queued input {}", notice.input_id))
                 }

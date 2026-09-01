@@ -1448,6 +1448,8 @@ mod tests {
             plan: Some(zuno_types::PlanProjection {
                 id: "plan-1".to_owned(),
                 goal_id: None,
+                parent_plan_id: None,
+                stack_depth: 0,
                 revision: 3,
                 title: "Ship ACP".to_owned(),
                 steps: vec![
@@ -1501,6 +1503,8 @@ mod tests {
             plan: Some(zuno_types::PlanProjection {
                 id: "plan-1".to_owned(),
                 goal_id: None,
+                parent_plan_id: None,
+                stack_depth: 0,
                 revision: 1,
                 title: "Invalid".to_owned(),
                 steps: vec![zuno_types::PlanStepProjection {

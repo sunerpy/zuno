@@ -1149,19 +1149,39 @@ impl SidebarView {
                 .count();
             lines.push(self.heading(
                 "Plan",
-                &format!("{completed}/{} complete", plan.steps.len()),
+                &if plan.stack_depth > 0 {
+                    format!(
+                        "subplan {} · {completed}/{} complete",
+                        plan.stack_depth,
+                        plan.steps.len()
+                    )
+                } else {
+                    format!("{completed}/{} complete", plan.steps.len())
+                },
                 self.disclosure(self.expanded.plan),
                 width,
             ));
             if self.expanded.plan {
-                lines.push(padded(
-                    &format!("  {} · r{}", plan.title, plan.revision),
-                    width,
-                    self.context.text(),
-                ));
+                for row in wrap(
+                    &plan.title,
+                    usize::from(width).saturating_sub(2),
+                    usize::MAX,
+                ) {
+                    lines.push(padded(&format!("  {row}"), width, self.context.text()));
+                }
+                if let Some(parent) = plan.parent_plan_id.as_deref() {
+                    for row in wrap(
+                        &format!("↳ returns to {parent}"),
+                        usize::from(width).saturating_sub(2),
+                        usize::MAX,
+                    ) {
+                        lines.push(padded(&format!("  {row}"), width, self.context.secondary()));
+                    }
+                }
                 lines.push(padded(
                     &format!(
-                        "  {} · {}",
+                        "  r{} · {} · {}",
+                        plan.revision,
                         span_duration(&plan.span),
                         span_usage(&plan.span)
                     ),
@@ -1176,7 +1196,21 @@ impl SidebarView {
                         "cancelled" => ("×", self.context.muted()),
                         _ => ("○", self.context.text()),
                     };
-                    lines.push(padded(&format!("  {glyph} {}", step.title), width, style));
+                    for (index, row) in wrap(
+                        &step.title,
+                        usize::from(width).saturating_sub(4),
+                        usize::MAX,
+                    )
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let prefix = if index == 0 {
+                            format!("  {glyph} ")
+                        } else {
+                            String::from("    ")
+                        };
+                        lines.push(padded(&format!("{prefix}{row}"), width, style));
+                    }
                 }
             }
         }

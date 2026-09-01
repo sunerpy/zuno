@@ -17,6 +17,7 @@ zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 | --- | --- |
 | Transcript | Durable assistant content, tool cards, errors, interruption markers |
 | Sidebar | Sessions, jobs, usage, and durable child sessions |
+| Queue dock | Durable FIFO follow-ups waiting above the composer during active work |
 | Composer | Your draft input |
 | Identity row | Resolved agent, catalog model display name, configured reasoning effort |
 | Final row | Live control surface: turn pulse, interrupt key, prompt occupancy, command key, agent and model badge |
@@ -43,8 +44,12 @@ session; cumulative token buckets live in the usage projection and sidebar.
 | `Shift+Enter`, `Alt+Enter`, `Ctrl+J` | Newline | Newline |
 | `Escape` | — | Interrupt; a second press confirms |
 
-An item is reported as queued only after SQLite commits it. Pending items can be edited or
-cancelled by revision and survive a process restart.
+An item is reported as queued only after SQLite commits it. The oldest entries stay fixed
+in a dock directly above the composer, labelled `next` or `steer` in durable FIFO order.
+The dock shows the effective `input_force_submit` binding rather than assuming the default
+`Ctrl+Enter`, and also shows the queue-manager binding. Pending items can be edited or
+cancelled by revision and survive a process restart. Promotion moves an entry into
+transcript history; cancellation removes it without presenting it as sent.
 
 Steering can wake a provider stream or a retry delay: Zuno checkpoints partial assistant
 output, promotes the durable input, and starts the next model step. An executing tool is
@@ -134,9 +139,9 @@ cannot shadow a runtime control.
 The direct `/goal <objective>` form is handled by the same durable host command as ACP.
 It creates a new goal when none exists or the previous one is complete or cancelled;
 otherwise it updates the current goal. Objective changes also reconcile an active durable
-Plan by terminalizing unfinished prior steps with a `Superseded:` title and binding the
-current `goal_id`; multi-stage work seeds a new epoch. An atomic objective does not rebind
-an already terminal historical Plan. Explicit actions such as `/goal show`, `/goal edit ...`,
+Plan by archiving the previous visible Plan and installing a new root bound to the current
+`goal_id` for multi-stage work. An atomic objective does not rebind an already terminal
+historical Plan. Explicit actions such as `/goal show`, `/goal edit ...`,
 and `/goal complete` remain available.
 
 Resource pickers follow the same naming: `/model`, `/agent`, `/session`, `/skill`,
@@ -162,9 +167,10 @@ resolves the tool as a typed denial and never fabricates an answer.
 
 With `mouse` absent or `true`, Zuno captures button, drag, release, and wheel events.
 Releasing a drag copies the selection through the configured clipboard and leaves the
-highlight visible. Transcript selection stays clamped rather than crossing into the
-sidebar, disclosure rows are clickable, and an overflowing conversation mounts a draggable
-scrollbar.
+highlight visible. Transcript copy uses semantic message content: speaker labels, borders,
+padding, and terminal soft wraps are omitted; only explicit source newlines become
+clipboard newlines. Selection stays clamped rather than crossing into the sidebar,
+disclosure rows are clickable, and an overflowing conversation mounts a draggable scrollbar.
 
 Wheel input starts precise: the first notch moves one row, then a sustained fast gesture
 accelerates. `scroll_speed` selects a constant multiplier instead;
