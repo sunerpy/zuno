@@ -5,8 +5,8 @@
 //! The selected Zuno database is the durable source of truth for session state.
 //! Every pooled connection receives the same explicit pragma sequence, and the
 //! location comes from [`zuno_paths::db_path`] rather than being re-derived by
-//! storage callers. Existing files must carry the current schema-format marker;
-//! other pre-release or cross-product formats are rejected without mutation.
+//! storage callers. Existing files must carry a supported schema-format marker;
+//! unsupported or cross-product formats are rejected without mutation.
 //!
 //! # The pragma that is load-bearing
 //!

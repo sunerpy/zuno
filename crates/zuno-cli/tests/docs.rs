@@ -349,6 +349,13 @@ fn architecture_documents_pin_the_native_harness_decisions() {
             "Model-visible means logged",
             "ToolReplayPolicy::Never",
             "reportDelivery: nextStep",
+            "A database format shipped in a release is durable user state",
+            "atomic forward migration",
+            "marker updated last",
+            "Future, unmarked, or structurally corrupt formats fail closed",
+            "Cross-Platform Development",
+            "backend dependency of the `glob` and `grep` tools only",
+            "Cross-compilation is useful evidence but does not replace native execution",
             "$zuno-dsh-sync",
         ],
     );
@@ -720,20 +727,167 @@ fn self_update_documentation_pins_the_verified_release_contract() {
 }
 
 #[test]
-fn database_docs_describe_a_hard_pre_release_format_cut() {
-    let text = read("docs/migration.md");
-    for required in [
-        "unsupported pre-release format",
-        "without modification",
-        "no incremental database migration",
-        "zuno_schema",
-        "never deletes or rewrites",
+fn installation_docs_pin_cross_platform_dependency_boundaries() {
+    contains_all(
+        "docs/guide/installation.md",
+        &[
+            "not a Zuno startup or core-runtime dependency",
+            "Linux-only backend",
+            "`read-only`",
+            "`workspace-write`",
+            "`danger-full-access`",
+            "`run-unconfined`",
+            "macOS",
+            "Windows PowerShell",
+            "Get-FileHash",
+            "ZUNO_CONFIG_DIR",
+            "Rust 1.98.0",
+            "Xcode Command Line Tools",
+            "MSVC v143",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/installation.md",
+        &[
+            "不是 Zuno 启动或核心运行依赖",
+            "只作为 Linux",
+            "`read-only`",
+            "`workspace-write`",
+            "`danger-full-access`",
+            "`run-unconfined`",
+            "macOS",
+            "Windows PowerShell",
+            "Get-FileHash",
+            "ZUNO_CONFIG_DIR",
+            "Rust 1.98.0",
+            "Xcode Command Line Tools",
+            "MSVC v143",
+        ],
+    );
+    for relative in [
+        "README.md",
+        "docs/index.md",
+        "docs/guide/installation.md",
+        "docs/guide/quick-start.md",
+        "docs/zh/index.md",
+        "docs/zh/guide/installation.md",
+        "docs/zh/guide/quick-start.md",
     ] {
+        let text = read(relative);
+        for required in [
+            "`glob`",
+            "`grep`",
+            "`danger-full-access`",
+            "`workspace-write`",
+            "`run-unconfined`",
+            "macOS",
+            "Windows",
+        ] {
+            assert!(
+                text.contains(required),
+                "{relative} must document {required:?}"
+            );
+        }
         assert!(
-            text.contains(required),
-            "migration guide must contain {required:?}"
+            !text.contains("0.0.1"),
+            "{relative} still advertises the retired 0.0.1 release"
         );
     }
+}
+
+#[test]
+fn completion_docs_describe_stdout_and_profile_safe_installation() {
+    contains_all(
+        "docs/cli/completion.md",
+        &[
+            "`--install`",
+            "atomically writes",
+            "never edits a shell profile",
+            "bash-completion/completions/zuno",
+            ".zsh/completions/_zuno",
+            "fish/completions/zuno.fish",
+            "LOCALAPPDATA",
+            "elvish/lib/zuno.elv",
+        ],
+    );
+    contains_all(
+        "docs/zh/cli/completion.md",
+        &[
+            "`--install`",
+            "原子写入",
+            "绝不会",
+            "bash-completion/completions/zuno",
+            ".zsh/completions/_zuno",
+            "fish/completions/zuno.fish",
+            "LOCALAPPDATA",
+            "elvish/lib/zuno.elv",
+        ],
+    );
+}
+
+#[test]
+fn database_docs_describe_guarded_format_five_to_six_migration() {
+    contains_all(
+        "docs/migration.md",
+        &[
+            "current database format is 6",
+            "Format 5",
+            "`BEGIN IMMEDIATE`",
+            "marker from 5 to 6",
+            "`session`, `message`, or `memory_candidate` rows",
+            "future format",
+            "fails closed without modification",
+            "format marker updated last",
+            "A valid format-5 database should",
+            "open and migrate automatically",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/migration.md",
+        &[
+            "当前数据库格式为 6",
+            "format 5",
+            "`BEGIN IMMEDIATE`",
+            "marker 从 5 改为 6",
+            "`session`、`message` 或",
+            "未来格式",
+            "失败关闭且不修改文件",
+            "最后更新格式 marker",
+            "当前二进制已经支持的格式重建数据库",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/prompt-workflow.md",
+        &[
+            "数据库当前格式为 6",
+            "format 5",
+            "`BEGIN IMMEDIATE`",
+            "`session`",
+            "`message`",
+            "`memory_candidate`",
+            "不要求重建数据库",
+        ],
+    );
+    let prompt_workflow = read("docs/zh/operate/prompt-workflow.md");
+    assert!(
+        !prompt_workflow.contains("pre-release format"),
+        "prompt workflow still describes a released database format as pre-release"
+    );
+    for relative in ["docs/migration.md", "docs/zh/operate/migration.md"] {
+        let text = read(relative);
+        for retired in [
+            "no incremental database migration",
+            "never upgraded through an incremental migration chain",
+            "永远不会通过增量迁移链升级",
+            "开发数据库随之重建",
+        ] {
+            assert!(
+                !text.contains(retired),
+                "{relative} still advertises retired migration policy {retired:?}"
+            );
+        }
+    }
+    let text = read("docs/migration.md");
     for retired in [
         "Pre-rename Zuno database filename",
         "__drizzle_migrations",

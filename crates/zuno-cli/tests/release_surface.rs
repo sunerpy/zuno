@@ -866,6 +866,116 @@ fn release_binary_and_smoke_driver_share_one_cargo_invocation() {
 }
 
 #[test]
+fn release_workflows_pin_the_verified_node24_artifact_actions() {
+    const UPLOAD: &str =
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1";
+    const DOWNLOAD: &str =
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1";
+
+    let workflows = ["ci.yml", "release-candidate.yml", "release.yml"]
+        .into_iter()
+        .map(workflow)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let upload_count = workflows.matches("actions/upload-artifact@").count();
+    let download_count = workflows.matches("actions/download-artifact@").count();
+    assert_eq!(
+        upload_count, 3,
+        "the CI/release surface changed upload count"
+    );
+    assert_eq!(
+        download_count, 2,
+        "the CI/release surface changed download count"
+    );
+    assert_eq!(
+        upload_count,
+        workflows.matches(UPLOAD).count(),
+        "every upload-artifact use in the CI/release surface must use the verified Node 24 pin"
+    );
+    assert_eq!(
+        download_count,
+        workflows.matches(DOWNLOAD).count(),
+        "every download-artifact use in the CI/release surface must use the verified Node 24 pin"
+    );
+}
+
+#[test]
+fn release_pipeline_docs_keep_the_verified_twenty_minute_slo() {
+    for (path, twenty, fifteen, identity) in [
+        (
+            "docs/operate/release-pipeline.md",
+            "within 20 minutes",
+            "within 15 minutes",
+            "candidate-byte identity",
+        ),
+        (
+            "docs/zh/operate/release-pipeline.md",
+            "20 分钟",
+            "15 分钟",
+            "候选字节身份",
+        ),
+    ] {
+        let docs = std::fs::read_to_string(workspace_root().join(path))
+            .unwrap_or_else(|error| panic!("read {path}: {error}"));
+        for required in [twenty, "Rosetta 2", identity] {
+            assert!(
+                docs.contains(required),
+                "{path} lost the release timing or verification contract {required:?}"
+            );
+        }
+        assert!(
+            !docs.contains(fifteen),
+            "{path} still advertises the obsolete 15-minute SLO"
+        );
+    }
+}
+
+#[test]
+fn macos_x86_candidate_cross_builds_on_arm_and_smokes_through_rosetta() {
+    let text = workflow("release-candidate.yml");
+    let x86 = matrix_entry(&text, "artifact", "x86_64-apple-darwin").join("\n");
+    for required in [
+        "runner: macos-15",
+        "cache_target: true",
+        "execution_arch: x86_64",
+    ] {
+        assert!(
+            x86.contains(required),
+            "the x86_64 macOS candidate leg is missing {required:?}"
+        );
+    }
+    assert!(
+        !x86.contains("macos-15-intel"),
+        "the macOS critical path still waits for the dedicated Intel runner"
+    );
+
+    let arm = matrix_entry(&text, "artifact", "aarch64-apple-darwin").join("\n");
+    for required in [
+        "runner: macos-15",
+        "cache_target: true",
+        "execution_arch: arm64",
+    ] {
+        assert!(
+            arm.contains(required),
+            "the arm64 macOS candidate leg is missing {required:?}"
+        );
+    }
+
+    let artifact = job_body(&text, "artifact").join("\n");
+    for required in [
+        "EXECUTION_ARCH: ${{ matrix.execution_arch }}",
+        "/usr/bin/lipo -verify_arch \"$EXECUTION_ARCH\" unpacked/zuno",
+        "/usr/bin/arch \"-${EXECUTION_ARCH}\"",
+        "\"target/${{ matrix.target }}/release/zuno-smoke\"",
+    ] {
+        assert!(
+            artifact.contains(required),
+            "macOS packaging lost the exact-architecture execution proof {required:?}"
+        );
+    }
+}
+
+#[test]
 fn public_workflows_use_only_standard_github_hosted_runners() {
     let workflows = [
         ("ci.yml", workflow("ci.yml")),
@@ -892,14 +1002,14 @@ fn public_workflows_use_only_standard_github_hosted_runners() {
     for (target, runner) in [
         ("x86_64-unknown-linux-musl", "runner: ubuntu-24.04"),
         ("aarch64-unknown-linux-musl", "runner: ubuntu-24.04-arm"),
-        ("x86_64-apple-darwin", "runner: macos-15-intel"),
+        ("x86_64-apple-darwin", "runner: macos-15"),
         ("aarch64-apple-darwin", "runner: macos-15"),
         ("x86_64-pc-windows-msvc", "runner: windows-2022"),
     ] {
         let entry = matrix_entry(candidate, "artifact", target).join("\n");
         assert!(
             entry.contains(runner),
-            "{target} is not routed to its native standard runner; missing {runner:?}"
+            "{target} is not routed to its expected standard runner; missing {runner:?}"
         );
     }
 }
@@ -1050,7 +1160,7 @@ fn release_controller_dispatches_exact_source_and_never_compiles() {
 }
 
 #[test]
-fn candidate_merge_explicitly_wakes_release_finalization() {
+fn candidate_auto_merge_is_separate_from_certification_and_wakes_finalization() {
     let text = workflow("release-candidate.yml");
     let prepare = job_body(&text, "prepare").join("\n");
     for required in [
@@ -1065,6 +1175,16 @@ fn candidate_merge_explicitly_wakes_release_finalization() {
     }
 
     let merge = job_body(&text, "merge").join("\n");
+    assert!(
+        text.contains(
+            "if: inputs.mode == 'automatic' && vars.RELEASE_CANDIDATE_AUTO_MERGE == 'true'"
+        ),
+        "candidate certification must not imply automatic merge"
+    );
+    assert!(
+        !merge.contains("RELEASE_CANDIDATE_AUTOMATION"),
+        "the candidate dispatch switch must not authorize merging"
+    );
     for required in [
         "--match-head-commit \"$EXPECTED_HEAD_SHA\"",
         "--auto",
@@ -1207,11 +1327,37 @@ fn the_musl_legs_use_zig_and_no_cross_toolchain() {
 
     // The positive half: the ruled-out mechanisms being absent proves nothing if
     // the sanctioned one is absent too.
-    for required in ["mlugg/setup-zig", "cargo-zigbuild", "cargo zigbuild"] {
+    for required in [
+        ".github/scripts/install-zig.sh",
+        "cargo-zigbuild",
+        "cargo zigbuild",
+    ] {
         assert!(
             text.contains(required),
             "release-candidate.yml does not mention `{required}`; the two musl legs cannot \
              cross-compile this workspace's C dependencies without Zig"
+        );
+    }
+    assert!(
+        !text.contains("mlugg/setup-zig"),
+        "release-candidate.yml reintroduced the Node-based setup-zig action"
+    );
+
+    let installer =
+        std::fs::read_to_string(workspace_root().join(".github/scripts/install-zig.sh"))
+            .expect("the pinned Zig installer is readable");
+    for required in [
+        "ZIG_VERSION=\"0.13.0\"",
+        "zig-linux-${archive_arch}-${ZIG_VERSION}.tar.xz",
+        "https://ziglang.org/download/${ZIG_VERSION}/${archive}",
+        "d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea",
+        "041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556",
+        "sha256sum --check --strict -",
+        "printf '%s\\n' \"$zig_dir\" >> \"$GITHUB_PATH\"",
+    ] {
+        assert!(
+            installer.contains(required),
+            "the Zig installer lost its pinned download contract {required:?}"
         );
     }
     for (musl, runner) in [
@@ -1639,15 +1785,13 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
 }
 
 #[test]
-fn ci_reuses_compiler_and_registry_caches_without_persisting_target_directories() {
+fn ci_limits_target_caches_to_target_isolated_macos_candidate_legs() {
     for name in ["ci.yml", "release-candidate.yml"] {
         let workflow = workflow(name);
         for required in [
             "CARGO_INCREMENTAL: 0",
             "SCCACHE_GHA_ENABLED: \"true\"",
             "RUSTC_WRAPPER: sccache",
-            "shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}",
-            "cache-targets: false",
             "mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba",
             "version: \"v0.16.0\"",
         ] {
@@ -1665,6 +1809,15 @@ fn ci_reuses_compiler_and_registry_caches_without_persisting_target_directories(
     }
 
     let ci = workflow("ci.yml");
+    for required in [
+        "shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}",
+        "cache-targets: false",
+    ] {
+        assert!(
+            ci.contains(required),
+            "ordinary CI must keep registry-only Cargo caching; missing {required:?}"
+        );
+    }
     let linux = job_body(&ci, "test").join("\n");
     for required in ["make lint", "make test-nextest"] {
         assert!(
@@ -1710,11 +1863,50 @@ fn ci_reuses_compiler_and_registry_caches_without_persisting_target_directories(
 
     let candidate = workflow("release-candidate.yml");
     let tests = job_body(&candidate, "test").join("\n");
-    for required in ["make lint", "make test-nextest"] {
+    for required in [
+        "make lint",
+        "make test-nextest",
+        "shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}",
+        "cache-targets: false",
+    ] {
         assert!(
             tests.contains(required),
             "candidate Clippy and tests must share one job-local target directory; missing \
              {required:?}"
+        );
+    }
+
+    let artifacts = job_body(&candidate, "artifact").join("\n");
+    for required in [
+        "shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}",
+        "key: candidate-${{ matrix.target }}",
+        "cache-targets: ${{ matrix.cache_target }}",
+        "cache-workspace-crates: false",
+    ] {
+        assert!(
+            artifacts.contains(required),
+            "candidate artifact caching lost its target-isolated dependency contract \
+             {required:?}"
+        );
+    }
+    for target in ["x86_64-apple-darwin", "aarch64-apple-darwin"] {
+        assert!(
+            matrix_entry(&candidate, "artifact", target)
+                .join("\n")
+                .contains("cache_target: true"),
+            "{target} must retain the macOS dependency target cache"
+        );
+    }
+    for target in [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "x86_64-pc-windows-msvc",
+    ] {
+        assert!(
+            matrix_entry(&candidate, "artifact", target)
+                .join("\n")
+                .contains("cache_target: false"),
+            "{target} must not upload a large Cargo target cache"
         );
     }
 }

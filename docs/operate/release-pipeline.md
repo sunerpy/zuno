@@ -13,8 +13,10 @@ the release tag has the same Git tree.
   and publication. It never installs Rust or compiles a binary.
 - `release-candidate.yml` owns the full test gate and the five release targets.
   Each target builds `zuno` and `zuno-smoke` together, packages and unpacks the
-  archive, executes the packaged binary on its native architecture, generates
-  provenance, and only then uploads its bytes.
+  archive, verifies the exact executable architecture, runs the packaged binary,
+  generates provenance, and only then uploads its bytes. Linux, Windows, and
+  arm64 macOS execute natively; x86_64 macOS executes through Rosetta 2 on the
+  `macos-15` Arm64 runner.
 
 The Linux source gate installs pinned `cargo-nextest`. Linux Clippy and tests
 share one job-local target directory; native Windows Clippy and tests are
@@ -57,9 +59,20 @@ binaries retain their normal cache identity.
 
 Both workflows use the pinned official sccache action and its GitHub Actions
 backend. `CARGO_INCREMENTAL=0` avoids CI-only incremental state, while Cargo
-registry and Git downloads use a platform-scoped cache. Raw `target/`
-directories are not uploaded, avoiding Cargo lock contention and stale
-cross-job artifacts.
+registry and Git downloads use a platform-scoped cache. Ordinary CI, candidate
+tests, Linux release targets, and Windows release targets set
+`cache-targets: false`, so they do not upload large `target/` trees. The two
+macOS candidate legs alone enable the Rust dependency target cache. Their cache
+key includes the exact Rust target, and `cache-workspace-crates: false` keeps
+workspace outputs out of the cache, so `x86_64-apple-darwin` and
+`aarch64-apple-darwin` cannot restore each other's target artifacts.
+
+Artifact transfer uses commit-pinned `actions/upload-artifact` v7.0.1 and
+`actions/download-artifact` v8.0.1, whose action runtimes are Node 24. The Linux
+musl legs do not use a Node-based Zig setup action. Instead,
+`.github/scripts/install-zig.sh` selects the official Zig 0.13.0 archive for the
+Linux runner's x86_64 or aarch64 architecture and checks its hard-coded official
+SHA-256 before extraction.
 
 Linux jobs install the distribution `bwrap-userns-restrict` AppArmor profile and
 prove both the user/mount/PID namespace path and the network namespace path before
@@ -74,12 +87,25 @@ conditional-compilation and link failures locally; it cannot prove MSVC,
 ConPTY, Windows Job Object, or hosted-runner loopback behavior, so native
 Windows CI remains authoritative.
 
+Both macOS release targets remain exact Rust triples. The
+`x86_64-apple-darwin` leg cross-builds on the `macos-15` Arm64 runner, verifies
+both `zuno` and `zuno-smoke` with `lipo`, and runs the x86_64 smoke driver with
+`arch -x86_64`, which exercises the packaged x86_64 binary through Rosetta 2.
+The `aarch64-apple-darwin` leg verifies and executes with `arch -arm64`. A
+translation, architecture, or smoke failure blocks attestation and upload; the
+optimization never replaces execution with a static inspection.
+
 The repository ruleset requires the `zuno/pr-gate` check with strict base-branch
 freshness. The candidate workflow refuses to merge when that rule is absent.
-After certification it enables squash auto-merge for the exact PR head, waits
-for GitHub to report the merge, and explicitly wakes release finalization.
-`RELEASE_CANDIDATE_AUTOMATION=true` is the rollout switch; without it the
-controller may update the release PR but cannot dispatch or merge automatically.
+`RELEASE_CANDIDATE_AUTOMATION=true` lets the controller dispatch and certify the
+exact release-PR head. Certification does not imply approval or merge:
+`RELEASE_CANDIDATE_AUTO_MERGE=true` is a separate opt-in. When that second switch
+is absent or false, a maintainer must revalidate the exact head and merge the
+certified PR manually. That user-authored merge push wakes release finalization.
+When the second switch is explicitly enabled, the candidate workflow enables
+squash auto-merge for the exact head, waits for GitHub to report the merge, and
+explicitly dispatches finalization because a `GITHUB_TOKEN` merge does not start
+another workflow.
 
 ## Candidate identity
 
@@ -120,6 +146,7 @@ checks.
 
 Measure from release-PR creation to public release publication, including runner
 queueing. A release change is not complete until three consecutive end-to-end
-runs finish within 15 minutes, publication itself finishes within three minutes,
+runs finish within 20 minutes, publication itself finishes within three minutes,
 and downloaded release assets pass checksum, provenance, and black-box smoke
-verification.
+verification. The timing objective does not relax per-target execution,
+candidate-byte identity, or publication checks.

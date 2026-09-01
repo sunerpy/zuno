@@ -20,7 +20,7 @@
 Zuno 是一个本地编程 Agent，提供内置终端界面、无界面执行、ACP 和 HTTP 服务。
 会话存储在 SQLite 中，运行时是原生 Rust 二进制，不依赖 Node 或 Python。
 
-项目仍处于活跃的预发布开发阶段。Zuno 使用自己的配置、命令、数据格式、工具参数和扩展协议。
+项目仍处于活跃的 0.x 早期开发阶段。Zuno 使用自己的配置、命令、数据格式、工具参数和扩展协议。
 
 ## 为什么选择 Zuno
 
@@ -55,14 +55,22 @@ irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | ie
 cargo install --git https://github.com/sunerpy/zuno zuno-cli --locked
 ```
 
-Zuno 需要 `rg`（ripgrep）14 或更新版本。Linux 上的受限 Shell 还需要 bubblewrap 0.8.0
-或更新版本。发行目标、手工摘要校验和沙箱要求见[安装指南](../guide/installation.md)。
+`rg`（ripgrep）14 或更新版本只在使用 `glob` 与 `grep` 工具时需要。Linux 上只有
+`read-only` 与 `workspace-write` 受限 Shell 需要 bubblewrap 0.8.0 或更新版本；
+显式 `danger-full-access` 不依赖它。发行目标、手工摘要校验和沙箱选择见
+[安装指南](../guide/installation.md)。
 
 已安装的发行版可以原地更新：
 
 ```sh
 zuno self-update --check
 zuno self-update
+```
+
+为当前用户安装 Shell 补全，且不修改 Shell profile：
+
+```sh
+zuno completion zsh --install
 ```
 
 完整更新契约见 [Self-update](../reference/self-update.md)。
@@ -84,11 +92,14 @@ zuno models myopenai --verbose
 示例使用原生 `openai` transport。若使用预编译版本且没有源码 checkout，可将
 [`examples/config/zuno.json`](../../examples/config/zuno.json) 的内容写入同一配置路径。
 
-先用只读任务验证整条链路：
+在具备可用约束后端的 Linux 上，先用只读任务验证整条链路：
 
 ```sh
 zuno run --agent plan "概述这个仓库的架构"
 ```
+
+在 macOS、Windows，或没有约束后端的受信 Linux 宿主上，请按
+[快速开始](../zh/guide/quick-start.md)显式选择原生执行路径。
 
 然后启动终端应用，或直接运行一个有明确边界的任务：
 

@@ -3,13 +3,13 @@
 //! Format 5 is the first historical layout Zuno upgrades in place. The learning
 //! flywheel adds only new tables and indices, so the upgrade can preserve every
 //! existing session, message, and resident-memory row. Other older, newer, or
-//! unmarked pre-release layouts are still rejected without mutation.
+//! unmarked layouts are still rejected without mutation.
 
 use crate::{open, schema};
 use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
 use zuno_error::DbError;
 
-/// Current unreleased database format.
+/// Current database format.
 ///
 /// Bump this whenever [`crate::schema`] changes incompatibly.
 pub const CURRENT_FORMAT: u32 = 6;
@@ -31,7 +31,7 @@ CREATE TABLE zuno_schema (
 ///
 /// # Errors
 ///
-/// [`DbError::SchemaMismatch`] for another pre-release format,
+/// [`DbError::SchemaMismatch`] for another unsupported format,
 /// [`DbError::Schema`] for invalid DDL or marker storage, and [`DbError::Busy`]
 /// while another writer owns SQLite's write lock.
 pub fn apply(connection: &mut Connection) -> Result<(), DbError> {

@@ -66,6 +66,13 @@ impl DiscoveryFailure {
 pub struct Ripgrep {
     program: PathBuf,
     version: Option<String>,
+    discovery: DiscoveryPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryPolicy {
+    Explicit,
+    DeferredSystem,
 }
 
 impl Ripgrep {
@@ -82,7 +89,23 @@ impl Ripgrep {
         Ok(Self {
             program: discovery.program,
             version: Some(discovery.version),
+            discovery: DiscoveryPolicy::Explicit,
         })
+    }
+
+    /// Defer resolving and version-checking the process-wide `rg` until a search runs.
+    ///
+    /// This keeps ripgrep an optional dependency of the `glob` and `grep` tools
+    /// instead of an unrelated startup requirement. The first invocation still
+    /// uses the same cached discovery and minimum-version validation as
+    /// [`Self::discover`].
+    #[must_use]
+    pub fn deferred_system() -> Self {
+        Self {
+            program: PathBuf::from("rg"),
+            version: None,
+            discovery: DiscoveryPolicy::DeferredSystem,
+        }
     }
 
     /// Use an explicit program without consulting `PATH`.
@@ -94,6 +117,7 @@ impl Ripgrep {
         Self {
             program: program.into(),
             version: None,
+            discovery: DiscoveryPolicy::Explicit,
         }
     }
 
@@ -213,7 +237,8 @@ impl Ripgrep {
         cancel: &dyn Cancellation,
         pattern: Option<Pattern<'_>>,
     ) -> Result<RipgrepOutput, SearchError> {
-        let mut child = Command::new(&self.program)
+        let program = self.execution_program()?;
+        let mut child = Command::new(&program)
             .args(args)
             .current_dir(cwd)
             .stdin(Stdio::null())
@@ -221,7 +246,7 @@ impl Ripgrep {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|source| SearchError::Spawn {
-                program: self.program.clone(),
+                program: program.clone(),
                 source,
             })?;
         let stdout = child
@@ -242,6 +267,17 @@ impl Ripgrep {
         Ok(RipgrepOutput {
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
         })
+    }
+
+    fn execution_program(&self) -> Result<PathBuf, SearchError> {
+        match self.discovery {
+            DiscoveryPolicy::Explicit => Ok(self.program.clone()),
+            DiscoveryPolicy::DeferredSystem => SYSTEM_RIPGREP
+                .get_or_init(discover_system)
+                .clone()
+                .map(|discovery| discovery.program)
+                .map_err(DiscoveryFailure::into_search_error),
+        }
     }
 }
 
@@ -495,6 +531,14 @@ mod tests {
             .and_then(|value| value.parse::<u64>().ok())
             .expect("major version");
         assert!(major >= MINIMUM_RIPGREP_MAJOR);
+    }
+
+    #[test]
+    fn deferred_system_construction_does_not_require_discovery() {
+        let engine = Ripgrep::deferred_system();
+        assert_eq!(engine.program(), Path::new("rg"));
+        assert_eq!(engine.version(), None);
+        assert_eq!(engine.discovery, DiscoveryPolicy::DeferredSystem);
     }
 
     #[test]

@@ -1,52 +1,80 @@
 # Installation
 
-Zuno ships as one executable per platform. Installation is: get the binary onto `PATH`,
-verify its checksum, and make sure `rg` is available. Nothing else has to be installed
-or kept version-aligned.
+Zuno ships as one executable per platform. The prebuilt binary can start, load
+configuration, open its database, connect to providers, and serve TUI, headless, ACP,
+and HTTP clients without Node, Python, ripgrep, or bubblewrap.
 
-## Requirements
+## Dependency boundaries
 
-| Requirement | Why |
+| Requirement | Scope |
 | --- | --- |
-| Linux, macOS, or Windows | Release targets below |
-| `rg` (ripgrep) 14 or newer | `glob` and `grep` drive the real ripgrep executable |
-| `bwrap` (bubblewrap) 0.8.0 or newer, Linux only | Required by the `read-only` and `workspace-write` sandbox backends |
-| `curl` or `wget`, and `tar` | Only for the shell installer |
+| Linux, macOS, or Windows | Supported release hosts are listed below |
+| `rg` (ripgrep) 14 or newer | Backend for the `glob` and `grep` tools only; not a Zuno startup or core-runtime dependency |
+| `bwrap` (bubblewrap) 0.8.0 or newer | Linux-only backend for confined `read-only` and `workspace-write` Shell execution |
+| `curl` or `wget`, `tar`, and `sha256sum` or `shasum` | Linux/macOS installer only |
+| Windows PowerShell 5.1 or PowerShell 7 | Windows installer; it uses `Invoke-WebRequest`, `Get-FileHash`, and `Expand-Archive` |
 
-Without a working confinement backend on Linux, a restricted sandbox mode fails closed
-by default. Install bubblewrap before relying on either confined mode, and verify it with
-`zuno debug sandbox`. A trusted deployment that intentionally runs without OS
-confinement can instead select explicit `danger-full-access`, or set
-`sandbox.onUnavailable` to `run-unconfined` for eligible write-capable
-`workspace-write` fallback. See [Permissions and sandboxing](/guide/permissions) for the
-exact boundary, complete probe list, and Ubuntu AppArmor case.
+If `rg` is absent, Zuno still starts; only calls that need the real `glob` or `grep`
+backend are unavailable. If `bwrap` is absent, Linux confinement is unavailable, but
+that does not prevent Zuno itself from starting or an explicitly trusted native mode
+from running.
 
-## Install script
+### Sandbox behavior by platform
 
-The installers download the release archive and its `SHA256SUMS`, compare the digest for
-that exact asset, and refuse to extract on a mismatch. A checksum failure is a hard
-error, never a warning.
+| Platform | Confined `read-only` / `workspace-write` | Native execution |
+| --- | --- | --- |
+| Linux | Requires trusted bubblewrap 0.8.0 or newer | Explicit `danger-full-access`, or eligible trusted `workspace-write` fallback with `run-unconfined` |
+| macOS | Not implemented | Explicit `danger-full-access`, or eligible trusted `workspace-write` fallback with `run-unconfined` |
+| Windows | Not implemented | Explicit `danger-full-access`, or eligible trusted `workspace-write` fallback with `run-unconfined` |
+
+`run-unconfined` is not a general “ignore the sandbox” switch. It applies only when a
+write-capable `workspace-write` request encounters a typed, eligible backend-availability
+failure. `read-only` never falls back and continues to fail closed. See
+[Permissions and sandboxing](/guide/permissions).
+
+## Release installers
+
+The installers download the release archive and `SHA256SUMS`, select the line for that
+exact asset, compare its SHA-256 digest, and refuse to extract on any mismatch.
+
+### Linux and macOS
+
+The shell installer selects x86_64 or aarch64 from `uname`, requires `curl` or `wget`,
+`tar`, and either `sha256sum` or `shasum`, and installs to `$HOME/.local/bin` by
+default:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.sh | sh
 ```
 
+To pin a release or destination:
+
+```sh
+ZUNO_VERSION=v0.1.0 \
+ZUNO_INSTALL_DIR="$HOME/bin" \
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.sh)"
+```
+
+### Windows
+
+Run the Windows installer from Windows PowerShell 5.1 or PowerShell 7. It publishes
+only the x86_64 MSVC target and installs to
+`$env:LOCALAPPDATA\Programs\zuno` by default:
+
 ```powershell
 irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | iex
 ```
 
-Both installers read two environment variables:
+To pin a release or destination:
 
-| Variable | Meaning | Default |
-| --- | --- | --- |
-| `ZUNO_VERSION` | Release to install, with or without a leading `v` | Latest published release |
-| `ZUNO_INSTALL_DIR` | Destination directory | `$HOME/.local/bin`; on Windows, `%LOCALAPPDATA%\Programs\zuno` |
-
-```sh
-ZUNO_VERSION=v0.0.1 ZUNO_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.sh)"
+```powershell
+$env:ZUNO_VERSION = "v0.1.0"
+$env:ZUNO_INSTALL_DIR = Join-Path $HOME "bin"
+irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | iex
 ```
 
-If the destination is not already on `PATH`, the installer prints the line to add.
+Both installers print the `PATH` change when the destination is not already visible.
+Open a new terminal after changing the user `PATH`.
 
 ## Release targets
 
@@ -58,102 +86,185 @@ If the destination is not already on `PATH`, the installer prints the line to ad
 | macOS aarch64 | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
 
-Linux always uses the static musl artifact. `aarch64-pc-windows-msvc` is deliberately
-absent: no available runner can execute that artifact, and the pipeline does not publish
-a binary it never ran.
+Linux uses the static musl artifact. There is no published Windows aarch64 artifact.
 
-## Manual download and verification
+## Manual download and checksum verification
 
-Doing it by hand is the same three steps the installer performs, and is the right choice
-when a policy forbids piping a remote script to a shell.
+When policy forbids piping a remote script into a shell, reproduce the installer steps
+manually. On Linux x86_64:
 
 ```sh
-version=0.0.1
+version=0.1.0
 target=x86_64-unknown-linux-musl
+asset="zuno-${version}-${target}.tar.gz"
 base="https://github.com/sunerpy/zuno/releases/download/v${version}"
 
-curl -fsSLO "${base}/zuno-${version}-${target}.tar.gz"
+curl -fsSLO "${base}/${asset}"
 curl -fsSLO "${base}/SHA256SUMS"
-
-grep " zuno-${version}-${target}.tar.gz\$" SHA256SUMS | sha256sum --check -
-tar -xzf "zuno-${version}-${target}.tar.gz"
+grep " ${asset}\$" SHA256SUMS | sha256sum --check -
+tar -xzf "$asset"
 install -m 755 zuno "$HOME/.local/bin/zuno"
 ```
 
-Verify the digest for your exact asset. A `SHA256SUMS` file listing five archives can
-otherwise be used to "verify" a different one.
+On Windows x86_64:
+
+```powershell
+$version = "0.1.0"
+$asset = "zuno-$version-x86_64-pc-windows-msvc.zip"
+$base = "https://github.com/sunerpy/zuno/releases/download/v$version"
+
+Invoke-WebRequest "$base/$asset" -OutFile $asset
+Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
+$line = Get-Content SHA256SUMS |
+  Where-Object { $_ -match "\s\*?$([Regex]::Escape($asset))$" } |
+  Select-Object -First 1
+if (-not $line) { throw "$asset is absent from SHA256SUMS" }
+$expected = ($line -split "\s+")[0].ToLowerInvariant()
+$actual = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "checksum mismatch for $asset" }
+Expand-Archive $asset -DestinationPath .
+```
+
+Always match the exact asset name. A checksum file containing several archives must not
+be treated as proof for a different file.
+
+## Configuration and data paths
+
+Zuno uses its own XDG-style layout on every platform, including macOS and Windows:
+
+| Platform | Default configuration | Default durable data |
+| --- | --- | --- |
+| Linux | `${XDG_CONFIG_HOME:-$HOME/.config}/zuno` | `${XDG_DATA_HOME:-$HOME/.local/share}/zuno` |
+| macOS | `${XDG_CONFIG_HOME:-$HOME/.config}/zuno` | `${XDG_DATA_HOME:-$HOME/.local/share}/zuno` |
+| Windows | `$HOME\.config\zuno` | `$HOME\.local\share\zuno` |
+
+The Windows configuration is not implicitly stored under `%APPDATA%`. Set
+`XDG_CONFIG_HOME` or `ZUNO_CONFIG_DIR` when a managed deployment needs another root.
+`ZUNO_CONFIG_DIR` adds a final higher-precedence configuration directory; use
+`zuno debug paths` and `zuno debug config` to verify the resolved result.
+
+PowerShell example:
+
+```powershell
+$config = Join-Path $HOME ".config\zuno"
+New-Item -ItemType Directory -Force -Path $config | Out-Null
+Copy-Item .\examples\config\zuno.json (Join-Path $config "zuno.json")
+notepad (Join-Path $config "zuno.json")
+
+# Optional switchable overlay:
+$env:ZUNO_CONFIG_DIR = Join-Path $config "profiles\work"
+zuno debug paths
+zuno debug config
+```
 
 ## Build from source
 
-A source build is the path for local development or for a target the release matrix does
-not cover.
+Source builds require:
+
+- Git;
+- Rust 1.98.0 with Cargo; `rustfmt` and Clippy are required for repository gates;
+- a working C compiler and native linker because bundled SQLite and `aws-lc-sys` build
+  native code;
+- Linux: GCC or Clang plus the normal native linker;
+- macOS: Xcode Command Line Tools (`xcode-select --install`);
+- Windows: Visual Studio 2022 Build Tools with the MSVC v143 C++ toolchain and a
+  Windows SDK, run from an x64 developer environment.
+
+Ripgrep and bubblewrap are runtime tool/backend dependencies described above, not
+source-compilation prerequisites.
+
+```sh
+rustup toolchain install 1.98.0 --component rustfmt clippy
+git clone https://github.com/sunerpy/zuno.git
+cd zuno
+cargo build --locked -p zuno-cli --bin zuno
+cargo test -p zuno-cli --test docs
+```
+
+For a direct Cargo installation:
 
 ```sh
 cargo install --git https://github.com/sunerpy/zuno zuno-cli --locked
 ```
 
-A source build has no channel define, so its channel is `local` and it opens
-`zuno-local.db` rather than the release `zuno.db`. An empty session list right after
-switching between an installed release and a source build is that, not lost data. See
-[Database lifecycle](/migration) for how to point one build at the other's database.
+A source build has channel `local` and normally opens `zuno-local.db`; a published
+release opens `zuno.db`. An apparently empty session list after switching builds usually
+means a different channel database was selected. See [Database lifecycle](/migration).
 
-## Confirm the installation
+## Verify the installation
+
+Linux and macOS:
 
 ```sh
+command -v zuno
 zuno --version
 zuno debug paths
+```
+
+Windows PowerShell:
+
+```powershell
+Get-Command zuno
+zuno --version
+zuno debug paths
+```
+
+Verify optional tool backends separately:
+
+```sh
+rg --version
+# Linux confined modes only:
+bwrap --version
 zuno debug sandbox --mode workspace-write --check
 ```
 
-`debug paths` prints the resolved roots, which is how to confirm which configuration and
-data directories this executable actually uses:
+On macOS and Windows, a confined `workspace-write` check is expected to report that the
+OS backend is not implemented. To verify only the explicit native path without running a
+model task:
 
-```text
-home       /config
-data       /config/.local/share/zuno
-bin        /config/.cache/zuno/bin
-log        /config/.local/share/zuno/log
-repos      /config/.local/share/zuno/repos
-cache      /config/.cache/zuno
-config     /config/.config/zuno
-state      /config/.local/state/zuno
-tmp        /tmp/zuno
+```powershell
+zuno debug sandbox --mode danger-full-access --check
 ```
-
-`debug sandbox --check` exits unsuccessfully when the requested policy is not deployable,
-which makes it usable as a deployment gate rather than something to read by eye.
 
 ## Shell completion
 
+Generate a script on stdout for inspection or manual placement:
+
 ```sh
-zuno completion zsh > "${fpath[1]}/_zuno"
-zuno completion bash > /etc/bash_completion.d/zuno
+zuno completion bash
 ```
 
-`bash`, `elvish`, `fish`, `powershell`, and `zsh` are supported. See
-[zuno completion](/cli/completion).
+Or install it into the current user's deterministic completion directory:
+
+```sh
+zuno completion bash --install
+zuno completion zsh --install
+zuno completion fish --install
+zuno completion powershell --install
+zuno completion elvish --install
+```
+
+Installation creates or atomically replaces only the completion file. It does not edit
+a shell profile; the command prints the installed path and the activation instruction.
+See [Shell completion](/cli/completion).
 
 ## Upgrading
 
 ```sh
 zuno self-update --check
 zuno self-update
-zuno self-update --tag v0.0.1
+zuno self-update --tag v0.1.0
 ```
 
-`self-update` replaces the running executable from a checksum-verified GitHub release. It
-downloads `SHA256SUMS`, requires exactly one digest for the selected archive, and stops
-before touching the current executable on any mismatch. Without `--yes`, a
-non-interactive invocation fails closed instead of replacing the binary silently.
-
-If the executable path is owned by another user, reinstall into a writable `PATH`
-directory such as `$HOME/.local/bin` rather than running the updater with elevated
-privileges. See [Self-update](/reference/self-update).
+`self-update` verifies the exact archive before atomically replacing the executable. A
+non-interactive replacement requires `--yes`. If the executable is not writable, install
+into a user-owned directory instead of elevating the updater. See
+[Self-update](/reference/self-update).
 
 ## Uninstalling
 
-There is no `zuno uninstall` that does work; the command exists only to say so. Remove
-the pieces yourself:
+Remove the executable separately from configuration and durable data. Deleting the data
+root discards session databases, logs, and credentials.
 
 ```sh
 rm "$HOME/.local/bin/zuno"
@@ -162,20 +273,23 @@ rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/zuno"
 rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/zuno"
 ```
 
-The data root holds session databases, logs, and the credential store, so removing it
-discards durable session history. Export first if any of it matters:
+Windows PowerShell:
 
-```sh
-zuno export "$HOME/zuno-backup.zuno-bundle"
+```powershell
+Remove-Item (Join-Path $env:LOCALAPPDATA "Programs\zuno\zuno.exe")
+# Delete these only when their configuration and history are no longer needed:
+Remove-Item -Recurse -Force (Join-Path $HOME ".config\zuno")
+Remove-Item -Recurse -Force (Join-Path $HOME ".local\share\zuno")
+Remove-Item -Recurse -Force (Join-Path $HOME ".cache\zuno")
 ```
 
-A default bundle carries configuration, Skills, extensions, and Agents, and deliberately
-excludes session databases and credential stores. See
+Export anything that must survive before deleting durable data. Portable bundles
+deliberately exclude session databases and credential stores; see
 [Portable bundles](/reference/portable-bundles).
 
 ## See also
 
 - [Quick start](/guide/quick-start)
+- [Permissions and sandboxing](/guide/permissions)
 - [Self-update](/reference/self-update)
-- [Portable bundles](/reference/portable-bundles)
 - [Database lifecycle](/migration)

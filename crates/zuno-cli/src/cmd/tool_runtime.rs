@@ -217,7 +217,7 @@ pub(crate) fn assemble(
         directory: directory.to_path_buf(),
         worktree: worktree.map_or_else(|| directory.to_path_buf(), Path::to_path_buf),
     };
-    let tooling = SearchTooling::discover(scope).map_err(to_string)?;
+    let tooling = SearchTooling::deferred(scope);
     let mut sandbox_notice = None;
     let shell = shell_visible(selected_profile, selected_agent, &selection).then(|| {
         let policy = sandbox_policy(directory, config, selected_profile, &rules)?;

@@ -13,15 +13,21 @@ zuno debug paths
 `debug paths` prints the roots this executable resolved. The `config` line is where
 `zuno.json` belongs; everything below assumes it.
 
+Zuno startup and its core runtime do not require ripgrep or bubblewrap. Ripgrep 14 or
+newer is needed only for the `glob` and `grep` tools. Bubblewrap 0.8.0 or newer is
+needed only for confined Shell execution on Linux.
+
 ## 2. Verify the sandbox before relying on it
 
 ```sh
+# Linux confined workspace-write
 zuno debug sandbox --mode workspace-write --check
 ```
 
 This runs the same backend Shell uses: it checks the launcher's ownership and trust, then
 executes a probe through the real bubblewrap, capability-drop, and seccomp path. `--check`
-exits unsuccessfully when the policy is not deployable.
+exits unsuccessfully when the policy is not deployable. This confined check is a Linux
+deployment gate; macOS and Windows currently have no confined backend.
 
 If it fails, the default is to refuse Shell rather than run with more authority than the
 configuration requested. On Linux the usual causes are a bubblewrap older than 0.8.0 or a
@@ -41,10 +47,17 @@ zuno run \
 ```
 
 The fallback form applies only to write-capable `workspace-write` Agents. Read-only Agents
-still refuse without a confined backend. On macOS and Windows, where confinement is not
-implemented yet, either trusted choice can run a write-capable Agent natively;
-`danger-full-access` skips the sandbox probe entirely. See
+still refuse without a confined backend. `danger-full-access` is the native backend on
+Linux, macOS, and Windows and skips the confinement probe. On macOS and Windows, the
+eligible trusted `workspace-write` fallback also resolves to native execution; it is not
+confinement. See
 [Permissions and sandboxing](/guide/permissions).
+
+Check ripgrep separately only when those tools are needed:
+
+```sh
+rg --version
+```
 
 ## 3. Configure a provider
 
@@ -55,6 +68,17 @@ Zuno ships no default model id. Declare a provider, its transport, and its model
 install -d -m 700 "${XDG_CONFIG_HOME:-$HOME/.config}/zuno"
 $EDITOR "${XDG_CONFIG_HOME:-$HOME/.config}/zuno/zuno.json"
 ```
+
+Windows PowerShell uses the same home-relative XDG-style default, not `%APPDATA%`:
+
+```powershell
+$config = Join-Path $HOME ".config\zuno"
+New-Item -ItemType Directory -Force -Path $config | Out-Null
+notepad (Join-Path $config "zuno.json")
+```
+
+Set `ZUNO_CONFIG_DIR` when an explicit higher-precedence configuration directory is
+required. Confirm every platform's resolved path with `zuno debug paths`.
 
 ```json
 {
@@ -98,6 +122,12 @@ ordinary provider id, not a reserved name.
 printf '%s' "$MYOPENAI_API_KEY" | zuno providers login --provider myopenai
 ```
 
+Windows PowerShell:
+
+```powershell
+$env:MYOPENAI_API_KEY | zuno providers login --provider myopenai
+```
+
 Piped login reads standard input; interactive login disables terminal echo. Either way
 the key stays out of shell history. Credentials land in
 `$XDG_DATA_HOME/zuno/auth.json` with mode `0600` on Unix.
@@ -125,7 +155,7 @@ zuno models myopenai --verbose
 fastest way to catch a value placed in the wrong file. `models` confirms the exact
 `provider/model` identifier that `run` and `tui` expect.
 
-Then run something read-only first:
+On Linux with a working confined backend, run something read-only first:
 
 ```sh
 zuno run --agent plan "summarize how configuration precedence works in this repository"
@@ -135,6 +165,19 @@ zuno run --agent plan "summarize how configuration precedence works in this repo
 `read-only` regardless of configuration. It is the safest way to confirm the whole path
 works end to end on a host with working confinement. A read-only Agent deliberately does
 not use `run-unconfined`.
+
+On macOS or Windows, a trusted first task that needs Shell must use a write-capable Agent
+and explicitly choose a native path:
+
+```powershell
+zuno run --agent build `
+  --sandbox workspace-write `
+  --sandbox-on-unavailable run-unconfined `
+  "summarize this repository without changing files"
+```
+
+That command runs natively because those platforms do not yet have a confined backend.
+Use it only where the Zuno process user's host authority is acceptable.
 
 Run a writable task:
 
@@ -152,6 +195,7 @@ zuno
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
+| `rg` is missing or too old | `glob` / `grep` backend is unavailable | Install ripgrep 14 or newer; Zuno startup and unrelated core features remain usable |
 | `no trusted system bubblewrap executable was found` | No confinement backend | Install bubblewrap 0.8.0 or newer, use explicit `danger-full-access`, or enable trusted unavailable fallback for a write-capable Agent |
 | `OS sandbox is not implemented for platform` | Confined mode on macOS or Windows | Use explicit `danger-full-access`, trusted `run-unconfined` fallback for a write-capable Agent, or run on Linux |
 | A validation error naming a rejected top-level key | TUI-only key such as `theme` in `zuno.json` | Move it to `tui.json`. See [Files and precedence](/config/files) |

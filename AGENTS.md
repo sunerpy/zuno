@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Zuno is an unreleased Rust agent harness. Prefer the correct foundation over compatibility layers, and update every internal caller in the same change. Zuno does not promise OpenCode configuration, database, plugin, hook, HTTP, tool-argument, or extension compatibility.
+Zuno is a released, fast-moving Rust agent harness. Prefer the correct foundation over compatibility layers, and update every internal caller in the same change. Zuno does not promise compatibility with OpenCode configuration, databases, plugins, hooks, HTTP APIs, tool arguments, or extensions; published Zuno database formats follow the migration rules below.
 
 ## Architecture
 
@@ -17,6 +17,10 @@ Zuno is an unreleased Rust agent harness. Prefer the correct foundation over com
 - Prompt assembly uses stable section identifiers, an exact source, ordered content, and a content digest. Persist the actual post-hook prompt before the provider request.
 - User prompts, steering, and subagent reports enter the durable FIFO inbox before execution. `reportDelivery: nextStep` must settle the child result, admit the parent input, and wake the parent without a polling race.
 - Client surfaces consume durable events, inbox state, and projections. TUI, server, ACP, and future GUI clients must not acquire private agent-loop behavior.
+- A database format shipped in a release is durable user state. Every supported older format advances through a guarded, atomic forward migration; never require users to rebuild a supported database.
+- Run schema creation, backfills, index creation, and the format-marker update in one transaction, with the marker updated last. A marker-only edit is corruption, not a migration.
+- Migration tests use exact old-format fixtures and verify preserved rows, not only table presence. At minimum compare representative session, message, and durable-memory values before and after, then verify the new tables, indexes, and marker.
+- Future, unmarked, or structurally corrupt formats fail closed without mutation. Keep recovery evidence and the original database available rather than guessing, downgrading, or deleting user data.
 
 ## Goals And Recovery
 
@@ -35,6 +39,15 @@ Zuno is an unreleased Rust agent harness. Prefer the correct foundation over com
 - A CLI command is not registered until a real handler exists. Help text, dispatch, assembled execution, and failure behavior must agree.
 - HTTP routes and OpenAPI operations are registered only with real handlers. Do not publish placeholder endpoints that can only report an unavailable backend.
 - Tool UI intent is part of the tool design. Keep tool arguments, result semantics, retry policy, and presentation independently testable.
+
+## Cross-Platform Development
+
+- Keep Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64 MSVC behavior explicit. Do not encode POSIX paths, shell quoting, executable suffixes, or case sensitivity into platform-neutral components.
+- `rg` 14 or newer is a backend dependency of the `glob` and `grep` tools only. Missing ripgrep may make those tools unavailable or fail their calls; it must not prevent Zuno startup, configuration, provider access, database access, or other core runtime behavior.
+- `bwrap` 0.8.0 or newer is only the Linux confinement backend for `read-only` and `workspace-write`. `danger-full-access` uses the native backend on every platform. Trusted `run-unconfined` fallback is limited to eligible unavailable-backend failures for write-capable `workspace-write`; `read-only` never falls back.
+- macOS and Windows currently have no confined backend. Keep native execution usable through the explicit full-access path or the eligible trusted fallback, and keep documentation and diagnostics clear that this is not confinement.
+- A platform-sensitive change is not complete after one host build. Run the available cross-target compile/link checks, then obtain native evidence for behavior tied to MSVC, ConPTY, Windows Job Objects, macOS process behavior, Linux namespaces, packaging, or architecture-specific artifacts.
+- Release support requires an executable smoke result for that exact OS/architecture artifact. Cross-compilation is useful evidence but does not replace native execution where runtime semantics differ.
 
 ## Research And Change Process
 

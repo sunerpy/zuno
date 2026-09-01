@@ -66,14 +66,15 @@ projection。客户端断开不会产生另一套 Agent 生命周期。
 替换 Profile 时，新 Profile 完整校验后才会发布，挂载失败则按逆序回滚。
 
 扩展可以提供 Agent、Workflow、Skill、WASI Component 或受控进程工具。Zuno 不加载 Rust
-动态库。唯一必需的外部运行工具是 `rg`（ripgrep）14 或更新版本，用于 `glob` 和 `grep`。
+动态库。`glob` 与 `grep` 使用外部的 `rg`（ripgrep）14 或更新版本；缺少它不会阻止
+Zuno 或其他无关工具启动，只有调用搜索工具时才会报告该能力不可用。
 
 参见 [Harness 运行时](/zh/operate/harness-runtime)、[插件与扩展](/zh/guide/plugins)以及
 [Harness 对比](https://github.com/sunerpy/zuno/blob/main/docs/design/harness-comparison.md)。
 
 ## 当前边界
 
-- Zuno 仍处于预发布开发阶段，数据和扩展格式可能变化。
+- Zuno 仍处于 0.x 早期开发阶段；数据和扩展格式会通过文档化的版本与迁移边界演进。
 - 它是本地 CLI 与 Server，不是托管式编程服务。
 - 它使用 Zuno 自己的配置和协议，不提供其他编程 Agent 的兼容层。
 - 受限 Shell 目前只在 Linux 上实现。

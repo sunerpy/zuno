@@ -51,7 +51,7 @@ A small set of options is accepted by every subcommand. They are documented once
 | --- | --- |
 | [`zuno self-update`](/cli/self-update) | Replace the running executable from a checksum-verified GitHub release. |
 | [`zuno debug`](/cli/debug) | Inspect paths, resolved configuration, prompts, permissions, sandbox, and snapshots. |
-| [`zuno completion`](/cli/completion) | Emit shell completion syntax for bash, elvish, fish, powershell, or zsh. |
+| [`zuno completion`](/cli/completion) | Generate or install completion for bash, elvish, fish, powershell, or zsh. |
 
 ## Excluded
 

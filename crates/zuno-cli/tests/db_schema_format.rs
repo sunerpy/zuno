@@ -67,8 +67,10 @@ fn unmarked_pre_release_format_is_refused_before_serving_a_query() {
         stdout.trim().is_empty(),
         "query ran before format validation: {stdout}"
     );
-    assert!(stderr.contains("unsupported pre-release"), "{stderr}");
-    assert!(stderr.contains("rebuild"), "{stderr}");
+    assert!(stderr.contains("unsupported schema format"), "{stderr}");
+    assert!(stderr.contains("preserve the database"), "{stderr}");
+    assert!(stderr.contains("validated forward migration"), "{stderr}");
+    assert!(!stderr.contains("rebuild"), "{stderr}");
 
     let title: String = connection
         .query_row("SELECT title FROM session", [], |row| row.get(0))

@@ -198,8 +198,7 @@ pub fn map_search_error(tool: &str, error: SearchError) -> ToolError {
 
 /// The official ripgrep adapter both tools run their requests through.
 ///
-/// Held by the tool so discovery and version validation happen once at
-/// registry-assembly time rather than once per invocation.
+/// Held by the tool so discovery and version validation are shared by both tools.
 #[derive(Debug, Clone)]
 pub struct SearchTooling {
     /// Where searches are rooted.
@@ -210,14 +209,20 @@ pub struct SearchTooling {
 
 impl SearchTooling {
     /// Tooling rooted at `directory`, deferring PATH failure until invocation.
-    ///
-    /// Production assembly uses [`Self::discover`] so an unavailable dependency is
-    /// reported before the tools are exposed.
     #[must_use]
     pub fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
             scope: SearchScope::new(directory),
-            ripgrep: Ripgrep::new("rg"),
+            ripgrep: Ripgrep::deferred_system(),
+        }
+    }
+
+    /// Tooling with a complete scope, deferring ripgrep discovery until use.
+    #[must_use]
+    pub fn deferred(scope: SearchScope) -> Self {
+        Self {
+            scope,
+            ripgrep: Ripgrep::deferred_system(),
         }
     }
 
