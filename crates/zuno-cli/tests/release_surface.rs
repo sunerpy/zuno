@@ -1937,6 +1937,23 @@ fn nextest_globally_isolates_the_startup_budget() {
          budget; a second wall-clock measurement recreates the hosted-runner flake without \
          measuring incremental watchdog cost"
     );
+    let scheduler_path = workspace_root().join("scripts/test-parallel.sh");
+    let scheduler = std::fs::read_to_string(&scheduler_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", scheduler_path.display()));
+    for required in [
+        "def is_windows_startup_budget_only_failure(target, code, output):",
+        "if os.name != 'nt' or target != 'startup' or code != 101:",
+        "'startup regressed past its budget:' in normalized",
+        "startup_medians_are_inside_their_budgets",
+        r"r'test result: FAILED\. \d+ passed; 1 failed;'",
+        "retry_code, retry_output, retry_elapsed = run_once(",
+        "code = retry_code",
+    ] {
+        assert!(
+            scheduler.contains(required),
+            "the Windows startup confirmation lost its fail-closed condition {required:?}"
+        );
+    }
 }
 
 /// The shared gate targets the plan names, plus the ones CI invokes by name. A workflow
