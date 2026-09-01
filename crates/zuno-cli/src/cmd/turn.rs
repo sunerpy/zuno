@@ -2942,7 +2942,10 @@ fn process_claimed_aggregation_job(
         .map_err(to_string)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "recovery workers receive the durable job plus the typed learning services needed to resume it"
+)]
 async fn run_recovered_learning_job(
     job: zuno_db::learning_job::LearningJobRecord,
     extractor: Arc<dyn LearningExtractor>,

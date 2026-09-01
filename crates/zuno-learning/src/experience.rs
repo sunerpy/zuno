@@ -493,7 +493,11 @@ fn checked_confidence(value: f64, field: &str) -> Result<u16> {
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
         return Err(invalid(field, "confidence must be between 0 and 1"));
     }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the finite inclusive 0..=1 check above bounds the rounded scale to 0..=10_000"
+    )]
     Ok((value * 10_000.0).round() as u16)
 }
 

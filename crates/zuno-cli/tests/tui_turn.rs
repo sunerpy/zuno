@@ -101,6 +101,7 @@ const PICKER_THIRD_ID: &str = "ses_picker_third";
 const PICKER_FIRST_TITLE: &str = "PickerFirstMarker";
 const PICKER_SECOND_TITLE: &str = "PickerSecondMarker";
 const PICKER_THIRD_TITLE: &str = "PickerThirdMarker";
+const PICKER_KEEP_LEARNING_PROMPT: &str = "ctrl+d keep learning";
 const PICKER_RENAMED_TITLE: &str = "PickerRenamedMarker";
 const DIRECT_GOAL_OBJECTIVE: &str = "Polish the TUI goal workflow directly";
 const PARALLEL_PARENT_PROMPT: &str = "ParentSurfaceMarker delegate two foreground children.";
@@ -1652,7 +1653,10 @@ fn run_consecutive_session_deletes_under_pty(
             stdin.write_all(b"\x04")?;
             stdin.flush()?;
             first_arm_sent = true;
-        } else if first_arm_sent && !first_confirm_sent && text.contains("deletion") {
+        } else if first_arm_sent
+            && !first_confirm_sent
+            && text.contains(PICKER_KEEP_LEARNING_PROMPT)
+        {
             first_title_count_before_remount = text.matches(PICKER_FIRST_TITLE).count();
             stdin.write_all(b"\x04")?;
             stdin.flush()?;
@@ -1662,13 +1666,13 @@ fn run_consecutive_session_deletes_under_pty(
             && !second_arm_sent
             && text.matches(PICKER_FIRST_TITLE).count() > first_title_count_before_remount
         {
-            second_confirmation_count = text.matches("deletion").count();
+            second_confirmation_count = text.matches(PICKER_KEEP_LEARNING_PROMPT).count();
             stdin.write_all(b"\x04")?;
             stdin.flush()?;
             second_arm_sent = true;
         } else if second_arm_sent
             && !second_confirm_sent
-            && text.matches("deletion").count() > second_confirmation_count
+            && text.matches(PICKER_KEEP_LEARNING_PROMPT).count() > second_confirmation_count
         {
             third_title_count_before_remount = text.matches(PICKER_THIRD_TITLE).count();
             stdin.write_all(b"\x04")?;

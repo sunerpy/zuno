@@ -9,9 +9,11 @@ zuno-continuity
 zuno-db
 zuno-engine
 zuno-error
+zuno-eval
 zuno-extension
 zuno-goal
 zuno-harness
+zuno-learning
 zuno-llm
 zuno-lsp
 zuno-mcp
