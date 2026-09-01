@@ -29,6 +29,11 @@
 //! `.config/nextest.toml` reserves the complete nextest worker pool for this
 //! test binary, so workspace concurrency cannot turn unrelated CPU or SQLite
 //! contention into a startup regression.
+//! The `session list` budget first asserts that the real parser classifies that
+//! path as watchdog-protected, so its single wall-clock sample includes watchdog
+//! creation, guard acquisition, and shutdown. Repeating the same benchmark in a
+//! second test would not isolate watchdog cost; it would only create another
+//! chance for hosted-runner jitter to fail the same product budget.
 //! And the assertion that actually catches the regression this gate exists for —
 //! a blocking step added to startup — is [`startup_version_pays_for_no_log_file_and_no_reexec`],
 //! which is structural and has no timing in it at all.
@@ -221,6 +226,11 @@ fn phases(line: &[(String, u128)]) -> BTreeSet<&str> {
 #[test]
 fn startup_medians_are_inside_their_budgets() {
     let _measurement_lock = startup_measurement_lock();
+    assert!(
+        classification(&["zuno", "session", "list"]),
+        "`session list` is no longer watchdog-protected, so its startup budget \
+         would not cover the instrumentation cost it is meant to include"
+    );
     let cases: [(&str, &[&str], Duration); 4] = [
         ("zuno --version", &["--version"], BUDGET_VERSION),
         (
@@ -456,35 +466,6 @@ fn startup_only_bounded_commands_are_guarded_against_silence() {
              the false positive the BUSY gate exists to prevent"
         );
     }
-}
-
-/// The watchdog must not be the reason a command got slower.
-///
-/// It spawns a thread and parks it, so its cost is one thread creation. The
-/// budget above already covers that, and this states the relationship: the
-/// classification decides whether a guard is taken, and neither answer may cost
-/// measurable time.
-#[test]
-fn startup_the_liveness_watchdog_costs_nothing_measurable_on_a_bounded_command() {
-    let _measurement_lock = startup_measurement_lock();
-    // Given: a command classified as bounded work, so a guard IS taken.
-    assert!(
-        classification(&["zuno", "session", "list"]),
-        "`session list` is bounded work; if it is no longer classified that way \
-         this test is measuring the wrong path"
-    );
-
-    // When: it is measured.
-    let (_, median, _) = measure("watchdog-cost", &["session", "list"]);
-
-    // Then: it is inside the same budget as before the watchdog existed. A
-    // liveness reporter that pushed startup over its own budget would be a
-    // regression dressed as instrumentation.
-    assert!(
-        median <= BUDGET_SESSION_LIST,
-        "with the watchdog wired in, `session list` median {median:?} exceeds its \
-         {BUDGET_SESSION_LIST:?} budget"
-    );
 }
 
 /// No command may report a stall merely by being run.

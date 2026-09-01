@@ -1931,6 +1931,12 @@ fn nextest_globally_isolates_the_startup_budget() {
         ),
         "the Linux session-list startup budget changed instead of isolating its measurement"
     );
+    assert!(
+        !startup.contains(r#"measure("watchdog-cost""#),
+        "the watchdog-active session-list path is already covered by the primary startup \
+         budget; a second wall-clock measurement recreates the hosted-runner flake without \
+         measuring incremental watchdog cost"
+    );
 }
 
 /// The shared gate targets the plan names, plus the ones CI invokes by name. A workflow

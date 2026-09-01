@@ -482,6 +482,14 @@ nextest worker pool while each startup case runs. Native Windows uses the same
 quiet-host boundary in `scripts/test-parallel.sh`. The 100 ms Linux budget is
 not loosened to absorb unrelated load.
 
+Each startup path has one wall-clock gate. Before timing `session list`, the
+test asserts through the real parser that this command is watchdog-protected;
+the resulting sample therefore includes watchdog creation, guard acquisition,
+and shutdown. A second timing test over the identical command cannot isolate
+the watchdog's incremental cost and only doubles the probability that transient
+host contention rejects the same budget. Watchdog classification and false-stall
+behavior remain separate untimed assertions.
+
 Nine runs per invocation, first run discarded (it pays for faulting the binary's
 pages in), isolated `XDG_CONFIG_HOME` and `XDG_DATA_HOME`, debug profile:
 
@@ -972,6 +980,15 @@ same revision measured 30.292 ms. The product path was not slower; the benchmark
 was sharing the runner with unrelated test processes. The repository-level
 nextest override described in *Startup budget* now gives Linux the same
 isolate-one/run-the-rest-concurrently topology already used on Windows.
+
+Windows CI run `33505110778` exposed a different duplicate-gate defect. The
+primary startup-budget case passed, but a later test timed the same watchdog-active
+`session list` path again and observed a 252.3702 ms median against the 200 ms
+ceiling. On the exact commit (`db91241b`), ten native Windows repetitions of the
+primary budget measured 67.0095–78.765 ms medians and both timing tests passed
+10/10. The repeated measurement was removed rather than loosening the budget:
+the primary sample already includes the watchdog, while its parser classification
+is now asserted before that single measurement.
 
 Native Windows run `33384920656` supplied the missing negative evidence. Its
 nextest step started at `11:06:31Z` and was still running at `11:34:09Z`, at least
