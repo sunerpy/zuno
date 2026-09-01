@@ -796,6 +796,46 @@ fn installation_docs_pin_cross_platform_dependency_boundaries() {
 }
 
 #[test]
+fn installation_docs_use_release_placeholders_instead_of_stale_version_pins() {
+    for (relative, explanation) in [
+        (
+            "docs/guide/installation.md",
+            "Replace `X.Y.Z` with the exact published release",
+        ),
+        (
+            "docs/zh/guide/installation.md",
+            "将 `X.Y.Z` 替换为准备安装的确切已发布版本",
+        ),
+    ] {
+        let text = read(relative);
+        assert!(
+            text.contains(explanation),
+            "{relative} must explain how to replace its release placeholder"
+        );
+
+        for (prefix, expected) in [
+            ("ZUNO_VERSION=v", "ZUNO_VERSION=vX.Y.Z \\"),
+            ("$env:ZUNO_VERSION = ", "$env:ZUNO_VERSION = \"vX.Y.Z\""),
+            ("version=", "version=X.Y.Z"),
+            ("$version = ", "$version = \"X.Y.Z\""),
+            ("zuno self-update --tag v", "zuno self-update --tag vX.Y.Z"),
+        ] {
+            let matches = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with(prefix))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches,
+                vec![expected],
+                "{relative} must keep {prefix:?} version-agnostic so a later release cannot \
+                 leave an older install command online"
+            );
+        }
+    }
+}
+
+#[test]
 fn completion_docs_describe_stdout_and_profile_safe_installation() {
     contains_all(
         "docs/cli/completion.md",

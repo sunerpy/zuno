@@ -50,10 +50,13 @@ curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.s
 To pin a release or destination:
 
 ```sh
-ZUNO_VERSION=v0.1.0 \
+ZUNO_VERSION=vX.Y.Z \
 ZUNO_INSTALL_DIR="$HOME/bin" \
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.sh)"
 ```
+
+Replace `X.Y.Z` with the exact published release you intend to install. The
+unpinned command above resolves the latest published release.
 
 ### Windows
 
@@ -68,7 +71,7 @@ irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | ie
 To pin a release or destination:
 
 ```powershell
-$env:ZUNO_VERSION = "v0.1.0"
+$env:ZUNO_VERSION = "vX.Y.Z"
 $env:ZUNO_INSTALL_DIR = Join-Path $HOME "bin"
 irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | iex
 ```
@@ -94,7 +97,7 @@ When policy forbids piping a remote script into a shell, reproduce the installer
 manually. On Linux x86_64:
 
 ```sh
-version=0.1.0
+version=X.Y.Z
 target=x86_64-unknown-linux-musl
 asset="zuno-${version}-${target}.tar.gz"
 base="https://github.com/sunerpy/zuno/releases/download/v${version}"
@@ -109,7 +112,7 @@ install -m 755 zuno "$HOME/.local/bin/zuno"
 On Windows x86_64:
 
 ```powershell
-$version = "0.1.0"
+$version = "X.Y.Z"
 $asset = "zuno-$version-x86_64-pc-windows-msvc.zip"
 $base = "https://github.com/sunerpy/zuno/releases/download/v$version"
 
@@ -253,7 +256,7 @@ See [Shell completion](/cli/completion).
 ```sh
 zuno self-update --check
 zuno self-update
-zuno self-update --tag v0.1.0
+zuno self-update --tag vX.Y.Z
 ```
 
 `self-update` verifies the exact archive before atomically replacing the executable. A

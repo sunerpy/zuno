@@ -1603,6 +1603,38 @@ fn the_ci_gate_requires_every_job_in_the_workflow() {
     );
 }
 
+/// Nextest runs each test case in a separate process, so `startup.rs`'s static
+/// mutex cannot protect its wall-clock measurements from unrelated workspace
+/// tests. The repository configuration must reserve the complete nextest pool
+/// for this binary rather than loosening the product's startup budget.
+#[test]
+fn nextest_globally_isolates_the_startup_budget() {
+    let config_path = workspace_root().join(".config/nextest.toml");
+    let config = std::fs::read_to_string(&config_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", config_path.display()));
+
+    for required in [
+        r#"nextest-version = "0.9.103""#,
+        r#"filter = 'binary(startup)'"#,
+        r#"threads-required = "num-test-threads""#,
+    ] {
+        assert!(
+            config.contains(required),
+            "nextest startup isolation lost {required:?}:\n{config}"
+        );
+    }
+
+    let startup_path = workspace_root().join("crates/zuno-cli/tests/startup.rs");
+    let startup = std::fs::read_to_string(&startup_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", startup_path.display()));
+    assert!(
+        startup.contains(
+            "#[cfg(not(windows))]\nconst BUDGET_SESSION_LIST: Duration = Duration::from_millis(100);"
+        ),
+        "the Linux session-list startup budget changed instead of isolating its measurement"
+    );
+}
+
 /// The five targets the plan names, plus the ones CI invokes by name. A workflow
 /// step calling a make target that does not exist fails only when that workflow
 /// runs, which for the release path could be months later.
