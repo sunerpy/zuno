@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.1](https://github.com/sunerpy/zuno/compare/v0.2.0...v0.2.1) (2026-09-01)
+
+
+### Bug Fixes
+
+* **ci:** isolate startup budget under nextest ([82e9103](https://github.com/sunerpy/zuno/commit/82e9103773fe0e350e57629f2951b6e95db9099d))
+* **windows:** align atomic visibility stress with retry contract ([c15265f](https://github.com/sunerpy/zuno/commit/c15265f08f3cd1cb15970d94154ea4d38c45b5a0))
+* **windows:** align goal projection stress with retry budget ([532d93e](https://github.com/sunerpy/zuno/commit/532d93ed3a5b1da0cbc5b6cbc774d7c938a17e87))
+
 ## [0.2.0](https://github.com/sunerpy/zuno/compare/v0.1.0...v0.2.0) (2026-09-01)
 
 
