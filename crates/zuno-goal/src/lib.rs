@@ -82,9 +82,9 @@ pub use crate::continuation::{
 pub use crate::error::GoalError;
 pub use crate::pause::{GoalPauseReason, GoalPauseState, InteractionPolicy};
 pub use crate::projection::{
-    Check, Document, Edited, Field, GITIGNORE_SNIPPET, GOAL_DIRECTORY, GoalProjection, Ingest,
-    MAX_CRITERION_CHARS, Notes, OBJECTIVE_BEGIN, OBJECTIVE_END, PROJECT_DIRECTORY, Refusal,
-    RejectedEdit, document_path, parse, render,
+    Check, Document, Edited, Field, GITIGNORE_SNIPPET, GOAL_DIRECTORY, GoalProjection,
+    IGNORE_PATTERN, Ingest, MAX_CRITERION_CHARS, Notes, OBJECTIVE_BEGIN, OBJECTIVE_END,
+    PROJECT_DIRECTORY, Refusal, RejectedEdit, document_path, parse, render,
 };
 pub use crate::retry::{
     DEFAULT_GOAL_RETRY_INITIAL_DELAY, DEFAULT_GOAL_RETRY_JITTER_PERCENT,

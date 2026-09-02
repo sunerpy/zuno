@@ -93,8 +93,20 @@
 //! # Keeping the document out of git
 //!
 //! The projection is derived, per-session, and churns on every material change, so
-//! it does not belong in a repository. [`GITIGNORE_SNIPPET`] is the recommended
-//! text, and it lives here as a constant because the project has no
+//! it does not belong in a repository. [`IGNORE_PATTERN`] is the one path that has
+//! to be ignored, and there are two ways to honour it.
+//!
+//! The host does it without touching a tracked file: the CLI passes
+//! [`IGNORE_PATTERN`] to `zuno_paths::ensure_managed_block`, which maintains a
+//! marked block in the repository-private `.git/info/exclude`. That keeps a
+//! generated path out of `git status` in somebody else's repository without
+//! Zuno ever editing a file the repository's own history owns — writing to a
+//! checked-in `.gitignore` would show up as an unexplained diff in the user's next
+//! commit.
+//!
+//! [`GITIGNORE_SNIPPET`] is for the other case: a team that wants the rule shared
+//! through version control, where a private exclude file per clone is exactly the
+//! wrong shape. It lives here as a constant because the project has no
 //! recommended-gitignore file for it to be appended to — searching the workspace
 //! for one turns up only gitignore *parsing* (`zuno-watch`, `zuno-search`,
 //! `zuno-snapshot`) and the repository's own `.gitignore`. Whoever adds user
@@ -115,10 +127,23 @@ pub use zuno_paths::PROJECT_DIRECTORY;
 /// The subdirectory of [`PROJECT_DIRECTORY`] holding goal documents.
 pub const GOAL_DIRECTORY: &str = "goal";
 
+/// The one path that has to be ignored: the directory the projection writes into.
+///
+/// A trailing slash so it matches a directory and not a file that happens to share
+/// the name, and no leading slash so it reads the same in `.git/info/exclude` as in
+/// a `.gitignore` at the worktree root. Spelled as a literal rather than composed
+/// from [`PROJECT_DIRECTORY`] and [`GOAL_DIRECTORY`] because a git pattern is always
+/// slash-separated, while joining those two would produce a backslash on Windows and
+/// silently stop matching.
+pub const IGNORE_PATTERN: &str = ".zuno/goal/";
+
 /// What to add to a repository's `.gitignore` for the goal projection.
 ///
 /// See the module docs for why this is a constant rather than an entry in an
-/// existing snippet file.
+/// existing snippet file, and for when to prefer the private exclude file instead.
+/// The pattern line is written out rather than interpolated from [`IGNORE_PATTERN`]
+/// because a `const` cannot be built from another one at compile time here; a test
+/// asserts the two agree.
 pub const GITIGNORE_SNIPPET: &str = "\
 # Zuno renders the authoritative goal to a human-editable Markdown document,
 # one per session. It is derived from the goal database and rewritten on every

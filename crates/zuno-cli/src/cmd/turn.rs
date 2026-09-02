@@ -3748,6 +3748,35 @@ impl TurnHost {
             let learning_projection =
                 zuno_learning::LearningProjectionService::new(Arc::clone(&database));
             let mut notes = plan.notes;
+            // The goal projection writes a generated Markdown document into the
+            // worktree, and a generated file that shows up in `git status` is how an
+            // agent ends up staging its own scratch output — or reporting a dirty tree
+            // as evidence of a change it did not make. The pattern goes in the
+            // repository-private `.git/info/exclude` rather than in a tracked
+            // `.gitignore`, because Zuno editing a file the repository's history owns
+            // would land as an unexplained diff in somebody else's next commit. Once
+            // per host: the call spawns git, and the block is idempotent, so a turn
+            // loop would pay for it repeatedly to learn nothing.
+            if let Some(worktree) = worktree.as_deref() {
+                match zuno_paths::ensure_managed_block(worktree, &[zuno_goal::IGNORE_PATTERN]) {
+                    // Silent when nothing changed: re-asserting the same block on every
+                    // session is the normal case and does not need reporting.
+                    Ok(outcome) if outcome.changed() => notes.push(format!(
+                        "excluded `{}` from git in {}",
+                        zuno_goal::IGNORE_PATTERN,
+                        worktree.display()
+                    )),
+                    Ok(_) => {}
+                    // A note, never a failure. Running outside a repository is ordinary,
+                    // and a machine without git still deserves a working session; the
+                    // cost of not writing the block is a generated file the user sees in
+                    // `git status`, which is a nuisance and not a correctness problem.
+                    Err(error) => notes.push(format!(
+                        "warning: could not exclude `{}` from git: {error}",
+                        zuno_goal::IGNORE_PATTERN
+                    )),
+                }
+            }
             let learning = match plan.learning_model.take() {
                 Some(learning_model) if learning_settings.enabled => {
                     let model = learning_model.model;
@@ -3986,7 +4015,10 @@ impl TurnHost {
             )
             .with_deferred_tools(runtime_tools.deferred_tool_ids)
             .with_hooks(Arc::new(
-                super::verification_ledger::VerificationLedger::new(Arc::clone(&database)),
+                super::verification_ledger::VerificationLedger::new(
+                    Arc::clone(&database),
+                    Arc::clone(&goal_store),
+                ),
             ));
             let council_presets = plan
                 .capability
@@ -7278,7 +7310,14 @@ impl TurnHost {
         )
         .with_live_inputs(guard, &self.inbox)
         .with_attachments(Arc::clone(&self.attachments))
-        .with_tool_concurrency(self.tool_concurrency);
+        .with_tool_concurrency(self.tool_concurrency)
+        // Installed on every turn, not only a goal-driven one. The policy is documented
+        // to leave a session with no goal, or a goal with no token budget, alone, so
+        // installing it imposes no limit nobody set — while a conditional install would
+        // mean a budget set mid-session was enforced only after a restart.
+        .with_budget_policy(Arc::new(zuno_goal::GoalBudgetPolicy::new(Arc::clone(
+            &self.goal_store,
+        ))));
         let outcome = self
             .driver
             .drive(
@@ -7761,9 +7800,20 @@ impl TurnHost {
         Ok(())
     }
 
+    /// Rewrite the goal document from durable state.
+    ///
+    /// Writes the criteria with the goal rather than the goal alone: the document is
+    /// what a human reads to see where the run stands, and a checklist that never
+    /// appears there makes an evidence-gated goal look like it is waiting on nothing.
     fn write_goal_projection(&self) -> Result<(), String> {
         if let Some(goal) = self.goal_store.goal(&self.session_id).map_err(to_string)? {
-            self.goal_projection.write(&goal).map_err(to_string)?;
+            let criteria = self
+                .goal_store
+                .criteria(&self.session_id)
+                .map_err(to_string)?;
+            self.goal_projection
+                .write_criteria(&goal, &criteria)
+                .map_err(to_string)?;
         }
         Ok(())
     }

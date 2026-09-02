@@ -6,6 +6,11 @@
 //! only place that turns such a statement into a durable row, and the only place that
 //! hands the model an identifier it can cite later.
 //!
+//! It also expires evidence, which is the same job seen from the other side. A check
+//! proves something about the files as they were when it ran, so a call that writes a
+//! file invalidates every earlier proof. Recording the proof and retiring it belong
+//! together: split apart, the two could disagree about the order of the same call.
+//!
 //! # Why a hook and not the turn loop
 //!
 //! [`zuno_engine::hooks::ToolHooks::after`] is the one seam that sees every completed
@@ -86,15 +91,76 @@ pub(crate) fn receipt_id(session_id: &str, call_id: &str) -> String {
     id
 }
 
-/// Records tool-reported receipts and publishes the id that cites them.
+/// Records tool-reported receipts, publishes the id that cites them, and retires the
+/// evidence a write invalidated.
 pub(crate) struct VerificationLedger {
     database: Arc<zuno_db::pool::Pool>,
+    goals: Arc<zuno_goal::GoalStore>,
 }
 
 impl VerificationLedger {
-    /// Wrap the session database this host already opened.
-    pub(crate) const fn new(database: Arc<zuno_db::pool::Pool>) -> Self {
-        Self { database }
+    /// Wrap the session database and goal store this host already opened.
+    pub(crate) const fn new(
+        database: Arc<zuno_db::pool::Pool>,
+        goals: Arc<zuno_goal::GoalStore>,
+    ) -> Self {
+        Self { database, goals }
+    }
+
+    /// Report a write, and tell the model what proof it just invalidated.
+    ///
+    /// Driven by the paths the tool itself reported, not by a list of writing tool ids:
+    /// [`zuno_tool::METADATA_WRITTEN_PATHS_KEY`] documents why, and a goal that silently
+    /// stopped being gated because a list was never updated is the failure this whole
+    /// mechanism exists to prevent.
+    ///
+    /// Both calls are no-ops for a session with no goal, so no guard query is needed.
+    /// Neither failure is fatal: the write already happened, and refusing the call would
+    /// report a completed edit as a failure. A note says so instead, because a run told
+    /// nothing would go on citing a check that no longer describes the files.
+    fn report_write(&self, session_id: &str, tool: &str, output: &mut ToolOutput) {
+        let written = output.written_paths();
+        if written.is_empty() {
+            return;
+        }
+        let reason = match written.as_slice() {
+            [only] => format!("`{tool}` wrote {only}"),
+            [first, rest @ ..] => format!(
+                "`{tool}` wrote {first} and {count} more",
+                count = rest.len()
+            ),
+            [] => unreachable!("checked above"),
+        };
+        let at_ms = zuno_db::message::now_millis();
+        if let Err(error) = self.goals.escalate_to_change(session_id, &reason, at_ms) {
+            announce(
+                output,
+                "[goal evidence unavailable]",
+                &format!(
+                    "this change could not be recorded against the goal ({error}), so                      completion may not be gated on evidence."
+                ),
+            );
+            return;
+        }
+        match self.goals.mark_mutation(session_id, at_ms) {
+            Ok(0) => {}
+            Ok(reopened) => announce(
+                output,
+                "[goal evidence]",
+                &format!(
+                    "{reopened} satisfied criteri{a} went back to open, because this change                      came after the check that satisfied {it}. Verify again after your last                      edit and cite the new receipt.",
+                    a = if reopened == 1 { "on" } else { "a" },
+                    it = if reopened == 1 { "it" } else { "them" },
+                ),
+            ),
+            Err(error) => announce(
+                output,
+                "[goal evidence unavailable]",
+                &format!(
+                    "evidence recorded before this change could not be retired ({error});                      treat any earlier check as describing files that have since changed."
+                ),
+            ),
+        }
     }
 }
 
@@ -229,6 +295,7 @@ impl ToolHooks for VerificationLedger {
         _args: &serde_json::Value,
         output: &mut ToolOutput,
     ) -> Result<(), String> {
+        self.report_write(session_id, tool, output);
         let reported = match VerificationReceipt::from_metadata(&output.metadata) {
             Ok(None) => return Ok(()),
             Ok(Some(receipt)) => receipt,
@@ -318,6 +385,18 @@ mod tests {
         Arc::new(pool)
     }
 
+    /// A ledger over one in-memory database, with the goal tables attached.
+    fn evidence_ledger(
+        database: &Arc<zuno_db::pool::Pool>,
+    ) -> (VerificationLedger, tempfile::TempDir) {
+        let spill = tempfile::tempdir().expect("spill directory");
+        let goals = Arc::new(
+            zuno_goal::GoalStore::from_pool(Arc::clone(database), spill.path().to_owned())
+                .expect("attach the goal tables"),
+        );
+        (VerificationLedger::new(Arc::clone(database), goals), spill)
+    }
+
     fn output_with(receipt: &VerificationReceipt) -> ToolOutput {
         ToolOutput::text("shell", "ran").with_verification(receipt)
     }
@@ -325,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn a_tool_that_reports_nothing_writes_no_receipt() {
         let database = pool();
-        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let (ledger, _spill) = evidence_ledger(&database);
         let mut output = ToolOutput::text("shell", "ran");
 
         ledger
@@ -351,7 +430,7 @@ mod tests {
     #[tokio::test]
     async fn a_reported_receipt_is_stored_and_its_id_is_published_to_the_model() {
         let database = pool();
-        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let (ledger, _spill) = evidence_ledger(&database);
         let mut output = output_with(&VerificationReceipt::passed("cargo test -p zuno-db"));
 
         ledger
@@ -390,7 +469,7 @@ mod tests {
     #[tokio::test]
     async fn a_replayed_call_keeps_one_receipt_and_one_citable_id() {
         let database = pool();
-        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let (ledger, _spill) = evidence_ledger(&database);
 
         let mut first = output_with(&VerificationReceipt::passed("cargo test"));
         ledger
@@ -437,7 +516,7 @@ mod tests {
     #[tokio::test]
     async fn the_receipt_id_reaches_the_model_in_the_text_and_not_only_the_metadata() {
         let database = pool();
-        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let (ledger, _spill) = evidence_ledger(&database);
         let mut output = output_with(&VerificationReceipt::passed("cargo test -p zuno-db"));
 
         ledger
@@ -468,7 +547,7 @@ mod tests {
     #[tokio::test]
     async fn a_status_that_proves_nothing_says_so_where_the_model_reads_it() {
         let database = pool();
-        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let (ledger, _spill) = evidence_ledger(&database);
         let mut receipt = VerificationReceipt::passed("cargo test | tail -5");
         receipt.exit_authority = ExitAuthority::Derived;
         let mut output = output_with(&receipt);
@@ -500,7 +579,7 @@ mod tests {
     #[tokio::test]
     async fn a_degraded_receipt_offers_the_model_no_id_at_all() {
         let database = pool();
-        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let (ledger, _spill) = evidence_ledger(&database);
         let mut output = ToolOutput::text("shell", "ran");
         output.metadata.insert(
             VERIFICATION_METADATA_KEY.to_owned(),
@@ -533,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn a_derived_exit_status_is_stored_but_proves_nothing() {
         let database = pool();
-        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let (ledger, _spill) = evidence_ledger(&database);
         let mut receipt = VerificationReceipt::passed("cargo test | tail -5");
         receipt.exit_authority = ExitAuthority::Derived;
         let mut output = output_with(&receipt);
@@ -565,7 +644,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_receipt_metadata_degrades_the_claim_without_failing_the_call() {
         let database = pool();
-        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let (ledger, _spill) = evidence_ledger(&database);
         let mut output = ToolOutput::text("shell", "ran");
         output.metadata.insert(
             VERIFICATION_METADATA_KEY.to_owned(),
@@ -601,6 +680,155 @@ mod tests {
         );
     }
 
+    /// The whole chain, across three crates, in one test.
+    ///
+    /// A tool reports a check; the ledger stores it and hands the model an id; the goal
+    /// gate accepts that id as evidence; a later write retires the evidence and says so.
+    /// Each half is unit-tested elsewhere, but only this proves the halves agree about
+    /// the identifier and the clock — and an id that resolves to nothing is exactly as
+    /// useless as no id at all.
+    #[tokio::test]
+    async fn a_recorded_check_satisfies_a_criterion_until_a_later_write_retires_it() {
+        let database = pool();
+        let spill = tempfile::tempdir().expect("spill directory");
+        let goals = Arc::new(
+            zuno_goal::GoalStore::from_pool(Arc::clone(&database), spill.path().to_owned())
+                .expect("attach the goal tables"),
+        );
+        let ledger = VerificationLedger::new(Arc::clone(&database), Arc::clone(&goals));
+        let created = goals
+            .create_goal_with_criteria(
+                "ses_1",
+                "make the tests pass",
+                &["cargo test -p zuno-db succeeds".to_owned()],
+                None,
+            )
+            .expect("create a goal with one criterion");
+        let criterion = created.criteria[0].criterion_id.clone();
+
+        let mut checked = output_with(&VerificationReceipt::passed("cargo test -p zuno-db"));
+        ledger
+            .after(
+                "shell",
+                "ses_1",
+                "call_1",
+                &serde_json::Value::Null,
+                &mut checked,
+            )
+            .await
+            .expect("record the check");
+        let cited = checked
+            .metadata
+            .get(VERIFICATION_METADATA_KEY)
+            .and_then(|value| value.get(RECEIPT_ID_FIELD))
+            .and_then(serde_json::Value::as_str)
+            .expect("an id to cite")
+            .to_owned();
+
+        // Satisfied at the epoch, so the write below is unambiguously later than the
+        // proof: both sides stamp in milliseconds, and a tie would not reopen.
+        goals
+            .satisfy_criterion("ses_1", created.goal.revision, &criterion, &cited, 1)
+            .expect("the goal gate must accept the id the ledger published");
+
+        let mut wrote = ToolOutput::text("edit", "wrote 1 file")
+            .with_written_path(std::path::Path::new("src/main.rs"));
+        ledger
+            .after(
+                "edit",
+                "ses_1",
+                "call_2",
+                &serde_json::Value::Null,
+                &mut wrote,
+            )
+            .await
+            .expect("a write is not a failure");
+
+        assert_eq!(
+            goals.kind("ses_1").expect("read the kind"),
+            zuno_goal::GoalKind::Change,
+            "a goal that wrote a file is no longer a question"
+        );
+        let after = goals.criteria("ses_1").expect("read the criteria");
+        assert_eq!(after[0].status, zuno_goal::GoalCriterionStatus::Open);
+        assert!(
+            after[0].receipt_id.is_none(),
+            "the retired citation must not survive the change it predates"
+        );
+        assert!(
+            wrote.output.contains("went back to open"),
+            "the model must be told its proof expired: {}",
+            wrote.output
+        );
+        assert!(
+            goals
+                .satisfy_criterion(
+                    "ses_1",
+                    goals.goal("ses_1").expect("read").expect("a goal").revision,
+                    &criterion,
+                    &cited,
+                    2,
+                )
+                .is_err(),
+            "the same check must not satisfy the criterion again after the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_that_writes_nothing_leaves_the_goal_a_question() {
+        let database = pool();
+        let spill = tempfile::tempdir().expect("spill directory");
+        let goals = Arc::new(
+            zuno_goal::GoalStore::from_pool(Arc::clone(&database), spill.path().to_owned())
+                .expect("attach the goal tables"),
+        );
+        let ledger = VerificationLedger::new(Arc::clone(&database), Arc::clone(&goals));
+        goals
+            .create_goal_with_criteria("ses_1", "explain the loop", &[], None)
+            .expect("create a goal");
+
+        let mut output = ToolOutput::text("read", "file contents");
+        ledger
+            .after(
+                "read",
+                "ses_1",
+                "call_1",
+                &serde_json::Value::Null,
+                &mut output,
+            )
+            .await
+            .expect("a read is not a mutation");
+
+        assert_eq!(
+            goals.kind("ses_1").expect("read the kind"),
+            zuno_goal::GoalKind::Question,
+            "reading files must not gate a goal that changes nothing"
+        );
+        assert_eq!(output.output, "file contents", "{}", output.output);
+    }
+
+    /// A tool may write outside any goal, and must not be punished for it.
+    #[tokio::test]
+    async fn a_write_in_a_session_with_no_goal_is_silent() {
+        let database = pool();
+        let (ledger, _spill) = evidence_ledger(&database);
+        let mut output = ToolOutput::text("edit", "wrote 1 file")
+            .with_written_path(std::path::Path::new("src/main.rs"));
+
+        ledger
+            .after(
+                "edit",
+                "ses_1",
+                "call_1",
+                &serde_json::Value::Null,
+                &mut output,
+            )
+            .await
+            .expect("no goal is not an error");
+
+        assert_eq!(output.output, "wrote 1 file", "{}", output.output);
+    }
+
     #[test]
     fn a_receipt_id_is_stable_per_call_and_distinct_across_sessions() {
         assert_eq!(receipt_id("ses_1", "call_1"), receipt_id("ses_1", "call_1"));
@@ -619,7 +847,7 @@ mod tests {
     #[tokio::test]
     async fn two_sessions_may_reuse_the_same_call_id() {
         let database = pool();
-        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let (ledger, _spill) = evidence_ledger(&database);
 
         for session in ["ses_1", "ses_2"] {
             let mut output = output_with(&VerificationReceipt::passed("cargo test"));

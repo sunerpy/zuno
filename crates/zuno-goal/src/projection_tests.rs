@@ -719,10 +719,11 @@ fn a_session_id_that_would_escape_the_directory_is_refused() {
 
 #[test]
 fn the_gitignore_snippet_names_the_projection_directory() {
-    assert!(GITIGNORE_SNIPPET.contains(".zuno/goal/"));
+    assert_eq!(IGNORE_PATTERN, ".zuno/goal/");
     assert!(
-        GITIGNORE_SNIPPET.lines().any(|line| line == ".zuno/goal/"),
-        "the pattern must be a line on its own so the snippet can be pasted verbatim"
+        GITIGNORE_SNIPPET.lines().any(|line| line == IGNORE_PATTERN),
+        "the pattern must be a line on its own so the snippet can be pasted verbatim, \
+         and it must be the same pattern the private exclude file gets"
     );
     assert!(
         GITIGNORE_SNIPPET
