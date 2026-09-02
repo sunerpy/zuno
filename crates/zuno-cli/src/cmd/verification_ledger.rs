@@ -15,6 +15,17 @@
 //! be told a check passed without being told how to cite it — and an uncitable receipt
 //! is indistinguishable from an absent one to the goal completion gate.
 //!
+//! # Why the id is written into the output text
+//!
+//! A tool's `metadata` is host-only. The provider request carries a tool result whose
+//! content is the output string and nothing else, so an id published only under
+//! [`zuno_tool::VERIFICATION_METADATA_KEY`] is invisible to the model that has to cite
+//! it. The id therefore goes in both places: the metadata for hosts and the transcript,
+//! and one appended line for the model. That line also states whether the receipt may
+//! be cited at all, because a passing exit status from a pipeline that swallows failure
+//! is recorded but is not proof, and the distinction is worthless if only the host can
+//! see it.
+//!
 //! # Why a ledger failure is not a tool failure
 //!
 //! Returning an error from the `after` hook converts a successful result into a failed
@@ -34,7 +45,9 @@ use std::sync::Arc;
 
 use sha2::{Digest as _, Sha256};
 use zuno_engine::hooks::ToolHooks;
-use zuno_tool::{ToolOutput, VERIFICATION_METADATA_KEY, VerificationReceipt};
+use zuno_tool::{
+    ExitAuthority, ReceiptOutcome, ToolOutput, VERIFICATION_METADATA_KEY, VerificationReceipt,
+};
 
 /// Prefix on every receipt id, so a citation is recognizable in prose.
 const RECEIPT_ID_PREFIX: &str = "rcp_";
@@ -115,15 +128,87 @@ const fn stored_outcome(
     }
 }
 
+/// The tag that opens the appended line, so a citation is findable in a transcript.
+const RECEIPT_NOTE_TAG: &str = "verification";
+
+/// What the model is told when the receipt is usable as proof.
+const CITABLE: &str = "Cite this id as evidence that the check passed.";
+
+/// What the model is told when it is not.
+const NOT_CITABLE: &str = "Recorded, but this proves nothing and cannot be cited as evidence.";
+
+/// How much the exit status is worth, in the words the model reads.
+const fn describe_authority(authority: ExitAuthority) -> &'static str {
+    match authority {
+        ExitAuthority::Authoritative => "authoritative",
+        ExitAuthority::Derived => "derived, so it may not reflect every stage",
+        ExitAuthority::Absent => "no exit status",
+    }
+}
+
+/// What the call decided, in the words the model reads.
+const fn describe_outcome(outcome: ReceiptOutcome) -> &'static str {
+    match outcome {
+        ReceiptOutcome::Passed => "passed",
+        ReceiptOutcome::Failed => "failed",
+        ReceiptOutcome::Unknown => "undecided",
+    }
+}
+
+/// Append one line to the text the model will read.
+///
+/// Appended rather than prepended so the tool's own output still leads: the line is a
+/// footnote about the call, not a replacement for what the call said.
+fn announce(output: &mut ToolOutput, headline: &str, verdict: &str) {
+    if !output.output.is_empty() {
+        output.output.push_str("\n\n");
+    }
+    output.output.push_str(headline);
+    output.output.push(' ');
+    output.output.push_str(verdict);
+}
+
+/// Announce a stored receipt and say whether it may be cited.
+fn announce_stored(output: &mut ToolOutput, id: &str, receipt: &VerificationReceipt) {
+    let authority = describe_authority(receipt.exit_authority);
+    let status = match receipt.exit_code {
+        Some(code) => format!("exit {code}, {authority}"),
+        None => authority.to_owned(),
+    };
+    let headline = format!(
+        "[{RECEIPT_NOTE_TAG} {id}] {outcome}: {summary} ({status}).",
+        outcome = describe_outcome(receipt.outcome),
+        summary = receipt.summary,
+    );
+    let verdict = if receipt.proves_success() {
+        CITABLE
+    } else {
+        NOT_CITABLE
+    };
+    announce(output, &headline, verdict);
+}
+
 /// Replace a published receipt with one that proves nothing, and say why.
 ///
-/// The summary survives so the tool result still describes what ran. The id does not
-/// appear, because there is no stored row to cite.
+/// The summary survives so the tool result still describes what ran. No id appears in
+/// the metadata or in the appended line, because there is no stored row to cite, and a
+/// model told to cite a row that does not exist would produce a dangling citation that
+/// the completion gate cannot tell from a fabricated one.
 fn degrade(output: &mut ToolOutput, summary: String, reason: String) {
     let receipt = VerificationReceipt::unknown(summary, reason);
+    let headline = format!(
+        "[{RECEIPT_NOTE_TAG} unavailable] {summary}: {reason}.",
+        summary = receipt.summary,
+        reason = receipt.detail.as_deref().unwrap_or("no reason recorded"),
+    );
     output.metadata.insert(
         VERIFICATION_METADATA_KEY.to_owned(),
         receipt.to_metadata_value(),
+    );
+    announce(
+        output,
+        &headline,
+        "No receipt was recorded, so this cannot be cited as evidence.",
     );
 }
 
@@ -190,8 +275,12 @@ impl ToolHooks for VerificationLedger {
                 if let Some(serde_json::Value::Object(published)) =
                     output.metadata.get_mut(VERIFICATION_METADATA_KEY)
                 {
-                    published.insert(RECEIPT_ID_FIELD.to_owned(), serde_json::Value::String(id));
+                    published.insert(
+                        RECEIPT_ID_FIELD.to_owned(),
+                        serde_json::Value::String(id.clone()),
+                    );
                 }
+                announce_stored(output, &id, &reported);
                 Ok(())
             }
             Ok(Err(error)) => {
@@ -337,6 +426,107 @@ mod tests {
         assert!(
             !receipts[0].proves_success(),
             "the later, failing observation is the one that counts"
+        );
+    }
+
+    /// The provider request carries the output string, not the metadata.
+    ///
+    /// This is the whole reason the id is appended to the text: a receipt the model
+    /// cannot read is a receipt it cannot cite, and an uncitable receipt fails the
+    /// completion gate exactly like a missing one.
+    #[tokio::test]
+    async fn the_receipt_id_reaches_the_model_in_the_text_and_not_only_the_metadata() {
+        let database = pool();
+        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let mut output = output_with(&VerificationReceipt::passed("cargo test -p zuno-db"));
+
+        ledger
+            .after(
+                "shell",
+                "ses_1",
+                "call_1",
+                &serde_json::Value::Null,
+                &mut output,
+            )
+            .await
+            .expect("recording a receipt");
+
+        let id = receipt_id("ses_1", "call_1");
+        assert!(
+            output.output.contains(&id),
+            "the model reads only the output string: {}",
+            output.output
+        );
+        assert!(output.output.contains(CITABLE), "{}", output.output);
+        assert!(
+            output.output.starts_with("ran"),
+            "the tool's own output must still lead: {}",
+            output.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_status_that_proves_nothing_says_so_where_the_model_reads_it() {
+        let database = pool();
+        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let mut receipt = VerificationReceipt::passed("cargo test | tail -5");
+        receipt.exit_authority = ExitAuthority::Derived;
+        let mut output = output_with(&receipt);
+
+        ledger
+            .after(
+                "shell",
+                "ses_1",
+                "call_1",
+                &serde_json::Value::Null,
+                &mut output,
+            )
+            .await
+            .expect("recording a receipt");
+
+        assert!(output.output.contains(NOT_CITABLE), "{}", output.output);
+        assert!(
+            !output.output.contains(CITABLE),
+            "a derived status must never invite a citation: {}",
+            output.output
+        );
+        assert!(
+            output.output.contains("derived"),
+            "the model is told why: {}",
+            output.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_degraded_receipt_offers_the_model_no_id_at_all() {
+        let database = pool();
+        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let mut output = ToolOutput::text("shell", "ran");
+        output.metadata.insert(
+            VERIFICATION_METADATA_KEY.to_owned(),
+            serde_json::json!({ "outcome": 7 }),
+        );
+
+        ledger
+            .after(
+                "shell",
+                "ses_1",
+                "call_1",
+                &serde_json::Value::Null,
+                &mut output,
+            )
+            .await
+            .expect("a malformed claim is not a failed call");
+
+        assert!(
+            !output.output.contains(RECEIPT_ID_PREFIX),
+            "there is no stored row, so the model must be offered nothing to cite: {}",
+            output.output
+        );
+        assert!(
+            output.output.contains("cannot be cited as evidence"),
+            "{}",
+            output.output
         );
     }
 
