@@ -154,6 +154,21 @@ in the receipt. `sh` is treated as unknown on purpose, since the name does not s
 what is behind it. PowerShell has no equivalent, so only `all` is authoritative
 there.
 
+The configuration is only the starting point. Zuno also reads the command's own
+text, because text that runs inside an authoritative shell can take the guarantee
+apart: `cargo test || true` exits zero whatever the tests did, `set +e` turns the
+prologue's option back off, `bash -c '…'` runs under its own options, a check
+written as an `if` or `while` condition exits zero when that check fails, a loop
+reports only its last iteration, and under `all` a `&&` chain before the last
+statement is exempt from `set -e`. In PowerShell, one native command piped into
+another leaves `$LASTEXITCODE` holding the second one's code alone.
+
+None of this changes what runs. The command executes exactly as written, and a
+`||` fallback is meant to win. What changes is the claim: it drops to `derived`
+with a limitation naming the construct and the remedy. The reading is a syntax
+tree rather than a search for characters, so `echo 'run tests || true'` masks
+nothing and keeps the configuration's verdict.
+
 A stored receipt is addressed by an id that appears in the tool result as
 `[verification rcp_…]`. That id, not a recollection of the transcript, is what
 satisfies a Goal completion criterion that requires evidence.

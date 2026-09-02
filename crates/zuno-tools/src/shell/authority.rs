@@ -11,6 +11,13 @@
 //! never saw our `pipefail`. Under `pipefail`, which sets no `-e`, a two-statement
 //! script reports only the second statement's status.
 //!
+//! `set -e` is narrower than it reads, too. POSIX exempts every member of an `&&` or
+//! `||` list but the last, and the exempt member is exactly the one that failed when
+//! the list short-circuits, so `cargo build && cargo test` followed by anything else
+//! exits on that other statement's status. An `if` or `case` whose condition fails or
+//! whose patterns miss exits zero under every policy, and a loop reports its last
+//! iteration. None of those are pipelines, so `pipefail` does not see them either.
+//!
 //! None of those are bugs in the wrapper. [`super::posix_script`] deliberately
 //! keeps the caller's command at the same shell level so their `set`, `trap`, `cd`
 //! and `exec` behave exactly as they would without us, and a command that turns an
@@ -155,8 +162,22 @@ fn posix_limitation(root: Node<'_>, source: &[u8], policy: ExitPolicy) -> Option
              reflected in this exit status"
         ));
     }
-    // `all` prepends `set -e`, which aborts the list at the first failing statement,
-    // so a multi-statement script is covered there and only `pipefail` is exposed.
+    if let Some(limitation) = find_masked_compound(root, source, policy) {
+        return Some(limitation);
+    }
+    // `all` prepends `set -e`, which stops a plain list at the first failing statement.
+    // It does not stop for a failure inside an `&&`/`||` list, and when such a list is
+    // not the last statement its status is discarded, so the failure leaves nothing
+    // behind. Under `pipefail` the rule below already covers the same text.
+    if matches!(policy, ExitPolicy::All)
+        && let Some(list) = find_nonfinal_and_or_list(root, source)
+    {
+        return Some(format!(
+            "the command runs `{list}` before its last statement, and `set -e` does not stop for \
+             a failure inside an `&&` or `||` list, so that failure is not reflected in this exit \
+             status; make the guarded work the last statement, or run one statement per call"
+        ));
+    }
     if matches!(policy, ExitPolicy::Pipefail) && statement_count(root) > 1 {
         return Some(format!(
             "the command runs more than one statement and exitPolicy \"{}\" reports only the last \
@@ -178,12 +199,195 @@ fn posix_limitation(root: Node<'_>, source: &[u8], policy: ExitPolicy) -> Option
 /// exited non-zero leaves nothing behind for that final check to find. One
 /// statement has nothing earlier to lose, which is why the count is the test.
 fn powershell_limitation(root: Node<'_>, source: &[u8]) -> Option<String> {
-    let _ = source;
-    (statement_count(root) > 1).then(|| {
-        "the command runs more than one statement and only the last one's `$LASTEXITCODE` is \
-         re-raised, so an earlier native command's failure is not reflected in this exit status; \
-         run one statement per call to have the status decide"
-            .to_owned()
+    if statement_count(root) > 1 {
+        return Some(
+            "the command runs more than one statement and only the last one's `$LASTEXITCODE` is \
+             re-raised, so an earlier native command's failure is not reflected in this exit \
+             status; run one statement per call to have the status decide"
+                .to_owned(),
+        );
+    }
+    find_uncovered_pipeline(root, source)
+}
+
+/// The first `|` pipeline whose earlier stages `$LASTEXITCODE` cannot carry.
+///
+/// One statement has no earlier *statement* to lose, but a pipeline is one statement
+/// with several commands in it, and `$LASTEXITCODE` holds the last native command's
+/// code alone: `cargo test 2>&1 | findstr FAIL` reports what `findstr` did about the
+/// output, never what `cargo` did about the tests.
+///
+/// A cmdlet is a different matter. `$ErrorActionPreference = 'Stop'` promotes its
+/// errors to terminating ones, which end the script whatever position it sits in, so
+/// `Get-Content log | Select-String fail` is covered. Only a hyphenated name is
+/// reliably a cmdlet rather than a native command or an alias, so the pipeline is
+/// reported when two or more stages could be native and left alone when at most one
+/// could be — the last of which is the stage the re-raise does see.
+fn find_uncovered_pipeline(root: Node<'_>, source: &[u8]) -> Option<String> {
+    first_match(root, &mut |node| {
+        if !pipes_into_a_stage(node, source) {
+            return None;
+        }
+        let stages = pipeline_stage_programs(node, source);
+        let native = stages.iter().filter(|name| !name.contains('-')).count();
+        (native > 1).then(|| {
+            "the command pipes one native command into another and `$LASTEXITCODE` holds only the \
+             last one's code, so an earlier stage's failure is not reflected in this exit status; \
+             run the check without a pipeline, or read the output"
+                .to_owned()
+        })
+    })
+}
+
+/// Whether `node` joins stages with a literal `|`.
+///
+/// Read off the operator token rather than the node's kind, because the two grammars
+/// disagree about which named node owns a pipe and a wrong kind name would silently
+/// find nothing. A `|` inside a string is part of that string's node and has no token
+/// of its own, which is the whole reason this reads the tree instead of the text.
+fn pipes_into_a_stage(node: Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| !child.is_named() && child.utf8_text(source).is_ok_and(|text| text == "|"))
+}
+
+/// The program each stage of `pipeline` names, lowercased, in source order.
+fn pipeline_stage_programs(pipeline: Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut cursor = pipeline.walk();
+    pipeline
+        .named_children(&mut cursor)
+        .filter_map(first_command)
+        .filter_map(|command| {
+            command_words(command, source)
+                .first()
+                .map(|word| program_name(word).to_ascii_lowercase())
+        })
+        .collect()
+}
+
+/// The first `command` node at or under `node`.
+fn first_command<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+    if node.kind() == "command" {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    let children = node.children(&mut cursor).collect::<Vec<_>>();
+    children.into_iter().find_map(first_command)
+}
+
+/// The first compound statement whose own status cannot report a failure inside it.
+///
+/// The condition of an `if`, a `while` or an `until` is exempt from `set -e`, and its
+/// failure is how the construct normally ends, so a check written there reports zero
+/// either way; a `case` that matches no pattern exits zero for the same reason. A
+/// `for` loop reports its last iteration alone, which under `pipefail` hides every
+/// earlier one, while under `all` `set -e` stops in the body at the first failure —
+/// unless the body guards that work with `&&` or `||`, which `-e` exempts.
+///
+/// A construct that re-raises — `if ! cargo test; then exit 1; fi` — is left alone.
+/// Its author has already made the failure the command's status, and telling them
+/// otherwise is how a reader learns to skip the limitation text.
+fn find_masked_compound(root: Node<'_>, source: &[u8], policy: ExitPolicy) -> Option<String> {
+    outcome_statements(root).into_iter().find_map(|statement| {
+        let reason = match statement.kind() {
+            "if_statement" => {
+                "the command's outcome is an `if`, which exits zero when its condition fails and \
+                 when no branch runs, so a check written as that condition reports success either \
+                 way"
+            }
+            "while_statement" | "until_statement" => {
+                "the command's outcome is a loop, which exits zero when its condition fails, so a \
+                 check written as that condition reports success either way"
+            }
+            "case_statement" => {
+                "the command's outcome is a `case`, which exits zero when no pattern matches, so \
+                 nothing inside it need have run"
+            }
+            "for_statement" | "c_style_for_statement" => match policy {
+                ExitPolicy::Pipefail => {
+                    "the command's outcome is a loop, which reports only its last iteration, so an \
+                     earlier iteration's failure is not reflected in this exit status"
+                }
+                ExitPolicy::All if contains_and_or_list(statement) => {
+                    "the command's outcome is a loop whose body guards work with `&&` or `||`, \
+                     which `set -e` does not stop for, so an earlier iteration's failure is not \
+                     reflected in this exit status"
+                }
+                // `set -e` stops in the body at the first failing statement, so the loop's
+                // own status is the honest one here. `last` never reaches this module: that
+                // configuration is derived before any text is read.
+                ExitPolicy::All | ExitPolicy::Last => return None,
+            },
+            _ => return None,
+        };
+        if re_raises_a_failure(statement, source) {
+            return None;
+        }
+        Some(format!(
+            "{reason}; run the check as its own call to have the status decide, or read the output"
+        ))
+    })
+}
+
+/// Whether the caller wrote an explicit re-raise anywhere inside `node`.
+///
+/// `exit`, `return` with a failing code, and `false` are how a compound hands its own
+/// failure back to the shell. Asked of the whole subtree rather than of the branch
+/// that will run, because which branch runs is not knowable here and one re-raise is
+/// enough to show the author is not resting on the construct's own status.
+fn re_raises_a_failure(node: Node<'_>, source: &[u8]) -> bool {
+    first_match(node, &mut |node| {
+        (node.kind() == "command" && propagates_failure(&command_words(node, source)))
+            .then(|| "re-raised".to_owned())
+    })
+    .is_some()
+}
+
+/// The statements whose status the shell could report as this command's own.
+///
+/// The outermost list the caller wrote, with `&&`/`||` chains opened up, because a
+/// compound sitting in one of those decides the command's outcome just as much as one
+/// written on its own line. A compound nested deeper — inside a function body, a
+/// subshell or another compound — is reached through the statement that contains it,
+/// and that statement is the one whose status the caller will read.
+fn outcome_statements<'tree>(root: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut statements = Vec::new();
+    for statement in outermost_statements(root) {
+        push_outcome(statement, &mut statements);
+    }
+    statements
+}
+
+/// Adds `statement`, or the members of the `&&`/`||` chain it is, to `statements`.
+fn push_outcome<'tree>(statement: Node<'tree>, statements: &mut Vec<Node<'tree>>) {
+    if statement.kind() == "list" {
+        for member in named_statements(statement) {
+            push_outcome(member, statements);
+        }
+        return;
+    }
+    statements.push(statement);
+}
+
+/// Whether an `&&` or `||` list appears anywhere under `node`.
+fn contains_and_or_list(node: Node<'_>) -> bool {
+    if node.kind() == "list" {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let children = node.children(&mut cursor).collect::<Vec<_>>();
+    children.into_iter().any(contains_and_or_list)
+}
+
+/// The first `&&`/`||` list the caller wrote before their last statement, as written.
+fn find_nonfinal_and_or_list(root: Node<'_>, source: &[u8]) -> Option<String> {
+    let statements = outermost_statements(root);
+    let (_, earlier) = statements.split_last()?;
+    earlier.iter().find_map(|statement| {
+        if statement.kind() != "list" {
+            return None;
+        }
+        Some(summarize(statement.utf8_text(source).ok()?.trim()))
     })
 }
 
@@ -193,12 +397,17 @@ fn powershell_limitation(root: Node<'_>, source: &[u8]) -> Option<String> {
 /// wraps the root in a list of one does not read as one statement when that
 /// statement is itself a list of several. Comments do not count.
 fn statement_count(node: Node<'_>) -> usize {
+    outermost_statements(node).len()
+}
+
+/// The statements of the outermost list the caller wrote, in source order.
+fn outermost_statements<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
     let mut current = node;
     loop {
         let statements = named_statements(current);
         match statements.len() {
             1 if STATEMENT_CONTAINERS.contains(&statements[0].kind()) => current = statements[0],
-            count => return count,
+            _ => return statements,
         }
     }
 }
@@ -510,6 +719,70 @@ mod tests {
     }
 
     #[test]
+    fn a_check_written_as_a_condition_is_reported_rather_than_trusted() {
+        for policy in [ExitPolicy::Pipefail, ExitPolicy::All] {
+            let limitation =
+                posix(policy, "if cargo test; then echo ok; fi").expect("condition is exempt");
+            assert!(limitation.contains("an `if`"), "{limitation}");
+            assert!(limitation.contains("condition fails"), "{limitation}");
+
+            let loop_ = posix(policy, "while cargo test; do echo again; done")
+                .expect("condition is exempt");
+            assert!(loop_.contains("condition fails"), "{loop_}");
+
+            let case = posix(policy, "case \"$1\" in build) cargo build ;; esac")
+                .expect("no pattern need match");
+            assert!(case.contains("a `case`"), "{case}");
+        }
+
+        // A construct whose author re-raised the failure already reports it.
+        for command in [
+            "if ! cargo test; then exit 1; fi",
+            "if cargo test; then echo ok; else exit 1; fi",
+            "case \"$1\" in build) cargo build ;; *) exit 2 ;; esac",
+        ] {
+            assert_eq!(posix(ExitPolicy::All, command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_loop_is_reported_when_the_policy_cannot_stop_inside_its_body() {
+        let each = "for crate in zuno-goal zuno-tools; do cargo test -p $crate; done";
+        let limitation = posix(ExitPolicy::Pipefail, each).expect("only the last iteration");
+        assert!(limitation.contains("last iteration"), "{limitation}");
+        // `set -e` stops in the body at the first failure, so the loop's status is honest.
+        assert_eq!(posix(ExitPolicy::All, each), None);
+
+        let guarded = "for crate in zuno-goal zuno-tools; do cargo build -p $crate && cargo test \
+                       -p $crate; done";
+        let limitation = posix(ExitPolicy::All, guarded).expect("`set -e` exempts the list");
+        assert!(limitation.contains("`&&` or `||`"), "{limitation}");
+    }
+
+    #[test]
+    fn a_guarded_list_before_the_last_statement_is_reported_under_all() {
+        let command = "cargo build && cargo test; echo done";
+        let limitation = posix(ExitPolicy::All, command).expect("`set -e` exempts the list");
+        assert!(
+            limitation.contains("cargo build && cargo test"),
+            "{limitation}"
+        );
+        assert!(
+            limitation.contains("before its last statement"),
+            "{limitation}"
+        );
+        // Under `pipefail` the same text is already covered by the statement count.
+        let counted = posix(ExitPolicy::Pipefail, command).expect("only the last statement");
+        assert!(counted.contains("more than one statement"), "{counted}");
+
+        // A list that *is* the last statement is the status the shell reports.
+        assert_eq!(
+            posix(ExitPolicy::All, "cargo build; cargo test && echo ok"),
+            None
+        );
+    }
+
+    #[test]
     fn powershell_admits_that_only_the_last_statement_is_re_raised() {
         let single = text_limitation(
             CommandShellKind::PowerShell,
@@ -525,6 +798,31 @@ mod tests {
         )
         .expect("only the last statement");
         assert!(limitation.contains("$LASTEXITCODE"), "{limitation}");
+    }
+
+    #[test]
+    fn powershell_reports_a_pipeline_the_single_re_raise_cannot_carry() {
+        let piped = text_limitation(
+            CommandShellKind::PowerShell,
+            ExitPolicy::All,
+            "cargo test | findstr FAIL",
+        )
+        .expect("only the last native command");
+        assert!(piped.contains("$LASTEXITCODE"), "{piped}");
+        assert!(piped.contains("native command"), "{piped}");
+
+        // A cmdlet's failure is a terminating error under `$ErrorActionPreference`,
+        // so a pipeline with one native command at most is left alone.
+        for command in [
+            "cargo test | Select-Object -First 5",
+            "Get-Content build.log | Select-String fail",
+        ] {
+            assert_eq!(
+                text_limitation(CommandShellKind::PowerShell, ExitPolicy::All, command),
+                None,
+                "{command}"
+            );
+        }
     }
 
     #[test]

@@ -2076,12 +2076,29 @@ mod tests {
                 ),
             ]
         );
+        // The configuration is authoritative, so a command with a single native
+        // program in it earns the full claim.
         assert_eq!(
-            contract(CommandShellKind::PowerShell, "pwsh", ExitPolicy::All),
+            exit_contract(
+                CommandShellKind::PowerShell,
+                "pwsh",
+                ExitPolicy::All,
+                "cargo test --workspace"
+            ),
             ExitContract {
                 authority: ExitAuthority::Authoritative,
                 limitation: None,
             }
+        );
+        // `PIPELINE` is the exception the one re-raise cannot cover: `$LASTEXITCODE`
+        // holds `tail`'s code, and `cargo`'s is gone by the time the script reads it.
+        let piped = contract(CommandShellKind::PowerShell, "pwsh", ExitPolicy::All);
+        assert_eq!(piped.authority, ExitAuthority::Derived);
+        assert!(
+            piped
+                .limitation
+                .is_some_and(|reason| reason.contains("holds only the last one's code")),
+            "the first native stage's status has to be admitted as lost"
         );
     }
 

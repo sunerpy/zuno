@@ -1173,6 +1173,34 @@ fn durable_state_guides_document_evidence_gated_completion() {
 /// precondition are written down for a human, and a page that named the key without
 /// its precondition would send someone to turn `strict` on in a repository with no
 /// index and conclude the gate does nothing.
+/// The receipt's authority is the one shell fact a caller acts on, and the text-level
+/// downgrade is invisible from the configuration table above it. A guide that stops at
+/// `exitPolicy` teaches a reader to expect `authoritative` and read `derived` as a bug.
+#[test]
+fn tool_guides_explain_what_the_command_s_own_text_takes_back() {
+    contains_all(
+        "docs/guide/tools.md",
+        &[
+            "can take the guarantee",
+            "written as an `if` or `while` condition exits zero when that check fails",
+            "a `&&` chain before the last",
+            "`$LASTEXITCODE` holding the second one's code alone",
+            "What changes is the claim: it drops to `derived`",
+            "nothing and keeps the configuration's verdict",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/tools.md",
+        &[
+            "因为跑在一个权威 shell 里的文本同样可以",
+            "循环只报告最后一次迭代",
+            "`$LASTEXITCODE` 里只剩后者的退出码",
+            "它降为 `derived`",
+            "什么都没掩盖",
+        ],
+    );
+}
+
 #[test]
 fn configuration_reference_documents_the_navigation_gate() {
     contains_all(
