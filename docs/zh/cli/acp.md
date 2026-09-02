@@ -22,6 +22,16 @@ mode。反向切换 Mode 也会选择对应 Agent，并同时发送 `current_mod
 运行中的 ACP 会话会订阅统一 Skill catalog generation。新增、修改、删除或重命名
 Skill 后，会发送新的 `available_commands_update`，无需重启会话。
 
+## Goal 续跑
+
+`/goal <目标>` 是“原生控制 + 自主执行”，不是只返回一行 Goal JSON。Zuno 先持久化
+类型化命令结果，随后立即通过共享 driver 推进 active Goal。新会话会把目标经由持久
+inbox 准入为首个 user turn；字面的斜杠命令不会发送给 provider。
+
+`session/load` 与 `session/resume` 会重建会话运行时并自动恢复 active 根 Goal，不需要
+额外发送一条提示词。对于 0.6.0 已写入 active Goal、但没有 user message 的会话，同一
+恢复路径会先补齐 durable user anchor 再续跑。
+
 ## 进程环境与代理
 
 编辑器在 custom Agent `env` 中设置的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与

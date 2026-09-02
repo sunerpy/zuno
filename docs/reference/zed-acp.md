@@ -243,7 +243,9 @@ Plan to the current Goal for multi-stage work. An atomic objective leaves an
 already terminal historical Plan attached to its original Goal. The command output is projected
 as an ordinary Agent message rather than as reasoning. Invalid arguments to an
 explicit action are returned as JSON-RPC invalid params, not as an internal
-session error.
+session error. A successful create or edit then advances the active Goal
+immediately. On a fresh session Zuno durably admits the objective as the first
+user turn anchor; the literal slash command never enters provider input.
 
 `/plan` toggles between Build and Plan. `/start-plan` enters the read-only Plan
 mode directly, while `/start-work` returns to Build. Leaving Plan requires a
@@ -391,16 +393,18 @@ disposed in reverse order. Commands, environment values, and headers are never s
 unadvertised; Zuno handles file and Shell work through its own tools, permission
 policy, and sandbox.
 
-Restoring a thread is deliberately cold. `session/load` and `session/resume`
-validate the session and complete client MCP declaration, expose selectors, and
-publish commands without starting a `TurnHost`. The first prompt performs the
-transactional activation. A later load or resume rebuilds process resources
-from the newly supplied complete list; it never reuses an earlier client MCP
-process. Load replay is bounded to the newest 512 retained messages, a 16 MiB
-stored-part and total projection budget, and an 8 MiB per-update frame. Zuno
-emits an omission notice when history exceeds those bounds. Stored part blobs
-are sized in SQLite before JSON hydration, so an oversized tool output is not
-first loaded into process memory and then discarded.
+Restoring a thread rebuilds its `TurnHost` and the complete configured and
+client-provided MCP set before publication. A later load or resume rebuilds
+process resources from the newly supplied complete list; it never reuses an
+earlier client MCP process. After replay and command publication, an active root
+Goal is scheduled through the detached continuation path without requiring
+another prompt. This includes older sessions that have a durable active Goal but
+no user message: the objective is first persisted as the user turn anchor.
+Load replay is bounded to the newest 512 retained messages, a 16 MiB stored-part
+and total projection budget, and an 8 MiB per-update frame. Zuno emits an
+omission notice when history exceeds those bounds. Stored part blobs are sized
+in SQLite before JSON hydration, so an oversized tool output is not first loaded
+into process memory and then discarded.
 
 Historical file references are not trusted merely because they were durable.
 Only existing regular files that canonicalize inside the project worktree
@@ -461,11 +465,12 @@ Closing or hiding Zed's Agent panel does not necessarily send
 `session/close`. Zed may keep its external-Agent process and workspace thread
 selection alive in the background.
 
-Current Zuno versions make a restored session dormant until its first prompt,
-deduplicate repeated load replay, bound transcript replay, filter stale
-actionable file paths, and cap one ACP connection at 32 open sessions. These
-protections keep Zuno from eagerly reconnecting MCP servers or replaying an
-unbounded historical transcript merely because Zed restored a thread.
+Current Zuno versions replace the prior process-local runtime on each explicit
+load or resume, deduplicate repeated load replay, bound transcript replay,
+filter stale actionable file paths, and cap one ACP connection at 32 open
+sessions. An active durable Goal is expected to resume after restoration, so
+provider or tool activity at that point is work continuation rather than a
+panel-rendering side effect.
 
 If the problem persists:
 

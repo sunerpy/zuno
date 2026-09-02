@@ -337,7 +337,18 @@ impl ProductionAcpAgent {
             return Err(error);
         }
         match session.lifecycle_response().await {
-            Ok(response) => Ok(response),
+            Ok(response) => match session.has_active_goal().await {
+                Ok(true) => {
+                    session.spawn_goal_recovery();
+                    Ok(response)
+                }
+                Ok(false) => Ok(response),
+                Err(error) => {
+                    self.state.sessions.lock().await.remove(&session_id);
+                    let _shutdown = session.shutdown().await;
+                    Err(error)
+                }
+            },
             Err(error) => {
                 self.state.sessions.lock().await.remove(&session_id);
                 let _shutdown = session.shutdown().await;
@@ -654,6 +665,7 @@ struct DormantSession {
 
 struct SessionResources {
     host: TurnHost,
+    detached_observer: Arc<dyn DetachedTurnObserver>,
     skill_updates: Option<tokio::task::JoinHandle<()>>,
     mcp: Option<McpRuntime>,
     subagents: Option<super::acp_subagent::AcpSubagentBridge>,
@@ -881,7 +893,7 @@ async fn open_session_resources(
             runs,
             mcp: mcp.as_ref().map(McpRuntime::catalog),
             child_observer,
-            detached_observer: Some(detached_observer),
+            detached_observer: Some(Arc::clone(&detached_observer)),
         },
     )
     .await;
@@ -1031,6 +1043,7 @@ async fn open_session_resources(
         .map(super::acp_subagent::AcpSubagentBridge::flush_handle);
     Ok(SessionResources {
         host,
+        detached_observer,
         skill_updates: Some(skill_updates),
         mcp,
         subagents,
@@ -1109,6 +1122,103 @@ fn persist_dormant_configuration(
 }
 
 impl AcpSession {
+    async fn has_active_goal(&self) -> Result<bool, zuno_acp::RpcError> {
+        let resources = self.resources.lock().await;
+        let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
+        Ok(resources
+            .host
+            .goal_store()
+            .goal(&self.id)
+            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
+            .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active))
+    }
+
+    fn spawn_goal_recovery(self: &Arc<Self>) {
+        let session = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = session.recover_active_goal().await {
+                tracing::warn!(
+                    session_id = session.id,
+                    %error,
+                    "ACP active Goal recovery stopped"
+                );
+            }
+        });
+    }
+
+    async fn recover_active_goal(&self) -> Result<(), String> {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let observer = {
+            let resources = self.resources.lock().await;
+            Arc::clone(
+                &resources
+                    .as_ref()
+                    .ok_or_else(|| format!("session {} is closed", self.id))?
+                    .detached_observer,
+            )
+        };
+        loop {
+            let active = match ActivePrompt::begin(&self.prompt_active) {
+                Ok(active) => active,
+                Err(_) => {
+                    // A prompt that won the race owns the same continuation path.
+                    return Ok(());
+                }
+            };
+            let (events, mut receiver) = event_channel();
+            let drive = async {
+                let mut resources = self.resources.lock().await;
+                let resources = resources
+                    .as_mut()
+                    .ok_or_else(|| format!("session {} is closed", self.id))?;
+                let continued = resources
+                    .host
+                    .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
+                    .await;
+                drop(events);
+                continued
+            };
+            let project = async {
+                while let Some(event) = receiver.recv().await {
+                    observer.event(&self.id, &event).await;
+                }
+            };
+            let (continued, ()) = tokio::join!(drive, project);
+            let continued = continued?;
+            drop(active);
+            if !continued {
+                break;
+            }
+            if self.closed.load(Ordering::Acquire) {
+                break;
+            }
+            // Retry polls and multi-turn Goals release the prompt gate between
+            // driver steps so newly admitted user input can take priority.
+            tokio::task::yield_now().await;
+        }
+        let work = {
+            let resources = self.resources.lock().await;
+            resources
+                .as_ref()
+                .ok_or_else(|| format!("session {} is closed", self.id))?
+                .host
+                .work_state()
+        };
+        match work {
+            Ok(work) => observer.work_state(&self.id, &work).await,
+            Err(error) => {
+                tracing::debug!(
+                    session_id = self.id,
+                    %error,
+                    "failed to read recovered Goal work state for ACP projection"
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn delete_durable(
         &self,
         cleanup_derived_experiences: bool,

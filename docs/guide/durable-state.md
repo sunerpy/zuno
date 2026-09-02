@@ -93,6 +93,17 @@ also reconcile an active Plan: a multi-stage objective archives the previous vis
 and installs a new root bound to the current `goal_id`. An atomic objective may terminalize
 stale unfinished work without rebinding an already terminal historical Plan.
 
+Creating or editing an active Goal is an execution command, not a status-only write. After
+the native command reaches its terminal event, the shared Goal driver immediately prepares
+the next autonomous turn. If the session has no earlier user message, Zuno first admits the
+user-provided objective through the durable FIFO inbox and persists it as the initial user
+turn anchor. The literal `/goal ...` control text never enters provider input.
+
+ACP `session/load` and `session/resume` also inspect the durable Goal after rebuilding the
+session runtime. An active Goal resumes in the background without requiring a sacrificial
+prompt. This also repairs sessions created by older releases that persisted an active Goal
+but stopped before admitting the first user turn.
+
 Known action names take precedence when they are the first token: `show`, `get`, `status`,
 `history`, `create`, `edit`, `pause`, `resume`, `block`, `complete`, `cancel`, and `help`.
 If an objective itself starts with one of those words, use `/goal create <objective>` or

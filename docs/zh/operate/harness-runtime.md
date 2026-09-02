@@ -93,6 +93,14 @@ session 级联删除，并进入 session export/import、sanitize 与 prune。TU
 
 活跃的 Goal 会持续推进，直到它完成、被显式暂停或阻塞、达到预算上限，或遇到类型化的永久失败。
 
+原生 `/goal <目标>` 创建或编辑成功后，会把这次宿主命令标记为完整的 idle edge，并立即
+交给共享 Goal continuation driver。若会话还没有 user message，driver 会先把目标本身
+通过持久 inbox 准入为首个 user turn anchor；字面的斜杠控制文本不会进入 provider。
+
+ACP load/resume 会重建运行时、按请求重放持久投影，然后通过 detached continuation
+observer 调度 active 根 Goal。恢复任务与普通 prompt 共用会话执行门，因此不会并发启动
+第二个 Goal 回合；0.6.0 已落盘但未产生首个 user message 的 Goal 也会在此路径补齐并续跑。
+
 可恢复的 provider、网络、流、SQLite 争用、回合预算和符合条件的工具失败，会在等待前先持久化一次指数退避重试。进程重启后从 SQLite 重建截止时间。
 
 重试延迟是正数、有上限、带抖动，并且可被用户输入打断。有效的对端 `Retry-After` 会被限制到配置上限，且绝不会被更早的本地延迟替换。

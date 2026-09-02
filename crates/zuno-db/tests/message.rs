@@ -455,6 +455,45 @@ fn user_and_assistant_messages_round_trip_byte_identically() {
 }
 
 #[test]
+fn user_message_presence_ignores_assistant_rows_and_detects_the_first_user_anchor() {
+    let connection = seeded();
+    let store = MessageStore::new(&connection);
+    assert!(
+        !store
+            .has_user_message_for_session(SESSION_ID)
+            .expect("inspect empty session")
+    );
+
+    let assistant = MessageRecord::from_json(assistant_message(
+        "msg_asst_anchor000000000000000000",
+        1_780_034_795_279,
+    ))
+    .expect("split assistant message");
+    store
+        .put_message_at(&assistant, assistant.time_created)
+        .expect("write assistant message");
+    assert!(
+        !store
+            .has_user_message_for_session(SESSION_ID)
+            .expect("inspect assistant-only session")
+    );
+
+    let user = MessageRecord::from_json(user_message(
+        "msg_user_anchor000000000000000000",
+        1_780_034_795_300,
+    ))
+    .expect("split user message");
+    store
+        .put_message_at(&user, user.time_created)
+        .expect("write user message");
+    assert!(
+        store
+            .has_user_message_for_session(SESSION_ID)
+            .expect("inspect anchored session")
+    );
+}
+
+#[test]
 fn message_an_unknown_part_variant_is_a_typed_error_when_split() {
     let payload = json!({
         "id": "prt_unknown000000000000000000000",

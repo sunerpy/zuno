@@ -1,6 +1,10 @@
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, mpsc};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+    mpsc,
+};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -1244,6 +1248,37 @@ impl Respond for TextTurnResponder {
     }
 }
 
+#[derive(Clone, Default)]
+struct GoalCompletionTurnResponder {
+    tool_requests: Arc<AtomicUsize>,
+}
+
+impl Respond for GoalCompletionTurnResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).expect("provider request JSON");
+        let has_tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if !has_tools {
+            return compatible_text_response("ACP goal title");
+        }
+        let request_index = self.tool_requests.fetch_add(1, Ordering::SeqCst);
+        if request_index.is_multiple_of(2) {
+            compatible_tool_response(
+                &format!("call_goal_complete_{}", request_index / 2 + 1),
+                "goal_update",
+                json!({
+                    "expected_revision": 1,
+                    "status": "complete"
+                }),
+            )
+        } else {
+            compatible_text_response("Goal completed automatically")
+        }
+    }
+}
+
 fn compatible_text_response(text: &str) -> ResponseTemplate {
     let chunk = json!({"choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":null}]});
     let finish = json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}});
@@ -2171,10 +2206,15 @@ async fn acp_compact_is_native_and_persists_a_summary_without_model_prompt_dispa
     }
 }
 
-#[test]
-fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(GoalCompletionTurnResponder::default())
+        .mount(&provider)
+        .await;
     let root = tempfile::tempdir().expect("temporary ACP root");
-    let config = danger_full_access_config("https://example.invalid");
+    let config = danger_full_access_config(&provider.uri());
     let mut child = isolated_command_with_config(root.path(), &config)
         .arg("acp")
         .stdin(Stdio::piped())
@@ -2240,16 +2280,20 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
             "sessionId": &session_id,
             "prompt": [{
                 "type":"text",
-                "text":"/goal 可能私有仓库配额优先，继续优化 README、docs 和站点"
+                "text":"/goal What is GOAL-ONE?"
             }]
         }),
     );
     assert_eq!(goal["stopReason"], "end_turn");
     assert!(goal_updates.iter().any(|update| {
         update["sessionUpdate"] == "agent_message_chunk"
-            && update["content"]["text"].as_str().is_some_and(|text| {
-                text.contains("可能私有仓库配额优先，继续优化 README、docs 和站点")
-            })
+            && update["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("What is GOAL-ONE?"))
+    }));
+    assert!(goal_updates.iter().any(|update| {
+        update["sessionUpdate"] == "agent_message_chunk"
+            && update["content"]["text"] == "Goal completed automatically"
     }));
 
     let (edited, edited_updates) = request_with_updates(
@@ -2261,7 +2305,7 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
             "sessionId": &session_id,
             "prompt": [{
                 "type":"text",
-                "text":"/goal 进一步移除不必要内容，减少 AI 味并合并"
+                "text":"/goal What is GOAL-TWO?"
             }]
         }),
     );
@@ -2270,7 +2314,11 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         update["sessionUpdate"] == "agent_message_chunk"
             && update["content"]["text"]
                 .as_str()
-                .is_some_and(|text| text.contains("进一步移除不必要内容，减少 AI 味并合并"))
+                .is_some_and(|text| text.contains("What is GOAL-TWO?"))
+    }));
+    assert!(edited_updates.iter().any(|update| {
+        update["sessionUpdate"] == "agent_message_chunk"
+            && update["content"]["text"] == "Goal completed automatically"
     }));
 
     let (shown, shown_updates) = request_with_updates(
@@ -2288,7 +2336,7 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         update["sessionUpdate"] == "agent_message_chunk"
             && update["content"]["text"]
                 .as_str()
-                .is_some_and(|text| text.contains("进一步移除不必要内容，减少 AI 味并合并"))
+                .is_some_and(|text| text.contains("What is GOAL-TWO?"))
     }));
 
     let invalid = request_failure(
@@ -2372,7 +2420,225 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         0,
         "native Goal edits must not manufacture or archive generic Plans"
     );
-    assert_eq!(goal.objective, "进一步移除不必要内容，减少 AI 味并合并");
+    assert_eq!(goal.objective, "What is GOAL-TWO?");
+    assert_eq!(goal.status, zuno_goal::GoalStatus::Complete);
+
+    let provider_requests = provider
+        .received_requests()
+        .await
+        .expect("provider requests");
+    let goal_turns = provider_requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter(|body| {
+            body.get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        goal_turns.len(),
+        4,
+        "each native Goal objective must drive one tool turn and one completion turn"
+    );
+    assert!(
+        goal_turns
+            .iter()
+            .all(|body| !body.to_string().contains("/goal")),
+        "native slash text must not enter provider input: {goal_turns:#?}"
+    );
+    assert!(
+        goal_turns
+            .iter()
+            .any(|body| body.to_string().contains("What is GOAL-TWO?")),
+        "the durable Goal objective was not injected into the autonomous provider turn"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_load_recovers_an_active_goal_without_a_prior_user_message() {
+    let provider = MockServer::start().await;
+    let responder = GoalCompletionTurnResponder::default();
+    Mock::given(method("POST"))
+        .respond_with(responder.clone())
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("temporary ACP root");
+    let config = danger_full_access_config(&provider.uri());
+
+    let mut first = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start first zuno acp");
+    let mut first_stdin = first.stdin.take().expect("first ACP stdin");
+    let mut first_stdout = BufReader::new(first.stdout.take().expect("first ACP stdout"));
+    request(
+        &mut first_stdin,
+        &mut first_stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut first_stdin,
+        &mut first_stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let _commands = read_session_update(&mut first_stdout);
+    request(
+        &mut first_stdin,
+        &mut first_stdout,
+        3,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    drop(first_stdin);
+    assert!(first.wait().expect("wait for first ACP process").success());
+
+    let location = zuno_paths::DbLocation::File(root.path().join("zuno-acp.db"));
+    let pool = Arc::new(zuno_db::Pool::open(&location).expect("open ACP recovery store"));
+    let goals = zuno_goal::GoalStore::from_pool(
+        Arc::clone(&pool),
+        root.path().join("goal-objective-spill"),
+    )
+    .expect("open ACP Goal store");
+    let objective = "What is RECOVERED-GOAL?";
+    goals
+        .create_goal(&session_id, objective, None)
+        .expect("seed active Goal without a user turn");
+    let connection = pool.get().expect("open ACP message store");
+    assert!(
+        !zuno_db::message::MessageStore::new(&connection)
+            .has_user_message_for_session(&session_id)
+            .expect("inspect pre-recovery messages")
+    );
+    drop(connection);
+
+    let mut second = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start second zuno acp");
+    let mut second_stdin = second.stdin.take().expect("second ACP stdin");
+    let mut second_stdout = BufReader::new(second.stdout.take().expect("second ACP stdout"));
+    request(
+        &mut second_stdin,
+        &mut second_stdout,
+        4,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let loaded = request(
+        &mut second_stdin,
+        &mut second_stdout,
+        5,
+        "session/load",
+        json!({
+            "sessionId": &session_id,
+            "cwd": root.path(),
+            "mcpServers": []
+        }),
+    );
+    assert_eq!(loaded["modes"]["currentModeId"], "build");
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let goal = goals
+                .goal(&session_id)
+                .expect("read recovered Goal")
+                .expect("persisted recovered Goal");
+            if goal.status == zuno_goal::GoalStatus::Complete {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("active Goal did not resume after session/load");
+
+    request(
+        &mut second_stdin,
+        &mut second_stdout,
+        6,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    drop(second_stdin);
+    assert!(
+        second
+            .wait()
+            .expect("wait for second ACP process")
+            .success()
+    );
+
+    let connection = pool.get().expect("open recovered ACP messages");
+    let history = zuno_db::message::MessageStore::new(&connection)
+        .hydrate_session(&session_id)
+        .expect("hydrate recovered ACP session");
+    let user_messages = history
+        .iter()
+        .filter(|message| message.info.role == zuno_db::message::MessageRole::User)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_messages.len(),
+        1,
+        "Goal recovery must create exactly one durable user anchor"
+    );
+    assert!(
+        user_messages[0]
+            .parts
+            .iter()
+            .any(|part| { part.data.get("text").and_then(Value::as_str) == Some(objective) })
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM session_input \
+                 WHERE session_id=?1 AND state='consumed'",
+                [&session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count consumed Goal anchors"),
+        1
+    );
+    drop(connection);
+
+    let provider_requests = provider
+        .received_requests()
+        .await
+        .expect("provider requests");
+    let goal_turns = provider_requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter(|body| {
+            body.get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(responder.tool_requests.load(Ordering::SeqCst), 2);
+    assert!(
+        goal_turns
+            .iter()
+            .all(|body| !body.to_string().contains("/goal"))
+    );
+    assert!(
+        goal_turns
+            .iter()
+            .any(|body| body.to_string().contains(objective)),
+        "recovered Goal objective must anchor provider input: {goal_turns:#?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

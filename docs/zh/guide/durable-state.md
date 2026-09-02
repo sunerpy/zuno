@@ -70,6 +70,15 @@ Goal 是续跑的授权来源。一个活跃的 goal 会持续下去，直到它
 多阶段目标会归档此前可见 Plan，并安装一个只包含新目标步骤、绑定当前 `goal_id` 的
 新根 Plan。若新目标是原子任务，可以终结陈旧未完成工作，但不会改绑已终态的历史 Plan。
 
+创建或编辑 active Goal 是执行命令，不是只写一条状态。原生命令到达终态事件后，共享
+Goal driver 会立即准备下一次自主回合。若会话此前没有 user message，Zuno 会先把用户
+给出的目标通过持久 FIFO inbox 准入，并将它保存为首个 user turn anchor。字面的
+`/goal ...` 控制文本不会进入 provider 输入。
+
+ACP 的 `session/load` 与 `session/resume` 在重建会话运行时后也会检查持久 Goal。active
+Goal 会在后台恢复，不需要额外发送一条“垫脚”提示词。这也会修复旧版本中已经落盘 active
+Goal、但尚未准入首个 user turn 就停止的会话。
+
 当首词为已知 action 时，action 优先：`show`、`get`、`status`、`history`、`create`、
 `edit`、`pause`、`resume`、`block`、`complete`、`cancel` 和 `help`。如果目标本身以
 这些词开头，请用 `/goal create <目标>` 或 `/goal edit <目标>` 消歧。`/goal help`
