@@ -43,7 +43,7 @@ Goal 是续跑的授权来源。一个活跃的 goal 会持续下去，直到它
 | --- | --- |
 | 传输失败、限流、不完整的流、SQLite 写者争用、空的 assistant 消息 | 调度另一个回合 |
 | 上下文超限失败 | 压缩保留的历史，然后重试 |
-| 认证失败、用户中断、事件消费者已关闭 | 暂停，等待人工处理 |
+| 认证失败、用户中断、单回合额度耗尽、事件消费者已关闭 | 暂停，等待人工处理 |
 | provider 协议无效、不支持的类型化输入、Agent 或模型不可用、持久状态损坏 | 阻塞 |
 
 永久运行时失败会把稳定的类型化代码和已脱敏说明写入 `blocked_reason`；Goal 不会再以
@@ -83,6 +83,73 @@ Goal、但尚未准入首个 user turn 就停止的会话。
 `edit`、`pause`、`resume`、`block`、`complete`、`cancel` 和 `help`。如果目标本身以
 这些词开头，请用 `/goal create <目标>` 或 `/goal edit <目标>` 消歧。`/goal help`
 可以查看精简用法。
+
+### 成功标准与证据
+
+一个会改动工作区的 Goal，不能仅凭断言完成。散文里的“测试通过了”是对工作区状态的一个
+声明，而 Goal 存在的全部理由，恰恰是运行中途做出的这类声明最容易出错。因此改动型 Goal
+会带上成功标准，每条标准只能靠一次已落盘的退出状态来关闭。
+
+`goal_propose` 接受 `success_criteria`，即一组具体检查项。每项会成为一行记录，带一个
+形如 `c1` 的短 id，并在结果中回显一次。模型此后不能改写它们：能被改成“正好符合已发生
+情况”的标准，不是标准。
+
+关闭一条标准只有两种方式，都通过 `goal_update`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `satisfy_criteria` | `criterionId` 加上一次已运行且通过的检查的 `receiptId` |
+| `waive_criteria` | `criterionId` 加上 `reason`，原文落盘 |
+
+receipt id 来自工具结果本身。运行过命令的工具会追加一行，指名它记录的 receipt：
+
+```text
+[verification rcp_01HQ...] passed: cargo test --workspace (exit 0, authoritative).
+Cite this id as evidence that the check passed.
+```
+
+若退出状态是推断得来、而非直接观测到的，这一行会明确说明，并声明它不能被引用。这个区分
+正是关键：一条 shell 流水线里失败的中间环节被后面的 `grep` 吞掉后，会给出一个什么都
+证明不了的零退出状态，因此它会被记录下来并被拒绝，而不是被默默接受。参见
+[Shell 退出状态能证明什么](tools.md#shell-退出状态能证明什么)。
+
+证据会过期。每一次写入文件的工具调用都会在 Goal 上打下改动时间戳，凡是 receipt 早于该
+时间戳的标准都会被退回到 open。这个退回会在写入发生的当时，就在工具结果里报告出来：
+
+```text
+[goal evidence] 2 satisfied criteria went back to open, because this change came
+after the check that satisfied them. Verify again after your last edit and cite the
+new receipts.
+```
+
+这些拒绝会指出问题所在，而不是笼统地要求重试。被引用的 receipt 在本会话中不存在、其结论
+是失败或无法判定、以及它早于最后一次写入，各自给出不同的句子；过期的那种还会打印两个
+时间戳，让先后关系直接可见。带着仍处于 open 的标准去完成，会报出哪些 id 尚未被证明。
+
+只回答问题的 Goal 不受此门禁约束：它没有什么需要验证。第一次写入文件的工具调用会把
+question Goal 转成 change Goal，因此即使一次运行开始时并不打算改动工作区，只要它最终
+改了，门禁就会生效。
+
+渲染出的 Goal 文档会列出每条标准及其状态，因此人看到的门禁与模型被约束的门禁是同一个。
+该文档是生成物，所以它所在的目录会被写入仓库私有的 `.git/info/exclude`，而不是写进纳入
+版本控制的 `.gitignore`。
+
+### Token 预算
+
+Goal 的 `token_budget` 在回合内的每一次 provider request 前后执行，而不是等到回合边界。
+否则一个很长的回合可以在任何计数器被读取之前就花掉全部额度。每次响应先记账到 Goal，再从
+这次写入产生的那一行读回决定，因此让运行停下来的东西，正是事后人所看到的那个数字。
+
+| 条件 | 结果 |
+| --- | --- |
+| 额度已用尽 | 回合停止，Goal 以 `turn_budget` 暂停 |
+| provider 未上报用量 | 回合停止；数不清的预算无法被遵守 |
+| 只剩最后十分之一额度 | 先请求压缩，然后继续 |
+
+最后十分之一是刻意留出的。压缩本身要花掉一次请求，还得给摘要和下一次真正的请求留出空间，
+所以正好在额度用尽的那一刻才要求压缩，等于在无钱可付时才去付账。
+
+没有 Goal 的会话，或没有 token 预算的 Goal，不受影响。
 
 ## Plan
 

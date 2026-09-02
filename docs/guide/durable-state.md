@@ -64,7 +64,7 @@ Recovery is selected from typed errors:
 | --- | --- |
 | Transport failures, rate limits, incomplete streams, SQLite writer contention, empty assistant messages | Schedule another turn |
 | Context-limit failures | Compact retained history, then retry |
-| Authentication failures, user interruption, human input, permissions, or an uncertain side effect | Pause with a typed reason |
+| Authentication failures, user interruption, human input, permissions, a spent turn allowance, or an uncertain side effect | Pause with a typed reason |
 | Invalid provider protocol, unsupported typed input, unavailable agent or model, corrupt durable state | Block |
 
 Permanent runtime failures store a stable typed code and scrubbed explanation in
@@ -113,6 +113,83 @@ summary.
 Goal status also shows the typed pause, cross-turn retry, provider backoff checkpoint,
 and pending human requests. Completion is rejected while any Plan step, WorkItem, Job,
 next-step report, or Goal-owned human request remains unfinished.
+
+### Success criteria and evidence
+
+A goal that changes the workspace cannot be completed on assertion alone. "The tests pass"
+in prose is a claim about the workspace, and the whole reason a goal exists is that claims
+made mid-run are the ones most likely to be wrong. So a change goal carries success
+criteria, and each one closes only against a recorded exit status.
+
+`goal_propose` takes `success_criteria`, a list of concrete checks. Each becomes a row with
+a short id such as `c1`, echoed once in the result. The model cannot rewrite them later:
+criteria that could be edited to match whatever happened are not criteria.
+
+Two things close a criterion, both through `goal_update`:
+
+| Field | Meaning |
+| --- | --- |
+| `satisfy_criteria` | `criterionId` plus the `receiptId` of a check that ran and passed |
+| `waive_criteria` | `criterionId` plus a `reason`, recorded verbatim |
+
+Receipt ids come from the tool results themselves. A tool that ran a command appends a line
+naming the receipt it recorded:
+
+```text
+[verification rcp_01HQ...] passed: cargo test --workspace (exit 0, authoritative).
+Cite this id as evidence that the check passed.
+```
+
+An exit status that was inferred rather than observed says so instead, and states that it
+cannot be cited. That distinction is the point: a shell pipeline whose failing stage was
+swallowed by a later `grep` produces a zero exit status that proves nothing, so it is
+recorded and refused rather than quietly accepted. See
+[Shell exit status](tools.md#what-a-shell-exit-status-proves).
+
+Evidence expires. Every tool call that writes files stamps the goal with the time of the
+change, which retires any criterion whose receipt is older than that stamp. The retirement
+is reported in the tool result, at the moment of the write:
+
+```text
+[goal evidence] 2 satisfied criteria went back to open, because this change came
+after the check that satisfied them. Verify again after your last edit and cite the
+new receipts.
+```
+
+The refusals name what is wrong rather than asking for a retry. A cited receipt that does
+not exist in this session, one whose outcome was failure or was undecidable, and one that
+predates the last write each produce a different sentence, and the stale case prints both
+timestamps so the mismatch is visible. Completing with criteria still open reports which
+ids are unproven.
+
+A goal that only answers a question is not gated: it has nothing to verify. The first tool
+call that writes a file turns a question goal into a change goal, so the gate applies to
+the run that turned out to modify the workspace even though it did not start out planning
+to.
+
+The rendered goal document lists the criteria with their state, so a human reads the same
+gate the model is held to. That document is generated, so its directory is added to the
+repository-private `.git/info/exclude` rather than to a tracked `.gitignore`.
+
+### Token budget
+
+A goal's `token_budget` is enforced around every provider request inside a turn, not at the
+turn boundary. A single long turn can otherwise spend an entire allowance before anything
+reads a counter. Each response is recorded against the goal first, and the decision is read
+back from the row that write produced, so what stops a run is exactly what a human sees
+afterwards.
+
+| Condition | Outcome |
+| --- | --- |
+| Allowance spent | The turn stops and the Goal pauses with `turn_budget` |
+| Provider reported no usage | The turn stops; an uncountable budget cannot be honoured |
+| Only the last tenth of the allowance is left | Compaction is requested, then the turn continues |
+
+The last tenth is held back deliberately. Compaction costs a request of its own and has to
+leave room for the summary plus the next real request, so asking for it exactly when the
+budget runs out would be asking when there is nothing left to pay with.
+
+A session with no goal, or a goal with no token budget, is unaffected.
 
 ### Human requests and autonomy
 

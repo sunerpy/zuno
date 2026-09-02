@@ -1086,3 +1086,46 @@ fn instruction_guides_document_the_fail_closed_admission() {
         ],
     );
 }
+
+#[test]
+fn durable_state_guides_document_evidence_gated_completion() {
+    contains_all(
+        "docs/guide/durable-state.md",
+        &[
+            "### Success criteria and evidence",
+            "cannot be completed on assertion alone",
+            "`satisfy_criteria`",
+            "`waive_criteria`",
+            "[verification rcp_",
+            "Cite this id as evidence",
+            "inferred rather than observed",
+            "Evidence expires",
+            "[goal evidence]",
+            "turns a question goal into a change goal",
+            "`.git/info/exclude`",
+            "### Token budget",
+            "around every provider request inside a turn",
+            "`turn_budget`",
+            "last tenth of the allowance",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/durable-state.md",
+        &[
+            "### 成功标准与证据",
+            "不能仅凭断言完成",
+            "`satisfy_criteria`",
+            "`waive_criteria`",
+            "[verification rcp_",
+            "推断得来、而非直接观测到的",
+            "证据会过期",
+            "[goal evidence]",
+            "转成 change Goal",
+            "`.git/info/exclude`",
+            "### Token 预算",
+            "每一次 provider request 前后执行",
+            "`turn_budget`",
+            "最后十分之一是刻意留出的",
+        ],
+    );
+}
