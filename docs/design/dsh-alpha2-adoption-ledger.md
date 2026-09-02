@@ -86,7 +86,7 @@ does not advance the pinned DSH baseline.
 
 | Design question | Decision | Zuno result |
 | --- | --- | --- |
-| Event-driven AgentDriver completion and reconciliation | adapt | Zuno persists a compact `DriverPhase` projection in the existing session event log and runs `PlanReconciliationDriver` before successful delivery. It continues active Goals, gives ordinary sessions at most two durable reconciliation attempts, and then creates typed `PlanUnreconciled` human wait. |
+| Event-driven AgentDriver completion and reconciliation | adapt | Zuno persists a compact `DriverPhase` projection in the existing session event log and runs `PlanReconciliationDriver` before successful delivery. It continues active Goals, gives ordinary sessions at most two durable reconciliation attempts for durably recorded work, and then creates typed `PlanUnreconciled` human wait. A session that recorded no Plan, Todo, or Job is settled, not continued. |
 | Durable service ownership and client-neutral projections | already-covered | Zuno already owns Goal, Plan, Todo, Job, inbox, and client projections through typed Rust services and durable events. The repair composes those services instead of adding prompt-only state or a second loop. |
 | Cordis, Bundle, TypeScript package graph, and DSH wire/runtime compatibility | reject | The useful driver pressure is implemented natively in Rust. Zuno does not import DSH's container, package architecture, or compatibility surface. |
 
