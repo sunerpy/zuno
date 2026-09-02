@@ -522,6 +522,13 @@ fn event_json(event: TurnEvent) -> Value {
         TurnEvent::SkillLoaded { name, source } => {
             json!({"type":"skill_loaded","name":name,"source":source})
         }
+        TurnEvent::Notice {
+            severity,
+            code,
+            detail,
+        } => {
+            json!({"type":"notice","severity":severity.as_str(),"code":code,"detail":detail})
+        }
         TurnEvent::TurnStarted { session_id } => {
             json!({"type":"turn_started","sessionID":session_id})
         }

@@ -1,5 +1,6 @@
 //! The turn engine: the agent loop, tool dispatch, compaction, retry, and cancellation.
 
+pub mod budget;
 pub mod compaction;
 mod deferred_tools;
 pub mod dispatch;

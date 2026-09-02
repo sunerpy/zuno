@@ -450,6 +450,18 @@ impl ToolOutput {
         self
     }
 
+    /// Attaches this call's verification evidence, chaining.
+    ///
+    /// Hosts persist the receipt and gate later success claims on it, so only
+    /// attach one when the tool genuinely observed the outcome it reports.
+    #[must_use]
+    pub fn with_verification(self, receipt: &crate::VerificationReceipt) -> Self {
+        self.with_metadata(
+            crate::VERIFICATION_METADATA_KEY,
+            receipt.to_metadata_value(),
+        )
+    }
+
     /// Adds one attachment, chaining.
     #[must_use]
     pub fn with_attachment(mut self, attachment: Attachment) -> Self {

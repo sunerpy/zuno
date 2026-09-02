@@ -52,6 +52,7 @@ use zuno_tool::{
     ToolDefinition, ToolOutput, ToolReplayPolicy, ToolResultPresentation, ToolUiIntent,
 };
 
+use crate::budget::{NoopBudgetPolicy, TurnBudgetPolicy};
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
 use crate::interrupt::{HardInterruptRequest, InterruptSignal, SoftInterruptMessage};
 use crate::prompt::{
@@ -178,6 +179,29 @@ impl ToolDiff {
     }
 }
 
+/// How much attention a [`TurnEvent::Notice`] needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NoticeSeverity {
+    /// Worth recording; the turn proceeded as asked.
+    Info,
+    /// The turn proceeded, but not the way the user configured it.
+    Warning,
+    /// The turn could not proceed as asked.
+    Error,
+}
+
+impl NoticeSeverity {
+    /// A stable lowercase name for events and client projections.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// Every interface-observable transition of one turn.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnEvent {
@@ -213,6 +237,17 @@ pub enum TurnEvent {
     SkillLoaded {
         name: String,
         source: String,
+    },
+    /// The host decided something about this turn that the user must be able to
+    /// see, such as refusing to admit an instruction file or stopping on budget.
+    ///
+    /// Notices are not model output. They carry a stable `code` for hosts to key
+    /// on and a `detail` written for a person, so a silently degraded turn cannot
+    /// look like a clean one.
+    Notice {
+        severity: NoticeSeverity,
+        code: String,
+        detail: String,
     },
     TurnStarted {
         session_id: String,
@@ -477,6 +512,11 @@ pub enum TurnError {
     },
     #[error("agent `{agent}` exhausted its {max_steps}-step turn budget")]
     StepLimit { agent: String, max_steps: u32 },
+    #[error("the turn stopped on its {} allowance: {detail}", kind.code())]
+    BudgetLimited {
+        kind: crate::budget::BudgetStopKind,
+        detail: String,
+    },
     #[error("provider stream ended during step {step} without MessageEnd")]
     StreamEndedWithoutMessageEnd { step: u32 },
     #[error("provider `{provider_id}` returned an empty assistant response during step {step}")]
@@ -562,6 +602,7 @@ impl TurnError {
             Self::AgentNotFound { .. } => "agent_not_found",
             Self::ModelNotFound { .. } => "model_not_found",
             Self::StepLimit { .. } => "step_limit",
+            Self::BudgetLimited { .. } => "budget_limited",
             Self::StreamEndedWithoutMessageEnd { .. } => "stream_ended_without_message_end",
             Self::EmptyAssistantMessage { .. } => "empty_assistant_message",
             Self::MissingHumanRequestId { .. } => "missing_human_request_id",
@@ -655,9 +696,9 @@ impl TurnError {
                     after: None,
                 }
             }
-            Self::Provider(ProviderError::Auth { .. }) | Self::EventConsumerClosed => {
-                TurnRecovery::Pause
-            }
+            Self::Provider(ProviderError::Auth { .. })
+            | Self::EventConsumerClosed
+            | Self::BudgetLimited { .. } => TurnRecovery::Pause,
             Self::Provider(
                 ProviderError::Refused { .. }
                 | ProviderError::UnsupportedCapability { .. }
@@ -1057,6 +1098,7 @@ pub struct TurnContext<'a> {
     dispatcher: &'a dyn ToolDispatcher,
     interrupt: &'a InterruptSignal,
     hooks: Arc<dyn TurnHooks>,
+    budget: Arc<dyn TurnBudgetPolicy>,
     live_inputs: Option<LiveInputs<'a>>,
     attachments: Option<Arc<zuno_attachment::AttachmentStore>>,
     tool_concurrency: ToolConcurrencyLimit,
@@ -1083,6 +1125,7 @@ impl<'a> TurnContext<'a> {
             dispatcher,
             interrupt,
             hooks: Arc::new(NoopHooks),
+            budget: Arc::new(NoopBudgetPolicy),
             live_inputs: None,
             attachments: None,
             tool_concurrency: ToolConcurrencyLimit::SERIAL,
@@ -1092,6 +1135,15 @@ impl<'a> TurnContext<'a> {
     #[must_use]
     pub fn with_hooks(mut self, hooks: Arc<dyn TurnHooks>) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    /// Bind the allowance this turn runs under.
+    ///
+    /// Without one the turn is unlimited, which is the historical behaviour.
+    #[must_use]
+    pub fn with_budget_policy(mut self, budget: Arc<dyn TurnBudgetPolicy>) -> Self {
+        self.budget = budget;
         self
     }
 

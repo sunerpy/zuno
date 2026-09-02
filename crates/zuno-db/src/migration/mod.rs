@@ -1,10 +1,10 @@
 //! Atomic current-schema creation and guarded format upgrades.
 //!
 //! Format 5 is the first historical layout Zuno upgrades in place. The learning
-//! flywheel and durable Plan stack add only tables, indices, and nullable/defaulted
-//! columns, so the upgrade can preserve every existing session, message, Plan, and
-//! resident-memory row. Other older, newer, or unmarked layouts are still rejected
-//! without mutation.
+//! flywheel, the durable Plan stack, and the tool-verification receipt ledger add
+//! only tables, indices, and nullable/defaulted columns, so every upgrade can
+//! preserve every existing session, message, Plan, and resident-memory row. Other
+//! older, newer, or unmarked layouts are still rejected without mutation.
 
 use crate::{open, schema};
 use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
@@ -13,9 +13,10 @@ use zuno_error::DbError;
 /// Current database format.
 ///
 /// Bump this whenever [`crate::schema`] changes incompatibly.
-pub const CURRENT_FORMAT: u32 = 7;
+pub const CURRENT_FORMAT: u32 = 8;
 const LEARNING_UPGRADE_FROM: u32 = 5;
 const PLAN_STACK_UPGRADE_FROM: u32 = 6;
+const VERIFICATION_UPGRADE_FROM: u32 = 7;
 
 const FORMAT_TABLE: &str = "zuno_schema";
 const FORMAT_SQL: &str = "
@@ -26,10 +27,10 @@ CREATE TABLE zuno_schema (
 
 /// Ensure that `connection` uses the current all-at-once schema.
 ///
-/// Empty databases are initialized. Format-5 databases receive both additive
-/// upgrades and format-6 databases receive the Plan-stack upgrade in one
-/// `BEGIN IMMEDIATE` transaction, with the marker changed only after every new
-/// object exists. Other existing formats are only validated or rejected.
+/// Empty databases are initialized. Every supported older format advances to
+/// [`CURRENT_FORMAT`] in one `BEGIN IMMEDIATE` transaction that applies each
+/// remaining additive step in order, with the marker changed only after every
+/// new object exists. Other existing formats are only validated or rejected.
 ///
 /// # Errors
 ///
@@ -45,6 +46,7 @@ pub fn apply(connection: &mut Connection) -> Result<(), DbError> {
         Some(CURRENT_FORMAT) => validate_current(connection, &tables),
         Some(LEARNING_UPGRADE_FROM) => migrate_learning(connection),
         Some(PLAN_STACK_UPGRADE_FROM) => migrate_plan_stack(connection),
+        Some(VERIFICATION_UPGRADE_FROM) => migrate_verification(connection),
         observed => Err(DbError::SchemaMismatch {
             expected: CURRENT_FORMAT,
             observed,
@@ -58,6 +60,7 @@ fn validate_current(connection: &Connection, tables: &[String]) -> Result<(), Db
         "message_feedback",
         "experience_record",
         "work_plan_archive",
+        "verification_receipt",
     ];
     let missing = required
         .into_iter()
@@ -135,6 +138,7 @@ fn migrate_learning(connection: &mut Connection) -> Result<(), DbError> {
     }
     schema::up_learning(&transaction)?;
     schema::up_plan_stack(&transaction)?;
+    schema::up_verification(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -168,6 +172,7 @@ fn migrate_plan_stack(connection: &mut Connection) -> Result<(), DbError> {
         )));
     }
     schema::up_plan_stack(&transaction)?;
+    schema::up_verification(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -177,6 +182,39 @@ fn migrate_plan_stack(connection: &mut Connection) -> Result<(), DbError> {
     if changed != 1 {
         return Err(failure(std::io::Error::other(
             "format-6 marker changed while the Plan-stack migration was running",
+        )));
+    }
+    transaction.commit().map_err(map_error)
+}
+
+/// Add the tool-verification receipt ledger without rewriting any format-7 row.
+fn migrate_verification(connection: &mut Connection) -> Result<(), DbError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_error)?;
+    let tables = transaction_table_names(&transaction)?;
+    let observed = observed_format(&transaction, &tables)?;
+    if observed != Some(VERIFICATION_UPGRADE_FROM) {
+        return Err(DbError::SchemaMismatch {
+            expected: VERIFICATION_UPGRADE_FROM,
+            observed,
+        });
+    }
+    if !tables.iter().any(|table| table == "session") {
+        return Err(failure(std::io::Error::other(
+            "format-7 marker exists without the required session table",
+        )));
+    }
+    schema::up_verification(&transaction)?;
+    let changed = transaction
+        .execute(
+            "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
+            params![CURRENT_FORMAT, VERIFICATION_UPGRADE_FROM],
+        )
+        .map_err(map_error)?;
+    if changed != 1 {
+        return Err(failure(std::io::Error::other(
+            "format-7 marker changed while the verification migration was running",
         )));
     }
     transaction.commit().map_err(map_error)
@@ -248,6 +286,12 @@ mod tests {
                  ALTER TABLE work_plan DROP COLUMN stack_depth;",
             )
             .expect("construct pre-Plan-stack schema");
+    }
+
+    fn remove_verification_schema(connection: &Connection) {
+        connection
+            .execute_batch("DROP TABLE verification_receipt;")
+            .expect("construct pre-verification schema");
     }
 
     #[test]
@@ -363,6 +407,7 @@ mod tests {
         let mut connection = memory();
         create_current(&mut connection).expect("create current schema");
         remove_plan_stack_schema(&connection);
+        remove_verification_schema(&connection);
         connection
             .execute_batch(
                 "INSERT INTO project \
@@ -511,6 +556,7 @@ mod tests {
         let mut connection = memory();
         create_current(&mut connection).expect("create current schema");
         remove_plan_stack_schema(&connection);
+        remove_verification_schema(&connection);
         connection
             .execute_batch(
                 "INSERT INTO project \
@@ -587,6 +633,83 @@ mod tests {
                 })
                 .expect("query archive"),
             0
+        );
+    }
+
+    #[test]
+    fn format_seven_adds_the_verification_ledger_without_rewriting_history() {
+        let mut connection = memory();
+        create_current(&mut connection).expect("create current schema");
+        remove_verification_schema(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO project \
+                   (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-1', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES ('session-1', 'project-1', 'slug', '/workspace', 'history', '1', 1, 1);
+                 INSERT INTO work_plan
+                   (session_id, id, goal_id, revision, title, steps, time_created, time_updated,
+                    stack_depth)
+                 VALUES (
+                   'session-1', 'plan-1', 'goal-1', 7, 'durable plan', '[]', 2, 3, 0
+                 );
+                 UPDATE zuno_schema SET format = 7 WHERE singleton = 1;",
+            )
+            .expect("construct format-seven schema");
+
+        apply(&mut connection).expect("upgrade format seven");
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT format FROM zuno_schema WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .expect("read migrated marker"),
+            CURRENT_FORMAT
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT title FROM work_plan WHERE session_id = 'session-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("plan survives the upgrade"),
+            "durable plan"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM verification_receipt", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .expect("query newly installed ledger"),
+            0
+        );
+        apply(&mut connection).expect("reopening the upgraded database validates");
+    }
+
+    #[test]
+    fn current_marker_without_the_verification_ledger_is_rejected_without_mutation() {
+        let mut connection = memory();
+        create_current(&mut connection).expect("create current schema");
+        remove_verification_schema(&connection);
+
+        let error = apply(&mut connection).expect_err("corrupt current shape must fail");
+        assert!(matches!(error, DbError::Schema { .. }));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT format FROM zuno_schema WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .expect("read unchanged marker"),
+            CURRENT_FORMAT
         );
     }
 

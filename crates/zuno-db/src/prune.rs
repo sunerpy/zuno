@@ -18,7 +18,7 @@ const SSE_AGGREGATE_PREFIX: &str = "sse:";
 /// retention while losing only the deleted provenance pointer. `experience_record`
 /// follows the same policy so retained learning can be reviewed independently of
 /// transcript retention.
-pub const PRUNE_TABLES: [&str; 19] = [
+pub const PRUNE_TABLES: [&str; 20] = [
     "session_note_operation",
     "session_note",
     "memory_reflection_job",
@@ -38,6 +38,7 @@ pub const PRUNE_TABLES: [&str; 19] = [
     "session",
     "event_sequence",
     "event",
+    "verification_receipt",
 ];
 
 /// Local rows are removed in this order before the final global `part` orphan sweep.
@@ -46,7 +47,7 @@ pub const PRUNE_TABLES: [&str; 19] = [
 /// which foreign-key cascades happen to exist in one schema revision. Dependants
 /// precede their owners (`memory_reflection_job` before its delivery row and
 /// `agent_job` before its optional report input).
-pub const DELETE_ORDER: [&str; 19] = PRUNE_TABLES;
+pub const DELETE_ORDER: [&str; 20] = PRUNE_TABLES;
 
 /// A reversible change to `session.time_archived`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -709,7 +710,7 @@ const OPTIONAL_TABLE_SPECS: [TableSpec; 2] = [
     },
 ];
 
-const TABLE_SPECS: [TableSpec; 17] = [
+const TABLE_SPECS: [TableSpec; 18] = [
     TableSpec {
         name: "memory_reflection_job",
         relation: Relation::SessionId,
@@ -972,5 +973,25 @@ const TABLE_SPECS: [TableSpec; 17] = [
         name: "event",
         relation: Relation::Aggregate,
         columns: &["id", "aggregate_id", "seq", "type", "data"],
+    },
+    TableSpec {
+        name: "verification_receipt",
+        relation: Relation::SessionId,
+        columns: &[
+            "id",
+            "session_id",
+            "turn_id",
+            "tool_call_id",
+            "tool_id",
+            "summary",
+            "workdir",
+            "exit_code",
+            "exit_authority",
+            "outcome",
+            "git_head",
+            "output_digest",
+            "detail",
+            "time_created",
+        ],
     },
 ];

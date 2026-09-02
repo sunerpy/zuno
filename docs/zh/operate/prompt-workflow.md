@@ -344,10 +344,10 @@ Todo、Plan step、pending report 与 Job，并记录 omitted count；稳定 ide
 状态、revision 和 reconciliation 字段优先保留。若权威 identity 本身仍无法放入
 预算，组装会失败关闭。typed tools 仍是进一步查询和修改这些 Store 的唯一入口。
 
-数据库当前格式为 7。format 5 会在一个 `BEGIN IMMEDIATE` 事务中
-增加 learning 表、Plan 栈字段和 archive 表；format 6 只增加 Plan 栈部分。两条路径
-都在最后以条件更新将 marker 改为 7，并保留已有的 `session`、`message`、
-`memory_candidate` 与 `work_plan` 值。未来格式、缺少 marker 或结构损坏会在不修改
+数据库当前格式为 8。format 5 会在一个 `BEGIN IMMEDIATE` 事务中
+增加 learning 表、Plan 栈字段、archive 表和 `verification_receipt` 账本；format 6 增加
+Plan 栈部分与该账本；format 7 只增加该账本。三条路径都在最后以条件更新将 marker
+改为 8，并保留已有的 `session`、`message`、`memory_candidate` 与 `work_plan` 值。未来格式、缺少 marker 或结构损坏会在不修改
 数据库的情况下失败关闭；当前二进制支持的旧格式不要求重建数据库。
 
 ## 10. 诊断命令

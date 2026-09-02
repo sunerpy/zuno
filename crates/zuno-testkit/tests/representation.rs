@@ -42,8 +42,8 @@ use serde_json::Value;
 use zuno_db::message::{MessageRecord, MessageRole, MessageWithParts, PartKind, PartRecord};
 use zuno_engine::interrupt::HardInterruptRequest;
 use zuno_engine::r#loop::{
-    ProjectedMessage, TURN_EVENT_CHANNEL_CAPACITY, ToolBlockKind, ToolDiff, ToolInterruption,
-    TurnEvent, project_history, project_history_owned,
+    NoticeSeverity, ProjectedMessage, TURN_EVENT_CHANNEL_CAPACITY, ToolBlockKind, ToolDiff,
+    ToolInterruption, TurnEvent, project_history, project_history_owned,
 };
 use zuno_engine::session_command::SessionCommand;
 use zuno_llm::event::{
@@ -185,6 +185,7 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
             size_of::<(SessionCommand, String)>(),
         ),
         payload("SkillLoaded", size_of::<(String, String)>()),
+        payload("Notice", size_of::<(NoticeSeverity, String, String)>()),
         payload("TurnStarted", size_of::<(String,)>()),
         payload("HistoryRepaired", size_of::<(usize,)>()),
         payload("AgentResolved", size_of::<(u32, String)>()),
@@ -258,6 +259,7 @@ fn turn_event_variant_name(event: &TurnEvent) -> &'static str {
         TurnEvent::SessionCommandCompleted { .. } => "SessionCommandCompleted",
         TurnEvent::SessionCommandFailed { .. } => "SessionCommandFailed",
         TurnEvent::SkillLoaded { .. } => "SkillLoaded",
+        TurnEvent::Notice { .. } => "Notice",
         TurnEvent::TurnStarted { .. } => "TurnStarted",
         TurnEvent::HistoryRepaired { .. } => "HistoryRepaired",
         TurnEvent::AgentResolved { .. } => "AgentResolved",

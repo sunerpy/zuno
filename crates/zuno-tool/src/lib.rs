@@ -74,6 +74,7 @@ pub mod guard;
 pub mod output;
 pub mod schema;
 pub mod store;
+pub mod verification;
 
 pub use crate::context::{
     AllowAll, DenyAll, InterruptHandle, NeverInterrupted, PermissionAsk, PermissionAsker,
@@ -88,6 +89,9 @@ pub use crate::output::{
 };
 pub use crate::schema::{ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY};
 pub use crate::store::{StoredOutput, ToolOutputStore};
+pub use crate::verification::{
+    ExitAuthority, ReceiptOutcome, VERIFICATION_METADATA_KEY, VerificationReceipt,
+};
 
 use async_trait::async_trait;
 use schemars::JsonSchema;

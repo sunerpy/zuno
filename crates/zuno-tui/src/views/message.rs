@@ -45,7 +45,7 @@ use ratatui::{Frame, symbols};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
-use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, TurnEvent};
+use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, NoticeSeverity, TurnEvent};
 use zuno_engine::session_command::SessionCommand;
 use zuno_llm::event::StreamEvent;
 pub use zuno_types::TokenUsage;
@@ -973,6 +973,21 @@ impl Transcript {
                     name: name.clone(),
                     source: Some(source.clone()),
                 })
+            }
+            TurnEvent::Notice {
+                severity,
+                code,
+                detail,
+            } => {
+                self.messages.push(Message::noticed(
+                    match severity {
+                        NoticeSeverity::Info => crate::views::toast::ToastLevel::Info,
+                        NoticeSeverity::Warning => crate::views::toast::ToastLevel::Warning,
+                        NoticeSeverity::Error => crate::views::toast::ToastLevel::Error,
+                    },
+                    format!("{detail} [{code}]"),
+                ));
+                true
             }
             TurnEvent::TurnStarted { .. } => {
                 self.mark_running();

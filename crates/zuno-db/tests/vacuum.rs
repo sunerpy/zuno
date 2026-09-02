@@ -529,6 +529,7 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
             "session_message",
             "session_share",
             "skill_candidate",
+            "verification_receipt",
             "work_item",
             "work_plan",
             "work_plan_archive",
