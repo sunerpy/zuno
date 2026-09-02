@@ -25,7 +25,7 @@ time, and upstream main commits observed during capture are recorded in
 
 The stable protocol baseline above is unchanged. For this implementation,
 current Zed `main` was additionally inspected at
-[`520d8bdaebe491fdb4a3656f6b76df53722165fd`](https://github.com/zed-industries/zed/commit/520d8bdaebe491fdb4a3656f6b76df53722165fd).
+[`97b1e64a177a2fe3c2803e323087b5c2fa6fff1e`](https://github.com/zed-industries/zed/commit/97b1e64a177a2fe3c2803e323087b5c2fa6fff1e).
 Its workspace pins `agent-client-protocol = 2.0.0` with unstable features while
 the client-consumed stable schema crate remains
 `agent-client-protocol-schema = 1.5.0`. Zuno keeps its production wire contract
@@ -33,11 +33,11 @@ at stable ACP V1.21 and adds a typed decode contract test against that exact
 client schema:
 
 - [`CurrentModeUpdate` mutates the session mode and `ConfigOptionUpdate`
-  replaces the option list and wakes its watcher](https://github.com/zed-industries/zed/blob/520d8bdaebe491fdb4a3656f6b76df53722165fd/crates/agent_servers/src/acp.rs);
+  replaces the option list and wakes its watcher](https://github.com/zed-industries/zed/blob/97b1e64a177a2fe3c2803e323087b5c2fa6fff1e/crates/agent_servers/src/acp.rs#L4842-L4860);
 - [standard `SessionUpdate::Plan` is passed to the ACP thread
-  model](https://github.com/zed-industries/zed/blob/520d8bdaebe491fdb4a3656f6b76df53722165fd/crates/acp_thread/src/acp_thread.rs#L2604-L2613);
+  model](https://github.com/zed-industries/zed/blob/97b1e64a177a2fe3c2803e323087b5c2fa6fff1e/crates/acp_thread/src/acp_thread.rs#L2604-L2613);
 - [the thread replaces, extends, or truncates its current Plan entries from each
-  complete update](https://github.com/zed-industries/zed/blob/520d8bdaebe491fdb4a3656f6b76df53722165fd/crates/acp_thread/src/acp_thread.rs#L3577-L3600).
+  complete update](https://github.com/zed-industries/zed/blob/97b1e64a177a2fe3c2803e323087b5c2fa6fff1e/crates/acp_thread/src/acp_thread.rs#L3577-L3600).
 
 The exact schema dependency is enabled only by the
 `zed-schema-contract` feature and exercised through
