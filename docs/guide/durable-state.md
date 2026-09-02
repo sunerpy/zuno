@@ -91,7 +91,9 @@ without resetting its status, budget, or accumulated usage. The explicit action 
 remain available for lifecycle management. Create, edit, and shorthand objective changes
 also reconcile an active Plan: a multi-stage objective archives the previous visible Plan
 and installs a new root bound to the current `goal_id`. An atomic objective may terminalize
-stale unfinished work without rebinding an already terminal historical Plan.
+stale unfinished work without rebinding an already terminal historical Plan; when that Plan
+belongs to a previous Goal it is archived as completed history, so the new Goal is never
+judged against another Goal's checklist.
 
 Creating or editing an active Goal is an execution command, not a status-only write. After
 the native command reaches its terminal event, the shared Goal driver immediately prepares

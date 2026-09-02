@@ -605,6 +605,55 @@ impl WorkStateStore {
         })
     }
 
+    /// Retire a finished Plan that another Goal wrote, leaving no visible Plan behind.
+    ///
+    /// `work_plan` is keyed by session and outlives the Goal it was written for. When the
+    /// next Goal objective is atomic nothing replaces that Plan: the model is not asked
+    /// for one, and the goal boundary deliberately refuses to rebind a terminal Plan,
+    /// because that would claim finished work for a Goal that did none of it. Left
+    /// visible, though, the old Plan is what the completion audit judges the new Goal
+    /// against, and the audit refuses another Goal's Plan — so a Goal that needed no
+    /// Plan could never complete. Archiving the Plan as `completed` keeps it as history,
+    /// which the audit does not consult, and lets the Goal complete on its own evidence.
+    ///
+    /// Refused unless every step is terminal: unfinished work is superseded only by the
+    /// explicit objective boundary, never retired quietly. Suspended ancestors are
+    /// superseded in the same transaction, as [`Self::replace_plan_for_objective`] does,
+    /// so a stale child stack cannot later restore work from the retired objective.
+    pub fn archive_terminal_plan(
+        &self,
+        session_id: &str,
+        expected_revision: i64,
+    ) -> Result<(), WorkStateError> {
+        let now = zuno_db::message::now_millis();
+        self.pool.try_transaction(|tx| {
+            let Some(current) = plan_in(tx, session_id)? else {
+                return Err(WorkStateError::NotFound {
+                    kind: "plan",
+                    id: session_id.to_owned(),
+                });
+            };
+            require_plan_revision(&current, Some(expected_revision))?;
+            if !current.steps.iter().all(|step| step.status.is_terminal()) {
+                return Err(WorkStateError::Invalid(
+                    "only a plan whose every step is terminal can be archived without a \
+                     replacement"
+                        .to_owned(),
+                ));
+            }
+            archive_plan(tx, &current, ArchivedPlanState::Completed, now)?;
+            tx.execute(
+                "UPDATE work_plan_archive SET state='superseded',time_archived=?1 \
+                 WHERE session_id=?2 AND state='suspended'",
+                params![now, session_id],
+            )
+            .map_err(zuno_db::map_error)?;
+            tx.execute("DELETE FROM work_plan WHERE session_id=?1", [session_id])
+                .map_err(zuno_db::map_error)?;
+            Ok(())
+        })
+    }
+
     /// Reconcile a Plan after the user established a new durable Goal objective.
     ///
     /// This is the one explicit boundary allowed to supersede unfinished steps that
@@ -2686,6 +2735,65 @@ mod tests {
                 .expect("count suspended plans"),
             0
         );
+    }
+
+    #[test]
+    fn a_finished_plan_can_be_retired_into_history_but_an_unfinished_one_cannot() {
+        let store = store();
+        let unfinished = store
+            .update_plan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: None,
+                    goal_id: Some("goal-old".to_owned()),
+                    title: "Old objective".to_owned(),
+                    steps: vec![step("ship", PlanStepStatus::InProgress)],
+                },
+            )
+            .expect("seed unfinished plan");
+        assert!(matches!(
+            store.archive_terminal_plan("ses", unfinished.revision),
+            Err(WorkStateError::Invalid(message)) if message.contains("every step is terminal")
+        ));
+        assert!(
+            store.plan("ses").expect("read plan").is_some(),
+            "a refused retirement leaves the plan visible"
+        );
+
+        let finished = store
+            .update_plan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: Some(unfinished.revision),
+                    goal_id: Some("goal-old".to_owned()),
+                    title: "Old objective".to_owned(),
+                    steps: vec![step("ship", PlanStepStatus::Completed)],
+                },
+            )
+            .expect("finish the plan");
+        assert!(matches!(
+            store.archive_terminal_plan("ses", finished.revision - 1),
+            Err(WorkStateError::RevisionConflict { .. })
+        ));
+        store
+            .archive_terminal_plan("ses", finished.revision)
+            .expect("retire the finished plan");
+
+        assert!(store.plan("ses").expect("read plan").is_none());
+        let connection = store.pool.get().expect("open archive connection");
+        let (state, goal_id): (String, Option<String>) = connection
+            .query_row(
+                "SELECT state, goal_id FROM work_plan_archive WHERE session_id='ses' AND id=?1",
+                [&finished.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the retired plan is history");
+        assert_eq!(state, "completed");
+        assert_eq!(goal_id.as_deref(), Some("goal-old"));
+        assert!(matches!(
+            store.archive_terminal_plan("ses", finished.revision),
+            Err(WorkStateError::NotFound { kind: "plan", .. })
+        ));
     }
 
     #[test]

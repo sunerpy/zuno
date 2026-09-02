@@ -882,8 +882,14 @@ fn atomic_goal_objective_rebinds_without_falsely_completing_active_work() {
     assert_eq!(plan.steps[0].title, "Old work");
 }
 
+/// The case the plan-ownership audit and the host boundary used to disagree on. Goal A
+/// finished with every step completed; nothing archives a Plan when its Goal completes.
+/// The user then set an atomic objective — `现在有几个 skill 可用`, one question — which
+/// mints Goal B. The boundary left A's Plan visible and unbound, the audit then refused
+/// B's completion because the visible Plan belonged to A, and B could not complete at
+/// all without an out-of-band `plan_update`. The Plan is history and is archived as such.
 #[test]
-fn atomic_goal_objective_does_not_rebind_a_terminal_historical_plan() {
+fn atomic_goal_objective_archives_a_terminal_plan_of_a_previous_goal_instead_of_rebinding_it() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
     );
@@ -923,7 +929,7 @@ fn atomic_goal_objective_does_not_rebind_a_terminal_historical_plan() {
         HostPlanningRequest {
             session_id: "ses-terminal-goal",
             agent: "build",
-            prompt: "Commit the current staged changes.",
+            prompt: "现在有几个 skill 可用",
             source: PlanningInputSource::GoalObjective,
             content: PlanningContentFacts::empty(),
             plan_available: true,
@@ -933,13 +939,107 @@ fn atomic_goal_objective_does_not_rebind_a_terminal_historical_plan() {
     .expect("classify atomic Goal with historical plan");
 
     assert!(matches!(outcome.decision, PlanningDecision::Atomic(_)));
-    assert!(!outcome.changed);
-    let plan = store
-        .plan("ses-terminal-goal")
-        .expect("read plan")
-        .expect("historical plan");
-    assert_eq!(plan.revision, original.revision);
-    assert_eq!(plan.goal_id.as_deref(), Some("goal-historical"));
+    assert!(
+        outcome.changed,
+        "retiring the historical plan is a visible change"
+    );
+    assert!(
+        store
+            .plan("ses-terminal-goal")
+            .expect("read plan")
+            .is_none(),
+        "the new Goal is not judged against another Goal's finished checklist"
+    );
+    let connection = pool.get().expect("archive connection");
+    let (state, goal_id, revision): (String, Option<String>, i64) = connection
+        .query_row(
+            "SELECT state, goal_id, revision FROM work_plan_archive \
+             WHERE session_id='ses-terminal-goal' AND id=?1",
+            [&original.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("the historical plan is kept as history");
+    assert_eq!(state, "completed");
+    assert_eq!(
+        goal_id.as_deref(),
+        Some("goal-historical"),
+        "history is not rebound"
+    );
+    assert_eq!(revision, original.revision);
+}
+
+#[test]
+fn a_terminal_plan_of_the_same_goal_or_of_no_goal_stays_visible() {
+    for (session, seeded_goal) in [
+        ("ses-own-terminal-plan", Some("goal-current")),
+        ("ses-unbound-terminal-plan", None),
+    ] {
+        let pool = Arc::new(
+            zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
+        );
+        {
+            let mut connection = pool.get().expect("schema connection");
+            zuno_db::migration::apply(&mut connection).expect("apply schema");
+            connection
+                .execute(
+                    "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                     VALUES ('project', '/workspace', 1, 1, '[]')",
+                    [],
+                )
+                .expect("seed project");
+            connection
+                .execute(
+                    "INSERT INTO session \
+                       (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                     VALUES (?1, 'project', 'goal', '/workspace', 'goal', '1', 1, 1)",
+                    [session],
+                )
+                .expect("seed session");
+        }
+        let store = zuno_tools::WorkStateStore::new(Arc::clone(&pool));
+        let original = store
+            .update_plan(
+                session,
+                zuno_tools::PlanUpdateParams {
+                    expected_revision: None,
+                    goal_id: seeded_goal.map(str::to_owned),
+                    title: "Finished work".to_owned(),
+                    steps: vec![zuno_tools::PlanStep {
+                        id: "done".to_owned(),
+                        title: "Finished work".to_owned(),
+                        status: zuno_tools::PlanStepStatus::Completed,
+                    }],
+                },
+            )
+            .expect("seed terminal plan");
+
+        let outcome = ensure_host_plan(
+            &pool,
+            HostPlanningRequest {
+                session_id: session,
+                agent: "build",
+                prompt: "现在有几个 skill 可用",
+                source: PlanningInputSource::GoalObjective,
+                content: PlanningContentFacts::empty(),
+                plan_available: true,
+                goal_id: Some("goal-current".to_owned()),
+            },
+        )
+        .expect("classify atomic Goal");
+
+        assert!(matches!(outcome.decision, PlanningDecision::Atomic(_)));
+        assert!(!outcome.changed, "{session}: nothing to retire");
+        let plan = store
+            .plan(session)
+            .expect("read plan")
+            .expect("plan stays visible");
+        assert_eq!(plan.revision, original.revision, "{session}");
+        assert_eq!(
+            plan.goal_id.as_deref(),
+            seeded_goal,
+            "{session}: no rebind either way"
+        );
+    }
 }
 
 #[test]

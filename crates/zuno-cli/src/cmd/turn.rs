@@ -8424,6 +8424,26 @@ fn ensure_host_plan(
             changed: false,
         });
     };
+    let other_goals_plan = goal_id.is_some()
+        && existing.goal_id.is_some()
+        && existing.goal_id.as_deref() != goal_id.as_deref();
+    // A finished Plan of a previous Goal is history, not this Goal's work. It is not
+    // rebound — that would credit this Goal with steps it never ran — and it cannot stay
+    // visible either: the completion audit judges a Goal against the visible Plan and
+    // refuses one that belongs to another Goal, so an objective that needs no Plan of
+    // its own (a question, one bounded read) could never complete. Archive it as
+    // completed, which the audit deliberately ignores, and let this Goal stand on its
+    // own evidence. A Plan with no `goal_id` predates the binding and passes the audit
+    // as it is, so it is left alone.
+    if other_goals_plan && existing_state == ExistingPlanState::Terminal {
+        store
+            .archive_terminal_plan(session_id, existing.revision)
+            .map_err(to_string)?;
+        return Ok(HostPlanningOutcome {
+            decision,
+            changed: true,
+        });
+    }
     let should_bind_goal = goal_id.is_some()
         && existing.goal_id.as_deref() != goal_id.as_deref()
         && existing_state == ExistingPlanState::Active;
