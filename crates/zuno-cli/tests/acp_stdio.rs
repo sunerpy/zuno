@@ -4475,30 +4475,13 @@ async fn acp_detached_parent_projects_final_plan_after_background_child_completi
                     text.contains("parent resumed after background child completion")
                 })
     }));
-    let resumed_index = detached_updates
+    let plan_update = detached_updates
         .iter()
-        .position(|params| {
-            params["sessionId"] == parent_session_id
-                && params["update"]["sessionUpdate"] == "agent_message_chunk"
-                && params["update"]["content"]["text"]
-                    .as_str()
-                    .is_some_and(|text| {
-                        text.contains("parent resumed after background child completion")
-                    })
-        })
-        .expect("missing resumed parent message");
-    let (plan_index, plan_update) = detached_updates
-        .iter()
-        .enumerate()
         .rev()
-        .find(|(_, params)| {
+        .find(|params| {
             params["sessionId"] == parent_session_id && params["update"]["sessionUpdate"] == "plan"
         })
         .expect("missing final durable plan projection");
-    assert!(
-        plan_index > resumed_index,
-        "the final durable plan projection must follow detached turn events"
-    );
     assert!(
         plan_update["update"]["entries"]
             .as_array()
@@ -4605,10 +4588,11 @@ async fn acp_prompt_projects_the_final_durable_plan_before_responding() {
         .filter(|(_, update)| update["sessionUpdate"] == "plan")
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    assert!(
-        plan_positions.len() >= 2,
-        "a durable Plan commit must be projected immediately and again as the terminal \
-         authoritative snapshot: {updates:#?}"
+    assert_eq!(
+        plan_positions.len(),
+        1,
+        "live projection and the terminal authoritative flush must deduplicate the same durable \
+         Plan revision: {updates:#?}"
     );
     let final_message = updates
         .iter()
@@ -4616,7 +4600,7 @@ async fn acp_prompt_projects_the_final_durable_plan_before_responding() {
         .expect("final assistant message projection");
     assert!(
         plan_positions[0] < final_message,
-        "the first Plan update must follow the durable tool commit rather than waiting for the \
+        "the Plan update must follow the durable work-state change rather than waiting for the \
          terminal answer: {updates:#?}"
     );
     let plan = updates
@@ -4933,6 +4917,15 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
         .find(|update| update["sessionUpdate"] == "tool_call_update")
         .expect("completed tool replay");
     let content = completed["content"].as_array().expect("tool content");
+    assert_eq!(completed["title"], "Editing files");
+    assert_eq!(completed["kind"], "edit");
+    assert!(
+        content.iter().all(|item| {
+            item["type"] == "diff"
+                || (item["type"] == "content" && item["content"]["type"] == "image")
+        }),
+        "successful edit replay must not duplicate the raw success text: {completed:#?}"
+    );
     let diff = content
         .iter()
         .find(|item| item["type"] == "diff")
@@ -4991,9 +4984,20 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
         }),
     );
     assert_eq!(resumed["modes"]["currentModeId"], "build");
+    assert_eq!(
+        resume_updates
+            .iter()
+            .filter(|update| update["sessionUpdate"] == "plan")
+            .count(),
+        1,
+        "session/resume must restore the authoritative Plan without replaying transcript history: \
+         {resume_updates:#?}"
+    );
     assert!(
-        resume_updates.is_empty(),
-        "session/resume must not duplicate durable history: {resume_updates:#?}"
+        resume_updates
+            .iter()
+            .all(|update| update["sessionUpdate"] == "plan"),
+        "session/resume must not replay durable transcript history: {resume_updates:#?}"
     );
     let (_loaded_after_resume, replay_after_resume) = request_with_updates(
         &mut stdin,
@@ -5102,6 +5106,7 @@ fn acp_load_replays_negotiated_child_sessions_on_their_own_routes() {
     assert_eq!(
         routes,
         vec![
+            (parent_session_id.as_str(), "plan"),
             (parent_session_id.as_str(), "session_info_update"),
             (parent_session_id.as_str(), "subagent_spawned"),
             (child_session_id, "user_message_chunk"),
@@ -5112,25 +5117,27 @@ fn acp_load_replays_negotiated_child_sessions_on_their_own_routes() {
         ],
         "session/load must rebuild the durable child tree before returning: {routed:#?}"
     );
+    assert_eq!(routed[0]["update"]["entries"], json!([]));
+    assert_eq!(routed[0]["update"]["_meta"]["zuno"]["cleared"], true);
     assert_eq!(
-        routed[0]["update"]["_meta"]["zuno"]["learning"]["experiences"],
+        routed[1]["update"]["_meta"]["zuno"]["learning"]["experiences"],
         json!([])
     );
-    assert_eq!(routed[1]["update"]["subagentSessionId"], child_session_id);
-    assert_eq!(routed[1]["update"]["name"], "explorer");
+    assert_eq!(routed[2]["update"]["subagentSessionId"], child_session_id);
+    assert_eq!(routed[2]["update"]["name"], "explorer");
     assert_eq!(
-        routed[2]["update"]["content"]["text"],
+        routed[3]["update"]["content"]["text"],
         "inspect the child tree"
     );
     assert_eq!(
-        routed[3]["update"]["content"]["text"],
+        routed[4]["update"]["content"]["text"],
         "child history restored"
     );
     assert_eq!(
-        routed[4]["update"]["_meta"]["zuno"]["learning"]["experiences"],
+        routed[5]["update"]["_meta"]["zuno"]["learning"]["experiences"],
         json!([])
     );
-    assert_eq!(routed[6]["update"]["state"], "disconnected");
+    assert_eq!(routed[7]["update"]["state"], "disconnected");
 
     request(
         &mut stdin,

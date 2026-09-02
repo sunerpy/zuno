@@ -373,6 +373,8 @@ pub enum ToolBlockKind {
     Denied,
     /// The model supplied malformed or unsafe arguments.
     InvalidArguments,
+    /// A mutation precondition failed before any requested effect ran.
+    Conflict,
     /// No callable implementation was available under the requested name.
     Unavailable,
 }
@@ -384,6 +386,7 @@ impl ToolBlockKind {
         match self {
             Self::Denied => "denied",
             Self::InvalidArguments => "invalid_arguments",
+            Self::Conflict => "conflict",
             Self::Unavailable => "unavailable",
         }
     }

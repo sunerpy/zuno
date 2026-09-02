@@ -1,9 +1,9 @@
 use crate::format::{FormatFailure, FormatOutcome, METADATA_FAILURES_KEY};
 use async_trait::async_trait;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -30,33 +30,76 @@ impl ResolvedPath {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
-    length: usize,
-    hash: u64,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileReadReceipt {
+    pub(crate) digest: String,
+    pub(crate) generation: u64,
 }
 
-impl FileStamp {
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let mut hasher = DefaultHasher::new();
-        bytes.hash(&mut hasher);
-        Self {
-            length: bytes.len(),
-            hash: hasher.finish(),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileReadConflictKind {
+    ReadRequired,
+    StaleRead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileReadConflict {
+    pub(crate) kind: FileReadConflictKind,
+    pub(crate) observed_digest: String,
+}
+
+impl FileReadConflict {
+    pub(crate) fn message(&self, path: &Path) -> String {
+        match self.kind {
+            FileReadConflictKind::ReadRequired => format!(
+                "File must be read before editing. Use the read tool on {}, then retry the edit.",
+                slash(path)
+            ),
+            FileReadConflictKind::StaleRead => format!(
+                "File changed after it was read. Read {} again, then retry the edit.",
+                slash(path)
+            ),
         }
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchConflictFence {
+    resources: Vec<(PathBuf, FileReadReceipt)>,
+    conflict: IdenticalPatchConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdenticalPatchConflict {
+    pub(crate) resource: String,
+    pub(crate) observed_digest: Option<String>,
+    pub(crate) hunk_index: Option<usize>,
+    pub(crate) hunk_header: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct FileAccessRecords {
+    reads: HashMap<(String, PathBuf), FileReadReceipt>,
+    patch_conflicts: HashMap<(String, String), PatchConflictFence>,
+    generation: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FileAccessState {
-    reads: Arc<Mutex<HashMap<(String, PathBuf), FileStamp>>>,
+    records: Arc<Mutex<FileAccessRecords>>,
 }
 
 impl FileAccessState {
     pub(crate) fn record_read(&self, session_id: &str, path: &Path, bytes: &[u8]) {
-        self.reads.lock().expect("file read-state lock").insert(
+        let mut records = self.records.lock().expect("file read-state lock");
+        records.generation = records.generation.wrapping_add(1);
+        let generation = records.generation;
+        records.reads.insert(
             (session_id.to_owned(), path.to_owned()),
-            FileStamp::from_bytes(bytes),
+            FileReadReceipt {
+                digest: digest_bytes(bytes),
+                generation,
+            },
         );
     }
 
@@ -65,26 +108,81 @@ impl FileAccessState {
         session_id: &str,
         path: &Path,
         bytes: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<FileReadReceipt, FileReadConflict> {
+        let observed_digest = digest_bytes(bytes);
         let expected = self
-            .reads
+            .records
             .lock()
             .expect("file read-state lock")
+            .reads
             .get(&(session_id.to_owned(), path.to_owned()))
-            .copied();
+            .cloned();
         let Some(expected) = expected else {
-            return Err(format!(
-                "File must be read before editing. Use the read tool on {}, then retry the edit.",
-                slash(path)
-            ));
+            return Err(FileReadConflict {
+                kind: FileReadConflictKind::ReadRequired,
+                observed_digest,
+            });
         };
-        if expected != FileStamp::from_bytes(bytes) {
-            return Err(format!(
-                "File changed after it was read. Read {} again, then retry the edit.",
-                slash(path)
-            ));
+        if expected.digest != observed_digest {
+            return Err(FileReadConflict {
+                kind: FileReadConflictKind::StaleRead,
+                observed_digest,
+            });
         }
-        Ok(())
+        Ok(expected)
+    }
+
+    pub(crate) fn record_patch_conflict(
+        &self,
+        session_id: &str,
+        operation_digest: &str,
+        resources: Vec<(PathBuf, FileReadReceipt)>,
+        conflict: IdenticalPatchConflict,
+    ) {
+        self.records
+            .lock()
+            .expect("file read-state lock")
+            .patch_conflicts
+            .insert(
+                (session_id.to_owned(), operation_digest.to_owned()),
+                PatchConflictFence {
+                    resources,
+                    conflict,
+                },
+            );
+    }
+
+    pub(crate) fn identical_patch_conflict(
+        &self,
+        session_id: &str,
+        operation_digest: &str,
+        resources: &[(PathBuf, FileReadReceipt)],
+    ) -> Option<IdenticalPatchConflict> {
+        let records = self.records.lock().expect("file read-state lock");
+        let fence = records
+            .patch_conflicts
+            .get(&(session_id.to_owned(), operation_digest.to_owned()))?;
+        if fence.resources.len() != resources.len() {
+            return None;
+        }
+        let same_images = fence.resources.iter().zip(resources).all(
+            |((previous_path, previous), (current_path, current))| {
+                // A fresh read advances the generation, but an unchanged
+                // authoritative image still makes the identical failed patch a
+                // deterministic replay.
+                let _reread_after_conflict = current.generation != previous.generation;
+                previous_path == current_path && previous.digest == current.digest
+            },
+        );
+        same_images.then(|| fence.conflict.clone())
+    }
+
+    pub(crate) fn clear_patch_conflict(&self, session_id: &str, operation_digest: &str) {
+        self.records
+            .lock()
+            .expect("file read-state lock")
+            .patch_conflicts
+            .remove(&(session_id.to_owned(), operation_digest.to_owned()));
     }
 
     pub(crate) fn record_write(&self, session_id: &str, path: &Path, bytes: &[u8]) {
@@ -92,11 +190,17 @@ impl FileAccessState {
     }
 
     pub(crate) fn forget(&self, path: &Path) {
-        self.reads
-            .lock()
-            .expect("file read-state lock")
-            .retain(|(_, recorded), _| recorded != path);
+        let mut records = self.records.lock().expect("file read-state lock");
+        records.reads.retain(|(_, recorded), _| recorded != path);
+        records
+            .patch_conflicts
+            .retain(|_, fence| !fence.resources.iter().any(|(recorded, _)| recorded == path));
     }
+}
+
+#[must_use]
+pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// The seam Todo 39 left for the formatter runtime, now filled by

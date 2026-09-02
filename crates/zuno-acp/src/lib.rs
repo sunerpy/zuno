@@ -19,8 +19,8 @@ pub use projection::{AttemptBufferedTurnEventProjector, TurnEventProjector, turn
 pub use question::AcpQuestionAsker;
 pub use replay::{
     DurableReplay, REPLAY_MESSAGE_CAP, REPLAY_TRANSCRIPT_BYTE_CAP, ReplayPolicy,
-    durable_learning_update, durable_plan_update, durable_updates, durable_usage_update,
-    durable_work_updates,
+    durable_learning_update, durable_plan_clear_update, durable_plan_update, durable_updates,
+    durable_usage_update, durable_work_updates,
 };
 pub use routing::{AcpSessionRoute, RoutedSession};
 pub use transport::{Agent, ClientConnection, RpcError, ServeError, serve_stdio};

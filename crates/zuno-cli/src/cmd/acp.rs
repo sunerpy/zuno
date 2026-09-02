@@ -330,6 +330,10 @@ impl ProductionAcpAgent {
             }
         } else {
             session.mark_replay_satisfied().await?;
+            session
+                .plan_projection
+                .project_durable(&session.id, &client, true)
+                .await?;
         }
         if let Err(error) = session.defer_available_commands(&client).await {
             self.state.sessions.lock().await.remove(&session_id);
@@ -543,11 +547,16 @@ impl ProductionAcpAgent {
             .to_path_buf();
         let background_notification_directory = plan.directory().to_path_buf();
         let background_notifications = self.state.environment.background_notifications();
+        let plan_projection = Arc::new(AcpPlanProjection::default());
         let resources = open_session_resources(
             plan,
             &self.state.environment,
             self.state.runs.clone(),
-            AcpSurfaceContext::from_state(self.state.as_ref(), client),
+            AcpSurfaceContext::from_state(
+                self.state.as_ref(),
+                client,
+                Arc::clone(&plan_projection),
+            ),
             None,
             &mcp_servers,
         )
@@ -568,6 +577,7 @@ impl ProductionAcpAgent {
             background_notifications,
             _session_slot: session_slot,
             mcp_servers: Arc::from(mcp_servers),
+            plan_projection,
             dormant: Mutex::new(None),
             resources: Mutex::new(Some(resources)),
         }))
@@ -614,6 +624,7 @@ impl ProductionAcpAgent {
             background_notifications,
             _session_slot: session_slot,
             mcp_servers: Arc::from(mcp_servers),
+            plan_projection: Arc::new(AcpPlanProjection::default()),
             dormant: Mutex::new(Some(DormantSession {
                 options,
                 configuration,
@@ -653,6 +664,7 @@ struct AcpSession {
     background_notifications: super::background_notification::BackgroundNotificationRegistry,
     _session_slot: OwnedSemaphorePermit,
     mcp_servers: Arc<[zuno_acp::AcpMcpServer]>,
+    plan_projection: Arc<AcpPlanProjection>,
     dormant: Mutex<Option<DormantSession>>,
     resources: Mutex<Option<SessionResources>>,
 }
@@ -667,6 +679,7 @@ struct SessionResources {
     host: TurnHost,
     detached_observer: Arc<dyn DetachedTurnObserver>,
     skill_updates: Option<tokio::task::JoinHandle<()>>,
+    plan_updates: Option<tokio::task::JoinHandle<()>>,
     mcp: Option<McpRuntime>,
     subagents: Option<super::acp_subagent::AcpSubagentBridge>,
     subagent_flush: Option<super::acp_subagent::AcpSubagentFlush>,
@@ -695,18 +708,83 @@ struct PreparedReconfiguration {
     persistence: ConfigurationPersistence,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcpPlanRevision {
+    id: String,
+    revision: i64,
+}
+
+#[derive(Debug, Default)]
+struct AcpPlanProjectionState {
+    visible: Option<AcpPlanRevision>,
+    initialized: bool,
+}
+
+#[derive(Debug, Default)]
+struct AcpPlanProjection {
+    state: Mutex<AcpPlanProjectionState>,
+}
+
+impl AcpPlanProjection {
+    async fn project_durable(
+        &self,
+        session_id: &str,
+        client: &zuno_acp::ClientConnection,
+        clear_if_absent: bool,
+    ) -> Result<(), zuno_acp::RpcError> {
+        // Serialize the authoritative read with the send and cursor commit. A
+        // slower snapshot can therefore never overtake a newer revision.
+        let mut state = self.state.lock().await;
+        let work = replay_plan_work_state(Arc::new(durable_pool()?), session_id)?;
+        let Some(plan) = work.plan.as_ref() else {
+            if state.visible.is_none() && (state.initialized || !clear_if_absent) {
+                return Ok(());
+            }
+            client
+                .session_update(session_id, zuno_acp::durable_plan_clear_update())
+                .await?;
+            state.visible = None;
+            state.initialized = true;
+            return Ok(());
+        };
+        let next = AcpPlanRevision {
+            id: plan.id.clone(),
+            revision: plan.revision,
+        };
+        if state
+            .visible
+            .as_ref()
+            .is_some_and(|current| current.id == next.id && current.revision >= next.revision)
+        {
+            return Ok(());
+        }
+        let update = zuno_acp::durable_plan_update(&work).ok_or_else(|| {
+            zuno_acp::RpcError::internal(format!(
+                "durable Plan {} revision {} contains a status unsupported by stable ACP",
+                plan.id, plan.revision
+            ))
+        })?;
+        client.session_update(session_id, update).await?;
+        state.visible = Some(next);
+        state.initialized = true;
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct AcpSurfaceContext {
     client: zuno_acp::ClientConnection,
     permission_grants: Arc<zuno_acp::AcpPermissionGrants>,
     elicitation_form: bool,
     native_subagents: bool,
+    plan_projection: Arc<AcpPlanProjection>,
 }
 
 struct AcpDetachedTurnObserver {
     root_session_id: Arc<OnceLock<String>>,
     client: zuno_acp::ClientConnection,
     projector: Mutex<zuno_acp::AttemptBufferedTurnEventProjector>,
+    plan_projection: Arc<AcpPlanProjection>,
     children: Option<Arc<dyn ChildTurnObserver>>,
 }
 
@@ -742,26 +820,43 @@ impl DetachedTurnObserver for AcpDetachedTurnObserver {
         {
             return;
         }
-        for update in zuno_acp::durable_work_updates(work) {
-            if let Err(error) = self.client.session_update(session_id, update).await {
-                tracing::debug!(
-                    session_id,
-                    %error,
-                    "detached root turn outlived its final ACP work-state projection"
-                );
-                break;
-            }
+        if let Err(error) = self
+            .plan_projection
+            .project_durable(session_id, &self.client, false)
+            .await
+        {
+            tracing::debug!(
+                session_id,
+                %error,
+                "detached root turn outlived its final ACP Plan projection"
+            );
+        }
+        if let Err(error) = self
+            .client
+            .session_update(session_id, zuno_acp::durable_learning_update(work))
+            .await
+        {
+            tracing::debug!(
+                session_id,
+                %error,
+                "detached root turn outlived its final ACP learning projection"
+            );
         }
     }
 }
 
 impl AcpSurfaceContext {
-    fn from_state(state: &AcpState, client: zuno_acp::ClientConnection) -> Self {
+    fn from_state(
+        state: &AcpState,
+        client: zuno_acp::ClientConnection,
+        plan_projection: Arc<AcpPlanProjection>,
+    ) -> Self {
         Self {
             client,
             permission_grants: Arc::clone(&state.permission_grants),
             elicitation_form: state.elicitation_form.load(Ordering::Acquire),
             native_subagents: state.native_subagents.load(Ordering::Acquire),
+            plan_projection,
         }
     }
 }
@@ -825,6 +920,7 @@ async fn open_session_resources(
         permission_grants,
         elicitation_form,
         native_subagents,
+        plan_projection,
     } = surface;
     let configuration = SessionConfiguration::from_plan(&plan, build_agent);
     let workspace = plan
@@ -882,6 +978,7 @@ async fn open_session_resources(
                 configuration.context_size,
             ),
         ),
+        plan_projection: Arc::clone(&plan_projection),
         children: child_observer.as_ref().map(Arc::clone),
     });
     let host = TurnHost::open_with_runtime_mcp_and_observers(
@@ -1038,6 +1135,27 @@ async fn open_session_resources(
             }
         })
     };
+    let plan_updates = {
+        let mut receiver = host.work_state_changes();
+        let session_id = host.session_id().to_owned();
+        let client = client.clone();
+        tokio::spawn(async move {
+            while receiver.changed().await.is_ok() {
+                let generation = *receiver.borrow_and_update();
+                if let Err(error) = plan_projection
+                    .project_durable(&session_id, &client, false)
+                    .await
+                {
+                    tracing::debug!(
+                        session_id,
+                        generation,
+                        %error,
+                        "ACP durable Plan projection could not follow a work-state change"
+                    );
+                }
+            }
+        })
+    };
     let subagent_flush = subagents
         .as_ref()
         .map(super::acp_subagent::AcpSubagentBridge::flush_handle);
@@ -1045,6 +1163,7 @@ async fn open_session_resources(
         host,
         detached_observer,
         skill_updates: Some(skill_updates),
+        plan_updates: Some(plan_updates),
         mcp,
         subagents,
         subagent_flush,
@@ -1057,6 +1176,9 @@ async fn open_session_resources(
 async fn shutdown_session_resources(mut resources: SessionResources) -> Result<(), String> {
     if let Some(skill_updates) = resources.skill_updates.take() {
         skill_updates.abort();
+    }
+    if let Some(plan_updates) = resources.plan_updates.take() {
+        plan_updates.abort();
     }
     let host = resources.host.shutdown().await;
     let subagents = shutdown_subagent_bridge(&mut resources.subagents).await;
@@ -1280,7 +1402,11 @@ impl AcpSession {
                 plan,
                 &state.environment,
                 state.runs.clone(),
-                AcpSurfaceContext::from_state(state, client),
+                AcpSurfaceContext::from_state(
+                    state,
+                    client,
+                    Arc::clone(&self.plan_projection),
+                ),
                 Some(build_agent),
                 &self.mcp_servers,
             )
@@ -1439,7 +1565,7 @@ impl AcpSession {
             plan,
             &state.environment,
             state.runs.clone(),
-            AcpSurfaceContext::from_state(state, client.clone()),
+            AcpSurfaceContext::from_state(state, client.clone(), Arc::clone(&self.plan_projection)),
             Some(&build_agent),
             &self.mcp_servers,
         )
@@ -1644,11 +1770,11 @@ impl AcpSession {
         let projection = project_turn(&self.id, context_size, receiver, client.clone());
         let (driven, projected) = tokio::join!(drive, projection);
         let projected = projected?;
-        self.flush_subagents().await?;
-        self.project_work_state(&client).await?;
         let mut driven = driven;
         let mut projected = projected;
         loop {
+            self.flush_subagents().await?;
+            self.project_work_state(&client).await?;
             match projected {
                 ProjectedTurn::Completed(stop_reason) => {
                     driven?;
@@ -1957,7 +2083,7 @@ impl AcpSession {
             plan,
             &state.environment,
             state.runs.clone(),
-            AcpSurfaceContext::from_state(state, client),
+            AcpSurfaceContext::from_state(state, client, Arc::clone(&self.plan_projection)),
             Some(&dormant.configuration.build_agent),
             &self.mcp_servers,
         )
@@ -1993,18 +2119,19 @@ impl AcpSession {
         &self,
         client: &zuno_acp::ClientConnection,
     ) -> Result<(), zuno_acp::RpcError> {
-        let updates = {
+        self.plan_projection
+            .project_durable(&self.id, client, false)
+            .await?;
+        let learning = {
             let resources = self.resources.lock().await;
             let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
             let work = resources
                 .host
                 .work_state()
                 .map_err(zuno_acp::RpcError::internal)?;
-            zuno_acp::durable_work_updates(&work)
+            zuno_acp::durable_learning_update(&work)
         };
-        for update in updates {
-            client.session_update(&self.id, update).await?;
-        }
+        client.session_update(&self.id, learning).await?;
         Ok(())
     }
 
@@ -2087,12 +2214,15 @@ impl AcpSession {
             }
             client.session_update(&self.id, update).await?;
         }
-        for update in zuno_acp::durable_work_updates(&work_state) {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(self.closed_error());
-            }
-            client.session_update(&self.id, update).await?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(self.closed_error());
         }
+        self.plan_projection
+            .project_durable(&self.id, client, true)
+            .await?;
+        client
+            .session_update(&self.id, zuno_acp::durable_learning_update(&work_state))
+            .await?;
         if let Some(update) =
             zuno_acp::durable_usage_update(&history.messages, context_size, stored.usage.cost)
         {
@@ -2191,6 +2321,18 @@ fn replay_work_state(
     let session = zuno_db::session::Store::new(pool.as_ref())
         .get(session_id)
         .map_err(|error| map_session_lookup(session_id, error))?;
+    let learning = zuno_learning::LearningProjectionService::new(Arc::clone(&pool))
+        .snapshot(session_id, &session.project_id)
+        .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+    let mut work = replay_plan_work_state(pool, session_id)?;
+    work.learning = learning;
+    Ok(work)
+}
+
+fn replay_plan_work_state(
+    pool: Arc<zuno_db::pool::Pool>,
+    session_id: &str,
+) -> Result<zuno_types::WorkStateProjection, zuno_acp::RpcError> {
     let snapshot = zuno_tools::work_state::WorkStateStore::new(Arc::clone(&pool))
         .snapshot(session_id)
         .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
@@ -2235,13 +2377,9 @@ fn replay_work_state(
             time_updated: item.time_updated,
         })
         .collect();
-    let learning = zuno_learning::LearningProjectionService::new(pool)
-        .snapshot(session_id, &session.project_id)
-        .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
     Ok(zuno_types::WorkStateProjection {
         plan,
         todos,
-        learning,
         ..zuno_types::WorkStateProjection::default()
     })
 }
@@ -3188,22 +3326,8 @@ async fn project_turn(
         zuno_acp::AttemptBufferedTurnEventProjector::with_context_size(context_size);
     let mut finish_reason = None;
     while let Some(event) = receiver.recv().await {
-        let plan_committed = matches!(
-            &event,
-            TurnEvent::ToolDispatchCompleted {
-                name,
-                is_error: false,
-                ..
-            } if name == zuno_tools::PLAN_UPDATE_TOOL_ID
-        );
         for update in projector.project(&event) {
             client.session_update(session_id, update).await?;
-        }
-        if plan_committed {
-            let work = replay_work_state(Arc::new(durable_pool()?), session_id)?;
-            if let Some(update) = zuno_acp::durable_plan_update(&work) {
-                client.session_update(session_id, update).await?;
-            }
         }
         match event {
             TurnEvent::StepCompleted {

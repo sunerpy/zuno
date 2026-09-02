@@ -21,18 +21,30 @@ The exact annotated tag objects, release asset IDs, URLs, sizes, hashes, fetch
 time, and upstream main commits observed during capture are recorded in
 `docs/upstream/acp/manifest.json`.
 
-### 2026-09-01 current Zed contract spot-check
+### 2026-09-02 current Zed contract spot-check
 
 The stable protocol baseline above is unchanged. For this implementation,
 current Zed `main` was additionally inspected at
-[`283460f5df4fc18d8077fe5051a0c4154f6ffe53`](https://github.com/zed-industries/zed/commit/283460f5df4fc18d8077fe5051a0c4154f6ffe53):
+[`97b1e64a177a2fe3c2803e323087b5c2fa6fff1e`](https://github.com/zed-industries/zed/commit/97b1e64a177a2fe3c2803e323087b5c2fa6fff1e).
+Its workspace pins `agent-client-protocol = 2.0.0` with unstable features while
+the client-consumed stable schema crate remains
+`agent-client-protocol-schema = 1.5.0`. Zuno keeps its production wire contract
+at stable ACP V1.21 and adds a typed decode contract test against that exact
+client schema:
 
 - [`CurrentModeUpdate` mutates the session mode and `ConfigOptionUpdate`
-  replaces the option list and wakes its watcher](https://github.com/zed-industries/zed/blob/283460f5df4fc18d8077fe5051a0c4154f6ffe53/crates/agent_servers/src/acp.rs#L4842-L4859);
+  replaces the option list and wakes its watcher](https://github.com/zed-industries/zed/blob/97b1e64a177a2fe3c2803e323087b5c2fa6fff1e/crates/agent_servers/src/acp.rs#L4842-L4860);
 - [standard `SessionUpdate::Plan` is passed to the ACP thread
-  model](https://github.com/zed-industries/zed/blob/283460f5df4fc18d8077fe5051a0c4154f6ffe53/crates/acp_thread/src/acp_thread.rs#L2604-L2613);
+  model](https://github.com/zed-industries/zed/blob/97b1e64a177a2fe3c2803e323087b5c2fa6fff1e/crates/acp_thread/src/acp_thread.rs#L2604-L2613);
 - [the thread replaces, extends, or truncates its current Plan entries from each
-  complete update](https://github.com/zed-industries/zed/blob/283460f5df4fc18d8077fe5051a0c4154f6ffe53/crates/acp_thread/src/acp_thread.rs#L3573-L3600).
+  complete update](https://github.com/zed-industries/zed/blob/97b1e64a177a2fe3c2803e323087b5c2fa6fff1e/crates/acp_thread/src/acp_thread.rs#L3577-L3600).
+
+The exact schema dependency is enabled only by the
+`zed-schema-contract` feature and exercised through
+`make test-zed-acp-schema`. Its upstream crate enables
+`serde_json/preserve_order`; isolating the contract build prevents that test-only
+feature from changing production type layouts or unrelated workspace Clippy
+results.
 
 Zuno's stdio black-box tests therefore assert standard mode, config, Plan, and
 live command updates. This spot-check does not advance the vendored ACP schema
@@ -124,11 +136,11 @@ loop.
 | Session lifecycle | Implements `session/new`, `load`, `resume`, `list`, `delete`, and `close`. Loading and resuming rebuild the `TurnHost` plus the complete configured and client-provided MCP set before publication. Loading replays durable history, while resume treats the client transcript as already owned. An active root Goal is scheduled after lifecycle publication without waiting for another prompt. |
 | Session configuration | Implements build/plan modes plus transactional Agent, model, and `reasoning_effort` replacement. `active_agent` is authoritative: selecting `plan` selects Plan mode, selecting an implementation Agent selects Build mode, and changing Mode performs the inverse mapping. Every successful change publishes both `current_mode_update` and `config_option_update`. The reasoning selector uses ACP category `thought_level` and only publishes levels supported by the active catalog model. Reconfiguration is rejected while a prompt is active and rolls back on failure. |
 | Commands and Skills | Publishes native `/compact`, `/goal`, `/plan`, `/start-plan`, and `/start-work` controls with real handlers, executable Catalog commands, and unambiguous slash-invokable Skills. The same session-scoped Skill snapshot drives prompt discovery, required Skills, the tool, slash routing, and ACP; each new generation publishes `available_commands_update` without a session restart. Native commands resolve first and suppress same-named Catalog or Skill entries. Compact and Goal invoke shared durable `TurnHost` handlers; Goal create/edit establishes the continuation idle edge and durably admits the objective as the first user anchor when needed. Plan controls transactionally replace the collaboration host and require a durable plan before returning to Work. Native command text never enters the model; other `/name arguments` invocations reuse the same command or Skill driver as other Zuno surfaces. |
-| Prompt execution | Admits input through the durable Zuno turn path and projects committed attempt output while the turn runs. Every successful durable `plan_update` commit immediately publishes a complete `sessionUpdate: "plan"` snapshot; load replays the current snapshot, and a detached root continuation publishes one final authoritative snapshot after its event stream drains. `superseded` maps to ACP `completed` with `_meta.zuno.outcome: "superseded"`. Projection failure never changes the committed turn outcome. Concurrent prompts for one session are rejected. |
+| Prompt execution | Admits input through the durable Zuno turn path and projects committed attempt output while the turn runs. A session-owned projection pump subscribes to `TurnHost::work_state_changes()` rather than recognizing a particular tool call. Each Plan revision causes an authoritative complete `sessionUpdate: "plan"` snapshot; `(plan_id, revision)` suppresses stale or duplicate updates, rapid commits may collapse to the newest revision, and prompt completion flushes the final revision. Removing a Plan sends empty entries so Zed clears stale UI. Load, resume, detached continuation, and host remount use the same projector. `superseded` maps to ACP `completed` with `_meta.zuno.outcome: "superseded"`. Projection failure never changes the committed turn outcome. Concurrent prompts for one session are rejected. |
 | Prompt content | Advertises and accepts text, inline image, native `resource_link`, embedded text resource, and embedded image resource content. Audio remains `false`. Resource links stay typed; images use typed durable file parts; embedded text keeps URI, MIME, and body in one stable persisted envelope. Selection, diagnostics, fetched context, and branch diff use the generic embedded-resource path rather than Zed-specific prompt branches. |
 | Assistant and tool projection | ACP text, reasoning, and pending tool updates are provisional until the assistant checkpoint because ACP has no rollback operation. A provider `RetryRollback` discards the failed attempt before any of those updates reach Zed; the successful replacement is then committed in order. An accepted `question` result is already durable, so Zuno immediately reasserts that tool call as `in_progress` with `_meta.zuno.question.continuationPending: true` while the continuation request is silent. The real `completed` update is sent before the continuation's checkpointed output, or during terminal cleanup if the turn fails or is interrupted. This keeps Zed visibly active without inventing assistant text or exposing provisional output. Tool dispatch start/update/completion, raw input/output, JSON/text content, written-file locations, and usage otherwise keep their normal order. A generated session title is a typed `session_info_update`; operational status and provider error text never masquerade as `agent_thought_chunk`. |
 | Delegation and child sessions | Every `task` call has a stable human-readable tool card plus raw details. If the client explicitly advertises the draft `clientCapabilities.subagents` object, Zuno advertises the matching session capability and additionally routes foreground child replay and live updates on the durable child session id. Spawn and terminal state stay on the direct parent route; child transcript, tools, reasoning, plan, and usage stay on the child route. Background children remain on the durable task/job lifecycle and are never represented as foreground native subagents. |
-| File edits and diffs | Zuno's native file tools produce stable ACP `diff` content with an absolute path and exact `oldText`/`newText`. A unified-diff text fallback remains only for tools that cannot provide typed file state. |
+| File edits and diffs | `edit`, `write`, and `apply_patch` share the `Editing files` edit card. A successful native mutation publishes only stable ACP `diff` content with an absolute path and exact `oldText`/`newText`; the original success text remains in `rawOutput` but is not duplicated in the visible content. A successful call with no diff keeps a short text fallback. Pre-write failures show actionable text without fabricated diffs. Partial or otherwise uncertain mutations are failed cards with observed paths/diffs and `_meta.zuno.outcome: "uncertain"`. Live delivery and replay use the same policy. A unified-diff text fallback remains only for tools that cannot provide typed file state. |
 | Human input | Routes ordinary tool permission through `session/request_permission`. Structured question forms are exposed only to Plan turns when the client advertises elicitation; ordinary Work finishes with a direct question only for a genuinely blocking choice, so it does not hold an active ACP tool call open for optional preferences. Question options remain native ACP `oneOf` single-select or array multi-select controls; when a typed answer is allowed, Zuno adds a separate optional `Other` field instead of degrading the choices into descriptive text. Reusable permission asks expose an ACP `allow_always` choice labelled `Allow for session`; Zuno stores the exact grant across host remounts and clears it on `session/close`. Manual asks remain one-shot. Effective `allow_all`, including `danger-full-access`, emits no ordinary permission request. A child permission ask uses its child route only after native subagents were negotiated; otherwise it uses the declared root session and carries `_meta.zuno.childSessionId` for attribution. Delegated children do not receive `question`; they report blockers to the parent, which owns any later direct question or Plan elicitation on the root session. Unknown, malformed, declined, and cancelled outcomes fail closed. |
 | Cancellation | `session/cancel`, JSON-RPC `$/cancel_request`, stdin EOF, and process shutdown abort active work and settle pending agent-to-client requests instead of leaving the transport hung. Request-id cancellation calls back into the Agent with the original method and params before dropping the handler future, allowing Zuno to abort the matching session process tree. Cancelling a parent prompt also cancels its foreground child and pending permission or elicitation request. `session/close` cancels and joins only background jobs owned by that root before releasing the host, MCP runtime, child projector, permission grants, and session slot. |
 | Durable load replay | Reconstructs a bounded retained suffix of user/assistant content, reasoning, tools, raw input/output, safe typed diffs and locations, resource links and image output, followed by the current plan and latest-context usage. Question and delegation tools replay as static cards while retaining raw details. When native subagents are negotiated, the durable child tree is restored in parent-before-child order and historical terminal state is conservatively `disconnected`. Omitted history is reported explicitly. |
@@ -288,7 +300,10 @@ Run this acceptance sequence from a Zed External Agent thread:
    internal session error.
 4. Select the Plan Agent and verify Zed receives Plan mode plus synchronized
    config updates. Select `deep` and verify Build mode. Then execute
-   `/start-plan`, create a durable plan, and execute `/start-work`.
+   `/start-plan`, create a durable Plan, and verify the bottom Plan panel appears
+   before the prompt completes. Patch multiple revisions and verify the panel
+   updates in place without reverting to an older revision, then execute
+   `/start-work`.
 5. After enough conversation history exists, execute `/compact`; verify it ends
    normally, persists a summary, and does not send `/compact` as model input.
 6. Add an image, selection, and branch diff; verify the selected model receives
@@ -302,7 +317,11 @@ Run this acceptance sequence from a Zed External Agent thread:
 9. Delegate one background child, close the root session, and verify the job is
    cancelled and joined without a native foreground-child stream.
 10. Request a file creation under strict permission policy, answer the Zed
-   permission card, and verify the native creation diff has `oldText: null`.
+   permission card, and verify the card is titled `Editing files`, shows only
+   the native `A/M/D` diff, and has no duplicate success sentence. Trigger one
+   pre-write conflict and one uncertain mutation fixture; verify the former
+   shows actionable recovery without a fabricated diff and the latter shows
+   failed status, observed paths, and the uncertain outcome.
 11. In Plan, ask a structured question with at least two options and verify Zed renders
    clickable choices plus an `Other` input. Submit an answer, confirm the
    question remains visibly `in_progress` while the model continues, and confirm

@@ -14,10 +14,19 @@ Plan mode；选择 `build`、`orchestrator`、`deep` 或其他实现 Agent 会�
 mode。反向切换 Mode 也会选择对应 Agent，并同时发送 `current_mode_update` 与
 `config_option_update`，避免 Zed 的两个 selector 漂移。
 
-每次 durable `plan_update` 成功 commit 后，Zuno 会立即发送完整的
-`sessionUpdate: "plan"`；load 会重放当前 Plan，detached Goal continuation 在事件流
-排空后再发送最终权威快照。ACP 没有 `superseded` 状态，因此 wire 上映射为
-`completed`，真实语义保存在 `_meta.zuno.outcome: "superseded"`。
+Plan 投影由 durable work-state revision 驱动，不再依赖识别 `plan_update` 工具调用。
+每个会话订阅当前 host，发生变化后读取权威 Plan 并发送完整的
+`sessionUpdate: "plan"`。`(plan_id, revision)` 会抑制重复或过期更新；连续快速提交
+可以合并到最新 revision，但 prompt 返回前必须 flush 最终状态。Plan 被移除时发送空
+entries 清除 Zed 旧面板。load、resume、detached Goal continuation 与 host 重建都复用
+同一个投影器。ACP 没有 `superseded` 状态，因此 wire 上映射为 `completed`，真实语义
+保存在 `_meta.zuno.outcome: "superseded"`。
+
+`edit`、`write` 与 `apply_patch` 统一投影为 `Editing files` 卡片。成功且存在结构化
+diff 时，可见内容只保留 `A/M/D <path>`，不再重复显示成功文案；完整原始输出仍在
+`rawOutput`。写入前失败展示可操作错误而不伪造 diff；部分写入或其他不确定结果使用
+failed 状态，保留已观察到的路径/diff，并设置 `_meta.zuno.outcome: "uncertain"`。
+实时更新与历史 replay 使用同一策略。
 
 运行中的 ACP 会话会订阅统一 Skill catalog generation。新增、修改、删除或重命名
 Skill 后，会发送新的 `available_commands_update`，无需重启会话。

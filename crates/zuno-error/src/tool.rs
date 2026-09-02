@@ -4,6 +4,69 @@ use crate::recovery::{Recoverable, Recovery};
 use crate::source::BoxSource;
 use std::time::Duration;
 
+/// Why a file mutation could not be safely applied.
+///
+/// These are pre-effect conflicts, not malformed JSON arguments and not
+/// transient failures. Replaying the identical mutation cannot repair any of
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolMutationConflictKind {
+    /// No read receipt exists for the current session and resource.
+    ReadRequired,
+    /// The resource changed after the session last read it.
+    StaleRead,
+    /// A syntactically valid mutation did not match the current resource image.
+    ContextMismatch,
+    /// The same failed mutation was submitted against the same resource image.
+    IdenticalReplay,
+}
+
+impl ToolMutationConflictKind {
+    /// Stable storage/client spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadRequired => "read_required",
+            Self::StaleRead => "stale_read",
+            Self::ContextMismatch => "context_mismatch",
+            Self::IdenticalReplay => "identical_replay",
+        }
+    }
+
+    /// Stable recovery instruction for model and client projections.
+    #[must_use]
+    pub const fn required_action(self) -> &'static str {
+        match self {
+            Self::ReadRequired | Self::StaleRead => "reread",
+            Self::ContextMismatch | Self::IdenticalReplay => "reread_and_revise",
+        }
+    }
+}
+
+/// Typed evidence for a mutation conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolMutationConflict {
+    pub kind: ToolMutationConflictKind,
+    /// Workspace-relative or absolute wire path naming the conflicted resource.
+    pub resource: String,
+    /// Stable digest of the complete requested mutation.
+    pub operation_digest: String,
+    /// Stable digest of the authoritative bytes observed during preflight.
+    pub observed_digest: Option<String>,
+    /// One-based patch hunk index, when the conflict belongs to a hunk.
+    pub hunk_index: Option<usize>,
+    /// Optional patch hunk header supplied by the caller.
+    pub hunk_header: Option<String>,
+}
+
+impl ToolMutationConflict {
+    /// The action required before another mutation attempt is safe.
+    #[must_use]
+    pub const fn required_action(&self) -> &'static str {
+        self.kind.required_action()
+    }
+}
+
 /// A failure from executing a tool.
 ///
 /// Every variant names the tool, because a tool failure is always reported
@@ -27,6 +90,19 @@ pub enum ToolError {
     #[error("tool {tool} received invalid arguments")]
     InvalidArgs {
         tool: String,
+        #[source]
+        source: BoxSource,
+    },
+
+    /// A mutation was refused before any requested effect ran.
+    ///
+    /// The structured conflict survives separately from its human-readable
+    /// source so callers never parse prose to decide whether to re-read, revise,
+    /// or reject an identical replay.
+    #[error("tool {tool} encountered a mutation conflict")]
+    MutationConflict {
+        tool: String,
+        conflict: Box<ToolMutationConflict>,
         #[source]
         source: BoxSource,
     },
@@ -95,6 +171,7 @@ impl ToolError {
         match self {
             Self::Denied { tool }
             | Self::InvalidArgs { tool, .. }
+            | Self::MutationConflict { tool, .. }
             | Self::Timeout { tool, .. }
             | Self::NetworkTimeout { tool, .. }
             | Self::Transient { tool, .. }
@@ -131,7 +208,9 @@ impl ToolError {
     #[must_use]
     pub fn is_model_correctable(&self) -> bool {
         match self {
-            Self::InvalidArgs { .. } | Self::NotFound { .. } => true,
+            Self::InvalidArgs { .. } | Self::MutationConflict { .. } | Self::NotFound { .. } => {
+                true
+            }
             Self::Denied { .. }
             | Self::Timeout { .. }
             | Self::NetworkTimeout { .. }
@@ -151,6 +230,7 @@ impl Recoverable for ToolError {
             },
             Self::Denied { .. }
             | Self::InvalidArgs { .. }
+            | Self::MutationConflict { .. }
             | Self::NotFound { .. }
             | Self::Failed { .. }
             | Self::Uncertain { .. } => Recovery::Fail,
@@ -170,6 +250,18 @@ mod tests {
             ToolError::InvalidArgs {
                 tool: "shell".to_owned(),
                 source: Box::new(std::io::Error::other("missing field `command`")),
+            },
+            ToolError::MutationConflict {
+                tool: "apply_patch".to_owned(),
+                conflict: Box::new(ToolMutationConflict {
+                    kind: ToolMutationConflictKind::ContextMismatch,
+                    resource: "src/lib.rs".to_owned(),
+                    operation_digest: "patch-digest".to_owned(),
+                    observed_digest: Some("file-digest".to_owned()),
+                    hunk_index: Some(1),
+                    hunk_header: Some("impl Demo".to_owned()),
+                }),
+                source: Box::new(std::io::Error::other("hunk context was not found")),
             },
             ToolError::Timeout {
                 tool: "shell".to_owned(),
@@ -205,7 +297,15 @@ mod tests {
     fn every_variant_names_its_tool() {
         let variants = every_variant();
         let expected = [
-            "shell", "shell", "shell", "webfetch", "shell", "shell", "shell", "shell",
+            "shell",
+            "shell",
+            "apply_patch",
+            "shell",
+            "webfetch",
+            "shell",
+            "shell",
+            "shell",
+            "shell",
         ];
         assert_eq!(variants.len(), expected.len());
         for (error, expected_tool) in variants.into_iter().zip(expected) {
@@ -260,7 +360,9 @@ mod tests {
         for e in every_variant() {
             let expected = matches!(
                 e,
-                ToolError::InvalidArgs { .. } | ToolError::NotFound { .. }
+                ToolError::InvalidArgs { .. }
+                    | ToolError::MutationConflict { .. }
+                    | ToolError::NotFound { .. }
             );
             assert_eq!(e.is_model_correctable(), expected, "{e}");
         }

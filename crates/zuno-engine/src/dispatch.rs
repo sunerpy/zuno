@@ -5,6 +5,7 @@
 //! name the registered implementation that permission policy and observability see.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,8 +19,10 @@ use zuno_observability::tool::ToolLifecycle;
 use zuno_permission::visibility::{is_tool_visible, permission_key};
 use zuno_permission::{PermissionAction, Rule, evaluate};
 use zuno_tool::{
-    ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY, PermissionAsk, PermissionAsker, PermissionOrigin, Tool,
+    ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY, METADATA_MUTATION_CONFLICT_KEY,
+    MutationConflictPresentation, PermissionAsk, PermissionAsker, PermissionOrigin, Tool,
     ToolConcurrencyPolicy, ToolContext, ToolDefinition, ToolOutput, ToolReplayPolicy,
+    ToolResultPresentation, UncertainMutationPresentation,
 };
 
 use crate::deferred_tools::DeferredToolCatalog;
@@ -897,9 +900,19 @@ fn tool_error_result(
 ) -> ToolDispatchResult {
     let mut message = zuno_error::source::describe(error);
     if !error.is_retryable() {
+        if let zuno_error::ToolError::MutationConflict { conflict, .. } = error {
+            let presentation = MutationConflictPresentation::from_conflict(conflict);
+            let metadata = serde_json::to_value(&presentation)
+                .expect("mutation conflict presentation is JSON-serializable");
+            let output = ToolOutput::text(format!("{tool} conflict"), message)
+                .with_metadata(METADATA_MUTATION_CONFLICT_KEY, metadata)
+                .with_presentation(ToolResultPresentation::MutationConflict(presentation));
+            return ToolDispatchResult::blocked(output, ToolBlockKind::Conflict);
+        }
         let blocked = match error {
             zuno_error::ToolError::Denied { .. } => Some(ToolBlockKind::Denied),
             zuno_error::ToolError::InvalidArgs { .. } => Some(ToolBlockKind::InvalidArguments),
+            zuno_error::ToolError::MutationConflict { .. } => Some(ToolBlockKind::Conflict),
             zuno_error::ToolError::NotFound { .. } => Some(ToolBlockKind::Unavailable),
             zuno_error::ToolError::Timeout { .. }
             | zuno_error::ToolError::NetworkTimeout { .. }
@@ -910,10 +923,19 @@ fn tool_error_result(
         if let Some(kind) = blocked {
             return blocked_result(tool, message, kind);
         }
-        if matches!(error, zuno_error::ToolError::Uncertain { .. }) {
+        if let zuno_error::ToolError::Uncertain { applied_paths, .. } = error {
             message.push_str(
                 "\n\nRecovery: this call changed authoritative state before losing its final outcome. Inspect the listed paths and continue from what is actually on disk; do not replay the call mechanically.",
             );
+            let presentation = UncertainMutationPresentation::new(applied_paths.clone());
+            let mut output = ToolOutput::text(format!("{tool} uncertain"), message)
+                .with_metadata("outcome", "uncertain")
+                .with_metadata("uncertain", true)
+                .with_presentation(ToolResultPresentation::UncertainMutation(presentation));
+            for path in applied_paths {
+                output = output.with_written_path(Path::new(path));
+            }
+            return ToolDispatchResult::error(output);
         }
         return error_result(tool, message);
     }
@@ -1084,6 +1106,67 @@ mod tests {
                 .output
                 .output
                 .contains("authoritative external state")
+        );
+    }
+
+    #[test]
+    fn mutation_conflicts_are_typed_blocked_results_and_never_retryable() {
+        let error = zuno_error::ToolError::MutationConflict {
+            tool: "apply_patch".to_owned(),
+            conflict: Box::new(zuno_error::ToolMutationConflict {
+                kind: zuno_error::ToolMutationConflictKind::ContextMismatch,
+                resource: "src/lib.rs".to_owned(),
+                operation_digest: "patch-digest".to_owned(),
+                observed_digest: Some("file-digest".to_owned()),
+                hunk_index: Some(2),
+                hunk_header: Some("impl Demo".to_owned()),
+            }),
+            source: Box::new(std::io::Error::other("hunk context was not found")),
+        };
+
+        let result = tool_error_result("apply_patch", ToolReplayPolicy::Never, &error);
+
+        assert_eq!(result.blocked, Some(ToolBlockKind::Conflict));
+        assert_eq!(result.recovery, None);
+        assert_eq!(
+            result.output.metadata[METADATA_MUTATION_CONFLICT_KEY]["kind"],
+            "context_mismatch"
+        );
+        assert_eq!(
+            result.output.metadata[METADATA_MUTATION_CONFLICT_KEY]["requiredAction"],
+            "reread_and_revise"
+        );
+        assert!(matches!(
+            result.output.presentation,
+            Some(ToolResultPresentation::MutationConflict(_))
+        ));
+    }
+
+    #[test]
+    fn uncertain_mutations_preserve_observed_paths_and_typed_outcome() {
+        let error = zuno_error::ToolError::Uncertain {
+            tool: "apply_patch".to_owned(),
+            applied_paths: vec!["/workspace/src/lib.rs".to_owned()],
+            source: Box::new(std::io::Error::other("formatter response was lost")),
+        };
+
+        let result = tool_error_result("apply_patch", ToolReplayPolicy::Never, &error);
+
+        assert!(result.is_error);
+        assert_eq!(result.blocked, None);
+        assert_eq!(result.recovery, None);
+        assert_eq!(result.output.metadata["outcome"], "uncertain");
+        assert_eq!(result.output.metadata["uncertain"], true);
+        assert_eq!(result.output.written_paths(), vec!["/workspace/src/lib.rs"]);
+        assert!(matches!(
+            result.output.presentation,
+            Some(ToolResultPresentation::UncertainMutation(_))
+        ));
+        assert!(
+            result
+                .output
+                .output
+                .contains("do not replay the call mechanically")
         );
     }
 }

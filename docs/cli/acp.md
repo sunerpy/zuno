@@ -9,6 +9,29 @@ Because the protocol owns stdout, do not read that stream as human output. Use `
 when you only want to confirm the adapter is present, and `--print-logs` to route
 diagnostics to stderr where they will not corrupt the protocol stream.
 
+## Agent, Mode, Plan, and file projection
+
+The Agent selector includes `plan`. `active_agent` is the authoritative state:
+selecting `plan` switches to Plan mode, while selecting `build`,
+`orchestrator`, `deep`, or another implementation Agent switches back to Build
+mode. The inverse Mode change selects the corresponding Agent and publishes
+both `current_mode_update` and `config_option_update`.
+
+Plan projection is driven by durable work-state revisions, not by recognizing a
+`plan_update` tool call. Each session reads and publishes the authoritative
+complete Plan after a change, deduplicates by `(plan_id, revision)`, flushes the
+final revision before prompt completion, and emits empty entries when the Plan
+is removed. Load, resume, detached Goal continuation, and host remount share the
+same projector.
+
+`edit`, `write`, and `apply_patch` use one `Editing files` card. A successful
+typed mutation shows only its structured add/modify/delete diff in visible
+content while preserving the complete original result in `rawOutput`.
+Pre-write failures show actionable text without a fabricated diff. Partial or
+otherwise uncertain mutations remain failed, preserve observed paths or diffs,
+and carry `_meta.zuno.outcome: "uncertain"`. Live delivery and replay use the
+same policy.
+
 ## Goal continuation
 
 `/goal <objective>` is a native control followed by autonomous execution. Zuno

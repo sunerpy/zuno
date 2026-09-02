@@ -17,7 +17,7 @@
 
 .PHONY: all help \
 		fmt fmt-check fmt-rust fmt-rust-check fmt-oxfmt fmt-oxfmt-check \
-		lint lint-windows-cross check test test-nextest test-par test-fast \
+		lint lint-windows-cross check test test-nextest test-zed-acp-schema test-par test-fast \
 		hook-fmt hook-test hooks ci pre-ci \
 		deny metadata \
         build release release-target package smoke smoke-artifact \
@@ -100,6 +100,7 @@ check:
 
 test:
 	$(CARGO) test --workspace --no-fail-fast $(OFFLINE)
+	$(MAKE) test-zed-acp-schema
 
 # The cross-platform CI runner. nextest compiles the workspace once and schedules
 # test binaries concurrently; `.config/nextest.toml` reserves the complete worker
@@ -110,6 +111,14 @@ test-nextest:
 	  || { echo "cargo-nextest is required; install cargo-nextest 0.9.103"; exit 1; }
 	$(CARGO) nextest run --workspace --no-fail-fast --no-tests=warn $(OFFLINE)
 	$(CARGO) test --workspace --doc --no-fail-fast $(OFFLINE)
+	$(MAKE) test-zed-acp-schema
+
+# The exact schema crate consumed by current Zed enables serde_json/preserve_order.
+# Keep that feature out of the default workspace graph so it cannot change
+# production type layouts or unrelated Clippy results; exercise it in one
+# isolated, explicitly gated contract build instead.
+test-zed-acp-schema:
+	$(CARGO) test -p zuno-acp --features zed-schema-contract --test contract $(OFFLINE)
 
 # Same non-ignored test surface as `test`, run concurrently. Prefer the maintained
 # cross-platform runner used by CI; retain the measured in-repository scheduler
@@ -261,6 +270,7 @@ help:
 	@echo "  check           cargo check --workspace --all-targets"
 	@echo "  test            cargo test --workspace --no-fail-fast"
 	@echo "  test-nextest    workspace tests concurrent across binaries + doctests"
+	@echo "  test-zed-acp-schema  decode ACP updates with current Zed's pinned schema crate"
 	@echo "  test-par        nextest when installed; measured in-tree fallback otherwise"
 	@echo "  test-fast       focused docs/release tests + installer syntax"
 	@echo "  hook-fmt        commit-time formatting gate"

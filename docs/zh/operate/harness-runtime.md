@@ -70,6 +70,12 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 普通会话最多续跑两次对账；仍不一致则进入 typed `PlanUnreconciled` 人工等待，不能
 以成功状态交付。进程重启会继续原对账 cycle，不解析模型自然语言判断“已经完成”。
 
+ACP 通过会话级投影器订阅 `TurnHost::work_state_changes()`，而不是识别某个工具名。
+每次唤醒都会读取权威 Plan 并发送完整的 stable-V1 更新；`(plan_id, revision)` 阻止
+重复与旧 revision 覆盖新状态，Plan 被移除时发送空 entries 清除客户端旧面板。
+实时变更、prompt 结束前 flush、load、resume、后台 continuation 与 host 重建共用同一
+投影器。
+
 ## 原生会话命令、压缩与硬中断
 
 会话命令、上下文压缩与硬中断都是原生能力，不依赖模型配合。
@@ -150,7 +156,11 @@ Unix PTY 通过前台守护进程拥有进程组与终端前台切换。Windows 
 
 网络出口受沙箱的网络授权控制。`deny` 会创建私有网络命名空间并拒绝网络系统调用，而不是一条可被绕过的防火墙规则。
 
-公开网页抓取使用独立 `PublicHttpClient`：只接受无凭据 HTTP(S)，直连且不使用环境代理；每次请求和每次重定向都重新解析、校验全部地址并进行 DNS pinning。公私混合 DNS、回环/私网/链路本地/CGNAT/保留地址，以及 IPv4-mapped IPv6 与 NAT64 中嵌套的非公开地址都会整体拒绝。
+公开网页抓取使用独立 `PublicHttpClient`：只接受无凭据 HTTP(S)，遵循进程级
+`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY`，并且代理失败不会静默
+改为直连。每次请求和每次重定向都重新解析、校验全部地址，通过代理连接已校验的目标 IP，
+同时保留原始 Host/TLS SNI。公私混合 DNS、回环/私网/链路本地/CGNAT/保留地址，以及
+IPv4-mapped IPv6 与 NAT64 中嵌套的非公开地址都会整体拒绝。
 
 WebSearch 的带密钥 wire URL 不进入诊断。错误只保留 provider、scheme、host、path、状态与类别，reqwest cause 在进入错误链前移除 URL。
 
@@ -167,6 +177,12 @@ WebSearch 的带密钥 wire URL 不进入诊断。错误只保留 provider、sch
 ## 客户端界面
 
 客户端界面消费持久事件、收件箱状态和投影。TUI、server、ACP 以及未来的 GUI 客户端不得获得私有的 Agent 循环行为。
+
+原生文件修改的实时投影与历史 replay 也共用同一内容策略。`edit`、`write` 和
+`apply_patch` 使用 `Editing files` 卡片；成功且有类型化状态时，可见内容只展示
+新增/修改/删除 diff，完整原始结果保留在 `rawOutput`。成功但没有 diff 时保留简短文本。
+写入前失败只展示可操作错误，不伪造 diff；部分写入或其他不确定结果保持 failed，
+保留已观察到的路径/diff，并发布类型化 `uncertain` outcome。
 
 `zuno run --show-reasoning` 只把 provider 明确提供的 reasoning delta 用稳定区块写入 stderr，最终答案继续只写 stdout；signed/encrypted reasoning 永不显示，且不能与 JSON 格式组合。
 

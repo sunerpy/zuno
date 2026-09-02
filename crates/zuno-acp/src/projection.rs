@@ -422,7 +422,11 @@ pub fn tool_call(
     raw_input: Option<Value>,
 ) -> Value {
     let presentation_input = raw_input.clone();
-    let title = shell_command(name, raw_input.as_ref()).unwrap_or(display_name);
+    let title = if is_file_edit_tool(name) {
+        "Editing files"
+    } else {
+        shell_command(name, raw_input.as_ref()).unwrap_or(display_name)
+    };
     let mut update = json!({
         "sessionUpdate": "tool_call",
         "toolCallId": call_id,
@@ -467,14 +471,22 @@ pub(crate) fn completed_tool_update(input: CompletedToolUpdate<'_>) -> Value {
         presentation,
         metadata,
     } = input;
-    let title = shell_command(name, raw_input).unwrap_or({
-        if title.is_empty() {
-            display_name
-        } else {
-            title
-        }
-    });
-    let mut content = vec![text_content(output)];
+    let title = if is_file_edit_tool(name) {
+        "Editing files"
+    } else {
+        shell_command(name, raw_input).unwrap_or({
+            if title.is_empty() {
+                display_name
+            } else {
+                title
+            }
+        })
+    };
+    let native_file_diff = diff.is_some_and(|diff| !diff.files().is_empty());
+    let mut content = Vec::new();
+    if !is_file_edit_tool(name) || is_error || !native_file_diff {
+        content.push(text_content(output));
+    }
     if let Some(diff) = diff {
         if diff.files().is_empty() {
             if let Some(unified) = diff.unified() {
@@ -484,11 +496,15 @@ pub(crate) fn completed_tool_update(input: CompletedToolUpdate<'_>) -> Value {
             content.extend(diff.files().iter().map(file_diff_content));
         }
     }
+    if content.is_empty() {
+        content.push(text_content(output));
+    }
     let locations = tool_locations(written_paths, diff);
     let mut update = json!({
         "sessionUpdate": "tool_call_update",
         "toolCallId": call_id,
         "title": title,
+        "kind": tool_kind(name),
         "status": if is_error { "failed" } else { "completed" },
         "rawOutput": json_or_string(output),
         "content": content,
@@ -555,7 +571,14 @@ pub(crate) fn interrupted_tool_update(
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .expect("zuno tool metadata is an object");
-    zuno.insert("outcome".to_owned(), json!("cancelled"));
+    zuno.insert(
+        "outcome".to_owned(),
+        json!(if interruption.uncertain() {
+            "uncertain"
+        } else {
+            "cancelled"
+        }),
+    );
     zuno.insert("cancelled".to_owned(), json!(true));
     zuno.insert("interruptionMode".to_owned(), json!(interruption.as_str()));
     zuno.insert("forced".to_owned(), json!(interruption.uncertain()));
@@ -671,4 +694,8 @@ fn tool_kind(name: &str) -> &'static str {
         "fetch" | "webfetch" => "fetch",
         _ => "other",
     }
+}
+
+fn is_file_edit_tool(name: &str) -> bool {
+    matches!(name, "write" | "edit" | "apply_patch")
 }

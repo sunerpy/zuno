@@ -219,6 +219,20 @@ pub fn durable_plan_update(work: &WorkStateProjection) -> Option<Value> {
     }))
 }
 
+/// Clears a previously projected stable ACP Plan.
+#[must_use]
+pub fn durable_plan_clear_update() -> Value {
+    json!({
+        "sessionUpdate": "plan",
+        "entries": [],
+        "_meta": {
+            "zuno": {
+                "cleared": true,
+            }
+        },
+    })
+}
+
 /// Replays the complete durable learning snapshot through ACP extensibility.
 ///
 /// `session_info_update` permits metadata-only patches. Keeping learning under
@@ -481,7 +495,7 @@ fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
             .and_then(|state| state.get("blockKind"))
             .and_then(Value::as_str)
             .unwrap_or("blocked");
-        completed["_meta"] = json!({ "zuno": { "blockedKind": kind } });
+        completed["_meta"]["zuno"]["blockedKind"] = json!(kind);
     }
     updates.push(completed);
     updates
@@ -710,9 +724,10 @@ mod tests {
         assert_eq!(updates[3]["rawInput"]["filePath"], edited);
         assert_eq!(updates[4]["sessionUpdate"], "tool_call_update");
         assert_eq!(updates[4]["status"], "completed");
-        assert_eq!(updates[4]["content"][1]["type"], "diff");
-        assert_eq!(updates[4]["content"][1]["path"], edited_wire);
-        assert_eq!(updates[4]["content"][2]["content"]["type"], "image");
+        assert_eq!(updates[4]["title"], "Editing files");
+        assert_eq!(updates[4]["content"][0]["type"], "diff");
+        assert_eq!(updates[4]["content"][0]["path"], edited_wire);
+        assert_eq!(updates[4]["content"][1]["content"]["type"], "image");
         assert_eq!(
             updates[4]["locations"],
             json!([{"path":edited_wire.clone()}])
@@ -755,9 +770,51 @@ mod tests {
         assert_eq!(replay.updates.len(), 2);
         let cancelled = &replay.updates[1];
         assert_eq!(cancelled["status"], "failed");
-        assert_eq!(cancelled["_meta"]["zuno"]["outcome"], "cancelled");
+        assert_eq!(cancelled["_meta"]["zuno"]["outcome"], "uncertain");
         assert_eq!(cancelled["_meta"]["zuno"]["interruptionMode"], "forced");
         assert_eq!(cancelled["_meta"]["zuno"]["uncertain"], true);
+    }
+
+    #[test]
+    fn replay_preserves_uncertain_file_paths_and_warning_outcome() {
+        let root = tempfile::tempdir().expect("replay root");
+        let changed = root.path().join("src/lib.rs");
+        std::fs::create_dir_all(changed.parent().expect("source parent"))
+            .expect("create source directory");
+        std::fs::write(&changed, "changed\n").expect("write changed file");
+        let changed = zuno_paths::wire_path(&changed);
+        let assistant = message(
+            "msg-assistant",
+            "assistant",
+            vec![part(
+                "p-tool",
+                "msg-assistant",
+                json!({
+                    "type": "tool",
+                    "callID": "call-patch",
+                    "tool": "apply_patch",
+                    "displayName": "Apply patch",
+                    "state": {
+                        "status": "error",
+                        "title": "apply_patch uncertain",
+                        "error": "inspect the listed paths; do not replay mechanically",
+                        "metadata": {
+                            "outcome": "uncertain",
+                            "uncertain": true,
+                            "writtenPaths": [changed],
+                        },
+                    },
+                }),
+            )],
+        );
+
+        let replay = durable_updates(&[assistant], &ReplayPolicy::for_workspace(root.path()), 0);
+        let completed = &replay.updates[1];
+        assert_eq!(completed["status"], "failed");
+        assert_eq!(completed["locations"], json!([{"path": changed}]));
+        assert_eq!(completed["_meta"]["zuno"]["outcome"], "uncertain");
+        assert_eq!(completed["_meta"]["zuno"]["uncertain"], true);
+        assert_eq!(completed["_meta"]["zuno"]["appliedPaths"], json!([changed]));
     }
 
     #[test]
@@ -1529,6 +1586,14 @@ mod tests {
             ..zuno_types::WorkStateProjection::default()
         };
         assert!(durable_plan_update(&work).is_none());
+    }
+
+    #[test]
+    fn replay_plan_clear_uses_the_stable_empty_entries_shape() {
+        let update = durable_plan_clear_update();
+        assert_eq!(update["sessionUpdate"], "plan");
+        assert_eq!(update["entries"], json!([]));
+        assert_eq!(update["_meta"]["zuno"]["cleared"], true);
     }
 
     #[test]

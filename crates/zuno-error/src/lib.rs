@@ -105,7 +105,7 @@ pub use crate::plugin::PluginError;
 pub use crate::provider::{ProviderError, ProviderProtocolFailure, ProviderStreamFailure};
 pub use crate::recovery::{Recoverable, Recovery};
 pub use crate::source::BoxSource;
-pub use crate::tool::ToolError;
+pub use crate::tool::{ToolError, ToolMutationConflict, ToolMutationConflictKind};
 
 use std::time::Duration;
 

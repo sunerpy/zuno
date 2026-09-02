@@ -2,11 +2,13 @@ use serde_json::json;
 use zuno_acp::{
     AttemptBufferedTurnEventProjector, IMPLEMENTED_METHODS, TurnEventProjector, turn_event_update,
 };
+#[cfg(feature = "zed-schema-contract")]
+use zuno_acp::{durable_plan_clear_update, durable_plan_update};
 use zuno_engine::r#loop::{ToolBlockKind, ToolDiff, ToolInterruption, TurnEvent};
 use zuno_llm::event::{PromptAccounting, StreamEvent};
 use zuno_tool::{
-    FileDiff, QuestionResultPresentation, QuestionResultStatus, ToolResultPresentation,
-    ToolUiIntent,
+    FileDiff, MutationConflictPresentation, QuestionResultPresentation, QuestionResultStatus,
+    ToolResultPresentation, ToolUiIntent, UncertainMutationPresentation,
 };
 
 #[test]
@@ -27,6 +29,49 @@ fn adapter_exposes_exactly_the_stable_v1_21_agent_methods() {
             "session/close",
         ]
     );
+}
+
+#[test]
+#[cfg(feature = "zed-schema-contract")]
+fn stable_plan_updates_decode_with_the_schema_pinned_by_current_zed() {
+    use agent_client_protocol_schema::v1::{PlanEntryPriority, PlanEntryStatus, SessionUpdate};
+
+    let work = zuno_types::WorkStateProjection {
+        plan: Some(zuno_types::PlanProjection {
+            id: "plan-live".to_owned(),
+            parent_plan_id: None,
+            stack_depth: 0,
+            goal_id: None,
+            revision: 4,
+            title: "Live ACP Plan".to_owned(),
+            steps: vec![zuno_types::PlanStepProjection {
+                id: "implement".to_owned(),
+                title: "Implement the projector".to_owned(),
+                status: "in_progress".to_owned(),
+            }],
+            span: zuno_types::ExecutionSpan::default(),
+            time_created: 1,
+            time_updated: 2,
+        }),
+        ..zuno_types::WorkStateProjection::default()
+    };
+    let update = durable_plan_update(&work).expect("representable stable Plan");
+    let decoded: SessionUpdate =
+        serde_json::from_value(update).expect("current Zed ACP schema must decode the Plan");
+    let SessionUpdate::Plan(plan) = decoded else {
+        panic!("expected a stable ACP Plan update");
+    };
+    assert_eq!(plan.entries.len(), 1);
+    assert_eq!(plan.entries[0].content, "Implement the projector");
+    assert_eq!(plan.entries[0].priority, PlanEntryPriority::Medium);
+    assert_eq!(plan.entries[0].status, PlanEntryStatus::InProgress);
+
+    let decoded: SessionUpdate = serde_json::from_value(durable_plan_clear_update())
+        .expect("current Zed ACP schema must decode an empty Plan clear");
+    let SessionUpdate::Plan(plan) = decoded else {
+        panic!("expected a stable ACP Plan clear");
+    };
+    assert!(plan.entries.is_empty());
 }
 
 #[test]
@@ -707,6 +752,12 @@ fn completed_tools_project_native_file_diffs_locations_and_json_output() {
             is_error: false,
         })
         .expect("completed dispatches are client-visible");
+    #[cfg(feature = "zed-schema-contract")]
+    {
+        let _: agent_client_protocol_schema::v1::SessionUpdate =
+            serde_json::from_value(completed.clone())
+                .expect("current Zed ACP schema must decode the file edit card");
+    }
     assert_eq!(completed["rawOutput"], json!({ "ok": true, "changed": 2 }));
     assert_eq!(
         completed["locations"],
@@ -716,8 +767,11 @@ fn completed_tools_project_native_file_diffs_locations_and_json_output() {
             { "path": deleted_path },
         ])
     );
+    assert_eq!(completed["title"], "Editing files");
+    assert_eq!(completed["kind"], "edit");
+    assert_eq!(completed["content"].as_array().map(Vec::len), Some(3));
     assert_eq!(
-        completed["content"][1],
+        completed["content"][0],
         json!({
             "type": "diff",
             "path": changed_path,
@@ -726,7 +780,7 @@ fn completed_tools_project_native_file_diffs_locations_and_json_output() {
         })
     );
     assert_eq!(
-        completed["content"][2],
+        completed["content"][1],
         json!({
             "type": "diff",
             "path": created_path,
@@ -734,8 +788,176 @@ fn completed_tools_project_native_file_diffs_locations_and_json_output() {
             "newText": "created\n",
         })
     );
-    assert_eq!(completed["content"][3]["path"], deleted_path);
-    assert_eq!(completed["content"][3]["newText"], "");
+    assert_eq!(completed["content"][2]["path"], deleted_path);
+    assert_eq!(completed["content"][2]["newText"], "");
+    assert!(
+        completed["content"]
+            .as_array()
+            .expect("tool content")
+            .iter()
+            .all(|item| item["type"] == "diff"),
+        "successful file edits with native diffs must not duplicate success prose"
+    );
+}
+
+#[test]
+fn file_edit_failures_keep_actionable_text_without_fabricating_a_diff() {
+    let completed = turn_event_update(&TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: "call-patch".to_owned(),
+        display_name: "Apply patch".to_owned(),
+        name: "apply_patch".to_owned(),
+        title: "apply_patch error".to_owned(),
+        output: "hunk context did not match; reread the file".to_owned(),
+        diff: None,
+        written_paths: Vec::new(),
+        is_error: true,
+    })
+    .expect("failed file mutation is client-visible");
+    assert_eq!(completed["title"], "Editing files");
+    assert_eq!(completed["kind"], "edit");
+    assert_eq!(completed["status"], "failed");
+    assert_eq!(
+        completed["content"][0]["content"]["text"],
+        "hunk context did not match; reread the file"
+    );
+    assert!(
+        completed["content"]
+            .as_array()
+            .expect("tool content")
+            .iter()
+            .all(|item| item["type"] != "diff")
+    );
+}
+
+#[test]
+fn uncertain_file_mutations_project_failed_status_paths_and_typed_outcome() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let changed = workspace.path().join("src/lib.rs");
+    let changed_path = zuno_paths::wire_path(&changed);
+    let mut projector = TurnEventProjector::new();
+    assert!(
+        projector
+            .project(&TurnEvent::ToolResultPresented {
+                step: 1,
+                call_id: "call-patch".to_owned(),
+                presentation: ToolResultPresentation::UncertainMutation(
+                    UncertainMutationPresentation::new(vec![changed_path.clone()]),
+                ),
+            })
+            .is_none()
+    );
+    let completed = projector
+        .project(&TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: "call-patch".to_owned(),
+            display_name: "Apply patch".to_owned(),
+            name: "apply_patch".to_owned(),
+            title: "apply_patch uncertain".to_owned(),
+            output: "inspect the listed paths; do not replay mechanically".to_owned(),
+            diff: None,
+            written_paths: vec![changed_path.clone()],
+            is_error: true,
+        })
+        .expect("uncertain file mutation is client-visible");
+    assert_eq!(completed["status"], "failed");
+    assert_eq!(completed["locations"], json!([{"path": changed_path}]));
+    assert_eq!(completed["_meta"]["zuno"]["outcome"], "uncertain");
+    assert_eq!(completed["_meta"]["zuno"]["uncertain"], true);
+    assert_eq!(
+        completed["_meta"]["zuno"]["appliedPaths"],
+        json!([changed_path])
+    );
+}
+
+#[test]
+fn moved_files_project_a_source_delete_and_destination_add() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let source = workspace.path().join("src/old.rs");
+    let destination = workspace.path().join("src/new.rs");
+    let source_path = zuno_paths::wire_path(&source);
+    let destination_path = zuno_paths::wire_path(&destination);
+    let completed = turn_event_update(&TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: "call-move".to_owned(),
+        display_name: "Apply patch".to_owned(),
+        name: "apply_patch".to_owned(),
+        title: "Moved file".to_owned(),
+        output: "Success. Updated the following files:\nM src/new.rs".to_owned(),
+        diff: ToolDiff::new(
+            None,
+            vec![
+                FileDiff::new(&source, Some("contents\n".to_owned()), String::new())
+                    .expect("source deletion"),
+                FileDiff::new(&destination, None, "contents\n".to_owned())
+                    .expect("destination addition"),
+            ],
+        ),
+        written_paths: vec![destination_path.clone()],
+        is_error: false,
+    })
+    .expect("move is client-visible");
+    assert_eq!(
+        completed["locations"],
+        json!([
+            {"path": destination_path},
+            {"path": source_path},
+        ])
+    );
+    assert_eq!(completed["content"][0]["path"], source_path);
+    assert_eq!(completed["content"][0]["newText"], "");
+    assert_eq!(completed["content"][1]["path"], destination_path);
+    assert_eq!(completed["content"][1]["oldText"], json!(null));
+}
+
+#[test]
+fn mutation_conflicts_keep_typed_recovery_metadata_on_the_failed_card() {
+    let conflict = zuno_error::ToolMutationConflict {
+        kind: zuno_error::ToolMutationConflictKind::ContextMismatch,
+        resource: "src/lib.rs".to_owned(),
+        operation_digest: "operation-digest".to_owned(),
+        observed_digest: Some("file-digest".to_owned()),
+        hunk_index: Some(2),
+        hunk_header: Some("impl Demo".to_owned()),
+    };
+    let mut projector = TurnEventProjector::new();
+    assert!(
+        projector
+            .project(&TurnEvent::ToolResultPresented {
+                step: 1,
+                call_id: "call-patch".to_owned(),
+                presentation: ToolResultPresentation::MutationConflict(
+                    MutationConflictPresentation::from_conflict(&conflict),
+                ),
+            })
+            .is_none()
+    );
+    let completed = projector
+        .project(&TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: "call-patch".to_owned(),
+            display_name: "Apply patch".to_owned(),
+            name: "apply_patch".to_owned(),
+            title: "apply_patch conflict".to_owned(),
+            output: "read the current file and submit a revised patch".to_owned(),
+            diff: None,
+            written_paths: Vec::new(),
+            is_error: true,
+        })
+        .expect("mutation conflict is client-visible");
+    assert_eq!(completed["status"], "failed");
+    assert_eq!(
+        completed["_meta"]["zuno"]["mutationConflict"]["kind"],
+        "context_mismatch"
+    );
+    assert_eq!(
+        completed["_meta"]["zuno"]["mutationConflict"]["requiredAction"],
+        "reread_and_revise"
+    );
+    assert_eq!(
+        completed["_meta"]["zuno"]["mutationConflict"]["hunkIndex"],
+        2
+    );
 }
 
 #[test]

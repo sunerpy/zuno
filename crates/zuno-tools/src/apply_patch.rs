@@ -2,18 +2,21 @@ mod parser;
 
 use crate::format::FormatFailure;
 use crate::read::{
-    FileToolRuntime, PathKind, ResolvedPath, check_interrupt, decode_text, encode_text, failed,
-    interrupted, invalid, report_formatting, slash, uncertain, write_with_dirs,
+    FileReadConflictKind, FileReadReceipt, FileToolRuntime, IdenticalPatchConflict, PathKind,
+    ResolvedPath, check_interrupt, decode_text, digest_bytes, encode_text, failed, interrupted,
+    invalid, report_formatting, slash, uncertain, write_with_dirs,
 };
 use async_trait::async_trait;
 use parser::{ChunkLine, PatchOperation, PatchParseError, UpdateChunk, parse_patch};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::HashSet;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use zuno_error::ToolError;
+use zuno_error::{ToolError, ToolMutationConflict, ToolMutationConflictKind};
 use zuno_tool::{ToolContext, ToolOutput, TypedTool};
 
 /// The description the model reads.
@@ -53,6 +56,54 @@ struct FileChange {
     new_bytes: Vec<u8>,
 }
 
+enum PreparedOperation {
+    Add {
+        source: ResolvedPath,
+        content: String,
+    },
+    Delete {
+        source: ResolvedPath,
+        old_bytes: Vec<u8>,
+    },
+    Update {
+        source: ResolvedPath,
+        destination: Option<ResolvedPath>,
+        chunks: Vec<UpdateChunk>,
+        old_bytes: Vec<u8>,
+        destination_old_bytes: Option<Vec<u8>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    CrLf,
+}
+
+impl LineEnding {
+    fn detect(text: &str) -> Self {
+        if text.contains("\r\n") {
+            Self::CrLf
+        } else {
+            Self::Lf
+        }
+    }
+
+    fn normalize<'a>(self, text: &'a str) -> Cow<'a, str> {
+        match self {
+            Self::Lf => Cow::Borrowed(text),
+            Self::CrLf => Cow::Owned(text.replace("\r\n", "\n")),
+        }
+    }
+
+    fn restore(self, text: String) -> String {
+        match self {
+            Self::Lf => text,
+            Self::CrLf => text.replace('\n', "\r\n"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChangeKind {
     Add,
@@ -88,6 +139,7 @@ impl TypedTool for ApplyPatchTool {
         if params.patch_text.is_empty() {
             return Err(invalid("apply_patch", "patchText is required"));
         }
+        let operation_digest = digest_bytes(params.patch_text.as_bytes());
         check_interrupt("apply_patch", &ctx)?;
         let operations = parse_patch(&params.patch_text, || ctx.is_interrupted()).map_err(
             |error| match error {
@@ -121,7 +173,10 @@ impl TypedTool for ApplyPatchTool {
         }
 
         let _guard = self.runtime.mutation.lock().await;
-        let changes = self.prepare_changes(&operations, &ctx)?;
+        let changes = self.prepare_changes(&operations, &operation_digest, &ctx)?;
+        self.runtime
+            .state
+            .clear_patch_conflict(&ctx.session_id, &operation_digest);
         let mut summaries = Vec::new();
         let mut files = Vec::<Value>::new();
         // Only the paths that still exist afterwards: a deleted file has no diagnostics,
@@ -317,9 +372,11 @@ impl ApplyPatchTool {
     fn prepare_changes(
         &self,
         operations: &[PatchOperation],
+        operation_digest: &str,
         ctx: &ToolContext,
     ) -> Result<Vec<FileChange>, ToolError> {
-        let mut changes = Vec::new();
+        let mut prepared = Vec::new();
+        let mut resources = Vec::new();
         let mut touched = HashSet::<PathBuf>::new();
         for operation in operations {
             check_interrupt("apply_patch", ctx)?;
@@ -347,37 +404,39 @@ impl ApplyPatchTool {
                             ),
                         ));
                     }
-                    changes.push(FileChange {
+                    prepared.push(PreparedOperation::Add {
                         source,
-                        destination: None,
-                        kind: ChangeKind::Add,
-                        old_bytes: None,
-                        destination_old_bytes: None,
-                        new_bytes: content.as_bytes().to_vec(),
+                        content: content.clone(),
                     });
                 }
                 PatchOperation::Delete { .. } => {
                     ensure_regular_file(&source.canonical)?;
                     let old_bytes = std::fs::read(&source.canonical)
                         .map_err(|error| failed("apply_patch", error))?;
-                    changes.push(FileChange {
-                        source,
-                        destination: None,
-                        kind: ChangeKind::Delete,
-                        old_bytes: Some(old_bytes),
-                        destination_old_bytes: None,
-                        new_bytes: Vec::new(),
-                    });
+                    let receipt = require_patch_read(
+                        &self.runtime,
+                        ctx,
+                        &source,
+                        &old_bytes,
+                        operation_digest,
+                    )?;
+                    resources.push((source.canonical.clone(), receipt));
+                    prepared.push(PreparedOperation::Delete { source, old_bytes });
                 }
                 PatchOperation::Update {
                     move_to, chunks, ..
                 } => {
                     ensure_regular_file(&source.canonical)?;
-                    let bytes = std::fs::read(&source.canonical)
+                    let old_bytes = std::fs::read(&source.canonical)
                         .map_err(|error| failed("apply_patch", error))?;
-                    let decoded =
-                        decode_text(&bytes).map_err(|error| failed("apply_patch", error))?;
-                    let content = apply_chunks(&source.canonical, &decoded.text, chunks, ctx)?;
+                    let receipt = require_patch_read(
+                        &self.runtime,
+                        ctx,
+                        &source,
+                        &old_bytes,
+                        operation_digest,
+                    )?;
+                    resources.push((source.canonical.clone(), receipt));
                     let destination = move_to
                         .as_ref()
                         .map(|path| {
@@ -397,23 +456,133 @@ impl ApplyPatchTool {
                             ),
                         ));
                     }
-                    let kind = if destination.is_some() {
-                        ChangeKind::Move
-                    } else {
-                        ChangeKind::Update
-                    };
                     let destination_old_bytes = destination
                         .as_ref()
                         .map(|target| read_optional_file(&target.canonical))
                         .transpose()?
                         .flatten();
+                    if let (Some(target), Some(bytes)) =
+                        (destination.as_ref(), destination_old_bytes.as_deref())
+                    {
+                        let receipt = require_patch_read(
+                            &self.runtime,
+                            ctx,
+                            target,
+                            bytes,
+                            operation_digest,
+                        )?;
+                        resources.push((target.canonical.clone(), receipt));
+                    }
+                    prepared.push(PreparedOperation::Update {
+                        source,
+                        destination,
+                        chunks: chunks.clone(),
+                        old_bytes,
+                        destination_old_bytes,
+                    });
+                }
+            }
+        }
+
+        if let Some(IdenticalPatchConflict {
+            resource,
+            observed_digest,
+            hunk_index,
+            hunk_header,
+        }) = self.runtime.state.identical_patch_conflict(
+            &ctx.session_id,
+            operation_digest,
+            &resources,
+        ) {
+            return Err(mutation_conflict(
+                ToolMutationConflictKind::IdenticalReplay,
+                resource.clone(),
+                operation_digest,
+                observed_digest,
+                hunk_index,
+                hunk_header,
+                format!(
+                    "apply_patch rejected an identical failed patch for {}; read the current file \
+                     and submit a revised patch with smaller, unique context",
+                    resource
+                ),
+            ));
+        }
+
+        let mut changes = Vec::with_capacity(prepared.len());
+        for operation in prepared {
+            check_interrupt("apply_patch", ctx)?;
+            match operation {
+                PreparedOperation::Add { source, content } => changes.push(FileChange {
+                    source,
+                    destination: None,
+                    kind: ChangeKind::Add,
+                    old_bytes: None,
+                    destination_old_bytes: None,
+                    new_bytes: content.into_bytes(),
+                }),
+                PreparedOperation::Delete { source, old_bytes } => {
+                    changes.push(FileChange {
+                        source,
+                        destination: None,
+                        kind: ChangeKind::Delete,
+                        old_bytes: Some(old_bytes),
+                        destination_old_bytes: None,
+                        new_bytes: Vec::new(),
+                    });
+                }
+                PreparedOperation::Update {
+                    source,
+                    destination,
+                    chunks,
+                    old_bytes,
+                    destination_old_bytes,
+                } => {
+                    let decoded =
+                        decode_text(&old_bytes).map_err(|error| failed("apply_patch", error))?;
+                    let line_ending = LineEnding::detect(&decoded.text);
+                    let normalized = line_ending.normalize(&decoded.text);
+                    let observed_digest = digest_bytes(&old_bytes);
+                    let content = match apply_chunks(
+                        &source,
+                        &normalized,
+                        &chunks,
+                        operation_digest,
+                        &observed_digest,
+                        ctx,
+                    ) {
+                        Ok(content) => content,
+                        Err(error @ ToolError::MutationConflict { .. }) => {
+                            let ToolError::MutationConflict { conflict, .. } = &error else {
+                                unreachable!("matched mutation conflict");
+                            };
+                            self.runtime.state.record_patch_conflict(
+                                &ctx.session_id,
+                                operation_digest,
+                                resources.clone(),
+                                IdenticalPatchConflict {
+                                    resource: conflict.resource.clone(),
+                                    observed_digest: conflict.observed_digest.clone(),
+                                    hunk_index: conflict.hunk_index,
+                                    hunk_header: conflict.hunk_header.clone(),
+                                },
+                            );
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let kind = if destination.is_some() {
+                        ChangeKind::Move
+                    } else {
+                        ChangeKind::Update
+                    };
                     changes.push(FileChange {
                         source,
                         destination,
                         kind,
-                        old_bytes: Some(bytes),
+                        old_bytes: Some(old_bytes),
                         destination_old_bytes,
-                        new_bytes: encode_text(&content, decoded.bom),
+                        new_bytes: encode_text(&line_ending.restore(content), decoded.bom),
                     });
                 }
             }
@@ -442,6 +611,66 @@ async fn authorize_once(
             .await?;
     }
     Ok(())
+}
+
+fn require_patch_read(
+    runtime: &FileToolRuntime,
+    ctx: &ToolContext,
+    target: &ResolvedPath,
+    bytes: &[u8],
+    operation_digest: &str,
+) -> Result<FileReadReceipt, ToolError> {
+    runtime
+        .state
+        .require_current_read(&ctx.session_id, &target.canonical, bytes)
+        .map_err(|conflict| {
+            let kind = match conflict.kind {
+                FileReadConflictKind::ReadRequired => ToolMutationConflictKind::ReadRequired,
+                FileReadConflictKind::StaleRead => ToolMutationConflictKind::StaleRead,
+            };
+            let message = match conflict.kind {
+                FileReadConflictKind::ReadRequired => format!(
+                    "apply_patch requires a current read of {} before modifying it",
+                    target.canonical.display()
+                ),
+                FileReadConflictKind::StaleRead => format!(
+                    "{} changed after it was read; read it again before applying a revised patch",
+                    target.canonical.display()
+                ),
+            };
+            mutation_conflict(
+                kind,
+                target.resource.clone(),
+                operation_digest,
+                Some(conflict.observed_digest),
+                None,
+                None,
+                message,
+            )
+        })
+}
+
+fn mutation_conflict(
+    kind: ToolMutationConflictKind,
+    resource: String,
+    operation_digest: &str,
+    observed_digest: Option<String>,
+    hunk_index: Option<usize>,
+    hunk_header: Option<String>,
+    message: String,
+) -> ToolError {
+    ToolError::MutationConflict {
+        tool: "apply_patch".to_owned(),
+        conflict: Box::new(ToolMutationConflict {
+            kind,
+            resource,
+            operation_digest: operation_digest.to_owned(),
+            observed_digest,
+            hunk_index,
+            hunk_header,
+        }),
+        source: Box::new(io::Error::other(message)),
+    }
 }
 
 fn ensure_regular_file(path: &Path) -> Result<(), ToolError> {
@@ -482,23 +711,30 @@ fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, ToolError> {
 }
 
 fn apply_chunks(
-    path: &Path,
+    target: &ResolvedPath,
     source: &str,
     chunks: &[UpdateChunk],
+    operation_digest: &str,
+    observed_digest: &str,
     ctx: &ToolContext,
 ) -> Result<String, ToolError> {
     let mut content = source.to_owned();
     let mut cursor = 0usize;
-    for chunk in chunks {
+    for (index, chunk) in chunks.iter().enumerate() {
         check_interrupt("apply_patch", ctx)?;
         let search_start = if let Some(header) = &chunk.header {
             find_header_end(&content, header, cursor).ok_or_else(|| {
-                invalid(
-                    "apply_patch",
+                mutation_conflict(
+                    ToolMutationConflictKind::ContextMismatch,
+                    target.resource.clone(),
+                    operation_digest,
+                    Some(observed_digest.to_owned()),
+                    Some(index + 1),
+                    Some(header.clone()),
                     format!(
                         "apply_patch verification failed: hunk header `{header}` was not found in \
                          {}; {CONTEXT_RECOVERY}",
-                        path.display(),
+                        target.canonical.display(),
                     ),
                 )
             })?
@@ -535,12 +771,17 @@ fn apply_chunks(
         }
         let Some(position) = find_line_block(&content, &old, search_start, chunk.end_of_file)
         else {
-            return Err(invalid(
-                "apply_patch",
+            return Err(mutation_conflict(
+                ToolMutationConflictKind::ContextMismatch,
+                target.resource.clone(),
+                operation_digest,
+                Some(observed_digest.to_owned()),
+                Some(index + 1),
+                chunk.header.clone(),
                 format!(
                     "apply_patch verification failed: hunk context was not found in {}; \
                      {CONTEXT_RECOVERY}",
-                    path.display(),
+                    target.canonical.display(),
                 ),
             ));
         };

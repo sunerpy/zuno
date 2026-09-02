@@ -75,7 +75,7 @@ impl TypedTool for WriteTool {
             self.runtime
                 .state
                 .require_current_read(&ctx.session_id, &target.canonical, bytes)
-                .map_err(|message| invalid("write", message))?;
+                .map_err(|conflict| invalid("write", conflict.message(&target.canonical)))?;
         }
 
         let old_bom = existing

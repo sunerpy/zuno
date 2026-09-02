@@ -538,6 +538,7 @@ fn lifecycle(events: &[TurnEvent]) -> Vec<String> {
                 match kind {
                     ToolBlockKind::Denied => "denied",
                     ToolBlockKind::InvalidArguments => "invalid-arguments",
+                    ToolBlockKind::Conflict => "conflict",
                     ToolBlockKind::Unavailable => "unavailable",
                 }
             )),

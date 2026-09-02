@@ -75,6 +75,32 @@ profile-overlay, permission, revision, and restart guidance.
 surface. `edit` remains available to explicitly constructed profiles; the default editing
 path is `apply_patch` plus `write`.
 
+## `apply_patch` conflict recovery
+
+`apply_patch` uses a stable SHA-256 read receipt plus a read generation instead
+of trusting remembered prose. An existing source used by `update`, `delete`, or
+`move` must first be read; an already-existing move destination must also be
+read. The tool acquires one mutation lock, validates every affected file, and
+only then writes, so any preflight conflict leaves all files unchanged.
+
+Mutation conflicts are typed and model-correctable, but never automatically
+replayed:
+
+| Conflict | Meaning | Required recovery |
+| --- | --- | --- |
+| `ReadRequired` | The current file has no valid read receipt | Read the named resource before constructing a mutation |
+| `StaleRead` | The file changed after the recorded read | Read the current file and rebuild the operation from that content |
+| `ContextMismatch` | A hunk no longer matches the current logical lines | Read the named hunk area and generate a smaller patch with fresh, unique context |
+| `IdenticalReplay` | The same operation digest was submitted against the same file content | Do not resend it; revise the operation, or wait for a real file change and read again |
+
+The conflict includes the resource, operation digest, current content digest,
+hunk number/title when applicable, and a concrete `requiredAction`. Matching is
+performed on logical lines while preserving the original BOM, LF or CRLF style,
+and final-newline state. Patch grammar errors remain `InvalidArgs`. If a later
+I/O or formatter failure occurs after a write, the result is `Uncertain`, names
+the paths observed as changed, and requires inspection rather than mechanical
+replay.
+
 `webfetch` accepts only credential-free HTTP(S) targets. Zuno resolves and
 validates every address, rejects a whole mixed public/private DNS answer, pins
 the validated addresses, and repeats validation for each of at most five
