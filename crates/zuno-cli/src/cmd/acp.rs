@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -686,6 +687,7 @@ struct SessionResources {
     question_asker: Option<Arc<zuno_acp::AcpQuestionAsker>>,
     permission_asker: Arc<zuno_acp::AcpPermissionAsker>,
     configuration: SessionConfiguration,
+    mcp_configuration_digest: String,
 }
 
 #[derive(Debug)]
@@ -694,6 +696,17 @@ enum SessionReconfiguration {
     Agent(String),
     Model(String),
     Reasoning(String),
+}
+
+impl SessionReconfiguration {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Mode(_) => "mode",
+            Self::Agent(_) => "agent",
+            Self::Model(_) => "model",
+            Self::Reasoning(_) => "reasoning",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -706,6 +719,20 @@ enum ConfigurationPersistence {
 struct PreparedReconfiguration {
     options: TurnOptions,
     persistence: ConfigurationPersistence,
+}
+
+struct ReconfigurationRollback {
+    options: TurnOptions,
+    client: zuno_acp::ClientConnection,
+    build_agent: String,
+    retained_mcp: Option<McpRuntime>,
+    retained_mcp_digest: Option<String>,
+    cause: String,
+}
+
+enum SessionMcpOpening {
+    Fresh,
+    Reuse(Option<zuno_mcp::Catalog>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -907,6 +934,13 @@ fn required_mcp_servers(
     RequiredMcpServers::new(entries)
 }
 
+fn mcp_configuration_digest(config: &zuno_config::schema::Config) -> String {
+    zuno_orchestration::sha256_json(&json!({
+        "servers": config.mcp.as_ref(),
+        "connectionConcurrency": config.resolved_concurrency().mcp_connections,
+    }))
+}
+
 async fn open_session_resources(
     plan: TurnPlan,
     environment: &StartupEnvironment,
@@ -914,6 +948,27 @@ async fn open_session_resources(
     surface: AcpSurfaceContext,
     build_agent: Option<&str>,
     client_mcp: &[zuno_acp::AcpMcpServer],
+) -> Result<SessionResources, String> {
+    open_session_resources_with_mcp(
+        plan,
+        environment,
+        runs,
+        surface,
+        build_agent,
+        client_mcp,
+        SessionMcpOpening::Fresh,
+    )
+    .await
+}
+
+async fn open_session_resources_with_mcp(
+    plan: TurnPlan,
+    environment: &StartupEnvironment,
+    runs: SessionRunRegistry,
+    surface: AcpSurfaceContext,
+    build_agent: Option<&str>,
+    client_mcp: &[zuno_acp::AcpMcpServer],
+    mcp_opening: SessionMcpOpening,
 ) -> Result<SessionResources, String> {
     let AcpSurfaceContext {
         client,
@@ -923,23 +978,32 @@ async fn open_session_resources(
         plan_projection,
     } = surface;
     let configuration = SessionConfiguration::from_plan(&plan, build_agent);
+    let mcp_configuration_digest = mcp_configuration_digest(plan.config());
     let workspace = plan
         .worktree()
         .unwrap_or_else(|| plan.directory())
         .to_path_buf();
-    let required_mcp = required_mcp_servers(client_mcp, plan.directory());
-    let mut mcp = McpRuntime::from_config_with_required(plan.config(), &workspace, required_mcp)?;
-    let notes = match mcp.as_ref() {
-        Some(runtime) => match runtime.connect_required().await {
-            Ok(notes) => notes,
-            Err(error) => {
-                if let Some(runtime) = mcp.take() {
-                    runtime.shutdown().await;
-                }
-                return Err(error);
-            }
-        },
-        None => Vec::new(),
+    let (mut mcp, notes, mcp_catalog) = match mcp_opening {
+        SessionMcpOpening::Fresh => {
+            let required_mcp = required_mcp_servers(client_mcp, plan.directory());
+            let mut runtime =
+                McpRuntime::from_config_with_required(plan.config(), &workspace, required_mcp)?;
+            let notes = match runtime.as_ref() {
+                Some(connected) => match connected.connect_required().await {
+                    Ok(notes) => notes,
+                    Err(error) => {
+                        if let Some(runtime) = runtime.take() {
+                            runtime.shutdown().await;
+                        }
+                        return Err(error);
+                    }
+                },
+                None => Vec::new(),
+            };
+            let catalog = runtime.as_ref().map(McpRuntime::catalog);
+            (runtime, notes, catalog)
+        }
+        SessionMcpOpening::Reuse(catalog) => (None, Vec::new(), catalog),
     };
     let session_route = Arc::new(zuno_acp::AcpSessionRoute::new(native_subagents));
     let question_asker = elicitation_form.then(|| {
@@ -988,7 +1052,7 @@ async fn open_session_resources(
             approval,
             question,
             runs,
-            mcp: mcp.as_ref().map(McpRuntime::catalog),
+            mcp: mcp_catalog,
             child_observer,
             detached_observer: Some(Arc::clone(&detached_observer)),
         },
@@ -1170,6 +1234,7 @@ async fn open_session_resources(
         question_asker,
         permission_asker,
         configuration,
+        mcp_configuration_digest,
     })
 }
 
@@ -1390,28 +1455,49 @@ impl AcpSession {
     async fn restore_after_reconfiguration_failure(
         &self,
         slot: &mut Option<SessionResources>,
-        options: TurnOptions,
         state: &AcpState,
-        client: zuno_acp::ClientConnection,
-        build_agent: &str,
-        cause: String,
+        mut rollback_context: ReconfigurationRollback,
     ) -> zuno_acp::RpcError {
         let rollback = async {
-            let plan = TurnPlan::resolve(&options, &state.environment).await?;
-            let resources = open_session_resources(
+            let plan =
+                TurnPlan::resolve(&rollback_context.options, &state.environment).await?;
+            let rollback_digest = mcp_configuration_digest(plan.config());
+            let reuse_mcp = rollback_context.retained_mcp_digest.as_deref()
+                == Some(rollback_digest.as_str());
+            if !reuse_mcp {
+                if let Some(mcp) = rollback_context.retained_mcp.take() {
+                    mcp.shutdown().await;
+                }
+                rollback_context.retained_mcp_digest = None;
+            }
+            let opening = if reuse_mcp {
+                SessionMcpOpening::Reuse(
+                    rollback_context
+                        .retained_mcp
+                        .as_ref()
+                        .map(McpRuntime::catalog),
+                )
+            } else {
+                SessionMcpOpening::Fresh
+            };
+            let mut resources = open_session_resources_with_mcp(
                 plan,
                 &state.environment,
                 state.runs.clone(),
                 AcpSurfaceContext::from_state(
                     state,
-                    client,
+                    rollback_context.client,
                     Arc::clone(&self.plan_projection),
                 ),
-                Some(build_agent),
+                Some(&rollback_context.build_agent),
                 &self.mcp_servers,
+                opening,
             )
             .await?;
             if resources.host.session_id() == self.id {
+                if reuse_mcp {
+                    resources.mcp = rollback_context.retained_mcp.take();
+                }
                 return Ok(resources);
             }
             let actual = resources.host.session_id().to_owned();
@@ -1431,12 +1517,17 @@ impl AcpSession {
         match rollback {
             Ok(resources) => {
                 *slot = Some(resources);
-                zuno_acp::RpcError::internal(cause)
+                zuno_acp::RpcError::internal(rollback_context.cause)
             }
-            Err(rollback) => zuno_acp::RpcError::internal(format!(
-                "{cause}; rollback failed and session {} is closed: {rollback}",
-                self.id
-            )),
+            Err(rollback) => {
+                if let Some(mcp) = rollback_context.retained_mcp.take() {
+                    mcp.shutdown().await;
+                }
+                zuno_acp::RpcError::internal(format!(
+                    "{}; rollback failed and session {} is closed: {rollback}",
+                    rollback_context.cause, self.id
+                ))
+            }
         }
     }
 
@@ -1508,6 +1599,8 @@ impl AcpSession {
         client: zuno_acp::ClientConnection,
         prompt_owns_session: bool,
     ) -> Result<SessionConfiguration, zuno_acp::RpcError> {
+        let reconfiguration_started = Instant::now();
+        let change_kind = change.kind();
         if !prompt_owns_session && self.prompt_active.load(Ordering::Acquire) {
             return Err(zuno_acp::RpcError::invalid_params(
                 "session configuration cannot change while a prompt is active",
@@ -1523,13 +1616,22 @@ impl AcpSession {
             drop(dormant);
             drop(mount);
             self.defer_available_commands(&client).await?;
+            tracing::info!(
+                session_id = self.id,
+                change = change_kind,
+                path = "dormant",
+                total_ms = reconfiguration_started.elapsed().as_millis(),
+                "ACP session configuration changed"
+            );
             return Ok(configuration);
         }
         drop(dormant);
 
+        let lock_started = Instant::now();
         let _composition = state.composition_gate.lock().await;
         let mut slot = self.resources.lock().await;
-        let current = slot.take().ok_or_else(|| self.closed_error())?;
+        let lock_ms = lock_started.elapsed().as_millis();
+        let mut current = slot.take().ok_or_else(|| self.closed_error())?;
         let prepared = match current.configuration.prepare_reconfiguration(
             live_options(&current.host),
             current.host.effort_override(),
@@ -1548,6 +1650,7 @@ impl AcpSession {
         };
         let rollback_options = rollback_options(&current.host);
         let build_agent = current.configuration.build_agent.clone();
+        let resolve_started = Instant::now();
         let plan = match TurnPlan::resolve(&prepared.options, &state.environment).await {
             Ok(plan) => plan,
             Err(error) => {
@@ -1555,19 +1658,35 @@ impl AcpSession {
                 return Err(zuno_acp::RpcError::invalid_params(error));
             }
         };
+        let resolve_ms = resolve_started.elapsed().as_millis();
+        let reuse_mcp = current.mcp_configuration_digest == mcp_configuration_digest(plan.config());
+        let retained_mcp_digest = reuse_mcp.then(|| current.mcp_configuration_digest.clone());
+        let mut retained_mcp = reuse_mcp.then(|| current.mcp.take()).flatten();
+        let shutdown_started = Instant::now();
         if let Err(error) = shutdown_session_resources(current).await {
+            if let Some(mcp) = retained_mcp.take() {
+                mcp.shutdown().await;
+            }
             return Err(zuno_acp::RpcError::internal(format!(
                 "could not stop the previous ACP session host: {error}; session {} is closed",
                 self.id
             )));
         }
-        let candidate = match open_session_resources(
+        let shutdown_ms = shutdown_started.elapsed().as_millis();
+        let opening = if reuse_mcp {
+            SessionMcpOpening::Reuse(retained_mcp.as_ref().map(McpRuntime::catalog))
+        } else {
+            SessionMcpOpening::Fresh
+        };
+        let open_started = Instant::now();
+        let mut candidate = match open_session_resources_with_mcp(
             plan,
             &state.environment,
             state.runs.clone(),
             AcpSurfaceContext::from_state(state, client.clone(), Arc::clone(&self.plan_projection)),
             Some(&build_agent),
             &self.mcp_servers,
+            opening,
         )
         .await
         {
@@ -1576,15 +1695,20 @@ impl AcpSession {
                 return Err(self
                     .restore_after_reconfiguration_failure(
                         &mut slot,
-                        rollback_options,
                         state,
-                        client,
-                        &build_agent,
-                        format!("ACP session reconfiguration failed: {error}"),
+                        ReconfigurationRollback {
+                            options: rollback_options,
+                            client,
+                            build_agent,
+                            retained_mcp,
+                            retained_mcp_digest,
+                            cause: format!("ACP session reconfiguration failed: {error}"),
+                        },
                     )
                     .await);
             }
         };
+        let open_ms = open_started.elapsed().as_millis();
         if candidate.host.session_id() != self.id {
             let actual = candidate.host.session_id().to_owned();
             let cleanup = shutdown_session_resources(candidate).await;
@@ -1601,11 +1725,15 @@ impl AcpSession {
             return Err(self
                 .restore_after_reconfiguration_failure(
                     &mut slot,
-                    rollback_options,
                     state,
-                    client,
-                    &build_agent,
-                    cause,
+                    ReconfigurationRollback {
+                        options: rollback_options,
+                        client,
+                        build_agent,
+                        retained_mcp,
+                        retained_mcp_digest,
+                        cause,
+                    },
                 )
                 .await);
         }
@@ -1625,13 +1753,20 @@ impl AcpSession {
             return Err(self
                 .restore_after_reconfiguration_failure(
                     &mut slot,
-                    rollback_options,
                     state,
-                    client,
-                    &build_agent,
-                    cause,
+                    ReconfigurationRollback {
+                        options: rollback_options,
+                        client,
+                        build_agent,
+                        retained_mcp,
+                        retained_mcp_digest,
+                        cause,
+                    },
                 )
                 .await);
+        }
+        if reuse_mcp {
+            candidate.mcp = retained_mcp.take();
         }
         let configuration = candidate.configuration.clone();
         *slot = Some(candidate);
@@ -1639,6 +1774,18 @@ impl AcpSession {
         drop(_composition);
         drop(mount);
         self.defer_available_commands(&client).await?;
+        tracing::info!(
+            session_id = self.id,
+            change = change_kind,
+            path = "active",
+            reused_mcp = reuse_mcp,
+            lock_ms,
+            resolve_ms,
+            shutdown_ms,
+            open_ms,
+            total_ms = reconfiguration_started.elapsed().as_millis(),
+            "ACP session configuration changed"
+        );
         Ok(configuration)
     }
 
@@ -3503,6 +3650,45 @@ mod tests {
     use super::*;
     use zuno_catalog::command::{Info, Source, Template};
     use zuno_llm::effort::ReasoningEffort;
+
+    #[test]
+    fn mcp_reuse_digest_tracks_only_mcp_runtime_inputs() {
+        let base = zuno_config::schema::Config::default();
+        let mut unrelated = base.clone();
+        unrelated.model = Some("test/other-model".to_owned());
+        assert_eq!(
+            mcp_configuration_digest(&base),
+            mcp_configuration_digest(&unrelated),
+            "a model-only change must keep the session MCP runtime reusable"
+        );
+
+        let with_server: zuno_config::schema::Config = serde_json::from_value(json!({
+            "mcp": {
+                "docs": {
+                    "type": "remote",
+                    "url": "https://mcp.example.test"
+                }
+            }
+        }))
+        .expect("remote MCP config");
+        assert_ne!(
+            mcp_configuration_digest(&base),
+            mcp_configuration_digest(&with_server),
+            "changing the MCP server set must force a fresh runtime"
+        );
+
+        let with_concurrency: zuno_config::schema::Config = serde_json::from_value(json!({
+            "concurrency": {
+                "mcp_connections": 16
+            }
+        }))
+        .expect("MCP concurrency config");
+        assert_ne!(
+            mcp_configuration_digest(&base),
+            mcp_configuration_digest(&with_concurrency),
+            "changing MCP connection concurrency must force a fresh runtime"
+        );
+    }
 
     fn configuration() -> SessionConfiguration {
         SessionConfiguration {
