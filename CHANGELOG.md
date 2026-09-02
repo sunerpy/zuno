@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.3](https://github.com/sunerpy/zuno/compare/v0.6.2...v0.6.3) (2026-09-02)
+
+
+### Bug Fixes
+
+* **acp:** resume active goals after native commands ([#79](https://github.com/sunerpy/zuno/issues/79)) ([45da09a](https://github.com/sunerpy/zuno/commit/45da09a0c51badceb325a5109f4ad077dc18afc9))
+
 ## [0.6.2](https://github.com/sunerpy/zuno/compare/v0.6.1...v0.6.2) (2026-09-02)
 
 
