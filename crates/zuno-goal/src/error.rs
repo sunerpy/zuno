@@ -6,6 +6,13 @@
 //! that *would* have worked, because a refusal the model has to guess at costs a
 //! whole extra turn.
 //!
+//! The evidence refusals are model-visible for the same reason:
+//! [`GoalError::EvidenceMissing`], [`GoalError::EvidenceUnproven`] and
+//! [`GoalError::EvidenceStale`] are the sentences that tell a model *which*
+//! criterion is still unproven and *why* the receipt it cited does not count. A
+//! completion refused without naming the criterion ids would leave the model
+//! guessing, and guessing at "done" is the defect these variants exist to stop.
+//!
 //! `zuno-error` deliberately gains nothing here. Four sibling crates depend on its
 //! shape, and none of these failures is a database failure — a refused status is
 //! a policy decision, not a broken statement. Database failures pass through
@@ -60,6 +67,20 @@ pub enum GoalError {
     /// A pause reason in the auxiliary table is outside the closed runtime set.
     #[error("unknown goal pause reason `{value}`")]
     UnknownPauseReason {
+        /// Corrupt stored discriminator.
+        value: String,
+    },
+
+    /// A criterion status in the auxiliary table is outside the closed runtime set.
+    #[error("unknown goal criterion status `{value}`")]
+    UnknownCriterionStatus {
+        /// Corrupt stored discriminator.
+        value: String,
+    },
+
+    /// A goal kind in the auxiliary table is outside the closed runtime set.
+    #[error("unknown goal kind `{value}`")]
+    UnknownGoalKind {
         /// Corrupt stored discriminator.
         value: String,
     },
@@ -123,6 +144,85 @@ pub enum GoalError {
         human_requests: usize,
     },
 
+    /// A criterion id was cited that this goal never assigned.
+    ///
+    /// Names the ids that *do* exist, because the ids are minted by the store and
+    /// echoed once in the `goal_propose` result; a model that lost them has no
+    /// other way back to them.
+    #[error("goal criterion `{criterion_id}` does not exist for session {session_id}; {known}")]
+    UnknownCriterion {
+        /// The session whose criteria were consulted.
+        session_id: String,
+        /// The id that matched nothing.
+        criterion_id: String,
+        /// The ids that would have been accepted.
+        known: String,
+    },
+
+    /// A waiver arrived without a reason.
+    ///
+    /// A waiver is the one way to close a criterion without evidence, so the
+    /// reason is the entire audit trail. An empty one would make the escape hatch
+    /// indistinguishable from the failure it exists to record.
+    #[error("goal criterion `{criterion_id}` cannot be waived without a reason")]
+    EmptyWaiverReason {
+        /// The criterion the caller tried to waive.
+        criterion_id: String,
+    },
+
+    /// A cited receipt does not prove the criterion.
+    ///
+    /// `reason` names which rule refused: no such receipt in this session, a
+    /// failed or undecidable outcome, an exit status that was inferred rather than
+    /// observed, or a criterion already settled by a waiver. Asserting success in
+    /// prose is exactly what this refusal exists to stop.
+    #[error("goal criterion `{criterion_id}` is not proven by receipt `{receipt_id}`: {reason}")]
+    EvidenceUnproven {
+        /// The criterion the caller tried to satisfy.
+        criterion_id: String,
+        /// The receipt that was cited.
+        receipt_id: String,
+        /// Which rule refused, in the words the model needs to act on.
+        reason: String,
+    },
+
+    /// A cited receipt predates the last recorded change to the workspace.
+    ///
+    /// "The tests passed, then I edited three more files, so it is done" is the
+    /// failure this variant refuses. Both timestamps are named so the model can
+    /// see that the evidence is older than its own last edit rather than merely
+    /// being told to try again.
+    #[error(
+        "goal criterion `{criterion_id}` cites receipt `{receipt_id}` recorded at \
+         {receipt_at_ms}, which predates the workspace change recorded at {marked_at_ms}; \
+         verify again after the last change and cite the new receipt"
+    )]
+    EvidenceStale {
+        /// The criterion whose evidence went stale.
+        criterion_id: String,
+        /// The receipt that is now too old to count.
+        receipt_id: String,
+        /// When the workspace last changed, in Unix milliseconds.
+        marked_at_ms: i64,
+        /// When the receipt was recorded, in Unix milliseconds.
+        receipt_at_ms: i64,
+    },
+
+    /// Completion was requested for a change goal whose criteria are unproven.
+    ///
+    /// An empty `unsatisfied` means the goal has no criteria at all: a goal that
+    /// changes the workspace cannot be completed on assertion alone, so there is
+    /// nothing for evidence to attach to and the remedy is to propose the checks
+    /// first.
+    #[error(
+        "goal cannot complete without recorded verification evidence: {}",
+        unsatisfied_detail(unsatisfied)
+    )]
+    EvidenceMissing {
+        /// The criterion ids that are neither satisfied nor waived.
+        unsatisfied: Vec<String>,
+    },
+
     /// An objective was empty or only whitespace.
     ///
     /// Ports the check at `codex-rs/tui/src/goal_files.rs:39-41`. A goal with no
@@ -183,6 +283,22 @@ pub enum GoalError {
     Clock(#[from] std::time::SystemTimeError),
 }
 
+/// How [`GoalError::EvidenceMissing`] describes what is still unproven.
+///
+/// Two sentences rather than one because the two cases have different remedies:
+/// named ids mean "verify these and cite the receipts", while an empty list means
+/// "this goal has no criteria to verify at all".
+fn unsatisfied_detail(unsatisfied: &[String]) -> String {
+    if unsatisfied.is_empty() {
+        "a goal that changes the workspace cannot complete without success criteria".to_owned()
+    } else {
+        format!(
+            "these criteria are neither satisfied nor waived: {}",
+            unsatisfied.join(", ")
+        )
+    }
+}
+
 impl GoalError {
     /// Whether this failure is the model's to fix by asking again differently.
     ///
@@ -198,10 +314,17 @@ impl GoalError {
             | Self::GoalNotActive { .. }
             | Self::RevisionConflict { .. }
             | Self::CompletionBlocked { .. }
+            | Self::UnknownCriterion { .. }
+            | Self::EmptyWaiverReason { .. }
+            | Self::EvidenceUnproven { .. }
+            | Self::EvidenceStale { .. }
+            | Self::EvidenceMissing { .. }
             | Self::EmptyObjective => true,
             Self::Db(_)
             | Self::UnknownRetryReason { .. }
             | Self::UnknownPauseReason { .. }
+            | Self::UnknownCriterionStatus { .. }
+            | Self::UnknownGoalKind { .. }
             | Self::Spill { .. }
             | Self::PointerTooLong { .. }
             | Self::Document { .. }

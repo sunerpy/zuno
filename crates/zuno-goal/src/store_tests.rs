@@ -2101,3 +2101,600 @@ fn next_step_reconciliation_blocks_until_the_replacement_report_is_consumed() {
         "a reconciled next-step job must remain blocked only until its replacement report is consumed",
     );
 }
+
+/// Record a receipt the way the runtime's verifying tool path does.
+///
+/// Written straight through the pool rather than through a fake, because the point
+/// of every test below is what the goal store does with a *real* stored receipt.
+fn record_receipt(
+    fixture: &Fixture,
+    session_id: &str,
+    id: &str,
+    outcome: ReceiptOutcome,
+    exit_authority: zuno_db::verification::ExitAuthority,
+    time_created: i64,
+) {
+    let connection = fixture.store.pool().get().expect("check out connection");
+    zuno_db::verification::record(
+        &connection,
+        &zuno_db::verification::NewVerificationReceipt {
+            id: id.to_owned(),
+            session_id: session_id.to_owned(),
+            turn_id: Some("turn-evidence".to_owned()),
+            tool_call_id: format!("call-{id}"),
+            tool_id: "shell".to_owned(),
+            summary: "cargo test -p zuno-goal".to_owned(),
+            workdir: None,
+            exit_code: Some(0),
+            exit_authority,
+            outcome,
+            git_head: None,
+            output_digest: None,
+            detail: None,
+            time_created,
+        },
+    )
+    .expect("record verification receipt");
+}
+
+/// A change goal with two criteria and one authoritative passing receipt.
+fn evidence_fixture() -> (Fixture, Goal) {
+    let fixture = Fixture::in_memory();
+    let created = fixture
+        .store
+        .create_goal_with_criteria(
+            SESSION,
+            "land the evidence gate",
+            &[
+                "the workspace gates pass".to_owned(),
+                "the release artifact exists".to_owned(),
+            ],
+            None,
+        )
+        .expect("create goal with criteria");
+    fixture
+        .store
+        .escalate_to_change(SESSION, "edited crates/zuno-goal/src/store.rs", 1_000)
+        .expect("escalate to a change goal");
+    record_receipt(
+        &fixture,
+        SESSION,
+        "rec_pass",
+        ReceiptOutcome::Passed,
+        zuno_db::verification::ExitAuthority::Authoritative,
+        2_000,
+    );
+    (fixture, created.goal)
+}
+
+#[test]
+fn success_criteria_are_assigned_short_ids_in_creation_order() {
+    let fixture = Fixture::in_memory();
+    let created = fixture
+        .store
+        .create_goal_with_criteria(
+            SESSION,
+            "keep the checklist addressable",
+            &[
+                "first check".to_owned(),
+                "second check".to_owned(),
+                "third check".to_owned(),
+            ],
+            None,
+        )
+        .expect("create goal with criteria");
+
+    assert_eq!(
+        created
+            .criteria
+            .iter()
+            .map(|criterion| (
+                criterion.criterion_id.as_str(),
+                criterion.statement.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("c1", "first check"),
+            ("c2", "second check"),
+            ("c3", "third check")
+        ],
+        "ids are positional so a model can cite them without transcribing a uuid"
+    );
+    assert_eq!(
+        fixture.store.criteria(SESSION).expect("read criteria"),
+        created.criteria,
+        "the stored order is the creation order"
+    );
+    assert_eq!(
+        created.goal.success_criteria,
+        ["first check", "second check", "third check"],
+        "the JSON column stays the compatibility projection of the same statements"
+    );
+    assert!(
+        created
+            .criteria
+            .iter()
+            .all(|criterion| criterion.status == GoalCriterionStatus::Open),
+        "nothing is proven at creation"
+    );
+}
+
+#[test]
+fn a_criterion_is_satisfied_by_an_authoritative_passing_receipt() {
+    let (fixture, goal) = evidence_fixture();
+
+    let outcome = fixture
+        .store
+        .satisfy_criterion(SESSION, goal.revision, "c1", "rec_pass", 3_000)
+        .expect("an authoritative passing receipt proves a criterion");
+
+    assert_eq!(outcome.criterion.status, GoalCriterionStatus::Satisfied);
+    assert_eq!(outcome.criterion.receipt_id.as_deref(), Some("rec_pass"));
+    assert_eq!(outcome.criterion.satisfied_at_ms, Some(3_000));
+    assert_eq!(
+        outcome.goal.revision,
+        goal.revision + 1,
+        "closing a criterion is a change to the goal, so the revision moves"
+    );
+}
+
+#[test]
+fn a_failed_receipt_cannot_satisfy_a_criterion() {
+    let (fixture, goal) = evidence_fixture();
+    record_receipt(
+        &fixture,
+        SESSION,
+        "rec_fail",
+        ReceiptOutcome::Failed,
+        zuno_db::verification::ExitAuthority::Authoritative,
+        2_500,
+    );
+
+    let refusal = fixture
+        .store
+        .satisfy_criterion(SESSION, goal.revision, "c1", "rec_fail", 3_000)
+        .expect_err("a failed check proves the opposite of success");
+
+    assert!(matches!(
+        &refusal,
+        GoalError::EvidenceUnproven {
+            criterion_id,
+            receipt_id,
+            ..
+        } if criterion_id == "c1" && receipt_id == "rec_fail"
+    ));
+    assert!(refusal.is_model_refusal(), "{refusal}");
+    assert_eq!(
+        fixture.store.goal(SESSION).expect("read goal"),
+        Some(goal),
+        "a refused citation leaves the goal untouched"
+    );
+}
+
+#[test]
+fn a_derived_exit_status_cannot_satisfy_a_criterion() {
+    let (fixture, goal) = evidence_fixture();
+    record_receipt(
+        &fixture,
+        SESSION,
+        "rec_derived",
+        ReceiptOutcome::Passed,
+        zuno_db::verification::ExitAuthority::Derived,
+        2_500,
+    );
+
+    let refusal = fixture
+        .store
+        .satisfy_criterion(SESSION, goal.revision, "c1", "rec_derived", 3_000)
+        .expect_err("a status inferred from the last stage of a pipeline is not evidence");
+
+    assert!(
+        refusal.to_string().contains("derived"),
+        "the refusal names why the status cannot be trusted: {refusal}"
+    );
+    assert!(matches!(refusal, GoalError::EvidenceUnproven { .. }));
+}
+
+#[test]
+fn a_receipt_from_another_session_cannot_satisfy_a_criterion() {
+    let (fixture, goal) = evidence_fixture();
+    record_receipt(
+        &fixture,
+        "ses_somebody_else",
+        "rec_borrowed",
+        ReceiptOutcome::Passed,
+        zuno_db::verification::ExitAuthority::Authoritative,
+        2_500,
+    );
+
+    let refusal = fixture
+        .store
+        .satisfy_criterion(SESSION, goal.revision, "c1", "rec_borrowed", 3_000)
+        .expect_err("a receipt is evidence about the run that produced it");
+
+    assert!(matches!(refusal, GoalError::EvidenceUnproven { .. }));
+}
+
+#[test]
+fn a_receipt_older_than_the_last_workspace_change_is_refused_as_stale() {
+    let (fixture, goal) = evidence_fixture();
+    let reopened = fixture
+        .store
+        .mark_mutation(SESSION, 4_000)
+        .expect("record a workspace change");
+    assert_eq!(reopened, 0, "nothing was satisfied yet");
+
+    let refusal = fixture
+        .store
+        .satisfy_criterion(SESSION, goal.revision, "c1", "rec_pass", 5_000)
+        .expect_err("evidence gathered before the last edit describes code that is gone");
+
+    assert!(matches!(
+        refusal,
+        GoalError::EvidenceStale {
+            marked_at_ms: 4_000,
+            receipt_at_ms: 2_000,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_criterion_satisfied_before_the_last_edit_reopens() {
+    let (fixture, goal) = evidence_fixture();
+    let satisfied = fixture
+        .store
+        .satisfy_criterion(SESSION, goal.revision, "c1", "rec_pass", 3_000)
+        .expect("satisfy the first criterion");
+
+    let reopened = fixture
+        .store
+        .mark_mutation(SESSION, 4_000)
+        .expect("record a workspace change");
+
+    assert_eq!(
+        reopened, 1,
+        "the one satisfied criterion is no longer proven"
+    );
+    let criteria = fixture.store.criteria(SESSION).expect("read criteria");
+    let first = criteria
+        .iter()
+        .find(|criterion| criterion.criterion_id == "c1")
+        .expect("the first criterion still exists");
+    assert_eq!(first.status, GoalCriterionStatus::Open);
+    assert_eq!(
+        first.receipt_id, None,
+        "the citation goes with the status, so nothing looks proven by a stale receipt"
+    );
+    assert_eq!(
+        satisfied.criterion.receipt_id.as_deref(),
+        Some("rec_pass"),
+        "the earlier outcome still describes what was true when it was returned"
+    );
+}
+
+#[test]
+fn a_mutation_mark_never_moves_backwards() {
+    let (fixture, goal) = evidence_fixture();
+    fixture
+        .store
+        .mark_mutation(SESSION, 9_000)
+        .expect("record the later change first");
+    fixture
+        .store
+        .mark_mutation(SESSION, 1_500)
+        .expect("record an out-of-order change");
+
+    let refusal = fixture
+        .store
+        .satisfy_criterion(SESSION, goal.revision, "c1", "rec_pass", 10_000)
+        .expect_err("a late report must not re-validate stale evidence");
+
+    assert!(matches!(
+        refusal,
+        GoalError::EvidenceStale {
+            marked_at_ms: 9_000,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_waiver_without_a_reason_is_refused() {
+    let (fixture, goal) = evidence_fixture();
+
+    let refusal = fixture
+        .store
+        .waive_criterion(SESSION, goal.revision, "c1", "   ", 3_000)
+        .expect_err("an unexplained waiver is indistinguishable from skipping the check");
+
+    assert!(matches!(
+        &refusal,
+        GoalError::EmptyWaiverReason { criterion_id } if criterion_id == "c1"
+    ));
+    assert!(refusal.is_model_refusal(), "{refusal}");
+
+    let waived = fixture
+        .store
+        .waive_criterion(
+            SESSION,
+            goal.revision,
+            "c1",
+            "  the artifact is produced by release tooling this run cannot invoke  ",
+            3_000,
+        )
+        .expect("a reasoned waiver is recorded");
+    assert_eq!(waived.criterion.status, GoalCriterionStatus::Waived);
+    assert_eq!(
+        waived.criterion.waiver_reason.as_deref(),
+        Some("the artifact is produced by release tooling this run cannot invoke"),
+        "the reason is stored trimmed and verbatim"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .mark_mutation(SESSION, 9_000)
+            .expect("record a workspace change"),
+        0,
+        "a decision is not invalidated by a later edit the way a test result is"
+    );
+}
+
+#[test]
+fn an_unknown_criterion_id_is_refused_with_the_ids_that_do_exist() {
+    let (fixture, goal) = evidence_fixture();
+
+    let refusal = fixture
+        .store
+        .satisfy_criterion(SESSION, goal.revision, "c9", "rec_pass", 3_000)
+        .expect_err("an id that was never assigned cannot be closed");
+
+    assert!(matches!(
+        &refusal,
+        GoalError::UnknownCriterion { criterion_id, .. } if criterion_id == "c9"
+    ));
+    assert!(
+        refusal.to_string().contains("c1, c2"),
+        "the refusal saves the model a turn spent guessing: {refusal}"
+    );
+}
+
+#[test]
+fn a_change_goal_cannot_complete_while_a_criterion_is_open() {
+    let (fixture, goal) = evidence_fixture();
+    let satisfied = fixture
+        .store
+        .satisfy_criterion(SESSION, goal.revision, "c1", "rec_pass", 3_000)
+        .expect("prove the first criterion");
+
+    let refusal = fixture
+        .store
+        .complete_checked(SESSION, satisfied.goal.revision)
+        .expect_err("a change goal is done when its criteria are, not when it says so");
+
+    assert!(matches!(
+        &refusal,
+        GoalError::EvidenceMissing { unsatisfied } if unsatisfied == &["c2".to_owned()]
+    ));
+    assert!(
+        refusal.to_string().contains("c2"),
+        "the refusal names exactly what is left: {refusal}"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .goal(SESSION)
+            .expect("read goal")
+            .expect("goal exists")
+            .status,
+        GoalStatus::Active,
+        "a refused completion leaves the run going"
+    );
+}
+
+#[test]
+fn a_change_goal_with_no_criteria_cannot_complete_at_all() {
+    let fixture = Fixture::in_memory();
+    let goal = fixture
+        .store
+        .create_goal(SESSION, "rewrite the parser", None)
+        .expect("create goal");
+    fixture
+        .store
+        .escalate_to_change(SESSION, "wrote crates/zuno-goal/src/store.rs", 1_000)
+        .expect("escalate to a change goal");
+
+    let refusal = fixture
+        .store
+        .complete_checked(SESSION, goal.revision)
+        .expect_err("an empty checklist is not a completed one");
+
+    assert!(matches!(
+        &refusal,
+        GoalError::EvidenceMissing { unsatisfied } if unsatisfied.is_empty()
+    ));
+    assert!(
+        refusal
+            .to_string()
+            .contains("cannot complete without success criteria"),
+        "the refusal says what is missing rather than which id: {refusal}"
+    );
+}
+
+#[test]
+fn a_waived_criterion_lets_a_change_goal_complete() {
+    let (fixture, goal) = evidence_fixture();
+    let satisfied = fixture
+        .store
+        .satisfy_criterion(SESSION, goal.revision, "c1", "rec_pass", 3_000)
+        .expect("prove the first criterion");
+    let waived = fixture
+        .store
+        .waive_criterion(
+            SESSION,
+            satisfied.goal.revision,
+            "c2",
+            "the release artifact is built by tooling outside this workspace",
+            3_100,
+        )
+        .expect("waive the second criterion");
+
+    let completed = fixture
+        .store
+        .complete_checked(SESSION, waived.goal.revision)
+        .expect("evidence plus a recorded decision settles every criterion")
+        .expect("goal exists");
+
+    assert_eq!(completed.status, GoalStatus::Complete);
+}
+
+#[test]
+fn a_question_goal_completes_without_any_evidence() {
+    let fixture = Fixture::in_memory();
+    let created = fixture
+        .store
+        .create_goal_with_criteria(
+            SESSION,
+            "explain how the budget flip works",
+            &["the answer names the statement that flips the status".to_owned()],
+            None,
+        )
+        .expect("create goal with criteria");
+
+    let completed = fixture
+        .store
+        .complete_checked(SESSION, created.goal.revision)
+        .expect("a goal that changed nothing has nothing to verify")
+        .expect("goal exists");
+
+    assert_eq!(completed.status, GoalStatus::Complete);
+    assert_eq!(
+        fixture.store.kind(SESSION).expect("read kind"),
+        GoalKind::Question,
+        "a goal is presumed harmless until something reports a change"
+    );
+}
+
+#[test]
+fn escalating_to_a_change_goal_keeps_the_first_reason_and_is_idempotent() {
+    let fixture = Fixture::in_memory();
+    fixture
+        .store
+        .create_goal(SESSION, "port the store", None)
+        .expect("create goal");
+
+    assert_eq!(
+        fixture
+            .store
+            .escalate_to_change(SESSION, "wrote store.rs", 1_000)
+            .expect("escalate"),
+        GoalKind::Change
+    );
+    assert_eq!(
+        fixture
+            .store
+            .escalate_to_change(SESSION, "wrote tools.rs", 2_000)
+            .expect("escalate again"),
+        GoalKind::Change
+    );
+    let connection = fixture.store.pool().get().expect("check out connection");
+    let (reason, escalated_at_ms): (String, i64) = connection
+        .query_row(
+            "SELECT reason, escalated_at_ms FROM goal_kind WHERE session_id = ?1",
+            params![SESSION],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read the recorded escalation");
+    assert_eq!(reason, "wrote store.rs");
+    assert_eq!(escalated_at_ms, 1_000);
+}
+
+#[test]
+fn a_session_without_a_goal_cannot_be_escalated_or_marked() {
+    let fixture = Fixture::in_memory();
+
+    assert_eq!(
+        fixture
+            .store
+            .escalate_to_change("ses_nothing", "wrote a file", 1_000)
+            .expect("escalate without a goal"),
+        GoalKind::Question,
+        "a stale escalation must not gate a goal created later"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .mark_mutation("ses_nothing", 1_000)
+            .expect("mark without a goal"),
+        0
+    );
+}
+
+#[test]
+fn a_replayed_request_id_is_charged_once() {
+    let fixture = Fixture::in_memory();
+    fixture
+        .store
+        .create_goal(SESSION, "spend the budget once", Some(10_000))
+        .expect("create goal");
+
+    let first = fixture
+        .store
+        .record_request_usage(SESSION, "turn-1:2", 250, 1_000)
+        .expect("record a request");
+    let replay = fixture
+        .store
+        .record_request_usage(SESSION, "turn-1:2", 250, 1_100)
+        .expect("record the same request again");
+
+    assert!(first.accounted, "the first sighting is charged");
+    assert!(!replay.accounted, "the replay is recognised, not charged");
+    assert_eq!(
+        replay.goal.as_ref().expect("goal exists").tokens_used,
+        250,
+        "a resumed turn must not spend the budget twice"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .record_request_usage(SESSION, "turn-1:3", 100, 1_200)
+            .expect("record the next request")
+            .goal
+            .expect("goal exists")
+            .tokens_used,
+        350
+    );
+    assert_eq!(
+        fixture
+            .store
+            .record_request_usage("ses_nothing", "turn-1:2", 100, 1_300)
+            .expect("record against a session with no goal")
+            .goal,
+        None
+    );
+}
+
+#[test]
+fn replacing_a_goal_clears_its_criteria_and_its_evidence() {
+    let (fixture, goal) = evidence_fixture();
+    fixture
+        .store
+        .satisfy_criterion(SESSION, goal.revision, "c1", "rec_pass", 3_000)
+        .expect("prove a criterion of the goal being replaced");
+
+    fixture
+        .store
+        .replace_goal_as_system(SESSION, "a different objective entirely", None)
+        .expect("replace the goal");
+
+    assert_eq!(
+        fixture.store.criteria(SESSION).expect("read criteria"),
+        Vec::new(),
+        "ids belong to one goal, so a citation cannot survive into the next"
+    );
+    assert_eq!(
+        fixture.store.kind(SESSION).expect("read kind"),
+        GoalKind::Question,
+        "the new goal has not changed anything yet"
+    );
+}

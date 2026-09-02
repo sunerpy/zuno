@@ -12,7 +12,7 @@
 //! Inspired by Codex's goal mechanism and extended with Zuno's durable
 //! cross-turn retry controller.
 //!
-//! # The four decisions this crate makes
+//! # The five decisions this crate makes
 //!
 //! **Statuses are split by who may write them.** The model may report `blocked`
 //! or `complete` — facts about its own work. It may not write `paused`,
@@ -29,6 +29,14 @@
 //! **Goal and work state share the application database.** Goal, plan, todo, job,
 //! and session checkpoints can be audited and completed against one SQLite
 //! transaction boundary. Test fixtures may still use private pools.
+//!
+//! **"Done" is a claim about the workspace, so it needs evidence.** A goal that
+//! changes files carries success criteria with ids, and each one is closed either
+//! by citing a verification receipt the runtime recorded — a real exit status from
+//! a real command, in this session — or by an explicit waiver with a reason. Prose
+//! asserting that the tests pass is not evidence, and evidence gathered before the
+//! last edit is not evidence about the code that exists now, so a recorded change
+//! reopens anything it invalidates. See [`store::GoalStore::satisfy_criterion`].
 //!
 //! **The Markdown document is a projection, and the conflict rule is fixed.** The
 //! goal is also rendered to `.zuno/goal/<sessionID>.md` for a human to read
@@ -54,6 +62,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+pub mod budget;
 pub mod continuation;
 pub mod error;
 pub mod pause;
@@ -64,6 +73,7 @@ pub mod status;
 pub mod store;
 pub mod tools;
 
+pub use crate::budget::{GoalBudgetPolicy, SOFT_RESERVE_DIVISOR};
 pub use crate::continuation::{
     BLOCKED_TURN_THRESHOLD, BlockedAudit, ContinuationAttempt, ContinuationSuppression,
     GoalContinuation, GoalTurnMode, GoalTurnOutcome, PreparedContinuation, QueuedUserInput,
@@ -73,8 +83,8 @@ pub use crate::error::GoalError;
 pub use crate::pause::{GoalPauseReason, GoalPauseState, InteractionPolicy};
 pub use crate::projection::{
     Check, Document, Edited, Field, GITIGNORE_SNIPPET, GOAL_DIRECTORY, GoalProjection, Ingest,
-    Notes, OBJECTIVE_BEGIN, OBJECTIVE_END, PROJECT_DIRECTORY, Refusal, RejectedEdit, document_path,
-    parse, render,
+    MAX_CRITERION_CHARS, Notes, OBJECTIVE_BEGIN, OBJECTIVE_END, PROJECT_DIRECTORY, Refusal,
+    RejectedEdit, document_path, parse, render,
 };
 pub use crate::retry::{
     DEFAULT_GOAL_RETRY_INITIAL_DELAY, DEFAULT_GOAL_RETRY_JITTER_PERCENT,
@@ -87,14 +97,15 @@ pub use crate::spill::{
 };
 pub use crate::status::{GoalStatus, ModelStatus, StatusOwner, SystemStatus};
 pub use crate::store::{
-    AUXILIARY_SCHEMA, FailureStreak, Goal, GoalHistoryEntry, GoalHumanRequestOrigin, GoalStore,
-    OBJECTIVE_SPILL_DIRECTORY, SCHEMA, TABLE, default_spill_dir,
+    AUXILIARY_SCHEMA, CriterionOutcome, FailureStreak, Goal, GoalCreation, GoalCriterion,
+    GoalCriterionStatus, GoalHistoryEntry, GoalHumanRequestOrigin, GoalKind, GoalStore,
+    OBJECTIVE_SPILL_DIRECTORY, SCHEMA, TABLE, UsageRecorded, default_spill_dir,
 };
 pub use crate::tools::{
     CREATE_GOAL_TOOL_ID, CreateGoalParams, CreateGoalTool, GET_GOAL_TOOL_ID, GetGoalParams,
     GetGoalTool, GoalInputOption, GoalRequestInputParams, GoalRequestInputTool,
-    REQUEST_GOAL_INPUT_TOOL_ID, UPDATE_GOAL_TOOL_ID, UpdateGoalParams, UpdateGoalStatus,
-    UpdateGoalTool, goal_from_metadata, goal_tools,
+    REQUEST_GOAL_INPUT_TOOL_ID, SatisfiedCriterion, UPDATE_GOAL_TOOL_ID, UpdateGoalParams,
+    UpdateGoalStatus, UpdateGoalTool, WaivedCriterion, goal_from_metadata, goal_tools,
 };
 
 #[cfg(test)]

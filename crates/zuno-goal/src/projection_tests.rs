@@ -776,8 +776,8 @@ fn the_render_is_deterministic_so_two_renders_of_one_state_are_identical() {
     let fixture = Fixture::new();
     let goal = fixture.create("determinism", Some(10_000));
     assert_eq!(
-        render(&goal, &Notes::default()),
-        render(&goal, &Notes::default())
+        render(&goal, &[], &Notes::default()),
+        render(&goal, &[], &Notes::default())
     );
     let notes = Notes {
         rejected: vec![RejectedEdit {
@@ -788,8 +788,11 @@ fn the_render_is_deterministic_so_two_renders_of_one_state_are_identical() {
         }],
         salvaged: None,
     };
-    assert_eq!(render(&goal, &notes), render(&goal, &notes));
-    assert_ne!(render(&goal, &notes), render(&goal, &Notes::default()));
+    assert_eq!(render(&goal, &[], &notes), render(&goal, &[], &notes));
+    assert_ne!(
+        render(&goal, &[], &notes),
+        render(&goal, &[], &Notes::default())
+    );
 }
 
 /// The acceptance criterion: every successful product read must expose one
@@ -995,6 +998,7 @@ fn an_opencode_goal_document_is_ignored_when_zunos_projection_is_restored() {
                 .goal(SESSION)
                 .expect("read goal")
                 .expect("goal exists"),
+            &[],
             &Notes::default()
         )
     );
@@ -1014,4 +1018,253 @@ fn a_goal_document_present_in_both_locations_ingests_the_new_one() {
     fixture.create("ship the thing", None);
     write_unrelated_opencode_document(&fixture, "unrelated projection\n");
     assert!(matches!(fixture.ingest(), Ingest::OwnRender));
+}
+
+impl Fixture {
+    /// A change goal with two criteria, rendered with its checklist.
+    fn create_with_criteria(&self, statements: &[&str]) -> crate::GoalCreation {
+        let owned = statements
+            .iter()
+            .map(|statement| (*statement).to_owned())
+            .collect::<Vec<_>>();
+        let created = self
+            .store
+            .create_goal_with_criteria(SESSION, "prove the checklist", &owned, None)
+            .expect("create goal with criteria");
+        self.store
+            .escalate_to_change(SESSION, "edited a file", 1_000)
+            .expect("escalate to a change goal");
+        self.projection
+            .write_criteria(&created.goal, &created.criteria)
+            .expect("render projection");
+        created
+    }
+
+    /// Re-render from SQL, the way the turn loop does after a store change.
+    fn rerender(&self) {
+        let goal = self.goal();
+        let criteria = self.store.criteria(SESSION).expect("read criteria");
+        self.projection
+            .write_criteria(&goal, &criteria)
+            .expect("render projection");
+    }
+
+    fn record_receipt(&self, id: &str, time_created: i64) {
+        let connection = self.store.pool().get().expect("check out connection");
+        zuno_db::verification::record(
+            &connection,
+            &zuno_db::verification::NewVerificationReceipt {
+                id: id.to_owned(),
+                session_id: SESSION.to_owned(),
+                turn_id: Some("turn_projection".to_owned()),
+                tool_call_id: format!("call_{id}"),
+                tool_id: "shell".to_owned(),
+                summary: "cargo test".to_owned(),
+                workdir: None,
+                exit_code: Some(0),
+                exit_authority: zuno_db::verification::ExitAuthority::Authoritative,
+                outcome: zuno_db::verification::ReceiptOutcome::Passed,
+                git_head: None,
+                output_digest: None,
+                detail: None,
+                time_created,
+            },
+        )
+        .expect("record verification receipt");
+    }
+}
+
+#[test]
+fn the_document_lists_each_criterion_with_its_id_status_and_citation() {
+    let fixture = Fixture::new();
+    let created =
+        fixture.create_with_criteria(&["the workspace gates pass", "the artifact exists"]);
+    fixture.record_receipt("rec_gates", 2_000);
+    let satisfied = fixture
+        .store
+        .satisfy_criterion(SESSION, created.goal.revision, "c1", "rec_gates", 3_000)
+        .expect("prove the first criterion");
+    fixture
+        .store
+        .waive_criterion(
+            SESSION,
+            satisfied.goal.revision,
+            "c2",
+            "release tooling builds it outside this workspace",
+            3_100,
+        )
+        .expect("waive the second criterion");
+    fixture.rerender();
+
+    let document = fixture.read();
+    assert!(document.contains("## Success criteria"), "{document}");
+    assert!(
+        document
+            .contains("- [x] `c1`: the workspace gates pass — satisfied by receipt `rec_gates`"),
+        "a reader can check the claim against the receipt: {document}"
+    );
+    assert!(
+        document.contains(
+            "- [x] `c2`: the artifact exists — waived: release tooling builds it outside \
+             this workspace"
+        ),
+        "{document}"
+    );
+}
+
+#[test]
+fn an_open_criterion_renders_unticked_and_a_goal_without_any_says_so() {
+    let fixture = Fixture::new();
+    fixture.create_with_criteria(&["the workspace gates pass"]);
+    assert!(
+        fixture
+            .read()
+            .contains("- [ ] `c1`: the workspace gates pass — open"),
+        "{}",
+        fixture.read()
+    );
+
+    let plain = Fixture::new();
+    plain.create("answer a question", None);
+    assert!(
+        plain
+            .read()
+            .contains("_This goal has no success criteria._"),
+        "an empty section would read as a checklist that is already done: {}",
+        plain.read()
+    );
+}
+
+#[test]
+fn a_criterion_statement_too_long_for_the_document_is_clipped_to_one_line() {
+    let fixture = Fixture::new();
+    let statement = format!("{} {}", "gates pass".repeat(40), "trailing words");
+    let created = fixture.create_with_criteria(&[&statement]);
+    assert_eq!(created.criteria[0].statement, statement);
+
+    let line = fixture
+        .read()
+        .lines()
+        .find(|line| line.starts_with("- [ ] `c1`"))
+        .map(ToOwned::to_owned)
+        .expect("the criterion renders");
+    assert!(
+        line.contains('…') && line.chars().count() < statement.chars().count(),
+        "the full text stays in SQL, so the document only has to stay readable: {line}"
+    );
+    assert!(
+        matches!(fixture.ingest(), Ingest::OwnRender),
+        "a clipped render is still recognised as our own write"
+    );
+}
+
+#[test]
+fn a_hand_edited_criterion_line_is_rejected_and_the_document_says_why() {
+    let fixture = Fixture::new();
+    fixture.create_with_criteria(&["the workspace gates pass"]);
+    fixture.edit(|document| {
+        document.replace(
+            "- [ ] `c1`: the workspace gates pass — open",
+            "- [x] `c1`: the workspace gates pass — satisfied by receipt `rec_fictional`",
+        )
+    });
+
+    let ingest = fixture.ingest();
+
+    let Ingest::Applied { adopted, rejected } = ingest else {
+        panic!("a save is an ingest even when every edit is refused: {ingest:?}");
+    };
+    assert_eq!(adopted, None);
+    assert_eq!(
+        rejected
+            .iter()
+            .map(|edit| edit.edited.clone())
+            .collect::<Vec<_>>(),
+        [Edited::Criterion("c1".to_owned())]
+    );
+    assert_eq!(
+        fixture
+            .store
+            .criteria(SESSION)
+            .expect("read criteria")
+            .first()
+            .expect("one criterion")
+            .status,
+        crate::GoalCriterionStatus::Open,
+        "a document cannot close a criterion, or an editor left open could finish a run"
+    );
+    let document = fixture.read();
+    assert!(
+        document.contains("the `c1` success criterion was edited to"),
+        "{document}"
+    );
+    assert!(
+        document.contains("the criterion checklist is the system's to set"),
+        "{document}"
+    );
+}
+
+#[test]
+fn a_criterion_line_invented_by_hand_is_rejected_rather_than_ignored() {
+    let fixture = Fixture::new();
+    fixture.create_with_criteria(&["the workspace gates pass"]);
+    fixture.edit(|document| {
+        document.replace(
+            "- [ ] `c1`: the workspace gates pass — open",
+            "- [ ] `c1`: the workspace gates pass — open\n- [x] `c7`: everything else — done",
+        )
+    });
+
+    let ingest = fixture.ingest();
+
+    let Ingest::Applied { rejected, .. } = ingest else {
+        panic!("an invented criterion must be reported: {ingest:?}");
+    };
+    assert_eq!(
+        rejected
+            .iter()
+            .map(|edit| edit.edited.clone())
+            .collect::<Vec<_>>(),
+        [Edited::Criterion("c7".to_owned())]
+    );
+    assert!(
+        fixture
+            .read()
+            .contains("the `c7` success criterion was edited to"),
+        "{}",
+        fixture.read()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .criteria(SESSION)
+            .expect("read criteria")
+            .len(),
+        1,
+        "the checklist is still the goal's, not the document's"
+    );
+}
+
+#[test]
+fn an_edited_objective_is_still_adopted_alongside_the_criterion_checklist() {
+    let fixture = Fixture::new();
+    fixture.create_with_criteria(&["the workspace gates pass"]);
+    fixture.edit(|document| replace_objective(&document, "prove the checklist, carefully"));
+
+    let ingest = fixture.ingest();
+
+    assert!(matches!(
+        ingest,
+        Ingest::Applied {
+            adopted: Some(ref objective),
+            ref rejected,
+        } if objective == "prove the checklist, carefully" && rejected.is_empty()
+    ));
+    assert!(
+        fixture
+            .read()
+            .contains("- [ ] `c1`: the workspace gates pass — open"),
+        "the re-render after an adopted edit keeps the checklist: {}",
+        fixture.read()
+    );
 }

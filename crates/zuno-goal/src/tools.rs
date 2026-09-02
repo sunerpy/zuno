@@ -1,6 +1,6 @@
 //! Model-facing tools for reading, creating, and finishing persisted goals.
 
-use crate::{Goal, GoalError, GoalStore, ModelStatus};
+use crate::{Goal, GoalCriterion, GoalCriterionStatus, GoalError, GoalStore, ModelStatus};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,26 @@ impl From<UpdateGoalStatus> for ModelStatus {
     }
 }
 
+/// One criterion the model claims a recorded receipt proves.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SatisfiedCriterion {
+    /// Criterion id assigned by `goal_propose`, such as `c1`.
+    pub criterion_id: String,
+    /// Receipt id printed by the tool result that ran the check.
+    pub receipt_id: String,
+}
+
+/// One criterion the model closes by decision instead of by evidence.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WaivedCriterion {
+    /// Criterion id assigned by `goal_propose`, such as `c1`.
+    pub criterion_id: String,
+    /// Why this criterion will not be verified. Recorded verbatim.
+    pub reason: String,
+}
+
 /// Payload for [`UpdateGoalTool`].
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +100,12 @@ pub struct UpdateGoalParams {
     /// Stable description of the impasse. Required only with `status: blocked`.
     #[serde(default)]
     pub blocking_condition: Option<String>,
+    /// Criteria proven by receipts, applied before the status changes.
+    #[serde(default)]
+    pub satisfy_criteria: Vec<SatisfiedCriterion>,
+    /// Criteria closed by decision, applied before the status changes.
+    #[serde(default)]
+    pub waive_criteria: Vec<WaivedCriterion>,
 }
 
 /// One selectable response for a durable Goal request.
@@ -202,7 +228,7 @@ impl TypedTool for CreateGoalTool {
             .filter(|criterion| !criterion.is_empty())
             .collect::<Vec<_>>();
         let token_budget = params.token_budget;
-        let goal = tokio::task::spawn_blocking(move || {
+        let created = tokio::task::spawn_blocking(move || {
             store.create_goal_with_criteria(
                 &session_id,
                 &objective,
@@ -213,7 +239,10 @@ impl TypedTool for CreateGoalTool {
         .await
         .map_err(|error| failed(CREATE_GOAL_TOOL_ID, error))?
         .map_err(|error| map_goal_error(CREATE_GOAL_TOOL_ID, error))?;
-        goal_output(CREATE_GOAL_TOOL_ID, Some(goal))
+        // The ids are echoed because they are minted here, and a criterion can only
+        // be closed later by citing one. A model that never sees `c1` cannot prove
+        // anything, and would be left asserting success in prose.
+        criteria_output(CREATE_GOAL_TOOL_ID, Some(created.goal), &created.criteria)
     }
 }
 
@@ -256,8 +285,19 @@ impl TypedTool for UpdateGoalTool {
         }
         let store = Arc::clone(&self.store);
         let session_id = ctx.session_id;
-        let expected_revision = params.expected_revision;
         let status = ModelStatus::from(params.status);
+        // Evidence first, status second, in one call: a model that verified its work
+        // and wants to finish should not have to choose which of the two writes to
+        // make, and the completion audit that follows must see the citations this
+        // call carries.
+        let revision = apply_criteria_updates(
+            &store,
+            &session_id,
+            params.expected_revision,
+            params.satisfy_criteria,
+            params.waive_criteria,
+        )
+        .await?;
         if matches!(status, ModelStatus::Blocked) {
             let condition = params
                 .blocking_condition
@@ -269,16 +309,12 @@ impl TypedTool for UpdateGoalTool {
                         UPDATE_GOAL_TOOL_ID,
                         "blocking_condition is required when status is blocked",
                     )
-                })?;
+                })?
+                .to_owned();
             let staged_store = Arc::clone(&store);
             let staged_session_id = session_id.clone();
-            let condition = condition.to_owned();
             let staged = tokio::task::spawn_blocking(move || {
-                staged_store.stage_failure_signal_checked(
-                    &staged_session_id,
-                    &condition,
-                    expected_revision,
-                )
+                staged_store.stage_failure_signal_checked(&staged_session_id, &condition, revision)
             })
             .await
             .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
@@ -289,11 +325,13 @@ impl TypedTool for UpdateGoalTool {
                     "cannot report a blocker because this session has no active goal",
                 ));
             }
-            let goal = tokio::task::spawn_blocking(move || store.goal(&session_id))
+            let read_store = Arc::clone(&store);
+            let read_session_id = session_id.clone();
+            let goal = tokio::task::spawn_blocking(move || read_store.goal(&read_session_id))
                 .await
                 .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
                 .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
-            return goal_output(UPDATE_GOAL_TOOL_ID, goal);
+            return current_goal_output(&store, &session_id, goal).await;
         }
         if params.blocking_condition.is_some() {
             return Err(invalid(
@@ -301,11 +339,13 @@ impl TypedTool for UpdateGoalTool {
                 "blocking_condition is only valid when status is blocked",
             ));
         }
+        let status_store = Arc::clone(&store);
+        let status_session_id = session_id.clone();
         let goal = tokio::task::spawn_blocking(move || {
             if matches!(status, ModelStatus::Complete) {
-                store.complete_checked(&session_id, expected_revision)
+                status_store.complete_checked(&status_session_id, revision)
             } else {
-                store.update_status_as_model_checked(&session_id, status, expected_revision)
+                status_store.update_status_as_model_checked(&status_session_id, status, revision)
             }
         })
         .await
@@ -317,7 +357,7 @@ impl TypedTool for UpdateGoalTool {
                 "cannot update goal because this session has no goal",
             ));
         }
-        goal_output(UPDATE_GOAL_TOOL_ID, goal)
+        current_goal_output(&store, &session_id, goal).await
     }
 }
 
@@ -447,6 +487,139 @@ fn validate_goal_request(params: &GoalRequestInputParams) -> Result<(), ToolErro
         }
     }
     Ok(())
+}
+
+/// Record every citation and waiver this call carries, before the status changes.
+///
+/// Sequential and revision-threaded deliberately. Each write bumps the goal
+/// revision, so the model's `expected_revision` guards the first one and each
+/// result guards the next; the status change then runs against the revision these
+/// writes produced. Passing the model's revision to every call instead would make
+/// any call that closes two criteria fail its own second write.
+///
+/// Stops at the first refusal, leaving earlier writes committed. That is the
+/// honest outcome: a citation that was accepted describes evidence that really
+/// exists, and rolling it back would ask the model to prove it twice.
+async fn apply_criteria_updates(
+    store: &Arc<GoalStore>,
+    session_id: &str,
+    expected_revision: i64,
+    satisfy: Vec<SatisfiedCriterion>,
+    waive: Vec<WaivedCriterion>,
+) -> Result<i64, ToolError> {
+    if satisfy.is_empty() && waive.is_empty() {
+        return Ok(expected_revision);
+    }
+    for satisfied in &satisfy {
+        let criterion_id = satisfied.criterion_id.trim();
+        if waive
+            .iter()
+            .any(|waived| waived.criterion_id.trim() == criterion_id)
+        {
+            return Err(invalid(
+                UPDATE_GOAL_TOOL_ID,
+                &format!(
+                    "criterion `{criterion_id}` appears in both satisfy_criteria and \
+                     waive_criteria; cite evidence or record a waiver, not both"
+                ),
+            ));
+        }
+    }
+    let at_ms = crate::store::now_ms().map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?;
+    let mut revision = expected_revision;
+    for satisfied in satisfy {
+        let call_store = Arc::clone(store);
+        let call_session_id = session_id.to_owned();
+        let outcome = tokio::task::spawn_blocking(move || {
+            call_store.satisfy_criterion(
+                &call_session_id,
+                revision,
+                satisfied.criterion_id.trim(),
+                satisfied.receipt_id.trim(),
+                at_ms,
+            )
+        })
+        .await
+        .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
+        .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
+        revision = outcome.goal.revision;
+    }
+    for waived in waive {
+        let call_store = Arc::clone(store);
+        let call_session_id = session_id.to_owned();
+        let outcome = tokio::task::spawn_blocking(move || {
+            call_store.waive_criterion(
+                &call_session_id,
+                revision,
+                waived.criterion_id.trim(),
+                waived.reason.trim(),
+                at_ms,
+            )
+        })
+        .await
+        .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
+        .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
+        revision = outcome.goal.revision;
+    }
+    Ok(revision)
+}
+
+/// Render a goal together with the checklist as it stands after the write.
+///
+/// Read afterwards rather than assembled from the request, so a model whose
+/// completion was refused sees which criteria are still open without spending a
+/// turn on `goal_get`.
+async fn current_goal_output(
+    store: &Arc<GoalStore>,
+    session_id: &str,
+    goal: Option<Goal>,
+) -> Result<ToolOutput, ToolError> {
+    let read_store = Arc::clone(store);
+    let read_session_id = session_id.to_owned();
+    let criteria = tokio::task::spawn_blocking(move || read_store.criteria(&read_session_id))
+        .await
+        .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
+        .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
+    criteria_output(UPDATE_GOAL_TOOL_ID, goal, &criteria)
+}
+
+/// A goal result carrying its criterion checklist, ids included.
+fn criteria_output(
+    tool: &str,
+    goal: Option<Goal>,
+    criteria: &[GoalCriterion],
+) -> Result<ToolOutput, ToolError> {
+    let mut output = goal_output(tool, goal)?;
+    if criteria.is_empty() {
+        return Ok(output);
+    }
+    let value = serde_json::to_value(criteria).map_err(|error| failed(tool, error))?;
+    let checklist = criteria
+        .iter()
+        .map(render_criterion)
+        .collect::<Vec<_>>()
+        .join("\n");
+    output.output = format!("{}\n\nSuccess criteria:\n{checklist}", output.output);
+    Ok(output.with_metadata("criteria", value))
+}
+
+/// One checklist line: the id to cite, the statement, and where it stands.
+fn render_criterion(criterion: &GoalCriterion) -> String {
+    let standing = match criterion.status {
+        GoalCriterionStatus::Open => "open; cite the receipt id that proves it".to_owned(),
+        GoalCriterionStatus::Satisfied => criterion.receipt_id.as_deref().map_or_else(
+            || "satisfied".to_owned(),
+            |receipt_id| format!("satisfied by receipt {receipt_id}"),
+        ),
+        GoalCriterionStatus::Waived => criterion
+            .waiver_reason
+            .as_deref()
+            .map_or_else(|| "waived".to_owned(), |reason| format!("waived: {reason}")),
+    };
+    format!(
+        "{}  {} [{standing}]",
+        criterion.criterion_id, criterion.statement
+    )
 }
 
 fn goal_output(tool: &str, goal: Option<Goal>) -> Result<ToolOutput, ToolError> {

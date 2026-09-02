@@ -321,3 +321,241 @@ fn a_terminal_status_discards_an_unsettled_blocker() {
         None
     );
 }
+
+/// The message the reporter shows the model, which lives on the chained cause.
+fn refusal_detail(error: &ToolError) -> String {
+    std::error::Error::source(error).map_or_else(|| error.to_string(), ToString::to_string)
+}
+
+/// Store an authoritative passing receipt for the tool session to cite.
+fn record_passing_receipt(fixture: &Fixture, id: &str, time_created: i64) {
+    let connection = fixture.store.pool().get().expect("check out connection");
+    zuno_db::verification::record(
+        &connection,
+        &zuno_db::verification::NewVerificationReceipt {
+            id: id.to_owned(),
+            session_id: "ses_tools".to_owned(),
+            turn_id: Some("turn_tools".to_owned()),
+            tool_call_id: format!("call_verify_{id}"),
+            tool_id: "shell".to_owned(),
+            summary: "cargo test".to_owned(),
+            workdir: None,
+            exit_code: Some(0),
+            exit_authority: zuno_db::verification::ExitAuthority::Authoritative,
+            outcome: zuno_db::verification::ReceiptOutcome::Passed,
+            git_head: None,
+            output_digest: None,
+            detail: None,
+            time_created,
+        },
+    )
+    .expect("record verification receipt");
+}
+
+#[test]
+fn goal_descriptions_teach_the_evidence_contract() {
+    assert!(
+        CREATE_DESCRIPTION.contains("success criteria"),
+        "{CREATE_DESCRIPTION}"
+    );
+    assert!(
+        UPDATE_DESCRIPTION.contains("receipt id"),
+        "{UPDATE_DESCRIPTION}"
+    );
+    assert!(
+        UPDATE_DESCRIPTION.contains("reopen"),
+        "{UPDATE_DESCRIPTION}"
+    );
+}
+
+#[tokio::test]
+async fn creating_a_goal_prints_the_criterion_id_to_cite_for_each_statement() {
+    let fixture = Fixture::new();
+    let output = erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "objective": "ship the evidence gate",
+                "success_criteria": ["workspace gates pass", "release artifact exists"]
+            }),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("create goal");
+
+    assert!(
+        output.output.contains("c1  workspace gates pass"),
+        "the model cannot cite an id it was never shown: {}",
+        output.output
+    );
+    assert!(
+        output.output.contains("c2  release artifact exists"),
+        "{}",
+        output.output
+    );
+    let criteria = output
+        .metadata
+        .get("criteria")
+        .expect("criteria metadata")
+        .as_array()
+        .expect("criteria is a list")
+        .len();
+    assert_eq!(criteria, 2);
+    assert!(
+        output.metadata.contains_key("goal"),
+        "the goal metadata other callers decode stays where it was"
+    );
+}
+
+#[tokio::test]
+async fn a_change_goal_completes_once_every_criterion_is_cited_or_waived() {
+    let fixture = Fixture::new();
+    let create = erase(CreateGoalTool::new(Arc::clone(&fixture.store)));
+    create
+        .execute(
+            json!({
+                "objective": "ship the evidence gate",
+                "success_criteria": ["workspace gates pass", "release artifact exists"]
+            }),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("create goal");
+    fixture
+        .store
+        .escalate_to_change("ses_tools", "edited crates/zuno-goal/src/store.rs", 1_000)
+        .expect("escalate to a change goal");
+    record_passing_receipt(&fixture, "rec_gates", 2_000);
+    let update = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
+
+    let refusal = update
+        .execute(
+            json!({"expected_revision": 1, "status": "complete"}),
+            fixture.context("call_bare_complete"),
+        )
+        .await
+        .expect_err("prose is not evidence");
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    let message = refusal_detail(&refusal);
+    assert!(
+        message.contains("c1") && message.contains("c2"),
+        "the refusal names every criterion still open: {message}"
+    );
+
+    let completed = update
+        .execute(
+            json!({
+                "expected_revision": 1,
+                "status": "complete",
+                "satisfy_criteria": [{"criterionId": "c1", "receiptId": "rec_gates"}],
+                "waive_criteria": [{
+                    "criterionId": "c2",
+                    "reason": "the artifact is built by release tooling outside this workspace"
+                }]
+            }),
+            fixture.context("call_complete"),
+        )
+        .await
+        .expect("citations and a waiver settle the checklist in one call");
+
+    assert_eq!(
+        goal_from_metadata(&completed)
+            .expect("decode update metadata")
+            .expect("goal exists")
+            .status,
+        GoalStatus::Complete
+    );
+    assert!(
+        completed.output.contains("satisfied by receipt rec_gates"),
+        "the result shows what the completion rests on: {}",
+        completed.output
+    );
+    assert!(
+        completed.output.contains("waived: the artifact is built"),
+        "{}",
+        completed.output
+    );
+}
+
+#[tokio::test]
+async fn citing_an_unproven_receipt_refuses_the_whole_update() {
+    let fixture = Fixture::new();
+    erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "objective": "ship the evidence gate",
+                "success_criteria": ["workspace gates pass"]
+            }),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("create goal");
+    let update = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
+
+    let refusal = update
+        .execute(
+            json!({
+                "expected_revision": 1,
+                "status": "complete",
+                "satisfy_criteria": [{"criterionId": "c1", "receiptId": "rec_imagined"}]
+            }),
+            fixture.context("call_invented"),
+        )
+        .await
+        .expect_err("a receipt id the model made up proves nothing");
+
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    assert!(refusal.is_model_correctable());
+    let goal = fixture
+        .store
+        .goal("ses_tools")
+        .expect("read goal")
+        .expect("goal exists");
+    assert_eq!(
+        goal.status,
+        GoalStatus::Active,
+        "the status change never runs, so the run is not silently ended"
+    );
+    assert_eq!(goal.revision, 1, "and nothing was written on the way out");
+}
+
+#[tokio::test]
+async fn one_criterion_cannot_be_both_cited_and_waived_in_a_call() {
+    let fixture = Fixture::new();
+    erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "objective": "ship the evidence gate",
+                "success_criteria": ["workspace gates pass"]
+            }),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("create goal");
+    record_passing_receipt(&fixture, "rec_gates", 2_000);
+
+    let refusal = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "expected_revision": 1,
+                "status": "complete",
+                "satisfy_criteria": [{"criterionId": "c1", "receiptId": "rec_gates"}],
+                "waive_criteria": [{"criterionId": "c1", "reason": "cannot be checked here"}]
+            }),
+            fixture.context("call_both"),
+        )
+        .await
+        .expect_err("evidence and a waiver are different claims about the same criterion");
+
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    assert_eq!(
+        fixture
+            .store
+            .criteria("ses_tools")
+            .expect("read criteria")
+            .first()
+            .expect("one criterion")
+            .status,
+        crate::GoalCriterionStatus::Open,
+        "the contradiction is caught before either half is applied"
+    );
+}
