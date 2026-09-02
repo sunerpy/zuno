@@ -27,7 +27,10 @@ use zuno_sandbox::{
     ExecutionAuthority, NetworkAccess, PrepareRequest, SandboxBackend, SandboxMode, SandboxPolicy,
     SandboxResolutionKind,
 };
-use zuno_tool::{OutputLimits, PermissionAsk, Tool, ToolContext, ToolOutput, ToolOutputStore};
+use zuno_tool::{
+    ExitAuthority, OutputLimits, PermissionAsk, ReceiptOutcome, Tool, ToolContext, ToolOutput,
+    ToolOutputStore, VerificationReceipt,
+};
 
 const TOOL_ID: &str = "shell";
 const BACKGROUND_DIRECTORY: &str = "background";
@@ -68,6 +71,72 @@ const FILE_COMMANDS: &[&str] = &[
     "rename-item",
 ];
 
+/// The single-line length a receipt summary is cut to.
+///
+/// A receipt is read as one checklist entry, so a heredoc or a long compound
+/// command has to collapse to one line of bounded length. The value is a display
+/// budget rather than a protocol limit; it only has to leave the interesting head
+/// of a command legible.
+const SUMMARY_MAX_BYTES: usize = 160;
+
+/// POSIX interpreters known to implement `set -o pipefail`.
+///
+/// `pipefail` is a ksh extension, not POSIX. `dash` — Debian's `/bin/sh` —
+/// rejects it, and because `set` is a special builtin the rejection is fatal: a
+/// non-interactive `dash` exits 2 without running a line of the caller's command.
+/// The prologue is therefore emitted only for an interpreter listed here, and the
+/// same list decides whether the resulting exit status may be called
+/// authoritative.
+///
+/// `sh` is deliberately absent even though it is `bash` in POSIX mode on macOS.
+/// The name does not say which interpreter is behind it, and the two ways of
+/// being wrong are not symmetric: guessing that `sh` honours `pipefail` risks a
+/// receipt claiming authority the shell never provided, while declining to guess
+/// only costs a `Derived` receipt on a shell that could have done better.
+const PIPEFAIL_INTERPRETERS: &[&str] = &["bash", "ksh", "zsh"];
+
+/// How much of a command's failure its reported exit status has to reflect.
+///
+/// Neither a POSIX shell nor PowerShell propagates a mid-pipeline failure on its
+/// own: `cargo test | tail -5` exits zero when the tests fail. This selects the
+/// shell configuration a command runs under, and with it how much authority the
+/// status carries in the verification receipt attached to the result.
+//
+// These doc comments are the wire schema every request carries, so they stay at
+// the length of the guidance a caller needs, and the reasoning a maintainer
+// needs sits in plain comments like this one. Two parts of that reasoning matter
+// most. First, `Pipefail` is the default even though it changes the observable
+// exit code of an existing POSIX pipeline — `false | true` now reports 1 where it
+// reported 0 — because the old status was not a weaker signal but a wrong one,
+// and turning a silent false pass into a visible failure costs a caller one extra
+// look where the reverse costs a session its conclusion. Second, `Last` is what
+// an unconfigured shell already does, kept as the explicit opt-out for a command
+// that is meant to tolerate a failing stage: a probe whose non-zero status is the
+// answer, or a pipeline whose reader closes the stream early.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum ExitPolicy {
+    /// A failure at any stage of a pipeline is the whole command's failure.
+    #[default]
+    Pipefail,
+    /// Only the last stage of a pipeline decides the status.
+    Last,
+    /// Also stop at the first failing command in a sequence: POSIX `set -e`.
+    All,
+}
+
+impl ExitPolicy {
+    /// The wire spelling, so a receipt can name the policy it ran under.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pipefail => "pipefail",
+            Self::Last => "last",
+            Self::All => "all",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShellParams {
@@ -88,6 +157,10 @@ pub struct ShellParams {
     /// Exact full object id expected at `HEAD` before rewriting local Git history.
     #[serde(default)]
     pub expected_git_head: Option<String>,
+    /// How much of a pipeline's failure the exit status must reflect; unset means
+    /// `pipefail`, a status that covers the whole command.
+    #[serde(default)]
+    pub exit_policy: Option<ExitPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +192,90 @@ struct ShellAuthorization {
 struct ShellExecutionLifecycle {
     purpose: BackgroundExecutionPurpose,
     retention: BackgroundExecutionRetention,
+}
+
+/// One command as it will be executed: the caller's text, the resolved directory,
+/// and the exit policy that decides how the interpreter is invoked.
+#[derive(Debug, Clone, Copy)]
+struct ShellRequest<'a> {
+    command: &'a str,
+    cwd: &'a Path,
+    exit_policy: ExitPolicy,
+}
+
+/// What a completed command's exit status is worth under one shell configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExitContract {
+    /// How much of the command the status covers.
+    authority: ExitAuthority,
+    /// Why it covers less than the whole command, for the receipt's `detail`.
+    limitation: Option<String>,
+}
+
+/// What a receipt needs to say about one call, gathered before the command runs.
+///
+/// Held for the whole call because none of it is recoverable from the result: the
+/// caller's own command text, the directory the tool resolved, the `HEAD` this
+/// call already read for its history-rewrite guard, and the contract the
+/// interpreter agreed to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellVerification {
+    /// The caller's command, verbatim: the transcript title and the summary source.
+    command: String,
+    /// The resolved working directory the command runs in.
+    workdir: String,
+    /// `HEAD` as already resolved for this call, absent when nothing resolved it.
+    git_head: Option<String>,
+    /// The exit contract of the configuration this command runs under.
+    contract: ExitContract,
+}
+
+impl ShellVerification {
+    /// A receipt for a run that produced no exit status at all.
+    ///
+    /// Used for a background launch, a promotion at the foreground deadline, and a
+    /// command killed by a signal. Outcome and authority keep their defaults —
+    /// `Unknown` and `Absent` — so [`VerificationReceipt::proves_success`] is false
+    /// no matter what a reader does with it.
+    fn unresolved(&self, detail: impl Into<String>) -> VerificationReceipt {
+        VerificationReceipt {
+            workdir: Some(self.workdir.clone()),
+            git_head: self.git_head.clone(),
+            ..VerificationReceipt::unknown(summarize_command(&self.command), detail)
+        }
+    }
+
+    /// The receipt for a run that finished, from its status and captured output.
+    ///
+    /// An absent exit code on a completed run means the process was killed by a
+    /// signal rather than exiting, which decides nothing about the work, so it
+    /// degrades to [`Self::unresolved`] and keeps only the output digest.
+    fn settled(&self, exit_code: Option<i32>, output: &[u8]) -> VerificationReceipt {
+        let output_digest = Some(crate::read::digest_bytes(output));
+        let Some(code) = exit_code else {
+            return VerificationReceipt {
+                output_digest,
+                ..self.unresolved(
+                    "the command reported no exit status, which means it was killed by a signal \
+                     rather than deciding an outcome of its own",
+                )
+            };
+        };
+        VerificationReceipt {
+            summary: summarize_command(&self.command),
+            workdir: Some(self.workdir.clone()),
+            exit_code: Some(i64::from(code)),
+            exit_authority: self.contract.authority,
+            outcome: if code == 0 {
+                ReceiptOutcome::Passed
+            } else {
+                ReceiptOutcome::Failed
+            },
+            git_head: self.git_head.clone(),
+            output_digest,
+            detail: self.contract.limitation.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,7 +447,7 @@ impl ShellTool {
             return Err(interrupted());
         }
         let env = self.environment(&cwd, &ctx).await?;
-        validate_expected_git_head(
+        let git_head = validate_expected_git_head(
             &risk_assessment,
             params.expected_git_head.as_deref(),
             &cwd,
@@ -299,7 +456,13 @@ impl ShellTool {
         if ctx.is_interrupted() {
             return Err(interrupted());
         }
-        let command = params.command.clone();
+        let exit_policy = params.exit_policy.unwrap_or_default();
+        let verification = ShellVerification {
+            command: params.command.clone(),
+            workdir: cwd.to_string_lossy().into_owned(),
+            git_head,
+            contract: exit_contract(self.shell.kind(), self.shell.name(), exit_policy),
+        };
         let foreground_timeout_ms = normalize_foreground_timeout(params.timeout);
         let retention = if params.background {
             BackgroundExecutionRetention::Durable
@@ -310,7 +473,17 @@ impl ShellTool {
             purpose: params.background_purpose,
             retention,
         };
-        let input = self.execution_input(&command, &cwd, env, &ctx, lifecycle, &authorization)?;
+        let input = self.execution_input(
+            ShellRequest {
+                command: &verification.command,
+                cwd: &cwd,
+                exit_policy,
+            },
+            env,
+            &ctx,
+            lifecycle,
+            &authorization,
+        )?;
         let (execution, mut lease) = self
             .background_executions
             .start_leased(input)
@@ -318,9 +491,14 @@ impl ShellTool {
 
         if params.background {
             lease.disarm();
+            let receipt = verification.unresolved(
+                "the command was launched in the background and has not finished, so no exit \
+                 status exists and this result proves nothing about its outcome",
+            );
             return Ok(with_sandbox_metadata(
-                background_started_output(command.clone(), &execution)
-                    .with_metadata("shell", self.shell.name()),
+                background_started_output(verification.command.clone(), &execution)
+                    .with_metadata("shell", self.shell.name())
+                    .with_verification(&receipt),
                 &execution.authority,
             ));
         }
@@ -351,9 +529,18 @@ impl ShellTool {
                 .promote(&execution.id)
                 .map_err(failed)?;
             lease.disarm();
+            let receipt = verification.unresolved(format!(
+                "the command was still running at its {foreground_timeout_ms}ms foreground \
+                 deadline and continues in the background, so no exit status exists yet"
+            ));
             return Ok(with_sandbox_metadata(
-                timeout_promoted_output(command.clone(), foreground_timeout_ms, &promoted)
-                    .with_metadata("shell", self.shell.name()),
+                timeout_promoted_output(
+                    verification.command.clone(),
+                    foreground_timeout_ms,
+                    &promoted,
+                )
+                .with_metadata("shell", self.shell.name())
+                .with_verification(&receipt),
                 &promoted.authority,
             ));
         }
@@ -363,7 +550,7 @@ impl ShellTool {
             .map_err(failed)?;
         lease.disarm();
         self.completed_output(
-            &command,
+            &verification,
             foreground_timeout_ms,
             waited.info,
             full,
@@ -535,23 +722,18 @@ impl ShellTool {
 
     fn execution_input(
         &self,
-        command: &str,
-        cwd: &Path,
+        request: ShellRequest<'_>,
         env: BTreeMap<String, String>,
         ctx: &ToolContext,
         lifecycle: ShellExecutionLifecycle,
         authorization: &ShellAuthorization,
     ) -> Result<BackgroundExecutionInput, ToolError> {
-        let arguments = match self.shell.kind() {
-            CommandShellKind::PowerShell => vec![
-                OsString::from("-NoLogo"),
-                OsString::from("-NoProfile"),
-                OsString::from("-NonInteractive"),
-                OsString::from("-Command"),
-                OsString::from(command),
-            ],
-            CommandShellKind::Posix => vec![OsString::from("-lc"), OsString::from(command)],
-        };
+        let arguments = shell_arguments(
+            self.shell.kind(),
+            self.shell.name(),
+            request.exit_policy,
+            request.command,
+        );
         let environment = env
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
@@ -568,7 +750,7 @@ impl ShellTool {
             .prepare(PrepareRequest {
                 program: self.shell.path().as_os_str().to_owned(),
                 arguments,
-                cwd: cwd.to_owned(),
+                cwd: request.cwd.to_owned(),
                 environment,
                 policy,
             })
@@ -576,8 +758,8 @@ impl ShellTool {
         Ok(BackgroundExecutionInput {
             prepared,
             session_id: ctx.session_id.clone(),
-            title: command.to_owned(),
-            command: command.to_owned(),
+            title: request.command.to_owned(),
+            command: request.command.to_owned(),
             purpose: lifecycle.purpose,
             hard_ceiling: self.hard_ceiling,
             retention: lifecycle.retention,
@@ -586,7 +768,7 @@ impl ShellTool {
 
     fn completed_output(
         &self,
-        command: &str,
+        verification: &ShellVerification,
         foreground_timeout_ms: u64,
         execution: BackgroundExecutionInfo,
         bytes: Vec<u8>,
@@ -621,18 +803,23 @@ impl ShellTool {
             }
         }
 
+        // The digest covers the bytes the command produced, not the rendered
+        // output: the placeholder below and any later size policy are presentation,
+        // while a citation is checked for drift against what actually ran.
+        let receipt = verification.settled(execution.exit_code, &bytes);
         let mut full = String::from_utf8_lossy(&bytes).into_owned();
         if full.is_empty() {
             full = "(no output)".to_owned();
         }
         let output = with_sandbox_metadata(
-            ToolOutput::text(command, full)
+            ToolOutput::text(verification.command.as_str(), full)
                 .with_metadata("exit", json!(execution.exit_code))
                 .with_metadata("truncated", false)
                 .with_metadata("background", false)
                 .with_metadata("task_id", execution.id.as_str())
                 .with_metadata("shell", self.shell.name())
-                .with_metadata("timeout", json!(foreground_timeout_ms)),
+                .with_metadata("timeout", json!(foreground_timeout_ms))
+                .with_verification(&receipt),
             &execution.authority,
         );
         OutputPolicy::new(self.output_store.clone(), self.output_limits)
@@ -642,6 +829,151 @@ impl ShellTool {
                 source: Box::new(error),
             })
     }
+}
+
+/// Whether `interpreter` accepts the `set -o pipefail` prologue.
+///
+/// See [`PIPEFAIL_INTERPRETERS`] for why this is a name table rather than a probe
+/// and why an unrecognised name answers `false`.
+fn honours_pipefail(interpreter: &str) -> bool {
+    PIPEFAIL_INTERPRETERS.contains(&interpreter)
+}
+
+/// The `set` prologue one POSIX policy needs, or `None` when it sets nothing.
+///
+/// A `pipefail` request on an interpreter that cannot honour it sets nothing at
+/// all rather than emitting a line that would abort the shell; [`exit_contract`]
+/// reports the resulting status as [`ExitAuthority::Derived`] so the silence is
+/// visible to whoever reads the receipt.
+fn posix_prologue(interpreter: &str, policy: ExitPolicy) -> Option<&'static str> {
+    match (policy, honours_pipefail(interpreter)) {
+        (ExitPolicy::Last, _) | (ExitPolicy::Pipefail, false) => None,
+        (ExitPolicy::Pipefail, true) => Some("set -o pipefail"),
+        (ExitPolicy::All, true) => Some("set -eo pipefail"),
+        (ExitPolicy::All, false) => Some("set -e"),
+    }
+}
+
+/// The script a POSIX interpreter is handed for `command` under `policy`.
+///
+/// The prologue is prepended on its own line rather than wrapping the command in a
+/// subshell or a function. The caller's command therefore still runs in the same
+/// shell at the same level, so its own `set`, `trap`, `cd`, `exec`, and variable
+/// assignments behave exactly as they did before this wrapper existed — and a
+/// command that deliberately turns an option back off still wins, because its
+/// `set` runs after ours.
+///
+/// Only the interpreter sees this text. [`analyze_command`] and the
+/// destructive-command gate run on the caller's command, so permission resources
+/// and risk verdicts are decided on what the caller wrote, never on the wrapper.
+fn posix_script(interpreter: &str, policy: ExitPolicy, command: &str) -> String {
+    posix_prologue(interpreter, policy).map_or_else(
+        || command.to_owned(),
+        |prologue| format!("{prologue}\n{command}"),
+    )
+}
+
+/// The script PowerShell is handed for `command` under `policy`.
+///
+/// PowerShell has no `pipefail`, and the asymmetry with [`posix_script`] is
+/// deliberate rather than an omission: a pipeline's status is the last command's,
+/// and a failed *native* command routinely leaves the status successful while only
+/// `$LASTEXITCODE` records the failure. No prologue repairs that, so `pipefail`
+/// and `last` set nothing and their status is reported as
+/// [`ExitAuthority::Derived`]. `all` is the one policy PowerShell can honour: it
+/// promotes errors to terminating and re-raises a native command's
+/// `$LASTEXITCODE` as the process exit code, which is what makes that status
+/// authoritative.
+fn powershell_script(policy: ExitPolicy, command: &str) -> String {
+    match policy {
+        ExitPolicy::Pipefail | ExitPolicy::Last => command.to_owned(),
+        ExitPolicy::All => format!(
+            "$ErrorActionPreference = 'Stop'\n{command}\nif ($LASTEXITCODE) {{ exit $LASTEXITCODE }}"
+        ),
+    }
+}
+
+/// The interpreter arguments that run `command` under `policy`.
+fn shell_arguments(
+    kind: CommandShellKind,
+    interpreter: &str,
+    policy: ExitPolicy,
+    command: &str,
+) -> Vec<OsString> {
+    match kind {
+        CommandShellKind::PowerShell => vec![
+            OsString::from("-NoLogo"),
+            OsString::from("-NoProfile"),
+            OsString::from("-NonInteractive"),
+            OsString::from("-Command"),
+            OsString::from(powershell_script(policy, command)),
+        ],
+        CommandShellKind::Posix => vec![
+            OsString::from("-lc"),
+            OsString::from(posix_script(interpreter, policy, command)),
+        ],
+    }
+}
+
+/// The exit contract of the configuration a command actually runs under.
+///
+/// Derived from the interpreter and the policy the wrapper could honour, never
+/// from the policy that was requested: a `pipefail` request on `dash` sets
+/// nothing, so calling its status authoritative would manufacture exactly the
+/// false confidence this policy exists to remove.
+fn exit_contract(kind: CommandShellKind, interpreter: &str, policy: ExitPolicy) -> ExitContract {
+    let authoritative = ExitContract {
+        authority: ExitAuthority::Authoritative,
+        limitation: None,
+    };
+    let derived = |limitation: String| ExitContract {
+        authority: ExitAuthority::Derived,
+        limitation: Some(limitation),
+    };
+    match (kind, policy) {
+        (_, ExitPolicy::Last) => derived(format!(
+            "exitPolicy \"{}\" reports only the last stage of a pipeline, so a failure in an \
+             earlier stage is not reflected in this exit status",
+            ExitPolicy::Last.as_str()
+        )),
+        (CommandShellKind::PowerShell, ExitPolicy::Pipefail) => derived(format!(
+            "PowerShell has no pipefail equivalent, so this exit status is the last command's and \
+             a failed native command need not have changed it; exitPolicy \"{}\" is the only \
+             policy that covers the whole command here",
+            ExitPolicy::All.as_str()
+        )),
+        (CommandShellKind::PowerShell, ExitPolicy::All) => authoritative,
+        (CommandShellKind::Posix, ExitPolicy::Pipefail | ExitPolicy::All) => {
+            if honours_pipefail(interpreter) {
+                authoritative
+            } else {
+                derived(format!(
+                    "the {interpreter} interpreter does not implement `set -o pipefail`, so a \
+                     failure in an earlier pipeline stage is not reflected in this exit status"
+                ))
+            }
+        }
+    }
+}
+
+/// The command as one line of receipt summary, cut on a character boundary.
+///
+/// Whitespace is folded first so a heredoc or a line-continued command collapses
+/// to something a checklist can hold, and the cut never splits a multi-byte
+/// character in half.
+fn summarize_command(command: &str) -> String {
+    let single_line = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.len() <= SUMMARY_MAX_BYTES {
+        return single_line;
+    }
+    let ellipsis = '…';
+    let mut end = SUMMARY_MAX_BYTES.saturating_sub(ellipsis.len_utf8());
+    while end > 0 && !single_line.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut summary = single_line[..end].trim_end().to_owned();
+    summary.push(ellipsis);
+    summary
 }
 
 fn with_sandbox_metadata(output: ToolOutput, authority: &ExecutionAuthority) -> ToolOutput {
@@ -662,14 +994,30 @@ fn with_sandbox_metadata(output: ToolOutput, authority: &ExecutionAuthority) -> 
         .with_metadata("sandboxFallbackReason", json!(authority.fallback_reason))
 }
 
+/// Refuse a local history rewrite whose `HEAD` is not the one the caller approved.
+///
+/// Returns the full object id at `HEAD` when this call resolved one, so the
+/// receipt can name the revision the command ran against without a second `git`
+/// invocation. A call that needs no guard returns `Ok(None)`: filling a receipt
+/// field is not worth adding a process spawn to every shell command, and an
+/// unresolved revision is honestly reported as absent.
+///
+/// # Errors
+///
+/// [`ToolError::InvalidArgs`] when a rewrite arrives with a repository-redirecting
+/// environment variable set, without `expectedGitHead`, or with a malformed one —
+/// each of which means the caller has not proved which history it is rewriting.
+/// [`ToolError::Failed`] when `HEAD` cannot be read or no longer matches, which
+/// means the history moved since the caller looked; in every failing case the
+/// command has not run.
 fn validate_expected_git_head(
     assessment: &RiskAssessment,
     expected: Option<&str>,
     cwd: &Path,
     env: &BTreeMap<String, String>,
-) -> Result<(), ToolError> {
+) -> Result<Option<String>, ToolError> {
     if !assessment.requires_expected_git_head() {
-        return Ok(());
+        return Ok(None);
     }
     if let Some(variable) = env.keys().find(|key| {
         GIT_REPOSITORY_ENVIRONMENT_VARIABLES
@@ -720,7 +1068,7 @@ fn validate_expected_git_head(
             ),
         )));
     }
-    Ok(())
+    Ok(Some(actual))
 }
 
 #[async_trait]
@@ -1236,5 +1584,195 @@ mod tests {
         ] {
             assert!(mutates(command), "{command}");
         }
+    }
+
+    const PIPELINE: &str = "cargo test | tail -5";
+
+    fn arguments(kind: CommandShellKind, interpreter: &str, policy: ExitPolicy) -> Vec<String> {
+        shell_arguments(kind, interpreter, policy, PIPELINE)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_default_policy_puts_pipefail_in_effect_for_a_posix_command() {
+        assert_eq!(ExitPolicy::default(), ExitPolicy::Pipefail);
+        assert_eq!(
+            arguments(CommandShellKind::Posix, "bash", ExitPolicy::default()),
+            vec!["-lc".to_owned(), format!("set -o pipefail\n{PIPELINE}")]
+        );
+        assert_eq!(
+            exit_contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+            ExitContract {
+                authority: ExitAuthority::Authoritative,
+                limitation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn the_last_policy_leaves_the_command_unwrapped_and_only_claims_a_derived_status() {
+        assert_eq!(
+            arguments(CommandShellKind::Posix, "bash", ExitPolicy::Last),
+            vec!["-lc".to_owned(), PIPELINE.to_owned()]
+        );
+        let contract = exit_contract(CommandShellKind::Posix, "bash", ExitPolicy::Last);
+        assert_eq!(contract.authority, ExitAuthority::Derived);
+        assert!(
+            contract
+                .limitation
+                .is_some_and(|reason| reason.contains("only the last stage")),
+            "the receipt must say why the status is partial"
+        );
+    }
+
+    #[test]
+    fn the_all_policy_adds_errexit_on_top_of_pipefail_for_a_posix_command() {
+        assert_eq!(
+            arguments(CommandShellKind::Posix, "zsh", ExitPolicy::All),
+            vec!["-lc".to_owned(), format!("set -eo pipefail\n{PIPELINE}")]
+        );
+        assert_eq!(
+            exit_contract(CommandShellKind::Posix, "zsh", ExitPolicy::All).authority,
+            ExitAuthority::Authoritative
+        );
+    }
+
+    #[test]
+    fn an_interpreter_without_pipefail_is_never_reported_as_authoritative() {
+        // `set` is a special builtin, so emitting `set -o pipefail` to dash would
+        // abort the shell before the caller's command ran. Saying so in the
+        // receipt is the honest alternative to pretending the option took effect.
+        assert_eq!(
+            arguments(CommandShellKind::Posix, "dash", ExitPolicy::Pipefail),
+            vec!["-lc".to_owned(), PIPELINE.to_owned()]
+        );
+        assert_eq!(
+            arguments(CommandShellKind::Posix, "dash", ExitPolicy::All),
+            vec!["-lc".to_owned(), format!("set -e\n{PIPELINE}")]
+        );
+        for policy in [ExitPolicy::Pipefail, ExitPolicy::All] {
+            let contract = exit_contract(CommandShellKind::Posix, "dash", policy);
+            assert_eq!(contract.authority, ExitAuthority::Derived, "{policy:?}");
+            assert!(
+                contract
+                    .limitation
+                    .is_some_and(|reason| reason.contains("does not implement `set -o pipefail`")),
+                "{policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_sets_nothing_under_pipefail_and_admits_the_status_is_partial() {
+        for policy in [ExitPolicy::Pipefail, ExitPolicy::Last] {
+            assert_eq!(
+                arguments(CommandShellKind::PowerShell, "pwsh", policy),
+                vec![
+                    "-NoLogo".to_owned(),
+                    "-NoProfile".to_owned(),
+                    "-NonInteractive".to_owned(),
+                    "-Command".to_owned(),
+                    PIPELINE.to_owned(),
+                ],
+                "{policy:?}"
+            );
+            assert_eq!(
+                exit_contract(CommandShellKind::PowerShell, "pwsh", policy).authority,
+                ExitAuthority::Derived,
+                "{policy:?}"
+            );
+        }
+        assert!(
+            exit_contract(CommandShellKind::PowerShell, "pwsh", ExitPolicy::Pipefail)
+                .limitation
+                .is_some_and(|reason| reason.contains("no pipefail equivalent")),
+            "the asymmetry with POSIX belongs in the receipt, not only in the code"
+        );
+    }
+
+    #[test]
+    fn powershell_under_all_stops_on_error_and_re_raises_a_native_exit_code() {
+        assert_eq!(
+            arguments(CommandShellKind::PowerShell, "pwsh", ExitPolicy::All),
+            vec![
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                format!(
+                    "$ErrorActionPreference = 'Stop'\n{PIPELINE}\nif ($LASTEXITCODE) {{ exit \
+                     $LASTEXITCODE }}"
+                ),
+            ]
+        );
+        assert_eq!(
+            exit_contract(CommandShellKind::PowerShell, "pwsh", ExitPolicy::All),
+            ExitContract {
+                authority: ExitAuthority::Authoritative,
+                limitation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_receipt_summary_is_one_line_cut_on_a_character_boundary() {
+        assert_eq!(
+            summarize_command("cargo test \\\n  --workspace"),
+            "cargo test \\ --workspace"
+        );
+
+        let long = format!("printf '{}'", "é".repeat(200));
+        let summary = summarize_command(&long);
+        assert!(summary.len() <= SUMMARY_MAX_BYTES, "{}", summary.len());
+        assert!(summary.ends_with('…'), "{summary}");
+        assert!(!summary.contains('\n'));
+        assert!(
+            summary.starts_with("printf 'é"),
+            "the head of the command has to stay legible: {summary}"
+        );
+    }
+
+    #[test]
+    fn a_launched_or_signalled_command_produces_a_receipt_that_proves_nothing() {
+        let verification = ShellVerification {
+            command: "cargo test --workspace".to_owned(),
+            workdir: "/workspace".to_owned(),
+            git_head: Some("f".repeat(40)),
+            contract: exit_contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+
+        let launched = verification.unresolved("still running in the background");
+        assert!(!launched.proves_success());
+        assert_eq!(launched.exit_authority, ExitAuthority::Absent);
+        assert_eq!(launched.outcome, ReceiptOutcome::Unknown);
+        assert_eq!(launched.exit_code, None);
+        assert_eq!(launched.output_digest, None);
+        assert_eq!(launched.workdir.as_deref(), Some("/workspace"));
+        assert_eq!(launched.git_head, verification.git_head);
+
+        let signalled = verification.settled(None, b"partial output");
+        assert!(!signalled.proves_success());
+        assert_eq!(signalled.exit_authority, ExitAuthority::Absent);
+        assert!(
+            signalled
+                .detail
+                .is_some_and(|detail| detail.contains("killed by a signal"))
+        );
+        assert_eq!(
+            signalled.output_digest,
+            Some(crate::read::digest_bytes(b"partial output"))
+        );
+
+        let passed = verification.settled(Some(0), b"ok");
+        assert!(passed.proves_success());
+        assert_eq!(passed.exit_code, Some(0));
+        assert_eq!(passed.detail, None);
+
+        let failed = verification.settled(Some(101), b"ok");
+        assert!(!failed.proves_success());
+        assert_eq!(failed.outcome, ReceiptOutcome::Failed);
+        assert_eq!(failed.exit_code, Some(101));
     }
 }

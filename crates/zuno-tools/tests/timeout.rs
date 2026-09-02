@@ -39,6 +39,7 @@ fn params(command: impl Into<String>, timeout: Option<u64>) -> ShellParams {
         background: false,
         background_purpose: BackgroundExecutionPurpose::Command,
         expected_git_head: None,
+        exit_policy: None,
     }
 }
 

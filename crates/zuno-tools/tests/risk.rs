@@ -436,6 +436,7 @@ async fn risk_existing_redirect_target_requires_fresh_human_approval() {
                 background: false,
                 background_purpose: zuno_pty::BackgroundExecutionPurpose::Command,
                 expected_git_head: None,
+                exit_policy: None,
             },
             tool_context_with(permission.clone()),
         )
@@ -483,6 +484,7 @@ async fn risk_gate_runs_before_explicit_background_dispatch() {
                 background: true,
                 background_purpose: zuno_pty::BackgroundExecutionPurpose::Command,
                 expected_git_head: None,
+                exit_policy: None,
             },
             tool_context_with(permission.clone()),
         )
