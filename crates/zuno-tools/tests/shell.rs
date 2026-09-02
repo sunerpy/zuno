@@ -426,24 +426,44 @@ async fn configured_shell_identity_is_metadata_not_part_of_the_copyable_title() 
 #[tokio::test]
 async fn shell_background_mode_returns_before_the_command_finishes() {
     let dir = tempfile::tempdir().expect("temp dir");
+    let release = dir.path().join("release-background");
     let marker = dir.path().join("background-finished");
-    let command = format!("sleep 0.1; touch '{}'", marker.display());
+    let command = format!(
+        "while [ ! -e '{}' ]; do sleep 0.01; done; touch '{}'",
+        release.display(),
+        marker.display()
+    );
     let mut input = params(command.clone());
     input.background = true;
     let tool = support::sandbox::configured_shell_tool(dir.path(), Some("/bin/sh"));
-    let started = Instant::now();
 
-    let output = tool
-        .run(input, context(Arc::new(zuno_tool::NeverInterrupted)))
-        .await
-        .expect("background command starts");
+    // Hosted runners can pause a correctly asynchronous spawn for hundreds of
+    // milliseconds under load. The command waits on a test-owned gate instead,
+    // so returning before the gate opens proves background dispatch directly.
+    let output = match tokio::time::timeout(
+        Duration::from_secs(5),
+        tool.run(input, context(Arc::new(zuno_tool::NeverInterrupted))),
+    )
+    .await
+    {
+        Ok(result) => result.expect("background command starts"),
+        Err(_) => {
+            std::fs::write(&release, b"release\n").expect("release blocked background command");
+            wait_for_file(&marker).await;
+            panic!("background execution waited for the command to finish");
+        }
+    };
 
-    assert!(started.elapsed() < Duration::from_millis(100));
+    assert!(
+        !marker.exists(),
+        "background execution returned only after the command finished"
+    );
     assert_eq!(output.title, command);
     assert_eq!(output.metadata["shell"], "sh");
     assert_eq!(output.metadata["background"], true);
     assert_eq!(output.metadata["background_purpose"], "command");
     assert_eq!(output.metadata["requires_authoritative_refresh"], false);
+    std::fs::write(&release, b"release\n").expect("release background command");
     wait_for_file(&marker).await;
 }
 
