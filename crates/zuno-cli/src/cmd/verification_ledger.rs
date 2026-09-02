@@ -109,17 +109,22 @@ impl VerificationLedger {
 
     /// Report a write, and tell the model what proof it just invalidated.
     ///
-    /// Driven by the paths the tool itself reported, not by a list of writing tool ids:
+    /// Driven by the paths the call itself reported, not by a list of writing tool ids:
     /// [`zuno_tool::METADATA_WRITTEN_PATHS_KEY`] documents why, and a goal that silently
     /// stopped being gated because a list was never updated is the failure this whole
     /// mechanism exists to prevent.
     ///
-    /// Both calls are no-ops for a session with no goal, so no guard query is needed.
-    /// Neither failure is fatal: the write already happened, and refusing the call would
-    /// report a completed edit as a failure. A note says so instead, because a run told
-    /// nothing would go on citing a check that no longer describes the files.
-    fn report_write(&self, session_id: &str, tool: &str, output: &mut ToolOutput) {
-        let written = output.written_paths();
+    /// Both store calls are no-ops for a session with no goal, so no guard query is
+    /// needed. Neither failure is fatal: the write already happened, and refusing the
+    /// call would report a completed edit as a failure. A note says so instead, because
+    /// a run told nothing would go on citing a check that no longer describes the files.
+    ///
+    /// The database work runs on a blocking thread for the same reason the receipt write
+    /// does. These are synchronous SQLite statements behind a process-wide writer mutex,
+    /// and running them on the async runtime lets one contended write stall every other
+    /// task on that worker, including the turn this hook is part of.
+    async fn report_write(&self, session_id: &str, tool: &str, output: &mut ToolOutput) {
+        let written = changed_paths(output);
         if written.is_empty() {
             return;
         }
@@ -132,36 +137,103 @@ impl VerificationLedger {
             [] => unreachable!("checked above"),
         };
         let at_ms = zuno_db::message::now_millis();
-        if let Err(error) = self.goals.escalate_to_change(session_id, &reason, at_ms) {
-            announce(
-                output,
-                "[goal evidence unavailable]",
-                &format!(
-                    "this change could not be recorded against the goal ({error}), so                      completion may not be gated on evidence."
-                ),
-            );
-            return;
-        }
-        match self.goals.mark_mutation(session_id, at_ms) {
-            Ok(0) => {}
-            Ok(reopened) => announce(
+        let goals = Arc::clone(&self.goals);
+        let session_id = session_id.to_owned();
+        let update = tokio::task::spawn_blocking(move || {
+            if let Err(error) = goals.escalate_to_change(&session_id, &reason, at_ms) {
+                return EvidenceUpdate::Unrecorded(error.to_string());
+            }
+            match goals.mark_mutation(&session_id, at_ms) {
+                Ok(0) => EvidenceUpdate::Quiet,
+                Ok(reopened) => EvidenceUpdate::Reopened(reopened),
+                Err(error) => EvidenceUpdate::Unretired(error.to_string()),
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            EvidenceUpdate::Unrecorded(format!("the update did not complete: {error}"))
+        });
+
+        match update {
+            EvidenceUpdate::Quiet => {}
+            EvidenceUpdate::Reopened(reopened) => announce(
                 output,
                 "[goal evidence]",
                 &format!(
-                    "{reopened} satisfied criteri{a} went back to open, because this change                      came after the check that satisfied {it}. Verify again after your last                      edit and cite the new receipt.",
+                    "{reopened} satisfied criteri{a} went back to open, because this change came \
+                     after the check that satisfied {it}. Verify again after your last edit and \
+                     cite the new receipt.",
                     a = if reopened == 1 { "on" } else { "a" },
                     it = if reopened == 1 { "it" } else { "them" },
                 ),
             ),
-            Err(error) => announce(
+            EvidenceUpdate::Unrecorded(error) => announce(
                 output,
                 "[goal evidence unavailable]",
                 &format!(
-                    "evidence recorded before this change could not be retired ({error});                      treat any earlier check as describing files that have since changed."
+                    "this change could not be recorded against the goal ({error}), so completion \
+                     may not be gated on evidence."
+                ),
+            ),
+            EvidenceUpdate::Unretired(error) => announce(
+                output,
+                "[goal evidence unavailable]",
+                &format!(
+                    "evidence recorded before this change could not be retired ({error}); treat \
+                     any earlier check as describing files that have since changed."
                 ),
             ),
         }
     }
+}
+
+/// What one write did to the goal's evidence.
+///
+/// Carried back from the blocking thread rather than announced there, because the
+/// note is appended to the tool output the caller still owns.
+enum EvidenceUpdate {
+    /// Nothing to say: the session has no goal, or no satisfied criterion was affected.
+    Quiet,
+    /// This many satisfied criteria went back to open.
+    Reopened(usize),
+    /// The change could not be recorded against the goal at all.
+    Unrecorded(String),
+    /// The change was recorded, but earlier evidence could not be retired.
+    Unretired(String),
+}
+
+/// Every path this call changed, from wherever the call was able to report it.
+///
+/// Two sources, because a tool that changes files does not always change them itself.
+/// A delegated task runs in a child session, and the parent sees only the child's
+/// report: the child's edits are listed under the task report's `changedPaths`, having
+/// been reconstructed from the child's own tool results. Reading only the parent's
+/// [`zuno_tool::ToolOutput::written_paths`] would mean a subagent could rewrite the
+/// files a criterion was satisfied against and the criterion would stay closed, which
+/// is the same failure as an unreported write and harder to notice.
+fn changed_paths(output: &ToolOutput) -> Vec<String> {
+    let mut paths: Vec<String> = output
+        .written_paths()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let delegated = output
+        .metadata
+        .get(zuno_tools::task::METADATA_SUBAGENT_KEY)
+        .and_then(|subagent| subagent.get("report"))
+        .and_then(|report| report.get("changedPaths"))
+        .and_then(serde_json::Value::as_array);
+    paths.extend(
+        delegated
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned),
+    );
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 /// Translate the tool-side authority into the stored one.
@@ -225,7 +297,7 @@ const fn describe_outcome(outcome: ReceiptOutcome) -> &'static str {
 ///
 /// Appended rather than prepended so the tool's own output still leads: the line is a
 /// footnote about the call, not a replacement for what the call said.
-fn announce(output: &mut ToolOutput, headline: &str, verdict: &str) {
+pub(super) fn announce(output: &mut ToolOutput, headline: &str, verdict: &str) {
     if !output.output.is_empty() {
         output.output.push_str("\n\n");
     }
@@ -295,7 +367,7 @@ impl ToolHooks for VerificationLedger {
         _args: &serde_json::Value,
         output: &mut ToolOutput,
     ) -> Result<(), String> {
-        self.report_write(session_id, tool, output);
+        self.report_write(session_id, tool, output).await;
         let reported = match VerificationReceipt::from_metadata(&output.metadata) {
             Ok(None) => return Ok(()),
             Ok(Some(receipt)) => receipt,
