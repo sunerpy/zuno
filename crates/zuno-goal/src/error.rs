@@ -179,12 +179,32 @@ pub enum GoalError {
         criterion_id: String,
     },
 
+    /// A waiver was aimed at a criterion that already has evidence.
+    ///
+    /// A satisfied criterion needs no excuse, and a waiver landing on it would swap a
+    /// recorded, re-checkable receipt for a judgement call nothing can re-check. The
+    /// receipt is named so the model can see that the criterion is closed, not merely
+    /// that its call was refused.
+    #[error(
+        "goal criterion `{criterion_id}` is already satisfied by receipt `{receipt_id}` and does \
+         not need waiving; a waiver may only close a criterion that is open or already waived"
+    )]
+    CriterionAlreadySatisfied {
+        /// The criterion the caller tried to waive.
+        criterion_id: String,
+        /// The receipt that already proves it.
+        receipt_id: String,
+    },
+
     /// A cited receipt does not prove the criterion.
     ///
     /// `reason` names which rule refused: no such receipt in this session, a
     /// failed or undecidable outcome, an exit status that was inferred rather than
-    /// observed, or a criterion already settled by a waiver. Asserting success in
-    /// prose is exactly what this refusal exists to stop.
+    /// observed, or a criterion already settled by a waiver. At completion time it
+    /// also names a receipt that proved the criterion once but has since been
+    /// rewritten by a replayed call or removed by pruning — the audit re-reads every
+    /// citation rather than trusting the row. Asserting success in prose is exactly
+    /// what this refusal exists to stop.
     #[error("goal criterion `{criterion_id}` is not proven by receipt `{receipt_id}`: {reason}")]
     EvidenceUnproven {
         /// The criterion the caller tried to satisfy.
@@ -448,6 +468,7 @@ impl GoalError {
             | Self::CompletionBlocked { .. }
             | Self::UnknownCriterion { .. }
             | Self::EmptyWaiverReason { .. }
+            | Self::CriterionAlreadySatisfied { .. }
             | Self::EvidenceUnproven { .. }
             | Self::EvidenceStale { .. }
             | Self::EvidenceMissing { .. }
@@ -542,6 +563,20 @@ mod tests {
              as `inferred`; `bedrock:converse:tool_use` of `vendor.model-a-v1:0` is recorded as \
              `unknown`; only `documented` or `probed` claims may be relied on — cite a vendor \
              document for this exact subject or record an observed probe with `capability_claim`"
+        );
+        assert!(error.is_model_refusal());
+    }
+
+    #[test]
+    fn waiving_a_satisfied_criterion_is_refused_by_naming_the_receipt_that_already_proves_it() {
+        let error = GoalError::CriterionAlreadySatisfied {
+            criterion_id: "c1".to_owned(),
+            receipt_id: "rec_pass".to_owned(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "goal criterion `c1` is already satisfied by receipt `rec_pass` and does not need \
+             waiving; a waiver may only close a criterion that is open or already waived"
         );
         assert!(error.is_model_refusal());
     }

@@ -843,3 +843,66 @@ async fn goal_update_cannot_complete_a_change_goal_while_a_capability_claim_is_i
         "the accepted citation stays; only the status change was refused"
     );
 }
+
+#[tokio::test]
+async fn goal_update_refuses_to_waive_a_criterion_that_is_already_satisfied() {
+    let fixture = Fixture::new();
+    erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "objective": "ship the evidence gate",
+                "success_criteria": ["workspace gates pass", "release artifact exists"]
+            }),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("create goal");
+    fixture
+        .store
+        .escalate_to_change("ses_tools", "edited crates/zuno-goal/src/store.rs", 1_000)
+        .expect("escalate to a change goal");
+    record_passing_receipt(&fixture, "rec_gates", 2_000);
+    let update = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
+
+    // The citation lands and stays; only the completion is refused, on `c2`.
+    update
+        .execute(
+            json!({
+                "expected_revision": 1,
+                "status": "complete",
+                "satisfy_criteria": [{"criterionId": "c1", "receiptId": "rec_gates"}]
+            }),
+            fixture.context("call_cite"),
+        )
+        .await
+        .expect_err("c2 is still open");
+
+    let refusal = update
+        .execute(
+            json!({
+                "expected_revision": 2,
+                "status": "complete",
+                "waive_criteria": [
+                    {"criterionId": "c1", "reason": "second thoughts"},
+                    {"criterionId": "c2", "reason": "built by release tooling"}
+                ]
+            }),
+            fixture.context("call_waive_over_evidence"),
+        )
+        .await
+        .expect_err("a waiver must not replace recorded evidence");
+
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    let message = refusal_detail(&refusal);
+    assert!(
+        message.contains("`c1` is already satisfied by receipt `rec_gates`"),
+        "{message}"
+    );
+    let criteria = fixture.store.criteria("ses_tools").expect("read criteria");
+    assert_eq!(criteria[0].status, crate::GoalCriterionStatus::Satisfied);
+    assert_eq!(
+        criteria[1].status,
+        crate::GoalCriterionStatus::Open,
+        "the refusal stops the call before the later waiver is applied"
+    );
+}

@@ -67,6 +67,9 @@
 //! let refusal = ModelStatus::parse("paused").expect_err("system-owned");
 //! assert!(refusal.to_string().contains("`blocked` or `complete`"));
 //!
+//! // `complete` is audited whichever entry point asks for it. This goal changed
+//! // nothing, so it has nothing to prove and completes; a goal that had written
+//! // files would be refused here exactly as `complete_checked` would refuse it.
 //! store.update_status_as_model("ses_1", ModelStatus::Complete)?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```

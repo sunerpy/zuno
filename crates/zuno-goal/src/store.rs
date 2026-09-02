@@ -74,6 +74,14 @@
 //! without an ownership check a new goal would complete against the previous
 //! goal's finished work. See [`GoalStore::complete_checked`].
 //!
+//! Two further rules keep the gate a gate. The audit re-reads every cited receipt
+//! when completion is requested, rather than trusting the criterion row, because
+//! the receipt ledger can be rewritten by a replayed call or emptied by pruning;
+//! and `complete` reaches the audit from every entry point, including
+//! [`GoalStore::update_status_as_model`], so no caller can finish a change goal by
+//! choosing the unguarded writer. A satisfied criterion also cannot be waived: a
+//! waiver may excuse a check that was never made, never replace one that was.
+//!
 //! A fourth rule is about reliance rather than verification. A session that enables
 //! a provider feature because a *related* model is documented to have it has made a
 //! claim it never observed, and the configuration it wrote looks the same as one
@@ -1108,16 +1116,26 @@ impl GoalStore {
     /// `complete` is still honoured, because finishing the work is true
     /// regardless of what it cost. Ports `goals.rs:328`.
     ///
+    /// `complete` is not a plain write. Whichever entry point asks for it, the request
+    /// runs the audit [`Self::complete_checked`] runs — plan ownership, unfinished
+    /// durable work, criterion evidence, capability claims — because a gate with an
+    /// unguarded side door is not a gate. Before this, an embedder calling here with
+    /// `Complete` could finish a change goal whose criteria were still open.
+    ///
     /// Returns `None` when the session has no goal.
     ///
     /// # Errors
     ///
-    /// [`GoalError::Db`] on a statement failure.
+    /// [`GoalError::Db`] on a statement failure, and for `Complete` every refusal
+    /// listed on [`Self::complete_checked`] except [`GoalError::RevisionConflict`].
     pub fn update_status_as_model(
         &self,
         session_id: &str,
         status: ModelStatus,
     ) -> Result<Option<Goal>, GoalError> {
+        if matches!(status, ModelStatus::Complete) {
+            return self.complete_with_revision(session_id, None);
+        }
         self.write_status(
             SET_STATUS_AS_MODEL,
             session_id,
@@ -1128,12 +1146,18 @@ impl GoalStore {
     }
 
     /// Update model-owned status only if `expected_revision` is still current.
+    ///
+    /// `Complete` takes the audited path exactly as [`Self::complete_checked`] does;
+    /// the two are the same call.
     pub fn update_status_as_model_checked(
         &self,
         session_id: &str,
         status: ModelStatus,
         expected_revision: i64,
     ) -> Result<Option<Goal>, GoalError> {
+        if matches!(status, ModelStatus::Complete) {
+            return self.complete_with_revision(session_id, Some(expected_revision));
+        }
         self.write_status(
             SET_STATUS_AS_MODEL,
             session_id,
@@ -1179,7 +1203,9 @@ impl GoalStore {
     ///
     /// The completion audit and status update share one `IMMEDIATE` transaction, so a
     /// concurrent writer cannot add unfinished work, record a receipt, or change the
-    /// workspace between the check and the update.
+    /// workspace between the check and the update. The same audit runs when
+    /// [`Self::update_status_as_model`] is handed `Complete`; this entry point adds
+    /// only the revision guard.
     ///
     /// Every pre-existing blocker still applies: unfinished plan steps, work items,
     /// jobs and pending human requests refuse completion exactly as before. On top
@@ -1191,16 +1217,35 @@ impl GoalStore {
     /// # Errors
     ///
     /// [`GoalError::RevisionConflict`] when the goal moved on since the caller read
-    /// it, [`GoalError::CompletionBlocked`] when durable work is unfinished,
-    /// [`GoalError::EvidenceMissing`] when a change goal has criteria that are
-    /// neither satisfied nor waived — or no criteria at all, which is completion by
-    /// assertion — [`GoalError::EvidenceStale`] when every cited receipt predates
-    /// the last recorded change to the workspace, and [`GoalError::Db`] on a
+    /// it, [`GoalError::PlanBelongsToAnotherGoal`] when the visible plan is bound to
+    /// a different goal, [`GoalError::CompletionBlocked`] when durable work is
+    /// unfinished, [`GoalError::EvidenceMissing`] when a change goal has criteria
+    /// that are neither satisfied nor waived — or no criteria at all, which is
+    /// completion by assertion — [`GoalError::EvidenceUnproven`] when a cited receipt
+    /// has since been rewritten or pruned so that it no longer proves success,
+    /// [`GoalError::EvidenceStale`] when a cited receipt predates the last recorded
+    /// change to the workspace, [`GoalError::CapabilityUnverified`] when a capability
+    /// claim recorded under this goal cannot be relied on, and [`GoalError::Db`] on a
     /// statement failure.
     pub fn complete_checked(
         &self,
         session_id: &str,
         expected_revision: i64,
+    ) -> Result<Option<Goal>, GoalError> {
+        self.complete_with_revision(session_id, Some(expected_revision))
+    }
+
+    /// The one statement path that sets `complete`, guarded on a revision or not.
+    ///
+    /// Shared by [`Self::complete_checked`] and by the two model status writers when
+    /// the model reports `complete`, so the audit cannot be skipped by choosing a
+    /// different entry point. The audit and the status write share one `IMMEDIATE`
+    /// transaction, so a concurrent writer cannot add unfinished work, rewrite a
+    /// receipt, or change the workspace between the check and the update.
+    fn complete_with_revision(
+        &self,
+        session_id: &str,
+        expected_revision: Option<i64>,
     ) -> Result<Option<Goal>, GoalError> {
         let now_ms = now_ms()?;
         self.pool.try_transaction(|tx| {
@@ -1215,10 +1260,12 @@ impl GoalStore {
             let Some(actual) = actual else {
                 return Ok(None);
             };
-            if actual != expected_revision {
+            if let Some(expected) = expected_revision
+                && actual != expected
+            {
                 return Err(GoalError::RevisionConflict {
                     session_id: session_id.to_owned(),
-                    expected: expected_revision,
+                    expected,
                     actual,
                 });
             }
@@ -1257,6 +1304,18 @@ impl GoalStore {
                 )
                 .map_err(zuno_db::map_error)?;
                 clear_retry_state(tx, session_id)?;
+                // A goal that just completed is no longer paused, so a pause row left
+                // behind would describe a resumption that can never happen.
+                if goal
+                    .as_ref()
+                    .is_some_and(|current| current.status != GoalStatus::Paused)
+                {
+                    tx.execute(
+                        "DELETE FROM goal_pause WHERE session_id = ?1",
+                        params![session_id],
+                    )
+                    .map_err(zuno_db::map_error)?;
+                }
             }
             Ok(goal)
         })
@@ -1387,13 +1446,20 @@ impl GoalStore {
     /// reopen it, because a decision is not invalidated by a later edit the way a
     /// test result is.
     ///
+    /// A satisfied criterion cannot be waived. It has evidence, so it needs no excuse,
+    /// and a waiver landing on it would swap a recorded, re-checkable receipt for a
+    /// judgement call that nothing can re-check — the exact substitution this table
+    /// exists to make visible. If the evidence has gone stale, [`Self::mark_mutation`]
+    /// has already reopened the criterion, and a waiver is then accepted.
+    ///
     /// # Errors
     ///
     /// [`GoalError::NoGoal`] when the session has no goal,
     /// [`GoalError::RevisionConflict`] when the goal moved on since the caller read
     /// it, [`GoalError::UnknownCriterion`] when the id was never assigned,
-    /// [`GoalError::EmptyWaiverReason`] when the reason is blank, and
-    /// [`GoalError::Db`] on a statement failure.
+    /// [`GoalError::EmptyWaiverReason`] when the reason is blank,
+    /// [`GoalError::CriterionAlreadySatisfied`] when the criterion already has
+    /// evidence, and [`GoalError::Db`] on a statement failure.
     pub fn waive_criterion(
         &self,
         session_id: &str,
@@ -1409,7 +1475,14 @@ impl GoalStore {
             });
         }
         self.pool.try_transaction(|tx| {
-            read_criterion_for_write(tx, session_id, expected_revision, criterion_id)?;
+            let criterion =
+                read_criterion_for_write(tx, session_id, expected_revision, criterion_id)?;
+            if criterion.status == GoalCriterionStatus::Satisfied {
+                return Err(GoalError::CriterionAlreadySatisfied {
+                    criterion_id: criterion_id.to_owned(),
+                    receipt_id: criterion.receipt_id.unwrap_or_default(),
+                });
+            }
             tx.execute(
                 "UPDATE goal_criterion \
                  SET status = 'waived', waiver_reason = ?3, receipt_id = NULL, \
@@ -2498,6 +2571,15 @@ fn insert_criteria(
 /// means the workspace moved after that check ran, so the receipt describes code
 /// that no longer exists.
 ///
+/// The cited receipts are re-read, not trusted. A criterion row says "satisfied by
+/// receipt X", but the receipt ledger is not append-only: it upserts on
+/// `(session_id, tool_call_id)`, so a replayed call can rewrite the row X named into
+/// a failed run — under a fresh id or the same one — and pruning can delete it
+/// outright. Either leaves a citation that resolves to nothing, or to a failure,
+/// while the criterion still reads as satisfied. Completion is the moment that
+/// matters, so it is the moment each receipt is fetched again and
+/// [`VerificationReceipt::proves_success`] is asked again.
+///
 /// A third failure is a reliance rather than a check: a capability the session
 /// enabled on a guess. Once the criteria are settled, the claims recorded under this
 /// goal are audited too — see [`crate::capability::audit_capability_claims`] — so a
@@ -2512,33 +2594,59 @@ fn audit_evidence(tx: &Transaction<'_>, session_id: &str) -> Result<(), GoalErro
         return Ok(());
     }
     let criteria = criteria_from(tx, session_id)?;
+    // A `satisfied` row with no citation is unproven by construction — the store
+    // never writes one — but a row is data, and the audit trusts it no further than
+    // the receipt it can fetch.
     let unsatisfied: Vec<String> = criteria
         .iter()
-        .filter(|criterion| !criterion.status.is_settled())
+        .filter(|criterion| {
+            !criterion.status.is_settled()
+                || (criterion.status == GoalCriterionStatus::Satisfied
+                    && criterion.receipt_id.is_none())
+        })
         .map(|criterion| criterion.criterion_id.clone())
         .collect();
     if criteria.is_empty() || !unsatisfied.is_empty() {
         return Err(GoalError::EvidenceMissing { unsatisfied });
     }
-    if let Some(marked_at_ms) = mutation_mark(tx, session_id)? {
-        // Checked per criterion rather than against the newest citation alone: each
-        // criterion stands on its own receipt, and the first stale one in list order
-        // is also the first one the run should verify again.
-        for criterion in &criteria {
-            let Some(receipt_id) = criterion.receipt_id.as_deref() else {
-                continue;
-            };
-            let Some(receipt) = receipt_for(tx, session_id, receipt_id)? else {
-                continue;
-            };
-            if marked_at_ms > receipt.time_created {
-                return Err(GoalError::EvidenceStale {
-                    criterion_id: criterion.criterion_id.clone(),
-                    receipt_id: receipt_id.to_owned(),
-                    marked_at_ms,
-                    receipt_at_ms: receipt.time_created,
-                });
-            }
+    let marked_at_ms = mutation_mark(tx, session_id)?;
+    // Checked per criterion rather than against the newest citation alone: each
+    // criterion stands on its own receipt, and the first one that fails in list order
+    // is also the first one the run should verify again.
+    for criterion in &criteria {
+        let Some(receipt_id) = criterion.receipt_id.as_deref() else {
+            continue;
+        };
+        let Some(receipt) = receipt_for(tx, session_id, receipt_id)? else {
+            return Err(GoalError::EvidenceUnproven {
+                criterion_id: criterion.criterion_id.clone(),
+                receipt_id: receipt_id.to_owned(),
+                reason: "the cited receipt is no longer recorded for this session — a replayed \
+                         call or receipt pruning removed it; run the check again and cite the \
+                         new receipt"
+                    .to_owned(),
+            });
+        };
+        if !receipt.proves_success() {
+            return Err(GoalError::EvidenceUnproven {
+                criterion_id: criterion.criterion_id.clone(),
+                receipt_id: receipt_id.to_owned(),
+                reason: format!(
+                    "the cited receipt no longer proves success — {}; run the check again and \
+                     cite the new receipt",
+                    unproven_reason(&receipt)
+                ),
+            });
+        }
+        if let Some(marked_at_ms) = marked_at_ms
+            && marked_at_ms > receipt.time_created
+        {
+            return Err(GoalError::EvidenceStale {
+                criterion_id: criterion.criterion_id.clone(),
+                receipt_id: receipt_id.to_owned(),
+                marked_at_ms,
+                receipt_at_ms: receipt.time_created,
+            });
         }
     }
     crate::capability::audit_capability_claims(tx, session_id)
