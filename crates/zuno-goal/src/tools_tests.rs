@@ -359,12 +359,69 @@ fn goal_descriptions_teach_the_evidence_contract() {
         "{CREATE_DESCRIPTION}"
     );
     assert!(
+        CREATE_DESCRIPTION.contains("treated as a question"),
+        "the empty-criteria case is a documented decision, not an accident: {CREATE_DESCRIPTION}"
+    );
+    assert!(
         UPDATE_DESCRIPTION.contains("receipt id"),
         "{UPDATE_DESCRIPTION}"
     );
     assert!(
         UPDATE_DESCRIPTION.contains("reopen"),
         "{UPDATE_DESCRIPTION}"
+    );
+}
+
+#[tokio::test]
+async fn a_goal_proposed_without_criteria_is_a_question_until_the_first_write_then_names_the_remedy()
+ {
+    let fixture = Fixture::new();
+    let created = erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({"objective": "enable structured output for the bedrock model"}),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("a goal without criteria is a question, and a question needs none");
+    assert!(
+        !created.output.contains("Success criteria"),
+        "no checklist is invented from the objective: {}",
+        created.output
+    );
+    assert!(!created.metadata.contains_key("criteria"));
+    assert_eq!(
+        fixture.store.kind("ses_tools").expect("read kind"),
+        crate::GoalKind::Question
+    );
+
+    // The host's verification ledger reports the first write; the store sees it as
+    // this call.
+    fixture
+        .store
+        .escalate_to_change("ses_tools", "`write` wrote zuno.toml", 1_000)
+        .expect("escalate to a change goal");
+
+    let refusal = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({"expected_revision": 1, "status": "complete"}),
+            fixture.context("call_complete"),
+        )
+        .await
+        .expect_err("a change goal with no criteria cannot complete by assertion");
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    let message = refusal_detail(&refusal);
+    assert!(
+        message.contains("propose success criteria with `goal_propose` before completing"),
+        "the model is told what would have worked: {message}"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .goal("ses_tools")
+            .expect("read goal")
+            .expect("goal exists")
+            .status,
+        GoalStatus::Active
     );
 }
 

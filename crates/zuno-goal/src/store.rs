@@ -1208,11 +1208,15 @@ impl GoalStore {
     /// only the revision guard.
     ///
     /// Every pre-existing blocker still applies: unfinished plan steps, work items,
-    /// jobs and pending human requests refuse completion exactly as before. On top
-    /// of them, a goal that [`Self::escalate_to_change`] marked as changing the
+    /// jobs and pending human requests refuse completion exactly as before. Before
+    /// those are even counted, the visible plan has to be *this* goal's: a
+    /// `work_plan` row whose `goal_id` names another goal is refused as stale
+    /// whatever its steps say — see [`audit_plan_ownership`] for why a plan with no
+    /// `goal_id`, and an archived plan, are deliberately let through. On top of all
+    /// that, a goal that [`Self::escalate_to_change`] marked as changing the
     /// workspace must have every criterion settled and must cite evidence no older
     /// than the last [`Self::mark_mutation`]. A [`GoalKind::Question`] goal is
-    /// unaffected and completes as it always did.
+    /// unaffected by the evidence rules and completes as it always did.
     ///
     /// # Errors
     ///
@@ -1249,15 +1253,15 @@ impl GoalStore {
     ) -> Result<Option<Goal>, GoalError> {
         let now_ms = now_ms()?;
         self.pool.try_transaction(|tx| {
-            let actual = tx
+            let current = tx
                 .query_row(
-                    "SELECT revision FROM goal WHERE session_id = ?1",
+                    "SELECT goal_id, revision FROM goal WHERE session_id = ?1",
                     params![session_id],
-                    |row| row.get::<_, i64>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()
                 .map_err(zuno_db::map_error)?;
-            let Some(actual) = actual else {
+            let Some((goal_id, actual)) = current else {
                 return Ok(None);
             };
             if let Some(expected) = expected_revision
@@ -1270,6 +1274,10 @@ impl GoalStore {
                 });
             }
 
+            // Ownership before arithmetic: a plan written for another goal is refused
+            // as stale whatever its step count says, because counting its unfinished
+            // steps would describe the previous goal's work as this one's.
+            audit_plan_ownership(tx, session_id, &goal_id)?;
             let (plan_steps, work_items, jobs, human_requests) =
                 completion_blockers(tx, session_id)?;
             if plan_steps != 0 || work_items != 0 || jobs != 0 || human_requests != 0 {
@@ -2498,6 +2506,51 @@ fn completion_blockers(
         0
     };
     Ok((plan_steps, work_items, jobs, human_requests))
+}
+
+/// Refuse completion when the visible plan was written for a different goal.
+///
+/// `work_plan` is keyed by session and outlives the goal it was written for. Once
+/// every step of the previous goal's plan is `completed`, [`completion_blockers`]
+/// counts nothing, so after `goal_propose` replaces that goal the new one could
+/// complete against the old checklist — or against a plan `plan_update` re-created
+/// for it while inheriting the stale `goal_id`. The check makes the plan the model
+/// can see the plan of the goal it is completing.
+///
+/// A plan with a `NULL` `goal_id` passes. It predates the binding, and refusing it
+/// would strand every session whose plan was written before plans knew their goal.
+///
+/// Archived plans (`work_plan_archive`) are deliberately not consulted. A
+/// `completed` or `superseded` row is history, and refusing over it would make any
+/// goal that ever replaced its plan uncompletable. A `suspended` row is a parent
+/// waiting to be restored; the moment it is restored it is the visible plan and this
+/// same check sees it. Ownership is judged where a plan can describe work again, not
+/// while it is dormant.
+fn audit_plan_ownership(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    goal_id: &str,
+) -> Result<(), GoalError> {
+    if !table_exists(tx, "work_plan")? {
+        return Ok(());
+    }
+    let plan_goal_id = tx
+        .query_row(
+            "SELECT goal_id FROM work_plan WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(zuno_db::map_error)?
+        .flatten();
+    match plan_goal_id {
+        Some(plan_goal_id) if plan_goal_id != goal_id => Err(GoalError::PlanBelongsToAnotherGoal {
+            session_id: session_id.to_owned(),
+            plan_goal_id,
+            goal_id: goal_id.to_owned(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 fn table_exists(tx: &Transaction<'_>, table: &str) -> Result<bool, DbError> {

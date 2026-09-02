@@ -12,6 +12,10 @@
 //! criterion is still unproven and *why* the receipt it cited does not count. A
 //! completion refused without naming the criterion ids would leave the model
 //! guessing, and guessing at "done" is the defect these variants exist to stop.
+//! [`GoalError::PlanBelongsToAnotherGoal`] belongs to the same family: it names
+//! both goal ids so a model can see that the plan it is looking at was written for
+//! a goal that no longer exists, rather than being told only that completion was
+//! refused.
 //!
 //! The capability refusals — [`GoalError::CapabilityUndocumented`],
 //! [`GoalError::CapabilityProbeUncited`], [`GoalError::CapabilityProbeUnproven`],
@@ -153,6 +157,29 @@ pub enum GoalError {
         human_requests: usize,
     },
 
+    /// The session's visible plan was written for a different goal.
+    ///
+    /// `work_plan` is keyed by session, not by goal, so the plan of a finished goal
+    /// stays visible after `goal_propose` replaces that goal — and `plan_update`
+    /// inherits the old `goal_id` when a caller re-creates the plan without naming
+    /// one. Every step of such a plan may already be `completed`, so the step count
+    /// blocks nothing, yet it describes the previous goal's work. Completing over it
+    /// would let a goal finish against a checklist nobody wrote for it. Both ids are
+    /// named so the model can see the plan is stale rather than be told to try again.
+    #[error(
+        "the visible plan for session {session_id} belongs to goal {plan_goal_id}, not to goal \
+         {goal_id} being completed; recreate the plan for this goal with `plan_update` \
+         (action `create`, goal_id `{goal_id}`) before completing"
+    )]
+    PlanBelongsToAnotherGoal {
+        /// The session whose plan was consulted.
+        session_id: String,
+        /// The goal the plan says it belongs to.
+        plan_goal_id: String,
+        /// The goal that was asked to complete.
+        goal_id: String,
+    },
+
     /// A criterion id was cited that this goal never assigned.
     ///
     /// Names the ids that *do* exist, because the ids are minted by the store and
@@ -239,10 +266,13 @@ pub enum GoalError {
 
     /// Completion was requested for a change goal whose criteria are unproven.
     ///
-    /// An empty `unsatisfied` means the goal has no criteria at all: a goal that
-    /// changes the workspace cannot be completed on assertion alone, so there is
-    /// nothing for evidence to attach to and the remedy is to propose the checks
-    /// first.
+    /// An empty `unsatisfied` means the goal has no criteria at all. That is a
+    /// deliberate outcome rather than an oversight: a goal proposed without criteria
+    /// is accepted as a question, because questions need none, and the first write
+    /// to the workspace makes it a change goal with nothing for evidence to attach
+    /// to. The message therefore names the remedy — criteria are proposed with
+    /// `goal_propose`, not asserted at completion — so the model does not spend a
+    /// turn discovering that no citation can help.
     #[error(
         "goal cannot complete without recorded verification evidence: {}",
         unsatisfied_detail(unsatisfied)
@@ -430,7 +460,10 @@ pub enum GoalError {
 /// "this goal has no criteria to verify at all".
 fn unsatisfied_detail(unsatisfied: &[String]) -> String {
     if unsatisfied.is_empty() {
-        "a goal that changes the workspace cannot complete without success criteria".to_owned()
+        "a goal that changes the workspace cannot complete without success criteria; propose \
+         success criteria with `goal_propose` before completing (an unfinished goal cannot be \
+         re-proposed, so this one has to be cancelled by the user first)"
+            .to_owned()
     } else {
         format!(
             "these criteria are neither satisfied nor waived: {}",
@@ -466,6 +499,7 @@ impl GoalError {
             | Self::GoalNotActive { .. }
             | Self::RevisionConflict { .. }
             | Self::CompletionBlocked { .. }
+            | Self::PlanBelongsToAnotherGoal { .. }
             | Self::UnknownCriterion { .. }
             | Self::EmptyWaiverReason { .. }
             | Self::CriterionAlreadySatisfied { .. }
