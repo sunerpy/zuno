@@ -60,7 +60,7 @@ $ZUNO_CONFIG_DIR/AGENTS.md        profile overlay
 规则文件要么整份进入 Prompt，要么完全不进入。Zuno 绝不截断：规则被截断后含义会改变，
 “除非 Y，否则做 X”在“做 X”之后被切断就是另一条指令，而用户仍以为原始规则生效。
 
-以下两种情况会在第一次 provider request 之前让本轮失败，并点名文件、字节数与修复方式：
+以下两种情况会在第一次 provider request 之前让本轮失败，并点名文件与修复方式，超预算时还给出字节数与预算：
 
 - 文件存在但无法读取，例如权限错误或字节不是合法 UTF-8；
 - 文件超出 instruction prompt 预算，该预算取 64 KB 与模型 context window 四分之一

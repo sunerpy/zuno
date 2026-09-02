@@ -38,6 +38,15 @@ otherwise uncertain mutations remain failed, preserve observed paths or diffs,
 and carry `_meta.zuno.outcome: "uncertain"`. Live delivery and replay use the
 same policy.
 
+Operational notices — a remote rule file that could not be fetched (its rules are not in
+force while the turn proceeds), a turn stopped by its
+token, tool-call, or wall-clock allowance, a compaction the budget policy requested —
+are projected as `agent_thought_chunk` updates tagged `_meta.zuno.notice` with
+`severity` (`info`, `warning`, or `error`) and a stable `code` such as
+`instruction.not_in_force`, `budget.compact`, or `budget.token_budget`. The tag is how
+a client distinguishes them from model output; they are never part of the transcript
+the model sees.
+
 ## Goal continuation
 
 `/goal <objective>` is a native control followed by autonomous execution. Zuno

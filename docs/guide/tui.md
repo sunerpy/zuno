@@ -141,8 +141,13 @@ It creates a new goal when none exists or the previous one is complete or cancel
 otherwise it updates the current goal. Objective changes also reconcile an active durable
 Plan by archiving the previous visible Plan and installing a new root bound to the current
 `goal_id` for multi-stage work. An atomic objective does not rebind an already terminal
-historical Plan. Explicit actions such as `/goal show`, `/goal edit ...`,
+historical Plan; one that belongs to a previous Goal is archived as completed history. Explicit actions such as `/goal show`, `/goal edit ...`,
 and `/goal complete` remain available.
+
+Zuno notices — a remote rule file that could not be fetched, a turn stopped by its token,
+tool-call, or wall-clock allowance, a compaction the budget policy requested — appear as
+toasts whose level follows the notice severity (`info`, `warning`, `error`) and end with the
+notice code in brackets. They are not model output.
 
 Resource pickers follow the same naming: `/model`, `/agent`, `/session`, `/skill`,
 `/theme`, `/mcp`, `/diff`, `/commands`, `/help`.

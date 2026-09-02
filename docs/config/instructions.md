@@ -83,8 +83,8 @@ A rule file is admitted whole or not at all. Zuno never truncates one, because a
 cut mid-sentence states something else: "do X unless Y" trimmed after "do X" is a
 different instruction, and the user goes on believing the original is in force.
 
-Two conditions fail the turn before the first provider request, each naming the file,
-its size, and the remedy:
+Two conditions fail the turn before the first provider request, each naming the file and
+the remedy, and for the budget case its size and the budget:
 
 - the file exists but cannot be read, for example a permission error or bytes that are
   not valid UTF-8;

@@ -1272,6 +1272,278 @@ fn configuration_reference_documents_the_navigation_gate() {
             "tracked per session",
         ],
     );
+    contains_all(
+        "docs/zh/config/reference.md",
+        &[
+            "## 源码导航与 CodeGraph 索引",
+            "`navigation.codegraph`",
+            "`off`（默认）",
+            "`advise`",
+            "`strict`",
+            "只有 worktree 根目录存在 `.codegraph` 目录时这道门才生效",
+            "`codegraph status`；`init`、`sync` 之类的索引生命周期子命令",
+            "既不满足也不违反它",
+            "这道门按会话跟踪",
+        ],
+    );
+}
+
+/// What the merge of the hardening work with #90 had to reconcile in the guides: a
+/// spent allowance pauses rather than retries, a Goal's finished Plan is archived rather
+/// than left to block the next Goal, and a client can tell a Zuno notice from a thought.
+#[test]
+fn release_docs_pin_allowance_pauses_retired_plans_and_tagged_notices() {
+    contains_all(
+        "docs/guide/sessions.md",
+        &[
+            "Agent step-limit, and eligible",
+            "pauses the Goal with `turn_budget` and waits for a",
+            "ends as `budget_limited` instead",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/sessions.md",
+        &[
+            "Agent 步数上限以及符合条件的工具失败",
+            "以 `turn_budget` 暂停 Goal 并等待人工",
+            "Goal 则进入 `budget_limited`",
+        ],
+    );
+    contains_all(
+        "AGENTS.md",
+        &[
+            "Agent step-limit, and eligible tool failures",
+            "pauses with `turn_budget` and is never retried mechanically",
+        ],
+    );
+    contains_all(
+        "docs/harness-runtime.md",
+        &[
+            "### Turn allowances",
+            "to 8,000,000 tokens",
+            "`TurnAllowance::UNLIMITED`",
+            "turn with `tool_call_budget` or `time_budget`",
+            "stops the turn with `usage_unknown`; under the",
+            "### Instruction file admission",
+            "does not fit the instruction budget",
+            "No notice is emitted for that case",
+            "the `warning` notice `instruction.not_in_force` naming the source",
+            "so the completion audit never judges the",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/harness-runtime.md",
+        &[
+            "Agent 步数上限和符合条件的工具失败",
+            "以 `turn_budget` 暂停",
+            "8,000,000 token 的宿主默认额度",
+            "以 `tool_call_budget` 或 `time_budget` 停止",
+            "用量不可测时以 `usage_unknown` 停止；宿主默认额度则继续执行",
+            "code 为 `budget.<kind>`",
+            "64 KB 与模型 context window 四分之一取较小值",
+            "这种\n情况不会发出任何 notice",
+            "`instruction.not_in_force` 报告哪个来源的规则本轮不生效",
+            "归档为已完成的历史，完成审计不会再拿它对账新 Goal",
+        ],
+    );
+    for (relative, needle) in [
+        (
+            "docs/guide/durable-state.md",
+            "archived as completed history",
+        ),
+        ("docs/guide/tui.md", "archived as completed history"),
+        (
+            "docs/reference/zed-acp.md",
+            "completed history and the panel is cleared",
+        ),
+        ("docs/zh/guide/durable-state.md", "归档为已完成的历史"),
+        ("docs/zh/guide/tui.md", "归档为已完成的历史"),
+        (
+            "docs/zh/guide/editors.md",
+            "归档为已完成的历史，面板随之清空",
+        ),
+    ] {
+        contains_all(relative, &[needle]);
+    }
+    contains_all(
+        "docs/reference/zed-acp.md",
+        &[
+            "`_meta.zuno.planId`, `revision`, `title`, and `stackDepth`",
+            "`parentPlanId`",
+            "`_meta.zuno.stepId`",
+            "`_meta.zuno.cleared: true`",
+            "`_meta.zuno.notice`",
+            "a remote rule file that could not be fetched",
+            "`instruction.*` or `budget.*` families",
+        ],
+    );
+    contains_all(
+        "docs/zh/cli/acp.md",
+        &[
+            "`_meta.zuno.planId`",
+            "`stackDepth`",
+            "`parentPlanId`",
+            "`_meta.zuno.stepId`",
+            "`_meta.zuno.cleared: true`",
+            "`_meta.zuno.notice`",
+            "无法抓取的远程规则文件",
+            "`instruction.not_in_force`、`budget.compact`、`budget.token_budget`",
+        ],
+    );
+    contains_all(
+        "docs/cli/acp.md",
+        &[
+            "`_meta.zuno.notice`",
+            "a remote rule file that could not be fetched",
+            "`instruction.not_in_force`, `budget.compact`, or `budget.token_budget`",
+        ],
+    );
+    contains_all(
+        "docs/guide/headless.md",
+        &[
+            "{\"type\":\"notice\",\"severity\":\"warning\",\"code\":\"budget.token_budget\"",
+            "while the turn still runs",
+            "produces no `notice` event",
+            "published on the server event stream as",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/headless.md",
+        &[
+            "{\"type\":\"notice\",\"severity\":\"warning\",\"code\":\"budget.token_budget\"",
+            "但回合继续执行",
+            "不会产生 `notice` 事件",
+            "同一事件在 server 事件流上以 `notice` 发布",
+        ],
+    );
+    contains_all(
+        "docs/design/zed-acp-integration.md",
+        &[
+            "with one tagged exception",
+            "`_meta.zuno.notice`",
+            "`_meta.zuno.{planId,revision,title,stackDepth}`",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/editors.md",
+        &[
+            "唯一带标记的例外",
+            "无法抓取的远程规则文件",
+            "`_meta.zuno.notice`",
+        ],
+    );
+    contains_all(
+        "docs/guide/tui.md",
+        &[
+            "appear as\ntoasts whose level follows the notice severity",
+            "They are not model output.",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/tui.md",
+        &[
+            "以 toast 显示，级别跟随通知的 severity",
+            "它们不是模型输出。",
+        ],
+    );
+    for (relative, retired) in [
+        ("docs/guide/sessions.md", "turn-budget"),
+        ("AGENTS.md", "turn-budget"),
+        ("docs/zh/guide/sessions.md", "回合预算以及符合"),
+        ("docs/zh/operate/harness-runtime.md", "回合预算和符合"),
+        ("docs/reference/zed-acp.md", "historical Plan attached"),
+        ("docs/harness-runtime.md", "silently truncated"),
+        (
+            "docs/harness-runtime.md",
+            "with the typed notice `instruction.not_in_force`",
+        ),
+        ("docs/guide/headless.md", "which fails the turn"),
+        ("docs/zh/guide/headless.md", "这会让本轮失败"),
+        ("docs/cli/acp.md", "could not be admitted"),
+        ("docs/zh/cli/acp.md", "无法进入 Prompt 的规则文件"),
+        ("docs/reference/zed-acp.md", "could not be admitted"),
+        ("docs/zh/guide/editors.md", "无法进入 Prompt 的规则文件"),
+    ] {
+        assert!(
+            !read(relative).contains(retired),
+            "{relative} still carries retired wording {retired:?}"
+        );
+    }
+}
+
+/// The two configuration index pages enumerate every top-level key by hand, and the count
+/// sentence above the table is typed by hand too. A key added to the schema without a row
+/// here is a feature the reference can be read cover to cover without discovering.
+#[test]
+fn config_index_tables_enumerate_every_schema_root_key() {
+    let schema: serde_json::Value =
+        serde_json::from_str(&read("schemas/zuno.json")).expect("schemas/zuno.json is JSON");
+    let mut schema_keys: Vec<String> = schema["properties"]
+        .as_object()
+        .expect("schema root has properties")
+        .keys()
+        .cloned()
+        .collect();
+    schema_keys.push("$schema".to_owned());
+    schema_keys.sort();
+    schema_keys.dedup();
+    let number_words = [
+        (43, "Forty-three", "四十三"),
+        (44, "Forty-four", "四十四"),
+        (45, "Forty-five", "四十五"),
+        (46, "Forty-six", "四十六"),
+        (47, "Forty-seven", "四十七"),
+        (48, "Forty-eight", "四十八"),
+    ];
+    let (_, english, chinese) = number_words
+        .iter()
+        .find(|(count, _, _)| *count == schema_keys.len())
+        .copied()
+        .unwrap_or_else(|| panic!("extend number_words for {} keys", schema_keys.len()));
+
+    for (relative, heading, count_sentence) in [
+        (
+            "docs/config/index.md",
+            "## The top-level shape",
+            format!("{english} keys exist."),
+        ),
+        (
+            "docs/zh/config/index.md",
+            "## 顶层结构",
+            format!("一共有{chinese}个键。"),
+        ),
+    ] {
+        let text = read(relative);
+        let start = text
+            .find(heading)
+            .unwrap_or_else(|| panic!("{relative} has {heading}"));
+        let section = &text[start..];
+        let section = section[heading.len()..]
+            .find("\n## ")
+            .map_or(section, |end| &section[..heading.len() + end]);
+        assert!(
+            section.contains(&count_sentence),
+            "{relative} must state {count_sentence:?} for {} schema keys",
+            schema_keys.len()
+        );
+        let mut listed: Vec<String> = section
+            .lines()
+            .filter(|line| line.starts_with("| ") && line.contains('`'))
+            .flat_map(|line| {
+                line.split('`')
+                    .skip(1)
+                    .step_by(2)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        listed.sort();
+        listed.dedup();
+        assert_eq!(
+            listed, schema_keys,
+            "{relative} top-level table drifted from schemas/zuno.json root properties"
+        );
+    }
 }
 
 /// The receipt's authority is the one shell fact a caller acts on, and the text-level

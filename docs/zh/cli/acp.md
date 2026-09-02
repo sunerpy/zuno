@@ -25,13 +25,22 @@ Plan 投影由 durable work-state revision 驱动，不再依赖识别 `plan_upd
 可以合并到最新 revision，但 prompt 返回前必须 flush 最终状态。Plan 被移除时发送空
 entries 清除 Zed 旧面板。load、resume、detached Goal continuation 与 host 重建都复用
 同一个投影器。ACP 没有 `superseded` 状态，因此 wire 上映射为 `completed`，真实语义
-保存在 `_meta.zuno.outcome: "superseded"`。
+保存在 `_meta.zuno.outcome: "superseded"`。每个非空的 Plan 快照还携带 `_meta.zuno.planId`、
+`revision`、`title` 与 `stackDepth`；Plan 绑定 Goal 时附带 `goalId`，可见的是聚焦子 Plan 时附带
+`parentPlanId`，客户端无需比对 entries 就能区分推入的子 Plan 与被替换的根 Plan；每个 entry 带
+`_meta.zuno.stepId`，清空更新只携带 `_meta.zuno.cleared: true`。
 
 `edit`、`write` 与 `apply_patch` 统一投影为 `Editing files` 卡片。成功且存在结构化
 diff 时，可见内容只保留 `A/M/D <path>`，不再重复显示成功文案；完整原始输出仍在
 `rawOutput`。写入前失败展示可操作错误而不伪造 diff；部分写入或其他不确定结果使用
 failed 状态，保留已观察到的路径/diff，并设置 `_meta.zuno.outcome: "uncertain"`。
 实时更新与历史 replay 使用同一策略。
+
+运维通知——无法抓取的远程规则文件（其规则本轮不生效，回合继续）、被 token、工具调用次数或墙上时间额度停下的回合、
+预算策略要求的一次压缩——以带 `_meta.zuno.notice` 标记的 `agent_thought_chunk` 投影，
+其中 `severity` 取 `info`、`warning` 或 `error`，`code` 是稳定的机器可读码，例如
+`instruction.not_in_force`、`budget.compact`、`budget.token_budget`。客户端靠这个标记
+把它们与模型输出区分开；它们永远不进入模型看到的对话记录。
 
 运行中的 ACP 会话会订阅统一 Skill catalog generation。新增、修改、删除或重命名
 Skill 后，会发送新的 `available_commands_update`，无需重启会话。

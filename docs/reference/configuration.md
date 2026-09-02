@@ -1103,8 +1103,9 @@ make the first step. Index lifecycle subcommands such as `init` and `sync` neith
 satisfy the gate nor violate it.
 
 The gate is tracked per session, because a delegated child is a different model
-whose context never saw the parent's index query. Every decision is recorded in the
-session event log, since the question it answers is asked long after the run.
+whose context never saw the parent's index query. Every advisory or refusal is recorded in the
+session event log as `navigation.index_bypassed` or `navigation.index_unchecked`, since the
+question it answers is asked long after the run.
 
 ## Child model selection policy
 
