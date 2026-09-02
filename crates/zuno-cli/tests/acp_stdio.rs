@@ -4558,13 +4558,26 @@ async fn acp_detached_parent_projects_final_plan_after_background_child_completi
         projected_revision, durable_plan.revision,
         "ACP must project the final durable plan revision"
     );
-    assert!(
-        zuno_db::human_request::HumanRequestStore::new(pool)
+    // The plan snapshot above is published while the continuation turn is still running,
+    // and the stale request is cancelled at that turn's end, just before `TurnCompleted`.
+    // Nothing orders the two from this side of the pipe, so a read taken the instant the
+    // snapshot arrives can precede the cancellation; wait for the durable state instead.
+    let human_requests = zuno_db::human_request::HumanRequestStore::new(pool);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let pending = human_requests
             .pending(Some(&parent_session_id))
-            .expect("read pending reconciliation requests")
-            .is_empty(),
-        "authoritative background completion must cancel the stale reconciliation request"
-    );
+            .expect("read pending reconciliation requests");
+        if pending.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "authoritative background completion must cancel the stale reconciliation \
+             request; still pending: {pending:#?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 
     request(
         &mut stdin,

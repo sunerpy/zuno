@@ -802,6 +802,15 @@ mod tests {
         goals
             .satisfy_criterion("ses_1", created.goal.revision, &criterion, &cited, 1)
             .expect("the goal gate must accept the id the ledger published");
+        // The receipt itself was stamped with the wall clock a moment ago, and the last
+        // assertion below needs the write to be strictly later than it: a receipt from the
+        // same millisecond as a change is not stale. In-memory SQLite finishes both calls
+        // well inside one millisecond, and a Windows clock advances in ~16 ms steps, so
+        // let the clock move before writing.
+        let recorded_by = zuno_db::message::now_millis();
+        while zuno_db::message::now_millis() <= recorded_by {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
 
         let mut wrote = ToolOutput::text("edit", "wrote 1 file")
             .with_written_path(std::path::Path::new("src/main.rs"));
