@@ -27,6 +27,15 @@ PR base SHA 等于触发本次控制器的 `main` commit，验证由机器人创
 恰好只有这一个 parent，并再次读取 PR，确认 base/head 组合仍然一致。过期的 API 视图只会在
 有界时间内重试，绝不会作为候选的 expected SHA 被调度。
 
+当文档类或其他不计入版本的提交推进 `main` 时，release-please 可能不会刷新已有 Release PR，
+导致其 head 仍以旧 `main` 为 parent。控制器连续观察到同一个稳定的过期身份后，会拉取同仓库
+release 分支，独立复核单一 parent、机器人作者与 `chore: release` 标题，并确认旧 parent 是
+本次触发 `main` 的祖先。随后它在临时 worktree 中把这一个 release commit
+cherry-pick 到精确触发 SHA，并使用绑定旧 head 的 `force-with-lease` 更新原分支；只有再次
+通过 PR API 确认新 head 后才调度候选。冲突、身份不匹配、非祖先或 lease 失败都会使控制器
+失败关闭，且不改变 PR 分支。正常恢复不会生成双 parent 的 “update branch” merge，也不再
+关闭并重新创建 Release PR。
+
 维护者必须核对精确 head SHA；当 GitHub 把普通 `CI` run 标记为 `action_required` 时，
 批准对应的精确 run。GitHub 放行 run 后，`ci.yml` 会有意忽略 `github.actor`：触发者可能是
 批准或重新运行它的维护者，并不等于 PR 作者身份。轻量路由改为严格要求 release-please

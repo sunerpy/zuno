@@ -35,6 +35,19 @@ has exactly that commit as its sole parent, and confirms the same base/head pair
 with a second PR read. A stale API view is retried for a bounded period and is
 never dispatched as the expected candidate SHA.
 
+If a documentation-only or otherwise non-releasable commit advances `main`,
+release-please may leave the existing release PR head on its older parent. After
+observing that stable stale identity repeatedly, the controller fetches the
+same-repository release branch, independently rechecks its single parent, bot
+author, and `chore: release` subject, and verifies that the old parent is an
+ancestor of the triggering `main`. It then cherry-picks that one release commit
+onto the exact triggering SHA in a temporary worktree and updates the existing
+branch with a lease bound to the previously observed head. The refreshed head is
+again confirmed through the PR API before candidate dispatch. A conflict,
+identity mismatch, non-ancestor, or lease failure stops the controller without
+changing the PR branch. The workflow never creates a two-parent “update branch”
+merge and never closes and recreates the PR as routine recovery.
+
 A maintainer reviews the exact head SHA and, when GitHub marks the ordinary `CI`
 run as `action_required`, approves that exact run. Once GitHub admits the run,
 `ci.yml` deliberately ignores `github.actor`: the initiator may be the
