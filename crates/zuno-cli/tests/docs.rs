@@ -1120,3 +1120,18 @@ fn database_docs_describe_guarded_format_five_or_six_to_seven_migration() {
         );
     }
 }
+
+#[test]
+fn tui_docs_pin_the_input_discarded_when_the_terminal_is_released() {
+    contains_all(
+        "docs/guide/tui.md",
+        &[
+            "then discards the input it never read",
+            "as a stray `0;54;31M` report",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/tui.md",
+        &["再丢弃尚未读取的输入", "`0;54;31M` 这类残留报文"],
+    );
+}
