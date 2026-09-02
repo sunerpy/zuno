@@ -168,8 +168,49 @@ the run that turned out to modify the workspace even though it did not start out
 to.
 
 The rendered goal document lists the criteria with their state, so a human reads the same
-gate the model is held to. That document is generated, so its directory is added to the
-repository-private `.git/info/exclude` rather than to a tracked `.gitignore`.
+gate the model is held to.
+
+### Capability claims
+
+Some claims are not about the workspace at all. Enabling a provider feature because a
+related model is documented to have it, and then reporting success, leaves nothing durable
+that says the belief was inferred rather than observed. The `capability_claim` tool records
+one claim per capability and subject, and answers plainly whether it may be relied on.
+
+| State | What it requires |
+| --- | --- |
+| `documented` | At least one cited source |
+| `probed` | A receipt from this session that proves success and is newer than the last write |
+| `inferred` | Nothing, and it blocks completion |
+| `unknown` | Nothing, and it blocks completion |
+
+The completion audit refuses a change goal while a claim recorded under it is `inferred` or
+`unknown`, and re-checks a `probed` claim's receipt against the mutation mark at audit time,
+so a later write retires the probe without anyone rewriting the ledger. Re-recording a claim
+updates the row and reports its previous state, which makes a retraction to a weaker state a
+recorded event rather than a refusal or a silent overwrite. Claims outlive goal replacement
+as provenance, but only claims recorded since the current goal instance began gate it.
+
+The `bedrock-model-capability-review` Skill says what counts as evidence for an Amazon
+Bedrock model: a vendor document naming that exact model id and region, or an observed
+probe. It also says to record the claim before writing configuration, not after.
+
+### Generated state stays out of the commit
+
+The goal document, spilled tool output, and background execution records are all generated,
+so their directories go into the repository-private `.git/info/exclude` rather than a
+tracked `.gitignore`. One registry supplies both that exclude block and the staging refusal
+below, so the two cannot disagree about which paths are generated.
+
+The exclude block only keeps them out of `git status`. A `git commit` that would deliver
+them anyway is refused before it runs, with the paths named and `git restore --staged` as
+the remedy. The check reads the index, and also the tracked working-tree changes when the
+command stages as it commits. Outside a repository there is nothing to check and nothing is
+refused.
+
+This exists because generated state that reaches the index is how an agent reports a dirty
+tree as evidence of a change it did not make, or delivers its own scratch output as part of
+the work.
 
 ### Token budget
 
@@ -189,7 +230,36 @@ The last tenth is held back deliberately. Compaction costs a request of its own 
 leave room for the summary plus the next real request, so asking for it exactly when the
 budget runs out would be asking when there is nothing left to pay with.
 
-A session with no goal, or a goal with no token budget, is unaffected.
+### The host's default allowance
+
+A goal whose `token_budget` is unset is not unbounded. `None` means "the host's default",
+and the harness's default profile publishes one: forty requests at a 200,000-token window,
+or 8,000,000 tokens. Every request re-sends the whole prompt and cache reads are charged, so
+that is close to the most one runaway turn can cost.
+
+An explicit goal budget always wins, and the default is never written into the goal row. A
+host that genuinely wants unbounded autonomy says so with `TurnAllowance::UNLIMITED`, not by
+leaving a field unset. The stop kind is `token_budget` either way, but the remedy differs: a
+user who set a budget is told to raise it, and a user who never set one is told to set one.
+
+Two further ceilings bound the turn rather than the goal. Both are off unless the host sets
+them, and both apply whether or not a Goal is active, because a turn without a goal can loop
+just as well as one with.
+
+| Ceiling | Stops the turn when |
+| --- | --- |
+| Tool calls | That many calls have been dispatched inside one turn |
+| Wall time | The turn has run that long, at one-second resolution |
+
+Tool calls are counted from the dispatch groups the loop actually ran, so a call that a stop
+or an urgent human request kept from running is never counted. A reached ceiling overrides a
+compaction request or a continue, because either would spend a request the ceiling no longer
+allows, and it defers to a stop the Goal already produced. A request already in flight when
+the clock passes a ceiling completes first.
+
+A session with no goal is unaffected by the token default. There is no durable counter to
+charge it against, and a default enforced from an in-memory turn total would reset every turn
+and never bind.
 
 ### Human requests and autonomy
 

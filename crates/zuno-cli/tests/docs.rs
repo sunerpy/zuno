@@ -1107,6 +1107,20 @@ fn durable_state_guides_document_evidence_gated_completion() {
             "around every provider request inside a turn",
             "`turn_budget`",
             "last tenth of the allowance",
+            "### The host's default allowance",
+            "8,000,000 tokens",
+            "`TurnAllowance::UNLIMITED`",
+            "told to set one",
+            "whether or not a Goal is active",
+            "no durable counter to",
+            "### Capability claims",
+            "`capability_claim`",
+            "`inferred`",
+            "reports its previous state",
+            "bedrock-model-capability-review",
+            "### Generated state stays out of the commit",
+            "refused before it runs",
+            "git restore --staged",
         ],
     );
     contains_all(
@@ -1126,6 +1140,68 @@ fn durable_state_guides_document_evidence_gated_completion() {
             "每一次 provider request 前后执行",
             "`turn_budget`",
             "最后十分之一是刻意留出的",
+            "### 宿主的默认额度",
+            "8,000,000",
+            "`TurnAllowance::UNLIMITED`",
+            "被告知去设一个",
+            "没有 Goal 的回合一样可以空转",
+            "没有可供记账的持久计数器",
+            "### 能力声明",
+            "`capability_claim`",
+            "`inferred`",
+            "退回到更弱的状态",
+            "bedrock-model-capability-review",
+            "### 生成物不会进入提交",
+            "拒绝信息点名这些路径",
+            "git restore --staged",
+        ],
+    );
+}
+
+/// The navigation gate is off by default, so a user who never reads this page never
+/// meets it. That makes the page the only place the three modes and the `.codegraph`
+/// precondition are written down for a human, and a page that named the key without
+/// its precondition would send someone to turn `strict` on in a repository with no
+/// index and conclude the gate does nothing.
+#[test]
+fn configuration_reference_documents_the_navigation_gate() {
+    contains_all(
+        "docs/reference/configuration.md",
+        &[
+            "## Source navigation and the CodeGraph index",
+            "`navigation.codegraph`",
+            "`off` (default)",
+            "`advise`",
+            "`strict`",
+            "inert unless the worktree root carries a `.codegraph` directory",
+            "including `codegraph status`",
+            "satisfy the gate nor violate it",
+            "tracked per session",
+        ],
+    );
+}
+
+/// A built-in Skill count is the one fact on these pages that a new Skill falsifies,
+/// and three pages carry it. Pinning the count together with the newest name keeps a
+/// reader from trusting a list that silently stopped being complete.
+#[test]
+fn skill_pages_count_every_built_in_skill() {
+    contains_all(
+        "docs/guide/skills.md",
+        &[
+            "compiles eleven first-party Skills",
+            "`bedrock-model-capability-review`",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/skills.md",
+        &["十一个第一方 Skill", "`bedrock-model-capability-review`"],
+    );
+    contains_all(
+        "docs/reference/configuration.md",
+        &[
+            "compiles eleven original first-party Skills",
+            "`bedrock-model-capability-review`",
         ],
     );
 }

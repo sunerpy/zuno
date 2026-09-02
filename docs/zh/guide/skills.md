@@ -121,7 +121,7 @@ warning，直到文件修复。
 
 ## 内置 Skill
 
-Zuno 把十个第一方 Skill 编译进 `zuno-orchestration` 包：`customize-zuno`、`develop-zuno`、`deepwork`、`codemap`、`verification-planning`、`reflect`、`worktree`、`git-workflow`、`github-delivery` 和 `ui-design`。
+Zuno 把十一个第一方 Skill 编译进 `zuno-orchestration` 包：`customize-zuno`、`develop-zuno`、`deepwork`、`codemap`、`verification-planning`、`reflect`、`worktree`、`git-workflow`、`github-delivery`、`ui-design` 和 `bedrock-model-capability-review`。
 
 每一个都有稳定的 `builtin://zuno-orchestration/...` 来源、内容哈希、来源溯源、允许的 Agent profile，以及所需工具声明。它们被编译进可执行文件，不会复制到你的配置目录，因此随二进制一起更新。把其中一个复制到用户 Skill 目录来「覆盖」它，只会造成同名来源歧义。
 

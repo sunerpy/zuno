@@ -157,9 +157,10 @@ cannot shadow a runtime control such as `/compact` or `/plan`.
 
 ## Built-in Skills
 
-Zuno compiles ten first-party Skills into the `zuno-orchestration` pack:
+Zuno compiles eleven first-party Skills into the `zuno-orchestration` pack:
 `customize-zuno`, `develop-zuno`, `deepwork`, `codemap`, `verification-planning`,
-`reflect`, `worktree`, `git-workflow`, `github-delivery`, and `ui-design`.
+`reflect`, `worktree`, `git-workflow`, `github-delivery`, `ui-design`, and
+`bedrock-model-capability-review`.
 
 Each has a stable `builtin://zuno-orchestration/...` source, a content hash, provenance,
 allowed agent profiles, and a required-tool declaration. They are compiled into the
