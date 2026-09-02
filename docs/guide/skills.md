@@ -54,6 +54,12 @@ ACP. Installing, editing, deleting, or renaming a Skill in an already-effective
 root is visible without restarting the session. A malformed edit retains the
 last valid entry and exposes a warning until the file is repaired.
 
+Roots that do not exist at session start are also supported. Zuno watches only
+their nearest existing ancestor non-recursively, narrows the subscription as
+directories appear, and enables recursive watching only at the exact configured
+root. Missing `~/.zuno` or `~/.agents` directories therefore do not cause a
+recursive scan of the whole home directory.
+
 If a caller tries to load an old exact source after a rename, Zuno refreshes
 once and then returns `CatalogStale` with the current exact locators. It never
 guesses between duplicate names.

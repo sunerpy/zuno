@@ -192,11 +192,12 @@ impl SkillOptions {
         &self.urls
     }
 
-    /// Existing roots, or their nearest existing parent, that can change discovery.
+    /// Logical roots that can change discovery, including roots not created yet.
     ///
-    /// The list is de-duplicated and removes nested roots when an existing parent is
-    /// already watched recursively. It never invents a source outside the standard,
-    /// configured, or remote-cache scopes used by [`SkillSources::discover`].
+    /// The list is de-duplicated and removes nested roots only when an existing
+    /// parent is already watched recursively. Missing roots retain their exact
+    /// identity so `zuno-watch` can follow them through non-recursive ancestor
+    /// subscriptions instead of recursively watching an unrelated home directory.
     #[must_use]
     pub fn watch_roots(&self) -> Vec<PathBuf> {
         let mut candidates = vec![
@@ -221,12 +222,16 @@ impl SkillOptions {
 
         let mut roots = candidates
             .into_iter()
-            .filter_map(nearest_existing_watch_root)
+            .filter_map(watch_target)
+            .map(|path| canonical_or_normalized(&path))
             .collect::<Vec<_>>();
         roots.sort_by_key(|path| path.components().count());
         let mut deduplicated = Vec::<PathBuf>::new();
         for root in roots {
-            if deduplicated.iter().any(|parent| root.starts_with(parent)) {
+            if deduplicated
+                .iter()
+                .any(|parent| root == *parent || (parent.is_dir() && root.starts_with(parent)))
+            {
                 continue;
             }
             deduplicated.push(root);
@@ -296,15 +301,17 @@ struct EffectivePathConfig {
     exposure: Option<SkillCatalogExposure>,
 }
 
-fn nearest_existing_watch_root(mut path: PathBuf) -> Option<PathBuf> {
-    loop {
-        if path.is_dir() {
-            path.parent()?;
-            return Some(std::fs::canonicalize(&path).unwrap_or(path));
-        }
-        if !path.pop() {
-            return None;
-        }
+fn watch_target(mut path: PathBuf) -> Option<PathBuf> {
+    if path.is_file()
+        || path
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"))
+    {
+        path.pop().then_some(path)
+    } else if path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(path)
     }
 }
 
@@ -990,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn path_config_for_a_future_skill_contributes_its_existing_watch_ancestor() {
+    fn path_config_for_a_future_skill_retains_its_exact_parent_target() {
         let fixture = Fixture::new();
         let project = fixture.dir.path().join("project");
         let external = fixture.dir.path().join("external");
@@ -1015,11 +1022,17 @@ mod tests {
                 recursive: None,
             }]);
 
-        let external = fs::canonicalize(external).expect("canonical external");
+        let future_parent = canonical_or_normalized(future.parent().expect("future parent"));
         assert!(
-            options.watch_roots().contains(&external),
+            options.watch_roots().contains(&future_parent),
             "{:?}",
             options.watch_roots()
+        );
+        assert!(
+            !options
+                .watch_roots()
+                .contains(&fs::canonicalize(external).expect("canonical external")),
+            "a missing target must not collapse into a recursive ancestor watch"
         );
     }
 }

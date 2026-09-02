@@ -103,6 +103,13 @@ session 级联删除，并进入 session export/import、sanitize 与 prune。TU
 
 搜索把遍历委托给 ripgrep 本身，Zuno 不维护第二个 ripgrep 兼容的遍历器。缺少 `rg` 是工具运行时的启动错误，而不是静默回退。
 
+## Skill catalog 热更新
+
+运行中的 Skill catalog 保留精确的逻辑根目录。根目录尚不存在时，只非递归监听最近的
+已有父目录；目录出现后，消费任务会在 native watcher 回调之外安全地逐级收窄订阅，
+并且只在精确根目录存在时开启递归监听。这样既能识别运行中新建的 `~/.zuno`、
+`~/.agents`、`skills.paths` 与远端缓存根，也不会在 TUI 首帧前递归扫描整个 home。
+
 Shell 执行受 OS 沙箱约束。`read-only` 与 `workspace-write` 都要求一个已验证的约束后端，不可用时拒绝启动而非降级。详见 [权限与沙箱](/zh/guide/permissions)。
 
 ## 常驻进程约束
