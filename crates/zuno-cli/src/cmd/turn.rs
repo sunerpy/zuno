@@ -52,9 +52,9 @@ use zuno_engine::compaction::{CompactionState, TokenWindow};
 use zuno_engine::dispatch::{AuthorizationPolicy, ToolRegistryDispatcher};
 use zuno_engine::driver::AgentDriver;
 use zuno_engine::r#loop::{
-    AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest,
-    ToolConcurrencyLimit, ToolDispatcher as _, ToolFailureRecovery, TurnContext, TurnError,
-    TurnEvent, TurnEventSender, TurnOutcome, TurnRecovery,
+    AgentModelResolver, NoticeSeverity, ResolvedAgent, ResolvedModel as EngineModel,
+    RunTurnRequest, ToolConcurrencyLimit, ToolDispatcher as _, ToolFailureRecovery, TurnContext,
+    TurnError, TurnEvent, TurnEventSender, TurnOutcome, TurnRecovery,
 };
 use zuno_engine::plan_driver::{
     PlanReconciliationDecision, PlanReconciliationDriver, PlanReconciliationInput,
@@ -2025,6 +2025,13 @@ pub(crate) struct TurnHost {
     compaction_state: CompactionState,
     window: TokenWindow,
     notes: Vec<String>,
+    /// Rule files that are not in force this turn, from the instruction admission.
+    ///
+    /// Reported as typed notices rather than folded into `notes`: "your remote rule
+    /// file did not load" is a statement about the request the model is about to
+    /// answer, and a surface that shows it as one status line among many is how the
+    /// fact went unnoticed before.
+    instruction_admission: InstructionAdmission,
     commands: zuno_catalog::command::Registry,
     goal_store: Arc<GoalStore>,
     goal_projection: GoalProjection,
@@ -3815,7 +3822,8 @@ impl TurnHost {
                 "zuno-extension::active-packages",
                 plan.extensions.prompt_section(),
             )?;
-            announce_instructions(&mut plan.resolver, &plan.instructions, &mut notes)?;
+            let instruction_admission =
+                announce_instructions(&mut plan.resolver, &plan.instructions, plan.window.context)?;
             let skill_snapshot = plan.skill_catalog.snapshot();
             announce_skills(
                 &mut plan.resolver,
@@ -4046,6 +4054,7 @@ impl TurnHost {
                 compaction_state: CompactionState::default(),
                 window: plan.window,
                 notes,
+                instruction_admission,
                 commands,
                 goal_store,
                 goal_projection,
@@ -6849,7 +6858,7 @@ impl TurnHost {
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, TurnFailure> {
         let outcome = self.run_prelude().await?;
-        report_prelude(&events, &self.notes, &outcome)
+        report_prelude(&events, &self.notes, &self.instruction_admission, &outcome)
             .await
             .map_err(TurnFailure::event_consumer)?;
         if !outcome.continue_turn {
@@ -7045,7 +7054,7 @@ impl TurnHost {
             Ok(_) => return Ok(None),
             Err(error) => return Err(error),
         };
-        report_prelude(&events, &self.notes, &prelude)
+        report_prelude(&events, &self.notes, &self.instruction_admission, &prelude)
             .await
             .map_err(TurnFailure::event_consumer)?;
         self.execute_turn_unaccounted(
@@ -9015,7 +9024,7 @@ fn ensure_selected_skill_prompt_budget(
     Ok(())
 }
 
-/// How many bytes of instruction files may enter the system prompt.
+/// Ceiling on the instruction bytes that may enter the system prompt.
 ///
 /// These are the rules the user wrote for this repository rather than a capability
 /// index, and the realistic corpus is larger than it looks: the `AGENTS.md` files on
@@ -9024,7 +9033,55 @@ fn ensure_selected_skill_prompt_budget(
 /// pathological file from consuming a small model's context.
 const INSTRUCTION_PROMPT_BUDGET: usize = 64 * 1024;
 
-/// Put the `AGENTS.md`-class rules in the system prompt, and say what did not fit.
+/// The share of a known model window instruction files may claim.
+///
+/// The ceiling above is an absolute byte count, which is the wrong shape on its own:
+/// 64 KB is a quarter of a 64,000-token window and under two percent of a one-million
+/// token one. Deriving a second limit from the window means a small model refuses an
+/// oversized rule file *here*, naming the file and its size, instead of assembling the
+/// request and failing later against the provider's context limit, where the reported
+/// cause is a total token count that names nothing the user can act on.
+const INSTRUCTION_CONTEXT_WINDOW_PERCENT: u64 = 25;
+
+/// The effective instruction budget for one model.
+///
+/// The smaller of [`INSTRUCTION_PROMPT_BUDGET`] and
+/// [`INSTRUCTION_CONTEXT_WINDOW_PERCENT`] of the window, so neither limit can be
+/// escaped by the other. An unknown window (`0`) keeps the absolute ceiling, because a
+/// derived share of an unknown quantity is not a limit — the provider stays the final
+/// authority there, exactly as it does for the skill budgets.
+fn instruction_prompt_budget(context_window: u64) -> usize {
+    if context_window == 0 {
+        return INSTRUCTION_PROMPT_BUDGET;
+    }
+    let derived = usize::try_from(
+        context_window
+            .saturating_mul(INSTRUCTION_CONTEXT_WINDOW_PERCENT)
+            .saturating_div(100),
+    )
+    .unwrap_or(usize::MAX)
+    .saturating_mul(APPROX_BYTES_PER_TOKEN);
+    derived.min(INSTRUCTION_PROMPT_BUDGET)
+}
+
+/// What the instruction admission decided, for whatever surface reports the turn.
+///
+/// Only the non-fatal outcome needs carrying: everything admitted is already recorded
+/// in `session.prompt.assembled` and recoverable with `zuno debug prompt`, and
+/// everything refused fails the turn before this value exists.
+#[derive(Debug, Default)]
+pub(crate) struct InstructionAdmission {
+    degraded: Vec<(String, String)>,
+}
+
+impl InstructionAdmission {
+    /// Rule sources that are **not** in force this turn, each with its reason.
+    pub(crate) fn degraded(&self) -> &[(String, String)] {
+        &self.degraded
+    }
+}
+
+/// Put the `AGENTS.md`-class rules in the system prompt, or refuse to take the turn.
 ///
 /// # Placement: after memory, before the skill catalogue
 ///
@@ -9039,30 +9096,74 @@ const INSTRUCTION_PROMPT_BUDGET: usize = 64 * 1024;
 /// here is agent prompt, memory, instructions, skills, which maps one-to-one onto the
 /// oracle's.
 ///
-/// # Whole files are admitted or dropped, never cut
+/// # A rule that cannot be admitted stops the turn
 ///
-/// [`announce_skills`] may drop individual skills because each is independent and an
-/// unmentioned skill merely goes unused. A rule file cut mid-sentence is worse than
-/// an absent one: "do X unless Y" truncated after "do X" inverts the rule the user
-/// wrote, while they go on believing it is in force. So the budget admits complete
-/// blocks in discovery order and names, by path and size, every file it had to leave
-/// out. Admitted contents are persisted in `session.prompt.assembled`, because
-/// model-visible input must remain reconstructable. They are not printed to the
-/// operational log.
+/// Whole files are admitted or refused, never cut. A rule file cut mid-sentence is
+/// worse than an absent one: "do X unless Y" truncated after "do X" inverts the rule
+/// the user wrote, while they go on believing it is in force.
 ///
-/// Warnings from the load ([`zuno_config::WarningKind`]) are surfaced the same way. A
-/// *missing* instruction file never reaches here at all, because discovery only
+/// Dropping the file and continuing has the same defect one step later, which is why
+/// this function no longer does it. The drop was reported, but only as one status
+/// detail among a turn's worth of them, and the request went to the provider anyway
+/// with the user's rules absent — so the model answered confidently under rules it had
+/// never seen, and the session's conclusions were wrong for a reason invisible in its
+/// own transcript. Refusing before the first provider request is the same treatment
+/// [`ensure_selected_skill_prompt_budget`] already gives an oversized Skill body, and
+/// an instruction file is the more authoritative of the two: a Skill that does not
+/// load merely goes unused.
+///
+/// Two conditions therefore fail the turn, each naming the path, the size and the
+/// remedy:
+///
+/// - a local file that exists but could not be read, because discovery records only
+///   paths that are there, so an unreadable one is a rule the user wrote and can fix;
+/// - any entry that does not fit [`instruction_prompt_budget`].
+///
+/// # A failed remote fetch is reported, not fatal
+///
+/// [`zuno_config::WarningKind::RemoteTimeout`], `RemoteStatus` and `RemoteTransport`
+/// describe a network, not a mistake in the workspace. Failing the turn on them would
+/// make an offline machine unusable and would hand the network authority over whether
+/// the agent runs at all. They are returned in [`InstructionAdmission::degraded`] so
+/// the surface can say which rules are not in force, and the turn proceeds.
+///
+/// A *missing* instruction file never reaches here at all, because discovery only
 /// records paths that exist — which is what keeps the common case, a project with no
 /// `AGENTS.md`, completely silent.
+///
+/// # Errors
+///
+/// An unreadable local rule file, an entry past the effective budget, or a rejection
+/// from [`Resolver::append_prompt_section`]. Contents are never echoed in the message:
+/// they are user-authored, and the path plus the byte count is what identifies the
+/// file to fix.
 fn announce_instructions(
     resolver: &mut Resolver,
     loaded: &zuno_config::LoadedInstructions,
-    notes: &mut Vec<String>,
-) -> Result<(), String> {
+    context_window: u64,
+) -> Result<InstructionAdmission, String> {
+    let mut admission = InstructionAdmission::default();
     for warning in loaded.warnings() {
-        notes.push(format!("warning: {warning}"));
+        match warning.kind() {
+            zuno_config::WarningKind::Unreadable(kind) => {
+                return Err(format!(
+                    "instruction file {} could not be read ({kind:?}), so none of its rules \
+                     would be in force; fix its permissions or encoding, or remove it from \
+                     `instructions`",
+                    warning.source(),
+                ));
+            }
+            zuno_config::WarningKind::RemoteTimeout
+            | zuno_config::WarningKind::RemoteStatus(_)
+            | zuno_config::WarningKind::RemoteTransport(_) => {
+                admission
+                    .degraded
+                    .push((warning.source().to_owned(), warning.to_string()));
+            }
+        }
     }
 
+    let budget = instruction_prompt_budget(context_window);
     let mut admitted_bytes = 0usize;
     for (index, entry) in loaded.entries().iter().enumerate() {
         let block = entry.render();
@@ -9071,15 +9172,14 @@ fn announce_instructions(
         } else {
             admitted_bytes + 2 + block.len()
         };
-        if projected > INSTRUCTION_PROMPT_BUDGET {
-            notes.push(format!(
-                "warning: instruction file {} ({} bytes) did not fit the \
-                 {INSTRUCTION_PROMPT_BUDGET}-byte prompt budget, so none of its rules are in \
-                 force; shorten it or remove it from `instructions`",
+        if projected > budget {
+            return Err(format!(
+                "instruction file {} ({} bytes) does not fit the {budget}-byte prompt budget \
+                 for this model, so none of its rules would be in force; shorten it or remove \
+                 it from `instructions`",
                 entry.source(),
                 block.len(),
             ));
-            continue;
         }
         admitted_bytes = projected;
         let origin = match entry.origin() {
@@ -9096,7 +9196,7 @@ fn announce_instructions(
         )?;
     }
 
-    Ok(())
+    Ok(admission)
 }
 
 fn configure_resident_memory(
@@ -9212,8 +9312,19 @@ fn without_credential(message: String, credential: Option<&str>) -> String {
 async fn report_prelude(
     events: &TurnEventSender,
     notes: &[String],
+    instructions: &InstructionAdmission,
     outcome: &PreludeOutcome,
 ) -> Result<(), String> {
+    for (source, reason) in instructions.degraded() {
+        events
+            .publish(TurnEvent::Notice {
+                severity: NoticeSeverity::Warning,
+                code: "instruction.not_in_force".to_owned(),
+                detail: format!("{reason}; none of the rules in {source} apply to this turn"),
+            })
+            .await
+            .map_err(to_string)?;
+    }
     let mut details: Vec<String> = notes.to_vec();
     if let Some(title) = &outcome.title {
         events

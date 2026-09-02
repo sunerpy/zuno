@@ -77,6 +77,30 @@ dropped from the result. It never fails the load, because a flaky URL in a confi
 must not make the agent unusable. Local reads and remote fetches are both bounded and
 concurrent, with a per-URL timeout.
 
+## When a rule file stops the turn
+
+A rule file is admitted whole or not at all. Zuno never truncates one, because a rule
+cut mid-sentence states something else: "do X unless Y" trimmed after "do X" is a
+different instruction, and the user goes on believing the original is in force.
+
+Two conditions fail the turn before the first provider request, each naming the file,
+its size, and the remedy:
+
+- the file exists but cannot be read, for example a permission error or bytes that are
+  not valid UTF-8;
+- the file does not fit the instruction prompt budget, which is the smaller of 64 KB
+  and a quarter of the model's context window.
+
+Neither is a warning. Sending the request anyway would put the model to work under
+rules it never received, and its answer would read as confident while being wrong for a
+reason nothing in the transcript shows. A failed remote fetch is the documented
+exception: it reports which rules are not in force and the turn proceeds, because a
+network must not decide whether the agent runs at all.
+
+The budget is per model, so the same file can be admitted by a large-window model and
+refused by a small one. The refusal states the byte count and the budget, which makes
+the fix either a shorter file or a model with more room.
+
 ## First run
 
 On the first ordinary discovery, Zuno creates a missing global `AGENTS.md` from its

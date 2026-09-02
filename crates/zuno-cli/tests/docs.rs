@@ -1050,3 +1050,39 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
         );
     }
 }
+
+/// Both instruction guides must state that an inadmissible rule file stops the turn.
+///
+/// The behaviour is the opposite of what it was — a dropped file used to be a warning
+/// the turn survived — so a stale guide here does not merely omit a detail. It tells a
+/// user their oversized `AGENTS.md` is silently ignored, which is the exact belief the
+/// change exists to correct, and the English and Chinese pages must not disagree about
+/// which of the two outcomes they will get.
+#[test]
+fn instruction_guides_document_the_fail_closed_admission() {
+    contains_all(
+        "docs/config/instructions.md",
+        &[
+            "## When a rule file stops the turn",
+            "admitted whole or not at all",
+            "fail the turn before the first provider request",
+            "cannot be read",
+            "smaller of 64 KB",
+            "quarter of the model's context window",
+            "Neither is a warning",
+            "failed remote fetch is the documented",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/instructions.md",
+        &[
+            "## 什么情况下规则文件会中止本轮",
+            "要么整份进入 Prompt，要么完全不进入",
+            "第一次 provider request 之前让本轮失败",
+            "无法读取",
+            "64 KB 与模型 context window 四分之一",
+            "两者都不是警告",
+            "远端抓取失败是上文记录的例外",
+        ],
+    );
+}

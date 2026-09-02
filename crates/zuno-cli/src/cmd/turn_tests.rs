@@ -2124,7 +2124,6 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
             "body",
         )]);
     let mut resolver = traced_resolver("AGENT");
-    let mut notes = Vec::new();
     configure_resident_memory(
         &mut resolver,
         &zuno_config::schema::Config::default(),
@@ -2138,7 +2137,7 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
             zuno_extension::ResolvedExtensions::default().prompt_section(),
         )
         .expect("inject extension provenance");
-    announce_instructions(&mut resolver, &loaded, &mut notes).expect("inject instructions");
+    let admission = announce_instructions(&mut resolver, &loaded, 0).expect("inject instructions");
     announce_skills(&mut resolver, &skills, 0, None).expect("inject skills");
 
     let assembly = resolver
@@ -2184,7 +2183,11 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
     assert_eq!(assembly.sections()[3].source(), "zuno skill trigger policy");
     assert_eq!(assembly.sections()[4].source(), "discovered skill index");
     assert_eq!(resolver.system_prompt, assembly.render());
-    assert!(notes.is_empty(), "{notes:?}");
+    assert!(
+        admission.degraded().is_empty(),
+        "{:?}",
+        admission.degraded()
+    );
 }
 
 /// Two models under one provider, with `title` overridden to the smaller one.
@@ -8076,12 +8079,32 @@ mod instruction_prompt {
         traced_resolver("AGENT PROMPT")
     }
 
-    async fn inject(options: &zuno_config::InstructionOptions) -> (Resolver, Vec<String>) {
+    /// Admit with an unknown model window, so the absolute ceiling is the only limit.
+    async fn inject(options: &zuno_config::InstructionOptions) -> (Resolver, InstructionAdmission) {
+        admit(options, 0).await.expect("announce instructions")
+    }
+
+    /// Admit against a stated window, returning the refusal instead of panicking on it.
+    async fn admit(
+        options: &zuno_config::InstructionOptions,
+        context_window: u64,
+    ) -> Result<(Resolver, InstructionAdmission), String> {
         let loaded = zuno_config::Instructions::discover(options).load().await;
         let mut resolver = resolver();
-        let mut notes = Vec::new();
-        announce_instructions(&mut resolver, &loaded, &mut notes).expect("announce instructions");
-        (resolver, notes)
+        let admission = announce_instructions(&mut resolver, &loaded, context_window)?;
+        Ok((resolver, admission))
+    }
+
+    /// The refusal, for the files that must never reach a provider request.
+    ///
+    /// A helper rather than `expect_err` because the success arm carries a `Resolver`,
+    /// and making the whole prompt assembly `Debug` to print a panic message is the
+    /// wrong trade.
+    async fn refuse(options: &zuno_config::InstructionOptions, context_window: u64) -> String {
+        match admit(options, context_window).await {
+            Ok(_) => panic!("the instruction admission accepted a file it must refuse"),
+            Err(error) => error,
+        }
     }
 
     #[tokio::test]
@@ -8091,7 +8114,7 @@ mod instruction_prompt {
         write(&global, "GLOBAL_RULE_MARKER");
         std::fs::create_dir_all(root.path().join("repo")).expect("mkdir repo");
 
-        let (resolver, notes) =
+        let (resolver, admission) =
             inject(&options(root.path(), root.path().join("repo"), Vec::new())).await;
 
         assert!(
@@ -8111,7 +8134,11 @@ mod instruction_prompt {
             "the oracle's header must name the source: {}",
             resolver.system_prompt
         );
-        assert!(notes.is_empty(), "{notes:?}");
+        assert!(
+            admission.degraded().is_empty(),
+            "{:?}",
+            admission.degraded()
+        );
     }
 
     #[tokio::test]
@@ -8121,7 +8148,8 @@ mod instruction_prompt {
         write(&repo.join("AGENTS.md"), "ROOT_RULE_MARKER");
         write(&fixture_path(&repo, "sub/AGENTS.md"), "SUB_RULE_MARKER");
 
-        let (resolver, notes) = inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
+        let (resolver, admission) =
+            inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
 
         let sub_at = resolver
             .system_prompt
@@ -8136,7 +8164,11 @@ mod instruction_prompt {
             "the project cascade must render root to cwd so the nearest rule has the highest later priority: {}",
             resolver.system_prompt
         );
-        assert!(notes.is_empty(), "{notes:?}");
+        assert!(
+            admission.degraded().is_empty(),
+            "{:?}",
+            admission.degraded()
+        );
     }
 
     /// Cross-product instruction files never participate in Zuno's native cascade.
@@ -8147,7 +8179,8 @@ mod instruction_prompt {
         write(&repo.join("AGENTS.md"), "ROOT_RULE_MARKER");
         write(&fixture_path(&repo, "sub/CLAUDE.md"), "SUB_CLAUDE_MARKER");
 
-        let (resolver, notes) = inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
+        let (resolver, admission) =
+            inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
 
         assert!(
             resolver.system_prompt.contains("ROOT_RULE_MARKER"),
@@ -8159,7 +8192,11 @@ mod instruction_prompt {
             "Zuno must not load `CLAUDE.md` implicitly: {}",
             resolver.system_prompt
         );
-        assert!(notes.is_empty(), "{notes:?}");
+        assert!(
+            admission.degraded().is_empty(),
+            "{:?}",
+            admission.degraded()
+        );
     }
 
     #[tokio::test]
@@ -8175,7 +8212,7 @@ mod instruction_prompt {
             "TILDE_RULE_MARKER",
         );
 
-        let (resolver, notes) = inject(&options(
+        let (resolver, admission) = inject(&options(
             root.path(),
             repo,
             vec!["docs/*.md".to_owned(), "~/tilde-rules.md".to_owned()],
@@ -8192,7 +8229,11 @@ mod instruction_prompt {
             "a `~/`-relative `instructions` entry never reached the prompt: {}",
             resolver.system_prompt
         );
-        assert!(notes.is_empty(), "{notes:?}");
+        assert!(
+            admission.degraded().is_empty(),
+            "{:?}",
+            admission.degraded()
+        );
     }
 
     /// The common case — no rule file anywhere — must cost nothing and say nothing.
@@ -8206,7 +8247,7 @@ mod instruction_prompt {
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
 
-        let (resolver, notes) = inject(&options(root.path(), repo, Vec::new())).await;
+        let (resolver, admission) = inject(&options(root.path(), repo, Vec::new())).await;
 
         assert_eq!(
             resolver.system_prompt.as_bytes(),
@@ -8214,51 +8255,51 @@ mod instruction_prompt {
             "an absent instruction file must add no bytes at all"
         );
         assert!(
-            notes.is_empty(),
-            "a missing rule file is the normal case and must be silent: {notes:?}"
+            admission.degraded().is_empty(),
+            "a missing rule file is the normal case and must be silent: {:?}",
+            admission.degraded()
         );
     }
 
-    /// An unreadable file is reported, once, and never silently skipped.
+    /// An unreadable rule file stops the turn instead of being reported and skipped.
     ///
     /// A rule the user wrote and believes is in force, that the agent never received,
     /// is the worst of the three outcomes — worse than a hard failure, which they would
-    /// at least notice. The count matters as much as the text: this is surfaced from a
-    /// load that happens once per host, not once per turn.
+    /// at least notice. So this is the hard failure. Discovery records only paths that
+    /// exist, so an unreadable one is a file that is really there and really meant to
+    /// apply; continuing would send the request under rules the model never saw.
     #[tokio::test]
-    async fn an_unreadable_rule_file_is_reported_exactly_once() {
+    async fn an_unreadable_rule_file_stops_the_turn_before_the_provider_is_called() {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
         let repo = root.path().join("repo");
         write(&repo.join("AGENTS.md"), [0xff_u8, 0xfe, 0x00, 0x9c]);
 
-        let (resolver, notes) = inject(&options(root.path(), repo.clone(), Vec::new())).await;
+        let error = refuse(&options(root.path(), repo.clone(), Vec::new()), 0).await;
 
-        assert_eq!(
-            resolver.system_prompt.as_bytes(),
-            b"AGENT PROMPT",
-            "an unreadable file must not contribute bytes"
-        );
-        assert_eq!(
-            notes.len(),
-            1,
-            "an unreadable rule file must be reported once — no more, and never zero: \
-             {notes:?}"
+        assert!(
+            error.contains(&repo.join("AGENTS.md").display().to_string()),
+            "the refusal must name the file the user has to fix: {error}"
         );
         assert!(
-            notes[0].contains(&repo.join("AGENTS.md").display().to_string()),
-            "the report must name the file the user has to fix: {}",
-            notes[0]
+            error.contains("could not be read"),
+            "the refusal must say what went wrong: {error}"
         );
         assert!(
-            notes[0].contains("could not be read"),
-            "the report must say what went wrong: {}",
-            notes[0]
+            error.contains("in force"),
+            "the refusal must say the rules do not apply, not merely that a read failed: \
+             {error}"
         );
     }
 
-    /// Past the budget a whole file is dropped and named — never cut mid-rule.
+    /// Past the budget the turn stops: a whole file is never cut, and never dropped.
+    ///
+    /// Dropping and continuing was the previous behaviour, and it reported the drop —
+    /// but as one status line among a turn's worth of them, after which the request
+    /// went to the provider with the user's rules absent. Refusing here is the same
+    /// treatment an oversized Skill body already gets, and a rule file outranks a
+    /// Skill.
     #[tokio::test]
-    async fn an_oversized_rule_file_is_dropped_whole_and_the_drop_is_reported() {
+    async fn a_rule_file_past_the_budget_stops_the_turn_rather_than_being_dropped() {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
         let repo = root.path().join("repo");
         let oversized = repo.join("AGENTS.md");
@@ -8274,40 +8315,112 @@ mod instruction_prompt {
             "SMALL_RULE_MARKER",
         );
 
-        let (resolver, notes) =
-            inject(&options(root.path(), repo, vec!["~/small.md".to_owned()])).await;
+        let error = refuse(
+            &options(root.path(), repo, vec!["~/small.md".to_owned()]),
+            0,
+        )
+        .await;
 
         assert!(
-            !resolver.system_prompt.contains("OVERSIZED_RULE_MARKER"),
-            "a file past the budget must be dropped whole, not truncated into a rule \
-             that says something else"
+            error.contains(&oversized.display().to_string()),
+            "the refusal must name the file: {error}"
         );
         assert!(
-            resolver.system_prompt.len() <= "AGENT PROMPT".len() + 2 + INSTRUCTION_PROMPT_BUDGET,
-            "the prompt exceeded the budget: {} bytes",
-            resolver.system_prompt.len()
+            error.contains(&INSTRUCTION_PROMPT_BUDGET.to_string()),
+            "the refusal must state the budget the file has to fit: {error}"
         );
         assert!(
-            resolver.system_prompt.contains("SMALL_RULE_MARKER"),
-            "one oversized file must not starve the rest: {}",
+            error.contains("in force"),
+            "the refusal must say the rules do not apply: {error}"
+        );
+        assert!(
+            !error.contains("OVERSIZED_RULE_MARKER"),
+            "instruction contents are user-authored and must never be echoed: {error}"
+        );
+    }
+
+    /// The same file can fit a large model and be refused by a small one.
+    ///
+    /// The absolute ceiling alone is the wrong shape: 64 KB is a rounding error in a
+    /// million-token window and half the usable prompt in a small one. The refusal
+    /// belongs here, naming the file, rather than later as a total token count that
+    /// names nothing.
+    #[tokio::test]
+    async fn a_rule_file_within_the_ceiling_is_still_refused_by_a_small_model_window() {
+        let root = tempfile::TempDir::new().expect("temporary instruction root");
+        let repo = root.path().join("repo");
+        write(
+            &repo.join("AGENTS.md"),
+            format!("WINDOWED_RULE_MARKER{}", "r".repeat(20 * 1024)),
+        );
+
+        let (resolver, admission) = admit(&options(root.path(), repo.clone(), Vec::new()), 0)
+            .await
+            .expect("20 KB fits the absolute ceiling");
+        assert!(
+            resolver.system_prompt.contains("WINDOWED_RULE_MARKER"),
+            "a file inside the ceiling must be admitted when the window is unknown"
+        );
+        assert!(
+            admission.degraded().is_empty(),
+            "{:?}",
+            admission.degraded()
+        );
+
+        let error = refuse(&options(root.path(), repo, Vec::new()), 16_000).await;
+        assert!(
+            error.contains("prompt budget for this model"),
+            "the refusal must attribute the limit to the model, not to a global constant: \
+             {error}"
+        );
+    }
+
+    /// A remote rule file that will not load is reported, and the turn still runs.
+    ///
+    /// The distinction that matters: an unreadable local file is a mistake in the
+    /// workspace, which the user can fix and which stops the turn. A failed fetch is a
+    /// network, and failing on it would hand the network authority over whether the
+    /// agent runs at all — an offline machine would have no working session.
+    #[tokio::test]
+    async fn a_remote_rule_file_that_cannot_be_fetched_is_reported_and_the_turn_continues() {
+        let root = tempfile::TempDir::new().expect("temporary instruction root");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        write(
+            &fixture_path(root.path(), "home/small.md"),
+            "LOCAL_RULE_MARKER",
+        );
+
+        let (resolver, admission) = admit(
+            &options(
+                root.path(),
+                repo,
+                vec![
+                    "~/small.md".to_owned(),
+                    "https://example.invalid/remote.md".to_owned(),
+                ],
+            ),
+            0,
+        )
+        .await
+        .expect("a failed fetch must not stop the turn");
+
+        assert!(
+            resolver.system_prompt.contains("LOCAL_RULE_MARKER"),
+            "an unreachable remote file must not starve the local rules: {}",
             resolver.system_prompt
         );
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(
-            notes[0].contains(&oversized.display().to_string()),
-            "the report must name the file: {}",
-            notes[0]
+        assert_eq!(
+            admission.degraded().len(),
+            1,
+            "the unreachable file must be reported once: {:?}",
+            admission.degraded()
         );
-        assert!(
-            notes[0].contains("none of its rules are in force"),
-            "the report must say the rules are not in effect, not merely that bytes were \
-             trimmed: {}",
-            notes[0]
-        );
-        assert!(
-            !notes[0].contains("OVERSIZED_RULE_MARKER"),
-            "instruction contents are user-authored and must never be echoed: {}",
-            notes[0]
+        assert_eq!(
+            admission.degraded()[0].0,
+            "https://example.invalid/remote.md",
+            "the report must name the source that is not in force: {:?}",
+            admission.degraded()
         );
     }
 }
