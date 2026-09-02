@@ -1118,6 +1118,11 @@ fn durable_state_guides_document_evidence_gated_completion() {
             "no provider can withhold",
             "whether or not a Goal is active",
             "no durable counter to",
+            "Nor is a session whose goal has finished",
+            "does not stop a turn",
+            "pause a goal the",
+            "still charged to the goal",
+            "`budget_limited` is the exception",
             "### Capability claims",
             "`capability_claim`",
             "`inferred`",
@@ -1156,6 +1161,11 @@ fn durable_state_guides_document_evidence_gated_completion() {
             "provider 无法扣下的边界",
             "没有 Goal 的回合一样可以空转",
             "没有可供记账的持久计数器",
+            "Goal 已经结束的会话同样不受影响",
+            "不会让回合停止",
+            "还会把模型已经完成的 Goal 改回暂停",
+            "响应仍然会记账到这个 Goal 上",
+            "`budget_limited` 是例外",
             "### 能力声明",
             "`capability_claim`",
             "`inferred`",
@@ -1173,6 +1183,24 @@ fn durable_state_guides_document_evidence_gated_completion() {
 /// precondition are written down for a human, and a page that named the key without
 /// its precondition would send someone to turn `strict` on in a repository with no
 /// index and conclude the gate does nothing.
+#[test]
+fn configuration_reference_documents_the_navigation_gate() {
+    contains_all(
+        "docs/reference/configuration.md",
+        &[
+            "## Source navigation and the CodeGraph index",
+            "`navigation.codegraph`",
+            "`off` (default)",
+            "`advise`",
+            "`strict`",
+            "inert unless the worktree root carries a `.codegraph` directory",
+            "including `codegraph status`",
+            "satisfy the gate nor violate it",
+            "tracked per session",
+        ],
+    );
+}
+
 /// The receipt's authority is the one shell fact a caller acts on, and the text-level
 /// downgrade is invisible from the configuration table above it. A guide that stops at
 /// `exitPolicy` teaches a reader to expect `authoritative` and read `derived` as a bug.
@@ -1197,24 +1225,6 @@ fn tool_guides_explain_what_the_command_s_own_text_takes_back() {
             "`$LASTEXITCODE` 里只剩后者的退出码",
             "它降为 `derived`",
             "什么都没掩盖",
-        ],
-    );
-}
-
-#[test]
-fn configuration_reference_documents_the_navigation_gate() {
-    contains_all(
-        "docs/reference/configuration.md",
-        &[
-            "## Source navigation and the CodeGraph index",
-            "`navigation.codegraph`",
-            "`off` (default)",
-            "`advise`",
-            "`strict`",
-            "inert unless the worktree root carries a `.codegraph` directory",
-            "including `codegraph status`",
-            "satisfy the gate nor violate it",
-            "tracked per session",
         ],
     );
 }

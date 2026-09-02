@@ -54,6 +54,7 @@
 //! no retry makes such state readable.
 
 use crate::error::GoalError;
+use crate::status::GoalStatus;
 use crate::store::{Goal, GoalStore};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -347,7 +348,8 @@ fn effective_budget(goal: &Goal, default_token_budget: Option<u64>) -> Option<(i
 /// observed, and the host's default budget.
 ///
 /// Ordered so the cheapest certainty wins. A session with no goal has nothing to
-/// charge and is left alone; the host's default is not applied to it because
+/// charge and is left alone, and so is a goal nobody is working on any more; the
+/// host's default is not applied to a session with no goal because
 /// there is no durable counter to apply it against, and a default enforced from an
 /// in-memory turn total would reset every turn and never bind. A goal with no
 /// budget of its own runs under the host's default, and under nothing when the
@@ -371,6 +373,20 @@ fn decide(
     let Some(goal) = goal else {
         return BudgetDecision::Continue;
     };
+    // A token budget bounds work towards an objective, so a goal that is no longer
+    // being worked towards does not spend one. Usage is still charged to it in every
+    // status, which is right — the tokens were spent against that goal — but the
+    // counter of a finished goal goes on rising through whatever conversation follows
+    // it, and the host's default is large enough that a long session crosses it.
+    // Stopping there would end turns no goal governs, on a limit nobody set, and the
+    // stop would rewrite the goal as well: the host pauses the goal on a token stop,
+    // so a goal the model had completed would come back paused. The store draws the
+    // same line — its own flip to `budget_limited` is guarded on `status = 'active'`
+    // — and `budget_limited` stays here because that status *is* the ceiling being
+    // held, and a turn must not resume through it.
+    if !matches!(goal.status, GoalStatus::Active | GoalStatus::BudgetLimited) {
+        return BudgetDecision::Continue;
+    }
     let Some((budget, source)) = effective_budget(goal, default_token_budget) else {
         return BudgetDecision::Continue;
     };
@@ -427,6 +443,7 @@ fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status::{ModelStatus, SystemStatus};
     use std::num::NonZeroU32;
     use std::time::Duration;
     use zuno_engine::budget::{BudgetStopKind, ProviderRequestUsage};
@@ -539,6 +556,57 @@ mod tests {
             .expect("decide");
 
         assert_eq!(decision, BudgetDecision::Continue);
+    }
+
+    #[tokio::test]
+    async fn a_goal_that_is_no_longer_being_worked_on_does_not_hold_the_turn() {
+        let fixture = fixture();
+        fixture
+            .store
+            .create_goal("ses_budget", "answer a question", None)
+            .expect("create goal");
+        // More than the host's default is charged to the goal, and then the goal ends.
+        // Every turn of the conversation that follows would otherwise stop on a limit
+        // belonging to work that is over.
+        fixture
+            .store
+            .record_usage("ses_budget", 5_000, 0, true)
+            .expect("record usage");
+        fixture
+            .store
+            .update_status_as_model("ses_budget", ModelStatus::Complete)
+            .expect("complete the goal");
+        let policy = under_default(&fixture.store, 1_000);
+        let snapshot = snapshot("turn-2", 0, 10, true);
+
+        assert_eq!(
+            policy.before_request(&snapshot).await.expect("decide"),
+            BudgetDecision::Continue
+        );
+        assert_eq!(
+            policy.after_response(&snapshot).await.expect("decide"),
+            BudgetDecision::Continue
+        );
+
+        // The response was still charged to the goal: the status decides whether the
+        // budget stops the turn, not whether the tokens are counted.
+        let goal = fixture
+            .store
+            .goal("ses_budget")
+            .expect("read the goal")
+            .expect("the session has a goal");
+        assert_eq!(goal.tokens_used, 5_010);
+
+        // The one status that is itself a spent ceiling still holds the turn.
+        fixture
+            .store
+            .set_status_as_system("ses_budget", SystemStatus::BudgetLimited)
+            .expect("set the budget limit");
+        let detail = expect_stop(
+            policy.before_request(&snapshot).await.expect("decide"),
+            BudgetStopKind::TokenBudget,
+        );
+        assert!(detail.contains("5010"), "{detail}");
     }
 
     #[tokio::test]

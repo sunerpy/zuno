@@ -274,6 +274,14 @@ A session with no goal is unaffected by the token default. There is no durable c
 charge it against, and a default enforced from an in-memory turn total would reset every turn
 and never bind.
 
+Nor is a session whose goal has finished. A budget bounds work towards an objective, so a goal
+that is complete, paused, blocked, cancelled or out of provider usage does not stop a turn. Its
+counter keeps rising through the conversation that follows, the default is large enough that a
+long session would cross it, and the stop would end turns no goal governs and pause a goal the
+model had completed. The response is still charged to the goal, because the tokens were spent
+against it. `budget_limited` is the exception: that status is a spent ceiling, and a turn must
+not resume through it.
+
 ### Human requests and autonomy
 
 An active Goal is autonomous by default and does not receive the ordinary synchronous
