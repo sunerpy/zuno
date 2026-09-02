@@ -461,6 +461,17 @@ Zuno ensures those exact sources are loaded and de-duplicates sources already pr
 in the durable prompt. A missing name or multiple visible sources with the same name
 fails child startup; Zuno never silently picks the first discovery result.
 
+The live Skill catalog preserves logical watch roots even before those directories
+exist. A missing root registers only the nearest existing ancestor and always does so
+non-recursively. After a filesystem event, the catalog consumer reconciles the
+subscription outside the native watcher callback, moves it one or more components
+toward the logical root, and enables recursion only when the exact root exists. Every
+move installs the narrower subscription before dropping the old one. This is the
+startup and hot-install invariant: creating `~/.zuno`, `~/.agents`, a configured
+`skills.paths` directory, or the remote cache remains observable, while an absent
+directory can never turn `$HOME` or another unrelated ancestor into a recursive scan
+before the first TUI frame.
+
 For example, a code-retrieval Agent may declare
 `requiredSkills: ["codegraph"]` so every child turn receives the CodeGraph operating
 instructions. That declaration grants no executable capability. CodeGraph MCP tools

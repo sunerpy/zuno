@@ -60,7 +60,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use notify::event::{ModifyKind, RenameMode};
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{
+    ErrorKind as NotifyErrorKind, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _,
+};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use zuno_paths::Env;
@@ -156,6 +158,7 @@ pub struct WatchOptions {
     root: PathBuf,
     vcs_dir: Option<PathBuf>,
     env: Env,
+    watch_missing_ancestors: bool,
     extra_ignore: Vec<String>,
     whitelist: Vec<String>,
     gitignore: bool,
@@ -174,6 +177,7 @@ impl WatchOptions {
             root: root.into(),
             vcs_dir: None,
             env: Env::from_process(),
+            watch_missing_ancestors: false,
             extra_ignore: Vec::new(),
             whitelist: Vec::new(),
             gitignore: false,
@@ -194,6 +198,20 @@ impl WatchOptions {
     #[must_use]
     pub fn env(mut self, env: Env) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Keep a requested directory live even when it does not exist yet.
+    ///
+    /// The watcher initially subscribes to the nearest existing ancestor
+    /// non-recursively. [`Watcher::reconcile`] moves that subscription closer as
+    /// missing path components appear, and switches to recursive mode only once
+    /// the requested directory itself exists. This preserves create-after-start
+    /// discovery without recursively watching an unrelated home or filesystem
+    /// tree.
+    #[must_use]
+    pub fn watch_missing_ancestors(mut self) -> Self {
+        self.watch_missing_ancestors = true;
         self
     }
 
@@ -329,8 +347,17 @@ pub struct Watcher {
     decision: Decision,
     shared: Arc<Shared>,
     filter: Arc<Filter>,
+    requested_root: PathBuf,
+    active_scope: Option<WatchScope>,
+    watch_missing_ancestors: bool,
     inner: Option<RecommendedWatcher>,
     flush: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WatchScope {
+    path: PathBuf,
+    recursive: bool,
 }
 
 /// The receiving end of the bounded publish channel.
@@ -427,6 +454,9 @@ impl Watcher {
                     decision,
                     shared,
                     filter,
+                    requested_root: options.root,
+                    active_scope: None,
+                    watch_missing_ancestors: options.watch_missing_ancestors,
                     inner: None,
                     flush: None,
                 },
@@ -434,7 +464,7 @@ impl Watcher {
             ));
         }
 
-        let inner = Self::spawn_notify(&options, &shared, &filter, &decision)?;
+        let (inner, active_scope) = Self::spawn_notify(&options, &shared, &filter, &decision)?;
         let flush = std::thread::Builder::new()
             .name("zuno-watch-flush".to_owned())
             .spawn({
@@ -451,6 +481,9 @@ impl Watcher {
                 decision,
                 shared,
                 filter,
+                requested_root: options.root,
+                active_scope,
+                watch_missing_ancestors: options.watch_missing_ancestors,
                 inner: Some(inner),
                 flush: Some(flush),
             },
@@ -464,7 +497,7 @@ impl Watcher {
         shared: &Arc<Shared>,
         filter: &Arc<Filter>,
         decision: &Decision,
-    ) -> Result<RecommendedWatcher, WatchError> {
+    ) -> Result<(RecommendedWatcher, Option<WatchScope>), WatchError> {
         let vcs_dir = options.vcs_dir.clone();
         let mut watcher = notify::recommended_watcher({
             let shared = Arc::clone(shared);
@@ -478,11 +511,12 @@ impl Watcher {
             source,
         })?;
 
-        if decision.watches_project() {
+        let active_scope = project_watch_scope(options, decision)?;
+        if let Some(scope) = active_scope.as_ref() {
             watcher
-                .watch(&options.root, RecursiveMode::Recursive)
+                .watch(&scope.path, recursive_mode(scope.recursive))
                 .map_err(|source| WatchError::Notify {
-                    path: options.root.clone(),
+                    path: scope.path.clone(),
                     source,
                 })?;
         }
@@ -498,7 +532,74 @@ impl Watcher {
                     source,
                 })?;
         }
-        Ok(watcher)
+        Ok((watcher, active_scope))
+    }
+
+    /// Reconcile an adaptive missing-directory subscription with the filesystem.
+    ///
+    /// Call this after receiving an event. It is intentionally not executed from
+    /// `notify`'s callback thread: some backends synchronously communicate with
+    /// their event loop when a watch is added, so reconfiguration from inside the
+    /// callback can deadlock. The new scope is installed before the old one is
+    /// removed, keeping the transition loss-resistant.
+    ///
+    /// Returns `true` when the active path or recursion mode changed.
+    pub fn reconcile(&mut self) -> Result<bool, WatchError> {
+        if !self.watch_missing_ancestors || !self.decision.watches_project() {
+            return Ok(false);
+        }
+        let desired =
+            adaptive_watch_scope(&self.requested_root).ok_or_else(|| WatchError::Notify {
+                path: self.requested_root.clone(),
+                source: notify::Error::path_not_found(),
+            })?;
+        if self.active_scope.as_ref() == Some(&desired) {
+            return Ok(false);
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(false);
+        };
+
+        inner
+            .watch(&desired.path, recursive_mode(desired.recursive))
+            .map_err(|source| WatchError::Notify {
+                path: desired.path.clone(),
+                source,
+            })?;
+
+        if let Some(previous) = self.active_scope.as_ref()
+            && previous.path != desired.path
+            && let Err(error) = inner.unwatch(&previous.path)
+            && !watch_is_already_gone(&error)
+        {
+            tracing::debug!(
+                path = %previous.path.display(),
+                %error,
+                "failed to remove superseded filesystem watch"
+            );
+        }
+        self.active_scope = Some(desired);
+        Ok(true)
+    }
+
+    /// The logical directory requested by the caller.
+    #[must_use]
+    pub fn requested_root(&self) -> &Path {
+        &self.requested_root
+    }
+
+    /// The directory currently registered with the platform watcher.
+    #[must_use]
+    pub fn active_root(&self) -> Option<&Path> {
+        self.active_scope.as_ref().map(|scope| scope.path.as_path())
+    }
+
+    /// Whether the current project subscription is recursive.
+    #[must_use]
+    pub fn watches_recursively(&self) -> bool {
+        self.active_scope
+            .as_ref()
+            .is_some_and(|scope| scope.recursive)
     }
 
     /// What the flags decided.
@@ -548,6 +649,68 @@ impl Watcher {
     pub fn pending(&self) -> usize {
         self.shared.lock().pending_len()
     }
+}
+
+fn project_watch_scope(
+    options: &WatchOptions,
+    decision: &Decision,
+) -> Result<Option<WatchScope>, WatchError> {
+    if !decision.watches_project() {
+        return Ok(None);
+    }
+    if options.watch_missing_ancestors {
+        return adaptive_watch_scope(&options.root)
+            .map(Some)
+            .ok_or_else(|| WatchError::Notify {
+                path: options.root.clone(),
+                source: notify::Error::path_not_found(),
+            });
+    }
+    Ok(Some(WatchScope {
+        path: options.root.clone(),
+        recursive: true,
+    }))
+}
+
+fn adaptive_watch_scope(requested: &Path) -> Option<WatchScope> {
+    let active = nearest_existing_directory(requested)?;
+    let requested = requested
+        .is_dir()
+        .then(|| std::fs::canonicalize(requested).unwrap_or_else(|_| requested.to_path_buf()));
+    Some(WatchScope {
+        recursive: requested.as_ref() == Some(&active),
+        path: active,
+    })
+}
+
+fn nearest_existing_directory(requested: &Path) -> Option<PathBuf> {
+    let mut candidate = requested.to_path_buf();
+    loop {
+        if candidate.is_dir() {
+            // Never turn a missing target into a subscription on the filesystem
+            // root. Even non-recursive root traffic is unrelated and too broad.
+            candidate.parent()?;
+            return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+        }
+        if !candidate.pop() {
+            return None;
+        }
+    }
+}
+
+const fn recursive_mode(recursive: bool) -> RecursiveMode {
+    if recursive {
+        RecursiveMode::Recursive
+    } else {
+        RecursiveMode::NonRecursive
+    }
+}
+
+fn watch_is_already_gone(error: &notify::Error) -> bool {
+    matches!(
+        error.kind,
+        NotifyErrorKind::PathNotFound | NotifyErrorKind::WatchNotFound
+    )
 }
 
 impl Drop for Watcher {

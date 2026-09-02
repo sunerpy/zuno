@@ -688,6 +688,81 @@ fn only_head_is_reported_from_the_vcs_directory() {
 }
 
 #[test]
+fn a_missing_root_advances_non_recursively_before_becoming_recursive() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let ancestor = dir.path().canonicalize().expect("canonical root");
+    let first = ancestor.join(".zuno");
+    let requested = first.join("skills");
+    let options = WatchOptions::new(&requested)
+        .env(zuno_paths::Env::empty().with("ZUNO_EXPERIMENTAL_FILEWATCHER", "true"))
+        .watch_missing_ancestors()
+        .debounce(Duration::from_millis(20))
+        .max_wait(Duration::from_millis(100));
+    let (mut watcher, mut stream) = Watcher::start(options).expect("adaptive watch starts");
+
+    assert_eq!(watcher.requested_root(), requested);
+    assert_eq!(watcher.active_root(), Some(ancestor.as_path()));
+    assert!(
+        !watcher.watches_recursively(),
+        "a missing child must never make its ancestor recursive"
+    );
+
+    let accepted = watcher.accepted();
+    fs::create_dir(&first).expect("first component");
+    assert!(
+        poll_until(Duration::from_secs(5), || watcher.accepted() > accepted),
+        "ancestor watch did not observe the first component"
+    );
+    assert!(watcher.reconcile().expect("move to first component"));
+    assert_eq!(
+        watcher.active_root(),
+        Some(first.canonicalize().expect("canonical first").as_path())
+    );
+    assert!(!watcher.watches_recursively());
+    let _first_events = drain_until_quiet(
+        &mut stream,
+        Duration::from_millis(100),
+        Duration::from_secs(2),
+    );
+
+    let accepted = watcher.accepted();
+    fs::create_dir(&requested).expect("requested root");
+    assert!(
+        poll_until(Duration::from_secs(5), || watcher.accepted() > accepted),
+        "narrowed watch did not observe the requested root"
+    );
+    assert!(watcher.reconcile().expect("move to requested root"));
+    assert_eq!(
+        watcher.active_root(),
+        Some(
+            requested
+                .canonicalize()
+                .expect("canonical requested")
+                .as_path()
+        )
+    );
+    assert!(
+        watcher.watches_recursively(),
+        "only the exact requested directory may become recursive"
+    );
+
+    let file = requested.join("nested/SKILL.md");
+    fs::create_dir_all(file.parent().expect("parent")).expect("nested");
+    assert!(
+        poll_until(Duration::from_secs(5), || {
+            fs::write(&file, b"skill").expect("skill write");
+            let (events, _) = drain_until_quiet(
+                &mut stream,
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+            );
+            tally(&events).0.contains_key(&file)
+        }),
+        "the final recursive scope did not observe a nested file"
+    );
+}
+
+#[test]
 fn dropping_the_watcher_closes_the_stream() {
     let fixture = Fixture::start(|options| options);
     let Fixture {

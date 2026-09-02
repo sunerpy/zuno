@@ -115,9 +115,11 @@ Zuno 按这个作用域顺序发现 Skill：
 
 每个运行中会话拥有一份不可变的
 `SkillCatalogSnapshot { generation, digest, skills, warnings }`。`zuno-watch`
-监听全部有效的本地 Skill 根目录与远端缓存根；如果合法根目录尚不存在，就监听最近的
-安全已有父目录。相关事件会防抖，watcher overflow 会触发完整重扫，新 generation
-一次性原子发布。
+监听全部有效的本地 Skill 根目录与远端缓存根；如果合法根目录尚不存在，只会以
+**非递归**方式监听最近的安全已有父目录。缺失目录逐级创建后，订阅会向逻辑根目录
+收窄，只有到达精确根目录才切换为递归监听。因此 Zuno 既能发现运行中新建的 Skill
+根目录，也不会在启动阶段扫描用户 home 的其他内容。相关事件会防抖，watcher
+overflow 会触发完整重扫，新 generation 一次性原子发布。
 
 Prompt 元数据、`requiredSkills`、斜杠命令、`skill` 工具、TUI 与 ACP 都读取同一份
 快照。因此新增、修改、删除或重命名 Skill 后，现有会话无需重启即可识别。一个损坏或

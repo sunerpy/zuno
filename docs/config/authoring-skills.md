@@ -133,9 +133,13 @@ Zuno-native `.zuno` roots stay enabled under the broad external switch.
 Each running session owns one immutable
 `SkillCatalogSnapshot { generation, digest, skills, warnings }`. `zuno-watch`
 observes every effective local Skill root and remote-cache root; when a valid
-root does not exist yet, it observes the nearest safe existing parent. Relevant
-events are debounced, watcher overflow forces a complete rescan, and the next
-generation is published atomically.
+root does not exist yet, it observes the nearest safe existing parent
+**non-recursively**. The subscription moves toward the logical root as missing
+directories are created and becomes recursive only at the exact root. Zuno
+therefore notices a newly created Skill root without scanning the rest of the
+user home directory during startup. Relevant events are debounced, watcher
+overflow forces a complete rescan, and the next generation is published
+atomically.
 
 Prompt metadata, `requiredSkills`, slash commands, the `skill` tool, TUI, and
 ACP all read that same snapshot. Adding, editing, deleting, or renaming a Skill

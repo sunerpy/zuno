@@ -60,7 +60,7 @@ pub struct SkillCatalogService {
     refresh: AsyncMutex<()>,
     watcher_warnings: Mutex<Vec<SkillWarning>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    watchers: Mutex<Vec<Watcher>>,
+    watchers: Mutex<Vec<Arc<Mutex<Watcher>>>>,
 }
 
 impl std::fmt::Debug for SkillCatalogService {
@@ -191,15 +191,21 @@ impl SkillCatalogService {
                 .env()
                 .clone()
                 .with(ZUNO_EXPERIMENTAL_FILEWATCHER, "true");
-            match Watcher::start(WatchOptions::new(&root).env(watch_env)) {
+            match Watcher::start(
+                WatchOptions::new(&root)
+                    .env(watch_env)
+                    .watch_missing_ancestors(),
+            ) {
                 Ok((watcher, stream)) => {
+                    let watcher = Arc::new(Mutex::new(watcher));
                     self.watchers
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(watcher);
+                        .push(Arc::clone(&watcher));
                     let weak = Arc::downgrade(self);
+                    let source = root.clone();
                     let task = tokio::spawn(async move {
-                        consume(stream, weak).await;
+                        consume(stream, weak, watcher, source).await;
                     });
                     self.tasks
                         .lock()
@@ -207,15 +213,27 @@ impl SkillCatalogService {
                         .push(task);
                 }
                 Err(error) => {
-                    self.watcher_warnings
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(SkillWarning::new(
-                            root.to_string_lossy(),
-                            SkillWarningKind::WatchFailed(error.to_string()),
-                        ));
+                    self.set_watcher_error(&root, Some(error.to_string()));
                 }
             }
+        }
+    }
+
+    fn set_watcher_error(&self, root: &std::path::Path, detail: Option<String>) {
+        let source = root.to_string_lossy();
+        let mut warnings = self
+            .watcher_warnings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        warnings.retain(|warning| {
+            warning.source() != source
+                || !matches!(warning.kind(), SkillWarningKind::WatchFailed(_))
+        });
+        if let Some(detail) = detail {
+            warnings.push(SkillWarning::new(
+                source,
+                SkillWarningKind::WatchFailed(detail),
+            ));
         }
     }
 
@@ -253,18 +271,39 @@ impl Drop for SkillCatalogService {
     }
 }
 
-async fn consume(mut stream: EventStream, service: std::sync::Weak<SkillCatalogService>) {
+async fn consume(
+    mut stream: EventStream,
+    service: std::sync::Weak<SkillCatalogService>,
+    watcher: Arc<Mutex<Watcher>>,
+    source: std::path::PathBuf,
+) {
     while let Some(first) = stream.recv().await {
         let mut relevant = event_is_relevant(&first);
         while let Some(event) = stream.try_recv() {
             relevant |= event_is_relevant(&event);
         }
-        if !relevant {
-            continue;
-        }
         let Some(service) = service.upgrade() else {
             break;
         };
+        match watcher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reconcile()
+        {
+            Ok(changed) => {
+                relevant |= changed;
+                if changed {
+                    service.set_watcher_error(&source, None);
+                }
+            }
+            Err(error) => {
+                service.set_watcher_error(&source, Some(error.to_string()));
+                relevant = true;
+            }
+        }
+        if !relevant {
+            continue;
+        }
         service.refresh().await;
     }
 }
@@ -578,6 +617,69 @@ mod tests {
         })
         .await
         .expect("watcher refresh");
+        service.shutdown();
+    }
+
+    #[tokio::test]
+    async fn watcher_follows_a_missing_global_skill_root_without_recursing_home() {
+        let root = tempfile::tempdir().expect("root");
+        let project = root.path().join("project");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&project).expect("project");
+        std::fs::create_dir_all(&home).expect("home");
+        let env = isolated_env(root.path());
+        let requested = home.join(".agents");
+        let canonical_home = std::fs::canonicalize(&home).expect("canonical home");
+        let service = SkillCatalogService::start(
+            SkillOptions::new(&project, Some(&project), &env, Vec::new(), Vec::new()),
+            Vec::new(),
+            Arc::new(|_| true),
+        )
+        .await;
+
+        let scopes = service
+            .watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|watcher| {
+                let watcher = watcher
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    watcher.requested_root().to_path_buf(),
+                    watcher.active_root().map(Path::to_path_buf),
+                    watcher.watches_recursively(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            scopes.iter().any(|(logical, active, recursive)| {
+                logical == &requested
+                    && active.as_deref() == Some(canonical_home.as_path())
+                    && !recursive
+            }),
+            "missing global roots must watch home non-recursively: {scopes:?}"
+        );
+
+        let mut updates = service.subscribe();
+        let skill = home.join(".agents/skills/sheet");
+        std::fs::create_dir_all(&skill).expect("skill directory");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: global-sheet\ndescription: Edit sheets\n---\nbody",
+        )
+        .expect("skill file");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                updates.changed().await.expect("catalog sender");
+                if updates.borrow().skills().get("global-sheet").is_some() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("adaptive watcher refresh");
         service.shutdown();
     }
 }
