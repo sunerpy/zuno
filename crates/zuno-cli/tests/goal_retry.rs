@@ -155,9 +155,11 @@ async fn active_goal_survives_request_retry_exhaustion_and_completes_automatical
             "complete-goal",
             "goal_update",
             json!({
-                // The failed turn records its usage after goal creation, advancing
-                // the authoritative goal from revision 1 to revision 2.
-                "expected_revision": 2,
+                // The revision the goal was created at. The failed turn recorded its
+                // usage against the goal, and that charge deliberately leaves the
+                // revision alone: a model that read the goal and then completes it
+                // must not lose the race to its own token accounting.
+                "expected_revision": 1,
                 "status": "complete"
             }),
         ))

@@ -230,6 +230,12 @@ The last tenth is held back deliberately. Compaction costs a request of its own 
 leave room for the summary plus the next real request, so asking for it exactly when the
 budget runs out would be asking when there is nothing left to pay with.
 
+Recording a response's tokens does not move the goal's revision. A charge is bookkeeping the
+host does on the model's behalf, so a model that read the goal and then completes it must not
+lose the optimistic-concurrency race to its own accounting: it would re-read, complete again,
+be charged again, and never land. The revision moves only when the charge changes the goal's
+status, which is a fact about the goal the model does have to see.
+
 ### The host's default allowance
 
 A goal whose `token_budget` is unset is not unbounded. `None` means "the host's default",
