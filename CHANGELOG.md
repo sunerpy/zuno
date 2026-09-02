@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.7](https://github.com/sunerpy/zuno/compare/v0.6.6...v0.6.7) (2026-09-02)
+
+
+### Bug Fixes
+
+* **engine:** reconcile only durably recorded work ([#90](https://github.com/sunerpy/zuno/issues/90)) ([6deec18](https://github.com/sunerpy/zuno/commit/6deec182d53cbb26745b695fa9eb379687c9bacc))
+* **tui:** discard unread input when leaving the terminal ([#91](https://github.com/sunerpy/zuno/issues/91)) ([b07cc1d](https://github.com/sunerpy/zuno/commit/b07cc1d4477555c0c6d3fda57269b5ad0052c690))
+
 ## [0.6.6](https://github.com/sunerpy/zuno/compare/v0.6.5...v0.6.6) (2026-09-02)
 
 
