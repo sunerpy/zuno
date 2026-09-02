@@ -6971,14 +6971,8 @@ impl TurnHost {
         if let Some(instruction) = planning_runtime_instruction(planning) {
             dynamic_context = dynamic_context.with_runtime_instruction(instruction);
         }
-        self.execute_turn_unaccounted(
-            dynamic_context,
-            routing,
-            guard,
-            planning_requires_plan(planning),
-            events,
-        )
-        .await
+        self.execute_turn_unaccounted(dynamic_context, routing, guard, events)
+            .await
     }
 
     fn persist_user_input(
@@ -7160,14 +7154,8 @@ impl TurnHost {
         report_prelude(&events, &self.notes, &self.instruction_admission, &prelude)
             .await
             .map_err(TurnFailure::event_consumer)?;
-        self.execute_turn_unaccounted(
-            dynamic_context,
-            None,
-            prepared.run_guard(),
-            planning_requires_plan(&planning),
-            events,
-        )
-        .await
+        self.execute_turn_unaccounted(dynamic_context, None, prepared.run_guard(), events)
+            .await
     }
 
     fn ensure_goal_turn_anchor(&mut self) -> Result<zuno_goal::Goal, String> {
@@ -7215,7 +7203,6 @@ impl TurnHost {
         mut dynamic_context: DynamicContext,
         routing: Option<&PromptRouting>,
         guard: &SessionRunGuard,
-        plan_required: bool,
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, TurnFailure> {
         let proposed_cycle_id = format!("driver_{}", Uuid::now_v7().simple());
@@ -7236,7 +7223,7 @@ impl TurnHost {
                 return Ok(Some(outcome));
             };
             let input = self
-                .plan_reconciliation_input(plan_required)
+                .plan_reconciliation_input()
                 .map_err(TurnFailure::host)?;
             match self
                 .plan_reconciliation
@@ -7401,10 +7388,7 @@ impl TurnHost {
         outcome.map_err(TurnFailure::Engine)
     }
 
-    fn plan_reconciliation_input(
-        &self,
-        plan_required: bool,
-    ) -> Result<PlanReconciliationInput, String> {
+    fn plan_reconciliation_input(&self) -> Result<PlanReconciliationInput, String> {
         let work = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
             .snapshot(&self.session_id)
             .map_err(to_string)?;
@@ -7457,7 +7441,6 @@ impl TurnHost {
             .map_err(to_string)?
             .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active);
         Ok(PlanReconciliationInput {
-            plan_required,
             plan_exists,
             plan_terminal,
             active_todo,
@@ -8465,13 +8448,6 @@ fn ensure_host_plan(
         decision,
         changed: true,
     })
-}
-
-fn planning_requires_plan(decision: &PlanningDecision) -> bool {
-    matches!(
-        decision,
-        PlanningDecision::Required(_) | PlanningDecision::Maintain(_)
-    )
 }
 
 fn planning_runtime_instruction(decision: &PlanningDecision) -> Option<String> {

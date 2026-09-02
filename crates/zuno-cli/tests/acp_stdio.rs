@@ -2650,7 +2650,7 @@ async fn acp_load_recovers_an_active_goal_without_a_prior_user_message() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn acp_load_rebuilds_resources_and_replays_for_each_load_request() {
+async fn acp_reconfiguration_reuses_mcp_while_load_rebuilds_resources() {
     let mcp = MockServer::start().await;
     mount_remote_mcp_fixture(&mcp).await;
     let provider = MockServer::start().await;
@@ -2666,7 +2666,16 @@ async fn acp_load_rebuilds_resources_and_replays_for_each_load_request() {
         "Inspect the restored ACP session for $ARGUMENTS.",
     )
     .expect("write project command");
-    let config = config_with_remote_mcp(&format!("{}/mcp", mcp.uri()), &provider.uri());
+    let mut config: Value = serde_json::from_str(&config_with_remote_mcp(
+        &format!("{}/mcp", mcp.uri()),
+        &provider.uri(),
+    ))
+    .expect("remote MCP test config");
+    config["provider"]["test"]["models"]["test-model"]["reasoning"] = json!(true);
+    config["provider"]["test"]["models"]["test-model"]["variants"] = json!({
+        "high": {"reasoningEffort": "high"}
+    });
+    let config = serde_json::to_string(&config).expect("encode remote MCP reasoning config");
     let mut child = isolated_command_with_config(root.path(), &config)
         .arg("acp")
         .stdin(Stdio::piped())
@@ -2751,6 +2760,46 @@ async fn acp_load_rebuilds_resources_and_replays_for_each_load_request() {
         "session/set_mode",
         json!({"sessionId": &session_id, "modeId": "build"}),
     );
+    request(
+        &mut stdin,
+        &mut stdout,
+        7,
+        "session/set_config_option",
+        json!({"sessionId": &session_id, "configId": "agent", "value": "deep"}),
+    );
+    request(
+        &mut stdin,
+        &mut stdout,
+        8,
+        "session/set_config_option",
+        json!({
+            "sessionId": &session_id,
+            "configId": "model",
+            "value": "test/test-model-2"
+        }),
+    );
+    request(
+        &mut stdin,
+        &mut stdout,
+        9,
+        "session/set_config_option",
+        json!({
+            "sessionId": &session_id,
+            "configId": "model",
+            "value": "test/test-model"
+        }),
+    );
+    request(
+        &mut stdin,
+        &mut stdout,
+        10,
+        "session/set_config_option",
+        json!({
+            "sessionId": &session_id,
+            "configId": "reasoning_effort",
+            "value": "high"
+        }),
+    );
     let initialize_after_reconfiguration = mcp
         .received_requests()
         .await
@@ -2762,7 +2811,7 @@ async fn acp_load_rebuilds_resources_and_replays_for_each_load_request() {
     let (_loaded_again, second_replay) = request_with_updates(
         &mut stdin,
         &mut stdout,
-        7,
+        11,
         "session/load",
         json!({
             "sessionId": &session_id,
@@ -2773,7 +2822,7 @@ async fn acp_load_rebuilds_resources_and_replays_for_each_load_request() {
     let (prompted, prompt_updates) = request_with_updates(
         &mut stdin,
         &mut stdout,
-        8,
+        12,
         "session/prompt",
         json!({
             "sessionId": &session_id,
@@ -2790,7 +2839,7 @@ async fn acp_load_rebuilds_resources_and_replays_for_each_load_request() {
     request(
         &mut stdin,
         &mut stdout,
-        9,
+        13,
         "session/close",
         json!({"sessionId": &session_id}),
     );
@@ -2820,8 +2869,8 @@ async fn acp_load_rebuilds_resources_and_replays_for_each_load_request() {
         "session/load must reconnect configured MCP before publishing the replacement session"
     );
     assert_eq!(
-        initialize_after_reconfiguration, 4,
-        "each transactional profile replacement must rebuild configured MCP resources"
+        initialize_after_reconfiguration, 2,
+        "Agent and mode changes must reuse the session MCP runtime when its configuration is unchanged"
     );
     assert_eq!(prompted["stopReason"], "end_turn");
     assert!(
@@ -2832,7 +2881,7 @@ async fn acp_load_rebuilds_resources_and_replays_for_each_load_request() {
         "the first prompt after a cold load did not activate and drive the session"
     );
     assert_eq!(
-        initialize_after_prompt, 5,
+        initialize_after_prompt, 3,
         "the second load already activated its replacement MCP resources before the prompt"
     );
 }

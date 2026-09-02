@@ -50,8 +50,10 @@ Notes 从不暴露宿主路径。每个作用域最多 100 个文档，单文档
 `completed` 和 `superseded` 都是终态。
 
 成功交付前，durable reconciliation driver 会检查 Plan、Todo、Job、Goal、工具结果与
-验证记录。普通会话最多执行两次对账续跑，仍不一致则进入 typed `PlanUnreconciled`
-人工等待，而不是声称完成。禁用 `plan_update` 会阻止模型创建或修改；已有 Plan 仍会
+验证记录。普通会话在持有未对账的持久工作时最多执行两次对账续跑，仍不一致则进入
+typed `PlanUnreconciled` 人工等待，而不是声称完成。只有实际写入持久状态的工作才算
+未对账：没有记录任何 Plan、Todo 或 Job 的会话在第一次回复后就结束，即使宿主分类器
+原本预期它需要 Plan。禁用 `plan_update` 会阻止模型创建或修改；已有 Plan 仍会
 持久化、投影并恢复。
 
 完整的开启/关闭、profile 覆盖、权限、revision 与重启说明见

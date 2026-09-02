@@ -62,9 +62,11 @@ the Plan. Every existing-Plan mutation requires the current
 `expected_revision`. `completed` and `superseded` are terminal.
 
 Before successful delivery, a durable reconciliation driver checks Plan, Todo,
-Job, Goal, tool-result, and verification state. Ordinary sessions receive at
-most two reconciliation continuations, then enter typed
-`PlanUnreconciled` human wait instead of claiming completion. Disabling
+Job, Goal, tool-result, and verification state. Ordinary sessions holding
+unreconciled durable work receive at most two reconciliation continuations, then
+enter typed `PlanUnreconciled` human wait instead of claiming completion. Only
+durably recorded work counts: a session that recorded no Plan, Todo, or Job
+finishes on its first answer even when the host classifier expected a Plan. Disabling
 `plan_update` prevents model creation or mutation; an existing Plan is still
 persisted, projected, and restored.
 

@@ -236,7 +236,7 @@ fn app_entering_the_terminal_enables_bracketed_paste_and_leaving_disables_it() {
 
     let mut left = Vec::new();
     assert!(
-        restore_terminal(&mut left, false).is_none(),
+        restore_terminal(&mut left, RecordingInput::new([]).as_ref(), false).is_none(),
         "restoring into a vector reported a failure"
     );
     let left = String::from_utf8(left).expect("crossterm writes utf-8");
@@ -378,12 +378,179 @@ fn app_mouse_reporting_asks_only_for_the_events_a_screen_consumes() {
         "native-selection mode did not ask the terminal to translate wheel notches: {without:?}"
     );
     let mut restored = Vec::new();
-    assert!(restore_terminal(&mut restored, false).is_none());
+    assert!(restore_terminal(&mut restored, RecordingInput::new([]).as_ref(), false).is_none());
     assert!(
         String::from_utf8(restored)
             .expect("crossterm writes utf-8")
             .contains("\u{1b}[?1007l"),
         "alternate scroll was not restored on exit"
+    );
+}
+
+/// A `Vec<u8>` sink whose contents a second observer can read while it is being written.
+#[derive(Clone)]
+struct SharedOutput(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for SharedOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        locked(&self.0).extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A queued input source that records what teardown had written when it was first polled.
+struct QueuedInput {
+    events: Mutex<VecDeque<CrosstermEvent>>,
+    written_when_polled: Mutex<Option<Vec<u8>>>,
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+impl QueuedInput {
+    fn new(
+        output: &Arc<Mutex<Vec<u8>>>,
+        events: impl IntoIterator<Item = CrosstermEvent>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            events: Mutex::new(events.into_iter().collect()),
+            written_when_polled: Mutex::new(None),
+            output: Arc::clone(output),
+        })
+    }
+
+    fn remaining(&self) -> usize {
+        locked(&self.events).len()
+    }
+
+    fn written_when_polled(&self) -> Option<Vec<u8>> {
+        locked(&self.written_when_polled).clone()
+    }
+}
+
+impl TerminalInput for QueuedInput {
+    fn poll(&self, timeout: Duration) -> io::Result<bool> {
+        assert_eq!(
+            timeout,
+            Duration::ZERO,
+            "a teardown drain that waits for input turns quitting into a stall"
+        );
+        let mut first = locked(&self.written_when_polled);
+        if first.is_none() {
+            *first = Some(locked(&self.output).clone());
+        }
+        Ok(!locked(&self.events).is_empty())
+    }
+
+    fn read(&self) -> io::Result<CrosstermEvent> {
+        locked(&self.events)
+            .pop_front()
+            .ok_or_else(|| io::Error::other("the scripted terminal input is empty"))
+    }
+}
+
+#[test]
+fn app_leaving_the_terminal_discards_the_input_the_tui_never_read() {
+    // The reported symptom: after `Ctrl+C`, the next shell prompt showed
+    // `0;54;31M0;54;31m` — an SGR mouse press and release the terminal encoded while the
+    // TUI's reader was already stopped, left in the queue for the shell to read.
+    let click = |kind| {
+        CrosstermEvent::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: 54,
+            row: 31,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        })
+    };
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let unread = QueuedInput::new(
+        &output,
+        [
+            click(MouseEventKind::Down(MouseButton::Left)),
+            click(MouseEventKind::Up(MouseButton::Left)),
+        ],
+    );
+    let mut writer = SharedOutput(Arc::clone(&output));
+
+    assert!(
+        restore_terminal(&mut writer, unread.as_ref(), true).is_none(),
+        "restoring into a vector reported a failure"
+    );
+
+    assert_eq!(
+        unread.remaining(),
+        0,
+        "the queued click survived teardown, so the user's shell reads it as garbage input"
+    );
+    let when_polled = unread
+        .written_when_polled()
+        .expect("teardown never polled for unread input at all");
+    // Byte-level only where `execute!` writes ANSI; the console API on Windows writes
+    // none, and the ordering it stands for is asserted by the drain being last in source.
+    #[cfg(not(windows))]
+    {
+        let when_polled = String::from_utf8(when_polled).expect("crossterm writes utf-8");
+        assert!(
+            when_polled.contains("\u{1b}[?1000l") && when_polled.contains("\u{1b}[?1006l"),
+            "the drain ran while mouse reporting was still enabled, so the terminal can \
+             queue another report behind it: {when_polled:?}"
+        );
+    }
+    #[cfg(windows)]
+    let _ = when_polled;
+}
+
+/// An input source with something to read forever, and one that cannot be read at all.
+struct EndlessInput {
+    fails: bool,
+    reads: AtomicUsize,
+}
+
+impl TerminalInput for EndlessInput {
+    fn poll(&self, _timeout: Duration) -> io::Result<bool> {
+        if self.fails {
+            return Err(io::Error::other("the terminal cannot be polled"));
+        }
+        Ok(true)
+    }
+
+    fn read(&self) -> io::Result<CrosstermEvent> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(CrosstermEvent::FocusGained)
+    }
+}
+
+#[test]
+fn app_input_that_never_stops_arriving_does_not_hold_the_exit_open() {
+    // Nothing here is a terminal queue, which is finite. It is the stdin that is a pipe
+    // somebody is still writing to: an uncapped drain would read it until the writer
+    // stopped, and the user would be left looking at a program that will not quit.
+    let endless = EndlessInput {
+        fails: false,
+        reads: AtomicUsize::new(0),
+    };
+    assert_eq!(
+        drain_unread_input(&endless),
+        UNREAD_INPUT_LIMIT,
+        "the drain stopped somewhere other than its own cap"
+    );
+    assert_eq!(
+        endless.reads.load(Ordering::SeqCst),
+        UNREAD_INPUT_LIMIT,
+        "the cap counted events it never actually consumed"
+    );
+
+    // And a source that cannot be polled is not retried until the cap either.
+    let unreadable = EndlessInput {
+        fails: true,
+        reads: AtomicUsize::new(0),
+    };
+    assert_eq!(
+        drain_unread_input(&unreadable),
+        0,
+        "a failing poll was retried, which makes an unreadable stdin a hang"
     );
 }
 

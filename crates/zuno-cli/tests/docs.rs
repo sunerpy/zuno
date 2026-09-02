@@ -103,6 +103,79 @@ fn harness_guide_documents_the_native_extension_contract() {
 }
 
 #[test]
+fn reconciliation_docs_pin_durable_work_as_the_only_unreconciled_work() {
+    contains_all(
+        "docs/harness-runtime.md",
+        &[
+            "A short single-clause question stays atomic whether or not it ends in",
+            "a session that recorded no durable work finishes on its first answer",
+            "holding unreconciled durable work receives at most two",
+            "Unreconciled work means durably recorded work.",
+            "recorded no Plan, Todo, or Job is settled",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/harness-runtime.md",
+        &[
+            "单句短问句",
+            "没有记录任何持久工作的会话在第一次回复后直接结束",
+            "普通会话在持有未对账的持久工作时",
+            "只是宿主的分类预测",
+        ],
+    );
+    contains_all(
+        "docs/guide/tools.md",
+        &[
+            "unreconciled durable work receive at most two reconciliation continuations",
+            "durably recorded work counts: a session that recorded no Plan, Todo, or Job",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/tools.md",
+        &[
+            "普通会话在持有未对账的持久工作时最多执行两次对账续跑",
+            "没有记录任何 Plan、Todo 或 Job 的会话在第一次回复后就结束",
+        ],
+    );
+    contains_all(
+        "docs/guide/durable-state.md",
+        &["a short single-clause question is a direct answer"],
+    );
+    contains_all(
+        "docs/zh/guide/durable-state.md",
+        &["单句短问句无论是否带问号都算直接回答"],
+    );
+    contains_all(
+        "docs/zh/operate/prompt-workflow.md",
+        &["单句短问句无论是否带问号都属于直接回答"],
+    );
+    contains_all(
+        "docs/design/dsh-alpha2-adoption-ledger.md",
+        &[
+            "for durably recorded work",
+            "A session that recorded no Plan, Todo, or Job is settled, not continued.",
+        ],
+    );
+    for (relative, retired) in [
+        (
+            "docs/harness-runtime.md",
+            "an ordinary session receives at most two durable reconciliation",
+        ),
+        ("docs/guide/tools.md", "Ordinary sessions receive at"),
+        ("docs/zh/guide/tools.md", "普通会话最多执行两次对账续跑"),
+        (
+            "docs/zh/operate/harness-runtime.md",
+            "普通会话最多续跑两次对账",
+        ),
+    ] {
+        assert!(
+            !read(relative).contains(retired),
+            "{relative} still claims unconditional reconciliation continuations {retired:?}"
+        );
+    }
+}
+
+#[test]
 fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
     contains_all(
         "docs/design/shell-sandbox-roadmap.md",
@@ -1251,5 +1324,20 @@ fn skill_pages_count_every_built_in_skill() {
             "compiles eleven original first-party Skills",
             "`bedrock-model-capability-review`",
         ],
+    );
+}
+
+#[test]
+fn tui_docs_pin_the_input_discarded_when_the_terminal_is_released() {
+    contains_all(
+        "docs/guide/tui.md",
+        &[
+            "then discards the input it never read",
+            "as a stray `0;54;31M` report",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/tui.md",
+        &["再丢弃尚未读取的输入", "`0;54;31M` 这类残留报文"],
     );
 }

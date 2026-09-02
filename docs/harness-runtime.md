@@ -133,7 +133,9 @@ with that capability applies one deterministic classifier shared by CLI, TUI,
 ACP, server, and child turns. It chooses `Required`, `Maintain`, `Atomic`, or
 `Unavailable`; it never creates user-visible generic steps. A direct answer, one
 bounded read, or one short commit of already-prepared changes may proceed
-atomically. Typed image, resource, selection, or branch-diff context, sufficiently
+atomically. A short single-clause question stays atomic whether or not it ends in
+a question mark, including Chinese phrasing that carries the interrogative in the
+middle of the sentence. Typed image, resource, selection, or branch-diff context, sufficiently
 large multi-block text, cross-component work, delegation, multiple gates, and
 restart-sensitive work select the planned path.
 
@@ -163,12 +165,19 @@ Machine execution state does not leak into the visible Plan. The
 session event log. Before a successful answer is delivered it evaluates only
 typed Plan, Todo, Job, Goal, tool-result, and verification state:
 
+- a session that recorded no durable work finishes on its first answer;
 - terminal Plan state with no active Todo or Job may finish;
 - an active Goal owns the next durable continuation;
-- an ordinary session receives at most two durable reconciliation
-  continuations;
+- an ordinary session holding unreconciled durable work receives at most two
+  reconciliation continuations;
 - unresolved work then creates `WaitingForHuman::PlanUnreconciled` and cannot be
   delivered as successful.
+
+Unreconciled work means durably recorded work. The classification that decided
+whether a turn should open a Plan is a host prediction, not recorded work, so a
+request classified as `Required` that recorded no Plan, Todo, or Job is settled
+rather than driven again; a misclassified question is answered once instead of
+spending two further turns on state that does not exist.
 
 A process restart resumes an interrupted reconciliation cycle and its attempt
 count. Assistant prose is never parsed as evidence that work completed. Hiding

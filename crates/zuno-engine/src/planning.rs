@@ -332,8 +332,69 @@ fn direct_answer(prompt: &str) -> bool {
             "说明一下",
         ]
         .iter()
-        .any(|prefix| lower.starts_with(prefix));
+        .any(|prefix| lower.starts_with(prefix))
+        || asks_without_a_question_mark(prompt, &lower);
     question && !contains_engineering_action(&lower)
+}
+
+/// Longest prompt whose interior interrogative still makes it a plain question.
+///
+/// A question is short. The bound is what keeps a specification that happens to contain
+/// `多少` — "make the retry cap configurable and record how many attempts were spent" —
+/// from being read as one, and it matches [`bounded_atomic_action`]'s own ceiling.
+const MEDIAL_QUESTION_MAX_CHARS: usize = 120;
+
+/// Question forms that carry the interrogative anywhere but the front.
+///
+/// Prefixes and a trailing `?` are the wrong shape for Chinese, which routinely omits the
+/// question mark and puts the marker where English puts it first: `你现在能看到多少个skill`
+/// asks "how many skills can you see now" with `多少` in the middle and no `？` at all.
+/// That prompt was classified as work requiring a durable Plan, and a question cannot be
+/// answered by creating one — see [`crate::plan_driver::PlanReconciliationInput`] for what
+/// the reconciliation loop then did with two further turns.
+const MEDIAL_QUESTION_MARKERS: [&str; 16] = [
+    "多少",
+    "几个",
+    "哪些",
+    "哪个",
+    "哪里",
+    "是不是",
+    "有没有",
+    "能不能",
+    "可不可以",
+    "吗",
+    "how many",
+    "how much",
+    "how long",
+    "any idea",
+    "is there",
+    "are there",
+];
+
+/// Whether a short, single-stage prompt asks something without marking it as a question.
+fn asks_without_a_question_mark(prompt: &str, lower: &str) -> bool {
+    lower.chars().count() <= MEDIAL_QUESTION_MAX_CHARS
+        && !multi_stage(prompt)
+        && single_clause(prompt)
+        && MEDIAL_QUESTION_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+}
+
+/// Whether the prompt is one clause, which a prompt that is only a question will be.
+///
+/// A Chinese comma joins clauses, so `把重试上限做成可配置，并记录用了多少次尝试` mentions a
+/// count inside an instruction rather than asking about one — and it names no action word
+/// that [`action_count`] would catch. Requiring a single clause is what keeps an interior
+/// interrogative from reaching work like that, and it costs a genuine question nothing: a
+/// question asks one thing.
+fn single_clause(prompt: &str) -> bool {
+    !prompt.contains('，')
+        && !prompt.contains(',')
+        && !prompt.contains('、')
+        && !["然后", "还要", "同时", "以及", " and ", " then "]
+            .iter()
+            .any(|joiner| prompt.contains(joiner))
 }
 
 fn single_read(prompt: &str) -> bool {
@@ -702,6 +763,47 @@ mod tests {
         ));
 
         assert!(matches!(decision, PlanningDecision::Required(_)));
+    }
+
+    #[test]
+    fn a_question_without_a_question_mark_is_still_a_question() {
+        // The reported session. The user asked how many skills were visible, the model
+        // answered, and because this was classified `Required` while the model correctly
+        // created no Plan, reconciliation spent two more turns asking for progress — the
+        // second of which offered to enumerate the whole catalog page by page.
+        for prompt in [
+            "你现在能看到多少个skill",
+            "现在有几个 skill 可用",
+            "这个配置项是不是必须的",
+            "会话里还有多少 token",
+            "how many skills are loaded right now",
+        ] {
+            let decision = PlanningPolicy::classify(PlanningInput::new(prompt, "orchestrator"));
+            assert!(
+                matches!(decision, PlanningDecision::Atomic(_)),
+                "{prompt:?} is a question and must not require a durable Plan: {decision:?}"
+            );
+            assert_eq!(decision.rationale().code(), "direct_answer");
+        }
+    }
+
+    #[test]
+    fn an_interior_question_word_does_not_make_real_work_atomic() {
+        // The bound that keeps the marker from swallowing requests that only mention a
+        // count, name a stage, or ask for work in the same breath as a question.
+        for prompt in [
+            "把重试上限做成可配置，并记录用了多少次尝试",
+            "看看有多少个 skill 缺失，然后补齐并验证",
+            "统计一下有多少个 crate 依赖 zuno-engine，实现缓存后再测试一遍这条路径的耗时表现",
+        ] {
+            assert!(
+                matches!(
+                    PlanningPolicy::classify(PlanningInput::new(prompt, "orchestrator")),
+                    PlanningDecision::Required(_)
+                ),
+                "{prompt:?} asks for work and must still create a durable Plan"
+            );
+        }
     }
 
     #[test]

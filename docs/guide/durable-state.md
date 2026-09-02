@@ -316,7 +316,8 @@ context compaction.
 Use one for normal research-modify-verify work. Keep one current for anything
 cross-component, anything involving delegation, anything with multiple acceptance gates,
 and anything likely to be interrupted. A direct answer, one bounded read, or a genuinely
-atomic operation does not need a plan.
+atomic operation does not need a plan; a short single-clause question is a direct answer
+whether or not it ends in a question mark.
 
 Rules that matter in practice:
 

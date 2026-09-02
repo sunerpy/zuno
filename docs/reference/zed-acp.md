@@ -201,7 +201,12 @@ To use the directly selectable `deep` Agent:
 
 Plan mode activates the read-only `plan` Agent. Returning to Build restores the
 last selected implementation Agent. Agent and model changes are session-local
-and are rejected while a prompt is actively running.
+and are rejected while a prompt is actively running. An idle configuration
+change still performs an atomic host replacement, but it reuses the connected
+session MCP runtime when the MCP server configuration and connection concurrency
+are unchanged. Editing those structural MCP inputs forces a fresh connection.
+Structured logs report the reconfiguration phase timings without recording the
+selected Agent, model, reasoning value, or credentials.
 
 `zuno acp` does not accept an `--agent` launch argument. Agent selection is an
 ACP session configuration operation, not a second process-level configuration

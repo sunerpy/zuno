@@ -179,6 +179,10 @@ are present.
 
 Set `"mouse": false` in `tui.json` to return drag selection to the terminal.
 
+Quitting releases the capture modes it enabled, then discards the input it never read, so a
+click or wheel notch that arrived while the session was shutting down cannot reach the shell
+as a stray `0;54;31M` report.
+
 ## See also
 
 - [Themes and keybindings](/config/theming)

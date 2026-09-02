@@ -61,14 +61,19 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 这类文字不构成进展。默认 profile 发布类型化的宿主 Planning capability；即使最终工具
 过滤隐藏了 `plan_update`，已有 Plan 仍会持久化、投影并在重启后恢复，但模型不能创建
 或修改新的战略步骤。宿主分类器只判断 `Required / Maintain / Atomic / Unavailable`，
-不会生成 `Establish scope / Execute / Integrate / Verify` 一类通用骨架。模型使用
+不会生成 `Establish scope / Execute / Integrate / Verify` 一类通用骨架。单句短问句
+无论是否以问号结尾都归为 `Atomic`，包括疑问词位于句中的中文问法。模型使用
 `create / patch / append / push / pop` 操作维护 Plan，step id 由宿主生成，已有 Plan
 修改都受 `expected_revision` 保护。
 
 机器执行阶段单独持久化为 `DriverPhase`，不进入用户可见 Plan。最终回复前，
 `PlanReconciliationDriver` 只检查 Plan、Todo、Job、Goal、工具结果与验证记录：
-普通会话最多续跑两次对账；仍不一致则进入 typed `PlanUnreconciled` 人工等待，不能
-以成功状态交付。进程重启会继续原对账 cycle，不解析模型自然语言判断“已经完成”。
+没有记录任何持久工作的会话在第一次回复后直接结束；普通会话在持有未对账的持久工作时
+最多续跑两次对账；仍不一致则进入 typed `PlanUnreconciled` 人工等待，不能以成功状态
+交付。「是否需要 Plan」只是宿主的分类预测，不是已记录的工作，因此被判为 `Required`
+却没有产生任何 Plan、Todo 或 Job 的请求视为已结算，不会再被续跑；一次被误分类的问题
+只回答一次，不会为不存在的状态再花两个回合。进程重启会继续原对账 cycle，不解析模型
+自然语言判断“已经完成”。
 
 ACP 通过会话级投影器订阅 `TurnHost::work_state_changes()`，而不是识别某个工具名。
 每次唤醒都会读取权威 Plan 并发送完整的 stable-V1 更新；`(plan_id, revision)` 阻止

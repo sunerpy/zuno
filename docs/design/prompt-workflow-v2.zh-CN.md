@@ -603,9 +603,10 @@ side effect，并在同一事务内替换未消费的 uncertain report。
 `action=pop`，归档子 Plan 并精确恢复父 Plan 一次。
 
 机器执行波次持久化为独立 `DriverPhase`，不写入用户 Plan。最终回复前的 driver 只
-检查 Plan、Todo、Job、Goal、工具结果与验证记录；普通会话最多触发两次 durable
-reconciliation continuation，仍无法对齐则进入 typed `PlanUnreconciled` 人工等待。
-进程重启继续原 cycle，模型自然语言不作为完成证据。
+检查 Plan、Todo、Job、Goal、工具结果与验证记录；没有记录任何持久工作的会话直接结算，
+持有未对账持久工作的普通会话最多触发两次 durable reconciliation continuation，仍无法
+对齐则进入 typed `PlanUnreconciled` 人工等待。宿主的 planning 分类只是预测，不构成
+未对账的持久工作。进程重启继续原 cycle，模型自然语言不作为完成证据。
 
 ### 9.2 执行波次
 
