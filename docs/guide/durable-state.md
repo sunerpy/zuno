@@ -223,7 +223,7 @@ afterwards.
 | Condition | Outcome |
 | --- | --- |
 | Allowance spent | The turn stops and the Goal pauses with `turn_budget` |
-| Provider reported no usage | The turn stops; an uncountable budget cannot be honoured |
+| Provider reported no usage | The turn stops; a budget you set that cannot be counted cannot be honoured |
 | Only the last tenth of the allowance is left | Compaction is requested, then the turn continues |
 
 The last tenth is held back deliberately. Compaction costs a request of its own and has to
@@ -242,9 +242,16 @@ host that genuinely wants unbounded autonomy says so with `TurnAllowance::UNLIMI
 leaving a field unset. The stop kind is `token_budget` either way, but the remedy differs: a
 user who set a budget is told to raise it, and a user who never set one is told to set one.
 
+One rule from the table above does not carry over. A provider that reports no usage stops a
+turn under a budget you set, because a budget that cannot be counted cannot be honoured and
+continuing on unreported numbers would quietly make it advisory. Under the default the turn
+continues: an endpoint that withholds usage is its own choice and not a runaway, and ending
+every such run on a limit nobody asked for leaves no remedy but to set one. The default still
+binds on whatever was counted, so a floor that crosses it stops above.
+
 Two further ceilings bound the turn rather than the goal. Both are off unless the host sets
 them, and both apply whether or not a Goal is active, because a turn without a goal can loop
-just as well as one with.
+just as well as one with. A host that wants a bound no provider can withhold uses them.
 
 | Ceiling | Stops the turn when |
 | --- | --- |

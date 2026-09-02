@@ -352,9 +352,11 @@ fn effective_budget(goal: &Goal, default_token_budget: Option<u64>) -> Option<(i
 /// in-memory turn total would reset every turn and never bind. A goal with no
 /// budget of its own runs under the host's default, and under nothing when the
 /// host set none. A spent allowance stops the turn before anything else is
-/// considered, because it is already spent whatever else is true. Unmeasured
-/// usage stops next, since a budget that cannot be counted cannot be honoured, and
-/// continuing on unreported numbers is how a budget silently becomes advisory.
+/// considered, because it is already spent whatever else is true. Unmeasured usage
+/// stops next when the budget is the goal's own, since a budget that cannot be counted
+/// cannot be honoured, and continuing on unreported numbers is how a budget silently
+/// becomes advisory. Under the host's default it does not stop, for the reason given at
+/// that branch.
 ///
 /// Compaction is asked for only by the consultation whose charge took the goal
 /// into its reserve. Inside the reserve both hooks answer `Continue`: a request is
@@ -385,6 +387,18 @@ fn decide(
         Consulted::AfterResponse { measured, .. } => measured,
     };
     if !goal.usage_known || !measured {
+        // Only a ceiling somebody asked for is worth stopping a run over. A user who
+        // set a budget gets it honoured or gets told it cannot be: continuing on
+        // unreported numbers is how a budget silently becomes advisory. The host's
+        // default is not that promise. Stopping on it would end every run on a
+        // provider that does not report usage — an endpoint's choice, not a runaway —
+        // and it would do so on a limit the user never set, with no remedy but to set
+        // one. The default still binds on whatever was counted, because a floor that
+        // crosses it stops above, and a host that wants a bound no provider can
+        // withhold has the tool-call and wall-time ceilings.
+        if source == BudgetSource::HostDefault {
+            return BudgetDecision::Continue;
+        }
         return BudgetDecision::stop_usage_unknown(format!(
             "{named} cannot be honoured because the provider did not report usage, so the {} \
              tokens recorded so far are a floor and not a measurement",
@@ -856,7 +870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreported_response_under_the_host_default_stops_the_turn() {
+    async fn an_unreported_response_under_the_host_default_keeps_going() {
         let fixture = fixture();
         fixture
             .store
@@ -868,10 +882,35 @@ mod tests {
             .await
             .expect("decide");
 
-        let detail = expect_stop(decision, BudgetStopKind::UsageUnknown);
+        assert_eq!(
+            decision,
+            BudgetDecision::Continue,
+            "a provider that reports no usage is an endpoint's choice, not a runaway, and the \
+             user never asked for the default it would be stopped on"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_host_default_still_stops_on_what_was_counted_under_a_floor() {
+        let fixture = fixture();
+        fixture
+            .store
+            .create_goal("ses_budget", "land the port", None)
+            .expect("create goal");
+        fixture
+            .store
+            .record_usage("ses_budget", 1_000, 0, false)
+            .expect("record unaccounted usage");
+
+        let decision = under_default(&fixture.store, 1_000)
+            .before_request(&snapshot("turn-1", 1, 0, true))
+            .await
+            .expect("decide");
+
+        let detail = expect_stop(decision, BudgetStopKind::TokenBudget);
         assert!(
-            detail.contains("default allowance"),
-            "the stop names the allowance that could not be honoured: {detail}"
+            detail.contains("default allowance") && detail.contains("1000"),
+            "an unmeasured goal is still stopped by the tokens that were counted: {detail}"
         );
     }
 
