@@ -6087,6 +6087,7 @@ fn the_turn_end_charges_usage_no_request_accounted_for() {
         last_confirmed_at: Some(1_780_000_000_000),
         goal_charged: goal,
         last_provider_request_seq: 4,
+        failed_turns: 0,
     };
 
     assert_eq!(
@@ -6152,37 +6153,57 @@ fn a_failed_turn_that_issued_no_request_leaves_the_goal_accounting_known() {
     );
 }
 
-/// Only a request that could have spent unmeasured tokens makes accounting unknown.
+/// Only spend the session could not measure makes accounting unknown.
+///
+/// The last case is the one that matters most in practice, because the flag never
+/// rises again: a session generates a title alongside its turn, that request is not
+/// charged to this session, and treating an untouched counter as a measurement gap
+/// stopped a goal that had spent nothing at all.
 #[test]
-fn accounting_is_unknown_when_a_request_was_issued_and_nothing_was_confirmed() {
-    let usage = |confirmed: i64, pending: Option<u64>, request_seq: i64, known: bool| GoalUsage {
-        tokens: confirmed,
-        confirmed_known: known,
-        estimated_pending_prompt_tokens: pending,
-        last_confirmed_at: Some(1_780_000_000_000 + confirmed),
-        goal_charged: 0,
-        last_provider_request_seq: request_seq,
-    };
+fn accounting_is_unknown_only_where_the_session_could_not_measure_the_spend() {
+    let usage =
+        |confirmed: i64, pending: Option<u64>, request_seq: i64, failed: u64, known: bool| {
+            GoalUsage {
+                tokens: confirmed,
+                confirmed_known: known,
+                estimated_pending_prompt_tokens: pending,
+                last_confirmed_at: Some(1_780_000_000_000 + confirmed),
+                goal_charged: 0,
+                last_provider_request_seq: request_seq,
+                failed_turns: failed,
+            }
+        };
 
     assert!(
-        !goal_turn_accounting_known(usage(100, None, 1, true), usage(100, Some(9_000), 2, true)),
+        !goal_turn_accounting_known(
+            usage(100, None, 1, 0, true),
+            usage(100, Some(9_000), 2, 0, true)
+        ),
         "an estimate still pending is a request whose usage never landed"
     );
     assert!(
-        goal_turn_accounting_known(usage(100, None, 1, true), usage(100, None, 1, true)),
+        goal_turn_accounting_known(usage(100, None, 1, 0, true), usage(100, None, 1, 0, true)),
         "a turn without a request adds no doubt"
     );
     assert!(
-        goal_turn_accounting_known(usage(100, None, 1, true), usage(340, None, 2, true)),
+        goal_turn_accounting_known(usage(100, None, 1, 0, true), usage(340, None, 2, 0, true)),
         "a confirmed response the session could normalize is measured"
     );
     assert!(
-        !goal_turn_accounting_known(usage(100, None, 1, true), usage(340, None, 2, false)),
+        !goal_turn_accounting_known(usage(100, None, 1, 0, true), usage(340, None, 2, 0, false)),
         "a response the session could not normalize is not a measurement"
     );
     assert!(
-        !goal_turn_accounting_known(usage(100, None, 1, true), usage(100, None, 2, true)),
-        "a request that reconciled nothing at all is unaccounted spend"
+        !goal_turn_accounting_known(usage(100, None, 1, 0, true), usage(100, None, 2, 1, true)),
+        "a turn that failed after reaching the provider may have spent what nobody counted"
+    );
+    assert!(
+        goal_turn_accounting_known(usage(100, None, 1, 1, true), usage(100, None, 1, 2, true)),
+        "a failed turn that never reached the provider spent nothing to be unsure about"
+    );
+    assert!(
+        goal_turn_accounting_known(usage(100, None, 1, 0, true), usage(100, None, 2, 0, true)),
+        "a request this session was never charged for is not a measurement gap"
     );
 }
 

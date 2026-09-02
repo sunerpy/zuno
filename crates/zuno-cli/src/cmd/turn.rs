@@ -8641,6 +8641,8 @@ struct GoalUsage {
     /// append-only, so a sequence that moved across a turn means a request was issued
     /// inside it.
     last_provider_request_seq: i64,
+    /// Turns this session has failed, which only ever rises.
+    failed_turns: u64,
 }
 
 fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<GoalUsage, String> {
@@ -8691,6 +8693,7 @@ fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<Goa
         last_confirmed_at: snapshot.last_confirmed_at,
         goal_charged,
         last_provider_request_seq,
+        failed_turns: snapshot.failed_turns,
     })
 }
 
@@ -8734,31 +8737,35 @@ fn goal_turn_unaccounted_tokens(before: GoalUsage, after: GoalUsage) -> i64 {
 /// `usage_known AND known`, because tokens spent without a measurement leave the
 /// total an underestimate for good. A goal whose flag is false stops before its next
 /// request, and with a default allowance installed for every session that stop now
-/// reaches goals that never named a budget. So the flag has to fall on evidence of
-/// unmeasured spend, not on the mere fact that something went wrong.
+/// reaches goals that never named a budget. One false answer therefore ends the
+/// session's every later turn before it begins, so the flag falls on evidence of
+/// unmeasured spend and on nothing weaker.
 ///
 /// The order of the questions is the order of the evidence:
 ///
-/// 1. An estimate still pending means a request was issued and its usage never
-///    landed — every path that reconciles usage clears the estimate. That is spend
-///    the confirmed total does not include.
-/// 2. A turn that never reached the provider spent nothing to be unsure about. Bad
-///    configuration, a refused tool, an interrupt during setup: these fail a turn
-///    without a request, and they used to poison the flag through the failed-turn
-///    counter alone, which ended every later turn of that session before it began.
-/// 3. Otherwise the session's own reconciliation decides, exactly as before: usage
-///    that moved is trusted only as far as the session says it can be normalized.
+/// 1. Usage that moved is the measurement itself, trusted exactly as far as the
+///    session's own reconciliation says it can be normalized.
+/// 2. An estimate that appeared or changed and was not reconciled away is spend the
+///    confirmed total does not include; every path that reconciles usage clears it.
+/// 3. A failed turn is only evidence of anything if it reached the provider. Bad
+///    configuration, a rule file that cannot be admitted, a refused tool, an
+///    interrupt during setup: these fail a turn without issuing a request, and
+///    counting them poisoned the flag for a session that had spent nothing.
+///
+/// A request that returned and reported nothing is deliberately not evidence here.
+/// The session's reconciliation already answers for the usage it attributes, and a
+/// request whose tokens this session was never charged for — a title generated
+/// alongside the turn, for instance — would otherwise make an untouched counter look
+/// like a measurement gap and stop a goal that never spent anything.
 fn goal_turn_accounting_known(before: GoalUsage, after: GoalUsage) -> bool {
-    if after.estimated_pending_prompt_tokens.is_some() {
-        return false;
-    }
-    if after.last_provider_request_seq == before.last_provider_request_seq {
-        return true;
-    }
     if after.tokens != before.tokens || after.last_confirmed_at != before.last_confirmed_at {
         return after.confirmed_known;
     }
-    false
+    if after.estimated_pending_prompt_tokens != before.estimated_pending_prompt_tokens {
+        return false;
+    }
+    after.failed_turns == before.failed_turns
+        || after.last_provider_request_seq == before.last_provider_request_seq
 }
 
 fn dynamic_context_from_goal_entry(
