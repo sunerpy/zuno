@@ -1828,6 +1828,44 @@
       },
       "type": "object"
     },
+    "NavigationConfig": {
+      "additionalProperties": false,
+      "description": "How much the runtime asks of a code-intelligence index before reading source.\n\nOff by default. An index is a per-repository choice, and a runtime that refused to\nread a file until somebody set one up would be unusable in every repository that\nhas not.",
+      "properties": {
+        "codegraph": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NavigationGate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What to do when a call reads source before the CodeGraph index was consulted."
+        }
+      },
+      "type": "object"
+    },
+    "NavigationGate": {
+      "description": "The three answers to \"a search ran before the index was asked anything\".",
+      "oneOf": [
+        {
+          "const": "off",
+          "description": "Allow every call and record nothing. The default.",
+          "type": "string"
+        },
+        {
+          "const": "advise",
+          "description": "Report the session's first such call and then leave it alone.",
+          "type": "string"
+        },
+        {
+          "const": "strict",
+          "description": "Fail such a call until the index has been queried once.",
+          "type": "string"
+        }
+      ]
+    },
     "OrderedMap_of_AgentConfig": {
       "additionalProperties": {
         "$ref": "#/$defs/AgentConfig"
@@ -3278,6 +3316,17 @@
         "string",
         "null"
       ]
+    },
+    "navigation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NavigationConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "What the runtime asks of a code-intelligence index before reading source."
     },
     "permission": {
       "anyOf": [
