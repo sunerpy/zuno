@@ -6080,6 +6080,7 @@ fn the_turn_end_charges_usage_no_request_accounted_for() {
         last_confirmed_at: Some(1_780_000_000_000),
         failed_turns: 0,
         goal_charged: goal,
+        last_provider_request_seq: 4,
     };
 
     assert_eq!(
@@ -6101,6 +6102,75 @@ fn the_turn_end_charges_usage_no_request_accounted_for() {
         goal_turn_unaccounted_tokens(charged(1_000, 900), charged(1_800, 100)),
         800,
         "a goal replaced mid-turn wears the turn rather than escaping it"
+    );
+}
+
+/// A turn that never reached the provider must not mark the goal's usage unknown.
+///
+/// The flag never rises again: the store writes `usage_known AND known`, and a goal
+/// whose flag is false stops before its next request. A failure that happens before
+/// the first request — bad configuration, a refused tool, an interrupt during setup —
+/// spent nothing unmeasured, so marking it unknown would end the session over an
+/// accounting gap that does not exist. With a default allowance installed for every
+/// session, that stop now reaches goals that never named a budget.
+#[test]
+fn a_failed_turn_that_issued_no_request_leaves_the_goal_accounting_known() {
+    let mut connection =
+        zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    let fixture_plan = plan("/workspace", SessionChoice::New);
+    let now = 1_780_000_000_000;
+    ensure_project(&connection, &fixture_plan.project, now).expect("persist project");
+    let session =
+        resolve_session(&mut connection, &fixture_plan, now).expect("create fixture session");
+
+    let before = goal_usage(&connection, &session.id).expect("read usage before the turn");
+    zuno_db::session::record_turn_failure(&connection, &session.id).expect("record failed turn");
+    let after = goal_usage(&connection, &session.id).expect("read usage after the failure");
+
+    assert_eq!(after.failed_turns, before.failed_turns + 1);
+    assert_eq!(
+        after.last_provider_request_seq, before.last_provider_request_seq,
+        "the fixture turn never reached a provider"
+    );
+    assert!(
+        goal_turn_accounting_known(before, after),
+        "a turn that spent nothing cannot make the goal's total an underestimate"
+    );
+}
+
+/// Only a request that could have spent unmeasured tokens makes accounting unknown.
+#[test]
+fn accounting_is_unknown_when_a_request_was_issued_and_nothing_was_confirmed() {
+    let usage = |confirmed: i64, pending: Option<u64>, request_seq: i64, known: bool| GoalUsage {
+        tokens: confirmed,
+        confirmed_known: known,
+        estimated_pending_prompt_tokens: pending,
+        last_confirmed_at: Some(1_780_000_000_000 + confirmed),
+        failed_turns: 0,
+        goal_charged: 0,
+        last_provider_request_seq: request_seq,
+    };
+
+    assert!(
+        !goal_turn_accounting_known(usage(100, None, 1, true), usage(100, Some(9_000), 2, true)),
+        "an estimate still pending is a request whose usage never landed"
+    );
+    assert!(
+        goal_turn_accounting_known(usage(100, None, 1, true), usage(100, None, 1, true)),
+        "a turn without a request adds no doubt"
+    );
+    assert!(
+        goal_turn_accounting_known(usage(100, None, 1, true), usage(340, None, 2, true)),
+        "a confirmed response the session could normalize is measured"
+    );
+    assert!(
+        !goal_turn_accounting_known(usage(100, None, 1, true), usage(340, None, 2, false)),
+        "a response the session could not normalize is not a measurement"
+    );
+    assert!(
+        !goal_turn_accounting_known(usage(100, None, 1, true), usage(100, None, 2, true)),
+        "a request that reconciled nothing at all is unaccounted spend"
     );
 }
 

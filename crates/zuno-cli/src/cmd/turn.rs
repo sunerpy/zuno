@@ -8634,6 +8634,14 @@ struct GoalUsage {
     /// difference between them. Zero when there is no goal, which makes the difference
     /// zero as well.
     goal_charged: i64,
+    /// Sequence of the newest provider-request event, or zero when there is none.
+    ///
+    /// Whether a turn reached the provider at all cannot be read from the usage
+    /// counters: a turn that failed before its first request looks exactly like a turn
+    /// whose request never came back. The event stream tells them apart, and it is
+    /// append-only, so a sequence that moved across a turn means a request was issued
+    /// inside it.
+    last_provider_request_seq: i64,
 }
 
 fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<GoalUsage, String> {
@@ -8665,6 +8673,18 @@ fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<Goa
     } else {
         0
     };
+    // Any stored version of the event answers the same question, so the pattern is a
+    // prefix rather than the `.1` suffix a caller would have to keep in step with the
+    // event log. Reading a version this build does not understand still tells the
+    // truth about whether a request happened.
+    let last_provider_request_seq = connection
+        .query_row(
+            "SELECT coalesce(max(seq), 0) FROM event \
+             WHERE aggregate_id = ?1 AND type GLOB 'session.provider.request.*'",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(to_string)?;
     Ok(GoalUsage {
         tokens: i64::try_from(snapshot.confirmed.total()).unwrap_or(i64::MAX),
         confirmed_known: snapshot.confirmed_known,
@@ -8672,6 +8692,7 @@ fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<Goa
         last_confirmed_at: snapshot.last_confirmed_at,
         failed_turns: snapshot.failed_turns,
         goal_charged,
+        last_provider_request_seq,
     })
 }
 
@@ -8709,16 +8730,37 @@ fn goal_turn_unaccounted_tokens(before: GoalUsage, after: GoalUsage) -> i64 {
         .max(0)
 }
 
+/// Whether this turn added nothing to what the goal has spent unmeasured.
+///
+/// The answer feeds a flag that only ever falls: the store writes
+/// `usage_known AND known`, because tokens spent without a measurement leave the
+/// total an underestimate for good. A goal whose flag is false stops before its next
+/// request, and with a default allowance installed for every session that stop now
+/// reaches goals that never named a budget. So the flag has to fall on evidence of
+/// unmeasured spend, not on the mere fact that something went wrong.
+///
+/// The order of the questions is the order of the evidence:
+///
+/// 1. An estimate still pending means a request was issued and its usage never
+///    landed — every path that reconciles usage clears the estimate. That is spend
+///    the confirmed total does not include.
+/// 2. A turn that never reached the provider spent nothing to be unsure about. Bad
+///    configuration, a refused tool, an interrupt during setup: these fail a turn
+///    without a request, and they used to poison the flag through the failed-turn
+///    counter alone, which ended every later turn of that session before it began.
+/// 3. Otherwise the session's own reconciliation decides, exactly as before: usage
+///    that moved is trusted only as far as the session says it can be normalized.
 fn goal_turn_accounting_known(before: GoalUsage, after: GoalUsage) -> bool {
+    if after.estimated_pending_prompt_tokens.is_some() {
+        return false;
+    }
+    if after.last_provider_request_seq == before.last_provider_request_seq {
+        return true;
+    }
     if after.tokens != before.tokens || after.last_confirmed_at != before.last_confirmed_at {
         return after.confirmed_known;
     }
-    if after.failed_turns > before.failed_turns
-        || after.estimated_pending_prompt_tokens != before.estimated_pending_prompt_tokens
-    {
-        return false;
-    }
-    true
+    false
 }
 
 fn dynamic_context_from_goal_entry(
