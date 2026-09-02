@@ -726,9 +726,13 @@ mod tests {
             assert!(limitation.contains("an `if`"), "{limitation}");
             assert!(limitation.contains("condition fails"), "{limitation}");
 
-            let loop_ = posix(policy, "while cargo test; do echo again; done")
-                .expect("condition is exempt");
-            assert!(loop_.contains("condition fails"), "{loop_}");
+            for command in [
+                "while cargo test; do echo again; done",
+                "until cargo test; do sleep 1; done",
+            ] {
+                let loop_ = posix(policy, command).expect("condition is exempt");
+                assert!(loop_.contains("condition fails"), "{command}: {loop_}");
+            }
 
             let case = posix(policy, "case \"$1\" in build) cargo build ;; esac")
                 .expect("no pattern need match");
