@@ -32,7 +32,9 @@
 //! [`ensure_managed_block`] maintains exactly one marker-delimited block. Content
 //! outside it is preserved byte for byte, so a user's own exclusions are never
 //! touched; content inside it is owned by Zuno, so the set of generated paths can
-//! change between releases without the file accumulating stale duplicates.
+//! change between releases without the file accumulating stale duplicates. The set
+//! itself is declared once, in [`crate::generated`]; a host passes
+//! [`crate::generated::IGNORE_PATTERNS`] here rather than spelling any path again.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};

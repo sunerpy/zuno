@@ -720,6 +720,15 @@ fn a_session_id_that_would_escape_the_directory_is_refused() {
 #[test]
 fn the_gitignore_snippet_names_the_projection_directory() {
     assert_eq!(IGNORE_PATTERN, ".zuno/goal/");
+    assert_eq!(
+        IGNORE_PATTERN,
+        format!("{PROJECT_DIRECTORY}/{GOAL_DIRECTORY}/"),
+        "the registry's pattern must name the directory this crate writes into"
+    );
+    assert!(
+        zuno_paths::IGNORE_PATTERNS.contains(&IGNORE_PATTERN),
+        "the host excludes the registry's patterns, so this one must be among them"
+    );
     assert!(
         GITIGNORE_SNIPPET.lines().any(|line| line == IGNORE_PATTERN),
         "the pattern must be a line on its own so the snippet can be pasted verbatim, \
@@ -734,6 +743,25 @@ fn the_gitignore_snippet_names_the_projection_directory() {
         "the snippet must explain itself to whoever finds it in a .gitignore"
     );
     assert!(GITIGNORE_SNIPPET.ends_with('\n'));
+}
+
+/// The registry answers for every file the projection writes into a worktree — the
+/// document and the salvage copy beside it — and for nothing it writes elsewhere: the
+/// global fallback location is not in the worktree and must not be claimed.
+#[test]
+fn everything_the_projection_writes_into_a_worktree_is_registered_generated_state() {
+    let worktree = Path::new("/tmp/repo");
+    let document = document_path(Some(worktree), "ses_abc").expect("resolve");
+    assert_eq!(
+        zuno_paths::generated::classify(worktree, &document),
+        Some(&zuno_paths::generated::GOAL_PROJECTION)
+    );
+    assert!(zuno_paths::is_generated(
+        worktree,
+        &document.with_file_name("ses_abc.md.bak.1700000000")
+    ));
+    let global = document_path(None, "ses_abc").expect("resolve");
+    assert!(!zuno_paths::is_generated(worktree, &global));
 }
 
 #[test]

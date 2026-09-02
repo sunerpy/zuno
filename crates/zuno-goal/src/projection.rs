@@ -93,11 +93,15 @@
 //! # Keeping the document out of git
 //!
 //! The projection is derived, per-session, and churns on every material change, so
-//! it does not belong in a repository. [`IGNORE_PATTERN`] is the one path that has
-//! to be ignored, and there are two ways to honour it.
+//! it does not belong in a repository. The directory is declared in
+//! `zuno_paths::generated`, the registry of every path Zuno generates inside a
+//! worktree; [`IGNORE_PATTERN`] is that entry's pattern, re-exported here so this
+//! crate and the registry cannot disagree about where the document goes. There are
+//! two ways to honour it.
 //!
-//! The host does it without touching a tracked file: the CLI passes
-//! [`IGNORE_PATTERN`] to `zuno_paths::ensure_managed_block`, which maintains a
+//! The host does it without touching a tracked file: the CLI passes the registry's
+//! patterns (`zuno_paths::IGNORE_PATTERNS`, which lists this one) to
+//! `zuno_paths::ensure_managed_block`, which maintains a
 //! marked block in the repository-private `.git/info/exclude`. That keeps a
 //! generated path out of `git status` in somebody else's repository without
 //! Zuno ever editing a file the repository's own history owns — writing to a
@@ -129,13 +133,15 @@ pub const GOAL_DIRECTORY: &str = "goal";
 
 /// The one path that has to be ignored: the directory the projection writes into.
 ///
-/// A trailing slash so it matches a directory and not a file that happens to share
-/// the name, and no leading slash so it reads the same in `.git/info/exclude` as in
-/// a `.gitignore` at the worktree root. Spelled as a literal rather than composed
-/// from [`PROJECT_DIRECTORY`] and [`GOAL_DIRECTORY`] because a git pattern is always
-/// slash-separated, while joining those two would produce a backslash on Windows and
-/// silently stop matching.
-pub const IGNORE_PATTERN: &str = ".zuno/goal/";
+/// Taken from the generated-path registry rather than spelled here, so the pattern
+/// the host excludes, the pattern this crate documents and the directory
+/// [`document_path`] writes into cannot drift apart; a test asserts the registry
+/// entry agrees with [`PROJECT_DIRECTORY`] and [`GOAL_DIRECTORY`]. The registry keeps
+/// it slash-separated with a trailing slash and no leading one: a git pattern is
+/// always slash-separated, joining the two directory names would produce a backslash
+/// on Windows and silently stop matching, and without the leading slash it reads the
+/// same in `.git/info/exclude` as in a `.gitignore` at the worktree root.
+pub const IGNORE_PATTERN: &str = zuno_paths::generated::GOAL_PROJECTION.pattern;
 
 /// What to add to a repository's `.gitignore` for the goal projection.
 ///

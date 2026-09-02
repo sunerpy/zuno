@@ -23,7 +23,21 @@ pub const SNAPSHOT_DIRECTORY: &str = "snapshot";
 
 /// The tool-output spill directory under `data()` —
 /// `ToolOutputStore.MANAGED_DIRECTORY`.
+///
+/// The shell tool and the tool registry also open a store at
+/// `<worktree>/.zuno/tool-output`, which is why [`crate::generated::TOOL_OUTPUT`]
+/// registers that directory as generated state.
 pub const TOOL_OUTPUT_DIRECTORY: &str = "tool-output";
+
+/// The background-execution state directory under a worktree's project directory:
+/// `<worktree>/.zuno/background`, the root `BackgroundExecutionService` is opened on.
+///
+/// Not joined onto `data()` like its neighbours, because the service is per workspace
+/// so that a background command survives a session switch in the same checkout. Named
+/// here, beside [`TOOL_OUTPUT_DIRECTORY`], so the crate that writes it and the
+/// generated-path registry ([`crate::generated::BACKGROUND_EXECUTIONS`]) spell it once;
+/// two spellings would let the writer move while the exclude pattern stayed behind.
+pub const BACKGROUND_DIRECTORY: &str = "background";
 
 /// The provider credential file under `data()`.
 pub const AUTH_FILE: &str = "auth.json";

@@ -35,7 +35,6 @@ use zuno_tool::{
 };
 
 const TOOL_ID: &str = "shell";
-const BACKGROUND_DIRECTORY: &str = "background";
 /// The description the model reads.
 pub const DESCRIPTION: &str = include_str!("description/shell.txt");
 
@@ -359,7 +358,7 @@ impl ShellTool {
             BackgroundExecutionService::open(
                 workspace
                     .join(zuno_paths::PROJECT_DIRECTORY)
-                    .join(BACKGROUND_DIRECTORY),
+                    .join(zuno_paths::BACKGROUND_DIRECTORY),
             )
             .map_err(io::Error::other)?,
         );
