@@ -17,6 +17,12 @@ selecting `plan` switches to Plan mode, while selecting `build`,
 mode. The inverse Mode change selects the corresponding Agent and publishes
 both `current_mode_update` and `config_option_update`.
 
+Idle Agent, model, Mode, and reasoning changes atomically replace the turn host.
+The session keeps its connected MCP runtime when the resolved MCP server set and
+connection concurrency are unchanged, avoiding an unnecessary network or
+subprocess handshake. Structural MCP changes still reconnect. Reconfiguration
+logs include phase timings but omit selected values and credentials.
+
 Plan projection is driven by durable work-state revisions, not by recognizing a
 `plan_update` tool call. Each session reads and publishes the authoritative
 complete Plan after a change, deduplicates by `(plan_id, revision)`, flushes the
@@ -50,6 +56,8 @@ Zuno advertises standard ACP MCP support for stdio and Streamable HTTP;
 legacy SSE remains unsupported. `session/new`, `session/load`, and
 `session/resume` must provide the complete `mcpServers` list for that session.
 Load and resume never reuse process resources from an earlier request.
+Configuration changes inside one active session do reuse its connected MCP
+runtime when the effective MCP configuration is unchanged.
 
 Declarations are validated before the session is published:
 

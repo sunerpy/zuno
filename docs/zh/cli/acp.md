@@ -14,6 +14,11 @@ Plan mode；选择 `build`、`orchestrator`、`deep` 或其他实现 Agent 会�
 mode。反向切换 Mode 也会选择对应 Agent，并同时发送 `current_mode_update` 与
 `config_option_update`，避免 Zed 的两个 selector 漂移。
 
+空闲状态下切换 Agent、模型、Mode 或推理等级时，Zuno 仍会原子替换 turn host，
+但如果解析后的 MCP server 集合与连接并发度没有变化，会保留该会话已经连接的 MCP
+runtime，避免重复网络或子进程握手。结构性 MCP 配置发生变化时仍会重新连接。重配置
+日志会记录锁等待、解析、关闭、打开和总耗时，但不会记录所选值或凭据。
+
 Plan 投影由 durable work-state revision 驱动，不再依赖识别 `plan_update` 工具调用。
 每个会话订阅当前 host，发生变化后读取权威 Plan 并发送完整的
 `sessionUpdate: "plan"`。`(plan_id, revision)` 会抑制重复或过期更新；连续快速提交
