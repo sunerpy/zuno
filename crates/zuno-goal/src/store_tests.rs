@@ -922,7 +922,7 @@ fn negative_deltas_are_clamped_rather_than_persisted() {
 }
 
 #[test]
-fn unknown_accounting_is_sticky_and_history_keeps_the_confirmed_lower_bound() {
+fn unknown_accounting_is_sticky_and_a_charge_is_not_a_revision() {
     let fixture = Fixture::in_memory();
     fixture
         .store
@@ -949,18 +949,26 @@ fn unknown_accounting_is_sticky_and_history_keeps_the_confirmed_lower_bound() {
         "a later confirmed checkpoint must not erase an earlier accounting gap"
     );
 
+    // The floor lives on the goal row, which is what every reader consults, and the
+    // two charges appended no history because a charge is not a revision. Usage is
+    // now recorded around every provider request, so a history that recorded charges
+    // would be a token log with the revision trail buried in it.
     let history = fixture.store.history(SESSION).expect("read history");
     assert_eq!(
         history
             .iter()
             .map(|entry| entry.goal.usage_known)
             .collect::<Vec<_>>(),
-        [true, false, false]
+        [true],
+        "only the creation is a revision here"
     );
-    assert_eq!(
-        history.last().map(|entry| entry.goal.tokens_used),
-        Some(150)
-    );
+    let current = fixture
+        .store
+        .goal(SESSION)
+        .expect("read the goal")
+        .expect("the session has a goal");
+    assert_eq!(current.tokens_used, 150);
+    assert!(!current.usage_known);
 }
 
 #[test]
@@ -1350,6 +1358,76 @@ fn goal_history_keeps_every_revision_across_cancel_and_replacement() {
         history
             .windows(2)
             .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+}
+
+/// A database created before the guard existed must not fail on its second charge.
+///
+/// The old trigger appended a history row for every `UPDATE goal`, and `goal_history` is
+/// keyed `UNIQUE(goal_id, revision)`. Now that a charge leaves the revision alone, that
+/// trigger fails the key on the second provider request of a session — on an upgraded
+/// install only, and at the moment the run records what it spent. This test builds the
+/// old trigger on purpose, so the repair is exercised rather than assumed.
+#[test]
+fn an_older_history_trigger_is_replaced_before_a_second_charge_lands() {
+    let spill = tempfile::tempdir().expect("create spill directory");
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
+    );
+    let mut connection = pool.open_connection().expect("open shared connection");
+    zuno_db::migration::apply(&mut connection).expect("apply shared schema");
+    connection
+        .execute_batch(SCHEMA)
+        .expect("create the goal table");
+    connection
+        .execute_batch(AUXILIARY_SCHEMA)
+        .expect("create the goal history table and its triggers");
+    connection
+        .execute_batch(
+            "DROP TRIGGER goal_history_after_update;
+             CREATE TRIGGER goal_history_after_update
+             AFTER UPDATE ON goal
+             BEGIN
+                 INSERT INTO goal_history (
+                     session_id, goal_id, revision, objective, success_criteria, status,
+                     blocked_reason, token_budget, tokens_used, usage_known,
+                     time_used_seconds, created_at_ms, updated_at_ms
+                 ) VALUES (
+                     NEW.session_id, NEW.goal_id, NEW.revision, NEW.objective,
+                     NEW.success_criteria, NEW.status, NEW.blocked_reason, NEW.token_budget,
+                     NEW.tokens_used, NEW.usage_known, NEW.time_used_seconds,
+                     NEW.created_at_ms, NEW.updated_at_ms
+                 );
+             END",
+        )
+        .expect("build the trigger this release replaced");
+    drop(connection);
+
+    let store = GoalStore::from_pool(Arc::clone(&pool), spill.path().to_owned())
+        .expect("attach goal store to the older database");
+    store
+        .create_goal(
+            SESSION,
+            "charge twice on an upgraded database",
+            Some(10_000),
+        )
+        .expect("create goal");
+
+    for (request_id, at_ms) in [("turn-1:1", 1_000), ("turn-1:2", 1_100)] {
+        store
+            .record_request_usage(SESSION, request_id, 11, at_ms)
+            .expect("charge a request on an upgraded database");
+    }
+
+    let goal = store
+        .goal(SESSION)
+        .expect("read the goal")
+        .expect("the session has a goal");
+    assert_eq!(goal.tokens_used, 22, "both charges must be recorded");
+    assert_eq!(
+        store.history(SESSION).expect("read history").len(),
+        1,
+        "the replaced trigger must not append a charge"
     );
 }
 
@@ -2671,6 +2749,77 @@ fn a_replayed_request_id_is_charged_once() {
             .expect("record against a session with no goal")
             .goal,
         None
+    );
+}
+
+/// The exact loop this guards against: the fixture ACP client reads a revision,
+/// asks the model to write with it, and the request that carries the question charges
+/// the goal. When that charge took the revision, the write conflicted, the client
+/// retried with the revision it was given, and the run issued thousands of provider
+/// requests without ever completing the goal.
+#[test]
+fn charging_a_request_leaves_a_writer_holding_the_revision() {
+    let fixture = Fixture::in_memory();
+    let created = fixture
+        .store
+        .create_goal(
+            SESSION,
+            "answer without spending the revision",
+            Some(10_000),
+        )
+        .expect("create goal");
+    let held = created.revision;
+
+    let charged = fixture
+        .store
+        .record_request_usage(SESSION, "turn-1:1", 11, 1_000)
+        .expect("charge the request that asked for the write")
+        .goal
+        .expect("goal exists");
+
+    assert!(charged.tokens_used > 0, "the charge must still be recorded");
+    assert_eq!(
+        charged.revision, held,
+        "accounting is not a change a writer needs to know about"
+    );
+    let completed = fixture
+        .store
+        .update_status_as_model_checked(SESSION, ModelStatus::Complete, held)
+        .expect("complete with the revision the writer was given")
+        .expect("goal exists");
+    assert_eq!(completed.status, GoalStatus::Complete);
+}
+
+/// A status flip is a real change, so it still takes the token. A writer that read the
+/// goal while it was active and completes it afterwards is asserting something about a
+/// goal that has since stopped, which is the case the revision exists to catch.
+#[test]
+fn a_charge_that_spends_the_budget_takes_the_revision() {
+    let fixture = Fixture::in_memory();
+    let created = fixture
+        .store
+        .create_goal(SESSION, "spend the whole budget", Some(100))
+        .expect("create goal");
+
+    let limited = fixture
+        .store
+        .record_request_usage(SESSION, "turn-1:1", 100, 1_000)
+        .expect("charge the request that spends the budget")
+        .goal
+        .expect("goal exists");
+
+    assert_eq!(limited.status, GoalStatus::BudgetLimited);
+    assert_eq!(limited.revision, created.revision + 1);
+    assert!(
+        matches!(
+            fixture.store.update_status_as_model_checked(
+                SESSION,
+                ModelStatus::Complete,
+                created.revision
+            ),
+            Err(GoalError::RevisionConflict { .. })
+        ),
+        "a status the writer never saw must not be overwritten"
     );
 }
 

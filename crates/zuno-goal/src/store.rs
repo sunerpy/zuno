@@ -298,6 +298,7 @@ BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS goal_history_after_update
 AFTER UPDATE ON goal
+WHEN NEW.revision <> OLD.revision
 BEGIN
     INSERT INTO goal_history (
         session_id, goal_id, revision, objective, success_criteria, status, blocked_reason,
@@ -617,6 +618,7 @@ impl GoalStore {
             tx.execute_batch(SCHEMA).map_err(zuno_db::map_error)?;
             tx.execute_batch(AUXILIARY_SCHEMA)
                 .map_err(zuno_db::map_error)?;
+            guard_history_on_revision(tx)?;
             widen_pause_reasons(tx)
         })?;
         Ok(Self { pool, spill_dir })
@@ -2359,12 +2361,29 @@ updated_at_ms";
 
 /// `tokens_used + ?1` reads the pre-update value, which is how the flip decides
 /// on the post-increment total inside the statement that performs the increment.
+/// Every right-hand side sees the pre-update row, so the two `CASE` expressions
+/// cannot disagree about whether this charge is the one that spends the budget.
+///
+/// The revision moves only when the status does, because `revision` is the token a
+/// writer holds to prove the goal has not changed under it, and accounting is not a
+/// change a writer needs to know about. Usage is now recorded around every provider
+/// request rather than once at the end of a turn, and there is always a provider
+/// request between reading a revision and writing with it: the request that asks the
+/// model to produce the write. Bumping on every charge would therefore make each
+/// first `goal_update` attempt a guaranteed conflict, and a client that retries with
+/// the revision it was given would never converge. A status flip is a real change and
+/// still takes the token.
 const RECORD_USAGE: &str = "\
 UPDATE goal
 SET tokens_used = tokens_used + ?1,
     time_used_seconds = time_used_seconds + ?2,
     usage_known = usage_known AND ?3,
-    revision = revision + 1,
+    revision = revision + CASE
+        WHEN status = 'active'
+             AND token_budget IS NOT NULL
+             AND tokens_used + ?1 >= token_budget THEN 1
+        ELSE 0
+    END,
     status = CASE
         WHEN status = 'active'
              AND token_budget IS NOT NULL
@@ -3291,6 +3310,41 @@ fn new_goal_id() -> String {
 pub(crate) fn now_ms() -> Result<i64, GoalError> {
     let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
     Ok(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Let history record changes rather than charges.
+///
+/// [`AUXILIARY_SCHEMA`] declares `goal_history_after_update` with a `WHEN` guard so a
+/// charge that moves only the counters appends nothing, and `goal_history` is keyed
+/// `UNIQUE(goal_id, revision)`, so an unguarded trigger fails that key the moment a
+/// second charge lands on one revision. `CREATE TRIGGER IF NOT EXISTS` does nothing to
+/// a trigger that already exists, so a database created before the guard keeps the old
+/// one and every provider request after the first would fail to record its usage.
+///
+/// Keyed on the declared SQL rather than a version number, for the reason given on
+/// [`widen_pause_reasons`]: these tables sit outside the [`zuno_db::migration`] format
+/// marker. A trigger holds no data, so the repair is a drop and a recreate from the one
+/// definition, and it runs inside the caller's transaction.
+fn guard_history_on_revision(tx: &Transaction<'_>) -> Result<(), DbError> {
+    let declared: Option<String> = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master \
+             WHERE type = 'trigger' AND name = 'goal_history_after_update'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(zuno_db::map_error)?;
+    let Some(declared) = declared else {
+        return Ok(());
+    };
+    if declared.contains("NEW.revision <> OLD.revision") {
+        return Ok(());
+    }
+    tx.execute_batch("DROP TRIGGER goal_history_after_update")
+        .map_err(zuno_db::map_error)?;
+    tx.execute_batch(AUXILIARY_SCHEMA)
+        .map_err(zuno_db::map_error)
 }
 
 /// Let the pause table accept every reason this build knows about.
