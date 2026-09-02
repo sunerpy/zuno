@@ -119,10 +119,14 @@ observer 调度 active 根 Goal。恢复任务与普通 prompt 共用会话执�
 
 ## Skill catalog 热更新
 
-运行中的 Skill catalog 保留精确的逻辑根目录。根目录尚不存在时，只非递归监听最近的
+运行中的 Skill catalog 会保留规范用户根目录
+`$XDG_CONFIG_HOME/zuno/skill` 与显式配置路径。根目录尚不存在时，只非递归监听最近的
 已有父目录；目录出现后，消费任务会在 native watcher 回调之外安全地逐级收窄订阅，
-并且只在精确根目录存在时开启递归监听。这样既能识别运行中新建的 `~/.zuno`、
-`~/.agents`、`skills.paths` 与远端缓存根，也不会在 TUI 首帧前递归扫描整个 home。
+并且只在精确根目录存在时开启递归监听。
+
+Zuno 不监听 `~/.zuno` 或远端 Skill 缓存；缓存只在配置远端索引并实际下载时按需创建。
+标准共享根 `~/.agents/skills` 只在启动时已经存在时监听，其他共享目录需要通过
+`skills.paths` 显式配置以支持运行中安装。
 
 Shell 执行受 OS 沙箱约束。`read-only` 与 `workspace-write` 都要求一个已验证的约束后端，不可用时拒绝启动而非降级。详见 [权限与沙箱](/zh/guide/permissions)。
 

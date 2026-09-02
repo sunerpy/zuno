@@ -27,9 +27,10 @@ silent surprise.
 
 Zuno discovers Skills in this scope order:
 
-1. project `.zuno/skill` and `.zuno/skills` roots, from the current directory to the worktree;
+1. project `.zuno/skill` roots, from the current directory to the worktree;
 2. project `.agents/skills` roots over the same walk;
-3. Zuno's global and configured config directories;
+3. `$XDG_CONFIG_HOME/zuno/skill` (normally `~/.config/zuno/skill`) and
+   `ZUNO_CONFIG_DIR/skill` when that override is set;
 4. global `~/.agents/skills`;
 5. explicit `skills.paths`;
 6. configured remote indexes.
@@ -38,6 +39,9 @@ Project scope is therefore advertised before user-global scope. Zuno never scans
 `.claude`, `.opencode`, or another product's config directory implicitly. A shared
 directory can still be selected deliberately through `skills.paths`. The same canonical
 source path is de-duplicated, including symlink aliases.
+
+Zuno does not implicitly scan `~/.zuno`, `~/.config/zuno/skills`, or project
+`.zuno/skills`. Add any non-canonical directory explicitly through `skills.paths`.
 
 ```sh
 ZUNO_DISABLE_EXTERNAL_SKILLS=1 zuno
@@ -54,11 +58,17 @@ ACP. Installing, editing, deleting, or renaming a Skill in an already-effective
 root is visible without restarting the session. A malformed edit retains the
 last valid entry and exposes a warning until the file is repaired.
 
-Roots that do not exist at session start are also supported. Zuno watches only
-their nearest existing ancestor non-recursively, narrows the subscription as
-directories appear, and enables recursive watching only at the exact configured
-root. Missing `~/.zuno` or `~/.agents` directories therefore do not cause a
-recursive scan of the whole home directory.
+The canonical user root and explicit configured paths may be created while a
+session is running. Zuno watches only their nearest existing ancestor
+non-recursively, narrows the subscription as directories appear, and enables
+recursive watching only at the exact configured root. A shared
+`~/.agents/skills` root is watched when it already exists; create it before
+starting Zuno or select it through `skills.paths` when hot installation is
+required.
+
+The remote download cache is private state. It is created only when
+`skills.urls` actually downloads a file and is never installed as a filesystem
+watch root.
 
 If a caller tries to load an old exact source after a rename, Zuno refreshes
 once and then returns `CatalogStale` with the current exact locators. It never

@@ -7,9 +7,9 @@
 //!
 //! | order | root | pattern | `dot` |
 //! |---|------|---------|-------|
-//! | 1 | every project `.zuno` from `directory` up to `worktree` | `{skill,skills}/**/SKILL.md` | no |
+//! | 1 | every project `.zuno` from `directory` up to `worktree` | `skill/**/SKILL.md` | no |
 //! | 2 | every project `.agents` | `skills/**/SKILL.md` | yes |
-//! | 3 | Zuno's global/configured config directories | `{skill,skills}/**/SKILL.md` | no |
+//! | 3 | `$XDG_CONFIG_HOME/zuno` and `ZUNO_CONFIG_DIR` | `skill/**/SKILL.md` | no |
 //! | 4 | `$HOME/.agents` | `skills/**/SKILL.md` | yes |
 //! | 5 | each `skills.paths[]` entry | `**/SKILL.md` | no |
 //! | 6 | each cache dir a `skills.urls[]` index produced | `**/SKILL.md` | no |
@@ -198,21 +198,30 @@ impl SkillOptions {
     /// parent is already watched recursively. Missing roots retain their exact
     /// identity so `zuno-watch` can follow them through non-recursive ancestor
     /// subscriptions instead of recursively watching an unrelated home directory.
+    ///
+    /// Remote caches are deliberately absent. They are private download state, not
+    /// an authoring root, and a remote pull already refreshes the catalog that wrote
+    /// them. Shared Agent Skills are watched only when their standard directory
+    /// already exists; Zuno never asks a user to create it merely for file watching.
     #[must_use]
     pub fn watch_roots(&self) -> Vec<PathBuf> {
         let mut candidates = vec![
             self.worktree
                 .clone()
                 .unwrap_or_else(|| self.directory.clone()),
-            self.layout.config().to_path_buf(),
-            self.layout.home().join(".zuno"),
-            self.layout.home().join(AGENTS_EXTERNAL_DIR),
-            self.remote_cache_root(),
+            self.layout.config().join("skill"),
         ];
-        candidates.extend(
-            self.layout
-                .config_directories(&self.directory, self.worktree.as_deref()),
-        );
+        if let Some(extra) = self
+            .layout
+            .config_dir_override()
+            .filter(|value| !value.is_empty())
+        {
+            candidates.push(PathBuf::from(extra).join("skill"));
+        }
+        let shared_agents = self.layout.home().join(AGENTS_EXTERNAL_DIR).join("skills");
+        if !self.external_disabled && shared_agents.is_dir() {
+            candidates.push(shared_agents);
+        }
         candidates.extend(self.paths.iter().map(|entry| expand_path(entry, self)));
         candidates.extend(
             self.raw_path_config
@@ -251,6 +260,26 @@ impl SkillOptions {
             return Vec::new();
         }
         vec![AGENTS_EXTERNAL_DIR]
+    }
+
+    /// Zuno-owned user configuration roots for Skills.
+    ///
+    /// Project `.zuno` directories are discovered separately. `$HOME/.zuno` is
+    /// intentionally not a user Skill root: the canonical location is the XDG
+    /// config directory, with an explicit `ZUNO_CONFIG_DIR` appended when set.
+    fn user_config_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.layout.config().to_path_buf()];
+        if let Some(extra) = self
+            .layout
+            .config_dir_override()
+            .filter(|value| !value.is_empty())
+        {
+            let extra = PathBuf::from(extra);
+            if !dirs.contains(&extra) {
+                dirs.push(extra);
+            }
+        }
+        dirs
     }
 }
 
@@ -318,7 +347,7 @@ fn watch_target(mut path: PathBuf) -> Option<PathBuf> {
 /// Which root produced a match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Root {
-    /// A project `.zuno/{skill,skills}` root.
+    /// A project `.zuno/skill` root.
     ProjectZuno,
     /// A project `.agents/skills` root.
     ProjectAgents,
@@ -385,8 +414,7 @@ impl SkillSources {
         };
         let external = options.external_dirs();
 
-        // Project scope first. Keep the project Zuno roots so the broader config
-        // directory list below can skip rescanning them.
+        // Project scope first.
         let project_zuno = if options.layout.project_config_disabled() {
             Vec::new()
         } else {
@@ -396,10 +424,6 @@ impl SkillSources {
                 options.worktree.as_deref(),
             )
         };
-        let project_zuno_identities = project_zuno
-            .iter()
-            .map(|root| identity(root))
-            .collect::<HashSet<_>>();
         for root in project_zuno {
             sources.absorb(&root, ZUNO_PREFIXES, false, Root::ProjectZuno);
         }
@@ -410,16 +434,10 @@ impl SkillSources {
             }
         }
 
-        // Global Zuno roots before global external-product roots. The shared
-        // config-chain helper also returns project `.zuno` directories; those
-        // were already scanned above with project provenance.
-        for dir in options
-            .layout
-            .config_directories(&options.directory, options.worktree.as_deref())
-        {
-            if project_zuno_identities.contains(&identity(&dir)) {
-                continue;
-            }
+        // The canonical user root is `$XDG_CONFIG_HOME/zuno/skill`. An explicit
+        // `ZUNO_CONFIG_DIR` is a second user-owned root. `$HOME/.zuno` belongs to
+        // the broader configuration chain but is not a Skill source.
+        for dir in options.user_config_dirs() {
             sources.absorb(&dir, ZUNO_PREFIXES, false, Root::GlobalZuno);
         }
 
@@ -655,7 +673,7 @@ mod tests {
     #[test]
     fn every_local_root_is_visited_in_zuno_scope_order() {
         let fixture = Fixture::new();
-        let project_zuno = fixture.skill("proj/sub/.zuno/skills/pz", "pz");
+        let project_zuno = fixture.skill("proj/sub/.zuno/skill/pz", "pz");
         let project_agents = fixture.skill("proj/sub/.agents/skills/pa", "pa");
         fixture.skill("proj/.claude/skills/pc", "ignored-project-claude");
         let config = fixture.skill("home/.config/zuno/skill/gz", "gz");
@@ -765,8 +783,8 @@ mod tests {
         fixture.skill("home/.agents/skills/b", "b");
         fixture.skill("proj/.opencode/skills/po", "po");
         fixture.skill("proj/.agents/skills/c", "c");
-        let project_zuno = fixture.skill("proj/.zuno/skills/pz", "pz");
-        let config = fixture.skill("home/.config/zuno/skills/d", "d");
+        let project_zuno = fixture.skill("proj/.zuno/skill/pz", "pz");
+        let config = fixture.skill("home/.config/zuno/skill/d", "d");
 
         let env = fixture.env().with("ZUNO_DISABLE_EXTERNAL_SKILLS", "1");
         let options = SkillOptions::new(
@@ -788,7 +806,7 @@ mod tests {
     #[test]
     fn project_config_switch_only_removes_project_zuno() {
         let fixture = Fixture::new();
-        fixture.skill("proj/.zuno/skills/zuno", "zuno");
+        fixture.skill("proj/.zuno/skill/zuno", "zuno");
         let agents = fixture.skill("proj/.agents/skills/agents", "agents");
         let env = fixture.env().with("ZUNO_DISABLE_PROJECT_CONFIG", "1");
         let options = SkillOptions::new(
@@ -896,7 +914,7 @@ mod tests {
             "ignored-global",
         );
         fixture.skill("proj/.opencode/skills/ignored-project", "ignored-project");
-        let project_zuno = fixture.skill("proj/sub/.zuno/skills/project-zuno", "project-zuno");
+        let project_zuno = fixture.skill("proj/sub/.zuno/skill/project-zuno", "project-zuno");
         let project_agents =
             fixture.skill("proj/sub/.agents/skills/project-agents", "project-agents");
         let global_zuno = fixture.skill("home/.config/zuno/skill/global-zuno", "global-zuno");
@@ -997,6 +1015,80 @@ mod tests {
     }
 
     #[test]
+    fn default_watch_roots_exclude_legacy_zuno_and_remote_cache_directories() {
+        let fixture = Fixture::new();
+        let project = fixture.dir.path().join("project");
+        fs::create_dir_all(&project).expect("project");
+        let options = SkillOptions::new(
+            &project,
+            Some(&project),
+            &fixture.env(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let roots = options.watch_roots();
+        assert!(
+            roots.contains(&canonical_or_normalized(&project)),
+            "{roots:?}"
+        );
+        assert!(
+            roots.contains(&canonical_or_normalized(
+                &fixture.home().join(".config/zuno/skill")
+            )),
+            "{roots:?}"
+        );
+        assert!(
+            !roots
+                .iter()
+                .any(|root| root == &fixture.home().join(".zuno")),
+            "{roots:?}"
+        );
+        assert!(
+            !roots
+                .iter()
+                .any(|root| root == &fixture.home().join(".cache/zuno/skills")),
+            "{roots:?}"
+        );
+        assert!(
+            !roots
+                .iter()
+                .any(|root| root == &fixture.home().join(".config/zuno/skills")),
+            "{roots:?}"
+        );
+    }
+
+    #[test]
+    fn existing_shared_agent_skills_are_watched_but_missing_ones_are_not() {
+        let fixture = Fixture::new();
+        let project = fixture.dir.path().join("project");
+        fs::create_dir_all(&project).expect("project");
+        let absent = SkillOptions::new(
+            &project,
+            Some(&project),
+            &fixture.env(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let shared = fixture.home().join(".agents/skills");
+        assert!(!absent.watch_roots().contains(&shared));
+
+        fs::create_dir_all(&shared).expect("shared Agent Skills");
+        let existing = SkillOptions::new(
+            &project,
+            Some(&project),
+            &fixture.env(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(
+            existing
+                .watch_roots()
+                .contains(&canonical_or_normalized(&shared))
+        );
+    }
+
+    #[test]
     fn path_config_for_a_future_skill_retains_its_exact_parent_target() {
         let fixture = Fixture::new();
         let project = fixture.dir.path().join("project");
@@ -1006,10 +1098,7 @@ mod tests {
             &project,
             &external,
             &fixture.home(),
-            &fixture.home().join(".zuno"),
-            &fixture.home().join(".agents"),
             &fixture.home().join(".config/zuno"),
-            &fixture.home().join(".cache/zuno/skills"),
         ] {
             fs::create_dir_all(directory).expect("watch root");
         }

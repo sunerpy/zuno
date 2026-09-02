@@ -107,7 +107,7 @@ fn expected_names(tail: &[&str]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn every_supported_root_contributes_and_claude_roots_are_ignored() {
+async fn canonical_roots_contribute_and_legacy_zuno_roots_are_ignored() {
     let tree = Tree::new();
     tree.skill(
         "proj/sub/.zuno/skill/from-project-zuno",
@@ -134,6 +134,11 @@ async fn every_supported_root_contributes_and_claude_roots_are_ignored() {
         "from-config-plural",
         Some("gp"),
     );
+    tree.skill(
+        "home/.zuno/skill/from-home-dot-zuno",
+        "from-home-dot-zuno",
+        Some("hz"),
+    );
     tree.skill("home/.agents/skills/from-agents", "from-agents", Some("a"));
     tree.skill("home/.claude/skills/from-claude", "from-claude", Some("c"));
     tree.skill("extra/from-path", "from-path", Some("x"));
@@ -151,7 +156,6 @@ async fn every_supported_root_contributes_and_claude_roots_are_ignored() {
             "from-project-zuno",
             "from-project-agents",
             "from-config",
-            "from-config-plural",
             "from-agents",
             "from-path",
         ])

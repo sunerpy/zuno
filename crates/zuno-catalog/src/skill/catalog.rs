@@ -621,15 +621,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watcher_follows_a_missing_global_skill_root_without_recursing_home() {
+    async fn watcher_follows_a_missing_canonical_skill_root_from_its_existing_ancestor() {
         let root = tempfile::tempdir().expect("root");
         let project = root.path().join("project");
         let home = root.path().join("home");
         std::fs::create_dir_all(&project).expect("project");
         std::fs::create_dir_all(&home).expect("home");
         let env = isolated_env(root.path());
-        let requested = home.join(".agents");
-        let canonical_home = std::fs::canonicalize(&home).expect("canonical home");
+        let requested = root.path().join("config/zuno/skill");
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonical root");
         let service = SkillCatalogService::start(
             SkillOptions::new(&project, Some(&project), &env, Vec::new(), Vec::new()),
             Vec::new(),
@@ -656,14 +656,14 @@ mod tests {
         assert!(
             scopes.iter().any(|(logical, active, recursive)| {
                 logical == &requested
-                    && active.as_deref() == Some(canonical_home.as_path())
+                    && active.as_deref() == Some(canonical_root.as_path())
                     && !recursive
             }),
-            "missing global roots must watch home non-recursively: {scopes:?}"
+            "the missing canonical root must be followed from its nearest existing ancestor: {scopes:?}"
         );
 
         let mut updates = service.subscribe();
-        let skill = home.join(".agents/skills/sheet");
+        let skill = requested.join("sheet");
         std::fs::create_dir_all(&skill).expect("skill directory");
         std::fs::write(
             skill.join("SKILL.md"),
