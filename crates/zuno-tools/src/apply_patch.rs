@@ -4,7 +4,7 @@ use crate::format::FormatFailure;
 use crate::read::{
     FileReadConflictKind, FileReadReceipt, FileToolRuntime, IdenticalPatchConflict, PathKind,
     ResolvedPath, check_interrupt, decode_text, digest_bytes, encode_text, failed, interrupted,
-    invalid, report_formatting, slash, uncertain, write_with_dirs,
+    invalid, report_formatting, slash, uncertain,
 };
 use async_trait::async_trait;
 use parser::{ChunkLine, PatchOperation, PatchParseError, UpdateChunk, parse_patch};
@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zuno_error::{ToolError, ToolMutationConflict, ToolMutationConflictKind};
@@ -54,6 +55,14 @@ struct FileChange {
     /// The pre-image at a move destination, absent when the destination did not exist.
     destination_old_bytes: Option<Vec<u8>>,
     new_bytes: Vec<u8>,
+    /// Digest of the image preparation found at the path this change *writes*, or
+    /// `None` when preparation found no file there.
+    ///
+    /// This is the write target — the move destination for a `Move`, the file itself
+    /// otherwise — not the source, because the write is what has to be protected.
+    /// [`write_verified`] re-reads the target and compares against this digest at the
+    /// instant of the write. A `Delete` writes nothing and never consults it.
+    target_digest: Option<String>,
 }
 
 enum PreparedOperation {
@@ -199,11 +208,22 @@ impl TypedTool for ApplyPatchTool {
             // Every branch that writes has already written by the time it formats,
             // so a formatter's failure is collected rather than propagated: one
             // uncooperative formatter must not abandon a patch mid-way.
+            //
+            // Each write re-verifies its target first, so a file that moved since
+            // preparation is refused rather than overwritten. While nothing has been
+            // applied that refusal is the plain typed conflict; once an earlier file
+            // of the same patch is on disk, `after_effect` promotes it to an
+            // uncertain outcome, because those bytes really are there and the model
+            // must not be told the whole patch failed.
             let formatted = match change.kind {
                 ChangeKind::Add | ChangeKind::Update => {
                     after_effect(
-                        write_with_dirs(&target_path, &change.new_bytes)
-                            .map_err(|error| failed("apply_patch", error)),
+                        write_verified(
+                            target,
+                            &change.new_bytes,
+                            change.target_digest.as_deref(),
+                            &operation_digest,
+                        ),
                         &applied,
                     )?;
                     applied.push(target_path.clone());
@@ -211,8 +231,12 @@ impl TypedTool for ApplyPatchTool {
                 }
                 ChangeKind::Move => {
                     after_effect(
-                        write_with_dirs(&target_path, &change.new_bytes)
-                            .map_err(|error| failed("apply_patch", error)),
+                        write_verified(
+                            target,
+                            &change.new_bytes,
+                            change.target_digest.as_deref(),
+                            &operation_digest,
+                        ),
                         &applied,
                     )?;
                     applied.push(target_path.clone());
@@ -520,6 +544,9 @@ impl ApplyPatchTool {
                     old_bytes: None,
                     destination_old_bytes: None,
                     new_bytes: content.into_bytes(),
+                    // Preparation established that nothing is there, so the write must
+                    // create the file rather than replace whatever arrived since.
+                    target_digest: None,
                 }),
                 PreparedOperation::Delete { source, old_bytes } => {
                     changes.push(FileChange {
@@ -529,6 +556,7 @@ impl ApplyPatchTool {
                         old_bytes: Some(old_bytes),
                         destination_old_bytes: None,
                         new_bytes: Vec::new(),
+                        target_digest: None,
                     });
                 }
                 PreparedOperation::Update {
@@ -576,6 +604,14 @@ impl ApplyPatchTool {
                     } else {
                         ChangeKind::Update
                     };
+                    // A move writes the destination, so the destination's pre-image is
+                    // what the write has to still find; an in-place update writes the
+                    // file the patch was computed against.
+                    let target_digest = if destination.is_some() {
+                        destination_old_bytes.as_deref().map(digest_bytes)
+                    } else {
+                        Some(observed_digest)
+                    };
                     changes.push(FileChange {
                         source,
                         destination,
@@ -583,6 +619,7 @@ impl ApplyPatchTool {
                         old_bytes: Some(old_bytes),
                         destination_old_bytes,
                         new_bytes: encode_text(&line_ending.restore(content), decoded.bom),
+                        target_digest,
                     });
                 }
             }
@@ -648,6 +685,127 @@ fn require_patch_read(
                 message,
             )
         })
+}
+
+/// Write `bytes` to the change's target, but only while the target still holds the
+/// image preparation validated.
+///
+/// `prepare_changes` digests every file it is about to change and refuses a patch
+/// whose read receipt is stale. That proves the file was unchanged when it was
+/// *read*, which is not when it is written: the patch is applied in memory first,
+/// a formatter may run over an earlier file of the same patch, and the worktree is
+/// shared with background jobs, other tool calls and the user's editor. Without
+/// this second check a concurrent edit is silently overwritten and the model
+/// reports success over somebody's lost work. Re-reading here narrows the window
+/// to one read-then-write pair; it cannot close it entirely without locking the
+/// filesystem, and narrowing it is what makes the loss observable instead of
+/// silent.
+///
+/// `expected_digest` is `None` when preparation found no file at the target. Such
+/// a write must *create* the file, never replace one, so it goes through
+/// `create_new`: the existence test and the creation are a single filesystem
+/// operation. `exists()` followed by a write is two operations, and a file that
+/// appears between them is destroyed by the second — the race this argument
+/// exists to avoid.
+///
+/// # Errors
+///
+/// [`ToolError::MutationConflict`] carrying
+/// [`ToolMutationConflictKind::StaleRead`] when the target no longer holds the
+/// prepared image, whether it was modified, removed, or created after preparation
+/// found it absent. Nothing is written in that case, so the concurrent content
+/// survives. [`ToolError::Failed`] for any other filesystem failure, including a
+/// partial write, because such a write may have landed and must not be
+/// reclassified as a refusal.
+fn write_verified(
+    target: &ResolvedPath,
+    bytes: &[u8],
+    expected_digest: Option<&str>,
+    operation_digest: &str,
+) -> Result<(), ToolError> {
+    let path = target.canonical.as_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| failed("apply_patch", error))?;
+    }
+    let Some(expected) = expected_digest else {
+        return match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => file
+                .write_all(bytes)
+                .map_err(|error| failed("apply_patch", error)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(moved_pre_image(
+                target,
+                operation_digest,
+                None,
+                format!(
+                    "apply_patch refused to overwrite {}: the file was created after the patch was \
+                     verified against its absence; read the current file and submit a patch \
+                     against it",
+                    target.canonical.display()
+                ),
+            )),
+            Err(error) => Err(failed("apply_patch", error)),
+        };
+    };
+    let current = match std::fs::read(path) {
+        Ok(current) => current,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(moved_pre_image(
+                target,
+                operation_digest,
+                None,
+                format!(
+                    "apply_patch refused to write {}: the file was removed after it was read; read \
+                     the current file and submit a patch against it",
+                    target.canonical.display()
+                ),
+            ));
+        }
+        Err(error) => return Err(failed("apply_patch", error)),
+    };
+    let observed = digest_bytes(&current);
+    if observed != expected {
+        return Err(moved_pre_image(
+            target,
+            operation_digest,
+            Some(observed),
+            format!(
+                "apply_patch refused to write {}: the file changed after it was read and before \
+                 the write; read the current file and submit a patch against it",
+                target.canonical.display()
+            ),
+        ));
+    }
+    std::fs::write(path, bytes).map_err(|error| failed("apply_patch", error))
+}
+
+/// The conflict for a pre-image that moved between preparation and the write.
+///
+/// [`ToolMutationConflictKind::StaleRead`] is the kind that describes it: the
+/// resource changed after the session read it, and `reread` — its required action
+/// — is exactly what repairs the situation. `ContextMismatch` would be a lie,
+/// because the patch did match the image it was computed against; the file moved
+/// underneath it. `ReadRequired` would be wrong because a read receipt exists, and
+/// `IdenticalReplay` would be wrong because the next attempt sees different bytes
+/// and is therefore not a replay of anything.
+fn moved_pre_image(
+    target: &ResolvedPath,
+    operation_digest: &str,
+    observed_digest: Option<String>,
+    message: String,
+) -> ToolError {
+    mutation_conflict(
+        ToolMutationConflictKind::StaleRead,
+        target.resource.clone(),
+        operation_digest,
+        observed_digest,
+        None,
+        None,
+        message,
+    )
 }
 
 fn mutation_conflict(
@@ -816,4 +974,132 @@ fn find_line_block(content: &str, block: &str, start: usize, end_of_file: bool) 
             let at_end = !end_of_file || end == content.trim_end_matches('\n').len();
             (starts_on_line && ends_on_line && at_end).then_some(position)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(path: &Path, resource: &str) -> ResolvedPath {
+        ResolvedPath {
+            canonical: path.to_path_buf(),
+            resource: resource.to_owned(),
+            external_pattern: None,
+            external_parent: None,
+        }
+    }
+
+    fn conflict_of(error: &ToolError) -> &ToolMutationConflict {
+        let ToolError::MutationConflict { conflict, .. } = error else {
+            panic!("expected a typed mutation conflict, got {error:?}");
+        };
+        conflict
+    }
+
+    #[test]
+    fn a_file_changed_between_read_and_write_is_never_overwritten() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let path = workspace.path().join("raced.txt");
+        std::fs::write(&path, "prepared\n").expect("prepared image");
+        let prepared = digest_bytes(b"prepared\n");
+        std::fs::write(&path, "somebody else\n").expect("concurrent edit");
+
+        let error = write_verified(
+            &target(&path, "raced.txt"),
+            b"patched\n",
+            Some(&prepared),
+            "patch-digest",
+        )
+        .expect_err("a moved pre-image must refuse the write");
+
+        let conflict = conflict_of(&error);
+        assert_eq!(conflict.kind, ToolMutationConflictKind::StaleRead);
+        assert_eq!(conflict.resource, "raced.txt");
+        assert_eq!(conflict.operation_digest, "patch-digest");
+        assert_eq!(
+            conflict.observed_digest.as_deref(),
+            Some(digest_bytes(b"somebody else\n").as_str()),
+            "the conflict must report the bytes that are actually on disk"
+        );
+        assert_eq!(conflict.required_action(), "reread");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the concurrent edit survives"),
+            "somebody else\n"
+        );
+    }
+
+    #[test]
+    fn a_file_removed_between_read_and_write_is_reported_as_a_conflict() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let path = workspace.path().join("vanished.txt");
+
+        let error = write_verified(
+            &target(&path, "vanished.txt"),
+            b"patched\n",
+            Some(&digest_bytes(b"prepared\n")),
+            "patch-digest",
+        )
+        .expect_err("a pre-image that no longer exists must refuse the write");
+
+        let conflict = conflict_of(&error);
+        assert_eq!(conflict.kind, ToolMutationConflictKind::StaleRead);
+        assert_eq!(conflict.observed_digest, None);
+        assert!(!path.exists(), "a refused write must not create the file");
+    }
+
+    #[test]
+    fn an_add_whose_path_appeared_concurrently_is_never_overwritten() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let path = workspace.path().join("nested").join("added.txt");
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("nested directory");
+        std::fs::write(&path, "somebody else\n").expect("concurrent create");
+
+        let error = write_verified(
+            &target(&path, "nested/added.txt"),
+            b"added\n",
+            None,
+            "patch-digest",
+        )
+        .expect_err("create-new semantics must refuse an existing path");
+
+        let conflict = conflict_of(&error);
+        assert_eq!(conflict.kind, ToolMutationConflictKind::StaleRead);
+        assert_eq!(conflict.resource, "nested/added.txt");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the concurrent create survives"),
+            "somebody else\n"
+        );
+    }
+
+    #[test]
+    fn a_target_that_still_holds_its_prepared_image_is_written() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let existing = workspace.path().join("update.txt");
+        std::fs::write(&existing, "prepared\n").expect("prepared image");
+        let created = workspace.path().join("new").join("added.txt");
+
+        write_verified(
+            &target(&existing, "update.txt"),
+            b"patched\n",
+            Some(&digest_bytes(b"prepared\n")),
+            "patch-digest",
+        )
+        .expect("an unchanged target accepts the write");
+        write_verified(
+            &target(&created, "new/added.txt"),
+            b"added\n",
+            None,
+            "patch-digest",
+        )
+        .expect("an absent target is created, parent directories included");
+
+        assert_eq!(
+            std::fs::read_to_string(&existing).expect("updated file"),
+            "patched\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&created).expect("created file"),
+            "added\n"
+        );
+    }
 }

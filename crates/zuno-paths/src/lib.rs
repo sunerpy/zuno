@@ -67,6 +67,7 @@
 pub mod config_chain;
 pub mod ensure;
 pub mod env;
+pub mod exclude;
 pub mod files;
 pub mod layout;
 pub mod node_path;
@@ -80,6 +81,10 @@ use std::sync::OnceLock;
 pub use crate::config_chain::{CONFIG_FILE_STEM, PROJECT_CONFIG_DIRECTORY, PROJECT_DIRECTORY};
 pub use crate::ensure::PathsError;
 pub use crate::env::Env;
+pub use crate::exclude::{
+    EXCLUDE_GIT_PATH, ExcludeError, ExcludeOutcome, MANAGED_BLOCK_BEGIN, MANAGED_BLOCK_END,
+    ensure_managed_block, resolve_exclude_path,
+};
 pub use crate::files::{
     AUTH_FILE, DEFAULT_DB_FILE, DEFAULT_MODELS_FILE, DEFAULT_MODELS_SOURCE, DbLocation,
     MCP_AUTH_FILE, MEMORY_SENTINEL, SNAPSHOT_DIRECTORY, TOOL_OUTPUT_DIRECTORY,
