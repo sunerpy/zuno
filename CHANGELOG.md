@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.6](https://github.com/sunerpy/zuno/compare/v0.6.5...v0.6.6) (2026-09-02)
+
+
+### Bug Fixes
+
+* **acp:** speed up session configuration changes ([#88](https://github.com/sunerpy/zuno/issues/88)) ([6f3340c](https://github.com/sunerpy/zuno/commit/6f3340c7c6eba92c8ff5ceea91eab9354e140006))
+
 ## [0.6.5](https://github.com/sunerpy/zuno/compare/v0.6.4...v0.6.5) (2026-09-02)
 
 
