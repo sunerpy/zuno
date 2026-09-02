@@ -12,12 +12,16 @@ use zuno_db::Pool;
 use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SubmissionState};
 use zuno_db::message::{MessageRecord, MessageStore, PartKind, PartRecord};
 use zuno_db::{Connection, migration, open};
+use zuno_engine::budget::{
+    BudgetDecision, BudgetStopKind, NoopBudgetPolicy, ProviderRequestUsage, TurnBudgetPolicy,
+    TurnUsageSnapshot,
+};
 use zuno_engine::hooks::TurnHooks;
 use zuno_engine::interrupt::{InterruptSignal, SoftInterruptMessage, SoftInterruptSource};
 use zuno_engine::r#loop::{
-    AgentModelResolver, AvailableTools, DispatchRequest, PreparedToolDispatch, ResolvedAgent,
-    ResolvedModel, RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnError,
-    TurnEvent, TurnOutcome, TurnRecovery, event_channel, hydrate_retained_history,
+    AgentModelResolver, AvailableTools, DispatchRequest, NoticeSeverity, PreparedToolDispatch,
+    ResolvedAgent, ResolvedModel, RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext,
+    TurnError, TurnEvent, TurnOutcome, TurnRecovery, event_channel, hydrate_retained_history,
     hydrate_retained_history_tail, project_history, project_history_owned, retained_history,
     run_turn,
 };
@@ -4711,4 +4715,597 @@ async fn loop_does_not_wait_forever_for_a_provider_that_streams_past_its_own_fin
         "the drain read {trailing} trailing frames, past its budget of {}",
         zuno_engine::r#loop::TRAILING_FRAME_BUDGET
     );
+}
+
+// ---------------------------------------------------------------------------
+// In-turn allowance enforcement.
+//
+// The behaviour under test is that the allowance is consulted around every
+// provider request while the turn is still running, so a turn cannot spend a
+// whole session's tokens between two turn-boundary reconciliations.
+// ---------------------------------------------------------------------------
+
+/// One snapshot the policy was handed, copied so a test can assert on it afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedUsage {
+    session_id: String,
+    turn_id: String,
+    step: u32,
+    turn_usage: ProviderRequestUsage,
+    last_request: ProviderRequestUsage,
+    estimated_prompt_tokens: u64,
+    context_limit: Option<u64>,
+    elapsed_seconds: u64,
+}
+
+impl ObservedUsage {
+    fn record(snapshot: &TurnUsageSnapshot<'_>) -> Self {
+        Self {
+            session_id: snapshot.session_id.to_owned(),
+            turn_id: snapshot.turn_id.to_owned(),
+            step: snapshot.step,
+            turn_usage: snapshot.turn_usage,
+            last_request: snapshot.last_request,
+            estimated_prompt_tokens: snapshot.estimated_prompt_tokens,
+            context_limit: snapshot.context_limit,
+            elapsed_seconds: snapshot.elapsed_seconds,
+        }
+    }
+}
+
+/// A policy whose answers a test writes in advance, recording every snapshot it saw.
+///
+/// An exhausted script answers `Continue`, so a test scripts only the decision it is
+/// about and stays silent about the rest.
+#[derive(Debug, Default)]
+struct ScriptedBudgetPolicy {
+    before: Mutex<VecDeque<Result<BudgetDecision, String>>>,
+    after: Mutex<VecDeque<Result<BudgetDecision, String>>>,
+    observed_before: Mutex<Vec<ObservedUsage>>,
+    observed_after: Mutex<Vec<ObservedUsage>>,
+}
+
+impl ScriptedBudgetPolicy {
+    fn deciding_before(decisions: Vec<Result<BudgetDecision, String>>) -> Arc<Self> {
+        Arc::new(Self {
+            before: Mutex::new(decisions.into()),
+            ..Self::default()
+        })
+    }
+
+    fn deciding_after(decisions: Vec<Result<BudgetDecision, String>>) -> Arc<Self> {
+        Arc::new(Self {
+            after: Mutex::new(decisions.into()),
+            ..Self::default()
+        })
+    }
+
+    fn observing() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn observed_before(&self) -> Vec<ObservedUsage> {
+        self.observed_before
+            .lock()
+            .expect("before-request observation lock")
+            .clone()
+    }
+
+    fn observed_after(&self) -> Vec<ObservedUsage> {
+        self.observed_after
+            .lock()
+            .expect("after-response observation lock")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl TurnBudgetPolicy for ScriptedBudgetPolicy {
+    async fn before_request(
+        &self,
+        snapshot: &TurnUsageSnapshot<'_>,
+    ) -> Result<BudgetDecision, String> {
+        self.observed_before
+            .lock()
+            .expect("before-request observation lock")
+            .push(ObservedUsage::record(snapshot));
+        self.before
+            .lock()
+            .expect("before-request script lock")
+            .pop_front()
+            .unwrap_or(Ok(BudgetDecision::Continue))
+    }
+
+    async fn after_response(
+        &self,
+        snapshot: &TurnUsageSnapshot<'_>,
+    ) -> Result<BudgetDecision, String> {
+        self.observed_after
+            .lock()
+            .expect("after-response observation lock")
+            .push(ObservedUsage::record(snapshot));
+        self.after
+            .lock()
+            .expect("after-response script lock")
+            .pop_front()
+            .unwrap_or(Ok(BudgetDecision::Continue))
+    }
+}
+
+/// Everything a budget test needs to assert on after one turn.
+struct BudgetRun {
+    outcome: Result<TurnOutcome, TurnError>,
+    events: Vec<TurnEvent>,
+    requests: Vec<CompletionRequest>,
+    calls: Vec<DispatchRequest>,
+    connection: Connection,
+}
+
+/// Run the same two-step echo turn the rest of this file uses, under `budget`.
+async fn run_turn_under_budget(
+    turn_id: &str,
+    context_limit: Option<u64>,
+    responses: Vec<ScriptedResponse>,
+    budget: Arc<dyn TurnBudgetPolicy>,
+) -> BudgetRun {
+    let mut connection = seeded();
+    put_user(&connection, "msg_user", 10, "echo hello");
+    let provider = Arc::new(FakeProvider::new(responses));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let mut turn_request = request(turn_id);
+    if let Some(limit) = context_limit {
+        turn_request = turn_request.with_context_limit(limit);
+    }
+
+    let turn = run_turn(
+        turn_request,
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        )
+        .with_budget_policy(budget),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    BudgetRun {
+        outcome,
+        events,
+        requests: provider.requests(),
+        calls: dispatcher.calls(),
+        connection,
+    }
+}
+
+fn zero_usage(accounted: bool) -> ProviderRequestUsage {
+    ProviderRequestUsage {
+        accounted,
+        ..ProviderRequestUsage::default()
+    }
+}
+
+/// A first step that reports its tokens and calls a tool, then an unreported answer.
+fn accounted_tool_call_then_unreported_answer() -> Vec<ScriptedResponse> {
+    vec![
+        ScriptedResponse::complete(vec![
+            StreamEvent::TextDelta("I will use echo.".to_owned()),
+            StreamEvent::ToolUseStart {
+                id: "call-1".to_owned(),
+                name: "echo".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call-1".to_owned(),
+                delta: r#"{"text":"hello"}"#.to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call-1".to_owned(),
+            },
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::ToolCalls),
+            },
+            StreamEvent::TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cache_read_input_tokens: Some(5),
+                cache_write_input_tokens: Some(1),
+                accounting: PromptAccounting::CacheInsideInput,
+            },
+        ]),
+        ScriptedResponse::complete(vec![
+            StreamEvent::TextDelta("echo returned hello".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ]),
+    ]
+}
+
+#[tokio::test]
+async fn a_spent_token_allowance_stops_the_turn_before_the_first_request() {
+    let policy = ScriptedBudgetPolicy::deciding_before(vec![Ok(BudgetDecision::stop_tokens(
+        "the session token allowance is spent",
+    ))]);
+
+    let run = run_turn_under_budget(
+        "turn-budget-head",
+        None,
+        full_turn_responses(),
+        Arc::clone(&policy) as Arc<dyn TurnBudgetPolicy>,
+    )
+    .await;
+
+    let error = run
+        .outcome
+        .expect_err("a spent token allowance must end the turn");
+    assert!(
+        matches!(
+            &error,
+            TurnError::BudgetLimited {
+                kind: BudgetStopKind::TokenBudget,
+                detail,
+            } if detail == "the session token allowance is spent"
+        ),
+        "the stop lost its kind or its detail: {error:?}"
+    );
+    assert_eq!(error.kind(), "budget_limited");
+    assert_eq!(
+        error.recovery(),
+        TurnRecovery::Pause,
+        "a spent allowance must not be retried automatically"
+    );
+    assert!(
+        run.requests.is_empty(),
+        "the provider was called after the allowance refused the request"
+    );
+    assert!(
+        run.events
+            .iter()
+            .all(|event| !matches!(event, TurnEvent::ProviderRequestStarted { .. })),
+        "a refused request still announced itself: {:#?}",
+        run.events
+    );
+    assert!(
+        run.events.contains(&TurnEvent::Notice {
+            severity: NoticeSeverity::Warning,
+            code: "budget.token_budget".to_owned(),
+            detail: "the session token allowance is spent".to_owned(),
+        }),
+        "the stop was invisible to every interface: {:#?}",
+        run.events
+    );
+    assert!(
+        policy.observed_after().is_empty(),
+        "a response was accounted for although no request was sent"
+    );
+}
+
+#[tokio::test]
+async fn a_token_allowance_spent_by_the_first_response_stops_the_turn_before_the_second_request() {
+    let policy = ScriptedBudgetPolicy::deciding_after(vec![Ok(BudgetDecision::stop_tokens(
+        "the first step spent what was left",
+    ))]);
+
+    let run = run_turn_under_budget(
+        "turn-budget-step",
+        None,
+        full_turn_responses(),
+        Arc::clone(&policy) as Arc<dyn TurnBudgetPolicy>,
+    )
+    .await;
+
+    let error = run
+        .outcome
+        .expect_err("an allowance spent by the first response must end the turn");
+    assert!(
+        matches!(
+            &error,
+            TurnError::BudgetLimited {
+                kind: BudgetStopKind::TokenBudget,
+                detail,
+            } if detail == "the first step spent what was left"
+        ),
+        "the stop lost its kind or its detail: {error:?}"
+    );
+    assert_eq!(error.recovery(), TurnRecovery::Pause);
+    assert_eq!(
+        run.requests.len(),
+        1,
+        "the second provider request was issued after the allowance was spent"
+    );
+    assert!(
+        run.calls.is_empty(),
+        "a spent allowance still authorized the step's tool dispatch"
+    );
+    assert_eq!(policy.observed_before().len(), 1);
+    assert_eq!(policy.observed_after().len(), 1);
+    assert!(
+        run.events.contains(&TurnEvent::Notice {
+            severity: NoticeSeverity::Warning,
+            code: "budget.token_budget".to_owned(),
+            detail: "the first step spent what was left".to_owned(),
+        }),
+        "the stop was invisible to every interface: {:#?}",
+        run.events
+    );
+
+    // The stop must not roll back what the first step already persisted.
+    assert!(
+        run.events.contains(&TurnEvent::AssistantCheckpointed {
+            step: 1,
+            message_id: "msg_turn-budget-step_0001".to_owned(),
+            interrupted: false,
+        }),
+        "the first step's checkpoint event was withdrawn: {:#?}",
+        run.events
+    );
+    let assistant = MessageStore::new(&run.connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate the stopped turn")
+        .into_iter()
+        .find(|message| message.info.id == "msg_turn-budget-step_0001")
+        .expect("the first step's assistant message survives the stop");
+    assert_eq!(
+        assistant.parts.len(),
+        2,
+        "the stopped step lost durable parts: {:#?}",
+        assistant.parts
+    );
+    let text = assistant
+        .parts
+        .iter()
+        .find(|part| part.kind == PartKind::Text)
+        .expect("the first step's text survives the stop");
+    assert_eq!(text.data["text"], "I will use echo.");
+    let tool = assistant
+        .parts
+        .iter()
+        .find(|part| part.kind == PartKind::Tool)
+        .expect("the first step's tool call survives the stop");
+    assert_eq!(
+        tool.data["state"]["status"], "pending",
+        "the undispatched call must stay repairable rather than be rewritten"
+    );
+}
+
+#[tokio::test]
+async fn a_budget_policy_that_asks_for_compaction_ends_the_turn_with_a_compaction_recovery() {
+    let policy = ScriptedBudgetPolicy::deciding_before(vec![Ok(BudgetDecision::Compact {
+        reason: "the transcript outgrew its window mid-turn".to_owned(),
+    })]);
+
+    let run = run_turn_under_budget(
+        "turn-budget-compact",
+        None,
+        full_turn_responses(),
+        Arc::clone(&policy) as Arc<dyn TurnBudgetPolicy>,
+    )
+    .await;
+
+    let error = run
+        .outcome
+        .expect_err("a compaction request must end the turn so the host can compact");
+    assert!(
+        matches!(
+            &error,
+            TurnError::CompactionRequired { reason }
+                if reason == "the transcript outgrew its window mid-turn"
+        ),
+        "the compaction request lost its reason: {error:?}"
+    );
+    assert_eq!(error.kind(), "compaction_required");
+    assert_eq!(
+        error.recovery(),
+        TurnRecovery::Compact,
+        "the host must reach its existing compact-and-retry path"
+    );
+    assert!(
+        run.requests.is_empty(),
+        "a request went out although the transcript had to shrink first"
+    );
+    assert!(
+        run.events.contains(&TurnEvent::Notice {
+            severity: NoticeSeverity::Info,
+            code: "budget.compact".to_owned(),
+            detail: "the transcript outgrew its window mid-turn".to_owned(),
+        }),
+        "the compaction request was invisible to every interface: {:#?}",
+        run.events
+    );
+}
+
+#[tokio::test]
+async fn a_budget_policy_that_cannot_decide_fails_the_turn_from_either_hook() {
+    let refused = run_turn_under_budget(
+        "turn-budget-undecided-head",
+        None,
+        full_turn_responses(),
+        ScriptedBudgetPolicy::deciding_before(vec![Err(
+            "the allowance store is unreachable".to_owned()
+        )]),
+    )
+    .await;
+
+    let error = refused
+        .outcome
+        .expect_err("a policy that cannot decide must not be read as permission");
+    assert!(
+        matches!(
+            &error,
+            TurnError::Hook(message)
+                if message.contains("before_request")
+                    && message.contains("the allowance store is unreachable")
+        ),
+        "the failure lost which hook could not decide, or why: {error:?}"
+    );
+    assert_eq!(error.recovery(), TurnRecovery::Fail);
+    assert!(
+        refused.requests.is_empty(),
+        "the turn spent a request on an allowance nobody could read"
+    );
+
+    let stalled = run_turn_under_budget(
+        "turn-budget-undecided-step",
+        None,
+        full_turn_responses(),
+        ScriptedBudgetPolicy::deciding_after(vec![Err(
+            "the allowance store is unreachable".to_owned()
+        )]),
+    )
+    .await;
+
+    let error = stalled
+        .outcome
+        .expect_err("a policy that cannot account for a response must not be ignored");
+    assert!(
+        matches!(
+            &error,
+            TurnError::Hook(message)
+                if message.contains("after_response")
+                    && message.contains("the allowance store is unreachable")
+        ),
+        "the failure lost which hook could not decide, or why: {error:?}"
+    );
+    assert_eq!(
+        stalled.requests.len(),
+        1,
+        "the turn continued past a policy that could not account for the last response"
+    );
+}
+
+#[tokio::test]
+async fn the_default_budget_policy_leaves_a_multi_step_turn_byte_identical() {
+    let (unpolicied, _requests, _calls) = run_full_turn_once().await;
+
+    let run = run_turn_under_budget(
+        "turn-full",
+        None,
+        full_turn_responses(),
+        Arc::new(NoopBudgetPolicy),
+    )
+    .await;
+
+    assert_eq!(
+        run.outcome
+            .expect("the default policy interferes with nothing"),
+        TurnOutcome::Completed {
+            assistant_message_id: "msg_turn-full_0002".to_owned(),
+            steps: 2,
+            unresolved_tool_failures: Vec::new(),
+        }
+    );
+    assert_eq!(
+        without_prompt_estimates(&run.events),
+        without_prompt_estimates(&unpolicied),
+        "installing the default policy changed the turn's observable events"
+    );
+    assert_eq!(
+        without_prompt_estimates(&run.events),
+        expected_full_turn_events(),
+        "the frozen event sequence moved"
+    );
+    assert!(
+        run.events
+            .iter()
+            .all(|event| !matches!(event, TurnEvent::Notice { .. })),
+        "the default policy published a notice: {:#?}",
+        run.events
+    );
+}
+
+#[tokio::test]
+async fn the_budget_snapshot_reports_the_turn_total_the_last_request_and_unreported_counts() {
+    let policy = ScriptedBudgetPolicy::observing();
+
+    let run = run_turn_under_budget(
+        "turn-budget-snapshot",
+        Some(200_000),
+        accounted_tool_call_then_unreported_answer(),
+        Arc::clone(&policy) as Arc<dyn TurnBudgetPolicy>,
+    )
+    .await;
+
+    assert_eq!(
+        run.outcome
+            .expect("an observing policy must not change the outcome"),
+        TurnOutcome::Completed {
+            assistant_message_id: "msg_turn-budget-snapshot_0002".to_owned(),
+            steps: 2,
+            unresolved_tool_failures: Vec::new(),
+        }
+    );
+    let before = policy.observed_before();
+    let after = policy.observed_after();
+    assert_eq!(before.len(), 2, "one decision per request: {before:#?}");
+    assert_eq!(after.len(), 2, "one accounting per response: {after:#?}");
+
+    let first = ProviderRequestUsage {
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_read_input_tokens: 5,
+        cache_write_input_tokens: 1,
+        accounted: true,
+    };
+    assert_eq!(before[0].session_id, SESSION_ID);
+    assert_eq!(before[0].turn_id, "turn-budget-snapshot");
+    assert_eq!(before[0].step, 1);
+    assert_eq!(
+        before[0].turn_usage,
+        zero_usage(true),
+        "the turn total must start empty and measured"
+    );
+    assert_eq!(
+        before[0].last_request,
+        zero_usage(false),
+        "there is no last request before the first response"
+    );
+    assert!(
+        before[0].estimated_prompt_tokens > 0,
+        "the policy was asked about a prompt of unknown size"
+    );
+    assert_eq!(
+        before[0].context_limit,
+        Some(200_000),
+        "the model's window never reached the policy"
+    );
+
+    assert_eq!(after[0].step, 1);
+    assert_eq!(after[0].last_request, first);
+    assert_eq!(after[0].turn_usage, first);
+    assert_eq!(after[0].turn_usage.total(), 126);
+
+    assert_eq!(before[1].step, 2);
+    assert_eq!(
+        before[1].turn_usage, first,
+        "the second request was decided against a stale total"
+    );
+    assert_eq!(before[1].last_request, first);
+
+    assert_eq!(after[1].step, 2);
+    assert_eq!(
+        after[1].last_request,
+        zero_usage(false),
+        "a request the provider never reported must not look like a free one"
+    );
+    assert!(
+        !after[1].turn_usage.accounted,
+        "one unreported response makes the whole turn total a floor"
+    );
+    assert_eq!(
+        after[1].turn_usage.total(),
+        126,
+        "the reported tokens were dropped from the turn total"
+    );
+    assert!(
+        before[0].elapsed_seconds <= after[1].elapsed_seconds,
+        "the turn is timed by more than one clock"
+    );
+    assert_eq!(run.requests.len(), 2);
+    assert_eq!(run.calls.len(), 1);
 }

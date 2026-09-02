@@ -6068,6 +6068,9 @@ fn every_turn_error() -> Vec<TurnError> {
             kind: zuno_engine::budget::BudgetStopKind::TokenBudget,
             detail: "budget-in-the-message".to_owned(),
         },
+        TurnError::CompactionRequired {
+            reason: "compaction-in-the-message".to_owned(),
+        },
         TurnError::StreamEndedWithoutMessageEnd { step: 3 },
         TurnError::EmptyAssistantMessage {
             provider_id: "empty-provider-in-the-message".to_owned(),
@@ -6177,6 +6180,7 @@ fn the_variant_table_covers_the_whole_enum() {
             TurnError::ModelNotFound { .. } => "ModelNotFound",
             TurnError::StepLimit { .. } => "StepLimit",
             TurnError::BudgetLimited { .. } => "BudgetLimited",
+            TurnError::CompactionRequired { .. } => "CompactionRequired",
             TurnError::StreamEndedWithoutMessageEnd { .. } => "StreamEndedWithoutMessageEnd",
             TurnError::EmptyAssistantMessage { .. } => "EmptyAssistantMessage",
             TurnError::DuplicateToolUse { .. } => "DuplicateToolUse",
@@ -6199,7 +6203,7 @@ fn the_variant_table_covers_the_whole_enum() {
 
     assert_eq!(
         named.len(),
-        22,
+        23,
         "the table covers only {named:?}; every variant needs a value or the rendering \
          claims above are vacuous for the ones missing"
     );

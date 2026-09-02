@@ -63,7 +63,10 @@ pub struct TurnUsageSnapshot<'a> {
     pub turn_usage: ProviderRequestUsage,
     /// The request that just completed; zero before the first response.
     pub last_request: ProviderRequestUsage,
-    /// Prompt size estimated for the next request, when one is assembled.
+    /// Prompt size estimated for the request this snapshot is about.
+    ///
+    /// The request about to be sent in [`TurnBudgetPolicy::before_request`], and the
+    /// one just answered in [`TurnBudgetPolicy::after_response`].
     pub estimated_prompt_tokens: u64,
     /// The model's context window, when the catalog reports one.
     pub context_limit: Option<u64>,
