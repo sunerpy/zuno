@@ -9,7 +9,11 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+zed-schema-contract = ["dep:agent-client-protocol-schema"]
+
 [dependencies]
+agent-client-protocol-schema = { version = "=1.5.0", default-features = false, optional = true }
 async-trait = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }

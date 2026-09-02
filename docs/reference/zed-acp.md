@@ -254,11 +254,16 @@ mode boundary. Successful changes emit ACP `current_mode_update` and
 `config_option_update` notifications, keeping Zed's selectors synchronized.
 None of these native commands is sent to the model.
 
-Every successful durable `plan_update` commit immediately publishes a complete
-ACP `sessionUpdate: "plan"` snapshot. Session load replays the current snapshot,
-and detached Goal continuation publishes one final authoritative snapshot after
-its event stream drains. ACP has no native `superseded` status, so Zuno maps it
-to `completed` and preserves the semantic outcome in
+ACP Plan updates are driven by durable work-state revisions, not by recognizing
+the `plan_update` tool name. Each session subscribes to the active host, reads
+the authoritative Plan after a change, and publishes a complete
+`sessionUpdate: "plan"` snapshot. Zuno deduplicates by `(plan_id, revision)`,
+may collapse a rapid burst to its newest revision, and flushes the final
+revision before returning from a prompt. Removing a Plan sends empty entries so
+Zed clears its previous panel. Load and resume project the current Plan through
+the same path, and a host remount replaces the subscription without resetting
+the revision cursor. ACP has no native `superseded` status, so Zuno maps it to
+`completed` and preserves the semantic outcome in
 `_meta.zuno.outcome: "superseded"`.
 
 Executing `/name arguments` uses Zuno's existing command-template or Skill
@@ -297,7 +302,13 @@ owner:
   effective `allow_all`, including `danger-full-access`, emits no permission
   request at all;
 - Zuno's Shell sandbox controls filesystem and network authority;
-- native file tools emit typed creation and edit diffs for Zed;
+- `edit`, `write`, and `apply_patch` share an `Editing files` card. Successful
+  native mutations show only typed `A/M/D` diffs in visible content; the
+  original success text remains available in `rawOutput`. A success without a
+  diff keeps a short text fallback;
+- a pre-write file failure shows actionable text and no fabricated diff.
+  Partial or otherwise uncertain mutations are failed cards that retain any
+  observed paths/diffs and `_meta.zuno.outcome: "uncertain"`;
 - Zuno-configured MCP servers remain available when the selected Agent profile
   permits them;
 - ACP-provided stdio and Streamable HTTP MCP servers are session-scoped and
@@ -549,8 +560,10 @@ After configuration:
    `/start-work` each appear exactly once;
 4. execute `/goal verify ACP shorthand`, `/goal edit verify ACP actions`, and
    `/goal show`; confirm the result appears as Agent output rather than Thinking;
-5. execute `/start-plan`, confirm Zed switches to Plan, then create a durable
-   plan and execute `/start-work`;
+5. execute `/start-plan`, confirm Zed switches to Plan, then create and patch a
+   durable Plan; confirm the bottom Plan panel appears and updates before the
+   prompt completes without reverting to an older revision, then execute
+   `/start-work`;
 6. after enough conversation history exists, execute `/compact` and confirm the
    summary survives a session reload;
 7. execute one configured command or unambiguous Skill;
@@ -565,7 +578,10 @@ After configuration:
 11. delegate a background child, close the root thread, and confirm the job is
     cancelled without a foreground native-child stream;
 12. request one file edit under an ask policy and confirm Zed displays both the
-   permission request and typed diff;
+    permission request and an `Editing files` card containing only the typed
+    diff, with no duplicate success sentence; also confirm a pre-write failure
+    has no fabricated diff and an uncertain mutation reports failed status plus
+    observed paths;
 13. cancel a running prompt and confirm the session returns to idle;
 14. close and reload the session and confirm content, question/task cards,
    child history, tools, plan, and usage are replayed once;

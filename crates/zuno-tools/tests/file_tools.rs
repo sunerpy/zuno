@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use zuno_error::ToolError;
+use zuno_error::{ToolError, ToolMutationConflictKind};
 use zuno_tool::{InterruptHandle, NeverInterrupted, PermissionAsk, PermissionAsker, ToolContext};
 use zuno_tools::{FileFormatter, FileTools, NoopFormatter};
 
@@ -143,6 +143,17 @@ fn setup() -> (TempDir, FileTools, Arc<RecordingPermission>) {
     let permission = Arc::new(RecordingPermission::default());
     let tools = FileTools::new(workspace.path()).expect("file tools");
     (workspace, tools, permission)
+}
+
+async fn read_for_mutation(tools: &FileTools, path: &Path) {
+    tools
+        .read
+        .execute(
+            json!({ "filePath": path }),
+            normal_context(Arc::new(RecordingPermission::default())),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("read {} before mutation: {error}", path.display()));
 }
 
 #[test]
@@ -605,6 +616,8 @@ async fn file_apply_patch_adds_updates_moves_and_deletes_files() {
     let permission = Arc::new(RecordingPermission::default());
     std::fs::write(workspace.path().join("source.txt"), "old\n").expect("source fixture");
     std::fs::write(workspace.path().join("delete.txt"), "gone\n").expect("delete fixture");
+    read_for_mutation(&tools, &workspace.path().join("source.txt")).await;
+    read_for_mutation(&tools, &workspace.path().join("delete.txt")).await;
 
     let output = tools
         .apply_patch
@@ -686,6 +699,7 @@ async fn file_apply_patch_context_drift_tells_the_model_how_to_recover() {
     let (workspace, tools, permission) = setup();
     let path = workspace.path().join("drifted.txt");
     std::fs::write(&path, "current\n").expect("fixture");
+    read_for_mutation(&tools, &path).await;
 
     let error = tools
         .apply_patch
@@ -705,7 +719,19 @@ async fn file_apply_patch_context_drift_tells_the_model_how_to_recover() {
         .await
         .expect_err("stale hunk context must be rejected");
 
-    let message = source_message(&error);
+    let ToolError::MutationConflict {
+        conflict, source, ..
+    } = &error
+    else {
+        panic!("expected typed mutation conflict, got {error:?}");
+    };
+    assert_eq!(conflict.kind, ToolMutationConflictKind::ContextMismatch);
+    assert_eq!(conflict.resource, "drifted.txt");
+    assert_eq!(conflict.hunk_index, Some(1));
+    assert_eq!(conflict.required_action(), "reread_and_revise");
+    assert_eq!(conflict.operation_digest.len(), 64);
+    assert_eq!(conflict.observed_digest.as_ref().map(String::len), Some(64));
+    let message = source.to_string();
     assert!(message.contains("read the current file"), "{message}");
     assert!(message.contains("smaller patch"), "{message}");
     assert!(
@@ -716,6 +742,291 @@ async fn file_apply_patch_context_drift_tells_the_model_how_to_recover() {
         std::fs::read_to_string(path).expect("unchanged file"),
         "current\n"
     );
+}
+
+#[tokio::test]
+async fn file_apply_patch_requires_a_current_read_before_touching_existing_files() {
+    let (workspace, tools, permission) = setup();
+    let path = workspace.path().join("unread.txt");
+    std::fs::write(&path, "old\n").expect("fixture");
+
+    let error = tools
+        .apply_patch
+        .execute(
+            json!({
+                "patchText": concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: unread.txt\n",
+                    "@@\n",
+                    "-old\n",
+                    "+new\n",
+                    "*** End Patch"
+                )
+            }),
+            normal_context(permission),
+        )
+        .await
+        .expect_err("an existing file needs a read receipt");
+
+    let ToolError::MutationConflict { conflict, .. } = error else {
+        panic!("expected mutation conflict, got {error:?}");
+    };
+    assert_eq!(conflict.kind, ToolMutationConflictKind::ReadRequired);
+    assert_eq!(conflict.resource, "unread.txt");
+    assert_eq!(conflict.required_action(), "reread");
+    assert_eq!(
+        std::fs::read_to_string(path).expect("unchanged file"),
+        "old\n"
+    );
+}
+
+#[tokio::test]
+async fn file_apply_patch_rejects_a_file_that_changed_after_it_was_read() {
+    let (workspace, tools, permission) = setup();
+    let path = workspace.path().join("stale.txt");
+    std::fs::write(&path, "old\n").expect("fixture");
+    read_for_mutation(&tools, &path).await;
+    std::fs::write(&path, "changed elsewhere\n").expect("external change");
+
+    let error = tools
+        .apply_patch
+        .execute(
+            json!({
+                "patchText": concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: stale.txt\n",
+                    "@@\n",
+                    "-old\n",
+                    "+new\n",
+                    "*** End Patch"
+                )
+            }),
+            normal_context(permission),
+        )
+        .await
+        .expect_err("a stale read receipt must not authorize a write");
+
+    let ToolError::MutationConflict { conflict, .. } = error else {
+        panic!("expected mutation conflict, got {error:?}");
+    };
+    assert_eq!(conflict.kind, ToolMutationConflictKind::StaleRead);
+    assert_eq!(conflict.resource, "stale.txt");
+    assert_eq!(conflict.observed_digest.as_ref().map(String::len), Some(64));
+    assert_eq!(
+        std::fs::read_to_string(path).expect("external change remains"),
+        "changed elsewhere\n"
+    );
+}
+
+#[tokio::test]
+async fn file_apply_patch_blocks_an_identical_failed_patch_until_the_patch_changes() {
+    let (workspace, tools, permission) = setup();
+    let path = workspace.path().join("replay.txt");
+    std::fs::write(&path, "current\n").expect("fixture");
+    read_for_mutation(&tools, &path).await;
+    let stale_patch = json!({
+        "patchText": concat!(
+            "*** Begin Patch\n",
+            "*** Update File: replay.txt\n",
+            "@@\n",
+            "-stale\n",
+            "+updated\n",
+            "*** End Patch"
+        )
+    });
+
+    let first = tools
+        .apply_patch
+        .execute(stale_patch.clone(), normal_context(permission.clone()))
+        .await
+        .expect_err("the first stale context fails");
+    assert!(matches!(
+        first,
+        ToolError::MutationConflict {
+            conflict,
+            ..
+        } if conflict.kind == ToolMutationConflictKind::ContextMismatch
+    ));
+
+    read_for_mutation(&tools, &path).await;
+    let replay = tools
+        .apply_patch
+        .execute(stale_patch, normal_context(permission))
+        .await
+        .expect_err("re-reading unchanged bytes must not permit an identical replay");
+    let ToolError::MutationConflict { conflict, .. } = replay else {
+        panic!("expected identical replay conflict, got {replay:?}");
+    };
+    assert_eq!(conflict.kind, ToolMutationConflictKind::IdenticalReplay);
+    assert_eq!(conflict.required_action(), "reread_and_revise");
+
+    tools
+        .apply_patch
+        .execute(
+            json!({
+                "patchText": concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: replay.txt\n",
+                    "@@\n",
+                    "-current\n",
+                    "+updated\n",
+                    "*** End Patch"
+                )
+            }),
+            normal_context(Arc::new(RecordingPermission::default())),
+        )
+        .await
+        .expect("a revised patch applies against the current image");
+    assert_eq!(
+        std::fs::read_to_string(path).expect("updated file"),
+        "updated\n"
+    );
+}
+
+#[tokio::test]
+async fn file_apply_patch_identical_replay_preserves_the_actual_conflicted_file_and_hunk() {
+    let (workspace, tools, permission) = setup();
+    let first = workspace.path().join("first.txt");
+    let second = workspace.path().join("second.txt");
+    std::fs::write(&first, "one\n").expect("first fixture");
+    std::fs::write(&second, "two\n").expect("second fixture");
+    read_for_mutation(&tools, &first).await;
+    read_for_mutation(&tools, &second).await;
+    let patch = json!({
+        "patchText": concat!(
+            "*** Begin Patch\n",
+            "*** Update File: first.txt\n",
+            "@@\n",
+            "-one\n",
+            "+ONE\n",
+            "*** Update File: second.txt\n",
+            "@@ expected section\n",
+            "-stale\n",
+            "+TWO\n",
+            "*** End Patch"
+        )
+    });
+
+    let first_error = tools
+        .apply_patch
+        .execute(patch.clone(), normal_context(permission.clone()))
+        .await
+        .expect_err("the second file hunk must fail");
+    let ToolError::MutationConflict {
+        conflict: first_conflict,
+        ..
+    } = first_error
+    else {
+        panic!("expected context conflict");
+    };
+    assert_eq!(
+        first_conflict.kind,
+        ToolMutationConflictKind::ContextMismatch
+    );
+    assert_eq!(first_conflict.resource, "second.txt");
+    assert_eq!(first_conflict.hunk_index, Some(1));
+    assert_eq!(
+        first_conflict.hunk_header.as_deref(),
+        Some("expected section")
+    );
+
+    read_for_mutation(&tools, &first).await;
+    read_for_mutation(&tools, &second).await;
+    let replay = tools
+        .apply_patch
+        .execute(patch, normal_context(permission))
+        .await
+        .expect_err("an identical multi-file replay remains blocked");
+    let ToolError::MutationConflict { conflict, .. } = replay else {
+        panic!("expected identical replay conflict");
+    };
+    assert_eq!(conflict.kind, ToolMutationConflictKind::IdenticalReplay);
+    assert_eq!(conflict.resource, "second.txt");
+    assert_eq!(conflict.hunk_index, Some(1));
+    assert_eq!(conflict.hunk_header.as_deref(), Some("expected section"));
+    assert_eq!(std::fs::read_to_string(first).expect("first"), "one\n");
+    assert_eq!(std::fs::read_to_string(second).expect("second"), "two\n");
+}
+
+#[tokio::test]
+async fn file_apply_patch_preflights_every_file_before_the_first_write() {
+    let (workspace, tools, permission) = setup();
+    let first = workspace.path().join("first.txt");
+    let second = workspace.path().join("second.txt");
+    std::fs::write(&first, "one\n").expect("first fixture");
+    std::fs::write(&second, "two\n").expect("second fixture");
+    read_for_mutation(&tools, &first).await;
+
+    let error = tools
+        .apply_patch
+        .execute(
+            json!({
+                "patchText": concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: first.txt\n",
+                    "@@\n",
+                    "-one\n",
+                    "+ONE\n",
+                    "*** Update File: second.txt\n",
+                    "@@\n",
+                    "-two\n",
+                    "+TWO\n",
+                    "*** End Patch"
+                )
+            }),
+            normal_context(permission),
+        )
+        .await
+        .expect_err("the unread second file rejects the whole patch");
+
+    assert!(matches!(
+        error,
+        ToolError::MutationConflict {
+            conflict,
+            ..
+        } if conflict.kind == ToolMutationConflictKind::ReadRequired
+    ));
+    assert_eq!(std::fs::read_to_string(first).expect("first"), "one\n");
+    assert_eq!(std::fs::read_to_string(second).expect("second"), "two\n");
+}
+
+#[tokio::test]
+async fn file_apply_patch_preserves_crlf_bom_and_missing_final_newline() {
+    let (workspace, tools, permission) = setup();
+    let crlf = workspace.path().join("crlf.txt");
+    let no_final = workspace.path().join("no-final.txt");
+    std::fs::write(&crlf, b"\xef\xbb\xbfold\r\nkeep\r\n").expect("CRLF fixture");
+    std::fs::write(&no_final, b"tail").expect("no-final fixture");
+    read_for_mutation(&tools, &crlf).await;
+    read_for_mutation(&tools, &no_final).await;
+
+    tools
+        .apply_patch
+        .execute(
+            json!({
+                "patchText": concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: crlf.txt\n",
+                    "@@\n",
+                    "-old\n",
+                    "+new\n",
+                    "*** Update File: no-final.txt\n",
+                    "@@\n",
+                    "-tail\n",
+                    "+done\n",
+                    "*** End Patch"
+                )
+            }),
+            normal_context(permission),
+        )
+        .await
+        .expect("line-ending aware patch");
+
+    assert_eq!(
+        std::fs::read(crlf).expect("CRLF result"),
+        b"\xef\xbb\xbfnew\r\nkeep\r\n"
+    );
+    assert_eq!(std::fs::read(no_final).expect("no-final result"), b"done");
 }
 
 #[tokio::test]
@@ -871,6 +1182,8 @@ async fn file_apply_patch_does_not_report_a_file_it_deleted_as_written() {
         FileTools::with_formatter(workspace.path(), Arc::new(NoopFormatter)).expect("file tools");
     std::fs::write(workspace.path().join("source.txt"), "old\n").expect("source fixture");
     std::fs::write(workspace.path().join("delete.txt"), "gone\n").expect("delete fixture");
+    read_for_mutation(&tools, &workspace.path().join("source.txt")).await;
+    read_for_mutation(&tools, &workspace.path().join("delete.txt")).await;
 
     let output = tools
         .apply_patch

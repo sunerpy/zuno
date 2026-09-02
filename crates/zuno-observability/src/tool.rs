@@ -109,6 +109,7 @@ pub fn error_kind(error: &ToolError) -> &'static str {
     match error {
         ToolError::Denied { .. } => "denied",
         ToolError::InvalidArgs { .. } => "invalid_args",
+        ToolError::MutationConflict { .. } => "mutation_conflict",
         ToolError::Timeout { .. } | ToolError::NetworkTimeout { .. } => "timeout",
         ToolError::Transient { .. } => "transient",
         ToolError::NotFound { .. } => "not_found",
@@ -319,6 +320,18 @@ mod tests {
                 tool: "shell".to_owned(),
                 source: Box::new(std::io::Error::other("bad")),
             },
+            ToolError::MutationConflict {
+                tool: "apply_patch".to_owned(),
+                conflict: Box::new(zuno_error::ToolMutationConflict {
+                    kind: zuno_error::ToolMutationConflictKind::ContextMismatch,
+                    resource: "src/lib.rs".to_owned(),
+                    operation_digest: "patch".to_owned(),
+                    observed_digest: Some("file".to_owned()),
+                    hunk_index: Some(1),
+                    hunk_header: None,
+                }),
+                source: Box::new(std::io::Error::other("conflict")),
+            },
             ToolError::Timeout {
                 tool: "shell".to_owned(),
                 elapsed: std::time::Duration::from_secs(1),
@@ -347,6 +360,7 @@ mod tests {
             [
                 "denied",
                 "invalid_args",
+                "mutation_conflict",
                 "timeout",
                 "transient",
                 "not_found",

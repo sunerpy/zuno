@@ -73,7 +73,7 @@ impl TypedTool for EditTool {
         self.runtime
             .state
             .require_current_read(&ctx.session_id, &target.canonical, &source)
-            .map_err(|message| invalid("edit", message))?;
+            .map_err(|conflict| invalid("edit", conflict.message(&target.canonical)))?;
         let decoded = decode_text(&source).map_err(|error| failed("edit", error))?;
         let ending = if decoded.text.contains("\r\n") {
             "\r\n"

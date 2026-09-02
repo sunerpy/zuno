@@ -58,6 +58,9 @@ pub const METADATA_WRITTEN_PATHS_KEY: &str = "writtenPaths";
 /// keeping both lets each consumer use the representation it actually understands.
 pub const METADATA_FILE_DIFFS_KEY: &str = "fileDiffs";
 
+/// Typed mutation-conflict details persisted for replay-capable clients.
+pub const METADATA_MUTATION_CONFLICT_KEY: &str = "mutationConflict";
+
 /// Durable human request that caused a tool-owned turn suspension.
 pub const METADATA_HUMAN_REQUEST_ID_KEY: &str = "humanRequestID";
 
@@ -178,7 +181,113 @@ impl QuestionResultPresentation {
     }
 }
 
-/// Typed client presentation attached to one successful tool result.
+/// Stable client spelling for a mutation conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationConflictPresentationKind {
+    ReadRequired,
+    StaleRead,
+    ContextMismatch,
+    IdenticalReplay,
+}
+
+impl From<zuno_error::ToolMutationConflictKind> for MutationConflictPresentationKind {
+    fn from(value: zuno_error::ToolMutationConflictKind) -> Self {
+        match value {
+            zuno_error::ToolMutationConflictKind::ReadRequired => Self::ReadRequired,
+            zuno_error::ToolMutationConflictKind::StaleRead => Self::StaleRead,
+            zuno_error::ToolMutationConflictKind::ContextMismatch => Self::ContextMismatch,
+            zuno_error::ToolMutationConflictKind::IdenticalReplay => Self::IdenticalReplay,
+        }
+    }
+}
+
+/// Typed client presentation for a mutation that was refused before writing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MutationConflictPresentation {
+    kind: MutationConflictPresentationKind,
+    resource: String,
+    operation_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hunk_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hunk_header: Option<String>,
+    required_action: String,
+}
+
+impl MutationConflictPresentation {
+    #[must_use]
+    pub fn from_conflict(conflict: &zuno_error::ToolMutationConflict) -> Self {
+        Self {
+            kind: conflict.kind.into(),
+            resource: conflict.resource.clone(),
+            operation_digest: conflict.operation_digest.clone(),
+            observed_digest: conflict.observed_digest.clone(),
+            hunk_index: conflict.hunk_index,
+            hunk_header: conflict.hunk_header.clone(),
+            required_action: conflict.required_action().to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> MutationConflictPresentationKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    #[must_use]
+    pub fn operation_digest(&self) -> &str {
+        &self.operation_digest
+    }
+
+    #[must_use]
+    pub fn observed_digest(&self) -> Option<&str> {
+        self.observed_digest.as_deref()
+    }
+
+    #[must_use]
+    pub const fn hunk_index(&self) -> Option<usize> {
+        self.hunk_index
+    }
+
+    #[must_use]
+    pub fn hunk_header(&self) -> Option<&str> {
+        self.hunk_header.as_deref()
+    }
+
+    #[must_use]
+    pub fn required_action(&self) -> &str {
+        &self.required_action
+    }
+}
+
+/// Typed client presentation for a mutation whose observed side effects require inspection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UncertainMutationPresentation {
+    applied_paths: Vec<String>,
+}
+
+impl UncertainMutationPresentation {
+    #[must_use]
+    pub fn new(applied_paths: Vec<String>) -> Self {
+        Self { applied_paths }
+    }
+
+    #[must_use]
+    pub fn applied_paths(&self) -> &[String] {
+        &self.applied_paths
+    }
+}
+
+/// Typed client presentation attached to one tool result.
 ///
 /// Variants belong here rather than in a surface adapter: the producing tool is
 /// the only component that can state the result authoritatively, while ACP, TUI,
@@ -187,6 +296,8 @@ impl QuestionResultPresentation {
 #[serde(rename_all = "camelCase")]
 pub enum ToolResultPresentation {
     Question(QuestionResultPresentation),
+    MutationConflict(MutationConflictPresentation),
+    UncertainMutation(UncertainMutationPresentation),
 }
 
 /// One text file modification produced by a tool call.

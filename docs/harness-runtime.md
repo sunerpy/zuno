@@ -175,6 +175,14 @@ count. Assistant prose is never parsed as evidence that work completed. Hiding
 `plan_update` prevents the model from creating or mutating a new strategic Plan;
 existing Plans remain durable, projected, and recoverable.
 
+ACP mirrors this state through a session-owned projection pump subscribed to
+`TurnHost::work_state_changes()`. A wake causes an authoritative Plan read and a
+complete stable-V1 update; `(plan_id, revision)` prevents duplicates and stale
+revisions, and a missing Plan emits empty entries to clear client state. Live
+changes, prompt-terminal flush, load, resume, detached continuation, and host
+remount all share this projector. The adapter does not infer Plan changes from
+tool names.
+
 Native Task admission also captures the active Plan location in the Job's
 versioned `workContext`: optional Goal id, Plan id, Plan revision, and Plan step
 id. A Plan step cannot complete while one of its linked Jobs is queued, running,
@@ -885,10 +893,11 @@ Detached turns use the same engine events as request-owned turns. TUI routes roo
 events back to the mounted transcript, ACP sends ordinary root
 `session/update` notifications, and the HTTP server commits and fans out the
 same durable event projection. Child-session events retain their child observer.
-After the detached event stream drains, ACP reads the authoritative work state
-from the host and sends the root session's final durable Plan projection when a
-Plan exists. This terminal projection is best-effort and cannot change the
-already committed turn outcome. No client owns a private continuation loop.
+After the detached event stream drains, ACP flushes the root session's
+authoritative durable Plan through the same revision-aware projector used for
+live changes and restoration. This terminal projection is best-effort and
+cannot change the already committed turn outcome. No client owns a private
+continuation loop.
 
 Interactive TUI input uses the same durable boundary. When idle, `Enter`
 starts a turn. During an active turn, `Enter` admits a FIFO `queue` item for the
@@ -1719,6 +1728,15 @@ commands, durable events, inbox, and frontend-neutral projections.
 `BackgroundExecutionProjection` prevent clients from rebuilding agent-loop state
 privately. Cursor replay closes gaps after disconnects; live delivery is only a
 wake/latency path. See [client interface architecture](design/client-interfaces.md).
+
+Native file mutations likewise have one presentation policy for live delivery
+and replay. `edit`, `write`, and `apply_patch` use an `Editing files` card.
+Successful calls with typed state expose only structured add/modify/delete
+diffs as visible content while retaining the original result in `rawOutput`;
+successful calls without a diff keep a short fallback. Pre-write failures show
+actionable text without inventing a diff. Partial or otherwise uncertain writes
+remain failed, retain observed paths or diffs, and publish the typed
+`uncertain` outcome.
 
 The headless CLI drains its bounded event channel concurrently with turn execution
 and closes both the detached observer and the producer on success or failure before

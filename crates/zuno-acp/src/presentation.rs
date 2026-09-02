@@ -5,7 +5,10 @@
 //! render without reverse-engineering a tool's JSON envelope.
 
 use serde_json::{Map, Value, json};
-use zuno_tool::{QuestionResultPresentation, ToolResultPresentation};
+use zuno_tool::{
+    METADATA_MUTATION_CONFLICT_KEY, MutationConflictPresentation, QuestionResultPresentation,
+    ToolResultPresentation,
+};
 
 pub(crate) fn decorate_tool_call(update: &mut Value, name: &str, raw_input: Option<&Value>) {
     match name {
@@ -38,12 +41,72 @@ pub(crate) fn decorate_completed_tool_update(
     output: &str,
     is_error: bool,
 ) {
+    let mutation_conflict = result_presentation
+        .and_then(|presentation| match presentation {
+            ToolResultPresentation::MutationConflict(conflict) => Some(conflict.clone()),
+            ToolResultPresentation::Question(_) | ToolResultPresentation::UncertainMutation(_) => {
+                None
+            }
+        })
+        .or_else(|| {
+            metadata
+                .and_then(|metadata| metadata.get(METADATA_MUTATION_CONFLICT_KEY))
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<MutationConflictPresentation>(value).ok()
+                })
+        });
+    if let Some(conflict) = mutation_conflict {
+        merge_zuno_metadata(
+            update,
+            "mutationConflict",
+            serde_json::to_value(conflict)
+                .expect("mutation conflict presentation is JSON-serializable"),
+        );
+    }
+    let uncertain_paths = result_presentation
+        .and_then(|presentation| match presentation {
+            ToolResultPresentation::UncertainMutation(uncertain) => {
+                Some(uncertain.applied_paths().to_vec())
+            }
+            ToolResultPresentation::Question(_) | ToolResultPresentation::MutationConflict(_) => {
+                None
+            }
+        })
+        .or_else(|| {
+            metadata
+                .filter(|metadata| {
+                    metadata.get("outcome").and_then(Value::as_str) == Some("uncertain")
+                        || metadata
+                            .get("uncertain")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                })
+                .map(|metadata| {
+                    metadata
+                        .get("writtenPaths")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+        });
+    if let Some(paths) = uncertain_paths {
+        merge_zuno_metadata(update, "outcome", json!("uncertain"));
+        merge_zuno_metadata(update, "uncertain", json!(true));
+        merge_zuno_metadata(update, "appliedPaths", json!(paths));
+    }
     match name {
         "question" => {
-            let live_metadata =
-                result_presentation.map(|ToolResultPresentation::Question(question)| {
-                    question_result_metadata(question)
-                });
+            let live_metadata = result_presentation.and_then(|presentation| match presentation {
+                ToolResultPresentation::Question(question) => {
+                    Some(question_result_metadata(question))
+                }
+                ToolResultPresentation::MutationConflict(_)
+                | ToolResultPresentation::UncertainMutation(_) => None,
+            });
             let metadata = live_metadata.as_ref().or(metadata);
             let status = metadata
                 .and_then(|metadata| metadata.get("questionStatus"))
