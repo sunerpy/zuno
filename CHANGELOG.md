@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/sunerpy/zuno/compare/v0.6.0...v0.6.1) (2026-09-02)
+
+
+### Bug Fixes
+
+* **release:** refresh stale release PR heads ([#76](https://github.com/sunerpy/zuno/issues/76)) ([f638225](https://github.com/sunerpy/zuno/commit/f638225eebaabdba6f1bf7402f5168b758a08691))
+
 ## [0.6.0](https://github.com/sunerpy/zuno/compare/v0.5.0...v0.6.0) (2026-09-01)
 
 
