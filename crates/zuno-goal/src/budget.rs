@@ -28,11 +28,37 @@
 //! The allowance's tool-call and wall-time ceilings bound the turn itself, goal or
 //! no goal, because a turn that loops cheaply on tool calls is a runaway no token
 //! ceiling would ever notice.
+//!
+//! # Why compaction is asked for once, and only after a response
+//!
+//! The decision is a function of the durable row, and the engine consults it
+//! before every request as well as after every response. A compaction asked for
+//! before a request would come back identical once the host had compacted and
+//! re-run the turn — the row it was decided from has not moved — so the turn would
+//! compact forever without issuing a single request. Compaction is a response to
+//! an observed cost: only the response whose charge takes the goal into its
+//! reserve asks for it, exactly once, and the turn then continues on the smaller
+//! transcript until the allowance is spent.
+//!
+//! # Why a database failure pauses the turn instead of blocking the goal
+//!
+//! The engine turns a policy `Err` into a hook failure, and the host records a
+//! hook failure as a permanent block. A `SQLITE_BUSY` that outlasted the pool's
+//! busy timeout is rare but real under concurrent sessions, and it says nothing
+//! about the goal, so it must not end the goal for good. A failure to read or
+//! charge the goal is therefore a stop: the turn still ends without spending
+//! anything more and never continues unmeasured, but the goal pauses and can be
+//! resumed once the database is readable. Only durable state this build cannot
+//! read at all — a value the schema promises but cannot be decoded, a format this
+//! build does not know, a status outside the closed set — stays an `Err`, because
+//! no retry makes such state readable.
 
+use crate::error::GoalError;
 use crate::store::{Goal, GoalStore};
 use async_trait::async_trait;
 use std::sync::Arc;
 use zuno_engine::budget::{BudgetDecision, TurnAllowance, TurnBudgetPolicy, TurnUsageSnapshot};
+use zuno_error::DbError;
 
 /// The reserve is the budget divided by this, so one tenth of the allowance.
 ///
@@ -49,15 +75,17 @@ pub const SOFT_RESERVE_DIVISOR: i64 = 10;
 ///
 /// Records each response's tokens against the goal, then decides from the
 /// resulting row: stop when the allowance is spent, stop when usage cannot be
-/// measured, compact when the reserve is all that is left, otherwise continue.
-/// The host's [`TurnAllowance`] supplies the budget for a goal that names none
-/// and the per-turn ceilings that stop a turn no token count would.
+/// measured, compact once when a response takes the goal into its reserve,
+/// otherwise continue. The host's [`TurnAllowance`] supplies the budget for a
+/// goal that names none and the per-turn ceilings that stop a turn no token count
+/// would.
 ///
-/// A store failure is returned as `Err`, which the engine treats as a turn
-/// failure. That is deliberate: a policy that cannot read the budget does not
-/// know whether the turn may continue, and answering
-/// [`BudgetDecision::Continue`] on a database error would turn every outage into
-/// an unlimited run.
+/// A failure to read or charge the goal never becomes
+/// [`BudgetDecision::Continue`]: a policy that cannot see the budget does not
+/// know whether the turn may go on, and continuing on a database error would turn
+/// every outage into an unlimited run. It becomes a stop, so the goal pauses and
+/// resumes once the database is readable; only durable state this build cannot
+/// read at all is returned as `Err`, which the engine treats as a turn failure.
 #[derive(Debug, Clone)]
 pub struct GoalBudgetPolicy {
     store: Arc<GoalStore>,
@@ -129,27 +157,32 @@ impl TurnBudgetPolicy for GoalBudgetPolicy {
     ///
     /// Reads only: nothing has been spent yet, and recording here would charge for
     /// a request that may never be issued — including the one this call is about
-    /// to stop.
+    /// to stop. Never asks for compaction, because nothing has been observed that
+    /// a compaction could be a response to; see `Consulted::BeforeRequest`.
     ///
     /// # Errors
     ///
-    /// A message when the goal cannot be read, which the engine treats as a turn
-    /// failure rather than as permission to continue.
+    /// A message only when the stored goal is in a state this build cannot read,
+    /// or the read never finished. A database that merely cannot be reached is a
+    /// stop, not an error; see `store_failure`.
     async fn before_request(
         &self,
         snapshot: &TurnUsageSnapshot<'_>,
     ) -> Result<BudgetDecision, String> {
         let store = Arc::clone(&self.store);
         let session_id = snapshot.session_id.to_owned();
-        let goal = tokio::task::spawn_blocking(move || store.goal(&session_id))
+        let goal = match tokio::task::spawn_blocking(move || store.goal(&session_id))
             .await
-            .map_err(|error| format!("goal budget lookup did not finish: {error}"))?
-            .map_err(|error| format!("goal budget lookup failed: {error}"))?;
-        // `true` because the snapshot's last request is not a measurement of
-        // anything yet: before the first response it is zero and unaccounted, and
-        // treating that as unmeasured usage would stop every budgeted turn on its
-        // first step. The goal's own `usage_known` flag still applies.
-        let decision = decide(goal.as_ref(), true, self.allowance.default_token_budget);
+            .map_err(|error| format!("reading the goal did not finish: {error}"))?
+        {
+            Ok(goal) => goal,
+            Err(error) => return store_failure("reading the goal", error),
+        };
+        let decision = decide(
+            goal.as_ref(),
+            Consulted::BeforeRequest,
+            self.allowance.default_token_budget,
+        );
         Ok(self.under_ceilings(snapshot, decision))
     }
 
@@ -157,8 +190,9 @@ impl TurnBudgetPolicy for GoalBudgetPolicy {
     ///
     /// # Errors
     ///
-    /// A message when the usage cannot be recorded or the resulting goal cannot be
-    /// read, which the engine treats as a turn failure.
+    /// A message only when the stored goal is in a state this build cannot read,
+    /// the host clock is unusable, or the write never finished. A database that
+    /// merely cannot be reached is a stop, not an error; see `store_failure`.
     async fn after_response(
         &self,
         snapshot: &TurnUsageSnapshot<'_>,
@@ -170,18 +204,89 @@ impl TurnBudgetPolicy for GoalBudgetPolicy {
         let measured = snapshot.last_request.accounted;
         let at_ms = crate::store::now_ms()
             .map_err(|error| format!("goal budget clock is unusable: {error}"))?;
-        let recorded = tokio::task::spawn_blocking(move || {
+        let recorded = match tokio::task::spawn_blocking(move || {
             store.record_request_usage(&session_id, &request_id, tokens, at_ms)
         })
         .await
-        .map_err(|error| format!("goal budget accounting did not finish: {error}"))?
-        .map_err(|error| format!("goal budget accounting failed: {error}"))?;
+        .map_err(|error| {
+            format!("recording the response against the goal did not finish: {error}")
+        })? {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                return store_failure(
+                    &format!("recording the response's {tokens} tokens against the goal"),
+                    error,
+                );
+            }
+        };
         let decision = decide(
             recorded.goal.as_ref(),
-            measured,
+            Consulted::AfterResponse {
+                charged: recorded.accounted.then_some(tokens),
+                measured,
+            },
             self.allowance.default_token_budget,
         );
         Ok(self.under_ceilings(snapshot, decision))
+    }
+}
+
+/// What the policy had just observed when it was consulted.
+///
+/// Compaction is a response to an observed cost, so only a consultation that just
+/// charged something may ask for it. A would-be compaction before a request would
+/// be decided again from the very same row after the host compacted and re-ran
+/// the turn, and the turn would compact forever without issuing a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Consulted {
+    /// Before a request. Nothing was charged, so nothing can have crossed into the
+    /// reserve and only a stop can be decided. The snapshot's last request is not
+    /// a measurement of anything yet either — before the first response it is zero
+    /// and unaccounted, and treating that as unmeasured usage would stop every
+    /// budgeted turn on its first step — so only the goal's own `usage_known`
+    /// applies here.
+    BeforeRequest,
+    /// After a response.
+    AfterResponse {
+        /// The tokens the ledger accounted for the first time on this call, or
+        /// `None` when it had already seen the request: a replay did not move the
+        /// row and therefore cannot have crossed anything.
+        charged: Option<i64>,
+        /// Whether the provider reported the response at all.
+        measured: bool,
+    },
+}
+
+/// Turn a failure in the policy's own path into what the engine should do.
+///
+/// `Err` becomes a hook failure, which the host records as a permanent block, so
+/// it is reserved for state no retry can make readable: a stored value the schema
+/// promises but this build cannot decode, a database in a format this build does
+/// not know, or a goal row whose status, kind or reason is outside the closed set.
+/// Every other database failure — the write lock held by another session, a
+/// statement that failed for any other reason, I/O included, a file that would not
+/// open — is the environment and not the goal, and becomes a stop instead: still
+/// fail-closed, because the turn ends without spending anything more and never
+/// continues unmeasured, but the goal pauses and can be resumed once the database
+/// is readable, rather than being blocked for good over a `SQLITE_BUSY` that
+/// happened to outlast the pool's busy timeout. That timeout is the bounded wait;
+/// retrying here again would only delay the pause.
+fn store_failure(doing: &str, error: GoalError) -> Result<BudgetDecision, String> {
+    match error {
+        GoalError::Db(DbError::Decode { .. } | DbError::SchemaMismatch { .. })
+        | GoalError::UnknownStatus { .. }
+        | GoalError::UnknownRetryReason { .. }
+        | GoalError::UnknownPauseReason { .. }
+        | GoalError::UnknownCriterionStatus { .. }
+        | GoalError::UnknownGoalKind { .. } => Err(format!(
+            "{doing} found durable goal state this build cannot read: {error}"
+        )),
+        GoalError::Db(error) => Ok(BudgetDecision::stop_usage_unknown(format!(
+            "the goal's budget cannot be honoured because {doing} failed ({error}); the turn \
+             stops rather than continue unmeasured, and can resume once the database is \
+             readable"
+        ))),
+        other => Err(format!("{doing} failed: {other}")),
     }
 }
 
@@ -238,8 +343,8 @@ fn effective_budget(goal: &Goal, default_token_budget: Option<u64>) -> Option<(i
     })
 }
 
-/// The whole goal decision, as a pure function of the goal, whether the last
-/// response was measured, and the host's default budget.
+/// The whole goal decision, as a pure function of the goal, what this consultation
+/// observed, and the host's default budget.
 ///
 /// Ordered so the cheapest certainty wins. A session with no goal has nothing to
 /// charge and is left alone; the host's default is not applied to it because
@@ -250,9 +355,15 @@ fn effective_budget(goal: &Goal, default_token_budget: Option<u64>) -> Option<(i
 /// considered, because it is already spent whatever else is true. Unmeasured
 /// usage stops next, since a budget that cannot be counted cannot be honoured, and
 /// continuing on unreported numbers is how a budget silently becomes advisory.
+///
+/// Compaction is asked for only by the consultation whose charge took the goal
+/// into its reserve. Inside the reserve both hooks answer `Continue`: a request is
+/// issued and charged, and the allowance runs out through a token stop rather than
+/// through a compaction that an unchanged row would ask for again on every
+/// consultation.
 fn decide(
     goal: Option<&Goal>,
-    measured: bool,
+    consulted: Consulted,
     default_token_budget: Option<u64>,
 ) -> BudgetDecision {
     let Some(goal) = goal else {
@@ -269,6 +380,10 @@ fn decide(
             source.remedy()
         ));
     }
+    let measured = match consulted {
+        Consulted::BeforeRequest => true,
+        Consulted::AfterResponse { measured, .. } => measured,
+    };
     if !goal.usage_known || !measured {
         return BudgetDecision::stop_usage_unknown(format!(
             "{named} cannot be honoured because the provider did not report usage, so the {} \
@@ -277,7 +392,14 @@ fn decide(
         ));
     }
     let remaining = budget.saturating_sub(goal.tokens_used).max(0);
-    if remaining <= budget / SOFT_RESERVE_DIVISOR {
+    let reserve = budget / SOFT_RESERVE_DIVISOR;
+    if remaining <= reserve
+        && let Consulted::AfterResponse {
+            charged: Some(charged),
+            ..
+        } = consulted
+        && remaining.saturating_add(charged) > reserve
+    {
         return BudgetDecision::Compact {
             reason: format!(
                 "only {remaining} of {named} is left, which is the reserve kept for winding \
@@ -360,6 +482,16 @@ mod tests {
         };
         assert_eq!(stop.kind, kind, "wrong stop kind: {stop:?}");
         stop.detail
+    }
+
+    /// Make every statement against the goal table fail, standing in for a database
+    /// that cannot be read right now. Renamed rather than dropped: nothing is
+    /// deleted, and the failure is exactly "the row could not be read".
+    fn make_goal_table_unreadable(store: &GoalStore) {
+        let connection = store.pool().get().expect("check out a connection");
+        connection
+            .execute_batch("ALTER TABLE goal RENAME TO goal_unreachable")
+            .expect("hide the goal table");
     }
 
     #[tokio::test]
@@ -869,6 +1001,193 @@ mod tests {
         expect_stop(
             policy.after_response(&snapshot).await.expect("decide"),
             BudgetStopKind::ToolCallBudget,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_goal_inside_the_reserve_makes_progress_instead_of_compacting_forever() {
+        let fixture = fixture();
+        fixture
+            .store
+            .create_goal("ses_budget", "land the port", Some(1_000))
+            .expect("create goal");
+        fixture
+            .store
+            .record_usage("ses_budget", 950, 0, true)
+            .expect("spend the goal down into its reserve");
+        let policy = GoalBudgetPolicy::new(Arc::clone(&fixture.store));
+        let request = snapshot("turn-2", 1, 0, true);
+
+        let first = policy.before_request(&request).await.expect("decide");
+        let second = policy.before_request(&request).await.expect("decide");
+
+        assert_eq!(
+            (first, second),
+            (BudgetDecision::Continue, BudgetDecision::Continue),
+            "an unchanged row inside the reserve asked for compaction before a request; the \
+             host would compact, re-run, and be told the same thing forever"
+        );
+        let charged = policy
+            .after_response(&snapshot("turn-2", 1, 20, true))
+            .await
+            .expect("decide");
+        assert_eq!(
+            charged,
+            BudgetDecision::Continue,
+            "a response that stayed inside the reserve crossed nothing and compacts nothing"
+        );
+        expect_stop(
+            policy
+                .after_response(&snapshot("turn-2", 2, 30, true))
+                .await
+                .expect("decide"),
+            BudgetStopKind::TokenBudget,
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_is_asked_for_once_when_a_response_crosses_into_the_reserve() {
+        let fixture = fixture();
+        fixture
+            .store
+            .create_goal("ses_budget", "land the port", Some(1_000))
+            .expect("create goal");
+        let policy = GoalBudgetPolicy::new(Arc::clone(&fixture.store));
+
+        assert_eq!(
+            policy
+                .after_response(&snapshot("turn-1", 0, 850, true))
+                .await
+                .expect("decide"),
+            BudgetDecision::Continue,
+            "150 left is still outside a reserve of 100"
+        );
+        let crossing = policy
+            .after_response(&snapshot("turn-1", 1, 100, true))
+            .await
+            .expect("decide");
+        let BudgetDecision::Compact { reason } = crossing else {
+            panic!("the response that took the goal into its reserve compacts, got {crossing:?}");
+        };
+        assert!(reason.contains("only 50 of"), "{reason}");
+
+        // The host compacts and re-runs the turn under a fresh turn id.
+        assert_eq!(
+            policy
+                .before_request(&snapshot("turn-2", 1, 0, true))
+                .await
+                .expect("decide"),
+            BudgetDecision::Continue,
+            "the compacted turn must be allowed to issue a request"
+        );
+        assert_eq!(
+            policy
+                .after_response(&snapshot("turn-2", 1, 30, true))
+                .await
+                .expect("decide"),
+            BudgetDecision::Continue,
+            "the reserve is spent on requests, not on a second compaction"
+        );
+        expect_stop(
+            policy
+                .after_response(&snapshot("turn-2", 2, 20, true))
+                .await
+                .expect("decide"),
+            BudgetStopKind::TokenBudget,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_crossing_response_does_not_ask_for_compaction_again() {
+        let fixture = fixture();
+        fixture
+            .store
+            .create_goal("ses_budget", "land the port", Some(1_000))
+            .expect("create goal");
+        let policy = GoalBudgetPolicy::new(Arc::clone(&fixture.store));
+        let crossing = snapshot("turn-1", 0, 950, true);
+
+        let first = policy.after_response(&crossing).await.expect("first pass");
+        let replay = policy.after_response(&crossing).await.expect("replay");
+
+        assert!(
+            matches!(first, BudgetDecision::Compact { .. }),
+            "the first pass crossed into the reserve: {first:?}"
+        );
+        assert_eq!(
+            replay,
+            BudgetDecision::Continue,
+            "the ledger had already seen turn-1:0, so the row did not move and nothing crossed"
+        );
+        let goal = fixture
+            .store
+            .goal("ses_budget")
+            .expect("read goal")
+            .expect("goal exists");
+        assert_eq!(goal.tokens_used, 950);
+    }
+
+    #[tokio::test]
+    async fn a_database_failure_pauses_the_turn_instead_of_blocking_the_goal() {
+        let fixture = fixture();
+        fixture
+            .store
+            .create_goal("ses_budget", "land the port", Some(1_000))
+            .expect("create goal");
+        make_goal_table_unreadable(&fixture.store);
+        let policy = GoalBudgetPolicy::new(Arc::clone(&fixture.store));
+
+        let before = policy
+            .before_request(&snapshot("turn-1", 0, 0, true))
+            .await
+            .expect("an unreadable database is a decision the goal can recover from, not a hook failure");
+        let detail = expect_stop(before, BudgetStopKind::UsageUnknown);
+        assert!(
+            detail.contains("reading the goal failed"),
+            "the stop names what failed: {detail}"
+        );
+
+        let after = policy
+            .after_response(&snapshot("turn-1", 0, 200, true))
+            .await
+            .expect("an unrecordable response is a decision the goal can recover from, not a hook failure");
+        let detail = expect_stop(after, BudgetStopKind::UsageUnknown);
+        assert!(
+            detail.contains("200 tokens"),
+            "the stop names the spend that went unrecorded: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_goal_status_this_build_cannot_read_still_fails_the_hook() {
+        let fixture = fixture();
+        fixture
+            .store
+            .create_goal("ses_budget", "land the port", Some(1_000))
+            .expect("create goal");
+        {
+            // The revision moves with the status, as it does for every real write, so the
+            // history trigger records a new row instead of colliding with the last one.
+            let connection = fixture.store.pool().get().expect("check out a connection");
+            connection
+                .execute_batch(
+                    "PRAGMA ignore_check_constraints = ON; \
+                     UPDATE goal SET status = 'from_the_future', revision = revision + 1 \
+                     WHERE session_id = 'ses_budget'; \
+                     PRAGMA ignore_check_constraints = OFF;",
+                )
+                .expect("write a status outside the closed set");
+        }
+        let policy = GoalBudgetPolicy::new(Arc::clone(&fixture.store));
+
+        let error = policy
+            .before_request(&snapshot("turn-1", 0, 0, true))
+            .await
+            .expect_err("a status no retry can make readable is not something a resume can fix");
+
+        assert!(
+            error.contains("from_the_future"),
+            "the failure names the unreadable value: {error}"
         );
     }
 }
