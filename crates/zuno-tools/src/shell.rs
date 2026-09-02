@@ -175,6 +175,15 @@ pub struct CommandResource {
     pub tokens: Vec<String>,
     pub always: String,
     pub changes_directory: bool,
+    /// True when this command is a later stage of a pipeline, so its standard input
+    /// is the previous stage's output rather than the filesystem.
+    ///
+    /// Recorded here because it is a fact about the syntax tree that the flat resource
+    /// list otherwise loses, and a consumer that needed it would have to reparse the
+    /// command with a second tokenizer. [`crate::navigation`] uses it to tell
+    /// `cargo test | grep FAILED`, which filters a result, from `grep -rn FAILED .`,
+    /// which searches the tree.
+    pub stdin_from_pipeline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1145,6 +1154,16 @@ fn command_resource(node: Node<'_>, source_bytes: &[u8]) -> Option<CommandResour
     if source.is_empty() {
         return None;
     }
+    // A command is fed by a pipe when it is not the first stage of its pipeline. Bash
+    // nests the stages directly under `pipeline`; PowerShell puts them under
+    // `pipeline_chain`, one chain per `&&`/`||` operand, so a chained command is
+    // still the first stage of its own chain.
+    let stdin_from_pipeline = source_node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "pipeline" | "pipeline_chain")
+            && parent
+                .named_child(0)
+                .is_some_and(|first| first.id() != source_node.id())
+    });
     let mut tokens = command_parts(node, source_bytes);
     if tokens.is_empty() {
         tokens = lexical_tokens(&source);
@@ -1166,6 +1185,7 @@ fn command_resource(node: Node<'_>, source_bytes: &[u8]) -> Option<CommandResour
         tokens,
         always,
         changes_directory,
+        stdin_from_pipeline,
     })
 }
 
@@ -1188,11 +1208,16 @@ fn command_parts(node: Node<'_>, source: &[u8]) -> Vec<String> {
             }
             continue;
         }
+        // `number` is what tree-sitter-bash makes of a purely numeric word such as the
+        // `10` in `nice -n 10 rg foo`. Dropping it shifted every later argument one
+        // place left, so a wrapper option that takes a value swallowed the program
+        // instead, and both the risk gate and the navigation gate lost sight of it.
         if matches!(
             child.kind(),
             "command_name"
                 | "command_name_expr"
                 | "word"
+                | "number"
                 | "string"
                 | "raw_string"
                 | "concatenation"
@@ -1584,6 +1609,56 @@ mod tests {
         ] {
             assert!(mutates(command), "{command}");
         }
+    }
+
+    #[test]
+    fn numeric_arguments_stay_in_place_so_wrapper_values_do_not_swallow_the_program() {
+        let analysis = analyze_command("nice -n 10 rg foo", ShellSyntax::Bash).expect("analysis");
+        assert_eq!(
+            analysis.commands[0].tokens,
+            ["nice", "-n", "10", "rg", "foo"].map(str::to_owned)
+        );
+        let analysis = analyze_command("head -5 Cargo.toml", ShellSyntax::Bash).expect("analysis");
+        assert_eq!(
+            analysis.commands[0].tokens,
+            ["head", "-5", "Cargo.toml"].map(str::to_owned)
+        );
+    }
+
+    #[test]
+    fn only_a_later_pipeline_stage_is_marked_as_reading_the_pipe() {
+        let piped = |command: &str, syntax: ShellSyntax| -> Vec<bool> {
+            analyze_command(command, syntax)
+                .expect("analysis")
+                .commands
+                .iter()
+                .map(|resource| resource.stdin_from_pipeline)
+                .collect()
+        };
+        assert_eq!(
+            piped("cargo test 2>&1 | grep -c FAILED", ShellSyntax::Bash),
+            [false, true]
+        );
+        assert_eq!(
+            piped("cd crates && rg foo", ShellSyntax::Bash),
+            [false, false]
+        );
+        assert_eq!(
+            piped("rg foo 2>/dev/null | head", ShellSyntax::Bash),
+            [false, true]
+        );
+        assert_eq!(
+            piped("(cd crates; rg foo)", ShellSyntax::Bash),
+            [false, false]
+        );
+        assert_eq!(
+            piped("cargo test 2>&1 | grep -c FAILED", ShellSyntax::PowerShell),
+            [false, true]
+        );
+        assert_eq!(
+            piped("Set-Location crates && rg foo", ShellSyntax::PowerShell),
+            [false, false]
+        );
     }
 
     const PIPELINE: &str = "cargo test | tail -5";

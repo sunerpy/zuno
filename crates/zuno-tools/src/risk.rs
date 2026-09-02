@@ -66,7 +66,9 @@ const WRAPPER_COMMANDS: &[&str] = &[
     "builtin", "exec", "setsid", "stdbuf", "chroot", "watch",
 ];
 
-const SHELL_COMMANDS: &[&str] = &[
+/// Shells whose `-c` script is followed into. Shared with [`crate::navigation`] so a
+/// nested script is classified by what it runs under both gates, from one table.
+pub(crate) const SHELL_COMMANDS: &[&str] = &[
     "sh",
     "bash",
     "zsh",
@@ -878,7 +880,8 @@ fn assess_su_script(
     )
 }
 
-fn is_command_script_option(option: &str) -> bool {
+/// Whether `option` introduces an inline script for one of [`SHELL_COMMANDS`].
+pub(crate) fn is_command_script_option(option: &str) -> bool {
     option.eq_ignore_ascii_case("-command")
         || option.eq_ignore_ascii_case("--command")
         || option
@@ -913,7 +916,13 @@ fn assess_embedded_script(
     Ok(())
 }
 
-fn unwrap_wrappers(tokens: &[String]) -> (&[String], Option<String>) {
+/// Strip `sudo`, `env VAR=x`, `timeout 5`, `xargs` and the other wrappers from the
+/// front of a command, returning what they run and the innermost wrapper's name.
+///
+/// Shared with [`crate::navigation`] so `env FOO=1 rg x` is `rg` under both gates;
+/// two wrapper tables would drift, and a wrapper only one of them knew would let a
+/// command through the other.
+pub(crate) fn unwrap_wrappers(tokens: &[String]) -> (&[String], Option<String>) {
     let mut remaining = tokens;
     let mut last_wrapper = None;
     loop {
@@ -1500,7 +1509,9 @@ fn is_destructive_command(program: &str) -> bool {
     DESTRUCTIVE_COMMANDS.contains(&program) || program.starts_with("mkfs.")
 }
 
-fn command_name(token: &str) -> String {
+/// The lowercase file name of a command token with shell quoting removed, so
+/// `"/usr/bin/RG"` names the same program as `rg`.
+pub(crate) fn command_name(token: &str) -> String {
     let static_name = static_shell_word(token);
     Path::new(&static_name)
         .file_name()
@@ -1549,7 +1560,7 @@ fn source_starts_with_dynamic_command(source: &str) -> bool {
     first.starts_with('$') || first.starts_with('`') || first.starts_with("$(")
 }
 
-fn unquote(text: &str) -> String {
+pub(crate) fn unquote(text: &str) -> String {
     if text.len() >= 2 {
         let first = text.as_bytes()[0];
         let last = text.as_bytes()[text.len() - 1];

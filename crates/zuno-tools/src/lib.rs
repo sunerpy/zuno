@@ -31,6 +31,16 @@
 //! intentionally does not classify credential reads such as
 //! `cat ~/.ssh/id_rsa` as destruction; see [`risk`]'s documented boundary.
 //!
+//! # Repository navigation
+//!
+//! [`navigation`] makes "query the CodeGraph index before you grep" a check rather
+//! than a request. When the host finds a `.codegraph/` index and a user has turned
+//! the policy on, the first source navigation of a session — native `grep` or
+//! `glob`, or a shell `rg`/`grep`/`find`/`sed`/`awk` reading the tree — must be a
+//! CodeGraph call; after one has run, everything is allowed. The policy is pure and
+//! session-scoped: the host detects the index, chooses the mode (`off` by default,
+//! so an installed policy imposes nothing), and persists what it decides.
+//!
 //! # The conditional tools
 //!
 //! Three tools are not always offered: [`invalid`], [`question`], and
@@ -98,6 +108,7 @@ pub mod bg;
 pub mod diff;
 pub mod edit;
 pub mod format;
+pub mod navigation;
 pub mod output_policy;
 pub mod read;
 pub mod risk;
@@ -110,6 +121,10 @@ pub use bg::{BackgroundAction, BackgroundParams, BackgroundTool, WIRE_ID as BG_W
 pub use format::{
     Availability, DEFINITIONS as FORMATTER_DEFINITIONS, Definition as FormatterDefinition,
     FailureKind, FormatFailure, FormatOutcome, Formatters, ProgramLocator, SystemPrograms,
+};
+pub use navigation::{
+    INDEX_BYPASSED as NAVIGATION_INDEX_BYPASSED, INDEX_UNCHECKED as NAVIGATION_INDEX_UNCHECKED,
+    NavigationDecision, NavigationMode, RepositoryNavigationPolicy, index_present,
 };
 pub use read::{FileFormatter, NoopFormatter};
 
