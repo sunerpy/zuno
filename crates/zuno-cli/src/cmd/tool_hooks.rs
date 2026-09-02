@@ -236,7 +236,6 @@ impl ToolHooks for HostToolHooks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zuno_engine::hooks::ToolHooks as _;
 
     const SESSION: &str = "ses_navigation";
     const OTHER_SESSION: &str = "ses_navigation_child";

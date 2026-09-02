@@ -5970,6 +5970,140 @@ fn failed_provider_request_keeps_confirmed_goal_usage_and_marks_the_turn_unknown
     assert!(!goal_turn_accounting_known(before, after));
 }
 
+/// A turn must not charge the goal twice for the same provider response.
+///
+/// The budget policy charges each request as it lands, because a ceiling checked only
+/// between turns cannot stop a runaway inside one; the turn end then charges what the
+/// session spent. Adding both to the same counter would bill every request twice, and
+/// a goal would stop at half the tokens its budget names — which, with a default
+/// allowance now in place for every session, is a ceiling that silently moves.
+#[test]
+fn a_turn_charges_the_goal_once_for_tokens_a_request_already_accounted_for() {
+    let pool = std::sync::Arc::new(
+        zuno_db::pool::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory database"),
+    );
+    let mut connection = pool.get().expect("database connection");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    let goal_spill = tempfile::tempdir().expect("goal spill directory");
+    let goals = GoalStore::from_pool(std::sync::Arc::clone(&pool), goal_spill.path().to_owned())
+        .expect("attach the goal tables");
+    let fixture_plan = plan("/workspace", SessionChoice::New);
+    let now = 1_780_000_000_000;
+    ensure_project(&connection, &fixture_plan.project, now).expect("persist project");
+    let session =
+        resolve_session(&mut connection, &fixture_plan, now).expect("create fixture session");
+    goals
+        .create_goal(&session.id, "ship the change", Some(1_000))
+        .expect("declare a budgeted goal");
+
+    let before = goal_usage(&connection, &session.id).expect("read usage before the turn");
+    let assistant = zuno_db::message::MessageRecord::from_json(serde_json::json!({
+        "id": "msg_charged_once",
+        "sessionID": session.id,
+        "role": "assistant",
+        "time": { "created": now + 2, "completed": now + 3 },
+        "parentID": "msg_parent",
+        "modelID": "model",
+        "providerID": "provider",
+        "mode": "build",
+        "agent": "build",
+        "path": { "cwd": "/workspace", "root": "/workspace" },
+        "cost": 0,
+        "tokens": {
+            "input": 10,
+            "output": 20,
+            "reasoning": 30,
+            "cache": { "read": 40, "write": 50 },
+            "accounting": "cache-beside-input"
+        },
+        "finish": "stop"
+    }))
+    .expect("valid assistant message");
+    connection
+        .transaction(|transaction| {
+            let store = zuno_db::message::MessageStore::new(transaction);
+            store.put_message(&assistant)?;
+            zuno_db::session::reconcile_usage(
+                transaction,
+                &session.id,
+                None,
+                zuno_db::session::MessageUsage::from_data(&assistant.data),
+                None,
+            )
+        })
+        .expect("commit the assistant checkpoint");
+    let recorded = goals
+        .record_request_usage(&session.id, "req_1", 150, now + 4)
+        .expect("charge the request as the policy does");
+    assert!(recorded.accounted, "the first charge for a request counts");
+
+    let after = goal_usage(&connection, &session.id).expect("read usage after the turn");
+
+    assert_eq!(
+        after.tokens - before.tokens,
+        150,
+        "the session confirmed the whole response"
+    );
+    assert_eq!(
+        after.goal_charged - before.goal_charged,
+        150,
+        "the policy already moved the goal's counter"
+    );
+    assert_eq!(
+        goal_turn_unaccounted_tokens(before, after),
+        0,
+        "the turn end must find nothing left to charge"
+    );
+    assert_eq!(
+        goals
+            .goal(&session.id)
+            .expect("read the goal")
+            .expect("the goal exists")
+            .tokens_used,
+        150,
+        "one response costs the goal one response"
+    );
+}
+
+/// Tokens no request accounted for are still the goal's to pay.
+///
+/// Compaction's own model calls, and a turn that failed before any response was
+/// recorded, spend tokens without passing through the per-request policy. If the turn
+/// end only ever charged zero, those would be free — a goal could spend its budget on
+/// nothing but compaction and never reach its ceiling.
+#[test]
+fn the_turn_end_charges_usage_no_request_accounted_for() {
+    let charged = |session: i64, goal: i64| GoalUsage {
+        tokens: session,
+        confirmed_known: true,
+        estimated_pending_prompt_tokens: None,
+        last_confirmed_at: Some(1_780_000_000_000),
+        failed_turns: 0,
+        goal_charged: goal,
+    };
+
+    assert_eq!(
+        goal_turn_unaccounted_tokens(charged(1_000, 400), charged(1_800, 900)),
+        300,
+        "the session spent 800 and requests accounted for 500"
+    );
+    assert_eq!(
+        goal_turn_unaccounted_tokens(charged(1_000, 400), charged(1_800, 400)),
+        800,
+        "with no request charged, the whole turn is unaccounted"
+    );
+    assert_eq!(
+        goal_turn_unaccounted_tokens(charged(1_000, 400), charged(1_100, 900)),
+        0,
+        "a policy ahead of the session's confirmed total never hands budget back"
+    );
+    assert_eq!(
+        goal_turn_unaccounted_tokens(charged(1_000, 900), charged(1_800, 100)),
+        800,
+        "a goal replaced mid-turn wears the turn rather than escaping it"
+    );
+}
+
 /// Neither surface may compose a turn or bypass the selected driver.
 ///
 /// The whole point of this module is that `run` and the TUI cannot drift apart in

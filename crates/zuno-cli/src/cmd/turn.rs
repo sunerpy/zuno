@@ -7855,9 +7855,13 @@ impl TurnHost {
         }
     }
 
+    /// Charge the goal for the turn: the tokens no request accounted for, and the time.
+    ///
+    /// See [`goal_turn_unaccounted_tokens`] for why the token figure is a difference
+    /// rather than the session's own delta.
     fn record_goal_usage(&self, before: GoalUsage, started: Instant) -> Result<(), String> {
         let after = goal_usage(&self.connection, &self.session_id)?;
-        let token_delta = after.tokens.saturating_sub(before.tokens);
+        let token_delta = goal_turn_unaccounted_tokens(before, after);
         let accounting_known = goal_turn_accounting_known(before, after);
         let elapsed = i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX);
         self.goal_store
@@ -8623,6 +8627,13 @@ struct GoalUsage {
     estimated_pending_prompt_tokens: Option<u64>,
     last_confirmed_at: Option<i64>,
     failed_turns: u64,
+    /// What the goal has already been charged, read from the goal's own counter.
+    ///
+    /// The session's confirmed usage and the goal's charged usage are two different
+    /// numbers written by two different paths, and the turn-end write needs the
+    /// difference between them. Zero when there is no goal, which makes the difference
+    /// zero as well.
+    goal_charged: i64,
 }
 
 fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<GoalUsage, String> {
@@ -8630,13 +8641,72 @@ fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<Goa
         .map_err(to_string)?
         .usage
         .snapshot();
+    // The goal tables belong to `zuno-goal` and are created by whoever attaches a
+    // store, so a connection without them is a session that has no goal policy rather
+    // than a broken database. Nothing can have been charged there, and asking is
+    // cheaper than failing a turn over a table that was never meant to exist.
+    let goal_attached = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'goal')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(to_string)?;
+    let goal_charged = if goal_attached {
+        connection
+            .query_row(
+                "SELECT tokens_used FROM goal WHERE session_id = ?1",
+                [session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(to_string)?
+            .unwrap_or_default()
+    } else {
+        0
+    };
     Ok(GoalUsage {
         tokens: i64::try_from(snapshot.confirmed.total()).unwrap_or(i64::MAX),
         confirmed_known: snapshot.confirmed_known,
         estimated_pending_prompt_tokens: snapshot.estimated_pending_prompt_tokens,
         last_confirmed_at: snapshot.last_confirmed_at,
         failed_turns: snapshot.failed_turns,
+        goal_charged,
     })
+}
+
+/// The tokens this turn spent that no provider request has already charged.
+///
+/// The session's confirmed token total measures what a turn cost, but it is not the
+/// only thing that moves the goal's counter: the budget policy charges each provider
+/// response as it lands, because a ceiling checked only between turns cannot stop a
+/// runaway inside one. Charging the whole session delta again at the end would bill
+/// every request twice, so a goal would hit its ceiling at half the tokens its budget
+/// names — and with a default allowance in place that number is binding rather than
+/// decorative.
+///
+/// So the session delta is reduced by what the goal's own counter moved over the same
+/// window. What remains is the usage no request accounted for: compaction's model
+/// calls, a turn that failed before any response was recorded, and anything else that
+/// spends tokens without passing through the policy.
+///
+/// The result never goes below zero. The policy can charge a number the session's
+/// confirmed total has not caught up with, and a negative charge would hand budget
+/// back — a goal that spends its way *under* its ceiling is exactly the accounting
+/// hole this closes. The same clamp over-charges a goal replaced mid-turn, whose
+/// counter starts again at zero: the replacement wears the whole turn. That direction
+/// is deliberate, because a ceiling arriving early is a nuisance and one that never
+/// arrives is the failure being prevented.
+fn goal_turn_unaccounted_tokens(before: GoalUsage, after: GoalUsage) -> i64 {
+    let already_charged = after
+        .goal_charged
+        .saturating_sub(before.goal_charged)
+        .max(0);
+    after
+        .tokens
+        .saturating_sub(before.tokens)
+        .saturating_sub(already_charged)
+        .max(0)
 }
 
 fn goal_turn_accounting_known(before: GoalUsage, after: GoalUsage) -> bool {
