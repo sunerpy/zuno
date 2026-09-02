@@ -1,0 +1,462 @@
+//! Durable persistence of the verification receipts tools report.
+//!
+//! A tool that ran a check knows whether the check passed and how much authority its
+//! exit status carries; nothing else in the process does. It states that in
+//! [`zuno_tool::VerificationReceipt`], attached to its own output. This module is the
+//! only place that turns such a statement into a durable row, and the only place that
+//! hands the model an identifier it can cite later.
+//!
+//! # Why a hook and not the turn loop
+//!
+//! [`zuno_engine::hooks::ToolHooks::after`] is the one seam that sees every completed
+//! tool call with its output still mutable, which is what lets the assigned receipt id
+//! be written back where the model will read it. Doing the same work in the turn loop
+//! would mean recording after the output had already been rendered, so the model would
+//! be told a check passed without being told how to cite it — and an uncitable receipt
+//! is indistinguishable from an absent one to the goal completion gate.
+//!
+//! # Why a ledger failure is not a tool failure
+//!
+//! Returning an error from the `after` hook converts a successful result into a failed
+//! one. That is the wrong trade here. By the time a receipt exists the tool has already
+//! run: the command executed, the file was written. Reporting that as a failure tells
+//! the model a mutation did not happen when it did, which is a worse lie than a missing
+//! record and invites a destructive retry.
+//!
+//! So a ledger failure degrades the *claim* instead of the result. The receipt is
+//! rewritten as [`zuno_tool::ReceiptOutcome::Unknown`] with the reason, and no receipt
+//! id is published. The tool still reports what it did, and nothing downstream can
+//! offer the call as proof, because
+//! [`zuno_db::verification::VerificationReceipt::proves_success`] is false for an
+//! unknown outcome and a citation the ledger never stored resolves to nothing.
+
+use std::sync::Arc;
+
+use sha2::{Digest as _, Sha256};
+use zuno_engine::hooks::ToolHooks;
+use zuno_tool::{ToolOutput, VERIFICATION_METADATA_KEY, VerificationReceipt};
+
+/// Prefix on every receipt id, so a citation is recognizable in prose.
+const RECEIPT_ID_PREFIX: &str = "rcp_";
+
+/// Hex characters of the digest kept in a receipt id.
+///
+/// Sixteen, because the id is meant to be copied by a language model out of one tool
+/// result and into the arguments of another. A full 64-character digest invites a
+/// transcription error that would be indistinguishable from a fabricated citation,
+/// and 16 hex characters is 64 bits — collision-free across any realistic session.
+const RECEIPT_ID_DIGEST_CHARS: usize = 16;
+
+/// The key under which the assigned id is published back to the model.
+const RECEIPT_ID_FIELD: &str = "receiptId";
+
+/// The receipt id for one tool call, derived rather than generated.
+///
+/// Derived from the session and the call so that a replayed call resolves to the same
+/// row and the same citation. A random id would make the ledger's
+/// `(session_id, tool_call_id)` upsert rewrite the identifier a model had already been
+/// given, turning a correct citation into a dangling one. The session is part of the
+/// input because the id is a global primary key while a provider's call ids are only
+/// unique within a conversation.
+#[must_use]
+pub(crate) fn receipt_id(session_id: &str, call_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(session_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(call_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut id = String::with_capacity(RECEIPT_ID_PREFIX.len() + RECEIPT_ID_DIGEST_CHARS);
+    id.push_str(RECEIPT_ID_PREFIX);
+    for byte in digest.iter().take(RECEIPT_ID_DIGEST_CHARS / 2) {
+        id.push_str(&format!("{byte:02x}"));
+    }
+    id
+}
+
+/// Records tool-reported receipts and publishes the id that cites them.
+pub(crate) struct VerificationLedger {
+    database: Arc<zuno_db::pool::Pool>,
+}
+
+impl VerificationLedger {
+    /// Wrap the session database this host already opened.
+    pub(crate) const fn new(database: Arc<zuno_db::pool::Pool>) -> Self {
+        Self { database }
+    }
+}
+
+/// Translate the tool-side authority into the stored one.
+///
+/// Two enums rather than one because `zuno-db` and `zuno-tool` do not depend on each
+/// other: a tool states its authority without a database in scope, and the ledger
+/// stores it without a tool trait in scope. This crate depends on both, so the
+/// translation belongs here and stays exhaustive on purpose — a new authority level
+/// must not silently become an existing one.
+const fn stored_authority(
+    authority: zuno_tool::ExitAuthority,
+) -> zuno_db::verification::ExitAuthority {
+    match authority {
+        zuno_tool::ExitAuthority::Authoritative => {
+            zuno_db::verification::ExitAuthority::Authoritative
+        }
+        zuno_tool::ExitAuthority::Derived => zuno_db::verification::ExitAuthority::Derived,
+        zuno_tool::ExitAuthority::Absent => zuno_db::verification::ExitAuthority::Absent,
+    }
+}
+
+/// Translate the tool-side outcome into the stored one.
+const fn stored_outcome(
+    outcome: zuno_tool::ReceiptOutcome,
+) -> zuno_db::verification::ReceiptOutcome {
+    match outcome {
+        zuno_tool::ReceiptOutcome::Passed => zuno_db::verification::ReceiptOutcome::Passed,
+        zuno_tool::ReceiptOutcome::Failed => zuno_db::verification::ReceiptOutcome::Failed,
+        zuno_tool::ReceiptOutcome::Unknown => zuno_db::verification::ReceiptOutcome::Unknown,
+    }
+}
+
+/// Replace a published receipt with one that proves nothing, and say why.
+///
+/// The summary survives so the tool result still describes what ran. The id does not
+/// appear, because there is no stored row to cite.
+fn degrade(output: &mut ToolOutput, summary: String, reason: String) {
+    let receipt = VerificationReceipt::unknown(summary, reason);
+    output.metadata.insert(
+        VERIFICATION_METADATA_KEY.to_owned(),
+        receipt.to_metadata_value(),
+    );
+}
+
+#[async_trait::async_trait]
+impl ToolHooks for VerificationLedger {
+    /// Persist the receipt this call reported, if it reported one.
+    ///
+    /// # Errors
+    ///
+    /// Never. Every failure mode degrades the receipt in place instead, for the reason
+    /// given in the module documentation: the tool has already run, and an error here
+    /// would misreport a side effect that really happened.
+    async fn after(
+        &self,
+        tool: &str,
+        session_id: &str,
+        call_id: &str,
+        _args: &serde_json::Value,
+        output: &mut ToolOutput,
+    ) -> Result<(), String> {
+        let reported = match VerificationReceipt::from_metadata(&output.metadata) {
+            Ok(None) => return Ok(()),
+            Ok(Some(receipt)) => receipt,
+            Err(error) => {
+                degrade(
+                    output,
+                    format!("{tool} reported a verification receipt that could not be read"),
+                    format!("the receipt metadata was malformed: {error}"),
+                );
+                return Ok(());
+            }
+        };
+
+        let id = receipt_id(session_id, call_id);
+        let record = zuno_db::verification::NewVerificationReceipt {
+            id: id.clone(),
+            session_id: session_id.to_owned(),
+            // The dispatch seam carries no turn identity. The session and the call are
+            // what evidence resolution matches on, and adding a turn id would mean
+            // widening a trait the engine's own tests implement.
+            turn_id: None,
+            tool_call_id: call_id.to_owned(),
+            tool_id: tool.to_owned(),
+            summary: reported.summary.clone(),
+            workdir: reported.workdir.clone(),
+            exit_code: reported.exit_code,
+            exit_authority: stored_authority(reported.exit_authority),
+            outcome: stored_outcome(reported.outcome),
+            git_head: reported.git_head.clone(),
+            output_digest: reported.output_digest.clone(),
+            detail: reported.detail.clone(),
+            time_created: zuno_db::message::now_millis(),
+        };
+
+        let database = Arc::clone(&self.database);
+        let stored = tokio::task::spawn_blocking(move || {
+            let connection = database.get()?;
+            zuno_db::verification::record(&connection, &record)
+        })
+        .await;
+
+        match stored {
+            Ok(Ok(())) => {
+                if let Some(serde_json::Value::Object(published)) =
+                    output.metadata.get_mut(VERIFICATION_METADATA_KEY)
+                {
+                    published.insert(RECEIPT_ID_FIELD.to_owned(), serde_json::Value::String(id));
+                }
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                degrade(
+                    output,
+                    reported.summary,
+                    format!("the verification ledger rejected the receipt: {error}"),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                degrade(
+                    output,
+                    reported.summary,
+                    format!("the verification ledger write did not complete: {error}"),
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zuno_tool::{ExitAuthority, ReceiptOutcome};
+
+    fn pool() -> Arc<zuno_db::pool::Pool> {
+        let pool = zuno_db::pool::Pool::open(&zuno_paths::DbLocation::Memory)
+            .expect("in-memory session database");
+        {
+            let mut connection = pool.get().expect("database connection");
+            zuno_db::migration::apply(&mut connection).expect("current schema");
+        }
+        Arc::new(pool)
+    }
+
+    fn output_with(receipt: &VerificationReceipt) -> ToolOutput {
+        ToolOutput::text("shell", "ran").with_verification(receipt)
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_reports_nothing_writes_no_receipt() {
+        let database = pool();
+        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let mut output = ToolOutput::text("shell", "ran");
+
+        ledger
+            .after(
+                "read",
+                "ses_1",
+                "call_1",
+                &serde_json::Value::Null,
+                &mut output,
+            )
+            .await
+            .expect("a silent tool is not an error");
+
+        let connection = database.get().expect("connection");
+        assert!(
+            zuno_db::verification::for_session(&connection, "ses_1")
+                .expect("query")
+                .is_empty(),
+            "a tool that claimed nothing must leave no evidence behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reported_receipt_is_stored_and_its_id_is_published_to_the_model() {
+        let database = pool();
+        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let mut output = output_with(&VerificationReceipt::passed("cargo test -p zuno-db"));
+
+        ledger
+            .after(
+                "shell",
+                "ses_1",
+                "call_1",
+                &serde_json::Value::Null,
+                &mut output,
+            )
+            .await
+            .expect("recording a receipt");
+
+        let published = output
+            .metadata
+            .get(VERIFICATION_METADATA_KEY)
+            .and_then(|value| value.get(RECEIPT_ID_FIELD))
+            .and_then(serde_json::Value::as_str)
+            .expect("the model must be given an id it can cite")
+            .to_owned();
+        assert_eq!(published, receipt_id("ses_1", "call_1"));
+
+        let connection = database.get().expect("connection");
+        let stored = zuno_db::verification::find(&connection, "ses_1", &published)
+            .expect("query")
+            .expect("the published id must resolve to a stored receipt");
+        assert_eq!(stored.tool_id, "shell");
+        assert_eq!(stored.tool_call_id, "call_1");
+        assert_eq!(stored.summary, "cargo test -p zuno-db");
+        assert!(
+            stored.proves_success(),
+            "a passing authoritative check must be usable as evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_call_keeps_one_receipt_and_one_citable_id() {
+        let database = pool();
+        let ledger = VerificationLedger::new(Arc::clone(&database));
+
+        let mut first = output_with(&VerificationReceipt::passed("cargo test"));
+        ledger
+            .after(
+                "shell",
+                "ses_1",
+                "call_1",
+                &serde_json::Value::Null,
+                &mut first,
+            )
+            .await
+            .expect("first record");
+        let mut second = output_with(&VerificationReceipt::failed("cargo test", Some(101)));
+        ledger
+            .after(
+                "shell",
+                "ses_1",
+                "call_1",
+                &serde_json::Value::Null,
+                &mut second,
+            )
+            .await
+            .expect("second record");
+
+        let connection = database.get().expect("connection");
+        let receipts = zuno_db::verification::for_session(&connection, "ses_1").expect("query");
+        assert_eq!(receipts.len(), 1, "a replay must not fork the evidence");
+        assert_eq!(
+            receipts[0].id,
+            receipt_id("ses_1", "call_1"),
+            "the id a model was already given must survive the replay"
+        );
+        assert!(
+            !receipts[0].proves_success(),
+            "the later, failing observation is the one that counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_derived_exit_status_is_stored_but_proves_nothing() {
+        let database = pool();
+        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let mut receipt = VerificationReceipt::passed("cargo test | tail -5");
+        receipt.exit_authority = ExitAuthority::Derived;
+        let mut output = output_with(&receipt);
+
+        ledger
+            .after(
+                "shell",
+                "ses_1",
+                "call_1",
+                &serde_json::Value::Null,
+                &mut output,
+            )
+            .await
+            .expect("recording a receipt");
+
+        let connection = database.get().expect("connection");
+        let stored = zuno_db::verification::for_session(&connection, "ses_1").expect("query");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].outcome,
+            zuno_db::verification::ReceiptOutcome::Passed
+        );
+        assert!(
+            !stored[0].proves_success(),
+            "a zero exit code from a pipeline that does not propagate failure is not proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_receipt_metadata_degrades_the_claim_without_failing_the_call() {
+        let database = pool();
+        let ledger = VerificationLedger::new(Arc::clone(&database));
+        let mut output = ToolOutput::text("shell", "ran");
+        output.metadata.insert(
+            VERIFICATION_METADATA_KEY.to_owned(),
+            serde_json::json!({ "outcome": 7 }),
+        );
+
+        ledger
+            .after(
+                "shell",
+                "ses_1",
+                "call_1",
+                &serde_json::Value::Null,
+                &mut output,
+            )
+            .await
+            .expect("a malformed claim must not turn a completed call into a failure");
+
+        let republished = VerificationReceipt::from_metadata(&output.metadata)
+            .expect("the degraded receipt must be readable")
+            .expect("the degraded receipt must be present");
+        assert_eq!(republished.outcome, ReceiptOutcome::Unknown);
+        assert!(
+            !republished.proves_success(),
+            "a receipt nobody could parse must never be evidence"
+        );
+        assert!(
+            output
+                .metadata
+                .get(VERIFICATION_METADATA_KEY)
+                .and_then(|value| value.get(RECEIPT_ID_FIELD))
+                .is_none(),
+            "there is no stored row, so there must be no id to cite"
+        );
+    }
+
+    #[test]
+    fn a_receipt_id_is_stable_per_call_and_distinct_across_sessions() {
+        assert_eq!(receipt_id("ses_1", "call_1"), receipt_id("ses_1", "call_1"));
+        assert_ne!(receipt_id("ses_1", "call_1"), receipt_id("ses_2", "call_1"));
+        assert_ne!(receipt_id("ses_1", "call_1"), receipt_id("ses_1", "call_2"));
+        let id = receipt_id("ses_1", "call_1");
+        assert!(id.starts_with(RECEIPT_ID_PREFIX), "{id}");
+        assert_eq!(id.len(), RECEIPT_ID_PREFIX.len() + RECEIPT_ID_DIGEST_CHARS);
+    }
+
+    /// A provider that reuses call ids across sessions must not collide.
+    ///
+    /// The id is a global primary key while a call id is only unique within one
+    /// conversation, which is why the session is hashed in. A test provider numbering
+    /// its calls from one would otherwise fail the second session's first tool call.
+    #[tokio::test]
+    async fn two_sessions_may_reuse_the_same_call_id() {
+        let database = pool();
+        let ledger = VerificationLedger::new(Arc::clone(&database));
+
+        for session in ["ses_1", "ses_2"] {
+            let mut output = output_with(&VerificationReceipt::passed("cargo test"));
+            ledger
+                .after(
+                    "shell",
+                    session,
+                    "call_1",
+                    &serde_json::Value::Null,
+                    &mut output,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("recording for {session}: {error}"));
+        }
+
+        let connection = database.get().expect("connection");
+        assert_eq!(
+            zuno_db::verification::for_session(&connection, "ses_1")
+                .expect("query")
+                .len(),
+            1
+        );
+        assert_eq!(
+            zuno_db::verification::for_session(&connection, "ses_2")
+                .expect("query")
+                .len(),
+            1
+        );
+    }
+}

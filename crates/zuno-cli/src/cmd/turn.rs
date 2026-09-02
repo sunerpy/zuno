@@ -3976,7 +3976,10 @@ impl TurnHost {
                 AuthorizationPolicy::from_mode(plan.config.effective_permission_mode()),
                 McpToolStatus::Ready,
             )
-            .with_deferred_tools(runtime_tools.deferred_tool_ids);
+            .with_deferred_tools(runtime_tools.deferred_tool_ids)
+            .with_hooks(Arc::new(
+                super::verification_ledger::VerificationLedger::new(Arc::clone(&database)),
+            ));
             let council_presets = plan
                 .capability
                 .councils

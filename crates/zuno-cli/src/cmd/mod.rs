@@ -30,6 +30,7 @@ mod tui_question;
 mod tui_reference;
 mod tui_replay;
 mod turn;
+mod verification_ledger;
 mod workflow;
 
 use crate::{CommandDispatcher, DispatchArguments, DispatchError, DispatchRequest};
