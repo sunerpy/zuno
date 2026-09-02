@@ -61,6 +61,7 @@ provider 请求前以 typed error 失败；不会静默截断 AGENTS、历史、
   不把通用模板重复追加到同一个列表；
 - child report、steering、retry 不会自行创建 Plan；
 - 直接回答、一次有界读取、对已经准备好的修改执行一次短小 commit：可作为原子操作；
+  单句短问句无论是否带问号都属于直接回答，包括疑问词位于句中的中文问法；
 - 图片、resource、selection、branch diff 等 typed context，以及足够大的多文本块
   输入：默认进入 planned path；
 - 其他普通工程任务：宿主把请求分类为 `Required`，但不写入任何通用骨架；模型必须先

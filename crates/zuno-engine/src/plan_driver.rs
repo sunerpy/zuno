@@ -41,10 +41,23 @@ impl DriverPhase {
 }
 
 /// Typed durable facts used for final reconciliation.
+///
+/// # Why the host's planning classification is not among them
+///
+/// [`crate::planning::PlanningPolicy`] classifies a request from its text before the
+/// model has seen it, and that verdict used to count here: a request classified
+/// `Required` with no Plan row was treated as unreconciled work. Nothing the model can
+/// do settles that except creating a Plan, so a misclassified request — a plain question
+/// with no question mark, say — spent the entire continuation budget on turns whose
+/// instruction told the model that durable state "is not terminal" when no Plan, Todo, or
+/// Job existed at all. A model asked to finish work it had already finished invents some.
+///
+/// So reconciliation reads only state something durably recorded. A prediction about a
+/// request is not evidence about a session; the classification's place is the runtime
+/// instruction in the turn that acts on it, where the model can still weigh it against
+/// the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlanReconciliationInput {
-    /// The request was classified as requiring a strategic Plan.
-    pub plan_required: bool,
     /// A visible Plan currently exists.
     pub plan_exists: bool,
     /// Every visible Plan step is terminal.
@@ -59,8 +72,7 @@ pub struct PlanReconciliationInput {
 
 impl PlanReconciliationInput {
     fn settled(self) -> bool {
-        let plan_settled =
-            (!self.plan_required && !self.plan_exists) || (self.plan_exists && self.plan_terminal);
+        let plan_settled = !self.plan_exists || self.plan_terminal;
         plan_settled && !self.active_todo && !self.active_job
     }
 }
@@ -319,7 +331,6 @@ mod tests {
 
     fn unfinished() -> PlanReconciliationInput {
         PlanReconciliationInput {
-            plan_required: true,
             plan_exists: true,
             plan_terminal: false,
             active_todo: false,
@@ -367,6 +378,53 @@ mod tests {
                 .unwrap()
                 .phase,
             DriverPhase::WaitingHuman
+        );
+    }
+
+    #[test]
+    fn a_session_that_recorded_no_durable_work_finishes_instead_of_being_driven_again() {
+        // The reported defect. `你现在能看到多少个skill` — "how many skills can you see" —
+        // was classified as requiring a Plan because it carries no question mark. The model
+        // answered it and created nothing, and the driver then spent both continuations
+        // telling the model that Plan, Todo, or Job state was "not terminal" while all
+        // three were empty. The second turn duly invented work to do: enumerate every
+        // page of the catalog to verify the count it had already reported.
+        let driver = PlanReconciliationDriver::new(pool());
+        let nothing_recorded = PlanReconciliationInput {
+            plan_exists: false,
+            plan_terminal: false,
+            active_todo: false,
+            active_job: false,
+            goal_active: false,
+        };
+
+        assert_eq!(
+            driver
+                .reconcile("ses", "cycle", nothing_recorded)
+                .expect("decision"),
+            PlanReconciliationDecision::Finish,
+            "a session that recorded no durable work has nothing to reconcile"
+        );
+        let projection = driver.projection("ses").expect("projection").unwrap();
+        assert_eq!(projection.phase, DriverPhase::Terminal);
+        assert_eq!(projection.reason.as_deref(), Some("durable_work_settled"));
+    }
+
+    #[test]
+    fn a_plan_left_with_live_steps_still_spends_the_continuation_budget() {
+        // The other half of the same edge: what makes a session unreconciled is a durable
+        // row that is not terminal, and that must still be driven rather than delivered.
+        let driver = PlanReconciliationDriver::new(pool());
+        let mut only_a_todo = unfinished();
+        only_a_todo.plan_exists = false;
+        only_a_todo.active_todo = true;
+
+        assert_eq!(
+            driver
+                .reconcile("ses", "cycle", only_a_todo)
+                .expect("decision"),
+            PlanReconciliationDecision::ContinueOrdinary { attempt: 1 },
+            "an open Todo is recorded work, not a prediction about the request"
         );
     }
 
