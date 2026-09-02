@@ -5,10 +5,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc,
 };
-use std::time::Duration;
-
-#[cfg(unix)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The provider fixture every ACP test resolves against.
 ///
