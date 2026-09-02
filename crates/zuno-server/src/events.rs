@@ -204,6 +204,18 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             "skill.loaded",
             object(json!({"name": name, "source": source})),
         ),
+        TurnEvent::Notice {
+            severity,
+            code,
+            detail,
+        } => (
+            "notice",
+            object(json!({
+                "severity": severity.as_str(),
+                "code": code,
+                "detail": detail,
+            })),
+        ),
         TurnEvent::TurnStarted { session_id } => {
             ("turn.started", object(json!({"sessionID": session_id})))
         }

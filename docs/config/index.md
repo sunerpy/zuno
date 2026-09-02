@@ -39,7 +39,7 @@ true of `delegates`, `requiredSkills`, `writableRoots`, and `instructions`.
 
 ## The top-level shape
 
-Forty-three keys exist. Grouped by what they decide:
+Forty-four keys exist. Grouped by what they decide:
 
 | Group | Keys |
 | --- | --- |
@@ -49,7 +49,7 @@ Forty-three keys exist. Grouped by what they decide:
 | Instructions, Skills, and learning | `instructions`, `skills`, `command`, `memory`, `learning` |
 | Context | `compaction`, `continuity`, `tool_output`, `attachment`, `references` |
 | Integrations | `mcp`, `lsp`, `formatter`, `web_search`, `watcher` |
-| Runtime | `concurrency`, `goal`, `snapshot`, `tools`, `logLevel` |
+| Runtime | `concurrency`, `goal`, `snapshot`, `tools`, `navigation`, `logLevel` |
 | Deployment | `server`, `share`, `autoupdate`, `enterprise`, `experimental` |
 | Presentation | `username`, `$schema` |
 

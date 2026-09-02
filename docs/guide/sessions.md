@@ -144,9 +144,12 @@ observed result and is never mechanically replayed.
 
 ## Retry and recovery
 
-Recoverable provider, network, stream, SQLite-contention, turn-budget, and eligible tool
-failures persist an exponential-backoff retry before waiting, so a process restart
-reconstructs the deadline from SQLite.
+Recoverable provider, network, stream, SQLite-contention, Agent step-limit, and eligible
+tool failures persist an exponential-backoff retry before waiting, so a process restart
+reconstructs the deadline from SQLite. A turn that spends its own token, tool-call, or
+wall-clock allowance is not retried: it pauses the Goal with `turn_budget` and waits for a
+person, because the next turn would spend the same allowance the same way. A Goal whose
+own `token_budget` is what ran out ends as `budget_limited` instead.
 
 ```json
 {

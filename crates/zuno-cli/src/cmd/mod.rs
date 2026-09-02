@@ -22,6 +22,7 @@ mod session;
 mod session_list;
 mod session_prune;
 mod terminal_prompt;
+mod tool_hooks;
 mod tool_runtime;
 mod tui;
 mod tui_lsp;
@@ -30,6 +31,7 @@ mod tui_question;
 mod tui_reference;
 mod tui_replay;
 mod turn;
+mod verification_ledger;
 mod workflow;
 
 use crate::{CommandDispatcher, DispatchArguments, DispatchError, DispatchRequest};

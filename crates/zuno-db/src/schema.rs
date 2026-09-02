@@ -5,7 +5,7 @@ use rusqlite::Transaction;
 use zuno_error::DbError;
 
 /// Number of application tables created by the current schema's single `up`.
-pub const TABLE_COUNT: usize = 37;
+pub const TABLE_COUNT: usize = 38;
 
 const CORE_SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -670,6 +670,29 @@ CREATE UNIQUE INDEX `skill_candidate_pattern_digest_unique_idx`
   ON `skill_candidate` (`pattern_id`,`proposed_digest`);
 "#;
 
+const VERIFICATION_SCHEMA_SQL: &str = r#"
+CREATE TABLE `verification_receipt` (
+  `id` text PRIMARY KEY,
+  `session_id` text NOT NULL,
+  `turn_id` text,
+  `tool_call_id` text NOT NULL,
+  `tool_id` text NOT NULL,
+  `summary` text NOT NULL,
+  `workdir` text,
+  `exit_code` integer,
+  `exit_authority` text NOT NULL CHECK (`exit_authority` IN ('authoritative','derived','absent')),
+  `outcome` text NOT NULL CHECK (`outcome` IN ('passed','failed','unknown')),
+  `git_head` text,
+  `output_digest` text,
+  `detail` text,
+  `time_created` integer NOT NULL
+);
+CREATE UNIQUE INDEX `verification_receipt_call_idx`
+  ON `verification_receipt` (`session_id`,`tool_call_id`);
+CREATE INDEX `verification_receipt_session_time_idx`
+  ON `verification_receipt` (`session_id`,`time_created`,`id`);
+"#;
+
 /// Create every application table and explicit index in the current schema.
 ///
 /// The caller owns the transaction so schema creation and format marking can
@@ -682,13 +705,26 @@ pub fn up(transaction: &Transaction<'_>) -> Result<(), DbError> {
     transaction
         .execute_batch(CORE_SCHEMA_SQL)
         .map_err(migration::map_error)?;
-    up_learning(transaction)
+    up_learning(transaction)?;
+    up_verification(transaction)
 }
 
 /// Add the learning-flywheel tables to a format-5 database.
 pub(crate) fn up_learning(transaction: &Transaction<'_>) -> Result<(), DbError> {
     transaction
         .execute_batch(LEARNING_SCHEMA_SQL)
+        .map_err(migration::map_error)
+}
+
+/// Add the tool-verification receipt ledger to a format-7 database.
+///
+/// Receipts are session-scoped but deliberately carry no foreign key to
+/// `session`: they are written from the turn loop before a session row is
+/// guaranteed to exist in every embedding host, and [`crate::prune`] removes
+/// them explicitly by `session_id` instead of relying on a cascade.
+pub(crate) fn up_verification(transaction: &Transaction<'_>) -> Result<(), DbError> {
+    transaction
+        .execute_batch(VERIFICATION_SCHEMA_SQL)
         .map_err(migration::map_error)
 }
 

@@ -224,10 +224,14 @@ impl StartupEnvironment {
         if let Some(service) = services.get(&key).and_then(Weak::upgrade) {
             return Ok(service);
         }
+        // Named rather than spelled: the generated-path registry excludes this exact
+        // directory from git, and a literal here would let the two drift apart, leaving
+        // background terminal state to show up as untracked files a model then reasons
+        // about as if the work had produced them.
         let service = Arc::new(BackgroundExecutionService::open(
             directory
                 .join(zuno_paths::PROJECT_DIRECTORY)
-                .join("background"),
+                .join(zuno_paths::BACKGROUND_DIRECTORY),
         )?);
         services.insert(key, Arc::downgrade(&service));
         Ok(service)

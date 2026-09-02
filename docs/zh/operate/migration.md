@@ -1,8 +1,8 @@
 # Zuno 数据库生命周期
 
-Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 7。空数据库直接创建为当前
+Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 8。空数据库直接创建为当前
 格式；受支持的旧格式通过受保护的前向迁移升级。format 5 是第一个受支持的历史格式，
-format 5 与 format 6 都会原地升级到 format 7，不需要重建数据库。
+format 5、format 6 与 format 7 都会原地升级到 format 8，不需要重建数据库。
 
 ## Channel 数据库
 
@@ -48,28 +48,32 @@ zuno session list
 
 数据库打开流程识别以下状态：
 
-1. **空数据库。** 完整的 format-7 schema 与唯一 `zuno_schema` marker 被原子创建。
-2. **Format 7。** 在执行应用查询前校验 marker 与当前格式要求的表。
-3. **Format 6。** 原地增加 Plan 栈字段与 `work_plan_archive`。
-4. **Format 5。** 在一个事务中增加 learning schema 与 Plan 栈 schema，并升级到 format 7。
-5. **其他任何状态。** 不受支持的更旧格式、未来格式、缺少 marker，或 marker 与必需
+1. **空数据库。** 完整的 format-8 schema 与唯一 `zuno_schema` marker 被原子创建。
+2. **Format 8。** 在执行应用查询前校验 marker 与当前格式要求的表。
+3. **Format 7。** 原地增加 `verification_receipt` 账本与其索引。
+4. **Format 6。** 原地增加 Plan 栈字段、`work_plan_archive` 与 `verification_receipt`
+   账本。
+5. **Format 5。** 在一个事务中增加 learning schema、Plan 栈 schema 与
+   `verification_receipt` 账本，并升级到 format 8。
+6. **其他任何状态。** 不受支持的更旧格式、未来格式、缺少 marker，或 marker 与必需
    表不匹配，都会失败关闭且不修改文件。
 
-### Format 5 或 6 到 format 7
+### Format 5、6 或 7 到 format 8
 
 受支持的迁移使用一个 SQLite `BEGIN IMMEDIATE` 事务：
 
-1. 重新读取表清单，并要求 marker 恰好为 format 5 或 6。
+1. 重新读取表清单，并要求 marker 恰好为 format 5、6 或 7。
 2. 在任何变更前要求历史 `session` 与 `work_plan` 表存在。
 3. 从 format 5 出发时，创建全部 format-6 learning 表和索引。
-4. 增加可空的 `parent_plan_id`、默认值为 0 的 `stack_depth` 与
-   `work_plan_archive`，不重写活跃 Plan 行。
-5. 通过带旧值条件的更新把 singleton marker 从 5 或 6 改为 7。
-6. 只有全部 schema 操作和 marker 更新成功后才提交。
+4. 从 format 5 或 6 出发时，增加可空的 `parent_plan_id`、默认值为 0 的 `stack_depth`
+   与 `work_plan_archive`，不重写活跃 Plan 行。
+5. 创建 `verification_receipt` 账本；它初始为空，不重写任何已有行。
+6. 通过带旧值条件的更新把 singleton marker 从 5、6 或 7 改为 8。
+7. 只有全部 schema 操作和 marker 更新成功后才提交。
 
 任何失败都会回滚整个事务。迁移不会重写已有的 `session`、`message`、
-`memory_candidate` 或 `work_plan` 值。测试构造精确的 format-5 与 format-6 形态，
-比较迁移前后的代表性行，再查询新增 learning 与 Plan archive 表。
+`memory_candidate` 或 `work_plan` 值。测试构造精确的 format-5、format-6 与 format-7
+形态，比较迁移前后的代表性行，再查询新增 learning、Plan archive 与 verification 表。
 
 只修改 `zuno_schema.format` 永远不是有效修复：应用查询还需要与 marker 匹配的表和
 索引。不要手工提升或降低 marker。
@@ -80,7 +84,8 @@ Zuno 会在执行应用查询前拒绝不受支持的 schema 格式，绝不会�
 任何人工恢复前都应保留原文件并创建副本。
 
 重要数据应使用对应旧二进制导出，或实现并验证明确的前向迁移。不要猜测 schema、静默
-丢行，也不要要求当前二进制已经支持的格式重建数据库。有效的 format-5 或 format-6 数据库应当自动
+丢行，也不要要求当前二进制已经支持的格式重建数据库。有效的 format-5、format-6 或
+format-7 数据库应当自动
 打开并完成迁移。
 
 ## 未来 schema 变更规则

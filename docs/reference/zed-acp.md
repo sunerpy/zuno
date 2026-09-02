@@ -244,8 +244,9 @@ objective without resetting its lifecycle state, budget, or usage. Explicit
 `block <reason>`, `complete`, and `cancel` actions remain available and take
 precedence when their name is the first token. Objective changes also supersede
 unfinished work by archiving the prior visible Plan and binding a fresh root
-Plan to the current Goal for multi-stage work. An atomic objective leaves an
-already terminal historical Plan attached to its original Goal. The command output is projected
+Plan to the current Goal for multi-stage work. An atomic objective never rebinds an
+already terminal historical Plan; one that belongs to a previous Goal is archived as
+completed history and the panel is cleared. The command output is projected
 as an ordinary Agent message rather than as reasoning. Invalid arguments to an
 explicit action are returned as JSON-RPC invalid params, not as an internal
 session error. A successful create or edit then advances the active Goal
@@ -269,7 +270,11 @@ Zed clears its previous panel. Load and resume project the current Plan through
 the same path, and a host remount replaces the subscription without resetting
 the revision cursor. ACP has no native `superseded` status, so Zuno maps it to
 `completed` and preserves the semantic outcome in
-`_meta.zuno.outcome: "superseded"`.
+`_meta.zuno.outcome: "superseded"`. Each non-empty Plan snapshot also carries
+`_meta.zuno.planId`, `revision`, `title`, and `stackDepth`, plus `goalId` when the Plan is
+bound to a Goal and `parentPlanId` while a focused child Plan is visible, so a client can
+tell a pushed child from a replaced root without diffing entries; every entry carries
+`_meta.zuno.stepId`, and the clearing update carries only `_meta.zuno.cleared: true`.
 
 Executing `/name arguments` uses Zuno's existing command-template or Skill
 driver, including normal permission and durable-session behavior. ACP does not
@@ -344,8 +349,13 @@ card showing its prompt, choices, status, and—when durable answer metadata is
 available—the selected values. `rawInput` and `rawOutput` remain available in
 tool details; loading history never reopens an elicitation request.
 
-Only provider reasoning deltas are projected into Zed's Thinking surface.
-Generated titles use ACP `session_info_update`, and operational status or
+Only provider reasoning deltas are projected into Zed's Thinking surface, with one
+tagged exception: a Zuno-originated notice — a remote rule file that could not be fetched, a
+turn stopped by its allowance, a compaction the budget policy requested — is sent as an
+`agent_thought_chunk` whose `_meta.zuno.notice` carries `severity` (`info`, `warning`,
+or `error`) and a stable `code` from the `instruction.*` or `budget.*` families. The
+tag is how a client tells it from model output; the text is written for a person.
+Generated titles use ACP `session_info_update`, and other operational status or
 provider failure text is handled by lifecycle/error reporting rather than being
 rendered as model thought.
 

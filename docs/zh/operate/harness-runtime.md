@@ -32,6 +32,13 @@ Agent 的确切 `tools` 允许列表会立即公开其中点名的 MCP schema；
 `mcpServers` 在严格连接门禁后也立即公开，但同一目录中的宿主配置 server 仍延迟发现；
 Catalog 会把这个会话边界传递到子回合与后台续跑。
 
+仓库与用户的规则文件要么整份进入 Prompt，要么不进入。宿主无法读取的本地规则文件，或者超出
+指令预算（64 KB 与模型 context window 四分之一取较小值）的规则文件，会在第一次 provider
+请求之前让本轮以类型化错误失败，错误点名文件与修复方式，超预算时还给出字节数与预算；这种
+情况不会发出任何 notice，因为回合根本没有运行。过去的"记一条警告、然后不带该文件继续发请求"
+行为已不存在：不带用户所写规则的回合不会运行。唯一的非致命情形是无法抓取的远程规则来源：
+回合继续执行，但以 `warning` 级 notice `instruction.not_in_force` 报告哪个来源的规则本轮不生效。
+
 ## 扩展包与可执行插件宿主
 
 扩展要么是显式 WASI 授权下的 WebAssembly 组件，要么是使用行分隔 JSON-RPC 的受限子进程。能力必须声明，不会被默认赋予。
@@ -107,16 +114,33 @@ session 级联删除，并进入 session export/import、sanitize 与 prune。TU
 原生 `/goal <目标>` 创建或编辑成功后，会把这次宿主命令标记为完整的 idle edge，并立即
 交给共享 Goal continuation driver。若会话还没有 user message，driver 会先把目标本身
 通过持久 inbox 准入为首个 user turn anchor；字面的斜杠控制文本不会进入 provider。
+目标变化也会同步活跃 Plan：多阶段目标归档此前可见 Plan 并安装绑定当前 `goal_id` 的新根
+Plan；原子目标不改绑已终态的历史 Plan，属于上一个 Goal 的终态 Plan 会在目标变化时、或仍
+可见时在下一次宿主规划决策时归档为已完成的历史，完成审计不会再拿它对账新 Goal。
 
 ACP load/resume 会重建运行时、按请求重放持久投影，然后通过 detached continuation
 observer 调度 active 根 Goal。恢复任务与普通 prompt 共用会话执行门，因此不会并发启动
 第二个 Goal 回合；0.6.0 已落盘但未产生首个 user message 的 Goal 也会在此路径补齐并续跑。
 
-可恢复的 provider、网络、流、SQLite 争用、回合预算和符合条件的工具失败，会在等待前先持久化一次指数退避重试。进程重启后从 SQLite 重建截止时间。
+可恢复的 provider、网络、流、SQLite 争用、Agent 步数上限和符合条件的工具失败，会在等待前先持久化一次指数退避重试。进程重启后从 SQLite 重建截止时间。
 
 重试延迟是正数、有上限、带抖动，并且可被用户输入打断。有效的对端 `Retry-After` 会被限制到配置上限，且绝不会被更早的本地延迟替换。
 
 重试决策使用类型化错误，而非渲染后的消息。认证失败与用户中断导致暂停；无效协议、损坏的持久状态和永久性配置失败导致阻塞。
+
+- 被自身预算策略停下的回合以 `turn_budget` 暂停。额度属于单个回合，Goal 保留剩余的
+  token 预算，但不会自动续跑：下一回合只会以同样的方式花掉同样的额度。这与 Goal 整体
+  预算耗尽的 `budget_limited` 状态不同。
+- 预算策略可以要求压缩而不是停止。这被归类为上下文上限失败并走同一条路径：压缩保留的
+  历史，然后重试该回合。
+- 每次 provider 请求前后都会咨询回合预算策略。默认 profile 发布的 `TurnAllowance` 把
+  未设预算的 Goal 置于 8,000,000 token 的宿主默认额度之下，并可另设工具调用次数上限与
+  墙上时间上限；这两道上限无论有没有 Goal 都生效，触顶时以 `tool_call_budget` 或 `time_budget` 停止。
+  在用户显式设定的 Goal 预算下，用量不可测时以 `usage_unknown` 停止；宿主默认额度则继续执行，
+  只按已计数的用量生效。上限优先于压缩请求或继续执行，但让位于 Goal 自身已产生的停止。
+  `None` 不再等于无限自治：只有不发布 allowance、或显式发布 `TurnAllowance::UNLIMITED` 的
+  profile 才没有上限。每次停止都是类型化的 `TurnError::BudgetLimited`，并以 `notice` 事件
+  （code 为 `budget.<kind>`）投影给客户端；压缩请求的 code 为 `budget.compact`。
 
 ## 原生搜索与 Shell 隔离
 

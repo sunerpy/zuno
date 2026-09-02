@@ -882,8 +882,14 @@ fn atomic_goal_objective_rebinds_without_falsely_completing_active_work() {
     assert_eq!(plan.steps[0].title, "Old work");
 }
 
+/// The case the plan-ownership audit and the host boundary used to disagree on. Goal A
+/// finished with every step completed; nothing archives a Plan when its Goal completes.
+/// The user then set an atomic objective — `现在有几个 skill 可用`, one question — which
+/// mints Goal B. The boundary left A's Plan visible and unbound, the audit then refused
+/// B's completion because the visible Plan belonged to A, and B could not complete at
+/// all without an out-of-band `plan_update`. The Plan is history and is archived as such.
 #[test]
-fn atomic_goal_objective_does_not_rebind_a_terminal_historical_plan() {
+fn atomic_goal_objective_archives_a_terminal_plan_of_a_previous_goal_instead_of_rebinding_it() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
     );
@@ -923,7 +929,7 @@ fn atomic_goal_objective_does_not_rebind_a_terminal_historical_plan() {
         HostPlanningRequest {
             session_id: "ses-terminal-goal",
             agent: "build",
-            prompt: "Commit the current staged changes.",
+            prompt: "现在有几个 skill 可用",
             source: PlanningInputSource::GoalObjective,
             content: PlanningContentFacts::empty(),
             plan_available: true,
@@ -933,13 +939,107 @@ fn atomic_goal_objective_does_not_rebind_a_terminal_historical_plan() {
     .expect("classify atomic Goal with historical plan");
 
     assert!(matches!(outcome.decision, PlanningDecision::Atomic(_)));
-    assert!(!outcome.changed);
-    let plan = store
-        .plan("ses-terminal-goal")
-        .expect("read plan")
-        .expect("historical plan");
-    assert_eq!(plan.revision, original.revision);
-    assert_eq!(plan.goal_id.as_deref(), Some("goal-historical"));
+    assert!(
+        outcome.changed,
+        "retiring the historical plan is a visible change"
+    );
+    assert!(
+        store
+            .plan("ses-terminal-goal")
+            .expect("read plan")
+            .is_none(),
+        "the new Goal is not judged against another Goal's finished checklist"
+    );
+    let connection = pool.get().expect("archive connection");
+    let (state, goal_id, revision): (String, Option<String>, i64) = connection
+        .query_row(
+            "SELECT state, goal_id, revision FROM work_plan_archive \
+             WHERE session_id='ses-terminal-goal' AND id=?1",
+            [&original.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("the historical plan is kept as history");
+    assert_eq!(state, "completed");
+    assert_eq!(
+        goal_id.as_deref(),
+        Some("goal-historical"),
+        "history is not rebound"
+    );
+    assert_eq!(revision, original.revision);
+}
+
+#[test]
+fn a_terminal_plan_of_the_same_goal_or_of_no_goal_stays_visible() {
+    for (session, seeded_goal) in [
+        ("ses-own-terminal-plan", Some("goal-current")),
+        ("ses-unbound-terminal-plan", None),
+    ] {
+        let pool = Arc::new(
+            zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
+        );
+        {
+            let mut connection = pool.get().expect("schema connection");
+            zuno_db::migration::apply(&mut connection).expect("apply schema");
+            connection
+                .execute(
+                    "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                     VALUES ('project', '/workspace', 1, 1, '[]')",
+                    [],
+                )
+                .expect("seed project");
+            connection
+                .execute(
+                    "INSERT INTO session \
+                       (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                     VALUES (?1, 'project', 'goal', '/workspace', 'goal', '1', 1, 1)",
+                    [session],
+                )
+                .expect("seed session");
+        }
+        let store = zuno_tools::WorkStateStore::new(Arc::clone(&pool));
+        let original = store
+            .update_plan(
+                session,
+                zuno_tools::PlanUpdateParams {
+                    expected_revision: None,
+                    goal_id: seeded_goal.map(str::to_owned),
+                    title: "Finished work".to_owned(),
+                    steps: vec![zuno_tools::PlanStep {
+                        id: "done".to_owned(),
+                        title: "Finished work".to_owned(),
+                        status: zuno_tools::PlanStepStatus::Completed,
+                    }],
+                },
+            )
+            .expect("seed terminal plan");
+
+        let outcome = ensure_host_plan(
+            &pool,
+            HostPlanningRequest {
+                session_id: session,
+                agent: "build",
+                prompt: "现在有几个 skill 可用",
+                source: PlanningInputSource::GoalObjective,
+                content: PlanningContentFacts::empty(),
+                plan_available: true,
+                goal_id: Some("goal-current".to_owned()),
+            },
+        )
+        .expect("classify atomic Goal");
+
+        assert!(matches!(outcome.decision, PlanningDecision::Atomic(_)));
+        assert!(!outcome.changed, "{session}: nothing to retire");
+        let plan = store
+            .plan(session)
+            .expect("read plan")
+            .expect("plan stays visible");
+        assert_eq!(plan.revision, original.revision, "{session}");
+        assert_eq!(
+            plan.goal_id.as_deref(),
+            seeded_goal,
+            "{session}: no rebind either way"
+        );
+    }
 }
 
 #[test]
@@ -2124,7 +2224,6 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
             "body",
         )]);
     let mut resolver = traced_resolver("AGENT");
-    let mut notes = Vec::new();
     configure_resident_memory(
         &mut resolver,
         &zuno_config::schema::Config::default(),
@@ -2138,7 +2237,7 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
             zuno_extension::ResolvedExtensions::default().prompt_section(),
         )
         .expect("inject extension provenance");
-    announce_instructions(&mut resolver, &loaded, &mut notes).expect("inject instructions");
+    let admission = announce_instructions(&mut resolver, &loaded, 0).expect("inject instructions");
     announce_skills(&mut resolver, &skills, 0, None).expect("inject skills");
 
     let assembly = resolver
@@ -2184,7 +2283,11 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
     assert_eq!(assembly.sections()[3].source(), "zuno skill trigger policy");
     assert_eq!(assembly.sections()[4].source(), "discovered skill index");
     assert_eq!(resolver.system_prompt, assembly.render());
-    assert!(notes.is_empty(), "{notes:?}");
+    assert!(
+        admission.degraded().is_empty(),
+        "{:?}",
+        admission.degraded()
+    );
 }
 
 /// Two models under one provider, with `title` overridden to the smaller one.
@@ -5963,8 +6066,245 @@ fn failed_provider_request_keeps_confirmed_goal_usage_and_marks_the_turn_unknown
         "confirmed usage must be monotonic"
     );
     assert_eq!(after.estimated_pending_prompt_tokens, Some(1_234));
-    assert_eq!(after.failed_turns, before.failed_turns + 1);
+    assert_eq!(
+        zuno_db::session::get(&connection, &session.id)
+            .expect("read the session")
+            .usage
+            .failed_turns,
+        1,
+        "the fixture recorded the failed turn"
+    );
     assert!(!goal_turn_accounting_known(before, after));
+}
+
+/// A turn must not charge the goal twice for the same provider response.
+///
+/// The budget policy charges each request as it lands, because a ceiling checked only
+/// between turns cannot stop a runaway inside one; the turn end then charges what the
+/// session spent. Adding both to the same counter would bill every request twice, and
+/// a goal would stop at half the tokens its budget names — which, with a default
+/// allowance now in place for every session, is a ceiling that silently moves.
+#[test]
+fn a_turn_charges_the_goal_once_for_tokens_a_request_already_accounted_for() {
+    let pool = std::sync::Arc::new(
+        zuno_db::pool::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory database"),
+    );
+    let mut connection = pool.get().expect("database connection");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    let goal_spill = tempfile::tempdir().expect("goal spill directory");
+    let goals = GoalStore::from_pool(std::sync::Arc::clone(&pool), goal_spill.path().to_owned())
+        .expect("attach the goal tables");
+    let fixture_plan = plan("/workspace", SessionChoice::New);
+    let now = 1_780_000_000_000;
+    ensure_project(&connection, &fixture_plan.project, now).expect("persist project");
+    let session =
+        resolve_session(&mut connection, &fixture_plan, now).expect("create fixture session");
+    goals
+        .create_goal(&session.id, "ship the change", Some(1_000))
+        .expect("declare a budgeted goal");
+
+    let before = goal_usage(&connection, &session.id).expect("read usage before the turn");
+    let assistant = zuno_db::message::MessageRecord::from_json(serde_json::json!({
+        "id": "msg_charged_once",
+        "sessionID": session.id,
+        "role": "assistant",
+        "time": { "created": now + 2, "completed": now + 3 },
+        "parentID": "msg_parent",
+        "modelID": "model",
+        "providerID": "provider",
+        "mode": "build",
+        "agent": "build",
+        "path": { "cwd": "/workspace", "root": "/workspace" },
+        "cost": 0,
+        "tokens": {
+            "input": 10,
+            "output": 20,
+            "reasoning": 30,
+            "cache": { "read": 40, "write": 50 },
+            "accounting": "cache-beside-input"
+        },
+        "finish": "stop"
+    }))
+    .expect("valid assistant message");
+    connection
+        .transaction(|transaction| {
+            let store = zuno_db::message::MessageStore::new(transaction);
+            store.put_message(&assistant)?;
+            zuno_db::session::reconcile_usage(
+                transaction,
+                &session.id,
+                None,
+                zuno_db::session::MessageUsage::from_data(&assistant.data),
+                None,
+            )
+        })
+        .expect("commit the assistant checkpoint");
+    let recorded = goals
+        .record_request_usage(&session.id, "req_1", 150, now + 4)
+        .expect("charge the request as the policy does");
+    assert!(recorded.accounted, "the first charge for a request counts");
+
+    let after = goal_usage(&connection, &session.id).expect("read usage after the turn");
+
+    assert_eq!(
+        after.tokens - before.tokens,
+        150,
+        "the session confirmed the whole response"
+    );
+    assert_eq!(
+        after.goal_charged - before.goal_charged,
+        150,
+        "the policy already moved the goal's counter"
+    );
+    assert_eq!(
+        goal_turn_unaccounted_tokens(before, after),
+        0,
+        "the turn end must find nothing left to charge"
+    );
+    assert_eq!(
+        goals
+            .goal(&session.id)
+            .expect("read the goal")
+            .expect("the goal exists")
+            .tokens_used,
+        150,
+        "one response costs the goal one response"
+    );
+}
+
+/// Tokens no request accounted for are still the goal's to pay.
+///
+/// Compaction's own model calls, and a turn that failed before any response was
+/// recorded, spend tokens without passing through the per-request policy. If the turn
+/// end only ever charged zero, those would be free — a goal could spend its budget on
+/// nothing but compaction and never reach its ceiling.
+#[test]
+fn the_turn_end_charges_usage_no_request_accounted_for() {
+    let charged = |session: i64, goal: i64| GoalUsage {
+        tokens: session,
+        confirmed_known: true,
+        estimated_pending_prompt_tokens: None,
+        last_confirmed_at: Some(1_780_000_000_000),
+        goal_charged: goal,
+        last_provider_request_seq: 4,
+        failed_turns: 0,
+    };
+
+    assert_eq!(
+        goal_turn_unaccounted_tokens(charged(1_000, 400), charged(1_800, 900)),
+        300,
+        "the session spent 800 and requests accounted for 500"
+    );
+    assert_eq!(
+        goal_turn_unaccounted_tokens(charged(1_000, 400), charged(1_800, 400)),
+        800,
+        "with no request charged, the whole turn is unaccounted"
+    );
+    assert_eq!(
+        goal_turn_unaccounted_tokens(charged(1_000, 400), charged(1_100, 900)),
+        0,
+        "a policy ahead of the session's confirmed total never hands budget back"
+    );
+    assert_eq!(
+        goal_turn_unaccounted_tokens(charged(1_000, 900), charged(1_800, 100)),
+        800,
+        "a goal replaced mid-turn wears the turn rather than escaping it"
+    );
+}
+
+/// A turn that never reached the provider must not mark the goal's usage unknown.
+///
+/// The flag never rises again: the store writes `usage_known AND known`, and a goal
+/// whose flag is false stops before its next request. A failure that happens before
+/// the first request — bad configuration, a refused tool, an interrupt during setup —
+/// spent nothing unmeasured, so marking it unknown would end the session over an
+/// accounting gap that does not exist. With a default allowance installed for every
+/// session, that stop now reaches goals that never named a budget.
+#[test]
+fn a_failed_turn_that_issued_no_request_leaves_the_goal_accounting_known() {
+    let mut connection =
+        zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    let fixture_plan = plan("/workspace", SessionChoice::New);
+    let now = 1_780_000_000_000;
+    ensure_project(&connection, &fixture_plan.project, now).expect("persist project");
+    let session =
+        resolve_session(&mut connection, &fixture_plan, now).expect("create fixture session");
+
+    let before = goal_usage(&connection, &session.id).expect("read usage before the turn");
+    zuno_db::session::record_turn_failure(&connection, &session.id).expect("record failed turn");
+    let after = goal_usage(&connection, &session.id).expect("read usage after the failure");
+
+    assert_eq!(
+        zuno_db::session::get(&connection, &session.id)
+            .expect("read the session")
+            .usage
+            .failed_turns,
+        1,
+        "the fixture recorded the failed turn"
+    );
+    assert_eq!(
+        after.last_provider_request_seq, before.last_provider_request_seq,
+        "the fixture turn never reached a provider"
+    );
+    assert!(
+        goal_turn_accounting_known(before, after),
+        "a turn that spent nothing cannot make the goal's total an underestimate"
+    );
+}
+
+/// Only spend the session could not measure makes accounting unknown.
+///
+/// The last case is the one that matters most in practice, because the flag never
+/// rises again: a session generates a title alongside its turn, that request is not
+/// charged to this session, and treating an untouched counter as a measurement gap
+/// stopped a goal that had spent nothing at all.
+#[test]
+fn accounting_is_unknown_only_where_the_session_could_not_measure_the_spend() {
+    let usage =
+        |confirmed: i64, pending: Option<u64>, request_seq: i64, failed: u64, known: bool| {
+            GoalUsage {
+                tokens: confirmed,
+                confirmed_known: known,
+                estimated_pending_prompt_tokens: pending,
+                last_confirmed_at: Some(1_780_000_000_000 + confirmed),
+                goal_charged: 0,
+                last_provider_request_seq: request_seq,
+                failed_turns: failed,
+            }
+        };
+
+    assert!(
+        !goal_turn_accounting_known(
+            usage(100, None, 1, 0, true),
+            usage(100, Some(9_000), 2, 0, true)
+        ),
+        "an estimate still pending is a request whose usage never landed"
+    );
+    assert!(
+        goal_turn_accounting_known(usage(100, None, 1, 0, true), usage(100, None, 1, 0, true)),
+        "a turn without a request adds no doubt"
+    );
+    assert!(
+        goal_turn_accounting_known(usage(100, None, 1, 0, true), usage(340, None, 2, 0, true)),
+        "a confirmed response the session could normalize is measured"
+    );
+    assert!(
+        !goal_turn_accounting_known(usage(100, None, 1, 0, true), usage(340, None, 2, 0, false)),
+        "a response the session could not normalize is not a measurement"
+    );
+    assert!(
+        !goal_turn_accounting_known(usage(100, None, 1, 0, true), usage(100, None, 2, 1, true)),
+        "a turn that failed after reaching the provider may have spent what nobody counted"
+    );
+    assert!(
+        goal_turn_accounting_known(usage(100, None, 1, 1, true), usage(100, None, 1, 2, true)),
+        "a failed turn that never reached the provider spent nothing to be unsure about"
+    );
+    assert!(
+        goal_turn_accounting_known(usage(100, None, 1, 0, true), usage(100, None, 2, 0, true)),
+        "a request this session was never charged for is not a measurement gap"
+    );
 }
 
 /// Neither surface may compose a turn or bypass the selected driver.
@@ -6060,6 +6400,13 @@ fn every_turn_error() -> Vec<TurnError> {
         TurnError::StepLimit {
             agent: "agent-in-the-message".to_owned(),
             max_steps: 100,
+        },
+        TurnError::BudgetLimited {
+            kind: zuno_engine::budget::BudgetStopKind::TokenBudget,
+            detail: "budget-in-the-message".to_owned(),
+        },
+        TurnError::CompactionRequired {
+            reason: "compaction-in-the-message".to_owned(),
         },
         TurnError::StreamEndedWithoutMessageEnd { step: 3 },
         TurnError::EmptyAssistantMessage {
@@ -6169,6 +6516,8 @@ fn the_variant_table_covers_the_whole_enum() {
             TurnError::AgentNotFound { .. } => "AgentNotFound",
             TurnError::ModelNotFound { .. } => "ModelNotFound",
             TurnError::StepLimit { .. } => "StepLimit",
+            TurnError::BudgetLimited { .. } => "BudgetLimited",
+            TurnError::CompactionRequired { .. } => "CompactionRequired",
             TurnError::StreamEndedWithoutMessageEnd { .. } => "StreamEndedWithoutMessageEnd",
             TurnError::EmptyAssistantMessage { .. } => "EmptyAssistantMessage",
             TurnError::DuplicateToolUse { .. } => "DuplicateToolUse",
@@ -6191,7 +6540,7 @@ fn the_variant_table_covers_the_whole_enum() {
 
     assert_eq!(
         named.len(),
-        21,
+        23,
         "the table covers only {named:?}; every variant needs a value or the rendering \
          claims above are vacuous for the ones missing"
     );
@@ -8071,12 +8420,32 @@ mod instruction_prompt {
         traced_resolver("AGENT PROMPT")
     }
 
-    async fn inject(options: &zuno_config::InstructionOptions) -> (Resolver, Vec<String>) {
+    /// Admit with an unknown model window, so the absolute ceiling is the only limit.
+    async fn inject(options: &zuno_config::InstructionOptions) -> (Resolver, InstructionAdmission) {
+        admit(options, 0).await.expect("announce instructions")
+    }
+
+    /// Admit against a stated window, returning the refusal instead of panicking on it.
+    async fn admit(
+        options: &zuno_config::InstructionOptions,
+        context_window: u64,
+    ) -> Result<(Resolver, InstructionAdmission), String> {
         let loaded = zuno_config::Instructions::discover(options).load().await;
         let mut resolver = resolver();
-        let mut notes = Vec::new();
-        announce_instructions(&mut resolver, &loaded, &mut notes).expect("announce instructions");
-        (resolver, notes)
+        let admission = announce_instructions(&mut resolver, &loaded, context_window)?;
+        Ok((resolver, admission))
+    }
+
+    /// The refusal, for the files that must never reach a provider request.
+    ///
+    /// A helper rather than `expect_err` because the success arm carries a `Resolver`,
+    /// and making the whole prompt assembly `Debug` to print a panic message is the
+    /// wrong trade.
+    async fn refuse(options: &zuno_config::InstructionOptions, context_window: u64) -> String {
+        match admit(options, context_window).await {
+            Ok(_) => panic!("the instruction admission accepted a file it must refuse"),
+            Err(error) => error,
+        }
     }
 
     #[tokio::test]
@@ -8086,7 +8455,7 @@ mod instruction_prompt {
         write(&global, "GLOBAL_RULE_MARKER");
         std::fs::create_dir_all(root.path().join("repo")).expect("mkdir repo");
 
-        let (resolver, notes) =
+        let (resolver, admission) =
             inject(&options(root.path(), root.path().join("repo"), Vec::new())).await;
 
         assert!(
@@ -8106,7 +8475,11 @@ mod instruction_prompt {
             "the oracle's header must name the source: {}",
             resolver.system_prompt
         );
-        assert!(notes.is_empty(), "{notes:?}");
+        assert!(
+            admission.degraded().is_empty(),
+            "{:?}",
+            admission.degraded()
+        );
     }
 
     #[tokio::test]
@@ -8116,7 +8489,8 @@ mod instruction_prompt {
         write(&repo.join("AGENTS.md"), "ROOT_RULE_MARKER");
         write(&fixture_path(&repo, "sub/AGENTS.md"), "SUB_RULE_MARKER");
 
-        let (resolver, notes) = inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
+        let (resolver, admission) =
+            inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
 
         let sub_at = resolver
             .system_prompt
@@ -8131,7 +8505,11 @@ mod instruction_prompt {
             "the project cascade must render root to cwd so the nearest rule has the highest later priority: {}",
             resolver.system_prompt
         );
-        assert!(notes.is_empty(), "{notes:?}");
+        assert!(
+            admission.degraded().is_empty(),
+            "{:?}",
+            admission.degraded()
+        );
     }
 
     /// Cross-product instruction files never participate in Zuno's native cascade.
@@ -8142,7 +8520,8 @@ mod instruction_prompt {
         write(&repo.join("AGENTS.md"), "ROOT_RULE_MARKER");
         write(&fixture_path(&repo, "sub/CLAUDE.md"), "SUB_CLAUDE_MARKER");
 
-        let (resolver, notes) = inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
+        let (resolver, admission) =
+            inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
 
         assert!(
             resolver.system_prompt.contains("ROOT_RULE_MARKER"),
@@ -8154,7 +8533,11 @@ mod instruction_prompt {
             "Zuno must not load `CLAUDE.md` implicitly: {}",
             resolver.system_prompt
         );
-        assert!(notes.is_empty(), "{notes:?}");
+        assert!(
+            admission.degraded().is_empty(),
+            "{:?}",
+            admission.degraded()
+        );
     }
 
     #[tokio::test]
@@ -8170,7 +8553,7 @@ mod instruction_prompt {
             "TILDE_RULE_MARKER",
         );
 
-        let (resolver, notes) = inject(&options(
+        let (resolver, admission) = inject(&options(
             root.path(),
             repo,
             vec!["docs/*.md".to_owned(), "~/tilde-rules.md".to_owned()],
@@ -8187,7 +8570,11 @@ mod instruction_prompt {
             "a `~/`-relative `instructions` entry never reached the prompt: {}",
             resolver.system_prompt
         );
-        assert!(notes.is_empty(), "{notes:?}");
+        assert!(
+            admission.degraded().is_empty(),
+            "{:?}",
+            admission.degraded()
+        );
     }
 
     /// The common case — no rule file anywhere — must cost nothing and say nothing.
@@ -8201,7 +8588,7 @@ mod instruction_prompt {
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
 
-        let (resolver, notes) = inject(&options(root.path(), repo, Vec::new())).await;
+        let (resolver, admission) = inject(&options(root.path(), repo, Vec::new())).await;
 
         assert_eq!(
             resolver.system_prompt.as_bytes(),
@@ -8209,51 +8596,51 @@ mod instruction_prompt {
             "an absent instruction file must add no bytes at all"
         );
         assert!(
-            notes.is_empty(),
-            "a missing rule file is the normal case and must be silent: {notes:?}"
+            admission.degraded().is_empty(),
+            "a missing rule file is the normal case and must be silent: {:?}",
+            admission.degraded()
         );
     }
 
-    /// An unreadable file is reported, once, and never silently skipped.
+    /// An unreadable rule file stops the turn instead of being reported and skipped.
     ///
     /// A rule the user wrote and believes is in force, that the agent never received,
     /// is the worst of the three outcomes — worse than a hard failure, which they would
-    /// at least notice. The count matters as much as the text: this is surfaced from a
-    /// load that happens once per host, not once per turn.
+    /// at least notice. So this is the hard failure. Discovery records only paths that
+    /// exist, so an unreadable one is a file that is really there and really meant to
+    /// apply; continuing would send the request under rules the model never saw.
     #[tokio::test]
-    async fn an_unreadable_rule_file_is_reported_exactly_once() {
+    async fn an_unreadable_rule_file_stops_the_turn_before_the_provider_is_called() {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
         let repo = root.path().join("repo");
         write(&repo.join("AGENTS.md"), [0xff_u8, 0xfe, 0x00, 0x9c]);
 
-        let (resolver, notes) = inject(&options(root.path(), repo.clone(), Vec::new())).await;
+        let error = refuse(&options(root.path(), repo.clone(), Vec::new()), 0).await;
 
-        assert_eq!(
-            resolver.system_prompt.as_bytes(),
-            b"AGENT PROMPT",
-            "an unreadable file must not contribute bytes"
-        );
-        assert_eq!(
-            notes.len(),
-            1,
-            "an unreadable rule file must be reported once — no more, and never zero: \
-             {notes:?}"
+        assert!(
+            error.contains(&repo.join("AGENTS.md").display().to_string()),
+            "the refusal must name the file the user has to fix: {error}"
         );
         assert!(
-            notes[0].contains(&repo.join("AGENTS.md").display().to_string()),
-            "the report must name the file the user has to fix: {}",
-            notes[0]
+            error.contains("could not be read"),
+            "the refusal must say what went wrong: {error}"
         );
         assert!(
-            notes[0].contains("could not be read"),
-            "the report must say what went wrong: {}",
-            notes[0]
+            error.contains("in force"),
+            "the refusal must say the rules do not apply, not merely that a read failed: \
+             {error}"
         );
     }
 
-    /// Past the budget a whole file is dropped and named — never cut mid-rule.
+    /// Past the budget the turn stops: a whole file is never cut, and never dropped.
+    ///
+    /// Dropping and continuing was the previous behaviour, and it reported the drop —
+    /// but as one status line among a turn's worth of them, after which the request
+    /// went to the provider with the user's rules absent. Refusing here is the same
+    /// treatment an oversized Skill body already gets, and a rule file outranks a
+    /// Skill.
     #[tokio::test]
-    async fn an_oversized_rule_file_is_dropped_whole_and_the_drop_is_reported() {
+    async fn a_rule_file_past_the_budget_stops_the_turn_rather_than_being_dropped() {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
         let repo = root.path().join("repo");
         let oversized = repo.join("AGENTS.md");
@@ -8269,40 +8656,112 @@ mod instruction_prompt {
             "SMALL_RULE_MARKER",
         );
 
-        let (resolver, notes) =
-            inject(&options(root.path(), repo, vec!["~/small.md".to_owned()])).await;
+        let error = refuse(
+            &options(root.path(), repo, vec!["~/small.md".to_owned()]),
+            0,
+        )
+        .await;
 
         assert!(
-            !resolver.system_prompt.contains("OVERSIZED_RULE_MARKER"),
-            "a file past the budget must be dropped whole, not truncated into a rule \
-             that says something else"
+            error.contains(&oversized.display().to_string()),
+            "the refusal must name the file: {error}"
         );
         assert!(
-            resolver.system_prompt.len() <= "AGENT PROMPT".len() + 2 + INSTRUCTION_PROMPT_BUDGET,
-            "the prompt exceeded the budget: {} bytes",
-            resolver.system_prompt.len()
+            error.contains(&INSTRUCTION_PROMPT_BUDGET.to_string()),
+            "the refusal must state the budget the file has to fit: {error}"
         );
         assert!(
-            resolver.system_prompt.contains("SMALL_RULE_MARKER"),
-            "one oversized file must not starve the rest: {}",
+            error.contains("in force"),
+            "the refusal must say the rules do not apply: {error}"
+        );
+        assert!(
+            !error.contains("OVERSIZED_RULE_MARKER"),
+            "instruction contents are user-authored and must never be echoed: {error}"
+        );
+    }
+
+    /// The same file can fit a large model and be refused by a small one.
+    ///
+    /// The absolute ceiling alone is the wrong shape: 64 KB is a rounding error in a
+    /// million-token window and half the usable prompt in a small one. The refusal
+    /// belongs here, naming the file, rather than later as a total token count that
+    /// names nothing.
+    #[tokio::test]
+    async fn a_rule_file_within_the_ceiling_is_still_refused_by_a_small_model_window() {
+        let root = tempfile::TempDir::new().expect("temporary instruction root");
+        let repo = root.path().join("repo");
+        write(
+            &repo.join("AGENTS.md"),
+            format!("WINDOWED_RULE_MARKER{}", "r".repeat(20 * 1024)),
+        );
+
+        let (resolver, admission) = admit(&options(root.path(), repo.clone(), Vec::new()), 0)
+            .await
+            .expect("20 KB fits the absolute ceiling");
+        assert!(
+            resolver.system_prompt.contains("WINDOWED_RULE_MARKER"),
+            "a file inside the ceiling must be admitted when the window is unknown"
+        );
+        assert!(
+            admission.degraded().is_empty(),
+            "{:?}",
+            admission.degraded()
+        );
+
+        let error = refuse(&options(root.path(), repo, Vec::new()), 16_000).await;
+        assert!(
+            error.contains("prompt budget for this model"),
+            "the refusal must attribute the limit to the model, not to a global constant: \
+             {error}"
+        );
+    }
+
+    /// A remote rule file that will not load is reported, and the turn still runs.
+    ///
+    /// The distinction that matters: an unreadable local file is a mistake in the
+    /// workspace, which the user can fix and which stops the turn. A failed fetch is a
+    /// network, and failing on it would hand the network authority over whether the
+    /// agent runs at all — an offline machine would have no working session.
+    #[tokio::test]
+    async fn a_remote_rule_file_that_cannot_be_fetched_is_reported_and_the_turn_continues() {
+        let root = tempfile::TempDir::new().expect("temporary instruction root");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        write(
+            &fixture_path(root.path(), "home/small.md"),
+            "LOCAL_RULE_MARKER",
+        );
+
+        let (resolver, admission) = admit(
+            &options(
+                root.path(),
+                repo,
+                vec![
+                    "~/small.md".to_owned(),
+                    "https://example.invalid/remote.md".to_owned(),
+                ],
+            ),
+            0,
+        )
+        .await
+        .expect("a failed fetch must not stop the turn");
+
+        assert!(
+            resolver.system_prompt.contains("LOCAL_RULE_MARKER"),
+            "an unreachable remote file must not starve the local rules: {}",
             resolver.system_prompt
         );
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(
-            notes[0].contains(&oversized.display().to_string()),
-            "the report must name the file: {}",
-            notes[0]
+        assert_eq!(
+            admission.degraded().len(),
+            1,
+            "the unreachable file must be reported once: {:?}",
+            admission.degraded()
         );
-        assert!(
-            notes[0].contains("none of its rules are in force"),
-            "the report must say the rules are not in effect, not merely that bytes were \
-             trimmed: {}",
-            notes[0]
-        );
-        assert!(
-            !notes[0].contains("OVERSIZED_RULE_MARKER"),
-            "instruction contents are user-authored and must never be echoed: {}",
-            notes[0]
+        assert_eq!(
+            admission.degraded()[0].0,
+            "https://example.invalid/remote.md",
+            "the report must name the source that is not in force: {:?}",
+            admission.degraded()
         );
     }
 }
@@ -8421,6 +8880,47 @@ fn the_headless_surfaces_wire_every_capability_the_tui_has() {
         assert!(
             read(surface).contains("TurnHost::open_with_runtime_mcp_and_observers"),
             "`{surface}` must reach the constructor that takes a catalog and detached-turn observer"
+        );
+    }
+}
+
+/// A ceiling nobody installs is a ceiling nobody has.
+///
+/// The budget policy treats an unbudgeted goal as unbounded unless the host hands it
+/// the profile's allowance, and the navigation gate reads its mode from configuration
+/// on every decision. Both are one call each, both are easy to drop while editing
+/// the composition, and dropping either is silent: the session still runs, it just
+/// runs without the limit somebody configured. The host is not constructible outside
+/// `open`, so the composition is checked where it is written.
+#[test]
+fn the_host_installs_the_ceilings_its_profile_and_configuration_declare() {
+    let turn = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("cmd")
+            .join("turn.rs"),
+    )
+    .expect("turn.rs is readable");
+
+    for required in [
+        // The profile's allowance is read, defaulted to unlimited only on absence,
+        // and reaches the policy the turn actually runs under.
+        ".service::<zuno_engine::budget::TurnAllowance>()",
+        "zuno_engine::budget::TurnAllowance::UNLIMITED",
+        ".with_allowance(self.turn_allowance)",
+        // The navigation gate is installed with its configured mode, whether the
+        // worktree is indexed, and the syntax its commands are parsed with.
+        ".with_navigation(",
+        "navigation.codegraph",
+        "zuno_tools::index_present",
+        // Generated paths come from the registry, so the exclude block and the
+        // staging refusal cannot name different paths.
+        "zuno_paths::IGNORE_PATTERNS",
+    ] {
+        assert!(
+            turn.contains(required),
+            "`turn.rs` no longer installs `{required}`, so a limit somebody configured \
+             would be silently absent from every session"
         );
     }
 }

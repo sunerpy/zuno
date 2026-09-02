@@ -919,10 +919,10 @@ continued turn. Required names resolve only after profile and Agent visibility
 filtering and must identify one source; missing and ambiguous names fail child
 startup.
 
-Zuno also compiles ten original first-party Skills into the
+Zuno also compiles eleven original first-party Skills into the
 `zuno-orchestration` pack: `customize-zuno`, `develop-zuno`, `deepwork`, `codemap`,
-`verification-planning`, `reflect`, `worktree`, `git-workflow`, `github-delivery`, and
-`ui-design`.
+`verification-planning`, `reflect`, `worktree`, `git-workflow`, `github-delivery`,
+`ui-design`, and `bedrock-model-capability-review`.
 Each has a stable
 `builtin://zuno-orchestration/...` source, content hash, provenance, allowed
 Agent profiles, and required-tool declaration. The active profile and its
@@ -1072,6 +1072,40 @@ must be resized; it does not weaken the byte, dimension, or pixel checks.
 `max_base64_bytes` is not accepted. See
 [Images and file references](attachments.md) for normalization, durable object,
 legacy replay, export, and GC behavior.
+
+## Source navigation and the CodeGraph index
+
+`navigation.codegraph` decides what the runtime asks of a code-intelligence index
+before a call reads source:
+
+```json
+{
+  "navigation": {
+    "codegraph": "advise"
+  }
+}
+```
+
+| Value | Effect |
+| --- | --- |
+| `off` (default) | Every call is allowed and nothing is recorded |
+| `advise` | The session's first bypass is reported in the tool result, then the session is left alone |
+| `strict` | Such a call fails until the index has been queried once |
+
+The gate is inert unless the worktree root carries a `.codegraph` directory. An
+index is a per-repository choice, and a runtime that refused to read a file until
+somebody built one would be unusable in every repository that has not.
+
+What counts as navigation is `grep`, `glob`, a shell command that searches or
+filters source, and either of those inside an `execute` batch. What satisfies the
+gate is any CodeGraph query, including `codegraph status`, which the instructions
+make the first step. Index lifecycle subcommands such as `init` and `sync` neither
+satisfy the gate nor violate it.
+
+The gate is tracked per session, because a delegated child is a different model
+whose context never saw the parent's index query. Every advisory or refusal is recorded in the
+session event log as `navigation.index_bypassed` or `navigation.index_unchecked`, since the
+question it answers is asked long after the run.
 
 ## Child model selection policy
 

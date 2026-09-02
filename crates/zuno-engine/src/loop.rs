@@ -52,6 +52,10 @@ use zuno_tool::{
     ToolDefinition, ToolOutput, ToolReplayPolicy, ToolResultPresentation, ToolUiIntent,
 };
 
+use crate::budget::{
+    BudgetDecision, BudgetStop, NoopBudgetPolicy, ProviderRequestUsage, TurnBudgetPolicy,
+    TurnUsageSnapshot,
+};
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
 use crate::interrupt::{HardInterruptRequest, InterruptSignal, SoftInterruptMessage};
 use crate::prompt::{
@@ -178,6 +182,29 @@ impl ToolDiff {
     }
 }
 
+/// How much attention a [`TurnEvent::Notice`] needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NoticeSeverity {
+    /// Worth recording; the turn proceeded as asked.
+    Info,
+    /// The turn proceeded, but not the way the user configured it.
+    Warning,
+    /// The turn could not proceed as asked.
+    Error,
+}
+
+impl NoticeSeverity {
+    /// A stable lowercase name for events and client projections.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// Every interface-observable transition of one turn.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnEvent {
@@ -213,6 +240,17 @@ pub enum TurnEvent {
     SkillLoaded {
         name: String,
         source: String,
+    },
+    /// The host decided something about this turn that the user must be able to
+    /// see, such as refusing to admit an instruction file or stopping on budget.
+    ///
+    /// Notices are not model output. They carry a stable `code` for hosts to key
+    /// on and a `detail` written for a person, so a silently degraded turn cannot
+    /// look like a clean one.
+    Notice {
+        severity: NoticeSeverity,
+        code: String,
+        detail: String,
     },
     TurnStarted {
         session_id: String,
@@ -477,6 +515,30 @@ pub enum TurnError {
     },
     #[error("agent `{agent}` exhausted its {max_steps}-step turn budget")]
     StepLimit { agent: String, max_steps: u32 },
+    #[error("the turn stopped on its {} allowance: {detail}", kind.code())]
+    BudgetLimited {
+        kind: crate::budget::BudgetStopKind,
+        detail: String,
+    },
+    /// The turn's allowance requires a smaller transcript before another request.
+    ///
+    /// Signalled, not performed, and that is deliberate rather than an oversight.
+    /// Compaction in this codebase runs in the prelude against a `PreludeContext`
+    /// holding the provider registry, engine internals, the compaction config, the
+    /// token window, and mutable compaction state — none of which [`TurnContext`]
+    /// carries. Threading all of it into the step loop would hand a second writer
+    /// the connection the loop already holds mutably and would re-enter compaction
+    /// from inside the very turn being compacted, which is a much larger change
+    /// with real deadlock and double-borrow risk.
+    ///
+    /// Returning this instead reaches the same place. Its [`TurnRecovery::Compact`]
+    /// is the recovery a host already implements for
+    /// [`ProviderError::ContextLimit`]: compact the retained history, then retry the
+    /// turn. Every assistant checkpoint and tool result this turn produced is
+    /// already durable when the variant is returned, so the retried turn resumes
+    /// from the shortened transcript without losing work.
+    #[error("the turn must compact before its next request: {reason}")]
+    CompactionRequired { reason: String },
     #[error("provider stream ended during step {step} without MessageEnd")]
     StreamEndedWithoutMessageEnd { step: u32 },
     #[error("provider `{provider_id}` returned an empty assistant response during step {step}")]
@@ -562,6 +624,8 @@ impl TurnError {
             Self::AgentNotFound { .. } => "agent_not_found",
             Self::ModelNotFound { .. } => "model_not_found",
             Self::StepLimit { .. } => "step_limit",
+            Self::BudgetLimited { .. } => "budget_limited",
+            Self::CompactionRequired { .. } => "compaction_required",
             Self::StreamEndedWithoutMessageEnd { .. } => "stream_ended_without_message_end",
             Self::EmptyAssistantMessage { .. } => "empty_assistant_message",
             Self::MissingHumanRequestId { .. } => "missing_human_request_id",
@@ -644,7 +708,8 @@ impl TurnError {
                 | DbError::Decode { .. },
             ) => TurnRecovery::Fail,
             Self::Attachment(_) => TurnRecovery::Fail,
-            Self::Provider(ProviderError::ContextLimit { .. }) => TurnRecovery::Compact,
+            Self::Provider(ProviderError::ContextLimit { .. })
+            | Self::CompactionRequired { .. } => TurnRecovery::Compact,
             Self::Provider(ProviderError::RateLimited { retry_after }) => TurnRecovery::Retry {
                 reason: TurnRetryReason::RateLimited,
                 after: *retry_after,
@@ -655,9 +720,9 @@ impl TurnError {
                     after: None,
                 }
             }
-            Self::Provider(ProviderError::Auth { .. }) | Self::EventConsumerClosed => {
-                TurnRecovery::Pause
-            }
+            Self::Provider(ProviderError::Auth { .. })
+            | Self::EventConsumerClosed
+            | Self::BudgetLimited { .. } => TurnRecovery::Pause,
             Self::Provider(
                 ProviderError::Refused { .. }
                 | ProviderError::UnsupportedCapability { .. }
@@ -1057,6 +1122,7 @@ pub struct TurnContext<'a> {
     dispatcher: &'a dyn ToolDispatcher,
     interrupt: &'a InterruptSignal,
     hooks: Arc<dyn TurnHooks>,
+    budget: Arc<dyn TurnBudgetPolicy>,
     live_inputs: Option<LiveInputs<'a>>,
     attachments: Option<Arc<zuno_attachment::AttachmentStore>>,
     tool_concurrency: ToolConcurrencyLimit,
@@ -1083,6 +1149,7 @@ impl<'a> TurnContext<'a> {
             dispatcher,
             interrupt,
             hooks: Arc::new(NoopHooks),
+            budget: Arc::new(NoopBudgetPolicy),
             live_inputs: None,
             attachments: None,
             tool_concurrency: ToolConcurrencyLimit::SERIAL,
@@ -1092,6 +1159,15 @@ impl<'a> TurnContext<'a> {
     #[must_use]
     pub fn with_hooks(mut self, hooks: Arc<dyn TurnHooks>) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    /// Bind the allowance this turn runs under.
+    ///
+    /// Without one the turn is unlimited, which is the historical behaviour.
+    #[must_use]
+    pub fn with_budget_policy(mut self, budget: Arc<dyn TurnBudgetPolicy>) -> Self {
+        self.budget = budget;
         self
     }
 
@@ -1122,6 +1198,98 @@ fn hard_interrupt_request(context: &TurnContext<'_>) -> Option<HardInterruptRequ
         .live_inputs
         .as_ref()
         .and_then(|live| live.guard.interrupt_request())
+}
+
+/// What one provider response cost, read from the loop's own accounting.
+///
+/// There is deliberately no second source of truth here: the fields are the ones
+/// [`StepAccumulator`] filled from the stream's `TokenUsage` frame, and `accounted`
+/// is the same `prompt_accounting` gate [`update_usage`] uses to decide whether the
+/// assistant row gets a `tokens` object at all. A policy and the durable usage row
+/// therefore can never disagree about whether a request was measured, and a request
+/// the provider never reported arrives as an explicit `accounted: false` rather than
+/// as a free one.
+fn request_usage(accumulator: &StepAccumulator) -> ProviderRequestUsage {
+    ProviderRequestUsage {
+        input_tokens: accumulator.input_tokens.unwrap_or(0),
+        output_tokens: accumulator.output_tokens.unwrap_or(0),
+        cache_read_input_tokens: accumulator.cache_read_input_tokens.unwrap_or(0),
+        cache_write_input_tokens: accumulator.cache_write_input_tokens.unwrap_or(0),
+        accounted: accumulator.prompt_accounting.is_some(),
+    }
+}
+
+/// The turn total before any request has been accounted for.
+///
+/// `accounted` starts `true` because nothing unaccounted has happened yet, which is
+/// what makes it the identity for [`ProviderRequestUsage::saturating_add`]: that
+/// operator keeps `accounted` pessimistic by conjunction, so seeding the total with
+/// `false` would make every turn look unmeasured forever. One unreported response
+/// still flips the total for the rest of the turn and can never flip back.
+const fn empty_turn_usage() -> ProviderRequestUsage {
+    ProviderRequestUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_write_input_tokens: 0,
+        accounted: true,
+    }
+}
+
+/// Fail the turn because the budget policy could not decide.
+///
+/// Closed rather than open, on purpose. A policy that cannot answer does not know
+/// how much of the allowance is left, so treating silence as permission would let a
+/// broken limiter spend exactly the allowance it exists to protect — the same defect
+/// as having no limiter, arrived at by accident instead of by configuration. The
+/// failure reuses [`TurnError::Hook`] because this is the same class of event as any
+/// other out-of-loop policy refusing to answer, and its [`TurnRecovery::Fail`] stops
+/// a misconfigured limiter from being retried in a loop.
+fn budget_hook_failure(hook: &'static str, message: String) -> TurnError {
+    TurnError::Hook(format!("turn budget policy `{hook}` failed: {message}"))
+}
+
+/// Honour one [`BudgetDecision`], making any intervention visible before it lands.
+///
+/// The notice is published before the failure returns so an allowance that ended a
+/// turn early cannot look like a turn that simply finished: the code is stable for
+/// hosts to key on and the detail is the policy's own words, unedited.
+///
+/// # Errors
+///
+/// [`TurnError::BudgetLimited`] when the policy stopped the turn, carrying the stop
+/// kind a host maps to a pause, and [`TurnError::CompactionRequired`] when it asked
+/// for a smaller transcript instead. [`TurnError::EventConsumerClosed`] or
+/// [`TurnError::Hook`] when the notice itself cannot be delivered, because a budget
+/// intervention nobody can observe is not one this loop is willing to apply
+/// silently.
+async fn honour_budget_decision(
+    events: &TurnEventSender,
+    decision: BudgetDecision,
+) -> Result<(), TurnError> {
+    match decision {
+        BudgetDecision::Continue => Ok(()),
+        BudgetDecision::Compact { reason } => {
+            events
+                .send(TurnEvent::Notice {
+                    severity: NoticeSeverity::Info,
+                    code: "budget.compact".to_owned(),
+                    detail: reason.clone(),
+                })
+                .await?;
+            Err(TurnError::CompactionRequired { reason })
+        }
+        BudgetDecision::Stop(BudgetStop { kind, detail }) => {
+            events
+                .send(TurnEvent::Notice {
+                    severity: NoticeSeverity::Warning,
+                    code: format!("budget.{}", kind.code()),
+                    detail: detail.clone(),
+                })
+                .await?;
+            Err(TurnError::BudgetLimited { kind, detail })
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1443,6 +1611,11 @@ async fn run_turn_in_span(
     events: TurnEventSender,
     turn_span: tracing::Span,
 ) -> Result<TurnOutcome, TurnError> {
+    // One clock for the whole turn, read every time the policy is consulted: a time
+    // allowance measured per step would restart on each provider request and could
+    // never expire.
+    let turn_started = std::time::Instant::now();
+    let budget = Arc::clone(&context.budget);
     let events = events.with_hooks(Arc::clone(&context.hooks));
     let session = session::get(context.connection, &request.session_id)?;
     let provider_session_identity =
@@ -1460,12 +1633,19 @@ async fn run_turn_in_span(
         .await?;
 
     let mut steps = 0_u32;
+    // Incremented where a dispatch group's results come back, so it counts calls the
+    // loop ran and never calls the model merely issued: a call a stop or an urgent
+    // input kept from running did no work, and a ceiling on this number is meant to
+    // bound work done.
+    let mut tool_calls_dispatched = 0_u32;
     let mut last_assistant_id = None;
     let mut prompt_cache: Option<PromptCache<ToolDefinition>> = None;
     let mut prompt_traces = PromptTraceSet::default();
     let mut unresolved_tool_failures = BTreeMap::<String, ToolFailureRecovery>::new();
     let mut consecutive_invalid_tool_calls = 0_u8;
     let mut step_limit_finalization_attempted = false;
+    let mut turn_usage = empty_turn_usage();
+    let mut last_request = ProviderRequestUsage::default();
 
     loop {
         if context.interrupt.is_set() {
@@ -1695,6 +1875,28 @@ async fn run_turn_in_span(
         };
         let estimated_prompt_tokens = estimate_completion_prompt_tokens(&completion);
         ensure_prompt_context_budget(estimated_prompt_tokens, request.context_limit)?;
+        // Consulted here and nowhere earlier: `estimated_prompt_tokens` is only the
+        // size of the request about to be sent once the prompt is assembled, the
+        // `prepare_request` hooks have run, and the context check has passed — before
+        // that the policy would be answering about a prompt that no longer exists.
+        // Consulted here and nowhere later: everything below writes provider-request
+        // bookkeeping, so a request the policy refuses leaves behind no started-request
+        // row, no prompt receipt, and no `ProviderRequestStarted` event.
+        let decision = budget
+            .before_request(&TurnUsageSnapshot {
+                session_id: &request.session_id,
+                turn_id: &request.turn_id,
+                step,
+                turn_usage,
+                last_request,
+                estimated_prompt_tokens,
+                context_limit: request.context_limit,
+                elapsed_seconds: turn_started.elapsed().as_secs(),
+                tool_calls_dispatched,
+            })
+            .await
+            .map_err(|message| budget_hook_failure("before_request", message))?;
+        honour_budget_decision(&events, decision).await?;
         let prompt_receipt_id = if let Some(receipt_id) =
             prompt_traces.receipt_id(actual_projection)
         {
@@ -2050,6 +2252,11 @@ async fn run_turn_in_span(
             );
             std::mem::replace(&mut *accumulator, replacement)
         };
+        // Accounted before the step's disposition is examined, so a request whose
+        // stream failed, was steered, or was interrupted still counts against the
+        // allowance. Those requests were paid for; only their answers were lost.
+        last_request = request_usage(&accumulator);
+        turn_usage = turn_usage.saturating_add(last_request);
         let provider_exit = match provider_result {
             Ok(exit) => exit,
             Err(error) => {
@@ -2286,6 +2493,28 @@ async fn run_turn_in_span(
                 interrupted: false,
             })
             .await?;
+        // Consulted after this step's tokens are in the turn total and after the
+        // assistant checkpoint is durable, so a stop here can never discard model
+        // output the user has already been shown, and before a single tool of this
+        // step is dispatched, so a spent allowance authorizes no further work of any
+        // kind. Unanswered tool calls left by that stop are closed by
+        // `repair_missing_tool_outputs` at the head of the next turn, exactly as a
+        // hard interrupt's are.
+        let decision = budget
+            .after_response(&TurnUsageSnapshot {
+                session_id: &request.session_id,
+                turn_id: &request.turn_id,
+                step,
+                turn_usage,
+                last_request,
+                estimated_prompt_tokens,
+                context_limit: request.context_limit,
+                elapsed_seconds: turn_started.elapsed().as_secs(),
+                tool_calls_dispatched,
+            })
+            .await
+            .map_err(|message| budget_hook_failure("after_response", message))?;
+        honour_budget_decision(&events, decision).await?;
 
         let calls = accumulator.calls.values().cloned().collect::<Vec<_>>();
         if !calls.is_empty()
@@ -2414,6 +2643,11 @@ async fn run_turn_in_span(
                     .collect::<Vec<_>>()
                     .await
                 };
+                // Every entry ran to a result, whether it succeeded, was blocked, or was
+                // interrupted, so this is the truthful count of tool work the turn did;
+                // the next `before_request` reads it.
+                tool_calls_dispatched = tool_calls_dispatched
+                    .saturating_add(u32::try_from(completed.len()).unwrap_or(u32::MAX));
 
                 // A completed parallel group is an indivisible durable unit: every
                 // execution result is appended in model order before an urgent inbox

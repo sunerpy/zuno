@@ -25,6 +25,18 @@
 //! <os.tmpdir()>/zuno               temp()
 //! ```
 //!
+//! Inside a worktree, Zuno also generates working state under the project
+//! directory. [`generated`] is the registry of exactly those paths and of the checks
+//! built on it; the rest of `.zuno/` is the user's own configuration and is never
+//! treated as generated.
+//!
+//! ```text
+//! <worktree>/.zuno
+//!   ├── goal/                      generated::GOAL_PROJECTION
+//!   ├── tool-output/               generated::TOOL_OUTPUT
+//!   └── background/                generated::BACKGROUND_EXECUTIONS
+//! ```
+//!
 //! # Two rules, and why they are not negotiable
 //!
 //! **Path getters are pure.** No getter creates a directory, and no getter
@@ -67,7 +79,9 @@
 pub mod config_chain;
 pub mod ensure;
 pub mod env;
+pub mod exclude;
 pub mod files;
+pub mod generated;
 pub mod layout;
 pub mod node_path;
 pub mod project;
@@ -80,10 +94,18 @@ use std::sync::OnceLock;
 pub use crate::config_chain::{CONFIG_FILE_STEM, PROJECT_CONFIG_DIRECTORY, PROJECT_DIRECTORY};
 pub use crate::ensure::PathsError;
 pub use crate::env::Env;
+pub use crate::exclude::{
+    EXCLUDE_GIT_PATH, ExcludeError, ExcludeOutcome, MANAGED_BLOCK_BEGIN, MANAGED_BLOCK_END,
+    ensure_managed_block, resolve_exclude_path,
+};
 pub use crate::files::{
-    AUTH_FILE, DEFAULT_DB_FILE, DEFAULT_MODELS_FILE, DEFAULT_MODELS_SOURCE, DbLocation,
-    MCP_AUTH_FILE, MEMORY_SENTINEL, SNAPSHOT_DIRECTORY, TOOL_OUTPUT_DIRECTORY,
+    AUTH_FILE, BACKGROUND_DIRECTORY, DEFAULT_DB_FILE, DEFAULT_MODELS_FILE, DEFAULT_MODELS_SOURCE,
+    DbLocation, MCP_AUTH_FILE, MEMORY_SENTINEL, SNAPSHOT_DIRECTORY, TOOL_OUTPUT_DIRECTORY,
     installation_channel,
+};
+pub use crate::generated::{
+    GENERATED_PATHS, GeneratedPath, GeneratedStateStaged, IGNORE_PATTERNS, StagedGeneratedPath,
+    is_generated, refuse_generated_state,
 };
 pub use crate::layout::{APP, DEBUG_PATHS_KEYS, Layout};
 pub use crate::project::{GLOBAL_PROJECT_ID, Repository, ResolvedProject, Vcs};
@@ -337,6 +359,12 @@ mod tests {
         assert_eq!(MCP_AUTH_FILE, "mcp-auth.json");
         assert_eq!(SNAPSHOT_DIRECTORY, "snapshot");
         assert_eq!(TOOL_OUTPUT_DIRECTORY, "tool-output");
+        assert_eq!(BACKGROUND_DIRECTORY, "background");
+        assert_eq!(IGNORE_PATTERNS.len(), GENERATED_PATHS.len());
+        assert!(is_generated(
+            Path::new("/repo"),
+            Path::new(".zuno/goal/ses.md")
+        ));
         assert_eq!(DEFAULT_DB_FILE, "zuno.db");
         assert_eq!(DEFAULT_MODELS_FILE, "models.json");
         assert_eq!(DEFAULT_MODELS_SOURCE, "https://models.dev");

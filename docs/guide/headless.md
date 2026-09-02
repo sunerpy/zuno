@@ -58,6 +58,16 @@ zuno run --format json "summarize the diff"
 `default` is human-readable text; `json` is for parsing. Use `json` in scripts rather than
 scraping formatted output, because the formatted shape is presentation.
 
+The JSON stream includes a `notice` event when the turn did not proceed exactly as
+configured: `{"type":"notice","severity":"warning","code":"budget.token_budget","detail":"…"}`.
+`severity` is `info`, `warning`, or `error`; `code` is stable and comes from the
+`instruction.*` family (a remote rule file that could not be fetched, so its rules are not
+in force for this turn while the turn still runs) or the `budget.*` family (a turn stopped
+by its allowance, or a compaction the budget policy requested). An unreadable or
+over-budget local rule file fails the turn with an error before any provider request and
+produces no `notice` event. The same event is published on the server event stream as
+`notice`.
+
 Provider-visible reasoning is opt-in:
 
 ```sh

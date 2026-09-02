@@ -64,7 +64,7 @@ Recovery is selected from typed errors:
 | --- | --- |
 | Transport failures, rate limits, incomplete streams, SQLite writer contention, empty assistant messages | Schedule another turn |
 | Context-limit failures | Compact retained history, then retry |
-| Authentication failures, user interruption, human input, permissions, or an uncertain side effect | Pause with a typed reason |
+| Authentication failures, user interruption, human input, permissions, a spent turn allowance, or an uncertain side effect | Pause with a typed reason |
 | Invalid provider protocol, unsupported typed input, unavailable agent or model, corrupt durable state | Block |
 
 Permanent runtime failures store a stable typed code and scrubbed explanation in
@@ -91,7 +91,9 @@ without resetting its status, budget, or accumulated usage. The explicit action 
 remain available for lifecycle management. Create, edit, and shorthand objective changes
 also reconcile an active Plan: a multi-stage objective archives the previous visible Plan
 and installs a new root bound to the current `goal_id`. An atomic objective may terminalize
-stale unfinished work without rebinding an already terminal historical Plan.
+stale unfinished work without rebinding an already terminal historical Plan; when that Plan
+belongs to a previous Goal it is archived as completed history, so the new Goal is never
+judged against another Goal's checklist.
 
 Creating or editing an active Goal is an execution command, not a status-only write. After
 the native command reaches its terminal event, the shared Goal driver immediately prepares
@@ -113,6 +115,174 @@ summary.
 Goal status also shows the typed pause, cross-turn retry, provider backoff checkpoint,
 and pending human requests. Completion is rejected while any Plan step, WorkItem, Job,
 next-step report, or Goal-owned human request remains unfinished.
+
+### Success criteria and evidence
+
+A goal that changes the workspace cannot be completed on assertion alone. "The tests pass"
+in prose is a claim about the workspace, and the whole reason a goal exists is that claims
+made mid-run are the ones most likely to be wrong. So a change goal carries success
+criteria, and each one closes only against a recorded exit status.
+
+`goal_propose` takes `success_criteria`, a list of concrete checks. Each becomes a row with
+a short id such as `c1`, echoed once in the result. The model cannot rewrite them later:
+criteria that could be edited to match whatever happened are not criteria.
+
+Two things close a criterion, both through `goal_update`:
+
+| Field | Meaning |
+| --- | --- |
+| `satisfy_criteria` | `criterionId` plus the `receiptId` of a check that ran and passed |
+| `waive_criteria` | `criterionId` plus a `reason`, recorded verbatim |
+
+Receipt ids come from the tool results themselves. A tool that ran a command appends a line
+naming the receipt it recorded:
+
+```text
+[verification rcp_01HQ...] passed: cargo test --workspace (exit 0, authoritative).
+Cite this id as evidence that the check passed.
+```
+
+An exit status that was inferred rather than observed says so instead, and states that it
+cannot be cited. That distinction is the point: a shell pipeline whose failing stage was
+swallowed by a later `grep` produces a zero exit status that proves nothing, so it is
+recorded and refused rather than quietly accepted. See
+[Shell exit status](tools.md#what-a-shell-exit-status-proves).
+
+Evidence expires. Every tool call that writes files stamps the goal with the time of the
+change, which retires any criterion whose receipt is older than that stamp. The retirement
+is reported in the tool result, at the moment of the write:
+
+```text
+[goal evidence] 2 satisfied criteria went back to open, because this change came
+after the check that satisfied them. Verify again after your last edit and cite the
+new receipts.
+```
+
+The refusals name what is wrong rather than asking for a retry. A cited receipt that does
+not exist in this session, one whose outcome was failure or was undecidable, and one that
+predates the last write each produce a different sentence, and the stale case prints both
+timestamps so the mismatch is visible. Completing with criteria still open reports which
+ids are unproven.
+
+A goal that only answers a question is not gated: it has nothing to verify. The first tool
+call that writes a file turns a question goal into a change goal, so the gate applies to
+the run that turned out to modify the workspace even though it did not start out planning
+to.
+
+The rendered goal document lists the criteria with their state, so a human reads the same
+gate the model is held to.
+
+### Capability claims
+
+Some claims are not about the workspace at all. Enabling a provider feature because a
+related model is documented to have it, and then reporting success, leaves nothing durable
+that says the belief was inferred rather than observed. The `capability_claim` tool records
+one claim per capability and subject, and answers plainly whether it may be relied on.
+
+| State | What it requires |
+| --- | --- |
+| `documented` | At least one cited source |
+| `probed` | A receipt from this session that proves success and is newer than the last write |
+| `inferred` | Nothing, and it blocks completion |
+| `unknown` | Nothing, and it blocks completion |
+
+The completion audit refuses a change goal while a claim recorded under it is `inferred` or
+`unknown`, and re-checks a `probed` claim's receipt against the mutation mark at audit time,
+so a later write retires the probe without anyone rewriting the ledger. Re-recording a claim
+updates the row and reports its previous state, which makes a retraction to a weaker state a
+recorded event rather than a refusal or a silent overwrite. Claims outlive goal replacement
+as provenance, but only claims recorded since the current goal instance began gate it.
+
+The `bedrock-model-capability-review` Skill says what counts as evidence for an Amazon
+Bedrock model: a vendor document naming that exact model id and region, or an observed
+probe. It also says to record the claim before writing configuration, not after.
+
+### Generated state stays out of the commit
+
+The goal document, spilled tool output, and background execution records are all generated,
+so their directories go into the repository-private `.git/info/exclude` rather than a
+tracked `.gitignore`. One registry supplies both that exclude block and the staging refusal
+below, so the two cannot disagree about which paths are generated.
+
+The exclude block only keeps them out of `git status`. A `git commit` that would deliver
+them anyway is refused before it runs, with the paths named and `git restore --staged` as
+the remedy. The check reads the index, and also the tracked working-tree changes when the
+command stages as it commits. Outside a repository there is nothing to check and nothing is
+refused.
+
+This exists because generated state that reaches the index is how an agent reports a dirty
+tree as evidence of a change it did not make, or delivers its own scratch output as part of
+the work.
+
+### Token budget
+
+A goal's `token_budget` is enforced around every provider request inside a turn, not at the
+turn boundary. A single long turn can otherwise spend an entire allowance before anything
+reads a counter. Each response is recorded against the goal first, and the decision is read
+back from the row that write produced, so what stops a run is exactly what a human sees
+afterwards.
+
+| Condition | Outcome |
+| --- | --- |
+| Allowance spent | The turn stops and the Goal pauses with `turn_budget` |
+| Provider reported no usage | The turn stops; a budget you set that cannot be counted cannot be honoured |
+| Only the last tenth of the allowance is left | Compaction is requested, then the turn continues |
+
+The last tenth is held back deliberately. Compaction costs a request of its own and has to
+leave room for the summary plus the next real request, so asking for it exactly when the
+budget runs out would be asking when there is nothing left to pay with.
+
+Recording a response's tokens does not move the goal's revision. A charge is bookkeeping the
+host does on the model's behalf, so a model that read the goal and then completes it must not
+lose the optimistic-concurrency race to its own accounting: it would re-read, complete again,
+be charged again, and never land. The revision moves only when the charge changes the goal's
+status, which is a fact about the goal the model does have to see.
+
+### The host's default allowance
+
+A goal whose `token_budget` is unset is not unbounded. `None` means "the host's default",
+and the harness's default profile publishes one: forty requests at a 200,000-token window,
+or 8,000,000 tokens. Every request re-sends the whole prompt and cache reads are charged, so
+that is close to the most one runaway turn can cost.
+
+An explicit goal budget always wins, and the default is never written into the goal row. A
+host that genuinely wants unbounded autonomy says so with `TurnAllowance::UNLIMITED`, not by
+leaving a field unset. The stop kind is `token_budget` either way, but the remedy differs: a
+user who set a budget is told to raise it, and a user who never set one is told to set one.
+
+One rule from the table above does not carry over. A provider that reports no usage stops a
+turn under a budget you set, because a budget that cannot be counted cannot be honoured and
+continuing on unreported numbers would quietly make it advisory. Under the default the turn
+continues: an endpoint that withholds usage is its own choice and not a runaway, and ending
+every such run on a limit nobody asked for leaves no remedy but to set one. The default still
+binds on whatever was counted, so a floor that crosses it stops above.
+
+Two further ceilings bound the turn rather than the goal. Both are off unless the host sets
+them, and both apply whether or not a Goal is active, because a turn without a goal can loop
+just as well as one with. A host that wants a bound no provider can withhold uses them.
+
+| Ceiling | Stops the turn when |
+| --- | --- |
+| Tool calls | That many calls have been dispatched inside one turn |
+| Wall time | The turn has run that long, at one-second resolution |
+
+Tool calls are counted from the dispatch groups the loop actually ran, so a call that a stop
+or an urgent human request kept from running is never counted. A reached ceiling overrides a
+compaction request or a continue, because either would spend a request the ceiling no longer
+allows, and it defers to a stop the Goal already produced. A request already in flight when
+the clock passes a ceiling completes first.
+
+A session with no goal is unaffected by the token default. There is no durable counter to
+charge it against, and a default enforced from an in-memory turn total would reset every turn
+and never bind.
+
+Nor is a session whose goal has finished. A budget bounds work towards an objective, so a goal
+that is complete, paused, blocked, cancelled or out of provider usage does not stop a turn. Its
+counter keeps rising through the conversation that follows, the default is large enough that a
+long session would cross it, and the stop would end turns no goal governs and pause a goal the
+model had completed. The response is still charged to the goal, because the tokens were spent
+against it. `budget_limited` is the exception: that status is a spent ceiling, and a turn must
+not resume through it.
 
 ### Human requests and autonomy
 

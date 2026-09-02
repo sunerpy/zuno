@@ -89,7 +89,7 @@ export/import 会保留 Notes 及其幂等 ledger。sanitize export 会脱敏文
 
 ## 重试与恢复
 
-可恢复的 provider、网络、流、SQLite 争用、回合预算以及符合条件的工具失败，会在等待之前先把一次指数退避重试落盘，因此进程重启后可以从 SQLite 重建截止时间。
+可恢复的 provider、网络、流、SQLite 争用、Agent 步数上限以及符合条件的工具失败，会在等待之前先把一次指数退避重试落盘，因此进程重启后可以从 SQLite 重建截止时间。一个回合花完自己的 token、工具调用次数或墙上时间额度时不会重试：它以 `turn_budget` 暂停 Goal 并等待人工，因为下一回合只会以同样的方式花掉同样的额度。若花完的是 Goal 自己显式设定的 `token_budget`，Goal 则进入 `budget_limited`。
 
 ```json
 {

@@ -1,10 +1,13 @@
+use std::num::NonZeroU32;
 use std::sync::Arc;
+use zuno_engine::budget::TurnAllowance;
 use zuno_engine::driver::{AgentDriver, DefaultAgentDriver};
 use zuno_harness::{
-    HostPlanningCapability, ProductCapabilityKind, ToolContributions, ToolManifest,
-    default_profile, default_profile_with_tools, named_capability_key,
+    DEFAULT_GOAL_TOKEN_BUDGET, DEFAULT_TURN_ALLOWANCE, HostPlanningCapability,
+    ProductCapabilityKind, ToolContributions, ToolManifest, default_profile,
+    default_profile_with_tools, default_profile_with_tools_and_allowance, named_capability_key,
     orchestration_capabilities_bundle, profile_with_tools, profile_with_tools_and_public_http,
-    skill_capability_key,
+    skill_capability_key, turn_allowance_bundle,
 };
 use zuno_orchestration::{
     CapabilityContents, CapabilitySnapshot, PackIdentity, ProfileDescriptor,
@@ -366,5 +369,95 @@ fn duplicate_contributed_tool_ids_fail_before_mount() {
     assert_eq!(
         error.to_string(),
         "tool `invalid` is contributed more than once"
+    );
+}
+
+#[tokio::test]
+async fn the_default_profile_publishes_the_allowance_an_unbudgeted_goal_runs_under() {
+    let runtime = HarnessRuntime::new("profile");
+    runtime
+        .activate_profile(default_profile())
+        .await
+        .expect("default profile activates");
+
+    let allowance = runtime
+        .service::<TurnAllowance>()
+        .expect("the default host names the allowance a turn runs under");
+    assert_eq!(*allowance, DEFAULT_TURN_ALLOWANCE);
+    assert_eq!(
+        allowance.default_token_budget,
+        Some(DEFAULT_GOAL_TOKEN_BUDGET),
+        "a goal nobody put a number on must not mean unlimited"
+    );
+    assert_eq!(
+        DEFAULT_GOAL_TOKEN_BUDGET, 8_000_000,
+        "forty steps at the 200,000-token window the workspace assumes"
+    );
+    assert_eq!(
+        allowance.max_tool_calls, None,
+        "no tool-call ceiling is invented for the interactive host"
+    );
+    assert_eq!(
+        allowance.max_duration, None,
+        "no wall-time ceiling is invented for the interactive host"
+    );
+}
+
+#[tokio::test]
+async fn a_host_that_wants_unlimited_autonomy_writes_that_choice_into_the_profile() {
+    let runtime = HarnessRuntime::new("profile");
+    runtime
+        .activate_profile(default_profile_with_tools_and_allowance(
+            ToolContributions::default(),
+            TurnAllowance::UNLIMITED,
+        ))
+        .await
+        .expect("default profile activates under an explicit allowance");
+
+    let allowance = runtime
+        .service::<TurnAllowance>()
+        .expect("an unlimited allowance is still published, so the choice is visible");
+    assert_eq!(*allowance, TurnAllowance::UNLIMITED);
+    assert_eq!(allowance.default_token_budget, None);
+}
+
+#[tokio::test]
+async fn a_custom_profile_publishes_no_allowance_until_it_mounts_one() {
+    let bare = HarnessRuntime::new("profile");
+    bare.activate_profile(profile_with_tools(
+        "benchmark",
+        Arc::new(DefaultAgentDriver),
+        ToolManifest::new([BuiltinSlot::Read]).expect("unique tool slots"),
+        ToolContributions::default(),
+    ))
+    .await
+    .expect("custom profile activates");
+    assert!(
+        bare.service::<TurnAllowance>().is_none(),
+        "custom profiles opt into an allowance rather than inheriting the interactive host's number"
+    );
+
+    let ceilinged = TurnAllowance {
+        max_tool_calls: NonZeroU32::new(50),
+        ..TurnAllowance::UNLIMITED
+    };
+    let mounted = HarnessRuntime::new("profile");
+    mounted
+        .activate_profile(
+            profile_with_tools(
+                "benchmark",
+                Arc::new(DefaultAgentDriver),
+                ToolManifest::new([BuiltinSlot::Read]).expect("unique tool slots"),
+                ToolContributions::default(),
+            )
+            .with_bundle(turn_allowance_bundle(ceilinged)),
+        )
+        .await
+        .expect("custom profile activates with an allowance");
+    assert_eq!(
+        *mounted
+            .service::<TurnAllowance>()
+            .expect("the mounted allowance is published"),
+        ceilinged
     );
 }

@@ -166,7 +166,7 @@ Plan 模式总是激活只读的 `plan` Agent。回到 Build 模式会恢复所�
 
 `/compact` 不接受参数。它调用与 TUI 相同的持久压缩路径，只在该命令达到终态生命周期事件之后才返回，并且不会把字面的斜杠命令发送给模型。原生控制项优先，因此一个用户定义的名为 `compact` 的命令或 Skill 不会作为第二个有歧义的条目被发布。
 
-`/goal` 暴露与 TUI 相同的持久 goal 处理器。不带参数时显示当前 Goal；`/goal <目标>` 会在尚无 Goal 或上一条 Goal 已完成、已取消时创建新 Goal，否则更新当前目标并保留生命周期状态、预算和累计用量。`show`、`history`、`create <目标>`、`edit <目标>`、`pause`、`resume`、`block <原因>`、`complete` 和 `cancel` 等显式 action 仍然可用，且首词匹配时优先。目标变化还会同步活跃 Plan：多阶段工作会归档此前可见 Plan，并安装一个绑定当前 `goal_id` 的新根 Plan；若新目标是原子任务，已终态的历史 Plan 不会改绑。该命令的输出投影为一条普通的 Agent 消息，而不是推理内容；显式 action 的非法参数会返回 JSON-RPC invalid params，而不是内部会话错误。创建或编辑成功后会立即推进 active Goal；新会话会先把目标持久化为首个 user turn anchor，字面的斜杠命令不会进入 provider 输入。
+`/goal` 暴露与 TUI 相同的持久 goal 处理器。不带参数时显示当前 Goal；`/goal <目标>` 会在尚无 Goal 或上一条 Goal 已完成、已取消时创建新 Goal，否则更新当前目标并保留生命周期状态、预算和累计用量。`show`、`history`、`create <目标>`、`edit <目标>`、`pause`、`resume`、`block <原因>`、`complete` 和 `cancel` 等显式 action 仍然可用，且首词匹配时优先。目标变化还会同步活跃 Plan：多阶段工作会归档此前可见 Plan，并安装一个绑定当前 `goal_id` 的新根 Plan；若新目标是原子任务，已终态的历史 Plan 不会改绑；属于上一个 Goal 的终态 Plan 会归档为已完成的历史，面板随之清空。该命令的输出投影为一条普通的 Agent 消息，而不是推理内容；显式 action 的非法参数会返回 JSON-RPC invalid params，而不是内部会话错误。创建或编辑成功后会立即推进 active Goal；新会话会先把目标持久化为首个 user turn anchor，字面的斜杠命令不会进入 provider 输入。
 
 `/plan` 在 Build 与 Plan 之间切换。`/start-plan` 直接进入只读的 Plan 模式，而 `/start-work` 返回 Build。离开 Plan 需要存在一个持久 plan，因此过早的交接会显式失败，而不是削弱模式边界。成功的更改会发出 ACP 的 `current_mode_update` 与 `config_option_update` 通知，让 Zed 的选择器保持同步。这些原生命令都不会被发送给模型。
 
@@ -206,7 +206,7 @@ Zed 呈现权限与征询请求，但策略拥有者仍然是 Zuno：
 
 在完成之后以及历史重放时，该问题仍是一张静态工具卡片，显示它的提示、选项、状态，以及在持久答案元数据可用时显示被选中的值。`rawInput` 与 `rawOutput` 在工具详情中仍然可用；加载历史绝不会重新打开一次征询请求。
 
-只有 provider 的推理增量会被投影到 Zed 的 Thinking 界面。生成的标题使用 ACP 的 `session_info_update`，而运维状态或 provider 失败文本由生命周期/错误报告处理，而不是被渲染成模型的思考内容。
+只有 provider 的推理增量会被投影到 Zed 的 Thinking 界面，唯一带标记的例外是 Zuno 自身发出的通知：无法抓取的远程规则文件、被额度停下的回合、预算策略要求的压缩，会以带 `_meta.zuno.notice` 的 `agent_thought_chunk` 发送，其中 `severity` 取 `info`、`warning` 或 `error`，`code` 来自 `instruction.*` 或 `budget.*` 族；客户端靠这个标记把它与模型输出区分开。生成的标题使用 ACP 的 `session_info_update`，其他运维状态或 provider 失败文本由生命周期/错误报告处理，而不是被渲染成模型的思考内容。
 
 历史重放会为将来的 provider 请求保持 provider 推理胶囊持久，但当同一条消息已经包含它可见的推理摘要时，不会再渲染一份完全相同的胶囊副本。仅存在于 provider 侧的推理仍然可见，因此重放去重不会隐藏唯一可用的思考内容。
 

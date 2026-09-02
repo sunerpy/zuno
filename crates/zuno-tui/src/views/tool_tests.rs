@@ -226,6 +226,11 @@ fn tool_summary_quotes_the_argument_that_identifies_each_call() {
         ),
         ("goal_propose", r#"{"objective":"ship P2-4"}"#, "ship P2-4"),
         (
+            "capability_claim",
+            r#"{"capability":"structured_output","subject":"anthropic.claude-sonnet-4","state":"inferred"}"#,
+            "structured_output on anthropic.claude-sonnet-4: inferred",
+        ),
+        (
             "goal_request_input",
             r#"{"expected_revision":3,"question":"Which deployment region should be used?","header":"Region","options":[]}"#,
             "Which deployment region should be used?",

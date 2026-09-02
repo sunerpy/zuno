@@ -56,6 +56,20 @@ fn stable_plan_updates_decode_with_the_schema_pinned_by_current_zed() {
         ..zuno_types::WorkStateProjection::default()
     };
     let update = durable_plan_update(&work).expect("representable stable Plan");
+    // Plan identity travels in `_meta.zuno`, so the wire contract has to pin it: a
+    // client that cannot see the goal, the parent plan and the stack depth cannot
+    // tell a suspended parent from the sub-plan that replaced it.
+    let meta = &update["_meta"]["zuno"];
+    assert_eq!(meta["planId"], "plan-live");
+    assert_eq!(meta["revision"], 4);
+    assert_eq!(meta["title"], "Live ACP Plan");
+    assert_eq!(meta["stackDepth"], 0);
+    assert_eq!(
+        meta.get("goalId"),
+        None,
+        "an absent goal is omitted, never sent as an explicit null"
+    );
+    assert_eq!(meta.get("parentPlanId"), None);
     let decoded: SessionUpdate =
         serde_json::from_value(update).expect("current Zed ACP schema must decode the Plan");
     let SessionUpdate::Plan(plan) = decoded else {
@@ -65,6 +79,39 @@ fn stable_plan_updates_decode_with_the_schema_pinned_by_current_zed() {
     assert_eq!(plan.entries[0].content, "Implement the projector");
     assert_eq!(plan.entries[0].priority, PlanEntryPriority::Medium);
     assert_eq!(plan.entries[0].status, PlanEntryStatus::InProgress);
+
+    let nested = zuno_types::WorkStateProjection {
+        plan: Some(zuno_types::PlanProjection {
+            id: "plan-child".to_owned(),
+            parent_plan_id: Some("plan-live".to_owned()),
+            stack_depth: 2,
+            goal_id: Some("goal-7".to_owned()),
+            revision: 1,
+            title: "Nested sub-plan".to_owned(),
+            steps: vec![zuno_types::PlanStepProjection {
+                id: "nested".to_owned(),
+                title: "Finish the nested step".to_owned(),
+                status: "pending".to_owned(),
+            }],
+            span: zuno_types::ExecutionSpan::default(),
+            time_created: 3,
+            time_updated: 4,
+        }),
+        ..zuno_types::WorkStateProjection::default()
+    };
+    let update = durable_plan_update(&nested).expect("representable nested stable Plan");
+    let meta = &update["_meta"]["zuno"];
+    assert_eq!(meta["planId"], "plan-child");
+    assert_eq!(meta["parentPlanId"], "plan-live");
+    assert_eq!(meta["goalId"], "goal-7");
+    assert_eq!(meta["stackDepth"], 2);
+    let decoded: SessionUpdate = serde_json::from_value(update)
+        .expect("current Zed ACP schema must decode a nested Plan with identity metadata");
+    let SessionUpdate::Plan(plan) = decoded else {
+        panic!("expected a stable ACP Plan update");
+    };
+    assert_eq!(plan.entries.len(), 1);
+    assert_eq!(plan.entries[0].status, PlanEntryStatus::Pending);
 
     let decoded: SessionUpdate = serde_json::from_value(durable_plan_clear_update())
         .expect("current Zed ACP schema must decode an empty Plan clear");

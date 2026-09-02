@@ -23,6 +23,7 @@
 //! | `token_budget`, `tokens_used`, `usage_known`, `time_used_seconds` | **SQL** | rejected the same way |
 //! | `session_id`, `goal_id`, the timestamps | **SQL** | rejected the same way |
 //! | the checklist | **SQL** — it is a projection, not an input | rejected the same way |
+//! | the criterion checklist | **SQL** — a criterion is closed by citing a receipt, never by ticking a box | rejected the same way |
 //!
 //! The asymmetry is deliberate. The objective is *prose a human wrote*, so the
 //! human's copy is the better one. Status is a *decision about whether the run
@@ -92,8 +93,24 @@
 //! # Keeping the document out of git
 //!
 //! The projection is derived, per-session, and churns on every material change, so
-//! it does not belong in a repository. [`GITIGNORE_SNIPPET`] is the recommended
-//! text, and it lives here as a constant because the project has no
+//! it does not belong in a repository. The directory is declared in
+//! `zuno_paths::generated`, the registry of every path Zuno generates inside a
+//! worktree; [`IGNORE_PATTERN`] is that entry's pattern, re-exported here so this
+//! crate and the registry cannot disagree about where the document goes. There are
+//! two ways to honour it.
+//!
+//! The host does it without touching a tracked file: the CLI passes the registry's
+//! patterns (`zuno_paths::IGNORE_PATTERNS`, which lists this one) to
+//! `zuno_paths::ensure_managed_block`, which maintains a
+//! marked block in the repository-private `.git/info/exclude`. That keeps a
+//! generated path out of `git status` in somebody else's repository without
+//! Zuno ever editing a file the repository's own history owns — writing to a
+//! checked-in `.gitignore` would show up as an unexplained diff in the user's next
+//! commit.
+//!
+//! [`GITIGNORE_SNIPPET`] is for the other case: a team that wants the rule shared
+//! through version control, where a private exclude file per clone is exactly the
+//! wrong shape. It lives here as a constant because the project has no
 //! recommended-gitignore file for it to be appended to — searching the workspace
 //! for one turns up only gitignore *parsing* (`zuno-watch`, `zuno-search`,
 //! `zuno-snapshot`) and the repository's own `.gitignore`. Whoever adds user
@@ -102,7 +119,7 @@
 
 use crate::error::GoalError;
 use crate::status::GoalStatus;
-use crate::store::{Goal, GoalStore};
+use crate::store::{Goal, GoalCriterion, GoalCriterionStatus, GoalStore};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -114,10 +131,25 @@ pub use zuno_paths::PROJECT_DIRECTORY;
 /// The subdirectory of [`PROJECT_DIRECTORY`] holding goal documents.
 pub const GOAL_DIRECTORY: &str = "goal";
 
+/// The one path that has to be ignored: the directory the projection writes into.
+///
+/// Taken from the generated-path registry rather than spelled here, so the pattern
+/// the host excludes, the pattern this crate documents and the directory
+/// [`document_path`] writes into cannot drift apart; a test asserts the registry
+/// entry agrees with [`PROJECT_DIRECTORY`] and [`GOAL_DIRECTORY`]. The registry keeps
+/// it slash-separated with a trailing slash and no leading one: a git pattern is
+/// always slash-separated, joining the two directory names would produce a backslash
+/// on Windows and silently stop matching, and without the leading slash it reads the
+/// same in `.git/info/exclude` as in a `.gitignore` at the worktree root.
+pub const IGNORE_PATTERN: &str = zuno_paths::generated::GOAL_PROJECTION.pattern;
+
 /// What to add to a repository's `.gitignore` for the goal projection.
 ///
 /// See the module docs for why this is a constant rather than an entry in an
-/// existing snippet file.
+/// existing snippet file, and for when to prefer the private exclude file instead.
+/// The pattern line is written out rather than interpolated from [`IGNORE_PATTERN`]
+/// because a `const` cannot be built from another one at compile time here; a test
+/// asserts the two agree.
 pub const GITIGNORE_SNIPPET: &str = "\
 # Zuno renders the authoritative goal to a human-editable Markdown document,
 # one per session. It is derived from the goal database and rewritten on every
@@ -310,12 +342,14 @@ impl Check {
 }
 
 /// What in the document was edited, for a rejection message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Edited {
     /// A `- \`key\`: value` line.
     Field(Field),
     /// A checklist checkbox.
     Check(Check),
+    /// A success criterion line, named by its criterion id.
+    Criterion(String),
     /// The objective region, when what it now holds cannot be stored.
     Objective,
 }
@@ -323,14 +357,24 @@ pub enum Edited {
 impl Edited {
     /// How a rejection message names the thing that was edited.
     #[must_use]
-    pub fn subject(self) -> String {
+    pub fn subject(&self) -> String {
         match self {
             Self::Field(field) => format!("`{}`", field.key()),
             Self::Check(check) => format!("the `{}` checklist item", check.key()),
+            Self::Criterion(criterion_id) => format!("the `{criterion_id}` success criterion"),
             Self::Objective => "`objective`".to_owned(),
         }
     }
 }
+
+/// The longest criterion statement or waiver reason the document renders in full.
+///
+/// Both are model-written prose, so neither is bounded at the source, and the
+/// document is something a human reads: one paragraph-long criterion should not
+/// push the rejected-edit notes off the screen. The database keeps the full text
+/// either way, so clipping the projection loses nothing that cannot be read from
+/// the goal itself.
+pub const MAX_CRITERION_CHARS: usize = 200;
 
 /// Why an edit was not applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,6 +465,12 @@ pub struct Document {
     pub fields: BTreeMap<&'static str, String>,
     /// Every checklist line's state, by key.
     pub checks: BTreeMap<&'static str, bool>,
+    /// Every success criterion line, by criterion id, exactly as the file holds it.
+    ///
+    /// The whole line rather than a parsed status: the id, the checkbox, the
+    /// statement and the citation are all projections, so any difference from what
+    /// was rendered is an edit, and none of them needs its own comparison rule.
+    pub criteria: BTreeMap<String, String>,
 }
 
 /// Where the goal document for `session_id` belongs.
@@ -462,11 +512,16 @@ pub fn document_path(worktree: Option<&Path>, session_id: &str) -> Option<PathBu
 
 /// Render the authoritative goal as the document a human reads and edits.
 ///
-/// Deterministic in `(goal, notes)`, with no clock and no filesystem access, so
-/// two renders of the same state are byte-identical — which is what lets
-/// [`GoalProjection`] recognise its own writes by comparison.
+/// Deterministic in `(goal, criteria, notes)`, with no clock and no filesystem
+/// access, so two renders of the same state are byte-identical — which is what
+/// lets [`GoalProjection`] recognise its own writes by comparison.
+///
+/// `criteria` comes from [`GoalStore::criteria`] and is rendered, never read back:
+/// the checklist shows which criteria are closed and what closed them, so a human
+/// can see whether "done" was earned, without giving the document a way to close
+/// one.
 #[must_use]
-pub fn render(goal: &Goal, notes: &Notes) -> String {
+pub fn render(goal: &Goal, criteria: &[GoalCriterion], notes: &Notes) -> String {
     let mut out = String::with_capacity(2_048);
     out.push_str(HEADER);
 
@@ -511,6 +566,16 @@ pub fn render(goal: &Goal, notes: &Notes) -> String {
         out.push('\n');
     }
 
+    out.push_str("\n## Success criteria\n\n");
+    if criteria.is_empty() {
+        out.push_str("_This goal has no success criteria._\n");
+    } else {
+        for criterion in criteria {
+            out.push_str(&criterion_line(criterion));
+            out.push('\n');
+        }
+    }
+
     out.push_str("\n## Rejected edits\n\n");
     if notes.is_empty() {
         out.push_str("_Nothing has been rejected._\n");
@@ -553,11 +618,14 @@ pub fn parse(text: &str) -> Option<Document> {
 
     let mut fields = BTreeMap::new();
     let mut checks = BTreeMap::new();
+    let mut criteria = BTreeMap::new();
     for line in text.lines().map(str::trim) {
         if let Some((field, value)) = field_line(line) {
             fields.insert(field.key(), value);
         } else if let Some((check, state)) = check_line(line) {
             checks.insert(check.key(), state);
+        } else if let Some(criterion_id) = criterion_line_id(line) {
+            criteria.insert(criterion_id, line.to_owned());
         }
     }
 
@@ -568,6 +636,7 @@ pub fn parse(text: &str) -> Option<Document> {
         objective,
         fields,
         checks,
+        criteria,
     })
 }
 
@@ -586,6 +655,7 @@ pub struct GoalProjection {
 struct LastRender {
     document: String,
     goal: Goal,
+    criteria: Vec<GoalCriterion>,
 }
 
 /// What one ingest did.
@@ -670,31 +740,55 @@ impl GoalProjection {
         path == self.path
     }
 
-    /// Render `goal` and replace the document atomically.
+    /// Render `goal` alone and replace the document atomically.
     ///
-    /// Call this on every material change. Records the rendered bytes so the
-    /// watch event this write causes is recognised as our own.
+    /// The compatibility entry point, and it renders an empty criterion checklist
+    /// because it has no way to know the criteria: a caller that only holds a
+    /// [`Goal`] cannot supply them, and reading the store from here would give this
+    /// method a database dependency the signature does not admit. Prefer
+    /// [`Self::write_criteria`]; an ingest always renders the full checklist,
+    /// because it reads the criteria itself.
     ///
     /// # Errors
     ///
     /// [`GoalError::Document`] when the directory, temporary write or atomic
     /// replacement fails.
     pub fn write(&self, goal: &Goal) -> Result<(), GoalError> {
-        self.write_notes(goal, &Notes::default())
+        self.write_notes(goal, &[], &Notes::default())
     }
 
-    /// Render `goal` together with `notes` and replace the document atomically.
+    /// Render `goal` with its success criteria and replace the document atomically.
+    ///
+    /// Call this on every material change, including a change to a criterion: the
+    /// checklist is how a human sees what closed each one.
+    ///
+    /// # Errors
+    ///
+    /// [`GoalError::Document`] when the directory, temporary write or atomic
+    /// replacement fails.
+    pub fn write_criteria(&self, goal: &Goal, criteria: &[GoalCriterion]) -> Result<(), GoalError> {
+        self.write_notes(goal, criteria, &Notes::default())
+    }
+
+    /// Render `goal` together with `criteria` and `notes`, and replace the document
+    /// atomically.
     ///
     /// # Errors
     ///
     /// [`GoalError::Document`] when the directory, the temporary file or the
     /// rename fails.
-    pub fn write_notes(&self, goal: &Goal, notes: &Notes) -> Result<(), GoalError> {
-        let document = render(goal, notes);
+    pub fn write_notes(
+        &self,
+        goal: &Goal,
+        criteria: &[GoalCriterion],
+        notes: &Notes,
+    ) -> Result<(), GoalError> {
+        let document = render(goal, criteria, notes);
         write_atomic(&self.path, &document)?;
         *self.lock() = Some(LastRender {
             document,
             goal: goal.clone(),
+            criteria: criteria.to_vec(),
         });
         Ok(())
     }
@@ -736,8 +830,9 @@ impl GoalProjection {
         let Some(goal) = store.goal(&self.session_id)? else {
             return Ok(Ingest::NoGoal);
         };
+        let criteria = store.criteria(&self.session_id)?;
         let Some(raw) = read_optional(&self.path)? else {
-            self.write(&goal)?;
+            self.write_criteria(&goal, &criteria)?;
             return Ok(Ingest::Restored);
         };
         if self
@@ -751,6 +846,7 @@ impl GoalProjection {
             let backup = back_up(&self.path, &raw)?;
             self.write_notes(
                 &goal,
+                &criteria,
                 &Notes {
                     rejected: Vec::new(),
                     salvaged: Some(backup.clone()),
@@ -766,6 +862,10 @@ impl GoalProjection {
             .lock()
             .as_ref()
             .map_or_else(|| goal.clone(), |last| last.goal.clone());
+        let baseline_criteria = self
+            .lock()
+            .as_ref()
+            .map_or_else(|| criteria.clone(), |last| last.criteria.clone());
 
         let mut rejected = Vec::new();
         for field in Field::ALL {
@@ -798,6 +898,51 @@ impl GoalProjection {
             }
         }
 
+        // A criterion is closed by a receipt, so every part of its line — the box,
+        // the statement, the citation — is projection. Comparing whole rendered
+        // lines means a hand-edited statement is refused as loudly as a ticked box,
+        // and an id the goal does not have is refused rather than ignored, because
+        // an invented criterion is exactly how a checklist would be talked into
+        // looking complete.
+        for criterion in &baseline_criteria {
+            let Some(observed) = document.criteria.get(&criterion.criterion_id) else {
+                continue;
+            };
+            let rendered = criterion_line(criterion);
+            if *observed != rendered {
+                let actual = criteria
+                    .iter()
+                    .find(|current| current.criterion_id == criterion.criterion_id)
+                    .map_or_else(|| rendered.clone(), criterion_line);
+                rejected.push(RejectedEdit {
+                    edited: Edited::Criterion(criterion.criterion_id.clone()),
+                    attempted: observed.clone(),
+                    actual,
+                    refusal: Refusal::SystemOwned {
+                        noun: "the criterion checklist",
+                        plural: false,
+                    },
+                });
+            }
+        }
+        for (criterion_id, observed) in &document.criteria {
+            if baseline_criteria
+                .iter()
+                .any(|criterion| &criterion.criterion_id == criterion_id)
+            {
+                continue;
+            }
+            rejected.push(RejectedEdit {
+                edited: Edited::Criterion(criterion_id.clone()),
+                attempted: observed.clone(),
+                actual: "not a criterion of this goal".to_owned(),
+                refusal: Refusal::SystemOwned {
+                    noun: "the criterion checklist",
+                    plural: false,
+                },
+            });
+        }
+
         let mut adopted = None;
         let mut goal = goal;
         if document.objective != baseline.objective {
@@ -821,6 +966,7 @@ impl GoalProjection {
 
         self.write_notes(
             &goal,
+            &criteria,
             &Notes {
                 rejected: rejected.clone(),
                 salvaged: None,
@@ -861,6 +1007,57 @@ fn push_field(out: &mut String, field: Field, goal: &Goal) {
     out.push_str("`: ");
     out.push_str(&field.value(goal));
     out.push('\n');
+}
+
+/// One rendered criterion line: the box, the id, the statement, the standing.
+///
+/// The standing is spelled out rather than left to the checkbox, because "closed"
+/// hides the difference that matters: a criterion proven by a recorded receipt and
+/// one waived by a decision are both settled, and only one of them is evidence.
+fn criterion_line(criterion: &GoalCriterion) -> String {
+    let standing = match criterion.status {
+        GoalCriterionStatus::Open => "open".to_owned(),
+        GoalCriterionStatus::Satisfied => criterion.receipt_id.as_deref().map_or_else(
+            || "satisfied".to_owned(),
+            |receipt_id| format!("satisfied by receipt `{receipt_id}`"),
+        ),
+        GoalCriterionStatus::Waived => criterion.waiver_reason.as_deref().map_or_else(
+            || "waived".to_owned(),
+            |reason| format!("waived: {}", clip(reason)),
+        ),
+    };
+    format!(
+        "- {} `{}`: {} — {standing}",
+        box_of(criterion.status.is_settled()),
+        criterion.criterion_id,
+        clip(&criterion.statement)
+    )
+}
+
+/// The criterion id a line names, if it is a criterion line at all.
+fn criterion_line_id(line: &str) -> Option<String> {
+    let (_, rest) = checkbox(line)?;
+    let (key, _) = rest.strip_prefix('`')?.split_once("`: ")?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some(key.to_owned())
+}
+
+/// Collapse model-written prose to one clipped line.
+///
+/// One line because the document is parsed by lines, so a statement containing a
+/// newline would otherwise render as something no reader could match back to its
+/// criterion; clipped because [`MAX_CRITERION_CHARS`] is the size budget the
+/// projection renders within.
+fn clip(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAX_CRITERION_CHARS {
+        return collapsed;
+    }
+    let kept: String = collapsed.chars().take(MAX_CRITERION_CHARS).collect();
+    format!("{kept}…")
 }
 
 fn field_line(line: &str) -> Option<(Field, String)> {

@@ -395,6 +395,19 @@ impl TurnEventProjector {
                     .saturating_add(output_tokens.unwrap_or_default());
                 json!({ "sessionUpdate": "usage_update", "used": used, "size": size })
             }),
+            TurnEvent::Notice {
+                severity,
+                code,
+                detail,
+            } => {
+                let mut update = content_update("agent_thought_chunk", detail);
+                update["_meta"] = json!({
+                    "zuno": {
+                        "notice": { "severity": severity.as_str(), "code": code },
+                    },
+                });
+                Some(update)
+            }
             TurnEvent::Provider {
                 event: StreamEvent::StatusDetail { .. },
                 ..

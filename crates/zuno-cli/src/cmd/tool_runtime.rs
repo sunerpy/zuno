@@ -462,6 +462,15 @@ pub(crate) fn assemble(
     for tool in zuno_goal::goal_tools(Arc::clone(&selection.goal_store)) {
         builder.register_configured_builtin(tool);
     }
+    // Registered beside the goal tools but not part of `goal_tools`, because a
+    // capability claim is not a goal operation: it records what the session believes a
+    // provider or model can do, and why it believes it. The goal gate then refuses to
+    // complete over a belief nobody verified. The `bedrock-model-capability-review`
+    // Skill declares this tool as required, so it stays invisible wherever the tool is
+    // not registered.
+    builder.register_configured_builtin(erase(zuno_goal::CapabilityClaimTool::new(Arc::clone(
+        &selection.goal_store,
+    ))));
     if selection.interaction_policy.allows_goal_request_input() && selection.question.is_some() {
         builder.register_configured_builtin(erase(zuno_goal::GoalRequestInputTool::new(
             Arc::clone(&selection.goal_store),

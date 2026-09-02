@@ -5,7 +5,7 @@ use zuno_orchestration::{
     COUNCILS, PACK_ID, PACK_VERSION, SKILLS, council, councils, pack, skill, skills,
 };
 
-const EXPECTED_NAMES: [&str; 10] = [
+const EXPECTED_NAMES: [&str; 11] = [
     "customize-zuno",
     "develop-zuno",
     "deepwork",
@@ -16,6 +16,7 @@ const EXPECTED_NAMES: [&str; 10] = [
     "git-workflow",
     "github-delivery",
     "ui-design",
+    "bedrock-model-capability-review",
 ];
 
 #[test]
@@ -212,6 +213,7 @@ fn focused_workflow_skills_stay_within_their_prompt_budgets() {
         ("git-workflow", 165, 195),
         ("github-delivery", 180, 245),
         ("verification-planning", 80, 105),
+        ("bedrock-model-capability-review", 190, 250),
     ] {
         let entry = skill(name).expect("skill descriptor");
         let words = entry.content.split_whitespace().count();
@@ -303,6 +305,48 @@ fn github_delivery_requires_machine_readable_remote_and_release_evidence() {
     assert_eq!(workflow.required_tools, &["read"]);
     assert!(workflow.allowed_profiles.contains(&"plan"));
     assert!(workflow.allowed_profiles.contains(&"build"));
+}
+
+#[test]
+fn bedrock_capability_review_accepts_only_cited_documents_or_observed_probes() {
+    let review =
+        skill("bedrock-model-capability-review").expect("bedrock capability review descriptor");
+    // Compared with whitespace collapsed, so a clause may be checked as one sentence
+    // however the Markdown happens to wrap it.
+    let body = review
+        .content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for clause in [
+        "before editing a provider model catalog or enabling a provider feature for an Amazon \
+         Bedrock model",
+        "specific to one model id in one region",
+        "A sibling model's documentation is not evidence about this model",
+        "Accept exactly two states as evidence",
+        "whose response you observed",
+        "Record the claim with `capability_claim` before writing the configuration",
+        "`documented` with the citation",
+        "`probed` with `probeReceiptId`",
+        "Probe again after the last change and record the claim again before completing",
+        "Never describe an inferred capability as supported",
+    ] {
+        assert!(
+            body.contains(clause),
+            "bedrock-model-capability-review is missing `{clause}`:\n{}",
+            review.content
+        );
+    }
+    assert_eq!(
+        review.required_tools,
+        &["read", "capability_claim"],
+        "the skill instructs a tool call, so it must not be advertised where the tool is absent"
+    );
+    assert!(review.allowed_profiles.contains(&"build"));
+    assert!(
+        !review.allowed_profiles.contains(&"plan"),
+        "the skill governs a write, which the read-only planner does not make"
+    );
 }
 
 #[test]

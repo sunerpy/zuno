@@ -45,7 +45,7 @@ use ratatui::{Frame, symbols};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
-use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, TurnEvent};
+use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, NoticeSeverity, TurnEvent};
 use zuno_engine::session_command::SessionCommand;
 use zuno_llm::event::StreamEvent;
 pub use zuno_types::TokenUsage;
@@ -190,6 +190,11 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         // One glyph for the non-interactive goal tools: they read, set and amend one
         // object, and separate glyphs would imply separate subjects.
         "goal_get" | "goal_propose" | "goal_update" => ("◎", "Reading the goal..."),
+        // Its own glyph, not the goal's: the ledger's subject is an external capability,
+        // and sharing `◎` would say a reader is looking at another edit to the one goal.
+        // A filled diamond rather than the hollow one reasoning uses, because a claim is
+        // what the session settled on and recorded, not what it is still turning over.
+        "capability_claim" => ("◆", "Recording a capability claim..."),
         _ => ("⚙", "Preparing..."),
     }
 }
@@ -973,6 +978,21 @@ impl Transcript {
                     name: name.clone(),
                     source: Some(source.clone()),
                 })
+            }
+            TurnEvent::Notice {
+                severity,
+                code,
+                detail,
+            } => {
+                self.messages.push(Message::noticed(
+                    match severity {
+                        NoticeSeverity::Info => crate::views::toast::ToastLevel::Info,
+                        NoticeSeverity::Warning => crate::views::toast::ToastLevel::Warning,
+                        NoticeSeverity::Error => crate::views::toast::ToastLevel::Error,
+                    },
+                    format!("{detail} [{code}]"),
+                ));
+                true
             }
             TurnEvent::TurnStarted { .. } => {
                 self.mark_running();

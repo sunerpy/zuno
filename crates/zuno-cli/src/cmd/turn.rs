@@ -52,9 +52,9 @@ use zuno_engine::compaction::{CompactionState, TokenWindow};
 use zuno_engine::dispatch::{AuthorizationPolicy, ToolRegistryDispatcher};
 use zuno_engine::driver::AgentDriver;
 use zuno_engine::r#loop::{
-    AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest,
-    ToolConcurrencyLimit, ToolDispatcher as _, ToolFailureRecovery, TurnContext, TurnError,
-    TurnEvent, TurnEventSender, TurnOutcome, TurnRecovery,
+    AgentModelResolver, NoticeSeverity, ResolvedAgent, ResolvedModel as EngineModel,
+    RunTurnRequest, ToolConcurrencyLimit, ToolDispatcher as _, ToolFailureRecovery, TurnContext,
+    TurnError, TurnEvent, TurnEventSender, TurnOutcome, TurnRecovery,
 };
 use zuno_engine::plan_driver::{
     PlanReconciliationDecision, PlanReconciliationDriver, PlanReconciliationInput,
@@ -2025,7 +2025,21 @@ pub(crate) struct TurnHost {
     compaction_state: CompactionState,
     window: TokenWindow,
     notes: Vec<String>,
+    /// Rule files that are not in force this turn, from the instruction admission.
+    ///
+    /// Reported as typed notices rather than folded into `notes`: "your remote rule
+    /// file did not load" is a statement about the request the model is about to
+    /// answer, and a surface that shows it as one status line among many is how the
+    /// fact went unnoticed before.
+    instruction_admission: InstructionAdmission,
     commands: zuno_catalog::command::Registry,
+    /// The ceilings a turn runs under when nobody set a goal budget.
+    ///
+    /// Resolved once from the active profile, because the answer is the profile's and
+    /// re-reading it per turn would let a mid-session profile swap change a limit the
+    /// running goal was already being measured against. A profile that publishes no
+    /// allowance means no ceilings, not a number this host invents.
+    turn_allowance: zuno_engine::budget::TurnAllowance,
     goal_store: Arc<GoalStore>,
     goal_projection: GoalProjection,
     goal_continuation: GoalContinuation,
@@ -2165,6 +2179,14 @@ impl TurnFailure {
             TurnRecovery::Pause => GoalTerminalFailure::Pause(match self {
                 Self::Engine(TurnError::Provider(ProviderError::Auth { .. })) => {
                     zuno_goal::GoalPauseReason::Authentication
+                }
+                // Naming the allowance matters more than it looks: the pause reason is
+                // what a status surface shows and what a restart reads. Reporting a
+                // turn that spent its token or time allowance as a user interruption
+                // tells the user they stopped the run themselves, and hides the one
+                // fact that would let them raise the allowance and continue.
+                Self::Engine(TurnError::BudgetLimited { .. }) => {
+                    zuno_goal::GoalPauseReason::TurnBudget
                 }
                 Self::Engine(_)
                 | Self::Host(_)
@@ -3647,6 +3669,15 @@ impl TurnHost {
             let public_http = runtime
                 .service::<zuno_network::PublicHttpClient>()
                 .ok_or_else(|| "profile did not register a public HTTP transport".to_owned())?;
+            // Optional, unlike the services above. An absent allowance is a profile
+            // saying "no ceilings", which is a valid answer and must not be read as a
+            // default this host supplies; `zuno_harness::turn_allowance_bundle`
+            // documents the contract from the other side.
+            let turn_allowance = runtime
+                .service::<zuno_engine::budget::TurnAllowance>()
+                .map_or(zuno_engine::budget::TurnAllowance::UNLIMITED, |allowance| {
+                    *allowance
+                });
             let todo_store = Arc::clone(&database);
             let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&todo_store));
             let goal_store = Arc::new(
@@ -3733,6 +3764,37 @@ impl TurnHost {
             let learning_projection =
                 zuno_learning::LearningProjectionService::new(Arc::clone(&database));
             let mut notes = plan.notes;
+            // Zuno writes several files into the worktree it is working in: the goal
+            // projection, spilled tool output, background execution records. A generated
+            // file that shows up in `git status` is how an agent ends up staging its own
+            // scratch output — or reporting a dirty tree as evidence of a change it did
+            // not make. The patterns come from `zuno_paths::IGNORE_PATTERNS`, which is
+            // derived from the same registry the staging refusal reads, so a path added
+            // in one place cannot be missed in the other. They go in the
+            // repository-private `.git/info/exclude` rather than in a tracked
+            // `.gitignore`, because Zuno editing a file the repository's history owns
+            // would land as an unexplained diff in somebody else's next commit. Once
+            // per host: the call spawns git, and the block is idempotent, so a turn
+            // loop would pay for it repeatedly to learn nothing.
+            if let Some(worktree) = worktree.as_deref() {
+                match zuno_paths::ensure_managed_block(worktree, zuno_paths::IGNORE_PATTERNS) {
+                    // Silent when nothing changed: re-asserting the same block on every
+                    // session is the normal case and does not need reporting.
+                    Ok(outcome) if outcome.changed() => notes.push(format!(
+                        "excluded {} from git in {}",
+                        zuno_paths::IGNORE_PATTERNS.join(", "),
+                        worktree.display()
+                    )),
+                    Ok(_) => {}
+                    // A note, never a failure. Running outside a repository is ordinary,
+                    // and a machine without git still deserves a working session; the
+                    // cost of not writing the block is a generated file the user sees in
+                    // `git status`, which is a nuisance and not a correctness problem.
+                    Err(error) => notes.push(format!(
+                        "warning: could not exclude generated paths from git: {error}"
+                    )),
+                }
+            }
             let learning = match plan.learning_model.take() {
                 Some(learning_model) if learning_settings.enabled => {
                     let model = learning_model.model;
@@ -3815,7 +3877,8 @@ impl TurnHost {
                 "zuno-extension::active-packages",
                 plan.extensions.prompt_section(),
             )?;
-            announce_instructions(&mut plan.resolver, &plan.instructions, &mut notes)?;
+            let instruction_admission =
+                announce_instructions(&mut plan.resolver, &plan.instructions, plan.window.context)?;
             let skill_snapshot = plan.skill_catalog.snapshot();
             announce_skills(
                 &mut plan.resolver,
@@ -3961,6 +4024,39 @@ impl TurnHost {
                     .clone()
                     .with_sandbox_notice(notice.clone());
             }
+            // A repository with a code-intelligence index has already answered "where is
+            // this defined" for every symbol in it, and a run that greps instead gets a
+            // narrower answer for more tokens. The gate says so; what it does about it
+            // is the user's choice, and the default is nothing.
+            let navigation_mode = plan
+                .config
+                .navigation
+                .as_ref()
+                .and_then(|navigation| navigation.codegraph)
+                .map_or(zuno_tools::NavigationMode::Off, |gate| match gate {
+                    zuno_config::schema::NavigationGate::Off => zuno_tools::NavigationMode::Off,
+                    zuno_config::schema::NavigationGate::Advise => {
+                        zuno_tools::NavigationMode::Advise
+                    }
+                    zuno_config::schema::NavigationGate::Strict => {
+                        zuno_tools::NavigationMode::Strict
+                    }
+                });
+            // Resolved once, not per call: the check touches the filesystem, and an index
+            // built halfway through a session must not change the verdict an earlier call
+            // in the same session already received.
+            let navigation_indexed = worktree.as_deref().is_some_and(zuno_tools::index_present);
+            // Resolved from the same configured shell the shell tool resolves from, so a
+            // command is parsed the way the shell that will run it parses it. POSIX when
+            // no shell resolves, because misreading the syntax can only make the gate
+            // overlook a navigation, never invent one.
+            let navigation_syntax = if zuno_pty::shells::preferred(plan.config.shell.as_deref())
+                .is_ok_and(|path| zuno_pty::shells::powershell(&path))
+            {
+                zuno_tools::shell::ShellSyntax::PowerShell
+            } else {
+                zuno_tools::shell::ShellSyntax::Bash
+            };
             let dispatcher = ToolRegistryDispatcher::new(
                 runtime_tools.tools,
                 runtime_tools.rules,
@@ -3968,7 +4064,21 @@ impl TurnHost {
                 AuthorizationPolicy::from_mode(plan.config.effective_permission_mode()),
                 McpToolStatus::Ready,
             )
-            .with_deferred_tools(runtime_tools.deferred_tool_ids);
+            .with_deferred_tools(runtime_tools.deferred_tool_ids)
+            .with_hooks(Arc::new(
+                super::tool_hooks::HostToolHooks::new(
+                    super::verification_ledger::VerificationLedger::new(
+                        Arc::clone(&database),
+                        Arc::clone(&goal_store),
+                    ),
+                )
+                .with_navigation(
+                    navigation_mode,
+                    navigation_indexed,
+                    navigation_syntax,
+                    zuno_db::event_log::SessionEventLog::new(Arc::clone(&database)),
+                ),
+            ));
             let council_presets = plan
                 .capability
                 .councils
@@ -4046,7 +4156,9 @@ impl TurnHost {
                 compaction_state: CompactionState::default(),
                 window: plan.window,
                 notes,
+                instruction_admission,
                 commands,
+                turn_allowance,
                 goal_store,
                 goal_projection,
                 goal_continuation,
@@ -6849,7 +6961,7 @@ impl TurnHost {
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, TurnFailure> {
         let outcome = self.run_prelude().await?;
-        report_prelude(&events, &self.notes, &outcome)
+        report_prelude(&events, &self.notes, &self.instruction_admission, &outcome)
             .await
             .map_err(TurnFailure::event_consumer)?;
         if !outcome.continue_turn {
@@ -7039,7 +7151,7 @@ impl TurnHost {
             Ok(_) => return Ok(None),
             Err(error) => return Err(error),
         };
-        report_prelude(&events, &self.notes, &prelude)
+        report_prelude(&events, &self.notes, &self.instruction_admission, &prelude)
             .await
             .map_err(TurnFailure::event_consumer)?;
         self.execute_turn_unaccounted(dynamic_context, None, prepared.run_guard(), events)
@@ -7245,7 +7357,20 @@ impl TurnHost {
         )
         .with_live_inputs(guard, &self.inbox)
         .with_attachments(Arc::clone(&self.attachments))
-        .with_tool_concurrency(self.tool_concurrency);
+        .with_tool_concurrency(self.tool_concurrency)
+        // Installed on every turn, not only a goal-driven one. The policy is documented
+        // to leave a session with no goal, or a goal with no token budget, alone, so
+        // installing it imposes no limit nobody set — while a conditional install would
+        // mean a budget set mid-session was enforced only after a restart.
+        // The allowance is the host's answer to "how much may one turn spend when
+        // nobody set a goal budget". Without it the policy treats an unbudgeted goal as
+        // unbounded, which is how a run that has stopped making progress keeps paying
+        // for requests until a human notices. Read from the runtime rather than
+        // constructed here so one default governs every front end.
+        .with_budget_policy(Arc::new(
+            zuno_goal::GoalBudgetPolicy::new(Arc::clone(&self.goal_store))
+                .with_allowance(self.turn_allowance),
+        ));
         let outcome = self
             .driver
             .drive(
@@ -7713,9 +7838,13 @@ impl TurnHost {
         }
     }
 
+    /// Charge the goal for the turn: the tokens no request accounted for, and the time.
+    ///
+    /// See [`goal_turn_unaccounted_tokens`] for why the token figure is a difference
+    /// rather than the session's own delta.
     fn record_goal_usage(&self, before: GoalUsage, started: Instant) -> Result<(), String> {
         let after = goal_usage(&self.connection, &self.session_id)?;
-        let token_delta = after.tokens.saturating_sub(before.tokens);
+        let token_delta = goal_turn_unaccounted_tokens(before, after);
         let accounting_known = goal_turn_accounting_known(before, after);
         let elapsed = i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX);
         self.goal_store
@@ -7724,9 +7853,20 @@ impl TurnHost {
         Ok(())
     }
 
+    /// Rewrite the goal document from durable state.
+    ///
+    /// Writes the criteria with the goal rather than the goal alone: the document is
+    /// what a human reads to see where the run stands, and a checklist that never
+    /// appears there makes an evidence-gated goal look like it is waiting on nothing.
     fn write_goal_projection(&self) -> Result<(), String> {
         if let Some(goal) = self.goal_store.goal(&self.session_id).map_err(to_string)? {
-            self.goal_projection.write(&goal).map_err(to_string)?;
+            let criteria = self
+                .goal_store
+                .criteria(&self.session_id)
+                .map_err(to_string)?;
+            self.goal_projection
+                .write_criteria(&goal, &criteria)
+                .map_err(to_string)?;
         }
         Ok(())
     }
@@ -8284,6 +8424,26 @@ fn ensure_host_plan(
             changed: false,
         });
     };
+    let other_goals_plan = goal_id.is_some()
+        && existing.goal_id.is_some()
+        && existing.goal_id.as_deref() != goal_id.as_deref();
+    // A finished Plan of a previous Goal is history, not this Goal's work. It is not
+    // rebound — that would credit this Goal with steps it never ran — and it cannot stay
+    // visible either: the completion audit judges a Goal against the visible Plan and
+    // refuses one that belongs to another Goal, so an objective that needs no Plan of
+    // its own (a question, one bounded read) could never complete. Archive it as
+    // completed, which the audit deliberately ignores, and let this Goal stand on its
+    // own evidence. A Plan with no `goal_id` predates the binding and passes the audit
+    // as it is, so it is left alone.
+    if other_goals_plan && existing_state == ExistingPlanState::Terminal {
+        store
+            .archive_terminal_plan(session_id, existing.revision)
+            .map_err(to_string)?;
+        return Ok(HostPlanningOutcome {
+            decision,
+            changed: true,
+        });
+    }
     let should_bind_goal = goal_id.is_some()
         && existing.goal_id.as_deref() != goal_id.as_deref()
         && existing_state == ExistingPlanState::Active;
@@ -8462,6 +8622,22 @@ struct GoalUsage {
     confirmed_known: bool,
     estimated_pending_prompt_tokens: Option<u64>,
     last_confirmed_at: Option<i64>,
+    /// What the goal has already been charged, read from the goal's own counter.
+    ///
+    /// The session's confirmed usage and the goal's charged usage are two different
+    /// numbers written by two different paths, and the turn-end write needs the
+    /// difference between them. Zero when there is no goal, which makes the difference
+    /// zero as well.
+    goal_charged: i64,
+    /// Sequence of the newest provider-request event, or zero when there is none.
+    ///
+    /// Whether a turn reached the provider at all cannot be read from the usage
+    /// counters: a turn that failed before its first request looks exactly like a turn
+    /// whose request never came back. The event stream tells them apart, and it is
+    /// append-only, so a sequence that moved across a turn means a request was issued
+    /// inside it.
+    last_provider_request_seq: i64,
+    /// Turns this session has failed, which only ever rises.
     failed_turns: u64,
 }
 
@@ -8470,25 +8646,122 @@ fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<Goa
         .map_err(to_string)?
         .usage
         .snapshot();
+    // The goal tables belong to `zuno-goal` and are created by whoever attaches a
+    // store, so a connection without them is a session that has no goal policy rather
+    // than a broken database. Nothing can have been charged there, and asking is
+    // cheaper than failing a turn over a table that was never meant to exist.
+    let goal_attached = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'goal')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(to_string)?;
+    let goal_charged = if goal_attached {
+        connection
+            .query_row(
+                "SELECT tokens_used FROM goal WHERE session_id = ?1",
+                [session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(to_string)?
+            .unwrap_or_default()
+    } else {
+        0
+    };
+    // Any stored version of the event answers the same question, so the pattern is a
+    // prefix rather than the `.1` suffix a caller would have to keep in step with the
+    // event log. Reading a version this build does not understand still tells the
+    // truth about whether a request happened.
+    let last_provider_request_seq = connection
+        .query_row(
+            "SELECT coalesce(max(seq), 0) FROM event \
+             WHERE aggregate_id = ?1 AND type GLOB 'session.provider.request.*'",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(to_string)?;
     Ok(GoalUsage {
         tokens: i64::try_from(snapshot.confirmed.total()).unwrap_or(i64::MAX),
         confirmed_known: snapshot.confirmed_known,
         estimated_pending_prompt_tokens: snapshot.estimated_pending_prompt_tokens,
         last_confirmed_at: snapshot.last_confirmed_at,
+        goal_charged,
+        last_provider_request_seq,
         failed_turns: snapshot.failed_turns,
     })
 }
 
+/// The tokens this turn spent that no provider request has already charged.
+///
+/// The session's confirmed token total measures what a turn cost, but it is not the
+/// only thing that moves the goal's counter: the budget policy charges each provider
+/// response as it lands, because a ceiling checked only between turns cannot stop a
+/// runaway inside one. Charging the whole session delta again at the end would bill
+/// every request twice, so a goal would hit its ceiling at half the tokens its budget
+/// names — and with a default allowance in place that number is binding rather than
+/// decorative.
+///
+/// So the session delta is reduced by what the goal's own counter moved over the same
+/// window. What remains is the usage no request accounted for: compaction's model
+/// calls, a turn that failed before any response was recorded, and anything else that
+/// spends tokens without passing through the policy.
+///
+/// The result never goes below zero. The policy can charge a number the session's
+/// confirmed total has not caught up with, and a negative charge would hand budget
+/// back — a goal that spends its way *under* its ceiling is exactly the accounting
+/// hole this closes. The same clamp over-charges a goal replaced mid-turn, whose
+/// counter starts again at zero: the replacement wears the whole turn. That direction
+/// is deliberate, because a ceiling arriving early is a nuisance and one that never
+/// arrives is the failure being prevented.
+fn goal_turn_unaccounted_tokens(before: GoalUsage, after: GoalUsage) -> i64 {
+    let already_charged = after
+        .goal_charged
+        .saturating_sub(before.goal_charged)
+        .max(0);
+    after
+        .tokens
+        .saturating_sub(before.tokens)
+        .saturating_sub(already_charged)
+        .max(0)
+}
+
+/// Whether this turn added nothing to what the goal has spent unmeasured.
+///
+/// The answer feeds a flag that only ever falls: the store writes
+/// `usage_known AND known`, because tokens spent without a measurement leave the
+/// total an underestimate for good. A goal whose flag is false stops before its next
+/// request, and with a default allowance installed for every session that stop now
+/// reaches goals that never named a budget. One false answer therefore ends the
+/// session's every later turn before it begins, so the flag falls on evidence of
+/// unmeasured spend and on nothing weaker.
+///
+/// The order of the questions is the order of the evidence:
+///
+/// 1. Usage that moved is the measurement itself, trusted exactly as far as the
+///    session's own reconciliation says it can be normalized.
+/// 2. An estimate that appeared or changed and was not reconciled away is spend the
+///    confirmed total does not include; every path that reconciles usage clears it.
+/// 3. A failed turn is only evidence of anything if it reached the provider. Bad
+///    configuration, a rule file that cannot be admitted, a refused tool, an
+///    interrupt during setup: these fail a turn without issuing a request, and
+///    counting them poisoned the flag for a session that had spent nothing.
+///
+/// A request that returned and reported nothing is deliberately not evidence here.
+/// The session's reconciliation already answers for the usage it attributes, and a
+/// request whose tokens this session was never charged for — a title generated
+/// alongside the turn, for instance — would otherwise make an untouched counter look
+/// like a measurement gap and stop a goal that never spent anything.
 fn goal_turn_accounting_known(before: GoalUsage, after: GoalUsage) -> bool {
     if after.tokens != before.tokens || after.last_confirmed_at != before.last_confirmed_at {
         return after.confirmed_known;
     }
-    if after.failed_turns > before.failed_turns
-        || after.estimated_pending_prompt_tokens != before.estimated_pending_prompt_tokens
-    {
+    if after.estimated_pending_prompt_tokens != before.estimated_pending_prompt_tokens {
         return false;
     }
-    true
+    after.failed_turns == before.failed_turns
+        || after.last_provider_request_seq == before.last_provider_request_seq
 }
 
 fn dynamic_context_from_goal_entry(
@@ -8991,7 +9264,7 @@ fn ensure_selected_skill_prompt_budget(
     Ok(())
 }
 
-/// How many bytes of instruction files may enter the system prompt.
+/// Ceiling on the instruction bytes that may enter the system prompt.
 ///
 /// These are the rules the user wrote for this repository rather than a capability
 /// index, and the realistic corpus is larger than it looks: the `AGENTS.md` files on
@@ -9000,7 +9273,55 @@ fn ensure_selected_skill_prompt_budget(
 /// pathological file from consuming a small model's context.
 const INSTRUCTION_PROMPT_BUDGET: usize = 64 * 1024;
 
-/// Put the `AGENTS.md`-class rules in the system prompt, and say what did not fit.
+/// The share of a known model window instruction files may claim.
+///
+/// The ceiling above is an absolute byte count, which is the wrong shape on its own:
+/// 64 KB is a quarter of a 64,000-token window and under two percent of a one-million
+/// token one. Deriving a second limit from the window means a small model refuses an
+/// oversized rule file *here*, naming the file and its size, instead of assembling the
+/// request and failing later against the provider's context limit, where the reported
+/// cause is a total token count that names nothing the user can act on.
+const INSTRUCTION_CONTEXT_WINDOW_PERCENT: u64 = 25;
+
+/// The effective instruction budget for one model.
+///
+/// The smaller of [`INSTRUCTION_PROMPT_BUDGET`] and
+/// [`INSTRUCTION_CONTEXT_WINDOW_PERCENT`] of the window, so neither limit can be
+/// escaped by the other. An unknown window (`0`) keeps the absolute ceiling, because a
+/// derived share of an unknown quantity is not a limit — the provider stays the final
+/// authority there, exactly as it does for the skill budgets.
+fn instruction_prompt_budget(context_window: u64) -> usize {
+    if context_window == 0 {
+        return INSTRUCTION_PROMPT_BUDGET;
+    }
+    let derived = usize::try_from(
+        context_window
+            .saturating_mul(INSTRUCTION_CONTEXT_WINDOW_PERCENT)
+            .saturating_div(100),
+    )
+    .unwrap_or(usize::MAX)
+    .saturating_mul(APPROX_BYTES_PER_TOKEN);
+    derived.min(INSTRUCTION_PROMPT_BUDGET)
+}
+
+/// What the instruction admission decided, for whatever surface reports the turn.
+///
+/// Only the non-fatal outcome needs carrying: everything admitted is already recorded
+/// in `session.prompt.assembled` and recoverable with `zuno debug prompt`, and
+/// everything refused fails the turn before this value exists.
+#[derive(Debug, Default)]
+pub(crate) struct InstructionAdmission {
+    degraded: Vec<(String, String)>,
+}
+
+impl InstructionAdmission {
+    /// Rule sources that are **not** in force this turn, each with its reason.
+    pub(crate) fn degraded(&self) -> &[(String, String)] {
+        &self.degraded
+    }
+}
+
+/// Put the `AGENTS.md`-class rules in the system prompt, or refuse to take the turn.
 ///
 /// # Placement: after memory, before the skill catalogue
 ///
@@ -9015,30 +9336,74 @@ const INSTRUCTION_PROMPT_BUDGET: usize = 64 * 1024;
 /// here is agent prompt, memory, instructions, skills, which maps one-to-one onto the
 /// oracle's.
 ///
-/// # Whole files are admitted or dropped, never cut
+/// # A rule that cannot be admitted stops the turn
 ///
-/// [`announce_skills`] may drop individual skills because each is independent and an
-/// unmentioned skill merely goes unused. A rule file cut mid-sentence is worse than
-/// an absent one: "do X unless Y" truncated after "do X" inverts the rule the user
-/// wrote, while they go on believing it is in force. So the budget admits complete
-/// blocks in discovery order and names, by path and size, every file it had to leave
-/// out. Admitted contents are persisted in `session.prompt.assembled`, because
-/// model-visible input must remain reconstructable. They are not printed to the
-/// operational log.
+/// Whole files are admitted or refused, never cut. A rule file cut mid-sentence is
+/// worse than an absent one: "do X unless Y" truncated after "do X" inverts the rule
+/// the user wrote, while they go on believing it is in force.
 ///
-/// Warnings from the load ([`zuno_config::WarningKind`]) are surfaced the same way. A
-/// *missing* instruction file never reaches here at all, because discovery only
+/// Dropping the file and continuing has the same defect one step later, which is why
+/// this function no longer does it. The drop was reported, but only as one status
+/// detail among a turn's worth of them, and the request went to the provider anyway
+/// with the user's rules absent — so the model answered confidently under rules it had
+/// never seen, and the session's conclusions were wrong for a reason invisible in its
+/// own transcript. Refusing before the first provider request is the same treatment
+/// [`ensure_selected_skill_prompt_budget`] already gives an oversized Skill body, and
+/// an instruction file is the more authoritative of the two: a Skill that does not
+/// load merely goes unused.
+///
+/// Two conditions therefore fail the turn, each naming the path, the size and the
+/// remedy:
+///
+/// - a local file that exists but could not be read, because discovery records only
+///   paths that are there, so an unreadable one is a rule the user wrote and can fix;
+/// - any entry that does not fit [`instruction_prompt_budget`].
+///
+/// # A failed remote fetch is reported, not fatal
+///
+/// [`zuno_config::WarningKind::RemoteTimeout`], `RemoteStatus` and `RemoteTransport`
+/// describe a network, not a mistake in the workspace. Failing the turn on them would
+/// make an offline machine unusable and would hand the network authority over whether
+/// the agent runs at all. They are returned in [`InstructionAdmission::degraded`] so
+/// the surface can say which rules are not in force, and the turn proceeds.
+///
+/// A *missing* instruction file never reaches here at all, because discovery only
 /// records paths that exist — which is what keeps the common case, a project with no
 /// `AGENTS.md`, completely silent.
+///
+/// # Errors
+///
+/// An unreadable local rule file, an entry past the effective budget, or a rejection
+/// from [`Resolver::append_prompt_section`]. Contents are never echoed in the message:
+/// they are user-authored, and the path plus the byte count is what identifies the
+/// file to fix.
 fn announce_instructions(
     resolver: &mut Resolver,
     loaded: &zuno_config::LoadedInstructions,
-    notes: &mut Vec<String>,
-) -> Result<(), String> {
+    context_window: u64,
+) -> Result<InstructionAdmission, String> {
+    let mut admission = InstructionAdmission::default();
     for warning in loaded.warnings() {
-        notes.push(format!("warning: {warning}"));
+        match warning.kind() {
+            zuno_config::WarningKind::Unreadable(kind) => {
+                return Err(format!(
+                    "instruction file {} could not be read ({kind:?}), so none of its rules \
+                     would be in force; fix its permissions or encoding, or remove it from \
+                     `instructions`",
+                    warning.source(),
+                ));
+            }
+            zuno_config::WarningKind::RemoteTimeout
+            | zuno_config::WarningKind::RemoteStatus(_)
+            | zuno_config::WarningKind::RemoteTransport(_) => {
+                admission
+                    .degraded
+                    .push((warning.source().to_owned(), warning.to_string()));
+            }
+        }
     }
 
+    let budget = instruction_prompt_budget(context_window);
     let mut admitted_bytes = 0usize;
     for (index, entry) in loaded.entries().iter().enumerate() {
         let block = entry.render();
@@ -9047,15 +9412,14 @@ fn announce_instructions(
         } else {
             admitted_bytes + 2 + block.len()
         };
-        if projected > INSTRUCTION_PROMPT_BUDGET {
-            notes.push(format!(
-                "warning: instruction file {} ({} bytes) did not fit the \
-                 {INSTRUCTION_PROMPT_BUDGET}-byte prompt budget, so none of its rules are in \
-                 force; shorten it or remove it from `instructions`",
+        if projected > budget {
+            return Err(format!(
+                "instruction file {} ({} bytes) does not fit the {budget}-byte prompt budget \
+                 for this model, so none of its rules would be in force; shorten it or remove \
+                 it from `instructions`",
                 entry.source(),
                 block.len(),
             ));
-            continue;
         }
         admitted_bytes = projected;
         let origin = match entry.origin() {
@@ -9072,7 +9436,7 @@ fn announce_instructions(
         )?;
     }
 
-    Ok(())
+    Ok(admission)
 }
 
 fn configure_resident_memory(
@@ -9188,8 +9552,19 @@ fn without_credential(message: String, credential: Option<&str>) -> String {
 async fn report_prelude(
     events: &TurnEventSender,
     notes: &[String],
+    instructions: &InstructionAdmission,
     outcome: &PreludeOutcome,
 ) -> Result<(), String> {
+    for (source, reason) in instructions.degraded() {
+        events
+            .publish(TurnEvent::Notice {
+                severity: NoticeSeverity::Warning,
+                code: "instruction.not_in_force".to_owned(),
+                detail: format!("{reason}; none of the rules in {source} apply to this turn"),
+            })
+            .await
+            .map_err(to_string)?;
+    }
     let mut details: Vec<String> = notes.to_vec();
     if let Some(title) = &outcome.title {
         events

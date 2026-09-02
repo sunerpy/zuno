@@ -268,7 +268,10 @@ fn remote_parts(host: &str, name: &str) -> Option<String> {
 ///
 /// Trailing newlines only — Git's output ends with one, but a path may legally
 /// contain leading or trailing spaces, and trimming those would corrupt it.
-fn resolve_git_path(cwd: &str, value: &str) -> String {
+///
+/// Visible to the crate because [`crate::exclude`] resolves the answer to
+/// `git rev-parse --git-path`, which has exactly this shape.
+pub(crate) fn resolve_git_path(cwd: &str, value: &str) -> String {
     let trimmed = value.trim_end_matches(['\r', '\n']);
     if trimmed.is_empty() {
         return cwd.to_owned();

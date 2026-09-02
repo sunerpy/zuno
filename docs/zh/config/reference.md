@@ -88,6 +88,34 @@ Schema 是从 Rust 类型生成的，因此它与运行时实际接受的内容�
 
 所有值都是正数硬上限。`auto_resize: false` 会拒绝必须缩放的源，不会放宽字节、尺寸或像素检查。`max_base64_bytes` 不被接受。规范化、持久对象、旧记录重放、export 与 GC 语义见[图像与文件引用](/zh/guide/attachments)。
 
+## 源码导航与 CodeGraph 索引
+
+`navigation.codegraph` 决定运行时在一次调用读取源码之前，对代码智能索引提出什么要求：
+
+```json
+{
+  "navigation": {
+    "codegraph": "advise"
+  }
+}
+```
+
+| 值 | 效果 |
+| --- | --- |
+| `off`（默认） | 每次调用都允许，不记录任何内容 |
+| `advise` | 会话中第一次绕过索引会在工具结果里报告，之后不再干预 |
+| `strict` | 在索引被查询过一次之前，这类调用直接失败 |
+
+只有 worktree 根目录存在 `.codegraph` 目录时这道门才生效。索引是按仓库做出的选择，一个
+在没人建索引之前就拒绝读文件的运行时，在所有没有索引的仓库里都无法使用。
+
+算作"导航"的调用包括 `grep`、`glob`、搜索或过滤源码的 shell 命令，以及 `execute` 批处理
+中的同类调用。任何一次 CodeGraph 查询都能满足这道门，包括指令要求作为第一步的
+`codegraph status`；`init`、`sync` 之类的索引生命周期子命令既不满足也不违反它。
+
+这道门按会话跟踪，因为被委派的子 Agent 是另一个模型，它的上下文从未看到父级的索引查询。
+每次提醒或拒绝都以 `navigation.index_bypassed` 或 `navigation.index_unchecked` 写入会话事件日志，因为它回答的问题往往在运行结束很久之后才被提出。
+
 ## 子模型选择策略
 
 `subagent_model_selection` 由宿主全局持有，但会冻结到每个持久 session：

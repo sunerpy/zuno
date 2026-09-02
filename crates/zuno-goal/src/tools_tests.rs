@@ -321,3 +321,645 @@ fn a_terminal_status_discards_an_unsettled_blocker() {
         None
     );
 }
+
+/// The message the reporter shows the model, which lives on the chained cause.
+fn refusal_detail(error: &ToolError) -> String {
+    std::error::Error::source(error).map_or_else(|| error.to_string(), ToString::to_string)
+}
+
+/// Store an authoritative passing receipt for the tool session to cite.
+fn record_passing_receipt(fixture: &Fixture, id: &str, time_created: i64) {
+    let connection = fixture.store.pool().get().expect("check out connection");
+    zuno_db::verification::record(
+        &connection,
+        &zuno_db::verification::NewVerificationReceipt {
+            id: id.to_owned(),
+            session_id: "ses_tools".to_owned(),
+            turn_id: Some("turn_tools".to_owned()),
+            tool_call_id: format!("call_verify_{id}"),
+            tool_id: "shell".to_owned(),
+            summary: "cargo test".to_owned(),
+            workdir: None,
+            exit_code: Some(0),
+            exit_authority: zuno_db::verification::ExitAuthority::Authoritative,
+            outcome: zuno_db::verification::ReceiptOutcome::Passed,
+            git_head: None,
+            output_digest: None,
+            detail: None,
+            time_created,
+        },
+    )
+    .expect("record verification receipt");
+}
+
+#[test]
+fn goal_descriptions_teach_the_evidence_contract() {
+    assert!(
+        CREATE_DESCRIPTION.contains("success criteria"),
+        "{CREATE_DESCRIPTION}"
+    );
+    assert!(
+        CREATE_DESCRIPTION.contains("treated as a question"),
+        "the empty-criteria case is a documented decision, not an accident: {CREATE_DESCRIPTION}"
+    );
+    assert!(
+        UPDATE_DESCRIPTION.contains("receipt id"),
+        "{UPDATE_DESCRIPTION}"
+    );
+    assert!(
+        UPDATE_DESCRIPTION.contains("reopen"),
+        "{UPDATE_DESCRIPTION}"
+    );
+}
+
+#[tokio::test]
+async fn a_goal_proposed_without_criteria_is_a_question_until_the_first_write_then_names_the_remedy()
+ {
+    let fixture = Fixture::new();
+    let created = erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({"objective": "enable structured output for the bedrock model"}),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("a goal without criteria is a question, and a question needs none");
+    assert!(
+        !created.output.contains("Success criteria"),
+        "no checklist is invented from the objective: {}",
+        created.output
+    );
+    assert!(!created.metadata.contains_key("criteria"));
+    assert_eq!(
+        fixture.store.kind("ses_tools").expect("read kind"),
+        crate::GoalKind::Question
+    );
+
+    // The host's verification ledger reports the first write; the store sees it as
+    // this call.
+    fixture
+        .store
+        .escalate_to_change("ses_tools", "`write` wrote zuno.toml", 1_000)
+        .expect("escalate to a change goal");
+
+    let refusal = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({"expected_revision": 1, "status": "complete"}),
+            fixture.context("call_complete"),
+        )
+        .await
+        .expect_err("a change goal with no criteria cannot complete by assertion");
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    let message = refusal_detail(&refusal);
+    assert!(
+        message.contains("propose success criteria with `goal_propose` before completing"),
+        "the model is told what would have worked: {message}"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .goal("ses_tools")
+            .expect("read goal")
+            .expect("goal exists")
+            .status,
+        GoalStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn creating_a_goal_prints_the_criterion_id_to_cite_for_each_statement() {
+    let fixture = Fixture::new();
+    let output = erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "objective": "ship the evidence gate",
+                "success_criteria": ["workspace gates pass", "release artifact exists"]
+            }),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("create goal");
+
+    assert!(
+        output.output.contains("c1  workspace gates pass"),
+        "the model cannot cite an id it was never shown: {}",
+        output.output
+    );
+    assert!(
+        output.output.contains("c2  release artifact exists"),
+        "{}",
+        output.output
+    );
+    let criteria = output
+        .metadata
+        .get("criteria")
+        .expect("criteria metadata")
+        .as_array()
+        .expect("criteria is a list")
+        .len();
+    assert_eq!(criteria, 2);
+    assert!(
+        output.metadata.contains_key("goal"),
+        "the goal metadata other callers decode stays where it was"
+    );
+}
+
+#[tokio::test]
+async fn a_change_goal_completes_once_every_criterion_is_cited_or_waived() {
+    let fixture = Fixture::new();
+    let create = erase(CreateGoalTool::new(Arc::clone(&fixture.store)));
+    create
+        .execute(
+            json!({
+                "objective": "ship the evidence gate",
+                "success_criteria": ["workspace gates pass", "release artifact exists"]
+            }),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("create goal");
+    fixture
+        .store
+        .escalate_to_change("ses_tools", "edited crates/zuno-goal/src/store.rs", 1_000)
+        .expect("escalate to a change goal");
+    record_passing_receipt(&fixture, "rec_gates", 2_000);
+    let update = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
+
+    let refusal = update
+        .execute(
+            json!({"expected_revision": 1, "status": "complete"}),
+            fixture.context("call_bare_complete"),
+        )
+        .await
+        .expect_err("prose is not evidence");
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    let message = refusal_detail(&refusal);
+    assert!(
+        message.contains("c1") && message.contains("c2"),
+        "the refusal names every criterion still open: {message}"
+    );
+
+    let completed = update
+        .execute(
+            json!({
+                "expected_revision": 1,
+                "status": "complete",
+                "satisfy_criteria": [{"criterionId": "c1", "receiptId": "rec_gates"}],
+                "waive_criteria": [{
+                    "criterionId": "c2",
+                    "reason": "the artifact is built by release tooling outside this workspace"
+                }]
+            }),
+            fixture.context("call_complete"),
+        )
+        .await
+        .expect("citations and a waiver settle the checklist in one call");
+
+    assert_eq!(
+        goal_from_metadata(&completed)
+            .expect("decode update metadata")
+            .expect("goal exists")
+            .status,
+        GoalStatus::Complete
+    );
+    assert!(
+        completed.output.contains("satisfied by receipt rec_gates"),
+        "the result shows what the completion rests on: {}",
+        completed.output
+    );
+    assert!(
+        completed.output.contains("waived: the artifact is built"),
+        "{}",
+        completed.output
+    );
+}
+
+#[tokio::test]
+async fn citing_an_unproven_receipt_refuses_the_whole_update() {
+    let fixture = Fixture::new();
+    erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "objective": "ship the evidence gate",
+                "success_criteria": ["workspace gates pass"]
+            }),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("create goal");
+    let update = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
+
+    let refusal = update
+        .execute(
+            json!({
+                "expected_revision": 1,
+                "status": "complete",
+                "satisfy_criteria": [{"criterionId": "c1", "receiptId": "rec_imagined"}]
+            }),
+            fixture.context("call_invented"),
+        )
+        .await
+        .expect_err("a receipt id the model made up proves nothing");
+
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    assert!(refusal.is_model_correctable());
+    let goal = fixture
+        .store
+        .goal("ses_tools")
+        .expect("read goal")
+        .expect("goal exists");
+    assert_eq!(
+        goal.status,
+        GoalStatus::Active,
+        "the status change never runs, so the run is not silently ended"
+    );
+    assert_eq!(goal.revision, 1, "and nothing was written on the way out");
+}
+
+#[tokio::test]
+async fn one_criterion_cannot_be_both_cited_and_waived_in_a_call() {
+    let fixture = Fixture::new();
+    erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "objective": "ship the evidence gate",
+                "success_criteria": ["workspace gates pass"]
+            }),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("create goal");
+    record_passing_receipt(&fixture, "rec_gates", 2_000);
+
+    let refusal = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "expected_revision": 1,
+                "status": "complete",
+                "satisfy_criteria": [{"criterionId": "c1", "receiptId": "rec_gates"}],
+                "waive_criteria": [{"criterionId": "c1", "reason": "cannot be checked here"}]
+            }),
+            fixture.context("call_both"),
+        )
+        .await
+        .expect_err("evidence and a waiver are different claims about the same criterion");
+
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    assert_eq!(
+        fixture
+            .store
+            .criteria("ses_tools")
+            .expect("read criteria")
+            .first()
+            .expect("one criterion")
+            .status,
+        crate::GoalCriterionStatus::Open,
+        "the contradiction is caught before either half is applied"
+    );
+}
+
+#[test]
+fn the_capability_claim_description_teaches_the_provenance_contract() {
+    for clause in [
+        "documented",
+        "probed",
+        "inferred",
+        "unknown",
+        "probeReceiptId",
+        "before configuration that relies on it is written",
+        "Only documented or probed claims may be relied on",
+    ] {
+        assert!(
+            CAPABILITY_CLAIM_DESCRIPTION.contains(clause),
+            "missing `{clause}`: {CAPABILITY_CLAIM_DESCRIPTION}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_capability_claim_result_says_plainly_whether_the_claim_may_be_relied_on() {
+    let fixture = Fixture::new();
+    let tool = erase(CapabilityClaimTool::new(Arc::clone(&fixture.store)));
+    assert_eq!(tool.id(), CAPABILITY_CLAIM_TOOL_ID);
+    assert_eq!(tool.replay_policy(), ToolReplayPolicy::Never);
+    let schema = tool.definition().parameters.to_string();
+    for clause in [
+        "probeReceiptId",
+        "documented",
+        "probed",
+        "inferred",
+        "unknown",
+    ] {
+        assert!(schema.contains(clause), "{schema}");
+    }
+
+    let inferred = tool
+        .execute(
+            json!({
+                "capability": "bedrock:converse:structured_output",
+                "subject": "vendor.model-a-v1:0",
+                "state": "inferred",
+                "sources": ["https://docs.example.invalid/models/model-b"]
+            }),
+            fixture.context("call_inferred"),
+        )
+        .await
+        .expect("an honest guess is always recordable");
+    assert_eq!(inferred.title, "Capability claim recorded");
+    assert!(
+        inferred.output.contains("This claim may not be relied on"),
+        "{}",
+        inferred.output
+    );
+    assert!(
+        inferred.output.contains("cannot complete while it stands"),
+        "{}",
+        inferred.output
+    );
+    assert_eq!(inferred.metadata.get("reliable"), Some(&json!(false)));
+    assert_eq!(inferred.metadata["capabilityClaim"]["state"], "inferred");
+
+    let documented = tool
+        .execute(
+            json!({
+                "capability": "bedrock:converse:structured_output",
+                "subject": "vendor.model-a-v1:0",
+                "state": "documented",
+                "sources": ["https://docs.example.invalid/models/model-a#structured-output"]
+            }),
+            fixture.context("call_documented"),
+        )
+        .await
+        .expect("a cited document");
+    assert_eq!(documented.title, "Capability claim recorded");
+    assert!(
+        documented
+            .output
+            .contains("This claim may be relied on: it cites 1 source."),
+        "{}",
+        documented.output
+    );
+    assert!(
+        documented
+            .output
+            .contains("This replaces the earlier `inferred` claim."),
+        "{}",
+        documented.output
+    );
+    assert_eq!(documented.metadata.get("reliable"), Some(&json!(true)));
+
+    let retracted = tool
+        .execute(
+            json!({
+                "capability": "bedrock:converse:structured_output",
+                "subject": "vendor.model-a-v1:0",
+                "state": "unknown"
+            }),
+            fixture.context("call_unknown"),
+        )
+        .await
+        .expect("new information retracts a claim");
+    assert_eq!(retracted.title, "Capability claim retracted");
+    assert!(
+        retracted
+            .output
+            .contains("This retracts the earlier `documented` claim."),
+        "{}",
+        retracted.output
+    );
+    assert_eq!(
+        fixture
+            .store
+            .capability_claims("ses_tools")
+            .expect("read claims")
+            .len(),
+        1,
+        "three recordings of one claim are one row"
+    );
+
+    let unknown_field = tool
+        .execute(
+            json!({
+                "capability": "bedrock:converse:structured_output",
+                "subject": "vendor.model-a-v1:0",
+                "state": "inferred",
+                "verified": true
+            }),
+            fixture.context("call_extra"),
+        )
+        .await
+        .expect_err("a field the schema does not declare is refused rather than ignored");
+    assert!(matches!(unknown_field, ToolError::InvalidArgs { .. }));
+}
+
+#[tokio::test]
+async fn a_probed_claim_through_the_tool_needs_the_probe_receipt_and_nothing_else_may_cite_one() {
+    let fixture = Fixture::new();
+    let tool = erase(CapabilityClaimTool::new(Arc::clone(&fixture.store)));
+    let claim = |state: &str, receipt: Option<&str>| {
+        let mut value = json!({
+            "capability": "bedrock:converse:structured_output",
+            "subject": "vendor.model-a-v1:0",
+            "state": state,
+            "sources": ["https://docs.example.invalid/models/model-a"]
+        });
+        if let Some(receipt) = receipt {
+            value["probeReceiptId"] = json!(receipt);
+        }
+        value
+    };
+
+    let misplaced = tool
+        .execute(
+            claim("documented", Some("rec_probe")),
+            fixture.context("call_misplaced"),
+        )
+        .await
+        .expect_err("a receipt on a claim that does not rest on it would read as evidence");
+    assert!(matches!(misplaced, ToolError::InvalidArgs { .. }));
+    assert!(
+        refusal_detail(&misplaced).contains("only valid when state is probed"),
+        "{}",
+        refusal_detail(&misplaced)
+    );
+
+    let uncited = tool
+        .execute(claim("probed", None), fixture.context("call_uncited"))
+        .await
+        .expect_err("a probe nobody can cite was not observed");
+    assert!(matches!(uncited, ToolError::InvalidArgs { .. }));
+    assert!(uncited.is_model_correctable());
+    assert!(
+        refusal_detail(&uncited).contains("record it as `inferred`"),
+        "{}",
+        refusal_detail(&uncited)
+    );
+
+    let imagined = tool
+        .execute(
+            claim("probed", Some("rec_imagined")),
+            fixture.context("call_imagined"),
+        )
+        .await
+        .expect_err("a receipt id the model made up proves nothing");
+    assert!(
+        refusal_detail(&imagined).contains("no receipt with that id"),
+        "{}",
+        refusal_detail(&imagined)
+    );
+    assert!(
+        fixture
+            .store
+            .capability_claims("ses_tools")
+            .expect("read claims")
+            .is_empty(),
+        "no refusal left a row behind"
+    );
+
+    record_passing_receipt(&fixture, "rec_probe", 2_000);
+    let probed = tool
+        .execute(
+            claim("probed", Some("rec_probe")),
+            fixture.context("call_probed"),
+        )
+        .await
+        .expect("an observed probe");
+    assert!(
+        probed
+            .output
+            .contains("This claim may be relied on: probe receipt `rec_probe` was observed"),
+        "{}",
+        probed.output
+    );
+    assert_eq!(
+        probed.metadata["capabilityClaim"]["probe_receipt_id"],
+        "rec_probe"
+    );
+    assert_eq!(probed.metadata.get("reliable"), Some(&json!(true)));
+}
+
+#[tokio::test]
+async fn goal_update_cannot_complete_a_change_goal_while_a_capability_claim_is_inferred() {
+    let fixture = Fixture::new();
+    erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "objective": "enable structured output for model a",
+                "success_criteria": ["the provider request succeeds"]
+            }),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("create goal");
+    fixture
+        .store
+        .escalate_to_change("ses_tools", "`write` wrote zuno.toml", 1_000)
+        .expect("escalate to a change goal");
+    record_passing_receipt(&fixture, "rec_gates", 2_000);
+    erase(CapabilityClaimTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "capability": "bedrock:converse:structured_output",
+                "subject": "vendor.model-a-v1:0",
+                "state": "inferred",
+                "sources": ["https://docs.example.invalid/models/model-b"]
+            }),
+            fixture.context("call_claim"),
+        )
+        .await
+        .expect("record the guess");
+
+    let refusal = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "expected_revision": 1,
+                "status": "complete",
+                "satisfy_criteria": [{"criterionId": "c1", "receiptId": "rec_gates"}]
+            }),
+            fixture.context("call_complete"),
+        )
+        .await
+        .expect_err("every criterion is proven, but the configuration rests on a guess");
+
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    assert!(refusal.is_model_correctable());
+    let message = refusal_detail(&refusal);
+    assert!(
+        message.contains("bedrock:converse:structured_output")
+            && message.contains("vendor.model-a-v1:0")
+            && message.contains("only `documented` or `probed` claims may be relied on"),
+        "the refusal names the reliance to settle and the states that count: {message}"
+    );
+    let goal = fixture
+        .store
+        .goal("ses_tools")
+        .expect("read goal")
+        .expect("goal exists");
+    assert_eq!(goal.status, GoalStatus::Active);
+    assert_eq!(
+        goal.revision, 2,
+        "the accepted citation stays; only the status change was refused"
+    );
+}
+
+#[tokio::test]
+async fn goal_update_refuses_to_waive_a_criterion_that_is_already_satisfied() {
+    let fixture = Fixture::new();
+    erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "objective": "ship the evidence gate",
+                "success_criteria": ["workspace gates pass", "release artifact exists"]
+            }),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("create goal");
+    fixture
+        .store
+        .escalate_to_change("ses_tools", "edited crates/zuno-goal/src/store.rs", 1_000)
+        .expect("escalate to a change goal");
+    record_passing_receipt(&fixture, "rec_gates", 2_000);
+    let update = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
+
+    // The citation lands and stays; only the completion is refused, on `c2`.
+    update
+        .execute(
+            json!({
+                "expected_revision": 1,
+                "status": "complete",
+                "satisfy_criteria": [{"criterionId": "c1", "receiptId": "rec_gates"}]
+            }),
+            fixture.context("call_cite"),
+        )
+        .await
+        .expect_err("c2 is still open");
+
+    let refusal = update
+        .execute(
+            json!({
+                "expected_revision": 2,
+                "status": "complete",
+                "waive_criteria": [
+                    {"criterionId": "c1", "reason": "second thoughts"},
+                    {"criterionId": "c2", "reason": "built by release tooling"}
+                ]
+            }),
+            fixture.context("call_waive_over_evidence"),
+        )
+        .await
+        .expect_err("a waiver must not replace recorded evidence");
+
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    let message = refusal_detail(&refusal);
+    assert!(
+        message.contains("`c1` is already satisfied by receipt `rec_gates`"),
+        "{message}"
+    );
+    let criteria = fixture.store.criteria("ses_tools").expect("read criteria");
+    assert_eq!(criteria[0].status, crate::GoalCriterionStatus::Satisfied);
+    assert_eq!(
+        criteria[1].status,
+        crate::GoalCriterionStatus::Open,
+        "the refusal stops the call before the later waiver is applied"
+    );
+}

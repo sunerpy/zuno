@@ -700,7 +700,7 @@ fn prune_rolled_back_delete_preserves_the_original_preview() {
 fn prune_delete_order_and_true_related_table_count_are_pinned() {
     assert_eq!(
         PRUNE_TABLES.len(),
-        19,
+        20,
         "every session-owned schema table must be explicit"
     );
     assert_eq!(
@@ -725,6 +725,7 @@ fn prune_delete_order_and_true_related_table_count_are_pinned() {
             "session",
             "event_sequence",
             "event",
+            "verification_receipt",
         ]
     );
     assert_eq!(

@@ -5,12 +5,17 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::time::Instant;
-
-const TEST_CONFIG: &str = r#"{"formatter":false,"lsp":false,"model":"test/test-model","provider":{"test":{"name":"test","id":"test","env":[],"transport":"openai-compatible","models":{"test-model":{"id":"test-model","name":"Test model","attachment":false,"reasoning":false,"temperature":false,"tool_call":true,"release_date":"2025-01-01","limit":{"context":100000,"output":10000},"cost":{"input":0,"output":0},"options":{}}},"options":{"apiKey":"acp-probe","baseURL":"https://example.invalid/v1"}}}}"#;
+/// The provider fixture every ACP test resolves against.
+///
+/// The context ceiling is deliberately larger than any prompt these tests
+/// assemble. `ensure_prompt_context_budget` refuses a turn whose estimated prompt
+/// exceeds the model's context, and the estimate counts the whole tool catalogue —
+/// every description and JSON schema — so a ceiling set just above today's
+/// catalogue turns any prompt edit anywhere in the workspace into a failure here,
+/// pointing at ACP rather than at the edit. Keep the headroom.
+const TEST_CONFIG: &str = r#"{"formatter":false,"lsp":false,"model":"test/test-model","provider":{"test":{"name":"test","id":"test","env":[],"transport":"openai-compatible","models":{"test-model":{"id":"test-model","name":"Test model","attachment":false,"reasoning":false,"temperature":false,"tool_call":true,"release_date":"2025-01-01","limit":{"context":200000,"output":10000},"cost":{"input":0,"output":0},"options":{}}},"options":{"apiKey":"acp-probe","baseURL":"https://example.invalid/v1"}}}}"#;
 
 use serde_json::{Value, json};
 use wiremock::matchers::{body_partial_json, method, path};
@@ -4550,13 +4555,26 @@ async fn acp_detached_parent_projects_final_plan_after_background_child_completi
         projected_revision, durable_plan.revision,
         "ACP must project the final durable plan revision"
     );
-    assert!(
-        zuno_db::human_request::HumanRequestStore::new(pool)
+    // The plan snapshot above is published while the continuation turn is still running,
+    // and the stale request is cancelled at that turn's end, just before `TurnCompleted`.
+    // Nothing orders the two from this side of the pipe, so a read taken the instant the
+    // snapshot arrives can precede the cancellation; wait for the durable state instead.
+    let human_requests = zuno_db::human_request::HumanRequestStore::new(pool);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let pending = human_requests
             .pending(Some(&parent_session_id))
-            .expect("read pending reconciliation requests")
-            .is_empty(),
-        "authoritative background completion must cancel the stale reconciliation request"
-    );
+            .expect("read pending reconciliation requests");
+        if pending.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "authoritative background completion must cancel the stale reconciliation \
+             request; still pending: {pending:#?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 
     request(
         &mut stdin,
@@ -5011,7 +5029,7 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
         .find(|update| update["sessionUpdate"] == "usage_update")
         .expect("usage replay");
     assert_eq!(usage["used"], 175);
-    assert_eq!(usage["size"], 100_000);
+    assert_eq!(usage["size"], 200_000);
     assert_eq!(usage["cost"], json!({"amount":1.25,"currency":"USD"}));
 
     request(

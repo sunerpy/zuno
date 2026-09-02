@@ -230,6 +230,18 @@ continues while the model requests follow-up work, subject to interruption,
 context management, durable goal state, and an optional operator-configured
 step ceiling.
 
+### Instruction file admission
+
+Repository and user instruction files are admitted whole or not at all. A local rule file
+the host cannot read, or one that does not fit the instruction budget — 64 KB, or a quarter
+of the model's context window when that is smaller — fails the turn before the first provider
+request with a typed error naming the file and the remedy, and for a budget refusal its size
+and the budget. No notice is emitted for that case, because the turn does not run. The former
+behaviour, a status warning and a request sent without the dropped file, is gone: a turn that
+does not carry the rules the user wrote does not run. A remote instruction source that could
+not be fetched is the one non-fatal case: the turn proceeds without those rules and reports
+the `warning` notice `instruction.not_in_force` naming the source.
+
 ## Extension packages and executable plugin hosts
 
 Zuno exposes one validated package protocol for agents, slash-command workflows,
@@ -1061,7 +1073,10 @@ while preserving lifecycle state, budget, and usage. Create, edit, and shorthand
 objective changes also reconcile an active durable Plan: a multi-stage objective
 archives the previous visible Plan and installs a new root bound to the current
 `goal_id`; an atomic objective can terminalize stale unfinished work without
-replacing an already terminal historical Plan. Recognized action
+rebinding an already terminal historical Plan, and a terminal Plan that belongs to a
+previous Goal is archived as completed history — at the objective change or, if it is still
+visible, at the next host planning decision — so the completion audit never judges the
+new Goal against it. Recognized action
 words take precedence over the shorthand.
 Neither surface sends the slash text to the model or synthesizes a private
 client-only result. Goal output is a typed session-command output event, not
@@ -1209,6 +1224,21 @@ Recovery is selected from typed errors, never rendered messages:
 - A timeout or lost response around a non-replayable side effect pauses with
   `uncertain_side_effect`; recovery requires authoritative-state inspection and never
   automatically invokes the tool again.
+- A turn stopped by its own budget policy pauses with `turn_budget`. The allowance
+  belongs to one turn, so the Goal keeps whatever token budget remains, but execution
+  does not resume automatically: the next turn would spend the same allowance the same
+  way. This is distinct from the `budget_limited` status, which is the Goal's whole
+  budget being spent.
+- A budget policy may ask for compaction instead of a stop. That is classified as a
+  context-limit failure and follows the same path: retained history is compacted, and
+  the turn is retried.
+- The budget policy is consulted before every provider request and after every
+  response. The profile-published `TurnAllowance` may add a tool-call ceiling and a
+  wall-clock ceiling that apply with or without a Goal; a reached ceiling stops the
+  turn with `tool_call_budget` or `time_budget`. Under a token budget the user set on the
+  Goal, usage the provider did not report stops the turn with `usage_unknown`; under the
+  host default the turn keeps going and the default binds on what was counted. A ceiling
+  wins over compaction or continuation and yields to a Goal stop.
 - Invalid provider protocol, unsupported typed input such as an image sent to a text-only model, unavailable agent/model configuration, corrupt durable state, and other permanent failures block the goal. The same transaction stores a stable typed code and scrubbed explanation in `blocked_reason`; a permanent runtime failure never produces an unexplained blocked Goal.
 
 OpenAI and Compatible Responses decoders treat `response.failed` as a typed
@@ -1216,6 +1246,18 @@ provider failure, not as an ordinary assistant `MessageEnd(Error)`. When the
 event carries a structured error body, its type, code, and message remain in the
 error source chain for diagnostics while recovery still follows the typed
 `ProviderError` variant.
+
+### Turn allowances
+
+The standard profile publishes a typed `TurnAllowance` through
+`zuno_harness::turn_allowance_bundle`; `default_profile_with_tools_and_allowance` is the
+seam for a host with its own view. `DEFAULT_TURN_ALLOWANCE` sets `default_token_budget`
+to 8,000,000 tokens and leaves `max_tool_calls` and `max_duration` unset. The token
+default is charged against the durable Goal row, so it can outlive one turn and bind; an
+explicit Goal budget always wins over it. `None` is no longer the implied meaning of an
+absent number: a profile that publishes no allowance, or publishes
+`TurnAllowance::UNLIMITED`, is the only way to run without ceilings. Every stop is a typed `TurnError::BudgetLimited` and is surfaced to
+clients as a `notice` with code `budget.<kind>`; a compaction request is `budget.compact`.
 
 ### Tool effects and strict authorization
 

@@ -183,6 +183,14 @@ pub fn durable_usage_update(
 }
 
 /// Replays the complete current plan snapshot in stable ACP's three-state vocabulary.
+///
+/// `_meta.zuno` carries the plan's identity as well as its content: the goal it
+/// serves, the plan it was nested inside, and how deep the plan stack is. Without
+/// those, a suspended parent plan and the sub-plan that replaced it arrive as two
+/// indistinguishable `plan` updates, and a client can only render the second as if
+/// the first had never existed. `goalId` and `parentPlanId` are omitted rather than
+/// sent as `null` when absent, so their presence alone answers "is this plan
+/// nested" and "does this plan serve a goal".
 #[must_use]
 pub fn durable_plan_update(work: &WorkStateProjection) -> Option<Value> {
     let plan = work.plan.as_ref()?;
@@ -206,7 +214,7 @@ pub fn durable_plan_update(work: &WorkStateProjection) -> Option<Value> {
         }
         entries.push(entry);
     }
-    Some(json!({
+    let mut update = json!({
         "sessionUpdate": "plan",
         "entries": entries,
         "_meta": {
@@ -214,9 +222,17 @@ pub fn durable_plan_update(work: &WorkStateProjection) -> Option<Value> {
                 "planId": plan.id,
                 "revision": plan.revision,
                 "title": plan.title,
+                "stackDepth": plan.stack_depth,
             }
         },
-    }))
+    });
+    if let Some(goal_id) = &plan.goal_id {
+        update["_meta"]["zuno"]["goalId"] = json!(goal_id);
+    }
+    if let Some(parent_plan_id) = &plan.parent_plan_id {
+        update["_meta"]["zuno"]["parentPlanId"] = json!(parent_plan_id);
+    }
+    Some(update)
 }
 
 /// Clears a previously projected stable ACP Plan.
@@ -1562,6 +1578,45 @@ mod tests {
         assert_eq!(update["entries"][1]["priority"], "medium");
         assert_eq!(update["_meta"]["zuno"]["planId"], "plan-1");
         assert_eq!(update["_meta"]["zuno"]["revision"], 3);
+        assert_eq!(update["_meta"]["zuno"]["stackDepth"], 0);
+        assert_eq!(
+            update["_meta"]["zuno"].get("goalId"),
+            None,
+            "a plan with no goal omits the key rather than reporting a null goal"
+        );
+        assert_eq!(update["_meta"]["zuno"].get("parentPlanId"), None);
+    }
+
+    /// A sub-plan and the parent it suspended are two `plan` updates for the same
+    /// session. Only this identity tells them apart, so a client can show the stack
+    /// instead of pretending the parent's work disappeared.
+    #[test]
+    fn replay_plan_identifies_a_nested_sub_plan_and_the_goal_it_serves() {
+        let work = zuno_types::WorkStateProjection {
+            plan: Some(zuno_types::PlanProjection {
+                id: "plan-child".to_owned(),
+                goal_id: Some("goal-7".to_owned()),
+                parent_plan_id: Some("plan-parent".to_owned()),
+                stack_depth: 2,
+                revision: 5,
+                title: "Nested sub-plan".to_owned(),
+                steps: vec![zuno_types::PlanStepProjection {
+                    id: "step".to_owned(),
+                    title: "Do the nested work".to_owned(),
+                    status: "pending".to_owned(),
+                }],
+                span: zuno_types::ExecutionSpan::default(),
+                time_created: 1,
+                time_updated: 2,
+            }),
+            ..zuno_types::WorkStateProjection::default()
+        };
+
+        let update = durable_plan_update(&work).expect("durable plan");
+        assert_eq!(update["_meta"]["zuno"]["planId"], "plan-child");
+        assert_eq!(update["_meta"]["zuno"]["parentPlanId"], "plan-parent");
+        assert_eq!(update["_meta"]["zuno"]["goalId"], "goal-7");
+        assert_eq!(update["_meta"]["zuno"]["stackDepth"], 2);
     }
 
     #[test]

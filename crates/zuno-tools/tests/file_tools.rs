@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use zuno_error::{ToolError, ToolMutationConflictKind};
+use zuno_error::{ToolError, ToolMutationConflict, ToolMutationConflictKind};
 use zuno_tool::{InterruptHandle, NeverInterrupted, PermissionAsk, PermissionAsker, ToolContext};
 use zuno_tools::{FileFormatter, FileTools, NoopFormatter};
 
@@ -101,6 +101,25 @@ impl FileFormatter for FailingFormatter {
     }
 }
 
+/// A formatter that edits *another* file while formatting the one it was given.
+///
+/// It stands in for every writer that shares a worktree with the agent — a
+/// background job, a second tool call, the user's editor — because a formatter is
+/// the only such writer a test can schedule exactly inside the window between the
+/// moment a patch verifies a file and the moment it writes it.
+struct ConcurrentEditor {
+    path: PathBuf,
+    contents: &'static str,
+}
+
+#[async_trait]
+impl FileFormatter for ConcurrentEditor {
+    async fn format(&self, _path: &Path) -> io::Result<bool> {
+        std::fs::write(&self.path, self.contents)?;
+        Ok(false)
+    }
+}
+
 #[derive(Debug)]
 struct Interrupted;
 
@@ -129,6 +148,19 @@ fn context(
 
 fn normal_context(permission: Arc<dyn PermissionAsker>) -> ToolContext {
     context(permission, Arc::new(NeverInterrupted))
+}
+
+/// The typed conflict an uncertain outcome carries as its cause.
+///
+/// A refused write keeps its full [`ToolError`] in `#[source]` position rather than
+/// being flattened to prose, so a caller that has to decide between re-reading and
+/// revising can still read the kind off the chain.
+fn mutation_conflict(source: &(dyn std::error::Error + 'static)) -> ToolMutationConflict {
+    let Some(ToolError::MutationConflict { conflict, .. }) = source.downcast_ref::<ToolError>()
+    else {
+        panic!("expected a typed mutation conflict in the cause chain, got {source:?}");
+    };
+    (**conflict).clone()
 }
 
 fn source_message(error: &ToolError) -> String {
@@ -1083,6 +1115,124 @@ async fn file_apply_patch_reports_an_uncertain_multi_file_outcome_after_a_late_f
     assert_eq!(
         std::fs::read_to_string(workspace.path().join("second.txt")).expect("second write"),
         "second\n"
+    );
+}
+
+#[tokio::test]
+async fn file_apply_patch_never_overwrites_a_file_changed_between_read_and_write() {
+    // The formatter stands in for anything that can touch the worktree while a patch is
+    // being applied — a background job, another tool call, the user's editor. It edits
+    // the file the second half of the patch is about to write, so the bytes that were
+    // verified during preparation are no longer the bytes on disk.
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let first = workspace.path().join("first.txt");
+    let second = workspace.path().join("second.txt");
+    std::fs::write(&first, "one\n").expect("first fixture");
+    std::fs::write(&second, "two\n").expect("second fixture");
+    let tools = FileTools::with_formatter(
+        workspace.path(),
+        Arc::new(ConcurrentEditor {
+            path: second.clone(),
+            contents: "somebody else\n",
+        }),
+    )
+    .expect("file tools");
+    read_for_mutation(&tools, &first).await;
+    read_for_mutation(&tools, &second).await;
+
+    let error = tools
+        .apply_patch
+        .execute(
+            json!({
+                "patchText": concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: first.txt\n",
+                    "@@\n",
+                    "-one\n",
+                    "+ONE\n",
+                    "*** Update File: second.txt\n",
+                    "@@\n",
+                    "-two\n",
+                    "+TWO\n",
+                    "*** End Patch"
+                )
+            }),
+            normal_context(Arc::new(RecordingPermission::default())),
+        )
+        .await
+        .expect_err("a file that moved under the write must not be overwritten");
+
+    // The first file's bytes really are on disk, so the call as a whole stays uncertain
+    // rather than becoming a plain refusal; the refusal is its typed cause.
+    let ToolError::Uncertain {
+        applied_paths,
+        source,
+        ..
+    } = &error
+    else {
+        panic!("expected an uncertain outcome after the first write landed, got {error:?}");
+    };
+    assert_eq!(applied_paths, &vec![slash(&first)]);
+    let conflict = mutation_conflict(source.as_ref());
+    assert_eq!(conflict.kind, ToolMutationConflictKind::StaleRead);
+    assert_eq!(conflict.resource, "second.txt");
+    assert_eq!(conflict.required_action(), "reread");
+    assert_eq!(
+        std::fs::read_to_string(&second).expect("the concurrent edit survives"),
+        "somebody else\n",
+        "the patch must not overwrite bytes it never read"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&first).expect("the first write landed"),
+        "ONE\n"
+    );
+}
+
+#[tokio::test]
+async fn file_apply_patch_never_overwrites_a_path_that_appeared_after_preparation() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let first = workspace.path().join("first.txt");
+    let added = workspace.path().join("added.txt");
+    std::fs::write(&first, "one\n").expect("first fixture");
+    let tools = FileTools::with_formatter(
+        workspace.path(),
+        Arc::new(ConcurrentEditor {
+            path: added.clone(),
+            contents: "somebody else\n",
+        }),
+    )
+    .expect("file tools");
+    read_for_mutation(&tools, &first).await;
+
+    let error = tools
+        .apply_patch
+        .execute(
+            json!({
+                "patchText": concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: first.txt\n",
+                    "@@\n",
+                    "-one\n",
+                    "+ONE\n",
+                    "*** Add File: added.txt\n",
+                    "+added\n",
+                    "*** End Patch"
+                )
+            }),
+            normal_context(Arc::new(RecordingPermission::default())),
+        )
+        .await
+        .expect_err("an add whose path appeared concurrently must not overwrite it");
+
+    let ToolError::Uncertain { source, .. } = &error else {
+        panic!("expected an uncertain outcome after the first write landed, got {error:?}");
+    };
+    let conflict = mutation_conflict(source.as_ref());
+    assert_eq!(conflict.kind, ToolMutationConflictKind::StaleRead);
+    assert_eq!(conflict.resource, "added.txt");
+    assert_eq!(
+        std::fs::read_to_string(&added).expect("the concurrent create survives"),
+        "somebody else\n"
     );
 }
 

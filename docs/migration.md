@@ -1,9 +1,9 @@
 # Zuno database lifecycle
 
-Zuno owns its configuration and data roots. The current database format is 7.
+Zuno owns its configuration and data roots. The current database format is 8.
 Empty databases are created at the current format, and supported older formats advance
 through guarded forward migrations. Format 5 is the first supported historical format
-and upgrades in place to format 7 without rebuilding the database.
+and upgrades in place to format 8 without rebuilding the database.
 
 ## The channel database
 
@@ -52,32 +52,35 @@ it opened. See
 
 Database opening recognizes these states:
 
-1. **Empty database.** The complete format-7 schema and the single `zuno_schema`
+1. **Empty database.** The complete format-8 schema and the single `zuno_schema`
    marker are created atomically.
-2. **Format 7.** The marker and required current tables are validated before
+2. **Format 8.** The marker and required current tables are validated before
    application queries run.
-3. **Format 6.** Durable Plan-stack columns and `work_plan_archive` are added in place.
-4. **Format 5.** The additive learning schema and Plan-stack schema are migrated to
-   format 7 in one transaction.
-5. **Any other state.** An older unsupported format, a future format, a missing marker,
+3. **Format 7.** The `verification_receipt` ledger and its indexes are added in place.
+4. **Format 6.** Durable Plan-stack columns, `work_plan_archive`, and the
+   `verification_receipt` ledger are added in place.
+5. **Format 5.** The additive learning schema, Plan-stack schema, and
+   `verification_receipt` ledger are migrated to format 8 in one transaction.
+6. **Any other state.** An older unsupported format, a future format, a missing marker,
    or a marker whose required tables are absent fails closed without modification.
 
-### Format 5 or 6 to format 7
+### Format 5, 6, or 7 to format 8
 
 The supported migration uses one SQLite `BEGIN IMMEDIATE` transaction:
 
-1. Re-read the table inventory and require the marker to be exactly format 5 or 6.
+1. Re-read the table inventory and require the marker to be exactly format 5, 6, or 7.
 2. Require the historical `session` and `work_plan` tables before changing anything.
 3. From format 5, create all format-6 learning tables and indexes.
-4. Add nullable `parent_plan_id`, defaulted `stack_depth`, and
+4. From format 5 or 6, add nullable `parent_plan_id`, defaulted `stack_depth`, and
    `work_plan_archive` without rewriting the active Plan row.
-5. Update the singleton marker from 5 or 6 to 7 with a conditional update.
-6. Commit only after every schema operation and the marker update succeed.
+5. Create the `verification_receipt` ledger, which starts empty and rewrites no row.
+6. Update the singleton marker from 5, 6, or 7 to 8 with a conditional update.
+7. Commit only after every schema operation and the marker update succeed.
 
 Any failure rolls the transaction back. The migration does not rewrite existing
 `session`, `message`, `memory_candidate`, or `work_plan` values. Tests construct
-exact format-5 and format-6 shapes, compare representative rows before and after,
-then query the new learning and Plan archive tables.
+exact format-5, format-6, and format-7 shapes, compare representative rows before and
+after, then query the new learning, Plan archive, and verification tables.
 
 Changing only `zuno_schema.format` is never a valid repair: application queries require
 the matching tables and indexes. Do not manually advance or downgrade the marker.
@@ -90,8 +93,8 @@ copy before any operator-led recovery.
 
 For important data, use the exact older binary to export it or implement and validate an
 explicit forward migration. Do not guess the schema, silently drop rows, or require a
-rebuild for a format that the current binary supports. A valid format-5 or format-6 database should
-open and migrate automatically.
+rebuild for a format that the current binary supports. A valid format-5, format-6, or format-7 database
+should open and migrate automatically.
 
 ## Rules for future schema changes
 

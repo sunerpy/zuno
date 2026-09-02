@@ -26,7 +26,7 @@ Zuno is a released, fast-moving Rust agent harness. Prefer the correct foundatio
 ## Goals And Recovery
 
 - An active goal continues until it completes, is explicitly paused or blocked, reaches its budget, or encounters a typed permanent failure.
-- Recoverable provider, network, stream, SQLite contention, turn-budget, and eligible tool failures persist an exponential-backoff retry before waiting. A process restart reconstructs the deadline from SQLite.
+- Recoverable provider, network, stream, SQLite contention, Agent step-limit, and eligible tool failures persist an exponential-backoff retry before waiting. A process restart reconstructs the deadline from SQLite. A turn that spends its token, tool-call, or wall-clock allowance pauses with `turn_budget` and is never retried mechanically; a Goal whose own token budget ran out ends as `budget_limited`.
 - Retry delays are positive, capped, jittered, and interruptible by user input. A valid peer `Retry-After` is clamped to the configured ceiling and is never replaced by an earlier local delay.
 - Retry decisions use typed errors, never rendered messages. Authentication and user interruption pause; invalid protocol, corrupt durable state, and permanent configuration failures block.
 - Tool execution is at-most-once by default. `ToolReplayPolicy::Never` is the default; only explicitly read-only or idempotent tools may declare `Safe`.

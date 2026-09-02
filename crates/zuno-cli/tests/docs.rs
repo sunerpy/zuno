@@ -1041,31 +1041,33 @@ fn completion_docs_describe_stdout_and_profile_safe_installation() {
 }
 
 #[test]
-fn database_docs_describe_guarded_format_five_or_six_to_seven_migration() {
+fn database_docs_describe_the_guarded_chain_to_the_current_format() {
     contains_all(
         "docs/migration.md",
         &[
-            "current database format is 7",
+            "current database format is 8",
             "Format 5",
             "Format 6",
+            "Format 7",
             "`BEGIN IMMEDIATE`",
-            "marker from 5 or 6 to 7",
+            "marker from 5, 6, or 7 to 8",
             "`session`, `message`, `memory_candidate`, or `work_plan` values",
             "future format",
             "fails closed without modification",
             "format marker updated last",
-            "A valid format-5 or format-6 database should",
-            "open and migrate automatically",
+            "A valid format-5, format-6, or format-7 database",
+            "should open and migrate automatically",
         ],
     );
     contains_all(
         "docs/zh/operate/migration.md",
         &[
-            "当前数据库格式为 7",
+            "当前数据库格式为 8",
             "format 5",
             "format 6",
+            "format 7",
             "`BEGIN IMMEDIATE`",
-            "marker 从 5 或 6 改为 7",
+            "marker 从 5、6 或 7 改为 8",
             "`session`、`message`、",
             "`work_plan` 值",
             "未来格式",
@@ -1077,9 +1079,10 @@ fn database_docs_describe_guarded_format_five_or_six_to_seven_migration() {
     contains_all(
         "docs/zh/operate/prompt-workflow.md",
         &[
-            "数据库当前格式为 7",
+            "数据库当前格式为 8",
             "format 5",
             "format 6",
+            "format 7",
             "`BEGIN IMMEDIATE`",
             "`session`",
             "`message`",
@@ -1119,6 +1122,481 @@ fn database_docs_describe_guarded_format_five_or_six_to_seven_migration() {
             "migration guide still advertises retired migration surface {retired:?}"
         );
     }
+}
+
+/// Both instruction guides must state that an inadmissible rule file stops the turn.
+///
+/// The behaviour is the opposite of what it was — a dropped file used to be a warning
+/// the turn survived — so a stale guide here does not merely omit a detail. It tells a
+/// user their oversized `AGENTS.md` is silently ignored, which is the exact belief the
+/// change exists to correct, and the English and Chinese pages must not disagree about
+/// which of the two outcomes they will get.
+#[test]
+fn instruction_guides_document_the_fail_closed_admission() {
+    contains_all(
+        "docs/config/instructions.md",
+        &[
+            "## When a rule file stops the turn",
+            "admitted whole or not at all",
+            "fail the turn before the first provider request",
+            "cannot be read",
+            "smaller of 64 KB",
+            "quarter of the model's context window",
+            "Neither is a warning",
+            "failed remote fetch is the documented",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/instructions.md",
+        &[
+            "## 什么情况下规则文件会中止本轮",
+            "要么整份进入 Prompt，要么完全不进入",
+            "第一次 provider request 之前让本轮失败",
+            "无法读取",
+            "64 KB 与模型 context window 四分之一",
+            "两者都不是警告",
+            "远端抓取失败是上文记录的例外",
+        ],
+    );
+}
+
+#[test]
+fn durable_state_guides_document_evidence_gated_completion() {
+    contains_all(
+        "docs/guide/durable-state.md",
+        &[
+            "### Success criteria and evidence",
+            "cannot be completed on assertion alone",
+            "`satisfy_criteria`",
+            "`waive_criteria`",
+            "[verification rcp_",
+            "Cite this id as evidence",
+            "inferred rather than observed",
+            "Evidence expires",
+            "[goal evidence]",
+            "turns a question goal into a change goal",
+            "`.git/info/exclude`",
+            "### Token budget",
+            "around every provider request inside a turn",
+            "`turn_budget`",
+            "last tenth of the allowance",
+            "does not move the goal's revision",
+            "only when the charge changes the goal's\nstatus",
+            "### The host's default allowance",
+            "8,000,000 tokens",
+            "`TurnAllowance::UNLIMITED`",
+            "told to set one",
+            "does not carry over",
+            "Under the default the turn\ncontinues",
+            "no provider can withhold",
+            "whether or not a Goal is active",
+            "no durable counter to",
+            "Nor is a session whose goal has finished",
+            "does not stop a turn",
+            "pause a goal the",
+            "still charged to the goal",
+            "`budget_limited` is the exception",
+            "### Capability claims",
+            "`capability_claim`",
+            "`inferred`",
+            "reports its previous state",
+            "bedrock-model-capability-review",
+            "### Generated state stays out of the commit",
+            "refused before it runs",
+            "git restore --staged",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/durable-state.md",
+        &[
+            "### 成功标准与证据",
+            "不能仅凭断言完成",
+            "`satisfy_criteria`",
+            "`waive_criteria`",
+            "[verification rcp_",
+            "推断得来、而非直接观测到的",
+            "证据会过期",
+            "[goal evidence]",
+            "转成 change Goal",
+            "`.git/info/exclude`",
+            "### Token 预算",
+            "每一次 provider request 前后执行",
+            "`turn_budget`",
+            "最后十分之一是刻意留出的",
+            "并不会推进 Goal 的 revision",
+            "只有当这次记账改变了 Goal 的状态时 revision 才会推进",
+            "### 宿主的默认额度",
+            "8,000,000",
+            "`TurnAllowance::UNLIMITED`",
+            "被告知去设一个",
+            "有一条规则不适用于默认值",
+            "但在默认额度下回合\n会继续",
+            "provider 无法扣下的边界",
+            "没有 Goal 的回合一样可以空转",
+            "没有可供记账的持久计数器",
+            "Goal 已经结束的会话同样不受影响",
+            "不会让回合停止",
+            "还会把模型已经完成的 Goal 改回暂停",
+            "响应仍然会记账到这个 Goal 上",
+            "`budget_limited` 是例外",
+            "### 能力声明",
+            "`capability_claim`",
+            "`inferred`",
+            "退回到更弱的状态",
+            "bedrock-model-capability-review",
+            "### 生成物不会进入提交",
+            "拒绝信息点名这些路径",
+            "git restore --staged",
+        ],
+    );
+}
+
+/// The navigation gate is off by default, so a user who never reads this page never
+/// meets it. That makes the page the only place the three modes and the `.codegraph`
+/// precondition are written down for a human, and a page that named the key without
+/// its precondition would send someone to turn `strict` on in a repository with no
+/// index and conclude the gate does nothing.
+#[test]
+fn configuration_reference_documents_the_navigation_gate() {
+    contains_all(
+        "docs/reference/configuration.md",
+        &[
+            "## Source navigation and the CodeGraph index",
+            "`navigation.codegraph`",
+            "`off` (default)",
+            "`advise`",
+            "`strict`",
+            "inert unless the worktree root carries a `.codegraph` directory",
+            "including `codegraph status`",
+            "satisfy the gate nor violate it",
+            "tracked per session",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/reference.md",
+        &[
+            "## 源码导航与 CodeGraph 索引",
+            "`navigation.codegraph`",
+            "`off`（默认）",
+            "`advise`",
+            "`strict`",
+            "只有 worktree 根目录存在 `.codegraph` 目录时这道门才生效",
+            "`codegraph status`；`init`、`sync` 之类的索引生命周期子命令",
+            "既不满足也不违反它",
+            "这道门按会话跟踪",
+        ],
+    );
+}
+
+/// What the merge of the hardening work with #90 had to reconcile in the guides: a
+/// spent allowance pauses rather than retries, a Goal's finished Plan is archived rather
+/// than left to block the next Goal, and a client can tell a Zuno notice from a thought.
+#[test]
+fn release_docs_pin_allowance_pauses_retired_plans_and_tagged_notices() {
+    contains_all(
+        "docs/guide/sessions.md",
+        &[
+            "Agent step-limit, and eligible",
+            "pauses the Goal with `turn_budget` and waits for a",
+            "ends as `budget_limited` instead",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/sessions.md",
+        &[
+            "Agent 步数上限以及符合条件的工具失败",
+            "以 `turn_budget` 暂停 Goal 并等待人工",
+            "Goal 则进入 `budget_limited`",
+        ],
+    );
+    contains_all(
+        "AGENTS.md",
+        &[
+            "Agent step-limit, and eligible tool failures",
+            "pauses with `turn_budget` and is never retried mechanically",
+        ],
+    );
+    contains_all(
+        "docs/harness-runtime.md",
+        &[
+            "### Turn allowances",
+            "to 8,000,000 tokens",
+            "`TurnAllowance::UNLIMITED`",
+            "turn with `tool_call_budget` or `time_budget`",
+            "stops the turn with `usage_unknown`; under the",
+            "### Instruction file admission",
+            "does not fit the instruction budget",
+            "No notice is emitted for that case",
+            "the `warning` notice `instruction.not_in_force` naming the source",
+            "so the completion audit never judges the",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/harness-runtime.md",
+        &[
+            "Agent 步数上限和符合条件的工具失败",
+            "以 `turn_budget` 暂停",
+            "8,000,000 token 的宿主默认额度",
+            "以 `tool_call_budget` 或 `time_budget` 停止",
+            "用量不可测时以 `usage_unknown` 停止；宿主默认额度则继续执行",
+            "code 为 `budget.<kind>`",
+            "64 KB 与模型 context window 四分之一取较小值",
+            "这种\n情况不会发出任何 notice",
+            "`instruction.not_in_force` 报告哪个来源的规则本轮不生效",
+            "归档为已完成的历史，完成审计不会再拿它对账新 Goal",
+        ],
+    );
+    for (relative, needle) in [
+        (
+            "docs/guide/durable-state.md",
+            "archived as completed history",
+        ),
+        ("docs/guide/tui.md", "archived as completed history"),
+        (
+            "docs/reference/zed-acp.md",
+            "completed history and the panel is cleared",
+        ),
+        ("docs/zh/guide/durable-state.md", "归档为已完成的历史"),
+        ("docs/zh/guide/tui.md", "归档为已完成的历史"),
+        (
+            "docs/zh/guide/editors.md",
+            "归档为已完成的历史，面板随之清空",
+        ),
+    ] {
+        contains_all(relative, &[needle]);
+    }
+    contains_all(
+        "docs/reference/zed-acp.md",
+        &[
+            "`_meta.zuno.planId`, `revision`, `title`, and `stackDepth`",
+            "`parentPlanId`",
+            "`_meta.zuno.stepId`",
+            "`_meta.zuno.cleared: true`",
+            "`_meta.zuno.notice`",
+            "a remote rule file that could not be fetched",
+            "`instruction.*` or `budget.*` families",
+        ],
+    );
+    contains_all(
+        "docs/zh/cli/acp.md",
+        &[
+            "`_meta.zuno.planId`",
+            "`stackDepth`",
+            "`parentPlanId`",
+            "`_meta.zuno.stepId`",
+            "`_meta.zuno.cleared: true`",
+            "`_meta.zuno.notice`",
+            "无法抓取的远程规则文件",
+            "`instruction.not_in_force`、`budget.compact`、`budget.token_budget`",
+        ],
+    );
+    contains_all(
+        "docs/cli/acp.md",
+        &[
+            "`_meta.zuno.notice`",
+            "a remote rule file that could not be fetched",
+            "`instruction.not_in_force`, `budget.compact`, or `budget.token_budget`",
+        ],
+    );
+    contains_all(
+        "docs/guide/headless.md",
+        &[
+            "{\"type\":\"notice\",\"severity\":\"warning\",\"code\":\"budget.token_budget\"",
+            "while the turn still runs",
+            "produces no `notice` event",
+            "published on the server event stream as",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/headless.md",
+        &[
+            "{\"type\":\"notice\",\"severity\":\"warning\",\"code\":\"budget.token_budget\"",
+            "但回合继续执行",
+            "不会产生 `notice` 事件",
+            "同一事件在 server 事件流上以 `notice` 发布",
+        ],
+    );
+    contains_all(
+        "docs/design/zed-acp-integration.md",
+        &[
+            "with one tagged exception",
+            "`_meta.zuno.notice`",
+            "`_meta.zuno.{planId,revision,title,stackDepth}`",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/editors.md",
+        &[
+            "唯一带标记的例外",
+            "无法抓取的远程规则文件",
+            "`_meta.zuno.notice`",
+        ],
+    );
+    contains_all(
+        "docs/guide/tui.md",
+        &[
+            "appear as\ntoasts whose level follows the notice severity",
+            "They are not model output.",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/tui.md",
+        &[
+            "以 toast 显示，级别跟随通知的 severity",
+            "它们不是模型输出。",
+        ],
+    );
+    for (relative, retired) in [
+        ("docs/guide/sessions.md", "turn-budget"),
+        ("AGENTS.md", "turn-budget"),
+        ("docs/zh/guide/sessions.md", "回合预算以及符合"),
+        ("docs/zh/operate/harness-runtime.md", "回合预算和符合"),
+        ("docs/reference/zed-acp.md", "historical Plan attached"),
+        ("docs/harness-runtime.md", "silently truncated"),
+        (
+            "docs/harness-runtime.md",
+            "with the typed notice `instruction.not_in_force`",
+        ),
+        ("docs/guide/headless.md", "which fails the turn"),
+        ("docs/zh/guide/headless.md", "这会让本轮失败"),
+        ("docs/cli/acp.md", "could not be admitted"),
+        ("docs/zh/cli/acp.md", "无法进入 Prompt 的规则文件"),
+        ("docs/reference/zed-acp.md", "could not be admitted"),
+        ("docs/zh/guide/editors.md", "无法进入 Prompt 的规则文件"),
+    ] {
+        assert!(
+            !read(relative).contains(retired),
+            "{relative} still carries retired wording {retired:?}"
+        );
+    }
+}
+
+/// The two configuration index pages enumerate every top-level key by hand, and the count
+/// sentence above the table is typed by hand too. A key added to the schema without a row
+/// here is a feature the reference can be read cover to cover without discovering.
+#[test]
+fn config_index_tables_enumerate_every_schema_root_key() {
+    let schema: serde_json::Value =
+        serde_json::from_str(&read("schemas/zuno.json")).expect("schemas/zuno.json is JSON");
+    let mut schema_keys: Vec<String> = schema["properties"]
+        .as_object()
+        .expect("schema root has properties")
+        .keys()
+        .cloned()
+        .collect();
+    schema_keys.push("$schema".to_owned());
+    schema_keys.sort();
+    schema_keys.dedup();
+    let number_words = [
+        (43, "Forty-three", "四十三"),
+        (44, "Forty-four", "四十四"),
+        (45, "Forty-five", "四十五"),
+        (46, "Forty-six", "四十六"),
+        (47, "Forty-seven", "四十七"),
+        (48, "Forty-eight", "四十八"),
+    ];
+    let (_, english, chinese) = number_words
+        .iter()
+        .find(|(count, _, _)| *count == schema_keys.len())
+        .copied()
+        .unwrap_or_else(|| panic!("extend number_words for {} keys", schema_keys.len()));
+
+    for (relative, heading, count_sentence) in [
+        (
+            "docs/config/index.md",
+            "## The top-level shape",
+            format!("{english} keys exist."),
+        ),
+        (
+            "docs/zh/config/index.md",
+            "## 顶层结构",
+            format!("一共有{chinese}个键。"),
+        ),
+    ] {
+        let text = read(relative);
+        let start = text
+            .find(heading)
+            .unwrap_or_else(|| panic!("{relative} has {heading}"));
+        let section = &text[start..];
+        let section = section[heading.len()..]
+            .find("\n## ")
+            .map_or(section, |end| &section[..heading.len() + end]);
+        assert!(
+            section.contains(&count_sentence),
+            "{relative} must state {count_sentence:?} for {} schema keys",
+            schema_keys.len()
+        );
+        let mut listed: Vec<String> = section
+            .lines()
+            .filter(|line| line.starts_with("| ") && line.contains('`'))
+            .flat_map(|line| {
+                line.split('`')
+                    .skip(1)
+                    .step_by(2)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        listed.sort();
+        listed.dedup();
+        assert_eq!(
+            listed, schema_keys,
+            "{relative} top-level table drifted from schemas/zuno.json root properties"
+        );
+    }
+}
+
+/// The receipt's authority is the one shell fact a caller acts on, and the text-level
+/// downgrade is invisible from the configuration table above it. A guide that stops at
+/// `exitPolicy` teaches a reader to expect `authoritative` and read `derived` as a bug.
+#[test]
+fn tool_guides_explain_what_the_command_s_own_text_takes_back() {
+    contains_all(
+        "docs/guide/tools.md",
+        &[
+            "can take the guarantee",
+            "written as an `if` or `while` condition exits zero when that check fails",
+            "a `&&` chain before the last",
+            "`$LASTEXITCODE` holding the second one's code alone",
+            "What changes is the claim: it drops to `derived`",
+            "nothing and keeps the configuration's verdict",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/tools.md",
+        &[
+            "因为跑在一个权威 shell 里的文本同样可以",
+            "循环只报告最后一次迭代",
+            "`$LASTEXITCODE` 里只剩后者的退出码",
+            "它降为 `derived`",
+            "什么都没掩盖",
+        ],
+    );
+}
+
+/// A built-in Skill count is the one fact on these pages that a new Skill falsifies,
+/// and three pages carry it. Pinning the count together with the newest name keeps a
+/// reader from trusting a list that silently stopped being complete.
+#[test]
+fn skill_pages_count_every_built_in_skill() {
+    contains_all(
+        "docs/guide/skills.md",
+        &[
+            "compiles eleven first-party Skills",
+            "`bedrock-model-capability-review`",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/skills.md",
+        &["十一个第一方 Skill", "`bedrock-model-capability-review`"],
+    );
+    contains_all(
+        "docs/reference/configuration.md",
+        &[
+            "compiles eleven original first-party Skills",
+            "`bedrock-model-capability-review`",
+        ],
+    );
 }
 
 #[test]
