@@ -1,6 +1,10 @@
-//! Model-facing tools for reading, creating, and finishing persisted goals.
+//! Model-facing tools for reading, creating, and finishing persisted goals, and for
+//! recording what a session relies on while it works towards one.
 
-use crate::{Goal, GoalCriterion, GoalCriterionStatus, GoalError, GoalStore, ModelStatus};
+use crate::{
+    CapabilityClaim, CapabilityClaimOutcome, CapabilityClaimState, Goal, GoalCriterion,
+    GoalCriterionStatus, GoalError, GoalStore, ModelStatus, NewCapabilityClaim,
+};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -21,6 +25,8 @@ pub const CREATE_GOAL_TOOL_ID: &str = "goal_propose";
 pub const UPDATE_GOAL_TOOL_ID: &str = "goal_update";
 /// Wire name of the durable Goal input request.
 pub const REQUEST_GOAL_INPUT_TOOL_ID: &str = "goal_request_input";
+/// Wire name of the capability-claim ledger writer.
+pub const CAPABILITY_CLAIM_TOOL_ID: &str = "capability_claim";
 
 /// The description the model reads for [`GetGoalTool`].
 pub const GET_DESCRIPTION: &str = include_str!("description/get-goal.txt");
@@ -30,6 +36,8 @@ pub const CREATE_DESCRIPTION: &str = include_str!("description/create-goal.txt")
 pub const UPDATE_DESCRIPTION: &str = include_str!("description/update-goal.txt");
 /// The description the model reads for [`GoalRequestInputTool`].
 pub const REQUEST_INPUT_DESCRIPTION: &str = include_str!("description/request-input.txt");
+/// The description the model reads for [`CapabilityClaimTool`].
+pub const CAPABILITY_CLAIM_DESCRIPTION: &str = include_str!("description/capability-claim.txt");
 
 /// No-argument payload for [`GetGoalTool`].
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -134,6 +142,25 @@ pub struct GoalRequestInputParams {
     /// Whether more than one offered option may be selected.
     #[serde(default)]
     pub multiple: Option<bool>,
+}
+
+/// Payload for [`CapabilityClaimTool`].
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CapabilityClaimParams {
+    /// The capability being claimed, such as `bedrock:converse:structured_output`.
+    pub capability: String,
+    /// What it is claimed about, such as a model id.
+    pub subject: String,
+    /// How the claim is known. Only `documented` and `probed` may be relied on.
+    pub state: CapabilityClaimState,
+    /// Citations: URLs, document titles or file paths. Required with `documented`.
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Receipt id printed by the tool result whose request exercised the capability.
+    /// Required with `probed`, and valid only there.
+    #[serde(default)]
+    pub probe_receipt_id: Option<String>,
 }
 
 /// Reads the current session goal.
@@ -440,7 +467,79 @@ impl TypedTool for GoalRequestInputTool {
     }
 }
 
+/// Records what the session believes an external capability can do, with provenance.
+///
+/// Every rule about what may be recorded lives in
+/// [`GoalStore::record_capability_claim`]; this tool only refuses the one combination
+/// the store would silently normalise — a receipt on a claim that does not rest on it
+/// — so the model learns the contract instead of losing an argument.
+#[derive(Debug, Clone)]
+pub struct CapabilityClaimTool {
+    store: Arc<GoalStore>,
+}
+
+impl CapabilityClaimTool {
+    /// Bind the tool to a shared goal store.
+    #[must_use]
+    pub fn new(store: Arc<GoalStore>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl TypedTool for CapabilityClaimTool {
+    type Params = CapabilityClaimParams;
+
+    fn id(&self) -> &str {
+        CAPABILITY_CLAIM_TOOL_ID
+    }
+
+    fn description(&self) -> &str {
+        CAPABILITY_CLAIM_DESCRIPTION
+    }
+
+    async fn run(
+        &self,
+        params: CapabilityClaimParams,
+        ctx: ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let cites_receipt = params
+            .probe_receipt_id
+            .as_deref()
+            .is_some_and(|receipt_id| !receipt_id.trim().is_empty());
+        if cites_receipt && params.state != CapabilityClaimState::Probed {
+            return Err(invalid(
+                CAPABILITY_CLAIM_TOOL_ID,
+                "probeReceiptId is only valid when state is probed; a receipt on a claim that \
+                 does not rest on it would read as evidence afterwards",
+            ));
+        }
+        let store = Arc::clone(&self.store);
+        let session_id = ctx.session_id;
+        let claim = NewCapabilityClaim {
+            capability: params.capability,
+            subject: params.subject,
+            state: params.state,
+            sources: params.sources,
+            probe_receipt_id: params.probe_receipt_id,
+        };
+        let at_ms =
+            crate::store::now_ms().map_err(|error| failed(CAPABILITY_CLAIM_TOOL_ID, error))?;
+        let outcome = tokio::task::spawn_blocking(move || {
+            store.record_capability_claim(&session_id, &claim, at_ms)
+        })
+        .await
+        .map_err(|error| failed(CAPABILITY_CLAIM_TOOL_ID, error))?
+        .map_err(|error| map_goal_error(CAPABILITY_CLAIM_TOOL_ID, error))?;
+        capability_claim_output(&outcome)
+    }
+}
+
 /// Build all three goal tools over one authoritative store.
+///
+/// [`CapabilityClaimTool`] is deliberately not among them: it is a separate
+/// registration, so a host that has no use for the ledger does not advertise a tool
+/// whose refusals would then never be read.
 #[must_use]
 pub fn goal_tools(store: Arc<GoalStore>) -> Vec<Arc<dyn Tool>> {
     vec![
@@ -620,6 +719,64 @@ fn render_criterion(criterion: &GoalCriterion) -> String {
         "{}  {} [{standing}]",
         criterion.criterion_id, criterion.statement
     )
+}
+
+/// A claim result that says plainly whether the claim may be relied on.
+///
+/// The verdict is the first thing after the echo, in the same words for every state,
+/// because the model reads this once and then either builds on the capability or
+/// goes to find a document or a probe. A result that merely echoed the row would
+/// leave "inferred" looking like a success.
+fn capability_claim_output(outcome: &CapabilityClaimOutcome) -> Result<ToolOutput, ToolError> {
+    let claim = &outcome.claim;
+    let title = if outcome.is_retraction() {
+        "Capability claim retracted"
+    } else {
+        "Capability claim recorded"
+    };
+    let mut lines = vec![format!(
+        "Recorded `{}` of `{}` as `{}`.",
+        claim.capability, claim.subject, claim.state
+    )];
+    if let Some(previous) = outcome.previous_state
+        && previous != claim.state
+    {
+        lines.push(if outcome.is_retraction() {
+            format!("This retracts the earlier `{previous}` claim.")
+        } else {
+            format!("This replaces the earlier `{previous}` claim.")
+        });
+    }
+    lines.push(reliance_verdict(claim));
+    let value =
+        serde_json::to_value(claim).map_err(|error| failed(CAPABILITY_CLAIM_TOOL_ID, error))?;
+    Ok(ToolOutput::text(title, lines.join("\n"))
+        .with_metadata("capabilityClaim", value)
+        .with_metadata("reliable", Value::Bool(claim.state.may_be_relied_on())))
+}
+
+/// One sentence saying whether the claim may be relied on, and what to do if not.
+fn reliance_verdict(claim: &CapabilityClaim) -> String {
+    match claim.state {
+        CapabilityClaimState::Documented => format!(
+            "This claim may be relied on: it cites {} source{}.",
+            claim.sources.len(),
+            if claim.sources.len() == 1 { "" } else { "s" }
+        ),
+        CapabilityClaimState::Probed => format!(
+            "This claim may be relied on: probe receipt `{}` was observed in this session. A \
+             later write to the workspace retires it; probe again after the last change if \
+             that happens.",
+            claim.probe_receipt_id.as_deref().unwrap_or("?")
+        ),
+        CapabilityClaimState::Inferred | CapabilityClaimState::Unknown => format!(
+            "This claim may not be relied on: it is `{}`, not observed or cited. A goal that \
+             changes the workspace cannot complete while it stands; cite a vendor document for \
+             this exact subject (`documented`) or make a real probe request and record its \
+             receipt (`probed`).",
+            claim.state
+        ),
+    }
 }
 
 fn goal_output(tool: &str, goal: Option<Goal>) -> Result<ToolOutput, ToolError> {

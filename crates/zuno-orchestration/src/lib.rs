@@ -196,7 +196,7 @@ macro_rules! pack_location {
 }
 
 /// Every Skill shipped by the first-party pack, in stable presentation order.
-pub const SKILLS: [BuiltinSkillDescriptor; 10] = [
+pub const SKILLS: [BuiltinSkillDescriptor; 11] = [
     BuiltinSkillDescriptor {
         name: "customize-zuno",
         description: "Inspect or change Zuno configuration, providers, authentication, permissions, Agents, workflows, Skills, MCP servers, or extensions.",
@@ -311,6 +311,17 @@ pub const SKILLS: [BuiltinSkillDescriptor; 10] = [
         allowed_profiles: UI_DESIGN_PROFILES,
         required_tools: &["read", "skill"],
         content_sha256: "c7be8a1d626f396f2dd068f6ca4f0cd64565bfc5584dba52e7360f4676afb7c0",
+        provenance: NATIVE_PROVENANCE,
+    },
+    BuiltinSkillDescriptor {
+        name: "bedrock-model-capability-review",
+        description: "Verify an Amazon Bedrock model capability per model id and region from a cited vendor document or an observed probe, and record it with capability_claim before writing provider configuration.",
+        content: include_str!("skills/bedrock-model-capability-review.md"),
+        source_id: pack_source_id!("skill/bedrock-model-capability-review"),
+        location: pack_location!("bedrock-model-capability-review"),
+        allowed_profiles: MUTATING_WORK_PROFILES,
+        required_tools: &["read", "capability_claim"],
+        content_sha256: "f56621fa11ffeadd9b3d09131ad3efc6e979101a6e4d2a2ba7b66dcc61b81285",
         provenance: NATIVE_PROVENANCE,
     },
 ];

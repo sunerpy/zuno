@@ -13,11 +13,20 @@
 //! completion refused without naming the criterion ids would leave the model
 //! guessing, and guessing at "done" is the defect these variants exist to stop.
 //!
+//! The capability refusals — [`GoalError::CapabilityUndocumented`],
+//! [`GoalError::CapabilityProbeUncited`], [`GoalError::CapabilityProbeUnproven`],
+//! [`GoalError::CapabilityProbeStale`] and [`GoalError::CapabilityUnverified`] — are
+//! model-visible for the same reason again: each names the capability and subject
+//! it is about and the state that would have been accepted, because the whole point
+//! of the ledger is that a guess is told apart from an observation *before* it is
+//! written into configuration, not discovered afterwards.
+//!
 //! `zuno-error` deliberately gains nothing here. Four sibling crates depend on its
 //! shape, and none of these failures is a database failure — a refused status is
 //! a policy decision, not a broken statement. Database failures pass through
 //! unchanged as [`GoalError::Db`].
 
+use crate::capability::UnverifiedCapability;
 use crate::status::GoalStatus;
 use std::path::PathBuf;
 use zuno_error::DbError;
@@ -223,6 +232,117 @@ pub enum GoalError {
         unsatisfied: Vec<String>,
     },
 
+    /// A capability claim state in the ledger is outside the closed runtime set.
+    #[error("unknown capability claim state `{value}`")]
+    UnknownCapabilityClaimState {
+        /// Corrupt stored discriminator.
+        value: String,
+    },
+
+    /// A capability claim named no capability, or nothing to claim it about.
+    ///
+    /// A claim is the sentence "`subject` has `capability`"; with either half blank
+    /// there is nothing for a state to be the provenance of, and an anonymous row
+    /// would satisfy the letter of "record the claim" while recording nothing.
+    #[error("capability claim {field} must not be empty")]
+    EmptyCapabilityClaimField {
+        /// Which half was blank: `capability` or `subject`.
+        field: &'static str,
+    },
+
+    /// A claim was called `documented` without citing anything.
+    ///
+    /// A claim with no citation is not documentation. This is the refusal that stops
+    /// "the docs say so" from being recorded as if a document had been read.
+    #[error(
+        "capability `{capability}` of `{subject}` cannot be recorded as documented without at \
+         least one source naming the document (a URL, a title or a file path); with nothing \
+         to cite, record it as `inferred`"
+    )]
+    CapabilityUndocumented {
+        /// The capability that was claimed.
+        capability: String,
+        /// What it was claimed about.
+        subject: String,
+    },
+
+    /// A claim was called `probed` without citing the probe's receipt.
+    ///
+    /// A probe whose response nobody can point at was not observed; it is a guess
+    /// with a request attached, and the honest state for that is `inferred`.
+    #[error(
+        "capability `{capability}` of `{subject}` cannot be recorded as probed without citing \
+         the receipt id printed by the tool result whose request exercised the capability; \
+         without one, record it as `inferred`"
+    )]
+    CapabilityProbeUncited {
+        /// The capability that was claimed.
+        capability: String,
+        /// What it was claimed about.
+        subject: String,
+    },
+
+    /// The cited probe receipt does not prove the probe was observed to succeed.
+    ///
+    /// `reason` names which rule refused, in the same vocabulary as
+    /// [`GoalError::EvidenceUnproven`]: no such receipt in this session, a failed or
+    /// undecidable outcome, or an exit status that was inferred rather than observed.
+    #[error(
+        "capability `{capability}` of `{subject}` is not proven by probe receipt `{receipt_id}`: \
+         {reason}"
+    )]
+    CapabilityProbeUnproven {
+        /// The capability that was claimed.
+        capability: String,
+        /// What it was claimed about.
+        subject: String,
+        /// The receipt that was cited.
+        receipt_id: String,
+        /// Which rule refused, in the words the model needs to act on.
+        reason: String,
+    },
+
+    /// The cited probe receipt predates the last recorded change to the workspace.
+    ///
+    /// The same rule as [`GoalError::EvidenceStale`], for the same reason: a probe
+    /// made before the configuration was written says nothing about the configuration
+    /// that exists now. Both timestamps are named so the model can see the order.
+    #[error(
+        "capability `{capability}` of `{subject}` cites probe receipt `{receipt_id}` recorded at \
+         {receipt_at_ms}, which predates the workspace change recorded at {marked_at_ms}; probe \
+         again after the last change and record the claim again"
+    )]
+    CapabilityProbeStale {
+        /// The capability that was claimed.
+        capability: String,
+        /// What it was claimed about.
+        subject: String,
+        /// The receipt that is now too old to count.
+        receipt_id: String,
+        /// When the workspace last changed, in Unix milliseconds.
+        marked_at_ms: i64,
+        /// When the receipt was recorded, in Unix milliseconds.
+        receipt_at_ms: i64,
+    },
+
+    /// Completion was requested while the goal rests on capability claims that were
+    /// never verified.
+    ///
+    /// Every claim is listed with the capability, the subject and why it does not
+    /// count, because the remedy is per claim: cite a document for *this* subject, or
+    /// probe *this* subject again after the last change. A refusal that said only
+    /// "unverified capability" would send the model back to guessing which one.
+    #[error(
+        "goal cannot complete while it relies on capability claims that were never verified: {}; \
+         only `documented` or `probed` claims may be relied on — cite a vendor document for this \
+         exact subject or record an observed probe with `capability_claim`",
+        unverified_detail(claims)
+    )]
+    CapabilityUnverified {
+        /// The claims that block, in the order they were recorded.
+        claims: Vec<UnverifiedCapability>,
+    },
+
     /// An objective was empty or only whitespace.
     ///
     /// Ports the check at `codex-rs/tui/src/goal_files.rs:39-41`. A goal with no
@@ -299,6 +419,18 @@ fn unsatisfied_detail(unsatisfied: &[String]) -> String {
     }
 }
 
+/// How [`GoalError::CapabilityUnverified`] lists what blocks.
+///
+/// One clause per claim, each reading "`capability` of `subject` is recorded as …",
+/// so the model can match every clause to a `capability_claim` call it has to make.
+fn unverified_detail(claims: &[UnverifiedCapability]) -> String {
+    claims
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 impl GoalError {
     /// Whether this failure is the model's to fix by asking again differently.
     ///
@@ -319,12 +451,19 @@ impl GoalError {
             | Self::EvidenceUnproven { .. }
             | Self::EvidenceStale { .. }
             | Self::EvidenceMissing { .. }
+            | Self::EmptyCapabilityClaimField { .. }
+            | Self::CapabilityUndocumented { .. }
+            | Self::CapabilityProbeUncited { .. }
+            | Self::CapabilityProbeUnproven { .. }
+            | Self::CapabilityProbeStale { .. }
+            | Self::CapabilityUnverified { .. }
             | Self::EmptyObjective => true,
             Self::Db(_)
             | Self::UnknownRetryReason { .. }
             | Self::UnknownPauseReason { .. }
             | Self::UnknownCriterionStatus { .. }
             | Self::UnknownGoalKind { .. }
+            | Self::UnknownCapabilityClaimState { .. }
             | Self::Spill { .. }
             | Self::PointerTooLong { .. }
             | Self::Document { .. }
@@ -360,5 +499,67 @@ mod tests {
             DbError::Busy { retry_after: None }.to_string(),
             "the transparent variant must not add a prefix of its own"
         );
+    }
+
+    #[test]
+    fn a_stale_plan_refusal_names_both_goals_and_the_tool_that_rebinds_the_plan() {
+        let error = GoalError::PlanBelongsToAnotherGoal {
+            session_id: "ses_abc".to_owned(),
+            plan_goal_id: "goal_old".to_owned(),
+            goal_id: "goal_new".to_owned(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "the visible plan for session ses_abc belongs to goal goal_old, not to goal goal_new \
+             being completed; recreate the plan for this goal with `plan_update` (action \
+             `create`, goal_id `goal_new`) before completing"
+        );
+        assert!(error.is_model_refusal());
+    }
+
+    #[test]
+    fn an_unverified_capability_refusal_names_every_claim_and_the_two_states_that_count() {
+        let error = GoalError::CapabilityUnverified {
+            claims: vec![
+                UnverifiedCapability {
+                    capability: "bedrock:converse:structured_output".to_owned(),
+                    subject: "vendor.model-a-v1:0".to_owned(),
+                    state: crate::CapabilityClaimState::Inferred,
+                    reason: "is recorded as `inferred`".to_owned(),
+                },
+                UnverifiedCapability {
+                    capability: "bedrock:converse:tool_use".to_owned(),
+                    subject: "vendor.model-a-v1:0".to_owned(),
+                    state: crate::CapabilityClaimState::Unknown,
+                    reason: "is recorded as `unknown`".to_owned(),
+                },
+            ],
+        };
+        assert_eq!(
+            error.to_string(),
+            "goal cannot complete while it relies on capability claims that were never \
+             verified: `bedrock:converse:structured_output` of `vendor.model-a-v1:0` is recorded \
+             as `inferred`; `bedrock:converse:tool_use` of `vendor.model-a-v1:0` is recorded as \
+             `unknown`; only `documented` or `probed` claims may be relied on — cite a vendor \
+             document for this exact subject or record an observed probe with `capability_claim`"
+        );
+        assert!(error.is_model_refusal());
+    }
+
+    #[test]
+    fn a_change_goal_with_no_criteria_is_told_to_propose_them_rather_than_which_id_is_open() {
+        let error = GoalError::EvidenceMissing {
+            unsatisfied: Vec::new(),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("propose success criteria with `goal_propose` before completing"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("neither satisfied nor waived"),
+            "an empty checklist has no ids to list: {message}"
+        );
+        assert!(error.is_model_refusal());
     }
 }

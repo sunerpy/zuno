@@ -12,7 +12,7 @@
 //! Inspired by Codex's goal mechanism and extended with Zuno's durable
 //! cross-turn retry controller.
 //!
-//! # The five decisions this crate makes
+//! # The six decisions this crate makes
 //!
 //! **Statuses are split by who may write them.** The model may report `blocked`
 //! or `complete` — facts about its own work. It may not write `paused`,
@@ -37,6 +37,15 @@
 //! asserting that the tests pass is not evidence, and evidence gathered before the
 //! last edit is not evidence about the code that exists now, so a recorded change
 //! reopens anything it invalidates. See [`store::GoalStore::satisfy_criterion`].
+//!
+//! **A capability the session relies on is a claim with provenance.** Enabling a
+//! provider feature because a *related* model is documented to have it is a guess,
+//! and a guess written into configuration and then reported as success is
+//! indistinguishable afterwards from a checked fact. The [`capability`] ledger
+//! records each claim with how it is known — a cited document, an observed probe, an
+//! inference, or nothing — and a goal that changes the workspace cannot complete
+//! while it rests on one of the last two. See
+//! [`store::GoalStore::record_capability_claim`].
 //!
 //! **The Markdown document is a projection, and the conflict rule is fixed.** The
 //! goal is also rendered to `.zuno/goal/<sessionID>.md` for a human to read
@@ -63,6 +72,7 @@
 //! ```
 
 pub mod budget;
+pub mod capability;
 pub mod continuation;
 pub mod error;
 pub mod pause;
@@ -74,6 +84,10 @@ pub mod store;
 pub mod tools;
 
 pub use crate::budget::{GoalBudgetPolicy, SOFT_RESERVE_DIVISOR};
+pub use crate::capability::{
+    CAPABILITY_CLAIM_TABLE, CapabilityClaim, CapabilityClaimOutcome, CapabilityClaimState,
+    NewCapabilityClaim, UnverifiedCapability,
+};
 pub use crate::continuation::{
     BLOCKED_TURN_THRESHOLD, BlockedAudit, ContinuationAttempt, ContinuationSuppression,
     GoalContinuation, GoalTurnMode, GoalTurnOutcome, PreparedContinuation, QueuedUserInput,
@@ -102,10 +116,11 @@ pub use crate::store::{
     OBJECTIVE_SPILL_DIRECTORY, SCHEMA, TABLE, UsageRecorded, default_spill_dir,
 };
 pub use crate::tools::{
-    CREATE_GOAL_TOOL_ID, CreateGoalParams, CreateGoalTool, GET_GOAL_TOOL_ID, GetGoalParams,
-    GetGoalTool, GoalInputOption, GoalRequestInputParams, GoalRequestInputTool,
-    REQUEST_GOAL_INPUT_TOOL_ID, SatisfiedCriterion, UPDATE_GOAL_TOOL_ID, UpdateGoalParams,
-    UpdateGoalStatus, UpdateGoalTool, WaivedCriterion, goal_from_metadata, goal_tools,
+    CAPABILITY_CLAIM_TOOL_ID, CREATE_GOAL_TOOL_ID, CapabilityClaimParams, CapabilityClaimTool,
+    CreateGoalParams, CreateGoalTool, GET_GOAL_TOOL_ID, GetGoalParams, GetGoalTool,
+    GoalInputOption, GoalRequestInputParams, GoalRequestInputTool, REQUEST_GOAL_INPUT_TOOL_ID,
+    SatisfiedCriterion, UPDATE_GOAL_TOOL_ID, UpdateGoalParams, UpdateGoalStatus, UpdateGoalTool,
+    WaivedCriterion, goal_from_metadata, goal_tools,
 };
 
 #[cfg(test)]

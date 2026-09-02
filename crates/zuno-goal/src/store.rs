@@ -62,6 +62,24 @@
 //! A [`GoalKind::Question`] goal is untouched by all three. Answering a question
 //! leaves nothing behind to verify, and demanding a receipt for it would only teach
 //! the model to manufacture one.
+//!
+//! Two consequences of that split are decisions, not gaps. A goal proposed with no
+//! criteria at all is accepted, because a question needs none, and it stays a
+//! question until the first write escalates it; from then on it can never complete,
+//! and the refusal says to propose criteria with `goal_propose` rather than
+//! inventing them from the objective — a checklist the store guessed would be a
+//! checklist nobody committed to. And the plan a session can see must belong to the
+//! goal being completed: `work_plan` is keyed by session, so a plan bound to an
+//! earlier goal survives replacement with every step already `completed`, and
+//! without an ownership check a new goal would complete against the previous
+//! goal's finished work. See [`GoalStore::complete_checked`].
+//!
+//! A fourth rule is about reliance rather than verification. A session that enables
+//! a provider feature because a *related* model is documented to have it has made a
+//! claim it never observed, and the configuration it wrote looks the same as one
+//! written on evidence. [`crate::capability`] records every such claim with its
+//! provenance, and a change goal cannot complete while a claim recorded under it is
+//! `inferred` or `unknown`, or rests on a probe that a later write retired.
 
 use crate::error::GoalError;
 use crate::pause::{GoalPauseReason, GoalPauseState};
@@ -136,13 +154,18 @@ CREATE TABLE IF NOT EXISTS goal (
 ///
 /// # Why the evidence tables are here and not in `zuno-db`
 ///
-/// `goal_criterion`, `goal_kind`, `goal_mutation_mark` and `goal_request_usage`
-/// are additive `CREATE TABLE IF NOT EXISTS` statements in this batch, outside
-/// the database format marker `zuno_db::migration` maintains. That is deliberate:
-/// they carry *goal* policy rather than application data, they are created by
-/// whichever process attaches a [`GoalStore`], and a database that predates them
-/// is not stale — it simply has no criteria yet. Putting them behind the format
-/// marker would make a goal-policy change a whole-database migration.
+/// `goal_criterion`, `goal_kind`, `goal_mutation_mark`, `goal_request_usage` and
+/// `goal_capability_claim` are additive `CREATE TABLE IF NOT EXISTS` statements in
+/// this batch, outside the database format marker `zuno_db::migration` maintains.
+/// That is deliberate: they carry *goal* policy rather than application data, they
+/// are created by whichever process attaches a [`GoalStore`], and a database that
+/// predates them is not stale — it simply has no criteria, and no claims, yet.
+/// Putting them behind the format marker would make a goal-policy change a
+/// whole-database migration.
+///
+/// `goal_capability_claim` is session-scoped rather than goal-scoped: it is
+/// provenance for what a session relied on, and [`crate::capability`] explains why
+/// goal replacement leaves it alone.
 pub const AUXILIARY_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS goal_criterion (
     session_id TEXT NOT NULL,
@@ -173,6 +196,18 @@ CREATE TABLE IF NOT EXISTS goal_request_usage (
     tokens INTEGER NOT NULL,
     recorded_at_ms INTEGER NOT NULL,
     PRIMARY KEY(session_id, request_id)
+);
+CREATE TABLE IF NOT EXISTS goal_capability_claim (
+    id TEXT PRIMARY KEY NOT NULL,
+    session_id TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('documented', 'probed', 'inferred', 'unknown')),
+    sources TEXT NOT NULL,
+    probe_receipt_id TEXT,
+    time_created INTEGER NOT NULL,
+    time_updated INTEGER NOT NULL,
+    UNIQUE(session_id, capability, subject)
 );
 CREATE TABLE IF NOT EXISTS goal_continuation_deferral (
     session_id TEXT PRIMARY KEY NOT NULL
@@ -2463,6 +2498,12 @@ fn insert_criteria(
 /// means the workspace moved after that check ran, so the receipt describes code
 /// that no longer exists.
 ///
+/// A third failure is a reliance rather than a check: a capability the session
+/// enabled on a guess. Once the criteria are settled, the claims recorded under this
+/// goal are audited too — see [`crate::capability::audit_capability_claims`] — so a
+/// goal cannot complete while it rests on an `inferred` or `unknown` claim, or on a
+/// probe that a later write retired.
+///
 /// A [`GoalKind::Question`] goal passes straight through. Nothing changed, so
 /// there is nothing to verify, and requiring a receipt would leave a run that was
 /// only ever asked a question with no way to finish.
@@ -2479,29 +2520,28 @@ fn audit_evidence(tx: &Transaction<'_>, session_id: &str) -> Result<(), GoalErro
     if criteria.is_empty() || !unsatisfied.is_empty() {
         return Err(GoalError::EvidenceMissing { unsatisfied });
     }
-    let Some(marked_at_ms) = mutation_mark(tx, session_id)? else {
-        return Ok(());
-    };
-    // Checked per criterion rather than against the newest citation alone: each
-    // criterion stands on its own receipt, and the first stale one in list order is
-    // also the first one the run should verify again.
-    for criterion in &criteria {
-        let Some(receipt_id) = criterion.receipt_id.as_deref() else {
-            continue;
-        };
-        let Some(receipt) = receipt_for(tx, session_id, receipt_id)? else {
-            continue;
-        };
-        if marked_at_ms > receipt.time_created {
-            return Err(GoalError::EvidenceStale {
-                criterion_id: criterion.criterion_id.clone(),
-                receipt_id: receipt_id.to_owned(),
-                marked_at_ms,
-                receipt_at_ms: receipt.time_created,
-            });
+    if let Some(marked_at_ms) = mutation_mark(tx, session_id)? {
+        // Checked per criterion rather than against the newest citation alone: each
+        // criterion stands on its own receipt, and the first stale one in list order
+        // is also the first one the run should verify again.
+        for criterion in &criteria {
+            let Some(receipt_id) = criterion.receipt_id.as_deref() else {
+                continue;
+            };
+            let Some(receipt) = receipt_for(tx, session_id, receipt_id)? else {
+                continue;
+            };
+            if marked_at_ms > receipt.time_created {
+                return Err(GoalError::EvidenceStale {
+                    criterion_id: criterion.criterion_id.clone(),
+                    receipt_id: receipt_id.to_owned(),
+                    marked_at_ms,
+                    receipt_at_ms: receipt.time_created,
+                });
+            }
         }
     }
-    Ok(())
+    crate::capability::audit_capability_claims(tx, session_id)
 }
 
 /// Every criterion for a session in list order, from any connection or
@@ -2655,7 +2695,10 @@ fn touch_goal(
 }
 
 /// When the workspace last changed, if anything reported a change.
-fn mutation_mark(connection: &Connection, session_id: &str) -> Result<Option<i64>, GoalError> {
+pub(crate) fn mutation_mark(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<i64>, GoalError> {
     let marked_at_ms = connection
         .query_row(
             "SELECT marked_at_ms FROM goal_mutation_mark WHERE session_id = ?1",
@@ -2694,7 +2737,7 @@ fn kind_from(connection: &Connection, session_id: &str) -> Result<GoalKind, Goal
 /// Scoped to `session_id` because a receipt is evidence about one run: an id
 /// borrowed from another session proves nothing here, and looking it up
 /// unscoped would make it look like it did.
-fn receipt_for(
+pub(crate) fn receipt_for(
     tx: &Transaction<'_>,
     session_id: &str,
     receipt_id: &str,
@@ -2711,7 +2754,7 @@ fn receipt_for(
 /// code, or run the check in a way that surfaces a real exit status — so the
 /// refusal distinguishes them instead of saying only that the citation was
 /// rejected.
-fn unproven_reason(receipt: &VerificationReceipt) -> String {
+pub(crate) fn unproven_reason(receipt: &VerificationReceipt) -> String {
     match receipt.outcome {
         ReceiptOutcome::Passed => format!(
             "its recorded exit status is {}, not authoritative, so it does not show the \
@@ -2929,6 +2972,10 @@ fn clear_auxiliary_state(tx: &Transaction<'_>, session_id: &str) -> Result<(), D
         params![session_id],
     )
     .map_err(zuno_db::map_error)?;
+    // `goal_capability_claim` is deliberately left alone. A claim is provenance for
+    // what the session relied on, not evidence about one goal; deleting it here would
+    // make an inferred capability indistinguishable from a checked one as soon as the
+    // goal that inferred it was replaced. See `crate::capability`.
     if table_exists(tx, "human_request")? {
         tx.execute(
             "UPDATE human_request \
