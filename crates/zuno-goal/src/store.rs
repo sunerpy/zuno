@@ -298,7 +298,7 @@ BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS goal_history_after_update
 AFTER UPDATE ON goal
-WHEN NEW.revision <> OLD.revision
+WHEN NEW.revision <> OLD.revision OR NEW.goal_id <> OLD.goal_id
 BEGIN
     INSERT INTO goal_history (
         session_id, goal_id, revision, objective, success_criteria, status, blocked_reason,
@@ -310,6 +310,14 @@ BEGIN
         NEW.updated_at_ms
     );
 END;";
+
+/// The guard on [`AUXILIARY_SCHEMA`]'s update trigger, as it is written there.
+///
+/// Read by [`guard_history_trigger`] to tell a current stored trigger from one this
+/// release replaced, and asserted against the schema by a test so the two cannot
+/// drift apart.
+const HISTORY_UPDATE_GUARD: &str =
+    "WHEN NEW.revision <> OLD.revision OR NEW.goal_id <> OLD.goal_id";
 
 const COLUMNS: &str = "session_id, goal_id, revision, objective, success_criteria, status, \
      blocked_reason, token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, \
@@ -618,7 +626,7 @@ impl GoalStore {
             tx.execute_batch(SCHEMA).map_err(zuno_db::map_error)?;
             tx.execute_batch(AUXILIARY_SCHEMA)
                 .map_err(zuno_db::map_error)?;
-            guard_history_on_revision(tx)?;
+            guard_history_trigger(tx)?;
             widen_pause_reasons(tx)
         })?;
         Ok(Self { pool, spill_dir })
@@ -3321,11 +3329,20 @@ pub(crate) fn now_ms() -> Result<i64, GoalError> {
 /// a trigger that already exists, so a database created before the guard keeps the old
 /// one and every provider request after the first would fail to record its usage.
 ///
+/// The guard also fires on a new `goal_id`, because a replacement resets the revision
+/// to 1: [`GoalStore::replace_goal_as_system`] writes a different goal over a goal that
+/// is still at its first revision, and a guard on the revision alone would compare 1
+/// with 1 and record nothing, leaving the new goal with no history at all. Two clauses
+/// rather than one on the row's identity, since the revision is what changes on every
+/// other update.
+///
 /// Keyed on the declared SQL rather than a version number, for the reason given on
 /// [`widen_pause_reasons`]: these tables sit outside the [`zuno_db::migration`] format
-/// marker. A trigger holds no data, so the repair is a drop and a recreate from the one
+/// marker. Keyed on the whole guard, so a database carrying either earlier trigger --
+/// the unguarded one, or the one that guarded only the revision -- is repaired. A
+/// trigger holds no data, so the repair is a drop and a recreate from the one
 /// definition, and it runs inside the caller's transaction.
-fn guard_history_on_revision(tx: &Transaction<'_>) -> Result<(), DbError> {
+fn guard_history_trigger(tx: &Transaction<'_>) -> Result<(), DbError> {
     let declared: Option<String> = tx
         .query_row(
             "SELECT sql FROM sqlite_master \
@@ -3338,7 +3355,7 @@ fn guard_history_on_revision(tx: &Transaction<'_>) -> Result<(), DbError> {
     let Some(declared) = declared else {
         return Ok(());
     };
-    if declared.contains("NEW.revision <> OLD.revision") {
+    if declared.contains(HISTORY_UPDATE_GUARD) {
         return Ok(());
     }
     tx.execute_batch("DROP TRIGGER goal_history_after_update")

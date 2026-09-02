@@ -1361,6 +1361,106 @@ fn goal_history_keeps_every_revision_across_cancel_and_replacement() {
     );
 }
 
+/// The trigger's guard has to say the same thing as the repair that enforces it.
+///
+/// Two copies of one string in two files that are never read together: a guard reworded
+/// in the schema and not here would leave every upgraded database being repaired on
+/// every open, or none of them being repaired at all.
+#[test]
+fn the_history_trigger_carries_the_guard_the_repair_looks_for() {
+    assert!(
+        AUXILIARY_SCHEMA.contains(HISTORY_UPDATE_GUARD),
+        "the update trigger must be declared with {HISTORY_UPDATE_GUARD}"
+    );
+}
+
+/// Replacing a goal that is still at revision 1 must not lose the new goal's history.
+///
+/// The revision resets to 1 for a replacement, so a trigger guarded on the revision
+/// alone compares 1 with 1 and appends nothing. The row that is lost is the first one:
+/// what the new goal was created as, which is the only record of its objective before
+/// anything edited it.
+#[test]
+fn replacing_a_first_revision_goal_records_the_new_goal_in_history() {
+    let fixture = Fixture::in_memory();
+    let first = fixture
+        .store
+        .create_goal(SESSION, "first objective", None)
+        .expect("create the first goal");
+    let second = fixture
+        .store
+        .replace_goal_as_system(SESSION, "replacement objective", None)
+        .expect("replace the goal");
+    assert_eq!(first.revision, second.revision, "both are at revision 1");
+    assert_ne!(first.goal_id, second.goal_id);
+
+    let history = fixture.store.history(SESSION).expect("read goal history");
+    assert_eq!(
+        history
+            .iter()
+            .map(|entry| (entry.goal.goal_id.as_str(), entry.revision))
+            .collect::<Vec<_>>(),
+        [(first.goal_id.as_str(), 1), (second.goal_id.as_str(), 1)]
+    );
+    assert_eq!(history[1].goal.objective, "replacement objective");
+}
+
+/// A database created with the revision-only guard is repaired the same way.
+///
+/// The trigger before this one recorded every revision change and nothing else, so it
+/// is not broken in the way the unguarded trigger was - it silently omits one row
+/// instead of failing a key. An install that never fails is exactly the one nobody
+/// would think to check, so the repair is exercised here rather than assumed.
+#[test]
+fn a_revision_only_history_trigger_is_replaced_before_a_goal_is_replaced() {
+    let spill = tempfile::tempdir().expect("create spill directory");
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
+    );
+    let mut connection = pool.open_connection().expect("open shared connection");
+    zuno_db::migration::apply(&mut connection).expect("apply shared schema");
+    connection
+        .execute_batch(SCHEMA)
+        .expect("create the goal table");
+    connection
+        .execute_batch(AUXILIARY_SCHEMA)
+        .expect("create the goal history table and its triggers");
+    connection
+        .execute_batch(
+            "DROP TRIGGER goal_history_after_update;
+             CREATE TRIGGER goal_history_after_update
+             AFTER UPDATE ON goal
+             WHEN NEW.revision <> OLD.revision
+             BEGIN
+                 INSERT INTO goal_history (
+                     session_id, goal_id, revision, objective, success_criteria, status,
+                     blocked_reason, token_budget, tokens_used, usage_known,
+                     time_used_seconds, created_at_ms, updated_at_ms
+                 ) VALUES (
+                     NEW.session_id, NEW.goal_id, NEW.revision, NEW.objective,
+                     NEW.success_criteria, NEW.status, NEW.blocked_reason, NEW.token_budget,
+                     NEW.tokens_used, NEW.usage_known, NEW.time_used_seconds,
+                     NEW.created_at_ms, NEW.updated_at_ms
+                 );
+             END",
+        )
+        .expect("build the trigger this release replaced");
+    drop(connection);
+
+    let store = GoalStore::from_pool(Arc::clone(&pool), spill.path().to_owned())
+        .expect("attach goal store to the older database");
+    store
+        .create_goal(SESSION, "replace me on an upgraded database", None)
+        .expect("create goal");
+    let replacement = store
+        .replace_goal_as_system(SESSION, "the replacement", None)
+        .expect("replace the goal");
+
+    let history = store.history(SESSION).expect("read history");
+    assert_eq!(history.len(), 2, "the replacement has to be recorded");
+    assert_eq!(history[1].goal.goal_id, replacement.goal_id);
+}
+
 /// A database created before the guard existed must not fail on its second charge.
 ///
 /// The old trigger appended a history row for every `UPDATE goal`, and `goal_history` is
