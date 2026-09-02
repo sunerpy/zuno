@@ -8547,6 +8547,47 @@ fn the_headless_surfaces_wire_every_capability_the_tui_has() {
     }
 }
 
+/// A ceiling nobody installs is a ceiling nobody has.
+///
+/// The budget policy treats an unbudgeted goal as unbounded unless the host hands it
+/// the profile's allowance, and the navigation gate reads its mode from configuration
+/// on every decision. Both are one call each, both are easy to drop while editing
+/// the composition, and dropping either is silent: the session still runs, it just
+/// runs without the limit somebody configured. The host is not constructible outside
+/// `open`, so the composition is checked where it is written.
+#[test]
+fn the_host_installs_the_ceilings_its_profile_and_configuration_declare() {
+    let turn = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("cmd")
+            .join("turn.rs"),
+    )
+    .expect("turn.rs is readable");
+
+    for required in [
+        // The profile's allowance is read, defaulted to unlimited only on absence,
+        // and reaches the policy the turn actually runs under.
+        ".service::<zuno_engine::budget::TurnAllowance>()",
+        "zuno_engine::budget::TurnAllowance::UNLIMITED",
+        ".with_allowance(self.turn_allowance)",
+        // The navigation gate is installed with its configured mode, whether the
+        // worktree is indexed, and the syntax its commands are parsed with.
+        ".with_navigation(",
+        "navigation.codegraph",
+        "zuno_tools::index_present",
+        // Generated paths come from the registry, so the exclude block and the
+        // staging refusal cannot name different paths.
+        "zuno_paths::IGNORE_PATTERNS",
+    ] {
+        assert!(
+            turn.contains(required),
+            "`turn.rs` no longer installs `{required}`, so a limit somebody configured \
+             would be silently absent from every session"
+        );
+    }
+}
+
 #[test]
 fn every_extension_contribution_reaches_its_native_consumer() {
     let cmd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

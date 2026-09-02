@@ -197,6 +197,11 @@ fn descriptions() -> Vec<Description> {
             text: zuno_goal::tools::UPDATE_DESCRIPTION,
         },
         Description {
+            wire_id: "capability_claim",
+            file: "crates/zuno-goal/src/description/capability-claim.txt",
+            text: zuno_goal::tools::CAPABILITY_CLAIM_DESCRIPTION,
+        },
+        Description {
             wire_id: "webfetch",
             file: "crates/zuno-tools/src/description/webfetch.txt",
             text: zuno_tools::webfetch::DESCRIPTION,

@@ -130,6 +130,9 @@ pub struct Config {
     /// Skill discovery and model-visible catalog settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills: Option<SkillsConfig>,
+    /// What the runtime asks of a code-intelligence index before reading source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub navigation: Option<NavigationConfig>,
     /// Named git or local directory references.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub references: Option<OrderedMap<ReferenceEntry>>,
@@ -358,6 +361,32 @@ pub enum LogLevel {
     Warn,
     /// Error.
     Error,
+}
+
+/// How much the runtime asks of a code-intelligence index before reading source.
+///
+/// Off by default. An index is a per-repository choice, and a runtime that refused to
+/// read a file until somebody set one up would be unusable in every repository that
+/// has not.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NavigationConfig {
+    /// What to do when a call reads source before the CodeGraph index was consulted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codegraph: Option<NavigationGate>,
+}
+
+/// The three answers to "a search ran before the index was asked anything".
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NavigationGate {
+    /// Allow every call and record nothing. The default.
+    #[default]
+    Off,
+    /// Report the session's first such call and then leave it alone.
+    Advise,
+    /// Fail such a call until the index has been queried once.
+    Strict,
 }
 
 /// Session sharing behaviour (`config/config.ts:59-62`).

@@ -2033,6 +2033,13 @@ pub(crate) struct TurnHost {
     /// fact went unnoticed before.
     instruction_admission: InstructionAdmission,
     commands: zuno_catalog::command::Registry,
+    /// The ceilings a turn runs under when nobody set a goal budget.
+    ///
+    /// Resolved once from the active profile, because the answer is the profile's and
+    /// re-reading it per turn would let a mid-session profile swap change a limit the
+    /// running goal was already being measured against. A profile that publishes no
+    /// allowance means no ceilings, not a number this host invents.
+    turn_allowance: zuno_engine::budget::TurnAllowance,
     goal_store: Arc<GoalStore>,
     goal_projection: GoalProjection,
     goal_continuation: GoalContinuation,
@@ -3662,6 +3669,15 @@ impl TurnHost {
             let public_http = runtime
                 .service::<zuno_network::PublicHttpClient>()
                 .ok_or_else(|| "profile did not register a public HTTP transport".to_owned())?;
+            // Optional, unlike the services above. An absent allowance is a profile
+            // saying "no ceilings", which is a valid answer and must not be read as a
+            // default this host supplies; `zuno_harness::turn_allowance_bundle`
+            // documents the contract from the other side.
+            let turn_allowance = runtime
+                .service::<zuno_engine::budget::TurnAllowance>()
+                .map_or(zuno_engine::budget::TurnAllowance::UNLIMITED, |allowance| {
+                    *allowance
+                });
             let todo_store = Arc::clone(&database);
             let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&todo_store));
             let goal_store = Arc::new(
@@ -3748,22 +3764,25 @@ impl TurnHost {
             let learning_projection =
                 zuno_learning::LearningProjectionService::new(Arc::clone(&database));
             let mut notes = plan.notes;
-            // The goal projection writes a generated Markdown document into the
-            // worktree, and a generated file that shows up in `git status` is how an
-            // agent ends up staging its own scratch output — or reporting a dirty tree
-            // as evidence of a change it did not make. The pattern goes in the
+            // Zuno writes several files into the worktree it is working in: the goal
+            // projection, spilled tool output, background execution records. A generated
+            // file that shows up in `git status` is how an agent ends up staging its own
+            // scratch output — or reporting a dirty tree as evidence of a change it did
+            // not make. The patterns come from `zuno_paths::IGNORE_PATTERNS`, which is
+            // derived from the same registry the staging refusal reads, so a path added
+            // in one place cannot be missed in the other. They go in the
             // repository-private `.git/info/exclude` rather than in a tracked
             // `.gitignore`, because Zuno editing a file the repository's history owns
             // would land as an unexplained diff in somebody else's next commit. Once
             // per host: the call spawns git, and the block is idempotent, so a turn
             // loop would pay for it repeatedly to learn nothing.
             if let Some(worktree) = worktree.as_deref() {
-                match zuno_paths::ensure_managed_block(worktree, &[zuno_goal::IGNORE_PATTERN]) {
+                match zuno_paths::ensure_managed_block(worktree, zuno_paths::IGNORE_PATTERNS) {
                     // Silent when nothing changed: re-asserting the same block on every
                     // session is the normal case and does not need reporting.
                     Ok(outcome) if outcome.changed() => notes.push(format!(
-                        "excluded `{}` from git in {}",
-                        zuno_goal::IGNORE_PATTERN,
+                        "excluded {} from git in {}",
+                        zuno_paths::IGNORE_PATTERNS.join(", "),
                         worktree.display()
                     )),
                     Ok(_) => {}
@@ -3772,8 +3791,7 @@ impl TurnHost {
                     // cost of not writing the block is a generated file the user sees in
                     // `git status`, which is a nuisance and not a correctness problem.
                     Err(error) => notes.push(format!(
-                        "warning: could not exclude `{}` from git: {error}",
-                        zuno_goal::IGNORE_PATTERN
+                        "warning: could not exclude generated paths from git: {error}"
                     )),
                 }
             }
@@ -4006,6 +4024,39 @@ impl TurnHost {
                     .clone()
                     .with_sandbox_notice(notice.clone());
             }
+            // A repository with a code-intelligence index has already answered "where is
+            // this defined" for every symbol in it, and a run that greps instead gets a
+            // narrower answer for more tokens. The gate says so; what it does about it
+            // is the user's choice, and the default is nothing.
+            let navigation_mode = plan
+                .config
+                .navigation
+                .as_ref()
+                .and_then(|navigation| navigation.codegraph)
+                .map_or(zuno_tools::NavigationMode::Off, |gate| match gate {
+                    zuno_config::schema::NavigationGate::Off => zuno_tools::NavigationMode::Off,
+                    zuno_config::schema::NavigationGate::Advise => {
+                        zuno_tools::NavigationMode::Advise
+                    }
+                    zuno_config::schema::NavigationGate::Strict => {
+                        zuno_tools::NavigationMode::Strict
+                    }
+                });
+            // Resolved once, not per call: the check touches the filesystem, and an index
+            // built halfway through a session must not change the verdict an earlier call
+            // in the same session already received.
+            let navigation_indexed = worktree.as_deref().is_some_and(zuno_tools::index_present);
+            // Resolved from the same configured shell the shell tool resolves from, so a
+            // command is parsed the way the shell that will run it parses it. POSIX when
+            // no shell resolves, because misreading the syntax can only make the gate
+            // overlook a navigation, never invent one.
+            let navigation_syntax = if zuno_pty::shells::preferred(plan.config.shell.as_deref())
+                .is_ok_and(|path| zuno_pty::shells::powershell(&path))
+            {
+                zuno_tools::shell::ShellSyntax::PowerShell
+            } else {
+                zuno_tools::shell::ShellSyntax::Bash
+            };
             let dispatcher = ToolRegistryDispatcher::new(
                 runtime_tools.tools,
                 runtime_tools.rules,
@@ -4015,9 +4066,17 @@ impl TurnHost {
             )
             .with_deferred_tools(runtime_tools.deferred_tool_ids)
             .with_hooks(Arc::new(
-                super::verification_ledger::VerificationLedger::new(
-                    Arc::clone(&database),
-                    Arc::clone(&goal_store),
+                super::tool_hooks::HostToolHooks::new(
+                    super::verification_ledger::VerificationLedger::new(
+                        Arc::clone(&database),
+                        Arc::clone(&goal_store),
+                    ),
+                )
+                .with_navigation(
+                    navigation_mode,
+                    navigation_indexed,
+                    navigation_syntax,
+                    zuno_db::event_log::SessionEventLog::new(Arc::clone(&database)),
                 ),
             ));
             let council_presets = plan
@@ -4099,6 +4158,7 @@ impl TurnHost {
                 notes,
                 instruction_admission,
                 commands,
+                turn_allowance,
                 goal_store,
                 goal_projection,
                 goal_continuation,
@@ -7315,9 +7375,15 @@ impl TurnHost {
         // to leave a session with no goal, or a goal with no token budget, alone, so
         // installing it imposes no limit nobody set — while a conditional install would
         // mean a budget set mid-session was enforced only after a restart.
-        .with_budget_policy(Arc::new(zuno_goal::GoalBudgetPolicy::new(Arc::clone(
-            &self.goal_store,
-        ))));
+        // The allowance is the host's answer to "how much may one turn spend when
+        // nobody set a goal budget". Without it the policy treats an unbudgeted goal as
+        // unbounded, which is how a run that has stopped making progress keeps paying
+        // for requests until a human notices. Read from the runtime rather than
+        // constructed here so one default governs every front end.
+        .with_budget_policy(Arc::new(
+            zuno_goal::GoalBudgetPolicy::new(Arc::clone(&self.goal_store))
+                .with_allowance(self.turn_allowance),
+        ));
         let outcome = self
             .driver
             .drive(
