@@ -463,6 +463,7 @@ impl ShellTool {
             &cwd,
             &env,
         )?;
+        refuse_generated_delivery(&analysis, &cwd, &env)?;
         if ctx.is_interrupted() {
             return Err(interrupted());
         }
@@ -1042,6 +1043,167 @@ fn with_sandbox_metadata(output: ToolOutput, authority: &ExecutionAuthority) -> 
 /// [`ToolError::Failed`] when `HEAD` cannot be read or no longer matches, which
 /// means the history moved since the caller looked; in every failing case the
 /// command has not run.
+/// Commit options that consume the token after them.
+///
+/// Needed only so a value is not mistaken for a flag: `git commit -m -a` would
+/// otherwise look like a commit that stages everything, and the mistake costs a
+/// refusal the caller cannot explain. Options spelled `--name=value` carry their value
+/// already and need no entry. `-S` is deliberately absent: its key is optional and
+/// attached, so it never consumes the next token.
+const COMMIT_OPTIONS_TAKING_A_VALUE: &[&str] = &[
+    "-m",
+    "--message",
+    "-F",
+    "--file",
+    "-c",
+    "--reedit-message",
+    "-C",
+    "--reuse-message",
+    "--author",
+    "--date",
+    "--fixup",
+    "--squash",
+    "--trailer",
+    "--cleanup",
+    "--pathspec-from-file",
+];
+
+/// Whether a `git commit` stages tracked modifications as part of committing.
+///
+/// `-a` arrives alone, inside a short cluster such as `-am`, or spelled `--all`.
+/// Everything after `--` is a pathspec, so the scan stops there.
+fn commit_stages_tracked_changes(arguments: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index) {
+        let argument = unquote(argument);
+        if COMMIT_OPTIONS_TAKING_A_VALUE.contains(&argument.as_str()) {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if argument == "--" {
+            return false;
+        }
+        if argument == "--all" {
+            return true;
+        }
+        if let Some(cluster) = argument.strip_prefix('-')
+            && !argument.starts_with("--")
+            && !cluster.is_empty()
+            && cluster.chars().all(|flag| flag.is_ascii_alphabetic())
+            && cluster.contains('a')
+        {
+            return true;
+        }
+        index = index.saturating_add(1);
+    }
+    false
+}
+
+/// Whether this command line creates a commit, and whether it stages while doing it.
+fn commit_delivery(analysis: &ShellAnalysis) -> Option<CommitDelivery> {
+    analysis.commands.iter().find_map(|resource| {
+        let (subcommand, arguments) = git_subcommand(&resource.tokens)?;
+        (subcommand == "commit").then(|| CommitDelivery {
+            stages_tracked_changes: commit_stages_tracked_changes(arguments),
+        })
+    })
+}
+
+/// What a `git commit` in this command line is about to deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommitDelivery {
+    /// Whether the commit stages tracked modifications itself, as `-a` does.
+    ///
+    /// The index alone is then not the whole delivery, so the worktree's tracked
+    /// changes have to be read as well.
+    stages_tracked_changes: bool,
+}
+
+/// The paths one git list command reports, read from its `-z` output.
+///
+/// `-z` because a path is bytes: git quotes anything unusual in its default output,
+/// and a quoted path is not a path. `None` when git could not answer at all, which is
+/// how "there is no repository here" arrives.
+fn git_reported_paths(
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    arguments: &[&str],
+) -> Result<Option<Vec<PathBuf>>, ToolError> {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(failed)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let listing = String::from_utf8(output.stdout).map_err(failed)?;
+    Ok(Some(
+        listing
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .collect(),
+    ))
+}
+
+/// Refuse a commit that would deliver Zuno's own generated working state.
+///
+/// Goal documents, tool output spills, background terminal state: files the runtime
+/// writes to keep working, which the repository-private exclude block normally hides.
+/// Committing them makes a later session read runtime residue as project source and
+/// reason from it, and the reasoning looks well founded because the files are in git.
+///
+/// What is delivered is read from git rather than from the command line, because the
+/// command line does not know it: an alias, a `-a`, a `commit.template`, or a
+/// pre-commit hook that stages all put paths in a commit that no argument named. The
+/// index is always read, and a commit that stages tracked modifications itself has
+/// those read too.
+///
+/// Pathspecs are not classified. `git commit -- <path>` commits that path from the
+/// worktree, so a generated path spelled there would pass, and that is the accepted
+/// gap: a pathspec has to be typed deliberately, while the refusal for a
+/// mis-classified message or option would land on an ordinary commit.
+///
+/// No repository, nothing delivered: when git cannot name a worktree the check does
+/// not run, and the commit fails on its own terms rather than through a refusal about
+/// generated state.
+///
+/// # Errors
+///
+/// [`ToolError::Failed`] carrying every generated path with the reason it exists and
+/// the remedy, when a commit would deliver one.
+fn refuse_generated_delivery(
+    analysis: &ShellAnalysis,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<(), ToolError> {
+    let Some(delivery) = commit_delivery(analysis) else {
+        return Ok(());
+    };
+    let Some(worktree) = git_reported_paths(cwd, env, &["rev-parse", "--show-toplevel"])?
+        .and_then(|paths| paths.into_iter().next())
+    else {
+        return Ok(());
+    };
+    let mut delivered = git_reported_paths(cwd, env, &["diff", "--cached", "--name-only", "-z"])?
+        .unwrap_or_default();
+    if delivery.stages_tracked_changes {
+        delivered.extend(
+            git_reported_paths(cwd, env, &["diff", "--name-only", "-z"])?.unwrap_or_default(),
+        );
+    }
+    zuno_paths::refuse_generated_state(&worktree, &delivered).map_err(|refusal| {
+        failed(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            refusal.report(),
+        ))
+    })
+}
+
 fn validate_expected_git_head(
     assessment: &RiskAssessment,
     expected: Option<&str>,
@@ -1445,31 +1607,38 @@ fn external_directories(
 
 fn mutates_git_metadata(analysis: &ShellAnalysis) -> bool {
     analysis.commands.iter().any(|resource| {
-        let Some(first) = resource.tokens.first() else {
-            return false;
-        };
-        if !unquote(first).eq_ignore_ascii_case("git") {
-            return false;
-        }
-        let mut index = 1;
-        while let Some(argument) = resource.tokens.get(index) {
-            let argument = unquote(argument).to_ascii_lowercase();
-            if matches!(
-                argument.as_str(),
-                "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace"
-            ) {
-                index = index.saturating_add(2);
-                continue;
-            }
-            if argument.starts_with('-') {
-                index = index.saturating_add(1);
-                continue;
-            }
-            let remaining = &resource.tokens[index + 1..];
-            return !git_subcommand_is_read_only(&argument, remaining);
-        }
-        false
+        git_subcommand(&resource.tokens).is_some_and(|(subcommand, remaining)| {
+            !git_subcommand_is_read_only(&subcommand, remaining)
+        })
     })
+}
+
+/// The subcommand of a `git` invocation, lowercased, and the arguments after it.
+///
+/// `None` when the command is not git or names no subcommand at all. Global options
+/// are skipped the way git parses them: the five that take a separate value consume
+/// the token after them, and any other dashed token stands alone.
+fn git_subcommand(tokens: &[String]) -> Option<(String, &[String])> {
+    if !unquote(tokens.first()?).eq_ignore_ascii_case("git") {
+        return None;
+    }
+    let mut index = 1;
+    while let Some(argument) = tokens.get(index) {
+        let argument = unquote(argument);
+        if matches!(
+            argument.as_str(),
+            "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace"
+        ) {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if argument.starts_with('-') {
+            index = index.saturating_add(1);
+            continue;
+        }
+        return Some((argument.to_ascii_lowercase(), &tokens[index + 1..]));
+    }
+    None
 }
 
 fn git_subcommand_is_read_only(subcommand: &str, arguments: &[String]) -> bool {
@@ -1606,6 +1775,60 @@ mod tests {
 
     fn mutates(command: &str) -> bool {
         mutates_git_metadata(&analyze_command(command, ShellSyntax::Bash).expect("analysis"))
+    }
+
+    fn delivery(command: &str) -> Option<CommitDelivery> {
+        commit_delivery(&analyze_command(command, ShellSyntax::Bash).expect("analysis"))
+    }
+
+    #[test]
+    fn only_a_commit_is_a_delivery() {
+        for command in [
+            "git status --short",
+            "git add .zuno/goal/ses_1.md",
+            "git stash",
+            "git commit-tree abc123",
+            "commit -m not-git",
+        ] {
+            assert!(delivery(command).is_none(), "{command}");
+        }
+        assert!(delivery("git commit -m done").is_some());
+        assert!(delivery("git -C repo commit --amend --no-edit").is_some());
+        assert!(delivery("cargo test && git commit -m done").is_some());
+    }
+
+    #[test]
+    fn a_commit_that_stages_as_it_commits_is_recognised_in_every_spelling() {
+        for command in [
+            "git commit -a -m done",
+            "git commit -am done",
+            "git commit --all -m done",
+            "git commit -qam done",
+        ] {
+            assert!(
+                delivery(command).expect("a commit").stages_tracked_changes,
+                "{command}"
+            );
+        }
+    }
+
+    /// A value is not a flag. Reading one as `-a` would cost a refusal on a commit
+    /// that stages nothing, and a refusal nobody can explain is worse than the risk
+    /// it was guarding against.
+    #[test]
+    fn a_commit_message_that_looks_like_a_flag_stages_nothing() {
+        for command in [
+            "git commit -m done",
+            "git commit -m -a",
+            "git commit --message -a",
+            "git commit --file -a",
+            "git commit -m done -- -a",
+        ] {
+            assert!(
+                !delivery(command).expect("a commit").stages_tracked_changes,
+                "{command}"
+            );
+        }
     }
 
     #[test]

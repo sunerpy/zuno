@@ -159,6 +159,117 @@ impl ShellEnvHook for RedirectGitRepository {
     }
 }
 
+/// A commit that would deliver Zuno's own working state is refused before it runs.
+///
+/// Goal documents live inside the worktree so a person can read where a run stands.
+/// Committing one puts runtime residue in the repository, where the next session reads
+/// it as project source and reasons from it with the confidence that git lends.
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_refuses_a_commit_that_would_deliver_generated_state() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let head = initialize_git_repository(workspace.path());
+    let tool = support::sandbox::shell_tool(workspace.path());
+
+    let goal = workspace.path().join(".zuno").join("goal");
+    std::fs::create_dir_all(&goal).expect("goal directory");
+    std::fs::write(goal.join("ses_1.md"), b"# Objective\n").expect("goal document");
+    // Forced, because the repository-private exclude block is what normally keeps this
+    // path out of the index. The refusal exists for when that block is gone or bypassed.
+    git(workspace.path(), &["add", "--force", ".zuno/goal/ses_1.md"]);
+
+    let refusal = tool
+        .run(
+            params("git commit --quiet -m deliver"),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect_err("a staged goal document must not reach a commit");
+    let rendered = format!("{refusal:?}");
+    assert!(rendered.contains(".zuno/goal/ses_1.md"), "{rendered}");
+    assert!(rendered.contains("goal projection"), "{rendered}");
+    assert!(rendered.contains("git restore --staged"), "{rendered}");
+    assert_eq!(
+        git(workspace.path(), &["rev-parse", "HEAD"]),
+        head,
+        "the refusal must happen before the commit"
+    );
+
+    git(
+        workspace.path(),
+        &["restore", "--staged", "--", ".zuno/goal/ses_1.md"],
+    );
+    std::fs::write(workspace.path().join("tracked.txt"), b"edited\n").expect("source edit");
+    tool.run(
+        params("git commit --quiet -a -m source"),
+        context(Arc::new(NeverInterrupted)),
+    )
+    .await
+    .expect("an ordinary source commit is untouched");
+    assert_ne!(
+        git(workspace.path(), &["rev-parse", "HEAD"]),
+        head,
+        "the source commit must have landed"
+    );
+}
+
+/// `git commit -a` stages tracked changes itself, so the index alone is not the delivery.
+///
+/// A generated path that is already tracked — committed once before the exclude block
+/// existed — is delivered again by every `-a` commit that follows, and nothing in the
+/// index would show it.
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_reads_the_worktree_when_a_commit_stages_tracked_changes_itself() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    initialize_git_repository(workspace.path());
+    let tool = support::sandbox::shell_tool(workspace.path());
+
+    let output = workspace.path().join(".zuno").join("tool-output");
+    std::fs::create_dir_all(&output).expect("tool output directory");
+    let spill = output.join("call_1.txt");
+    std::fs::write(&spill, b"first\n").expect("spilled output");
+    git(
+        workspace.path(),
+        &["add", "--force", ".zuno/tool-output/call_1.txt"],
+    );
+    git(workspace.path(), &["commit", "--quiet", "-m", "residue"]);
+    let head = git(workspace.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(&spill, b"second\n").expect("spilled output again");
+
+    let refusal = tool
+        .run(
+            params("git commit --quiet -am residue"),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect_err("a tracked spill must not be delivered again");
+    let rendered = format!("{refusal:?}");
+    assert!(
+        rendered.contains(".zuno/tool-output/call_1.txt"),
+        "{rendered}"
+    );
+    assert_eq!(
+        git(workspace.path(), &["rev-parse", "HEAD"]),
+        head,
+        "the refusal must happen before the commit"
+    );
+
+    std::fs::write(workspace.path().join("tracked.txt"), b"edited\n").expect("source edit");
+    git(workspace.path(), &["add", "tracked.txt"]);
+    tool.run(
+        params("git commit --quiet -m source"),
+        context(Arc::new(NeverInterrupted)),
+    )
+    .await
+    .expect("a commit of the index alone ignores the worktree's generated changes");
+    assert_ne!(
+        git(workspace.path(), &["rev-parse", "HEAD"]),
+        head,
+        "the source commit must have landed"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn shell_history_rewrite_requires_the_fresh_approved_head() {
