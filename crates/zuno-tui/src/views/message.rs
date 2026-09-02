@@ -190,6 +190,11 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         // One glyph for the non-interactive goal tools: they read, set and amend one
         // object, and separate glyphs would imply separate subjects.
         "goal_get" | "goal_propose" | "goal_update" => ("◎", "Reading the goal..."),
+        // Its own glyph, not the goal's: the ledger's subject is an external capability,
+        // and sharing `◎` would say a reader is looking at another edit to the one goal.
+        // A filled diamond rather than the hollow one reasoning uses, because a claim is
+        // what the session settled on and recorded, not what it is still turning over.
+        "capability_claim" => ("◆", "Recording a capability claim..."),
         _ => ("⚙", "Preparing..."),
     }
 }

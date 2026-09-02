@@ -148,7 +148,7 @@ impl Summary {
 /// disciplines.
 /// Runtime aliases such as `exec_command` and `google_search` reuse those rules but stay
 /// out of this registry-wire-id list, because the stale-rule half of that test is exact.
-pub const SUMMARISED: [&str; 29] = [
+pub const SUMMARISED: [&str; 30] = [
     // The 18 `BuiltinSlot` positions, in `BUILTIN_ORDER`.
     "invalid",
     "question",
@@ -178,6 +178,9 @@ pub const SUMMARISED: [&str; 29] = [
     "plan_update",
     "todo_get",
     "todo_update",
+    // Registered beside the goal tools rather than among them, because a host with no
+    // use for the capability ledger does not advertise it.
+    "capability_claim",
     // Optional native continuity contributions.
     "history",
     "notes",
@@ -389,6 +392,19 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
             Summary::tail(match text("blocking_condition") {
                 Some(reason) => format!("{status}: {reason}"),
                 None => status,
+            })
+        }),
+        // What was claimed and about what, then the state a reader is checking for: an
+        // `inferred` claim is the one a later completion can be refused over, so it earns
+        // its place on the row.
+        "capability_claim" => text("capability").map(|capability| {
+            let claim = match text("subject") {
+                Some(subject) => format!("{capability} on {subject}"),
+                None => capability,
+            };
+            Summary::tail(match text("state") {
+                Some(state) => format!("{claim}: {state}"),
+                None => claim,
             })
         }),
         // `plan_exit` and `goal_get` take no arguments, so there is nothing to summarise
