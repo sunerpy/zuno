@@ -502,7 +502,11 @@ fn enter_terminal(output: &mut impl io::Write, mouse_capture: bool) -> io::Resul
 /// bracketed-paste mode wraps every later paste *in the user's shell* with
 /// `\e[200~`/`\e[201~`, which the shell then shows literally — a visible bug in a
 /// program the user has already exited.
-fn restore_terminal(output: &mut impl io::Write, mouse_capture: bool) -> Option<io::Error> {
+fn restore_terminal(
+    output: &mut impl io::Write,
+    input: &dyn TerminalInput,
+    mouse_capture: bool,
+) -> Option<io::Error> {
     let mut first_error = execute!(output, LeaveAlternateScreen).err();
     if let Err(error) = execute!(output, DisableBracketedPaste) {
         first_error.get_or_insert(error);
@@ -513,7 +517,63 @@ fn restore_terminal(output: &mut impl io::Write, mouse_capture: bool) -> Option<
     if !mouse_capture && let Err(error) = execute!(output, AlternateScrollRelease) {
         first_error.get_or_insert(error);
     }
+    // Last, once the modes above are off so the queue can only shrink, and deliberately
+    // not reported: a stdin that cannot be polled while the process is ending is nothing
+    // the user can act on, and surfacing it from here would hide a real restoration
+    // failure behind it.
+    let _discarded = drain_unread_input(input);
     first_error
+}
+
+/// How many unread events one teardown discards before it stops trying.
+///
+/// A terminal's input queue is bounded — `MAX_INPUT` is 4096 bytes on Linux — and the
+/// shortest report this exists to remove, an SGR mouse press, is nine bytes, so a queue
+/// filled to its limit holds fewer than five hundred of them. The cap is therefore above
+/// anything a terminal can be holding and is not meant to be reached: it bounds the loop
+/// for the case where stdin is not a terminal at all and something is still writing into
+/// it, so quitting cannot become an unbounded read.
+const UNREAD_INPUT_LIMIT: usize = 512;
+
+/// Discard input the TUI never read, so it cannot arrive in the user's shell instead.
+///
+/// # The defect this removes
+///
+/// Mouse reporting is on for as long as the TUI owns the terminal, while the one physical
+/// reader stops at [`TerminalInputControl::stop`] — before worker shutdown, which is
+/// allowed ten seconds, and with the last frame still on screen. A click in that window is
+/// encoded by the terminal and queued, nobody reads it, and the modes are disabled only
+/// afterwards. Those bytes outlive the process: the user's next shell prompt shows
+/// `0;54;31M0;54;31m`, an SGR press and release whose leading `\e[<` the line editor
+/// swallowed as an unknown key.
+///
+/// # Why discarding is right rather than a loss
+///
+/// It is the rule the pause barrier already applies at the other ownership boundary, where
+/// a key read before a handoff belongs to neither the editor nor the resumed TUI and is
+/// dropped. Process exit is that same boundary. Input aimed at an alternate screen that is
+/// being torn down was aimed at a program that is gone, and the alternative is not that
+/// the user keeps it — it is that their shell runs it.
+///
+/// Called with the modes already disabled, so nothing new can be encoded behind it, and
+/// while raw mode is still on, because a cooked terminal withholds bytes until a newline
+/// and would report the queue as empty.
+fn drain_unread_input(input: &dyn TerminalInput) -> usize {
+    let mut discarded = 0;
+    while discarded < UNREAD_INPUT_LIMIT {
+        // Zero timeout, because only what has already arrived is stale. The poll is also
+        // what keeps the read from blocking: crossterm answers it from a parsed event, so
+        // a half-delivered escape sequence reports nothing here rather than parking the
+        // exit path until the rest of it arrives.
+        if !matches!(input.poll(Duration::ZERO), Ok(true)) {
+            break;
+        }
+        if input.read().is_err() {
+            break;
+        }
+        discarded += 1;
+    }
+    discarded
 }
 
 impl TerminalLifecycle for CrosstermLifecycle {
@@ -538,7 +598,8 @@ impl TerminalLifecycle for CrosstermLifecycle {
             return Ok(());
         }
 
-        let mut first_error = restore_terminal(&mut io::stdout(), self.mouse_capture);
+        let mut first_error =
+            restore_terminal(&mut io::stdout(), &CrosstermInput, self.mouse_capture);
         if let Err(error) = disable_raw_mode() {
             first_error.get_or_insert(error);
         }
