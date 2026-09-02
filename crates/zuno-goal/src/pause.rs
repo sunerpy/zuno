@@ -23,17 +23,25 @@ pub enum GoalPauseReason {
     Authentication,
     /// A side effect may have completed even though its response was lost.
     UncertainSideEffect,
+    /// One turn spent the allowance the budget policy gave it.
+    ///
+    /// Distinct from [`crate::GoalStatus::BudgetLimited`], which is the whole goal's
+    /// token budget running out. This is a single turn stopped mid-flight, so the goal
+    /// still has budget left and the work is still resumable — but not automatically,
+    /// because the next turn would spend the same allowance the same way.
+    TurnBudget,
 }
 
 impl GoalPauseReason {
     /// Closed set persisted in SQLite and exposed on status surfaces.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::UserInterruption,
         Self::PlanMode,
         Self::HumanInput,
         Self::Permission,
         Self::Authentication,
         Self::UncertainSideEffect,
+        Self::TurnBudget,
     ];
 
     /// Stable storage and wire spelling.
@@ -46,6 +54,7 @@ impl GoalPauseReason {
             Self::Permission => "permission",
             Self::Authentication => "authentication",
             Self::UncertainSideEffect => "uncertain_side_effect",
+            Self::TurnBudget => "turn_budget",
         }
     }
 

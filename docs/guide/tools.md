@@ -127,6 +127,37 @@ change permissions or make the remote system part of the local process result; i
 requires the resumed Agent to refresh authoritative remote state before claiming that a
 CI run, deployment, or release completed.
 
+## What a shell exit status proves
+
+A pipeline's exit code is the last stage's exit code. `cargo test | tail -5` exits
+zero when the tests fail, because only `tail` decided it. Zuno therefore puts
+`set -o pipefail` in effect for every `shell` call by default, so a failure at any
+stage is the command's failure.
+
+`exitPolicy` selects that behaviour explicitly:
+
+| Value | Effect | Exit status authority |
+| --- | --- | --- |
+| `pipefail` (default) | A failing stage of a pipeline fails the command | Authoritative on `bash`, `ksh`, and `zsh` |
+| `all` | Also stops at the first failing command in a sequence | Authoritative |
+| `last` | Only the final stage decides, the POSIX default | Derived |
+
+Choose `last` deliberately, for a command meant to tolerate a failing stage.
+
+Every result carries a verification receipt saying what ran, what it decided, the
+exit code, and how far that code reaches. The distinction is the point: a `derived`
+status is recorded but is not evidence, because the code came from a stage that
+never saw the failure. The interpreter matters too. `set -o pipefail` is not in
+POSIX, and `dash` exits without running the command at all when it is asked for it,
+so an interpreter outside the known-capable set reports `derived` and names itself
+in the receipt. `sh` is treated as unknown on purpose, since the name does not say
+what is behind it. PowerShell has no equivalent, so only `all` is authoritative
+there.
+
+A stored receipt is addressed by an id that appears in the tool result as
+`[verification rcp_…]`. That id, not a recollection of the transcript, is what
+satisfies a Goal completion criterion that requires evidence.
+
 ## Effect classification
 
 Every invocation classifies as one of four effects, and the default is the strict one:

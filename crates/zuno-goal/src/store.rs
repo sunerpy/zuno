@@ -125,7 +125,8 @@ CREATE TABLE IF NOT EXISTS goal_pause (
         'human_input',
         'permission',
         'authentication',
-        'uncertain_side_effect'
+        'uncertain_side_effect',
+        'turn_budget'
     )),
     human_request_id TEXT,
     paused_at_ms INTEGER NOT NULL
@@ -335,7 +336,8 @@ impl GoalStore {
         pool.transaction(|tx| {
             tx.execute_batch(SCHEMA).map_err(zuno_db::map_error)?;
             tx.execute_batch(AUXILIARY_SCHEMA)
-                .map_err(zuno_db::map_error)
+                .map_err(zuno_db::map_error)?;
+            widen_pause_reasons(tx)
         })?;
         Ok(Self { pool, spill_dir })
     }
@@ -626,7 +628,8 @@ impl GoalStore {
                 }
                 GoalPauseReason::UserInterruption
                 | GoalPauseReason::Authentication
-                | GoalPauseReason::UncertainSideEffect => false,
+                | GoalPauseReason::UncertainSideEffect
+                | GoalPauseReason::TurnBudget => false,
                 GoalPauseReason::HumanInput | GoalPauseReason::Permission => {
                     unreachable!("human request reasons handled by the guard")
                 }
@@ -2131,6 +2134,55 @@ fn new_goal_id() -> String {
 fn now_ms() -> Result<i64, GoalError> {
     let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
     Ok(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Let the pause table accept every reason this build knows about.
+///
+/// [`AUXILIARY_SCHEMA`] creates `goal_pause` with a `CHECK` constraint naming each
+/// [`GoalPauseReason`], and `CREATE TABLE IF NOT EXISTS` does nothing to a table that
+/// already exists. A database created before a reason was added therefore keeps a
+/// constraint that rejects it, and SQLite cannot `ALTER` a `CHECK` constraint. Without
+/// this, adding a reason would work on a fresh install and fail on an upgraded one, at
+/// the worst moment: the write that records why a run stopped.
+///
+/// The goal tables sit outside the [`zuno_db::migration`] format marker, which versions
+/// only the tables `zuno-db` itself owns, so the repair is expressed here and keyed on
+/// the constraint rather than on a version number.
+///
+/// The rebuild is the standard SQLite sequence — rename, recreate, copy, drop — and runs
+/// inside the caller's transaction, so a failure anywhere leaves the original table in
+/// place. Recreating by re-running [`AUXILIARY_SCHEMA`] rather than a second copy of the
+/// DDL is deliberate: one definition cannot drift from another. `goal_pause` carries no
+/// index or trigger, so nothing else has to be reattached.
+fn widen_pause_reasons(tx: &Transaction<'_>) -> Result<(), DbError> {
+    let declared: Option<String> = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'goal_pause'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(zuno_db::map_error)?;
+    let Some(declared) = declared else {
+        return Ok(());
+    };
+    if GoalPauseReason::ALL
+        .into_iter()
+        .all(|reason| declared.contains(&format!("'{}'", reason.as_str())))
+    {
+        return Ok(());
+    }
+    tx.execute_batch("ALTER TABLE goal_pause RENAME TO goal_pause_superseded")
+        .map_err(zuno_db::map_error)?;
+    tx.execute_batch(AUXILIARY_SCHEMA)
+        .map_err(zuno_db::map_error)?;
+    tx.execute_batch(
+        "INSERT INTO goal_pause (session_id, goal_id, reason, human_request_id, paused_at_ms)
+           SELECT session_id, goal_id, reason, human_request_id, paused_at_ms
+           FROM goal_pause_superseded;
+         DROP TABLE goal_pause_superseded",
+    )
+    .map_err(zuno_db::map_error)
 }
 
 #[cfg(test)]

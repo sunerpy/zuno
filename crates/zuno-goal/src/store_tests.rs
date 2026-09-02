@@ -1353,6 +1353,123 @@ fn goal_history_keeps_every_revision_across_cancel_and_replacement() {
     );
 }
 
+/// A database created before `turn_budget` existed must still accept it.
+///
+/// The pause table's `CHECK` constraint names every reason, `CREATE TABLE IF NOT EXISTS`
+/// cannot change it, and SQLite cannot `ALTER` it. Without the repair in `from_pool`, a
+/// new reason works on a fresh install and fails on every upgraded one, at the moment it
+/// records why a run stopped. This test builds the old table on purpose, so the repair is
+/// exercised rather than assumed.
+#[test]
+fn an_older_pause_table_is_widened_without_losing_the_pauses_it_holds() {
+    let spill = tempfile::tempdir().expect("create spill directory");
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
+    );
+    let mut connection = pool.open_connection().expect("open shared connection");
+    zuno_db::migration::apply(&mut connection).expect("apply shared schema");
+    connection
+        .execute_batch(
+            "CREATE TABLE goal_pause (
+                 session_id TEXT PRIMARY KEY NOT NULL,
+                 goal_id TEXT NOT NULL,
+                 reason TEXT NOT NULL CHECK(reason IN (
+                     'user_interruption',
+                     'plan_mode',
+                     'human_input',
+                     'permission',
+                     'authentication',
+                     'uncertain_side_effect'
+                 )),
+                 human_request_id TEXT,
+                 paused_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO goal_pause (session_id, goal_id, reason, human_request_id, paused_at_ms)
+             VALUES ('older-session', 'older-goal', 'human_input', 'req-1', 7)",
+        )
+        .expect("build the pause table this release replaced");
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO goal_pause \
+                 (session_id, goal_id, reason, human_request_id, paused_at_ms) \
+                 VALUES ('other', 'goal', 'turn_budget', NULL, 8)",
+                [],
+            )
+            .is_err(),
+        "the old constraint must reject the new reason, or this test proves nothing"
+    );
+    drop(connection);
+
+    let store = GoalStore::from_pool(Arc::clone(&pool), spill.path().to_owned())
+        .expect("attach goal store to the older database");
+
+    let connection = pool.get().expect("check out a connection");
+    let (goal_id, reason, request, paused_at): (String, String, Option<String>, i64) = connection
+        .query_row(
+            "SELECT goal_id, reason, human_request_id, paused_at_ms \
+             FROM goal_pause WHERE session_id = 'older-session'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("the pause the older database held must survive the rebuild");
+    assert_eq!(goal_id, "older-goal");
+    assert_eq!(reason, "human_input");
+    assert_eq!(request.as_deref(), Some("req-1"));
+    assert_eq!(paused_at, 7);
+    assert!(
+        connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' \
+                 AND name = 'goal_pause_superseded'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .expect("query for the temporary table")
+            .is_none(),
+        "the rebuild must not leave its scratch table behind"
+    );
+    drop(connection);
+
+    let connection = pool.get().expect("check out a connection");
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO project \
+             (id,worktree,vcs,name,icon_url,icon_url_override,icon_color,time_created,\
+              time_updated,time_initialized,sandboxes,commands) \
+             VALUES ('goal-fixture','/tmp',NULL,NULL,NULL,NULL,NULL,1,1,NULL,'[]',NULL)",
+            [],
+        )
+        .expect("insert project");
+    connection
+        .execute(
+            "INSERT INTO session \
+             (id,project_id,slug,directory,title,version,time_created,time_updated) \
+             VALUES (?1,'goal-fixture',?1,'/tmp',?1,'test',1,1)",
+            params![SESSION],
+        )
+        .expect("insert session");
+    drop(connection);
+
+    store
+        .create_goal(SESSION, "ship safely", None)
+        .expect("create goal");
+    let paused = store
+        .pause_with_reason(SESSION, GoalPauseReason::TurnBudget)
+        .expect("record a turn-budget pause")
+        .expect("the goal was active");
+    assert_eq!(paused.status, GoalStatus::Paused);
+    assert_eq!(
+        store
+            .pause_state(SESSION)
+            .expect("read the pause")
+            .expect("a pause exists")
+            .reason,
+        GoalPauseReason::TurnBudget
+    );
+}
+
 fn shared_completion_fixture() -> (TempDir, Arc<zuno_db::Pool>, GoalStore, Goal) {
     let spill = tempfile::tempdir().expect("create spill directory");
     let pool = Arc::new(

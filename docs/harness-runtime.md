@@ -1200,6 +1200,14 @@ Recovery is selected from typed errors, never rendered messages:
 - A timeout or lost response around a non-replayable side effect pauses with
   `uncertain_side_effect`; recovery requires authoritative-state inspection and never
   automatically invokes the tool again.
+- A turn stopped by its own budget policy pauses with `turn_budget`. The allowance
+  belongs to one turn, so the Goal keeps whatever token budget remains, but execution
+  does not resume automatically: the next turn would spend the same allowance the same
+  way. This is distinct from the `budget_limited` status, which is the Goal's whole
+  budget being spent.
+- A budget policy may ask for compaction instead of a stop. That is classified as a
+  context-limit failure and follows the same path: retained history is compacted, and
+  the turn is retried.
 - Invalid provider protocol, unsupported typed input such as an image sent to a text-only model, unavailable agent/model configuration, corrupt durable state, and other permanent failures block the goal. The same transaction stores a stable typed code and scrubbed explanation in `blocked_reason`; a permanent runtime failure never produces an unexplained blocked Goal.
 
 OpenAI and Compatible Responses decoders treat `response.failed` as a typed

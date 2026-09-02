@@ -2173,6 +2173,14 @@ impl TurnFailure {
                 Self::Engine(TurnError::Provider(ProviderError::Auth { .. })) => {
                     zuno_goal::GoalPauseReason::Authentication
                 }
+                // Naming the allowance matters more than it looks: the pause reason is
+                // what a status surface shows and what a restart reads. Reporting a
+                // turn that spent its token or time allowance as a user interruption
+                // tells the user they stopped the run themselves, and hides the one
+                // fact that would let them raise the allowance and continue.
+                Self::Engine(TurnError::BudgetLimited { .. }) => {
+                    zuno_goal::GoalPauseReason::TurnBudget
+                }
                 Self::Engine(_)
                 | Self::Host(_)
                 | Self::EventConsumer(_)
