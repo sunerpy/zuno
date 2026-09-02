@@ -10,7 +10,15 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
 
-const TEST_CONFIG: &str = r#"{"formatter":false,"lsp":false,"model":"test/test-model","provider":{"test":{"name":"test","id":"test","env":[],"transport":"openai-compatible","models":{"test-model":{"id":"test-model","name":"Test model","attachment":false,"reasoning":false,"temperature":false,"tool_call":true,"release_date":"2025-01-01","limit":{"context":100000,"output":10000},"cost":{"input":0,"output":0},"options":{}}},"options":{"apiKey":"acp-probe","baseURL":"https://example.invalid/v1"}}}}"#;
+/// The provider fixture every ACP test resolves against.
+///
+/// The context ceiling is deliberately larger than any prompt these tests
+/// assemble. `ensure_prompt_context_budget` refuses a turn whose estimated prompt
+/// exceeds the model's context, and the estimate counts the whole tool catalogue —
+/// every description and JSON schema — so a ceiling set just above today's
+/// catalogue turns any prompt edit anywhere in the workspace into a failure here,
+/// pointing at ACP rather than at the edit. Keep the headroom.
+const TEST_CONFIG: &str = r#"{"formatter":false,"lsp":false,"model":"test/test-model","provider":{"test":{"name":"test","id":"test","env":[],"transport":"openai-compatible","models":{"test-model":{"id":"test-model","name":"Test model","attachment":false,"reasoning":false,"temperature":false,"tool_call":true,"release_date":"2025-01-01","limit":{"context":200000,"output":10000},"cost":{"input":0,"output":0},"options":{}}},"options":{"apiKey":"acp-probe","baseURL":"https://example.invalid/v1"}}}}"#;
 
 use serde_json::{Value, json};
 use wiremock::matchers::{body_partial_json, method, path};
@@ -4962,7 +4970,7 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
         .find(|update| update["sessionUpdate"] == "usage_update")
         .expect("usage replay");
     assert_eq!(usage["used"], 175);
-    assert_eq!(usage["size"], 100_000);
+    assert_eq!(usage["size"], 200_000);
     assert_eq!(usage["cost"], json!({"amount":1.25,"currency":"USD"}));
 
     request(
