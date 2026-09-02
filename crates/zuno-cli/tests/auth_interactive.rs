@@ -153,7 +153,7 @@ fn bare_auth_login_hides_catalog_only_and_credential_only_providers() {
         ],
     );
     assert!(
-        terminal.wait_for_output("Select provider"),
+        terminal.wait_for_frame("Select provider"),
         "{}",
         terminal.output()
     );
@@ -234,7 +234,7 @@ fn openai_login_prompts_for_the_authentication_method() {
     );
     terminal.write(b"\r");
     assert!(
-        terminal.wait_for_output("Login method"),
+        terminal.wait_for_frame("Login method"),
         "{}",
         terminal.output()
     );
@@ -251,6 +251,9 @@ fn openai_login_prompts_for_the_authentication_method() {
     assert!(!status.success(), "{output}");
     assert!(output.contains("provider login cancelled"), "{output}");
 }
+
+/// Last line of every `terminal_prompt` frame, and so the point at which one is complete.
+const FRAME_END: &str = "esc cancel";
 
 struct TestPty {
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -318,9 +321,32 @@ impl TestPty {
     }
 
     fn wait_for_output(&mut self, expected: &str) -> bool {
+        self.wait_until(|output| output.contains(expected))
+    }
+
+    /// Wait for a whole prompt frame, not just the line that names it.
+    ///
+    /// `TerminalSession::render` writes each line of a frame with its own unbuffered write
+    /// and flushes once at the end, so a reader can hold `? Select provider` and the search
+    /// line while the choice rows are still in flight — asserting on a row then reads a
+    /// frame that has none yet. Every frame ends with the key hints, so their arrival after
+    /// the message is what makes the rows between them readable. Looking only at the text
+    /// that follows the last occurrence of the message keeps the hints of an earlier frame
+    /// from settling a later prompt.
+    fn wait_for_frame(&mut self, message: &str) -> bool {
+        self.wait_until(|output| {
+            output.contains(message)
+                && output
+                    .rsplit(message)
+                    .next()
+                    .is_some_and(|tail| tail.contains(FRAME_END))
+        })
+    }
+
+    fn wait_until(&mut self, settled: impl Fn(&str) -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if self.output().contains(expected) {
+            if settled(&self.output()) {
                 return true;
             }
             if self
@@ -329,7 +355,7 @@ impl TestPty {
                 .expect("poll authentication command")
                 .is_some()
             {
-                return self.output().contains(expected);
+                return settled(&self.output());
             }
             std::thread::sleep(Duration::from_millis(10));
         }
