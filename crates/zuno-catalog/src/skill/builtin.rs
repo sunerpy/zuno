@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn external_sources_are_not_governed_by_first_party_metadata() {
         assert!(visible_to(
-            "/project/.zuno/skills/custom/SKILL.md",
+            "/project/.zuno/skill/custom/SKILL.md",
             "custom-agent",
             Some(&[]),
             &[],

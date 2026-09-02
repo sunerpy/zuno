@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! AGENT_SKILL_PATTERN = "skills/**/SKILL.md"          // ~/.agents and project .agents
-//! ZUNO_SKILL_PATTERN  = "{skill,skills}/**/SKILL.md"  // every Zuno config directory
+//! ZUNO_SKILL_PATTERN  = "skill/**/SKILL.md"           // every Zuno config directory
 //! SKILL_PATTERN       = "**/SKILL.md"                  // skills.paths[], pulled URLs
 //! ```
 //!
@@ -39,11 +39,8 @@ pub const SKILL_FILENAME: &str = "SKILL.md";
 /// Subdirectory prefixes for `skills/**/SKILL.md`.
 pub const EXTERNAL_PREFIXES: &[&str] = &["skills"];
 
-/// Subdirectory prefixes for `{skill,skills}/**/SKILL.md`.
-///
-/// Brace order is the oracle's textual order. It only becomes observable when
-/// the same skill name lives under both, which is the duplicate-name case.
-pub const ZUNO_PREFIXES: &[&str] = &["skill", "skills"];
+/// The canonical Zuno-owned Skill subdirectory.
+pub const ZUNO_PREFIXES: &[&str] = &["skill"];
 
 /// No prefix at all: `**/SKILL.md` from the root itself.
 pub const ROOT_PREFIXES: &[&str] = &[""];
@@ -157,13 +154,12 @@ mod tests {
     }
 
     #[test]
-    fn both_brace_prefixes_are_scanned() {
+    fn only_the_canonical_singular_zuno_prefix_is_scanned() {
         let dir = TempDir::new().expect("tempdir");
         let singular = write(dir.path(), "skill/a/SKILL.md");
-        let plural = write(dir.path(), "skills/b/SKILL.md");
+        write(dir.path(), "skills/b/SKILL.md");
         let found = scan(dir.path(), ZUNO_PREFIXES, false);
-        assert!(found.matches.contains(&singular));
-        assert!(found.matches.contains(&plural));
+        assert_eq!(found.matches, vec![singular]);
     }
 
     #[test]

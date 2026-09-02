@@ -16,9 +16,10 @@ Skill 不授予任何东西。它不会增加工具、权限、文件系统访�
 
 Zuno 按这个作用域顺序发现 Skill：
 
-1. 项目 `.zuno/skill` 与 `.zuno/skills` 根目录，从当前目录一路到 worktree；
+1. 项目 `.zuno/skill` 根目录，从当前目录一路到 worktree；
 2. 项目 `.agents/skills` 根目录，沿同一路径遍历；
-3. Zuno 的全局与已配置的 config 目录；
+3. `$XDG_CONFIG_HOME/zuno/skill`（通常是 `~/.config/zuno/skill`），以及显式设置
+   `ZUNO_CONFIG_DIR` 时的 `ZUNO_CONFIG_DIR/skill`；
 4. 全局 `~/.agents/skills`；
 5. 显式的 `skills.paths`；
 6. 已配置的远端索引。
@@ -26,6 +27,9 @@ Zuno 按这个作用域顺序发现 Skill：
 因此项目作用域会先于用户全局作用域被公布。Zuno 不会隐式扫描 `.claude`、
 `.opencode` 或其他产品的配置目录；确实需要共享时，仍可通过 `skills.paths`
 显式选择该目录。同一个规范化来源路径会被去重，包括符号链接别名。
+
+Zuno 不再隐式扫描 `~/.zuno`、`~/.config/zuno/skills` 或项目
+`.zuno/skills`。任何非规范目录都应通过 `skills.paths` 显式添加。
 
 ```sh
 ZUNO_DISABLE_EXTERNAL_SKILLS=1 zuno
@@ -41,9 +45,13 @@ ZUNO_DISABLE_EXTERNAL_SKILLS=1 zuno
 删除或重命名 Skill 后，无需重启会话即可识别。损坏的修改会保留上一份有效条目并公布
 warning，直到文件修复。
 
-会话启动时尚不存在的根目录也受支持。Zuno 只以非递归方式监听其最近的已有父目录，
-在目录出现后逐级收窄订阅，并且只在到达精确配置根目录后开启递归监听。因此缺失的
-`~/.zuno` 或 `~/.agents` 不会让 Zuno 递归扫描整个用户 home。
+规范用户根目录和显式配置路径即使在会话启动时尚不存在也受支持。Zuno 只以非递归
+方式监听其最近的已有父目录，在目录出现后逐级收窄订阅，并且只在到达精确配置根目录
+后开启递归监听。共享的 `~/.agents/skills` 只在启动时已经存在时自动监听；若需要运行中
+新建，请在启动前创建，或通过 `skills.paths` 显式选择。
+
+远端下载缓存属于私有状态。只有 `skills.urls` 确实下载文件时才会按需创建，而且它不会
+成为文件系统监听根目录。
 
 若调用方在重命名后仍尝试加载旧的精确来源，Zuno 会强制刷新一次，然后返回
 `CatalogStale` 和当前精确 locator；不会在同名来源之间猜测。

@@ -126,20 +126,21 @@ ambiguous name also disables the direct `/<skill-name>` slash form.
 | --- | --- |
 | `ZUNO_DISABLE_EXTERNAL_SKILLS=1` | Disable implicit `.agents` roots |
 
-Zuno-native `.zuno` roots stay enabled under the broad external switch.
+Project `.zuno/skill` roots and Zuno's canonical user Skill root stay enabled
+under the broad external switch.
 
 ## Live catalog generations
 
 Each running session owns one immutable
 `SkillCatalogSnapshot { generation, digest, skills, warnings }`. `zuno-watch`
-observes every effective local Skill root and remote-cache root; when a valid
-root does not exist yet, it observes the nearest safe existing parent
-**non-recursively**. The subscription moves toward the logical root as missing
-directories are created and becomes recursive only at the exact root. Zuno
-therefore notices a newly created Skill root without scanning the rest of the
-user home directory during startup. Relevant events are debounced, watcher
-overflow forces a complete rescan, and the next generation is published
-atomically.
+observes project scope, the canonical user root, existing shared Agent Skills,
+and explicit configured paths. It does not observe `~/.zuno` or the private
+remote download cache. When a canonical or explicit root does not exist yet,
+the watcher observes the nearest safe existing parent **non-recursively**. The
+subscription moves toward the logical root as missing directories are created
+and becomes recursive only at the exact root. Relevant events are debounced,
+watcher overflow forces a complete rescan, and the next generation is
+published atomically.
 
 Prompt metadata, `requiredSkills`, slash commands, the `skill` tool, TUI, and
 ACP all read that same snapshot. Adding, editing, deleting, or renaming a Skill

@@ -824,9 +824,9 @@ permission deny always wins.
 
 Zuno discovers skills in this scope order:
 
-1. project `.zuno/skill(s)` roots from the current directory to the worktree;
+1. project `.zuno/skill` roots from the current directory to the worktree;
 2. project `.agents/skills` roots over the same walk;
-3. Zuno's global and configured config directories;
+3. `$XDG_CONFIG_HOME/zuno/skill` and `ZUNO_CONFIG_DIR/skill` when configured;
 4. global `~/.agents/skills`;
 5. explicit `skills.paths`;
 6. configured remote indexes.
@@ -838,6 +838,8 @@ source path is de-duplicated, including symlink aliases, while same-named files
 from different sources remain independently addressable; no hidden winner is
 selected. Set `ZUNO_DISABLE_EXTERNAL_SKILLS=1` to disable implicit `.agents`
 roots. Zuno-native `.zuno` roots remain enabled by the external switch.
+`~/.zuno`, plural Zuno `skills` directories, and the remote download cache are
+not implicit discovery or watch roots.
 
 The model prompt receives a bounded `index` catalog rather than every `SKILL.md`
 body. Search-only metadata stays available through the `skill` tool, while
@@ -952,7 +954,7 @@ needed merely to add a slash entry.
 
 Product- and organization-specific workflows remain user owned. For example,
 define `dual-review` or `auto-release` under a global
-`~/.config/zuno/skills/<name>/SKILL.md` or project `.zuno/skills/<name>/SKILL.md`
+`~/.config/zuno/skill/<name>/SKILL.md` or project `.zuno/skill/<name>/SKILL.md`
 when that policy is wanted. Zuno supplies the discovery, source identity,
 permission filtering, resource loading, and direct slash entry; it does not ship
 either policy body or assume a reviewer, release process, remote authority, gate
