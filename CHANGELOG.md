@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/sunerpy/zuno/compare/v0.6.7...v0.7.0) (2026-09-02)
+
+
+### Features
+
+* harden agent reliability with evidence gates, turn allowances, and fail-closed instructions ([#94](https://github.com/sunerpy/zuno/issues/94)) ([8022511](https://github.com/sunerpy/zuno/commit/802251140367ba6f60c17a84be9ad98b9321bbf1))
+
 ## [0.6.7](https://github.com/sunerpy/zuno/compare/v0.6.6...v0.6.7) (2026-09-02)
 
 
