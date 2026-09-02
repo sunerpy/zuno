@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.4](https://github.com/sunerpy/zuno/compare/v0.6.3...v0.6.4) (2026-09-02)
+
+
+### Bug Fixes
+
+* **acp:** project plans and file mutations durably ([#83](https://github.com/sunerpy/zuno/issues/83)) ([90ee67a](https://github.com/sunerpy/zuno/commit/90ee67a1d38a07255aedfb2e8f70fcdf0e691e93))
+
 ## [0.6.3](https://github.com/sunerpy/zuno/compare/v0.6.2...v0.6.3) (2026-09-02)
 
 
