@@ -1633,6 +1633,11 @@ async fn run_turn_in_span(
         .await?;
 
     let mut steps = 0_u32;
+    // Incremented where a dispatch group's results come back, so it counts calls the
+    // loop ran and never calls the model merely issued: a call a stop or an urgent
+    // input kept from running did no work, and a ceiling on this number is meant to
+    // bound work done.
+    let mut tool_calls_dispatched = 0_u32;
     let mut last_assistant_id = None;
     let mut prompt_cache: Option<PromptCache<ToolDefinition>> = None;
     let mut prompt_traces = PromptTraceSet::default();
@@ -1887,6 +1892,7 @@ async fn run_turn_in_span(
                 estimated_prompt_tokens,
                 context_limit: request.context_limit,
                 elapsed_seconds: turn_started.elapsed().as_secs(),
+                tool_calls_dispatched,
             })
             .await
             .map_err(|message| budget_hook_failure("before_request", message))?;
@@ -2504,6 +2510,7 @@ async fn run_turn_in_span(
                 estimated_prompt_tokens,
                 context_limit: request.context_limit,
                 elapsed_seconds: turn_started.elapsed().as_secs(),
+                tool_calls_dispatched,
             })
             .await
             .map_err(|message| budget_hook_failure("after_response", message))?;
@@ -2636,6 +2643,11 @@ async fn run_turn_in_span(
                     .collect::<Vec<_>>()
                     .await
                 };
+                // Every entry ran to a result, whether it succeeded, was blocked, or was
+                // interrupted, so this is the truthful count of tool work the turn did;
+                // the next `before_request` reads it.
+                tool_calls_dispatched = tool_calls_dispatched
+                    .saturating_add(u32::try_from(completed.len()).unwrap_or(u32::MAX));
 
                 // A completed parallel group is an indivisible durable unit: every
                 // execution result is appended in model order before an urgent inbox

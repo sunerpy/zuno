@@ -4736,6 +4736,7 @@ struct ObservedUsage {
     estimated_prompt_tokens: u64,
     context_limit: Option<u64>,
     elapsed_seconds: u64,
+    tool_calls_dispatched: u32,
 }
 
 impl ObservedUsage {
@@ -4749,6 +4750,7 @@ impl ObservedUsage {
             estimated_prompt_tokens: snapshot.estimated_prompt_tokens,
             context_limit: snapshot.context_limit,
             elapsed_seconds: snapshot.elapsed_seconds,
+            tool_calls_dispatched: snapshot.tool_calls_dispatched,
         }
     }
 }
@@ -5306,6 +5308,26 @@ async fn the_budget_snapshot_reports_the_turn_total_the_last_request_and_unrepor
         before[0].elapsed_seconds <= after[1].elapsed_seconds,
         "the turn is timed by more than one clock"
     );
+    assert_eq!(
+        (
+            before[0].tool_calls_dispatched,
+            after[0].tool_calls_dispatched
+        ),
+        (0, 0),
+        "the first step's call had not run when either decision about that step was taken"
+    );
+    assert_eq!(
+        (
+            before[1].tool_calls_dispatched,
+            after[1].tool_calls_dispatched
+        ),
+        (1, 1),
+        "the call the first step dispatched must be counted before the second step is decided"
+    );
     assert_eq!(run.requests.len(), 2);
-    assert_eq!(run.calls.len(), 1);
+    assert_eq!(
+        run.calls.len(),
+        1,
+        "the count the policy saw must match what the dispatcher actually ran"
+    );
 }

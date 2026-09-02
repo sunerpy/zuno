@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::sync::Arc;
+use zuno_engine::budget::TurnAllowance;
 use zuno_engine::driver::{AgentDriver, AgentDriverComponent, DefaultAgentDriver};
 use zuno_orchestration::{CapabilitySnapshot, sha256_json, sha256_text};
 use zuno_runtime::{
@@ -18,11 +19,39 @@ const ORCHESTRATION_CAPABILITIES_BUNDLE_ID: &str = "zuno.orchestration-capabilit
 const ORCHESTRATION_CAPABILITIES_COMPONENT_ID: &str = "zuno.orchestration-capabilities";
 const HOST_PLANNING_BUNDLE_ID: &str = "zuno.host-planning";
 const HOST_PLANNING_COMPONENT_ID: &str = "zuno.host-planning";
+const TURN_ALLOWANCE_BUNDLE_ID: &str = "zuno.turn-allowance";
+const TURN_ALLOWANCE_COMPONENT_ID: &str = "zuno.turn-allowance";
 const TOOL_MANIFEST_COMPONENT_ID: &str = "zuno.tools";
 const TOOL_CONTRIBUTIONS_COMPONENT_ID: &str = "zuno.tool-contributions";
 const PUBLIC_HTTP_COMPONENT_ID: &str = "zuno.public-http";
 const PRODUCT_CAPABILITY_SCOPE: &str = "profile";
 const PRODUCT_CAPABILITY_VERSION: CapabilityVersion = CapabilityVersion::new(1, 0);
+
+/// The token budget the default host grants a goal nobody put a number on.
+///
+/// Forty steps at a 200,000-token window. Both factors are already this workspace's:
+/// 200,000 is the context window the engine's own budget tests assume and the one the
+/// configuration fixtures use most, and a forty-step turn is the runaway the budget
+/// module names as the case it exists to stop. Every provider
+/// request re-sends the whole prompt, the prompt cannot exceed the window, and cache
+/// reads are charged, so 40 × 200,000 = 8,000,000 tokens is the most one such turn can
+/// cost. A goal that gets here without anyone having set a budget has had one full
+/// runaway's worth of allowance; the next number should come from a human, and the
+/// stop says so. A host that wants unlimited autonomy says so with
+/// [`TurnAllowance::UNLIMITED`] rather than with a larger number.
+pub const DEFAULT_GOAL_TOKEN_BUDGET: u64 = 40 * 200_000;
+
+/// The allowance the standard profile grants a turn.
+///
+/// Only the token default is set. The tool-call and wall-time ceilings stay at none
+/// because the workspace assumes no number for them, and a ceiling invented here
+/// would stop legitimate long turns on a guess; a host that has measured its own
+/// turns sets them through [`default_profile_with_tools_and_allowance`].
+pub const DEFAULT_TURN_ALLOWANCE: TurnAllowance = TurnAllowance {
+    default_token_budget: Some(DEFAULT_GOAL_TOKEN_BUDGET),
+    max_tool_calls: None,
+    max_duration: None,
+};
 
 /// Product descriptor families projected into the runtime-named capability plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +236,35 @@ impl Component for HostPlanningCapabilityComponent {
 
     async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
         context.provide(Arc::new(HostPlanningCapability))
+    }
+}
+
+/// Publishes the host's [`TurnAllowance`] as a typed profile service.
+///
+/// A profile service rather than a constant read by the goal store, so the number a
+/// run stops on is visible where the host composes its runtime and can differ per
+/// profile; a store-level constant would make every host's default the same and
+/// would hide the choice from the profile that is supposed to own it.
+struct TurnAllowanceComponent {
+    allowance: Arc<TurnAllowance>,
+}
+
+impl TurnAllowanceComponent {
+    fn new(allowance: TurnAllowance) -> Self {
+        Self {
+            allowance: Arc::new(allowance),
+        }
+    }
+}
+
+#[async_trait]
+impl Component for TurnAllowanceComponent {
+    fn id(&self) -> &str {
+        TURN_ALLOWANCE_COMPONENT_ID
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        context.provide(Arc::clone(&self.allowance))
     }
 }
 
@@ -398,6 +456,21 @@ pub fn orchestration_capabilities_bundle(snapshot: Arc<CapabilitySnapshot>) -> P
         .with_component(OrchestrationCapabilitiesComponent::new(snapshot))
 }
 
+/// Bundle the allowance a host grants every turn, as a typed profile service.
+///
+/// The host resolves it with `runtime.service::<TurnAllowance>()` when it builds a
+/// turn's budget policy. A profile that mounts no such bundle publishes no
+/// allowance, and a host must read that absence as [`TurnAllowance::UNLIMITED`]:
+/// the runtime treats an absent optional service as not configured, never as a
+/// default it invents. Custom profiles mount this explicitly rather than
+/// inheriting a number sized for the interactive host, for the same reason they
+/// opt into host planning.
+#[must_use]
+pub fn turn_allowance_bundle(allowance: TurnAllowance) -> ProfileBundle {
+    ProfileBundle::new(TURN_ALLOWANCE_BUNDLE_ID)
+        .with_component(TurnAllowanceComponent::new(allowance))
+}
+
 /// Build a profile bundle that publishes one complete native tool snapshot.
 ///
 /// A child runtime can mount this bundle to shadow inherited contributions after
@@ -479,6 +552,20 @@ pub fn default_profile() -> HarnessProfile {
 /// custom harness.
 #[must_use]
 pub fn default_profile_with_tools(contributions: ToolContributions) -> HarnessProfile {
+    default_profile_with_tools_and_allowance(contributions, DEFAULT_TURN_ALLOWANCE)
+}
+
+/// The standard interactive harness under an allowance the host chose.
+///
+/// The seam for a host with its own view of what an unbudgeted goal may spend or
+/// how long a turn may run, including [`TurnAllowance::UNLIMITED`] for one that
+/// genuinely wants no ceiling: that choice is then written in the profile rather
+/// than implied by a missing number.
+#[must_use]
+pub fn default_profile_with_tools_and_allowance(
+    contributions: ToolContributions,
+    allowance: TurnAllowance,
+) -> HarnessProfile {
     profile_with_tools(
         "default",
         Arc::new(DefaultAgentDriver),
@@ -488,4 +575,5 @@ pub fn default_profile_with_tools(contributions: ToolContributions) -> HarnessPr
     .with_bundle(
         ProfileBundle::new(HOST_PLANNING_BUNDLE_ID).with_component(HostPlanningCapabilityComponent),
     )
+    .with_bundle(turn_allowance_bundle(allowance))
 }

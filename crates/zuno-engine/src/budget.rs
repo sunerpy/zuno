@@ -10,6 +10,8 @@
 //! asked; the policy owns the limits and where they are stored.
 
 use async_trait::async_trait;
+use std::num::NonZeroU32;
+use std::time::Duration;
 
 /// Token counts attributable to provider requests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -72,6 +74,14 @@ pub struct TurnUsageSnapshot<'a> {
     pub context_limit: Option<u64>,
     /// Wall-clock seconds since the turn started.
     pub elapsed_seconds: u64,
+    /// Tool calls this turn has dispatched so far.
+    ///
+    /// Counts calls the loop actually ran, not calls the model issued: a call left
+    /// behind by a stop or skipped for an urgent input did no work, and a ceiling
+    /// on this number is meant to bound work done. It is a dimension of its own
+    /// rather than something inferred from `step` because a turn can loop cheaply
+    /// and endlessly on tool calls without ever nearing a token ceiling.
+    pub tool_calls_dispatched: u32,
 }
 
 /// Why a turn must stop.
@@ -81,6 +91,8 @@ pub enum BudgetStopKind {
     TokenBudget,
     /// The time allowance is spent.
     TimeBudget,
+    /// The tool-call allowance is spent.
+    ToolCallBudget,
     /// Usage cannot be measured, so the allowance cannot be honoured.
     UsageUnknown,
 }
@@ -92,6 +104,7 @@ impl BudgetStopKind {
         match self {
             Self::TokenBudget => "token_budget",
             Self::TimeBudget => "time_budget",
+            Self::ToolCallBudget => "tool_call_budget",
             Self::UsageUnknown => "usage_unknown",
         }
     }
@@ -142,6 +155,15 @@ impl BudgetDecision {
             detail: detail.into(),
         })
     }
+
+    /// Stop the turn because the tool-call allowance is spent.
+    #[must_use]
+    pub fn stop_tool_calls(detail: impl Into<String>) -> Self {
+        Self::Stop(BudgetStop {
+            kind: BudgetStopKind::ToolCallBudget,
+            detail: detail.into(),
+        })
+    }
 }
 
 /// The limits a turn runs under, consulted while the turn is still running.
@@ -181,6 +203,84 @@ pub trait TurnBudgetPolicy: Send + Sync {
 pub struct NoopBudgetPolicy;
 
 impl TurnBudgetPolicy for NoopBudgetPolicy {}
+
+/// What a host allows a turn when nothing more specific was set.
+///
+/// Carried by the harness profile and handed to a [`TurnBudgetPolicy`] when it is
+/// built, so the ceiling a run stops on is a decision the host made once and wrote
+/// down, not a constant buried in whichever store the policy reads. Every field is
+/// an `Option` so that "no ceiling of this kind" is a visible choice in the type: a
+/// zero here would have to mean either unlimited, which is the runaway this exists
+/// to prevent, or a turn that may do nothing, and a reader could not tell which.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnAllowance {
+    /// The token budget a goal runs under when nobody put a number on it.
+    ///
+    /// An explicit goal budget always wins over this. `None` leaves such a goal
+    /// without a token ceiling, which is the historical behaviour and the choice a
+    /// host makes when it genuinely wants unlimited autonomy. It is not a turn
+    /// ceiling: the policy charges it against the durable goal, where an allowance
+    /// can outlive the turn and actually bind.
+    pub default_token_budget: Option<u64>,
+    /// The most tool calls one turn may dispatch.
+    ///
+    /// Non-zero because a turn allowed no tool calls would stop on its first
+    /// request before the model could answer; `None` is how a host says there is
+    /// no ceiling.
+    pub max_tool_calls: Option<NonZeroU32>,
+    /// The longest one turn may run, measured from the turn's start.
+    ///
+    /// Honoured at the snapshot's one-second resolution and only where the policy
+    /// is consulted: the ceiling is never reported reached before the turn has
+    /// actually run this long, and a provider request already in flight when the
+    /// clock passes it completes before the turn stops.
+    pub max_duration: Option<Duration>,
+}
+
+impl TurnAllowance {
+    /// No ceilings of any kind: what a turn ran under before allowances existed.
+    pub const UNLIMITED: Self = Self {
+        default_token_budget: None,
+        max_tool_calls: None,
+        max_duration: None,
+    };
+
+    /// The turn ceiling this snapshot has reached, if any.
+    ///
+    /// A pure function of the allowance and the snapshot, so a policy can call it
+    /// from either hook and a test can exercise it without a loop. The tool-call
+    /// ceiling is checked first because its count is exact, whereas elapsed time is
+    /// rounded down to whole seconds; when both are reached the stop names the
+    /// measurement that cannot be argued with. The token default is deliberately
+    /// not consulted here: it belongs to the goal, not the turn.
+    #[must_use]
+    pub fn ceiling_reached(&self, snapshot: &TurnUsageSnapshot<'_>) -> Option<BudgetStop> {
+        if let Some(max) = self.max_tool_calls
+            && snapshot.tool_calls_dispatched >= max.get()
+        {
+            return Some(BudgetStop {
+                kind: BudgetStopKind::ToolCallBudget,
+                detail: format!(
+                    "the turn's tool-call ceiling of {max} is reached: {} tool calls dispatched",
+                    snapshot.tool_calls_dispatched
+                ),
+            });
+        }
+        if let Some(max) = self.max_duration
+            && Duration::from_secs(snapshot.elapsed_seconds) >= max
+        {
+            return Some(BudgetStop {
+                kind: BudgetStopKind::TimeBudget,
+                detail: format!(
+                    "the turn's wall-time ceiling of {} seconds is reached: {} seconds elapsed",
+                    max.as_secs_f64(),
+                    snapshot.elapsed_seconds
+                ),
+            });
+        }
+        None
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -227,6 +327,7 @@ mod tests {
             estimated_prompt_tokens: 1_000,
             context_limit: Some(200_000),
             elapsed_seconds: 12,
+            tool_calls_dispatched: 2,
         };
 
         assert_eq!(
@@ -260,5 +361,109 @@ mod tests {
             },
             "usage_unknown"
         );
+        assert_eq!(
+            match BudgetDecision::stop_tool_calls("too many tool calls") {
+                BudgetDecision::Stop(stop) => stop.kind.code(),
+                _ => panic!("expected a stop"),
+            },
+            "tool_call_budget"
+        );
+    }
+
+    fn snapshot(tool_calls_dispatched: u32, elapsed_seconds: u64) -> TurnUsageSnapshot<'static> {
+        TurnUsageSnapshot {
+            session_id: "session-1",
+            turn_id: "turn-1",
+            step: 4,
+            turn_usage: usage(100, 50, true),
+            last_request: usage(10, 5, true),
+            estimated_prompt_tokens: 1_000,
+            context_limit: Some(200_000),
+            elapsed_seconds,
+            tool_calls_dispatched,
+        }
+    }
+
+    #[test]
+    fn an_unlimited_allowance_reaches_no_ceiling_however_long_a_turn_runs() {
+        assert_eq!(TurnAllowance::default(), TurnAllowance::UNLIMITED);
+        assert_eq!(
+            TurnAllowance::UNLIMITED.ceiling_reached(&snapshot(u32::MAX, u64::MAX)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tool_call_ceiling_is_reached_by_the_count_and_names_both_numbers() {
+        let allowance = TurnAllowance {
+            max_tool_calls: NonZeroU32::new(3),
+            ..TurnAllowance::UNLIMITED
+        };
+
+        assert_eq!(allowance.ceiling_reached(&snapshot(2, 0)), None);
+        let stop = allowance
+            .ceiling_reached(&snapshot(3, 0))
+            .expect("the third call reaches the ceiling");
+        assert_eq!(stop.kind, BudgetStopKind::ToolCallBudget);
+        assert_eq!(
+            stop.detail,
+            "the turn's tool-call ceiling of 3 is reached: 3 tool calls dispatched"
+        );
+        let over = allowance
+            .ceiling_reached(&snapshot(5, 0))
+            .expect("past the ceiling is still reached");
+        assert!(
+            over.detail.contains("5 tool calls dispatched"),
+            "the stop must report the observed count, not the ceiling: {over:?}"
+        );
+    }
+
+    #[test]
+    fn a_wall_time_ceiling_is_never_reached_before_the_turn_has_run_that_long() {
+        let allowance = TurnAllowance {
+            max_duration: Some(Duration::from_millis(1_500)),
+            ..TurnAllowance::UNLIMITED
+        };
+
+        // A reading of one second means the turn has run at least one second and
+        // less than two, which may or may not be past 1.5; a reading of two certainly
+        // is. The ceiling is reported only once it is certain.
+        assert_eq!(allowance.ceiling_reached(&snapshot(0, 1)), None);
+        let stop = allowance
+            .ceiling_reached(&snapshot(0, 2))
+            .expect("two whole seconds exceed the ceiling");
+        assert_eq!(stop.kind, BudgetStopKind::TimeBudget);
+        assert_eq!(
+            stop.detail,
+            "the turn's wall-time ceiling of 1.5 seconds is reached: 2 seconds elapsed"
+        );
+    }
+
+    #[test]
+    fn the_exact_tool_call_count_is_reported_ahead_of_the_rounded_clock() {
+        let allowance = TurnAllowance {
+            default_token_budget: Some(1),
+            max_tool_calls: NonZeroU32::new(1),
+            max_duration: Some(Duration::from_secs(10)),
+        };
+
+        let stop = allowance
+            .ceiling_reached(&snapshot(1, 10))
+            .expect("both ceilings are reached");
+
+        assert_eq!(stop.kind, BudgetStopKind::ToolCallBudget);
+    }
+
+    #[test]
+    fn the_token_default_is_a_goal_matter_and_not_a_turn_ceiling() {
+        let allowance = TurnAllowance {
+            default_token_budget: Some(1),
+            ..TurnAllowance::UNLIMITED
+        };
+
+        // The snapshot has spent far more than one token; the ceiling check does not
+        // care, because charging the default against a turn total would reset every
+        // turn and never bind.
+        assert_eq!(allowance.ceiling_reached(&snapshot(0, 0)), None);
     }
 }
