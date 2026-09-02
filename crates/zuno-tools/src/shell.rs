@@ -1,3 +1,5 @@
+mod authority;
+
 use crate::output_policy::OutputPolicy;
 use crate::risk::{
     GIT_REPOSITORY_ENVIRONMENT_VARIABLES, GateOutcome, RiskAssessment, RiskContext, assess_and_gate,
@@ -470,7 +472,12 @@ impl ShellTool {
             command: params.command.clone(),
             workdir: cwd.to_string_lossy().into_owned(),
             git_head,
-            contract: exit_contract(self.shell.kind(), self.shell.name(), exit_policy),
+            contract: exit_contract(
+                self.shell.kind(),
+                self.shell.name(),
+                exit_policy,
+                &params.command,
+            ),
         };
         let foreground_timeout_ms = normalize_foreground_timeout(params.timeout);
         let retention = if params.background {
@@ -930,14 +937,31 @@ fn shell_arguments(
 /// from the policy that was requested: a `pipefail` request on `dash` sets
 /// nothing, so calling its status authoritative would manufacture exactly the
 /// false confidence this policy exists to remove.
-fn exit_contract(kind: CommandShellKind, interpreter: &str, policy: ExitPolicy) -> ExitContract {
-    let authoritative = ExitContract {
-        authority: ExitAuthority::Authoritative,
-        limitation: None,
-    };
+///
+/// The configuration is only half of it. A caller's `set +e`, `|| true`, or inner
+/// `bash -c` outlives the prologue, so a configuration that would otherwise be
+/// authoritative is re-read against the text in [`authority::text_limitation`]
+/// before this returns. That changes nothing about how the command runs — only what
+/// the receipt is allowed to claim about the status it produced.
+fn exit_contract(
+    kind: CommandShellKind,
+    interpreter: &str,
+    policy: ExitPolicy,
+    command: &str,
+) -> ExitContract {
     let derived = |limitation: String| ExitContract {
         authority: ExitAuthority::Derived,
         limitation: Some(limitation),
+    };
+    // Lazy: the branches that are derived on configuration alone have nothing to
+    // learn from the text, and parsing a command to answer a question already
+    // settled would be work spent on an answer that cannot change.
+    let configured = || match authority::text_limitation(kind, policy, command) {
+        Some(limitation) => derived(limitation),
+        None => ExitContract {
+            authority: ExitAuthority::Authoritative,
+            limitation: None,
+        },
     };
     match (kind, policy) {
         (_, ExitPolicy::Last) => derived(format!(
@@ -951,10 +975,10 @@ fn exit_contract(kind: CommandShellKind, interpreter: &str, policy: ExitPolicy) 
              policy that covers the whole command here",
             ExitPolicy::All.as_str()
         )),
-        (CommandShellKind::PowerShell, ExitPolicy::All) => authoritative,
+        (CommandShellKind::PowerShell, ExitPolicy::All) => configured(),
         (CommandShellKind::Posix, ExitPolicy::Pipefail | ExitPolicy::All) => {
             if honours_pipefail(interpreter) {
-                authoritative
+                configured()
             } else {
                 derived(format!(
                     "the {interpreter} interpreter does not implement `set -o pipefail`, so a \
@@ -1670,6 +1694,14 @@ mod tests {
             .collect()
     }
 
+    /// The contract [`PIPELINE`] earns under one configuration.
+    ///
+    /// Every configuration test uses the same command so the verdict is the
+    /// configuration's alone; the text's own effect on it has its own tests.
+    fn contract(kind: CommandShellKind, interpreter: &str, policy: ExitPolicy) -> ExitContract {
+        exit_contract(kind, interpreter, policy, PIPELINE)
+    }
+
     #[test]
     fn the_default_policy_puts_pipefail_in_effect_for_a_posix_command() {
         assert_eq!(ExitPolicy::default(), ExitPolicy::Pipefail);
@@ -1678,7 +1710,7 @@ mod tests {
             vec!["-lc".to_owned(), format!("set -o pipefail\n{PIPELINE}")]
         );
         assert_eq!(
-            exit_contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+            contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
             ExitContract {
                 authority: ExitAuthority::Authoritative,
                 limitation: None,
@@ -1692,7 +1724,7 @@ mod tests {
             arguments(CommandShellKind::Posix, "bash", ExitPolicy::Last),
             vec!["-lc".to_owned(), PIPELINE.to_owned()]
         );
-        let contract = exit_contract(CommandShellKind::Posix, "bash", ExitPolicy::Last);
+        let contract = contract(CommandShellKind::Posix, "bash", ExitPolicy::Last);
         assert_eq!(contract.authority, ExitAuthority::Derived);
         assert!(
             contract
@@ -1709,8 +1741,48 @@ mod tests {
             vec!["-lc".to_owned(), format!("set -eo pipefail\n{PIPELINE}")]
         );
         assert_eq!(
-            exit_contract(CommandShellKind::Posix, "zsh", ExitPolicy::All).authority,
+            contract(CommandShellKind::Posix, "zsh", ExitPolicy::All).authority,
             ExitAuthority::Authoritative
+        );
+    }
+
+    #[test]
+    fn a_command_that_masks_its_own_status_is_derived_under_any_configuration() {
+        // The best configuration this tool can build still runs whatever it was
+        // given, and `|| true` survives `set -eo pipefail` untouched. A contract
+        // read off the prologue alone would call this status authoritative and let
+        // it close a success criterion the command never demonstrated.
+        let masked = exit_contract(
+            CommandShellKind::Posix,
+            "bash",
+            ExitPolicy::All,
+            "cargo test || true",
+        );
+        assert_eq!(masked.authority, ExitAuthority::Derived);
+        assert!(
+            masked
+                .limitation
+                .as_deref()
+                .is_some_and(|limitation| limitation.contains("|| true")),
+            "{:?}",
+            masked.limitation
+        );
+
+        // A configuration that was already derived keeps the reason it was derived
+        // for: the interpreter's own gap is the more useful thing to report.
+        let dash = exit_contract(
+            CommandShellKind::Posix,
+            "dash",
+            ExitPolicy::All,
+            "cargo test || true",
+        );
+        assert_eq!(dash.authority, ExitAuthority::Derived);
+        assert!(
+            dash.limitation
+                .as_deref()
+                .is_some_and(|limitation| limitation.contains("pipefail")),
+            "{:?}",
+            dash.limitation
         );
     }
 
@@ -1728,7 +1800,7 @@ mod tests {
             vec!["-lc".to_owned(), format!("set -e\n{PIPELINE}")]
         );
         for policy in [ExitPolicy::Pipefail, ExitPolicy::All] {
-            let contract = exit_contract(CommandShellKind::Posix, "dash", policy);
+            let contract = contract(CommandShellKind::Posix, "dash", policy);
             assert_eq!(contract.authority, ExitAuthority::Derived, "{policy:?}");
             assert!(
                 contract
@@ -1754,13 +1826,13 @@ mod tests {
                 "{policy:?}"
             );
             assert_eq!(
-                exit_contract(CommandShellKind::PowerShell, "pwsh", policy).authority,
+                contract(CommandShellKind::PowerShell, "pwsh", policy).authority,
                 ExitAuthority::Derived,
                 "{policy:?}"
             );
         }
         assert!(
-            exit_contract(CommandShellKind::PowerShell, "pwsh", ExitPolicy::Pipefail)
+            contract(CommandShellKind::PowerShell, "pwsh", ExitPolicy::Pipefail)
                 .limitation
                 .is_some_and(|reason| reason.contains("no pipefail equivalent")),
             "the asymmetry with POSIX belongs in the receipt, not only in the code"
@@ -1783,7 +1855,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            exit_contract(CommandShellKind::PowerShell, "pwsh", ExitPolicy::All),
+            contract(CommandShellKind::PowerShell, "pwsh", ExitPolicy::All),
             ExitContract {
                 authority: ExitAuthority::Authoritative,
                 limitation: None,
@@ -1815,7 +1887,7 @@ mod tests {
             command: "cargo test --workspace".to_owned(),
             workdir: "/workspace".to_owned(),
             git_head: Some("f".repeat(40)),
-            contract: exit_contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
         };
 
         let launched = verification.unresolved("still running in the background");
