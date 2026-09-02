@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/sunerpy/zuno/compare/v0.6.1...v0.6.2) (2026-09-02)
+
+
+### Bug Fixes
+
+* avoid recursive ancestor skill watches ([#78](https://github.com/sunerpy/zuno/issues/78)) ([b8c230d](https://github.com/sunerpy/zuno/commit/b8c230d8322e8363c58d85d0be49466e6cbc328e))
+
 ## [0.6.1](https://github.com/sunerpy/zuno/compare/v0.6.0...v0.6.1) (2026-09-02)
 
 
