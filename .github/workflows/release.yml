@@ -85,11 +85,12 @@ jobs:
     timeout-minutes: 5
     permissions:
       actions: write
-      contents: read
+      contents: write
       pull-requests: read
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Resolve the one open release PR
@@ -99,6 +100,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ACTION_PR: ${{ needs.release_please.outputs.pr }}
           EXPECTED_BASE_SHA: ${{ github.sha }}
+          RELEASE_PR_REFRESH_ENABLED: "1"
         run: |
           set -euo pipefail
           if [ -n "${ACTION_PR:-}" ] && jq -e 'type == "object" and .number != null' <<<"$ACTION_PR" >/dev/null; then
@@ -132,11 +134,17 @@ jobs:
           )
           head_sha=$(jq -r '.head_sha' <<<"$resolved")
           head_ref=$(jq -r '.head_ref' <<<"$resolved")
+          refreshed=$(jq -r '.refreshed' <<<"$resolved")
+          previous_base_sha=$(jq -r '.previous_base_sha // ""' <<<"$resolved")
+          previous_head_sha=$(jq -r '.previous_head_sha // ""' <<<"$resolved")
           {
             echo "dispatch=true"
             echo "number=${number}"
             echo "head_sha=${head_sha}"
             echo "head_ref=${head_ref}"
+            echo "refreshed=${refreshed}"
+            echo "previous_base_sha=${previous_base_sha}"
+            echo "previous_head_sha=${previous_head_sha}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Dispatch exact candidate ref
@@ -162,11 +170,22 @@ jobs:
         env:
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           HEAD_SHA: ${{ steps.release_pr.outputs.head_sha }}
+          REFRESHED: ${{ steps.release_pr.outputs.refreshed }}
+          PREVIOUS_BASE_SHA: ${{ steps.release_pr.outputs.previous_base_sha }}
+          PREVIOUS_HEAD_SHA: ${{ steps.release_pr.outputs.previous_head_sha }}
         run: |
           set -euo pipefail
           {
             echo "### Manual release approval required"
             echo
+            if [ "$REFRESHED" = true ]; then
+              echo "The existing release PR was safely refreshed after a non-releasable main update:"
+              echo
+              echo "- previous base: \`${PREVIOUS_BASE_SHA}\`"
+              echo "- previous head: \`${PREVIOUS_HEAD_SHA}\`"
+              echo "- certified head: \`${HEAD_SHA}\`"
+              echo
+            fi
             echo "Release PR #${PR_NUMBER} was created by \`GITHUB_TOKEN\` at \`${HEAD_SHA}\`."
             echo "If GitHub marks its ordinary CI run as \`action_required\`, approve that exact run."
             echo

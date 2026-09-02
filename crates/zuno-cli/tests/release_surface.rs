@@ -1351,9 +1351,11 @@ fn release_controller_dispatches_exact_source_and_never_compiles() {
     let dispatch = job_body(&release, "dispatch_candidate").join("\n");
     for required in [
         "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+        "fetch-depth: 0",
         "persist-credentials: false",
         ".github/scripts/resolve-release-pr-head.sh",
         "EXPECTED_BASE_SHA: ${{ github.sha }}",
+        "RELEASE_PR_REFRESH_ENABLED: \"1\"",
         "RELEASE_PR_NUMBER=\"$number\"",
         "gh workflow run release-candidate.yml",
         "--ref \"$HEAD_REF\"",
@@ -1385,6 +1387,27 @@ fn release_controller_dispatches_exact_source_and_never_compiles() {
             "release controller recompiles during promotion via {forbidden:?}"
         );
     }
+
+    let resolver = std::fs::read_to_string(
+        workspace_root().join(".github/scripts/resolve-release-pr-head.sh"),
+    )
+    .expect("read release PR resolver");
+    for required in [
+        "merge-base --is-ancestor",
+        "cherry-pick \"$old_head\"",
+        "--force-with-lease=\"refs/heads/${head_ref}:${old_head}\"",
+        "GIT_ASKPASS",
+        "previous_head_sha",
+    ] {
+        assert!(
+            resolver.contains(required),
+            "release PR refresh lost safety mechanism {required:?}"
+        );
+    }
+    assert!(
+        !resolver.contains("push --force "),
+        "release PR refresh must never overwrite a concurrent branch update"
+    );
 
     let resolve = job_body(&release, "resolve_release").join("\n");
     for required in [
@@ -1526,6 +1549,7 @@ esac
     assert_eq!(resolved["number"], 62);
     assert_eq!(resolved["base_sha"], NEW_BASE);
     assert_eq!(resolved["head_sha"], NEW_HEAD);
+    assert_eq!(resolved["refreshed"], false);
 
     let stale_state = fixture.path().join("stale-state");
     let stale = run(&stale_state, true);
@@ -1537,6 +1561,243 @@ esac
         String::from_utf8_lossy(&stale.stderr).contains("did not stabilize on main"),
         "stale failure did not explain the bounded wait:\n{}",
         String::from_utf8_lossy(&stale.stderr)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn release_pr_head_resolver_replays_one_trusted_commit_and_fails_closed_on_conflict() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn clear_parent_git_context(command: &mut Command) {
+        for variable in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_PREFIX",
+        ] {
+            command.env_remove(variable);
+        }
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let mut command = Command::new("git");
+        clear_parent_git_context(&mut command);
+        let output = command
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {} failed:\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    let fixture = tempfile::tempdir().expect("temporary resolver Git fixture");
+    let remote = fixture.path().join("remote.git");
+    let repository = fixture.path().join("repository");
+    std::fs::create_dir(&remote).expect("create bare remote directory");
+    std::fs::create_dir(&repository).expect("create fixture repository");
+    git(&remote, &["init", "--bare"]);
+    git(&repository, &["init", "-b", "main"]);
+    git(
+        &repository,
+        &["config", "user.name", "Release Fixture Maintainer"],
+    );
+    git(
+        &repository,
+        &["config", "user.email", "maintainer@example.com"],
+    );
+    git(
+        &repository,
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote.to_str().expect("UTF-8 remote"),
+        ],
+    );
+
+    std::fs::write(repository.join("version.txt"), "0.6.0\n").expect("write version fixture");
+    std::fs::write(repository.join("guide.md"), "initial guide\n").expect("write guide fixture");
+    git(&repository, &["add", "version.txt", "guide.md"]);
+    git(&repository, &["commit", "-m", "feat: establish fixture"]);
+    let old_base = git(&repository, &["rev-parse", "HEAD"]);
+    git(&repository, &["push", "-u", "origin", "main"]);
+
+    let head_ref = "release-please--branches--main--components--zuno";
+    git(&repository, &["checkout", "-b", head_ref]);
+    std::fs::write(repository.join("version.txt"), "0.6.1\n")
+        .expect("write release version fixture");
+    git(&repository, &["add", "version.txt"]);
+    git(
+        &repository,
+        &[
+            "-c",
+            "user.name=github-actions[bot]",
+            "-c",
+            "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+            "commit",
+            "-m",
+            "chore: release 0.6.1",
+        ],
+    );
+    let old_head = git(&repository, &["rev-parse", "HEAD"]);
+    git(&repository, &["push", "-u", "origin", head_ref]);
+
+    git(&repository, &["checkout", "main"]);
+    std::fs::write(
+        repository.join("guide.md"),
+        "initial guide\ndocs-only clarification\n",
+    )
+    .expect("write docs-only main change");
+    git(&repository, &["add", "guide.md"]);
+    git(
+        &repository,
+        &["commit", "-m", "docs: clarify release guide"],
+    );
+    let expected_base = git(&repository, &["rev-parse", "HEAD"]);
+    git(&repository, &["push", "origin", "main"]);
+    assert_eq!(
+        git(&repository, &["merge-base", &old_head, &expected_base]),
+        old_base
+    );
+
+    let fake_gh = fixture.path().join("gh");
+    let fake = r#"#!/usr/bin/env bash
+set -euo pipefail
+[ "$1" = api ]
+case "$2" in
+  */pulls/77)
+    head=$(git --git-dir="$FAKE_REMOTE" rev-parse "refs/heads/$FAKE_HEAD_REF")
+    jq -n \
+      --arg repository "sunerpy/zuno" \
+      --arg base "$FAKE_BASE_SHA" \
+      --arg head "$head" \
+      --arg head_ref "$FAKE_HEAD_REF" \
+      '{
+        state: "open",
+        user: {login: "github-actions[bot]"},
+        base: {ref: "main", sha: $base},
+        head: {
+          repo: {full_name: $repository},
+          ref: $head_ref,
+          sha: $head
+        },
+        labels: [{name: "autorelease: pending"}]
+      }'
+    ;;
+  */commits/*)
+    sha=${2##*/}
+    parent=$(git --git-dir="$FAKE_REMOTE" show -s --format=%P "$sha")
+    email=$(git --git-dir="$FAKE_REMOTE" show -s --format=%ae "$sha")
+    message=$(git --git-dir="$FAKE_REMOTE" show -s --format=%B "$sha")
+    jq -n \
+      --arg parent "$parent" \
+      --arg email "$email" \
+      --arg message "$message" \
+      '{
+        parents: [{sha: $parent}],
+        author: {login: "github-actions[bot]"},
+        commit: {author: {email: $email}, message: $message}
+      }'
+    ;;
+  *)
+    echo "unexpected fake gh request: $*" >&2
+    exit 1
+    ;;
+esac
+"#;
+    std::fs::write(&fake_gh, fake).expect("write dynamic fake gh");
+    let mut permissions = std::fs::metadata(&fake_gh)
+        .expect("dynamic fake gh metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, permissions).expect("make dynamic fake gh executable");
+
+    let resolver = workspace_root().join(".github/scripts/resolve-release-pr-head.sh");
+    let run = |base: &str| {
+        let mut command = Command::new("bash");
+        clear_parent_git_context(&mut command);
+        command
+            .arg(&resolver)
+            .current_dir(&repository)
+            .env("GITHUB_REPOSITORY", "sunerpy/zuno")
+            .env("RELEASE_PR_NUMBER", "77")
+            .env("EXPECTED_BASE_SHA", base)
+            .env("RELEASE_PR_RESOLVE_ATTEMPTS", "5")
+            .env("RELEASE_PR_RESOLVE_DELAY_SECONDS", "0")
+            .env("RELEASE_PR_REFRESH_OBSERVATIONS", "1")
+            .env("GH_TOKEN", "fixture-token")
+            .env("GH_BIN", &fake_gh)
+            .env("FAKE_REMOTE", &remote)
+            .env("FAKE_HEAD_REF", head_ref)
+            .env("FAKE_BASE_SHA", base)
+            .output()
+            .expect("run release PR resolver against Git fixture")
+    };
+
+    let refreshed = run(&expected_base);
+    assert!(
+        refreshed.status.success(),
+        "resolver failed to refresh one trusted release commit:\n{}",
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    let resolved: serde_json::Value =
+        serde_json::from_slice(&refreshed.stdout).expect("resolver emits refreshed JSON");
+    assert_eq!(resolved["number"], 77);
+    assert_eq!(resolved["base_sha"], expected_base);
+    assert_eq!(resolved["refreshed"], true);
+    assert_eq!(resolved["previous_base_sha"], old_base);
+    assert_eq!(resolved["previous_head_sha"], old_head);
+
+    let refreshed_head = git(&remote, &["rev-parse", &format!("refs/heads/{head_ref}")]);
+    assert_ne!(refreshed_head, old_head);
+    assert_eq!(
+        git(&remote, &["show", "-s", "--format=%P", &refreshed_head]),
+        expected_base
+    );
+    assert_eq!(
+        git(&remote, &["show", "-s", "--format=%ae", &refreshed_head]),
+        "41898282+github-actions[bot]@users.noreply.github.com"
+    );
+    assert_eq!(
+        git(&remote, &["show", "-s", "--format=%s", &refreshed_head]),
+        "chore: release 0.6.1"
+    );
+
+    std::fs::write(repository.join("version.txt"), "0.6.2-dev\n")
+        .expect("write conflicting main version");
+    git(&repository, &["add", "version.txt"]);
+    git(
+        &repository,
+        &["commit", "-m", "docs: record development version"],
+    );
+    let conflicting_base = git(&repository, &["rev-parse", "HEAD"]);
+    git(&repository, &["push", "origin", "main"]);
+
+    let conflict = run(&conflicting_base);
+    assert!(
+        !conflict.status.success(),
+        "resolver overwrote the release branch after a replay conflict"
+    );
+    assert!(
+        String::from_utf8_lossy(&conflict.stderr).contains("CONFLICT"),
+        "resolver did not expose the cherry-pick conflict:\n{}",
+        String::from_utf8_lossy(&conflict.stderr)
+    );
+    assert_eq!(
+        git(&remote, &["rev-parse", &format!("refs/heads/{head_ref}")]),
+        refreshed_head,
+        "a failed replay must leave the release PR branch unchanged"
     );
 }
 

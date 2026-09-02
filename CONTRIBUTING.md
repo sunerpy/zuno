@@ -130,6 +130,9 @@ must consume one immutable candidate run without compiling; and `zuno/pr-gate`
 must require every job in `ci.yml`. If you add a CI job or release target, that
 suite will tell you what else to update. See
 [`docs/operate/release-pipeline.md`](./docs/operate/release-pipeline.md).
+The release controller may replay one verified release-please commit onto a newer
+non-releasable `main` tip, but only through an exact force-with-lease; never replace
+that path with an unguarded force push or a merge commit.
 
 ## Reporting a bug
 
