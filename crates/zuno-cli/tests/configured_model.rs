@@ -20,7 +20,9 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
 
-use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config};
+use zuno_testkit::{
+    DbChoice, MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config,
+};
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
@@ -261,7 +263,12 @@ async fn route_with_config(
     #[cfg(not(unix))]
     let _ = wanted;
 
-    let env = ScriptedEnv::new().expect("isolated environment");
+    // This is a process/PTY routing proof, not an in-memory database proof. Give each
+    // subprocess an isolated file database so workspace-wide nextest pressure cannot
+    // turn shared-memory URI setup into an unrelated model-routing failure.
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
     let variables = variables(&env, config);
     let aaa_before = aaa.captured().await.len();
     let zzz_before = zzz.captured().await.len();
