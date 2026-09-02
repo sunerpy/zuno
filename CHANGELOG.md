@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.5](https://github.com/sunerpy/zuno/compare/v0.6.4...v0.6.5) (2026-09-02)
+
+
+### Bug Fixes
+
+* **skills:** consolidate default discovery roots ([#86](https://github.com/sunerpy/zuno/issues/86)) ([bf63edc](https://github.com/sunerpy/zuno/commit/bf63edc7761075fc7204b5790c23d74d932057e3))
+
 ## [0.6.4](https://github.com/sunerpy/zuno/compare/v0.6.3...v0.6.4) (2026-09-02)
 
 
