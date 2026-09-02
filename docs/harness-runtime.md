@@ -1042,10 +1042,14 @@ archives the previous visible Plan and installs a new root bound to the current
 `goal_id`; an atomic objective can terminalize stale unfinished work without
 replacing an already terminal historical Plan. Recognized action
 words take precedence over the shorthand.
-Neither surface sends the slash text to the model or synthesizes a private client-only result. Goal output is a typed
-session-command output event, not reasoning. Invalid explicit action arguments
-remain typed command failures; ACP maps them to JSON-RPC invalid params rather
-than an internal session error.
+Neither surface sends the slash text to the model or synthesizes a private
+client-only result. Goal output is a typed session-command output event, not
+reasoning. A successful create or edit command also establishes the host-owned
+idle edge that lets the shared Goal continuation driver run immediately. When
+the session has no user message, the driver durably admits the objective itself
+as the initial user turn anchor before the provider request. Invalid explicit
+action arguments remain typed command failures; ACP maps them to JSON-RPC
+invalid params rather than an internal session error.
 
 The command acquires the session's exclusive run ownership and emits typed
 started, output, completed, or failed lifecycle events. TUI and ACP consume
@@ -1157,7 +1161,7 @@ the context limit, and the latest accounting mode.
 
 An active goal uses two recovery layers. The provider request layer retries a bounded sequence in place and rolls back unpublished partial output before another request. Its absolute recovery deadline is anchored when the original request starts. The original request remains governed by transport and stream-idle limits, while rollback, locally jittered backoff, and every replacement attempt must finish before that deadline; expiry cancels an active replay and persists its attempt as a typed deadline failure. Before every wait Zuno commits a `provider_retry_backoff` checkpoint with the request id, turn id, failed and next attempt, typed reason, selected delay, and wait deadline. Its in-place backoff is interruptible by both hard cancellation and durable live steering; waking it does not replay the stale provider request. After a process restart, Zuno waits out any remaining checkpoint deadline and starts a new turn and provider request instead of attempting to revive the old transport. If the bounded sequence still ends in a recoverable error, the goal controller writes a `goal_retry` row before waiting and starts a fresh agent turn when its persisted deadline arrives. There is no cross-turn retry-count ceiling for recoverable failures: the delay grows exponentially, reaches the configured cap, and the goal remains active until it completes, is paused, reaches its token budget, or encounters a permanent failure.
 
-The retry row is tied to the exact `goal_id` and stores the attempt, typed reason, selected delay, schedule time, and next eligible time. Reopening the same session reconstructs the wait from SQLite. Queued user input has priority over an automatic turn, and long waits are split by `poll_interval_ms` so an interactive surface can notice that input promptly.
+The retry row is tied to the exact `goal_id` and stores the attempt, typed reason, selected delay, schedule time, and next eligible time. Reopening the same session reconstructs the wait from SQLite. ACP load and resume rebuild the runtime, replay the requested durable projections, then schedule any active root Goal through the detached continuation observer. This recovery path is process-owned and uses the same per-session execution gate as a prompt, so it cannot race a second Goal turn. Queued user input has priority over an automatic turn, and long waits are split by `poll_interval_ms` so an interactive surface can notice that input promptly.
 
 Local delays use exponential backoff with symmetric jitter and never collapse to zero. A valid provider `Retry-After` value is never shortened by jitter; it is clamped to the configured ceiling rather than replaced by an earlier local delay.
 

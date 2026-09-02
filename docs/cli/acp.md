@@ -9,6 +9,18 @@ Because the protocol owns stdout, do not read that stream as human output. Use `
 when you only want to confirm the adapter is present, and `--print-logs` to route
 diagnostics to stderr where they will not corrupt the protocol stream.
 
+## Goal continuation
+
+`/goal <objective>` is a native control followed by autonomous execution. Zuno
+persists the typed command result, then immediately advances the active Goal
+through the shared driver. On a fresh session the objective is admitted through
+the durable inbox as the first user turn; the literal slash command is never
+sent to the provider.
+
+`session/load` and `session/resume` rebuild the session runtime and automatically
+resume an active root Goal. No extra prompt is required, including for a session
+written by 0.6.0 that contains an active Goal but no user message.
+
 ## Session MCP servers
 
 Zuno advertises standard ACP MCP support for stdio and Streamable HTTP;

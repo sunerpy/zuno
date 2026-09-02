@@ -4693,7 +4693,13 @@ impl TurnHost {
                         command: SessionCommand::Goal,
                     })
                     .await
-                    .map_err(SessionCommandError::internal)
+                    .map_err(SessionCommandError::internal)?;
+                // A native Goal command is a complete host-owned turn. Fresh sessions start
+                // with `last_turn_completed = false`, so without this idle edge the durable
+                // active Goal is persisted but the shared continuation driver is never allowed
+                // to prepare its first autonomous turn.
+                self.last_turn_completed = true;
+                Ok(())
             }
             Err(error) => {
                 events
@@ -7025,7 +7031,14 @@ impl TurnHost {
         prepared: &zuno_goal::PreparedContinuation,
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, TurnFailure> {
-        let dynamic_context = dynamic_context_from_goal_entry(prepared.entry());
+        let goal = self.ensure_goal_turn_anchor().map_err(TurnFailure::host)?;
+        let planning = self
+            .ensure_durable_plan(&goal.objective, PlanningInputSource::GoalObjective, None)
+            .map_err(TurnFailure::host)?;
+        let mut dynamic_context = dynamic_context_from_goal_entry(prepared.entry());
+        if let Some(instruction) = planning_runtime_instruction(&planning) {
+            dynamic_context = dynamic_context.with_runtime_instruction(instruction);
+        }
         let prelude = self.run_prelude().await;
         let prelude = match prelude {
             Ok(prelude) if prelude.continue_turn => prelude,
@@ -7035,8 +7048,54 @@ impl TurnHost {
         report_prelude(&events, &self.notes, &prelude)
             .await
             .map_err(TurnFailure::event_consumer)?;
-        self.execute_turn_unaccounted(dynamic_context, None, prepared.run_guard(), true, events)
-            .await
+        self.execute_turn_unaccounted(
+            dynamic_context,
+            None,
+            prepared.run_guard(),
+            planning_requires_plan(&planning),
+            events,
+        )
+        .await
+    }
+
+    fn ensure_goal_turn_anchor(&mut self) -> Result<zuno_goal::Goal, String> {
+        let goal = self
+            .goal_store
+            .goal(&self.session_id)
+            .map_err(to_string)?
+            .filter(|goal| goal.status == zuno_goal::GoalStatus::Active)
+            .ok_or_else(|| {
+                format!(
+                    "session `{}` lost its active Goal before the first autonomous turn",
+                    self.session_id
+                )
+            })?;
+        let message_store = zuno_db::message::MessageStore::new(&self.connection);
+        if message_store
+            .has_user_message_for_session(&self.session_id)
+            .map_err(to_string)?
+        {
+            return Ok(goal);
+        }
+        let latest = message_store
+            .latest_time_created(&self.session_id)
+            .map_err(to_string)?;
+        let now = zuno_db::message::created_after(zuno_db::message::now_millis(), latest);
+        let (message, parts) = prepare_user_message(
+            UserMessageInput {
+                session_id: &self.session_id,
+                agent: &self.agent,
+                provider_id: &self.provider_id,
+                model_id: &self.model_id,
+                text: &goal.objective,
+                message_id: None,
+                now,
+            },
+            None,
+            &self.attachments,
+        )?;
+        self.persist_user_input(&message, &parts)?;
+        Ok(goal)
     }
 
     async fn execute_turn_unaccounted(

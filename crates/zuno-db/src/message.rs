@@ -739,6 +739,26 @@ impl<'conn> MessageStore<'conn> {
             .map_err(map_error)
     }
 
+    /// Whether the session has a user message that can anchor a provider turn.
+    ///
+    /// Native Goal activation may precede the first ordinary prompt. Its continuation
+    /// driver uses this query to decide whether it must persist the user-provided Goal
+    /// objective as the initial turn anchor.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Query`] or [`DbError::Busy`] from SQLite.
+    pub fn has_user_message_for_session(&self, session_id: &str) -> Result<bool, DbError> {
+        self.prepare(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM message \
+                 WHERE session_id = ?1 AND json_extract(data, '$.role') = 'user' \
+             )",
+        )?
+        .query_row([session_id], |row| row.get::<_, bool>(0))
+        .map_err(map_error)
+    }
+
     /// Every message of a session, oldest first.
     ///
     /// Ordered `(time_created, id)` to ride `message_session_time_created_id_idx`
