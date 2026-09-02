@@ -5966,7 +5966,14 @@ fn failed_provider_request_keeps_confirmed_goal_usage_and_marks_the_turn_unknown
         "confirmed usage must be monotonic"
     );
     assert_eq!(after.estimated_pending_prompt_tokens, Some(1_234));
-    assert_eq!(after.failed_turns, before.failed_turns + 1);
+    assert_eq!(
+        zuno_db::session::get(&connection, &session.id)
+            .expect("read the session")
+            .usage
+            .failed_turns,
+        1,
+        "the fixture recorded the failed turn"
+    );
     assert!(!goal_turn_accounting_known(before, after));
 }
 
@@ -6078,7 +6085,6 @@ fn the_turn_end_charges_usage_no_request_accounted_for() {
         confirmed_known: true,
         estimated_pending_prompt_tokens: None,
         last_confirmed_at: Some(1_780_000_000_000),
-        failed_turns: 0,
         goal_charged: goal,
         last_provider_request_seq: 4,
     };
@@ -6128,7 +6134,14 @@ fn a_failed_turn_that_issued_no_request_leaves_the_goal_accounting_known() {
     zuno_db::session::record_turn_failure(&connection, &session.id).expect("record failed turn");
     let after = goal_usage(&connection, &session.id).expect("read usage after the failure");
 
-    assert_eq!(after.failed_turns, before.failed_turns + 1);
+    assert_eq!(
+        zuno_db::session::get(&connection, &session.id)
+            .expect("read the session")
+            .usage
+            .failed_turns,
+        1,
+        "the fixture recorded the failed turn"
+    );
     assert_eq!(
         after.last_provider_request_seq, before.last_provider_request_seq,
         "the fixture turn never reached a provider"
@@ -6147,7 +6160,6 @@ fn accounting_is_unknown_when_a_request_was_issued_and_nothing_was_confirmed() {
         confirmed_known: known,
         estimated_pending_prompt_tokens: pending,
         last_confirmed_at: Some(1_780_000_000_000 + confirmed),
-        failed_turns: 0,
         goal_charged: 0,
         last_provider_request_seq: request_seq,
     };

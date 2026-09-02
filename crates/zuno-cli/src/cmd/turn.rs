@@ -8626,7 +8626,6 @@ struct GoalUsage {
     confirmed_known: bool,
     estimated_pending_prompt_tokens: Option<u64>,
     last_confirmed_at: Option<i64>,
-    failed_turns: u64,
     /// What the goal has already been charged, read from the goal's own counter.
     ///
     /// The session's confirmed usage and the goal's charged usage are two different
@@ -8690,7 +8689,6 @@ fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<Goa
         confirmed_known: snapshot.confirmed_known,
         estimated_pending_prompt_tokens: snapshot.estimated_pending_prompt_tokens,
         last_confirmed_at: snapshot.last_confirmed_at,
-        failed_turns: snapshot.failed_turns,
         goal_charged,
         last_provider_request_seq,
     })
