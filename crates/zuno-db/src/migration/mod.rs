@@ -636,6 +636,48 @@ mod tests {
         );
     }
 
+    /// Every table a v0.6.7 database (format 7) contains, in `sqlite_master` order.
+    const FORMAT_SEVEN_TABLES: [&str; 38] = [
+        "account",
+        "account_state",
+        "agent_job",
+        "control_account",
+        "credential",
+        "data_migration",
+        "evaluation_case",
+        "evaluation_result",
+        "evaluation_run",
+        "evaluation_suite",
+        "event",
+        "event_sequence",
+        "experience_evidence",
+        "experience_record",
+        "human_request",
+        "learning_job",
+        "learning_pattern",
+        "memory_candidate",
+        "memory_reflection_delivery",
+        "memory_reflection_job",
+        "message",
+        "message_feedback",
+        "part",
+        "permission",
+        "project",
+        "project_directory",
+        "provider_retry_backoff",
+        "session",
+        "session_context_epoch",
+        "session_input",
+        "session_message",
+        "session_share",
+        "skill_candidate",
+        "work_item",
+        "work_plan",
+        "work_plan_archive",
+        "workspace",
+        "zuno_schema",
+    ];
+
     #[test]
     fn format_seven_adds_the_verification_ledger_without_rewriting_history() {
         let mut connection = memory();
@@ -649,17 +691,254 @@ mod tests {
                  INSERT INTO session \
                    (id, project_id, slug, directory, title, version, time_created, time_updated) \
                  VALUES ('session-1', 'project-1', 'slug', '/workspace', 'history', '1', 1, 1);
-                 INSERT INTO work_plan
-                   (session_id, id, goal_id, revision, title, steps, time_created, time_updated,
-                    stack_depth)
+                 INSERT INTO message \
+                   (id, session_id, time_created, time_updated, data) \
+                 VALUES ('message-1', 'session-1', 1, 1, '{\"role\":\"user\"}');
+                 INSERT INTO memory_candidate (
+                   id, target, target_path, action, content, reason, confidence, source_kind,
+                   source_session_id, source_message_id, status, time_created, time_updated
+                 ) VALUES (
+                   'memory-1', 'project', '/workspace/MEMORY.md', 'add', 'keep history',
+                   'fixture', 9000, 'user', 'session-1', 'message-1', 'pending', 1, 1
+                 );
+                 INSERT INTO work_plan_archive
+                   (id, session_id, parent_plan_id, stack_depth, goal_id, revision, title, steps,
+                    state, time_created, time_updated, time_archived)
                  VALUES (
-                   'session-1', 'plan-1', 'goal-1', 7, 'durable plan', '[]', 2, 3, 0
+                   'plan-0', 'session-1', NULL, 0, 'goal-1', 3, 'parent plan',
+                   '[{\"id\":\"deliver\",\"title\":\"Deliver\",\"status\":\"in_progress\"}]',
+                   'suspended', 1, 2, 2
+                 );
+                 INSERT INTO work_plan
+                   (session_id, id, parent_plan_id, stack_depth, goal_id, revision, title, steps,
+                    time_created, time_updated)
+                 VALUES (
+                   'session-1', 'plan-1', 'plan-0', 1, 'goal-1', 7, 'durable plan',
+                   '[{\"id\":\"ship\",\"title\":\"Ship it\",\"status\":\"in_progress\"}]', 2, 3
                  );
                  UPDATE zuno_schema SET format = 7 WHERE singleton = 1;",
             )
             .expect("construct format-seven schema");
+        // The fixture is derived from the current schema minus the ledger, so pin what that
+        // produced against the tables v0.6.7 actually shipped: if `create_current` grows
+        // another table later, this stops being a format-7 database and the test says so.
+        let tables: Vec<String> = connection
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .expect("list tables")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query tables")
+            .collect::<Result<_, _>>()
+            .expect("collect tables");
+        assert_eq!(
+            tables, FORMAT_SEVEN_TABLES,
+            "fixture is not the format-7 table set"
+        );
+        let session_before = connection
+            .query_row(
+                "SELECT id, project_id, slug, directory, title, version, time_created, \
+                        time_updated \
+                 FROM session WHERE id = 'session-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .expect("read session before upgrade");
+        let archive_before = connection
+            .query_row(
+                "SELECT id, parent_plan_id, stack_depth, goal_id, revision, title, steps, state, \
+                        time_created, time_updated, time_archived \
+                 FROM work_plan_archive WHERE session_id = 'session-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                    ))
+                },
+            )
+            .expect("read suspended parent before upgrade");
+        let message_before = connection
+            .query_row(
+                "SELECT data FROM message WHERE id = 'message-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read message before upgrade");
+        let memory_before = connection
+            .query_row(
+                "SELECT content FROM memory_candidate WHERE id = 'memory-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read memory candidate before upgrade");
+        let plan_before = connection
+            .query_row(
+                "SELECT id, parent_plan_id, stack_depth, goal_id, revision, title, steps, \
+                        time_created, time_updated \
+                 FROM work_plan WHERE session_id = 'session-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .expect("read plan before upgrade");
 
         apply(&mut connection).expect("upgrade format seven");
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT id, project_id, slug, directory, title, version, time_created, \
+                            time_updated \
+                     FROM session WHERE id = 'session-1'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, i64>(7)?,
+                        ))
+                    },
+                )
+                .expect("session survives the upgrade"),
+            session_before
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT id, parent_plan_id, stack_depth, goal_id, revision, title, steps, \
+                            state, time_created, time_updated, time_archived \
+                     FROM work_plan_archive WHERE session_id = 'session-1'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, i64>(9)?,
+                            row.get::<_, i64>(10)?,
+                        ))
+                    },
+                )
+                .expect("suspended parent survives the upgrade unchanged"),
+            archive_before
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT data FROM message WHERE id = 'message-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("message survives the upgrade"),
+            message_before
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT content FROM memory_candidate WHERE id = 'memory-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("memory candidate survives the upgrade"),
+            memory_before
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT id, parent_plan_id, stack_depth, goal_id, revision, title, steps, \
+                            time_created, time_updated \
+                     FROM work_plan WHERE session_id = 'session-1'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
+                        ))
+                    },
+                )
+                .expect("plan survives the upgrade unchanged"),
+            plan_before
+        );
+        for (index, unique) in [
+            ("verification_receipt_call_idx", true),
+            ("verification_receipt_session_time_idx", false),
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master \
+                         WHERE type = 'index' AND name = ?1 AND tbl_name = 'verification_receipt'",
+                        [index],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("query index"),
+                1,
+                "the upgrade installs {index} on verification_receipt"
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT \"unique\" FROM pragma_index_list('verification_receipt') \
+                         WHERE name = ?1",
+                        [index],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .expect("query index uniqueness"),
+                unique,
+                "{index} uniqueness is part of the at-most-once receipt contract"
+            );
+        }
 
         assert_eq!(
             connection
