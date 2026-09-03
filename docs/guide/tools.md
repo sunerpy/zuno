@@ -17,7 +17,7 @@ The default model-visible surface is deliberately small:
 | `write` | Create a file, or intentionally replace one whole | Side-effecting |
 | `apply_patch` | Localized, context-verified source edits | Side-effecting |
 | `shell` | Run a command under the active sandbox | Side-effecting |
-| `bg` | Inspect or cancel background commands | Read-only inspection; `cancel` is side-effecting |
+| `bg` | Inspect or cancel background commands, and page output kept out of the transcript | Read-only inspection; `cancel` is side-effecting |
 | `task` | Delegate a bounded objective to another agent | Delegating |
 | `job` | Inspect background job state | Read-only |
 | `webfetch` | Retrieve one URL | Read-only |
@@ -131,6 +131,35 @@ change permissions or make the remote system part of the local process result; i
 requires the resumed Agent to refresh authoritative remote state before claiming that a
 CI run, deployment, or release completed.
 
+## Reading output in windows
+
+Output that is not in the transcript is read back through `bg`, one bounded window at a
+time. There are two kinds, and one cursor convention:
+
+| Action | Reads | Names the source with |
+| --- | --- | --- |
+| `bg output`, `bg wait` | A background execution's output | `taskID` |
+| `bg artifact` | Output a size limit withheld | `outputPath` |
+
+`cursor` is an absolute byte offset and `limit` is the size of the window. Both reads
+return the cursor the next window starts at, plus `hasMore`, so you page by handing that
+cursor back rather than by guessing an offset. `limit` defaults to 16384 bytes and is
+clamped to 51200 — the byte threshold at which output stops being inlined at all — so a
+window can never be larger than what would have been returned inline. A window is bounded
+before anything is read, and asking for more than the ceiling is clamped rather than
+refused.
+
+A running command retains its most recent 2 MiB in memory while its complete output stays
+on disk. A `cursor` older than what is still retained is served from that file, so the
+beginning of a long-running command's output stays reachable through `bg` instead of
+requiring a shell command to slice the file by hand. `fromDisk` reports which copy
+answered. Omitting `cursor` means "what is retained now", which is the tail a terminal
+renders and never a file read.
+
+Retrieval never re-runs the command that produced the output, and never goes through the
+output limits: a retrieved window is already bounded, and passing it through the limits
+would withhold it a second time.
+
 ## What a shell exit status proves
 
 A pipeline's exit code is the last stage's exit code. `cargo test | tail -5` exits
@@ -242,8 +271,8 @@ Every invocation classifies as one of four effects, and the default is the stric
 | `SideEffecting` | Default. Changes state or reaches outside | Fresh approval required |
 
 Because `SideEffecting` is the default, an unknown harness or MCP tool fails closed. A
-mixed tool may classify from validated arguments: `bg list`, `bg output`, and `bg wait`
-are read-only while `bg cancel` is side-effecting.
+mixed tool may classify from validated arguments: `bg list`, `bg output`, `bg wait`, and
+`bg artifact` are read-only while `bg cancel` is side-effecting.
 
 Native reads, `glob`, `grep`, skill and session and job inspection, `tool_search`,
 read-only LSP, MCP resource reads, `webfetch`, and `web_search` do not receive the extra strict prompt.

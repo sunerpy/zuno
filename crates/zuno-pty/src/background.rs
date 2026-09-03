@@ -215,11 +215,15 @@ pub struct BackgroundExecutionInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackgroundExecutionOutput {
     pub bytes: Vec<u8>,
+    /// Absolute cursor just past [`Self::bytes`]: where the next window starts.
     pub cursor: u64,
     pub retained_from: u64,
     pub total_written: u64,
     pub discarded: u64,
     pub output_file: PathBuf,
+    /// Whether these bytes came from the persisted file rather than the retained ring,
+    /// because the requested cursor predated [`Self::retained_from`].
+    pub from_disk: bool,
 }
 
 /// Result of waiting for a terminal state or one caller attention deadline.
@@ -415,8 +419,12 @@ impl BackgroundExecutionService {
             let total_written = std::fs::metadata(&output_file)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
-            let tail = read_tail(&output_file, BUFFER_LIMIT)
-                .map_err(|source| state_error(&output_file, source))?;
+            let tail = read_window(
+                &output_file,
+                total_written.saturating_sub(BUFFER_LIMIT as u64),
+                None,
+            )
+            .map_err(|source| state_error(&output_file, source))?;
             let (info, _) = watch::channel(persisted.info);
             let (cancel, _) = watch::channel(false);
             service.executions().insert(
@@ -635,22 +643,59 @@ impl BackgroundExecutionService {
         Ok(info)
     }
 
-    /// Replays bounded output from an absolute cursor.
+    /// Replays one bounded window of output from an absolute cursor.
+    ///
+    /// `limit` caps the bytes returned; `None` returns everything from the cursor to the
+    /// current end, which is what a client rendering a tail wants and what a
+    /// model-facing caller must not ask for. The returned
+    /// [`BackgroundExecutionOutput::cursor`] is where the next window begins, so a
+    /// caller pages by handing it back.
+    ///
+    /// [`ReplayCursor::From`] naming a cursor older than what the ring still retains is
+    /// served from the persisted output file instead of being clamped forward. The ring
+    /// is bounded at [`crate::BUFFER_LIMIT`] and the file is not, so clamping left the
+    /// discarded prefix permanently unreachable through this service while it sat
+    /// complete on disk, and the only way to see it was a shell command slicing the file
+    /// by hand. [`ReplayCursor::Full`] still means "everything still retained" and never
+    /// reaches for the file: it is the tail request every client surface makes, and a
+    /// caller that wants the beginning says `From(0)`.
+    ///
+    /// A file that is gone — an ephemeral foreground command cleans up after itself —
+    /// replays as no bytes rather than as a failure, the same tolerance restoring a
+    /// retained tail applies.
     pub fn output(
         &self,
         id: &BackgroundExecutionId,
         cursor: ReplayCursor,
+        limit: Option<usize>,
     ) -> Result<BackgroundExecutionOutput, BackgroundExecutionError> {
         let state = self.state(id)?;
+        let info = state.info();
         let output = state.output();
-        let replay = output.replay(cursor);
+        let retained_from = output.start_cursor();
+        let total_written = output.total_written();
+        let discarded = output.discarded();
+        let (bytes, next, from_disk) = match cursor {
+            ReplayCursor::From(requested) if requested < retained_from => {
+                drop(output);
+                let bytes = read_window(&info.output_file, requested, limit)
+                    .map_err(|source| state_error(&info.output_file, source))?;
+                let next = requested.saturating_add(bytes.len() as u64);
+                (bytes, next, true)
+            }
+            cursor => {
+                let replay = output.replay_window(cursor, limit);
+                (replay.bytes, replay.cursor, false)
+            }
+        };
         Ok(BackgroundExecutionOutput {
-            bytes: replay.bytes,
-            cursor: replay.cursor,
-            retained_from: output.start_cursor(),
-            total_written: output.total_written(),
-            discarded: output.discarded(),
-            output_file: state.info().output_file,
+            bytes,
+            cursor: next,
+            retained_from,
+            total_written,
+            discarded,
+            output_file: info.output_file,
+            from_disk,
         })
     }
 
@@ -999,17 +1044,31 @@ fn remove_if_exists(path: &Path) -> Result<(), BackgroundExecutionError> {
     }
 }
 
-fn read_tail(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+/// One window of a persisted output file, read by seeking rather than from the start.
+///
+/// The only seek reader in this crate. It answers both questions asked of the persisted
+/// output — the last [`BUFFER_LIMIT`] bytes when a restart restores a retained tail, and
+/// an arbitrary window when a caller asks for a prefix the ring has discarded — because
+/// two readers over the same file is two places for an off-by-one to live.
+///
+/// An absent file reads as no bytes: a foreground command removes its own output once
+/// the caller has consumed it, and a restart is entitled to find the file gone.
+fn read_window(path: &Path, offset: u64, limit: Option<usize>) -> std::io::Result<Vec<u8>> {
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
     let length = file.metadata()?.len();
-    let start = length.saturating_sub(limit as u64);
+    let start = offset.min(length);
     file.seek(std::io::SeekFrom::Start(start))?;
-    let mut bytes = Vec::with_capacity((length - start) as usize);
-    file.read_to_end(&mut bytes)?;
+    let remaining = usize::try_from(length - start).unwrap_or(usize::MAX);
+    let take = limit.map_or(remaining, |limit| limit.min(remaining));
+    let mut bytes = Vec::with_capacity(take);
+    file.take(take as u64).read_to_end(&mut bytes)?;
+    if start.saturating_add(bytes.len() as u64) < length {
+        crate::buffer::trim_incomplete_tail(&mut bytes);
+    }
     Ok(bytes)
 }
 

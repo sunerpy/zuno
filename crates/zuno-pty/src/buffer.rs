@@ -176,9 +176,25 @@ impl ScrollbackBuffer {
     /// retained byte rather than rejected, matching `Math.max(0, from - start)`
     /// at `packages/core/src/pty.ts:236`. The returned [`Replay::cursor`] is
     /// therefore authoritative and a caller must adopt it rather than assume its
-    /// request was honoured.
+    /// request was honoured. What was discarded is not lost when the output was also
+    /// persisted; recovering it is the persisted file's job, not this ring's.
     #[must_use]
     pub fn replay(&self, cursor: ReplayCursor) -> Replay {
+        self.replay_window(cursor, None)
+    }
+
+    /// [`Self::replay`] bounded to at most `limit` bytes.
+    ///
+    /// For a caller that has to decide how much of a command's output to carry, not
+    /// only where to start: a 2 MiB replay is a legitimate answer to "everything since
+    /// my cursor" and a ruinous one to hand a model in a single tool result.
+    ///
+    /// A window that stops short of the end is trimmed back to a UTF-8 boundary, so
+    /// paging never splits a code point across two reads for the same reason the head
+    /// is realigned after a discard. A window that reaches the end is returned as it
+    /// is: there is no following read to align with, and a PTY also carries binary.
+    #[must_use]
+    pub fn replay_window(&self, cursor: ReplayCursor, limit: Option<usize>) -> Replay {
         let requested = match cursor {
             ReplayCursor::Full => 0,
             ReplayCursor::Tail => self.end_cursor,
@@ -186,9 +202,16 @@ impl ScrollbackBuffer {
         };
         let from = requested.clamp(self.start_cursor, self.end_cursor);
         let offset = usize::try_from(from - self.start_cursor).unwrap_or(self.len);
+        let mut bytes = self.bytes_from(offset.min(self.len));
+        if let Some(limit) = limit
+            && bytes.len() > limit
+        {
+            bytes.truncate(limit);
+            trim_incomplete_tail(&mut bytes);
+        }
         Replay {
-            bytes: self.bytes_from(offset.min(self.len)),
-            cursor: self.end_cursor,
+            cursor: from + bytes.len() as u64,
+            bytes,
         }
     }
 
@@ -345,6 +368,23 @@ const fn is_continuation(byte: u8) -> bool {
     byte & 0b1100_0000 == 0b1000_0000
 }
 
+/// Drops an incomplete UTF-8 sequence from the end of one window.
+///
+/// The tail counterpart of [`ScrollbackBuffer::align_head`], and the same rationale:
+/// the first thing a client does with a window is decode it. Only a tail that is the
+/// prefix of a longer sequence is dropped, so binary output keeps every byte it
+/// produced, and the window is never emptied — a limit smaller than one code point
+/// still has to make progress or a caller paging by the returned cursor would ask for
+/// the same window forever.
+pub(crate) fn trim_incomplete_tail(bytes: &mut Vec<u8>) {
+    if let Err(error) = std::str::from_utf8(bytes)
+        && error.error_len().is_none()
+        && error.valid_up_to() > 0
+    {
+        bytes.truncate(error.valid_up_to());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +508,65 @@ mod tests {
             buffer.replay(ReplayCursor::From(99)).bytes.is_empty(),
             "a cursor past the end yields nothing rather than panicking"
         );
+    }
+
+    #[test]
+    fn a_bounded_window_reports_the_cursor_the_next_one_starts_at() {
+        let mut buffer = ScrollbackBuffer::with_limit(32);
+        buffer.push(b"0123456789");
+
+        let first = buffer.replay_window(ReplayCursor::Full, Some(4));
+        assert_eq!(first.bytes, b"0123");
+        assert_eq!(first.cursor, 4, "an unbounded replay ended at 10");
+
+        let second = buffer.replay_window(ReplayCursor::From(first.cursor), Some(4));
+        assert_eq!(second.bytes, b"4567");
+        assert_eq!(second.cursor, 8);
+
+        let last = buffer.replay_window(ReplayCursor::From(second.cursor), Some(4));
+        assert_eq!(last.bytes, b"89");
+        assert_eq!(last.cursor, 10);
+        assert_eq!(
+            buffer
+                .replay_window(ReplayCursor::From(last.cursor), Some(4))
+                .bytes,
+            b"",
+            "a cursor at the end returns nothing rather than repeating the tail"
+        );
+    }
+
+    #[test]
+    fn a_bounded_window_short_of_the_end_stops_on_a_code_point() {
+        // Three-byte code points read four bytes at a time: an untrimmed window would
+        // end mid-character and both sides of the cut would decode as U+FFFD.
+        let mut buffer = ScrollbackBuffer::with_limit(32);
+        buffer.push("中文测试".as_bytes());
+
+        let mut cursor = 0u64;
+        let mut decoded = String::new();
+        while cursor < buffer.end_cursor() {
+            let window = buffer.replay_window(ReplayCursor::From(cursor), Some(4));
+            decoded.push_str(std::str::from_utf8(&window.bytes).expect("window decodes alone"));
+            assert!(!window.bytes.is_empty(), "the window has to advance");
+            cursor = window.cursor;
+        }
+
+        assert_eq!(decoded, "中文测试");
+    }
+
+    #[test]
+    fn a_window_that_reaches_the_end_keeps_bytes_that_are_not_text() {
+        let mut buffer = ScrollbackBuffer::with_limit(32);
+        buffer.push(&[b'a', 0xe4]);
+
+        let window = buffer.replay_window(ReplayCursor::Full, Some(8));
+
+        assert_eq!(
+            window.bytes,
+            [b'a', 0xe4],
+            "there is no next window to align with, so nothing may be dropped"
+        );
+        assert_eq!(window.cursor, 2);
     }
 
     #[test]

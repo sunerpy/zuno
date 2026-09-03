@@ -158,6 +158,22 @@ impl GeneratedDirectory {
         self.generated
     }
 
+    /// The worktree root this directory is rooted at.
+    ///
+    /// The inverse of [`Self::in_worktree`]: the registered segments come back off. A
+    /// caller that was handed one generated directory can reach a sibling one — the
+    /// background service's root and the tool-output store share a worktree — without
+    /// resolving the root again, which spawns git, and without a second spelling of
+    /// where generated state lives.
+    #[must_use]
+    pub fn worktree(&self) -> &Path {
+        let mut root = self.path.as_path();
+        for _ in self.generated.segments() {
+            root = root.parent().unwrap_or(root);
+        }
+        root
+    }
+
     /// Create the directory and its own `.gitignore`, and report where it is.
     ///
     /// Idempotent, and cheap to repeat: the file is read first and rewritten only when
@@ -268,6 +284,27 @@ mod tests {
             "the directory the writer creates must be the one the classifier hides"
         );
         assert!(!directory.path().exists(), "constructing must not create");
+    }
+
+    #[test]
+    fn the_worktree_comes_back_off_a_directory_so_siblings_need_no_second_spelling() {
+        let root = Path::new("/repo");
+
+        for entry in [&TOOL_OUTPUT, &BACKGROUND_EXECUTIONS, &GOAL_PROJECTION] {
+            let directory = GeneratedDirectory::in_worktree(root, entry);
+            assert_eq!(directory.worktree(), root, "{}", entry.pattern);
+        }
+
+        let claimed = GeneratedDirectory::claim(
+            &root.join(".zuno").join("background"),
+            &BACKGROUND_EXECUTIONS,
+        )
+        .expect("the background service root is a registered directory");
+        assert_eq!(
+            GeneratedDirectory::in_worktree(claimed.worktree(), &TOOL_OUTPUT).path(),
+            GeneratedDirectory::in_worktree(root, &TOOL_OUTPUT).path(),
+            "reaching a sibling through the worktree has to land where a writer would"
+        );
     }
 
     #[test]

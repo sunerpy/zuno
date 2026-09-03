@@ -294,10 +294,15 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
         "job" => text("jobID").map(Summary::tail),
         "bg" => {
             let action = text("action")?;
-            Some(Summary::tail(match text("taskID") {
-                Some(id) => format!("{action} {id}"),
-                None => action,
-            }))
+            // `taskID` for an execution, `outputPath` for withheld output: an
+            // `artifact` read names neither an execution nor a command, and a
+            // transcript line reading only `artifact` says nothing about what was read.
+            Some(Summary::tail(
+                match text("taskID").or_else(|| text("outputPath")) {
+                    Some(subject) => format!("{action} {subject}"),
+                    None => action,
+                },
+            ))
         }
         "plan_update" => text("title").map(Summary::tail),
         "plan_get" | "todo_get" => None,
