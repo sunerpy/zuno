@@ -682,3 +682,97 @@ async fn session_fanout_is_released_when_the_last_subscriber_disconnects() {
         "publishing must not allocate a fan-out for an unobserved session: {events:?}"
     );
 }
+
+/// A publication that carries state has to commit with that state or not at all.
+///
+/// Both halves are checked, because each failure mode is a different lie: a
+/// committed event whose mutation rolled back tells every replay the change
+/// happened, and a committed mutation with no event leaves the durable stream
+/// unable to reconstruct it.
+#[tokio::test]
+async fn an_event_committed_with_its_state_survives_or_rolls_back_together() {
+    fn rename(
+        title: &'static str,
+    ) -> impl FnOnce(&rusqlite::Transaction<'_>) -> Result<(), zuno_error::DbError> {
+        move |transaction| {
+            transaction
+                .execute(
+                    "UPDATE session SET title = ?2 WHERE id = ?1",
+                    rusqlite::params!["ses_transactional", title],
+                )
+                .map_err(|source| zuno_error::DbError::Query {
+                    source: Box::new(source),
+                })?;
+            Ok(())
+        }
+    }
+
+    let (pool, events) = event_service(8);
+    create_session(&pool, "ses_transactional");
+    let app = event_app(events.clone());
+    let mut stream = open_stream(&app, "ses_transactional", None).await;
+
+    let committed = events
+        .publish_with("ses_transactional", event(1), rename("renamed"))
+        .await
+        .expect("the mutation and its event commit together");
+    assert_eq!(committed.sequence(), 0);
+
+    let rolled_back = events
+        .publish_with("ses_transactional", event(2), |transaction| {
+            rename("never")(transaction)?;
+            Err(zuno_error::DbError::Query {
+                source: Box::new(std::io::Error::other("the mutation refused")),
+            })
+        })
+        .await;
+    assert!(
+        rolled_back.is_err(),
+        "a refused mutation must fail the publication: {rolled_back:?}"
+    );
+
+    let committed_again = events
+        .publish_with("ses_transactional", event(3), rename("renamed-again"))
+        .await
+        .expect("a later publication still commits");
+    assert_eq!(
+        committed_again.sequence(),
+        1,
+        "the rolled-back event must not have consumed a sequence number"
+    );
+
+    let title: String = {
+        let connection = pool.get().expect("pooled connection");
+        connection
+            .query_row(
+                "SELECT title FROM session WHERE id = ?1",
+                ["ses_transactional"],
+                |row| row.get(0),
+            )
+            .expect("the session row is readable")
+    };
+    assert_eq!(
+        title, "renamed-again",
+        "the refused mutation must not have been applied"
+    );
+
+    let replayed = events
+        .replay("ses_transactional", None)
+        .await
+        .expect("replay reads committed events");
+    assert_eq!(
+        replayed
+            .iter()
+            .map(|event| event.properties()["ordinal"].clone())
+            .collect::<Vec<Value>>(),
+        vec![json!(1), json!(3)],
+        "the rolled-back event must not be durable"
+    );
+
+    // The subscriber sees the same two, in the same order, with nothing between
+    // them: the rolled-back event was never offered to the fan-out.
+    let (_, first) = decode_frame(&next_frame(&mut stream).await);
+    let (_, second) = decode_frame(&next_frame(&mut stream).await);
+    assert_eq!(first["data"]["ordinal"], json!(1));
+    assert_eq!(second["data"]["ordinal"], json!(3));
+}

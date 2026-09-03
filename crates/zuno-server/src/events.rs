@@ -78,6 +78,38 @@ impl EventService {
         Ok(stored)
     }
 
+    /// Commits one event in the same transaction as the state that event asserts,
+    /// then offers it to live subscribers.
+    ///
+    /// A route that publishes first and mutates second can commit a durable claim
+    /// its own state never backs: the SSE stream and any replay report the change,
+    /// while the row the change was about is unchanged. `mutate` runs inside the
+    /// event's transaction, so either both commit or neither does, and the event
+    /// reaches subscribers only after that commit.
+    pub async fn publish_with<F>(
+        &self,
+        session_id: &str,
+        event: NewEvent,
+        mutate: F,
+    ) -> Result<StreamEvent, EventStreamError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<(), zuno_error::DbError> + Send + 'static,
+    {
+        let session_id = types::validate_session_id(session_id)?.to_owned();
+        let store = Arc::clone(&self.store);
+        let stored = tokio::task::spawn_blocking({
+            let session_id = session_id.clone();
+            move || store.append_with(&session_id, event, mutate)
+        })
+        .await
+        .map_err(|source| EventStreamError::Worker { source })??;
+        if let Some(fanout) = self.live_fanout(&session_id) {
+            fanout.publish(stored.clone());
+        }
+        self.global.publish(stored.clone());
+        Ok(stored)
+    }
+
     /// Reads committed events strictly after an optional cursor.
     pub async fn replay(
         &self,
