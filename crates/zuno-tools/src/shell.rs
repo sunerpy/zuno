@@ -2,7 +2,8 @@ mod authority;
 
 use crate::output_policy::OutputPolicy;
 use crate::risk::{
-    GIT_REPOSITORY_ENVIRONMENT_VARIABLES, GateOutcome, RiskAssessment, RiskContext, assess_and_gate,
+    GIT_REPOSITORY_ENVIRONMENT_VARIABLES, GateOutcome, RiskAssessment, RiskContext,
+    assess_and_gate, git_subcommand, git_uses_repository_override,
 };
 use crate::search_common::directory_grant_pattern;
 use crate::timeout::{
@@ -503,7 +504,7 @@ impl ShellTool {
             &cwd,
             &env,
         )?;
-        refuse_generated_delivery(&analysis, &cwd, &env)?;
+        refuse_generated_delivery(&analysis, self.syntax(), &cwd, &env)?;
         if ctx.is_interrupted() {
             return Err(interrupted());
         }
@@ -727,7 +728,7 @@ impl ShellTool {
         };
         ctx.ask(TOOL_ID, ask).await?;
 
-        let git_metadata_writable = mutates_git_metadata(analysis);
+        let git_metadata_writable = mutates_git_metadata(analysis, self.syntax());
         if git_metadata_writable {
             if self.sandbox_policy.mode() == SandboxMode::ReadOnly {
                 return Err(failed(io::Error::new(
@@ -1197,24 +1198,81 @@ fn commit_stages_tracked_changes(arguments: &[String]) -> bool {
     false
 }
 
-/// Whether this command line creates a commit, and whether it stages while doing it.
-fn commit_delivery(analysis: &ShellAnalysis) -> Option<CommitDelivery> {
-    analysis.commands.iter().find_map(|resource| {
-        let (subcommand, arguments) = git_subcommand(&resource.tokens)?;
-        (subcommand == "commit").then(|| CommitDelivery {
-            stages_tracked_changes: commit_stages_tracked_changes(arguments),
+/// Every `git commit` in this command line, in the order they would run.
+///
+/// Every one of them, not the first: `git commit -m a && git commit -am b` delivers the
+/// worktree's tracked changes through its second commit, and reading only the first said
+/// the index was the whole delivery.
+fn commit_deliveries(analysis: &ShellAnalysis, syntax: ShellSyntax) -> Vec<CommitDelivery> {
+    analysis
+        .commands
+        .iter()
+        .filter_map(|resource| {
+            let (subcommand, arguments) = git_subcommand(&resource.tokens, syntax)?;
+            if subcommand != "commit" {
+                return None;
+            }
+            let retarget = if git_uses_repository_override(&resource.tokens) {
+                Some(Retarget::Option)
+            } else {
+                leading_assignments(&resource.source)
+                    .find(|name| {
+                        GIT_REPOSITORY_ENVIRONMENT_VARIABLES
+                            .iter()
+                            .any(|variable| name.eq_ignore_ascii_case(variable))
+                    })
+                    .map(|name| Retarget::Assignment(name.to_owned()))
+            };
+            Some(CommitDelivery {
+                stages_tracked_changes: commit_stages_tracked_changes(arguments),
+                retarget,
+            })
         })
-    })
+        .collect()
 }
 
 /// What a `git commit` in this command line is about to deliver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CommitDelivery {
     /// Whether the commit stages tracked modifications itself, as `-a` does.
     ///
     /// The index alone is then not the whole delivery, so the worktree's tracked
     /// changes have to be read as well.
     stages_tracked_changes: bool,
+    /// How the commit names a repository other than the one this call inspects.
+    retarget: Option<Retarget>,
+}
+
+/// How a commit points itself at a repository the check would not read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Retarget {
+    /// A git global option: `-C`, `--git-dir`, `--work-tree`, `--namespace`.
+    Option,
+    /// An inline assignment of a Git repository variable, carrying its name.
+    Assignment(String),
+}
+
+/// The variable names a command line assigns before it names its program.
+///
+/// The analyzer drops a `variable_assignment` from the token list, correctly — it is
+/// not an argument — so `GIT_DIR=/elsewhere git commit` is indistinguishable from
+/// `git commit` there and has to be read from the source. Only the leading run counts,
+/// because that is the only position where a shell treats `NAME=value` as an assignment
+/// to the command's environment: the same text after the program name is an argument,
+/// and inside a commit message it is prose, and refusing that would be a refusal nobody
+/// could explain.
+fn leading_assignments(source: &str) -> impl Iterator<Item = &str> {
+    source
+        .split_whitespace()
+        .map_while(|word| word.split_once('='))
+        .take_while(|(name, _)| {
+            !name.is_empty()
+                && !name.starts_with(|first: char| first.is_ascii_digit())
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+        .map(|(name, _)| name)
 }
 
 /// The paths one git list command reports, read from its `-z` output.
@@ -1266,32 +1324,78 @@ fn git_reported_paths(
 /// gap: a pathspec has to be typed deliberately, while the refusal for a
 /// mis-classified message or option would land on an ordinary commit.
 ///
+/// A commit that chooses its own repository is refused instead of inspected. `-C`,
+/// `--git-dir`, `--work-tree`, `--namespace` and an inline `GIT_DIR=…` all point the
+/// commit somewhere these git reads do not follow, so inspecting anyway reports on a
+/// repository that is not the one being written. The repository belongs in the tool's
+/// `workdir`, where it is one fact both the check and the commit use.
+///
 /// No repository, nothing delivered: when git cannot name a worktree the check does
 /// not run, and the commit fails on its own terms rather than through a refusal about
 /// generated state.
 ///
 /// # Errors
 ///
+/// [`ToolError::InvalidArgs`] when a commit retargets its repository, and
 /// [`ToolError::Failed`] carrying every generated path with the reason it exists and
 /// the remedy, when a commit would deliver one.
 fn refuse_generated_delivery(
     analysis: &ShellAnalysis,
+    syntax: ShellSyntax,
     cwd: &Path,
     env: &BTreeMap<String, String>,
 ) -> Result<(), ToolError> {
-    let Some(delivery) = commit_delivery(analysis) else {
+    let deliveries = commit_deliveries(analysis, syntax);
+    if deliveries.is_empty() {
         return Ok(());
-    };
+    }
+    if let Some(retarget) = deliveries
+        .iter()
+        .find_map(|delivery| delivery.retarget.as_ref())
+    {
+        let chosen = match retarget {
+            Retarget::Option => {
+                "a Git global option (`-C`, `--git-dir`, `--work-tree`, `--namespace`)".to_owned()
+            }
+            Retarget::Assignment(name) => format!("`{name}`"),
+        };
+        return Err(invalid(format!(
+            "this `git commit` selects its repository with {chosen}, which points it at a              repository this call does not inspect, so the check for Zuno's own generated state              would report on a different one; select the repository with the Shell workdir instead"
+        )));
+    }
     let Some(worktree) = git_reported_paths(cwd, env, &["rev-parse", "--show-toplevel"])?
         .and_then(|paths| paths.into_iter().next())
     else {
         return Ok(());
     };
-    let mut delivered = git_reported_paths(cwd, env, &["diff", "--cached", "--name-only", "-z"])?
-        .unwrap_or_default();
-    if delivery.stages_tracked_changes {
+    // `diff.relative` is a configuration a repository may set, and with it on, `git diff`
+    // reports paths relative to the current directory and omits the ones above it: a
+    // session in a subdirectory would then be told that generated state at the worktree
+    // root is not part of the delivery.
+    let mut delivered = git_reported_paths(
+        cwd,
+        env,
+        &[
+            "-c",
+            "diff.relative=false",
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+        ],
+    )?
+    .unwrap_or_default();
+    if deliveries
+        .iter()
+        .any(|delivery| delivery.stages_tracked_changes)
+    {
         delivered.extend(
-            git_reported_paths(cwd, env, &["diff", "--name-only", "-z"])?.unwrap_or_default(),
+            git_reported_paths(
+                cwd,
+                env,
+                &["-c", "diff.relative=false", "diff", "--name-only", "-z"],
+            )?
+            .unwrap_or_default(),
         );
     }
     zuno_paths::refuse_generated_state(&worktree, &delivered).map_err(|refusal| {
@@ -1747,40 +1851,12 @@ fn external_directories(
     directories
 }
 
-fn mutates_git_metadata(analysis: &ShellAnalysis) -> bool {
+fn mutates_git_metadata(analysis: &ShellAnalysis, syntax: ShellSyntax) -> bool {
     analysis.commands.iter().any(|resource| {
-        git_subcommand(&resource.tokens).is_some_and(|(subcommand, remaining)| {
+        git_subcommand(&resource.tokens, syntax).is_some_and(|(subcommand, remaining)| {
             !git_subcommand_is_read_only(&subcommand, remaining)
         })
     })
-}
-
-/// The subcommand of a `git` invocation, lowercased, and the arguments after it.
-///
-/// `None` when the command is not git or names no subcommand at all. Global options
-/// are skipped the way git parses them: the five that take a separate value consume
-/// the token after them, and any other dashed token stands alone.
-fn git_subcommand(tokens: &[String]) -> Option<(String, &[String])> {
-    if !unquote(tokens.first()?).eq_ignore_ascii_case("git") {
-        return None;
-    }
-    let mut index = 1;
-    while let Some(argument) = tokens.get(index) {
-        let argument = unquote(argument);
-        if matches!(
-            argument.as_str(),
-            "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace"
-        ) {
-            index = index.saturating_add(2);
-            continue;
-        }
-        if argument.starts_with('-') {
-            index = index.saturating_add(1);
-            continue;
-        }
-        return Some((argument.to_ascii_lowercase(), &tokens[index + 1..]));
-    }
-    None
 }
 
 fn git_subcommand_is_read_only(subcommand: &str, arguments: &[String]) -> bool {
@@ -1950,11 +2026,22 @@ mod tests {
     }
 
     fn mutates(command: &str) -> bool {
-        mutates_git_metadata(&analyze_command(command, ShellSyntax::Bash).expect("analysis"))
+        mutates_git_metadata(
+            &analyze_command(command, ShellSyntax::Bash).expect("analysis"),
+            ShellSyntax::Bash,
+        )
+    }
+
+    fn deliveries(command: &str) -> Vec<CommitDelivery> {
+        deliveries_in(command, ShellSyntax::Bash)
+    }
+
+    fn deliveries_in(command: &str, syntax: ShellSyntax) -> Vec<CommitDelivery> {
+        commit_deliveries(&analyze_command(command, syntax).expect("analysis"), syntax)
     }
 
     fn delivery(command: &str) -> Option<CommitDelivery> {
-        commit_delivery(&analyze_command(command, ShellSyntax::Bash).expect("analysis"))
+        deliveries(command).into_iter().next()
     }
 
     #[test]
@@ -2002,6 +2089,81 @@ mod tests {
         ] {
             assert!(
                 !delivery(command).expect("a commit").stages_tracked_changes,
+                "{command}"
+            );
+        }
+    }
+
+    /// A check keyed on the program spelled `git` is a check a model steps around by
+    /// accident. An absolute path is what a script writes, `.exe` is what Windows
+    /// resolves to, and a backslash is how that path is spelled there.
+    #[test]
+    fn a_commit_is_a_delivery_however_the_program_is_spelled() {
+        for command in [
+            "/usr/bin/git commit -m done",
+            "GIT commit -m done",
+            "git.exe commit -m done",
+            "/usr/local/bin/git.exe commit -m done",
+        ] {
+            assert_eq!(deliveries(command).len(), 1, "{command}");
+        }
+        for command in [
+            r"C:\Program\git.exe commit -m done",
+            r"C:\Program\GIT.EXE commit -m done",
+        ] {
+            assert_eq!(
+                deliveries_in(command, ShellSyntax::PowerShell).len(),
+                1,
+                "{command}"
+            );
+        }
+    }
+
+    /// The first commit is not the delivery. Reading only it said the index was
+    /// everything, while the `-a` that follows delivers the whole worktree.
+    #[test]
+    fn every_commit_in_a_chain_is_read_not_only_the_first() {
+        let chain = deliveries("git commit -m first && git commit -am second");
+
+        assert_eq!(chain.len(), 2);
+        assert!(!chain[0].stages_tracked_changes);
+        assert!(chain[1].stages_tracked_changes);
+    }
+
+    #[test]
+    fn a_commit_that_selects_its_own_repository_is_recognised_as_one() {
+        for command in [
+            "git -C other commit -m done",
+            "git --git-dir=/elsewhere/.git commit -m done",
+            "git --work-tree /elsewhere commit -m done",
+            "git --namespace=zuno commit -m done",
+        ] {
+            assert_eq!(
+                delivery(command).expect("a commit").retarget,
+                Some(Retarget::Option),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            delivery("GIT_DIR=/elsewhere/.git git commit -m done")
+                .expect("a commit")
+                .retarget,
+            Some(Retarget::Assignment("GIT_DIR".to_owned()))
+        );
+    }
+
+    /// `NAME=value` is an assignment only in front of the program. Reading it anywhere
+    /// would refuse an ordinary commit for what its message says.
+    #[test]
+    fn a_repository_variable_in_a_commit_message_is_prose() {
+        for command in [
+            "git commit -m GIT_DIR=/elsewhere",
+            "git commit -m 'set GIT_WORK_TREE=. first'",
+            "git commit -m done",
+        ] {
+            assert_eq!(
+                delivery(command).expect("a commit").retarget,
+                None,
                 "{command}"
             );
         }

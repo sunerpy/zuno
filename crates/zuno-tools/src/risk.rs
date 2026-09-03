@@ -671,7 +671,12 @@ fn assess_local_git_history_rewrite(
     }
 }
 
-fn git_uses_repository_override(tokens: &[String]) -> bool {
+/// Whether a git invocation chooses its repository with a global option.
+///
+/// `-C`, `--git-dir`, `--work-tree` and `--namespace`, in both the separated and the
+/// `=` spelling. Shared with [`crate::shell`], which refuses a commit that retargets
+/// the repository rather than inspecting a different one than the commit writes.
+pub(crate) fn git_uses_repository_override(tokens: &[String]) -> bool {
     let mut index = 1;
     while let Some(raw) = tokens.get(index) {
         let token = unquote(raw);
@@ -694,7 +699,17 @@ fn git_uses_repository_override(tokens: &[String]) -> bool {
     false
 }
 
-fn git_subcommand(tokens: &[String], syntax: ShellSyntax) -> Option<(String, &[String])> {
+/// The subcommand of a git invocation, lowercased, and the arguments after it.
+///
+/// `None` when the command is not git or names no subcommand. The program is reduced by
+/// [`command_name`], so `/usr/bin/git`, `GIT` and `git.exe` are all git: spelling the
+/// comparison out here instead let a path-qualified or `.exe`-suffixed git walk past
+/// every check keyed on a subcommand. Global options are skipped the way git parses
+/// them, so the subcommand is the first token that is not one.
+pub(crate) fn git_subcommand(
+    tokens: &[String],
+    syntax: ShellSyntax,
+) -> Option<(String, &[String])> {
     if tokens
         .first()
         .is_none_or(|token| command_name(token, syntax) != "git")

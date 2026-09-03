@@ -143,6 +143,18 @@ fn initialize_git_repository(workspace: &Path) -> String {
     git(workspace, &["rev-parse", "HEAD"])
 }
 
+/// Where git is, spelled absolutely, the way a script or a Windows resolver spells it.
+#[cfg(unix)]
+fn git_program() -> std::path::PathBuf {
+    let output = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("locate git");
+    assert!(output.status.success(), "git must be on PATH for this test");
+    let located = String::from_utf8(output.stdout).expect("utf-8 path");
+    std::path::PathBuf::from(located.trim())
+}
+
 #[cfg(unix)]
 struct RedirectGitRepository {
     git_dir: String,
@@ -361,6 +373,133 @@ async fn a_deleted_background_directory_comes_back_excluded() {
         "the recreated directory must be excluded again"
     );
     assert_eq!(git(&root, &["status", "--porcelain"]), "");
+}
+
+/// The program `git` is not the only way to spell git.
+///
+/// The delivery check compared the first token with `git`, so `/usr/bin/git commit` —
+/// what a script writes, and what `git.exe` is on Windows — reached the commit without
+/// ever reaching the check.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_path_qualified_git_commit_reaches_the_delivery_check() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let head = initialize_git_repository(workspace.path());
+    let tool = support::sandbox::shell_tool(workspace.path());
+    let goal = workspace.path().join(".zuno").join("goal");
+    std::fs::create_dir_all(&goal).expect("goal directory");
+    std::fs::write(goal.join("ses_1.md"), b"# Objective\n").expect("goal document");
+    git(workspace.path(), &["add", "--force", ".zuno/goal/ses_1.md"]);
+
+    let refusal = tool
+        .run(
+            params(format!(
+                "{} commit --quiet -m deliver",
+                git_program().display()
+            )),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect_err("an absolutely spelled git is still git");
+
+    assert!(
+        format!("{refusal:?}").contains(".zuno/goal/ses_1.md"),
+        "{refusal:?}"
+    );
+    assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), head);
+}
+
+/// A commit that names its own repository is refused, not inspected.
+///
+/// `-C` was skipped as an option and its value discarded, so the check read the
+/// repository the tool's `workdir` names while the commit wrote a different one. There
+/// is no reading that fixes that: the repository has to be one fact both use.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_commit_that_selects_its_own_repository_is_refused() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let here = initialize_git_repository(workspace.path());
+    let elsewhere = tempfile::tempdir().expect("other repository");
+    let there = initialize_git_repository(elsewhere.path());
+    std::fs::write(elsewhere.path().join("tracked.txt"), b"edited\n").expect("source edit");
+    let tool = support::sandbox::shell_tool(workspace.path());
+
+    for command in [
+        format!(
+            "git -C {} commit --quiet -am done",
+            elsewhere.path().display()
+        ),
+        format!(
+            "GIT_DIR={} git commit --quiet -am done",
+            elsewhere.path().join(".git").display()
+        ),
+    ] {
+        let refusal = tool
+            .run(params(&command), context(Arc::new(NeverInterrupted)))
+            .await
+            .expect_err("a commit in another repository must not be admitted");
+        let rendered = format!("{refusal:?}");
+        assert!(
+            rendered.contains("select the repository with the Shell workdir"),
+            "{rendered}"
+        );
+        assert!(
+            matches!(refusal, ToolError::InvalidArgs { .. }),
+            "the arguments are what is wrong, and nothing ran: {refusal:?}"
+        );
+    }
+    assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), here);
+    assert_eq!(git(elsewhere.path(), &["rev-parse", "HEAD"]), there);
+}
+
+/// `git add -A` collects nothing generated, whatever the delivery check saw.
+///
+/// The check reads the index before the command runs, so `git add -A && git commit` is
+/// past it by construction — as is a Makefile target, an alias, or a script the analyzer
+/// cannot see into. What holds instead is that each generated directory excludes itself
+/// as it is created, with no repository-private exclude block written here at all.
+#[cfg(unix)]
+#[tokio::test]
+async fn staging_everything_collects_no_generated_state() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let head = initialize_git_repository(workspace.path());
+    let root = workspace
+        .path()
+        .canonicalize()
+        .expect("canonical workspace");
+    let spilling = support::sandbox::shell_tool(&root).with_output_limits(OutputLimits {
+        max_lines: 1,
+        max_bytes: 4,
+    });
+    spilling
+        .execute(
+            json!({
+                "command": "printf 'one\\ntwo\\n'",
+                ACCEPT_LARGE_OUTPUT_KEY: true,
+            }),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect("the command runs and spills its output");
+    std::fs::write(root.join("source.txt"), b"written by the model\n").expect("source file");
+    let tool = support::sandbox::shell_tool(&root);
+
+    tool.run(
+        params("git add -A && git commit --quiet -m wip"),
+        context(Arc::new(NeverInterrupted)),
+    )
+    .await
+    .expect("an ordinary commit of source");
+
+    assert_ne!(
+        git(&root, &["rev-parse", "HEAD"]),
+        head,
+        "the commit must have landed"
+    );
+    let committed = git(&root, &["show", "--pretty=", "--name-only", "HEAD"]);
+    assert_eq!(committed, "source.txt", "{committed}");
+    assert!(root.join(".zuno").join("tool-output").is_dir());
+    assert!(root.join(".zuno").join("background").is_dir());
 }
 
 #[cfg(unix)]
