@@ -49,7 +49,7 @@ use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use tokio::sync::{mpsc, watch};
 use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
-use zuno_engine::r#loop::{TurnEvent, TurnEventSender, event_channel};
+use zuno_engine::r#loop::{NoticeSeverity, TurnEvent, TurnEventSender, event_channel};
 use zuno_engine::session_command::SessionCommand;
 use zuno_engine::status::SessionRunRegistry;
 use zuno_engine::terminal_lease::{TerminalLease, TerminalLeaseCleanup};
@@ -3376,23 +3376,33 @@ async fn drive_one(
                 queue_wake,
                 None,
             );
-            turn_outcome?;
-            loop {
-                let queued = if prompts.is_empty() {
-                    zuno_goal::QueuedUserInput::Absent
-                } else {
-                    zuno_goal::QueuedUserInput::Present
-                };
-                if !host.continue_goal_if_idle(queued, events.clone()).await? {
-                    break;
+            // Bound, not propagated. A turn that failed or was interrupted has
+            // usually already written files, so returning here with `?` is how
+            // `/undo` lost exactly the edits the user most wants back. The verdict
+            // travels through `TurnCapture::finish_with`, which hands it back only
+            // after the post-turn tree is captured.
+            let progressed = async {
+                turn_outcome?;
+                loop {
+                    let queued = if prompts.is_empty() {
+                        zuno_goal::QueuedUserInput::Absent
+                    } else {
+                        zuno_goal::QueuedUserInput::Present
+                    };
+                    if !host.continue_goal_if_idle(queued, events.clone()).await? {
+                        break;
+                    }
+                }
+                Ok::<(), String>(())
+            }
+            .await;
+            match capture {
+                Some(capture) => finish_snapshot(capture, progressed, snapshots, events).await,
+                None => {
+                    snapshots.redo.clear();
+                    progressed
                 }
             }
-            if let Some(capture) = capture {
-                finish_snapshot(capture, snapshots, events).await;
-            } else {
-                snapshots.redo.clear();
-            }
-            Ok::<(), String>(())
         }
         .await;
         if let Err(message) = outcome {
@@ -3721,27 +3731,46 @@ async fn report_turn_failure(events: &TurnEventSender, message: String) {
     let _closed = reported.is_err();
 }
 
+/// Close this turn's undo boundary, then return the turn's own outcome.
+///
+/// The outcome goes in and comes back out so a caller cannot propagate a turn
+/// failure before the checkpoint exists; see [`zuno_snapshot::TurnCapture`]. A
+/// checkpoint that cannot be written is a warning about a lost undo point, never a
+/// turn failure: the turn itself already happened.
 async fn finish_snapshot(
     capture: zuno_snapshot::TurnCapture,
+    outcome: Result<(), String>,
     snapshots: &mut SnapshotHistory,
     events: &TurnEventSender,
-) {
+) -> Result<(), String> {
     snapshots.redo.clear();
-    match tokio::task::spawn_blocking(move || capture.finish()).await {
-        Ok(Ok(checkpoint)) => snapshots.undo.push(checkpoint),
-        Ok(Err(error)) => {
-            publish_snapshot_detail(
+    // The clone is what survives a panic inside the blocking task, which would
+    // otherwise take the turn's verdict with it.
+    let carried = outcome.clone();
+    match tokio::task::spawn_blocking(move || capture.finish_with(outcome)).await {
+        Ok((Ok(checkpoint), outcome)) => {
+            snapshots.undo.push(checkpoint);
+            outcome
+        }
+        Ok((Err(error), outcome)) => {
+            publish_snapshot_notice(
                 events,
-                format!("warning: turn snapshot could not be completed: {error}"),
+                NoticeSeverity::Warning,
+                "snapshot.checkpoint_incomplete",
+                format!("this turn has no undo point: {error}"),
             )
             .await;
+            outcome
         }
         Err(error) => {
-            publish_snapshot_detail(
+            publish_snapshot_notice(
                 events,
-                format!("warning: turn snapshot task failed: {error}"),
+                NoticeSeverity::Warning,
+                "snapshot.checkpoint_incomplete",
+                format!("this turn has no undo point: snapshot task failed: {error}"),
             )
             .await;
+            carried
         }
     }
 }
@@ -3754,17 +3783,21 @@ async fn begin_snapshot(
     match tokio::task::spawn_blocking(move || store.begin_turn()).await {
         Ok(Ok(capture)) => capture,
         Ok(Err(error)) => {
-            publish_snapshot_detail(
+            publish_snapshot_notice(
                 events,
-                format!("warning: turn snapshot could not start: {error}"),
+                NoticeSeverity::Warning,
+                "snapshot.capture_unavailable",
+                format!("this turn cannot be undone: {error}"),
             )
             .await;
             None
         }
         Err(error) => {
-            publish_snapshot_detail(
+            publish_snapshot_notice(
                 events,
-                format!("warning: turn snapshot task failed: {error}"),
+                NoticeSeverity::Warning,
+                "snapshot.capture_unavailable",
+                format!("this turn cannot be undone: snapshot task failed: {error}"),
             )
             .await;
             None
@@ -3803,13 +3836,27 @@ async fn restore_snapshot(
         }
     };
     let Some(checkpoint) = source.last().cloned() else {
-        return Err(format!("nothing to {}", restore_name(restore)));
+        return Err(format!("nothing to {restore}"));
     };
     let store = snapshots.store.clone();
     let report = tokio::task::spawn_blocking(move || store.restore_turn(&checkpoint, restore))
         .await
-        .map_err(|error| format!("{} snapshot task failed: {error}", restore_name(restore)))?
-        .map_err(|error| format!("{} refused: {error}", restore_name(restore)))?;
+        .map_err(|error| {
+            // A panic mid-restore leaves the worktree in whatever state the apply
+            // reached, so this cannot claim nothing changed either.
+            format!("{restore} did not report an outcome; the worktree may have been partly rewritten: {error}")
+        })?
+        .map_err(|error| {
+            // `worktree_untouched` is the typed boundary between a refusal and an
+            // uncertain outcome. Only the first may be called "refused"; the second
+            // has already rewritten files and says so itself, including where the
+            // persisted evidence is.
+            if error.worktree_untouched() {
+                format!("{restore} refused: {error}")
+            } else {
+                error.to_string()
+            }
+        })?;
     let checkpoint = source
         .pop()
         .expect("the restored checkpoint remains at the top of its stack");
@@ -3860,43 +3907,39 @@ async fn execute_host_command(
     }
 }
 
+/// Report a completed restore as one line the user actually sees.
+///
+/// The wording, the counts and the note about paths the snapshot never held all
+/// come from [`zuno_snapshot::TurnRestoreReport::summary`], so every surface says
+/// the same thing. It is published as a notice rather than as provider status
+/// detail because a status detail is transient and the TUI keeps only the ones
+/// prefixed `warning: ` — a successful `/undo` used to be dropped outright.
 async fn publish_restore_report(
     events: &TurnEventSender,
     report: &zuno_snapshot::TurnRestoreReport,
 ) {
-    let action = restore_name(report.restore());
-    if report.files().is_empty() {
-        publish_snapshot_detail(events, format!("{action}: no files changed")).await;
-        return;
-    }
-    publish_snapshot_detail(
+    publish_snapshot_notice(
         events,
-        format!("{action}: restored {} file(s)", report.files().len()),
+        NoticeSeverity::Info,
+        "snapshot.restored",
+        report.summary(),
     )
     .await;
-    for file in report.files() {
-        publish_snapshot_detail(
-            events,
-            format!("{action}: {:?} {}", file.operation, file.path),
-        )
-        .await;
-    }
 }
 
-async fn publish_snapshot_detail(events: &TurnEventSender, detail: String) {
+async fn publish_snapshot_notice(
+    events: &TurnEventSender,
+    severity: NoticeSeverity,
+    code: &str,
+    detail: String,
+) {
     let _reported = events
-        .publish(TurnEvent::Provider {
-            step: 0,
-            event: StreamEvent::StatusDetail { detail },
+        .publish(TurnEvent::Notice {
+            severity,
+            code: code.to_owned(),
+            detail,
         })
         .await;
-}
-
-fn restore_name(restore: zuno_snapshot::TurnRestore) -> &'static str {
-    match restore {
-        zuno_snapshot::TurnRestore::Undo => "undo",
-        zuno_snapshot::TurnRestore::Redo => "redo",
-    }
 }
 
 fn to_string(error: impl std::fmt::Display) -> String {
@@ -5805,7 +5848,9 @@ mod tests {
             .expect("capture before turn")
             .expect("snapshots enabled");
         fs::write(&file, "after\n").expect("simulate turn edit");
-        finish_snapshot(capture, &mut history, &events).await;
+        finish_snapshot(capture, Ok(()), &mut history, &events)
+            .await
+            .expect("the turn itself succeeded");
         assert_eq!(history.undo.len(), 1);
         assert!(history.redo.is_empty());
 
@@ -5861,7 +5906,9 @@ mod tests {
             .expect("first capture")
             .expect("snapshots enabled");
         fs::write(&file, "two\n").expect("first edit");
-        finish_snapshot(first, &mut history, &events).await;
+        finish_snapshot(first, Ok(()), &mut history, &events)
+            .await
+            .expect("the first turn succeeded");
         restore_snapshot(HostCommand::Undo, &mut history, &events)
             .await
             .expect("undo first turn");
@@ -5872,11 +5919,181 @@ mod tests {
             .expect("second capture")
             .expect("snapshots enabled");
         fs::write(&file, "three\n").expect("new edit after undo");
-        finish_snapshot(second, &mut history, &events).await;
+        finish_snapshot(second, Ok(()), &mut history, &events)
+            .await
+            .expect("the second turn succeeded");
 
         assert!(history.redo.is_empty());
         assert_eq!(history.undo.len(), 1);
         assert_eq!(fs::read_to_string(file).expect("read new turn"), "three\n");
+    }
+
+    /// A tracked worktree with one committed file, ready for a turn.
+    fn snapshot_fixture(temp: &std::path::Path) -> (zuno_snapshot::Store, std::path::PathBuf) {
+        let root = temp.join("snapshot");
+        let worktree = temp.join("worktree");
+        fs::create_dir_all(&root).expect("create snapshot root");
+        fs::create_dir_all(&worktree).expect("create worktree");
+        for args in [
+            vec!["init", "-q", "."],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&worktree)
+                .status()
+                .expect("run git fixture command");
+            assert!(status.success());
+        }
+        fs::write(worktree.join("turn.txt"), "before\n").expect("seed tracked file");
+        for args in [vec!["add", "-A"], vec!["commit", "-qm", "init"]] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&worktree)
+                .status()
+                .expect("run git fixture command");
+            assert!(status.success());
+        }
+        let store =
+            zuno_snapshot::Store::open(zuno_snapshot::Location::new(root, "project", &worktree));
+        (store, worktree)
+    }
+
+    fn drain(source: &mut mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = source.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// A turn that fails has still written files, so it still needs its undo point.
+    ///
+    /// The host used to propagate the turn's error with `?` several statements before it
+    /// finished the capture, so the one turn a user most wants to undo — the one that
+    /// broke — was the only kind that got no checkpoint. The outcome now travels through
+    /// [`zuno_snapshot::TurnCapture::finish_with`], which hands it back only after the
+    /// post-turn tree exists.
+    #[tokio::test]
+    async fn a_failed_turn_still_gets_the_undo_point_for_what_it_wrote() {
+        let temp = tempfile::tempdir().expect("snapshot fixture");
+        let (store, worktree) = snapshot_fixture(temp.path());
+        let mut history = SnapshotHistory::new(store.clone());
+        let (events, _event_source) = event_channel();
+        let capture = store
+            .begin_turn()
+            .expect("capture before turn")
+            .expect("snapshots enabled");
+        let file = worktree.join("turn.txt");
+        fs::write(&file, "written before the turn failed\n").expect("simulate turn edit");
+
+        let outcome = finish_snapshot(
+            capture,
+            Err("provider stream ended mid-answer".to_owned()),
+            &mut history,
+            &events,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            Err("provider stream ended mid-answer".to_owned()),
+            "the turn's own verdict must survive the capture unchanged"
+        );
+        assert_eq!(history.undo.len(), 1, "a failed turn is still undoable");
+        restore_snapshot(HostCommand::Undo, &mut history, &events)
+            .await
+            .expect("undo the failed turn");
+        assert_eq!(fs::read_to_string(&file).expect("read undo"), "before\n");
+    }
+
+    /// A successful `/undo` has to arrive somewhere the client actually renders.
+    ///
+    /// Success used to be published as `StreamEvent::StatusDetail`, and the only
+    /// `StatusDetail` arm in `crates/zuno-tui/src/views/message.rs` keeps details prefixed
+    /// `warning: `. A successful undo therefore rewrote the worktree and said nothing at
+    /// all. This drives the real transcript so "the client renders it" is asserted rather
+    /// than assumed.
+    #[tokio::test]
+    async fn a_successful_undo_is_reported_where_the_client_renders_it() {
+        let temp = tempfile::tempdir().expect("snapshot fixture");
+        let (store, worktree) = snapshot_fixture(temp.path());
+        let mut history = SnapshotHistory::new(store.clone());
+        let (events, mut event_source) = event_channel();
+        let capture = store
+            .begin_turn()
+            .expect("capture before turn")
+            .expect("snapshots enabled");
+        fs::write(worktree.join("turn.txt"), "after\n").expect("simulate turn edit");
+        finish_snapshot(capture, Ok(()), &mut history, &events)
+            .await
+            .expect("the turn itself succeeded");
+        let _turn = drain(&mut event_source);
+
+        restore_snapshot(HostCommand::Undo, &mut history, &events)
+            .await
+            .expect("undo succeeds");
+
+        let published = drain(&mut event_source);
+        let reports: Vec<&TurnEvent> = published
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    TurnEvent::Notice { code, .. } if code == "snapshot.restored"
+                )
+            })
+            .collect();
+        assert_eq!(reports.len(), 1, "one line, once: {published:?}");
+        let TurnEvent::Notice {
+            severity, detail, ..
+        } = reports[0]
+        else {
+            unreachable!("filtered above");
+        };
+        assert_eq!(
+            *severity,
+            NoticeSeverity::Info,
+            "a restore that worked is not a warning"
+        );
+        assert!(
+            detail.starts_with("undo complete: 1 file(s) restored to tree "),
+            "{detail}"
+        );
+        assert!(
+            !published.iter().any(|event| matches!(
+                event,
+                TurnEvent::Provider {
+                    event: StreamEvent::StatusDetail { .. },
+                    ..
+                }
+            )),
+            "provider status detail is transient and filtered; it cannot carry a result"
+        );
+
+        let mut transcript = zuno_tui::views::message::Transcript::new();
+        for event in &published {
+            transcript.observe(event);
+        }
+        let rendered: Vec<(&str, zuno_tui::views::toast::ToastLevel)> = transcript
+            .messages()
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                zuno_tui::views::message::MessagePart::Notice { text, level } => {
+                    Some((text.as_str(), *level))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            rendered.iter().any(|(text, level)| {
+                text.contains("undo complete: 1 file(s) restored to tree ")
+                    && *level == zuno_tui::views::toast::ToastLevel::Info
+            }),
+            "the transcript the user reads never received the report: {rendered:?}"
+        );
     }
 
     /// The owner's report, at the surface he saw it: `/model` offered only the session

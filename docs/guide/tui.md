@@ -155,6 +155,40 @@ Resource pickers follow the same naming: `/model`, `/agent`, `/session`, `/skill
 `/council` appears only when the active agent's final capability snapshot can actually
 reach `council_run`, so the picker cannot advertise a run the dispatcher would reject.
 
+### What `/undo` covers
+
+`/undo` and `/redo` move the whole worktree between the two trees Zuno captured around a
+turn. The capture is not limited to the directory Zuno was started in, so a session
+started in a subdirectory can restore files beside it.
+
+A snapshot does not hold every file. Three kinds of path are left out, and a restore
+never changes any of them:
+
+- untracked files larger than 2 MiB;
+- paths a `.gitignore` rule covers at the moment the snapshot is taken;
+- paths Git could not read.
+
+An excluded path keeps whatever content it already had, so a restore can leave part of
+the tree looking untouched even though it succeeded. Zuno counts them in the line a
+successful restore prints:
+
+```text
+undo complete: 3 file(s) restored to tree 250c08c795d9 (1 created, 1 modified, 1 deleted); 2 path(s) are outside this snapshot and were not restored: 1 over the 2 MiB untracked-file limit, 1 matching an ignore rule
+```
+
+If a listed path matters to you, recover it from your own version control or backups. The
+snapshot store never held a copy.
+
+A turn that failed or was interrupted still gets its snapshot, because it has usually
+already written files.
+
+A restore can also end in an **uncertain outcome**: files were rewritten and the
+requested tree could not be confirmed afterwards. Zuno reports that as what it is rather
+than as a refusal, writes `zuno-restore-uncertain.json` into the snapshot store, and
+refuses every later `/undo` and `/redo` until that record is gone. Nothing is retried
+automatically. Read the record, compare it with your worktree, resolve the difference
+yourself, and then delete the file to re-enable restores.
+
 ## Permission prompts and questions
 
 Tool-owned human input replaces the composer region rather than adding a transcript card.
