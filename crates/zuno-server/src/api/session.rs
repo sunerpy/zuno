@@ -11,12 +11,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
-use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SessionInput};
-use zuno_db::session::{ListQuery, Session, SessionCreate, SortDirection};
-use zuno_engine::interrupt::{
-    HardInterruptReason, HardInterruptRequest, HardInterruptSource, SoftInterruptMessage,
-    SoftInterruptSource,
+use zuno_db::inbox::{
+    DurableInputKind, InputDelivery, NewSessionInput, SessionInbox, SessionInput,
 };
+use zuno_db::session::{ListQuery, Session, SessionCreate, SortDirection};
+use zuno_engine::admission::{InputAdmission, SessionInputAdmission, SteeringContent, TurnLease};
+use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::event_channel;
 use zuno_engine::status::{SessionRunGuard, SessionStatus};
 use zuno_error::DbError;
@@ -275,23 +275,51 @@ impl From<PersistedModelSelection> for SessionModelSelection {
     }
 }
 
+/// The one durable inbox shape this surface writes: an HTTP prompt body together
+/// with the agent and model overrides the request carried.
+///
+/// Every other shape this driver runs was written elsewhere and is read back
+/// through [`DurableInputKind`], so there is a single decoder per published kind.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-enum PersistedDriverInput {
-    User {
-        prompt: PromptInputBody,
-        agent: Option<String>,
-        model: Option<PersistedModelSelection>,
-    },
-    SubagentReport {
-        #[serde(rename = "jobID")]
-        _job_id: String,
-        #[serde(rename = "childSessionID")]
-        _child_session_id: String,
-        #[serde(rename = "status")]
-        _status: String,
-        text: String,
-    },
+#[serde(tag = "kind", rename = "user", rename_all = "camelCase")]
+struct PersistedUserPrompt {
+    prompt: PromptInputBody,
+    agent: Option<String>,
+    model: Option<PersistedModelSelection>,
+}
+
+/// One pending inbox row the HTTP prompt driver is the consumer for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrivenInput {
+    /// An HTTP prompt body with its agent and model overrides.
+    UserPrompt,
+    /// A settled report or answered human request delivered as plain text.
+    PlainText,
+}
+
+impl DrivenInput {
+    /// Classify one pending row, or `None` when this driver must leave it alone.
+    ///
+    /// A TUI submission and an ACP prompt carry structured payloads only their own
+    /// surface can render, and a turn host message is never observed pending.
+    /// Promoting one of those here and then failing to decode it would settle
+    /// another surface's durable input as `failed` instead of leaving it for the
+    /// driver that can run it. A payload no writer publishes is left pending for the
+    /// same reason: an unrecognized shape is preserved rather than destroyed.
+    fn of(prompt: &Value) -> Option<Self> {
+        match DurableInputKind::classify(prompt)? {
+            DurableInputKind::User => Some(Self::UserPrompt),
+            DurableInputKind::SubagentReport
+            | DurableInputKind::ProductAgentReport
+            | DurableInputKind::WorkflowReport
+            | DurableInputKind::CouncilReport
+            | DurableInputKind::BackgroundExecutionReport
+            | DurableInputKind::HumanRequestAnswer => Some(Self::PlainText),
+            DurableInputKind::TuiPrompt
+            | DurableInputKind::AcpPrompt
+            | DurableInputKind::HostMessage => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -776,48 +804,46 @@ pub async fn prompt(
         }),
         None => session_model(session.model.as_deref())?,
     };
-    let persisted = PersistedDriverInput::User {
+    let persisted = PersistedUserPrompt {
         prompt: prompt.clone(),
         agent: agent.or(session.agent),
         model: selected_model.map(PersistedModelSelection::from),
     };
-    let admitted_input = SessionInbox::new(state.pool_arc()).admit(NewSessionInput::new(
-        message_id.clone(),
-        session_id.clone(),
-        serde_json::to_value(persisted)
-            .map_err(|error| ApiError::MutationFailed(error.to_string()))?,
-        delivery.into_inbox(),
-        created,
-    ))?;
-    let admitted_seq = u64::try_from(admitted_input.admitted_sequence)
+    // Admission writes the durable row before contending for the live-turn lease,
+    // so a prompt that arrives mid-turn is recorded and steered rather than lost.
+    let admission =
+        SessionInputAdmission::new(SessionInbox::new(state.pool_arc()), services.runs.clone());
+    let steering = (delivery == PromptDelivery::Steer)
+        .then(|| SteeringContent::user(prompt.text.clone()).with_attachments(admitted_attachments));
+    let lease = if resume == Some(false) {
+        TurnLease::Deferred
+    } else {
+        TurnLease::Acquire
+    };
+    let admitted_input = admission.admit(
+        NewSessionInput::new(
+            message_id.clone(),
+            session_id.clone(),
+            serde_json::to_value(persisted)
+                .map_err(|error| ApiError::MutationFailed(error.to_string()))?,
+            delivery.into_inbox(),
+            created,
+        ),
+        lease,
+        steering,
+    )?;
+    let admitted_seq = u64::try_from(admitted_input.input().admitted_sequence)
         .map_err(|_| ApiError::MutationFailed("negative admission sequence".to_owned()))?;
     let admitted = PromptAdmitted {
         admitted_seq,
-        id: message_id.clone(),
+        id: message_id,
         session_id: session_id.clone(),
-        prompt: prompt.clone(),
+        prompt,
         delivery,
         time_created: created,
     };
-
-    if resume != Some(false) {
-        match services.runs.begin_turn(&session_id) {
-            Ok(guard) => spawn_prompt_driver(state, services, executor, session_id, guard),
-            Err(_) if delivery == PromptDelivery::Steer => {
-                let _live_turn_won_race = services.runs.queue_soft_interrupt(
-                    &session_id,
-                    SoftInterruptMessage {
-                        input_id: Some(message_id),
-                        content: prompt.text,
-                        images: Vec::new(),
-                        attachments: admitted_attachments,
-                        urgent: false,
-                        source: SoftInterruptSource::User,
-                    },
-                );
-            }
-            Err(_) => {}
-        }
+    if let InputAdmission::Drive { guard, .. } = admitted_input {
+        spawn_prompt_driver(state, services, executor, session_id, guard);
     }
     Ok(Json(Data::new(admitted)))
 }
@@ -834,18 +860,18 @@ fn spawn_prompt_driver(
         let inbox = SessionInbox::new(state.pool_arc());
         let mut guard = Some(guard);
         loop {
-            let promoted = match inbox.promote_next(&session_id, None) {
+            let promoted = match promote_next_driven(&inbox, &session_id) {
                 Ok(promoted) => promoted,
                 Err(error) => {
                     eprintln!("session input promotion failed for `{session_id}`: {error}");
                     return;
                 }
             };
-            let Some(promoted) = promoted else {
+            let Some((promoted, driven)) = promoted else {
                 return;
             };
             let promoted_id = promoted.id.clone();
-            let request = match prompt_execution(&state, promoted) {
+            let request = match prompt_execution(&state, promoted, driven) {
                 Ok(request) => request,
                 Err(error) => {
                     let _settled = inbox.mark_failed(&session_id, &promoted_id, error.clone());
@@ -880,16 +906,44 @@ fn spawn_prompt_driver(
     });
 }
 
+/// Promote the oldest pending row this surface drives, stepping over the rows
+/// another client owns so they stay pending for their own driver.
+///
+/// The read is followed by a promotion keyed on that exact row, so a concurrent
+/// driver that claimed it first simply moves this loop to the next candidate.
+fn promote_next_driven(
+    inbox: &SessionInbox,
+    session_id: &str,
+) -> Result<Option<(SessionInput, DrivenInput)>, DbError> {
+    for pending in inbox.pending(session_id)? {
+        let Some(driven) = DrivenInput::of(&pending.prompt) else {
+            continue;
+        };
+        if let Some(promoted) = inbox.promote_id(session_id, &pending.id)? {
+            return Ok(Some((promoted, driven)));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether any pending row is one this surface drives.
+fn has_driven_pending(inbox: &SessionInbox, session_id: &str) -> Result<bool, DbError> {
+    Ok(inbox
+        .pending(session_id)?
+        .iter()
+        .any(|pending| DrivenInput::of(&pending.prompt).is_some()))
+}
+
 fn continue_prompt_driver(
     inbox: &SessionInbox,
     services: &ServerServices,
     session_id: &str,
     guard: &mut Option<SessionRunGuard>,
 ) -> bool {
-    match inbox.pending(session_id) {
-        Ok(pending) if pending.is_empty() => false,
-        Ok(_) if guard.is_some() => true,
-        Ok(_) => match services.runs.begin_turn(session_id) {
+    match has_driven_pending(inbox, session_id) {
+        Ok(false) => false,
+        Ok(true) if guard.is_some() => true,
+        Ok(true) => match services.runs.begin_turn(session_id) {
             Ok(next_guard) => {
                 *guard = Some(next_guard);
                 true
@@ -906,31 +960,39 @@ fn continue_prompt_driver(
 fn prompt_execution(
     state: &ApiState,
     input: SessionInput,
+    driven: DrivenInput,
 ) -> Result<SessionPromptExecution, String> {
-    let stored = serde_json::from_value::<PersistedDriverInput>(input.prompt)
-        .map_err(|error| format!("invalid persisted session input `{}`: {error}", input.id))?;
     let session = state
         .sessions()
         .get(&input.session_id)
         .map_err(|error| error.to_string())?;
-    match stored {
-        PersistedDriverInput::User {
-            prompt,
-            agent,
-            model,
-        } => {
-            let content = prompt_request_content(&prompt)?;
+    match driven {
+        DrivenInput::UserPrompt => {
+            let stored =
+                serde_json::from_value::<PersistedUserPrompt>(input.prompt).map_err(|error| {
+                    format!("invalid persisted session input `{}`: {error}", input.id)
+                })?;
+            let content = prompt_request_content(&stored.prompt)?;
             Ok(SessionPromptExecution {
                 session_id: input.session_id,
                 directory: session.directory.into(),
                 message_id: input.id,
-                prompt: prompt.text,
+                prompt: stored.prompt.text,
                 content,
-                agent,
-                model: model.map(SessionModelSelection::from),
+                agent: stored.agent,
+                model: stored.model.map(SessionModelSelection::from),
             })
         }
-        PersistedDriverInput::SubagentReport { text, .. } => {
+        DrivenInput::PlainText => {
+            let text = DurableInputKind::classify(&input.prompt)
+                .and_then(|kind| kind.plain_text(&input.prompt))
+                .ok_or_else(|| {
+                    format!(
+                        "persisted session input `{}` carries no model-visible text",
+                        input.id
+                    )
+                })?
+                .to_owned();
             let model =
                 session_model(session.model.as_deref()).map_err(|error| error.to_string())?;
             Ok(SessionPromptExecution {
@@ -1163,9 +1225,9 @@ async fn resume_pending_inputs(
     executor: Arc<dyn crate::SessionMutationExecutor>,
     session_id: &str,
 ) {
-    match SessionInbox::new(state.pool_arc()).pending(session_id) {
-        Ok(pending) if pending.is_empty() => return,
-        Ok(_) => {}
+    match has_driven_pending(&SessionInbox::new(state.pool_arc()), session_id) {
+        Ok(false) => return,
+        Ok(true) => {}
         Err(error) => {
             eprintln!("session input inspection failed for `{session_id}`: {error}");
             return;

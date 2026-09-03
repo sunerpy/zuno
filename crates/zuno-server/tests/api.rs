@@ -16,7 +16,7 @@ use tower::ServiceExt;
 use zuno_db::Pool;
 use zuno_db::artifact_gc::ArtifactGcPaths;
 use zuno_db::event_log::SessionEventLog;
-use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox};
+use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SubmissionState};
 use zuno_db::session::SessionCreate;
 use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, TurnEventSender};
@@ -1556,6 +1556,10 @@ async fn api_prompt_defaults_to_queue_and_resume_false_does_not_start_a_turn() {
         .expect("pending input reads");
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, "msg_deferred");
+    // The published payload keeps its `user` discriminator so every surface still
+    // classifies this row through the shared decoder.
+    assert_eq!(pending[0].prompt["kind"], "user");
+    assert_eq!(pending[0].prompt["prompt"]["text"], "later");
     let events = SessionEventLog::new(fixture.pool)
         .read_after("ses_deferred", None)
         .expect("admission event reads");
@@ -1704,6 +1708,11 @@ async fn api_prompt_driver_runs_a_durable_subagent_report_before_later_user_inpu
     services.runs.wait_until_idle("ses_report").await;
 }
 
+/// A payload no writer publishes is left untouched instead of promoted and settled
+/// as `failed`: the driver cannot tell an unrecognized shape apart from a shape
+/// another surface owns, and destroying durable user input to record a diagnostic
+/// is the worse of the two. The expectation this test used to carry — that the row
+/// ended `failed` — changed with that policy.
 #[tokio::test]
 async fn api_prompt_driver_skips_a_malformed_durable_input_without_stranding_the_queue() {
     let fixture = MutationApiFixture::new("ses_malformed");
@@ -1745,6 +1754,157 @@ async fn api_prompt_driver_skips_a_malformed_durable_input_without_stranding_the
         AbortDisposition::Active
     );
     services.runs.wait_until_idle("ses_malformed").await;
+
+    let unrecognized = SessionInbox::new(Arc::clone(&fixture.pool))
+        .get("ses_malformed", "input_malformed")
+        .expect("unrecognized input reads")
+        .expect("unrecognized input still exists");
+    assert_eq!(unrecognized.state, SubmissionState::Queued);
+    assert_eq!(unrecognized.error, None);
+}
+
+/// A durable row written by another client stays pending for the surface that can
+/// render it. The HTTP driver promotes only the shapes it decodes, so mixing a TUI
+/// or ACP session with HTTP prompts cannot settle another surface's input as
+/// `failed`.
+#[tokio::test]
+async fn api_prompt_driver_leaves_another_surfaces_pending_input_untouched() {
+    let fixture = MutationApiFixture::new("ses_foreign");
+    let inbox = SessionInbox::new(Arc::clone(&fixture.pool));
+    inbox
+        .admit(NewSessionInput::new(
+            "input_tui",
+            "ses_foreign",
+            json!({
+                "kind": "tuiPrompt",
+                "submission": {"kind": "text", "data": "typed in the terminal"},
+                "origin": "tui_keybinding"
+            }),
+            InputDelivery::Queue,
+            1,
+        ))
+        .expect("admit a terminal submission");
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_foreign/prompt",
+            Some(json!({
+                "id": "msg_user",
+                "prompt": {"text": "user input", "files": [], "agents": []},
+                "delivery": "queue"
+            })),
+        ))
+        .await
+        .expect("user prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    executor.wait_until_prompt_count(1).await;
+    assert_eq!(executor.prompts()[0].message_id, "msg_user");
+    assert_eq!(executor.prompts()[0].prompt, "user input");
+    assert_eq!(
+        services.runs.abort("ses_foreign", api_cancel()),
+        AbortDisposition::Active
+    );
+    services.runs.wait_until_idle("ses_foreign").await;
+
+    let terminal = inbox
+        .get("ses_foreign", "input_tui")
+        .expect("terminal submission reads")
+        .expect("terminal submission still exists");
+    assert_eq!(terminal.state, SubmissionState::Queued);
+    assert_eq!(terminal.error, None);
+}
+
+/// Every asynchronous report shape reaches the model as plain text. Only
+/// `subagentReport` used to decode, so a workflow, council, product-agent, or
+/// background-execution report was promoted and then failed instead of delivered.
+#[tokio::test]
+async fn api_prompt_driver_delivers_every_asynchronous_report_shape() {
+    let fixture = MutationApiFixture::new("ses_reports");
+    let inbox = SessionInbox::new(Arc::clone(&fixture.pool));
+    let reports = [
+        (
+            "input_workflow",
+            json!({
+                "kind": "workflowReport",
+                "jobID": "job_w",
+                "runID": "run_w",
+                "workflow": "release",
+                "status": "completed",
+                "text": "workflow finished"
+            }),
+        ),
+        (
+            "input_council",
+            json!({
+                "kind": "councilReport",
+                "jobID": "job_c",
+                "runID": "run_c",
+                "preset": "review",
+                "status": "completed",
+                "text": "council finished"
+            }),
+        ),
+    ];
+    for (index, (id, prompt)) in reports.iter().enumerate() {
+        inbox
+            .admit(NewSessionInput::new(
+                *id,
+                "ses_reports",
+                prompt.clone(),
+                InputDelivery::Queue,
+                i64::try_from(index).expect("small index") + 1,
+            ))
+            .expect("admit report");
+    }
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_reports/prompt",
+            Some(json!({
+                "id": "msg_user",
+                "prompt": {"text": "user input", "files": [], "agents": []},
+                "delivery": "queue"
+            })),
+        ))
+        .await
+        .expect("user prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for expected in 1..=3 {
+        executor.wait_until_prompt_count(expected).await;
+        assert_eq!(
+            services.runs.abort("ses_reports", api_cancel()),
+            AbortDisposition::Active
+        );
+    }
+    services.runs.wait_until_idle("ses_reports").await;
+    assert_eq!(
+        executor
+            .prompts()
+            .into_iter()
+            .map(|request| (request.message_id, request.prompt))
+            .collect::<Vec<_>>(),
+        [
+            ("input_workflow".to_owned(), "workflow finished".to_owned()),
+            ("input_council".to_owned(), "council finished".to_owned()),
+            ("msg_user".to_owned(), "user input".to_owned())
+        ]
+    );
 }
 
 #[tokio::test]
