@@ -8,12 +8,14 @@
 //! the old pattern in the exclude file while the new files land in `git status`, where
 //! a model reads them as the user's uncommitted work.
 //!
-//! [`GENERATED_PATHS`] is the single source of truth. One entry per runtime path, each
+//! Two lists decide every answer here. [`GENERATED_PATHS`] names each runtime path
 //! with the git pattern that hides it, the reason it exists, and whether its entries
-//! belong to a session. Everything else here is derived from it: [`IGNORE_PATTERNS`] is
-//! what the host hands to [`crate::ensure_managed_block`], [`is_generated`] answers
-//! whether a path is generated state, and [`refuse_generated_state`] is the delivery
-//! check that keeps such a path out of a commit.
+//! belong to a session. [`USER_OWNED_ENTRIES`] names each entry directly under the
+//! project directory that a person authors and commits. Everything else is derived:
+//! [`IGNORE_PATTERNS`] is what the host hands to [`crate::ensure_managed_block`],
+//! [`is_generated`] answers whether a path is generated state, and
+//! [`refuse_generated_state`] is the delivery check that keeps such a path out of a
+//! commit.
 //!
 //! # Why the registry is a `const`
 //!
@@ -24,25 +26,50 @@
 //! in full in this file, and adding to it is a reviewed change that has to say what the
 //! new path is, why it exists, and which code writes it.
 //!
-//! # Why `.zuno/` as a whole is not registered
+//! # Why the default under `.zuno/` is "generated"
 //!
-//! The project directory also holds `zuno.json`, skills, agents, commands, extensions
-//! and `RULES.md`: configuration a user writes and commits. A single `.zuno/` pattern
-//! would hide a user's own edit to their configuration from `git status`, and the
-//! delivery check would refuse to commit it. Only the subdirectories Zuno *generates*
-//! are listed, each proven by the code that writes it. Plans under `.zuno/plans/` are
-//! deliberately absent too: the model writes them through the ordinary `write` tool
-//! under the user's permission rules, and `zuno-agent`'s `plan_file` documents them as
-//! a path the user may gitignore or commit as they choose.
+//! The registry used to be the whole answer: a path was generated only when it matched
+//! a registered entry, and everything else under the project directory was source. That
+//! is the wrong default, and it is how a session came to commit its own `.zuno/`. A
+//! directory Zuno starts writing — this release, or the next one, or a subdirectory a
+//! release renames — is not in the exclude block until somebody remembers to register
+//! it, and until then `git add -A` collects it and the delivery check waves it through.
+//! The failure is silent and it lands in the user's history.
+//!
+//! So the default is inverted. Anything under [`PROJECT_DIRECTORY`] that is not one of
+//! [`USER_OWNED_ENTRIES`] is generated state, reported as
+//! [`GeneratedReason::UnregisteredProjectState`]. The registry stays, because a
+//! registered path can name *why* it exists in a report; what it no longer does is
+//! decide whether an unnamed path is safe to commit.
+//!
+//! [`USER_OWNED_ENTRIES`] is therefore the thing to keep honest: it is every entry a
+//! person authors — `zuno.json`, `skill/`, `agent/`, `command/`, `extensions/`,
+//! `plans/`, `RULES.md` — and each name there is a name Zuno's own loaders read from
+//! the project directory. Plans are among them because the model writes them through
+//! the ordinary `write` tool under the user's permission rules, and `zuno-agent`'s
+//! `plan_file` documents them as a path the user may gitignore or commit as they choose.
+//!
+//! # Why an ambiguous spelling is resolved in the user's favour
+//!
+//! Two comparisons could go either way, and both are decided the same direction: a
+//! wrongly refused commit blocks a person's own work, while a missed one is still
+//! caught by the `.gitignore` that every generated directory carries
+//! ([`crate::generated_dir`]). So the project directory's own name is compared exactly
+//! — a `.ZUNO/` on a case-sensitive filesystem is somebody else's directory — and a
+//! user-owned entry's name is compared without ASCII case, because git folds case
+//! itself wherever `core.ignorecase` is set, which is every Windows and macOS
+//! checkout. `.zuno/Zuno.json` is re-included by git there, and this module must not
+//! then call it generated.
 //!
 //! # Why the check can be lexical
 //!
-//! Every registered pattern is a plain directory prefix — `.zuno/<name>/`, slash
-//! separated, no glob characters, a trailing slash so it names a directory and not a
-//! file that shares the name. That is the whole reason [`is_generated`] can be a
-//! component-wise comparison instead of a gitignore matcher: git and this module read a
-//! prefix the same way. The shape is enforced at compile time, so a pattern that would
-//! make the two disagree cannot be registered.
+//! [`is_generated`] is a component-wise comparison rather than a gitignore matcher,
+//! and stays honest only because both shapes it has to agree with are constrained at
+//! compile time. A registered pattern is a plain directory prefix — `.zuno/<name>/`,
+//! slash separated, no glob characters, a trailing slash so it names a directory and
+//! not a file that shares the name. A rendered pattern in [`IGNORE_PATTERNS`] is
+//! either [`PROJECT_STATE_PATTERN`] or one negated user-owned entry, and nothing else:
+//! that is the only glob shape git and this module read the same way.
 //!
 //! ```
 //! use std::path::Path;
@@ -51,7 +78,10 @@
 //! let worktree = Path::new("/repo");
 //! assert!(is_generated(worktree, Path::new(".zuno/goal/ses_1.md")));
 //! assert!(is_generated(worktree, Path::new("/repo/src/../.zuno/tool-output/tool_x")));
+//! // Not registered, not authored by a person: generated all the same.
+//! assert!(is_generated(worktree, Path::new(".zuno/whatever-comes-next/state.json")));
 //! assert!(!is_generated(worktree, Path::new(".zuno/zuno.json")));
+//! assert!(!is_generated(worktree, Path::new(".zuno/plans/1700000000000-swift-otter.md")));
 //! assert!(!is_generated(worktree, Path::new("/elsewhere/.zuno/goal/ses_1.md")));
 //!
 //! let refusal = refuse_generated_state(worktree, [".zuno/goal/ses_1.md", "src/lib.rs"])
@@ -100,7 +130,12 @@ impl GeneratedPath {
     }
 
     /// The pattern's directory names, outermost first.
-    fn segments(&self) -> impl Iterator<Item = &'static str> {
+    ///
+    /// How [`crate::generated_dir::GeneratedDirectory`] composes the native path from
+    /// the git pattern: the pattern is the single spelling, and joining its own
+    /// segments is what keeps the directory that gets created and the pattern that
+    /// hides it from ever being two different places.
+    pub(crate) fn segments(&self) -> impl Iterator<Item = &'static str> {
         self.pattern
             .split('/')
             .filter(|segment| !segment.is_empty())
@@ -162,28 +197,103 @@ pub const BACKGROUND_EXECUTIONS: GeneratedPath = GeneratedPath {
 /// A `const` rather than anything a caller can extend; see the module documentation
 /// for why. Adding an entry means also proving, in its doc comment, which code writes
 /// the path.
+///
+/// This list names paths; it does not decide what is generated. A path under the
+/// project directory that is in no entry here is still generated state — reported as
+/// [`GeneratedReason::UnregisteredProjectState`] — so forgetting to register a new
+/// directory costs a less specific report and never a committed one.
 pub const GENERATED_PATHS: &[GeneratedPath] =
     &[GOAL_PROJECTION, TOOL_OUTPUT, BACKGROUND_EXECUTIONS];
 
-const PATTERN_COUNT: usize = GENERATED_PATHS.len();
+/// The git pattern that excludes everything directly under the project directory.
+///
+/// `.zuno/*`, and never `.zuno/`. Git does not descend into a directory an ignore
+/// rule already excluded, so a directory pattern would make every negation below it
+/// unreachable: a user's `zuno.json` could not be brought back, and the pattern set
+/// would hide the configuration they are trying to commit. `.zuno/*` excludes the
+/// project directory's direct children, which git still enumerates, so one `!` per
+/// user-owned entry re-includes it — and because `*` does not cross a `/`, nothing
+/// below a re-included directory is excluded either.
+pub const PROJECT_STATE_PATTERN: &str = ".zuno/*";
 
-const fn ignore_pattern_array() -> [&'static str; PATTERN_COUNT] {
-    let mut patterns = [""; PATTERN_COUNT];
-    let mut index = 0;
-    while index < PATTERN_COUNT {
-        patterns[index] = GENERATED_PATHS[index].pattern;
-        index += 1;
-    }
-    patterns
+/// Declare the entries a person owns, and render the exclude patterns from them.
+///
+/// One list, two consts, so an entry cannot be taught to the classifier and forgotten
+/// in the exclude block. [`concat!`] needs literals, which is why the project
+/// directory is spelled here rather than composed from [`PROJECT_DIRECTORY`]; the
+/// compile-time assertion below rejects every rendered pattern that is not anchored
+/// at that const, so the two cannot drift.
+macro_rules! user_owned_entries {
+    ($($entry:literal),+ $(,)?) => {
+        /// Every entry directly under the project directory that a person authors.
+        ///
+        /// The complement of this list is generated state — see the module
+        /// documentation for why that is the default — so each name here has to be a
+        /// name one of Zuno's own loaders reads from `<worktree>/.zuno/`:
+        ///
+        /// | Entry | Read by |
+        /// | --- | --- |
+        /// | `zuno.json`, `zuno.jsonc` | the configuration chain, through [`crate::config_chain::CONFIG_FILE_STEM`] |
+        /// | `tui.json`, `tui.jsonc` | `zuno-cli`'s `tui_config_paths` |
+        /// | `RULES.md` | `zuno-memory`'s `Scope::Project` |
+        /// | `skill`, `skills` | `zuno-catalog`'s `skill::scan` prefixes |
+        /// | `agent`, `agents` | `zuno-catalog`'s `AGENT_DIRECTORY_PREFIXES` |
+        /// | `command`, `commands` | `zuno-catalog`'s `COMMAND_DIRECTORY_PREFIXES` |
+        /// | `extensions` | `zuno-extension`'s `STATIC_DIRECTORY` |
+        /// | `plans` | `zuno-agent`'s `PLANS_DIRECTORY`, written by the model through the `write` tool |
+        ///
+        /// Compared without ASCII case; see the module documentation for why an
+        /// ambiguous spelling is resolved in the user's favour.
+        pub const USER_OWNED_ENTRIES: &[&str] = &[$($entry),+];
+
+        /// The exclude patterns for [`crate::ensure_managed_block`], in the order git
+        /// has to read them.
+        ///
+        /// [`PROJECT_STATE_PATTERN`] first, then one `!.zuno/<entry>` per
+        /// [`USER_OWNED_ENTRIES`] entry: a later pattern wins in git, so the
+        /// negations have to follow the exclusion they undo. Rendered from the list
+        /// the classifier reads, so the block and [`is_generated`] cannot disagree
+        /// about which entries belong to the user.
+        ///
+        /// A registered pattern is deliberately *not* here. `.zuno/*` already covers
+        /// every registered directory, and naming them again would say that the ones
+        /// nobody registered are somebody's to commit.
+        pub const IGNORE_PATTERNS: &[&str] = &[
+            PROJECT_STATE_PATTERN,
+            $(concat!("!", ".zuno/", $entry)),+
+        ];
+    };
 }
 
-const IGNORE_PATTERN_ARRAY: [&str; PATTERN_COUNT] = ignore_pattern_array();
+user_owned_entries!(
+    "RULES.md",
+    "agent",
+    "agents",
+    "command",
+    "commands",
+    "extensions",
+    "plans",
+    "skill",
+    "skills",
+    "tui.json",
+    "tui.jsonc",
+    "zuno.json",
+    "zuno.jsonc",
+);
 
-/// Every registered pattern, in registry order, ready for [`crate::ensure_managed_block`].
+/// Whether `entry`, one name directly under the project directory, is user-owned.
 ///
-/// Derived from [`GENERATED_PATHS`] at compile time rather than listed a second time,
-/// so the exclude block and the registry cannot name different paths.
-pub const IGNORE_PATTERNS: &[&str] = &IGNORE_PATTERN_ARRAY;
+/// ASCII case is folded because git folds it wherever `core.ignorecase` is set, which
+/// is every Windows and macOS checkout: `.zuno/Zuno.json` is re-included there by
+/// `!.zuno/zuno.json`, and this module must not then call it generated. The bytes are
+/// compared rather than the `str`, so a name that is not UTF-8 is an ordinary
+/// mismatch instead of an unanswerable question.
+fn is_user_owned(entry: &OsStr) -> bool {
+    let entry = entry.as_encoded_bytes();
+    USER_OWNED_ENTRIES
+        .iter()
+        .any(|owned| entry.eq_ignore_ascii_case(owned.as_bytes()))
+}
 
 /// Whether `pattern` is `.zuno/<directory>[/<directory>…]/` and nothing more.
 ///
@@ -244,7 +354,130 @@ const _: () = {
     }
 };
 
-/// The registry entry that covers `path`, or `None` when `path` is not generated state.
+/// Whether `pattern` is one of the two shapes [`IGNORE_PATTERNS`] may contain.
+///
+/// Either [`PROJECT_STATE_PATTERN`] — the project directory, a slash, and a lone `*`
+/// — or `!` followed by the project directory, a slash, and one entry name that is
+/// itself glob-free. Nothing else: no second `*`, no `?`, no character class, no
+/// nested path, no leading slash, no trailing slash, and no whitespace, which git
+/// strips from the end of a pattern unless it is escaped. Those two shapes are the
+/// ones git and [`classify`] read the same way, and rendering anything else would
+/// give the exclude block a reach the lexical check cannot reproduce.
+const fn is_rendered_pattern(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let project = PROJECT_DIRECTORY.as_bytes();
+    let negated = !bytes.is_empty() && bytes[0] == b'!';
+    let start = if negated { 1 } else { 0 };
+    // `.zuno/` plus at least one character.
+    if bytes.len() < start + project.len() + 2 {
+        return false;
+    }
+    let mut index = 0;
+    while index < project.len() {
+        if bytes[start + index] != project[index] {
+            return false;
+        }
+        index += 1;
+    }
+    if bytes[start + project.len()] != b'/' {
+        return false;
+    }
+    let name = start + project.len() + 1;
+    if !negated {
+        return bytes.len() == name + 1 && bytes[name] == b'*';
+    }
+    let mut cursor = name;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte <= b' ' || matches!(byte, b'*' | b'?' | b'[' | b']' | b'!' | b'\\' | b'#' | b'/') {
+            return false;
+        }
+        cursor += 1;
+    }
+    let length = cursor - name;
+    !(length == 1 && bytes[name] == b'.'
+        || length == 2 && bytes[name] == b'.' && bytes[name + 1] == b'.')
+}
+
+/// Whether a rendered pattern re-includes rather than excludes.
+const fn is_negated(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    !bytes.is_empty() && bytes[0] == b'!'
+}
+
+const _: () = {
+    assert!(
+        !is_negated(IGNORE_PATTERNS[0]) && is_rendered_pattern(IGNORE_PATTERNS[0]),
+        "the first rendered pattern must be the project-state exclusion: git reads a \
+         later pattern as the winner, so a negation before it would be undone"
+    );
+    let mut index = 1;
+    while index < IGNORE_PATTERNS.len() {
+        assert!(
+            is_negated(IGNORE_PATTERNS[index]) && is_rendered_pattern(IGNORE_PATTERNS[index]),
+            "every pattern after the project-state exclusion must re-include one \
+             user-owned entry directly under the project directory"
+        );
+        index += 1;
+    }
+};
+
+/// Why a path is generated state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GeneratedReason {
+    /// A path under one of the registered runtime directories, which names what it is
+    /// and which code writes it.
+    Registered(&'static GeneratedPath),
+    /// Something under the project directory that is neither registered nor one of
+    /// [`USER_OWNED_ENTRIES`].
+    ///
+    /// The honest answer for a directory a release started writing without registering
+    /// it, and the reason a path like that is kept out of a commit instead of being
+    /// waved through until somebody notices.
+    UnregisteredProjectState,
+}
+
+impl GeneratedReason {
+    /// The git pattern that hides the path.
+    #[must_use]
+    pub fn pattern(&self) -> &'static str {
+        match self {
+            Self::Registered(generated) => generated.pattern,
+            Self::UnregisteredProjectState => PROJECT_STATE_PATTERN,
+        }
+    }
+
+    /// Why the path exists, as one clause a human can read in a report.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Registered(generated) => generated.reason,
+            Self::UnregisteredProjectState => UNREGISTERED_REASON,
+        }
+    }
+
+    /// The registry entry, when the path is under a registered directory.
+    #[must_use]
+    pub fn registered(&self) -> Option<&'static GeneratedPath> {
+        match self {
+            Self::Registered(generated) => Some(generated),
+            Self::UnregisteredProjectState => None,
+        }
+    }
+}
+
+/// What [`GeneratedReason::UnregisteredProjectState`] reads as in a report.
+const UNREGISTERED_REASON: &str = "state under Zuno's project directory that is not one of \
+     the entries a person authors, so it is the runtime's and not the repository's";
+
+/// Why `path` is generated state, or `None` when it is not.
+///
+/// Under the project directory the answer is "generated" unless the entry it sits in is
+/// one of [`USER_OWNED_ENTRIES`]; outside it, nothing is generated. A registered
+/// directory is reported as [`GeneratedReason::Registered`] so a caller can name the
+/// reason it exists, and everything else under `.zuno/` as
+/// [`GeneratedReason::UnregisteredProjectState`]. The project directory itself is not
+/// generated state: it holds the user's own configuration.
 ///
 /// `path` is taken as absolute or as relative to `worktree`, and `.` and `..` are
 /// resolved lexically, without touching the filesystem — so a path git printed, a path
@@ -257,15 +490,28 @@ const _: () = {
 /// Comparison is component-wise in the platform's own separators, so a Windows path
 /// spelled with backslashes matches the slash-separated pattern, while on Unix a
 /// backslash is an ordinary filename byte and is not a separator, which is how git
-/// reads it too. Names are compared exactly: Zuno writes these directories in the
-/// registered spelling, and a case-folded match would claim a user's own `.Zuno/`
-/// directory on a case-sensitive filesystem.
+/// reads it too. The project directory's own name is compared exactly and a user-owned
+/// entry's without ASCII case; the module documentation says why each side is decided
+/// that way.
 #[must_use]
-pub fn classify(worktree: &Path, path: &Path) -> Option<&'static GeneratedPath> {
+pub fn classify(worktree: &Path, path: &Path) -> Option<GeneratedReason> {
     let relative = relative_to_worktree(worktree, path)?;
-    GENERATED_PATHS
+    let [project, entry, ..] = relative.as_slice() else {
+        return None;
+    };
+    if *project != OsStr::new(PROJECT_DIRECTORY) {
+        return None;
+    }
+    if let Some(generated) = GENERATED_PATHS
         .iter()
         .find(|generated| generated.covers(&relative))
+    {
+        return Some(GeneratedReason::Registered(generated));
+    }
+    if is_user_owned(entry) {
+        return None;
+    }
+    Some(GeneratedReason::UnregisteredProjectState)
 }
 
 /// Whether `path`, inside `worktree`, is generated working state rather than source.
@@ -281,8 +527,8 @@ pub fn is_generated(worktree: &Path, path: &Path) -> bool {
 pub struct StagedGeneratedPath {
     /// The path exactly as the caller reported it.
     pub path: PathBuf,
-    /// The registry entry it falls under, which names the reason it exists.
-    pub generated: &'static GeneratedPath,
+    /// Why it is generated state, which names the reason it exists.
+    pub generated: GeneratedReason,
 }
 
 /// The refusal [`refuse_generated_state`] returns: generated state is about to be
@@ -303,15 +549,30 @@ pub struct GeneratedStateStaged {
 impl GeneratedStateStaged {
     /// What to do about it, and why it happened.
     ///
-    /// The exclude block normally keeps these paths out of the index altogether, so a
-    /// generated path reaching a commit has exactly two causes, and the remedy names
-    /// both: the block was removed, or the file was added with `--force`.
+    /// The exclude block and the directory's own `.gitignore` normally keep these
+    /// paths out of the index altogether, so a generated path reaching a commit has a
+    /// short list of causes, and the remedy names them: both exclusions were removed,
+    /// or the file was added with `--force`.
     pub const REMEDY: &'static str = "Unstage each one (`git restore --staged -- <path>`) \
-        and leave it out of the commit. The repository-private exclude block should already \
-        have hidden it, so it is here because the block was removed or the file was \
-        force-added.";
+        and leave it out of the commit. The repository-private exclude block and the \
+        directory's own `.gitignore` should already have hidden it, so it is here because \
+        both were removed or the file was force-added.";
 
-    /// The human-facing report: one line per path with its reason, then the remedy.
+    /// What to do about a path under the project directory that Zuno does not
+    /// recognise as anybody's source.
+    ///
+    /// Everything under `.zuno/` other than the entries a person authors belongs to the
+    /// runtime, so the remedy has to say where a file of one's own goes instead —
+    /// otherwise the refusal reads as a bug in the check rather than as an answer.
+    pub const UNREGISTERED_REMEDY: &'static str = "Everything directly under `.zuno/` \
+        other than the entries a person authors — `zuno.json`, `tui.json`, `RULES.md`, \
+        `skill/`, `agent/`, `command/`, `plans/`, `extensions/` — is Zuno's own working \
+        state and is not committed. Unstage each one (`git restore --staged -- <path>`); if \
+        one of them is a file you wrote and want in the repository, keep it outside \
+        `.zuno/`.";
+
+    /// The human-facing report: one line per path with its reason, then the remedy for
+    /// each kind of path that is in it.
     #[must_use]
     pub fn report(&self) -> String {
         let mut report = String::new();
@@ -324,11 +585,28 @@ impl GeneratedStateStaged {
             report.push_str(&format!(
                 "  {} — {}\n",
                 crate::display_path(&staged.path),
-                staged.generated.reason
+                staged.generated.reason()
             ));
         }
-        report.push_str(Self::REMEDY);
-        report.push('\n');
+        let mut remedies = Vec::new();
+        if self
+            .offending
+            .iter()
+            .any(|staged| staged.generated.registered().is_some())
+        {
+            remedies.push(Self::REMEDY);
+        }
+        if self
+            .offending
+            .iter()
+            .any(|staged| staged.generated == GeneratedReason::UnregisteredProjectState)
+        {
+            remedies.push(Self::UNREGISTERED_REMEDY);
+        }
+        for remedy in remedies {
+            report.push_str(remedy);
+            report.push('\n');
+        }
         report
     }
 }
@@ -344,7 +622,7 @@ impl fmt::Display for GeneratedStateStaged {
                 f,
                 "{} (matches `{}`)",
                 crate::display_path(&staged.path),
-                staged.generated.pattern
+                staged.generated.pattern()
             )?;
         }
         Ok(())
@@ -521,7 +799,10 @@ fn volume(prefix: Prefix<'_>) -> Option<Volume<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ensure_managed_block, files::BACKGROUND_DIRECTORY, files::TOOL_OUTPUT_DIRECTORY};
+    use crate::{
+        config_chain::CONFIG_FILE_STEM, ensure_managed_block, files::BACKGROUND_DIRECTORY,
+        files::TOOL_OUTPUT_DIRECTORY,
+    };
     use std::fs;
     use std::process::Command;
 
@@ -610,19 +891,104 @@ mod tests {
         );
     }
 
+    /// The exclude block used to be one pattern per registered directory, which let
+    /// `git add -A` pick up any directory nobody had registered. It is now the
+    /// project-state exclusion followed by one re-inclusion per user-owned entry, and
+    /// the order is what makes it work: git takes the last matching pattern, so a
+    /// negation placed before the exclusion it undoes would do nothing.
     #[test]
-    fn ignore_patterns_are_the_registry_patterns_in_registry_order() {
-        let expected: Vec<&str> = GENERATED_PATHS
-            .iter()
-            .map(|generated| generated.pattern)
-            .collect();
+    fn the_exclude_patterns_are_the_project_state_exclusion_then_one_negation_per_user_entry() {
+        let mut expected = vec![PROJECT_STATE_PATTERN.to_owned()];
+        expected.extend(
+            USER_OWNED_ENTRIES
+                .iter()
+                .map(|entry| format!("!{PROJECT_DIRECTORY}/{entry}")),
+        );
         assert_eq!(IGNORE_PATTERNS, expected.as_slice());
+        assert!(
+            !IGNORE_PATTERNS.iter().any(|pattern| GENERATED_PATHS
+                .iter()
+                .any(|generated| generated.pattern == *pattern)),
+            "naming the registered directories again would say the unregistered ones \
+             are somebody's to commit"
+        );
         for pattern in IGNORE_PATTERNS {
             assert!(
                 !pattern.contains(['\n', '\r']),
                 "`ensure_managed_block` refuses a multi-line entry: {pattern:?}"
             );
         }
+    }
+
+    /// `.zuno/*` and never `.zuno/`: git does not descend into a directory an ignore
+    /// rule already excluded, so a directory pattern would make every negation below
+    /// it unreachable and hide the user's own `zuno.json` from their commit.
+    #[test]
+    fn the_project_state_pattern_excludes_the_project_directorys_children_not_the_directory() {
+        assert_eq!(PROJECT_STATE_PATTERN, format!("{PROJECT_DIRECTORY}/*"));
+        assert!(!PROJECT_STATE_PATTERN.ends_with('/'));
+    }
+
+    /// Every name here has to be one a loader actually reads from `<worktree>/.zuno/`,
+    /// because the complement of this list is refused at delivery. Sorted and unique
+    /// so a duplicate cannot render two identical negations and a new entry lands
+    /// where a reader looks for it.
+    #[test]
+    fn the_user_owned_entries_are_unique_sorted_and_plain_names() {
+        let mut sorted = USER_OWNED_ENTRIES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(USER_OWNED_ENTRIES, sorted.as_slice());
+        sorted.dedup();
+        assert_eq!(USER_OWNED_ENTRIES.len(), sorted.len(), "a duplicate entry");
+        for entry in USER_OWNED_ENTRIES {
+            assert!(
+                !entry.contains('/') && !entry.contains('\\'),
+                "an entry is one name directly under the project directory: {entry:?}"
+            );
+        }
+        for expected in [
+            CONFIG_FILE_STEM.to_owned() + ".json",
+            CONFIG_FILE_STEM.to_owned() + ".jsonc",
+        ] {
+            assert!(
+                USER_OWNED_ENTRIES.contains(&expected.as_str()),
+                "the configuration chain reads {expected}, so it is the user's"
+            );
+        }
+    }
+
+    /// The compile-time check guards the rendered set; this pins what it refuses,
+    /// since a `const` assertion cannot be exercised with a bad input.
+    #[test]
+    fn the_rendered_pattern_shape_check_accepts_an_exclusion_and_single_name_negations() {
+        for accepted in [".zuno/*", "!.zuno/zuno.json", "!.zuno/skills", "!.zuno/a"] {
+            assert!(is_rendered_pattern(accepted), "{accepted:?}");
+        }
+        for refused in [
+            ".zuno/",           // the project directory as a whole
+            ".zuno/**",         // reaches deeper than the classifier does
+            ".zuno/*/",         // a directory glob
+            "!.zuno/*",         // re-includes everything the exclusion covered
+            "!.zuno/skills/",   // a trailing slash git reads differently
+            "!.zuno/a/b",       // a nested path
+            "!.zuno/zuno.js?n", // a glob
+            "!.zuno/[a]",       // a character class
+            "!.zuno/a b",       // fine for git, but the block is space-separated nowhere
+            "!.zuno/a\tb",      // whitespace git strips from the end
+            "!.zuno/.",         // a dot segment
+            "!.zuno/..",        // a dot segment
+            "!/.zuno/a",        // anchored with a leading slash
+            "!.zuno\\a",        // Windows separators
+            "!.zunox/a",        // a different directory sharing the prefix
+            "!a",               // not under the project directory
+            "!.zuno/",          // a negation with no name
+            "!",
+            "",
+        ] {
+            assert!(!is_rendered_pattern(refused), "{refused:?}");
+        }
+        assert!(is_negated("!.zuno/zuno.json"));
+        assert!(!is_negated(".zuno/*"));
     }
 
     /// The compile-time check guards the registry; this pins down what it refuses,
@@ -658,21 +1024,21 @@ mod tests {
     fn an_absolute_path_inside_the_worktree_is_classified() {
         assert_eq!(
             classify(worktree(), Path::new("/repo/.zuno/goal/ses_1.md")),
-            Some(&GOAL_PROJECTION)
+            Some(GeneratedReason::Registered(&GOAL_PROJECTION))
         );
         assert_eq!(
             classify(
                 worktree(),
                 Path::new("/repo/.zuno/tool-output/tool_ses_1_01")
             ),
-            Some(&TOOL_OUTPUT)
+            Some(GeneratedReason::Registered(&TOOL_OUTPUT))
         );
         assert_eq!(
             classify(
                 worktree(),
                 Path::new("/repo/.zuno/background/bg_1.status.json")
             ),
-            Some(&BACKGROUND_EXECUTIONS)
+            Some(GeneratedReason::Registered(&BACKGROUND_EXECUTIONS))
         );
         assert!(is_generated(
             Path::new("/repo/"),
@@ -692,7 +1058,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify(worktree(), Path::new(path)),
-                Some(&GOAL_PROJECTION),
+                Some(GeneratedReason::Registered(&GOAL_PROJECTION)),
                 "{path:?}"
             );
         }
@@ -759,23 +1125,88 @@ mod tests {
         ));
     }
 
+    /// The project directory's own name is compared exactly, so a path that is not
+    /// under `.zuno/` is nobody's generated state.
+    ///
+    /// This test used to assert that `.zuno/Goal/`, `.zuno/goals/` and
+    /// `.zuno/tool-outputs/` were *not* generated, because only a registered pattern
+    /// counted. Under default deny they are: a misspelling of a registered directory
+    /// is still Zuno's working state, and treating it as source is exactly how an
+    /// unregistered directory got committed.
     #[test]
-    fn names_are_compared_exactly_so_neighbours_and_lookalikes_are_not_claimed() {
+    fn the_project_directorys_own_name_is_compared_exactly_so_neighbours_are_not_claimed() {
         for path in [
             ".ZUNO/goal/x.md",
+            "sub/.zuno/goal/x.md",
+            "src/lib.rs",
+            "zuno/goal/x.md",
+        ] {
+            assert!(!is_generated(worktree(), Path::new(path)), "{path:?}");
+        }
+        for path in [
             ".zuno/Goal/x.md",
             ".zuno/goals/x.md",
             ".zuno/goal.md",
             ".zuno/tool-outputs/x",
-            "sub/.zuno/goal/x.md",
         ] {
-            assert!(!is_generated(worktree(), Path::new(path)), "{path:?}");
+            assert_eq!(
+                classify(worktree(), Path::new(path)),
+                Some(GeneratedReason::UnregisteredProjectState),
+                "a near-miss of a registered directory is still not source: {path:?}"
+            );
         }
         assert_eq!(
             classify(worktree(), Path::new(".zuno/tool-output")),
-            Some(&TOOL_OUTPUT),
-            "the directory itself is generated state, only its lookalikes are not"
+            Some(GeneratedReason::Registered(&TOOL_OUTPUT)),
+            "the registered directory itself is named, not merely covered"
         );
+    }
+
+    /// Default deny: a directory a release starts writing without registering it is
+    /// generated state from the first write, not after somebody remembers the registry.
+    #[test]
+    fn anything_under_the_project_directory_that_is_not_the_users_is_generated_state() {
+        for path in [
+            ".zuno/whatever-comes-next/state.json",
+            ".zuno/cache/blobs/ab/cd",
+            ".zuno/scratch",
+            ".zuno/index.db",
+            "/repo/.zuno/telemetry/spans.jsonl",
+        ] {
+            assert_eq!(
+                classify(worktree(), Path::new(path)),
+                Some(GeneratedReason::UnregisteredProjectState),
+                "{path:?}"
+            );
+        }
+        let reason = classify(worktree(), Path::new(".zuno/scratch")).expect("generated");
+        assert_eq!(reason.pattern(), PROJECT_STATE_PATTERN);
+        assert_eq!(reason.registered(), None);
+        assert!(
+            !reason.reason().is_empty() && !reason.reason().ends_with('.'),
+            "the reason is a clause for a report: {:?}",
+            reason.reason()
+        );
+    }
+
+    /// Git folds ASCII case wherever `core.ignorecase` is set — every Windows and
+    /// macOS checkout — so `!.zuno/zuno.json` re-includes `.zuno/Zuno.json` there.
+    /// Calling it generated would refuse a commit git had already un-ignored.
+    #[test]
+    fn a_user_owned_entry_is_the_users_whatever_its_ascii_case() {
+        for path in [
+            ".zuno/Zuno.json",
+            ".zuno/ZUNO.JSONC",
+            ".zuno/SKILLS/review/SKILL.md",
+            ".zuno/Agents/build.md",
+            ".zuno/rules.md",
+            ".zuno/Plans/1700000000000-swift-otter.md",
+        ] {
+            assert!(
+                !is_generated(worktree(), Path::new(path)),
+                "an ambiguous spelling is resolved in the user's favour: {path:?}"
+            );
+        }
     }
 
     /// The project directory holds the user's configuration, and every one of these
@@ -806,7 +1237,10 @@ mod tests {
     fn a_platform_joined_path_matches_the_slash_separated_pattern() {
         let root = std::env::temp_dir().join("zuno-generated-paths-test");
         let document = root.join(".zuno").join("goal").join("ses_1.md");
-        assert_eq!(classify(&root, &document), Some(&GOAL_PROJECTION));
+        assert_eq!(
+            classify(&root, &document),
+            Some(GeneratedReason::Registered(&GOAL_PROJECTION))
+        );
         assert!(!is_generated(&root, &root.join(".zuno").join("zuno.json")));
     }
 
@@ -929,15 +1363,15 @@ mod tests {
             vec![
                 StagedGeneratedPath {
                     path: PathBuf::from(".zuno/goal/ses_1.md"),
-                    generated: &GOAL_PROJECTION,
+                    generated: GeneratedReason::Registered(&GOAL_PROJECTION),
                 },
                 StagedGeneratedPath {
                     path: PathBuf::from("/repo/.zuno/background/bg_1.status.json"),
-                    generated: &BACKGROUND_EXECUTIONS,
+                    generated: GeneratedReason::Registered(&BACKGROUND_EXECUTIONS),
                 },
                 StagedGeneratedPath {
                     path: PathBuf::from(".zuno/tool-output/"),
-                    generated: &TOOL_OUTPUT,
+                    generated: GeneratedReason::Registered(&TOOL_OUTPUT),
                 },
             ],
             "only the generated paths, in the order they were reported"
@@ -950,7 +1384,7 @@ mod tests {
                 report.contains(&staged.path.display().to_string()),
                 "{report}"
             );
-            assert!(report.contains(staged.generated.reason), "{report}");
+            assert!(report.contains(staged.generated.reason()), "{report}");
         }
         assert!(report.contains(GeneratedStateStaged::REMEDY), "{report}");
         assert!(report.contains("force-added"), "{report}");
@@ -979,12 +1413,42 @@ mod tests {
         );
     }
 
-    /// The registry, through the real exclude mechanism, must hide exactly the
-    /// generated directories: a user's own configuration in the same project
-    /// directory has to stay visible to `git status`.
+    /// A refusal for an unregistered path has to tell the user where a file of their
+    /// own goes instead, or it reads as a bug in the check rather than as an answer.
     #[test]
-    fn the_registry_patterns_hide_every_generated_path_from_git_and_nothing_else() {
+    fn a_refusal_for_unregistered_project_state_names_the_entries_that_are_the_users() {
+        let refusal = refuse_generated_state(worktree(), [".zuno/whatever/state.json"])
+            .expect_err("state under the project directory is not source");
+
+        let report = refusal.report();
+        assert!(
+            report.contains(GeneratedStateStaged::UNREGISTERED_REMEDY),
+            "{report}"
+        );
+        assert!(
+            !report.contains(GeneratedStateStaged::REMEDY),
+            "the registered remedy talks about a `.gitignore` this path has none of: \
+             {report}"
+        );
+        assert!(report.contains("keep it outside"), "{report}");
+        assert!(
+            refusal
+                .to_string()
+                .contains("state.json (matches `.zuno/*`)"),
+            "{refusal}"
+        );
+    }
+
+    /// The one test that lets git settle it: the pattern set has to hide every
+    /// generated directory, registered or not, and leave every entry a person authors
+    /// visible in the same project directory.
+    ///
+    /// It replaces an assertion that only checked the three registered directories,
+    /// which is what let an unregistered one be committed.
+    #[test]
+    fn the_exclude_patterns_hide_generated_state_from_git_and_leave_the_users_entries_visible() {
         let root = repository();
+        let project = root.path().join(PROJECT_DIRECTORY);
         for generated in GENERATED_PATHS {
             let directory = generated
                 .segments()
@@ -995,8 +1459,27 @@ mod tests {
             fs::write(directory.join("entry"), "generated\n").expect("write a generated entry");
             assert!(is_generated(root.path(), &directory.join("entry")));
         }
-        fs::write(root.path().join(".zuno").join("zuno.json"), "{}\n")
-            .expect("write the user's configuration");
+        // Nobody registered these. Under default deny they are hidden all the same.
+        for unregistered in ["whatever-comes-next", "cache"] {
+            let directory = project.join(unregistered);
+            fs::create_dir_all(&directory).expect("create an unregistered directory");
+            fs::write(directory.join("state.json"), "{}\n").expect("write unregistered state");
+        }
+        fs::write(project.join("index.db"), "binary\n").expect("write an unregistered file");
+        // And every entry a person authors, one per rendered negation.
+        let mut expected = Vec::new();
+        for entry in USER_OWNED_ENTRIES {
+            if entry.contains('.') {
+                fs::write(project.join(entry), "{}\n").expect("write the user's file");
+                expected.push(format!("?? {PROJECT_DIRECTORY}/{entry}"));
+            } else {
+                let directory = project.join(entry);
+                fs::create_dir_all(&directory).expect("create the user's directory");
+                fs::write(directory.join("mine.md"), "# mine\n").expect("write the user's file");
+                expected.push(format!("?? {PROJECT_DIRECTORY}/{entry}/mine.md"));
+            }
+        }
+        expected.sort_unstable();
         assert!(
             !run(root.path(), &["git", "status", "--porcelain"]).is_empty(),
             "the fixture must be dirty before the exclusion, or it proves nothing"
@@ -1008,10 +1491,11 @@ mod tests {
             root.path(),
             &["git", "status", "--porcelain", "--untracked-files=all"],
         );
+        let mut reported: Vec<String> = status.lines().map(str::to_owned).collect();
+        reported.sort_unstable();
         assert_eq!(
-            status.trim(),
-            "?? .zuno/zuno.json",
-            "every generated directory hidden, the user's configuration still visible"
+            reported, expected,
+            "generated state hidden, registered or not; every user-owned entry visible"
         );
     }
 }

@@ -45,7 +45,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::generated::IGNORE_PATTERNS;
+use crate::generated::{GENERATED_PATHS, IGNORE_PATTERNS};
 use crate::project::resolve_git_path;
 
 /// The exclude-file path, relative to the git directory, that git resolves for us.
@@ -321,8 +321,9 @@ pub fn ensure_managed_block(
         }
     }
     let path = resolve_exclude_path(worktree)?;
+    let filesystem = |(path, source)| ExcludeError::Filesystem { path, source };
     let Some(content) = read_optional(&path)? else {
-        replace_atomically(&path, &render_block(entries, LineEnding::Lf))?;
+        replace_atomically(&path, &render_block(entries, LineEnding::Lf)).map_err(filesystem)?;
         return Ok(ExcludeOutcome::Created);
     };
     let found = managed_block(&content, entries);
@@ -335,7 +336,7 @@ pub fn ensure_managed_block(
             next.extend_from_slice(newline.as_bytes());
         }
         next.extend_from_slice(&block);
-        replace_atomically(&path, &next)?;
+        replace_atomically(&path, &next).map_err(filesystem)?;
         return Ok(ExcludeOutcome::Created);
     };
     if content[range.clone()] == block[..] {
@@ -345,7 +346,7 @@ pub fn ensure_managed_block(
     next.extend_from_slice(&content[..range.start]);
     next.extend_from_slice(&block);
     next.extend_from_slice(&content[range.end..]);
-    replace_atomically(&path, &next)?;
+    replace_atomically(&path, &next).map_err(filesystem)?;
     Ok(ExcludeOutcome::Updated)
 }
 
@@ -467,14 +468,23 @@ fn managed_block(content: &[u8], entries: &[&str]) -> Option<Range<usize>> {
 }
 
 /// Whether a trimmed line is one this module writes into a block: a begin marker, or
-/// an entry — from this call or from the registry of every pattern Zuno generates,
-/// since hosts pass different subsets of that registry and a block one host left
-/// unterminated must be recognised in full by another.
+/// an entry — from this call, from the pattern set Zuno writes today, or from the
+/// registry of named generated directories, since hosts pass different subsets and a
+/// block one host left unterminated must be recognised in full by another.
+///
+/// The registry is checked as well as [`IGNORE_PATTERNS`] because the two differ across
+/// releases: a block written before the pattern set became `.zuno/*` plus negations
+/// names `.zuno/goal/` and its siblings line by line. Those lines are Zuno's, and an
+/// upgrade has to absorb them into the block it rewrites instead of leaving them behind
+/// as if a person had typed them.
 fn is_block_content(text: &[u8], entries: &[&str]) -> bool {
+    let registered = GENERATED_PATHS.iter().map(|generated| generated.pattern);
     text == MANAGED_BLOCK_BEGIN.as_bytes()
         || entries
             .iter()
-            .chain(IGNORE_PATTERNS)
+            .copied()
+            .chain(IGNORE_PATTERNS.iter().copied())
+            .chain(registered)
             .any(|entry| entry.as_bytes().trim_ascii() == text)
 }
 
@@ -496,10 +506,23 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, ExcludeError> {
 /// beside — and renamed onto — the file at the end of the chain, so a link survives
 /// and the rename stays within one directory. [`ensure_managed_block`] describes the
 /// cases a link can present and how each is treated.
-fn replace_atomically(path: &Path, contents: &[u8]) -> Result<(), ExcludeError> {
+///
+/// Shared with [`crate::generated_dir`], which publishes a generated directory's own
+/// `.gitignore` the same way and reports a different error type, so the failure is
+/// returned as the path that failed and what the filesystem said rather than as an
+/// [`ExcludeError`].
+///
+/// # Errors
+///
+/// The path the write was attempted at and the operating system's error, when the
+/// destination cannot be resolved, its directory is missing behind a link, the
+/// temporary cannot be created or written, or the rename fails. Nothing is left
+/// behind in any of those cases: the previous contents stay on disk and the temporary
+/// is removed.
+pub(crate) fn replace_atomically(path: &Path, contents: &[u8]) -> Result<(), (PathBuf, io::Error)> {
     let filesystem = |path: &Path| {
         let path = path.to_path_buf();
-        move |source| ExcludeError::Filesystem { path, source }
+        move |source| (path, source)
     };
     let destination = resolve_destination(path).map_err(filesystem(path))?;
     let parent = destination
@@ -511,16 +534,16 @@ fn replace_atomically(path: &Path, contents: &[u8]) -> Result<(), ExcludeError> 
         // The target is wherever the user pointed the link. Creating the file there
         // completes the link; creating directories there invents a place.
         if !parent.is_dir() {
-            return Err(ExcludeError::Filesystem {
-                path: path.to_path_buf(),
-                source: io::Error::new(
+            return Err((
+                path.to_path_buf(),
+                io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "the exclude file is a symbolic link to {}, whose directory does not exist",
+                        "it is a symbolic link to {}, whose directory does not exist",
                         destination.path.display()
                     ),
                 ),
-            });
+            ));
         }
     } else {
         fs::create_dir_all(parent).map_err(filesystem(parent))?;
@@ -965,29 +988,38 @@ mod tests {
         assert_eq!(again.matches(MANAGED_BLOCK_END).count(), 1, "{again}");
     }
 
-    /// Hosts pass different subsets of the registry — the CLI passes only the goal
-    /// projection — so a block one host left unterminated must be recognised in full
-    /// by another, or its remaining entries would be mistaken for the user's lines.
+    /// Hosts pass different subsets of the pattern set, and a released Zuno wrote a
+    /// different set than this one, so a block left unterminated by either must be
+    /// recognised in full or its remaining lines would be mistaken for the user's.
+    ///
+    /// The fixture is deliberately the union: the directory patterns an older release
+    /// listed one by one, and the `.zuno/*`-plus-negations set written today.
     #[test]
-    fn an_orphaned_block_is_recognised_by_every_registered_pattern_not_only_this_calls_entries() {
+    fn an_orphaned_block_is_recognised_by_every_pattern_zuno_writes_not_only_this_calls_entries() {
         let root = repository();
         let path = resolve_exclude_path(root.path()).expect("resolve the exclude path");
         fs::create_dir_all(path.parent().expect("info directory")).expect("create info");
         assert!(
-            IGNORE_PATTERNS.contains(&GENERATED),
-            "the fixture assumes the goal projection is registered"
+            !IGNORE_PATTERNS.contains(&GENERATED),
+            "the fixture assumes a directory pattern only an older release wrote"
         );
         assert!(
-            IGNORE_PATTERNS.len() > 1,
-            "the fixture needs a registered pattern this call does not pass"
+            GENERATED_PATHS
+                .iter()
+                .any(|generated| generated.pattern == GENERATED),
+            "the fixture assumes the goal projection is a registered directory"
         );
         let mut truncated = format!("{MANAGED_BLOCK_BEGIN}\n");
+        for pattern in GENERATED_PATHS.iter().map(|generated| generated.pattern) {
+            truncated.push_str(pattern);
+            truncated.push('\n');
+        }
         for pattern in IGNORE_PATTERNS {
             truncated.push_str(pattern);
             truncated.push('\n');
         }
         truncated.push_str("mine/\n");
-        fs::write(&path, &truncated).expect("a truncated block from a fuller host");
+        fs::write(&path, &truncated).expect("a truncated block from another host");
 
         let outcome = ensure_managed_block(root.path(), &[GENERATED]).expect("heal the block");
 
@@ -995,7 +1027,7 @@ mod tests {
         assert_eq!(
             read(&path),
             format!("{MANAGED_BLOCK_BEGIN}\n{GENERATED}\n{MANAGED_BLOCK_END}\nmine/\n"),
-            "registered entries are absorbed into the block; the user's line is not"
+            "every line Zuno ever wrote is absorbed into the block; the user's is not"
         );
     }
 

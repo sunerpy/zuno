@@ -96,17 +96,23 @@
 //! it does not belong in a repository. The directory is declared in
 //! `zuno_paths::generated`, the registry of every path Zuno generates inside a
 //! worktree; [`IGNORE_PATTERN`] is that entry's pattern, re-exported here so this
-//! crate and the registry cannot disagree about where the document goes. There are
-//! two ways to honour it.
+//! crate and the registry cannot disagree about where the document goes. Three
+//! mechanisms honour it, and they are independent on purpose.
 //!
-//! The host does it without touching a tracked file: the CLI passes the registry's
-//! patterns (`zuno_paths::IGNORE_PATTERNS`, which lists this one) to
-//! `zuno_paths::ensure_managed_block`, which maintains a
-//! marked block in the repository-private `.git/info/exclude`. That keeps a
-//! generated path out of `git status` in somebody else's repository without
-//! Zuno ever editing a file the repository's own history owns — writing to a
-//! checked-in `.gitignore` would show up as an unexplained diff in the user's next
-//! commit.
+//! The directory excludes itself. This crate creates it through
+//! `zuno_paths::GeneratedDirectory`, which writes `.zuno/goal/.gitignore` containing
+//! `*` in the same call that creates the directory, so the document is out of every
+//! commit from the moment there is a directory to hold it — whatever the exclude
+//! block says, and however a commit is spelled.
+//!
+//! The host also keeps it out of `git status`: the CLI passes
+//! `zuno_paths::IGNORE_PATTERNS` to `zuno_paths::ensure_managed_block`, which
+//! maintains a marked block in the repository-private `.git/info/exclude`. Those
+//! patterns exclude everything under `.zuno/` that a person does not author, rather
+//! than naming this directory, so a directory nobody registered is covered too. That
+//! keeps a generated path quiet in somebody else's repository without Zuno ever
+//! editing a file the repository's own history owns — writing to a checked-in
+//! `.gitignore` would show up as an unexplained diff in the user's next commit.
 //!
 //! [`GITIGNORE_SNIPPET`] is for the other case: a team that wants the rule shared
 //! through version control, where a private exclude file per clone is exactly the
@@ -124,6 +130,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
+use zuno_paths::GeneratedDirectory;
 use zuno_watch::{ChangeKind, FileEvent};
 
 pub use zuno_paths::PROJECT_DIRECTORY;
@@ -134,9 +141,11 @@ pub const GOAL_DIRECTORY: &str = "goal";
 /// The one path that has to be ignored: the directory the projection writes into.
 ///
 /// Taken from the generated-path registry rather than spelled here, so the pattern
-/// the host excludes, the pattern this crate documents and the directory
-/// [`document_path`] writes into cannot drift apart; a test asserts the registry
-/// entry agrees with [`PROJECT_DIRECTORY`] and [`GOAL_DIRECTORY`]. The registry keeps
+/// this crate documents and the directory [`document_path`] writes into cannot drift
+/// apart; a test asserts the registry entry agrees with [`PROJECT_DIRECTORY`] and
+/// [`GOAL_DIRECTORY`]. It is not what the host excludes — `zuno_paths::IGNORE_PATTERNS`
+/// covers everything under `.zuno/` that a person does not author, which is a wider
+/// rule than this one line. The registry keeps
 /// it slash-separated with a trailing slash and no leading one: a git pattern is
 /// always slash-separated, joining the two directory names would produce a backslash
 /// on Windows and silently stop matching, and without the leading slash it reads the
@@ -647,6 +656,12 @@ pub fn parse(text: &str) -> Option<Document> {
 #[derive(Debug)]
 pub struct GoalProjection {
     path: PathBuf,
+    /// The generated directory holding the document, when it is inside a worktree.
+    ///
+    /// `None` for the global fallback location, which is under the data directory and
+    /// so is in no repository and needs no exclusion. Held rather than derived per
+    /// write because resolving it spawns git.
+    directory: Option<GeneratedDirectory>,
     session_id: String,
     last: Mutex<Option<LastRender>>,
 }
@@ -704,19 +719,37 @@ impl Ingest {
 impl GoalProjection {
     /// Bind a projection to the document for `session_id` under `worktree`.
     ///
+    /// `worktree` is a repository root, already resolved by the caller — the same path
+    /// the exclude block is anchored at — so the directory this binds to is the one the
+    /// patterns cover. Nothing is created here; [`Self::write_notes`] creates the
+    /// directory, and its exclusion, on the first write.
+    ///
     /// Returns `None` when [`document_path`] refuses the session id.
     #[must_use]
     pub fn new(worktree: Option<&Path>, session_id: &str) -> Option<Self> {
-        Some(Self::at(document_path(worktree, session_id)?, session_id))
+        let path = document_path(worktree, session_id)?;
+        let directory = worktree.map(|worktree| {
+            GeneratedDirectory::in_worktree(worktree, &zuno_paths::generated::GOAL_PROJECTION)
+        });
+        Some(Self {
+            path,
+            directory,
+            session_id: session_id.to_owned(),
+            last: Mutex::new(None),
+        })
     }
 
-    /// Bind a projection to an explicit path.
+    /// Bind a projection to an explicit path, with no worktree behind it.
     ///
-    /// For a caller that has already resolved the location, and for tests.
+    /// For a caller that has already resolved the location, and for tests. The path is
+    /// taken as given, so no generated directory is claimed for it and no exclusion is
+    /// written: a caller that wants the document hidden from git has to pass a worktree
+    /// to [`Self::new`], which is what the CLI does.
     #[must_use]
     pub fn at(path: PathBuf, session_id: &str) -> Self {
         Self {
             path,
+            directory: None,
             session_id: session_id.to_owned(),
             last: Mutex::new(None),
         }
@@ -726,6 +759,27 @@ impl GoalProjection {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Create the directory the document lives in, and the exclusion that hides it.
+    ///
+    /// Called before every write rather than once at construction: the directory can
+    /// be removed under a running session, and the exclusion is what keeps the document
+    /// out of a commit, so a write that silently proceeded without it would reintroduce
+    /// exactly the state this guards against. `zuno_atomic_file::replace` would create
+    /// the directory on its own, unexcluded, which is why this comes first.
+    fn ensure_directory(&self) -> Result<(), GoalError> {
+        let Some(directory) = &self.directory else {
+            return Ok(());
+        };
+        directory
+            .ensure()
+            .map(|_| ())
+            .map_err(|error| GoalError::Document {
+                operation: "create directory",
+                path: error.path,
+                source: error.source,
+            })
     }
 
     /// The session whose goal this projects.
@@ -784,6 +838,7 @@ impl GoalProjection {
         notes: &Notes,
     ) -> Result<(), GoalError> {
         let document = render(goal, criteria, notes);
+        self.ensure_directory()?;
         write_atomic(&self.path, &document)?;
         *self.lock() = Some(LastRender {
             document,
