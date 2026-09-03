@@ -44,6 +44,33 @@ mod tests {
         );
     }
 
+    /// The published `toolOutput` text must describe what the limits do.
+    ///
+    /// These descriptions ship in editor completion, and they said output was truncated
+    /// at the threshold. Nothing is truncated: the whole output is saved and withheld
+    /// behind a notice. A user who believed the old text raised the limit to get their
+    /// output back, which is the opposite of what the limit is for.
+    #[test]
+    fn the_published_tool_output_limits_describe_withholding_and_not_truncation() {
+        let schema = document();
+        let published = schema["$defs"]["ToolOutputConfig"].clone();
+        let text = serde_json::to_string(&published).expect("a published definition is JSON");
+
+        assert!(
+            !text.contains("truncation"),
+            "the limits withhold output, they do not truncate it: {text}"
+        );
+        for field in ["max_lines", "max_bytes"] {
+            let description = published["properties"][field]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                description.contains("inlined") && description.contains("never truncated"),
+                "{field} must say what happens above the threshold: {description}"
+            );
+        }
+    }
+
     /// The published schema and the parser's whitelist are two hand-maintained
     /// lists of the same thing. [`crate::schema::KNOWN_TOP_LEVEL_KEYS`] is what
     /// actually rejects a key at parse time, so a property that the schema

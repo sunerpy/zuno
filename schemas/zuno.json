@@ -2972,10 +2972,10 @@
       "description": "A timeout in milliseconds, or `false` to disable it\n(`config/provider.ts:101-116`)."
     },
     "ToolOutputConfig": {
-      "description": "Tool-output truncation thresholds (`config/config.ts:137-150`).",
+      "description": "Thresholds above which tool output is withheld rather than inlined\n(`config/config.ts:137-150`).",
       "properties": {
         "max_bytes": {
-          "description": "Bytes of output before truncation. Defaults to 51200.",
+          "description": "Bytes of output that are still inlined. Defaults to 51200. Output above this is\nsaved whole and read back through `bg`, never truncated.",
           "format": "uint32",
           "minimum": 1,
           "type": [
@@ -2984,7 +2984,7 @@
           ]
         },
         "max_lines": {
-          "description": "Lines of output before truncation. Defaults to 2000.",
+          "description": "Lines of output that are still inlined. Defaults to 2000. Output above this is\nsaved whole and read back through `bg`, never truncated.",
           "format": "uint32",
           "minimum": 1,
           "type": [

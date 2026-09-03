@@ -663,13 +663,16 @@ pub struct GoalRetryConfig {
     pub poll_interval_ms: Option<NonZeroU64>,
 }
 
-/// Tool-output truncation thresholds (`config/config.ts:137-150`).
+/// Thresholds above which tool output is withheld rather than inlined
+/// (`config/config.ts:137-150`).
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ToolOutputConfig {
-    /// Lines of output before truncation. Defaults to 2000.
+    /// Lines of output that are still inlined. Defaults to 2000. Output above this is
+    /// saved whole and read back through `bg`, never truncated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_lines: Option<NonZeroU32>,
-    /// Bytes of output before truncation. Defaults to 51200.
+    /// Bytes of output that are still inlined. Defaults to 51200. Output above this is
+    /// saved whole and read back through `bg`, never truncated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<NonZeroU32>,
 }
