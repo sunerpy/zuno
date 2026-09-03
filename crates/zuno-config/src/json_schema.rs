@@ -50,6 +50,12 @@ mod tests {
     /// at the threshold. Nothing is truncated: the whole output is saved and withheld
     /// behind a notice. A user who believed the old text raised the limit to get their
     /// output back, which is the opposite of what the limit is for.
+    ///
+    /// The claim is what is pinned, not the wording. Two packages in the same batch wrote
+    /// this description and this guard independently, and the guard first demanded the word
+    /// `inlined` — so the clearer rewrite, which says the same thing in plainer words, broke
+    /// a test about truncation by improving a sentence. What a reader must be able to learn
+    /// is that output above the threshold is kept and fetched, so that is what is asserted.
     #[test]
     fn the_published_tool_output_limits_describe_withholding_and_not_truncation() {
         let schema = document();
@@ -65,8 +71,9 @@ mod tests {
                 .as_str()
                 .unwrap_or_default();
             assert!(
-                description.contains("inlined") && description.contains("never truncated"),
-                "{field} must say what happens above the threshold: {description}"
+                description.contains("never truncated") && description.contains("read back"),
+                "{field} must say that output above the threshold is kept and read back \
+                 rather than cut: {description}"
             );
         }
     }
