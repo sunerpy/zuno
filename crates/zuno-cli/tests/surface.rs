@@ -226,12 +226,14 @@ struct Leaf {
 /// absence: [`surface_no_dispatchable_leaf_refuses_for_want_of_a_handler`] exempts
 /// exactly the [`Disposition::Rejected`] rows and nothing else.
 ///
-/// Two pairs of leaves share their observable, and it is a property of the code
+/// Three pairs of leaves share their observable, and it is a property of the code
 /// rather than of the probe. `plugin add` and `plugin update` are one `install`
-/// handler distinguished only by an `InstallMode` a caller cannot see, and
+/// handler distinguished only by an `InstallMode` a caller cannot see,
 /// `debug snapshot patch` and `debug snapshot diff` both fail in the shared store
-/// preflight before they diverge. Each still proves that its own leaf routes into
-/// that handler, which is the claim this inventory makes.
+/// preflight before they diverge, and `debug lsp diagnostics` and
+/// `debug lsp document-symbols` both stop at the same "no language server" lookup.
+/// Each still proves that its own leaf routes into that handler, which is the claim
+/// this inventory makes.
 const LEAVES: &[Leaf] = &[
     Leaf {
         path: &["acp"],
@@ -437,11 +439,24 @@ const LEAVES: &[Leaf] = &[
         evidence: Evidence::Fragment("[]"),
     },
     Leaf {
-        // `file:///probe.rs` resolves to an absolute path, which is what separates
-        // this fragment from `diagnostics`' probe under the temporary root.
+        // The argument is workspace-relative, and deliberately not a `file://` URI:
+        // `resolve_path` sends a URI through `Url::to_file_path`, whose Windows
+        // implementation accepts only a drive-rooted first segment, so any URI a
+        // fixture could spell here is either rejected on Windows or rejected on
+        // Unix. That branch is platform-specific and is pinned by
+        // `paths_accept_file_uris_and_workspace_relative_values` in `cmd/debug.rs`,
+        // which builds the URI from a real path. This leaf's own claim is routing,
+        // and it shares `diagnostics`' observable because both arguments reach the
+        // same `LspManager` lookup; the file name differs so a failure report says
+        // which probe produced it.
         path: &["debug", "lsp", "document-symbols"],
-        argv: &["debug", "lsp", "document-symbols", "file:///probe.rs"],
-        evidence: Evidence::Fragment("no language server is available for /probe.rs"),
+        argv: &[
+            "debug",
+            "lsp",
+            "document-symbols",
+            "document-symbols-probe.rs",
+        ],
+        evidence: Evidence::Fragment("no language server is available for"),
     },
     Leaf {
         path: &["debug", "snapshot", "track"],
@@ -598,6 +613,63 @@ fn surface_every_dispatchable_leaf_is_inventoried() {
         );
     }
     assert_eq!(walked.len(), LEAVES.len());
+}
+
+/// **No probe spells a path only one platform accepts, and no evidence quotes a
+/// resolved one.**
+///
+/// This inventory runs on Linux, macOS and Windows CI, so a fixture that encodes a
+/// POSIX path passes where it was written and fails where it was not. Both halves
+/// have a concrete failure: an argument like `file:///probe.rs` reaches
+/// `resolve_path`, whose `Url::to_file_path` accepts only a drive-rooted first
+/// segment on Windows and answers `invalid file URI` there, and a fragment that
+/// quotes the path the handler resolved cannot match on a host that spells the
+/// separator `\`.
+///
+/// A fragment may contain `/` inside a code span, because that is Zuno's own markup
+/// for a route or a spelling — `generate` points at `/openapi.json` — rather than a
+/// path the handler resolved on the running host.
+#[test]
+fn surface_no_probe_or_evidence_spells_a_platform_specific_path() {
+    fn drive_rooted(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    }
+
+    fn outside_code_spans(fragment: &str) -> String {
+        fragment
+            .split('`')
+            .step_by(2)
+            .collect::<Vec<&str>>()
+            .join(" ")
+    }
+
+    let mut offences = Vec::new();
+    for leaf in LEAVES {
+        let leaf_name = leaf.path.join(" ");
+        for argument in leaf.argv {
+            let rooted = argument.starts_with('/')
+                || argument.contains("file://")
+                || argument.contains('\\')
+                || drive_rooted(argument);
+            if rooted {
+                offences.push(format!(
+                    "`{leaf_name}` probes with {argument:?}, which names a path only one \
+                     platform accepts"
+                ));
+            }
+        }
+        if let Evidence::Fragment(fragment) = leaf.evidence {
+            let prose = outside_code_spans(fragment);
+            if prose.contains('/') || prose.contains('\\') || drive_rooted(&prose) {
+                offences.push(format!(
+                    "`{leaf_name}` expects {fragment:?}, which quotes a path the handler \
+                     resolved; the separator differs by platform"
+                ));
+            }
+        }
+    }
+    assert!(offences.is_empty(), "{}", offences.join("\n"));
 }
 
 /// `agent create` is gone, rather than registered over a refusal.
@@ -865,7 +937,7 @@ fn surface_failure_scenario_shipped_absent_handler_refusals_are_detected() {
         "refusing the caller's input is a handler doing its job"
     );
     assert!(
-        absent_capability_phrase("no language server is available for /probe.rs").is_none(),
+        absent_capability_phrase("no language server is available for probe.rs").is_none(),
         "an absent external dependency is not an absent handler"
     );
 }
