@@ -2,9 +2,13 @@
 //!
 //! Rust 2024 makes `std::env::set_var` unsafe and this workspace forbids unsafe
 //! code. The CLI therefore resolves the environment as an [`zuno_paths::Env`] value
-//! and starts its command process with those overrides. Downstream services see
-//! the same real environment upstream's middleware writes, while unit tests can
-//! inspect the value without racing another test.
+//! and dispatches against that value. Every command implementation reads it from
+//! [`StartupEnvironment`], so the resolution is complete without any process ever
+//! having to be replaced, and unit tests can inspect the value without racing
+//! another test. On Unix, where replacing this image is free, the CLI also `exec`s
+//! once with these overrides applied so launched processes inherit them; a platform
+//! without `exec` must not buy that with a second process, because the handle a
+//! supervisor holds would then name a waiter instead of the command.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -192,7 +196,11 @@ impl StartupEnvironment {
         &self.resolved
     }
 
-    /// Only the values this CLI must overlay when starting its command process.
+    /// Only the values this CLI overlays on the process snapshot it resolved.
+    ///
+    /// Already folded into [`Self::resolved`] and [`Self::flags`], so dispatch does
+    /// not depend on them reaching the real process environment. The Unix bootstrap
+    /// `exec` applies the same set so launched processes inherit it too.
     pub fn overrides(&self) -> impl Iterator<Item = (&'static str, &str)> {
         self.overrides
             .iter()

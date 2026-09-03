@@ -42,10 +42,13 @@ pub enum StartupPhase {
     Parse,
     /// Resolving the process environment into a startup environment.
     Environment,
-    /// The one-child re-exec that hands the command process its environment.
+    /// The Unix `exec` that hands the command process its environment.
     ///
-    /// Present only on invocations that dispatch a command. `--version` and a
-    /// `clap` error return before it, which is why they are the fast paths.
+    /// Present only on Unix, and there only on invocations that dispatch a
+    /// command. `--version` and a `clap` error return before it, which is why they
+    /// are the fast paths. Platforms without `exec` never reach this phase: they
+    /// apply the resolved environment in this process rather than starting a second
+    /// one, so a dispatching invocation there writes one profile line, not two.
     BootstrapRestart,
     /// Building the tracing subscriber and opening the structured log store.
     Logging,
