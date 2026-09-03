@@ -328,6 +328,15 @@ async fn deliver_execution(target: &NotificationTarget, info: &BackgroundExecuti
     }
 }
 
+/// Deliver this session's pending settled reports as one batch.
+///
+/// One delivery covers the whole batch: the wake it reaches claims every pending report
+/// under a single turn lease, and a wake that finds the session busy offers all of them
+/// to the running turn. Awaiting a delivery per row instead made each report wait for
+/// the previous report's entire turn, so a fan-out that settled together arrived as a
+/// stream of turns that each announced a state the next report had already replaced.
+///
+/// A report the wake cannot place stays pending, and the next scan retries it.
 async fn deliver_pending_inputs(session_id: &str, target: &NotificationTarget) {
     let pending = match target.inbox.pending(session_id) {
         Ok(pending) => pending,
@@ -340,12 +349,13 @@ async fn deliver_pending_inputs(session_id: &str, target: &NotificationTarget) {
             return;
         }
     };
-    for input in pending
+    let Some(report) = pending
         .into_iter()
-        .filter(|input| is_async_notification(&input.prompt))
-    {
-        wake_with_retry(target.wake.as_ref(), input).await;
-    }
+        .find(|input| is_async_notification(&input.prompt))
+    else {
+        return;
+    };
+    wake_with_retry(target.wake.as_ref(), report).await;
 }
 
 /// Whether this durable prompt is a settled report the idle wake path delivers.
@@ -472,16 +482,16 @@ mod tests {
 
     #[async_trait]
     impl ParentReportWake for ClaimingWake {
+        /// Claim the woken report's whole batch, exactly as the parent wake does.
         async fn wake(&self, input: SessionInput) -> Result<(), String> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            if self
+            let promoted = self
                 .inbox
-                .promote_id(&input.session_id, &input.id)
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
+                .promote_pending_async(&input.session_id)
+                .map_err(|error| error.to_string())?;
+            for claimed in promoted {
                 self.inbox
-                    .mark_consumed(&input.session_id, &input.id)
+                    .mark_consumed(&claimed.session_id, &claimed.id)
                     .map_err(|error| error.to_string())?;
             }
             Ok(())
@@ -716,7 +726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_async_reports_redrive_but_ordinary_user_queue_does_not() {
+    async fn one_delivery_redrives_every_pending_report_and_leaves_the_user_queue() {
         let (inbox, jobs, runs, wake) = fixture();
         inbox
             .admit(NewSessionInput::new(
@@ -754,7 +764,11 @@ mod tests {
 
         deliver_pending_inputs("ses_parent", &target).await;
 
-        assert_eq!(wake.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            wake.calls.load(Ordering::Relaxed),
+            1,
+            "two settled reports cost one delivery, not one delivery each"
+        );
         assert_eq!(
             inbox
                 .get("ses_parent", "msg_report")

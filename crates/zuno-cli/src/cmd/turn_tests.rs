@@ -1095,20 +1095,173 @@ fn production_turn_runs_the_host_planning_classifier_after_input_is_durable() {
             .join("turn.rs"),
     )
     .expect("turn.rs is readable");
-    let persisted = turn
-        .find("self.persist_user_input(&message, &parts)?")
-        .expect("input persistence call");
-    let classified = turn
-        .find("self.ensure_durable_plan(prompt, options.planning_source, options.content)?")
+    for entry in [
+        "    async fn drive_input_routed(",
+        "    pub(crate) async fn drive_promoted_reports_with_guard(",
+    ] {
+        let body = &turn[turn.find(entry).expect("turn entry point")..];
+        let persisted = body.find("self.persist").expect("input persistence call");
+        let handed_off = body
+            .find("self.drive_prepared(")
+            .expect("accounted turn call");
+        assert!(
+            persisted < handed_off,
+            "`{entry}` must make its input durable before the accounted turn begins"
+        );
+    }
+    let prepared = &turn[turn
+        .find("    async fn drive_prepared(")
+        .expect("accounted turn body")..];
+    let classified = prepared
+        .find("self.ensure_durable_plan(")
         .expect("host planning classifier call");
-    let provider = turn
+    let provider = prepared
         .find(".drive_input_unaccounted(")
         .expect("provider turn call");
 
     assert!(
-        persisted < classified && classified < provider,
+        classified < provider,
         "the host must classify only after the user input is durable and before the provider call"
     );
+}
+
+#[test]
+fn a_batched_report_turn_persists_every_report_before_its_single_provider_call() {
+    let turn = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("cmd")
+            .join("turn.rs"),
+    )
+    .expect("turn.rs is readable");
+    let body = &turn[turn
+        .find("    pub(crate) async fn drive_promoted_reports_with_guard(")
+        .expect("batched report entry point")..];
+    let each_report = body
+        .find("for report in reports {")
+        .expect("every report is persisted, not only the one that seeds the plan");
+    let persisted = body
+        .find("self.persist_promoted_user_input(&message, &parts)?;")
+        .expect("promoted report persistence call");
+    let provider = body
+        .find("self.drive_prepared(")
+        .expect("accounted turn call");
+
+    assert!(
+        each_report < persisted && persisted < provider,
+        "a batch must persist one durable user message per report before the provider request"
+    );
+}
+
+#[test]
+fn a_promoted_report_batch_keeps_one_task_report_metadata_per_message() {
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
+    );
+    {
+        let mut connection = pool.get().expect("schema connection");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-batch', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES \
+                   ('ses-batch', 'project-batch', 'batch', '/workspace', 'batch', '1', 1, 1);",
+            )
+            .expect("seed batch session");
+    }
+    let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&pool));
+    for (input_id, job_id, agent, text) in [
+        ("input-first", "job-first", "explorer", "first result"),
+        ("input-second", "job-second", "reviewer", "second result"),
+    ] {
+        inbox
+            .admit(zuno_db::inbox::NewSessionInput::new(
+                input_id,
+                "ses-batch",
+                json!({
+                    "kind": "subagentReport",
+                    "jobID": job_id,
+                    "childSessionID": "ses-child",
+                    "status": "completed",
+                    "text": text,
+                    "metadata": {
+                        "schemaVersion": 1,
+                        "agent": agent,
+                        "finalText": text
+                    }
+                }),
+                zuno_db::inbox::InputDelivery::Queue,
+                2,
+            ))
+            .expect("admit report");
+    }
+    let promoted = inbox
+        .promote_pending_async("ses-batch")
+        .expect("claim the whole batch");
+    assert_eq!(promoted.len(), 2);
+
+    let connection = pool.get().expect("persistence connection");
+    for (index, input) in promoted.iter().enumerate() {
+        let created = 3 + i64::try_from(index).expect("small batch");
+        let mut message = zuno_db::message::MessageRecord::from_json(json!({
+            "id": input.id,
+            "sessionID": "ses-batch",
+            "role": "user",
+            "time": {"created": created},
+            "agent": "orchestrator",
+            "model": {"providerID": "fake", "modelID": "fake-model"}
+        }))
+        .expect("user message");
+        let part = zuno_db::message::PartRecord::from_json(
+            json!({
+                "id": format!("part-{}", input.id),
+                "sessionID": "ses-batch",
+                "messageID": input.id,
+                "type": "text",
+                "text": input.prompt["text"]
+            }),
+            created,
+        )
+        .expect("report text part");
+        let transaction =
+            zuno_db::open::immediate_transaction(&connection).expect("begin transaction");
+        attach_promoted_task_report_metadata(&transaction, &mut message)
+            .expect("attach task report metadata");
+        persist_prepared_user_message(&transaction, &message, &[part])
+            .expect("persist report message");
+        consume_promoted_input(&transaction, "ses-batch", &input.id).expect("consume report");
+        transaction.commit().expect("commit report");
+    }
+
+    let store = zuno_db::message::MessageStore::new(&connection);
+    assert_eq!(
+        store
+            .message("input-first")
+            .expect("first stored message")
+            .data["taskReport"]["agent"],
+        "explorer"
+    );
+    assert_eq!(
+        store
+            .message("input-second")
+            .expect("second stored message")
+            .data["taskReport"]["agent"],
+        "reviewer",
+        "a batched delivery must not collapse two reports onto one message"
+    );
+    for input_id in ["input-first", "input-second"] {
+        assert_eq!(
+            inbox
+                .get("ses-batch", input_id)
+                .expect("read settled report")
+                .expect("settled report")
+                .state,
+            zuno_db::inbox::SubmissionState::Consumed
+        );
+    }
 }
 
 #[test]

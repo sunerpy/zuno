@@ -24,7 +24,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SessionInput};
+use zuno_db::inbox::{
+    DurableInputKind, InputDelivery, NewSessionInput, SessionInbox, SessionInput,
+};
 use zuno_db::job::{
     AgentJob, AgentJobStore, JobSettlement, JobStatus, JobSubject, JobWorkContext, NewAgentJob,
     ReportDelivery as DbReportDelivery,
@@ -43,7 +45,9 @@ use zuno_tools::task::{
 };
 
 use super::delegation::DelegationLimiter;
-use super::turn::{SessionChoice, TurnHost, TurnHostDependencies, TurnOptions, TurnPlan};
+use super::turn::{
+    PromotedReport, SessionChoice, TurnHost, TurnHostDependencies, TurnOptions, TurnPlan,
+};
 use crate::environment::StartupEnvironment;
 
 /// How deep a delegation chain may be walked before the walk is called cyclic.
@@ -1985,18 +1989,14 @@ struct ParentReportDriver {
 
 #[async_trait]
 impl PendingInputDriver for ParentReportDriver {
+    /// Drive every settled report this session has pending as one turn.
+    ///
+    /// The wake that reached this driver names one report, but a parent commonly holds
+    /// several: a fan-out settles together, and restart recovery re-admits reports for
+    /// work that already settled. Claiming the whole batch under this one turn lease is
+    /// what stops the parent from opening a turn per report and announcing states a
+    /// later report in the same batch already replaced.
     async fn drive(&self, input: SessionInput, guard: SessionRunGuard) -> Result<(), String> {
-        let text = input
-            .prompt
-            .get("text")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "background report input `{}` has no string `text` field",
-                    input.id
-                )
-            })?
-            .to_owned();
         let options = TurnOptions {
             directory: Some(self.directory.clone()),
             model: Some(self.model.clone()),
@@ -2028,24 +2028,57 @@ impl PendingInputDriver for ParentReportDriver {
         host.activate_extension_composition()?;
         let promoted = self
             .inbox
-            .promote_id(&input.session_id, &input.id)
+            .promote_pending_async(&input.session_id)
             .map_err(to_string)?;
-        if promoted.is_none() {
+        let batch = ReportBatch::project(&promoted);
+        for input_id in batch.undecodable() {
+            self.settle_undecodable(&input.session_id, input_id);
+        }
+        if batch.is_empty() {
             return host.shutdown().await;
         }
-        let planning_source = detached_planning_source(&input.prompt);
-        let outcome = drive_detached_and_drain(
+        let outcome = drive_reports_and_drain(
             &mut host,
-            &text,
-            Some(input.id.as_str()),
-            Some(guard),
-            planning_source,
+            &batch,
+            guard,
             input.session_id.as_str(),
             self.detached_observer.clone(),
         )
         .await;
         let shutdown = host.shutdown().await;
         super::turn::finish_with_shutdown(outcome, shutdown)
+    }
+}
+
+impl ParentReportDriver {
+    /// Retire a promoted report the model can never read.
+    ///
+    /// A settled report whose durable prompt carries no text cannot become a user
+    /// message, so leaving it promoted would stall every report admitted behind it.
+    /// It settles as failed with a durable reason and the rest of the batch still runs.
+    fn settle_undecodable(&self, session_id: &str, input_id: &str) {
+        match self.inbox.mark_failed(
+            session_id,
+            input_id,
+            "settled report carries no model-visible text",
+        ) {
+            Ok(Some(_)) => tracing::warn!(
+                session_id,
+                input_id,
+                "failed a settled report that carries no model-visible text"
+            ),
+            Ok(None) => tracing::debug!(
+                session_id,
+                input_id,
+                "a report with no model-visible text was already settled"
+            ),
+            Err(error) => tracing::error!(
+                session_id,
+                input_id,
+                %error,
+                "could not settle a report that carries no model-visible text"
+            ),
+        }
     }
 }
 
@@ -2158,41 +2191,20 @@ async fn drive_and_drain(
     outcome
 }
 
-async fn drive_detached_and_drain(
+/// Run one batched report turn while forwarding its events to the detached projection.
+async fn drive_reports_and_drain(
     host: &mut TurnHost,
-    prompt: &str,
-    message_id: Option<&str>,
-    guard: Option<SessionRunGuard>,
-    planning_source: PlanningInputSource,
+    batch: &ReportBatch,
+    guard: SessionRunGuard,
     session_id: &str,
     observer: Option<Arc<dyn DetachedTurnObserver>>,
 ) -> Result<(), String> {
     let (sender, receiver) = event_channel();
     let drive = async {
-        let outcome = match (guard, message_id) {
-            (Some(guard), Some(message_id)) => {
-                host.drive_promoted_report_with_guard(
-                    prompt,
-                    message_id,
-                    planning_source,
-                    &guard,
-                    sender.clone(),
-                )
-                .await
-            }
-            (None, Some(message_id)) => {
-                host.drive_promoted_report(prompt, message_id, planning_source, sender.clone())
-                    .await
-            }
-            (Some(guard), None) => {
-                host.drive_with_message_id_and_guard(prompt, None, &guard, sender.clone())
-                    .await
-            }
-            (None, None) => {
-                host.drive_with_message_id(prompt, None, sender.clone())
-                    .await
-            }
-        };
+        let reports = batch.promoted();
+        let outcome = host
+            .drive_promoted_reports_with_guard(&reports, &guard, sender.clone())
+            .await;
         if outcome.is_ok() {
             while host
                 .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, sender.clone())
@@ -2241,6 +2253,133 @@ async fn forward_detached_events(
             observer.event(&session_id, &event).await;
         }
     }
+}
+
+/// One settled report as a batched wake turn renders it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BatchedReport {
+    /// Durable inbox id, reused as this report's user message id.
+    input_id: String,
+    /// Exact model-visible text, including its batch annotation when one applies.
+    text: String,
+    /// Which planning origin this report seeds.
+    source: PlanningInputSource,
+}
+
+/// The render-time projection of one claimed batch of settled reports.
+///
+/// Grouping is a projection, not a durable claim: no inbox row is merged, dropped,
+/// reordered, or given a new state. Rows describing the same work are compared by the
+/// instant that work completed, and only the newest of each group is presented as
+/// current, so a batch carrying three snapshots of one job stops reading as three live
+/// states the parent must chase.
+#[derive(Debug, Default)]
+struct ReportBatch {
+    reports: Vec<BatchedReport>,
+    /// Promoted rows carrying no model-visible text, which cannot become messages.
+    undecodable: Vec<String>,
+    /// Index in `reports` of the newest terminal state the whole batch carries.
+    plan_seed: usize,
+}
+
+impl ReportBatch {
+    /// Project promoted rows, in admission order, onto what the model will read.
+    fn project(promoted: &[SessionInput]) -> Self {
+        let mut reports = Vec::new();
+        let mut undecodable = Vec::new();
+        let mut identities = Vec::new();
+        let mut completions = Vec::new();
+        for input in promoted {
+            let text = DurableInputKind::classify(&input.prompt)
+                .and_then(|kind| kind.plain_text(&input.prompt));
+            let Some(text) = text else {
+                undecodable.push(input.id.clone());
+                continue;
+            };
+            identities.push(report_work_identity(&input.prompt));
+            completions.push((input.time_created, input.admitted_sequence));
+            reports.push(BatchedReport {
+                input_id: input.id.clone(),
+                text: text.to_owned(),
+                source: detached_planning_source(&input.prompt),
+            });
+        }
+        let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for (index, identity) in identities.iter().enumerate() {
+            if let Some(identity) = identity {
+                groups.entry(identity.as_str()).or_default().push(index);
+            }
+        }
+        for (work, members) in &groups {
+            if members.len() < 2 {
+                continue;
+            }
+            let newest = members
+                .iter()
+                .copied()
+                .max_by_key(|index| completions[*index])
+                .expect("a grouped batch member exists");
+            let size = members.len();
+            for index in members.iter().copied() {
+                let annotation = if index == newest {
+                    format!(
+                        "[current report] Newest of {size} reports for work `{work}` in this delivery."
+                    )
+                } else {
+                    format!(
+                        "[superseded report] Work `{work}` reported again later in this same \
+                         delivery; the report marked current for `{work}` is its state now."
+                    )
+                };
+                reports[index].text = format!("{annotation}\n\n{}", reports[index].text);
+            }
+        }
+        let plan_seed = (0..reports.len())
+            .max_by_key(|index| completions[*index])
+            .unwrap_or_default();
+        Self {
+            reports,
+            undecodable,
+            plan_seed,
+        }
+    }
+
+    /// Whether this batch has nothing the model can read.
+    fn is_empty(&self) -> bool {
+        self.reports.is_empty()
+    }
+
+    /// Promoted rows that cannot become user messages and must be settled failed.
+    fn undecodable(&self) -> &[String] {
+        &self.undecodable
+    }
+
+    /// The batch as the turn host persists and drives it.
+    fn promoted(&self) -> Vec<PromotedReport<'_>> {
+        self.reports
+            .iter()
+            .enumerate()
+            .map(|(index, report)| PromotedReport {
+                message_id: &report.input_id,
+                text: &report.text,
+                source: report.source,
+                current: index == self.plan_seed,
+            })
+            .collect()
+    }
+}
+
+/// The work one settled report describes, when its durable prompt names it.
+///
+/// Two rows sharing this identity are the same work at different instants: settlement
+/// and restart recovery each admit a report for one job, so a parent can hold several
+/// rows whose newest member is the only current state. A row that names no work is its
+/// own group and is rendered exactly as its writer wrote it.
+fn report_work_identity(prompt: &Value) -> Option<String> {
+    ["jobID", "executionID"]
+        .into_iter()
+        .find_map(|field| prompt.get(field).and_then(Value::as_str))
+        .map(str::to_owned)
 }
 
 fn detached_planning_source(prompt: &Value) -> PlanningInputSource {

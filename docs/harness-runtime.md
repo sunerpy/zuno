@@ -978,7 +978,7 @@ terminal activation. It opens an empty conversation shell directly instead of
 returning to the launch welcome surface, and it does not bypass this lazy
 materialization boundary.
 
-Drivers promote inputs in FIFO order. Promotion is transactional and can target one input identifier for a live soft interrupt. A row a driver owns but cannot decode records a session error and does not strand later queue entries.
+Drivers promote inputs in FIFO order. Promotion is transactional and can target one input identifier for a live soft interrupt, or every pending settled report at once for a batched idle wake. A row a driver owns but cannot decode records a session error and does not strand later queue entries.
 
 Admission never competes with the live-turn lease. One shared admission service commits the `session_input` row first and resolves how it reaches the model second, so every surface — TUI, ACP, HTTP, and the `run` host — reports one of three outcomes over an input that is already durable: the caller received the exclusive turn lease and drives the row itself; a running turn accepted the row as a soft interrupt and promotes it at its next safe point; or the row stays pending for the next FIFO promotion. Contending for the lease first and returning early when it is held is what loses a prompt with no durable trace, so a busy session is an outcome of admission rather than a failure of it. A caller whose own driver loop already owns every turn for the session never asks for the lease at all and is answered with the steered or pending outcome.
 
@@ -990,6 +990,27 @@ User prompts and subagent reports share this protocol:
 - If the report misses the final safe point, the wake coordinator waits for the active lease to end and starts another turn while the input is still pending.
 - An idle parent is claimed and driven immediately.
 - A restarted process recovers pending reports from the durable inbox.
+
+Settled reports are delivered as a batch, not one row at a time. A single wake
+claims every report the parent has pending in one transaction and drives them in
+one turn. Each report still becomes its own durable user message with its own
+`session.input.promoted` and `session.input.consumed` events and its own
+`message.data.taskReport`; only the provider request is shared. A wake that finds
+the session busy offers the whole pending report batch to the running turn's next
+safe point for the same reason, and a report that turn never reaches stays
+pending for the next scan. Driving one turn per row instead made a fan-out that
+settled together arrive as a stream of turns, each announcing a state a later
+report in the same batch had already replaced.
+
+Reports are grouped by the work they describe when a batch is rendered. Where a
+batch carries several reports for one job or background execution, only the report
+whose work completed last is presented as that work's current state; the earlier
+ones are marked superseded in the text the model reads, and Plan reconciliation is
+seeded from the newest report in the batch. Grouping is a projection over durable
+rows: nothing is merged, reordered, dropped, or given a new inbox state, and a
+delivery carrying one report per unit of work is presented exactly as its writers
+wrote it. A promoted report whose durable prompt carries no model-visible text is
+settled `failed` with that reason rather than stalling the reports behind it.
 
 The same boundary now covers every asynchronous continuation source:
 `subagentReport`, `productAgentReport`, `workflowReport`, `councilReport`, and
@@ -1881,7 +1902,10 @@ the process reconcile to `uncertain` and are not replayed. Concurrent
 process-local wake attempts for one `(session_id, input_id)` are coalesced by an
 in-flight lease. A failed wake releases that lease and may be retried against
 the same durable input, so the guarantee is one logical report and effective
-delivery, not a ban on retries across a crash. Normal settlement and restart
+delivery, not a ban on retries across a crash. That lease stays per input even
+though delivery is batched: the wake that wins the turn claims every pending
+report, and the wakes that lose find their own row already claimed and return
+without driving anything. Normal settlement and restart
 recovery use the same bounded wake helper: at most three attempts, beginning at
 10 ms and exponentially capped at 100 ms.
 
