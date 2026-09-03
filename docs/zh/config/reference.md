@@ -156,8 +156,10 @@ Schema 是从 Rust 类型生成的，因此它与运行时实际接受的内容�
 ## 用信任接纳检出声明的本机命令
 
 项目层声明本机会运行的命令会被拒绝：项目 `zuno.json[c]` 或 `.zuno` 中的 `shell`、本地
-`mcp.*.command`、未被禁用的 `lsp.*.command` 与 `formatter.*.command`，以及
-`productAgent.*.command` 都会导致校验失败。只有受信层里的 `trust.project_host_commands`
+`mcp.*.command`、`lsp.*.command`、`formatter.*.command`，以及 `productAgent.*.command`
+都会导致校验失败。把条目关掉也一样：命令旁边的 `enabled: false` 或 `disabled: true` 与命令
+同在检出可控的那一层，之后任何一层都能在不重述命令的情况下把它打开，因此一条休眠的声明同样是
+信任问题，而不是被容忍的例外。只有受信层里的 `trust.project_host_commands`
 能接纳它：
 
 ```json
@@ -347,13 +349,13 @@ ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined zuno
 用 `zuno debug sandbox` 查看请求/实际权限、降级资格、`resolutionKind` 和
 `fallbackReason`。`--check` 仍严格检查请求的约束是否可部署，不会因为允许降级而成功。
 
-来源同样约束本机命令，目前只是告警而不是拒绝。项目 `zuno.json[c]` 或 `.zuno` 层声明了
-`shell`、本地 `mcp.*.command`、未被禁用的 `lsp.*.command` 或 `formatter.*.command`，或
-`productAgent.*.command` 时，配置发现会逐个键记录一条指明文件与键名的警告。该层仍然被
-接受，取值原样保留；告警的原因是这些程序都以当前用户的权限在本机运行，而选择它们的是
-被检出的仓库，因此运维者应先审阅仓库再信任它。远程 MCP server 不在本机运行任何东西，
-不会被告警。未来版本会改为直接拒绝项目层的这些声明，请现在就把本机命令移到全局
-`zuno.json` 或其他受信层。
+来源同样约束本机命令，而且项目层的声明是被拒绝，而不是仅仅告警。项目 `zuno.json[c]` 或
+`.zuno` 层声明了 `shell`、本地 `mcp.*.command`、`lsp.*.command`、`formatter.*.command`，
+或 `productAgent.*.command` 时，配置发现会以校验错误失败，并指明该文件与其中每一个命令键；
+条目是否被关掉都一样。这些程序都会以当前用户的权限在本机运行，而选择它们的是被检出的仓库，
+所以这个决定不该由检出做。远程 MCP server 不在本机运行任何东西，永远不会被拒绝。请把本机
+命令放在全局 `zuno.json` 或其他受信层，或者用 `trust.project_host_commands`
+接纳特定检出，详见本页「用信任接纳检出声明的本机命令」一节。
 
 ## 严格 HITL 授权
 

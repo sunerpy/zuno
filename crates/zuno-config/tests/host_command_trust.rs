@@ -310,6 +310,57 @@ fn a_trusted_layer_may_declare_host_commands_without_any_trust_grant() {
     assert_eq!(config.shell.as_deref(), Some("./bin/project-shell"));
 }
 
+/// An off switch beside the command is not evidence the program will not run: it
+/// lives in the same untrusted layer as the command, and any later layer can flip it
+/// without restating the command. Every section is refused on the declaration alone,
+/// so which dormant executable is tolerated does not depend on which section holds
+/// it.
+#[test]
+fn a_dormant_project_layer_host_command_is_refused_like_an_active_one() {
+    // Given: a checkout where every host command it declares is switched off — the
+    // local MCP server and the LSP and formatter entries explicitly, and the product
+    // agent by the default that leaves it disabled unless `enabled` is true.
+    let fixture = Fixture::new(
+        r#"{
+    "mcp": {"repo-tool": {"type": "local", "command": ["./scripts/mcp.sh"], "enabled": false}},
+    "lsp": {"custom": {"command": ["./bin/lsp"], "extensions": [".zx"], "disabled": true}},
+    "formatter": {"fmt": {"command": ["./bin/fmt", "$FILE"], "disabled": true}},
+    "productAgent": {"helper": {"kind": "codex", "command": "./bin/helper"}}
+}"#,
+    );
+
+    // When/Then: the refusal still names every command key in the file.
+    let (path, issues) = refusal(&fixture);
+    assert_eq!(path, fixture.project_config());
+    assert_eq!(
+        keys(&issues),
+        [
+            "mcp.repo-tool.command",
+            "lsp.custom.command",
+            "formatter.fmt.command",
+            "productAgent.helper.command",
+        ]
+    );
+}
+
+/// The dormant declarations reach the same upgrade path as the active ones, so the
+/// refusal is a trust question and not a ban on writing the key at all.
+#[test]
+fn a_trusted_checkout_may_declare_a_dormant_host_command() {
+    let fixture = Fixture::new(
+        r#"{
+    "model": "provider/model",
+    "lsp": {"custom": {"command": ["./bin/lsp"], "extensions": [".zx"], "disabled": true}}
+}"#,
+    );
+    let grant = trust_roots(&[&fixture.root]);
+    let fixture = fixture.with_trusted_global(&grant);
+
+    let config = discover_with(&fixture.options())
+        .expect("an explicitly trusted checkout may declare a disabled command too");
+    assert_eq!(config.model.as_deref(), Some("provider/model"));
+}
+
 #[test]
 fn a_project_layer_that_names_no_command_needs_no_trust() {
     // Given: a checkout that only selects a model and a remote MCP server.

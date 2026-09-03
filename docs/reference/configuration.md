@@ -413,10 +413,14 @@ own budget is the more trustworthy number.
 ## Trusting a checkout with host commands
 
 A project config layer that declares a command this machine would run is refused:
-`shell`, a local `mcp.*.command`, an `lsp.*.command` or `formatter.*.command` that
-is not disabled, and a `productAgent.*.command` all fail validation when they come
-from a project `zuno.json[c]` or `.zuno` file. `trust.project_host_commands` is the
-only way to admit one, and it is read only from a trusted layer:
+`shell`, a local `mcp.*.command`, an `lsp.*.command`, a `formatter.*.command`, and a
+`productAgent.*.command` all fail validation when they come from a project
+`zuno.json[c]` or `.zuno` file. Switching the entry off does not change that. An
+`enabled: false` or `disabled: true` beside the command lives in the same layer the
+checkout controls and any later layer can flip it without restating the command, so a
+dormant declaration is a trust question too, not a tolerated one.
+`trust.project_host_commands` is the only way to admit one, and it is read only from a
+trusted layer:
 
 ```json
 {
@@ -908,17 +912,17 @@ The environment equivalent is `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`.
 Managed policy has later precedence and may still replace either override with
 `deny`.
 
-Provenance also governs host commands, for now with a warning rather than a
-refusal. A project `zuno.json[c]` or `.zuno` layer that sets `shell`, a local
-`mcp.*.command`, an `lsp.*.command` or `formatter.*.command` that is not
-disabled, or a `productAgent.*.command` is logged as a warning naming the file
-and each such key when configuration is discovered. The layer is still accepted
-and the values are kept verbatim; the warning exists because every one of those
-programs runs on this machine with the current user's authority while the
-checkout chose it, so the operator should review the repository before trusting
-it. A remote MCP server runs nothing locally and is not warned about. A future
-release will reject these declarations from a project layer instead of warning,
-so move host commands to the global `zuno.json` or another trusted layer now.
+Provenance also governs host commands, and a project layer that declares one is
+refused rather than warned about. A project `zuno.json[c]` or `.zuno` layer that
+sets `shell`, a local `mcp.*.command`, an `lsp.*.command`, a
+`formatter.*.command`, or a `productAgent.*.command` fails discovery with a
+validation error naming that file and each such key, whether or not the entry is
+switched off. Every one of those programs would run on this machine with the
+current user's authority while the checkout chose it, so the decision is not the
+checkout's to make. A remote MCP server runs nothing locally and is never
+refused. Keep host commands in the global `zuno.json` or another trusted layer,
+or admit a specific checkout with `trust.project_host_commands` — see [trusting a
+checkout with host commands](#trusting-a-checkout-with-host-commands).
 
 On Linux, confined Shell registration requires a trusted system bubblewrap plus
 successful user, mount, PID, UTS, IPC, seccomp, and—when `network` is

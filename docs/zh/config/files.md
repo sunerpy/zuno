@@ -110,10 +110,12 @@ ZUNO_CONFIG_DIR="$HOME/.config/zuno/profiles/kiro" zuno
 `run-unconfined`。因此一份被检入仓库的配置无法提升自己的约束级别，正是这个性质让克隆一个陌生仓库变得安全。
 
 点名可执行文件的项目层会被拒绝。项目 `zuno.json[c]` 或 `.zuno` 文件设置了 `shell`、本地
-`mcp.*.command`、未被禁用的 `lsp.*.command` 或 `formatter.*.command`，或
+`mcp.*.command`、`lsp.*.command`、`formatter.*.command`，或
 `productAgent.*.command` 时，配置发现会以校验错误失败，并指明那个文件与其中每一个命令键。
 这些程序都会以你的权限在本机运行，而选择它们的是被检出的仓库，所以这个决定不归仓库做。
-远程 MCP server 不在本机运行任何东西，永远不会被拒绝。
+命令旁边写 `enabled: false` 或 `disabled: true` 同样会被拒绝，因为这个开关就在检出可控的那一层，
+之后任何一层都能在不重述命令的情况下把它打开。远程 MCP server 不在本机运行任何东西，永远不会
+被拒绝。
 
 升级路径是 `trust.project_host_commands`，它只在受信层被读取：
 

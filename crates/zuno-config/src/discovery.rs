@@ -487,6 +487,13 @@ fn validate_layer_authority(
     // collected and settled against `trust.project_host_commands` once every layer
     // has merged, because the trusted layer that grants the trust may still be
     // ahead of this one in precedence order.
+    //
+    // The entry's own on/off switch is deliberately not consulted. `enabled` and
+    // `disabled` live in the same untrusted layer as the command and can be flipped
+    // by any later layer without restating the command, so an off switch is not
+    // evidence that the program will not run. Refusing every declaration also means
+    // one rule covers all five sections instead of each section tolerating a
+    // different shape of dormant executable.
     let mut host_commands: Vec<ConfigIssue> = Vec::new();
     if config.shell.is_some() {
         host_commands.push(ConfigIssue::new(
@@ -506,7 +513,7 @@ fn validate_layer_authority(
     }
     if let Some(crate::schema::lsp::LspConfig::Servers(servers)) = &config.lsp {
         for (id, entry) in servers.iter() {
-            if entry.command.is_some() && entry.disabled != Some(true) {
+            if entry.command.is_some() {
                 host_commands.push(ConfigIssue::new(
                     ["lsp", id, "command"],
                     "declares an LSP server command",
@@ -518,7 +525,7 @@ fn validate_layer_authority(
         &config.formatter
     {
         for (name, entry) in formatters.iter() {
-            if entry.command.is_some() && entry.disabled != Some(true) {
+            if entry.command.is_some() {
                 host_commands.push(ConfigIssue::new(
                     ["formatter", name, "command"],
                     "declares a formatter command",

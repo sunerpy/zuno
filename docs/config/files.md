@@ -129,12 +129,14 @@ therefore cannot escalate its own confinement, which is the property that makes 
 unfamiliar repository safe.
 
 A project layer that names an executable is refused. When a project `zuno.json[c]` or
-`.zuno` file sets `shell`, a local `mcp.*.command`, an `lsp.*.command` or
-`formatter.*.command` that is not disabled, or a `productAgent.*.command`, discovery fails
-with a validation error that names that file and every command key inside it. Each of those
-programs would run on this machine with your authority while the checkout is what chose it,
-so the checkout does not get to make that decision. A remote MCP server runs nothing locally
-and is never refused.
+`.zuno` file sets `shell`, a local `mcp.*.command`, an `lsp.*.command`, a
+`formatter.*.command`, or a `productAgent.*.command`, discovery fails with a validation
+error that names that file and every command key inside it. Each of those programs would run
+on this machine with your authority while the checkout is what chose it, so the checkout does
+not get to make that decision. An `enabled: false` or `disabled: true` beside the command is
+refused the same way, because that switch is in the layer the checkout controls and any later
+layer can turn it back on without restating the command. A remote MCP server runs nothing
+locally and is never refused.
 
 The upgrade path is `trust.project_host_commands`, and it is read only from a trusted layer:
 

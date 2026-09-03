@@ -66,9 +66,11 @@ defined server without repeating its definition.
 A local server's `command` is a host executable, and the layer that declares it matters.
 Declared in a project `zuno.json[c]` or `.zuno` file, it is refused: discovery fails with a
 validation error naming `mcp.<name>.command`, because the checkout would be choosing a
-program that runs on this machine with your authority. A remote server runs nothing locally
-and is never refused, and the toggle form is how a project layer turns a globally defined
-server off.
+program that runs on this machine with your authority. `"enabled": false` beside the command
+does not change that: the switch is in the layer the checkout controls and any later layer can
+turn it back on without restating the command. A remote server runs nothing locally and is
+never refused, and the toggle form is how a project layer turns a globally defined server
+off.
 
 To let a checkout keep its own local servers, name it in a trusted layer:
 
