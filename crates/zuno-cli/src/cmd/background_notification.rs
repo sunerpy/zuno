@@ -199,7 +199,15 @@ async fn run_watcher(
             event = events.recv() => match event {
                 Ok(BackgroundExecutionEvent::Settled(info)) if info.session_id == session_id => {
                     let current = target.borrow().clone();
-                    deliver_execution(&current, &info).await;
+                    admit_execution(&current, &info);
+                    match drain_settlements(&mut events, &session_id, &current) {
+                        SettlementBurst::Admitted => {
+                            deliver_pending_inputs(&session_id, &current).await;
+                        }
+                        SettlementBurst::Lagged => {
+                            reconcile(&service, &session_id, &current).await;
+                        }
+                    }
                 }
                 Ok(BackgroundExecutionEvent::Created(_)
                     | BackgroundExecutionEvent::Settled(_)) => {}
@@ -213,6 +221,48 @@ async fn run_watcher(
                 let current = target.borrow().clone();
                 reconcile(&service, &session_id, &current).await;
             }
+        }
+    }
+}
+
+/// What the watcher must do once a settlement burst has been admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettlementBurst {
+    /// Every settlement the burst carried is durable; deliver the batch.
+    Admitted,
+    /// Settlement events were dropped, so the durable process records decide instead.
+    Lagged,
+}
+
+/// Admit every settlement already waiting behind the one that woke this watcher.
+///
+/// Settlements arrive one broadcast event at a time, so a fan-out that finished
+/// together is a queue of events, not a single one. Delivering the first event before
+/// reading the rest let the wake see a batch of exactly one row — the later rows did
+/// not exist yet — and the parent then spent one full turn per background execution,
+/// each announcing a completion the next event had already followed. Draining the ready
+/// events first makes the durable batch complete before any turn is requested.
+///
+/// Draining never awaits: admission is a durable write, and a delivery turn must not be
+/// able to sit in front of one.
+fn drain_settlements(
+    events: &mut tokio::sync::broadcast::Receiver<BackgroundExecutionEvent>,
+    session_id: &str,
+    target: &NotificationTarget,
+) -> SettlementBurst {
+    loop {
+        match events.try_recv() {
+            Ok(BackgroundExecutionEvent::Settled(info)) if info.session_id == session_id => {
+                admit_execution(target, &info);
+            }
+            Ok(BackgroundExecutionEvent::Created(_) | BackgroundExecutionEvent::Settled(_)) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                return SettlementBurst::Lagged;
+            }
+            Err(
+                tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed,
+            ) => return SettlementBurst::Admitted,
         }
     }
 }
@@ -249,12 +299,23 @@ async fn reconcile(
         .into_iter()
         .filter(|info| info.status.is_terminal())
     {
-        deliver_execution(target, &info).await;
+        admit_execution(target, &info);
     }
     deliver_pending_inputs(session_id, target).await;
 }
 
-async fn deliver_execution(target: &NotificationTarget, info: &BackgroundExecutionInfo) {
+/// Make one settled background execution durable, without requesting a turn.
+///
+/// Admission and delivery are deliberately separate steps. Waking the parent from inside
+/// this function meant awaiting a whole model turn before the next settled execution was
+/// even admitted, so a batch could never contain more than the one row that existed when
+/// the turn started and each background execution bought its own turn. Every caller now
+/// admits the settlements it knows about first and asks for a single delivery afterwards.
+///
+/// A row already promoted by a turn that died is returned to its pending lane here, so
+/// the same delivery covers it. A conflicting or unwritable row is logged and left for
+/// the next scan rather than replaced.
+fn admit_execution(target: &NotificationTarget, info: &BackgroundExecutionInfo) {
     let input_id = format!("msg_{}", info.id.as_str());
     let input = match target.inbox.get(&info.session_id, &input_id) {
         Ok(Some(input)) => match validate_execution_input(&input, info.id.as_str()) {
@@ -302,32 +363,32 @@ async fn deliver_execution(target: &NotificationTarget, info: &BackgroundExecuti
         }
     };
 
-    let input = if input.state == SubmissionState::Promoted {
+    if input.state == SubmissionState::Promoted {
         let _recovery = match target.runs.begin_recovery(&input.session_id) {
             Ok(recovery) => recovery,
             Err(_) => return,
         };
-        match target.inbox.recover_promoted(&input.session_id, &input.id) {
-            Ok(Some(input)) => input,
-            Ok(None) => return,
-            Err(error) => {
-                tracing::error!(
-                    execution_id = %info.id,
-                    input_id = %input.id,
-                    %error,
-                    "could not recover promoted background completion input"
-                );
-                return;
-            }
+        if let Err(error) = target.inbox.recover_promoted(&input.session_id, &input.id) {
+            tracing::error!(
+                execution_id = %info.id,
+                input_id = %input.id,
+                %error,
+                "could not recover promoted background completion input"
+            );
         }
-    } else {
-        input
-    };
-    if input.state.is_pending() {
-        wake_with_retry(target.wake.as_ref(), input).await;
     }
 }
 
+/// Deliver this session's pending settled reports as one batch.
+///
+/// This is the only place in the watcher that requests a turn, and it requests one for
+/// the whole batch: the wake it reaches claims every pending report under a single turn
+/// lease, and a wake that finds the session busy offers all of them to the running turn.
+/// Awaiting a delivery per row instead made each report wait for the previous report's
+/// entire turn, so a fan-out that settled together arrived as a stream of turns that
+/// each announced a state the next report had already replaced.
+///
+/// A report the wake cannot place stays pending, and the next scan retries it.
 async fn deliver_pending_inputs(session_id: &str, target: &NotificationTarget) {
     let pending = match target.inbox.pending(session_id) {
         Ok(pending) => pending,
@@ -340,25 +401,22 @@ async fn deliver_pending_inputs(session_id: &str, target: &NotificationTarget) {
             return;
         }
     };
-    for input in pending
+    let Some(report) = pending
         .into_iter()
-        .filter(|input| is_async_notification(&input.prompt))
-    {
-        wake_with_retry(target.wake.as_ref(), input).await;
-    }
+        .find(|input| is_async_notification(&input.prompt))
+    else {
+        return;
+    };
+    wake_with_retry(target.wake.as_ref(), report).await;
 }
 
+/// Whether this durable prompt is a settled report the idle wake path delivers.
+///
+/// The published shapes live in one classifier so a new writer cannot silently
+/// escape this test.
 pub(super) fn is_async_notification(prompt: &Value) -> bool {
-    matches!(
-        prompt.get("kind").and_then(Value::as_str),
-        Some(
-            "subagentReport"
-                | "productAgentReport"
-                | "workflowReport"
-                | "councilReport"
-                | "backgroundExecutionReport"
-        )
-    )
+    zuno_db::inbox::DurableInputKind::classify(prompt)
+        .is_some_and(zuno_db::inbox::DurableInputKind::is_asynchronous_report)
 }
 
 async fn wake_with_retry(wake: &dyn ParentReportWake, input: SessionInput) {
@@ -476,16 +534,16 @@ mod tests {
 
     #[async_trait]
     impl ParentReportWake for ClaimingWake {
+        /// Claim the woken report's whole batch, exactly as the parent wake does.
         async fn wake(&self, input: SessionInput) -> Result<(), String> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            if self
+            let promoted = self
                 .inbox
-                .promote_id(&input.session_id, &input.id)
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
+                .promote_pending_async(&input.session_id)
+                .map_err(|error| error.to_string())?;
+            for claimed in promoted {
                 self.inbox
-                    .mark_consumed(&input.session_id, &input.id)
+                    .mark_consumed(&claimed.session_id, &claimed.id)
                     .map_err(|error| error.to_string())?;
             }
             Ok(())
@@ -529,6 +587,14 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         (inbox, jobs, runs, wake)
+    }
+
+    /// Another terminal execution for the same or a different session.
+    fn settled_sibling(id: &str, session_id: &str) -> BackgroundExecutionInfo {
+        let mut info = info();
+        info.id = BackgroundExecutionId::parse(id).expect("valid execution id");
+        info.session_id = session_id.to_owned();
+        info
     }
 
     fn info() -> BackgroundExecutionInfo {
@@ -629,8 +695,13 @@ mod tests {
         };
         let info = info();
 
-        deliver_execution(&target, &info).await;
-        deliver_execution(&target, &info).await;
+        // Admission and delivery are separate steps now, so both are exercised: a
+        // second pass over the same settlement must neither re-admit the row nor ask
+        // for another turn.
+        admit_execution(&target, &info);
+        deliver_pending_inputs("ses_parent", &target).await;
+        admit_execution(&target, &info);
+        deliver_pending_inputs("ses_parent", &target).await;
 
         let input = inbox
             .get("ses_parent", "msg_bg_0123456789abcdef0123456789abcdef")
@@ -659,7 +730,8 @@ mod tests {
             wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
         };
 
-        deliver_execution(&target, &info).await;
+        admit_execution(&target, &info);
+        deliver_pending_inputs(&admitted.session_id, &target).await;
 
         assert_eq!(
             inbox
@@ -693,7 +765,8 @@ mod tests {
             wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
         };
 
-        deliver_execution(&target, &info).await;
+        admit_execution(&target, &info);
+        deliver_pending_inputs(&admitted.session_id, &target).await;
 
         assert_eq!(wake.calls.load(Ordering::Relaxed), 0);
         assert_eq!(
@@ -706,7 +779,8 @@ mod tests {
         );
         drop(guard);
 
-        deliver_execution(&target, &info).await;
+        admit_execution(&target, &info);
+        deliver_pending_inputs(&admitted.session_id, &target).await;
 
         assert_eq!(wake.calls.load(Ordering::Relaxed), 1);
         assert_eq!(
@@ -720,7 +794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_async_reports_redrive_but_ordinary_user_queue_does_not() {
+    async fn one_delivery_redrives_every_pending_report_and_leaves_the_user_queue() {
         let (inbox, jobs, runs, wake) = fixture();
         inbox
             .admit(NewSessionInput::new(
@@ -758,7 +832,11 @@ mod tests {
 
         deliver_pending_inputs("ses_parent", &target).await;
 
-        assert_eq!(wake.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            wake.calls.load(Ordering::Relaxed),
+            1,
+            "two settled reports cost one delivery, not one delivery each"
+        );
         assert_eq!(
             inbox
                 .get("ses_parent", "msg_report")
@@ -783,6 +861,75 @@ mod tests {
                 .state,
             SubmissionState::Queued
         );
+    }
+
+    #[tokio::test]
+    async fn a_settlement_burst_is_admitted_before_the_batch_is_delivered() {
+        let (inbox, jobs, runs, wake) = fixture();
+        let target = NotificationTarget {
+            inbox: inbox.clone(),
+            jobs,
+            runs,
+            wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
+        };
+        let first = info();
+        let second = settled_sibling("bg_11111111111111111111111111111111", "ses_parent");
+        let third = settled_sibling("bg_22222222222222222222222222222222", "ses_parent");
+        let other_session = settled_sibling("bg_33333333333333333333333333333333", "ses_other");
+        let (sender, mut events) = tokio::sync::broadcast::channel(8);
+        sender
+            .send(BackgroundExecutionEvent::Settled(second.clone()))
+            .expect("queue the second settlement");
+        sender
+            .send(BackgroundExecutionEvent::Created(third.clone()))
+            .expect("queue an unrelated creation");
+        sender
+            .send(BackgroundExecutionEvent::Settled(third.clone()))
+            .expect("queue the third settlement");
+        sender
+            .send(BackgroundExecutionEvent::Settled(other_session.clone()))
+            .expect("queue another session's settlement");
+
+        admit_execution(&target, &first);
+        assert_eq!(
+            drain_settlements(&mut events, "ses_parent", &target),
+            SettlementBurst::Admitted
+        );
+
+        for info in [&first, &second, &third] {
+            let input = inbox
+                .get("ses_parent", &format!("msg_{}", info.id))
+                .expect("read admitted settlement")
+                .expect("every settlement in the burst is durable before any turn");
+            assert!(input.state.is_pending(), "{}", info.id);
+        }
+        assert!(
+            inbox
+                .get("ses_other", &format!("msg_{}", other_session.id))
+                .expect("inspect the other session")
+                .is_none(),
+            "another session's settlement belongs to that session's watcher"
+        );
+
+        deliver_pending_inputs("ses_parent", &target).await;
+
+        assert_eq!(
+            wake.calls.load(Ordering::Relaxed),
+            1,
+            "three settlements that arrived together cost one delivery, not one each"
+        );
+        for info in [&first, &second, &third] {
+            assert_eq!(
+                inbox
+                    .get("ses_parent", &format!("msg_{}", info.id))
+                    .expect("read delivered settlement")
+                    .expect("delivered settlement")
+                    .state,
+                SubmissionState::Consumed,
+                "{}",
+                info.id
+            );
+        }
     }
 
     #[tokio::test]
@@ -962,6 +1109,70 @@ mod tests {
                 .expect("command report")
                 .state,
             SubmissionState::Consumed
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restart_delivers_every_terminal_execution_as_one_batch() {
+        let directory = tempfile::tempdir().expect("notification workspace");
+        let (inbox, jobs, runs, wake) = fixture();
+        let service = Arc::new(
+            BackgroundExecutionService::open(directory.path().join("background"))
+                .expect("background service"),
+        );
+        let mut settled = Vec::new();
+        for index in 0..3 {
+            let info = service
+                .start(background_input(
+                    directory.path(),
+                    &format!("printf done{index}"),
+                ))
+                .expect("start background command");
+            service
+                .wait(&info.id, None)
+                .await
+                .expect("background command settles");
+            settled.push(format!("msg_{}", info.id));
+        }
+        let registry = BackgroundNotificationRegistry::default();
+
+        // The watcher starts only after every execution reached a terminal status, which
+        // is what a restarted process finds. Reconciliation must admit all three records
+        // and then ask for one turn, not one turn per record.
+        registry.register(
+            &tokio::runtime::Handle::current(),
+            directory.path(),
+            BackgroundNotificationRegistration {
+                service: Arc::clone(&service),
+                session_id: "ses_parent".to_owned(),
+                inbox: inbox.clone(),
+                jobs,
+                runs,
+                wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !settled.iter().all(|input_id| {
+                inbox
+                    .get("ses_parent", input_id)
+                    .expect("read recovered settlement")
+                    .is_some_and(|input| input.state == SubmissionState::Consumed)
+            }) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restart reconciliation delivers every terminal execution");
+
+        let task = registry
+            .unregister(directory.path(), "ses_parent")
+            .expect("registered watcher");
+        task.await.expect("watcher stops cleanly");
+        assert_eq!(
+            wake.calls.load(Ordering::Relaxed),
+            1,
+            "three already-terminal executions cost one delivery, not one delivery each"
         );
     }
 

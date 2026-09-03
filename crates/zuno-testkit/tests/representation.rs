@@ -217,6 +217,7 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
                 String,
                 String,
                 ToolInterruption,
+                bool,
             )>(),
         ),
         payload(

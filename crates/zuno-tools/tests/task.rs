@@ -5,8 +5,9 @@
 //! outbound request** — which is proven by handing the recorded dispatch to
 //! [`zuno_llm::effort::EffortResolution::apply_to`], the same function a provider
 //! adapter uses to decorate a body. The second is the assertion
-//! `zuno-agent/src/builtin.rs:78` defers to this crate: that its `GOVERNED_TOOL_IDS`
-//! still name real registry built-ins.
+//! `zuno-agent/src/builtin.rs` defers to this crate: that its `GOVERNED_TOOL_IDS`
+//! still name real registry built-ins, **and** that every built-in of the default
+//! surface is named by them.
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
@@ -20,7 +21,9 @@ use zuno_llm::effort::{
 use zuno_llm::registry::ApiSurface;
 use zuno_tool::{AllowAll, NeverInterrupted, ToolContext, erase};
 use zuno_tools::FileTools;
-use zuno_tools::registry::{BUILTIN_ORDER, BuiltinSlot, RegistryFlags, ToolRegistryBuilder};
+use zuno_tools::registry::{
+    BUILTIN_ORDER, BuiltinSlot, DEFAULT_BUILTINS, RegistryFlags, ToolRegistryBuilder,
+};
 use zuno_tools::task::{
     COORDINATOR, ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest, FixedFacts,
     GENERIC_EXECUTOR, RecordingHost, TaskTool, WIRE_ID, valid_targets,
@@ -261,6 +264,36 @@ fn every_governed_tool_id_is_a_real_production_tool() {
         assert!(
             !GOVERNED_TOOL_IDS.contains(&dead),
             "`{dead}` cannot be named by a rule and must stay out of the governed set"
+        );
+    }
+}
+
+/// The direction that was missing, and the one that hid `bg` and `job`.
+///
+/// A permission set that never names a tool does not leave it neutral: the roster's
+/// leading wildcard deny becomes the last rule that matches it, so the tool is hidden
+/// from every deny-by-default Agent. `bg` and `job` shipped in `DEFAULT_BUILTINS`,
+/// were documented as part of the default surface, and `bg` was even gated in the
+/// engine's runtime prompt, while no permission set named either — for as long as the
+/// only assertion ran from the roster to the registry and not back.
+#[test]
+fn every_default_builtin_the_model_can_see_is_governed_by_the_roster() {
+    for slot in DEFAULT_BUILTINS {
+        let id = slot.wire_id();
+        // `write` and `apply_patch` are governed under the `edit` key and `invalid` is
+        // the load-failure placeholder; `zuno-agent`'s `GOVERNED_TOOL_IDS` documents
+        // why naming them in a rule would be dead config.
+        if matches!(id, "write" | "apply_patch" | "invalid") {
+            assert!(
+                !GOVERNED_TOOL_IDS.contains(&id),
+                "`{id}` cannot be named by a rule and must stay out of the governed set"
+            );
+            continue;
+        }
+        assert!(
+            GOVERNED_TOOL_IDS.contains(&id),
+            "`{id}` is on the default model surface but no permission set may name it, \
+             so every deny-by-default Agent is blind to it: {GOVERNED_TOOL_IDS:?}"
         );
     }
 }

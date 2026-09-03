@@ -12,7 +12,7 @@ use zuno_server::{
     AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventFanout, EventService, NewEvent,
     PermissionRequest, QuestionDecision, QuestionRequest, QuestionToolCall, RequestBroker,
     ServerBuilder, ServerConfig, ServerServices, SessionCompactExecution, SessionMutationExecutor,
-    SessionMutationFuture, SessionPromptExecution, events_router,
+    SessionMutationFuture, SessionPromptExecution, SessionReportExecution, events_router,
 };
 use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin};
 use zuno_tools::question::{QuestionAsker, QuestionOutcome};
@@ -126,6 +126,32 @@ impl ServerSessionMutationExecutor {
         }
     }
 
+    /// Close one server-driven turn: publish its final work state, shut the host down,
+    /// and reconcile a staged extension transition.
+    ///
+    /// Every mutation this executor runs ends the same way, so the sequence lives here
+    /// rather than being repeated per entry point where one step could drift.
+    async fn finish_hosted(
+        &self,
+        spec: &ServerHostSpec,
+        mut host: TurnHost,
+        outcome: Result<(), String>,
+    ) -> Result<(), String> {
+        if let Some(work) = self.final_work_state(&host, &spec.session_id) {
+            self.detached_observer
+                .work_state(&spec.session_id, &work)
+                .await;
+        }
+        let extension_scope = host.extension_scope().clone();
+        let shutdown = host.shutdown().await;
+        let reconciliation = if shutdown.is_ok() {
+            self.reconcile_extensions(spec, &extension_scope).await
+        } else {
+            Ok(())
+        };
+        finish_server_mutation(outcome, shutdown, reconciliation)
+    }
+
     /// Publish a staged extension mutation once all request hosts on the old revision
     /// have stopped. A live peer defers the transition; its own shutdown will retry.
     async fn reconcile_extensions(
@@ -233,12 +259,17 @@ impl PermissionAsker for ServerPermissionAsker {
         tool: &str,
         ask: PermissionAsk,
     ) -> Result<(), ToolError> {
+        // Only a reusable ask may offer a saved authorization. A manual ask is a
+        // deliberate one-time confirmation, and an ask with no `always` option has
+        // nothing to save; either way the request carries no `save`, so the broker
+        // neither installs a standing grant from it nor answers it with one.
+        let reusable = !ask.manual && !ask.always.is_empty();
         let request = PermissionRequest {
             id: format!("per_{}", Uuid::new_v4().simple()),
             session_id: origin.session_id().to_owned(),
             action: ask.permission,
             resources: ask.patterns,
-            save: ask.always,
+            save: if reusable { ask.always } else { Vec::new() },
             metadata: ask.metadata,
             source: None,
         };
@@ -382,7 +413,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                     host.drive_promoted_with_guard(
                         &request.prompt,
                         &request.message_id,
-                        guard,
+                        &guard,
                         events.clone(),
                     )
                     .await?;
@@ -391,11 +422,14 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                         &request.prompt,
                         &request.content,
                         &request.message_id,
-                        guard,
+                        &guard,
                         events.clone(),
                     )
                     .await?;
                 }
+                // Goal continuation acquires its own lease, so this prompt's lease
+                // must be released before it runs or continuation is suppressed.
+                drop(guard);
                 while host
                     .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
                     .await?
@@ -403,21 +437,39 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 Ok(())
             }
             .await;
-            let work = executor.final_work_state(&host, &spec.session_id);
-            if let Some(work) = work {
-                executor
-                    .detached_observer
-                    .work_state(&spec.session_id, &work)
-                    .await;
-            }
-            let extension_scope = host.extension_scope().clone();
-            let shutdown = host.shutdown().await;
-            let reconciliation = if shutdown.is_ok() {
-                executor.reconcile_extensions(&spec, &extension_scope).await
-            } else {
-                Ok(())
+            executor.finish_hosted(&spec, host, outcome).await
+        })
+    }
+
+    fn reports(
+        &self,
+        request: SessionReportExecution,
+        guard: SessionRunGuard,
+        events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        let executor = self.clone();
+        Box::pin(async move {
+            let spec = ServerHostSpec {
+                session_id: request.session_id.clone(),
+                directory: request.directory,
+                agent: request.agent,
+                model: request.model,
             };
-            finish_server_mutation(outcome, shutdown, reconciliation)
+            let mut host = executor.open_active(&spec).await?;
+            let outcome = async {
+                host.drive_promoted_reports_with_guard(&request.reports, &guard, events.clone())
+                    .await?;
+                // Goal continuation acquires its own lease, so this batch's lease
+                // must be released before it runs or continuation is suppressed.
+                drop(guard);
+                while host
+                    .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
+                    .await?
+                {}
+                Ok(())
+            }
+            .await;
+            executor.finish_hosted(&spec, host, outcome).await
         })
     }
 
@@ -446,21 +498,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 Ok(())
             }
             .await;
-            let work = executor.final_work_state(&host, &spec.session_id);
-            if let Some(work) = work {
-                executor
-                    .detached_observer
-                    .work_state(&spec.session_id, &work)
-                    .await;
-            }
-            let extension_scope = host.extension_scope().clone();
-            let shutdown = host.shutdown().await;
-            let reconciliation = if shutdown.is_ok() {
-                executor.reconcile_extensions(&spec, &extension_scope).await
-            } else {
-                Ok(())
-            };
-            finish_server_mutation(outcome, shutdown, reconciliation)
+            executor.finish_hosted(&spec, host, outcome).await
         })
     }
 }
@@ -489,16 +527,6 @@ fn finish_server_mutation(
 }
 
 pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Result<(), String> {
-    if args.mdns {
-        return Err("--mdns is not supported by the Rust server runtime yet".to_owned());
-    }
-    if args.mdns_domain != "zuno.local" {
-        return Err("--mdns-domain requires --mdns, which is not supported yet".to_owned());
-    }
-    if !args.cors.is_empty() {
-        return Err("--cors is not supported by the Rust server runtime yet".to_owned());
-    }
-
     let directory_path = std::env::current_dir().map_err(|error| error.to_string())?;
     let directory = directory_path.to_string_lossy().into_owned();
     let auth = AuthConfig::from_env();
@@ -671,9 +699,11 @@ mod tests {
     use std::sync::Arc;
 
     use serde_json::json;
+    use zuno_tool::{NeverInterrupted, ToolContext};
 
     use super::{
-        PendingExtensionReservation, listen_config, reserve_pending_extension_transition,
+        PendingExtensionReservation, PermissionAsk, PermissionAsker, PermissionRequest,
+        RequestBroker, ServerPermissionAsker, listen_config, reserve_pending_extension_transition,
         server_readiness_message,
     };
     use crate::command::ServeArgs;
@@ -682,9 +712,6 @@ mod tests {
         ServeArgs {
             port,
             hostname: hostname.map(str::to_owned),
-            mdns: false,
-            mdns_domain: "zuno.local".to_owned(),
-            cors: Vec::new(),
             browser_auth: false,
         }
     }
@@ -696,7 +723,6 @@ mod tests {
         zuno_config::schema::ServerConfig {
             port: port.and_then(std::num::NonZeroU32::new),
             hostname: hostname.map(str::to_owned),
-            ..Default::default()
         }
     }
 
@@ -820,5 +846,64 @@ mod tests {
             "a late old host must not enter while candidate preparation is reserved"
         );
         prepared.abort().expect("candidate fixture aborts cleanly");
+    }
+
+    /// Drives one ask through the HTTP asker and returns the request it parked.
+    ///
+    /// The ask has to park: nothing in the test answers it, so a returned reply would
+    /// mean the broker authorized the call without a human.
+    async fn parked_request(ask: PermissionAsk) -> PermissionRequest {
+        let requests = RequestBroker::default();
+        let asker: Arc<dyn PermissionAsker> = Arc::new(ServerPermissionAsker {
+            requests: requests.clone(),
+        });
+        let context = ToolContext::new(
+            "ses_ask",
+            "msg_ask",
+            "call_ask",
+            "build",
+            asker,
+            Arc::new(NeverInterrupted),
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                context.ask("shell", ask),
+            )
+            .await
+            .is_err(),
+            "the ask was answered without a human"
+        );
+        let mut parked = requests.permissions(Some("ses_ask"));
+        assert_eq!(parked.len(), 1);
+        parked.remove(0)
+    }
+
+    /// A manual ask offers nothing to save, so no saved permission can come from it.
+    ///
+    /// `PermissionAsk::manual` exists to force a fresh human decision. The HTTP asker
+    /// used to copy `always` onto the wire request regardless, so a manual prompt
+    /// answered with `always` installed a standing authorization and the next matching
+    /// call in that session was approved without anyone seeing it.
+    #[tokio::test]
+    async fn a_manual_permission_ask_offers_nothing_to_save() {
+        let reusable = PermissionAsk {
+            always: vec!["git push".to_owned()],
+            ..PermissionAsk::new("shell", "git push")
+        };
+        let manual = PermissionAsk {
+            manual: true,
+            ..reusable.clone()
+        };
+
+        assert_eq!(
+            parked_request(reusable).await.save,
+            vec!["git push".to_owned()],
+            "a reusable ask should still offer its saved patterns"
+        );
+        assert!(
+            parked_request(manual).await.save.is_empty(),
+            "a manual ask offered a saved authorization"
+        );
     }
 }

@@ -323,6 +323,63 @@ fn only_orchestrator_may_delegate() {
     assert!(is_tool_hidden("task", &BUILD.rules()));
 }
 
+/// Two tables describe the same roster and only one of them is enforced.
+///
+/// This roster is the design statement; the runtime composes
+/// [`zuno_catalog::agent::builtin::Builtin::permission_overlay`] over a
+/// `"*": allow` default and enforces that. `bg` and `job` were absent from both, so
+/// nothing noticed. The narrow contract asserted here is the one that broke: an agent
+/// that may start a background execution can read it back, and only the delegator can
+/// inspect a Job — in the design table and in the enforced one, with the same verdict.
+#[test]
+fn background_and_job_authority_match_between_the_roster_and_the_enforced_overlay() {
+    for agent in lean() {
+        let roster = agent.rules();
+        let enforced = enforced_rules(agent.name);
+
+        for tool in ["shell", "bg", "job"] {
+            assert_eq!(
+                is_tool_hidden(tool, &roster),
+                is_tool_hidden(tool, &enforced),
+                "{}: this roster and the enforced native overlay disagree about `{tool}`",
+                agent.name
+            );
+        }
+
+        if !is_tool_hidden("shell", &roster) {
+            assert!(
+                !is_tool_hidden("bg", &roster),
+                "{}: may start a background execution with `shell` but cannot read it \
+                 back with `bg`",
+                agent.name
+            );
+        }
+        assert_eq!(
+            is_tool_hidden("job", &roster),
+            agent.delegation == Delegation::NoChildren,
+            "{}: `job` must follow the delegation boundary, because a Job row resolves \
+             only for the session that created it",
+            agent.name
+        );
+    }
+}
+
+/// The rule layers the runtime composes for a native agent, as far as they decide a
+/// tool id: the common `"*": allow` default, then the catalog's native overlay.
+fn enforced_rules(name: &str) -> Vec<zuno_permission::Rule> {
+    let mut rules = vec![zuno_permission::Rule {
+        permission: "*".to_owned(),
+        pattern: "*".to_owned(),
+        action: PermissionAction::Allow,
+    }];
+    let overlay = zuno_catalog::agent::builtin::get(name)
+        .unwrap_or_else(|| panic!("{name} must have a catalog definition"))
+        .permission_overlay()
+        .unwrap_or_else(|| panic!("{name} must have an enforced permission overlay"));
+    rules.extend(zuno_permission::rules_from_config(&overlay));
+    rules
+}
+
 #[test]
 fn only_subagents_are_valid_delegation_targets() {
     let targets: Vec<&str> = delegable(true).iter().map(|agent| agent.name).collect();

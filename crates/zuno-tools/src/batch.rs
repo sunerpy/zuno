@@ -2,6 +2,7 @@
 
 mod binding;
 
+use crate::bg::ArtifactWindow;
 use crate::output_policy::OutputPolicy;
 use crate::registry::{RegistryHandle, canonical_tool_name};
 use async_trait::async_trait;
@@ -10,6 +11,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+use std::path::Path;
 use tokio::task::JoinSet;
 use zuno_error::ToolError;
 use zuno_error::source::describe;
@@ -294,6 +296,7 @@ fn render(mut results: Vec<Invocation>, session_id: &str, store: &ToolOutputStor
         },
     );
     let mut lines = Vec::new();
+    let mut artifacts = Vec::new();
     let mut succeeded = 0usize;
     let mut failed = 0usize;
 
@@ -303,18 +306,34 @@ fn render(mut results: Vec<Invocation>, session_id: &str, store: &ToolOutputStor
             None => (result.call_index + 1).to_string(),
         };
         lines.push(format!("--- [{label}] {} ---", result.tool));
-        match result.result {
-            Ok(_output) if result.bind.is_some() => {
+        let retrieved = result.result.as_ref().ok().and_then(ArtifactWindow::of);
+        match (result.result, retrieved) {
+            (Ok(_output), _) if result.bind.is_some() => {
                 succeeded += 1;
                 lines.push(format!(
                     "(bound as `{}`; output withheld)",
                     result.bind.as_deref().unwrap_or_default()
                 ));
             }
-            Ok(output) => {
+            (Ok(output), Some(window)) => {
+                // A retrieval never goes through the limits, here least of all. Its window
+                // was already bounded on the server, and persisting it would write a
+                // subset of the artifact it just read, then hand back a notice naming a
+                // brand-new path — so a model paging withheld output inside `execute`
+                // would collect one file per attempt and never the bytes.
+                succeeded += 1;
+                artifacts.push(window.output_path.clone());
+                lines.push(retrieved_block(output, &window, budget));
+            }
+            (Ok(output), None) => {
+                // A sub-call whose output was withheld for size still succeeded, and its
+                // rendered block is the notice naming the artifact and the windowed read.
+                // Only a store that could not be written arrives here as an error, and
+                // that is the one case where this batch really lost the output.
                 match policy.apply(&result.tool, session_id, output, result.accept_large_output) {
                     Ok(output) => {
                         succeeded += 1;
+                        artifacts.extend(output.output_paths().into_iter().map(str::to_owned));
                         lines.push(output.output);
                     }
                     Err(error) => {
@@ -323,7 +342,7 @@ fn render(mut results: Vec<Invocation>, session_id: &str, store: &ToolOutputStor
                     }
                 }
             }
-            Err(error) => {
+            (Err(error), _) => {
                 failed += 1;
                 lines.push(format!("Error: {}", describe(&error)));
             }
@@ -331,5 +350,34 @@ fn render(mut results: Vec<Invocation>, session_id: &str, store: &ToolOutputStor
         lines.push(String::new());
     }
     lines.push(format!("Completed: {succeeded} succeeded, {failed} failed"));
-    ToolOutput::text("Parallel tool execution", lines.join("\n"))
+    let mut output = ToolOutput::text("Parallel tool execution", lines.join("\n"));
+    // Only the sub-call text reaches the block above, so without this the artifact a
+    // withheld sub-call produced survived as prose alone: the durable part of the
+    // composition carried no reference a client or a later turn could act on.
+    for artifact in artifacts {
+        output.record_output_path(Path::new(&artifact));
+    }
+    output
+}
+
+/// One retrieved window as a block, or a refusal to inline more than this batch's share.
+///
+/// A window that fits is returned as it is. One that does not is not persisted a second
+/// time — the bytes are already in the artifact the window names — so the block says which
+/// artifact holds them and what would fit, and the read is retried at a size this
+/// composition can carry. That keeps `TOTAL_OUTPUT_BYTES` a real bound on the whole
+/// composition without turning a read into a write.
+fn retrieved_block(output: ToolOutput, window: &ArtifactWindow, budget: usize) -> String {
+    if output.output.len() <= budget {
+        return output.output;
+    }
+    format!(
+        "Window not inlined: {} bytes read from {} exceeds this composition's {budget}-byte \
+         share of its {TOTAL_OUTPUT_BYTES}-byte output budget. All {} bytes are still there; \
+         read it again with `{}: {budget}` or smaller, or on its own outside `execute`.",
+        output.output.len(),
+        window.output_path,
+        window.total_bytes,
+        crate::bg::LIMIT,
+    )
 }

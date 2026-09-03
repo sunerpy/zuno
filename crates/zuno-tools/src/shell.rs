@@ -2,7 +2,8 @@ mod authority;
 
 use crate::output_policy::OutputPolicy;
 use crate::risk::{
-    GIT_REPOSITORY_ENVIRONMENT_VARIABLES, GateOutcome, RiskAssessment, RiskContext, assess_and_gate,
+    GIT_REPOSITORY_ENVIRONMENT_VARIABLES, GateOutcome, RiskAssessment, RiskContext,
+    assess_and_gate, git_subcommand, git_uses_repository_override,
 };
 use crate::search_common::directory_grant_pattern;
 use crate::timeout::{
@@ -10,7 +11,7 @@ use crate::timeout::{
 };
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tree_sitter::{Node, Parser};
 use zuno_error::ToolError;
+use zuno_paths::GeneratedDirectory;
 use zuno_process::GuardExit;
 use zuno_pty::{
     BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionPurpose,
@@ -310,6 +312,79 @@ impl ShellVerification {
     }
 }
 
+/// The metadata key carrying what a cancelled call still proved.
+///
+/// A cancelled `shell` result is a settled result, not an error, so a reader has to be
+/// able to tell the two cancellations apart without parsing the notice: one where the
+/// process had already exited and reported its own status, and one where it was killed
+/// mid-flight and decided nothing. [`zuno_engine`]'s dispatcher reads `uncertain` from
+/// here to decide whether the interruption it records needs authoritative inspection.
+///
+/// The engine does not depend on this crate, so the key is spelled once here and once
+/// there; the contract is the JSON shape below, and both sides pin the spelling in a
+/// test.
+pub const METADATA_CANCELLATION_KEY: &str = "cancellation";
+
+/// What a call the caller's interrupt ended is allowed to claim.
+///
+/// Serialized onto the result under [`METADATA_CANCELLATION_KEY`], beside — never
+/// instead of — the notice a model reads, so a client surface and a later turn can act
+/// on the facts without re-reading a sentence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelledExecution {
+    /// Always true: this key exists only on a result cancellation produced.
+    pub cancelled: bool,
+    /// Whether the reported facts decide what the command did.
+    ///
+    /// True only when the process exited on its own before the kill landed, so the
+    /// exit status is the command's own verdict rather than the kill's.
+    pub authoritative: bool,
+    /// Whether the final side-effect state has to be inspected before anything else.
+    ///
+    /// The negation of [`Self::authoritative`], carried explicitly because it is the
+    /// field a consumer acts on and a reader must not have to invert a claim to find
+    /// it.
+    pub uncertain: bool,
+    /// The exit status the process reported before the kill landed, when it exited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The background service's terminal status for this execution.
+    pub status: String,
+    /// Why the outcome is, or is not, the command's own.
+    pub detail: String,
+}
+
+impl CancelledExecution {
+    /// The facts of a command that had already exited when the interrupt was serviced.
+    fn exited(status: BackgroundExecutionStatus, exit_code: i32, detail: String) -> Self {
+        Self {
+            cancelled: true,
+            authoritative: true,
+            uncertain: false,
+            exit_code: Some(exit_code),
+            status: status.as_str().to_owned(),
+            detail,
+        }
+    }
+
+    /// The facts of a command that was still running and was killed.
+    fn killed(status: BackgroundExecutionStatus, exit_code: Option<i32>, detail: String) -> Self {
+        Self {
+            cancelled: true,
+            authoritative: false,
+            uncertain: true,
+            exit_code,
+            status: status.as_str().to_owned(),
+            detail,
+        }
+    }
+
+    fn to_metadata_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellEnvInput {
     pub cwd: PathBuf,
@@ -340,6 +415,10 @@ pub struct ShellTool {
     output_limits: OutputLimits,
     hard_ceiling: Duration,
     background_executions: Arc<BackgroundExecutionService>,
+    /// The generated directory the background service writes into, when its root is
+    /// one. `None` for a service a caller rooted somewhere of its own choosing, which
+    /// is not Zuno's generated state and not Zuno's to exclude.
+    background_directory: Option<GeneratedDirectory>,
     sandbox: Arc<dyn SandboxBackend>,
     sandbox_policy: SandboxPolicy,
 }
@@ -371,18 +450,21 @@ impl ShellTool {
     ) -> io::Result<Self> {
         let workspace = workspace.canonicalize()?;
         let shell = zuno_pty::shells::command(configured)?;
-        let output_store = ToolOutputStore::new(
-            workspace
-                .join(zuno_paths::PROJECT_DIRECTORY)
-                .join(zuno_paths::TOOL_OUTPUT_DIRECTORY),
+        // Generated state is rooted at the worktree, because that is where the exclude
+        // patterns are anchored and where `classify` looks; joining the project
+        // directory onto a session's own directory put it somewhere nothing covered.
+        // Resolved once because it spawns git, and only these two roots move: the
+        // workspace itself still decides the sandbox boundary, the default working
+        // directory, and what a relative `workdir` resolves against.
+        let generated_root = zuno_paths::generated_root(&workspace);
+        let output_store = ToolOutputStore::in_worktree(&generated_root);
+        let background_directory = GeneratedDirectory::in_worktree(
+            &generated_root,
+            &zuno_paths::generated::BACKGROUND_EXECUTIONS,
         );
         let background_executions = Arc::new(
-            BackgroundExecutionService::open(
-                workspace
-                    .join(zuno_paths::PROJECT_DIRECTORY)
-                    .join(zuno_paths::BACKGROUND_DIRECTORY),
-            )
-            .map_err(io::Error::other)?,
+            BackgroundExecutionService::open(background_directory.path())
+                .map_err(io::Error::other)?,
         );
         Ok(Self {
             workspace,
@@ -392,6 +474,7 @@ impl ShellTool {
             output_limits: OutputLimits::default(),
             hard_ceiling: crate::timeout::DEFAULT_HARD_CEILING,
             background_executions,
+            background_directory: Some(background_directory),
             sandbox,
             sandbox_policy,
         })
@@ -421,8 +504,17 @@ impl ShellTool {
         self
     }
 
+    /// Uses a background service the process already owns, instead of the one this tool
+    /// opened.
+    ///
+    /// The exclusion follows the service, because the directory that must stay out of a
+    /// commit is the one the service actually creates.
     #[must_use]
     pub fn with_background_executions(mut self, service: Arc<BackgroundExecutionService>) -> Self {
+        self.background_directory = GeneratedDirectory::claim(
+            service.root(),
+            &zuno_paths::generated::BACKGROUND_EXECUTIONS,
+        );
         self.background_executions = service;
         self
     }
@@ -485,7 +577,7 @@ impl ShellTool {
             &cwd,
             &env,
         )?;
-        refuse_generated_delivery(&analysis, &cwd, &env)?;
+        refuse_generated_delivery(&analysis, self.syntax(), &cwd, &env)?;
         if ctx.is_interrupted() {
             return Err(interrupted());
         }
@@ -522,6 +614,12 @@ impl ShellTool {
             lifecycle,
             &authorization,
         )?;
+        if let Some(directory) = &self.background_directory {
+            // Republished on every start, not once when the service was opened: the
+            // service creates its root whenever it is missing, so a root deleted
+            // mid-session has to come back excluded rather than come back bare.
+            directory.ensure().map_err(failed)?;
+        }
         let (execution, mut lease) = self
             .background_executions
             .start_leased(input)
@@ -549,16 +647,53 @@ impl ShellTool {
             }
             () = ctx.interrupt.notified() => {
                 let _cancelled = self.background_executions.cancel(&execution.id);
-                let _settled = self.background_executions.wait(&execution.id, None).await;
-                if let Err(error) = self.background_executions.finish_foreground(&execution.id) {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        error = %error,
-                        "could not remove interrupted foreground execution"
-                    );
-                }
+                // The settled info and the captured bytes are the whole point of this
+                // arm: a cancelled command has usually already written something, and
+                // the process may even have exited before the kill landed. Discarding
+                // both used to turn a side effect that really happened into a bare
+                // "interrupted" error.
+                let settled = match self.background_executions.wait(&execution.id, None).await {
+                    Ok(outcome) => outcome.info,
+                    Err(error) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            error = %error,
+                            "could not observe the terminal state of an interrupted \
+                             foreground execution"
+                        );
+                        // The launch snapshot is still `Running`, which
+                        // `cancelled_output` reads as an undecided outcome — exactly
+                        // what a failed terminal wait leaves behind.
+                        execution.clone()
+                    }
+                };
+                let captured = match self.background_executions.finish_foreground(&execution.id) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            error = %error,
+                            "could not remove interrupted foreground execution"
+                        );
+                        // The handoff is also how the captured bytes are read, so
+                        // failing it would discard them a second way. The artifact is
+                        // still there whenever the record is — the handoff removes it
+                        // only after reading it — so it is read directly before this
+                        // call gives up on the command's output.
+                        self.background_executions
+                            .complete_output(&execution.id)
+                            .unwrap_or_default()
+                    }
+                };
                 lease.disarm();
-                return Err(interrupted());
+                return self.cancelled_output(
+                    &verification,
+                    foreground_timeout_ms,
+                    &settled,
+                    captured,
+                    &ctx.session_id,
+                    accept_large_output,
+                );
             }
         };
         if waited.timed_out {
@@ -703,7 +838,7 @@ impl ShellTool {
         };
         ctx.ask(TOOL_ID, ask).await?;
 
-        let git_metadata_writable = mutates_git_metadata(analysis);
+        let git_metadata_writable = mutates_git_metadata(analysis, self.syntax());
         if git_metadata_writable {
             if self.sandbox_policy.mode() == SandboxMode::ReadOnly {
                 return Err(failed(io::Error::new(
@@ -813,7 +948,19 @@ impl ShellTool {
     ) -> Result<ToolOutput, ToolError> {
         match execution.status {
             BackgroundExecutionStatus::Completed => {}
-            BackgroundExecutionStatus::Cancelled => return Err(interrupted()),
+            // A terminal wait that returns a cancelled execution has the same facts the
+            // interrupt arm has, and loses them the same way if it answers with an
+            // error: the command ran, wrote output, and may have changed state.
+            BackgroundExecutionStatus::Cancelled => {
+                return self.cancelled_output(
+                    verification,
+                    foreground_timeout_ms,
+                    &execution,
+                    bytes,
+                    session_id,
+                    accept_large_output,
+                );
+            }
             BackgroundExecutionStatus::Failed if execution.timed_out => {
                 return Err(ToolError::Timeout {
                     tool: TOOL_ID.to_owned(),
@@ -858,12 +1005,190 @@ impl ShellTool {
                 .with_verification(&receipt),
             &execution.authority,
         );
-        OutputPolicy::new(self.output_store.clone(), self.output_limits)
-            .apply(TOOL_ID, session_id, output, accept_large_output)
-            .map_err(|error| ToolError::Failed {
-                tool: TOOL_ID.to_owned(),
-                source: Box::new(error),
-            })
+        // The bytes, not the lossy string: what a size policy persists is the copy that
+        // outlives this call, and the ephemeral `<id>.output` file was already removed by
+        // the foreground handoff above. Persisting the decoded text would have made the
+        // artifact a copy of the damage — `U+FFFD` where the command's bytes were — with
+        // no original left anywhere to page back.
+        OutputPolicy::new(self.output_store.clone(), self.output_limits).apply_bytes(
+            TOOL_ID,
+            session_id,
+            output,
+            &bytes,
+            accept_large_output,
+        )
+    }
+
+    /// The settled result of a foreground call the caller's interrupt ended.
+    ///
+    /// Cancellation used to answer with a bare error, which threw away everything the
+    /// command had written and told the model the tool had "completed its cleanup" —
+    /// a clean, certain, effect-free reading of a command that may have been killed
+    /// halfway through a write. This returns `Ok` instead, and separates the two
+    /// cancellations that differ in what the model may do next:
+    ///
+    /// - the process had already exited when the interrupt was serviced, so its status
+    ///   is its own verdict; the call is `cancelled` but not `uncertain`, and the
+    ///   receipt is the one a completed run would have earned;
+    /// - the process was killed, so it decided nothing; the receipt is
+    ///   [`ShellVerification::unresolved`] and the notice says authoritative state has
+    ///   to be inspected before anything is retried.
+    ///
+    /// A guard failure — `exit 125` with the guard's own diagnostic — is the second
+    /// case even though a code exists, because that code says nothing about whether
+    /// the command ran. [`Self::guard_aware_receipt`] already encodes that rule, so it
+    /// is asked rather than re-derived: an outcome it declines to certify is exactly an
+    /// outcome that cannot be cited.
+    ///
+    /// The preserved bytes go through [`OutputPolicy`], the same size policy a
+    /// completed run uses, so oversized cancelled output is persisted byte for byte and
+    /// withheld behind the windowed read rather than inlined or truncated. The notice
+    /// is prepended after that decision, so it survives withholding and never counts
+    /// against the threshold the command's own output is measured by.
+    fn cancelled_output(
+        &self,
+        verification: &ShellVerification,
+        foreground_timeout_ms: u64,
+        execution: &BackgroundExecutionInfo,
+        bytes: Vec<u8>,
+        session_id: &str,
+        accept_large_output: bool,
+    ) -> Result<ToolOutput, ToolError> {
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        // Whatever the record holds, reported verbatim: a code that decides nothing is
+        // still what a terminal would have shown, and dropping it would leave the
+        // metadata disagreeing with the captured output.
+        let reported = execution.exit_code;
+        // Only `Completed` means the process reported a status of its own. Every other
+        // terminal status says the number beside it, when there is one, is not the
+        // command's verdict: `Cancelled` is the kill, a `Failed` is the hard ceiling or
+        // an output capture that broke after the process had already exited, `Uncertain`
+        // is a process that disappeared, and `Running` is the snapshot a failed terminal
+        // wait leaves behind. Reading a code out of any of those would certify an
+        // outcome the service explicitly declined to settle.
+        let decided = matches!(execution.status, BackgroundExecutionStatus::Completed)
+            .then_some(reported)
+            .flatten();
+        let certified = decided.and_then(|code| {
+            Self::guard_aware_receipt(verification, Some(code), &bytes, &text)
+                .ok()
+                .map(|receipt| (code, receipt))
+        });
+        let (facts, receipt, notice) = match certified {
+            Some((code, receipt)) => {
+                let detail = format!(
+                    "the command had already exited with status {code} when the cancellation was \
+                     serviced, so this is its own outcome and the kill changed nothing about it"
+                );
+                let notice = format!(
+                    "Cancelled by the user. The command had already exited with status {code} \
+                     before the cancellation was serviced, so this result is the command's own \
+                     outcome and the output below is complete."
+                );
+                (
+                    CancelledExecution::exited(execution.status, code, detail),
+                    receipt,
+                    notice,
+                )
+            }
+            None => {
+                let reason = Self::undecided_cancellation_reason(execution, decided);
+                let detail = format!(
+                    "the command {reason}; whatever it had already changed is unknown from this \
+                     result"
+                );
+                let notice = format!(
+                    "Cancelled by the user. `{}` {reason}. Whatever output it had produced is \
+                     below. Inspect the authoritative state this command would have changed \
+                     before deciding what to do next; it must not be re-run on the assumption \
+                     that it did nothing.",
+                    summarize_command(&verification.command)
+                );
+                (
+                    CancelledExecution::killed(execution.status, reported, detail.clone()),
+                    verification.unresolved(detail),
+                    notice,
+                )
+            }
+        };
+        let body = if text.is_empty() {
+            "(no output)".to_owned()
+        } else {
+            text
+        };
+        let output = with_sandbox_metadata(
+            ToolOutput::text(verification.command.as_str(), body)
+                .with_metadata("exit", json!(facts.exit_code))
+                .with_metadata("truncated", false)
+                .with_metadata("background", false)
+                .with_metadata("task_id", execution.id.as_str())
+                .with_metadata("shell", self.shell.name())
+                .with_metadata("timeout", json!(foreground_timeout_ms))
+                .with_metadata(METADATA_CANCELLATION_KEY, facts.to_metadata_value())
+                .with_verification(&receipt),
+            &execution.authority,
+        );
+        let mut output = OutputPolicy::new(self.output_store.clone(), self.output_limits)
+            .apply_bytes(TOOL_ID, session_id, output, &bytes, accept_large_output)?;
+        output.output = format!("{notice}\n\n{}", output.output);
+        Ok(output)
+    }
+
+    /// Why a cancelled call decided nothing, read off the record the service settled.
+    ///
+    /// The clause completes `` `<command>` … `` so the model-visible notice and the
+    /// receipt's detail can both state the reason without either one inventing a fact
+    /// the record does not carry. One fixed sentence cannot do that: an undecided
+    /// cancellation reaches this point with a code as often as without one — the guard's
+    /// own `125`, or the status a process had already reported before its output capture
+    /// broke — and claiming the command "has no exit status" contradicts the `exit`
+    /// metadata sitting beside it.
+    fn undecided_cancellation_reason(
+        execution: &BackgroundExecutionInfo,
+        decided: Option<i32>,
+    ) -> String {
+        // A code the process really reported that `guard_aware_receipt` still declined:
+        // the only outcome it declines is the guard's own failure.
+        if let Some(code) = decided {
+            return format!(
+                "reported exit {code}, but that code is the child-process guard's own failure \
+                 and says nothing about whether the command ran"
+            );
+        }
+        if execution.timed_out {
+            return "was still running at its hard ceiling and was killed there rather than \
+                    reporting an outcome of its own"
+                .to_owned();
+        }
+        if let Some(code) = execution.exit_code {
+            let settled = execution.status.as_str();
+            return match &execution.error {
+                Some(error) => format!(
+                    "reported exit {code}, but the execution settled as {settled} rather than as \
+                     the command's own outcome: {error}"
+                ),
+                None => format!(
+                    "reported exit {code}, but the execution settled as {settled} rather than as \
+                     the command's own outcome"
+                ),
+            };
+        }
+        match execution.status {
+            BackgroundExecutionStatus::Uncertain => {
+                "left no authoritative terminal result behind, because its process disappeared"
+                    .to_owned()
+            }
+            BackgroundExecutionStatus::Running => {
+                "was cancelled without this call observing it reach a terminal state, so nothing \
+                 about it was settled"
+                    .to_owned()
+            }
+            BackgroundExecutionStatus::Cancelled
+            | BackgroundExecutionStatus::Completed
+            | BackgroundExecutionStatus::Failed => {
+                "was still running and was killed, so it reported no outcome of its own".to_owned()
+            }
+        }
     }
 
     /// The receipt for a finished run, reading a guard verdict as the guard's.
@@ -1173,24 +1498,249 @@ fn commit_stages_tracked_changes(arguments: &[String]) -> bool {
     false
 }
 
-/// Whether this command line creates a commit, and whether it stages while doing it.
-fn commit_delivery(analysis: &ShellAnalysis) -> Option<CommitDelivery> {
-    analysis.commands.iter().find_map(|resource| {
-        let (subcommand, arguments) = git_subcommand(&resource.tokens)?;
-        (subcommand == "commit").then(|| CommitDelivery {
-            stages_tracked_changes: commit_stages_tracked_changes(arguments),
-        })
-    })
+/// How much of the worktree a staging command reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StagedScope {
+    /// The whole worktree, because no pathspec narrows it or none can be read.
+    Worktree,
+    /// Only these pathspecs, spelled the way the command spelled them.
+    ///
+    /// Passed back to git as pathspecs rather than compared as text: they are relative
+    /// to where the command runs, and git's pathspec language is not the lexical
+    /// comparison [`zuno_paths::refuse_generated_state`] performs.
+    Paths(Vec<String>),
 }
 
-/// What a `git commit` in this command line is about to deliver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CommitDelivery {
-    /// Whether the commit stages tracked modifications itself, as `-a` does.
+impl StagedScope {
+    /// The union of two reaches.
+    fn widen(&mut self, other: Self) {
+        match (&mut *self, other) {
+            (Self::Worktree, _) => {}
+            (_, Self::Worktree) => *self = Self::Worktree,
+            (Self::Paths(mine), Self::Paths(theirs)) => mine.extend(theirs),
+        }
+    }
+
+    /// The pathspec arguments that limit a git read to this reach.
     ///
-    /// The index alone is then not the whole delivery, so the worktree's tracked
-    /// changes have to be read as well.
-    stages_tracked_changes: bool,
+    /// `:/` is git's spelling for the whole worktree, which is what a read has to say
+    /// when the command runs in a subdirectory: a bare `git diff` reports only the
+    /// paths below it.
+    fn pathspecs(&self) -> Vec<&str> {
+        match self {
+            Self::Worktree => vec![":/"],
+            Self::Paths(paths) => paths.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// What a command line puts in the index before a commit in it runs.
+///
+/// The check reads git before the command runs, so the index it can read is the index as
+/// it is *now*. A chain stages first — `git add -A && git commit -m wip` is the shape a
+/// model writes most — and everything that `add` collects is invisible to a read of the
+/// index taken before it. What the arguments do say is which part of the worktree the
+/// staging reaches, and that is enough to read the same paths from the worktree instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StagedWork {
+    /// Whether tracked modifications inside the reach are staged.
+    ///
+    /// This is the case no exclusion can answer. `.git/info/exclude` and a generated
+    /// directory's own `.gitignore` suppress only an *untracked* path, so a goal
+    /// document an earlier release committed is staged again by every `git add` that
+    /// reaches it.
+    tracked: bool,
+    /// Whether files git does not track yet, and does not ignore, are staged too.
+    ///
+    /// False for `git add -u` and `git commit -a`, which update only what git already
+    /// tracks.
+    untracked: bool,
+    /// How much of the worktree the staging reaches.
+    scope: Option<StagedScope>,
+}
+
+impl StagedWork {
+    /// Add everything `other` stages to what this already stages.
+    fn absorb(&mut self, other: Self) {
+        self.tracked |= other.tracked;
+        self.untracked |= other.untracked;
+        match (&mut self.scope, other.scope) {
+            (_, None) => {}
+            (Some(mine), Some(theirs)) => mine.widen(theirs),
+            (slot @ None, theirs) => *slot = theirs,
+        }
+    }
+}
+
+/// What this command line's commits would deliver, read in the order the commands run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ChainDelivery {
+    /// How the first commit that chooses its own repository chooses it.
+    retarget: Option<Retarget>,
+    /// What the chain stages before, or as part of, a commit.
+    staged: StagedWork,
+}
+
+/// What every `git commit` in this command line would deliver, or `None` when it has
+/// none.
+///
+/// Every commit, not the first: `git commit -m a && git commit -am b` delivers the
+/// worktree's tracked changes through its second commit, and reading only the first said
+/// the index was the whole delivery.
+///
+/// Order is why this is a walk and not a filter. A `git add` before a commit is part of
+/// that commit's delivery; the same `git add` after the last commit is not, and reading
+/// it as one would refuse a commit of source over a file staged for the next one.
+fn chain_delivery(analysis: &ShellAnalysis, syntax: ShellSyntax) -> Option<ChainDelivery> {
+    let mut pending = StagedWork::default();
+    let mut delivery: Option<ChainDelivery> = None;
+    for resource in &analysis.commands {
+        let Some((subcommand, arguments)) = git_subcommand(&resource.tokens, syntax) else {
+            continue;
+        };
+        match subcommand.as_str() {
+            "add" | "stage" => pending.absorb(staged_by_add(arguments)),
+            "commit" => {
+                let chain = delivery.get_or_insert_default();
+                chain.staged.absorb(std::mem::take(&mut pending));
+                if commit_stages_tracked_changes(arguments) {
+                    chain.staged.absorb(StagedWork {
+                        tracked: true,
+                        untracked: false,
+                        scope: Some(StagedScope::Worktree),
+                    });
+                }
+                if chain.retarget.is_none() {
+                    chain.retarget = commit_retarget(resource);
+                }
+            }
+            _ => {}
+        }
+    }
+    delivery
+}
+
+/// How a `git commit` names a repository other than the one this call inspects, if it
+/// does at all.
+fn commit_retarget(resource: &CommandResource) -> Option<Retarget> {
+    if git_uses_repository_override(&resource.tokens) {
+        return Some(Retarget::Option);
+    }
+    leading_assignments(&resource.source)
+        .find(|name| {
+            GIT_REPOSITORY_ENVIRONMENT_VARIABLES
+                .iter()
+                .any(|variable| name.eq_ignore_ascii_case(variable))
+        })
+        .map(|name| Retarget::Assignment(name.to_owned()))
+}
+
+/// What one `git add` — or `git stage`, its alias — stages, read from its arguments.
+///
+/// A pathspec limits the reach; `-A` and `-u` without one reach the whole worktree; `-u`
+/// leaves untracked files alone. A pathspec carrying a glob or one of git's magic
+/// `:`-prefixed forms widens the reach to the worktree instead of being evaluated here,
+/// and so does `--pathspec-from-file`, whose list lives in a file or on standard input.
+/// Over-reporting the reach costs a refusal that names paths the caller can unstage;
+/// under-reporting costs the commit this check exists to prevent.
+///
+/// A `git add` with neither a pathspec nor `-A` or `-u` stages nothing — git refuses it
+/// — so it contributes nothing rather than everything.
+fn staged_by_add(arguments: &[String]) -> StagedWork {
+    let mut pathspecs: Vec<String> = Vec::new();
+    let mut all = false;
+    let mut update = false;
+    let mut unreadable = false;
+    let mut only_pathspecs = false;
+    let mut index = 0;
+    while let Some(raw) = arguments.get(index) {
+        let argument = unquote(raw);
+        index = index.saturating_add(1);
+        if only_pathspecs || !argument.starts_with('-') || argument == "-" {
+            pathspecs.push(argument);
+            continue;
+        }
+        if argument == "--" {
+            only_pathspecs = true;
+            continue;
+        }
+        if let Some(long) = argument.strip_prefix("--") {
+            match long.split('=').next().unwrap_or(long) {
+                "all" | "no-ignore-removal" => all = true,
+                "update" => update = true,
+                "pathspec-from-file" => unreadable = true,
+                "chmod" if !argument.contains('=') => index = index.saturating_add(1),
+                _ => {}
+            }
+            continue;
+        }
+        for flag in argument.chars().skip(1) {
+            match flag {
+                'A' => all = true,
+                'u' => update = true,
+                _ => {}
+            }
+        }
+    }
+    let scope = if unreadable || pathspecs.iter().any(|spec| widens_to_the_worktree(spec)) {
+        StagedScope::Worktree
+    } else if pathspecs.is_empty() {
+        if !(all || update) {
+            return StagedWork::default();
+        }
+        StagedScope::Worktree
+    } else {
+        StagedScope::Paths(pathspecs)
+    };
+    StagedWork {
+        tracked: true,
+        untracked: all || !update,
+        scope: Some(scope),
+    }
+}
+
+/// Whether a pathspec is one this check reads as the whole worktree rather than as a
+/// path.
+///
+/// `.` reaches everything below where the command runs, a `:`-prefixed pathspec is one
+/// of git's magic forms — `:/` for the whole tree, `:(glob)` and the rest — and a glob
+/// is a pattern git evaluates and this module does not.
+fn widens_to_the_worktree(spec: &str) -> bool {
+    spec.starts_with(':')
+        || spec.contains(['*', '?', '['])
+        || matches!(spec.trim_end_matches(['/', '\\']), "" | "." | "..")
+}
+
+/// How a commit points itself at a repository the check would not read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Retarget {
+    /// A git global option: `-C`, `--git-dir`, `--work-tree`, `--namespace`.
+    Option,
+    /// An inline assignment of a Git repository variable, carrying its name.
+    Assignment(String),
+}
+
+/// The variable names a command line assigns before it names its program.
+///
+/// The analyzer drops a `variable_assignment` from the token list, correctly — it is
+/// not an argument — so `GIT_DIR=/elsewhere git commit` is indistinguishable from
+/// `git commit` there and has to be read from the source. Only the leading run counts,
+/// because that is the only position where a shell treats `NAME=value` as an assignment
+/// to the command's environment: the same text after the program name is an argument,
+/// and inside a commit message it is prose, and refusing that would be a refusal nobody
+/// could explain.
+fn leading_assignments(source: &str) -> impl Iterator<Item = &str> {
+    source
+        .split_whitespace()
+        .map_while(|word| word.split_once('='))
+        .take_while(|(name, _)| {
+            !name.is_empty()
+                && !name.starts_with(|first: char| first.is_ascii_digit())
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+        .map(|(name, _)| name)
 }
 
 /// The paths one git list command reports, read from its `-z` output.
@@ -1232,43 +1782,119 @@ fn git_reported_paths(
 /// reason from it, and the reasoning looks well founded because the files are in git.
 ///
 /// What is delivered is read from git rather than from the command line, because the
-/// command line does not know it: an alias, a `-a`, a `commit.template`, or a
-/// pre-commit hook that stages all put paths in a commit that no argument named. The
-/// index is always read, and a commit that stages tracked modifications itself has
-/// those read too.
+/// command line does not know it: an alias, a `-a`, a `commit.template`, or a pre-commit
+/// hook that stages all put paths in a commit that no argument named. The index is
+/// always read.
 ///
-/// Pathspecs are not classified. `git commit -- <path>` commits that path from the
-/// worktree, so a generated path spelled there would pass, and that is the accepted
-/// gap: a pathspec has to be typed deliberately, while the refusal for a
-/// mis-classified message or option would land on an ordinary commit.
+/// A chain that stages before it commits is read from the worktree instead. The check
+/// runs before the command, so `git add -A && git commit -m wip` has an index that says
+/// nothing yet; what its arguments do say is how much of the worktree the staging
+/// reaches, so the same reach is read as tracked modifications and as untracked
+/// unignored files. That is the shape that matters most: an exclude rule cannot hide a
+/// path git already tracks, so a `.zuno/goal` document an earlier release committed is
+/// picked up by every `git add -A` until someone runs `git rm --cached` on it, and this
+/// is the check that says so.
 ///
-/// No repository, nothing delivered: when git cannot name a worktree the check does
-/// not run, and the commit fails on its own terms rather than through a refusal about
+/// A pathspec is handed back to git as a pathspec, never compared as text. `git add
+/// .zuno` and `git add -- ':(glob)**/*.md'` mean whatever git means by them, and a
+/// lexical guess at that is how a check comes to report on paths a command never
+/// touched. A pathspec whose reach cannot be read narrowly widens to the whole
+/// worktree.
+///
+/// `git commit -- <path>` is still not classified: it commits that path from the
+/// worktree without staging it, and that is the accepted gap — a pathspec on the commit
+/// itself has to be typed deliberately, while the refusal for a mis-read message or
+/// option would land on an ordinary commit.
+///
+/// A commit that chooses its own repository is refused instead of inspected. `-C`,
+/// `--git-dir`, `--work-tree`, `--namespace` and an inline `GIT_DIR=…` all point the
+/// commit somewhere these git reads do not follow, so inspecting anyway reports on a
+/// repository that is not the one being written. The repository belongs in the tool's
+/// `workdir`, where it is one fact both the check and the commit use.
+///
+/// No repository, nothing delivered: when git cannot name a worktree the check does not
+/// run, and the commit fails on its own terms rather than through a refusal about
 /// generated state.
 ///
 /// # Errors
 ///
-/// [`ToolError::Failed`] carrying every generated path with the reason it exists and
-/// the remedy, when a commit would deliver one.
+/// [`ToolError::InvalidArgs`] when a commit retargets its repository, and
+/// [`ToolError::Failed`] carrying every generated path with the reason it exists and the
+/// remedy, when a commit would deliver one.
 fn refuse_generated_delivery(
     analysis: &ShellAnalysis,
+    syntax: ShellSyntax,
     cwd: &Path,
     env: &BTreeMap<String, String>,
 ) -> Result<(), ToolError> {
-    let Some(delivery) = commit_delivery(analysis) else {
+    let Some(delivery) = chain_delivery(analysis, syntax) else {
         return Ok(());
     };
+    if let Some(retarget) = &delivery.retarget {
+        let chosen = match retarget {
+            Retarget::Option => {
+                "a Git global option (`-C`, `--git-dir`, `--work-tree`, `--namespace`)".to_owned()
+            }
+            Retarget::Assignment(name) => format!("`{name}`"),
+        };
+        return Err(invalid(format!(
+            "this `git commit` selects its repository with {chosen}, which points it at a \
+             repository this call does not inspect, so the check for Zuno's own generated \
+             state would report on a different one; select the repository with the Shell \
+             workdir instead"
+        )));
+    }
     let Some(worktree) = git_reported_paths(cwd, env, &["rev-parse", "--show-toplevel"])?
         .and_then(|paths| paths.into_iter().next())
     else {
         return Ok(());
     };
-    let mut delivered = git_reported_paths(cwd, env, &["diff", "--cached", "--name-only", "-z"])?
-        .unwrap_or_default();
-    if delivery.stages_tracked_changes {
-        delivered.extend(
-            git_reported_paths(cwd, env, &["diff", "--name-only", "-z"])?.unwrap_or_default(),
-        );
+    // `diff.relative` is a configuration a repository may set, and with it on, `git diff`
+    // reports paths relative to the current directory and omits the ones above it: a
+    // session in a subdirectory would then be told that generated state at the worktree
+    // root is not part of the delivery.
+    let mut delivered = git_reported_paths(
+        cwd,
+        env,
+        &[
+            "-c",
+            "diff.relative=false",
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+        ],
+    )?
+    .unwrap_or_default();
+    if let Some(scope) = &delivery.staged.scope {
+        let pathspecs = scope.pathspecs();
+        if delivery.staged.tracked {
+            let mut arguments = vec![
+                "-c",
+                "diff.relative=false",
+                "diff",
+                "--name-only",
+                "-z",
+                "--",
+            ];
+            arguments.extend(pathspecs.iter().copied());
+            delivered.extend(git_reported_paths(cwd, env, &arguments)?.unwrap_or_default());
+        }
+        if delivery.staged.untracked {
+            // `--full-name` for the same reason `diff.relative=false` is set above: without
+            // it `ls-files` answers relative to the current directory, and a path above it
+            // comes back with `../` segments that name no worktree entry.
+            let mut arguments = vec![
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "--full-name",
+                "-z",
+                "--",
+            ];
+            arguments.extend(pathspecs.iter().copied());
+            delivered.extend(git_reported_paths(cwd, env, &arguments)?.unwrap_or_default());
+        }
     }
     zuno_paths::refuse_generated_state(&worktree, &delivered).map_err(|refusal| {
         failed(io::Error::new(
@@ -1723,40 +2349,12 @@ fn external_directories(
     directories
 }
 
-fn mutates_git_metadata(analysis: &ShellAnalysis) -> bool {
+fn mutates_git_metadata(analysis: &ShellAnalysis, syntax: ShellSyntax) -> bool {
     analysis.commands.iter().any(|resource| {
-        git_subcommand(&resource.tokens).is_some_and(|(subcommand, remaining)| {
+        git_subcommand(&resource.tokens, syntax).is_some_and(|(subcommand, remaining)| {
             !git_subcommand_is_read_only(&subcommand, remaining)
         })
     })
-}
-
-/// The subcommand of a `git` invocation, lowercased, and the arguments after it.
-///
-/// `None` when the command is not git or names no subcommand at all. Global options
-/// are skipped the way git parses them: the five that take a separate value consume
-/// the token after them, and any other dashed token stands alone.
-fn git_subcommand(tokens: &[String]) -> Option<(String, &[String])> {
-    if !unquote(tokens.first()?).eq_ignore_ascii_case("git") {
-        return None;
-    }
-    let mut index = 1;
-    while let Some(argument) = tokens.get(index) {
-        let argument = unquote(argument);
-        if matches!(
-            argument.as_str(),
-            "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace"
-        ) {
-            index = index.saturating_add(2);
-            continue;
-        }
-        if argument.starts_with('-') {
-            index = index.saturating_add(1);
-            continue;
-        }
-        return Some((argument.to_ascii_lowercase(), &tokens[index + 1..]));
-    }
-    None
 }
 
 fn git_subcommand_is_read_only(subcommand: &str, arguments: &[String]) -> bool {
@@ -1926,11 +2524,22 @@ mod tests {
     }
 
     fn mutates(command: &str) -> bool {
-        mutates_git_metadata(&analyze_command(command, ShellSyntax::Bash).expect("analysis"))
+        mutates_git_metadata(
+            &analyze_command(command, ShellSyntax::Bash).expect("analysis"),
+            ShellSyntax::Bash,
+        )
     }
 
-    fn delivery(command: &str) -> Option<CommitDelivery> {
-        commit_delivery(&analyze_command(command, ShellSyntax::Bash).expect("analysis"))
+    fn delivery(command: &str) -> Option<ChainDelivery> {
+        delivery_in(command, ShellSyntax::Bash)
+    }
+
+    fn delivery_in(command: &str, syntax: ShellSyntax) -> Option<ChainDelivery> {
+        chain_delivery(&analyze_command(command, syntax).expect("analysis"), syntax)
+    }
+
+    fn staged(command: &str) -> StagedWork {
+        delivery(command).expect("a commit").staged
     }
 
     #[test]
@@ -1950,15 +2559,20 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_that_stages_as_it_commits_is_recognised_in_every_spelling() {
+    fn a_commit_that_stages_as_it_commits_reaches_every_tracked_change() {
         for command in [
             "git commit -a -m done",
             "git commit -am done",
             "git commit --all -m done",
             "git commit -qam done",
         ] {
-            assert!(
-                delivery(command).expect("a commit").stages_tracked_changes,
+            assert_eq!(
+                staged(command),
+                StagedWork {
+                    tracked: true,
+                    untracked: false,
+                    scope: Some(StagedScope::Worktree),
+                },
                 "{command}"
             );
         }
@@ -1976,8 +2590,163 @@ mod tests {
             "git commit --file -a",
             "git commit -m done -- -a",
         ] {
+            assert_eq!(staged(command), StagedWork::default(), "{command}");
+        }
+    }
+
+    /// The index a commit delivers is the index after the `git add` in front of it, and
+    /// the check runs before either. Reading only the index said `git add -A && git
+    /// commit -m wip` delivered nothing, which is the shape a model writes most.
+    #[test]
+    fn what_a_chain_stages_before_it_commits_is_part_of_the_delivery() {
+        assert_eq!(
+            staged("git add -A && git commit -m wip"),
+            StagedWork {
+                tracked: true,
+                untracked: true,
+                scope: Some(StagedScope::Worktree),
+            }
+        );
+        assert_eq!(
+            staged("git add -u && git commit -m wip"),
+            StagedWork {
+                tracked: true,
+                untracked: false,
+                scope: Some(StagedScope::Worktree),
+            }
+        );
+        assert_eq!(
+            staged("git stage src/lib.rs; git commit -m wip"),
+            StagedWork {
+                tracked: true,
+                untracked: true,
+                scope: Some(StagedScope::Paths(vec!["src/lib.rs".to_owned()])),
+            }
+        );
+    }
+
+    /// A pathspec that reaches everything is not a path. `.` and git's magic forms
+    /// widen the read instead of being compared as text, because a lexical guess at
+    /// git's pathspec language reports on paths the command never touched.
+    #[test]
+    fn a_pathspec_that_reaches_everything_widens_the_read_to_the_worktree() {
+        for command in [
+            "git add . && git commit -m wip",
+            "git add ./ && git commit -m wip",
+            "git add :/ && git commit -m wip",
+            "git add ':(glob)**/*.md' && git commit -m wip",
+            "git add '*.md' && git commit -m wip",
+            "git add --pathspec-from-file=list && git commit -m wip",
+        ] {
+            assert_eq!(
+                staged(command).scope,
+                Some(StagedScope::Worktree),
+                "{command}"
+            );
+        }
+    }
+
+    /// A `git add` after the last commit stages for the next call, not for this one.
+    /// Absorbing it would refuse a commit of source over a file nobody delivered yet.
+    #[test]
+    fn staging_after_the_last_commit_is_not_part_of_the_delivery() {
+        assert_eq!(
+            staged("git commit -m done && git add -A"),
+            StagedWork::default()
+        );
+        assert_eq!(
+            staged("git add src/lib.rs && git commit -m first && git add -A"),
+            StagedWork {
+                tracked: true,
+                untracked: true,
+                scope: Some(StagedScope::Paths(vec!["src/lib.rs".to_owned()])),
+            }
+        );
+    }
+
+    /// `git add` needs a pathspec or `-A`/`-u`; without one git stages nothing, so
+    /// widening the read to the worktree would be a refusal about a command that did
+    /// not run.
+    #[test]
+    fn a_git_add_that_names_nothing_stages_nothing() {
+        assert_eq!(
+            staged("git add --dry-run && git commit -m done"),
+            StagedWork::default()
+        );
+    }
+
+    /// A check keyed on the program spelled `git` is a check a model steps around by
+    /// accident. An absolute path is what a script writes, `.exe` is what Windows
+    /// resolves to, and a backslash is how that path is spelled there.
+    #[test]
+    fn a_commit_is_a_delivery_however_the_program_is_spelled() {
+        for command in [
+            "/usr/bin/git commit -m done",
+            "GIT commit -m done",
+            "git.exe commit -m done",
+            "/usr/local/bin/git.exe commit -m done",
+        ] {
+            assert!(delivery(command).is_some(), "{command}");
+        }
+        for command in [
+            r"C:\Program\git.exe commit -m done",
+            r"C:\Program\GIT.EXE commit -m done",
+        ] {
             assert!(
-                !delivery(command).expect("a commit").stages_tracked_changes,
+                delivery_in(command, ShellSyntax::PowerShell).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    /// The first commit is not the delivery. Reading only it said the index was
+    /// everything, while the `-a` that follows delivers the whole worktree.
+    #[test]
+    fn every_commit_in_a_chain_is_read_not_only_the_first() {
+        assert_eq!(
+            staged("git commit -m first && git commit -am second"),
+            StagedWork {
+                tracked: true,
+                untracked: false,
+                scope: Some(StagedScope::Worktree),
+            }
+        );
+    }
+
+    #[test]
+    fn a_commit_that_selects_its_own_repository_is_recognised_as_one() {
+        for command in [
+            "git -C other commit -m done",
+            "git --git-dir=/elsewhere/.git commit -m done",
+            "git --work-tree /elsewhere commit -m done",
+            "git --namespace=zuno commit -m done",
+        ] {
+            assert_eq!(
+                delivery(command).expect("a commit").retarget,
+                Some(Retarget::Option),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            delivery("GIT_DIR=/elsewhere/.git git commit -m done")
+                .expect("a commit")
+                .retarget,
+            Some(Retarget::Assignment("GIT_DIR".to_owned()))
+        );
+    }
+
+    /// `NAME=value` is an assignment only in front of the program. Reading it anywhere
+    /// would refuse an ordinary commit for what its message says.
+    #[test]
+    fn a_repository_variable_in_a_commit_message_is_prose() {
+        for command in [
+            "git commit -m GIT_DIR=/elsewhere",
+            "git commit -m 'set GIT_WORK_TREE=. first'",
+            "git commit -m done",
+        ] {
+            assert_eq!(
+                delivery(command).expect("a commit").retarget,
+                None,
                 "{command}"
             );
         }
@@ -2408,5 +3177,506 @@ mod tests {
                 Some(crate::read::digest_bytes(output.as_bytes()))
             );
         }
+    }
+
+    /// A sandbox that exists only to satisfy the constructor.
+    ///
+    /// Assembling a cancelled result never spawns anything: it reads a settled
+    /// execution record and the bytes that were captured. A backend that refuses
+    /// `prepare` therefore keeps the test honest — reaching it would mean the
+    /// assembly path had started a command.
+    #[derive(Debug)]
+    struct NeverSpawningSandbox(zuno_sandbox::SandboxCapabilities);
+
+    impl NeverSpawningSandbox {
+        fn new() -> Self {
+            Self(zuno_sandbox::SandboxCapabilities {
+                backend: "test_never_spawning".to_owned(),
+                executable: None,
+                read_only: true,
+                workspace_write: true,
+                danger_full_access: true,
+                network_isolation: true,
+            })
+        }
+    }
+
+    impl SandboxBackend for NeverSpawningSandbox {
+        fn capabilities(&self) -> &zuno_sandbox::SandboxCapabilities {
+            &self.0
+        }
+
+        fn prepare(
+            &self,
+            _request: PrepareRequest,
+        ) -> Result<zuno_sandbox::PreparedCommand, zuno_sandbox::SandboxError> {
+            unreachable!("assembling a cancelled result must not launch a command")
+        }
+    }
+
+    fn assembly_tool(workspace: &Path) -> ShellTool {
+        let policy = SandboxPolicy::new(
+            workspace,
+            SandboxMode::WorkspaceWrite,
+            NetworkAccess::Allowed,
+        )
+        .expect("test sandbox policy");
+        ShellTool::with_sandbox_backend(
+            workspace,
+            None,
+            Arc::new(NeverSpawningSandbox::new()),
+            policy,
+        )
+        .expect("shell tool")
+    }
+
+    fn test_authority(workspace: &Path) -> ExecutionAuthority {
+        ExecutionAuthority {
+            schema_version: 3,
+            backend: "test_never_spawning".to_owned(),
+            backend_executable: None,
+            workspace: workspace.to_owned(),
+            mode: SandboxMode::WorkspaceWrite,
+            network: NetworkAccess::Allowed,
+            requested_mode: None,
+            requested_network: None,
+            resolution_kind: SandboxResolutionKind::ExplicitNative,
+            fallback_reason: None,
+            writable_roots: vec![workspace.to_owned()],
+            protected_paths: Vec::new(),
+            cwd: workspace.to_owned(),
+            command_sha256: String::new(),
+            environment_keys: Vec::new(),
+            approval_mode: "never".to_owned(),
+            reviewer_policy_sha256: String::new(),
+        }
+    }
+
+    /// A settled execution record, as the terminal wait in the interrupt arm returns one.
+    fn settled_execution(
+        workspace: &Path,
+        status: BackgroundExecutionStatus,
+        exit_code: Option<i32>,
+    ) -> BackgroundExecutionInfo {
+        BackgroundExecutionInfo {
+            id: zuno_pty::BackgroundExecutionId::parse(format!("bg_{}", "a".repeat(32)))
+                .expect("a well-formed execution id"),
+            session_id: "ses_cancel".to_owned(),
+            title: "cargo test --workspace".to_owned(),
+            command: "cargo test --workspace".to_owned(),
+            purpose: BackgroundExecutionPurpose::Command,
+            cwd: workspace.to_owned(),
+            status,
+            pid: None,
+            exit_code,
+            timed_out: false,
+            time_created: 0,
+            time_updated: 0,
+            time_completed: Some(0),
+            error: None,
+            output_file: workspace.join("execution.output"),
+            status_file: workspace.join("execution.status"),
+            authority: test_authority(workspace),
+        }
+    }
+
+    fn cancellation_facts(output: &ToolOutput) -> &Value {
+        output
+            .metadata
+            .get(METADATA_CANCELLATION_KEY)
+            .expect("a cancelled result states what it proved")
+    }
+
+    /// Cancelling a command keeps what it wrote, and says the outcome is undecided.
+    ///
+    /// The bytes and the exit information used to be discarded on the way out, leaving
+    /// the model an "interrupted" error for a command that had already written output
+    /// and may have been killed mid-write.
+    #[test]
+    fn a_killed_command_keeps_its_output_and_reports_an_undecided_outcome() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let tool = assembly_tool(workspace.path());
+        let verification = ShellVerification {
+            command: "cargo test --workspace".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let execution =
+            settled_execution(workspace.path(), BackgroundExecutionStatus::Cancelled, None);
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                b"running 3 tests\ntest one ... ok\n".to_vec(),
+                "ses_cancel",
+                false,
+            )
+            .expect("a cancelled command is a settled result, not a failure");
+
+        assert!(
+            output.output.contains("running 3 tests\ntest one ... ok\n"),
+            "every captured byte has to survive cancellation: {}",
+            output.output
+        );
+        assert!(
+            output.output.contains("Inspect the authoritative state"),
+            "an undecided outcome must ask for state inspection: {}",
+            output.output
+        );
+        let facts = cancellation_facts(&output);
+        assert_eq!(facts["cancelled"], true);
+        assert_eq!(facts["uncertain"], true);
+        assert_eq!(facts["authoritative"], false);
+        assert_eq!(facts["status"], "cancelled");
+        assert!(facts.get("exitCode").is_none());
+        assert_eq!(output.metadata["exit"], Value::Null);
+
+        // The receipt is the part a later success claim is checked against, so a killed
+        // command must not leave one that could be cited.
+        let receipt = VerificationReceipt::from_metadata(&output.metadata)
+            .expect("decodable receipt")
+            .expect("a cancelled result carries a receipt");
+        assert_eq!(receipt.outcome, ReceiptOutcome::Unknown);
+        assert_eq!(receipt.exit_authority, ExitAuthority::Absent);
+        assert_eq!(receipt.exit_code, None);
+        assert!(!receipt.proves_success());
+        assert!(
+            receipt
+                .detail
+                .is_some_and(|detail| detail.contains("still running")),
+            "the receipt has to say why nothing was decided"
+        );
+    }
+
+    /// A command that had already exited keeps its own verdict.
+    ///
+    /// The kill lands on a process that is already gone, so nothing about the command
+    /// changed: the exit status is authoritative and the call is `cancelled` without
+    /// being `uncertain`. Reporting it as undecided would send the model to inspect
+    /// state that the command itself already reported on.
+    #[test]
+    fn a_command_that_exited_before_the_kill_landed_reports_its_own_exit_status() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let tool = assembly_tool(workspace.path());
+        let verification = ShellVerification {
+            command: "cargo test --workspace".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: Some("c".repeat(40)),
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let execution = settled_execution(
+            workspace.path(),
+            BackgroundExecutionStatus::Completed,
+            Some(101),
+        );
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                b"test result: FAILED. 2 passed; 1 failed\n".to_vec(),
+                "ses_cancel",
+                false,
+            )
+            .expect("an exited command is a settled result");
+
+        assert!(
+            output
+                .output
+                .contains("test result: FAILED. 2 passed; 1 failed")
+        );
+        assert!(
+            output.output.contains("already exited with status 101"),
+            "{}",
+            output.output
+        );
+        assert!(
+            !output.output.contains("Inspect the authoritative state"),
+            "a decided outcome must not send the model looking for state: {}",
+            output.output
+        );
+        let facts = cancellation_facts(&output);
+        assert_eq!(facts["cancelled"], true);
+        assert_eq!(facts["uncertain"], false);
+        assert_eq!(facts["authoritative"], true);
+        assert_eq!(facts["exitCode"], 101);
+        assert_eq!(output.metadata["exit"], 101);
+
+        let receipt = VerificationReceipt::from_metadata(&output.metadata)
+            .expect("decodable receipt")
+            .expect("a cancelled result carries a receipt");
+        assert_eq!(receipt.outcome, ReceiptOutcome::Failed);
+        assert_eq!(receipt.exit_code, Some(101));
+        assert_eq!(receipt.exit_authority, ExitAuthority::Authoritative);
+        assert_eq!(receipt.git_head, verification.git_head);
+    }
+
+    /// A guard failure is undecided even though an exit code exists.
+    ///
+    /// `exit 125` with the guard's own diagnostic says the supervisor broke, so it
+    /// decides nothing about whether the command ran. Cancellation must read it the way
+    /// a completed run does rather than promote it to an authoritative verdict just
+    /// because a number arrived.
+    #[test]
+    fn a_guard_failure_during_cancellation_is_still_an_undecided_outcome() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let tool = assembly_tool(workspace.path());
+        let verification = ShellVerification {
+            command: "cargo publish -p zuno".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let execution = settled_execution(
+            workspace.path(),
+            BackgroundExecutionStatus::Completed,
+            Some(125),
+        );
+        let captured = format!(
+            "{}pidfd_open: Permission denied\n",
+            zuno_process::GUARD_DIAGNOSTIC_PREFIX
+        );
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                captured.into_bytes(),
+                "ses_cancel",
+                false,
+            )
+            .expect("a guard failure is a settled result too");
+
+        let facts = cancellation_facts(&output);
+        assert_eq!(facts["uncertain"], true);
+        assert_eq!(facts["authoritative"], false);
+        assert_eq!(
+            facts["exitCode"], 125,
+            "the code is still recorded, it just proves nothing"
+        );
+        assert!(output.output.contains("Inspect the authoritative state"));
+        // The notice and the metadata are read together, so the notice must not deny a
+        // code the metadata reports. It says which claim the code cannot support.
+        assert!(
+            output
+                .output
+                .contains("that code is the child-process guard's own failure"),
+            "an undecided outcome that has a code has to say what the code fails to \
+             prove: {}",
+            output.output
+        );
+        assert!(
+            !output.output.contains("was still running and was killed"),
+            "the guard failed; the command was not observed being killed: {}",
+            output.output
+        );
+    }
+
+    /// A capture failure around a cancelled command is not the command's verdict.
+    ///
+    /// The background service reports the code a process had already given and then
+    /// settles the execution as `failed` when the output it captured was incomplete. An
+    /// ordinary completed run refuses to return that as a result at all, so cancellation
+    /// must not promote it to an authoritative `exit 0` with a receipt a later success
+    /// claim could cite.
+    #[test]
+    fn a_cancelled_command_whose_output_capture_broke_is_not_certified() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let tool = assembly_tool(workspace.path());
+        let verification = ShellVerification {
+            command: "cargo build --release".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let mut execution =
+            settled_execution(workspace.path(), BackgroundExecutionStatus::Failed, Some(0));
+        execution.error = Some("capturing command output failed: broken pipe".to_owned());
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                b"Compiling zuno v0.6.6\n".to_vec(),
+                "ses_cancel",
+                false,
+            )
+            .expect("a settled result, damaged capture and all");
+
+        let facts = cancellation_facts(&output);
+        assert_eq!(facts["uncertain"], true);
+        assert_eq!(facts["authoritative"], false);
+        assert_eq!(facts["exitCode"], 0);
+        assert!(
+            output.output.contains("capturing command output failed"),
+            "the reason the code cannot be cited belongs in the result: {}",
+            output.output
+        );
+        let receipt = VerificationReceipt::from_metadata(&output.metadata)
+            .expect("decodable receipt")
+            .expect("a cancelled result carries a receipt");
+        assert!(
+            !receipt.proves_success(),
+            "an exit 0 the service refused to settle must not prove success"
+        );
+        assert_eq!(receipt.exit_code, None);
+        assert_eq!(receipt.exit_authority, ExitAuthority::Absent);
+    }
+
+    /// A hard-ceiling kill during cancellation says which deadline ended the command.
+    #[test]
+    fn a_cancelled_command_killed_at_its_hard_ceiling_says_so() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let tool = assembly_tool(workspace.path());
+        let verification = ShellVerification {
+            command: "sleep 900".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let mut execution =
+            settled_execution(workspace.path(), BackgroundExecutionStatus::Failed, None);
+        execution.timed_out = true;
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                Vec::new(),
+                "ses_cancel",
+                false,
+            )
+            .expect("settled");
+
+        assert_eq!(cancellation_facts(&output)["uncertain"], true);
+        assert!(
+            output.output.contains("hard ceiling"),
+            "the deadline that ended the command is part of what it decided: {}",
+            output.output
+        );
+    }
+
+    /// Oversized cancelled output is withheld, exactly as a completed run's is.
+    ///
+    /// Cancellation is not a second truncation path: the bytes are persisted whole and
+    /// the model is handed the notice that names the windowed read, with the
+    /// cancellation statement still in front of it.
+    #[test]
+    fn oversized_cancelled_output_is_withheld_rather_than_truncated() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let store_dir = tempfile::tempdir().expect("store dir");
+        let store = ToolOutputStore::new(store_dir.path());
+        let tool = assembly_tool(workspace.path())
+            .with_output_store(store.clone())
+            .with_output_limits(OutputLimits {
+                max_lines: 1,
+                max_bytes: 4,
+            });
+        let verification = ShellVerification {
+            command: "cargo test --workspace".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let execution =
+            settled_execution(workspace.path(), BackgroundExecutionStatus::Cancelled, None);
+        let captured = b"one\ntwo\n";
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                captured.to_vec(),
+                "ses_cancel",
+                false,
+            )
+            .expect("oversized output is an outcome, not a failure");
+
+        assert_eq!(output.metadata["oversized"], true);
+        assert!(
+            output.output.contains("Tool output withheld"),
+            "{}",
+            output.output
+        );
+        assert!(
+            output.output.starts_with("Cancelled by the user."),
+            "withholding must not swallow the cancellation statement: {}",
+            output.output
+        );
+        assert!(
+            !output.output.contains("one\ntwo\n"),
+            "withheld output is not inlined: {}",
+            output.output
+        );
+        assert_eq!(cancellation_facts(&output)["uncertain"], true);
+
+        let paths = output.output_paths();
+        let path = paths.first().expect("the artifact holding every byte");
+        let window = store
+            .read_window("shell", "ses_cancel", Path::new(path), 0, 4_096)
+            .expect("stored cancelled output");
+        assert_eq!(
+            window.bytes, captured,
+            "cancellation persists the bytes byte for byte"
+        );
+    }
+
+    /// A cancelled command that wrote nothing says so instead of returning empty text.
+    #[test]
+    fn a_cancelled_command_with_no_output_still_returns_a_readable_result() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let tool = assembly_tool(workspace.path());
+        let verification = ShellVerification {
+            command: "sleep 30".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let execution =
+            settled_execution(workspace.path(), BackgroundExecutionStatus::Cancelled, None);
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                Vec::new(),
+                "ses_cancel",
+                false,
+            )
+            .expect("settled");
+
+        assert!(output.output.ends_with("(no output)"), "{}", output.output);
+        assert_eq!(cancellation_facts(&output)["uncertain"], true);
+    }
+
+    /// The metadata key is a cross-crate contract, so its spelling is pinned here.
+    ///
+    /// `zuno-engine` reads `uncertain` out of this object to decide whether a
+    /// cooperative interruption needs authoritative inspection, and it cannot import
+    /// the constant: dispatch is the layer this crate's tools are handed to. Renaming
+    /// the key silently would leave the dispatcher reading a key nothing writes.
+    #[test]
+    fn the_cancellation_metadata_key_is_the_one_the_dispatcher_reads() {
+        assert_eq!(METADATA_CANCELLATION_KEY, "cancellation");
+        let facts = CancelledExecution::killed(
+            BackgroundExecutionStatus::Cancelled,
+            None,
+            "killed".to_owned(),
+        );
+        let value = facts.to_metadata_value();
+        assert_eq!(value["uncertain"], true);
+        assert_eq!(value["cancelled"], true);
+        assert_eq!(value["authoritative"], false);
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(value["detail"], "killed");
     }
 }

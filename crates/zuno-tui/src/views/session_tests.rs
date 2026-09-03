@@ -2865,6 +2865,7 @@ fn session_screen_suppresses_late_provider_and_tool_events_after_cancellation_is
         title: String::from("Inspect repository"),
         output: String::from("child supervisor settled"),
         interruption: zuno_engine::r#loop::ToolInterruption::Cooperative,
+        uncertain: false,
     }));
 
     let stopping = rows(&render_offscreen(&mut screen, 100, 24).expect("infallible")).join("\n");

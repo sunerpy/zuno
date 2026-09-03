@@ -30,19 +30,26 @@ pub use version::{BUILD_ID, RUST_PACKAGE_VERSION, long_version, user_agent, vers
 
 use std::ffi::OsString;
 use std::io::Write as _;
-use std::process::{ExitCode, Stdio};
+use std::process::ExitCode;
 
 use clap::{CommandFactory as _, Parser as _, error::ErrorKind};
 use zuno_observability::LogConfig;
 use zuno_paths::Env;
 
+/// Set in the replacement image so the Unix bootstrap restart happens exactly once.
+#[cfg(unix)]
 const BOOTSTRAP_MARKER: &str = "ZUNO_RUST_CLI_BOOTSTRAPPED";
 
 /// Runs the process boundary with the default command dispatcher.
 ///
-/// Startup uses one child process because Rust 2024 correctly makes global
-/// environment mutation unsafe. `Command::env` is safe and gives command-owned
-/// code the real `AGENT`, `ZUNO`, PID, and logging values it expects.
+/// Rust 2024 correctly makes global environment mutation unsafe and this workspace
+/// forbids unsafe code, so startup resolves the environment into a
+/// [`StartupEnvironment`] value that command-owned code reads instead of writing
+/// `AGENT`, `ZUNO`, PID, and logging values back into the process. Unix
+/// additionally replaces this image once so its command process owns those
+/// variables for real and every process it launches inherits them;
+/// [`bootstrap_restart`] records why no other platform buys that with a second
+/// process.
 #[must_use]
 pub fn run_process() -> ExitCode {
     // The guard work `main` did before calling in is already behind us, so the
@@ -86,11 +93,8 @@ pub fn run_process() -> ExitCode {
         Action::Version { .. } => None,
     };
 
-    if std::env::var_os(BOOTSTRAP_MARKER).is_none()
-        && let Some(environment) = environment
-    {
-        profile.emit(startup::StartupPhase::BootstrapRestart);
-        return restart_with_environment(&args, environment);
+    if let Some(code) = bootstrap_restart(&mut profile, &args, environment) {
+        return code;
     }
 
     let _logging = match init_logging(&action) {
@@ -151,7 +155,56 @@ pub fn run_process() -> ExitCode {
 
 const WATCHDOG_DISPATCH_PHASE: &str = "cli.dispatch";
 
+/// Hands the command process its bootstrap environment, where that is free.
+///
+/// Unix only, and deliberately so. `exec` *replaces* this image: one process, one
+/// pid, and the handle a supervisor holds still names the process doing the work.
+/// `Command::status` is the only thing a platform without `exec` could use, and it
+/// is not the same thing at all — it starts a second process and leaves this one a
+/// waiter holding the inherited stdio write ends. `Child::kill` is
+/// `TerminateProcess` on Windows and ended only that waiter, so the command process
+/// kept running, kept the pipes open, and a supervisor's `wait_with_output` never
+/// reached end of file; an editor, an ACP client, or a test runner leaked one
+/// `zuno.exe` per invocation. Platforms without `exec` therefore dispatch in the
+/// process that parsed the arguments and read the same values from
+/// [`StartupEnvironment`], which already carries every override.
+///
+/// Routing the restart through `zuno_process::guarded_argv` is not an alternative:
+/// its Windows guard arms a Windows PowerShell parent watcher, and PowerShell is a
+/// backend dependency of that guard, not of starting `zuno`.
+#[cfg(unix)]
+fn bootstrap_restart(
+    profile: &mut startup::StartupProfile,
+    args: &[OsString],
+    environment: Option<&StartupEnvironment>,
+) -> Option<ExitCode> {
+    let environment = environment?;
+    if std::env::var_os(BOOTSTRAP_MARKER).is_some() {
+        return None;
+    }
+    profile.emit(startup::StartupPhase::BootstrapRestart);
+    Some(restart_with_environment(args, environment))
+}
+
+/// Dispatch happens in this process; the Unix arm records why.
+#[cfg(not(unix))]
+fn bootstrap_restart(
+    _profile: &mut startup::StartupProfile,
+    _args: &[OsString],
+    _environment: Option<&StartupEnvironment>,
+) -> Option<ExitCode> {
+    None
+}
+
+/// Replaces this image with one that owns the resolved bootstrap environment.
+///
+/// Returns only on failure: a successful `exec` continues in [`run_process`] with
+/// the marker set. Stdio is inherited by default and `exec` keeps the descriptors,
+/// so a supervisor's pipes stay attached to the same pid.
+#[cfg(unix)]
 fn restart_with_environment(args: &[OsString], environment: &StartupEnvironment) -> ExitCode {
+    use std::os::unix::process::CommandExt as _;
+
     let executable = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
@@ -163,28 +216,11 @@ fn restart_with_environment(args: &[OsString], environment: &StartupEnvironment)
     command
         .args(args.iter().skip(1))
         .env(BOOTSTRAP_MARKER, "1")
-        .envs(environment.overrides())
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .envs(environment.overrides());
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-
-        let error = command.exec();
-        eprintln!("failed to replace zuno with its command process: {error}");
-        ExitCode::FAILURE
-    }
-
-    #[cfg(not(unix))]
-    match command.status() {
-        Ok(status) => exit_code(status.code().unwrap_or(1)),
-        Err(error) => {
-            eprintln!("failed to start zuno command process: {error}");
-            ExitCode::FAILURE
-        }
-    }
+    let error = command.exec();
+    eprintln!("failed to replace zuno with its command process: {error}");
+    ExitCode::FAILURE
 }
 
 fn init_logging(

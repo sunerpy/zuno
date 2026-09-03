@@ -10,6 +10,7 @@
 use crate::Config;
 use crate::instructions::{DEFAULT_GLOBAL_INSTRUCTIONS, GLOBAL_INSTRUCTION_FILENAME};
 use crate::schema::JsonMap;
+use crate::schema::permission::permission_key;
 use crate::schema::sandbox::{SandboxMode, SandboxNetworkMode, SandboxUnavailableAction};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -158,7 +159,10 @@ impl DiscoveryOptions {
         self
     }
 
-    /// Override the fallback username used when config does not set one.
+    /// Override the account name used to locate macOS managed preferences.
+    ///
+    /// Only the per-user `/Library/Managed Preferences/<user>` lookup reads it;
+    /// no config key carries it.
     #[must_use]
     pub fn with_default_username(mut self, username: impl Into<String>) -> Self {
         self.default_username = username.into();
@@ -197,11 +201,19 @@ pub fn discover(directory: &Path, worktree: Option<&Path>) -> Result<Config, Con
 pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> {
     ensure_default_global_files(options)?;
     let mut result = RawJson::empty_object();
+    // Every project-layer host-command declaration, settled after the last layer
+    // merges so a trusted layer of any precedence can admit it.
+    let mut host_commands: Vec<HostCommandDeclaration> = Vec::new();
 
     // Each file is one layer, so list-like values retain their per-layer merge
     // semantics between JSON and JSONC too.
     for path in Layout::file_in_directory(options.layout.config(), CONFIG_FILE_STEM) {
-        merge_file(&mut result, &path, SandboxLayerAuthority::Trusted)?;
+        merge_file(
+            &mut result,
+            &path,
+            SandboxLayerAuthority::Trusted,
+            &mut host_commands,
+        )?;
     }
 
     // config.ts:401-404.
@@ -210,13 +222,19 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
             &mut result,
             &resolve_from(&options.directory, path),
             SandboxLayerAuthority::Trusted,
+            &mut host_commands,
         )?;
     }
 
     // config.ts:406-410 and ConfigPaths.files: ancestors first, nearest last.
     if !options.layout.project_config_disabled() {
         for path in Layout::config_files(CONFIG_FILE_STEM, &options.directory, options.worktree()) {
-            merge_file(&mut result, &path, SandboxLayerAuthority::Project)?;
+            merge_file(
+                &mut result,
+                &path,
+                SandboxLayerAuthority::Project,
+                &mut host_commands,
+            )?;
         }
     }
 
@@ -227,7 +245,7 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
     {
         let authority = config_directory_authority(options, &directory);
         for path in Layout::file_in_directory(&directory, CONFIG_FILE_STEM) {
-            merge_file(&mut result, &path, authority)?;
+            merge_file(&mut result, &path, authority, &mut host_commands)?;
         }
     }
     result.insert_if_absent("command", RawJson::empty_object());
@@ -238,6 +256,7 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
             Path::new(ZUNO_CONFIG_CONTENT),
             text,
             SandboxLayerAuthority::Trusted,
+            &mut host_commands,
         )?;
         merge_config(&mut result, layer);
     }
@@ -267,7 +286,12 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
     // config.ts:516-522.
     if options.managed_config_dir.exists() {
         for path in Layout::file_in_directory(&options.managed_config_dir, CONFIG_FILE_STEM) {
-            merge_file(&mut result, &path, SandboxLayerAuthority::Trusted)?;
+            merge_file(
+                &mut result,
+                &path,
+                SandboxLayerAuthority::Trusted,
+                &mut host_commands,
+            )?;
         }
     }
 
@@ -278,6 +302,7 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
             preferences.source(),
             preferences.text(),
             SandboxLayerAuthority::Trusted,
+            &mut host_commands,
         )?;
         merge_config(&mut result, layer);
     }
@@ -292,9 +317,10 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
     }
 
     apply_tools_permissions(&mut result);
-    apply_username(&mut result, &options.default_username);
     apply_compaction_flags(&mut result, &options.env);
-    config_from_raw(Path::new(MERGED_CONFIG_SOURCE), &result)
+    let config = config_from_raw(Path::new(MERGED_CONFIG_SOURCE), &result)?;
+    settle_host_command_trust(&config, &host_commands)?;
+    Ok(config)
 }
 
 /// Merge already-validated config layers with the same semantics discovery uses.
@@ -404,6 +430,7 @@ fn merge_file(
     result: &mut RawJson,
     path: &Path,
     authority: SandboxLayerAuthority,
+    host_commands: &mut Vec<HostCommandDeclaration>,
 ) -> Result<(), ConfigError> {
     if !path.exists() {
         return Ok(());
@@ -412,7 +439,7 @@ fn merge_file(
         path: path.to_path_buf(),
         source,
     })?;
-    let layer = parse_layer(path, &text, authority)?;
+    let layer = parse_layer(path, &text, authority, host_commands)?;
     merge_config(result, layer);
     Ok(())
 }
@@ -421,13 +448,14 @@ fn parse_layer(
     path: &Path,
     text: &str,
     authority: SandboxLayerAuthority,
+    host_commands: &mut Vec<HostCommandDeclaration>,
 ) -> Result<RawJson, ConfigError> {
     // Todo 9's variable substitution seam is immediately before this byte-stable
     // JSONC pass. Discovery itself deliberately does not interpret {env:...} or
     // {file:...} tokens.
     let strict = strip_jsonc(text);
     let config = Config::from_json_str(path, &strict)?;
-    validate_layer_authority(path, &config, authority)?;
+    validate_layer_authority(path, &config, authority, host_commands)?;
     raw_from_config(path, &config)
 }
 
@@ -435,15 +463,37 @@ fn validate_layer_authority(
     path: &Path,
     config: &Config,
     authority: SandboxLayerAuthority,
+    declared: &mut Vec<HostCommandDeclaration>,
 ) -> Result<(), ConfigError> {
     if authority == SandboxLayerAuthority::Trusted {
         return Ok(());
     }
 
+    // Trust is a decision about a checkout, so the checkout cannot take part in it.
+    // Refusing the key outright here is what makes any `trust` value that survives
+    // the merge provably the work of a trusted layer.
+    if config.trust.is_some() {
+        return Err(ConfigError::Invalid {
+            path: path.to_path_buf(),
+            issues: vec![ConfigIssue::new(
+                ["trust"],
+                "a project config layer cannot grant itself trust; move this section to a trusted global, managed, or environment layer",
+            )],
+        });
+    }
+
     // A project layer that names an executable asks this machine to run something
-    // the checkout controls, with this user's authority. This batch reports each
-    // declaration as a warning so an operator can review the checkout; the explicit
-    // trust decision and the rejection path belong to the next release.
+    // the checkout controls, with this user's authority. Each declaration is
+    // collected and settled against `trust.project_host_commands` once every layer
+    // has merged, because the trusted layer that grants the trust may still be
+    // ahead of this one in precedence order.
+    //
+    // The entry's own on/off switch is deliberately not consulted. `enabled` and
+    // `disabled` live in the same untrusted layer as the command and can be flipped
+    // by any later layer without restating the command, so an off switch is not
+    // evidence that the program will not run. Refusing every declaration also means
+    // one rule covers all five sections instead of each section tolerating a
+    // different shape of dormant executable.
     let mut host_commands: Vec<ConfigIssue> = Vec::new();
     if config.shell.is_some() {
         host_commands.push(ConfigIssue::new(
@@ -463,7 +513,7 @@ fn validate_layer_authority(
     }
     if let Some(crate::schema::lsp::LspConfig::Servers(servers)) = &config.lsp {
         for (id, entry) in servers.iter() {
-            if entry.command.is_some() && entry.disabled != Some(true) {
+            if entry.command.is_some() {
                 host_commands.push(ConfigIssue::new(
                     ["lsp", id, "command"],
                     "declares an LSP server command",
@@ -475,7 +525,7 @@ fn validate_layer_authority(
         &config.formatter
     {
         for (name, entry) in formatters.iter() {
-            if entry.command.is_some() && entry.disabled != Some(true) {
+            if entry.command.is_some() {
                 host_commands.push(ConfigIssue::new(
                     ["formatter", name, "command"],
                     "declares a formatter command",
@@ -493,14 +543,14 @@ fn validate_layer_authority(
             }
         }
     }
-    for issue in &host_commands {
-        tracing::warn!(
-            path = %path.display(),
-            key = %issue.key_path.join("."),
-            "project config {}; it runs on this machine with this user's authority, so review the checkout before trusting it",
-            issue.detail
-        );
-    }
+    declared.extend(
+        host_commands
+            .into_iter()
+            .map(|issue| HostCommandDeclaration {
+                source: path.to_path_buf(),
+                issue,
+            }),
+    );
 
     let Some(sandbox) = &config.sandbox else {
         return Ok(());
@@ -545,6 +595,67 @@ fn validate_layer_authority(
             issues,
         })
     }
+}
+
+/// One project-layer entry that would have this host run a command.
+#[derive(Debug, Clone)]
+struct HostCommandDeclaration {
+    /// The project config file that declared it.
+    source: PathBuf,
+    /// Which key it was, and what running it means.
+    issue: ConfigIssue,
+}
+
+/// Refuse project-layer host commands that no trusted layer admitted.
+///
+/// `config.trust` can only have come from a trusted layer, because
+/// [`validate_layer_authority`] refuses a project layer that carries the section
+/// at all. An admitted declaration is still logged: an operator reading the log
+/// should be able to see that a checkout, not this host, chose the command.
+fn settle_host_command_trust(
+    config: &Config,
+    declared: &[HostCommandDeclaration],
+) -> Result<(), ConfigError> {
+    if declared.is_empty() {
+        return Ok(());
+    }
+    let trust = config
+        .trust
+        .as_ref()
+        .and_then(|trust| trust.project_host_commands.as_ref());
+    let mut refused: Vec<&HostCommandDeclaration> = Vec::new();
+    for declaration in declared {
+        if trust.is_some_and(|trust| trust.admits(&declaration.source)) {
+            tracing::warn!(
+                path = %declaration.source.display(),
+                key = %declaration.issue.key_path.join("."),
+                "project config {}; trust.project_host_commands admits this checkout, so it runs on this machine with this user's authority",
+                declaration.issue.detail
+            );
+        } else {
+            refused.push(declaration);
+        }
+    }
+    let Some(first) = refused.first() else {
+        return Ok(());
+    };
+    let issues = refused
+        .iter()
+        .filter(|declaration| declaration.source == first.source)
+        .map(|declaration| {
+            ConfigIssue::new(
+                declaration.issue.key_path.clone(),
+                format!(
+                    "{}, and a project config layer is not trusted to run commands on this machine; add this project root to trust.project_host_commands in a trusted global, managed, or environment layer",
+                    declaration.issue.detail
+                ),
+            )
+        })
+        .collect();
+    Err(ConfigError::Invalid {
+        path: first.source.clone(),
+        issues,
+    })
 }
 
 fn config_directory_authority(
@@ -684,6 +795,14 @@ fn merge_deep(target: &mut RawJson, source: RawJson) {
     }
 }
 
+/// Turn the top-level `tools` switch into the lowest-precedence permission rules.
+///
+/// The map is keyed by tool name, so every key has to be translated to the
+/// permission key that governs that tool before it becomes a rule: a synthesized
+/// key an alias collapses would be a rule nothing evaluates, and
+/// [`PermissionObject`](crate::schema::permission::PermissionObject) refuses one.
+/// [`permission_key`] is the single translation both this synthesis and that
+/// refusal use, so no third table can drift out of step with either.
 fn apply_tools_permissions(result: &mut RawJson) {
     let Some(RawJson::Object(tools)) = result.get("tools").cloned() else {
         return;
@@ -693,13 +812,8 @@ fn apply_tools_permissions(result: &mut RawJson) {
         let RawJson::Bool(enabled) = enabled else {
             continue;
         };
-        let key = if matches!(tool.as_str(), "write" | "edit" | "patch") {
-            "edit"
-        } else {
-            tool.as_str()
-        };
         defaults.insert(
-            key,
+            permission_key(&tool),
             RawJson::String(if enabled { "allow" } else { "deny" }.to_owned()),
         );
     }
@@ -708,14 +822,6 @@ fn apply_tools_permissions(result: &mut RawJson) {
         merge_deep(&mut defaults, rules);
     }
     policy.insert("rules", defaults);
-}
-
-fn apply_username(result: &mut RawJson, fallback: &str) {
-    let has_username =
-        matches!(result.get("username"), Some(RawJson::String(value)) if !value.is_empty());
-    if !has_username {
-        result.insert("username", RawJson::String(fallback.to_owned()));
-    }
 }
 
 fn apply_compaction_flags(result: &mut RawJson, env: &Env) {

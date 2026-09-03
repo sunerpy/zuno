@@ -30,8 +30,7 @@ fn free_port() -> u16 {
 /// Collect a stream's lines on its own thread.
 ///
 /// Both streams need a reader for the whole life of the child. `wait_with_output` would
-/// read them for us, but it returns only once every writer has closed its end, and on
-/// Windows that is not the same as the child having exited — see [`terminate_tree`]. A
+/// read them for us, but it returns only once every writer has closed its end, and a
 /// stream nobody reads is worse still: the child blocks forever on a full pipe.
 fn collect(stream: impl std::io::Read + Send + 'static, sink: mpsc::Sender<String>) {
     std::thread::spawn(move || {
@@ -43,23 +42,16 @@ fn collect(stream: impl std::io::Read + Send + 'static, sink: mpsc::Sender<Strin
     });
 }
 
-/// End the served tree, not only the process this fixture spawned.
+/// End the process this fixture spawned — that one, and nothing below it.
 ///
-/// `run_process` restarts the executable once with its bootstrap environment. On Unix
-/// that restart is an `exec`, so the child this fixture holds *is* the server. Windows
-/// has no `exec`, so the restart is a real child and the process this fixture holds is
-/// only its waiter: killing the waiter alone leaves the server running, still owning
-/// the inherited pipes, and the test would then hang instead of fail. `taskkill /T`
-/// ends the waiter and everything below it.
-fn terminate_tree(child: &mut Child) {
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &child.id().to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
+/// One `zuno` invocation is one process on every platform, so the child this fixture
+/// holds *is* the server and its pid is the whole server. A tree kill would work too,
+/// and that is the reason not to use one: it would also end a second process below the
+/// pid the fixture holds, so a reintroduced double-spawn would leave this fixture green
+/// while a client's `wait_with_output` blocked forever on the inherited pipes. Killing
+/// exactly what was spawned keeps that regression observable here, as the hang this
+/// fixture's deadline turns into a failure.
+fn terminate(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -130,7 +122,7 @@ fn serve_binds_the_port_configured_in_zuno_json() {
         }
     };
 
-    terminate_tree(&mut child);
+    terminate(&mut child);
     let stderr = stderr_lines.lock().expect("stderr transcript").join("\n");
 
     let readiness = readiness.unwrap_or_else(|| {

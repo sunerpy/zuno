@@ -7,6 +7,9 @@
 由于协议占用了 stdout，不要把那条流当作人类可读输出来读。只想确认适配器存在时用 `--check`，
 用 `--print-logs` 把诊断信息路由到 stderr，那里不会破坏协议流。
 
+编辑器只启动并持有一个进程。那个进程就是提供协议服务的进程，因此终止它就结束该会话，它的
+管道也随之到达 EOF。参见[一次调用就是一个进程](/zh/cli/#一次调用就是一个进程)。
+
 ## Agent、Mode 与 Plan 投影
 
 Agent selector 会显示 `plan`。`active_agent` 是唯一状态源：选择 `plan` 会自动切换到
@@ -18,6 +21,17 @@ mode。反向切换 Mode 也会选择对应 Agent，并同时发送 `current_mod
 但如果解析后的 MCP server 集合与连接并发度没有变化，会保留该会话已经连接的 MCP
 runtime，避免重复网络或子进程握手。结构性 MCP 配置发生变化时仍会重新连接。重配置
 日志会记录锁等待、解析、关闭、打开和总耗时，但不会记录所选值或凭据。
+
+会话已经在跑一个回合时到达的 `session/prompt`，会先被提交进持久输入 inbox，再被转向
+进那个回合，因此模型能收到它，而正在进行的工作不会被打断。第二个请求以 JSON-RPC 错误
+`-32001` 回答，其 `data` 报告 `admission`（`steered`、`queued` 或 `rejected`）、
+`sessionId` 与持久的 `inputId`；流式输出与 `stopReason` 仍留在拥有该回合的那个请求上。
+斜杠命令无法被转向，会以 `reason: "commandRequiresIdleSession"` 被拒绝，且不写入任何
+持久内容；只有能解析到真实命令、Skill 或原生控制项的文本才算斜杠命令，因此仅以 `/`
+开头的提示词会作为普通内容被接纳。在一个 prompt 请求返回之前用 `$/cancel_request`
+撤回它，会取消该请求接纳的那条持久行，使被撤回的文本永不到达模型，并以 `-32800`
+与 `data.admission: "withdrawn"` 回答该请求。完整形态见
+[Zed ACP 集成](/zh/guide/editors)。
 
 Plan 投影由 durable work-state revision 驱动，不再依赖识别 `plan_update` 工具调用。
 每个会话订阅当前 host，发生变化后读取权威 Plan 并发送完整的

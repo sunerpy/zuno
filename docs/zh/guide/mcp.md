@@ -56,6 +56,27 @@ zuno mcp list
 
 开关形态只接受 `enabled`，项目层就是这样在不重复定义的前提下禁用一个全局定义的 server。
 
+本地 server 的 `command` 是一个本机可执行文件，声明它的那一层很重要。写在项目 `zuno.json[c]`
+或 `.zuno` 文件里会被拒绝：配置发现以校验错误失败，并指明 `mcp.<name>.command`，因为那等于让
+被检出的仓库替你选择一个以你的权限在本机运行的程序。命令旁边写 `"enabled": false` 也一样：这个
+开关与命令同在检出可控的那一层，之后任何一层都能在不重述命令的情况下把它打开。远程 server 不在
+本机运行任何东西，永远不会被拒绝；开关形态则是项目层关闭一个全局定义 server 的方式。
+
+要让某个检出保留自己的本地 server，在受信层里点名它：
+
+```json
+{
+  "trust": {
+    "project_host_commands": ["/home/you/src"]
+  }
+}
+```
+
+`true` 信任本机上的每个检出，`false` 是默认值，列表则信任这些绝对路径根目录之内的项目配置文件。
+项目层自己设置 `trust` 会被拒绝，因此授权始终来自全局 `zuno.json`、`ZUNO_CONFIG`、
+`ZUNO_CONFIG_CONTENT`、受管配置目录或 macOS 受管偏好。被接纳的声明仍会逐个键记入日志。完整的
+优先级规则见[配置文件与优先级](/zh/config/files)。
+
 ## 认证
 
 对于需要 OAuth 的远端 server：
@@ -154,7 +175,7 @@ provider 请求快照记录搜索后的确切工具 schema；搜索结果也会�
 
 `mcp_connections` 限定跨*不同* server 的同时生命周期操作数。同一个 server 的操作保持串行，这避免了第二次连接与它自己的断开竞速。该字段接受 `1..=64`。
 
-请求超时优先使用按 server 的 `timeout`。也存在一个实验性的全局 `experimental.mcp_timeout`。
+请求超时按 server 设置：在条目上写 `timeout`。不存在全局的 MCP 超时键。
 
 MCP 调用失败按「失败在哪」分类，而不是只看「失败了」。5xx、408、429 响应以及连接被断开属于可恢复失败，回合会带退避重试。其余 4xx —— 400、401、403、404、405 —— 以及 OAuth 失败（例如你设了 `"oauth": false` 的 server）则直接阻塞，因为在配置改变之前，同样的请求只会同样地失败。
 

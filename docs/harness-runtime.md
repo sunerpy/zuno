@@ -53,6 +53,12 @@ a lock never released, which is the one outcome worse than a late stop, so it is
 detached and keeps reclaiming in the background. A disposer that returns an error or
 panics is reported as `Uncertain`.
 
+A deployment may bound every one of those waits with `runtime.max_component_stop_ms`,
+which the runtime applies as `min(declared, ceiling)`; absent or `0` means this host
+imposes no ceiling, which is the default. The ceiling only shortens the wait — the
+disposer is still detached rather than cancelled, so a clamped process-tree reap still
+runs to completion in the background.
+
 `RuntimeSnapshot` and `ComponentSnapshot` expose lifecycle state, effect ids,
 provided/required service types, and scrubbed diagnostics without coupling a
 client to the runtime implementation. The TUI projects this inventory today; the
@@ -978,7 +984,11 @@ terminal activation. It opens an empty conversation shell directly instead of
 returning to the launch welcome surface, and it does not bypass this lazy
 materialization boundary.
 
-Drivers promote inputs in FIFO order. Promotion is transactional and can target one input identifier for a live soft interrupt. A malformed input records a session error and does not strand later queue entries.
+Drivers promote inputs in FIFO order. Promotion is transactional and can target one input identifier for a live soft interrupt, or every pending settled report at once for a batched idle wake. A row a driver owns but cannot decode records a session error and does not strand later queue entries.
+
+Admission never competes with the live-turn lease. One shared admission service commits the `session_input` row first and resolves how it reaches the model second, so every surface — TUI, ACP, HTTP, and the `run` host — reports one of three outcomes over an input that is already durable: the caller received the exclusive turn lease and drives the row itself; a running turn accepted the row as a soft interrupt and promotes it at its next safe point; or the row stays pending for the next FIFO promotion. Contending for the lease first and returning early when it is held is what loses a prompt with no durable trace, so a busy session is an outcome of admission rather than a failure of it. A caller whose own driver loop already owns every turn for the session never asks for the lease at all and is answered with the steered or pending outcome.
+
+Each surface decodes only the payload shapes it can drive, and every published shape has exactly one decoder. A pending row a driver cannot render — a queued terminal submission met by the HTTP prompt driver, an HTTP body carrying its own agent and model overrides met by the terminal driver — is stepped over in FIFO order and left pending for the surface that owns it, instead of being promoted and then settled as `failed`. Settled asynchronous reports and answered human requests carry plain text, so every prompt driver runs them. A payload no writer publishes is left pending for the same reason a foreign one is: a driver cannot tell an unrecognized shape apart from a shape it simply does not own, so the row is preserved and stays visible in the queue rather than destroyed. Mixing surfaces on one session therefore cannot let one row a driver does not own break that driver.
 
 User prompts and subagent reports share this protocol:
 
@@ -986,6 +996,45 @@ User prompts and subagent reports share this protocol:
 - If the report misses the final safe point, the wake coordinator waits for the active lease to end and starts another turn while the input is still pending.
 - An idle parent is claimed and driven immediately.
 - A restarted process recovers pending reports from the durable inbox.
+
+Settled reports are delivered as a batch, not one row at a time. A single wake
+claims every report the parent has pending in one transaction and drives them in
+one turn. Each report still becomes its own durable user message with its own
+`session.input.promoted` and `session.input.consumed` events and its own
+`message.data.taskReport`; only the provider request is shared. A wake that finds
+the session busy offers the whole pending report batch to the running turn's next
+safe point for the same reason, and a report that turn never reaches stays
+pending for the next scan. Driving one turn per row instead made a fan-out that
+settled together arrive as a stream of turns, each announcing a state a later
+report in the same batch had already replaced. The HTTP prompt driver claims the
+same batch in the same transaction, so a session holding three settled reports
+produces one assistant turn on that surface too, while a typed prompt still runs as
+its own request with its own agent and model overrides.
+
+Admission never waits behind a delivery. A background command's completion is
+admitted as a durable inbox row before any turn is requested, and the watcher
+admits every settlement already waiting behind it in the same pass, so a group of
+background commands that finished together is one batch and a restarted process
+that finds several terminal commands delivers them as one batch too. A command
+that settles while a delivery turn is already running is admitted immediately and
+joins the next batch, because its report cannot exist before it settles.
+
+Reports are grouped by the work they describe when a batch is rendered. Where a
+batch carries several reports for one job or background execution, only the report
+whose work completed last is presented as that work's current state; the earlier
+ones are marked superseded in the text the model reads. The projection belongs to
+the engine rather than to one client, so the batch a wake drives as a new turn and
+the batch a wake offers to a running turn carry identical text: a replaced state
+reads as superseded whether the parent was idle or busy when the newer report
+arrived, and every present and future client surface reaches the same decision from
+the same durable rows. Plan reconciliation is seeded from the newest report of a
+batch the wake drives as its own turn; a batch admitted into a turn that is already
+running enters as durable user input and that turn keeps the planning source it
+started with. Grouping is a projection over durable rows: nothing is merged,
+reordered, dropped, or given a new inbox state, and a delivery carrying one report
+per unit of work is presented exactly as its writers wrote it. A promoted report
+whose durable prompt carries no model-visible text is settled `failed` with that
+reason rather than stalling the reports behind it.
 
 The same boundary now covers every asynchronous continuation source:
 `subagentReport`, `productAgentReport`, `workflowReport`, `councilReport`, and
@@ -1282,8 +1331,31 @@ an observed result and is never mechanically replayed. A running tool receives a
 two-second cooperative cleanup window. Settling in that window produces a typed
 `cooperative` cancellation and preserves the tool's terminal report; expiry
 force-aborts the invocation and records `forced` plus `uncertain`, requiring
-authoritative-state inspection before retry. Post-tool hooks may add diagnostics
-but cannot rewrite either cancellation outcome as an ordinary failure.
+authoritative-state inspection before retry. A cooperative settlement is not
+automatically certain. A tool that was stopped before its work reached a decided
+outcome declares that on its settled result under the `cancellation` metadata
+key; the dispatcher records `uncertain` for that call too and appends the
+authoritative-state demand to the settled report the model reads, so the
+requirement is model-visible and not only durable. A tool that declares nothing
+keeps the certain cooperative reading, text included. `shell` carries both
+readings, and what separates them is whether the service settled a status as the
+command's own, not merely whether the process had exited. A run that completed
+and reported its own verdict before the cancellation was serviced reports that
+exit status with the receipt a completed run earns and is cancelled but not
+uncertain. Every other cancelled run preserves its captured output, carries an
+unresolved receipt with no exit authority, and is uncertain — including the runs
+that do report a number: an `exit 125` that is the child-process guard's own
+failure, a run killed at its hard ceiling, and a status the execution reported
+but settled as something other than the command's own outcome. The reported code
+stays in the result because it is what a terminal would have shown, so an
+uncertain cancellation may still name an exit code; the receipt is what refuses
+to certify it. Neither reading is ever mechanically replayed. The resolved
+verdict travels on the `ToolDispatchInterrupted` runtime event and not only in
+the durable record, so the SSE `tool.dispatch.interrupted` payload, the ACP
+session update, and `zuno run` publish the same `uncertain` a replayed session
+reconstructs from durable metadata, while `forced` keeps meaning only that the
+grace window expired. Post-tool hooks may add diagnostics but cannot rewrite
+either cancellation outcome as an ordinary failure.
 `TurnInterrupted` adds a separate session-owned
 `Conversation interrupted by user.` row to the live transcript. The source and
 reason are persisted on `turn.interrupted` and, when an assistant checkpoint
@@ -1741,6 +1813,20 @@ the payload running, supervised for its own exit only; a lost helper is never re
 dead parent. `tasklist` remains only in the idempotency check of `taskkill`-based tree
 termination.
 
+Starting `zuno` itself inserts nothing into that tree, and the CLI's own startup is not
+a guarded process. A client that spawns `zuno acp`, `zuno serve`, or any other
+invocation supervises exactly one process on every supported platform: the process it
+spawned runs the command, ending that process ends the command, and the command's
+`stdout` and `stderr` reach end of file when it exits. Startup resolves global options
+and `ZUNO_*` variables into one in-process value; on Unix it additionally replaces its
+own image once, keeping the same process id, so launched processes inherit the resolved
+values, and a platform without image replacement dispatches in the process the caller
+spawned rather than starting a second one. No `zuno` invocation starts a second `zuno`
+to carry that environment, so starting Zuno never arms the PowerShell parent-watch
+helper above, and Windows PowerShell remains a backend dependency of that guard rather
+than of running the CLI. See
+[One invocation, one process](cli/index.md#one-invocation-one-process).
+
 ## Background command execution
 
 `shell` registers a command with the process-owned
@@ -1766,11 +1852,27 @@ always-durable format are discarded on first open; an old running row is
 conservatively rewritten as `uncertain` and is never replayed.
 
 The `bg` tool supports `list`, `output`, `wait`, and `cancel` for executions owned
-by the current session. The complete tool has `ToolReplayPolicy::Never` because
-one action cancels a process tree. Cancellation reaches descendants through the
-shared process containment layer. A hard process ceiling records failure; a
-process restart converts a previously running row to `uncertain` and never
-replays it.
+by the current session, and `artifact` for output a size limit withheld from any tool
+in that session. `output`, `wait`, and `artifact` take an optional `limit` beside
+`cursor` and return the cursor the next window starts at, so a caller pages by handing
+that cursor back instead of slicing a file with a shell command. `output` and `wait`
+with no cursor return the newest window; `artifact` names the `outputPath` the withheld
+result carries and starts at the beginning. A window is 16,384 bytes when the call
+states no size, and the server clamps any window to 51,200 bytes — the default output
+byte limit's number, fixed rather than a function of the configured
+`tool_output.max_bytes` — so retrieval can never hand back more than an inline result
+would have, and an oversized request is clamped rather than refused. A cursor that
+predates the 2 MiB live ring falls through to a window of the execution's on-disk
+`.output` file and reports `fromDisk`, which makes a discarded prefix reachable again
+instead of clamping the request forward. `artifact` is the retrieval the withholding
+notice names, and the only call that pages those bytes without re-running the call that
+produced them and without passing the window back through the output limits that
+withheld it: an agent profile that hides `bg` leaves its own withheld output reachable
+only through `accept_large_output: true`, which re-runs that call. The complete tool
+has `ToolReplayPolicy::Never` because one action cancels a process tree. Cancellation
+reaches descendants through the shared process containment layer. A hard process
+ceiling records failure; a process restart converts a previously running row to
+`uncertain` and never replays it.
 
 Every execution the service launches runs behind the `__zuno_child_guard` process, so
 the exit status the shell tool reads is the guard's, and three codes may belong to the
@@ -1877,7 +1979,10 @@ the process reconcile to `uncertain` and are not replayed. Concurrent
 process-local wake attempts for one `(session_id, input_id)` are coalesced by an
 in-flight lease. A failed wake releases that lease and may be retried against
 the same durable input, so the guarantee is one logical report and effective
-delivery, not a ban on retries across a crash. Normal settlement and restart
+delivery, not a ban on retries across a crash. That lease stays per input even
+though delivery is batched: the wake that wins the turn claims every pending
+report, and the wakes that lose find their own row already claimed and return
+without driving anything. Normal settlement and restart
 recovery use the same bounded wake helper: at most three attempts, beginning at
 10 ms and exponentially capped at 100 ms.
 

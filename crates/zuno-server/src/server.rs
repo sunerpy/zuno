@@ -23,6 +23,7 @@ use axum::{Extension, Router};
 use tokio::net::{TcpListener, lookup_host};
 use zuno_db::session_prune::SessionPruneProgress;
 use zuno_engine::r#loop::{TurnEvent, TurnEventSender};
+use zuno_engine::report::ProjectedReport;
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 
 use crate::auth::WWW_AUTHENTICATE_VALUE;
@@ -49,6 +50,22 @@ pub struct SessionPromptExecution {
     pub model: Option<SessionModelSelection>,
 }
 
+/// Every settled report a session had pending, as one provider request.
+///
+/// Reports are never executed one row at a time on this surface. A parent that holds
+/// three settled reports would otherwise pay three model turns, each announcing a
+/// state a later report in the same batch had already replaced. Each report keeps its
+/// own durable user message and its own inbox transitions; only the request is shared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionReportExecution {
+    pub session_id: String,
+    pub directory: PathBuf,
+    pub agent: Option<String>,
+    pub model: Option<SessionModelSelection>,
+    /// The batch as the engine's shared projection renders it, in admission order.
+    pub reports: Vec<ProjectedReport>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionCompactExecution {
     pub session_id: String,
@@ -62,6 +79,14 @@ pub trait SessionMutationExecutor: Send + Sync + std::fmt::Debug {
     fn prompt(
         &self,
         request: SessionPromptExecution,
+        guard: SessionRunGuard,
+        events: TurnEventSender,
+    ) -> SessionMutationFuture;
+
+    /// Drive one batch of settled reports as a single provider request.
+    fn reports(
+        &self,
+        request: SessionReportExecution,
         guard: SessionRunGuard,
         events: TurnEventSender,
     ) -> SessionMutationFuture;

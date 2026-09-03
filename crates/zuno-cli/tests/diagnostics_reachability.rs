@@ -326,12 +326,20 @@ fn every_place_that_admits_a_turn_also_counts_the_session() {
     // `resume_pending_inputs` runs the input that arrived while compaction held the
     // lease, and it admits that turn the same way `prompt` does: it hands the lease
     // straight to the counted durable driver rather than counting anything itself.
-    const ADMISSION: &str = "services.runs.begin_turn(";
+    //
+    // `prompt` reaches the lease through `SessionInputAdmission`, which commits the
+    // durable inbox row before contending for it. That indirection still hands back a
+    // live lease, so it is an admission this gate has to see.
+    const DIRECT_ADMISSION: &str = "services.runs.begin_turn(";
+    const DURABLE_ADMISSION: &str = "admission.admit(";
     let server = cli_source("../zuno-server/src/api/session.rs");
     let functions = functions(&server);
     let mut admitting = functions
         .iter()
-        .filter(|(_, body)| squash_whitespace(body).contains(ADMISSION))
+        .filter(|(_, body)| {
+            let body = squash_whitespace(body);
+            body.contains(DIRECT_ADMISSION) || body.contains(DURABLE_ADMISSION)
+        })
         .map(|(name, _)| name.as_str())
         .collect::<Vec<_>>();
     admitting.sort_unstable();

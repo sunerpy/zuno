@@ -2,9 +2,13 @@
 //!
 //! Rust 2024 makes `std::env::set_var` unsafe and this workspace forbids unsafe
 //! code. The CLI therefore resolves the environment as an [`zuno_paths::Env`] value
-//! and starts its command process with those overrides. Downstream services see
-//! the same real environment upstream's middleware writes, while unit tests can
-//! inspect the value without racing another test.
+//! and dispatches against that value. Every command implementation reads it from
+//! [`StartupEnvironment`], so the resolution is complete without any process ever
+//! having to be replaced, and unit tests can inspect the value without racing
+//! another test. On Unix, where replacing this image is free, the CLI also `exec`s
+//! once with these overrides applied so launched processes inherit them; a platform
+//! without `exec` must not buy that with a second process, because the handle a
+//! supervisor holds would then name a waiter instead of the command.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -192,7 +196,11 @@ impl StartupEnvironment {
         &self.resolved
     }
 
-    /// Only the values this CLI must overlay when starting its command process.
+    /// Only the values this CLI overlays on the process snapshot it resolved.
+    ///
+    /// Already folded into [`Self::resolved`] and [`Self::flags`], so dispatch does
+    /// not depend on them reaching the real process environment. The Unix bootstrap
+    /// `exec` applies the same set so launched processes inherit it too.
     pub fn overrides(&self) -> impl Iterator<Item = (&'static str, &str)> {
         self.overrides
             .iter()
@@ -212,11 +220,27 @@ impl StartupEnvironment {
     /// the service here keeps already-running commands alive and observable instead
     /// of binding them to whichever [`crate::cmd::turn::TurnHost`] happened to
     /// launch them.
+    ///
+    /// Keyed by the resolved directory rather than by `directory`, so two sessions
+    /// started in different subdirectories of one checkout share one service. Keying by
+    /// the session's own directory gave each of them a service of its own on a root of
+    /// its own, and two live services reconciling the same executions is exactly what
+    /// this cache exists to prevent. Resolving spawns git, which is why it happens here,
+    /// at host open, and not per command.
     pub fn background_executions(
         &self,
         directory: &Path,
     ) -> Result<Arc<BackgroundExecutionService>, zuno_pty::BackgroundExecutionError> {
-        let key = directory.to_path_buf();
+        // Named rather than spelled, and rooted at the worktree rather than at the
+        // session's directory: the generated-path registry excludes this exact directory
+        // from git, and either drift — a literal here, or a root under a subdirectory —
+        // leaves background terminal state showing up as untracked files a model then
+        // reasons about as if the work had produced them.
+        let root = zuno_paths::GeneratedDirectory::resolve(
+            directory,
+            &zuno_paths::generated::BACKGROUND_EXECUTIONS,
+        );
+        let key = root.path().to_path_buf();
         let mut services = self
             .background_executions
             .lock()
@@ -224,15 +248,7 @@ impl StartupEnvironment {
         if let Some(service) = services.get(&key).and_then(Weak::upgrade) {
             return Ok(service);
         }
-        // Named rather than spelled: the generated-path registry excludes this exact
-        // directory from git, and a literal here would let the two drift apart, leaving
-        // background terminal state to show up as untracked files a model then reasons
-        // about as if the work had produced them.
-        let service = Arc::new(BackgroundExecutionService::open(
-            directory
-                .join(zuno_paths::PROJECT_DIRECTORY)
-                .join(zuno_paths::BACKGROUND_DIRECTORY),
-        )?);
+        let service = Arc::new(BackgroundExecutionService::open(root.path())?);
         services.insert(key, Arc::downgrade(&service));
         Ok(service)
     }

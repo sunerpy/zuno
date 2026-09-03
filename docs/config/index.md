@@ -39,19 +39,19 @@ true of `delegates`, `requiredSkills`, `writableRoots`, and `instructions`.
 
 ## The top-level shape
 
-Forty-four keys exist. Grouped by what they decide:
+Forty-one keys exist. Grouped by what they decide:
 
 | Group | Keys |
 | --- | --- |
 | Model routing | `model`, `small_model`, `preset`, `presets`, `provider`, `enabled_providers`, `disabled_providers` |
 | Agents and delegation | `agents`, `default_agent`, `subagent_depth`, `subagent_model_selection`, `workflows`, `productAgent` |
-| Authority | `permission`, `sandbox`, `shell` |
+| Authority | `permission`, `sandbox`, `shell`, `trust` |
 | Instructions, Skills, and learning | `instructions`, `skills`, `command`, `memory`, `learning` |
 | Context | `compaction`, `continuity`, `tool_output`, `attachment`, `references` |
 | Integrations | `mcp`, `lsp`, `formatter`, `web_search`, `watcher` |
-| Runtime | `concurrency`, `goal`, `snapshot`, `tools`, `navigation`, `logLevel` |
-| Deployment | `server`, `share`, `autoupdate`, `enterprise`, `experimental` |
-| Presentation | `username`, `$schema` |
+| Runtime | `concurrency`, `goal`, `runtime`, `snapshot`, `tools`, `navigation`, `logLevel` |
+| Deployment | `server` |
+| Editor support | `$schema` |
 
 The key-by-key reference is [Configuration reference](/reference/configuration). This page
 and its siblings explain the groups; that page is authoritative for a single field.
@@ -133,6 +133,13 @@ when the backend has an eligible typed availability failure:
 managed layer. Project configuration cannot enable it, read-only Agents never use it, and
 managed policy may force it back to `deny`. See
 [Permissions and sandboxing](/guide/permissions) for the exact fallback boundary.
+
+A project layer that declares a host command is refused. `shell`, a local `mcp.*.command`,
+an `lsp.*.command` or `formatter.*.command` that is not disabled, and a
+`productAgent.*.command` in a project `zuno.json[c]` or `.zuno` file all fail validation;
+remote MCP servers are unaffected. Only `trust.project_host_commands` in a trusted layer
+admits a checkout, and a project layer that sets `trust` itself is refused too. See
+[Files and precedence](/config/files).
 
 ## Schema validation while editing
 

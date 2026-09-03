@@ -725,9 +725,21 @@ fn the_gitignore_snippet_names_the_projection_directory() {
         format!("{PROJECT_DIRECTORY}/{GOAL_DIRECTORY}/"),
         "the registry's pattern must name the directory this crate writes into"
     );
+    // This used to assert the host excluded exactly this pattern. It no longer does:
+    // `IGNORE_PATTERNS` excludes everything under `.zuno/` a person does not author, so
+    // naming the goal directory again would say the directories nobody registered are
+    // somebody's to commit. What has to hold is that the wider rule still covers this
+    // document.
     assert!(
-        zuno_paths::IGNORE_PATTERNS.contains(&IGNORE_PATTERN),
-        "the host excludes the registry's patterns, so this one must be among them"
+        !zuno_paths::IGNORE_PATTERNS.contains(&IGNORE_PATTERN),
+        "the host's patterns are rendered from the user's entries, not from this one"
+    );
+    assert!(
+        zuno_paths::is_generated(
+            Path::new("/tmp/repo"),
+            &document_path(Some(Path::new("/tmp/repo")), "ses_abc").expect("resolve")
+        ),
+        "the host's patterns and this crate must still agree the document is generated"
     );
     assert!(
         GITIGNORE_SNIPPET.lines().any(|line| line == IGNORE_PATTERN),
@@ -754,7 +766,9 @@ fn everything_the_projection_writes_into_a_worktree_is_registered_generated_stat
     let document = document_path(Some(worktree), "ses_abc").expect("resolve");
     assert_eq!(
         zuno_paths::generated::classify(worktree, &document),
-        Some(&zuno_paths::generated::GOAL_PROJECTION)
+        Some(zuno_paths::GeneratedReason::Registered(
+            &zuno_paths::generated::GOAL_PROJECTION
+        ))
     );
     assert!(zuno_paths::is_generated(
         worktree,

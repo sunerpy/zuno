@@ -711,7 +711,19 @@ pub fn measure(text: &str, limits: OutputLimits) -> SizeMeasurement {
 /// `'\n'` occurrences plus one, matching `tool-output-store.ts:105-109`.
 #[must_use]
 pub fn line_count(text: &str) -> usize {
-    text.bytes().filter(|byte| *byte == b'\n').count() + 1
+    line_count_of(text.as_bytes())
+}
+
+/// [`line_count`] for output that has not been decoded as text.
+///
+/// The store persists the bytes a command produced rather than a lossy rendering of
+/// them, so the line count it reports has to come from those same bytes. The arithmetic
+/// is identical: a newline is one byte in every encoding this crate handles, and
+/// decoding a whole artifact to count its lines would copy every byte to learn nothing
+/// the bytes did not already say.
+#[must_use]
+pub fn line_count_of(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|byte| **byte == b'\n').count() + 1
 }
 
 #[cfg(test)]

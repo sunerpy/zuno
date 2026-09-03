@@ -184,6 +184,18 @@ fn run(
         &UnavailableRemote,
         &mut move |progress: SessionPruneProgress| events.publish(progress),
     )?;
+    // A session's standing permission grants end with the session. This is the one
+    // place the server observes a session ending, so archiving or deleting a session
+    // withdraws every `always` it granted; a preview changes nothing and withdraws
+    // nothing.
+    if matches!(
+        report.action,
+        SessionPruneAction::Archive { .. } | SessionPruneAction::Delete
+    ) {
+        services
+            .requests
+            .forget_session_grants(&report.selected_session_ids);
+    }
     let bytes = zuno_db::session_prune::to_json_bytes(&report)?;
     Response::builder()
         .status(StatusCode::OK)

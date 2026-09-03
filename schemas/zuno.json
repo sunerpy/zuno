@@ -279,29 +279,6 @@
       },
       "type": "object"
     },
-    "Autoupdate": {
-      "anyOf": [
-        {
-          "description": "Install updates automatically, or never.",
-          "type": "boolean"
-        },
-        {
-          "$ref": "#/$defs/AutoupdateMode",
-          "description": "Announce updates only."
-        }
-      ],
-      "description": "Update behaviour (`config/config.ts:67-71`)."
-    },
-    "AutoupdateMode": {
-      "description": "The `\"notify\"` arm of [`Autoupdate`].",
-      "oneOf": [
-        {
-          "const": "notify",
-          "description": "Announce updates without installing them.",
-          "type": "string"
-        }
-      ]
-    },
     "CommandConfig": {
       "description": "One custom command (`config/command.ts:5-12`).",
       "properties": {
@@ -501,82 +478,6 @@
           "description": "Expose session-and-agent scoped working notes.",
           "type": [
             "boolean",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "EnterpriseConfig": {
-      "description": "Enterprise deployment settings (`config/config.ts:134-136`).",
-      "properties": {
-        "url": {
-          "description": "Enterprise URL.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "ExperimentalConfig": {
-      "description": "Options under active development (`config/config.ts:173-188`).",
-      "properties": {
-        "batch_tool": {
-          "description": "Enable the batch tool.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "continue_loop_on_deny": {
-          "description": "Keep the agent loop running after a denied tool call.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "disable_paste_summary": {
-          "description": "Stop summarizing pasted text.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "mcp_timeout": {
-          "description": "Timeout in milliseconds for MCP requests.",
-          "format": "uint32",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "openTelemetry": {
-          "description": "Emit OpenTelemetry spans for model calls.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "policies": {
-          "description": "Policy statements applied to supported resources.",
-          "items": {
-            "$ref": "#/$defs/PolicyStatement"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "primary_tools": {
-          "description": "Tools only primary agents may use.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
             "null"
           ]
         }
@@ -1994,7 +1895,7 @@
         "rules": {
           "$ref": "#/$defs/PermissionObject",
           "default": {},
-          "description": "Ordered per-tool rules. Explicit denies remain terminal in every mode."
+          "description": "Ordered per-tool rules, keyed by permission key. Explicit denies remain\nterminal in every mode. A key that only aliases another key — `write`,\n`apply_patch`, and the three MCP resource tools — is rejected, because\nsuch a rule can never match."
         }
       },
       "type": "object"
@@ -2035,54 +1936,6 @@
         }
       ],
       "description": "A permission rule: one action for the whole tool, or per-pattern actions\n(`config/permission.ts:8-12`)."
-    },
-    "PolicyAction": {
-      "description": "An action a policy statement can govern.\n\n`packages/core/src/config/experimental.ts:9` builds this from\n`Catalog.PolicyActions`, which is `Literals([\"provider.use\"])` — one action,\nand anything else is rejected.",
-      "oneOf": [
-        {
-          "const": "provider.use",
-          "description": "Use of a provider.",
-          "type": "string"
-        }
-      ]
-    },
-    "PolicyEffect": {
-      "description": "Whether a policy statement permits or refuses (`packages/core/src/policy.ts:8`).",
-      "oneOf": [
-        {
-          "const": "allow",
-          "description": "Permit.",
-          "type": "string"
-        },
-        {
-          "const": "deny",
-          "description": "Refuse.",
-          "type": "string"
-        }
-      ]
-    },
-    "PolicyStatement": {
-      "description": "One policy statement (`packages/core/src/policy.ts:11-15` plus the narrowed\n`action` from `config/experimental.ts:11-14`). Every field is required.",
-      "properties": {
-        "action": {
-          "$ref": "#/$defs/PolicyAction",
-          "description": "The action governed."
-        },
-        "effect": {
-          "$ref": "#/$defs/PolicyEffect",
-          "description": "Permit or refuse."
-        },
-        "resource": {
-          "description": "The resource pattern the statement matches.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "action",
-        "effect",
-        "resource"
-      ],
-      "type": "object"
     },
     "PresetConfig": {
       "additionalProperties": false,
@@ -2262,6 +2115,22 @@
           "type": "string"
         }
       ]
+    },
+    "ProjectHostCommands": {
+      "anyOf": [
+        {
+          "description": "`true` trusts every checkout on this host; `false` trusts none.",
+          "type": "boolean"
+        },
+        {
+          "description": "Absolute directories whose project config layers are trusted.\n\nA layer is trusted when its file lives inside one of these roots. Relative\nentries are refused: a trust decision that depends on the current directory\nis not a decision.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "Whose project config may declare a host command."
     },
     "ProviderConfig": {
       "additionalProperties": false,
@@ -2599,6 +2468,22 @@
         }
       ]
     },
+    "RuntimeConfig": {
+      "additionalProperties": false,
+      "description": "Ceilings the deployment puts on the component runtime.",
+      "properties": {
+        "max_component_stop_ms": {
+          "description": "Longest this host waits for one component to stop, in milliseconds.\n\nA component asks for its own stop budget; this ceiling shortens a request\nthat is longer than the deployment tolerates. `0` or absent means the host\nimposes no ceiling and every component keeps the budget it asked for.\nShortening the wait never cancels the component: disposal stays reverse\nregistration order, and an overrunning disposer is left running to\ncompletion so process-tree reaping still happens.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "SandboxConfig": {
       "additionalProperties": false,
       "description": "Policy additions shared by every Shell call in one resolved profile.",
@@ -2710,34 +2595,11 @@
       ]
     },
     "ServerConfig": {
-      "description": "Server configuration (`config/server.ts:6-18`).",
+      "additionalProperties": false,
+      "description": "What the HTTP server binds to.\n\nClosed: a key here that Zuno does not read is a promise it cannot keep, so an\nunknown key is a validation error rather than a silently ignored one.",
       "properties": {
-        "cors": {
-          "description": "Additional origins to allow for CORS.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
         "hostname": {
           "description": "Hostname to listen on.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "mdns": {
-          "description": "Advertise the server over mDNS.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "mdnsDomain": {
-          "description": "mDNS domain; the runtime defaults to `zuno.local`.",
           "type": [
             "string",
             "null"
@@ -2754,26 +2616,6 @@
         }
       },
       "type": "object"
-    },
-    "ShareMode": {
-      "description": "Session sharing behaviour (`config/config.ts:59-62`).",
-      "oneOf": [
-        {
-          "const": "manual",
-          "description": "Share only when asked.",
-          "type": "string"
-        },
-        {
-          "const": "auto",
-          "description": "Share every new session.",
-          "type": "string"
-        },
-        {
-          "const": "disabled",
-          "description": "Never share.",
-          "type": "string"
-        }
-      ]
     },
     "SkillCatalogExposure": {
       "description": "How one enabled Skill participates in model-driven discovery.",
@@ -2972,10 +2814,10 @@
       "description": "A timeout in milliseconds, or `false` to disable it\n(`config/provider.ts:101-116`)."
     },
     "ToolOutputConfig": {
-      "description": "Tool-output truncation thresholds (`config/config.ts:137-150`).",
+      "description": "The size at which tool output stops being model-visible.\n\nOutput over either limit is persisted in full and then withheld: the model\nreceives a pointer and the measured cost instead of a prefix, and must accept\nthe context cost explicitly to read it.",
       "properties": {
         "max_bytes": {
-          "description": "Bytes of output before truncation. Defaults to 51200.",
+          "description": "Bytes of output the model may receive directly. Defaults to 51200. Output above this\nis saved whole and read back through `bg`, never truncated.",
           "format": "uint32",
           "minimum": 1,
           "type": [
@@ -2984,13 +2826,31 @@
           ]
         },
         "max_lines": {
-          "description": "Lines of output before truncation. Defaults to 2000.",
+          "description": "Lines of output the model may receive directly. Defaults to 2000. Output above this\nis saved whole and read back through `bg`, never truncated.",
           "format": "uint32",
           "minimum": 1,
           "type": [
             "integer",
             "null"
           ]
+        }
+      },
+      "type": "object"
+    },
+    "TrustConfig": {
+      "additionalProperties": false,
+      "description": "Trust this host extends to configuration a checkout controls.\n\nThis section is only honoured from a trusted layer. A project layer that sets\nit at all is refused, so a checkout cannot widen its own authority.",
+      "properties": {
+        "project_host_commands": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectHostCommands"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which checkouts may declare commands this machine runs.\n\nAbsent refuses every project-layer `shell`, local `mcp` server, `lsp`,\n`formatter`, and `productAgent` command."
         }
       },
       "type": "object"
@@ -3154,17 +3014,6 @@
       ],
       "description": "Attachment processing."
     },
-    "autoupdate": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/Autoupdate"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Update behaviour: `true`, `false`, or `\"notify\"`."
-    },
     "command": {
       "anyOf": [
         {
@@ -3235,28 +3084,6 @@
         "array",
         "null"
       ]
-    },
-    "enterprise": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/EnterpriseConfig"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Enterprise deployment settings."
-    },
-    "experimental": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ExperimentalConfig"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Options under active development."
     },
     "formatter": {
       "anyOf": [
@@ -3425,6 +3252,17 @@
       ],
       "description": "Named git or local directory references."
     },
+    "runtime": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RuntimeConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Deployment ceilings for the component runtime that owns shutdown."
+    },
     "sandbox": {
       "anyOf": [
         {
@@ -3446,17 +3284,6 @@
         }
       ],
       "description": "Server configuration for `zuno serve` and the web command."
-    },
-    "share": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ShareMode"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Session sharing behaviour."
     },
     "shell": {
       "description": "Default shell for terminals and the model-facing Shell tool.",
@@ -3519,7 +3346,7 @@
           "type": "null"
         }
       ],
-      "description": "Thresholds for truncating tool output."
+      "description": "Size limits above which tool output is withheld from the model."
     },
     "tools": {
       "anyOf": [
@@ -3532,12 +3359,16 @@
       ],
       "description": "Tool switches, keyed by tool name."
     },
-    "username": {
-      "description": "Name to show for the user instead of the system username.",
-      "type": [
-        "string",
-        "null"
-      ]
+    "trust": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TrustConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Trust this host extends to project checkouts. Never readable from a project layer."
     },
     "watcher": {
       "anyOf": [

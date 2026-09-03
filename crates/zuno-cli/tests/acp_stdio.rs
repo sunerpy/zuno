@@ -2557,20 +2557,26 @@ async fn acp_load_recovers_an_active_goal_without_a_prior_user_message() {
     );
     assert_eq!(loaded["modes"]["currentModeId"], "build");
 
-    tokio::time::timeout(Duration::from_secs(10), async {
+    // The Goal row flips to `Complete` while the recovered turn is still running,
+    // because `goal_update` commits during the first tool call. Waiting only on
+    // that status lets `session/close` cancel the turn before it answers the tool
+    // call, so the turn count below has to be part of the settle condition.
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let goal = goals
                 .goal(&session_id)
                 .expect("read recovered Goal")
                 .expect("persisted recovered Goal");
-            if goal.status == zuno_goal::GoalStatus::Complete {
+            if goal.status == zuno_goal::GoalStatus::Complete
+                && responder.tool_requests.load(Ordering::SeqCst) >= 2
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("active Goal did not resume after session/load");
+    .expect("active Goal did not resume and settle after session/load");
 
     request(
         &mut second_stdin,
@@ -5225,4 +5231,827 @@ fn acp_load_replays_negotiated_child_sessions_on_their_own_routes() {
             .expect("read ACP stderr");
         panic!("ACP process failed: {stderr}");
     }
+}
+
+/// A provider that parks one turn request until the test releases it.
+///
+/// Admission behavior is only observable while a turn is genuinely in flight, so
+/// the first turn request blocks here rather than being raced against a sleep.
+/// Title generation is answered immediately: it is not the turn under test.
+struct GatedTurnResponder {
+    turns: Arc<AtomicUsize>,
+    release: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
+}
+
+impl GatedTurnResponder {
+    fn new(turns: Arc<AtomicUsize>) -> (Self, mpsc::Sender<()>) {
+        let (release, gate) = mpsc::channel();
+        (
+            Self {
+                turns,
+                release: std::sync::Mutex::new(Some(gate)),
+            },
+            release,
+        )
+    }
+}
+
+impl Respond for GatedTurnResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).expect("provider request JSON");
+        let has_tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if !has_tools {
+            return compatible_text_response("ACP title");
+        }
+        if self.turns.fetch_add(1, Ordering::SeqCst) == 0 {
+            let gate = self
+                .release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(gate) = gate {
+                let _released = gate.recv_timeout(Duration::from_secs(60));
+            }
+        }
+        compatible_text_response("ACP reply")
+    }
+}
+
+/// Write one request without waiting for its response.
+///
+/// Two `session/prompt` requests have to be in flight at once for admission to be
+/// observable at all, so sending and reading are separate operations here.
+fn send_request(stdin: &mut ChildStdin, id: u64, method: &str, params: Value) {
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::to_string(&frame).expect("encode ACP request")
+    )
+    .expect("write ACP request");
+    stdin.flush().expect("flush ACP request");
+}
+
+/// Read frames until the response for `id` arrives, keeping the session updates.
+///
+/// The whole response frame is returned rather than its `result`, because the
+/// admission outcome of a second concurrent prompt travels in `error.data`.
+fn await_response(stdout: &mut BufReader<ChildStdout>, id: u64, updates: &mut Vec<Value>) -> Value {
+    loop {
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read ACP frame");
+        assert!(
+            !line.is_empty(),
+            "ACP closed before responding to request {id}"
+        );
+        let frame: Value = serde_json::from_str(&line).expect("ACP frame JSON");
+        if frame.get("id") == Some(&json!(id)) {
+            return frame;
+        }
+        assert_eq!(
+            frame.get("method").and_then(Value::as_str),
+            Some("session/update"),
+            "unexpected ACP frame while waiting for request {id}: {frame}"
+        );
+        updates.push(frame["params"]["update"].clone());
+    }
+}
+
+/// Wait until `count` turn requests have reached the gated provider.
+async fn await_turn_requests(turns: &AtomicUsize, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while turns.load(Ordering::SeqCst) < count {
+        assert!(
+            Instant::now() < deadline,
+            "the provider received {} turn requests, expected {count}",
+            turns.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn acp_database(root: &std::path::Path) -> zuno_paths::DbLocation {
+    zuno_paths::DbLocation::File(root.join("zuno-acp.db"))
+}
+
+fn durable_input(
+    root: &std::path::Path,
+    session_id: &str,
+    input_id: &str,
+) -> zuno_db::inbox::SessionInput {
+    let connection = zuno_db::open::open(&acp_database(root)).expect("open ACP database");
+    zuno_db::inbox::read_in(&connection, session_id, input_id)
+        .expect("read durable inbox row")
+        .unwrap_or_else(|| panic!("durable inbox row `{input_id}` is missing"))
+}
+
+/// Admit a pending row that belongs to a different client surface.
+///
+/// A TUI submission is durable input the ACP surface must never drive: it carries
+/// another surface's payload shape and its own queue projection.
+fn admit_foreign_pending_input(
+    root: &std::path::Path,
+    session_id: &str,
+    input_id: &str,
+    text: &str,
+) {
+    let pool = Arc::new(zuno_db::Pool::open(&acp_database(root)).expect("open ACP database pool"));
+    zuno_db::inbox::SessionInbox::new(pool)
+        .admit(zuno_db::inbox::NewSessionInput::new(
+            input_id,
+            session_id,
+            json!({
+                "kind": "tuiPrompt",
+                "submission": {"kind": "text", "data": text},
+                "origin": "tui_keybinding"
+            }),
+            zuno_db::inbox::InputDelivery::Queue,
+            zuno_db::message::now_millis(),
+        ))
+        .expect("admit foreign pending input");
+}
+
+fn join_acp_process(mut child: std::process::Child, stdin: ChildStdin) {
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP process failed: {stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acp_admits_a_second_prompt_durably_and_steers_it_into_the_live_turn() {
+    let provider = MockServer::start().await;
+    let turns = Arc::new(AtomicUsize::new(0));
+    let (responder, release) = GatedTurnResponder::new(Arc::clone(&turns));
+    Mock::given(method("POST"))
+        .respond_with(responder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let config = config_with_second_model(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    send_request(
+        &mut stdin,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type": "text", "text": "Start the long ACP turn."}]
+        }),
+    );
+    await_turn_requests(&turns, 1).await;
+
+    send_request(
+        &mut stdin,
+        4,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type": "text", "text": "Also read the release notes."}]
+        }),
+    );
+    let mut updates = Vec::new();
+    let admitted = await_response(&mut stdout, 4, &mut updates);
+    let error = admitted
+        .get("error")
+        .unwrap_or_else(|| panic!("the second prompt did not report its admission: {admitted}"));
+    assert_eq!(error["code"], -32001);
+    assert_eq!(error["data"]["sessionId"], session_id.as_str());
+    assert_eq!(error["data"]["admission"], "steered");
+    assert_eq!(error["data"]["delivery"], "steer");
+    let input_id = error["data"]["inputId"]
+        .as_str()
+        .expect("the admission must name its durable input")
+        .to_owned();
+    assert!(
+        error["data"]["admittedSequence"]
+            .as_i64()
+            .is_some_and(|sequence| sequence > 0),
+        "the admission must name its durable sequence: {error}"
+    );
+
+    let _released = release.send(());
+    let completed = await_response(&mut stdout, 3, &mut updates);
+    assert!(
+        completed.get("error").is_none(),
+        "the running turn was disturbed by the steered prompt: {completed}"
+    );
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+
+    let received = provider
+        .received_requests()
+        .await
+        .expect("provider requests");
+    let steered = received
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .find(|body| body.contains("Also read the release notes."))
+        .expect("the steered prompt never reached the provider");
+    assert!(
+        steered.contains("Start the long ACP turn."),
+        "the steered prompt did not continue the same conversation: {steered}"
+    );
+    // The turn that was already running received the steered prompt before its
+    // own assistant reply existed: the gate held the first provider response
+    // until after this prompt was admitted. A prompt that had instead waited for
+    // the running turn to finish would arrive behind that reply.
+    assert!(
+        !steered.contains("ACP reply"),
+        "the steered prompt waited for the running turn to finish: {steered}"
+    );
+
+    join_acp_process(child, stdin);
+    let settled = durable_input(root.path(), &session_id, &input_id);
+    assert_eq!(settled.state, zuno_db::inbox::SubmissionState::Consumed);
+    assert_eq!(settled.delivery, zuno_db::inbox::InputDelivery::Steer);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acp_rejects_a_command_invocation_while_a_turn_is_live_without_admitting_it() {
+    let provider = MockServer::start().await;
+    let turns = Arc::new(AtomicUsize::new(0));
+    let (responder, release) = GatedTurnResponder::new(Arc::clone(&turns));
+    Mock::given(method("POST"))
+        .respond_with(responder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let command_dir = root.path().join(".zuno/command");
+    std::fs::create_dir_all(&command_dir).expect("create project command directory");
+    std::fs::write(
+        command_dir.join("acp-check.md"),
+        "Inspect the ACP integration for $ARGUMENTS.",
+    )
+    .expect("write project command");
+    let config = config_with_second_model(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    send_request(
+        &mut stdin,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type": "text", "text": "Start the long ACP turn."}]
+        }),
+    );
+    await_turn_requests(&turns, 1).await;
+
+    send_request(
+        &mut stdin,
+        4,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type": "text", "text": "/acp-check src/lib.rs"}]
+        }),
+    );
+    let mut updates = Vec::new();
+    let refused = await_response(&mut stdout, 4, &mut updates);
+    let error = refused
+        .get("error")
+        .unwrap_or_else(|| panic!("a command invocation cannot run inside a live turn: {refused}"));
+    assert_eq!(error["code"], -32001);
+    assert_eq!(error["data"]["sessionId"], session_id.as_str());
+    assert_eq!(error["data"]["admission"], "rejected");
+    assert_eq!(error["data"]["reason"], "commandRequiresIdleSession");
+    assert!(
+        error["data"].get("inputId").is_none(),
+        "a rejected command must not claim a durable input: {error}"
+    );
+
+    let _released = release.send(());
+    let completed = await_response(&mut stdout, 3, &mut updates);
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+
+    let received = provider
+        .received_requests()
+        .await
+        .expect("provider requests");
+    assert!(
+        !received.iter().any(|request| {
+            String::from_utf8_lossy(&request.body)
+                .contains("Inspect the ACP integration for src/lib.rs.")
+        }),
+        "the refused command reached the model anyway"
+    );
+
+    join_acp_process(child, stdin);
+    let connection = zuno_db::open::open(&acp_database(root.path())).expect("open ACP database");
+    let pending =
+        zuno_db::inbox::pending_in(&connection, &session_id).expect("read pending inputs");
+    assert!(
+        pending.is_empty(),
+        "the refused command left durable input behind: {pending:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_prompts_keep_working_when_another_surface_left_pending_input() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(TextTurnResponder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let config = config_with_second_model(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    admit_foreign_pending_input(
+        root.path(),
+        &session_id,
+        "inp_foreign_tui",
+        "queued from the TUI composer",
+    );
+
+    let (completed, updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type": "text", "text": "Answer the ACP prompt."}]
+        }),
+    );
+    assert_eq!(completed["stopReason"], "end_turn");
+    assert!(
+        updates.iter().any(|update| {
+            update["sessionUpdate"] == "agent_message_chunk"
+                && update["content"]["text"] == "ACP reply"
+        }),
+        "the ACP turn did not run past the foreign pending row: {updates:?}"
+    );
+
+    let received = provider
+        .received_requests()
+        .await
+        .expect("provider requests");
+    assert!(
+        received.iter().any(
+            |request| String::from_utf8_lossy(&request.body).contains("Answer the ACP prompt.")
+        ),
+        "the ACP prompt never reached the provider"
+    );
+    assert!(
+        !received
+            .iter()
+            .any(|request| String::from_utf8_lossy(&request.body)
+                .contains("queued from the TUI composer")),
+        "the ACP turn drove another surface's queued submission"
+    );
+
+    join_acp_process(child, stdin);
+    let foreign = durable_input(root.path(), &session_id, "inp_foreign_tui");
+    assert_eq!(foreign.state, zuno_db::inbox::SubmissionState::Queued);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acp_steers_a_slash_prefixed_prompt_that_names_no_command() {
+    let provider = MockServer::start().await;
+    let turns = Arc::new(AtomicUsize::new(0));
+    let (responder, release) = GatedTurnResponder::new(Arc::clone(&turns));
+    Mock::given(method("POST"))
+        .respond_with(responder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    // A real project command exists, so the catalog is populated and the prompt
+    // below is refused by resolution rather than by an empty catalog.
+    let command_dir = root.path().join(".zuno/command");
+    std::fs::create_dir_all(&command_dir).expect("create project command directory");
+    std::fs::write(
+        command_dir.join("acp-check.md"),
+        "Inspect the ACP integration for $ARGUMENTS.",
+    )
+    .expect("write project command");
+    let config = config_with_second_model(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    send_request(
+        &mut stdin,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type": "text", "text": "Start the long ACP turn."}]
+        }),
+    );
+    await_turn_requests(&turns, 1).await;
+
+    // An absolute POSIX path is a prompt, not an invocation. Deciding by the
+    // leading `/` alone refused it as an unresolvable command and kept nothing.
+    let path_prompt = "/tmp/zuno-debug.log has the panic — read it and fix the cause";
+    send_request(
+        &mut stdin,
+        4,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type": "text", "text": path_prompt}]
+        }),
+    );
+    let mut updates = Vec::new();
+    let admitted = await_response(&mut stdout, 4, &mut updates);
+    let error = admitted.get("error").unwrap_or_else(|| {
+        panic!("a `/`-prefixed prompt did not report its admission: {admitted}")
+    });
+    assert_eq!(error["code"], -32001);
+    assert_eq!(
+        error["data"]["admission"], "steered",
+        "a prompt that names no command must be steered, not refused: {error}"
+    );
+    assert!(
+        error["data"]["reason"].is_null(),
+        "a prompt that names no command must not be reported as a command: {error}"
+    );
+    let input_id = error["data"]["inputId"]
+        .as_str()
+        .expect("the admission must name its durable input")
+        .to_owned();
+
+    let _released = release.send(());
+    let completed = await_response(&mut stdout, 3, &mut updates);
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+
+    let received = provider
+        .received_requests()
+        .await
+        .expect("provider requests");
+    assert!(
+        received
+            .iter()
+            .any(|request| String::from_utf8_lossy(&request.body).contains("/tmp/zuno-debug.log")),
+        "the steered path prompt never reached the provider"
+    );
+    assert!(
+        !received.iter().any(|request| {
+            String::from_utf8_lossy(&request.body)
+                .contains("Inspect the ACP integration for src/lib.rs.")
+        }),
+        "the path prompt was expanded as a project command"
+    );
+
+    join_acp_process(child, stdin);
+    let settled = durable_input(root.path(), &session_id, &input_id);
+    assert_eq!(settled.state, zuno_db::inbox::SubmissionState::Consumed);
+}
+
+/// Send one `session/prompt` and withdraw it in the same write.
+///
+/// `$/cancel_request` only reaches the Agent while the request it names is still in
+/// flight, so both frames leave in a single write: the transport reads the
+/// withdrawal out of its own buffer instead of waiting for more input, which is the
+/// only ordering that puts a withdrawal and an admission in the same instant.
+fn send_prompt_then_withdraw(stdin: &mut ChildStdin, id: u64, params: Value) {
+    let prompt = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/prompt",
+        "params": params,
+    });
+    let withdrawal = json!({
+        "jsonrpc": "2.0",
+        "method": "$/cancel_request",
+        "params": {"requestId": id},
+    });
+    let mut frames = serde_json::to_string(&prompt).expect("encode ACP prompt");
+    frames.push('\n');
+    frames.push_str(&serde_json::to_string(&withdrawal).expect("encode ACP withdrawal"));
+    frames.push('\n');
+    stdin
+        .write_all(frames.as_bytes())
+        .expect("write withdrawn ACP prompt");
+    stdin.flush().expect("flush withdrawn ACP prompt");
+}
+
+/// How many prompt/withdrawal pairs a test sends before giving up on the race.
+///
+/// A withdrawal only reaches the Agent while its own request is in flight, and that
+/// window is one durable admission wide. Each attempt is an independent try, so the
+/// bound is a contention ceiling rather than a timeout.
+const WITHDRAWAL_ATTEMPTS: u64 = 24;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acp_withdrawing_a_duplicate_prompt_leaves_the_owning_turn_running() {
+    let provider = MockServer::start().await;
+    let turns = Arc::new(AtomicUsize::new(0));
+    let (responder, release) = GatedTurnResponder::new(Arc::clone(&turns));
+    Mock::given(method("POST"))
+        .respond_with(responder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let config = config_with_second_model(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    // Every prompt below carries byte-identical params. Request identity is the
+    // only thing that separates the request owning the turn from a duplicate, so
+    // keying turn ownership on params made these indistinguishable.
+    let params = json!({
+        "sessionId": &session_id,
+        "prompt": [{"type": "text", "text": "Keep working on the long ACP turn."}]
+    });
+    send_request(&mut stdin, 3, "session/prompt", params.clone());
+    await_turn_requests(&turns, 1).await;
+
+    let mut updates = Vec::new();
+    let mut withdrawn_in_flight = false;
+    for id in 4..4 + WITHDRAWAL_ATTEMPTS {
+        send_prompt_then_withdraw(&mut stdin, id, params.clone());
+        let answered = await_response(&mut stdout, id, &mut updates);
+        // -32800 is only produced after the Agent was told this request was
+        // withdrawn, so it is the observation this test needs.
+        if answered["error"]["code"] == json!(-32800) {
+            withdrawn_in_flight = true;
+            break;
+        }
+        assert_eq!(
+            answered["error"]["code"],
+            json!(-32001),
+            "a duplicate prompt was neither admitted nor withdrawn: {answered}"
+        );
+    }
+    assert!(
+        withdrawn_in_flight,
+        "no withdrawal reached the Agent while its own prompt was in flight"
+    );
+
+    let _released = release.send(());
+    let completed = await_response(&mut stdout, 3, &mut updates);
+    assert_eq!(
+        completed["result"]["stopReason"], "end_turn",
+        "withdrawing a duplicate prompt interrupted the turn a different request owns: {completed}"
+    );
+
+    join_acp_process(child, stdin);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acp_withdrawing_an_admitted_prompt_cancels_its_durable_row() {
+    let provider = MockServer::start().await;
+    let turns = Arc::new(AtomicUsize::new(0));
+    let (responder, release) = GatedTurnResponder::new(Arc::clone(&turns));
+    Mock::given(method("POST"))
+        .respond_with(responder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let config = config_with_second_model(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    send_request(
+        &mut stdin,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type": "text", "text": "Keep working on the long ACP turn."}]
+        }),
+    );
+    await_turn_requests(&turns, 1).await;
+
+    let mut updates = Vec::new();
+    let mut withdrawn = None;
+    for id in 4..4 + WITHDRAWAL_ATTEMPTS {
+        let text = format!("Withdrawn prompt {id} must never reach the model.");
+        send_prompt_then_withdraw(
+            &mut stdin,
+            id,
+            json!({
+                "sessionId": &session_id,
+                "prompt": [{"type": "text", "text": &text}]
+            }),
+        );
+        let answered = await_response(&mut stdout, id, &mut updates);
+        let admission = answered["error"]["data"]["admission"].as_str();
+        if admission == Some("withdrawn") {
+            let input_id = answered["error"]["data"]["inputId"]
+                .as_str()
+                .expect("a withdrawn admission must name the durable row it retired")
+                .to_owned();
+            withdrawn = Some((text, input_id));
+            break;
+        }
+        if answered["error"]["code"] == json!(-32800) {
+            // The transport answered the withdrawal before the request reached its
+            // own admission, so this attempt has no durable row to retire.
+            continue;
+        }
+        assert!(
+            matches!(admission, Some("steered" | "queued")),
+            "a prompt was neither admitted nor withdrawn: {answered}"
+        );
+    }
+    let (withdrawn_text, withdrawn_input) = withdrawn.expect(
+        "no withdrawal reached the Agent between its prompt's durable admission and its response",
+    );
+
+    let _released = release.send(());
+    let completed = await_response(&mut stdout, 3, &mut updates);
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+
+    let received = provider
+        .received_requests()
+        .await
+        .expect("provider requests");
+    assert!(
+        !received
+            .iter()
+            .any(|request| String::from_utf8_lossy(&request.body).contains(&withdrawn_text)),
+        "a withdrawn prompt was still promoted into a turn"
+    );
+
+    join_acp_process(child, stdin);
+    let retired = durable_input(root.path(), &session_id, &withdrawn_input);
+    assert_eq!(
+        retired.state,
+        zuno_db::inbox::SubmissionState::Cancelled,
+        "the withdrawn prompt's durable row was left promotable: {retired:?}"
+    );
+    let connection = zuno_db::open::open(&acp_database(root.path())).expect("open ACP database");
+    let pending =
+        zuno_db::inbox::pending_in(&connection, &session_id).expect("read pending inputs");
+    assert!(
+        pending.is_empty(),
+        "a withdrawn or steered prompt was left pending: {pending:?}"
+    );
 }

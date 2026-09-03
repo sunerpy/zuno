@@ -5431,3 +5431,168 @@ async fn a_budget_policy_that_meets_a_locked_store_ends_the_turn_as_a_typed_data
         "the turn continued past a response it could not charge"
     );
 }
+
+/// A tool that admits its cancelled call decided nothing, the way `shell` does.
+///
+/// It cooperates with the interruption — it returns rather than being force-aborted —
+/// and it preserves what it produced, but it declares under the `cancellation` metadata
+/// key that its final side-effect state is unknown.
+struct UndecidedCancellationEcho {
+    started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl zuno_tool::Tool for UndecidedCancellationEcho {
+    fn id(&self) -> &str {
+        "echo"
+    }
+
+    fn description(&self) -> &str {
+        "Preserve what was produced and admit the outcome is undecided."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "text": { "type": "string" } },
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(
+        &self,
+        _args: Value,
+        ctx: zuno_tool::ToolContext,
+    ) -> Result<ToolOutput, zuno_error::ToolError> {
+        self.started.notify_one();
+        ctx.interrupt.notified().await;
+        Ok(ToolOutput::text("echo", "partial progress").with_metadata(
+            "cancellation",
+            json!({ "cancelled": true, "authoritative": false, "uncertain": true }),
+        ))
+    }
+}
+
+struct AllowEverything;
+
+#[async_trait]
+impl zuno_tool::PermissionAsker for AllowEverything {
+    async fn ask(
+        &self,
+        _origin: zuno_tool::PermissionOrigin<'_>,
+        _tool: &str,
+        _ask: zuno_tool::PermissionAsk,
+    ) -> Result<(), zuno_error::ToolError> {
+        Ok(())
+    }
+}
+
+/// The live event carries the verdict the dispatcher resolved, not the interruption mode.
+///
+/// This is the one seam where the two answers differ. A cooperative return means the tool
+/// stopped when it was asked to, which used to be read as a certain outcome everywhere a
+/// client looks; the tool's own `cancellation` claim is what says otherwise. The durable
+/// row always held that claim, so re-deriving certainty from the mode at publication time
+/// made live SSE, live ACP, and `zuno run` contradict the row they were written from. The
+/// whole chain runs here — real dispatcher, real interrupt, real tool claim — because the
+/// hand-built events in the surface tests cannot show where the value came from.
+#[tokio::test]
+async fn loop_publishes_the_cancellation_verdict_the_tool_claimed_not_the_mode() {
+    let mut connection = seeded();
+    put_user(
+        &connection,
+        "msg_undecided_cancel",
+        10,
+        "run the undecided tool",
+    );
+    let provider = Arc::new(FakeProvider::new(full_turn_responses()));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dispatcher = zuno_engine::dispatch::ToolRegistryDispatcher::new(
+        vec![Arc::new(UndecidedCancellationEcho {
+            started: Arc::clone(&started),
+        })],
+        vec![zuno_permission::Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: zuno_permission::PermissionAction::Allow,
+        }],
+        Arc::new(AllowEverything),
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
+        McpToolStatus::Ready,
+    );
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-undecided-cancel"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let cancel = async {
+        started.notified().await;
+        interrupt.fire();
+    };
+    let (outcome, events, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(turn, collect_events(receiver), cancel)
+    })
+    .await
+    .expect("the cancelled tool settles inside its cooperative window");
+
+    assert!(
+        matches!(
+            outcome.expect("an interrupted turn is not an error"),
+            TurnOutcome::Interrupted { .. }
+        ),
+        "the fired interrupt ends the turn"
+    );
+    let interrupted = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolDispatchInterrupted {
+                interruption,
+                uncertain,
+                output,
+                ..
+            } => Some((*interruption, *uncertain, output.clone())),
+            _ => None,
+        })
+        .expect("the cancelled tool call published an interruption event");
+    assert_eq!(
+        interrupted.0,
+        zuno_engine::r#loop::ToolInterruption::Cooperative,
+        "the tool returned inside its grace window, so the mode is cooperative"
+    );
+    assert!(
+        interrupted.1,
+        "the mode says certain and the tool said undecided; the event must carry the \
+         tool's claim, or every live surface contradicts the durable row"
+    );
+    assert!(
+        interrupted
+            .2
+            .contains("inspect authoritative state before retrying"),
+        "the model reads the demand too, not only the metadata: {}",
+        interrupted.2
+    );
+
+    let stored = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("stored messages");
+    let recorded = stored
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .find(|part| part.kind == PartKind::Tool)
+        .expect("the cancelled call was persisted");
+    assert_eq!(
+        recorded.data["state"]["metadata"]["interruption"]["uncertain"], true,
+        "the durable row is the value the event was published from"
+    );
+}

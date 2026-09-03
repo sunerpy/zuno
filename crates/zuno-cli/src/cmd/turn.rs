@@ -69,6 +69,7 @@ use zuno_engine::prelude::{
     compact_requested, run_prelude,
 };
 use zuno_engine::prompt::{PromptAssembly, RuntimePromptPolicy};
+use zuno_engine::report::ProjectedReport;
 use zuno_engine::session_command::SessionCommand;
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_error::{DbError, ProviderError, Recovery};
@@ -3602,7 +3603,20 @@ impl TurnHost {
         let selected_skill_prompt_budget =
             selected_skill_prompt_budget(skill_context_window, skill_config.as_ref());
         let commands = plan.command_registry(env, mcp.as_ref());
-        let profile_runtime = HarnessRuntime::new("profile");
+        // The deployment's stop ceiling is resolved here because this is the only
+        // production root runtime: `zuno-runtime` does not depend on `zuno-config`, so
+        // the value can only reach `RuntimeOptions` at the composition root, and every
+        // child scope inherits the options from this root.
+        let runtime_options = match plan
+            .config
+            .runtime
+            .as_ref()
+            .and_then(zuno_config::schema::RuntimeConfig::max_component_stop)
+        {
+            Some(ceiling) => zuno_runtime::RuntimeOptions::default().with_max_stop_timeout(ceiling),
+            None => zuno_runtime::RuntimeOptions::default(),
+        };
+        let profile_runtime = HarnessRuntime::with_options("profile", runtime_options);
         let profile = plan.profile;
         if let Err(error) = profile_runtime.activate_profile(profile).await {
             let shutdown = profile_runtime.shutdown().await;
@@ -3803,8 +3817,8 @@ impl TurnHost {
                     // Silent when nothing changed: re-asserting the same block on every
                     // session is the normal case and does not need reporting.
                     Ok(outcome) if outcome.changed() => notes.push(format!(
-                        "excluded {} from git in {}",
-                        zuno_paths::IGNORE_PATTERNS.join(", "),
+                        "excluded Zuno's generated state under {} from git in {}",
+                        zuno_paths::PROJECT_DIRECTORY,
                         worktree.display()
                     )),
                     Ok(_) => {}
@@ -6182,6 +6196,15 @@ impl TurnHost {
         self.inbox.clone()
     }
 
+    /// Durable-first input admission shared by every client surface.
+    ///
+    /// Clients admit through this instead of writing the inbox and contending for
+    /// the live-turn lease themselves; the service keeps the durable write ahead of
+    /// the lease so a busy session never discards input.
+    pub(crate) fn input_admission(&self) -> zuno_engine::admission::SessionInputAdmission {
+        zuno_engine::admission::SessionInputAdmission::new(self.inbox.clone(), self.runs.clone())
+    }
+
     /// Database pool shared with independently driven child-session input.
     pub(crate) fn database_pool(&self) -> Arc<zuno_db::pool::Pool> {
         Arc::clone(&self.database)
@@ -6458,7 +6481,7 @@ impl TurnHost {
         &mut self,
         prompt: &str,
         message_id: Option<&str>,
-        guard: SessionRunGuard,
+        guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
         self.drive_input(
@@ -6469,7 +6492,7 @@ impl TurnHost {
                 UserInputPersistence::AdmitAndPromote,
                 PlanningInputSource::User,
             ),
-            &guard,
+            guard,
             events,
         )
         .await
@@ -6480,7 +6503,7 @@ impl TurnHost {
         &mut self,
         prompt: &str,
         message_id: &str,
-        guard: SessionRunGuard,
+        guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
         self.drive_input(
@@ -6491,7 +6514,7 @@ impl TurnHost {
                 UserInputPersistence::AlreadyPromoted,
                 PlanningInputSource::User,
             ),
-            &guard,
+            guard,
             events,
         )
         .await
@@ -6503,7 +6526,7 @@ impl TurnHost {
         prompt: &str,
         content: &[RequestContentBlock],
         message_id: &str,
-        guard: SessionRunGuard,
+        guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
         self.drive_input(
@@ -6514,34 +6537,7 @@ impl TurnHost {
                 UserInputPersistence::AlreadyPromoted,
                 PlanningInputSource::User,
             ),
-            &guard,
-            events,
-        )
-        .await
-    }
-
-    /// Drive a settled child report without allowing host-generated prose to seed a plan.
-    pub(crate) async fn drive_promoted_report_with_guard(
-        &mut self,
-        prompt: &str,
-        message_id: &str,
-        source: PlanningInputSource,
-        guard: SessionRunGuard,
-        events: TurnEventSender,
-    ) -> Result<(), String> {
-        debug_assert!(matches!(
-            source,
-            PlanningInputSource::ChildReport | PlanningInputSource::BackgroundReport
-        ));
-        self.drive_input(
-            prompt,
-            DriveInputOptions::plain(
-                Some(message_id),
-                None,
-                UserInputPersistence::AlreadyPromoted,
-                source,
-            ),
-            &guard,
+            guard,
             events,
         )
         .await
@@ -6565,36 +6561,6 @@ impl TurnHost {
                 None,
                 UserInputPersistence::AlreadyPromoted,
                 PlanningInputSource::User,
-            ),
-            &guard,
-            events,
-        )
-        .await
-    }
-
-    /// Drive a settled child report after acquiring the parent session lease.
-    pub(crate) async fn drive_promoted_report(
-        &mut self,
-        prompt: &str,
-        message_id: &str,
-        source: PlanningInputSource,
-        events: TurnEventSender,
-    ) -> Result<(), String> {
-        debug_assert!(matches!(
-            source,
-            PlanningInputSource::ChildReport | PlanningInputSource::BackgroundReport
-        ));
-        let guard = self
-            .runs
-            .begin_turn(self.session_id.clone())
-            .map_err(to_string)?;
-        self.drive_input(
-            prompt,
-            DriveInputOptions::plain(
-                Some(message_id),
-                None,
-                UserInputPersistence::AlreadyPromoted,
-                source,
             ),
             &guard,
             events,
@@ -6834,6 +6800,86 @@ impl TurnHost {
         events: TurnEventSender,
     ) -> Result<(), String> {
         self.require_active_extension_composition()?;
+        self.preload_turn_skills(&[prompt], &events).await?;
+        let (message, parts) =
+            self.prepare_turn_user_message(prompt, options.message_id, options.content)?;
+        let materialized = match options.persistence {
+            UserInputPersistence::AdmitAndPromote => self.persist_user_input(&message, &parts)?,
+            UserInputPersistence::AlreadyPromoted => {
+                self.persist_promoted_user_input(&message, &parts)?;
+                false
+            }
+        };
+        if materialized {
+            events
+                .publish(TurnEvent::SessionMaterialized {
+                    session_id: self.session_id.clone(),
+                    title: self.session_title.clone(),
+                })
+                .await
+                .map_err(to_string)?;
+        }
+        self.drive_prepared(
+            prompt,
+            options.planning_source,
+            options.content,
+            options.routing.as_ref(),
+            guard,
+            events,
+        )
+        .await
+    }
+
+    /// Drive every settled report one idle wake claimed as a single provider request.
+    ///
+    /// Each report keeps its own durable user message, its own `session.input.consumed`
+    /// transition, and its own `message.data.taskReport` metadata; only the provider
+    /// request is shared. Spending one turn per report is what let a session announce
+    /// intermediate states that a later report in the same batch had already replaced.
+    ///
+    /// Plan reconciliation reads the report the batch marks current, so a superseded
+    /// state cannot reopen work the newest report already finished.
+    pub(crate) async fn drive_promoted_reports_with_guard(
+        &mut self,
+        reports: &[ProjectedReport],
+        guard: &SessionRunGuard,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        let newest = reports
+            .iter()
+            .find(|report| report.newest)
+            .or_else(|| reports.last())
+            .ok_or_else(|| "a batched report turn needs one promoted report".to_owned())?;
+        debug_assert!(matches!(
+            newest.source,
+            PlanningInputSource::ChildReport | PlanningInputSource::BackgroundReport
+        ));
+        let planning_prompt = newest.text.clone();
+        let planning_source = newest.source;
+        self.require_active_extension_composition()?;
+        let prompts = reports
+            .iter()
+            .map(|report| report.text.as_str())
+            .collect::<Vec<_>>();
+        self.preload_turn_skills(&prompts, &events).await?;
+        for report in reports {
+            let (message, parts) =
+                self.prepare_turn_user_message(&report.text, Some(report.input_id.as_str()), None)?;
+            self.persist_promoted_user_input(&message, &parts)?;
+        }
+        self.drive_prepared(&planning_prompt, planning_source, None, None, guard, events)
+            .await
+    }
+
+    /// Load the Skills this turn's inputs name before any of them reaches the model.
+    ///
+    /// A batched report turn passes every report's text, because a Skill named by one
+    /// report must be loaded even when a different report seeds the plan.
+    async fn preload_turn_skills(
+        &mut self,
+        prompts: &[&str],
+        events: &TurnEventSender,
+    ) -> Result<(), String> {
         let skills = self.skill_catalog.snapshot();
         let required_skills = resolve_required_skill_identities(
             &self.agent,
@@ -6857,65 +6903,79 @@ impl TurnHost {
                 .await
                 .map_err(to_string)?;
         }
-        let newly_loaded = preload_explicit_skills(
-            &mut self.resolver,
-            skills.skills(),
-            &mut self.selected_skills,
-            prompt,
-            self.selected_skill_prompt_budget,
-        )
-        .await?;
-        for skill in newly_loaded {
-            events
-                .publish(TurnEvent::SkillLoaded {
-                    name: skill.name,
-                    source: skill.source,
-                })
-                .await
-                .map_err(to_string)?;
+        for prompt in prompts.iter().copied() {
+            let newly_loaded = preload_explicit_skills(
+                &mut self.resolver,
+                skills.skills(),
+                &mut self.selected_skills,
+                prompt,
+                self.selected_skill_prompt_budget,
+            )
+            .await?;
+            for skill in newly_loaded {
+                events
+                    .publish(TurnEvent::SkillLoaded {
+                        name: skill.name,
+                        source: skill.source,
+                    })
+                    .await
+                    .map_err(to_string)?;
+            }
         }
+        Ok(())
+    }
+
+    /// Build one user message and its parts after the session's existing history.
+    fn prepare_turn_user_message(
+        &self,
+        text: &str,
+        message_id: Option<&str>,
+        content: Option<&[RequestContentBlock]>,
+    ) -> Result<
+        (
+            zuno_db::message::MessageRecord,
+            Vec<zuno_db::message::PartRecord>,
+        ),
+        String,
+    > {
         let latest = zuno_db::message::MessageStore::new(&self.connection)
             .latest_time_created(&self.session_id)
             .map_err(to_string)?;
-        let (message, parts) = prepare_user_message(
+        prepare_user_message(
             UserMessageInput {
                 session_id: &self.session_id,
                 agent: &self.agent,
                 provider_id: &self.provider_id,
                 model_id: &self.model_id,
-                text: prompt,
-                message_id: options.message_id,
+                text,
+                message_id,
                 now: zuno_db::message::created_after(zuno_db::message::now_millis(), latest),
             },
-            options.content,
+            content,
             &self.attachments,
-        )?;
-        let materialized = match options.persistence {
-            UserInputPersistence::AdmitAndPromote => self.persist_user_input(&message, &parts)?,
-            UserInputPersistence::AlreadyPromoted => {
-                self.persist_promoted_user_input(&message, &parts)?;
-                false
-            }
-        };
-        if materialized {
-            events
-                .publish(TurnEvent::SessionMaterialized {
-                    session_id: self.session_id.clone(),
-                    title: self.session_title.clone(),
-                })
-                .await
-                .map_err(to_string)?;
-        }
+        )
+    }
+
+    /// Reconcile work and run one accounted turn over already persisted input.
+    async fn drive_prepared(
+        &mut self,
+        planning_prompt: &str,
+        planning_source: PlanningInputSource,
+        planning_content: Option<&[RequestContentBlock]>,
+        routing: Option<&PromptRouting>,
+        guard: &SessionRunGuard,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
         self.recover_background_reports().await?;
         self.goal_projection
             .ingest(&self.goal_store)
             .map_err(to_string)?;
         let planning =
-            self.ensure_durable_plan(prompt, options.planning_source, options.content)?;
+            self.ensure_durable_plan(planning_prompt, planning_source, planning_content)?;
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
         let result = self
-            .drive_input_unaccounted(guard, options.routing.as_ref(), &planning, events.clone())
+            .drive_input_unaccounted(guard, routing, &planning, events.clone())
             .await;
         match result {
             Ok(outcome) => {

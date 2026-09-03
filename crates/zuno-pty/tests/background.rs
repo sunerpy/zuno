@@ -104,7 +104,7 @@ async fn one_service_owns_start_wait_and_bounded_output() {
     assert_eq!(settled.status, BackgroundExecutionStatus::Completed);
     assert_eq!(settled.exit_code, Some(0));
     let output = service
-        .output(&info.id, ReplayCursor::Full)
+        .output(&info.id, ReplayCursor::Full, None)
         .expect("output replay");
     assert_eq!(output.bytes, b"firstsecond");
     assert_eq!(
@@ -205,16 +205,135 @@ async fn live_output_is_bounded_while_the_complete_file_is_retained() {
         .expect("large command settles");
 
     let output = service
-        .output(&info.id, ReplayCursor::Full)
+        .output(&info.id, ReplayCursor::Full, None)
         .expect("bounded output");
     assert!(output.bytes.len() <= BUFFER_LIMIT);
     assert_eq!(output.total_written, total as u64);
     assert_eq!(output.discarded, 4_096);
+    assert!(
+        !output.from_disk,
+        "the retained tail is served from memory, not by re-reading the file"
+    );
     assert_eq!(
         std::fs::metadata(output.output_file)
             .expect("complete output file")
             .len(),
         total as u64
+    );
+}
+
+#[tokio::test]
+async fn a_cursor_older_than_the_retained_ring_is_served_from_the_persisted_file() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let service = BackgroundExecutionService::open(directory.path()).expect("background service");
+    let total = BUFFER_LIMIT + 4_096;
+    let info = service
+        .start(input(
+            directory.path(),
+            format!("printf 'first line\\n'; head -c {total} /dev/zero | tr '\\0' x"),
+            Duration::from_secs(10),
+        ))
+        .expect("command starts");
+    service
+        .wait(&info.id, None)
+        .await
+        .expect("large command settles");
+
+    let retained = service
+        .output(&info.id, ReplayCursor::Full, None)
+        .expect("retained tail");
+    assert!(
+        retained.discarded > 0,
+        "the ring has to have dropped its prefix for this to mean anything"
+    );
+    assert!(
+        !String::from_utf8_lossy(&retained.bytes).contains("first line"),
+        "the opening line must be gone from memory"
+    );
+
+    // The discarded prefix is on disk in full. Clamping a cursor forward made it
+    // unreachable through this service and left `tail` on a file the only way to see it.
+    let recovered = service
+        .output(&info.id, ReplayCursor::From(0), Some(11))
+        .expect("prefix from the persisted file");
+    assert_eq!(recovered.bytes, b"first line\n");
+    assert_eq!(
+        recovered.cursor, 11,
+        "the next window starts where this one ended"
+    );
+    assert!(recovered.from_disk);
+    assert_eq!(recovered.total_written, total as u64 + 11);
+    assert!(
+        recovered.retained_from > recovered.cursor,
+        "the window is behind what the ring retains, which is why it came from the file"
+    );
+
+    let next = service
+        .output(&info.id, ReplayCursor::From(recovered.cursor), Some(4))
+        .expect("the window after the prefix");
+    assert_eq!(next.bytes, b"xxxx");
+    assert!(next.from_disk);
+}
+
+#[tokio::test]
+async fn a_window_limit_bounds_one_replay_without_moving_the_cursor_space() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let service = BackgroundExecutionService::open(directory.path()).expect("background service");
+    let info = service
+        .start(input(
+            directory.path(),
+            "printf '0123456789'".to_owned(),
+            Duration::from_secs(5),
+        ))
+        .expect("command starts");
+    service.wait(&info.id, None).await.expect("settles");
+
+    let first = service
+        .output(&info.id, ReplayCursor::From(0), Some(4))
+        .expect("first window");
+    assert_eq!(first.bytes, b"0123");
+    assert_eq!(first.cursor, 4);
+    assert!(!first.from_disk, "these bytes are still retained");
+    assert_eq!(first.total_written, 10);
+
+    let second = service
+        .output(&info.id, ReplayCursor::From(first.cursor), Some(4))
+        .expect("second window");
+    assert_eq!(second.bytes, b"4567");
+    assert_eq!(second.cursor, 8);
+}
+
+/// A bounded read of "everything still retained" is the newest window, not the oldest.
+///
+/// This is the request a caller makes when it names no cursor at all. Serving it from the
+/// head returned an execution's opening bytes forever: every poll of a running command
+/// came back identical, and the summary the caller was waiting for was one call per window
+/// away.
+#[tokio::test]
+async fn a_bounded_retained_read_returns_the_newest_window_of_an_execution() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let service = BackgroundExecutionService::open(directory.path()).expect("background service");
+    let info = service
+        .start(input(
+            directory.path(),
+            "printf '0123456789'".to_owned(),
+            Duration::from_secs(5),
+        ))
+        .expect("command starts");
+    service.wait(&info.id, None).await.expect("settles");
+
+    let window = service
+        .output(&info.id, ReplayCursor::Full, Some(4))
+        .expect("newest window");
+
+    assert_eq!(window.bytes, b"6789");
+    assert_eq!(
+        window.cursor, window.total_written,
+        "a tail window leaves nothing newer to page toward"
+    );
+    assert!(
+        !window.from_disk,
+        "the newest bytes are always still retained"
     );
 }
 
@@ -343,7 +462,7 @@ fn persisted_running_state_reconciles_to_uncertain_without_replay() {
     );
     assert_eq!(
         service
-            .output(&id, ReplayCursor::Full)
+            .output(&id, ReplayCursor::Full, None)
             .expect("recovered output")
             .bytes,
         b"partial"

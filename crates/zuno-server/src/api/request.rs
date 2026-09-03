@@ -4,7 +4,6 @@ use axum::extract::{Extension, Path, Request, State};
 use axum::http::StatusCode;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use zuno_permission::ReplyKind;
 
 use super::Data;
@@ -62,14 +61,6 @@ pub async fn question_requests(
     Extension(services): Extension<ServerServices>,
 ) -> Json<impl Serialize> {
     Json(location_response(&state, services.requests.questions(None)))
-}
-
-pub async fn saved_permissions() -> Json<Data<Vec<Value>>> {
-    Json(Data::new(Vec::new()))
-}
-
-pub async fn remove_saved_permission(Path(_id): Path<String>) -> StatusCode {
-    StatusCode::NO_CONTENT
 }
 
 pub async fn session_questions(

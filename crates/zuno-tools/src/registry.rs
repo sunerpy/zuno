@@ -344,11 +344,11 @@ impl ToolRegistryBuilder {
     /// Load every source once and freeze the native source order.
     #[must_use]
     pub fn build(self) -> ToolRegistry {
-        let output_store = ToolOutputStore::new(
-            self.directory
-                .join(zuno_paths::PROJECT_DIRECTORY)
-                .join(zuno_paths::TOOL_OUTPUT_DIRECTORY),
-        );
+        // At the worktree root, not at this registry's own directory: the exclude
+        // patterns and `classify` are both anchored there, so a store under a
+        // subdirectory would be generated state nothing recognises.
+        let output_store =
+            ToolOutputStore::in_worktree(&zuno_paths::generated_root(&self.directory));
         let mut diagnostics = Vec::new();
         let core = Arc::new_cyclic(|weak| {
             let mut sourced_tools = Vec::new();

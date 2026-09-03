@@ -159,7 +159,7 @@ pub struct SessionPruneDatabaseImpact {
 /// One external artifact projected or removed by the service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionPruneArtifact {
-    /// Filesystem path rendered without platform-dependent JSON objects.
+    /// Filesystem path in wire form: a string, with forward slashes on every platform.
     pub path: String,
     /// File content bytes below the path.
     pub bytes: u64,
@@ -276,12 +276,12 @@ pub fn execute(
         ProgressPhase::Artifacts,
         Some(selected_count),
     ));
-    let artifacts = match request.action {
-        SessionPruneAction::Archive { .. } => SessionPruneArtifactImpact::default(),
+    let (artifacts, skipped_roots) = match request.action {
+        SessionPruneAction::Archive { .. } => (SessionPruneArtifactImpact::default(), Vec::new()),
         SessionPruneAction::Preview | SessionPruneAction::Delete
             if outcome.preview.session_ids.is_empty() =>
         {
-            SessionPruneArtifactImpact::default()
+            (SessionPruneArtifactImpact::default(), Vec::new())
         }
         SessionPruneAction::Preview | SessionPruneAction::Delete => {
             let mut artifact_request = ArtifactGcRequest::new(
@@ -293,7 +293,15 @@ pub fn execute(
             }
             let report = artifact_gc::execute(connection, paths, &artifact_request)
                 .map_err(SessionPruneError::Artifacts)?;
-            artifact_impact(report)
+            // A root the pass could not read is reported, not swallowed: those files were
+            // left in place, and after a delete the sessions that own them are already
+            // gone from the database, so this line is the only record that names them.
+            let skipped = report
+                .skipped_roots
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            (artifact_impact(report), skipped)
         }
     };
 
@@ -301,6 +309,7 @@ pub fn execute(
     if let Some(warning) = visibility_warning {
         warnings.push(warning);
     }
+    warnings.extend(skipped_roots);
     let report = SessionPruneReport {
         action: request.action,
         selected_session_ids: outcome.preview.session_ids.clone(),
@@ -412,7 +421,13 @@ fn artifact_impact(report: artifact_gc::ArtifactGcReport) -> SessionPruneArtifac
             .artifacts
             .into_iter()
             .map(|artifact| SessionPruneArtifact {
-                path: artifact.path.to_string_lossy().into_owned(),
+                // Rendered the way every other path Zuno publishes is rendered. The
+                // field is serialized into `session prune`'s JSON, and
+                // `to_string_lossy` handed a Windows reader backslashes where the same
+                // report's neighbours, the tool results naming these very files, and the
+                // ACP and HTTP surfaces all use forward slashes. A consumer that joins
+                // or compares the two forms sees two different files.
+                path: zuno_paths::wire_path(&artifact.path),
                 bytes: artifact.bytes,
                 kind: artifact_kind(artifact.kind).to_owned(),
                 reason: reclaim_reason(&artifact.reason),
@@ -486,5 +501,40 @@ fn system_time(now_ms: i64) -> SystemTime {
         UNIX_EPOCH
             .checked_sub(Duration::from_millis(now_ms.unsigned_abs()))
             .unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifact_gc::{ArtifactGcReport, ReclaimedArtifact};
+    use std::path::Path;
+
+    #[test]
+    fn a_projected_artifact_path_is_rendered_in_wire_form_on_every_platform() {
+        // The field is a `String` in `session prune`'s JSON, so its separator is a
+        // published detail. Rendering it natively made the same report disagree with
+        // itself on Windows: this path arrived with backslashes while every neighbouring
+        // surface naming the very same files used forward slashes.
+        let path = Path::new("checkout")
+            .join(".zuno")
+            .join("tool-output")
+            .join("tool_ses_old_call.jsonl");
+        let impact = artifact_impact(ArtifactGcReport {
+            artifacts: vec![ReclaimedArtifact {
+                path,
+                bytes: 12,
+                kind: ArtifactKind::ToolOutput,
+                reason: ReclaimReason::DeletedSession("ses_old".to_owned()),
+                removed: false,
+            }],
+            total_bytes: 12,
+            skipped_roots: Vec::new(),
+        });
+
+        assert_eq!(
+            impact.items[0].path, "checkout/.zuno/tool-output/tool_ses_old_call.jsonl",
+            "a published artifact path uses forward slashes on every platform"
+        );
     }
 }

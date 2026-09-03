@@ -46,8 +46,10 @@ pub enum PermissionRule {
     Patterns(OrderedMap<PermissionAction>),
 }
 
-/// The keys the oracle names explicitly (`config/permission.ts:18-34`). Any other
-/// key is still valid — the oracle's rest record accepts it — and is kept.
+/// The permission keys Zuno names explicitly. A key outside this list is still
+/// valid — dynamic MCP, plugin, and skill tools are governed by their own name,
+/// and a key may be a wildcard pattern — as long as it is not an alias that
+/// [`permission_key`] collapses onto another key.
 pub const KNOWN_KEYS: &[&str] = &[
     "read",
     "edit",
@@ -71,6 +73,36 @@ pub const KNOWN_KEYS: &[&str] = &[
     "skill",
 ];
 
+/// Tools routed through the `edit` permission key. `edit` governs itself, so
+/// only the trailing names are aliases.
+pub const EDIT_TOOLS: [&str; 3] = ["edit", "write", "apply_patch"];
+
+/// Tools routed through the `read` permission key: the three MCP resource
+/// tools. The `read` tool governs itself.
+pub const READ_TOOLS: [&str; 3] = [
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource",
+];
+
+/// The permission key that governs `tool`.
+///
+/// Every tool outside an alias group is governed by its own name, including
+/// dynamic MCP, plugin, and skill tools. This is the single source of truth for
+/// the collapse: the evaluator in `zuno-permission` re-exports it, and
+/// [`PermissionObject`] deserialization uses it to refuse a rule whose key is
+/// only an alias and could therefore never match.
+#[must_use]
+pub fn permission_key(tool: &str) -> &str {
+    if EDIT_TOOLS.contains(&tool) {
+        return "edit";
+    }
+    if READ_TOOLS.contains(&tool) {
+        return "read";
+    }
+    tool
+}
+
 /// The subset of [`KNOWN_KEYS`] the oracle types as a bare action, with no
 /// per-pattern form (`config/permission.ts:27-30,32`).
 pub const ACTION_ONLY_KEYS: &[&str] = &[
@@ -92,7 +124,10 @@ pub struct PermissionConfig {
     /// How unresolved and side-effecting calls are admitted.
     #[serde(default)]
     pub mode: PermissionMode,
-    /// Ordered per-tool rules. Explicit denies remain terminal in every mode.
+    /// Ordered per-tool rules, keyed by permission key. Explicit denies remain
+    /// terminal in every mode. A key that only aliases another key — `write`,
+    /// `apply_patch`, and the three MCP resource tools — is rejected, because
+    /// such a rule can never match.
     #[serde(default)]
     pub rules: PermissionObject,
 }
@@ -154,6 +189,13 @@ fn validate_rule<E: de::Error>(key: &str, rule: &PermissionRule) -> Result<(), E
     if ACTION_ONLY_KEYS.contains(&key) && matches!(rule, PermissionRule::Patterns(_)) {
         return Err(de::Error::custom(format!(
             "permission {key:?} takes a bare action, not per-pattern rules"
+        )));
+    }
+    let governing = permission_key(key);
+    if governing != key {
+        return Err(de::Error::custom(format!(
+            "permission {key:?} is never evaluated: the {key} tool is governed by \
+             {governing:?}, so move this rule under {governing:?}"
         )));
     }
     Ok(())

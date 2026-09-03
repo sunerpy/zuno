@@ -1,9 +1,11 @@
 # zuno agent
 
-Agent 各自携带自己的提示、模型、权限与委派边界。`zuno agent` 就是编写 Agent、以及检查当前
-配置链实际解析出什么的那个面 —— 在全局定义与项目定义相互重叠时这尤其重要。
+Agent 各自携带自己的提示、模型、权限与委派边界。`zuno agent` 就是检查当前配置链实际解析
+出什么的那个面 —— 在全局定义与项目定义相互重叠时这尤其重要。
 
-`create` 写出一个新的 Agent 定义；`list` 报告从这里可见的 Agent。
+`list` 报告从这里可见的 Agent，并逐个给出本构建为其强制执行的权限规则。编写 Agent 就是在
+`.zuno/agent/` 下写一个 Markdown 文件；该文件接受的 front matter 见
+[自定义 Agent](/zh/config/custom-agents)。
 
 ## 用法
 
@@ -26,29 +28,8 @@ zuno agent [OPTIONS] <COMMAND>
 
 | 子命令 | 说明 |
 | --- | --- |
-| [`create`](#zuno-agent-create) | |
-| [`list`](#zuno-agent-list) | |
+| [`list`](#zuno-agent-list) | 列出当前配置链解析出的 Agent |
 | `help` | 打印本消息或给定子命令的帮助 |
-
-### zuno agent create
-
-```sh
-zuno agent create [OPTIONS]
-```
-
-| 选项 | 说明 | 默认值 |
-| --- | --- | --- |
-| `--path <PATH>` | | |
-| `-v`, `--version` | 显示 Zuno 包版本 | |
-| `--description <DESCRIPTION>` | | |
-| `--mode <MODE>` | 可选值：`all`、`primary`、`subagent` | |
-| `--print-logs` | 除结构化本地日志存储之外，同时把日志打印到 stderr | |
-| `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
-| `--permissions <PERMISSIONS>` | 别名：`--tools` | |
-| `-m`, `--model <MODEL>` | | |
-| `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
-| `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
-| `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ### zuno agent list
 
@@ -73,13 +54,7 @@ zuno agent list [OPTIONS]
 zuno agent list
 ```
 
-在显式路径上创建一个 subagent 定义，带说明并固定模型。
-
-```sh
-zuno agent create --path .zuno/agent/reviewer.md --mode subagent --description "Review diffs for regressions" --model openai/gpt-5
-```
-
-创建之后检视某个 Agent 完全解析后的定义。
+写出 `.zuno/agent/reviewer.md` 之后，检视该 Agent 完全解析后的定义。
 
 ```sh
 zuno debug agent reviewer

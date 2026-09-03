@@ -1,4 +1,4 @@
-use serde_json::json;
+use serde_json::{Value, json};
 use zuno_acp::{
     AttemptBufferedTurnEventProjector, IMPLEMENTED_METHODS, TurnEventProjector, turn_event_update,
 };
@@ -719,6 +719,7 @@ fn cancelled_tools_use_stable_acp_status_with_typed_zuno_metadata() {
             title: "Inspect repository".to_owned(),
             output: "child supervisor settled".to_owned(),
             interruption: ToolInterruption::Cooperative,
+            uncertain: false,
         })
         .expect("cancelled tool is client-visible");
 
@@ -733,6 +734,112 @@ fn cancelled_tools_use_stable_acp_status_with_typed_zuno_metadata() {
         cancelled["content"][0]["content"]["text"],
         "child supervisor settled"
     );
+}
+
+fn projector_with_raw_input(call_id: &str, name: &str, raw_input: &Value) -> TurnEventProjector {
+    let mut projector = TurnEventProjector::new();
+    let _ = projector.project(&TurnEvent::Provider {
+        step: 1,
+        event: StreamEvent::ToolUseStart {
+            id: call_id.to_owned(),
+            name: name.to_owned(),
+        },
+    });
+    let _ = projector.project(&TurnEvent::Provider {
+        step: 1,
+        event: StreamEvent::ToolInputDelta {
+            id: call_id.to_owned(),
+            delta: serde_json::to_string(raw_input).expect("raw input"),
+        },
+    });
+    projector
+}
+
+fn task_projector(call_id: &str) -> TurnEventProjector {
+    projector_with_raw_input(
+        call_id,
+        "task",
+        &json!({
+            "agent": "explorer",
+            "objective": "Inspect repository",
+            "deliverable": "A call-chain report.",
+        }),
+    )
+}
+
+fn question_projector(call_id: &str) -> TurnEventProjector {
+    projector_with_raw_input(
+        call_id,
+        "question",
+        &json!({
+            "questions": [{
+                "header": "Database",
+                "question": "Which database?",
+                "options": [{"label": "SQLite", "description": "Embedded"}]
+            }]
+        }),
+    )
+}
+
+fn cancelled_tool_update(
+    projector: &mut TurnEventProjector,
+    call_id: &str,
+    name: &str,
+    uncertain: bool,
+) -> Value {
+    projector
+        .project(&TurnEvent::ToolDispatchInterrupted {
+            step: 1,
+            call_id: call_id.to_owned(),
+            display_name: "Delegate".to_owned(),
+            name: name.to_owned(),
+            title: "Inspect repository".to_owned(),
+            output: "the call was stopped".to_owned(),
+            interruption: ToolInterruption::Cooperative,
+            uncertain,
+        })
+        .expect("a cancelled tool is client-visible")
+}
+
+#[test]
+fn a_cooperative_cancellation_whose_work_was_undecided_presents_uncertain() {
+    let mut projector = task_projector("call-task");
+    let cancelled = cancelled_tool_update(&mut projector, "call-task", "task", true);
+
+    assert_eq!(cancelled["_meta"]["zuno"]["outcome"], "uncertain");
+    assert_eq!(cancelled["_meta"]["zuno"]["uncertain"], true);
+    // `forced` is the grace window, which this call never exhausted.
+    assert_eq!(cancelled["_meta"]["zuno"]["forced"], false);
+    assert_eq!(
+        cancelled["_meta"]["zuno"]["interruptionMode"],
+        "cooperative"
+    );
+    assert_eq!(cancelled["_meta"]["zuno"]["subagent"]["state"], "uncertain");
+
+    let mut projector = question_projector("call-question");
+    let question = cancelled_tool_update(&mut projector, "call-question", "question", true);
+
+    assert_eq!(question["_meta"]["zuno"]["outcome"], "uncertain");
+    assert_eq!(question["_meta"]["zuno"]["question"]["status"], "uncertain");
+}
+
+#[test]
+fn a_cooperative_cancellation_that_claimed_nothing_still_presents_cancelled() {
+    // The regression guard for the projection above: an ordinary cancellation must not
+    // tell the model to inspect authoritative state, or every stopped call would.
+    let mut projector = task_projector("call-task");
+    let cancelled = cancelled_tool_update(&mut projector, "call-task", "task", false);
+
+    assert_eq!(cancelled["_meta"]["zuno"]["outcome"], "cancelled");
+    assert_eq!(cancelled["_meta"]["zuno"]["uncertain"], false);
+    assert_eq!(cancelled["_meta"]["zuno"]["forced"], false);
+    assert_eq!(cancelled["_meta"]["zuno"]["subagent"]["state"], "cancelled");
+
+    let mut projector = question_projector("call-question");
+    let question = cancelled_tool_update(&mut projector, "call-question", "question", false);
+
+    assert_eq!(question["_meta"]["zuno"]["outcome"], "cancelled");
+    assert_eq!(question["_meta"]["zuno"]["question"]["status"], "cancelled");
 }
 
 #[test]

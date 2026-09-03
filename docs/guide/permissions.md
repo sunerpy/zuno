@@ -111,6 +111,13 @@ For a persistent user choice, put the JSON in the global `zuno.json` under the
 config root printed by `zuno debug paths`—normally
 `$XDG_CONFIG_HOME/zuno/zuno.json` or `~/.config/zuno/zuno.json`.
 
+The same principle covers programs a checkout names. A project layer that sets `shell`, a
+local `mcp.*.command`, an `lsp.*.command`, a `formatter.*.command`, or a
+`productAgent.*.command` is refused outright, and switching that entry off with
+`enabled: false` or `disabled: true` changes nothing, because the switch sits in the layer
+the checkout controls. Only `trust.project_host_commands` in a trusted layer admits that
+checkout. See [Files and precedence](/config/files).
+
 ### Network authority
 
 `sandbox.network` is `deny` or `allow`. In confined modes the default is `deny`,
@@ -236,6 +243,22 @@ Note what `allow_all` does **not** do. It does not disable the sandbox, and it d
 not override a rule that says `deny`. An explicit deny is terminal in every mode,
 including this one.
 
+## A saved "always" belongs to one session
+
+Answering an ask with **always** saves the decision for the session you answered
+in, not for the whole process. The same call in another session — including one
+started later, and one another client is driving — asks again. A one-time
+confirmation with no patterns to save installs nothing and is never satisfied by
+an earlier `always`.
+
+A saved `always` lives in the running process, not in the database, and it ends
+when the session ends. Over HTTP, archiving or deleting a session with
+`POST /api/session/prune` withdraws every authorization that session granted, and
+restarting `zuno serve` clears them all; disconnecting and reconnecting an event
+stream keeps them, because a stream is not the session. A decision meant to
+outlive one session belongs in `permission.rules`. See
+[Session retention](/session-retention#archiving-ends-a-sessions-standing-http-authorizations).
+
 ## Per-tool rules
 
 `permission.rules` is ordered, and **the last matching rule wins**. A rule is either
@@ -267,8 +290,13 @@ removes the protection, because `*` written last would override every rule above
 and turn `rm -rf /` back into a prompt.
 
 The `edit` key covers the `write`, `edit`, and `apply_patch` tools; all three request
-authorization under it. There is no separate `write` or `apply_patch` rule key, so a
-rule written under either name never matches anything.
+authorization under it. There is no separate `write` or `apply_patch` rule key, and
+`permission.rules` refuses one: a rule under `write`, `apply_patch`,
+`list_mcp_resources`, `list_mcp_resource_templates`, or `read_mcp_resource` fails
+configuration validation with a message naming the key to use instead — `edit` for the
+first two, `read` for the three MCP resource tools. Those five keys used to be accepted
+and evaluated nothing. Any other key is still legitimate, because MCP, plugin, and Skill
+tools are named at runtime and a key may be a wildcard pattern.
 
 A path rule is matched against the path the call names and against its normalized
 spelling, so separators are unified and `.` segments and repeated separators are
@@ -373,6 +401,15 @@ for. This direction is one-way by design: an agent contract can only reduce
 authority, so selecting a read-only agent is a guarantee rather than a default that
 configuration can quietly reverse. It also means a read-only Agent never uses
 `run-unconfined`.
+
+An agent contract is deny-by-default, so a tool the contract does not name is *hidden*
+rather than merely unauthorized: the contract's leading `"*": "deny"` is the last rule
+that matches an unnamed id, and the model is never offered the tool at all. Two of the
+default grants follow from that. `bg` is granted wherever `shell` is, including the
+read-only roles, because a background execution is started by `shell` and read back only
+through `bg` — and so is a result too large to return in full. `job` is granted only to
+the delegating agent, because a Job resolves only for the session whose `task` call
+created it.
 
 ```sh
 # Cannot write, whatever sandbox.mode says.

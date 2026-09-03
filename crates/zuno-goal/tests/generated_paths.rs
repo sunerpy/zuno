@@ -2,12 +2,19 @@
 //! written into a fresh repository does not appear in `git status`.
 //!
 //! Nothing is stubbed. The block is written the way the host writes it, through
-//! `zuno_paths::ensure_managed_block` with the registry's patterns; the document is
-//! written by the real `GoalProjection`; and git itself is asked what it sees. The test
-//! therefore fails if the registry stops naming the projection directory, if the block
-//! stops being written or stops matching, or if the projection starts writing anywhere
-//! the block does not cover — and it proves the block is the cause by removing it and
-//! watching the directory reappear.
+//! `zuno_paths::ensure_managed_block` with the pattern set the CLI passes; the document
+//! is written by the real `GoalProjection`; and git itself is asked what it sees. The
+//! test therefore fails if the patterns stop covering the projection directory, if the
+//! block stops being written or stops matching, or if the projection starts writing
+//! anywhere the block does not cover.
+//!
+//! Two exclusions have to hold independently, so the test dismantles them one at a
+//! time. Removing the managed block alone must leave the tree clean, because the
+//! directory the projection created excludes its own contents; removing that
+//! `.gitignore` as well must make git report the directory. That order is the point:
+//! the block is a convenience, and the directory's own exclusion is what survives a
+//! host that never wrote a block, a `git add -A` inside a script, and a repository
+//! where the block was deleted.
 
 use std::path::Path;
 use std::process::Command;
@@ -95,6 +102,20 @@ fn a_goal_document_written_into_a_fresh_repository_leaves_git_status_clean() {
         "a repository gets a project-local document, not the global fallback"
     );
     assert!(zuno_paths::is_generated(root, projection.path()));
+    let self_exclusion = projection
+        .path()
+        .parent()
+        .expect("the document has a directory")
+        .join(".gitignore");
+    assert_eq!(
+        std::fs::read_to_string(&self_exclusion)
+            .expect("the directory excludes itself")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>(),
+        ["*"],
+        "creating the directory must have written the exclusion, not only the document"
+    );
 
     assert_eq!(
         status(),
@@ -115,8 +136,9 @@ fn a_goal_document_written_into_a_fresh_repository_leaves_git_status_clean() {
     assert!(zuno_paths::is_generated(root, backup));
     assert_eq!(status(), "", "the salvage copy is generated state too");
 
-    // Remove only the managed block and git sees the directory again: the clean
-    // status above came from the block, not from anything else about the fixture.
+    // Remove the managed block. The tree must stay clean, because the directory's own
+    // exclusion does not depend on it — this is the case a host that could not write
+    // the block, or a repository where somebody removed it, actually lands in.
     let exclude = resolve_exclude_path(root).expect("resolve the exclude file");
     let content = std::fs::read_to_string(&exclude).expect("read the exclude file");
     let begin = content
@@ -131,9 +153,18 @@ fn a_goal_document_written_into_a_fresh_repository_leaves_git_status_clean() {
         format!("{}{}", &content[..begin], &content[end..]),
     )
     .expect("remove the block");
+    assert_eq!(
+        status(),
+        "",
+        "the directory's own exclusion must hold with no managed block at all"
+    );
+
+    // Remove that too and git reports the directory: the clean status above came from
+    // Zuno's exclusions, not from anything else about the fixture.
+    std::fs::remove_file(&self_exclusion).expect("remove the directory's own exclusion");
     let dirty = status();
     assert!(
         dirty.contains(".zuno/"),
-        "without the block git must report the generated directory, got {dirty:?}"
+        "with no exclusion at all git must report the generated directory, got {dirty:?}"
     );
 }

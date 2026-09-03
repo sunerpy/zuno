@@ -202,51 +202,54 @@ pub enum RunFormat {
     Json,
 }
 
+/// The headless turn's options.
+///
+/// Every field here reaches turn composition or rendering. A flag whose only
+/// possible outcome is a refusal is not registered: `--fork`, `--share`,
+/// `--attach`, `--password`, `--username`, `--port`, `--interactive` and `--auto`
+/// were all registered without a handler and are gone, because help text that
+/// lists an option the handler always rejects is help text that lies.
 #[derive(Debug, Clone, Args)]
 pub struct RunArgs {
+    /// The message to run. Omit it to read the message from stdin.
     #[arg(value_name = "message")]
     pub message: Vec<String>,
+    /// Run this configured command, with the message as its arguments.
     #[arg(long)]
     pub command: Option<String>,
+    /// Continue the most recent session in this directory.
     #[arg(short = 'c', long)]
     pub r#continue: bool,
+    /// Run in this exact session.
     #[arg(short = 's', long)]
     pub session: Option<String>,
-    #[arg(long)]
-    pub fork: bool,
-    #[arg(long)]
-    pub share: bool,
+    /// The model to use, as `provider/model`.
     #[arg(short = 'm', long)]
     pub model: Option<String>,
+    /// The agent to use.
     #[arg(long)]
     pub agent: Option<String>,
+    /// Output format.
     #[arg(long, value_enum, default_value_t)]
     pub format: RunFormat,
     /// Write provider-supplied reasoning deltas to stderr.
     #[arg(long, default_value_t = false)]
     pub show_reasoning: bool,
+    /// Attach a text or image file to the message. Repeatable.
     #[arg(short = 'f', long)]
     pub file: Vec<String>,
+    /// The title a newly created session gets.
     #[arg(long)]
     pub title: Option<String>,
-    #[arg(long)]
-    pub attach: Option<String>,
-    #[arg(short = 'p', long)]
-    pub password: Option<String>,
-    #[arg(short = 'u', long)]
-    pub username: Option<String>,
+    /// Directory to run in. Defaults to the working directory.
     #[arg(long)]
     pub dir: Option<String>,
-    #[arg(long)]
-    pub port: Option<u16>,
+    /// Reasoning variant to request, for a model that publishes named variants.
     #[arg(long, conflicts_with = "thinking")]
     pub variant: Option<String>,
+    /// Request the model's own default thinking budget.
     #[arg(long, conflicts_with = "variant")]
     pub thinking: bool,
-    #[arg(short = 'i', long, default_value_t = false)]
-    pub interactive: bool,
-    #[arg(long, default_value_t = false)]
-    pub auto: bool,
 }
 
 /// The interactive terminal application, which takes no arguments of its own.
@@ -298,12 +301,6 @@ pub struct ServeArgs {
     /// means `127.0.0.1`.
     #[arg(long)]
     pub hostname: Option<String>,
-    #[arg(long, default_value_t = false)]
-    pub mdns: bool,
-    #[arg(long, default_value = "zuno.local")]
-    pub mdns_domain: String,
-    #[arg(long)]
-    pub cors: Vec<String>,
     /// Enable one-time loopback browser bootstrap and signed session cookies.
     #[arg(long, default_value_t = false)]
     pub browser_auth: bool,
@@ -429,31 +426,17 @@ pub struct AgentArgs {
     pub command: Option<AgentCommand>,
 }
 
+/// `agent`'s subcommands.
+///
+/// `create` used to be registered here over a handler that refused every
+/// invocation, so the only thing it could do was print a message about a
+/// generator that does not exist. Writing an agent definition is editing a
+/// Markdown file under `.zuno/agent/`, which `docs/config/custom-agents.md`
+/// documents; a subcommand is not registered until its behavior exists.
 #[derive(Debug, Clone, Subcommand)]
 pub enum AgentCommand {
-    Create(AgentCreateArgs),
+    /// List the agents the current configuration chain resolves.
     List,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum AgentMode {
-    All,
-    Primary,
-    Subagent,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct AgentCreateArgs {
-    #[arg(long)]
-    pub path: Option<String>,
-    #[arg(long)]
-    pub description: Option<String>,
-    #[arg(long, value_enum)]
-    pub mode: Option<AgentMode>,
-    #[arg(long, visible_alias = "tools")]
-    pub permissions: Option<String>,
-    #[arg(short = 'm', long)]
-    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -802,7 +785,7 @@ pub enum Command {
     Serve(ServeArgs),
     /// Manage sessions.
     Session(SessionArgs),
-    /// Manage agents.
+    /// List the agents visible from this directory.
     Agent(AgentArgs),
     /// List available models.
     Models(ModelsArgs),
@@ -1305,13 +1288,107 @@ mod tests {
         assert!(Cli::try_parse_from(["zuno", "--pure"]).is_err());
     }
 
+    /// The `run` options whose only possible outcome was a refusal are gone.
+    ///
+    /// Each was registered on [`RunArgs`] over a `validate_flags` arm that rejected
+    /// the flag on its own, so no invocation naming one could ever reach a turn.
+    /// Help text that lists an option the handler always refuses is help text that
+    /// lies, and completion scripts propagated the lie further.
     #[test]
-    fn serve_uses_the_zuno_mdns_domain_by_default() {
-        let cli = Cli::try_parse_from(["zuno", "serve"]).expect("serve parses");
-        let Some(Command::Serve(args)) = cli.command else {
-            panic!("expected serve command");
+    fn run_no_longer_parses_the_options_it_could_only_refuse() {
+        for argv in [
+            vec!["zuno", "run", "--fork", "probe"],
+            vec!["zuno", "run", "--share", "probe"],
+            vec!["zuno", "run", "--attach", "ses_probe", "probe"],
+            vec!["zuno", "run", "--port", "4096", "probe"],
+            vec!["zuno", "run", "--username", "probe", "probe"],
+            vec!["zuno", "run", "-u", "probe", "probe"],
+            vec!["zuno", "run", "--password", "probe", "probe"],
+            vec!["zuno", "run", "-p", "probe", "probe"],
+            vec!["zuno", "run", "--interactive", "probe"],
+            vec!["zuno", "run", "-i", "probe"],
+            vec!["zuno", "run", "--auto", "probe"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{argv:?} must not parse"
+            );
+        }
+    }
+
+    /// `run` keeps every option that reaches turn composition or rendering.
+    ///
+    /// The companion to the removal above: the point was to drop the options that
+    /// could not work, not to narrow the surface that does.
+    #[test]
+    fn run_still_parses_every_option_that_reaches_the_turn() {
+        let cli = Cli::try_parse_from([
+            "zuno",
+            "run",
+            "--continue",
+            "--model",
+            "probe/probe",
+            "--agent",
+            "build",
+            "--format",
+            "json",
+            "--show-reasoning",
+            "--file",
+            "probe.txt",
+            "--title",
+            "probe",
+            "--dir",
+            ".",
+            "--thinking",
+            "probe",
+        ])
+        .expect("the surviving run options parse");
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run command");
         };
-        assert_eq!(args.mdns_domain, "zuno.local");
+        assert!(args.r#continue);
+        assert_eq!(args.model.as_deref(), Some("probe/probe"));
+        assert_eq!(args.agent.as_deref(), Some("build"));
+        assert_eq!(args.format, RunFormat::Json);
+        assert!(args.show_reasoning);
+        assert_eq!(args.file, vec!["probe.txt".to_owned()]);
+        assert_eq!(args.title.as_deref(), Some("probe"));
+        assert_eq!(args.dir.as_deref(), Some("."));
+        assert!(args.thinking);
+        assert_eq!(args.message, vec!["probe".to_owned()]);
+    }
+
+    /// `agent create` is no longer parsed.
+    ///
+    /// It was registered over a handler that could only report the absence of a
+    /// model-backed generator. Authoring an agent is writing a Markdown file under
+    /// `.zuno/agent/`, which `docs/config/custom-agents.md` documents.
+    #[test]
+    fn agent_no_longer_parses_the_removed_create_subcommand() {
+        assert!(Cli::try_parse_from(["zuno", "agent", "create"]).is_err());
+        assert!(Cli::try_parse_from(["zuno", "agent", "create", "--name", "probe"]).is_err());
+        let cli = Cli::try_parse_from(["zuno", "agent", "list"]).expect("agent list parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Agent(AgentArgs {
+                command: Some(AgentCommand::List),
+            }))
+        ));
+    }
+
+    /// `serve` accepted `--mdns`, `--mdns-domain` and `--cors` in order to refuse every
+    /// invocation that named one. Nothing stood behind them, so they are gone and the
+    /// parser is where the caller now learns that — before a process opens a database.
+    #[test]
+    fn serve_rejects_the_options_it_could_only_refuse() {
+        for argv in [
+            ["zuno", "serve", "--mdns"].as_slice(),
+            ["zuno", "serve", "--mdns-domain", "example.local"].as_slice(),
+            ["zuno", "serve", "--cors", "https://example.test"].as_slice(),
+        ] {
+            let error = Cli::try_parse_from(argv).expect_err("serve rejects the option");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
     }
 
     #[test]

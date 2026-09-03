@@ -99,9 +99,9 @@ const BUDGET_HELP: Duration = Duration::from_millis(30);
 
 /// `zuno session list`, the cheapest invocation that pays full startup.
 ///
-/// This is the budget with real content: it re-execs once to hand the command
-/// process its environment, builds the tracing subscriber, opens the structured log
-/// file and opens the database. Measured debug-profile median 15.666 ms over nine
+/// This is the budget with real content: on Unix it re-execs once to hand the command
+/// process its environment, and everywhere it builds the tracing subscriber, opens the
+/// structured log file and opens the database. Measured debug-profile median 15.666 ms over nine
 /// runs (min 15.196, max 18.327, max/min 1.2061x); budget 100 ms, 6.4x headroom —
 /// the same multiple as the fast paths, so no invocation is held to a looser
 /// standard than the rest.
@@ -198,8 +198,9 @@ fn measure(label: &str, args: &[&str]) -> (Duration, Duration, Duration) {
 
 /// Every profile line one invocation wrote to stderr, parsed into phase maps.
 ///
-/// A dispatching invocation writes two: the parent that re-execs and the command
-/// process it becomes.
+/// On Unix a dispatching invocation writes two: the image that re-execs and the
+/// command process it becomes. Elsewhere it writes one, because one invocation is
+/// one process.
 fn profile_lines(label: &str, args: &[&str]) -> Vec<Vec<(String, u128)>> {
     let output = command_in(label, args, true)
         .output()
@@ -310,11 +311,18 @@ fn startup_profile_attributes_every_phase_it_declares() {
         "`--version` must be one process; it wrote {} profile lines",
         version.len()
     );
+    // Two on Unix: the image that re-execs, then the command process it becomes.
+    // The expectation used to be two everywhere, because a platform without `exec`
+    // spawned a second process to hand the command its environment and each half
+    // wrote a line. Those platforms now resolve the environment into a value and
+    // dispatch in the process that parsed the arguments, so one invocation is one
+    // process and writes one line.
+    let expected_dispatch = if cfg!(unix) { 2 } else { 1 };
     assert_eq!(
         dispatch.len(),
-        2,
-        "a dispatching invocation is the parent plus the command process it \
-         re-execs into; it wrote {} profile lines",
+        expected_dispatch,
+        "a dispatching invocation writes {expected_dispatch} profile line(s) on this \
+         platform; it wrote {}",
         dispatch.len()
     );
 
@@ -326,8 +334,12 @@ fn startup_profile_attributes_every_phase_it_declares() {
         );
         seen.extend(phases(line));
     }
+    // `bootstrap_restart` times the Unix `exec`. The name stays declared on every
+    // platform so profile consumers parse one vocabulary, but only Unix reaches it,
+    // and a phase this platform cannot reach cannot be required here.
     let declared: BTreeSet<&str> = StartupPhase::ALL
         .into_iter()
+        .filter(|phase| cfg!(unix) || *phase != StartupPhase::BootstrapRestart)
         .map(StartupPhase::as_str)
         .collect();
 

@@ -12,7 +12,7 @@
 //! Entering raw mode and the alternate screen on a pipe writes escape sequences
 //! into whatever is reading it and leaves no way to type the key that exits. The
 //! refusal names `run` because that is the surface a non-interactive caller wants,
-//! and it is the same reason `run` refuses `--interactive`.
+//! and it is the same reason `run` no longer accepts `--interactive` at all.
 //!
 //! # The turn runs beside the loop, never inside it
 //!
@@ -2582,8 +2582,8 @@ async fn apply_queued_input_mutation(
                     .map_err(to_string)?;
                 if delivery == zuno_db::inbox::InputDelivery::Steer {
                     let _removed = control.cancel_soft_interrupt(&id);
-                    if let Some(message) = soft_interrupt(delivery, &id, &submission) {
-                        let _queued = control.queue_soft_interrupt(message);
+                    if let Some(steering) = steering_content(delivery, &submission) {
+                        let _queued = control.queue_soft_interrupt(steering.into_message(&id));
                     }
                 }
                 Ok(QueuedInputNoticeKind::Edited)
@@ -2720,7 +2720,7 @@ async fn drive_turns(
                     DriverPrompt::direct(prompt.payload)
                 } else {
                     if let Err(message) = admit_followup(
-                        driver.host.session_inbox(),
+                        driver.host.input_admission(),
                         driver.host.control(),
                         driver.reference_root.clone(),
                         Some(driver.host.attachment_store()),
@@ -2746,7 +2746,7 @@ async fn drive_turns(
                             DriverPrompt::direct(prompt.payload)
                         } else {
                             if let Err(message) = admit_followup(
-                                driver.host.session_inbox(),
+                                driver.host.input_admission(),
                                 driver.host.control(),
                                 driver.reference_root.clone(),
                                 Some(driver.host.attachment_store()),
@@ -3244,6 +3244,7 @@ async fn drive_one(
             }
             let capture = begin_snapshot(&snapshots.store, events).await;
             let inbox = host.session_inbox();
+            let admission = host.input_admission();
             let control = host.control();
             let attachment_store = host.attachment_store();
             let admission_root = reference_root.to_path_buf();
@@ -3252,7 +3253,7 @@ async fn drive_one(
                 FuturesUnordered::new();
             while let Some(followup) = root_prompts.pop_front() {
                 admissions.push(Box::pin(admit_followup(
-                    inbox.clone(),
+                    admission.clone(),
                     control.clone(),
                     admission_root.clone(),
                     Some(Arc::clone(&attachment_store)),
@@ -3297,7 +3298,7 @@ async fn drive_one(
                                 target: PromptTarget::Root,
                                 prompt,
                             }) => admissions.push(Box::pin(admit_followup(
-                                    inbox.clone(),
+                                    admission.clone(),
                                     control.clone(),
                                     admission_root.clone(),
                                     Some(Arc::clone(&attachment_store)),
@@ -3330,7 +3331,7 @@ async fn drive_one(
             while let Ok(followup) = prompts.try_recv() {
                 match followup.target {
                     PromptTarget::Root => admissions.push(Box::pin(admit_followup(
-                        inbox.clone(),
+                        admission.clone(),
                         control.clone(),
                         admission_root.clone(),
                         Some(Arc::clone(&attachment_store)),
@@ -3500,19 +3501,22 @@ fn followup_delivery(prompt: &PromptEnvelope) -> zuno_db::inbox::InputDelivery {
     }
 }
 
-fn soft_interrupt(
+/// The projection a live turn injects when a queued submission steers it.
+///
+/// `None` means the submission is not steerable at all: catalog commands, Skills,
+/// Council launches, and host operations rebuild session state, so they run as
+/// their own turn rather than being injected into someone else's.
+fn steering_content(
     delivery: zuno_db::inbox::InputDelivery,
-    input_id: &str,
     prompt: &PromptSubmission,
-) -> Option<zuno_engine::interrupt::SoftInterruptMessage> {
+) -> Option<zuno_engine::admission::SteeringContent> {
     if delivery != zuno_db::inbox::InputDelivery::Steer {
         return None;
     }
-    let (content, images, attachments) = match prompt {
-        PromptSubmission::Text(text) => (text.clone(), Vec::new(), Vec::new()),
+    let (content, attachments) = match prompt {
+        PromptSubmission::Text(text) => (text.clone(), Vec::new()),
         PromptSubmission::Content { content, .. } => {
             let mut text = Vec::new();
-            let mut images = Vec::new();
             let mut attachments = Vec::new();
             for block in content {
                 match block {
@@ -3525,36 +3529,29 @@ fn soft_interrupt(
                         };
                         text.push(block.into_owned());
                     }
-                    zuno_llm::event::RequestContentBlock::Image {
-                        media_type, data, ..
-                    } => {
-                        images.push((media_type.clone(), data.clone()));
-                    }
                     zuno_llm::event::RequestContentBlock::ImageAttachment { reference } => {
                         attachments.push(reference.clone());
                     }
                     _ => return None,
                 }
             }
-            (text.join("\n\n"), images, attachments)
+            (text.join("\n\n"), attachments)
         }
         PromptSubmission::Command { .. }
         | PromptSubmission::Skill { .. }
         | PromptSubmission::Council { .. }
         | PromptSubmission::Host(_) => return None,
     };
-    Some(zuno_engine::interrupt::SoftInterruptMessage {
-        input_id: Some(input_id.to_owned()),
-        content,
-        images,
-        attachments,
-        urgent: false,
-        source: zuno_engine::interrupt::SoftInterruptSource::User,
-    })
+    Some(zuno_engine::admission::SteeringContent::user(content).with_attachments(attachments))
 }
 
+/// Admit one terminal submission durably, then offer it to the running turn.
+///
+/// The terminal driver loop owns every turn for this session, so admission is
+/// deferred: this path never takes a lease and therefore never has to refuse input
+/// because one is held.
 async fn admit_followup(
-    inbox: zuno_db::inbox::SessionInbox,
+    admission: zuno_engine::admission::SessionInputAdmission,
     control: zuno_engine::status::SessionControl,
     reference_root: PathBuf,
     attachments: Option<Arc<zuno_attachment::AttachmentStore>>,
@@ -3567,22 +3564,26 @@ async fn admit_followup(
     let mut prompt =
         super::tui_reference::resolve_submission(&reference_root, prompt.payload).await?;
     admit_submission_images(attachments.as_deref(), &mut prompt)?;
-    let input_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-    inbox
-        .admit(zuno_db::inbox::NewSessionInput::new(
-            input_id.clone(),
-            control.session_id(),
-            serde_json::to_value(PersistedTuiInput::TuiPrompt {
-                submission: prompt.clone(),
-                origin,
-            })
-            .map_err(to_string)?,
-            delivery,
-            zuno_db::message::now_millis(),
-        ))
+    let admitted = admission
+        .admit(
+            zuno_db::inbox::NewSessionInput::new(
+                format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                control.session_id(),
+                serde_json::to_value(PersistedTuiInput::TuiPrompt {
+                    submission: prompt.clone(),
+                    origin,
+                })
+                .map_err(to_string)?,
+                delivery,
+                zuno_db::message::now_millis(),
+            ),
+            zuno_engine::admission::TurnLease::Deferred,
+            steering_content(delivery, &prompt),
+        )
         .map_err(to_string)?;
+    let input_id = admitted.input().id.clone();
     refresh_queued_input_projection(
-        &inbox,
+        admission.inbox(),
         control.session_id(),
         &queued_inputs,
         &queue_wake,
@@ -3594,23 +3595,20 @@ async fn admit_followup(
             }),
         }),
     );
-    if delivery == zuno_db::inbox::InputDelivery::Steer
-        && let Some(message) = soft_interrupt(delivery, &input_id, &prompt)
-    {
-        match control.queue_soft_interrupt(message) {
-            Ok(()) => tracing::debug!(
-                target: "zuno::tui::steering",
-                session_id = %control.session_id(),
-                input_id,
-                "durable TUI input woke the active turn"
-            ),
-            Err(_) => tracing::debug!(
-                target: "zuno::tui::steering",
-                session_id = %control.session_id(),
-                input_id,
-                "turn ended before steering; durable TUI input remains pending"
-            ),
-        }
+    if admitted.steered() {
+        tracing::debug!(
+            target: "zuno::tui::steering",
+            session_id = %control.session_id(),
+            input_id,
+            "durable TUI input woke the active turn"
+        );
+    } else {
+        tracing::debug!(
+            target: "zuno::tui::steering",
+            session_id = %control.session_id(),
+            input_id,
+            "durable TUI input remains pending for the next turn"
+        );
     }
     Ok(())
 }
@@ -3656,15 +3654,25 @@ fn promote_pending_prompt(
     queue_wake: &mpsc::Sender<TerminalEvent>,
 ) -> Result<Option<DriverPrompt>, String> {
     let inbox = host.session_inbox();
-    let Some(input) = inbox
-        .pending(host.session_id())
-        .map_err(to_string)?
-        .into_iter()
-        .next()
+    let pending = inbox.pending(host.session_id()).map_err(to_string)?;
+    let Some((input, submission)) =
+        pending
+            .into_iter()
+            .find_map(|input| match decode_pending_prompt(&input) {
+                Some(submission) => Some((input, submission)),
+                None => {
+                    tracing::debug!(
+                        target: "zuno::tui::inbox",
+                        session_id = %host.session_id(),
+                        input_id = %input.id,
+                        "pending durable input belongs to another surface; leaving it queued"
+                    );
+                    None
+                }
+            })
     else {
         return Ok(None);
     };
-    let submission = decode_pending_prompt(&input)?;
     let Some(promoted) = inbox
         .promote_id(host.session_id(), &input.id)
         .map_err(to_string)?
@@ -3684,27 +3692,35 @@ fn promote_pending_prompt(
     Ok(Some(DriverPrompt::promoted(promoted.id, submission)))
 }
 
-fn decode_pending_prompt(input: &zuno_db::inbox::SessionInput) -> Result<PromptSubmission, String> {
-    if input.prompt.get("kind").and_then(serde_json::Value::as_str) == Some("tuiPrompt") {
-        let PersistedTuiInput::TuiPrompt { submission, .. } =
-            serde_json::from_value(input.prompt.clone()).map_err(to_string)?;
-        return Ok(submission);
+/// Decode a durable input, or `None` when another surface owns its shape.
+///
+/// The terminal driver shares one session inbox with ACP and HTTP, so it meets
+/// rows it cannot run. Returning `None` leaves such a row pending for the surface
+/// that can run it; failing here would tear down the whole terminal session over
+/// one foreign row.
+fn decode_pending_prompt(input: &zuno_db::inbox::SessionInput) -> Option<PromptSubmission> {
+    let kind = zuno_db::inbox::DurableInputKind::classify(&input.prompt)?;
+    if kind == zuno_db::inbox::DurableInputKind::TuiPrompt {
+        let persisted = serde_json::from_value(input.prompt.clone());
+        return match persisted {
+            Ok(PersistedTuiInput::TuiPrompt { submission, .. }) => Some(submission),
+            Err(error) => {
+                tracing::warn!(
+                    target: "zuno::tui::inbox",
+                    input_id = %input.id,
+                    %error,
+                    "durable terminal submission did not decode; leaving it queued"
+                );
+                None
+            }
+        };
     }
-    if super::background_notification::is_async_notification(&input.prompt)
-        || input.prompt.get("kind").and_then(serde_json::Value::as_str)
-            == Some("humanRequestAnswer")
-    {
-        let text = input
-            .prompt
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("pending report input `{}` has no string `text`", input.id))?;
-        return Ok(PromptSubmission::Text(text.to_owned()));
-    }
-    Err(format!(
-        "pending session input `{}` has an unsupported durable prompt shape",
-        input.id
-    ))
+    let text = kind.plain_text(&input.prompt)?.to_owned();
+    let Some(blocks) = kind.content_blocks(&input.prompt) else {
+        return Some(PromptSubmission::Text(text));
+    };
+    let content = serde_json::from_value(serde_json::Value::Array(blocks.clone())).ok()?;
+    Some(PromptSubmission::Content { text, content })
 }
 
 async fn report_input_failure(events: &TurnEventSender, message: String) {
@@ -3963,12 +3979,82 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use serde_json::json;
     use zuno_engine::terminal_lease::TerminalBroker;
     use zuno_testkit::FakeTerminalOwner;
     use zuno_tui::config::ResolveOptions;
     use zuno_tui::keybind::{Chord, Resolution};
 
     use super::*;
+
+    fn pending_row(id: &str, prompt: serde_json::Value) -> zuno_db::inbox::SessionInput {
+        zuno_db::inbox::SessionInput {
+            id: id.to_owned(),
+            session_id: "ses_decode".to_owned(),
+            prompt,
+            delivery: zuno_db::inbox::InputDelivery::Queue,
+            state: zuno_db::inbox::SubmissionState::Queued,
+            revision: 1,
+            admitted_sequence: 1,
+            promoted_sequence: None,
+            error: None,
+            time_created: 1,
+            time_updated: 1,
+        }
+    }
+
+    /// The terminal driver shares one inbox with ACP and HTTP. A row it cannot run
+    /// must stay pending for the surface that can, because failing on it would end
+    /// the terminal session over another client's input.
+    #[test]
+    fn pending_input_decoding_runs_terminal_and_report_shapes_and_leaves_the_rest_queued() {
+        let terminal = decode_pending_prompt(&pending_row(
+            "inp_tui",
+            json!({
+                "kind": "tuiPrompt",
+                "submission": {"kind": "text", "data": "typed here"},
+                "origin": "tui_keybinding"
+            }),
+        ))
+        .expect("a terminal submission decodes");
+        assert!(matches!(terminal, PromptSubmission::Text(text) if text == "typed here"));
+
+        let report = decode_pending_prompt(&pending_row(
+            "inp_workflow",
+            json!({
+                "kind": "workflowReport",
+                "jobID": "job_w",
+                "runID": "run_w",
+                "workflow": "release",
+                "status": "completed",
+                "text": "workflow finished"
+            }),
+        ))
+        .expect("an asynchronous report decodes as text");
+        assert!(matches!(report, PromptSubmission::Text(text) if text == "workflow finished"));
+
+        for (id, prompt) in [
+            (
+                "inp_http",
+                json!({
+                    "kind": "user",
+                    "prompt": {"text": "from HTTP", "files": [], "agents": []},
+                    "agent": null,
+                    "model": null
+                }),
+            ),
+            (
+                "inp_host",
+                json!({"message": {"id": "msg_host"}, "parts": []}),
+            ),
+            ("inp_future", json!({"kind": "somethingNewer", "text": "x"})),
+        ] {
+            assert!(
+                decode_pending_prompt(&pending_row(id, prompt)).is_none(),
+                "`{id}` must stay queued for the surface that owns it"
+            );
+        }
+    }
 
     #[test]
     fn primary_agent_selector_includes_deep_and_excludes_subagent_only_roles() {
@@ -4390,7 +4476,7 @@ mod tests {
         let (wake, _wake_source) = zuno_tui::app::terminal_event_channel();
 
         admit_followup(
-            inbox.clone(),
+            zuno_engine::admission::SessionInputAdmission::new(inbox.clone(), registry.clone()),
             registry.control("ses_tui_steer"),
             reference_root.path().to_path_buf(),
             None,
@@ -4467,7 +4553,7 @@ mod tests {
         let (wake, _wake_source) = zuno_tui::app::terminal_event_channel();
 
         admit_followup(
-            inbox.clone(),
+            zuno_engine::admission::SessionInputAdmission::new(inbox.clone(), registry.clone()),
             registry.control("ses_tui_steer_race"),
             reference_root.path().to_path_buf(),
             None,
@@ -4515,15 +4601,16 @@ mod tests {
     }
 
     #[test]
-    fn tui_soft_interrupt_keeps_resolved_text_and_images() {
-        let submission = PromptSubmission::Content {
+    fn tui_steering_keeps_resolved_text_and_refuses_undurable_images() {
+        // The steering projection used to carry inline base64 image bytes straight to
+        // the running turn. That made model-visible content that no durable inbox row
+        // held, because the inbox stores normalized attachment references only. Inline
+        // bytes are now refused here and admitted into the attachment store first.
+        let inline = PromptSubmission::Content {
             text: String::from("inspect @diagram.png"),
             content: vec![
                 zuno_llm::event::RequestContentBlock::Text {
                     text: String::from("inspect @diagram.png"),
-                },
-                zuno_llm::event::RequestContentBlock::Text {
-                    text: String::from("Referenced image: diagram.png"),
                 },
                 zuno_llm::event::RequestContentBlock::Image {
                     filename: Some(String::from("diagram.png")),
@@ -4532,23 +4619,32 @@ mod tests {
                 },
             ],
         };
+        assert!(
+            steering_content(zuno_db::inbox::InputDelivery::Steer, &inline).is_none(),
+            "inline image bytes steered a turn without a durable record"
+        );
 
-        let message = soft_interrupt(
-            zuno_db::inbox::InputDelivery::Steer,
-            "msg_followup",
-            &submission,
-        )
-        .expect("content can steer safely");
+        let resolved = PromptSubmission::Content {
+            text: String::from("inspect @diagram.png"),
+            content: vec![
+                zuno_llm::event::RequestContentBlock::Text {
+                    text: String::from("inspect @diagram.png"),
+                },
+                zuno_llm::event::RequestContentBlock::Text {
+                    text: String::from("Referenced image: diagram.png"),
+                },
+            ],
+        };
+        let message = steering_content(zuno_db::inbox::InputDelivery::Steer, &resolved)
+            .expect("resolved text can steer safely")
+            .into_message("msg_followup");
 
         assert_eq!(message.input_id.as_deref(), Some("msg_followup"));
         assert_eq!(
             message.content,
             "inspect @diagram.png\n\nReferenced image: diagram.png"
         );
-        assert_eq!(
-            message.images,
-            vec![(String::from("image/png"), String::from("AAAA"))]
-        );
+        assert!(message.images.is_empty());
         assert!(!message.urgent);
     }
 
@@ -4592,12 +4688,9 @@ mod tests {
             usize::try_from(reference.encoded_bytes).expect("encoded size fits usize")
         );
 
-        let message = soft_interrupt(
-            zuno_db::inbox::InputDelivery::Steer,
-            "msg_image",
-            &submission,
-        )
-        .expect("admitted content can steer");
+        let message = steering_content(zuno_db::inbox::InputDelivery::Steer, &submission)
+            .expect("admitted content can steer")
+            .into_message("msg_image");
         assert!(message.images.is_empty());
         assert_eq!(message.attachments, vec![reference]);
     }

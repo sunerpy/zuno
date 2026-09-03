@@ -15,6 +15,20 @@ zuno <command> --help
 有一小部分选项被每个子命令都接受。它们在[全局选项](/zh/cli/global-options)中集中记录一次，
 而不是在每个页面上重复说明。
 
+## 一次调用就是一个进程
+
+启动 Zuno 的客户端——通过 [`zuno acp`](/zh/cli/acp) 接入的编辑器、监管
+[`zuno serve`](/zh/cli/serve) 的服务、脚本、CI 任务——在所有受支持平台上，每次调用都只得到
+一个进程。它派生的那个进程就是运行该命令的进程；结束这个进程就结束该命令；命令结束时它的
+`stdout` 与 `stderr` 也随之到达 EOF。
+
+启动过程把全局选项与 `ZUNO_*` 变量解析成一个值，命令直接读这个值，因此任何一次调用都不依赖
+把它们写回进程环境。在 Unix 上，可执行文件还会在启动时替换自身镜像一次（进程 id 不变），
+这样它之后启动的程序可以从操作系统继承这些解析后的值。Windows 没有等价的替换操作，因此那里
+解析后的值只留在 Zuno 进程内部：`--sandbox`、`--sandbox-on-unavailable`、`--log-level` 与
+`--print-logs` 仍然完全按文档约束本次调用，但 Zuno 启动的程序不会从自己的环境里读到它们，
+Windows 上嵌套的 `zuno` 会按配置而不是按外层命令行解析约束模式。
+
 ## 运行 Zuno
 
 | 命令 | 用途 |
@@ -29,7 +43,7 @@ zuno <command> --help
 | 命令 | 用途 |
 | --- | --- |
 | [`zuno session`](/zh/cli/session) | 列出、按期清理与删除持久 session。 |
-| [`zuno agent`](/zh/cli/agent) | 创建 Agent 定义，并列出当前解析出的 Agent。 |
+| [`zuno agent`](/zh/cli/agent) | 列出当前配置链解析出的 Agent。 |
 | [`zuno db`](/zh/cli/db) | 对本地 session 数据库执行查询。 |
 | [`zuno export`](/zh/cli/export) | 把配置、Skill、扩展与 Agent 写入一个可移植 bundle。 |
 | [`zuno import`](/zh/cli/import) | 把一个可移植 bundle 还原到本机的用户环境中。 |

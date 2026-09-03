@@ -477,6 +477,7 @@ fn views_user_cancelled_tool_as_cancelled_instead_of_failed() {
         title: String::from("Inspect repository"),
         output: String::from("child supervisor settled"),
         interruption: zuno_engine::r#loop::ToolInterruption::Cooperative,
+        uncertain: false,
     });
 
     let [

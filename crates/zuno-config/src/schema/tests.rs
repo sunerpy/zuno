@@ -10,7 +10,9 @@ use crate::schema::formatter::FormatterConfig;
 use crate::schema::lsp::{BUILTIN_SERVER_IDS, LspConfig};
 use crate::schema::mcp::{McpOauth, McpServerConfig};
 use crate::schema::ordered::False;
-use crate::schema::permission::{PermissionAction, PermissionMode, PermissionRule};
+use crate::schema::permission::{
+    PermissionAction, PermissionMode, PermissionRule, READ_TOOLS, permission_key,
+};
 use crate::schema::product_agent::{ProductAgentKind, ProductAgentPermissionMode};
 use crate::schema::provider::{ReasoningReplay, ResponsesTextBlocks, Timeout};
 use crate::schema::reference::ReferenceEntry;
@@ -894,10 +896,46 @@ fn agent_colour_takes_hex_and_theme_names_only() {
 
 #[test]
 fn deprecated_top_level_keys_are_not_accepted() {
-    for key in ["mode", "layout", "autoshare"] {
+    // `share`, `autoupdate`, `username`, `enterprise`, and `experimental` were
+    // accepted and documented but never read by any Zuno behavior, so they are
+    // gone rather than tolerated: a config that still carries one is a config
+    // whose author expects something that will not happen.
+    for key in [
+        "mode",
+        "layout",
+        "autoshare",
+        "share",
+        "autoupdate",
+        "username",
+        "enterprise",
+        "experimental",
+    ] {
         let error = parse_value(json!({ key: json!({}) })).expect_err("must be rejected");
         assert_eq!(issue_path(&error), key);
         assert_eq!(issue_detail(&error), "unrecognized key");
+    }
+    for value in [json!(true), json!("notify"), json!("someone")] {
+        for key in ["share", "autoupdate", "username"] {
+            let error = parse_value(json!({ key: value.clone() })).expect_err("must be rejected");
+            assert_eq!(issue_path(&error), key);
+        }
+    }
+}
+
+#[test]
+fn the_server_section_only_carries_keys_the_server_reads() {
+    let config = parse_value(json!({ "server": { "port": 8080, "hostname": "127.0.0.1" } }))
+        .expect("port and hostname are read when the server binds");
+    let server = config.server.as_ref().expect("server");
+    assert_eq!(server.port.map(std::num::NonZeroU32::get), Some(8080));
+    assert_eq!(server.hostname.as_deref(), Some("127.0.0.1"));
+    // mDNS advertisement and CORS origins were never read from config; the flags
+    // of the same name failed at the CLI. Keeping the keys would keep promising
+    // behavior that does not exist.
+    for key in ["mdns", "mdnsDomain", "cors"] {
+        let error =
+            parse_value(json!({ "server": { key: json!({}) } })).expect_err("must be rejected");
+        assert_eq!(issue_path(&error), format!("server.{key}"));
     }
 }
 
@@ -1153,24 +1191,6 @@ fn a_broken_mcp_entry_reports_the_arm_its_type_names() {
         "message must name the missing key: {}",
         issue_detail(&error)
     );
-}
-
-#[test]
-fn autoupdate_is_a_bool_or_notify() {
-    assert_eq!(
-        parse_value(json!({ "autoupdate": true }))
-            .expect("bool")
-            .autoupdate,
-        Some(Autoupdate::Enabled(true))
-    );
-    assert_eq!(
-        parse_value(json!({ "autoupdate": "notify" }))
-            .expect("notify")
-            .autoupdate,
-        Some(Autoupdate::Mode(AutoupdateMode::Notify))
-    );
-    let error = parse_value(json!({ "autoupdate": "later" })).expect_err("must be rejected");
-    assert_eq!(issue_path(&error), "autoupdate");
 }
 
 #[test]
@@ -1613,15 +1633,73 @@ fn action_only_permissions_reject_per_pattern_rules() {
 
 #[test]
 fn an_unknown_permission_key_is_kept() {
-    let config = parse_value(json!({
-        "permission": { "rules": { "custom_audit": "allow" } }
-    }))
-    .expect("deserializes");
-    let rules = &config.permission.as_ref().expect("permission").rules;
-    assert_eq!(
-        rules.get("custom_audit"),
-        Some(&PermissionRule::Action(PermissionAction::Allow))
-    );
+    // A rule key may name a dynamic MCP, plugin, or skill tool, or be a
+    // wildcard pattern, so an unrecognized key is not an error by itself.
+    for key in ["custom_audit", "mcp_github_create_issue", "cust*"] {
+        let config = parse_value(json!({
+            "permission": { "rules": { (key): "allow" } }
+        }))
+        .expect("deserializes");
+        let rules = &config.permission.as_ref().expect("permission").rules;
+        assert_eq!(
+            rules.get(key),
+            Some(&PermissionRule::Action(PermissionAction::Allow))
+        );
+    }
+}
+
+#[test]
+fn permission_keys_that_only_alias_another_key_are_rejected() {
+    // `permission_key` collapses these names before evaluation, so a rule
+    // written under one of them can never match. Refuse it and name the key
+    // the author meant.
+    for (dead, governing) in [
+        ("write", "edit"),
+        ("apply_patch", "edit"),
+        ("list_mcp_resources", "read"),
+        ("list_mcp_resource_templates", "read"),
+        ("read_mcp_resource", "read"),
+    ] {
+        for rule in [json!("deny"), json!({ "*": "deny" })] {
+            let error = parse_value(json!({
+                "permission": { "rules": { (dead): rule } }
+            }))
+            .expect_err("an alias key is a dead rule");
+            assert_eq!(issue_path(&error), format!("permission.rules.{dead}"));
+            let detail = issue_detail(&error);
+            assert!(detail.contains(dead), "{detail}");
+            assert!(
+                detail.contains(&format!("{governing:?}")),
+                "the error must name the governing key: {detail}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_governing_permission_keys_of_the_alias_groups_are_accepted() {
+    for key in ["edit", "read"] {
+        let config = parse_value(json!({
+            "permission": { "rules": { (key): { "*": "ask" } } }
+        }))
+        .expect("the governing key carries the rule");
+        assert!(
+            config
+                .permission
+                .as_ref()
+                .expect("permission")
+                .rules
+                .get(key)
+                .is_some()
+        );
+        assert_eq!(permission_key(key), key, "a governing key is not an alias");
+    }
+    for alias in ["write", "apply_patch"] {
+        assert_eq!(permission_key(alias), "edit");
+    }
+    for alias in READ_TOOLS {
+        assert_eq!(permission_key(alias), "read");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1710,11 +1788,15 @@ fn an_mcp_callback_port_stays_inside_the_port_range() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn nested_unknown_keys_are_ignored_like_the_oracle() {
-    // Effect Schema's default `onExcessProperty` is "ignore", so this is accepted
-    // and the stray key is dropped rather than rejected.
-    let config = parse_value(json!({ "server": { "port": 1234, "prot": 4321 } }))
-        .expect("a nested typo is not fatal");
+fn a_typo_in_the_closed_server_section_names_the_key() {
+    // The `server` section is closed, so a key Zuno does not read is reported
+    // instead of dropped. This is what makes removing `mdns`, `mdnsDomain`, and
+    // `cors` a real removal: a config that still carries one says so.
+    let error = parse_value(json!({ "server": { "port": 1234, "prot": 4321 } }))
+        .expect_err("a key the server never reads is an error");
+    assert_eq!(issue_path(&error), "server.prot");
+
+    let config = parse_value(json!({ "server": { "port": 1234 } })).expect("a read key parses");
     assert_eq!(
         config.server.as_ref().and_then(|s| s.port).map(|p| p.get()),
         Some(1234)
@@ -1760,18 +1842,30 @@ fn the_key_path_reaches_through_maps_and_arrays() {
         "provider.anthropic.models.m.limit.context"
     );
 
+    // Through an array, into the element, down to the offending optional key.
     let error = parse_value(json!({
-        "experimental": { "policies": [{ "action": "provider.use", "effect": "maybe", "resource": "*" }] }
+        "skills": { "config": [{ "path": "skills/api", "exposure": "maybe" }] }
     }))
-    .expect_err("maybe is not an effect");
-    // The probe stops at the enclosing object: `effect` is required, and no probe
-    // value satisfies a closed set of string variants, so its removal or
-    // substitution cannot be shown to fix the document. The detail carries the rest.
-    assert_eq!(issue_path(&error), "experimental.policies.0");
+    .expect_err("maybe is not an exposure");
+    assert_eq!(issue_path(&error), "skills.config.0.exposure");
     assert!(
         issue_detail(&error).contains("unknown variant `maybe`"),
         "detail must still identify the offending value: {}",
         issue_detail(&error)
+    );
+
+    // The probe stops at the enclosing object when the offending key is required:
+    // no probe value satisfies a closed set of string variants, so neither its
+    // removal nor its substitution can be shown to fix the document. The detail
+    // carries the rest.
+    let error = parse_value(json!({
+        "mcp": { "x": { "type": "smoke", "url": "https://example.invalid" } }
+    }))
+    .expect_err("smoke is not an MCP transport");
+    assert_eq!(issue_path(&error), "mcp.x");
+    assert!(
+        !issue_detail(&error).is_empty(),
+        "the enclosing object must still carry a detail"
     );
 }
 
@@ -1824,7 +1918,7 @@ fn the_curated_config_examples_all_deserialize() {
     names.sort();
     assert_eq!(
         names.len(),
-        32,
+        28,
         "the curated config example corpus must not silently shrink"
     );
     for path in &names {
@@ -1946,4 +2040,132 @@ fn an_empty_config_round_trips_to_an_empty_object() {
         json!({}),
         "absent keys must not become nulls"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Runtime stop ceiling and project trust.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_component_stop_ceiling_is_read_in_milliseconds() {
+    let config = parse_value(json!({"runtime": {"max_component_stop_ms": 1_500}}))
+        .expect("a deployment may bound component shutdown");
+    let runtime = config.runtime.expect("runtime section");
+    assert_eq!(
+        runtime.max_component_stop(),
+        Some(Duration::from_millis(1_500))
+    );
+}
+
+#[test]
+fn an_absent_or_zero_stop_ceiling_means_this_host_imposes_none() {
+    let absent = parse("{}").expect("an empty config is valid");
+    assert!(absent.runtime.is_none());
+    let empty = parse_value(json!({"runtime": {}})).expect("an empty section is valid");
+    assert_eq!(
+        empty.runtime.expect("runtime section").max_component_stop(),
+        None,
+        "a section that sets nothing must not invent a ceiling"
+    );
+    let zero = parse_value(json!({"runtime": {"max_component_stop_ms": 0}}))
+        .expect("zero neutralises an inherited ceiling instead of failing");
+    assert_eq!(
+        zero.runtime.expect("runtime section").max_component_stop(),
+        None,
+        "zero must not be read as `wait no time at all`"
+    );
+}
+
+#[test]
+fn an_unknown_runtime_or_trust_key_is_named_rather_than_ignored() {
+    for (document, expected) in [
+        (
+            json!({"runtime": {"max_component_stop": 1_000}}),
+            "runtime.max_component_stop",
+        ),
+        (json!({"trust": {"project_commands": true}}), "trust"),
+    ] {
+        let error = parse_value(document).expect_err("a ceiling nobody reads is a broken promise");
+        assert!(
+            issue_path(&error).starts_with(expected),
+            "expected an issue at {expected}, got {}",
+            issue_path(&error)
+        );
+    }
+}
+
+#[test]
+fn trusting_every_checkout_admits_any_project_config_path() {
+    let config = parse_value(json!({"trust": {"project_host_commands": true}}))
+        .expect("a host may trust every checkout");
+    let trust = config
+        .trust
+        .expect("trust section")
+        .project_host_commands
+        .expect("grant");
+    assert_eq!(trust, ProjectHostCommands::Every(true));
+    assert!(trust.admits(&std::env::temp_dir().join("anywhere/.zuno/zuno.json")));
+
+    let refused = parse_value(json!({"trust": {"project_host_commands": false}}))
+        .expect("`false` is the default written down");
+    assert!(
+        !refused
+            .trust
+            .expect("trust section")
+            .project_host_commands
+            .expect("grant")
+            .admits(&std::env::temp_dir().join("anywhere/.zuno/zuno.json"))
+    );
+}
+
+#[test]
+fn a_trusted_root_admits_only_the_config_files_inside_it() {
+    let trusted = std::env::temp_dir().join("zuno-trusted-root");
+    let beside = std::env::temp_dir().join("zuno-trusted-root-sibling");
+    let config = parse_value(json!({
+        "trust": {"project_host_commands": [trusted.display().to_string()]}
+    }))
+    .expect("a host may trust named checkouts");
+    let trust = config
+        .trust
+        .expect("trust section")
+        .project_host_commands
+        .expect("grant");
+
+    assert!(trust.admits(&trusted.join("repo/.zuno/zuno.json")));
+    assert!(trust.admits(&trusted.join("zuno.json")));
+    assert!(
+        !trust.admits(&beside.join("repo/.zuno/zuno.json")),
+        "a shared name prefix is not containment"
+    );
+    assert!(!trust.admits(&std::env::temp_dir().join("elsewhere/zuno.json")));
+}
+
+#[test]
+fn a_relative_trusted_root_is_refused_because_it_is_not_a_decision() {
+    for root in ["./checkouts", "checkouts", ""] {
+        let error = parse_value(json!({"trust": {"project_host_commands": [root]}}))
+            .expect_err("a trust root that depends on the current directory is not a decision");
+        let ConfigError::Invalid { issues, .. } = &error else {
+            panic!("expected a validation failure for {root:?}");
+        };
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.detail.contains("absolute path")
+                    || issue.detail.contains("empty")),
+            "{issues:?}"
+        );
+    }
+}
+
+#[test]
+fn a_trust_grant_is_neither_a_number_nor_an_object() {
+    for document in [
+        json!({"trust": {"project_host_commands": 1}}),
+        json!({"trust": {"project_host_commands": {"every": true}}}),
+        json!({"trust": {"project_host_commands": "/opt/checkouts"}}),
+    ] {
+        parse_value(document).expect_err("a trust grant is a boolean or a list of roots");
+    }
 }

@@ -201,8 +201,9 @@ To use the directly selectable `deep` Agent:
 
 Plan mode activates the read-only `plan` Agent. Returning to Build restores the
 last selected implementation Agent. Agent and model changes are session-local
-and are rejected while a prompt is actively running. An idle configuration
-change still performs an atomic host replacement, but it reuses the connected
+and are rejected while the session has work in flight: a prompt request, a live
+turn, or a background continuation restored by `session/load`. An idle
+configuration change still performs an atomic host replacement, but it reuses the connected
 session MCP runtime when the MCP server configuration and connection concurrency
 are unchanged. Editing those structural MCP inputs forces a fresh connection.
 Structured logs report the reconfiguration phase timings without recording the
@@ -368,6 +369,75 @@ Shell tool-call titles are the exact submitted command, not an interpreter-prefi
 pseudo-command. For example, Zed receives `git diff --check` as the copyable title
 and receives the resolved `zsh` identity separately in
 `_meta.zuno.interpreter`. Completion and historical replay preserve the same shape.
+
+### Concurrent prompts in one session
+
+A session runs one turn at a time, but a prompt sent while a turn is running is
+never discarded. Zuno commits the prompt to the session's durable input inbox
+first and decides who runs it second:
+
+- normally the prompt is steered into the turn that is already running. The
+  model receives it at that turn's next safe point — between provider requests,
+  or after the tool calls in flight — and keeps working in the same turn;
+- if the running turn ends before the steer lands, the prompt stays durably
+  queued and the next turn in the session promotes it in admission order.
+
+ACP v1 has no success shape for "accepted, but this request ran no turn":
+`stopReason` is a closed enum, so every value would misreport a turn this
+request never had. Zuno therefore answers the second `session/prompt` with a
+JSON-RPC error in the implementation-defined range and carries the admission
+facts in `error.data`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "error": {
+    "code": -32001,
+    "message": "session ses_x is running a turn; this prompt was admitted durably and steered into it",
+    "data": {
+      "sessionId": "ses_x",
+      "admission": "steered",
+      "inputId": "msg_1f2e",
+      "admittedSequence": 42,
+      "delivery": "steer"
+    }
+  }
+}
+```
+
+`data.admission` is `steered` when the running turn accepted the prompt and
+`queued` when it is waiting for the next turn; `delivery` and `admittedSequence`
+are the durable inbox row's own fields, and `inputId` names that row. The
+streamed `user_message_chunk`, assistant output, and `stopReason` for the
+admitted prompt all arrive on the request that owns the turn, so a v1 client
+that ignores `data` still shows the work — it sees the error message text
+instead of a second `stopReason`.
+
+A slash command is different. It is resolved against the host command catalog
+and runs as its own turn, so it cannot be steered into work already in flight.
+Zuno refuses it with the same code, `admission: "rejected"`, and
+`reason: "commandRequiresIdleSession"`, and writes nothing durable; send it
+again once the session is idle. Only a prompt that actually names a command, an
+unambiguous Skill, or a native session control is a command invocation. A prompt
+that merely begins with `/` — an absolute POSIX path, a regular expression — is
+ordinary content, so it is admitted durably and steered like any other prompt
+rather than refused as an unresolvable command.
+
+Cancellation is keyed on the JSON-RPC request id, never on what a request asked
+for: two prompts can carry byte-identical params. `$/cancel_request` for the
+request that owns the turn interrupts that turn, and no other request's
+cancellation can stop it.
+
+Withdrawing a `session/prompt` that has not been answered yet retires exactly
+what that request contributed. Its durable inbox row is cancelled, so the
+withdrawn text is never promoted into any turn, and the request is answered with
+the JSON-RPC cancellation code `-32800` carrying `data.admission: "withdrawn"`
+and the `inputId` of the row it retired. A request that was already answered with
+`admission: "steered"` or `"queued"` is finished: `$/cancel_request` for it does
+nothing at all, because its prompt is already durable and the turn it feeds
+belongs to a different request. Use `session/cancel` to stop the session's live
+turn regardless of which request owns it.
 
 ### Delegated child sessions
 

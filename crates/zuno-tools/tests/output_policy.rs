@@ -7,7 +7,24 @@ use std::sync::Arc;
 use zuno_tool::{ACCEPT_LARGE_OUTPUT_KEY, OutputLimits, ToolOutput, ToolOutputStore};
 #[cfg(unix)]
 use zuno_tool::{AllowAll, NeverInterrupted, Tool, ToolContext};
+use zuno_tools::output_policy::METADATA_WITHHELD_OUTPUT_KEY;
 use zuno_tools::output_policy::OutputPolicy;
+
+/// Every window of one artifact, joined, as a caller pages it back.
+fn read_all(store: &ToolOutputStore, session_id: &str, path: &std::path::Path) -> String {
+    let mut bytes = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let window = store
+            .read_window("shell", session_id, path, cursor, 4_096)
+            .expect("read window");
+        bytes.extend_from_slice(&window.bytes);
+        cursor = window.cursor;
+        if cursor >= window.total {
+            return String::from_utf8(bytes).expect("text artifact");
+        }
+    }
+}
 
 fn limits() -> OutputLimits {
     OutputLimits {
@@ -28,42 +45,99 @@ fn context() -> ToolContext {
     )
 }
 
+/// Withholding is a successful result that says how to read what was withheld.
+///
+/// This used to be an error, and the annotated result it dropped on the way out was the
+/// only thing that knew where the artifact was. The expectation changed with the
+/// behaviour: a withheld result now carries the notice as its text, the artifact on its
+/// `outputPaths`, and the typed facts a client can act on without parsing prose.
 #[test]
-fn output_policy_refuses_oversized_output_after_persisting_every_byte() {
+fn withheld_output_is_a_result_that_names_the_artifact_and_the_way_to_read_it() {
     let store_dir = tempfile::tempdir().expect("store dir");
     let store = ToolOutputStore::new(store_dir.path());
     let policy = OutputPolicy::new(store.clone(), limits());
     let full = "one\ntwo\n";
 
-    let error = policy
+    let output = policy
         .apply(
             "shell",
             "ses_output_policy",
             ToolOutput::text("large", full),
             false,
         )
-        .expect_err("oversized output requires explicit acceptance");
+        .expect("being over the limit is an outcome, not a failure");
 
-    let zuno_tools::output_policy::OutputPolicyError::Oversized(refusal) = &error else {
-        panic!("expected a structured oversized-output refusal, got {error:?}");
-    };
-    assert_eq!(refusal.measurement.bytes, full.len());
-    assert_eq!(refusal.measurement.lines, 3);
+    let paths = output.output_paths();
+    let path = paths.first().expect("retrieval path");
     assert_eq!(
-        store
-            .read("shell", &refusal.output_path)
-            .expect("persisted full output"),
+        read_all(&store, "ses_output_policy", std::path::Path::new(path)),
         full
     );
+    assert_eq!(output.metadata["oversized"], true);
+    assert!(output.metadata.get("largeOutputAccepted").is_none());
 
-    let message = error.to_string();
-    assert!(message.contains("8 bytes across 3 lines"), "{message}");
-    assert!(message.contains("~2 tokens"), "{message}");
-    assert!(message.contains(ACCEPT_LARGE_OUTPUT_KEY), "{message}");
-    assert!(
-        message.contains(&refusal.output_path.to_string_lossy().into_owned()),
-        "{message}"
-    );
+    let facts = &output.metadata[METADATA_WITHHELD_OUTPUT_KEY];
+    assert_eq!(facts["outputPath"], *path);
+    assert_eq!(facts["artifactBytes"], full.len());
+    assert_eq!(facts["artifactLines"], 3);
+    assert_eq!(facts["measuredBytes"], full.len());
+    assert_eq!(facts["measuredLines"], 3);
+    assert_eq!(facts["limitBytes"], 4);
+    assert_eq!(facts["limitLines"], 1);
+    assert_eq!(facts["estimatedTokens"], 2);
+    assert_eq!(facts["retrievalTool"], "bg");
+    assert_eq!(facts["retrievalAction"], "artifact");
+
+    let notice = &output.output;
+    assert!(notice.contains("8 bytes across 3 lines"), "{notice}");
+    assert!(notice.contains("~2 tokens"), "{notice}");
+    assert!(notice.contains(*path), "{notice}");
+    // Retrieval before the back door: the artifact already exists, while the back door
+    // re-runs a call that `shell` declares must never be replayed.
+    let retrieval = notice.find("`bg`").expect("retrieval offer");
+    let backdoor = notice
+        .find(ACCEPT_LARGE_OUTPUT_KEY)
+        .expect("inline back door");
+    assert!(retrieval < backdoor, "{notice}");
+    assert!(notice.contains("run again"), "{notice}");
+}
+
+/// The artifact holds the command's bytes, not a decoded copy of them.
+#[test]
+fn withheld_output_persists_the_bytes_the_command_wrote() {
+    let store_dir = tempfile::tempdir().expect("store dir");
+    let store = ToolOutputStore::new(store_dir.path());
+    let policy = OutputPolicy::new(store.clone(), limits());
+    let raw = b"one\n\xff\xfe\ntwo\n";
+    let lossy = String::from_utf8_lossy(raw).into_owned();
+
+    let output = policy
+        .apply_bytes(
+            "shell",
+            "ses_output_policy",
+            ToolOutput::text("large", &lossy),
+            raw,
+            false,
+        )
+        .expect("withheld");
+
+    let paths = output.output_paths();
+    let path = paths.first().expect("retrieval path");
+    let window = store
+        .read_window(
+            "shell",
+            "ses_output_policy",
+            std::path::Path::new(path),
+            0,
+            4_096,
+        )
+        .expect("read window");
+    assert_eq!(window.bytes, raw);
+    // The notice measures what the model would have been shown, which is the decoded
+    // text, while the artifact reports its own byte count.
+    let facts = &output.metadata[METADATA_WITHHELD_OUTPUT_KEY];
+    assert_eq!(facts["artifactBytes"], raw.len());
+    assert_eq!(facts["measuredBytes"], lossy.len());
 }
 
 #[test]
@@ -88,9 +162,7 @@ fn output_policy_explicit_acceptance_returns_the_complete_output() {
     let paths = output.output_paths();
     let path = paths.first().expect("retrieval path");
     assert_eq!(
-        store
-            .read("shell", std::path::Path::new(path))
-            .expect("persisted full output"),
+        read_all(&store, "ses_output_policy", std::path::Path::new(path)),
         full
     );
 }

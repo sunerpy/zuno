@@ -215,6 +215,14 @@ impl SessionRunRegistry {
     ///
     /// The waiter is registered before the status re-check, so a guard dropped
     /// between observation and suspension cannot lose its wake-up.
+    ///
+    /// The wait is deliberately unbounded, and that is the production contract:
+    /// `wake`, an HTTP session wait, and an ACP prompt handoff must keep waiting
+    /// for as long as a real turn legitimately runs, so no ceiling here could be
+    /// both safe for a long turn and useful as a failure signal. A caller that
+    /// must fail rather than hang — a test driving a fake executor, for instance —
+    /// owns its own bound: wrap this call in `tokio::time::timeout` and report
+    /// [`Self::status`] and [`Self::active_sessions`] as the diagnostic.
     pub async fn wait_until_idle(&self, session_id: &str) {
         loop {
             let mut notified = std::pin::pin!(self.inner.idle.notified());
@@ -381,6 +389,16 @@ impl SessionControl {
         &self.session_id
     }
 
+    /// The current process-local status of this session.
+    ///
+    /// Surfaces read this instead of keeping a private "a prompt is running" flag.
+    /// A second exclusion mechanism can disagree with the registry, and the
+    /// registry is the one that actually admits turns.
+    #[must_use]
+    pub fn status(&self) -> SessionStatus {
+        self.registry.status(&self.session_id)
+    }
+
     /// Aborts whichever turn is live now, not the turn that created this handle.
     pub fn abort(&self, request: HardInterruptRequest) -> AbortDisposition {
         self.registry.abort(&self.session_id, request)
@@ -393,6 +411,8 @@ impl SessionControl {
     }
 
     /// Wait until the current live turn, if any, releases this session.
+    ///
+    /// Unbounded for the reason given on [`SessionRunRegistry::wait_until_idle`].
     pub async fn wait_until_idle(&self) {
         self.registry.wait_until_idle(&self.session_id).await;
     }

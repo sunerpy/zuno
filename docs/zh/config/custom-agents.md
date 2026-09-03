@@ -98,10 +98,12 @@ Report findings as a list. Do not edit files.
 
 Agent 的 `model` 是最具体的路由。当它缺省时，先应用当前激活 preset 的 Agent 路由，然后是父会话模型。为整个团队做路由时，preset 是更合适的工具 —— 参见[模型路由](/zh/config/models) —— 因为它把模型选择集中在一处，而不是散落在各个 Agent 定义中。
 
-## 创建与检查
+## 检查一份定义
+
+Zuno 不会替你生成 Agent 定义。请通过编辑 `zuno.json`，或按[两种定义方式](#两种定义方式)里的 frontmatter 在 `.zuno/agent/` 下写一个 Markdown 文件来创建，然后读回 Zuno 解析出的结果：
 
 ```sh
-zuno agent create --path .zuno/agent/reviewer.md --mode subagent
+zuno agent list
 zuno debug agent reviewer
 ```
 

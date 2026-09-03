@@ -17,7 +17,7 @@ The default model-visible surface is deliberately small:
 | `write` | Create a file, or intentionally replace one whole | Side-effecting |
 | `apply_patch` | Localized, context-verified source edits | Side-effecting |
 | `shell` | Run a command under the active sandbox | Side-effecting |
-| `bg` | Inspect or cancel background commands | Read-only inspection; `cancel` is side-effecting |
+| `bg` | Inspect or cancel background commands, and page output kept out of the transcript | Read-only inspection; `cancel` is side-effecting |
 | `task` | Delegate a bounded objective to another agent | Delegating |
 | `job` | Inspect background job state | Read-only |
 | `webfetch` | Retrieve one URL | Read-only |
@@ -131,6 +131,48 @@ change permissions or make the remote system part of the local process result; i
 requires the resumed Agent to refresh authoritative remote state before claiming that a
 CI run, deployment, or release completed.
 
+## Reading output in windows
+
+Output that is not in the transcript is read back through `bg`, one bounded window at a
+time. There are two kinds, and one cursor convention:
+
+| Action | Reads | Names the source with |
+| --- | --- | --- |
+| `bg output`, `bg wait` | A background execution's output | `taskID` |
+| `bg artifact` | Output a size limit withheld | `outputPath` |
+
+`cursor` is an absolute byte offset and `limit` is the size of the window. Both reads
+return the cursor the next window starts at, plus `hasMore`, so you page forward by
+handing that cursor back rather than by guessing an offset. Both also return `windowFrom`
+and `hasEarlier`, the same two facts pointing backwards, so a window states where it
+begins instead of leaving you to subtract its length from its cursor. `limit` defaults to
+16384 bytes and is clamped to 51200. That ceiling is fixed — one window of `bg` is bounded
+the way one `read` of a file is — and it is deliberately not a function of
+`tool_output.max_bytes`: lowering the inline threshold does not shrink a retrieval window,
+because a retrieval is how output that threshold withheld is read back. A window is
+bounded before anything is read, and asking for more than the ceiling is clamped rather
+than refused.
+
+A running command retains its most recent 2 MiB in memory while its complete output stays
+on disk. A `cursor` older than what is still retained is served from that file, so the
+beginning of a long-running command's output stays reachable through `bg` instead of
+requiring a shell command to slice the file by hand. `fromDisk` reports which copy
+answered.
+
+`bg output` and `bg wait` without a `cursor` return the newest window: the tail a terminal
+renders, ending at `totalWritten`, because that is where a command says what happened.
+Polling a running command that way keeps showing new bytes, and `windowFrom` is where to
+page backwards from. `bg artifact` is the other way round — a withheld artifact is not
+growing, and the notice that withheld it already stated its total size — so a read with no
+cursor starts at byte 0 and pages forward.
+
+Retrieval never re-runs the command that produced the output, and never goes through the
+output limits: a retrieved window is already bounded, and passing it through the limits
+would withhold it a second time. That holds inside `execute`, where the sub-calls share
+one 50000-byte budget: a window larger than this composition's share is neither inlined
+nor persisted again. The block names the artifact that still holds every byte and the
+`limit` that would fit, so the next read is smaller rather than aimed at a new file.
+
 ## What a shell exit status proves
 
 A pipeline's exit code is the last stage's exit code. `cargo test | tail -5` exits
@@ -201,6 +243,44 @@ the captured output, and only the guard writes that line, so a `make` that repor
 at all and is reported as killed by a signal, which likewise decides nothing about
 the work.
 
+## Cancelling a running command
+
+Interrupting a turn cancels the `shell` command it was waiting on, and what comes back is
+a settled result rather than a bare error. Everything the command had written is
+preserved, the exit information is reported when there is any, and the result states which
+of the two cancellations happened — because the two do not permit the same next step.
+
+| What the interrupt found | Exit status | Verification receipt |
+| --- | --- | --- |
+| The command had exited and reported its own status | Reported, with its usual authority | The receipt a completed run earns |
+| Anything else | Reported when the record holds one, but it decides nothing | `unknown`, with no exit code |
+
+The first case is not uncertain. The kill landed on a process that was already gone, so
+the command's own verdict stands and the result is the one it had earned; it is marked as
+cancelled and nothing else changes.
+
+The second case is uncertain, and says so in its first line: the command decided nothing,
+and what it had already changed cannot be read off this result. It asks for the
+authoritative state the command would have changed to be inspected before anything is
+retried. `shell` never replays a call on its own — a command can commit half a write
+before the kill reaches it — so this outcome ends with a look at real state rather than
+with a second attempt.
+
+A number in the exit status does not by itself move a cancellation into the first case,
+and the result names what the number fails to prove instead of pretending there is none:
+
+- an `exit 125` that is the guard's own failure says nothing about whether the command
+  ran, for the reason given in [the reserved codes above](#exit-codes-the-guard-reserves);
+- a command that reached its hard ceiling was killed there rather than deciding anything;
+- a status the run reported but Zuno could not settle — an output capture that broke after
+  the process exited, say — is not a verdict the result will let anything cite.
+
+Preserved output goes through the ordinary [output limits](#output-limits). A cancelled
+command that produced more than the inline threshold has every byte saved and is handed
+the notice naming the windowed read, with the cancellation statement still in front of it.
+Nothing is truncated, and a cancelled command that wrote nothing says `(no output)` rather
+than coming back blank.
+
 ## What a shell command inherits
 
 A `shell` call runs with the host environment the Zuno process itself has, minus
@@ -242,8 +322,8 @@ Every invocation classifies as one of four effects, and the default is the stric
 | `SideEffecting` | Default. Changes state or reaches outside | Fresh approval required |
 
 Because `SideEffecting` is the default, an unknown harness or MCP tool fails closed. A
-mixed tool may classify from validated arguments: `bg list`, `bg output`, and `bg wait`
-are read-only while `bg cancel` is side-effecting.
+mixed tool may classify from validated arguments: `bg list`, `bg output`, `bg wait`, and
+`bg artifact` are read-only while `bg cancel` is side-effecting.
 
 Native reads, `glob`, `grep`, skill and session and job inspection, `tool_search`,
 read-only LSP, MCP resource reads, `webfetch`, and `web_search` do not receive the extra strict prompt.
@@ -343,10 +423,19 @@ worth knowing when reading a transcript: blocked means nothing happened.
 ```
 
 Those are the defaults. Output beyond either limit is withheld rather than allowed to
-consume the model window. Nothing is truncated and nothing is lost: the full output is
-saved to a file, and the model receives one refusal naming the measured size, the limit it
-crossed, and that file's path. A call can ask for the whole thing by repeating itself with
-`accept_large_output: true`.
+consume the model window. Nothing is truncated and nothing is lost, and the call still
+succeeds: every byte is saved first — for `shell`, exactly the bytes the command wrote
+rather than a decoded copy of them — and what the model receives in place of the output is
+a notice naming the measured size, the limit it crossed, the artifact and its size, and
+the read that gets it back, which is `bg` with `action: "artifact"`.
+
+Withholding is an outcome, not a failure. The exit code, the verification receipt, and
+the sandbox facts of the command are all still on the result, and the artifact is recorded
+on the durable tool part twice over: in `outputPaths`, and in a typed `withheldOutput`
+object, so a client surface or a later turn can offer retrieval without parsing the
+notice. Sending the output back inline is still possible with `accept_large_output: true`,
+but that re-runs the call and spends the context this limit protects, so it is a
+deliberate back door rather than the first thing the notice suggests.
 
 ## See also
 

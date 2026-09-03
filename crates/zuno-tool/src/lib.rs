@@ -88,7 +88,7 @@ pub use crate::output::{
     ToolResultPresentation, UncertainMutationPresentation,
 };
 pub use crate::schema::{ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY};
-pub use crate::store::{StoredOutput, ToolOutputStore};
+pub use crate::store::{StoredOutput, StoredWindow, ToolOutputStore};
 pub use crate::verification::{
     ExitAuthority, ReceiptOutcome, VERIFICATION_METADATA_KEY, VerificationReceipt,
 };

@@ -38,4 +38,5 @@ pub use request_broker::{
 pub use server::{
     BoundServer, ServerBuilder, ServerConfig, ServerError, ServerServices, SessionCompactExecution,
     SessionModelSelection, SessionMutationExecutor, SessionMutationFuture, SessionPromptExecution,
+    SessionReportExecution,
 };

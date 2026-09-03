@@ -53,6 +53,31 @@ fn session_retention_table_list_tracks_the_destructive_delete_order() {
 }
 
 #[test]
+fn retention_guide_states_that_archiving_withdraws_standing_http_authorizations() {
+    // Archiving is reversible in the database, yet it withdraws every standing `always`
+    // authorization the selected sessions granted and `restore_archive` does not bring one
+    // back. Both retention pages must say so beside their "nothing is removed" claim.
+    contains_all(
+        "docs/session-retention.md",
+        &[
+            "Archiving ends a session's standing HTTP authorizations",
+            "does not outlive the session",
+            "reinstate an authorization",
+            "the CLI withdraws nothing",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/session-retention.md",
+        &[
+            "归档会终止该 session 的常驻 HTTP 授权",
+            "不会比给出它的那个 session 活得更久",
+            "重新装回一条授权",
+            "不持有 request broker",
+        ],
+    );
+}
+
+#[test]
 fn harness_guide_documents_the_native_extension_contract() {
     contains_all(
         "docs/harness-runtime.md",
@@ -225,6 +250,12 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "\"onUnavailable\": \"run-unconfined\"",
             "ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined",
             "read-only Agent never uses",
+            // A saved `always` is session-scoped, in memory, and unaffected by a
+            // dropped stream. All three are easy to re-document as global, which is
+            // what the batch-2 fix stopped being true.
+            "belongs to one session",
+            "not in the database",
+            "a stream is not the session",
         ],
     );
     contains_all(
@@ -234,6 +265,8 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "\"onUnavailable\": \"run-unconfined\"",
             "ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined",
             "只读 Agent 永远不会使用",
+            "只属于一个 session",
+            "而不在数据库里",
         ],
     );
     contains_all(
@@ -582,6 +615,8 @@ fn architecture_documents_pin_the_native_harness_decisions() {
             "Last-Event-ID",
             "does not mount an unscoped `/event` adapter",
             "only when a real handler exists",
+            "scoped to the session that granted",
+            "a stream is not the session",
         ],
     );
     contains_all(
@@ -1574,6 +1609,9 @@ fn config_index_tables_enumerate_every_schema_root_key() {
     schema_keys.sort();
     schema_keys.dedup();
     let number_words = [
+        (40, "Forty", "四十"),
+        (41, "Forty-one", "四十一"),
+        (42, "Forty-two", "四十二"),
         (43, "Forty-three", "四十三"),
         (44, "Forty-four", "四十四"),
         (45, "Forty-five", "四十五"),
@@ -1698,4 +1736,41 @@ fn tui_docs_pin_the_input_discarded_when_the_terminal_is_released() {
         "docs/zh/guide/tui.md",
         &["再丢弃尚未读取的输入", "`0;54;31M` 这类残留报文"],
     );
+}
+
+/// A cancellation's certainty is the fact this batch found easiest to re-document wrongly.
+///
+/// Both pages once said a cooperative return was certain and that an uncertain cancellation
+/// reports no exit code, and both claims were false — the second one for a guard `exit 125`
+/// that had already exited and still decides nothing. These needles pin the corrected
+/// contract in both languages, including that the demand reaches the model's own text.
+#[test]
+fn cancellation_docs_pin_certainty_as_a_verdict_and_not_a_mode() {
+    contains_all(
+        "docs/harness-runtime.md",
+        &[
+            "A cooperative settlement is not",
+            "demand to the settled report the model reads",
+            "keeps the certain cooperative reading, text included.",
+            "not merely whether the process had exited",
+            "Every other cancelled run preserves its captured output",
+            "uncertain cancellation may still name an exit code",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/harness-runtime.md",
+        &[
+            "### 工具取消的确定性",
+            "协作式取消并不自动等于结果确定。",
+            "检查权威状态的那句话追加到模型读到的报告里",
+            "区分它们的是服务是否把某个状态结算为命令自己的判定",
+            "不确定的取消也可能给出退出码",
+            "两种读法都绝不会被机械重放。",
+        ],
+    );
+    contains_all(
+        "docs/guide/tools.md",
+        &["says nothing about whether the command"],
+    );
+    contains_all("docs/zh/guide/tools.md", &["对命令是否运行过一概不说"]);
 }

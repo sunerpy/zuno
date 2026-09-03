@@ -77,21 +77,29 @@ zuno run --agent plan "audit the retry policy"
 
 ## Read-only is a role boundary, not just a sandbox mode
 
-`explorer` is native-read-only rather than shell-read-only. Its default surface is
-`read`, `glob`, `grep`, and read-only `lsp`; `shell`, edits, delegation, and network
-research are denied. Commands such as `du`, `stat`, and `file` are executables reached
-through `shell`, so they do not belong to `explorer` even though they only read.
+`explorer` is read-only by role, not merely by sandbox mode. Its default surface is
+`read`, `glob`, `grep`, read-only `lsp`, `skill`, and `shell` with `bg` under the
+read-only filesystem policy a read-only role always receives; edits, delegation, `job`,
+and network research are denied. So `du`, `stat`, and `file` are available for evidence,
+while anything that writes is refused below the prompt instead of discouraged by it.
 
-Global `permission.mode: "allow_all"` skips ordinary confirmation but does not erase that
-explicit deny. When command-based inspection is needed, delegate to a shell-capable agent
-such as `deep` or `general`, or run the bounded command in the parent session.
+Every role that may run a command may also inspect what it started. `bg` is granted
+wherever `shell` is, including the read-only roles: a background execution is reachable
+only through `bg`, and so is a result too large to return in the transcript.
+
+Global `permission.mode: "allow_all"` skips ordinary confirmation but does not erase
+those explicit denies. When external research or a change is needed, delegate to the role
+that owns it — `librarian` for evidence outside this repository, `deep` or `general` for
+an edit — or do the work in the parent session.
 
 ## Plan mode
 
 `/plan` in the terminal application switches collaboration mode, and the restriction is
 enforced below the prompt by a deny-by-default capability overlay: repository inspection,
-read-only LSP and search, questions, Skills, and typed Goal/Plan/Todo operations are
-allowed while shell and file mutation are denied.
+read-only LSP and search, external research, questions, Skills, background inspection,
+and typed Goal/Plan/Todo operations are allowed, while file mutation, delegation, `job`,
+and `execute` are denied. `shell` stays available under the read-only sandbox the role
+receives, so a command can gather evidence but cannot change the tree.
 
 Returning to Work mode requires a durable plan to exist, and the confirmation names its
 title, revision, and completed-step count. The model can recommend starting work but
@@ -115,11 +123,18 @@ definitions overlap.
 ## Custom agents
 
 An agent is defined either in `zuno.json` under `agents.<name>` or as a Markdown file
-with frontmatter under `.zuno/agent/`:
+with frontmatter under `.zuno/agent/`. The file is the definition: Zuno has no command
+that writes one for you. Author `.zuno/agent/reviewer.md` yourself, then read the
+resolved definition back with `zuno agent list`.
 
-```sh
-zuno agent create --path .zuno/agent/reviewer.md --mode subagent \
-  --description "Review diffs for regressions" --model openai/gpt-5
+```markdown
+---
+description: Review diffs for regressions
+mode: subagent
+model: openai/gpt-5
+---
+
+Review the diff for regressions and report each one with its file and line.
 ```
 
 A configured or extension agent whose mode is `subagent` or `all` can join the delegation

@@ -8,6 +8,12 @@ confinement, and help output, and they behave identically whether you pass them 
 Because they are accepted everywhere, they are documented here once instead of being
 repeated on each command page.
 
+Each of them applies to the invocation it is passed to. Zuno reads them from the values
+it resolved at startup rather than from the environment of the running process, which is
+why they do not depend on that environment being rewritten; on Windows that also means a
+program Zuno launches does not inherit them. See
+[One invocation, one process](/cli/#one-invocation-one-process).
+
 ## Synopsis
 
 ```sh

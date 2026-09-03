@@ -491,6 +491,17 @@ and assigns it `threads-required = "num-test-threads"`, reserving the complete
 nextest worker pool while each startup case runs. Native Windows uses the same
 quiet-repository boundary in `scripts/test-parallel.sh`.
 
+That file also carries the suite's only per-test ceiling. The default profile
+reports a case `SLOW` after 60 seconds and terminates it after four periods
+(240 seconds), so a test that stops making progress fails with its own name
+instead of blocking until the job's `timeout-minutes`, which reports a job
+timeout and names nothing. The ceiling is a liveness bound, not a performance
+gate: no admission decision reads it, and a case that legitimately runs long
+enough to be reported `SLOW` should be measured or split rather than have the
+ceiling raised. The `#[ignore]`d 500-turn soak binary, which is documented to
+run for hours when it is explicitly requested, is exempted and only ever
+reports as slow.
+
 Each startup path has one wall-clock measurement. Before timing `session list`, the
 test asserts through the real parser that this command is watchdog-protected;
 the resulting sample therefore includes watchdog creation, guard acquisition,
@@ -523,8 +534,9 @@ ZUNO_ENFORCE_STARTUP_BUDGET=1 \
 
 Phase attribution comes from `ZUNO_STARTUP_PROFILE=1`, which writes one
 `zuno-startup` line per process to **stderr** — never stdout, for the reason
-`zuno-observability`'s crate docs give. A dispatching invocation writes two lines,
-because it re-execs once to hand the command process its environment. Measured
+`zuno-observability`'s crate docs give. On Unix a dispatching invocation writes two
+lines, because it re-execs once to hand the command process its environment;
+elsewhere it writes one, because the invocation stays a single process. Measured
 phase split for `zuno session list`: parent `parse` 1,163 µs, `environment`
 293 µs; command process `logging` 796 µs, `dispatch` 28,385 µs.
 

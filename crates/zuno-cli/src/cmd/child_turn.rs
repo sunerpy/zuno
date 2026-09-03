@@ -32,6 +32,7 @@ use zuno_db::job::{
 use zuno_engine::interrupt::{SoftInterruptMessage, SoftInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
 use zuno_engine::planning::PlanningInputSource;
+use zuno_engine::report::ReportBatch;
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_engine::wake::{PendingInputDriver, SessionWakeCoordinator};
 use zuno_orchestration::AttemptSnapshot;
@@ -1985,18 +1986,14 @@ struct ParentReportDriver {
 
 #[async_trait]
 impl PendingInputDriver for ParentReportDriver {
+    /// Drive every settled report this session has pending as one turn.
+    ///
+    /// The wake that reached this driver names one report, but a parent commonly holds
+    /// several: a fan-out settles together, and restart recovery re-admits reports for
+    /// work that already settled. Claiming the whole batch under this one turn lease is
+    /// what stops the parent from opening a turn per report and announcing states a
+    /// later report in the same batch already replaced.
     async fn drive(&self, input: SessionInput, guard: SessionRunGuard) -> Result<(), String> {
-        let text = input
-            .prompt
-            .get("text")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "background report input `{}` has no string `text` field",
-                    input.id
-                )
-            })?
-            .to_owned();
         let options = TurnOptions {
             directory: Some(self.directory.clone()),
             model: Some(self.model.clone()),
@@ -2028,24 +2025,57 @@ impl PendingInputDriver for ParentReportDriver {
         host.activate_extension_composition()?;
         let promoted = self
             .inbox
-            .promote_id(&input.session_id, &input.id)
+            .promote_pending_async(&input.session_id)
             .map_err(to_string)?;
-        if promoted.is_none() {
+        let batch = ReportBatch::project(&promoted);
+        for input_id in batch.undecodable() {
+            self.settle_undecodable(&input.session_id, input_id);
+        }
+        if batch.is_empty() {
             return host.shutdown().await;
         }
-        let planning_source = detached_planning_source(&input.prompt);
-        let outcome = drive_detached_and_drain(
+        let outcome = drive_reports_and_drain(
             &mut host,
-            &text,
-            Some(input.id.as_str()),
-            Some(guard),
-            planning_source,
+            &batch,
+            guard,
             input.session_id.as_str(),
             self.detached_observer.clone(),
         )
         .await;
         let shutdown = host.shutdown().await;
         super::turn::finish_with_shutdown(outcome, shutdown)
+    }
+}
+
+impl ParentReportDriver {
+    /// Retire a promoted report the model can never read.
+    ///
+    /// A settled report whose durable prompt carries no text cannot become a user
+    /// message, so leaving it promoted would stall every report admitted behind it.
+    /// It settles as failed with a durable reason and the rest of the batch still runs.
+    fn settle_undecodable(&self, session_id: &str, input_id: &str) {
+        match self.inbox.mark_failed(
+            session_id,
+            input_id,
+            "settled report carries no model-visible text",
+        ) {
+            Ok(Some(_)) => tracing::warn!(
+                session_id,
+                input_id,
+                "failed a settled report that carries no model-visible text"
+            ),
+            Ok(None) => tracing::debug!(
+                session_id,
+                input_id,
+                "a report with no model-visible text was already settled"
+            ),
+            Err(error) => tracing::error!(
+                session_id,
+                input_id,
+                %error,
+                "could not settle a report that carries no model-visible text"
+            ),
+        }
     }
 }
 
@@ -2134,11 +2164,11 @@ async fn drive_and_drain(
     let drive = async {
         let outcome = match (guard, message_id, planning_source) {
             (Some(guard), Some(message_id), _) => {
-                host.drive_promoted_with_guard(prompt, message_id, guard, sender.clone())
+                host.drive_promoted_with_guard(prompt, message_id, &guard, sender.clone())
                     .await
             }
             (Some(guard), None, _) => {
-                host.drive_with_message_id_and_guard(prompt, None, guard, sender.clone())
+                host.drive_with_message_id_and_guard(prompt, None, &guard, sender.clone())
                     .await
             }
             (None, Some(message_id), _) => {
@@ -2158,41 +2188,19 @@ async fn drive_and_drain(
     outcome
 }
 
-async fn drive_detached_and_drain(
+/// Run one batched report turn while forwarding its events to the detached projection.
+async fn drive_reports_and_drain(
     host: &mut TurnHost,
-    prompt: &str,
-    message_id: Option<&str>,
-    guard: Option<SessionRunGuard>,
-    planning_source: PlanningInputSource,
+    batch: &ReportBatch,
+    guard: SessionRunGuard,
     session_id: &str,
     observer: Option<Arc<dyn DetachedTurnObserver>>,
 ) -> Result<(), String> {
     let (sender, receiver) = event_channel();
     let drive = async {
-        let outcome = match (guard, message_id) {
-            (Some(guard), Some(message_id)) => {
-                host.drive_promoted_report_with_guard(
-                    prompt,
-                    message_id,
-                    planning_source,
-                    guard,
-                    sender.clone(),
-                )
-                .await
-            }
-            (None, Some(message_id)) => {
-                host.drive_promoted_report(prompt, message_id, planning_source, sender.clone())
-                    .await
-            }
-            (Some(guard), None) => {
-                host.drive_with_message_id_and_guard(prompt, None, guard, sender.clone())
-                    .await
-            }
-            (None, None) => {
-                host.drive_with_message_id(prompt, None, sender.clone())
-                    .await
-            }
-        };
+        let outcome = host
+            .drive_promoted_reports_with_guard(batch.reports(), &guard, sender.clone())
+            .await;
         if outcome.is_ok() {
             while host
                 .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, sender.clone())
@@ -2240,14 +2248,6 @@ async fn forward_detached_events(
         if let Some(observer) = observer.as_ref() {
             observer.event(&session_id, &event).await;
         }
-    }
-}
-
-fn detached_planning_source(prompt: &Value) -> PlanningInputSource {
-    if prompt.get("kind").and_then(Value::as_str) == Some("backgroundExecutionReport") {
-        PlanningInputSource::BackgroundReport
-    } else {
-        PlanningInputSource::ChildReport
     }
 }
 

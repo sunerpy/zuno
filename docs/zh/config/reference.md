@@ -135,6 +135,51 @@ Schema 是从 Rust 类型生成的，因此它与运行时实际接受的内容�
 
 `concurrency` 控制同时运行的工作量上限。它约束的是编排层的并行度，而不是单次工具调用内部的并发。
 
+## 组件停止上限
+
+`runtime.max_component_stop_ms` 是本机对组件自报停止预算设置的上限：
+
+```json
+{
+  "runtime": {
+    "max_component_stop_ms": 3000
+  }
+}
+```
+
+要求更长的组件只等这么久，要求更短的组件保留自己的预算。省略或 `0` 表示本机不设上限、每个组件
+保留自己要求的预算，这也是默认行为。
+
+上限只缩短等待，从不取消工作。disposer 仍按注册的相反顺序逐个运行；超出上限的 disposer 记为
+`TimedOut` 生命周期诊断并被留到自然结束，因此进程树回收仍会在超时之后发生。
+
+## 用信任接纳检出声明的本机命令
+
+项目层声明本机会运行的命令会被拒绝：项目 `zuno.json[c]` 或 `.zuno` 中的 `shell`、本地
+`mcp.*.command`、`lsp.*.command`、`formatter.*.command`，以及 `productAgent.*.command`
+都会导致校验失败。把条目关掉也一样：命令旁边的 `enabled: false` 或 `disabled: true` 与命令
+同在检出可控的那一层，之后任何一层都能在不重述命令的情况下把它打开，因此一条休眠的声明同样是
+信任问题，而不是被容忍的例外。只有受信层里的 `trust.project_host_commands`
+能接纳它：
+
+```json
+{
+  "trust": {
+    "project_host_commands": ["/home/you/src", "/opt/checkouts"]
+  }
+}
+```
+
+| 取值 | 含义 |
+| --- | --- |
+| 省略或 `false` | 任何检出都不能声明本机命令 |
+| `true` | 本机上的每个检出都可以 |
+| 绝对路径列表 | 位于这些根目录之内的项目配置文件可以 |
+
+根目录在规范化之后比较，因此经软链接到达的检出仍是同一个检出；相对路径或空字符串是校验错误，
+而不是一条静默不匹配的根目录。项目层自己设置 `trust` 同样会被拒绝，这正是授权层可被证明为受信层
+的原因。被接纳的声明仍会逐个键记入日志。
+
 ## 可选的 Agent 步数护栏
 
 `steps` 为一个 Agent 设置在最终一次纯文本回复之前，允许的最大工具可用迭代次数。省略即不设固定步数上限。
@@ -221,6 +266,15 @@ Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程�
 
 `permission.rules` 是有序的，**最后一条匹配的规则胜出**。规则要么是对整个工具的一个动作，要么是按模式匹配的多个动作。因此 catch-all `*` 要写在最前面，从它当中划出例外的窄模式要写在最后面。`edit` 这个键同时管 `write`、`edit` 和 `apply_patch` 三个工具；不存在单独的 `write` 规则键。
 
+只用来别名另一个键的规则键是校验错误，并且错误会指出应当改用哪个键：`write` 与 `apply_patch`
+都折叠到 `edit`，`list_mcp_resources`、`list_mcp_resource_templates` 与 `read_mcp_resource`
+都折叠到 `read`。这些键此前会被接受，却什么都不评估。其他键仍然合法，因为 MCP、插件与 Skill
+工具的名字在运行时才确定，键本身也可以是通配模式。
+
+顶层 `tools` 开关仍然按工具名索引，同一套折叠也适用于它：`{"tools": {"apply_patch": false}}`
+会变成一条优先级最低的 `edit` 拒绝，因此 `edit` 与 `write` 也会被一起关掉。如果这不是你想要的，
+请直接写那个起管辖作用的工具名。
+
 按目录授予的 `external_directory` 规则写成「目录加 `/*`」，使用正斜杠，去掉 Windows 的逐字
 `\\?\` 前缀，例如 `{"external_directory": {"C:/build-cache/*": "allow"}}`。所有工具都按
 这一种拼法发起请求，因此一条规则同时覆盖 shell 工具与文件、搜索工具。
@@ -295,13 +349,13 @@ ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined zuno
 用 `zuno debug sandbox` 查看请求/实际权限、降级资格、`resolutionKind` 和
 `fallbackReason`。`--check` 仍严格检查请求的约束是否可部署，不会因为允许降级而成功。
 
-来源同样约束本机命令，目前只是告警而不是拒绝。项目 `zuno.json[c]` 或 `.zuno` 层声明了
-`shell`、本地 `mcp.*.command`、未被禁用的 `lsp.*.command` 或 `formatter.*.command`，或
-`productAgent.*.command` 时，配置发现会逐个键记录一条指明文件与键名的警告。该层仍然被
-接受，取值原样保留；告警的原因是这些程序都以当前用户的权限在本机运行，而选择它们的是
-被检出的仓库，因此运维者应先审阅仓库再信任它。远程 MCP server 不在本机运行任何东西，
-不会被告警。未来版本会改为直接拒绝项目层的这些声明，请现在就把本机命令移到全局
-`zuno.json` 或其他受信层。
+来源同样约束本机命令，而且项目层的声明是被拒绝，而不是仅仅告警。项目 `zuno.json[c]` 或
+`.zuno` 层声明了 `shell`、本地 `mcp.*.command`、`lsp.*.command`、`formatter.*.command`，
+或 `productAgent.*.command` 时，配置发现会以校验错误失败，并指明该文件与其中每一个命令键；
+条目是否被关掉都一样。这些程序都会以当前用户的权限在本机运行，而选择它们的是被检出的仓库，
+所以这个决定不该由检出做。远程 MCP server 不在本机运行任何东西，永远不会被拒绝。请把本机
+命令放在全局 `zuno.json` 或其他受信层，或者用 `trust.project_host_commands`
+接纳特定检出，详见本页「用信任接纳检出声明的本机命令」一节。
 
 ## 严格 HITL 授权
 

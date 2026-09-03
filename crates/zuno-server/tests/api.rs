@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -16,11 +17,11 @@ use tower::ServiceExt;
 use zuno_db::Pool;
 use zuno_db::artifact_gc::ArtifactGcPaths;
 use zuno_db::event_log::SessionEventLog;
-use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox};
+use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SubmissionState};
 use zuno_db::session::SessionCreate;
 use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, TurnEventSender};
-use zuno_engine::status::{AbortDisposition, SessionStatus};
+use zuno_engine::status::{AbortDisposition, SessionRunRegistry, SessionStatus};
 use zuno_llm::event::RequestContentBlock;
 use zuno_paths::DbLocation;
 use zuno_permission::ReplyKind;
@@ -29,7 +30,7 @@ use zuno_server::api::{self, ApiState};
 use zuno_server::{
     Delivery, EventService, NewEvent, PermissionRequest, QuestionDecision, QuestionRequest,
     RequestBroker, ServerBuilder, ServerConfig, ServerServices, SessionCompactExecution,
-    SessionMutationExecutor, SessionMutationFuture, SessionPromptExecution,
+    SessionMutationExecutor, SessionMutationFuture, SessionPromptExecution, SessionReportExecution,
 };
 
 fn api_app(state: ApiState) -> Router {
@@ -69,24 +70,102 @@ fn native_pty_command(script: &str) -> (String, Vec<String>) {
     ("sh".to_owned(), vec!["-c".to_owned(), script.to_owned()])
 }
 
+/// Upper bound for every test-support wait in this suite.
+///
+/// `#[tokio::test]` installs no default timeout, so an unbounded wait turns a
+/// driver regression into a hung suite instead of a failure: nothing is left to
+/// wake the waiter, no timer is pending, and the run burns the whole CI job
+/// without ever naming a test. Every wait below is satisfied by an in-process
+/// notify in microseconds, so this ceiling keeps orders of magnitude of headroom
+/// on a loaded host and fires only when the driver stopped making progress.
+const WAIT_LIMIT: Duration = Duration::from_secs(60);
+
+/// Awaits `wait`, or fails naming what was awaited and what `observed` reported.
+async fn bounded_wait<T>(
+    what: &str,
+    wait: impl Future<Output = T>,
+    observed: impl FnOnce() -> String,
+) -> T {
+    match tokio::time::timeout(WAIT_LIMIT, wait).await {
+        Ok(value) => value,
+        Err(_elapsed) => panic!(
+            "waited {WAIT_LIMIT:?} for {what} with no progress; observed {}",
+            observed()
+        ),
+    }
+}
+
+/// Spins until `ready` holds, under the same ceiling as [`bounded_wait`].
+async fn bounded_until(
+    what: &str,
+    mut ready: impl FnMut() -> bool,
+    observed: impl FnOnce() -> String,
+) {
+    bounded_wait(
+        what,
+        async {
+            while !ready() {
+                tokio::task::yield_now().await;
+            }
+        },
+        observed,
+    )
+    .await;
+}
+
+/// Waits for one session's live turn to end, bounded so a stuck driver fails.
+///
+/// [`SessionRunRegistry::wait_until_idle`] is deliberately unbounded, because a
+/// host waiting on a real turn must keep waiting. A test needs the opposite, so
+/// the ceiling belongs here rather than in the engine.
+async fn wait_until_session_idle(runs: &SessionRunRegistry, session_id: &str) {
+    bounded_wait(
+        &format!("session `{session_id}` to release its turn lease"),
+        runs.wait_until_idle(session_id),
+        || {
+            format!(
+                "status={:?}, active sessions={:?}",
+                runs.status(session_id),
+                runs.active_sessions()
+            )
+        },
+    )
+    .await;
+}
+
 #[derive(Debug, Default)]
 struct BlockingMutationExecutor {
     prompt_started: Arc<AtomicBool>,
     prompt_started_notify: Arc<Notify>,
     prompts: Mutex<Vec<SessionPromptExecution>>,
+    report_batches: Mutex<Vec<SessionReportExecution>>,
     compact_calls: AtomicUsize,
 }
 
 impl BlockingMutationExecutor {
     async fn wait_until_prompt_started(&self) {
-        loop {
-            let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
-            notified.as_mut().enable();
-            if self.prompt_started.load(Ordering::SeqCst) {
-                return;
-            }
-            notified.await;
-        }
+        bounded_wait(
+            "the executor to start its first execution",
+            async {
+                loop {
+                    let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
+                    notified.as_mut().enable();
+                    if self.prompt_started.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    notified.await;
+                }
+            },
+            || {
+                format!(
+                    "started={}, prompts={:?}, report batches={:?}",
+                    self.prompt_started.load(Ordering::SeqCst),
+                    self.prompt_ids(),
+                    self.report_batch_sizes()
+                )
+            },
+        )
+        .await;
     }
 
     fn prompts(&self) -> Vec<SessionPromptExecution> {
@@ -97,14 +176,75 @@ impl BlockingMutationExecutor {
     }
 
     async fn wait_until_prompt_count(&self, count: usize) {
-        loop {
-            let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
-            notified.as_mut().enable();
-            if self.prompts().len() >= count {
-                return;
-            }
-            notified.await;
-        }
+        bounded_wait(
+            &format!("{count} started prompt execution(s)"),
+            async {
+                loop {
+                    let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
+                    notified.as_mut().enable();
+                    if self.prompts().len() >= count {
+                        return;
+                    }
+                    notified.await;
+                }
+            },
+            || {
+                format!(
+                    "prompts={:?}, report batches={:?}",
+                    self.prompt_ids(),
+                    self.report_batch_sizes()
+                )
+            },
+        )
+        .await;
+    }
+
+    fn report_batches(&self) -> Vec<SessionReportExecution> {
+        self.report_batches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// The admitted message id of every prompt this executor was asked to run.
+    fn prompt_ids(&self) -> Vec<String> {
+        self.prompts()
+            .into_iter()
+            .map(|prompt| prompt.message_id)
+            .collect()
+    }
+
+    /// How many reports each batch carried, in the order the batches arrived.
+    fn report_batch_sizes(&self) -> Vec<usize> {
+        self.report_batches()
+            .iter()
+            .map(|batch| batch.reports.len())
+            .collect()
+    }
+
+    /// Wait for this many provider requests, counting a whole report batch as one.
+    async fn wait_until_execution_count(&self, count: usize) {
+        bounded_wait(
+            &format!("{count} provider execution(s)"),
+            async {
+                loop {
+                    let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
+                    notified.as_mut().enable();
+                    if self.prompts().len() + self.report_batches().len() >= count {
+                        return;
+                    }
+                    notified.await;
+                }
+            },
+            || {
+                format!(
+                    "prompts={:?}, report batches={:?}",
+                    self.prompt_ids(),
+                    self.report_batch_sizes()
+                )
+            },
+        )
+        .await;
     }
 }
 
@@ -116,6 +256,26 @@ impl SessionMutationExecutor for BlockingMutationExecutor {
         _events: TurnEventSender,
     ) -> SessionMutationFuture {
         self.prompts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(request);
+        let started = Arc::clone(&self.prompt_started);
+        let started_notify = Arc::clone(&self.prompt_started_notify);
+        Box::pin(async move {
+            started.store(true, Ordering::SeqCst);
+            started_notify.notify_waiters();
+            guard.interrupt_signal().notified().await;
+            Ok(())
+        })
+    }
+
+    fn reports(
+        &self,
+        request: SessionReportExecution,
+        guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        self.report_batches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(request);
@@ -167,6 +327,15 @@ impl SessionMutationExecutor for InterruptEventExecutor {
         })
     }
 
+    fn reports(
+        &self,
+        _request: SessionReportExecution,
+        _guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        Box::pin(async { Err("a report batch is not expected in this test".to_owned()) })
+    }
+
     fn compact(
         &self,
         _request: SessionCompactExecution,
@@ -186,14 +355,26 @@ struct BlockingCompactMutationExecutor {
 
 impl BlockingCompactMutationExecutor {
     async fn wait_until_compact_started(&self) {
-        loop {
-            let mut notified = std::pin::pin!(self.compact_started_notify.notified());
-            notified.as_mut().enable();
-            if self.compact_started.load(Ordering::SeqCst) {
-                return;
-            }
-            notified.await;
-        }
+        bounded_wait(
+            "the executor to take the compaction lease",
+            async {
+                loop {
+                    let mut notified = std::pin::pin!(self.compact_started_notify.notified());
+                    notified.as_mut().enable();
+                    if self.compact_started.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    notified.await;
+                }
+            },
+            || {
+                format!(
+                    "compaction started={}",
+                    self.compact_started.load(Ordering::SeqCst)
+                )
+            },
+        )
+        .await;
     }
 
     fn release_compact(&self) {
@@ -209,6 +390,15 @@ impl SessionMutationExecutor for BlockingCompactMutationExecutor {
         _events: TurnEventSender,
     ) -> SessionMutationFuture {
         Box::pin(async { Err("prompt is not expected in this test".to_owned()) })
+    }
+
+    fn reports(
+        &self,
+        _request: SessionReportExecution,
+        _guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        Box::pin(async { Err("a report batch is not expected in this test".to_owned()) })
     }
 
     fn compact(
@@ -485,8 +675,10 @@ fn fixture_operations(document: &Value) -> BTreeSet<(String, String)> {
 fn api_openapi_contains_only_registered_zuno_operations() {
     let generated = api::openapi();
     let actual = fixture_operations(&generated);
-    assert_eq!(actual.len(), 51, "the registered Zuno API surface changed");
+    assert_eq!(actual.len(), 49, "the registered Zuno API surface changed");
     for operation in [
+        ("/api/permission/saved", "get"),
+        ("/api/permission/saved/{id}", "delete"),
         ("/api/integration/{integrationID}/connect/key", "post"),
         ("/api/integration/{integrationID}/connect/oauth", "post"),
         ("/api/integration/attempt/{attemptID}", "get"),
@@ -965,7 +1157,6 @@ async fn api_permission_and_question_read_routes_match_the_empty_process_state()
     for path in [
         "/api/permission/request",
         "/api/question/request",
-        "/api/permission/saved",
         "/api/session/ses_empty/question",
     ] {
         let response = app
@@ -976,16 +1167,322 @@ async fn api_permission_and_question_read_routes_match_the_empty_process_state()
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         assert_eq!(response_json(response).await["data"], json!([]), "{path}");
     }
+}
 
-    let removed = app
+/// Zuno publishes no saved-permission surface.
+///
+/// `GET /api/permission/saved` and `DELETE /api/permission/saved/{id}` used to be
+/// fixed-response stubs: the list always reported an empty grant set and the delete
+/// always reported success, while a live standing authorization kept auto-approving
+/// matching calls. An unregistered route is honest about that; a route that can only
+/// lie is not.
+#[tokio::test]
+async fn api_publishes_no_saved_permission_routes_or_operations() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    let app = api_app(state);
+
+    for (method, path) in [
+        (Method::GET, "/api/permission/saved"),
+        (Method::DELETE, "/api/permission/saved/per_missing"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(method.clone(), path, None))
+            .await
+            .expect("the router answers an unregistered path");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+    }
+
+    let document = api::openapi();
+    assert!(
+        document["paths"]["/api/permission/saved"].is_null(),
+        "the removed list operation is still advertised"
+    );
+    assert!(
+        document["paths"]["/api/permission/saved/{id}"].is_null(),
+        "the removed revoke operation is still advertised"
+    );
+}
+
+/// A shell permission request for one session, saving the given patterns.
+fn shell_permission(id: &str, session_id: &str, save: Vec<String>) -> PermissionRequest {
+    PermissionRequest {
+        id: id.to_owned(),
+        session_id: session_id.to_owned(),
+        action: "shell".to_owned(),
+        resources: vec!["git push".to_owned()],
+        save,
+        metadata: serde_json::Map::new(),
+        source: None,
+    }
+}
+
+/// Waits for `session_id` to have a request parked in the broker.
+async fn await_parked(requests: &RequestBroker, session_id: &str) {
+    bounded_until(
+        &format!("session `{session_id}` to park a permission ask in the broker"),
+        || !requests.permissions(Some(session_id)).is_empty(),
+        || {
+            format!(
+                "parked for this session={}, parked overall={}",
+                requests.permissions(Some(session_id)).len(),
+                requests.permissions(None).len()
+            )
+        },
+    )
+    .await;
+}
+
+/// Asks, replies `always` once the ask parks, and returns what the asker received.
+async fn answer_with_always(requests: &RequestBroker, request: PermissionRequest) -> ReplyKind {
+    let session_id = request.session_id.clone();
+    let request_id = request.id.clone();
+    let mut asked = tokio::spawn({
+        let requests = requests.clone();
+        async move { requests.ask_permission(request).await }
+    });
+    await_parked(requests, &session_id).await;
+    assert!(
+        requests
+            .claim_permission(&session_id, &request_id)
+            .expect("the owning session claims its own request")
+            .resolve(ReplyKind::Always)
+    );
+    tokio::time::timeout(Duration::from_secs(1), &mut asked)
+        .await
+        .expect("the asker resumes")
+        .expect("the asker task does not panic")
+}
+
+/// Asserts that an ask waits for a human instead of being answered by a saved reply.
+async fn assert_parks_for_a_human(
+    requests: &RequestBroker,
+    request: PermissionRequest,
+    message: &str,
+) {
+    let session_id = request.session_id.clone();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), requests.ask_permission(request))
+            .await
+            .is_err(),
+        "{message}"
+    );
+    assert_eq!(
+        requests.permissions(Some(&session_id)).len(),
+        1,
+        "the ask should be waiting as a pending request"
+    );
+}
+
+/// A saved `always` belongs to the session that granted it.
+///
+/// The resident key used to be `(action, resources)` alone, so one session's saved
+/// reply pre-approved the identical call in every other session this process served,
+/// including sessions started later and sessions the replying client never saw. The
+/// granting session still reuses its own saved reply without asking again.
+#[tokio::test]
+async fn a_saved_permission_authorizes_only_the_session_that_granted_it() {
+    let requests = RequestBroker::default();
+    assert_eq!(
+        answer_with_always(
+            &requests,
+            shell_permission("per_grant", "ses_grant", vec!["git push".to_owned()]),
+        )
+        .await,
+        ReplyKind::Always
+    );
+
+    assert_eq!(
+        requests
+            .ask_permission(shell_permission(
+                "per_again",
+                "ses_grant",
+                vec!["git push".to_owned()],
+            ))
+            .await,
+        ReplyKind::Once,
+        "the granting session should reuse its own saved permission"
+    );
+    assert!(requests.permissions(None).is_empty());
+
+    assert_parks_for_a_human(
+        &requests,
+        shell_permission("per_other", "ses_other", vec!["git push".to_owned()]),
+        "another session's request was authorized by ses_grant's saved permission",
+    )
+    .await;
+}
+
+/// An ask that offered nothing to save never becomes a standing authorization.
+///
+/// An empty `save` means the surface presented no "always" option — a manual
+/// confirmation, for instance. Replying `always` to such a request used to install a
+/// resident grant anyway, so the next matching call in that session skipped the human
+/// the ask existed to reach.
+#[tokio::test]
+async fn replying_always_to_an_unsavable_request_installs_no_standing_authorization() {
+    let requests = RequestBroker::default();
+    assert_eq!(
+        answer_with_always(
+            &requests,
+            shell_permission("per_once", "ses_once", Vec::new()),
+        )
+        .await,
+        ReplyKind::Always
+    );
+
+    assert_parks_for_a_human(
+        &requests,
+        shell_permission("per_repeat", "ses_once", Vec::new()),
+        "a request with nothing to save installed a standing authorization",
+    )
+    .await;
+}
+
+/// An `always` reply that never reaches its asker saves nothing.
+///
+/// The saved permission comes from a delivered reply, not from the attempt. When the
+/// asking turn is already gone the call it asked about is denied, so keeping the
+/// authorization would authorize the *next* matching call on behalf of a tool call
+/// that never ran.
+#[tokio::test]
+async fn an_undelivered_always_reply_saves_no_permission() {
+    let requests = RequestBroker::default();
+    let asking = tokio::spawn({
+        let requests = requests.clone();
+        async move {
+            requests
+                .ask_permission(shell_permission(
+                    "per_gone",
+                    "ses_gone",
+                    vec!["git push".to_owned()],
+                ))
+                .await
+        }
+    });
+    await_parked(&requests, "ses_gone").await;
+    asking.abort();
+    assert!(
+        asking
+            .await
+            .expect_err("the asking turn is cancelled")
+            .is_cancelled()
+    );
+
+    assert!(
+        !requests
+            .claim_permission("ses_gone", "per_gone")
+            .expect("the reply claims the abandoned request")
+            .resolve(ReplyKind::Always),
+        "a reply with no asker left should report that it was not delivered"
+    );
+    assert_parks_for_a_human(
+        &requests,
+        shell_permission("per_next", "ses_gone", vec!["git push".to_owned()]),
+        "an undelivered always reply installed a standing authorization",
+    )
+    .await;
+}
+
+/// Archiving a session withdraws the permissions it saved, and only those.
+///
+/// A saved `always` lives exactly as long as the session that took it, so cleanup
+/// hangs off the session ending rather than off an event stream: an SSE client may
+/// disconnect and reconnect without losing its saved replies, while a pruned session
+/// takes them with it and a later session reusing the id inherits nothing. A preview
+/// mutates nothing and so withdraws nothing.
+#[tokio::test]
+async fn archiving_a_session_withdraws_its_saved_permissions() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    state
+        .sessions()
+        .create(
+            &SessionCreate::new(
+                "ses_old", "ses_old", "global", "/repo", "/repo", "old", "test",
+            )
+            .at(1),
+        )
+        .expect("old fixture session inserts");
+    state
+        .sessions()
+        .create(&SessionCreate::new(
+            "ses_live", "ses_live", "global", "/repo", "/repo", "live", "test",
+        ))
+        .expect("recent fixture session inserts");
+    let requests = RequestBroker::default();
+    let services = ServerServices::new(64).with_requests(requests.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services)
+        .with_routes(api::router(state))
+        .router();
+
+    for (request_id, session_id) in [("per_old", "ses_old"), ("per_live", "ses_live")] {
+        assert_eq!(
+            answer_with_always(
+                &requests,
+                shell_permission(request_id, session_id, vec!["git push".to_owned()]),
+            )
+            .await,
+            ReplyKind::Always
+        );
+    }
+
+    let preview = app
+        .clone()
         .oneshot(request(
-            Method::DELETE,
-            "/api/permission/saved/per_missing",
+            Method::GET,
+            "/api/session/prune?olderThan=90&project=global",
             None,
         ))
         .await
-        .expect("saved permission delete responds");
-    assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+        .expect("maintenance preview responds");
+    assert_eq!(preview.status(), StatusCode::OK);
+    assert_eq!(
+        requests
+            .ask_permission(shell_permission(
+                "per_preview",
+                "ses_old",
+                vec!["git push".to_owned()],
+            ))
+            .await,
+        ReplyKind::Once,
+        "a preview must not withdraw a saved permission"
+    );
+
+    let archive = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/prune",
+            Some(json!({
+                "olderThan": 90,
+                "project": "global",
+                "action": "archive",
+                "apply": true
+            })),
+        ))
+        .await
+        .expect("maintenance archive responds");
+    assert_eq!(archive.status(), StatusCode::OK);
+    assert_eq!(response_json(archive).await["changed_sessions"], 1);
+
+    assert_eq!(
+        requests
+            .ask_permission(shell_permission(
+                "per_survives",
+                "ses_live",
+                vec!["git push".to_owned()],
+            ))
+            .await,
+        ReplyKind::Once,
+        "archiving one session withdrew a session that was never selected"
+    );
+    assert_parks_for_a_human(
+        &requests,
+        shell_permission("per_after", "ses_old", vec!["git push".to_owned()]),
+        "the archived session's saved permission still authorized calls",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1013,9 +1510,12 @@ async fn api_reply_routes_validate_bodies_before_rejecting_cross_session_request
                 .await
         }
     });
-    while requests.permissions(None).is_empty() {
-        tokio::task::yield_now().await;
-    }
+    bounded_until(
+        "an unowned permission ask to park in the broker",
+        || !requests.permissions(None).is_empty(),
+        || format!("parked permissions={}", requests.permissions(None).len()),
+    )
+    .await;
 
     let malformed_permission = app
         .clone()
@@ -1072,9 +1572,12 @@ async fn api_reply_routes_validate_bodies_before_rejecting_cross_session_request
                 .await
         }
     });
-    while requests.questions(None).is_empty() {
-        tokio::task::yield_now().await;
-    }
+    bounded_until(
+        "an unowned question ask to park in the broker",
+        || !requests.questions(None).is_empty(),
+        || format!("parked questions={}", requests.questions(None).len()),
+    )
+    .await;
 
     let malformed_question = app
         .clone()
@@ -1182,9 +1685,12 @@ async fn malformed_owned_question_reply_rejects_and_removes_the_request() {
                 .await
         }
     });
-    while requests.questions(None).is_empty() {
-        tokio::task::yield_now().await;
-    }
+    bounded_until(
+        "an unowned question ask to park in the broker",
+        || !requests.questions(None).is_empty(),
+        || format!("parked questions={}", requests.questions(None).len()),
+    )
+    .await;
 
     let malformed = app
         .oneshot(request(
@@ -1228,6 +1734,9 @@ async fn permission_without_an_observer_is_rejected_by_the_deadline() {
                 .await
         }
     });
+    // A ceiling cannot help this spin: a `yield_now` loop keeps the runtime runnable,
+    // so this test's paused clock never auto-advances and a `timeout` here would never
+    // fire. `.config/nextest.toml`'s `terminate-after` is what names this test in CI.
     while requests.permissions(None).is_empty() {
         tokio::task::yield_now().await;
     }
@@ -1265,6 +1774,9 @@ async fn question_without_an_observer_is_rejected_by_the_deadline() {
                 .await
         }
     });
+    // A ceiling cannot help this spin: a `yield_now` loop keeps the runtime runnable,
+    // so this test's paused clock never auto-advances and a `timeout` here would never
+    // fire. `.config/nextest.toml`'s `terminate-after` is what names this test in CI.
     while requests.questions(None).is_empty() {
         tokio::task::yield_now().await;
     }
@@ -1488,7 +2000,17 @@ async fn api_interrupt_source_reaches_the_durable_turn_event() {
         .await
         .expect("prompt responds");
     assert_eq!(response.status(), StatusCode::OK);
-    executor.started.notified().await;
+    bounded_wait(
+        "the executor to report that the interrupted turn started",
+        executor.started.notified(),
+        || {
+            format!(
+                "session status={:?}",
+                services.runs.status("ses_interrupt_event")
+            )
+        },
+    )
+    .await;
 
     let interrupted = app
         .oneshot(request(
@@ -1499,7 +2021,7 @@ async fn api_interrupt_source_reaches_the_durable_turn_event() {
         .await
         .expect("interrupt responds");
     assert_eq!(interrupted.status(), StatusCode::NO_CONTENT);
-    services.runs.wait_until_idle("ses_interrupt_event").await;
+    wait_until_session_idle(&services.runs, "ses_interrupt_event").await;
 
     let event_log = SessionEventLog::new(fixture.pool);
     let properties = tokio::time::timeout(Duration::from_secs(1), async {
@@ -1556,6 +2078,10 @@ async fn api_prompt_defaults_to_queue_and_resume_false_does_not_start_a_turn() {
         .expect("pending input reads");
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, "msg_deferred");
+    // The published payload keeps its `user` discriminator so every surface still
+    // classifies this row through the shared decoder.
+    assert_eq!(pending[0].prompt["kind"], "user");
+    assert_eq!(pending[0].prompt["prompt"]["text"], "later");
     let events = SessionEventLog::new(fixture.pool)
         .read_after("ses_deferred", None)
         .expect("admission event reads");
@@ -1636,7 +2162,7 @@ async fn api_busy_steer_is_durable_and_runs_after_the_active_prompt() {
         services.runs.abort("ses_queued", api_cancel()),
         AbortDisposition::Active
     );
-    services.runs.wait_until_idle("ses_queued").await;
+    wait_until_session_idle(&services.runs, "ses_queued").await;
 }
 
 #[tokio::test]
@@ -1678,32 +2204,161 @@ async fn api_prompt_driver_runs_a_durable_subagent_report_before_later_user_inpu
         .expect("user prompt responds");
     assert_eq!(response.status(), StatusCode::OK);
 
-    executor.wait_until_prompt_count(1).await;
-    assert_eq!(executor.prompts()[0].message_id, "input_report");
-    assert_eq!(executor.prompts()[0].prompt, "background result");
+    executor.wait_until_execution_count(1).await;
+    let batches = executor.report_batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0]
+            .reports
+            .iter()
+            .map(|report| (report.input_id.clone(), report.text.clone()))
+            .collect::<Vec<_>>(),
+        [("input_report".to_owned(), "background result".to_owned())]
+    );
+    assert!(
+        executor.prompts().is_empty(),
+        "a settled report runs as a report batch, not as a user prompt"
+    );
     assert_eq!(
         services.runs.abort("ses_report", api_cancel()),
         AbortDisposition::Active
     );
-    executor.wait_until_prompt_count(2).await;
+    executor.wait_until_execution_count(2).await;
     assert_eq!(
         executor
             .prompts()
             .into_iter()
             .map(|request| (request.message_id, request.prompt))
             .collect::<Vec<_>>(),
-        [
-            ("input_report".to_owned(), "background result".to_owned()),
-            ("msg_user".to_owned(), "user input".to_owned())
-        ]
+        [("msg_user".to_owned(), "user input".to_owned())]
     );
+    assert_eq!(executor.report_batches().len(), 1);
     assert_eq!(
         services.runs.abort("ses_report", api_cancel()),
         AbortDisposition::Active
     );
-    services.runs.wait_until_idle("ses_report").await;
+    wait_until_session_idle(&services.runs, "ses_report").await;
 }
 
+/// Three settled reports must cost one provider request on this surface too, and the
+/// state a later report in the same batch replaced must read as superseded. Driving
+/// one row per turn is what made a fan-out that settled together arrive as a stream of
+/// turns, each announcing work the newest report had already finished.
+#[tokio::test]
+async fn api_prompt_driver_runs_every_settled_report_as_one_request() {
+    let fixture = MutationApiFixture::new("ses_batch");
+    let inbox = SessionInbox::new(Arc::clone(&fixture.pool));
+    for (input_id, job, text, created) in [
+        ("input_early", "job_1", "job one is halfway", 1),
+        ("input_other", "job_2", "job two finished", 2),
+        ("input_late", "job_1", "job one finished", 3),
+    ] {
+        inbox
+            .admit(NewSessionInput::new(
+                input_id,
+                "ses_batch",
+                json!({
+                    "kind": "subagentReport",
+                    "jobID": job,
+                    "childSessionID": "ses_child",
+                    "status": "completed",
+                    "text": text
+                }),
+                InputDelivery::Queue,
+                created,
+            ))
+            .expect("admit settled report");
+    }
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_batch/prompt",
+            Some(json!({
+                "id": "msg_user",
+                "prompt": {"text": "user input", "files": [], "agents": []},
+                "delivery": "queue"
+            })),
+        ))
+        .await
+        .expect("user prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    executor.wait_until_execution_count(1).await;
+    let batches = executor.report_batches();
+    assert_eq!(
+        batches.len(),
+        1,
+        "three settled reports must cost one provider request, not three"
+    );
+    let reports = &batches[0].reports;
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report.input_id.as_str())
+            .collect::<Vec<_>>(),
+        ["input_early", "input_other", "input_late"],
+        "the batch keeps durable admission order"
+    );
+    assert!(
+        reports[0].text.starts_with("[superseded report]"),
+        "the replaced state must not read as live: {}",
+        reports[0].text
+    );
+    assert!(reports[0].text.ends_with("job one is halfway"));
+    assert_eq!(
+        reports[1].text, "job two finished",
+        "a report that is the only one for its work carries no annotation"
+    );
+    assert!(
+        reports[2].text.starts_with("[current report]"),
+        "the newest report for a job is the one marked current: {}",
+        reports[2].text
+    );
+    assert!(reports[2].newest, "Plan reconciliation is seeded from it");
+    assert_eq!(
+        inbox
+            .pending("ses_batch")
+            .expect("pending reads")
+            .into_iter()
+            .map(|input| input.id)
+            .collect::<Vec<_>>(),
+        ["msg_user"],
+        "the whole report batch is promoted in one transaction"
+    );
+
+    assert_eq!(
+        services.runs.abort("ses_batch", api_cancel()),
+        AbortDisposition::Active
+    );
+    executor.wait_until_execution_count(2).await;
+    assert_eq!(executor.report_batches().len(), 1);
+    assert_eq!(
+        executor
+            .prompts()
+            .into_iter()
+            .map(|request| request.message_id)
+            .collect::<Vec<_>>(),
+        ["msg_user"]
+    );
+    assert_eq!(
+        services.runs.abort("ses_batch", api_cancel()),
+        AbortDisposition::Active
+    );
+    wait_until_session_idle(&services.runs, "ses_batch").await;
+}
+
+/// A payload no writer publishes is left untouched instead of promoted and settled
+/// as `failed`: the driver cannot tell an unrecognized shape apart from a shape
+/// another surface owns, and destroying durable user input to record a diagnostic
+/// is the worse of the two. The expectation this test used to carry — that the row
+/// ended `failed` — changed with that policy.
 #[tokio::test]
 async fn api_prompt_driver_skips_a_malformed_durable_input_without_stranding_the_queue() {
     let fixture = MutationApiFixture::new("ses_malformed");
@@ -1744,7 +2399,272 @@ async fn api_prompt_driver_skips_a_malformed_durable_input_without_stranding_the
         services.runs.abort("ses_malformed", api_cancel()),
         AbortDisposition::Active
     );
-    services.runs.wait_until_idle("ses_malformed").await;
+    wait_until_session_idle(&services.runs, "ses_malformed").await;
+
+    let unrecognized = SessionInbox::new(Arc::clone(&fixture.pool))
+        .get("ses_malformed", "input_malformed")
+        .expect("unrecognized input reads")
+        .expect("unrecognized input still exists");
+    assert_eq!(unrecognized.state, SubmissionState::Queued);
+    assert_eq!(unrecognized.error, None);
+}
+
+/// A durable row written by another client stays pending for the surface that can
+/// render it. The HTTP driver promotes only the shapes it decodes, so mixing a TUI
+/// or ACP session with HTTP prompts cannot settle another surface's input as
+/// `failed`.
+#[tokio::test]
+async fn api_prompt_driver_leaves_another_surfaces_pending_input_untouched() {
+    let fixture = MutationApiFixture::new("ses_foreign");
+    let inbox = SessionInbox::new(Arc::clone(&fixture.pool));
+    inbox
+        .admit(NewSessionInput::new(
+            "input_tui",
+            "ses_foreign",
+            json!({
+                "kind": "tuiPrompt",
+                "submission": {"kind": "text", "data": "typed in the terminal"},
+                "origin": "tui_keybinding"
+            }),
+            InputDelivery::Queue,
+            1,
+        ))
+        .expect("admit a terminal submission");
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_foreign/prompt",
+            Some(json!({
+                "id": "msg_user",
+                "prompt": {"text": "user input", "files": [], "agents": []},
+                "delivery": "queue"
+            })),
+        ))
+        .await
+        .expect("user prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    executor.wait_until_prompt_count(1).await;
+    assert_eq!(executor.prompts()[0].message_id, "msg_user");
+    assert_eq!(executor.prompts()[0].prompt, "user input");
+    assert_eq!(
+        services.runs.abort("ses_foreign", api_cancel()),
+        AbortDisposition::Active
+    );
+    wait_until_session_idle(&services.runs, "ses_foreign").await;
+
+    let terminal = inbox
+        .get("ses_foreign", "input_tui")
+        .expect("terminal submission reads")
+        .expect("terminal submission still exists");
+    assert_eq!(terminal.state, SubmissionState::Queued);
+    assert_eq!(terminal.error, None);
+}
+
+/// A promoted report carrying no model-visible text is settled `failed` on this surface
+/// too, and the rest of its batch still runs. Failing the whole batch would hold every
+/// other settled report out of the transcript because one writer published a row that
+/// cannot become a user message.
+#[tokio::test]
+async fn api_prompt_driver_fails_an_unreadable_report_and_runs_the_rest_of_the_batch() {
+    let fixture = MutationApiFixture::new("ses_unreadable");
+    let inbox = SessionInbox::new(Arc::clone(&fixture.pool));
+    inbox
+        .admit(NewSessionInput::new(
+            "input_broken",
+            "ses_unreadable",
+            json!({
+                "kind": "subagentReport",
+                "jobID": "job_1",
+                "childSessionID": "ses_child",
+                "status": "completed"
+            }),
+            InputDelivery::Queue,
+            1,
+        ))
+        .expect("admit unreadable report");
+    inbox
+        .admit(NewSessionInput::new(
+            "input_ok",
+            "ses_unreadable",
+            json!({
+                "kind": "subagentReport",
+                "jobID": "job_2",
+                "childSessionID": "ses_child",
+                "status": "completed",
+                "text": "job two finished"
+            }),
+            InputDelivery::Queue,
+            2,
+        ))
+        .expect("admit report");
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_unreadable/prompt",
+            Some(json!({
+                "id": "msg_user",
+                "prompt": {"text": "user input", "files": [], "agents": []},
+                "delivery": "queue"
+            })),
+        ))
+        .await
+        .expect("user prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    executor.wait_until_execution_count(1).await;
+    let batches = executor.report_batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0]
+            .reports
+            .iter()
+            .map(|report| report.input_id.as_str())
+            .collect::<Vec<_>>(),
+        ["input_ok"],
+        "the readable report still runs"
+    );
+    let broken = inbox
+        .get("ses_unreadable", "input_broken")
+        .expect("unreadable report reads")
+        .expect("unreadable report still exists");
+    assert_eq!(broken.state, SubmissionState::Failed);
+    assert_eq!(
+        broken.error.as_deref(),
+        Some("persisted session input `input_broken` carries no model-visible text")
+    );
+
+    assert_eq!(
+        services.runs.abort("ses_unreadable", api_cancel()),
+        AbortDisposition::Active
+    );
+    executor.wait_until_execution_count(2).await;
+    assert_eq!(
+        executor
+            .prompts()
+            .into_iter()
+            .map(|request| request.message_id)
+            .collect::<Vec<_>>(),
+        ["msg_user"]
+    );
+    assert_eq!(
+        services.runs.abort("ses_unreadable", api_cancel()),
+        AbortDisposition::Active
+    );
+    wait_until_session_idle(&services.runs, "ses_unreadable").await;
+}
+
+/// Every asynchronous report shape reaches the model as plain text, and shapes that
+/// differ still share one batch. Only `subagentReport` used to decode, so a workflow,
+/// council, product-agent, or background-execution report was promoted and then failed
+/// instead of delivered.
+#[tokio::test]
+async fn api_prompt_driver_delivers_every_asynchronous_report_shape() {
+    let fixture = MutationApiFixture::new("ses_reports");
+    let inbox = SessionInbox::new(Arc::clone(&fixture.pool));
+    let reports = [
+        (
+            "input_workflow",
+            json!({
+                "kind": "workflowReport",
+                "jobID": "job_w",
+                "runID": "run_w",
+                "workflow": "release",
+                "status": "completed",
+                "text": "workflow finished"
+            }),
+        ),
+        (
+            "input_council",
+            json!({
+                "kind": "councilReport",
+                "jobID": "job_c",
+                "runID": "run_c",
+                "preset": "review",
+                "status": "completed",
+                "text": "council finished"
+            }),
+        ),
+    ];
+    for (index, (id, prompt)) in reports.iter().enumerate() {
+        inbox
+            .admit(NewSessionInput::new(
+                *id,
+                "ses_reports",
+                prompt.clone(),
+                InputDelivery::Queue,
+                i64::try_from(index).expect("small index") + 1,
+            ))
+            .expect("admit report");
+    }
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_reports/prompt",
+            Some(json!({
+                "id": "msg_user",
+                "prompt": {"text": "user input", "files": [], "agents": []},
+                "delivery": "queue"
+            })),
+        ))
+        .await
+        .expect("user prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for expected in 1..=2 {
+        executor.wait_until_execution_count(expected).await;
+        assert_eq!(
+            services.runs.abort("ses_reports", api_cancel()),
+            AbortDisposition::Active
+        );
+    }
+    wait_until_session_idle(&services.runs, "ses_reports").await;
+    let batches = executor.report_batches();
+    assert_eq!(
+        batches.len(),
+        1,
+        "reports of different shapes still share one provider request"
+    );
+    assert_eq!(
+        batches[0]
+            .reports
+            .iter()
+            .map(|report| (report.input_id.clone(), report.text.clone()))
+            .collect::<Vec<_>>(),
+        [
+            ("input_workflow".to_owned(), "workflow finished".to_owned()),
+            ("input_council".to_owned(), "council finished".to_owned())
+        ]
+    );
+    assert_eq!(
+        executor
+            .prompts()
+            .into_iter()
+            .map(|request| (request.message_id, request.prompt))
+            .collect::<Vec<_>>(),
+        [("msg_user".to_owned(), "user input".to_owned())]
+    );
 }
 
 #[tokio::test]
@@ -2398,8 +3318,14 @@ async fn api_maintenance_preview_is_inert_and_emits_ordered_progress() {
     );
 
     let mut phases = Vec::new();
-    for _ in 0..5 {
-        let delivery = progress.recv().await.expect("progress stream remains open");
+    for expected in 1..=5 {
+        let delivery = bounded_wait(
+            &format!("maintenance progress event {expected} of 5"),
+            progress.recv(),
+            || format!("phases so far={phases:?}"),
+        )
+        .await
+        .expect("progress stream remains open");
         let Delivery::Event(event) = delivery else {
             panic!("progress must not lag");
         };
@@ -3171,14 +4097,27 @@ struct CompactionLeaseExecutor {
 
 impl CompactionLeaseExecutor {
     async fn wait_until_compact_started(&self) {
-        loop {
-            let mut notified = std::pin::pin!(self.compact_started_notify.notified());
-            notified.as_mut().enable();
-            if self.compact_started.load(Ordering::SeqCst) {
-                return;
-            }
-            notified.await;
-        }
+        bounded_wait(
+            "the executor to take the compaction lease",
+            async {
+                loop {
+                    let mut notified = std::pin::pin!(self.compact_started_notify.notified());
+                    notified.as_mut().enable();
+                    if self.compact_started.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    notified.await;
+                }
+            },
+            || {
+                format!(
+                    "compaction started={}, prompts={}",
+                    self.compact_started.load(Ordering::SeqCst),
+                    self.prompts().len()
+                )
+            },
+        )
+        .await;
     }
 
     fn prompts(&self) -> Vec<SessionPromptExecution> {
@@ -3189,14 +4128,27 @@ impl CompactionLeaseExecutor {
     }
 
     async fn wait_until_prompt_count(&self, count: usize) {
-        loop {
-            let mut notified = std::pin::pin!(self.prompt_notify.notified());
-            notified.as_mut().enable();
-            if self.prompts().len() >= count {
-                return;
-            }
-            notified.await;
-        }
+        bounded_wait(
+            &format!("{count} prompt execution(s) after the compaction lease"),
+            async {
+                loop {
+                    let mut notified = std::pin::pin!(self.prompt_notify.notified());
+                    notified.as_mut().enable();
+                    if self.prompts().len() >= count {
+                        return;
+                    }
+                    notified.await;
+                }
+            },
+            || {
+                format!(
+                    "compaction started={}, prompts={}",
+                    self.compact_started.load(Ordering::SeqCst),
+                    self.prompts().len()
+                )
+            },
+        )
+        .await;
     }
 }
 
@@ -3217,6 +4169,15 @@ impl SessionMutationExecutor for CompactionLeaseExecutor {
             notify.notify_waiters();
             Ok(())
         })
+    }
+
+    fn reports(
+        &self,
+        _request: SessionReportExecution,
+        _guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        Box::pin(async { Err("a report batch is not expected in this test".to_owned()) })
     }
 
     fn compact(
@@ -3352,5 +4313,5 @@ async fn api_prompt_queued_during_compaction_runs_after_the_lease_is_released() 
             .collect::<Vec<_>>(),
         vec!["msg_after_compaction"]
     );
-    services.runs.wait_until_idle("ses_compact_queue").await;
+    wait_until_session_idle(&services.runs, "ses_compact_queue").await;
 }

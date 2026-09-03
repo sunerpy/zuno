@@ -6,7 +6,8 @@
 
 `--archive` 是**可逆**的。`--delete` 是**不可逆**的。
 
-- `--archive` 只写入一列：`session.time_archived`。什么都不会被移除。逆操作存在于库中
+- `--archive` 只写入一列：`session.time_archived`。不会移除任何 session、message、part
+  或 artifact 行。逆操作存在于库中
   （`zuno_db::prune::PruneRequest::restore_archive`，它把 `time_archived` 设回
   `NULL`），并由
   `crates/zuno-db/tests/prune.rs::prune_archive_is_reversible_without_deleting_session_data`
@@ -16,7 +17,29 @@
 
 大规模归档之前请注意一处不对称：**CLI 与 HTTP 界面能设置归档标记，但目前不能清除它。**
 今天要撤销一次归档，意味着从 Rust 调用 `restore_archive` 或者自己清空该列。可逆性是真实
-存在的，但它还不是一个命令行标志。
+存在的，但它还不是一个命令行标志。归档在运行中的服务上也并非没有副作用 —— 见
+[归档会终止该 session 的常驻 HTTP 授权](#归档会终止该-session-的常驻-http-授权)。
+
+## 归档会终止该 session 的常驻 HTTP 授权
+
+在数据库里可逆，不等于对一个正在运行的服务没有影响。`POST /api/session/prune` 带
+`action: "archive"` 时，与 `action: "delete"` 一样，会撤销被选中的这些 session 在那个
+`zuno serve` 进程里授予的每一条常驻 `always` 授权，且只撤销这些：一条 `always` 回复是
+某一个 session 的决定，因此它不会比给出它的那个 session 活得更久。
+
+没有任何持久状态丢失，因为这些授权从来就不是持久的。它们活在服务进程里，`zuno serve`
+重启同样会丢掉它们。变化之处在于：被恢复的 session 会再问一次 —— `restore_archive` 清空
+`time_archived`，它不会重新装回一条授权。
+
+对于依赖已保存 `always` 回复的无人值守 HTTP 客户端，由此有两点：
+
+- 通过 HTTP 时，存活性排除依据是服务进程自己那份「有回合在执行中」的 session 集合，
+  `includeRecent` 永远不会扩大它。因此一个空闲但仍可恢复、且早于 `olderThan` 的 session
+  是可被选中的；归档之后它的下一次权限询问会停下来等人，而自动化可能并没有人。请把这类
+  session 留在窗口之外，或者只在客户端用完之后再归档。
+- `zuno session prune --archive` 跑在它自己的进程里，不持有 request broker，所以 CLI 什么
+  都不会撤销。在 `zuno serve` 仍在运行时从 CLI 归档，会让那个服务的授权继续装着，直到某次
+  HTTP prune 选中同样的 session 或该进程退出。
 
 ## 永远先预览
 
@@ -117,6 +140,30 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno --test docs
 
 在表删除之后，没有存活 session 的 part 会被清扫，artifact 收集以删除模式运行。
 
+### 会清扫哪些 tool-output 根
+
+持久化的工具输出存放在两处，一次删除会覆盖两处：
+
+- `$DATA/tool-output`，由所有 session 共享；
+- `<worktree>/.zuno/tool-output`，对应被清理的数据库在 `project.worktree` 中记录的每个
+  检出目录 —— session 就在它正在修改的代码旁边写下这份存储。
+
+两处规则完全一致。文件名带着已删除 session 的文件会被回收；属于存活 session 的文件会保留，
+因为模型正是通过那条路径读回被输出上限扣留的内容；文件名完全不带 session 的文件，只有在超过
+七天之后才会被回收。没有任何 `project` 行指向的检出目录不会被扫描。
+
+读不到的根会被跳过，而不是让整轮失败 —— 例如离线的网络挂载、已经不在的卷上的检出、权限被改过
+的目录，或者检出曾经所在的路径。它的文件会原样留在那里，其他每个根仍然照常清扫，报告中会为每个
+被跳过的根带上一条警告：
+
+```text
+tool output under /mnt/nas/repo/.zuno/tool-output was not swept: could not inspect /mnt/nas/repo/.zuno/tool-output (No such device)
+```
+
+这条警告是那些文件唯一的记录。删除模式在清扫运行之前就已经移除了 session 行，因此后续的清理
+无法再把一个以不存在 session 命名的文件归属到任何 session 上，而七天规则只适用于完全不带
+session 的文件。如果需要回收这部分空间，请在该路径重新可访问之后自行删除。
+
 ## 读懂 artifact 警告
 
 报告中可能带有：
@@ -169,6 +216,9 @@ curl -X POST localhost:PORT/api/session/prune \
 ```text
 session prune mutation requires `apply: true`; nothing was changed
 ```
+
+一次成功的 `archive` 或 `delete` 还会撤销它选中的每个 session 的常驻 HTTP 授权 ——
+见[归档会终止该 session 的常驻 HTTP 授权](#归档会终止该-session-的常驻-http-授权)。
 
 CLI 与 HTTP 的预览输出逐字节相同的 JSON ——
 `crates/zuno-cli/src/cmd/session_prune.rs::session_prune_cli_and_http_preview_json_are_byte_identical`

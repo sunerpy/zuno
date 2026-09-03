@@ -115,15 +115,15 @@ export/import 会保留 Notes 及其幂等 ledger。sanitize export 会脱敏文
 
 对端要求的等待超过同请求恢复所剩时间时，结果同样由夹取决定。provider 层对同一个请求最多恢复 180 秒；超过这个窗口所剩时间的 `Retry-After` 既不会被睡过去，也不会被换成更短的本地退避。回合以对端的错误结束，Goal 级重试等待的是对端值按 `max_delay_ms` 截断后的结果。
 
-## 续跑与分叉
+## 续跑会话
 
 ```sh
 zuno run --continue "now cap the page size at 100"
 zuno run --session ses_1a2b3c "what changed?"
-zuno run --session ses_1a2b3c --fork --agent plan "what would a safe migration look like?"
+zuno run --session ses_1a2b3c --agent plan "what would a safe migration look like?"
 ```
 
-`--fork` 不会触碰原始对话记录，因此当你想探索一个替代方案又不污染想保留的那个会话时，它是正确做法。
+这个二进制不提供会话分叉，因此想探索一个替代方案又不污染想保留的那个会话时，就新起一个：`--continue` 与 `--session` 都不给，并给它一个 `--title`。
 
 ## 保留
 

@@ -6,6 +6,9 @@
 服务器 owner 在进程内包装 `zuno_server::ServerBuilder`。它不会派生一个单独的 `zuno-server`
 可执行文件，也不会重复实现监听器行为。
 
+监管方只持有一个进程。它派生的那个进程就是正在监听的进程，因此停止这个进程就会释放端口并
+关闭它的管道。参见[一次调用就是一个进程](/zh/cli/#一次调用就是一个进程)。
+
 `ZUNO_SERVER_PASSWORD` 启用 HTTP Basic Auth；`ZUNO_SERVER_USERNAME` 默认是 `zuno`。没有非空密码时，只要 hostname 解析结果中包含非回环地址，Zuno 就拒绝监听。
 
 这两个变量都不会交给 `shell` 工具，因此模型组装出来的命令读不到保护这个监听器的凭据。
@@ -26,11 +29,8 @@ zuno serve [OPTIONS]
 | `--port <PORT>` | 监听端口。不传时由 `server.port` 决定；该键也未设置时使用操作系统分配的端口 | |
 | `-v`, `--version` | 显示 Zuno 包版本 | |
 | `--hostname <HOSTNAME>` | 绑定的 hostname。不传时由 `server.hostname` 决定；该键也未设置时使用 `127.0.0.1` | |
-| `--mdns` | | |
 | `--print-logs` | 除结构化本地日志存储之外，同时把日志打印到 stderr | |
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
-| `--mdns-domain <MDNS_DOMAIN>` | | `zuno.local` |
-| `--cors <CORS>` | | |
 | `--browser-auth` | 启用单次回环浏览器 bootstrap 与签名 session Cookie | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
@@ -75,7 +75,9 @@ ZUNO_SERVER_PASSWORD='replace-with-a-secret' \
 zuno serve --port 4096 --print-logs --log-level DEBUG
 ```
 
-`--mdns`、`--mdns-domain` 与 `--cors` 已保留，但当前 Rust server runtime 尚未实现。
+`--mdns`、`--mdns-domain` 与 `--cors` 在早先的版本里可以被接受，但每一次给出它们的调用都会
+被拒绝 —— 因为它们背后没有任何实现。现在它们完全不再被接受：脚本传入其中之一会在解析阶段就
+失败，而不是在进程启动之后。
 
 ## 参见
 

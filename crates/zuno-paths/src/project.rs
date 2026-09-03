@@ -106,6 +106,22 @@ pub fn discover_repository(start: &Path) -> Option<Repository> {
     })
 }
 
+/// The root of the worktree containing `start`, or `None` when `start` is in no
+/// repository git recognises.
+///
+/// Exactly the path [`resolve_project`] reports as `directory`, by asking the same
+/// function: a stray `.git` that git itself rejects is not a worktree here either, and
+/// a caller that rooted state at a directory `resolve_project` disagreed with would
+/// write outside the anchor every exclude pattern is read against.
+///
+/// That anchor is why this exists. [`crate::generated_dir`] roots Zuno's generated
+/// directories here so a session started deep inside a checkout writes to the same
+/// place as one started at the top, and needs the root without needing the project id.
+#[must_use]
+pub fn worktree_root(start: &Path) -> Option<PathBuf> {
+    discover_repository(start).map(|repository| repository.worktree)
+}
+
 /// Port of `Project.resolve`.
 ///
 /// Outside a repository the directory becomes `path.parse(start).root` — `/` for
@@ -354,6 +370,41 @@ mod tests {
         assert_same_path(&discovered.worktree, root.path());
         assert_same_path(&discovered.git_directory, &root.path().join(".git"));
         assert_same_path(&discovered.common_directory, &root.path().join(".git"));
+    }
+
+    /// Generated state is rooted here and every exclude pattern is read against it, so
+    /// the cheap resolution has to agree with the full one from anywhere in the tree.
+    #[test]
+    fn the_worktree_root_is_the_same_from_a_nested_directory_as_from_the_top() {
+        let root = repository();
+        let nested = root.path().join("a").join("b");
+        fs::create_dir_all(&nested).expect("create nested");
+
+        let from_nested = worktree_root(&nested).expect("a worktree root");
+
+        assert_same_path(&from_nested, root.path());
+        assert_same_path(
+            &from_nested,
+            &worktree_root(root.path()).expect("from the top"),
+        );
+        assert_same_path(
+            &from_nested,
+            &discover_repository(&nested).expect("repository").worktree,
+        );
+    }
+
+    /// A directory with no repository above it, and — as a shared `/tmp` on a build
+    /// machine can have — one with a `.git` git itself does not accept, both have to
+    /// answer the same way [`resolve_project`] does: there is no worktree here.
+    #[test]
+    fn outside_a_repository_recognised_by_git_there_is_no_worktree_root() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        assert_eq!(worktree_root(outside.path()), None);
+
+        fs::create_dir(outside.path().join(".git")).expect("an empty .git");
+
+        assert_eq!(worktree_root(outside.path()), None);
+        assert_eq!(resolve_project(outside.path()).vcs, None);
     }
 
     /// In a linked worktree the git directory is per-worktree while the common

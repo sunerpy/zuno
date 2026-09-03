@@ -20,6 +20,9 @@ use crate::open;
 /// Default retention window for unattributable tool output.
 pub const DEFAULT_TOOL_OUTPUT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// The caller identity `zuno_tool`'s store reports in an error it raises for this pass.
+const TOOL_OUTPUT_READER: &str = "session_prune";
+
 /// Whether a pass only reports candidates or also removes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ArtifactGcMode {
@@ -31,11 +34,15 @@ pub enum ArtifactGcMode {
 }
 
 /// Explicit roots keep tests and callers away from process-global path state.
+///
+/// Tool output has a second class of root that no caller can name: the store inside each
+/// checkout. Those are read from the database being pruned, by
+/// [`tool_output_roots`], because `session prune` reclaims across every project at once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactGcPaths {
     /// `$DATA/snapshot`.
     pub snapshots: PathBuf,
-    /// `$DATA/tool-output`.
+    /// `$DATA/tool-output`, the store shared by every session.
     pub tool_output: PathBuf,
     /// `$DATA/attachments`.
     pub attachments: PathBuf,
@@ -147,6 +154,36 @@ pub struct ReclaimedArtifact {
     pub removed: bool,
 }
 
+/// A tool-output root this pass could not read, and why.
+///
+/// Evidence rather than a failure: the root stays untouched and every other root is still
+/// swept. `operation` and `reason` are the original I/O attempt and its message, so an
+/// operator can tell an offline mount from a permission problem without re-running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedRoot {
+    /// The tool-output store directory that was being swept.
+    pub root: PathBuf,
+    /// The exact path whose inspection failed, which may be a file inside `root`.
+    pub path: PathBuf,
+    /// The I/O attempt that failed, matching [`ArtifactGcError::Filesystem`].
+    pub operation: &'static str,
+    /// The original I/O message.
+    pub reason: String,
+}
+
+impl fmt::Display for SkippedRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "tool output under {} was not swept: could not {} {} ({})",
+            self.root.display(),
+            self.operation,
+            self.path.display(),
+            self.reason
+        )
+    }
+}
+
 /// Stable, inspectable output for preview and deletion modes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ArtifactGcReport {
@@ -154,6 +191,8 @@ pub struct ArtifactGcReport {
     pub artifacts: Vec<ReclaimedArtifact>,
     /// Sum of candidate content bytes.
     pub total_bytes: u64,
+    /// Tool-output roots that could not be read, in the order they were tried.
+    pub skipped_roots: Vec<SkippedRoot>,
 }
 
 /// A classified database, snapshot scan, or filesystem failure.
@@ -264,12 +303,23 @@ pub fn execute(
     };
 
     let mut candidates = Vec::new();
+    let mut skipped_roots = Vec::new();
     discover_snapshot_candidates(paths, &survivors, &mut candidates)?;
-    discover_tool_output_candidates(paths, request, &deleted_session_ids, &mut candidates)?;
+    discover_tool_output_candidates(
+        &transaction,
+        paths,
+        request,
+        &deleted_session_ids,
+        &mut candidates,
+        &mut skipped_roots,
+    )?;
     discover_attachment_candidates(&transaction, paths, &deleted_session_ids, &mut candidates)?;
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
 
-    let mut report = ArtifactGcReport::default();
+    let mut report = ArtifactGcReport {
+        skipped_roots,
+        ..ArtifactGcReport::default()
+    };
     for candidate in candidates {
         let bytes = measure(&candidate.path)?;
         let removed = if request.mode == ArtifactGcMode::Delete {
@@ -407,25 +457,111 @@ fn discover_snapshot_candidates(
     Ok(())
 }
 
+/// Every directory that may hold persisted tool output for this database.
+///
+/// The shared root the caller named, then `<worktree>/.zuno/tool-output/` for every
+/// checkout the database has recorded. The in-checkout stores cannot be caller-supplied:
+/// `session prune` reclaims across every project at once, and only the `project` rows
+/// know which checkouts this database wrote into. Leaving them out is what made that
+/// store grow without bound — it has two writers and, until this pass covered it, no
+/// sweeper — while the shared root next to it was already swept.
+///
+/// Locating a store from `project.worktree` is the attribution
+/// [`discover_snapshot_candidates`] already relies on, and each root is the same
+/// `zuno_tool` store the writers open, so no second spelling of where artifacts live
+/// enters this module.
+fn tool_output_roots(
+    connection: &rusqlite::Transaction<'_>,
+    paths: &ArtifactGcPaths,
+) -> Result<Vec<PathBuf>, ArtifactGcError> {
+    let mut roots = BTreeSet::new();
+    roots.insert(paths.tool_output.clone());
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT worktree FROM project
+             WHERE worktree IS NOT NULL AND worktree <> ''
+             ORDER BY worktree ASC",
+        )
+        .map_err(open::map_error)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(open::map_error)?;
+    for row in rows {
+        let worktree = PathBuf::from(row.map_err(open::map_error)?);
+        roots.insert(
+            zuno_tool::ToolOutputStore::in_worktree(&worktree)
+                .root()
+                .to_path_buf(),
+        );
+    }
+    Ok(roots.into_iter().collect())
+}
+
+/// Sweep every tool-output root, tolerating the ones that cannot be read.
+///
+/// A root derived from `project.worktree` is a path the user controls: an offline network
+/// mount, a checkout on an unplugged volume, a directory whose permissions changed, or a
+/// `.zuno` replaced by a regular file. Propagating that I/O error abandoned the whole
+/// artifact phase — including the shared `$DATA` root, which had always been swept — and
+/// it did so after [`crate::prune`] had already committed the row deletion, so the files
+/// belonging to those now-deleted sessions could never be named by a later pass again.
+///
+/// Each root is therefore scanned into a local buffer and appended only once it is
+/// complete, and an I/O failure records a [`SkippedRoot`] instead. The root keeps its
+/// files and the operator gets the path and the reason. Nothing else is relaxed: a
+/// database error still fails the pass, because it says the survivor set is not
+/// trustworthy, and the snapshot and attachment roots stay strict because they live under
+/// the data directory the caller named.
 fn discover_tool_output_candidates(
+    connection: &rusqlite::Transaction<'_>,
     paths: &ArtifactGcPaths,
     request: &ArtifactGcRequest,
     deleted_session_ids: &BTreeSet<String>,
     candidates: &mut Vec<Candidate>,
+    skipped: &mut Vec<SkippedRoot>,
 ) -> Result<(), ArtifactGcError> {
-    if !is_real_directory(&paths.tool_output)? {
+    for root in tool_output_roots(connection, paths)? {
+        let mut found = Vec::new();
+        match scan_tool_output_root(&root, request, deleted_session_ids, &mut found) {
+            Ok(()) => candidates.append(&mut found),
+            Err(ArtifactGcError::Filesystem {
+                operation,
+                path,
+                source,
+            }) => skipped.push(SkippedRoot {
+                root,
+                path,
+                operation,
+                reason: source.to_string(),
+            }),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn scan_tool_output_root(
+    root: &Path,
+    request: &ArtifactGcRequest,
+    deleted_session_ids: &BTreeSet<String>,
+    candidates: &mut Vec<Candidate>,
+) -> Result<(), ArtifactGcError> {
+    let cutoff = request.now.checked_sub(request.tool_output_retention);
+    if !is_real_directory(root)? {
         return Ok(());
     }
-    let cutoff = request.now.checked_sub(request.tool_output_retention);
-    for entry in read_directory(&paths.tool_output)? {
-        let path = entry.path();
-        if !entry_is_regular_file(&entry)? {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
+    // The store's own reader decides which names it minted, so every file this pass
+    // can remove is one that store would hand back to a retrieval call.
+    let entries = zuno_tool::ToolOutputStore::new(root)
+        .entries(TOOL_OUTPUT_READER)
+        .map_err(|source| filesystem_error("scan", root, std::io::Error::other(source)))?;
+    for path in entries {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(filesystem_error("inspect", &path, source)),
         };
-        if !name.starts_with(zuno_tool::store::FILE_PREFIX) {
+        if !metadata.file_type().is_file() {
             continue;
         }
         let reason = match zuno_tool::store::session_of(&path) {
@@ -434,9 +570,8 @@ fn discover_tool_output_candidates(
             }
             Some(_) => None,
             None => {
-                let modified = entry
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
+                let modified = metadata
+                    .modified()
                     .map_err(|source| filesystem_error("read metadata for", &path, source))?;
                 cutoff
                     .filter(|cutoff| modified < *cutoff)
@@ -586,13 +721,6 @@ fn read_directory(path: &Path) -> Result<Vec<fs::DirEntry>, ArtifactGcError> {
         .collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(fs::DirEntry::file_name);
     Ok(entries)
-}
-
-fn entry_is_regular_file(entry: &fs::DirEntry) -> Result<bool, ArtifactGcError> {
-    entry
-        .file_type()
-        .map(|kind| kind.is_file())
-        .map_err(|source| filesystem_error("inspect", &entry.path(), source))
 }
 
 fn is_real_directory(path: &Path) -> Result<bool, ArtifactGcError> {
@@ -933,6 +1061,67 @@ mod tests {
         assert!(fresh_foreign.exists(), "fresh foreign output is retained");
     }
 
+    /// The in-checkout store is swept by the same rules as the shared one, and only for
+    /// a checkout the database names. Before this pass it had two writers and no
+    /// sweeper, so every artifact ever written beside a working copy stayed forever.
+    #[test]
+    fn in_checkout_tool_output_is_swept_only_for_a_recorded_worktree() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
+        let recorded = temp.path().join("recorded");
+        let unrecorded = temp.path().join("unrecorded");
+        let root = zuno_tool::ToolOutputStore::in_worktree(&recorded)
+            .root()
+            .to_path_buf();
+        let deleted = root.join("tool_ses_deleted_00000000000000000000000000000001");
+        let live = root.join("tool_ses_live_00000000000000000000000000000002");
+        let old_foreign = root.join("tool_019abcdef0123456789ABCDEFG");
+        let fresh_foreign = root.join("tool_019abcdef0123456789ABCDEH");
+        let elsewhere = zuno_tool::ToolOutputStore::in_worktree(&unrecorded)
+            .root()
+            .join("tool_ses_deleted_00000000000000000000000000000003");
+        for path in [&deleted, &live, &old_foreign, &fresh_foreign, &elsewhere] {
+            write(path, b"in-checkout output");
+        }
+        backdate(&live, Duration::from_secs(30 * 24 * 60 * 60));
+        backdate(&old_foreign, Duration::from_secs(8 * 24 * 60 * 60));
+        backdate(&elsewhere, Duration::from_secs(30 * 24 * 60 * 60));
+
+        let mut connection = database();
+        insert_project(&connection, "project", &recorded);
+        insert_session(&connection, "ses_live", "project", &recorded);
+
+        let report = execute(
+            &mut connection,
+            &paths,
+            &ArtifactGcRequest::new(["ses_deleted"], SystemTime::now()).deleting(),
+        )
+        .expect("collect artifacts");
+
+        assert!(
+            !deleted.exists(),
+            "a deleted session's output is attributable"
+        );
+        assert!(live.exists(), "an attributed survivor is not age-swept");
+        assert!(
+            !old_foreign.exists(),
+            "an unattributed name uses the backstop"
+        );
+        assert!(
+            fresh_foreign.exists(),
+            "a fresh unattributed name is retained"
+        );
+        assert!(
+            elsewhere.is_file(),
+            "a checkout no project row names is not scanned at all"
+        );
+        assert!(report.artifacts.iter().any(|artifact| {
+            artifact.path == deleted
+                && artifact.kind == ArtifactKind::ToolOutput
+                && artifact.removed
+        }));
+    }
+
     #[test]
     fn attachment_gc_is_scoped_to_the_open_database_and_retains_live_derivations() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1043,6 +1232,69 @@ mod tests {
         assert_eq!(report.total_bytes, 5);
         assert_eq!(report.artifacts.len(), 1);
         assert!(!report.artifacts[0].removed);
+    }
+
+    /// One unreadable checkout must not cost every other root its sweep.
+    ///
+    /// The roots are tried in path order, so a failing one used to abandon the phase
+    /// before the shared data root and the healthy checkout were reached. `session prune`
+    /// had already committed the row deletion by then, so those files could never be
+    /// attributed to a deleted session again: the disk was leaked for good. The
+    /// unreadable root is now recorded and skipped, and the rest of the pass proceeds.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_tool_output_root_is_recorded_and_the_other_roots_are_still_swept() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data = temp.path().join("data");
+        let paths = ArtifactGcPaths::from_data_root(&data);
+        // Sorted before both other roots, which is what made it fatal for them.
+        let blocked = temp.path().join("blocked");
+        write(&blocked, b"a checkout replaced by a file");
+        let blocked_root = zuno_tool::ToolOutputStore::in_worktree(&blocked)
+            .root()
+            .to_path_buf();
+        let recorded = temp.path().join("recorded");
+        let in_checkout = zuno_tool::ToolOutputStore::in_worktree(&recorded)
+            .root()
+            .join("tool_ses_deleted_00000000000000000000000000000001");
+        let shared = paths
+            .tool_output
+            .join("tool_ses_deleted_00000000000000000000000000000002");
+        write(&in_checkout, b"in-checkout output");
+        write(&shared, b"shared output");
+
+        let mut connection = database();
+        insert_project(&connection, "blocked-project", &blocked);
+        insert_project(&connection, "recorded-project", &recorded);
+        insert_session(&connection, "ses_live", "recorded-project", &recorded);
+
+        let report = execute(
+            &mut connection,
+            &paths,
+            &ArtifactGcRequest::new(["ses_deleted"], SystemTime::now()).deleting(),
+        )
+        .expect("an unreadable root is not a failed pass");
+
+        assert!(
+            !in_checkout.exists(),
+            "the healthy checkout must still be swept"
+        );
+        assert!(!shared.exists(), "the shared root must still be swept");
+        assert_eq!(report.artifacts.len(), 2);
+        assert_eq!(report.skipped_roots.len(), 1);
+        let skipped = &report.skipped_roots[0];
+        assert_eq!(skipped.root, blocked_root);
+        assert_eq!(skipped.operation, "inspect");
+        let reported = skipped.to_string();
+        assert!(reported.contains("was not swept"), "{reported}");
+        assert!(
+            reported.contains(&blocked_root.display().to_string()),
+            "an operator needs the path: {reported}"
+        );
+        assert!(
+            !skipped.reason.is_empty(),
+            "the original cause is the evidence: {reported}"
+        );
     }
 
     #[cfg(unix)]

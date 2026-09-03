@@ -150,7 +150,7 @@ impl BackgroundView {
         if let Some(error) = &execution.error {
             detail_row(&mut lines, &self.context, width, "error", error.clone());
         }
-        if let Ok(replay) = self.service.output(&execution.id, ReplayCursor::Full) {
+        if let Ok(replay) = self.service.output(&execution.id, ReplayCursor::Full, None) {
             let text = crate::attention::strip_ansi(&String::from_utf8_lossy(&replay.bytes));
             let tail = text.lines().rev().take(12).collect::<Vec<_>>();
             if !tail.is_empty() {

@@ -7,8 +7,14 @@
 //! fail-closed cleanup. A claimed request owns its answer sender, and dropping the
 //! claim sends a failed terminal decision. Consequently a malformed or disconnected
 //! reply can never authorize a tool by accident or consume another session's request.
+//!
+//! A saved `always` reply installs a process-local standing authorization keyed by the
+//! granting session, so it can only pre-approve later calls in that same session, and
+//! only for an ask that offered something to save. Archiving or deleting the session
+//! withdraws it; an SSE client disconnecting does not, because a stream is not the
+//! session.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
@@ -82,9 +88,36 @@ pub enum QuestionDecision {
     Failed,
 }
 
+/// A standing authorization: the session that granted it, plus what it covers.
+///
+/// The session id is part of the key because an `always` reply is one session's
+/// decision. Without it, a grant taken in one session would silently pre-approve a
+/// matching call in every other session this process serves, including sessions
+/// started later and sessions the replying client never saw.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct StandingGrant {
+    session_id: String,
+    action: String,
+    resources: Vec<String>,
+}
+
+/// The grant an ask could install, or `None` when the ask is single-use.
+///
+/// A request only offers a standing authorization when it carries something to save.
+/// `ServerPermissionAsker` clears `save` for a manual ask, so a manual ask can
+/// neither install a grant nor be satisfied by one.
+fn reusable_grant(request: &PermissionRequest) -> Option<StandingGrant> {
+    (!request.save.is_empty()).then(|| StandingGrant {
+        session_id: request.session_id.clone(),
+        action: request.action.clone(),
+        resources: request.resources.clone(),
+    })
+}
+
 struct PendingPermission {
     request: PermissionRequest,
     answer: oneshot::Sender<ReplyKind>,
+    grant: Option<StandingGrant>,
 }
 
 struct PendingQuestion {
@@ -96,7 +129,7 @@ struct PendingQuestion {
 struct Pending {
     permissions: HashMap<String, PendingPermission>,
     questions: HashMap<String, PendingQuestion>,
-    standing: Vec<(String, Vec<String>)>,
+    standing: BTreeSet<StandingGrant>,
     observers: HashMap<String, usize>,
 }
 
@@ -160,11 +193,13 @@ impl RequestBroker {
     }
 
     pub async fn ask_permission(&self, request: PermissionRequest) -> ReplyKind {
-        let grant = (request.action.clone(), request.resources.clone());
+        let grant = reusable_grant(&request);
         let (sender, receiver) = oneshot::channel();
         {
             let mut pending = self.lock();
-            if pending.standing.contains(&grant) {
+            if let Some(grant) = &grant
+                && pending.standing.contains(grant)
+            {
                 return ReplyKind::Once;
             }
             if self.persist_permission(&request).is_err() {
@@ -175,6 +210,7 @@ impl RequestBroker {
                 PendingPermission {
                     request: request.clone(),
                     answer: sender,
+                    grant,
                 },
             );
         }
@@ -319,6 +355,20 @@ impl RequestBroker {
         }
     }
 
+    /// Withdraws every standing authorization granted by these sessions.
+    ///
+    /// A standing `always` is one session's decision, so it lives exactly as long as
+    /// that session: archiving or deleting the session drops its grants, and a later
+    /// session that reuses the id inherits nothing.
+    pub fn forget_session_grants(&self, session_ids: &[String]) {
+        if session_ids.is_empty() {
+            return;
+        }
+        self.lock()
+            .standing
+            .retain(|grant| !session_ids.contains(&grant.session_id));
+    }
+
     #[must_use]
     pub fn claim_permission(
         &self,
@@ -337,14 +387,10 @@ impl RequestBroker {
         let live = {
             let mut pending = self.lock();
             match pending.permissions.get(request_id) {
-                Some(request) if request.request.session_id == session_id => {
-                    pending.permissions.remove(request_id).map(|pending| {
-                        (
-                            pending.answer,
-                            (pending.request.action, pending.request.resources),
-                        )
-                    })
-                }
+                Some(request) if request.request.session_id == session_id => pending
+                    .permissions
+                    .remove(request_id)
+                    .map(|pending| (pending.answer, pending.grant)),
                 Some(_) | None => None,
             }
         };
@@ -375,7 +421,7 @@ impl RequestBroker {
         let projected = permission_from_durable(&request)?;
         Some(PermissionResolution {
             answer: None,
-            grant: (projected.action, projected.resources),
+            grant: reusable_grant(&projected),
             standing: Arc::clone(&self.pending),
             durable: self.durable.clone(),
             goals: self.goals.clone(),
@@ -735,7 +781,7 @@ fn take_session_requests(
 
 pub struct PermissionResolution {
     answer: Option<oneshot::Sender<ReplyKind>>,
-    grant: (String, Vec<String>),
+    grant: Option<StandingGrant>,
     standing: Arc<Mutex<Pending>>,
     durable: Option<HumanRequestStore>,
     goals: Option<Arc<zuno_goal::GoalStore>>,
@@ -746,13 +792,6 @@ pub struct PermissionResolution {
 
 impl PermissionResolution {
     pub fn resolve(mut self, reply: ReplyKind) -> bool {
-        if reply == ReplyKind::Always {
-            self.standing
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .standing
-                .push(self.grant.clone());
-        }
         let live = self.answer.is_some();
         if let Some(store) = &self.durable {
             let response = json!({"reply": reply});
@@ -788,9 +827,25 @@ impl PermissionResolution {
             return false;
         }
         self.goals = None;
-        self.answer
+        let delivered = self
+            .answer
             .take()
-            .map_or(!live, |answer| answer.send(reply).is_ok())
+            .map_or(!live, |answer| answer.send(reply).is_ok());
+        // A standing authorization is installed only once the reply it came from has
+        // actually landed. A reply that failed to persist, or whose asker is gone,
+        // leaves the call denied, so it must not leave an `always` behind that would
+        // auto-approve the next matching call.
+        if delivered
+            && reply == ReplyKind::Always
+            && let Some(grant) = self.grant.take()
+        {
+            self.standing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .standing
+                .insert(grant);
+        }
+        delivered
     }
 }
 

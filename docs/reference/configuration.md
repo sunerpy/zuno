@@ -385,6 +385,63 @@ Foreground native `task` delegation is not detached: it inherits the parent
 turn interrupt, aborts the live child turn when fired, and waits for child drain
 and runtime shutdown before the tool call settles.
 
+## Component stop ceiling
+
+Each runtime component declares how long shutdown may wait for one of its own
+disposers. `runtime.max_component_stop_ms` is the ceiling this host puts on that
+declaration:
+
+```json
+{
+  "runtime": {
+    "max_component_stop_ms": 3000
+  }
+}
+```
+
+A component that asks for longer waits only this long; a component that asks for
+less keeps its own shorter budget. Absent, or `0`, means this host imposes no
+ceiling and every component keeps the budget it asked for, which is the default.
+
+The ceiling shortens a wait, it never cancels work. Disposers still run in reverse
+registration order, one at a time, and a disposer that outlives the ceiling is
+recorded as a `TimedOut` lifecycle diagnostic and left running to completion, so
+process-tree reaping still happens after the deadline. Set the ceiling when a
+deployment must bound total shutdown time; leave it absent when a slow disposer's
+own budget is the more trustworthy number.
+
+## Trusting a checkout with host commands
+
+A project config layer that declares a command this machine would run is refused:
+`shell`, a local `mcp.*.command`, an `lsp.*.command`, a `formatter.*.command`, and a
+`productAgent.*.command` all fail validation when they come from a project
+`zuno.json[c]` or `.zuno` file. Switching the entry off does not change that. An
+`enabled: false` or `disabled: true` beside the command lives in the same layer the
+checkout controls and any later layer can flip it without restating the command, so a
+dormant declaration is a trust question too, not a tolerated one.
+`trust.project_host_commands` is the only way to admit one, and it is read only from a
+trusted layer:
+
+```json
+{
+  "trust": {
+    "project_host_commands": ["/home/you/src", "/opt/checkouts"]
+  }
+}
+```
+
+| Value | Meaning |
+| --- | --- |
+| absent or `false` | No checkout may declare a host command |
+| `true` | Every checkout on this host may |
+| a list of absolute roots | A project config file inside one of those roots may |
+
+Roots are compared after canonicalization, so a symlinked checkout is the same
+checkout, and a relative or empty root is a validation error rather than a root
+that quietly matches nothing. A project layer that sets `trust` at all is refused,
+which is what makes the granting layer provably trusted. An admitted declaration is
+still logged one key at a time.
+
 ## Optional Agent step guard
 
 An Agent has no fixed provider-step limit unless its definition sets `steps`:
@@ -661,6 +718,18 @@ first and the narrow patterns that carve exceptions out of it belong last. The
 `edit` key covers the `write`, `edit`, and `apply_patch` tools; there is no
 separate `write` rule key.
 
+A rule key that only aliases another key is a validation error that names the key
+to use instead: `write` and `apply_patch` both fold into `edit`, and
+`list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource` all
+fold into `read`. Those keys used to be accepted and evaluated nothing. Any other
+key is still legitimate, because MCP, plugin, and Skill tools are named at runtime
+and a key may be a wildcard pattern.
+
+The top-level `tools` switch stays keyed by tool name, and the same folding applies
+to it: `{"tools": {"apply_patch": false}}` becomes a lowest-precedence `edit` deny,
+so it turns off `edit` and `write` as well. Name the governing tool when that is not
+what you meant.
+
 To run tool calls without Zuno HITL prompts, use `allow_all`:
 
 ```json
@@ -843,17 +912,17 @@ The environment equivalent is `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`.
 Managed policy has later precedence and may still replace either override with
 `deny`.
 
-Provenance also governs host commands, for now with a warning rather than a
-refusal. A project `zuno.json[c]` or `.zuno` layer that sets `shell`, a local
-`mcp.*.command`, an `lsp.*.command` or `formatter.*.command` that is not
-disabled, or a `productAgent.*.command` is logged as a warning naming the file
-and each such key when configuration is discovered. The layer is still accepted
-and the values are kept verbatim; the warning exists because every one of those
-programs runs on this machine with the current user's authority while the
-checkout chose it, so the operator should review the repository before trusting
-it. A remote MCP server runs nothing locally and is not warned about. A future
-release will reject these declarations from a project layer instead of warning,
-so move host commands to the global `zuno.json` or another trusted layer now.
+Provenance also governs host commands, and a project layer that declares one is
+refused rather than warned about. A project `zuno.json[c]` or `.zuno` layer that
+sets `shell`, a local `mcp.*.command`, an `lsp.*.command`, a
+`formatter.*.command`, or a `productAgent.*.command` fails discovery with a
+validation error naming that file and each such key, whether or not the entry is
+switched off. Every one of those programs would run on this machine with the
+current user's authority while the checkout chose it, so the decision is not the
+checkout's to make. A remote MCP server runs nothing locally and is never
+refused. Keep host commands in the global `zuno.json` or another trusted layer,
+or admit a specific checkout with `trust.project_host_commands` — see [trusting a
+checkout with host commands](#trusting-a-checkout-with-host-commands).
 
 On Linux, confined Shell registration requires a trusted system bubblewrap plus
 successful user, mount, PID, UTS, IPC, seccomp, and—when `network` is

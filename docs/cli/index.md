@@ -17,6 +17,24 @@ zuno <command> --help
 A small set of options is accepted by every subcommand. They are documented once, in
 [Global options](/cli/global-options), rather than being explained again on each page.
 
+## One invocation, one process
+
+A client that launches Zuno — an editor over [`zuno acp`](/cli/acp), a service
+supervising [`zuno serve`](/cli/serve), a script, a CI job — gets one process per
+invocation on every supported platform. The process it spawned is the process that runs
+the command, ending that process ends the command, and the command's `stdout` and
+`stderr` reach end of file when it does.
+
+Startup resolves global options and `ZUNO_*` variables into a single value the command
+reads directly, so no invocation depends on writing them back into the environment. On
+Unix the executable additionally replaces its own image once at startup, keeping the
+same process id, so programs it later launches inherit the resolved values from the
+operating system. Windows has no equivalent replacement, so there the resolved values
+stay inside the Zuno process: `--sandbox`, `--sandbox-on-unavailable`, `--log-level`,
+and `--print-logs` govern the invocation exactly as documented, but a program Zuno
+starts does not read them from its own environment, and a nested `zuno` on Windows
+resolves confinement from configuration rather than from the outer command line.
+
 ## Running Zuno
 
 | Command | Purpose |
@@ -31,7 +49,7 @@ A small set of options is accepted by every subcommand. They are documented once
 | Command | Purpose |
 | --- | --- |
 | [`zuno session`](/cli/session) | List, prune, and delete durable sessions. |
-| [`zuno agent`](/cli/agent) | Create agent definitions and list the agents currently resolved. |
+| [`zuno agent`](/cli/agent) | List the agents the current configuration chain resolves. |
 | [`zuno db`](/cli/db) | Run a query against the local session database. |
 | [`zuno export`](/cli/export) | Write configuration, Skills, extensions, and Agents into a portable bundle. |
 | [`zuno import`](/cli/import) | Restore a portable bundle into this machine's user environment. |

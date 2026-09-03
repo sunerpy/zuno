@@ -143,6 +143,18 @@ fn initialize_git_repository(workspace: &Path) -> String {
     git(workspace, &["rev-parse", "HEAD"])
 }
 
+/// Where git is, spelled absolutely, the way a script or a Windows resolver spells it.
+#[cfg(unix)]
+fn git_program() -> std::path::PathBuf {
+    let output = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("locate git");
+    assert!(output.status.success(), "git must be on PATH for this test");
+    let located = String::from_utf8(output.stdout).expect("utf-8 path");
+    std::path::PathBuf::from(located.trim())
+}
+
 #[cfg(unix)]
 struct RedirectGitRepository {
     git_dir: String,
@@ -268,6 +280,328 @@ async fn shell_reads_the_worktree_when_a_commit_stages_tracked_changes_itself() 
         head,
         "the source commit must have landed"
     );
+}
+
+/// Generated state is rooted at the worktree and hidden by the directory itself.
+///
+/// A session started in a subdirectory used to write `sub/.zuno/tool-output/`, which is
+/// neither covered by the repository-private exclude block — anchored at the worktree
+/// root — nor recognised by `classify`, so `git add -A` collected it and the delivery
+/// check did not object. Two things have to hold at once: the directory lands at the
+/// root, and it excludes itself as it is created, with no exclude block written here at
+/// all.
+#[cfg(unix)]
+#[tokio::test]
+async fn generated_state_from_a_session_in_a_subdirectory_is_rooted_and_hidden() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    initialize_git_repository(workspace.path());
+    let root = workspace
+        .path()
+        .canonicalize()
+        .expect("canonical workspace");
+    let session = root.join("sub");
+    std::fs::create_dir(&session).expect("session subdirectory");
+    let tool = support::sandbox::shell_tool(&session).with_output_limits(OutputLimits {
+        max_lines: 1,
+        max_bytes: 4,
+    });
+
+    let output = tool
+        .execute(
+            json!({
+                "command": "printf 'one\\ntwo\\n'",
+                ACCEPT_LARGE_OUTPUT_KEY: true,
+            }),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect("the command runs");
+
+    let paths = output.output_paths();
+    let stored = std::path::Path::new(paths.first().expect("stored output path"));
+    assert!(
+        stored.starts_with(root.join(".zuno").join("tool-output")),
+        "{}",
+        stored.display()
+    );
+    assert!(
+        !session.join(".zuno").exists(),
+        "the session's own directory is not where generated state goes"
+    );
+    for name in [".zuno/tool-output", ".zuno/background"] {
+        let marker = root.join(name).join(".gitignore");
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .unwrap_or_else(|error| panic!("{}: {error}", marker.display()))
+                .lines()
+                .filter(|line| !line.starts_with('#') && !line.is_empty())
+                .collect::<Vec<_>>(),
+            vec!["*"],
+            "{name} must exclude everything it holds"
+        );
+    }
+    assert_eq!(
+        git(&root, &["status", "--porcelain"]),
+        "",
+        "nothing wrote an exclude block here: the directories hide themselves"
+    );
+}
+
+/// The exclusion is republished on every start, because the service recreates its root.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_deleted_background_directory_comes_back_excluded() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    initialize_git_repository(workspace.path());
+    let root = workspace
+        .path()
+        .canonicalize()
+        .expect("canonical workspace");
+    let tool = support::sandbox::shell_tool(&root);
+    tool.run(params("true"), context(Arc::new(NeverInterrupted)))
+        .await
+        .expect("the first command runs");
+    let background = root.join(".zuno").join("background");
+    std::fs::remove_dir_all(&background).expect("a person cleaning up");
+
+    tool.run(params("true"), context(Arc::new(NeverInterrupted)))
+        .await
+        .expect("the second command runs");
+
+    assert!(
+        background.join(".gitignore").is_file(),
+        "the recreated directory must be excluded again"
+    );
+    assert_eq!(git(&root, &["status", "--porcelain"]), "");
+}
+
+/// The program `git` is not the only way to spell git.
+///
+/// The delivery check compared the first token with `git`, so `/usr/bin/git commit` —
+/// what a script writes, and what `git.exe` is on Windows — reached the commit without
+/// ever reaching the check.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_path_qualified_git_commit_reaches_the_delivery_check() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let head = initialize_git_repository(workspace.path());
+    let tool = support::sandbox::shell_tool(workspace.path());
+    let goal = workspace.path().join(".zuno").join("goal");
+    std::fs::create_dir_all(&goal).expect("goal directory");
+    std::fs::write(goal.join("ses_1.md"), b"# Objective\n").expect("goal document");
+    git(workspace.path(), &["add", "--force", ".zuno/goal/ses_1.md"]);
+
+    let refusal = tool
+        .run(
+            params(format!(
+                "{} commit --quiet -m deliver",
+                git_program().display()
+            )),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect_err("an absolutely spelled git is still git");
+
+    assert!(
+        format!("{refusal:?}").contains(".zuno/goal/ses_1.md"),
+        "{refusal:?}"
+    );
+    assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), head);
+}
+
+/// A commit that names its own repository is refused, not inspected.
+///
+/// `-C` was skipped as an option and its value discarded, so the check read the
+/// repository the tool's `workdir` names while the commit wrote a different one. There
+/// is no reading that fixes that: the repository has to be one fact both use.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_commit_that_selects_its_own_repository_is_refused() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let here = initialize_git_repository(workspace.path());
+    let elsewhere = tempfile::tempdir().expect("other repository");
+    let there = initialize_git_repository(elsewhere.path());
+    std::fs::write(elsewhere.path().join("tracked.txt"), b"edited\n").expect("source edit");
+    let tool = support::sandbox::shell_tool(workspace.path());
+
+    for command in [
+        format!(
+            "git -C {} commit --quiet -am done",
+            elsewhere.path().display()
+        ),
+        format!(
+            "GIT_DIR={} git commit --quiet -am done",
+            elsewhere.path().join(".git").display()
+        ),
+    ] {
+        let refusal = tool
+            .run(params(&command), context(Arc::new(NeverInterrupted)))
+            .await
+            .expect_err("a commit in another repository must not be admitted");
+        let rendered = format!("{refusal:?}");
+        assert!(
+            rendered.contains("select the repository with the Shell workdir"),
+            "{rendered}"
+        );
+        assert!(
+            matches!(refusal, ToolError::InvalidArgs { .. }),
+            "the arguments are what is wrong, and nothing ran: {refusal:?}"
+        );
+    }
+    assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), here);
+    assert_eq!(git(elsewhere.path(), &["rev-parse", "HEAD"]), there);
+}
+
+/// `git add -A` collects nothing generated, whatever the delivery check reads.
+///
+/// The delivery check reads the reach of the staging it can see, and a Makefile target,
+/// an alias, or a script the analyzer cannot see into has no reach it can read. What
+/// holds without any reading is that each generated directory excludes itself as it is
+/// created, with no repository-private exclude block written here at all — so an
+/// untracked spill is invisible to `git add -A` in the first place, and the commit of
+/// source goes through.
+#[cfg(unix)]
+#[tokio::test]
+async fn staging_everything_collects_no_generated_state() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let head = initialize_git_repository(workspace.path());
+    let root = workspace
+        .path()
+        .canonicalize()
+        .expect("canonical workspace");
+    let spilling = support::sandbox::shell_tool(&root).with_output_limits(OutputLimits {
+        max_lines: 1,
+        max_bytes: 4,
+    });
+    spilling
+        .execute(
+            json!({
+                "command": "printf 'one\\ntwo\\n'",
+                ACCEPT_LARGE_OUTPUT_KEY: true,
+            }),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect("the command runs and spills its output");
+    std::fs::write(root.join("source.txt"), b"written by the model\n").expect("source file");
+    let tool = support::sandbox::shell_tool(&root);
+
+    tool.run(
+        params("git add -A && git commit --quiet -m wip"),
+        context(Arc::new(NeverInterrupted)),
+    )
+    .await
+    .expect("an ordinary commit of source");
+
+    assert_ne!(
+        git(&root, &["rev-parse", "HEAD"]),
+        head,
+        "the commit must have landed"
+    );
+    let committed = git(&root, &["show", "--pretty=", "--name-only", "HEAD"]);
+    assert_eq!(committed, "source.txt", "{committed}");
+    assert!(root.join(".zuno").join("tool-output").is_dir());
+    assert!(root.join(".zuno").join("background").is_dir());
+}
+
+/// A chain that stages before it commits is read from the worktree, not from the index.
+///
+/// The check runs before the command, so at that moment `git add -A && git commit -m
+/// wip` has staged nothing and the index says the commit is empty. The `add` is the
+/// whole delivery, and its reach is readable: everything tracked, plus everything
+/// untracked git does not ignore. This is the shape that matters, because no ignore rule
+/// applies to a path git already tracks — a goal document an earlier release committed
+/// is re-delivered by every `git add -A` until someone runs `git rm --cached` on it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_chain_that_stages_before_it_commits_is_refused_for_tracked_generated_state() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    initialize_git_repository(workspace.path());
+    let goal = workspace.path().join(".zuno").join("goal");
+    std::fs::create_dir_all(&goal).expect("goal directory");
+    std::fs::write(goal.join("ses_1.md"), b"# Objective\n").expect("goal document");
+    git(workspace.path(), &["add", "--force", ".zuno/goal/ses_1.md"]);
+    git(workspace.path(), &["commit", "--quiet", "-m", "residue"]);
+    let head = git(workspace.path(), &["rev-parse", "HEAD"]);
+    let tool = support::sandbox::shell_tool(workspace.path());
+    // What the goal projection does every time the plan moves.
+    std::fs::write(goal.join("ses_1.md"), b"# Objective\n\n- [x] step\n").expect("reprojected");
+
+    for command in [
+        "git add -A && git commit --quiet -m wip",
+        "git add -u && git commit --quiet -m wip",
+        "git add . && git commit --quiet -m wip",
+        "git add .zuno && git commit --quiet -m wip",
+        "git stage --update && git commit --quiet -m wip",
+    ] {
+        let refusal = tool
+            .run(params(command), context(Arc::new(NeverInterrupted)))
+            .await
+            .expect_err("what the chain stages is part of the delivery");
+        let rendered = format!("{refusal:?}");
+        assert!(
+            rendered.contains(".zuno/goal/ses_1.md"),
+            "{command}: {rendered}"
+        );
+        assert!(
+            rendered.contains("git rm --cached"),
+            "{command}: {rendered}"
+        );
+        assert_eq!(
+            git(workspace.path(), &["rev-parse", "HEAD"]),
+            head,
+            "{command}: the refusal must happen before the commit"
+        );
+    }
+
+    // A narrower pathspec is a narrower read: the same chain limited to source stages no
+    // generated state, so it commits.
+    std::fs::write(workspace.path().join("tracked.txt"), b"edited\n").expect("source edit");
+    tool.run(
+        params("git add tracked.txt && git commit --quiet -m source"),
+        context(Arc::new(NeverInterrupted)),
+    )
+    .await
+    .expect("a chain that stages only source is untouched");
+    let committed = git(
+        workspace.path(),
+        &["show", "--pretty=", "--name-only", "HEAD"],
+    );
+    assert_eq!(committed, "tracked.txt", "{committed}");
+}
+
+/// A `git add` after the last commit stages for the next call, not for this one.
+///
+/// Reading every `git add` in the command line regardless of order would refuse a commit
+/// of source because a later `add` reaches generated state that this commit never
+/// carried.
+#[cfg(unix)]
+#[tokio::test]
+async fn staging_after_the_last_commit_does_not_refuse_it() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let head = initialize_git_repository(workspace.path());
+    let goal = workspace.path().join(".zuno").join("goal");
+    std::fs::create_dir_all(&goal).expect("goal directory");
+    std::fs::write(goal.join("ses_1.md"), b"# Objective\n").expect("goal document");
+    git(workspace.path(), &["add", "--force", ".zuno/goal/ses_1.md"]);
+    git(workspace.path(), &["commit", "--quiet", "-m", "residue"]);
+    std::fs::write(goal.join("ses_1.md"), b"# Objective\n\n- [x] step\n").expect("reprojected");
+    std::fs::write(workspace.path().join("tracked.txt"), b"edited\n").expect("source edit");
+    let tool = support::sandbox::shell_tool(workspace.path());
+
+    tool.run(
+        params("git add tracked.txt && git commit --quiet -m source && git add -A"),
+        context(Arc::new(NeverInterrupted)),
+    )
+    .await
+    .expect("the commit carries source only");
+
+    let committed = git(
+        workspace.path(),
+        &["show", "--pretty=", "--name-only", "HEAD"],
+    );
+    assert_eq!(committed, "tracked.txt", "{committed}");
+    assert_ne!(git(workspace.path(), &["rev-parse", "HEAD"]), head);
 }
 
 #[cfg(unix)]
@@ -460,15 +794,70 @@ async fn shell_cancellation_kills_the_shell_and_its_whole_process_group() {
     let child = read_pid(&child_file);
 
     interrupt.fire();
-    let error = tokio::time::timeout(Duration::from_secs(2), running)
+    let output = tokio::time::timeout(Duration::from_secs(2), running)
         .await
         .expect("cancellation must finish promptly")
         .expect("task join")
-        .expect_err("an interrupted command is not successful");
+        .expect("a cancelled command settles rather than failing");
 
-    assert!(matches!(error, ToolError::Failed { .. }));
+    // Killing the tree is the behaviour under test; the result shape is asserted here
+    // only so that a future change cannot go back to reporting the kill as a clean,
+    // certain cancellation.
+    assert_eq!(output.metadata["cancellation"]["uncertain"], true);
     wait_for_process_exit(parent).await;
     wait_for_process_exit(child).await;
+}
+
+/// Cancelling a running command hands back what it had already written.
+///
+/// Everything the command produced used to be discarded on the way out, and the model
+/// was told the tool had completed its cleanup — a clean, certain, effect-free reading
+/// of a command that was killed mid-flight. The bytes, the absent exit status, and the
+/// demand for state inspection all have to survive.
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_cancellation_returns_the_bytes_the_command_had_already_written() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let marker = dir.path().join("printed");
+    // An external `echo` rather than the shell's builtin: an exited process has flushed
+    // its bytes into the pipe, so what the test waits for is what the capture holds.
+    let command = format!(
+        "/bin/echo 'partial progress'; : > '{}'; sleep 30",
+        marker.display()
+    );
+    let interrupt = Arc::new(FirableInterrupt::default());
+    let tool = support::sandbox::shell_tool(dir.path());
+    let run_context = context(interrupt.clone());
+
+    let running = tokio::spawn(async move { tool.run(params(command), run_context).await });
+    wait_for_file(&marker).await;
+    interrupt.fire();
+    let output = tokio::time::timeout(Duration::from_secs(2), running)
+        .await
+        .expect("cancellation must finish promptly")
+        .expect("task join")
+        .expect("a cancelled command is a settled result, not a failure");
+
+    assert!(
+        output.output.contains("partial progress"),
+        "cancellation must preserve captured output: {}",
+        output.output
+    );
+    assert!(
+        output.output.contains("Inspect the authoritative state"),
+        "a killed command's outcome is not certain: {}",
+        output.output
+    );
+    assert_eq!(output.metadata["cancellation"]["cancelled"], true);
+    assert_eq!(output.metadata["cancellation"]["uncertain"], true);
+    assert_eq!(output.metadata["cancellation"]["authoritative"], false);
+    assert_eq!(output.metadata["exit"], serde_json::Value::Null);
+
+    let receipt = receipt(&output);
+    assert!(!receipt.proves_success());
+    assert_eq!(receipt.outcome, ReceiptOutcome::Unknown);
+    assert_eq!(receipt.exit_authority, ExitAuthority::Absent);
+    assert_eq!(receipt.exit_code, None);
 }
 
 #[cfg(unix)]
@@ -654,10 +1043,121 @@ async fn shell_oversized_output_is_detected_and_persisted_in_the_shared_store() 
     assert_eq!(output.metadata["oversized"], true);
     let paths = output.output_paths();
     let path = paths.first().expect("stored output path");
+    let window = store
+        .read_window(
+            "shell",
+            &context(Arc::new(zuno_tool::NeverInterrupted)).session_id,
+            std::path::Path::new(path),
+            0,
+            4_096,
+        )
+        .expect("stored full output");
     assert_eq!(
-        store
-            .read("shell", std::path::Path::new(path))
-            .expect("stored full output"),
+        String::from_utf8(window.bytes).expect("text"),
+        output.output
+    );
+    assert_eq!(window.cursor, window.total);
+}
+
+/// A command that succeeded and produced too much output is still a successful result.
+///
+/// Withholding used to be returned as a tool failure, which threw away the exit code,
+/// the verification receipt, and the artifact reference of a command that had run
+/// perfectly, and left the model with prose telling it to re-run a call `shell` declares
+/// must never be replayed.
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_withheld_output_keeps_the_receipt_and_offers_the_windowed_read() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store_dir = tempfile::tempdir().expect("store dir");
+    let store = ToolOutputStore::new(store_dir.path());
+    let tool = support::sandbox::shell_tool(dir.path())
+        .with_output_store(store.clone())
+        .with_output_limits(OutputLimits {
+            max_lines: 1,
+            max_bytes: 4,
+        });
+
+    let output = tool
+        .execute(
+            json!({ "command": "printf 'one\\ntwo\\n'" }),
+            context(Arc::new(zuno_tool::NeverInterrupted)),
+        )
+        .await
+        .expect("a command that ran does not fail because its output was large");
+
+    assert_eq!(output.metadata["exit"], 0);
+    assert_eq!(
+        output.metadata[VERIFICATION_METADATA_KEY]["exitAuthority"],
+        "authoritative"
+    );
+    assert_eq!(output.metadata["oversized"], true);
+    assert!(
+        output.output.contains("Tool output withheld"),
+        "{}",
+        output.output
+    );
+    assert!(output.output.contains("`bg`"), "{}", output.output);
+
+    let paths = output.output_paths();
+    let path = paths.first().expect("stored output path");
+    let window = store
+        .read_window(
+            "shell",
+            &context(Arc::new(zuno_tool::NeverInterrupted)).session_id,
+            std::path::Path::new(path),
+            0,
+            4_096,
+        )
+        .expect("stored full output");
+    assert_eq!(String::from_utf8(window.bytes).expect("text"), "one\ntwo\n");
+}
+
+/// The artifact holds the command's own bytes, even when they are not text.
+///
+/// The foreground handoff removes the execution's `.output` file as it hands the bytes
+/// back, so the artifact written here is the only copy that outlives the call. Decoding
+/// before persisting made that copy a record of the damage instead of the output.
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_persists_the_bytes_a_command_wrote_not_their_lossy_decoding() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store_dir = tempfile::tempdir().expect("store dir");
+    let store = ToolOutputStore::new(store_dir.path());
+    let tool = support::sandbox::shell_tool(dir.path())
+        .with_output_store(store.clone())
+        .with_output_limits(OutputLimits {
+            max_lines: 1,
+            max_bytes: 4,
+        });
+
+    let output = tool
+        .execute(
+            json!({ "command": r"printf 'a\nb\377\376\n'" }),
+            context(Arc::new(zuno_tool::NeverInterrupted)),
+        )
+        .await
+        .expect("withheld");
+
+    let paths = output.output_paths();
+    let path = paths.first().expect("stored output path");
+    let window = store
+        .read_window(
+            "shell",
+            &context(Arc::new(zuno_tool::NeverInterrupted)).session_id,
+            std::path::Path::new(path),
+            0,
+            4_096,
+        )
+        .expect("stored full output");
+    assert!(
+        window.bytes.contains(&0xff) && window.bytes.contains(&0xfe),
+        "the artifact must keep the bytes, not U+FFFD: {:?}",
+        window.bytes
+    );
+    assert!(
+        !output.output.contains('\u{fffd}'),
+        "the notice replaces the decoded text entirely: {}",
         output.output
     );
 }
