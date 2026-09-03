@@ -349,6 +349,349 @@ fn a_shell_deny_survives_the_command_builtin() {
 }
 
 #[test]
+fn a_shell_deny_survives_quoting_and_escaping_inside_the_program_token() {
+    // Reversing a surrounding quote pair and a leading `\` covered `'rm'` and `\rm`
+    // and nothing else, so every line below reached the catch-all and ran the
+    // command the user had explicitly denied.
+    for command in [
+        "r\\m -rf /tmp/build",
+        "\\r\\m -rf /tmp/build",
+        "rm\"\" -rf /tmp/build",
+        "\"\"rm -rf /tmp/build",
+        "r\"m\" -rf /tmp/build",
+        "\"r\"m -rf /tmp/build",
+        "'r'm -rf /tmp/build",
+        "r'm' -rf /tmp/build",
+        "r''m -rf /tmp/build",
+        "'r'\"m\" -rf /tmp/build",
+        "command r\\m -rf /tmp/build",
+        "'\\rm' -rf /tmp/build",
+        // cmd escapes with `^` and PowerShell with a backtick. A deny has to hold
+        // whichever interpreter runs the line.
+        "r^m -rf /tmp/build",
+        "r`m -rf /tmp/build",
+        // The program here is the single word `rm -rf`, which no host has. Refusing
+        // it anyway is the reading that fails safe.
+        "rm\" \"-rf /tmp/build",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &deny_rm_rf()),
+            PermissionAction::Deny,
+            "`{command}` is the denied command respelled"
+        );
+    }
+}
+
+#[test]
+fn a_shell_deny_survives_a_windows_style_program_path() {
+    // `\` separates a Windows path, so the file name it ends with is reached the same
+    // way `/bin/rm` is reduced to `rm`.
+    let rules =
+        rules_from_json(r#"{"mode":"standard","rules":{"shell":{"*":"ask","rm.exe *":"deny"}}}"#);
+
+    assert_eq!(
+        evaluate("shell", r"C:\Windows\System32\rm.exe -rf C:\build", &rules),
+        PermissionAction::Deny
+    );
+    assert_eq!(
+        evaluate("shell", r".\rm.exe -rf C:\build", &rules),
+        PermissionAction::Deny
+    );
+}
+
+#[test]
+fn a_shell_deny_survives_dollar_quoting_in_the_program_token() {
+    // `$'...'` is bash/zsh ANSI-C quoting and `$"..."` is bash locale quoting. Both
+    // are *quoting*, not expansion, so every line below runs `rm` under bash —
+    // measured with a fake `rm` on `PATH` — while `$` was read as an ordinary
+    // literal here and the explicit deny degraded to the catch-all `ask`.
+    for command in [
+        "r$'m' -rf /tmp/build",
+        "r$\"m\" -rf /tmp/build",
+        "rm$'' -rf /tmp/build",
+        "$'rm' -rf /tmp/build",
+        "$\"rm\" -rf /tmp/build",
+        // `\x72\x6d` spells `rm` only once it is decoded. The program is reported as
+        // unresolvable instead of guessed, and the deny fails closed on it.
+        "$'\\x72\\x6d' -rf /tmp/build",
+        // The `command` builtin can be spelled the same way.
+        "com$'m'and rm -rf /tmp/build",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &deny_rm_rf()),
+            PermissionAction::Deny,
+            "`{command}` is the denied command respelled"
+        );
+    }
+}
+
+#[test]
+fn a_shell_deny_survives_a_glob_in_the_program_token() {
+    // `bash` expands `/bin/r?` to `/bin/rm` and runs it, and the matcher reads a `?`
+    // in a *resource* as a literal character, so a program written as a glob used to
+    // match no rule at all. A program this crate cannot resolve now fails closed on
+    // the deny side instead.
+    for command in [
+        "/bin/r? -rf /tmp/build",
+        "/bin/r[m] -rf /tmp/build",
+        "/bin/r* -rf /tmp/build",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &deny_rm_rf()),
+            PermissionAction::Deny,
+            "`{command}` can expand to the denied command"
+        );
+    }
+}
+
+#[test]
+fn a_shell_deny_survives_an_unquoted_expansion_that_word_splits() {
+    // An *unquoted* expansion, substitution or glob is word-split, so its result
+    // supplies the program *and* its arguments. Measured with a fake `rm` and a fake
+    // `git` on `PATH`: bash and dash both print `FAKE-RM invoked with args: -rf
+    // /tmp/build` for the first two rows and for both quoting spellings of the
+    // program, `FAKE-GIT invoked with args: push --force` for the `git` row below,
+    // and bash, dash and zsh all run the two substitution rows. Every one of them is
+    // a single token here, so reporting only the *program* as unresolvable let the
+    // deny retry compare the bare rule program (`rm`) against `rm -rf*` and match
+    // nothing, and the explicit prohibition degraded to `ask`.
+    //
+    // The `rm'` row is the one spelling of the five that no shell runs -- bash says
+    // "unexpected EOF while looking for matching `''", dash "Unterminated quoted
+    // string", zsh "unmatched '", and pwsh exits 1 without running anything. A token
+    // no dialect can read is still not statically resolvable, and answering `ask`
+    // because of that would be the same silent non-match, so it fails closed too.
+    for command in [
+        "rm${IFS}-rf${IFS}/tmp/build",
+        "rm$IFS-rf$IFS/tmp/build",
+        "rm'${IFS}-rf${IFS}/tmp/build",
+        "$(echo rm -rf /tmp/build)",
+        "`echo rm -rf /tmp/build`",
+        "rm''${IFS}-rf${IFS}/tmp/build",
+        "r$'m'${IFS}-rf${IFS}/tmp/build",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &deny_rm_rf()),
+            PermissionAction::Deny,
+            "`{command}` runs the denied command, and a line this crate cannot read \
+             at all has to assume it does"
+        );
+    }
+    // It is not `rm`-specific.
+    let deny_push =
+        rules_from_json(r#"{"mode":"standard","rules":{"shell":{"*":"ask","git push*":"deny"}}}"#);
+    assert_eq!(
+        evaluate("shell", "git${IFS}push${IFS}--force", &deny_push),
+        PermissionAction::Deny
+    );
+    // The bound. A *quoted* run is one word however it expands, so it supplies the
+    // program only, and where argument tokens follow the run they are still the words
+    // the shell will pass: both keep the retry that makes the arguments fit the rule.
+    for command in ["$PROG status", "\"$PROG\"", "$'\\x72\\x6d'"] {
+        assert_eq!(
+            evaluate("shell", command, &deny_rm_rf()),
+            PermissionAction::Ask,
+            "`{command}` cannot run `rm -rf ...`, so `rm -rf*` is not a deny-everything"
+        );
+    }
+}
+
+#[test]
+fn authorizing_a_long_unresolvable_command_line_stays_linear() {
+    // `merge_open_substitution` re-scanned the whole accumulated program token once
+    // per argument, which is quadratic in text the model controls, on a synchronous
+    // path inside async authorization: 1 KB took 1.1 ms here, 40 KB took 1.19 s and
+    // 120 KB took 9.59 s, all of it blocking the runtime. The scan is now carried
+    // across tokens. The ceiling is deliberately generous so a loaded box does not
+    // fail it; the quadratic version misses it by two orders of magnitude.
+    let unit = "rm -rf /tmp/build ";
+    let command = format!("`echo {}", unit.repeat(120 * 1024 / unit.len() + 1));
+    assert!(command.len() > 120 * 1024, "the fixture is 120 KB of text");
+
+    let started = std::time::Instant::now();
+    let action = evaluate("shell", &command, &deny_rm_rf());
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        action,
+        PermissionAction::Deny,
+        "an unterminated substitution is one unresolvable token, so the deny fails \
+         closed on it"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "authorizing {} bytes took {elapsed:?}",
+        command.len()
+    );
+}
+
+#[test]
+fn a_program_this_crate_cannot_resolve_fails_closed_only_where_the_rule_fits() {
+    // An expansion or a substitution can name anything, so a deny is retried with the
+    // program the *rule* names. That deliberately over-refuses — `$PROG -rf x` is
+    // refused by `rm -rf*` — but it must not degrade into denying every command.
+    let rules = deny_rm_rf();
+
+    for command in [
+        "$PROG -rf /tmp/build",
+        "`which rm` -rf /tmp/build",
+        "$(which rm) -rf /tmp/build",
+        "${RM} -rf /tmp/build",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &rules),
+            PermissionAction::Deny,
+            "`{command}` could be the denied command, and a deny that cannot tell \
+             has to assume it is"
+        );
+    }
+    assert_eq!(
+        evaluate("shell", "$PROG status", &rules),
+        PermissionAction::Ask,
+        "the arguments still have to fit the rule; `rm -rf*` is not a deny-everything"
+    );
+    assert_eq!(
+        evaluate("shell", "git commit -m \"$message\"", &rules),
+        PermissionAction::Ask,
+        "an expansion in an *argument* says nothing about which program ran"
+    );
+}
+
+#[test]
+fn an_allow_is_never_widened_by_a_dialect_the_host_may_not_be() {
+    // `$'...'` runs `rm` under bash and zsh; dash reads `r$'m'` as the program `r$m`
+    // and `$"rm"` as `$rm` (measured). A grant may not guess which of those the
+    // configured interpreter is, and it may not guess at a glob either.
+    let rules =
+        rules_from_json(r#"{"mode":"standard","rules":{"shell":{"*":"ask","rm -rf x":"allow"}}}"#);
+
+    for command in [
+        "r$'m' -rf x",
+        "$\"rm\" -rf x",
+        "rm$'' -rf x",
+        "$'\\x72\\x6d' -rf x",
+        "/bin/r? -rf x",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &rules),
+            PermissionAction::Ask,
+            "`{command}` names `rm` only under some interpreters, so it may widen a \
+             deny and never a grant"
+        );
+    }
+}
+
+#[test]
+fn an_allow_never_governs_a_program_word_that_re_partitions_the_rule() {
+    // Quote removal inside the program token is identity-preserving only while the
+    // word stays one token. A word that contains whitespace can line up with the
+    // rule's own program/argument boundary, and the matcher compares one flattened
+    // command line, so the reduction would hand the grant to a *different* file: the
+    // one literally named `/bin/rm -rf`, `./tool.sh evil` or `/usr/bin/git commit`,
+    // each of them plantable with `cp evil.sh "./tool.sh evil"` in a directory the
+    // agent can already write. Being path-shaped is orthogonal to that, so no shape
+    // of a space-containing word reaches an `allow`.
+    for (resource, pattern) in [
+        ("\"./tool.sh evil\"", "./tool.sh *"),
+        ("\"./tool.sh evil\" arg", "./tool.sh *"),
+        ("\"/bin/rm -rf\" /", "/bin/rm -rf *"),
+        ("'/bin/rm -rf' /", "/bin/rm -rf *"),
+        ("\"/usr/bin/git commit\" -m x", "/usr/bin/git commit -m *"),
+        ("\"/opt/my tool/rm\" -rf x", "/opt/my tool/rm -rf *"),
+        ("'/opt/my tool/rm' -rf x", "/opt/my tool/rm -rf *"),
+        ("\"git evil\"", "git *"),
+    ] {
+        let allow = vec![
+            rule("shell", "*", PermissionAction::Ask),
+            rule("shell", pattern, PermissionAction::Allow),
+        ];
+        assert_eq!(
+            evaluate("shell", resource, &allow),
+            PermissionAction::Ask,
+            "`{pattern}` must not grant `{resource}`, whose program word contains a \
+             space"
+        );
+        let deny = vec![
+            rule("shell", "*", PermissionAction::Ask),
+            rule("shell", pattern, PermissionAction::Deny),
+        ];
+        assert_eq!(
+            evaluate("shell", resource, &deny),
+            PermissionAction::Deny,
+            "the same respelling is still refused by a deny"
+        );
+    }
+    // The bound: the ordinary spelling of each of those rules still grants.
+    let rules = rules_from_json(
+        r#"{"mode":"standard","rules":{"shell":{"*":"ask","./tool.sh *":"allow","/opt/my tool/rm -rf *":"allow"}}}"#,
+    );
+    assert_eq!(
+        evaluate("shell", "./tool.sh evil", &rules),
+        PermissionAction::Allow,
+        "`./tool.sh` really is the program the rule names"
+    );
+    assert_eq!(
+        evaluate("shell", "/opt/my tool/rm -rf x", &rules),
+        PermissionAction::Allow,
+        "a rule whose own program path contains a space still matches the unquoted \
+         command line the caller wrote"
+    );
+}
+
+#[test]
+fn an_allow_does_not_cover_a_bare_program_name_that_contains_a_space() {
+    // `"git commit"` is looked up on `PATH`, where an executable literally named
+    // `git commit` could otherwise inherit the grant. Only a *path* is admitted.
+    let rules = rules_from_json(
+        r#"{"mode":"standard","rules":{"shell":{"*":"ask","git commit -m *":"allow"}}}"#,
+    );
+
+    assert_eq!(
+        evaluate("shell", "git commit -m x", &rules),
+        PermissionAction::Allow
+    );
+    assert_eq!(
+        evaluate("shell", "\"git commit\" -m x", &rules),
+        PermissionAction::Ask
+    );
+    assert_eq!(
+        evaluate(
+            "shell",
+            "\"git commit\" -m x",
+            &rules_from_json(
+                r#"{"mode":"standard","rules":{"shell":{"*":"ask","git commit -m *":"deny"}}}"#
+            )
+        ),
+        PermissionAction::Deny,
+        "the same respelling is still refused by a deny"
+    );
+}
+
+#[test]
+fn an_allow_rule_does_not_inherit_a_spelling_only_a_deny_may_see() {
+    let rules =
+        rules_from_json(r#"{"mode":"standard","rules":{"shell":{"*":"ask","rm -rf x":"allow"}}}"#);
+
+    assert_eq!(
+        evaluate("shell", "'r'm -rf x", &rules),
+        PermissionAction::Allow,
+        "quote removal names the same program whichever shell reads the line"
+    );
+    assert_eq!(
+        evaluate("shell", "r^m -rf x", &rules),
+        PermissionAction::Ask,
+        "removing cmd's escape character guesses the interpreter, so it may only \
+         widen a deny"
+    );
+    assert_eq!(
+        evaluate("shell", "rm\" \"-rf x", &rules),
+        PermissionAction::Ask,
+        "a grant covers the program the user named, not a different word that \
+         re-tokenizes into it"
+    );
+}
+
+#[test]
 fn the_raw_spelling_keeps_matching_the_rules_written_for_it() {
     // Normalization only ever adds spellings. A rule written against the exact text
     // a user sees in their terminal must keep working.

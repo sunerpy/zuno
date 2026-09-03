@@ -39,8 +39,11 @@ fn the_canonical_shell_spelling_normalizes_the_program_and_the_spacing() {
     assert_eq!(canonical_shell_resource("rm\t-rf x"), "rm -rf x");
     assert_eq!(canonical_shell_resource("'rm' -rf x"), "rm -rf x");
     assert_eq!(canonical_shell_resource("\"rm\" -rf x"), "rm -rf x");
-    assert_eq!(canonical_shell_resource("\\rm -rf x"), "rm -rf x");
-    assert_eq!(canonical_shell_resource("command rm -rf x"), "rm -rf x");
+    // `\rm` and the `command` builtin read differently under cmd and PowerShell, so
+    // they are pinned per host by
+    // `the_host_shell_decides_which_escape_and_which_builtin_the_identity_reading_has`
+    // in `src/resource.rs`; asserting the POSIX answer here would fail a native
+    // Windows run.
     assert_eq!(
         canonical_shell_resource("rm -rf 'a b'"),
         "rm -rf 'a b'",
@@ -51,6 +54,108 @@ fn the_canonical_shell_spelling_normalizes_the_program_and_the_spacing() {
         "/bin/rm -rf x",
         "the canonical spelling still names the executable that was invoked"
     );
+}
+
+#[test]
+fn the_canonical_shell_spelling_removes_quoting_anywhere_in_the_program() {
+    // A shell removes quotes and escape characters per character, not only around a
+    // whole word, and it does that before it looks up the program. Every spelling
+    // below therefore invokes `rm`.
+    // Only the quote spellings are here: every shell removes a quote, while `\` is an
+    // escape under a POSIX shell and a path separator under cmd and PowerShell. The
+    // `\` rows are pinned per host in `src/resource.rs`.
+    for command in [
+        "rm\"\" -rf x",
+        "\"\"rm -rf x",
+        "r\"m\" -rf x",
+        "\"r\"m -rf x",
+        "'r'm -rf x",
+        "r'm' -rf x",
+        "r''m -rf x",
+        "'r'\"m\" -rf x",
+    ] {
+        assert_eq!(
+            canonical_shell_resource(command),
+            "rm -rf x",
+            "`{command}` names the program `rm`"
+        );
+    }
+}
+
+#[test]
+fn the_canonical_shell_spelling_stops_where_the_program_stops_being_one_word() {
+    assert_eq!(
+        canonical_shell_resource("'\\rm' -rf x"),
+        "\\rm -rf x",
+        "single quotes are literal, so the backslash belongs to the program name"
+    );
+    assert_eq!(
+        canonical_shell_resource("\"r\\m\" -rf x"),
+        "r\\m -rf x",
+        "inside double quotes a backslash only escapes what could end the string"
+    );
+    assert_eq!(
+        canonical_shell_resource("rm\" \"-rf x"),
+        "rm\" \"-rf x",
+        "the program there is the single word `rm -rf`; respelling it would invent a \
+         command line nobody ran"
+    );
+    assert_eq!(
+        canonical_shell_resource("\"unterminated -rf x"),
+        "\"unterminated -rf x",
+        "no shell runs an unterminated quote, so there is nothing to canonicalize"
+    );
+    assert_eq!(
+        canonical_shell_resource("r^m -rf x"),
+        "r^m -rf x",
+        "no POSIX shell honours cmd's escape character, so removing it widens a deny \
+         only"
+    );
+}
+
+#[test]
+fn the_canonical_shell_spelling_leaves_a_dialect_or_a_glob_to_the_deny_side() {
+    // `r$'m'` is `rm` under bash and zsh and the program `r$m` under dash, and
+    // `/bin/r?` is whatever the glob expands to. None of those is a spelling of one
+    // known program, so the canonical (identity) spelling keeps the token as written
+    // and only a deny reads further.
+    for command in [
+        "r$'m' -rf x",
+        "$\"rm\" -rf x",
+        "rm$'' -rf x",
+        "$'\\x72\\x6d' -rf x",
+        "/bin/r? -rf x",
+        "$PROG -rf x",
+    ] {
+        assert_eq!(
+            canonical_shell_resource(command),
+            command,
+            "`{command}` names no one program, so the identity spelling is the token"
+        );
+    }
+}
+
+#[test]
+fn the_canonical_shell_spelling_leaves_a_program_word_with_a_space_to_the_deny_side() {
+    // The matcher compares one flattened command line, so a program word that contains
+    // whitespace can line up with the rule's own program/argument boundary: reducing
+    // `"/bin/rm -rf" /` to `/bin/rm -rf /` lets allow `/bin/rm -rf *` govern a file
+    // literally named `/bin/rm -rf`. Naming a path does not change that, so the
+    // reduction stays deny-only whatever the word looks like.
+    for command in [
+        "\"/opt/my tool/rm\" -rf x",
+        "\"/bin/rm -rf\" /",
+        "'/bin/rm -rf' /",
+        "\"./tool.sh evil\"",
+        "\"git commit\" -m x",
+    ] {
+        assert_eq!(
+            canonical_shell_resource(command),
+            command,
+            "`{command}` names a program whose word contains a space, so the identity \
+             spelling is the token as written"
+        );
+    }
 }
 
 #[test]
