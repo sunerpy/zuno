@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.9.0](https://github.com/sunerpy/zuno/compare/v0.8.0...v0.9.0) (2026-09-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* this release removes surfaces that existed only to refuse, and narrows two that were wider than they claimed.
+
+### Features
+
+* batch 2 of the repository audit — remove refusal-only surfaces and fix the five reported defects ([#101](https://github.com/sunerpy/zuno/issues/101)) ([c004e2a](https://github.com/sunerpy/zuno/commit/c004e2a180b65b16f66adce5f45e5021d3787d81))
+
 ## [0.8.0](https://github.com/sunerpy/zuno/compare/v0.7.1...v0.8.0) (2026-09-03)
 
 
