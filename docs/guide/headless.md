@@ -21,14 +21,15 @@ be resumed in the terminal application and the reverse.
 | none | Start a new session |
 | `-c`, `--continue` | Continue the most recent session in this directory |
 | `-s`, `--session <SESSION>` | Talk in this exact session |
-| `--fork` | Fork the target session, leaving the original transcript untouched |
 
 ```sh
-zuno run --session ses_1a2b3c --fork --agent plan "what would a safe migration look like?"
+zuno run --session ses_1a2b3c --agent plan "what would a safe migration look like?"
 ```
 
-Forking is the right choice when a script explores an alternative it does not want mixed
-into the session a human is reading.
+Forking a session is not part of this binary. A script that explores an alternative it
+does not want mixed into the session a human is reading starts a fresh one instead: omit
+both `--continue` and `--session`, and pass `--title` so the run is findable afterwards.
+See [zuno run](/cli/run) for the options earlier releases accepted and rejected.
 
 ## Selecting the agent, model, and effort
 
@@ -90,7 +91,7 @@ zuno run --print-logs --log-level DEBUG "summarize the build failure"
 
 ## Attaching files
 
-`-f`/`--file` is repeatable, and `--attach` carries an attachment. A supported
+`-f`/`--file` is repeatable, and it is the only option that carries a file. A supported
 image is normalized and admitted to the database-scoped durable object store
 before the inbox write; the default source limit is 20 MiB and the normalized
 encoded limit is 5 MiB. Any other reference must be UTF-8 text within 51,200

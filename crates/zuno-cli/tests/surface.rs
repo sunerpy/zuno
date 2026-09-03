@@ -967,49 +967,134 @@ fn surface_export_no_longer_reports_a_pending_handler() {
     );
 }
 
-/// The two `run` pages must not offer an option the parser now refuses.
-///
-/// Documentation is part of the surface contract: a table row or a copyable
-/// example is a promise that the flag works. Each of these had its own option row
-/// on both pages, and `--fork` also carried a worked example, so this test fails
-/// against the pages as they shipped. The paragraph that records the removal
-/// names the same flags on purpose, which is why the assertion looks at option
-/// rows and at `zuno run` command lines rather than at the whole page.
-#[test]
-fn surface_run_pages_do_not_offer_the_options_run_no_longer_accepts() {
-    const REMOVED: &[&str] = &[
-        "--fork",
-        "--share",
-        "--attach",
-        "--port",
-        "--username",
-        "--password",
-        "--interactive",
-        "--auto",
-    ];
-    const PAGES: &[(&str, &str)] = &[
-        ("docs/cli/run.md", include_str!("../../../docs/cli/run.md")),
-        (
-            "docs/zh/cli/run.md",
-            include_str!("../../../docs/zh/cli/run.md"),
-        ),
-    ];
+// ---------------------------------------------------------------------------
+// The documentation half of the surface contract
+// ---------------------------------------------------------------------------
 
-    for (page, text) in PAGES {
-        for (number, line) in text.lines().enumerate() {
-            let line = line.trim();
-            let offers_option = line.starts_with("| `-");
-            let offers_invocation = line.starts_with("zuno run");
-            if !offers_option && !offers_invocation {
-                continue;
-            }
-            for flag in REMOVED {
-                assert!(
-                    !line.contains(flag),
-                    "{page}:{} still offers {flag}: {line}",
-                    number + 1
-                );
+/// Every Markdown page under `docs/`, as a repo-relative path and its text.
+///
+/// Read from disk rather than through `include_str!`, because the pages that go
+/// stale after a removal are the ones nobody thought to name: the guard that
+/// shipped with these removals listed the two reference pages its author had just
+/// edited, and the four guide pages that still promised `--fork` were outside it by
+/// construction. A walk cannot be out of date.
+fn documentation_pages() -> Vec<(String, String)> {
+    fn walk(directory: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let entries = std::fs::read_dir(directory)
+            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()));
+        for entry in entries {
+            let path = entry.expect("documentation directory entry").path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else if path.extension().is_some_and(|extension| extension == "md") {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("documentation page is under the workspace root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                out.push((relative, text));
             }
         }
     }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("zuno-cli is under <workspace>/crates")
+        .to_path_buf();
+    let mut pages = Vec::new();
+    walk(&root.join("docs"), &root, &mut pages);
+    pages.sort_by(|left, right| left.0.cmp(&right.0));
+    assert!(
+        pages.len() > 100,
+        "the documentation walk found only {} pages; it is looking in the wrong place",
+        pages.len()
+    );
+    pages
+}
+
+/// The eight options `zuno run` accepted and could only refuse.
+const REMOVED_RUN_OPTIONS: &[&str] = &[
+    "--fork",
+    "--share",
+    "--attach",
+    "--port",
+    "--username",
+    "--password",
+    "--interactive",
+    "--auto",
+];
+
+/// **No page anywhere offers an option `zuno run` no longer accepts.**
+///
+/// Documentation is part of the surface contract: an option row or a copyable
+/// example is a promise that the flag works. Three rules, because the eight
+/// removals are not all the same shape.
+///
+/// A `zuno run` command line, on any page, may not name any of the eight — that is
+/// what a reader copies. The two `run` reference pages may not carry an option row
+/// for one either, which is the table a reader trusts over the prose. And the four
+/// that no Zuno command accepts at all — `--fork`, `--share`, `--attach`,
+/// `--interactive` — may appear only on the one page per language that records the
+/// removal, because a mention anywhere else is a page that has not been updated.
+/// `--port` and `--auto` are excluded from that last rule: `zuno serve --port` and
+/// `zuno tui --auto` are real.
+#[test]
+fn surface_documentation_never_offers_a_run_option_the_parser_rejects() {
+    /// The one page per language that says these options were removed.
+    const REMOVAL_RECORD: &[&str] = &["docs/cli/run.md", "docs/zh/cli/run.md"];
+    /// The subset no Zuno command accepts under any name.
+    const RETIRED_OUTRIGHT: &[&str] = &["--fork", "--share", "--attach", "--interactive"];
+
+    let mut offences = Vec::new();
+    for (page, text) in documentation_pages() {
+        let records_the_removal = REMOVAL_RECORD.contains(&page.as_str());
+        let mut invocation = false;
+        for (index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            let number = index + 1;
+            invocation = invocation || line.contains("zuno run");
+            for option in REMOVED_RUN_OPTIONS {
+                if invocation && line.contains(option) {
+                    offences.push(format!("{page}:{number} runs {option}: {line}"));
+                }
+                if records_the_removal && line.starts_with("| `") && line.contains(option) {
+                    offences.push(format!("{page}:{number} tabulates {option}: {line}"));
+                }
+            }
+            if !records_the_removal {
+                for option in RETIRED_OUTRIGHT {
+                    if line.contains(option) {
+                        offences.push(format!("{page}:{number} mentions {option}: {line}"));
+                    }
+                }
+            }
+            invocation = invocation && line.ends_with('\\');
+        }
+    }
+    assert!(offences.is_empty(), "{}", offences.join("\n"));
+}
+
+/// **The CLI reference never offers `zuno agent create`.**
+///
+/// Authoring an agent is writing a Markdown file under `.zuno/agent/`, and the
+/// subcommand that claimed to generate one is gone. This is the reference tree,
+/// where a removed subcommand would otherwise keep its synopsis, its option table
+/// and its worked example long after the parser stopped accepting it.
+#[test]
+fn surface_cli_reference_never_offers_the_removed_agent_create() {
+    let mut offences = Vec::new();
+    for (page, text) in documentation_pages() {
+        if !page.starts_with("docs/cli/") && !page.starts_with("docs/zh/cli/") {
+            continue;
+        }
+        for (index, line) in text.lines().enumerate() {
+            if line.contains("agent create") {
+                offences.push(format!("{page}:{} offers {line}", index + 1));
+            }
+        }
+    }
+    assert!(offences.is_empty(), "{}", offences.join("\n"));
 }

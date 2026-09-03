@@ -17,13 +17,12 @@ zuno run --continue "now add tests for the new branch"
 | 不指定 | 启动一个新会话 |
 | `-c`、`--continue` | 继续当前目录下最近的会话 |
 | `-s`、`--session <SESSION>` | 在这个确切会话中对话 |
-| `--fork` | 分叉目标会话，原始对话记录保持不动 |
 
 ```sh
-zuno run --session ses_1a2b3c --fork --agent plan "what would a safe migration look like?"
+zuno run --session ses_1a2b3c --agent plan "what would a safe migration look like?"
 ```
 
-当脚本要探索一个替代方案，又不想让它混进某个人正在阅读的会话时，分叉是正确选择。
+这个二进制不提供会话分叉。脚本要探索一个替代方案，又不想让它混进某个人正在阅读的会话时，改为新起一个会话：同时省掉 `--continue` 与 `--session`，并用 `--title` 让这次运行事后好找。早期版本接受又拒绝的那些选项见 [zuno run](/zh/cli/run)。
 
 ## 选择 Agent、模型与推理强度
 
@@ -70,7 +69,7 @@ zuno run --print-logs --log-level DEBUG "summarize the build failure"
 
 ## 附加文件
 
-`-f`/`--file` 可重复使用，`--attach` 携带一个附件。受支持的图像会在写入 inbox 前完成规范化，并接纳到当前数据库专属的持久对象存储；默认源上限是 20 MiB，规范化编码上限是 5 MiB。任何其他引用必须是 UTF-8 文本，且在 51,200 字节与 2,000 行以内，插入时带显式的起止标记。不受支持的二进制文件，包括 PDF，不会被静默转换。参见[图像与文件引用](/zh/guide/attachments)。
+`-f`/`--file` 可重复使用，而且它是唯一携带文件的选项。受支持的图像会在写入 inbox 前完成规范化，并接纳到当前数据库专属的持久对象存储；默认源上限是 20 MiB，规范化编码上限是 5 MiB。任何其他引用必须是 UTF-8 文本，且在 51,200 字节与 2,000 行以内，插入时带显式的起止标记。不受支持的二进制文件，包括 PDF，不会被静默转换。参见[图像与文件引用](/zh/guide/attachments)。
 
 ## 脚本中的约束
 

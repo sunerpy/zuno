@@ -185,16 +185,17 @@ recovery has left. The provider layer retries one request for at most 180 second
 by a shorter local backoff. The turn ends with the peer's error, and the Goal retry waits
 the peer's value clamped to `max_delay_ms`.
 
-## Continuing and forking
+## Continuing a session
 
 ```sh
 zuno run --continue "now cap the page size at 100"
 zuno run --session ses_1a2b3c "what changed?"
-zuno run --session ses_1a2b3c --fork --agent plan "what would a safe migration look like?"
+zuno run --session ses_1a2b3c --agent plan "what would a safe migration look like?"
 ```
 
-`--fork` leaves the original transcript untouched, which makes it the right way to
-explore an alternative without polluting the session you intend to keep.
+Forking a session is not part of this binary, so exploring an alternative without
+polluting the session you intend to keep means starting a fresh one: name neither
+`--continue` nor `--session`, and give it a `--title`.
 
 ## Retention
 
