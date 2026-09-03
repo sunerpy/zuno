@@ -64,12 +64,28 @@ The toggle form takes only `enabled`, which is how a project layer disables a gl
 defined server without repeating its definition.
 
 A local server's `command` is a host executable, and the layer that declares it matters.
-Declared in a project `zuno.json[c]` or `.zuno` file, it is logged as a warning naming the
-key, `mcp.<name>.command`, when the configuration is discovered, because the checkout would
-be choosing a program that runs on this machine with your authority. The server still
-starts. A remote server runs nothing locally and is not warned about. A future release will
-reject project-layer host commands instead, so keep local server definitions in the global
-`zuno.json` or another trusted layer and let the project layer use the toggle form.
+Declared in a project `zuno.json[c]` or `.zuno` file, it is refused: discovery fails with a
+validation error naming `mcp.<name>.command`, because the checkout would be choosing a
+program that runs on this machine with your authority. A remote server runs nothing locally
+and is never refused, and the toggle form is how a project layer turns a globally defined
+server off.
+
+To let a checkout keep its own local servers, name it in a trusted layer:
+
+```json
+{
+  "trust": {
+    "project_host_commands": ["/home/you/src"]
+  }
+}
+```
+
+`true` trusts every checkout on this host, `false` is the default, and a list trusts the
+project config files inside those absolute roots. A project layer that sets `trust` itself is
+refused, so the grant always comes from the global `zuno.json`, `ZUNO_CONFIG`,
+`ZUNO_CONFIG_CONTENT`, the managed config directory, or macOS managed preferences. Admitted
+declarations are still logged one key at a time. Full precedence rules are in
+[Files and precedence](/config/files).
 
 ## Authentication
 
@@ -188,8 +204,8 @@ stay eager for that turn and the host emits a warning.
 server's operations stay serialized, which avoids a second connect racing its own
 disconnect. The field accepts `1..=64`.
 
-For request timeouts, prefer the per-server `timeout`. An experimental global
-`experimental.mcp_timeout` also exists.
+Request timeouts are per server: set `timeout` on the entry. There is no global MCP
+timeout key.
 
 A failed MCP call is classified by what failed, not by the fact that it failed. A
 5xx, 408, or 429 response and a dropped connection are recoverable, so the turn

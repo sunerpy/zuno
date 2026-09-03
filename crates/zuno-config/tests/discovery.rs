@@ -60,7 +60,14 @@ fn project_aware_options_keep_ancestor_config_visible_outside_git() {
     let parent = root.path().join("plain-project");
     let nested = parent.join("nested");
     fs::create_dir_all(&nested).expect("create non-git nested directory");
-    write(&parent.join(".zuno/zuno.json"), r#"{"shell":"/bin/sh"}"#);
+    // The marker is `model`, not `shell`: a project layer that names a host command
+    // is now refused unless a trusted layer admits the checkout, which
+    // `tests/host_command_trust.rs` pins. This test is about which files are
+    // *visible* outside a git worktree.
+    write(
+        &parent.join(".zuno/zuno.json"),
+        r#"{"model":"provider/model"}"#,
+    );
     let home = root.path().join("home");
     let xdg_config = root.path().join("xdg-config");
     fs::create_dir_all(&home).expect("create isolated home");
@@ -77,7 +84,7 @@ fn project_aware_options_keep_ancestor_config_visible_outside_git() {
 
     assert!(options.worktree().is_none());
     let config = discover_with(&options).expect("ancestor project config is discovered");
-    assert_eq!(config.shell.as_deref(), Some("/bin/sh"));
+    assert_eq!(config.model.as_deref(), Some("provider/model"));
 }
 
 #[test]

@@ -19,33 +19,21 @@ use zuno_config::schema::permission::PermissionAction;
 
 /// Tools routed through the `edit` permission key.
 ///
-/// Oracle: `const edits = ["edit", "write", "apply_patch"]`.
-pub const EDIT_TOOLS: [&str; 3] = ["edit", "write", "apply_patch"];
+/// Re-exported from `zuno-config`, which owns the table so configuration
+/// validation can refuse a rule written under an alias.
+pub use zuno_config::schema::permission::EDIT_TOOLS;
 
 /// Tools routed through the `read` permission key.
 ///
-/// Oracle: `const reads = ["list_mcp_resources", "list_mcp_resource_templates",
-/// "read_mcp_resource"]`. These are the three MCP resource tools declared in
-/// `packages/opencode/src/session/tools.ts:28-32` as `MCP_RESOURCE_TOOLS`.
-pub const READ_TOOLS: [&str; 3] = [
-    "list_mcp_resources",
-    "list_mcp_resource_templates",
-    "read_mcp_resource",
-];
+/// Re-exported from `zuno-config`; see [`EDIT_TOOLS`].
+pub use zuno_config::schema::permission::READ_TOOLS;
 
 /// Map a tool name onto the permission key that governs it.
 ///
-/// Every tool not in an alias group is governed by its own name.
-#[must_use]
-pub fn permission_key(tool: &str) -> &str {
-    if EDIT_TOOLS.contains(&tool) {
-        return "edit";
-    }
-    if READ_TOOLS.contains(&tool) {
-        return "read";
-    }
-    tool
-}
+/// Every tool not in an alias group is governed by its own name. Re-exported
+/// from `zuno-config` so the evaluator and the configuration validator agree by
+/// construction.
+pub use zuno_config::schema::permission::permission_key;
 
 /// Layer rulesets in order; later rules win under the `findLast` evaluator.
 ///

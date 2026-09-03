@@ -481,7 +481,10 @@ fn debug_config_emits_only_resolved_json() {
         .current_dir(root.path())
         .env(
             "ZUNO_CONFIG_CONTENT",
-            r#"{"username":"debug-user","share":"disabled","web_search":{"provider":"exa","max_queries":3,"max_results":7,"timeout_ms":12000}}"#,
+            // `model` and `small_model` stand in for the scalar keys this test used
+            // to carry: `username` and `share` were removed because nothing read
+            // them, so a config naming either one is now a validation error.
+            r#"{"model":"debug/primary","small_model":"debug/fast","web_search":{"provider":"exa","max_queries":3,"max_results":7,"timeout_ms":12000}}"#,
         );
     isolated(&mut command, root.path());
     let output = command.output().expect("debug config");
@@ -492,8 +495,8 @@ fn debug_config_emits_only_resolved_json() {
     );
     let config: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout contains only JSON");
-    assert_eq!(config["username"], "debug-user");
-    assert_eq!(config["share"], "disabled");
+    assert_eq!(config["model"], "debug/primary");
+    assert_eq!(config["small_model"], "debug/fast");
     assert_eq!(
         config["web_search"],
         serde_json::json!({
@@ -742,7 +745,7 @@ fn an_opencode_named_file_is_not_part_of_the_zuno_config_graph() {
     let root = tempfile::tempdir().expect("tempdir");
     let unrelated = root.path().join("config/zuno/opencode.json");
     std::fs::create_dir_all(unrelated.parent().expect("parent")).expect("config dir");
-    std::fs::write(&unrelated, r#"{"username":"not-zuno-input"}"#).expect("seed file");
+    std::fs::write(&unrelated, r#"{"model":"probe/not-zuno-input"}"#).expect("seed file");
 
     let output = run(root.path(), &["debug", "config"]);
     assert!(
@@ -765,7 +768,7 @@ fn a_canonically_named_config_takes_effect() {
     let root = tempfile::tempdir().expect("tempdir");
     let config = root.path().join("config/zuno/zuno.json");
     std::fs::create_dir_all(config.parent().expect("parent")).expect("config dir");
-    std::fs::write(&config, r#"{"username":"canonical-name-reader"}"#).expect("seed config");
+    std::fs::write(&config, r#"{"model":"probe/canonical-name-reader"}"#).expect("seed config");
 
     let output = run(root.path(), &["debug", "config"]);
     assert!(

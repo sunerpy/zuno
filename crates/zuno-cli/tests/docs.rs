@@ -1601,6 +1601,9 @@ fn config_index_tables_enumerate_every_schema_root_key() {
     schema_keys.sort();
     schema_keys.dedup();
     let number_words = [
+        (40, "Forty", "四十"),
+        (41, "Forty-one", "四十一"),
+        (42, "Forty-two", "四十二"),
         (43, "Forty-three", "四十三"),
         (44, "Forty-four", "四十四"),
         (45, "Forty-five", "四十五"),

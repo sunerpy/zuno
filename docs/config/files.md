@@ -128,16 +128,32 @@ roots. It also cannot enable `run-unconfined`. A checked-in repository configura
 therefore cannot escalate its own confinement, which is the property that makes cloning an
 unfamiliar repository safe.
 
-A project layer may still name executables, and Zuno now says so. When a project
-`zuno.json[c]` or `.zuno` file sets `shell`, a local `mcp.*.command`, an `lsp.*.command`
-or `formatter.*.command` that is not disabled, or a `productAgent.*.command`, discovery
-writes one warning per key to the operational log, naming the file and the key. The layer
-is still accepted and the value is kept verbatim. The warning exists because each of those
-programs runs on this machine with your authority while the checkout is what chose it, so
-it is the cue to review the repository before trusting it. A remote MCP server runs nothing
-locally and is not warned about. A future release will reject these declarations from a
-project layer instead of warning, so move host commands to the global `zuno.json` or
-another trusted layer now.
+A project layer that names an executable is refused. When a project `zuno.json[c]` or
+`.zuno` file sets `shell`, a local `mcp.*.command`, an `lsp.*.command` or
+`formatter.*.command` that is not disabled, or a `productAgent.*.command`, discovery fails
+with a validation error that names that file and every command key inside it. Each of those
+programs would run on this machine with your authority while the checkout is what chose it,
+so the checkout does not get to make that decision. A remote MCP server runs nothing locally
+and is never refused.
+
+The upgrade path is `trust.project_host_commands`, and it is read only from a trusted layer:
+
+```json
+{
+  "trust": {
+    "project_host_commands": ["/home/you/src"]
+  }
+}
+```
+
+Any project config file inside a listed root may then declare host commands. `true` trusts
+every checkout on this host, `false` is the default written down, and roots must be absolute
+paths — a trust decision that depends on the current directory is not a decision. A project
+layer that sets `trust` at all is refused, so a checkout can never grant itself the trust it
+needs: the grant has to come from the trusted global `zuno.json`, `ZUNO_CONFIG`,
+`ZUNO_CONFIG_CONTENT`, the managed config directory, or macOS managed preferences. An
+admitted declaration is still logged one key at a time, so the operational log still shows
+which checkout chose which program.
 
 Use a trusted one-invocation override when a wider mode is genuinely wanted:
 

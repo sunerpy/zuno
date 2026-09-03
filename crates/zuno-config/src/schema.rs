@@ -49,6 +49,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// A free-form JSON object.
 pub type JsonMap = serde_json::Map<String, serde_json::Value>;
@@ -67,8 +69,6 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "references",
     "watcher",
     "snapshot",
-    "share",
-    "autoupdate",
     "disabled_providers",
     "enabled_providers",
     "model",
@@ -78,7 +78,6 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "default_agent",
     "subagent_depth",
     "subagent_model_selection",
-    "username",
     "agents",
     "workflows",
     "provider",
@@ -90,7 +89,6 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "permission",
     "tools",
     "attachment",
-    "enterprise",
     "web_search",
     "goal",
     "tool_output",
@@ -99,7 +97,8 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "concurrency",
     "learning",
     "memory",
-    "experimental",
+    "runtime",
+    "trust",
 ];
 
 /// One parsed Zuno config layer, not a merged result.
@@ -143,12 +142,6 @@ pub struct Config {
     /// Record filesystem snapshots so edits can be undone. Defaults to true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<bool>,
-    /// Session sharing behaviour.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub share: Option<ShareMode>,
-    /// Update behaviour: `true`, `false`, or `"notify"`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub autoupdate: Option<Autoupdate>,
     /// Providers to drop even when their credentials are present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_providers: Option<Vec<String>>,
@@ -176,9 +169,6 @@ pub struct Config {
     /// Host-owned allowlist for model-facing child model and effort selection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_model_selection: Option<SubagentModelSelectionConfig>,
-    /// Name to show for the user instead of the system username.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
     /// Agent definitions and overrides, keyed by agent name.
     ///
     /// The oracle names `plan`, `build`, `general`, `explore`, `title`, `summary`,
@@ -217,16 +207,13 @@ pub struct Config {
     /// Attachment processing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment: Option<AttachmentConfig>,
-    /// Enterprise deployment settings.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enterprise: Option<EnterpriseConfig>,
     /// Web-search provider and runtime-owned batch limits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_search: Option<WebSearchConfig>,
     /// Persistent goal continuation and retry settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal: Option<GoalConfig>,
-    /// Thresholds for truncating tool output.
+    /// Size limits above which tool output is withheld from the model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_output: Option<ToolOutputConfig>,
     /// Context-compaction behaviour.
@@ -244,9 +231,12 @@ pub struct Config {
     /// Persistent resident-memory configuration. Absent defaults to enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryConfig>,
-    /// Options under active development.
+    /// Deployment ceilings for the component runtime that owns shutdown.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub experimental: Option<ExperimentalConfig>,
+    pub runtime: Option<RuntimeConfig>,
+    /// Trust this host extends to project checkouts. Never readable from a project layer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust: Option<TrustConfig>,
 }
 
 /// Host-global child model selection policy, frozen into each durable session.
@@ -390,38 +380,12 @@ pub enum NavigationGate {
     Strict,
 }
 
-/// Session sharing behaviour (`config/config.ts:59-62`).
-#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ShareMode {
-    /// Share only when asked.
-    Manual,
-    /// Share every new session.
-    Auto,
-    /// Never share.
-    Disabled,
-}
-
-/// The `"notify"` arm of [`Autoupdate`].
-#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AutoupdateMode {
-    /// Announce updates without installing them.
-    Notify,
-}
-
-/// Update behaviour (`config/config.ts:67-71`).
-#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Autoupdate {
-    /// Install updates automatically, or never.
-    Enabled(bool),
-    /// Announce updates only.
-    Mode(AutoupdateMode),
-}
-
-/// Server configuration (`config/server.ts:6-18`).
+/// What the HTTP server binds to.
+///
+/// Closed: a key here that Zuno does not read is a promise it cannot keep, so an
+/// unknown key is a validation error rather than a silently ignored one.
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Port to listen on.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -429,15 +393,140 @@ pub struct ServerConfig {
     /// Hostname to listen on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
-    /// Advertise the server over mDNS.
+}
+
+/// Ceilings the deployment puts on the component runtime.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeConfig {
+    /// Longest this host waits for one component to stop, in milliseconds.
+    ///
+    /// A component asks for its own stop budget; this ceiling shortens a request
+    /// that is longer than the deployment tolerates. `0` or absent means the host
+    /// imposes no ceiling and every component keeps the budget it asked for.
+    /// Shortening the wait never cancels the component: disposal stays reverse
+    /// registration order, and an overrunning disposer is left running to
+    /// completion so process-tree reaping still happens.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mdns: Option<bool>,
-    /// mDNS domain; the runtime defaults to `zuno.local`.
-    #[serde(rename = "mdnsDomain", skip_serializing_if = "Option::is_none")]
-    pub mdns_domain: Option<String>,
-    /// Additional origins to allow for CORS.
+    pub max_component_stop_ms: Option<u64>,
+}
+
+impl RuntimeConfig {
+    /// The configured stop ceiling, or `None` when this host imposes none.
+    ///
+    /// `0` resolves to `None` so a deployment can neutralise an inherited ceiling
+    /// without deleting the key.
+    #[must_use]
+    pub fn max_component_stop(&self) -> Option<Duration> {
+        self.max_component_stop_ms
+            .filter(|milliseconds| *milliseconds > 0)
+            .map(Duration::from_millis)
+    }
+}
+
+/// Trust this host extends to configuration a checkout controls.
+///
+/// This section is only honoured from a trusted layer. A project layer that sets
+/// it at all is refused, so a checkout cannot widen its own authority.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustConfig {
+    /// Which checkouts may declare commands this machine runs.
+    ///
+    /// Absent refuses every project-layer `shell`, local `mcp` server, `lsp`,
+    /// `formatter`, and `productAgent` command.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cors: Option<Vec<String>>,
+    pub project_host_commands: Option<ProjectHostCommands>,
+}
+
+/// Whose project config may declare a host command.
+// Deserialization is written out rather than derived as `#[serde(untagged)]`:
+// untagged variants discard the error of every failed variant, and "a trust root
+// must be absolute" is the whole point of validating here.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ProjectHostCommands {
+    /// `true` trusts every checkout on this host; `false` trusts none.
+    Every(bool),
+    /// Absolute directories whose project config layers are trusted.
+    ///
+    /// A layer is trusted when its file lives inside one of these roots. Relative
+    /// entries are refused: a trust decision that depends on the current directory
+    /// is not a decision.
+    Roots(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for ProjectHostCommands {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(ProjectHostCommandsVisitor)
+    }
+}
+
+struct ProjectHostCommandsVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ProjectHostCommandsVisitor {
+    type Value = ProjectHostCommands;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("true, false, or a list of absolute project roots")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(ProjectHostCommands::Every(value))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut roots = Vec::new();
+        while let Some(root) = sequence.next_element::<String>()? {
+            if root.is_empty() {
+                return Err(serde::de::Error::custom(
+                    "a trusted project root must not be empty",
+                ));
+            }
+            if !Path::new(&root).is_absolute() {
+                return Err(serde::de::Error::custom(format!(
+                    "trusted project root {root:?} must be an absolute path on this host"
+                )));
+            }
+            roots.push(root);
+        }
+        Ok(ProjectHostCommands::Roots(roots))
+    }
+}
+
+impl ProjectHostCommands {
+    /// Whether the project config file at `source` may declare a host command.
+    #[must_use]
+    pub fn admits(&self, source: &Path) -> bool {
+        match self {
+            Self::Every(every) => *every,
+            Self::Roots(roots) => {
+                let resolved = resolve_for_comparison(source);
+                roots
+                    .iter()
+                    .any(|root| resolved.starts_with(resolve_for_comparison(Path::new(root))))
+            }
+        }
+    }
+}
+
+/// Resolve a path so a trust root and a config file compare on equal terms.
+///
+/// Canonicalisation is what makes the comparison hold across symbolic links and
+/// the on-disk spelling Windows reports; a path that cannot be canonicalised
+/// (typically because it does not exist) compares as written, which can only
+/// narrow trust.
+fn resolve_for_comparison(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// One custom command (`config/command.ts:5-12`).
@@ -600,14 +689,6 @@ impl ImageAttachmentConfig {
     }
 }
 
-/// Enterprise deployment settings (`config/config.ts:134-136`).
-#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct EnterpriseConfig {
-    /// Enterprise URL.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-}
-
 /// Web-search settings owned by the active profile.
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct WebSearchConfig {
@@ -663,16 +744,19 @@ pub struct GoalRetryConfig {
     pub poll_interval_ms: Option<NonZeroU64>,
 }
 
-/// Thresholds above which tool output is withheld rather than inlined
-/// (`config/config.ts:137-150`).
+/// The size at which tool output stops being model-visible.
+///
+/// Output over either limit is persisted in full and then withheld: the model
+/// receives a pointer and the measured cost instead of a prefix, and must accept
+/// the context cost explicitly to read it.
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ToolOutputConfig {
-    /// Lines of output that are still inlined. Defaults to 2000. Output above this is
-    /// saved whole and read back through `bg`, never truncated.
+    /// Lines of output the model may receive directly. Defaults to 2000. Output above this
+    /// is saved whole and read back through `bg`, never truncated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_lines: Option<NonZeroU32>,
-    /// Bytes of output that are still inlined. Defaults to 51200. Output above this is
-    /// saved whole and read back through `bg`, never truncated.
+    /// Bytes of output the model may receive directly. Defaults to 51200. Output above this
+    /// is saved whole and read back through `bg`, never truncated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<NonZeroU32>,
 }
@@ -1212,64 +1296,4 @@ impl Default for ResolvedMemoryConfig {
             auto_confidence: DEFAULT_MEMORY_AUTO_CONFIDENCE,
         }
     }
-}
-
-/// Options under active development (`config/config.ts:173-188`).
-#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct ExperimentalConfig {
-    /// Stop summarizing pasted text.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disable_paste_summary: Option<bool>,
-    /// Enable the batch tool.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub batch_tool: Option<bool>,
-    /// Emit OpenTelemetry spans for model calls.
-    #[serde(rename = "openTelemetry", skip_serializing_if = "Option::is_none")]
-    pub open_telemetry: Option<bool>,
-    /// Tools only primary agents may use.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub primary_tools: Option<Vec<String>>,
-    /// Keep the agent loop running after a denied tool call.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub continue_loop_on_deny: Option<bool>,
-    /// Timeout in milliseconds for MCP requests.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mcp_timeout: Option<NonZeroU32>,
-    /// Policy statements applied to supported resources.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub policies: Option<Vec<PolicyStatement>>,
-}
-
-/// An action a policy statement can govern.
-///
-/// `packages/core/src/config/experimental.ts:9` builds this from
-/// `Catalog.PolicyActions`, which is `Literals(["provider.use"])` — one action,
-/// and anything else is rejected.
-#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PolicyAction {
-    /// Use of a provider.
-    #[serde(rename = "provider.use")]
-    ProviderUse,
-}
-
-/// Whether a policy statement permits or refuses (`packages/core/src/policy.ts:8`).
-#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PolicyEffect {
-    /// Permit.
-    Allow,
-    /// Refuse.
-    Deny,
-}
-
-/// One policy statement (`packages/core/src/policy.ts:11-15` plus the narrowed
-/// `action` from `config/experimental.ts:11-14`). Every field is required.
-#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PolicyStatement {
-    /// The action governed.
-    pub action: PolicyAction,
-    /// Permit or refuse.
-    pub effect: PolicyEffect,
-    /// The resource pattern the statement matches.
-    pub resource: String,
 }

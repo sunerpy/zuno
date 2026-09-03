@@ -27,19 +27,19 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
 
 ## 顶层结构
 
-一共有四十四个键。按它们决定什么来分组：
+一共有四十一个键。按它们决定什么来分组：
 
 | 分组 | 键 |
 | --- | --- |
 | 模型路由 | `model`、`small_model`、`preset`、`presets`、`provider`、`enabled_providers`、`disabled_providers` |
 | Agent 与委派 | `agents`、`default_agent`、`subagent_depth`、`subagent_model_selection`、`workflows`、`productAgent` |
-| 权限 | `permission`、`sandbox`、`shell` |
+| 权限 | `permission`、`sandbox`、`shell`、`trust` |
 | 指令、Skill 与学习 | `instructions`、`skills`、`command`、`memory`、`learning` |
 | 上下文 | `compaction`、`continuity`、`tool_output`、`attachment`、`references` |
 | 集成 | `mcp`、`lsp`、`formatter`、`web_search`、`watcher` |
-| 运行时 | `concurrency`、`goal`、`snapshot`、`tools`、`navigation`、`logLevel` |
-| 部署 | `server`、`share`、`autoupdate`、`enterprise`、`experimental` |
-| 展示 | `username`、`$schema` |
+| 运行时 | `concurrency`、`goal`、`runtime`、`snapshot`、`tools`、`navigation`、`logLevel` |
+| 部署 | `server` |
+| 编辑器支持 | `$schema` |
 
 逐键参考是[配置项参考](/zh/config/reference)。本页及其同级页面解释各个分组；对单个字段而言，那一页才是权威。
 
@@ -118,11 +118,11 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
 启用它，只读 Agent 永远不会使用它，受管策略也可以把它强制改回 `deny`。精确的降级边界见
 [权限与沙箱](/zh/guide/permissions)。
 
-项目层声明本机命令时会收到告警。项目 `zuno.json[c]` 或 `.zuno` 中的 `shell`、本地
+项目层声明本机命令会被拒绝。项目 `zuno.json[c]` 或 `.zuno` 中的 `shell`、本地
 `mcp.*.command`、未被禁用的 `lsp.*.command` 与 `formatter.*.command`，以及
-`productAgent.*.command`，都会在配置发现时逐个键记录一条警告；配置仍被接受，远程 MCP
-server 不受影响。未来版本会改为拒绝，请把本机命令放在全局 `zuno.json` 或其他受信层。详见
-[配置文件与优先级](/zh/config/files)。
+`productAgent.*.command`，都会让配置发现以校验错误失败；远程 MCP server 不受影响。
+只有受信层里的 `trust.project_host_commands` 能接纳一个检出，而项目层自己设置 `trust`
+同样会被拒绝。详见[配置文件与优先级](/zh/config/files)。
 
 ## 编辑时的 schema 校验
 

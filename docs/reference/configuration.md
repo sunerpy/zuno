@@ -385,6 +385,59 @@ Foreground native `task` delegation is not detached: it inherits the parent
 turn interrupt, aborts the live child turn when fired, and waits for child drain
 and runtime shutdown before the tool call settles.
 
+## Component stop ceiling
+
+Each runtime component declares how long shutdown may wait for one of its own
+disposers. `runtime.max_component_stop_ms` is the ceiling this host puts on that
+declaration:
+
+```json
+{
+  "runtime": {
+    "max_component_stop_ms": 3000
+  }
+}
+```
+
+A component that asks for longer waits only this long; a component that asks for
+less keeps its own shorter budget. Absent, or `0`, means this host imposes no
+ceiling and every component keeps the budget it asked for, which is the default.
+
+The ceiling shortens a wait, it never cancels work. Disposers still run in reverse
+registration order, one at a time, and a disposer that outlives the ceiling is
+recorded as a `TimedOut` lifecycle diagnostic and left running to completion, so
+process-tree reaping still happens after the deadline. Set the ceiling when a
+deployment must bound total shutdown time; leave it absent when a slow disposer's
+own budget is the more trustworthy number.
+
+## Trusting a checkout with host commands
+
+A project config layer that declares a command this machine would run is refused:
+`shell`, a local `mcp.*.command`, an `lsp.*.command` or `formatter.*.command` that
+is not disabled, and a `productAgent.*.command` all fail validation when they come
+from a project `zuno.json[c]` or `.zuno` file. `trust.project_host_commands` is the
+only way to admit one, and it is read only from a trusted layer:
+
+```json
+{
+  "trust": {
+    "project_host_commands": ["/home/you/src", "/opt/checkouts"]
+  }
+}
+```
+
+| Value | Meaning |
+| --- | --- |
+| absent or `false` | No checkout may declare a host command |
+| `true` | Every checkout on this host may |
+| a list of absolute roots | A project config file inside one of those roots may |
+
+Roots are compared after canonicalization, so a symlinked checkout is the same
+checkout, and a relative or empty root is a validation error rather than a root
+that quietly matches nothing. A project layer that sets `trust` at all is refused,
+which is what makes the granting layer provably trusted. An admitted declaration is
+still logged one key at a time.
+
 ## Optional Agent step guard
 
 An Agent has no fixed provider-step limit unless its definition sets `steps`:
@@ -660,6 +713,13 @@ Rules are ordered and **the last matching rule wins**, so a catch-all belongs
 first and the narrow patterns that carve exceptions out of it belong last. The
 `edit` key covers the `write`, `edit`, and `apply_patch` tools; there is no
 separate `write` rule key.
+
+A rule key that only aliases another key is a validation error that names the key
+to use instead: `write` and `apply_patch` both fold into `edit`, and
+`list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource` all
+fold into `read`. Those keys used to be accepted and evaluated nothing. Any other
+key is still legitimate, because MCP, plugin, and Skill tools are named at runtime
+and a key may be a wildcard pattern.
 
 To run tool calls without Zuno HITL prompts, use `allow_all`:
 

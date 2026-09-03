@@ -11,10 +11,7 @@
   "logLevel": "DEBUG",
   "server": {
     "port": 4096,
-    "hostname": "127.0.0.1",
-    "mdns": true,
-    "mdnsDomain": "zuno.local",
-    "cors": ["https://example.com"]
+    "hostname": "127.0.0.1"
   },
   "command": {
     "review": {
@@ -65,8 +62,6 @@
     "ignore": ["node_modules/**", "target/**"]
   },
   "snapshot": false,
-  "share": "manual",
-  "autoupdate": "notify",
   "disabled_providers": ["openai"],
   "enabled_providers": ["anthropic", "google"],
   "model": "anthropic/claude-sonnet-4-5",
@@ -92,7 +87,6 @@
     "enabled": true,
     "allowed_models": ["anthropic/claude-sonnet-4-5"]
   },
-  "username": "ada",
   "agents": {
     "build": {
       "model": "anthropic/claude-sonnet-4-5",
@@ -318,7 +312,6 @@
       "max_encoded_bytes": 5242880
     }
   },
-  "enterprise": { "url": "https://opencode.example.com" },
   "web_search": {
     "enabled": true,
     "provider": "exa",
@@ -383,16 +376,10 @@
     "promotion": "review",
     "auto_confidence": 0.9
   },
-  "experimental": {
-    "disable_paste_summary": true,
-    "batch_tool": true,
-    "openTelemetry": false,
-    "primary_tools": ["task"],
-    "continue_loop_on_deny": true,
-    "mcp_timeout": 15000,
-    "policies": [
-      { "action": "provider.use", "effect": "deny", "resource": "openai/*" },
-      { "action": "provider.use", "effect": "allow", "resource": "anthropic/*" }
-    ]
+  "runtime": {
+    "max_component_stop_ms": 3000
+  },
+  "trust": {
+    "project_host_commands": true
   }
 }

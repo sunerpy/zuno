@@ -135,6 +135,49 @@ Schema 是从 Rust 类型生成的，因此它与运行时实际接受的内容�
 
 `concurrency` 控制同时运行的工作量上限。它约束的是编排层的并行度，而不是单次工具调用内部的并发。
 
+## 组件停止上限
+
+`runtime.max_component_stop_ms` 是本机对组件自报停止预算设置的上限：
+
+```json
+{
+  "runtime": {
+    "max_component_stop_ms": 3000
+  }
+}
+```
+
+要求更长的组件只等这么久，要求更短的组件保留自己的预算。省略或 `0` 表示本机不设上限、每个组件
+保留自己要求的预算，这也是默认行为。
+
+上限只缩短等待，从不取消工作。disposer 仍按注册的相反顺序逐个运行；超出上限的 disposer 记为
+`TimedOut` 生命周期诊断并被留到自然结束，因此进程树回收仍会在超时之后发生。
+
+## 用信任接纳检出声明的本机命令
+
+项目层声明本机会运行的命令会被拒绝：项目 `zuno.json[c]` 或 `.zuno` 中的 `shell`、本地
+`mcp.*.command`、未被禁用的 `lsp.*.command` 与 `formatter.*.command`，以及
+`productAgent.*.command` 都会导致校验失败。只有受信层里的 `trust.project_host_commands`
+能接纳它：
+
+```json
+{
+  "trust": {
+    "project_host_commands": ["/home/you/src", "/opt/checkouts"]
+  }
+}
+```
+
+| 取值 | 含义 |
+| --- | --- |
+| 省略或 `false` | 任何检出都不能声明本机命令 |
+| `true` | 本机上的每个检出都可以 |
+| 绝对路径列表 | 位于这些根目录之内的项目配置文件可以 |
+
+根目录在规范化之后比较，因此经软链接到达的检出仍是同一个检出；相对路径或空字符串是校验错误，
+而不是一条静默不匹配的根目录。项目层自己设置 `trust` 同样会被拒绝，这正是授权层可被证明为受信层
+的原因。被接纳的声明仍会逐个键记入日志。
+
 ## 可选的 Agent 步数护栏
 
 `steps` 为一个 Agent 设置在最终一次纯文本回复之前，允许的最大工具可用迭代次数。省略即不设固定步数上限。
@@ -220,6 +263,11 @@ Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程�
 | `allow_all` | 跳过提示，但保留显式拒绝与沙箱校验。 |
 
 `permission.rules` 是有序的，**最后一条匹配的规则胜出**。规则要么是对整个工具的一个动作，要么是按模式匹配的多个动作。因此 catch-all `*` 要写在最前面，从它当中划出例外的窄模式要写在最后面。`edit` 这个键同时管 `write`、`edit` 和 `apply_patch` 三个工具；不存在单独的 `write` 规则键。
+
+只用来别名另一个键的规则键是校验错误，并且错误会指出应当改用哪个键：`write` 与 `apply_patch`
+都折叠到 `edit`，`list_mcp_resources`、`list_mcp_resource_templates` 与 `read_mcp_resource`
+都折叠到 `read`。这些键此前会被接受，却什么都不评估。其他键仍然合法，因为 MCP、插件与 Skill
+工具的名字在运行时才确定，键本身也可以是通配模式。
 
 按目录授予的 `external_directory` 规则写成「目录加 `/*`」，使用正斜杠，去掉 Windows 的逐字
 `\\?\` 前缀，例如 `{"external_directory": {"C:/build-cache/*": "allow"}}`。所有工具都按
