@@ -24,7 +24,7 @@ pub use replay::{
 };
 pub use routing::{AcpSessionRoute, RoutedSession};
 pub use transport::{
-    Agent, ClientConnection, RpcError, SESSION_BUSY_CODE, ServeError, serve_stdio,
+    Agent, ClientConnection, RequestId, RpcError, SESSION_BUSY_CODE, ServeError, serve_stdio,
 };
 
 pub const IMPLEMENTED_METHODS: [&str; 11] = [

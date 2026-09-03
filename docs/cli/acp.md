@@ -30,8 +30,13 @@ request is answered with JSON-RPC error `-32001` whose `data` reports `admission
 (`steered`, `queued`, or `rejected`), `sessionId`, and the durable `inputId`; the
 streamed output and the `stopReason` stay on the request that owns the turn. A
 slash command cannot be steered and is refused with
-`reason: "commandRequiresIdleSession"` and nothing durable written. See
-[Zed ACP integration](/reference/zed-acp) for the full shape.
+`reason: "commandRequiresIdleSession"` and nothing durable written; only text
+that resolves to a real command, Skill, or native control counts as a slash
+command, so a prompt that merely starts with `/` is admitted as ordinary content.
+Withdrawing a prompt request with `$/cancel_request` before it returns cancels
+the durable row that request admitted, so the withdrawn text never reaches the
+model, and answers that request with `-32800` and `data.admission: "withdrawn"`.
+See [Zed ACP integration](/reference/zed-acp) for the full shape.
 
 Plan projection is driven by durable work-state revisions, not by recognizing a
 `plan_update` tool call. Each session reads and publishes the authoritative

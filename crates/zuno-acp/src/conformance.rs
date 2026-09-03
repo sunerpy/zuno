@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use zuno_engine::interrupt::InterruptSignal;
 
-use crate::{Agent, ClientConnection, RpcError};
+use crate::{Agent, ClientConnection, RequestId, RpcError};
 
 const AUTH_METHOD: &str = "zuno-login";
 
@@ -140,6 +140,7 @@ impl Agent for ConformanceAgent {
     async fn request(
         &self,
         method: &str,
+        _request: &RequestId,
         params: Value,
         client: ClientConnection,
     ) -> Result<Value, RpcError> {

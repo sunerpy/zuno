@@ -241,9 +241,11 @@ ACP v1 没有「已接纳，但本请求没有跑任何回合」的成功形态�
 
 当正在运行的回合接纳了这条提示词时，`data.admission` 为 `steered`；当它在等待下一个回合时为 `queued`。`delivery` 与 `admittedSequence` 就是那条持久 inbox 行自己的字段，`inputId` 指名该行。被接纳的提示词对应的 `user_message_chunk`、助手输出与 `stopReason` 全部到达拥有该回合的那个请求，所以一个忽略 `data` 的 v1 客户端仍然能看到这些工作 —— 它看到的是错误消息文本，而不是第二个 `stopReason`。
 
-斜杠命令不同。它要对宿主命令目录解析，并作为自己的回合运行，因此无法被转向进已经在飞的工作里。Zuno 用同一个错误码拒绝它，`admission` 为 `"rejected"`，`reason` 为 `"commandRequiresIdleSession"`，并且不写入任何持久内容；等会话空闲后重新发送即可。
+斜杠命令不同。它要对宿主命令目录解析，并作为自己的回合运行，因此无法被转向进已经在飞的工作里。Zuno 用同一个错误码拒绝它，`admission` 为 `"rejected"`，`reason` 为 `"commandRequiresIdleSession"`，并且不写入任何持久内容；等会话空闲后重新发送即可。只有真正指名了某个命令、某个无歧义 Skill 或某个原生会话控制项的提示词才算命令调用。仅仅以 `/` 开头的提示词 —— 一个 POSIX 绝对路径、一个正则表达式 —— 是普通内容，因此会像其他提示词一样被持久接纳并转向，而不是被当成无法解析的命令拒绝。
 
-取消遵循同一条归属规则。对拥有回合的那个请求发 `$/cancel_request` 会中断该回合；取消一个已经以 `admission: "steered"` 或 `"queued"` 回答过的请求不会中断任何东西：它已经被回答过了，而它的提示词喂入的那个回合属于另一个请求。要不论归属地停掉会话的活跃回合，使用 `session/cancel`。
+取消按 JSON-RPC 请求 id 键控，绝不按请求的内容键控：两条提示词可以携带逐字节相同的 params。对拥有回合的那个请求发 `$/cancel_request` 会中断该回合，而任何其他请求的取消都停不掉它。
+
+撤回一个尚未被回答的 `session/prompt` 只会退役该请求自己贡献的东西：它的持久 inbox 行被取消，因此被撤回的文本永远不会被提升进任何回合；该请求以 JSON-RPC 取消码 `-32800` 回答，`data.admission` 为 `"withdrawn"`，并带上它退役的那一行的 `inputId`。已经以 `admission: "steered"` 或 `"queued"` 回答过的请求已经结束：对它发 `$/cancel_request` 什么都不做，因为它的提示词已经持久化，而它喂入的那个回合属于另一个请求。要不论归属地停掉会话的活跃回合，使用 `session/cancel`。
 
 ### 被委派的子会话
 

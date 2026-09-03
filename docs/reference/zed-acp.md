@@ -418,14 +418,26 @@ A slash command is different. It is resolved against the host command catalog
 and runs as its own turn, so it cannot be steered into work already in flight.
 Zuno refuses it with the same code, `admission: "rejected"`, and
 `reason: "commandRequiresIdleSession"`, and writes nothing durable; send it
-again once the session is idle.
+again once the session is idle. Only a prompt that actually names a command, an
+unambiguous Skill, or a native session control is a command invocation. A prompt
+that merely begins with `/` — an absolute POSIX path, a regular expression — is
+ordinary content, so it is admitted durably and steered like any other prompt
+rather than refused as an unresolvable command.
 
-Cancellation follows the same ownership rule. `$/cancel_request` for the request
-that owns the turn interrupts that turn. Cancelling a request that was answered
-with `admission: "steered"` or `"queued"` does not interrupt anything: it was
-already answered, and the turn its prompt fed belongs to a different request.
-Use `session/cancel` to stop the session's live turn regardless of which request
-owns it.
+Cancellation is keyed on the JSON-RPC request id, never on what a request asked
+for: two prompts can carry byte-identical params. `$/cancel_request` for the
+request that owns the turn interrupts that turn, and no other request's
+cancellation can stop it.
+
+Withdrawing a `session/prompt` that has not been answered yet retires exactly
+what that request contributed. Its durable inbox row is cancelled, so the
+withdrawn text is never promoted into any turn, and the request is answered with
+the JSON-RPC cancellation code `-32800` carrying `data.admission: "withdrawn"`
+and the `inputId` of the row it retired. A request that was already answered with
+`admission: "steered"` or `"queued"` is finished: `$/cancel_request` for it does
+nothing at all, because its prompt is already durable and the turn it feeds
+belongs to a different request. Use `session/cancel` to stop the session's live
+turn regardless of which request owns it.
 
 ### Delegated child sessions
 

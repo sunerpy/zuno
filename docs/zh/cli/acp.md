@@ -24,7 +24,11 @@ runtime，避免重复网络或子进程握手。结构性 MCP 配置发生变�
 `-32001` 回答，其 `data` 报告 `admission`（`steered`、`queued` 或 `rejected`）、
 `sessionId` 与持久的 `inputId`；流式输出与 `stopReason` 仍留在拥有该回合的那个请求上。
 斜杠命令无法被转向，会以 `reason: "commandRequiresIdleSession"` 被拒绝，且不写入任何
-持久内容。完整形态见 [Zed ACP 集成](/zh/guide/editors)。
+持久内容；只有能解析到真实命令、Skill 或原生控制项的文本才算斜杠命令，因此仅以 `/`
+开头的提示词会作为普通内容被接纳。在一个 prompt 请求返回之前用 `$/cancel_request`
+撤回它，会取消该请求接纳的那条持久行，使被撤回的文本永不到达模型，并以 `-32800`
+与 `data.admission: "withdrawn"` 回答该请求。完整形态见
+[Zed ACP 集成](/zh/guide/editors)。
 
 Plan 投影由 durable work-state revision 驱动，不再依赖识别 `plan_update` 工具调用。
 每个会话订阅当前 host，发生变化后读取权威 Plan 并发送完整的

@@ -12,6 +12,24 @@ use tokio::task::JoinSet;
 /// JSON-RPC code for a prompt admitted durably without owning its own turn.
 pub const SESSION_BUSY_CODE: i64 = -32001;
 
+/// Transport-owned identity of one accepted client request.
+///
+/// JSON-RPC ids may be strings or numbers, so the transport canonicalizes every
+/// accepted id into a single comparable key and hands that key to the Agent. An
+/// Agent keys per-request state on this instead of on the request's params: two
+/// requests can carry byte-identical params, so params cannot say which request
+/// owns a turn or which one a `$/cancel_request` withdrew.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RequestId(String);
+
+impl RequestId {
+    /// Canonicalize a JSON-RPC id, rejecting shapes JSON-RPC 2.0 does not allow.
+    #[must_use]
+    pub fn from_json(value: &Value) -> Option<Self> {
+        id_key(value).map(Self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("ACP request failed ({code}): {message}")]
 pub struct RpcError {
@@ -100,6 +118,7 @@ pub trait Agent: Send + Sync + 'static {
     async fn request(
         &self,
         method: &str,
+        request: &RequestId,
         params: Value,
         client: ClientConnection,
     ) -> Result<Value, RpcError>;
@@ -114,10 +133,11 @@ pub trait Agent: Send + Sync + 'static {
     /// Notify the Agent before an in-flight client request future is dropped.
     ///
     /// The transport owns JSON-RPC request ids, while the Agent owns session and
-    /// process-tree cancellation. Passing the original method and params lets the
-    /// Agent abort that durable operation without teaching the transport about
+    /// process-tree cancellation. `request` is the withdrawn request's identity, so
+    /// the Agent can retire exactly what that request started; the method and
+    /// params say what it was, without teaching the transport about
     /// product-specific session fields.
-    async fn request_cancelled(&self, _method: &str, _params: &Value) {}
+    async fn request_cancelled(&self, _method: &str, _request: &RequestId, _params: &Value) {}
 }
 
 enum Outbound {
@@ -161,7 +181,7 @@ struct InFlightRequest {
     response_ready: Arc<AtomicBool>,
 }
 
-type InFlight = HashMap<String, InFlightRequest>;
+type InFlight = HashMap<RequestId, InFlightRequest>;
 
 #[derive(Default)]
 struct PendingState {
@@ -536,9 +556,9 @@ where
 
             if method == "$/cancel_request" {
                 if let Some(request_id) = params.get("requestId") {
-                    if let Some(request) = take_in_flight(&in_flight, request_id) {
+                    if let Some((withdrawn, request)) = take_in_flight(&in_flight, request_id) {
                         agent
-                            .request_cancelled(&request.method, &request.params)
+                            .request_cancelled(&request.method, &withdrawn, &request.params)
                             .await;
                         let _ignored = request.cancel.send(());
                     }
@@ -564,7 +584,7 @@ where
             }
 
             if let Some(id) = frame.get("id").cloned() {
-                let Some(request_key) = id_key(&id) else {
+                let Some(request_key) = RequestId::from_json(&id) else {
                     client
                         .response(
                             Value::Null,
@@ -635,7 +655,7 @@ where
                 requests.spawn(async move {
                     let request_client = client.request_scoped();
                     let result = tokio::select! {
-                        result = agent.request(&method, params, request_client.clone()) => result,
+                        result = agent.request(&method, &request_key, params, request_client.clone()) => result,
                         _ = cancel_rx => {
                             if let Err(error) = request_client.cancel_scoped_requests().await {
                                 eprintln!("ACP child request cancellation failed: {error}");
@@ -700,12 +720,12 @@ where
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         keys.into_iter()
-            .filter_map(|key| active.remove(&key))
+            .filter_map(|key| active.remove(&key).map(|request| (key, request)))
             .collect::<Vec<_>>()
     };
-    for request in cancellations {
+    for (withdrawn, request) in cancellations {
         agent
-            .request_cancelled(&request.method, &request.params)
+            .request_cancelled(&request.method, &withdrawn, &request.params)
             .await;
         let _ignored = request.cancel.send(());
     }
@@ -786,9 +806,13 @@ where
     }
 }
 
-fn take_in_flight(in_flight: &Mutex<InFlight>, request_id: &Value) -> Option<InFlightRequest> {
-    let request_key = id_key(request_id)?;
-    lock(in_flight).remove(&request_key)
+fn take_in_flight(
+    in_flight: &Mutex<InFlight>,
+    request_id: &Value,
+) -> Option<(RequestId, InFlightRequest)> {
+    let request_key = RequestId::from_json(request_id)?;
+    let request = lock(in_flight).remove(&request_key)?;
+    Some((request_key, request))
 }
 
 async fn write_frames<W>(
@@ -860,6 +884,7 @@ mod tests {
         async fn request(
             &self,
             method: &str,
+            _request: &RequestId,
             _params: Value,
             _client: ClientConnection,
         ) -> Result<Value, RpcError> {
@@ -886,6 +911,7 @@ mod tests {
         async fn request(
             &self,
             _method: &str,
+            _request: &RequestId,
             _params: Value,
             client: ClientConnection,
         ) -> Result<Value, RpcError> {
@@ -938,6 +964,7 @@ mod tests {
         async fn request(
             &self,
             _method: &str,
+            _request: &RequestId,
             _params: Value,
             client: ClientConnection,
         ) -> Result<Value, RpcError> {
@@ -1024,6 +1051,7 @@ mod tests {
         async fn request(
             &self,
             method: &str,
+            _request: &RequestId,
             params: Value,
             client: ClientConnection,
         ) -> Result<Value, RpcError> {
@@ -1205,7 +1233,10 @@ mod tests {
     struct BlockingAgent {
         started: Arc<Notify>,
         dropped: Arc<AtomicBool>,
-        cancelled: Arc<AtomicBool>,
+        /// Identity the transport served this request under.
+        served: Arc<Mutex<Option<RequestId>>>,
+        /// Identity the transport reported as withdrawn.
+        cancelled: Arc<Mutex<Option<RequestId>>>,
     }
 
     struct DropSignal(Arc<AtomicBool>);
@@ -1221,12 +1252,14 @@ mod tests {
         async fn request(
             &self,
             method: &str,
+            request: &RequestId,
             _params: Value,
             _client: ClientConnection,
         ) -> Result<Value, RpcError> {
             if method == "initialize" {
                 return Ok(json!({}));
             }
+            *lock(&self.served) = Some(request.clone());
             let _drop = DropSignal(Arc::clone(&self.dropped));
             self.started.notify_one();
             std::future::pending::<()>().await;
@@ -1242,9 +1275,9 @@ mod tests {
             Err(RpcError::method_not_found(method))
         }
 
-        async fn request_cancelled(&self, method: &str, params: &Value) {
+        async fn request_cancelled(&self, method: &str, request: &RequestId, params: &Value) {
             if method == "session/prompt" && params["sessionId"] == "ses_cancel" {
-                self.cancelled.store(true, AtomicOrdering::SeqCst);
+                *lock(&self.cancelled) = Some(request.clone());
             }
         }
     }
@@ -1253,10 +1286,12 @@ mod tests {
     async fn cancel_request_aborts_the_matching_in_flight_request() {
         let started = Arc::new(Notify::new());
         let dropped = Arc::new(AtomicBool::new(false));
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let served = Arc::new(Mutex::new(None));
+        let cancelled = Arc::new(Mutex::new(None));
         let agent = BlockingAgent {
             started: Arc::clone(&started),
             dropped: Arc::clone(&dropped),
+            served: Arc::clone(&served),
             cancelled: Arc::clone(&cancelled),
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(4096);
@@ -1300,7 +1335,13 @@ mod tests {
         let response: Value = serde_json::from_str(&line).expect("cancellation response");
         assert_eq!(response["id"], 2);
         assert_eq!(response["error"]["code"], -32800);
-        assert!(cancelled.load(AtomicOrdering::SeqCst));
+        // The withdrawn request is reported by the identity the transport served
+        // it under, not by its params: an Agent that keys per-request state on
+        // params cannot tell two identical requests apart.
+        let withdrawn = lock(&cancelled).clone();
+        assert_eq!(withdrawn, RequestId::from_json(&json!(2)));
+        assert_eq!(withdrawn, lock(&served).clone());
+        assert_ne!(withdrawn, RequestId::from_json(&json!("2")));
         assert!(dropped.load(AtomicOrdering::SeqCst));
 
         input_writer.shutdown().await.expect("close ACP input");
@@ -1315,10 +1356,12 @@ mod tests {
     async fn clean_eof_aborts_in_flight_requests_before_joining() {
         let started = Arc::new(Notify::new());
         let dropped = Arc::new(AtomicBool::new(false));
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let served = Arc::new(Mutex::new(None));
+        let cancelled = Arc::new(Mutex::new(None));
         let agent = BlockingAgent {
             started: Arc::clone(&started),
             dropped: Arc::clone(&dropped),
+            served: Arc::clone(&served),
             cancelled: Arc::clone(&cancelled),
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(4096);
@@ -1350,7 +1393,7 @@ mod tests {
             .expect("clean EOF cancels active requests")
             .expect("server task joins")
             .expect("server exits cleanly");
-        assert!(cancelled.load(AtomicOrdering::SeqCst));
+        assert_eq!(lock(&cancelled).clone(), RequestId::from_json(&json!(2)));
         assert!(dropped.load(AtomicOrdering::SeqCst));
     }
 
@@ -1362,6 +1405,7 @@ mod tests {
         async fn request(
             &self,
             _method: &str,
+            _request: &RequestId,
             _params: Value,
             _client: ClientConnection,
         ) -> Result<Value, RpcError> {
@@ -1422,6 +1466,7 @@ mod tests {
         async fn request(
             &self,
             method: &str,
+            _request: &RequestId,
             _params: Value,
             client: ClientConnection,
         ) -> Result<Value, RpcError> {
