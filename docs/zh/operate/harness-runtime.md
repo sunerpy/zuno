@@ -81,6 +81,10 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 
 用户提示词、steering 以及子 Agent 报告在执行前进入持久 FIFO 收件箱。`reportDelivery: nextStep` 必须完成子结果结算、准许父级输入并唤醒父级，且不存在轮询竞态。
 
+准入不与活跃回合租约竞争。同一个准入服务先提交 `session_input` 行，再决定它如何到达模型，因此每个界面（TUI、ACP、HTTP 与 `run` 宿主）对一条**已经持久**的输入只报告三种结果之一：调用方拿到独占回合租约并自己驱动该行；某个正在运行的回合以软中断接纳该行，并在下一个安全点提升它；或者该行保持待决，等下一次 FIFO 提升。先抢租约、抢不到就提前返回，正是那种「提示词丢失且没有任何持久痕迹」的做法，所以会话忙碌是准入的一种结果，而不是准入的失败。若调用方自己的驱动循环本就拥有该会话的每个回合，它根本不申请租约，只会收到 steered 或待决结果。
+
+每个界面只解码自己能驱动的载荷形态，而每一种已发布形态只有一个解码器。驱动方无法渲染的待决行（HTTP 提示驱动遇到的排队 TUI 提交、终端驱动遇到的带自己 agent 与模型覆盖的 HTTP 请求体）会按 FIFO 顺序被跨过，保持待决交给拥有它的界面，而不是先提升再结算为 `failed`。已结算的异步报告与已回答的人工请求都是纯文本，所以每个提示驱动都会运行它们。没有任何写入方发布的载荷，出于同一个理由也保持待决：驱动方无法区分「无法识别的形态」与「自己本就不拥有的形态」，所以该行被保留并继续显示在队列里，而不是被销毁。因此在同一个会话上混用多个界面时，一条驱动方并不拥有的行不可能废掉该驱动方。
+
 图像入口在写入 inbox 前统一经过 `AttachmentStore`：规范化方向、像素与编码，原子发布当前数据库身份下的内容寻址对象，持久 part 只保存 `ImageAttachmentRef`。Provider 请求组装时才校验并内联对象；缺失或 digest 不符是永久持久状态失败，不回退原始路径。
 
 提交转录回退（`revert_commit`）会删除暂存边界消息 `(time_created, id)` 之后的投影 `session_message` 行与旧表 `message` 行，清空会话的 context epoch，并把所有 `queued`、`steering`、`promoted` 的收件箱输入经常规取消迁移退役，每条各记一条 `session.input.cancelled`；已消费（consumed）的输入是不可变历史，不受影响。回退永不删除收件箱行。随后追加一条 `session.reverted` 事件，字段为：`sessionID`（字符串）、`messageID`（字符串，回退后仍是转录尾部的边界消息）、`marker`（对象，暂存的回退 JSON 原样，如 `{"messageID": "...", "files": []}`）、`boundaryTimeCreated`（i64 毫秒）、`removedMessageCount`（u64，删除的投影行数）、`removedLegacyMessageCount`（u64，删除的旧表行数）、`cancelledInputIDs`（字符串数组，按准入顺序）、`contextEpochCleared`（布尔）、`timeUpdated`（i64 毫秒）。所有键始终存在。

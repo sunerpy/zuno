@@ -381,6 +381,16 @@ impl SessionControl {
         &self.session_id
     }
 
+    /// The current process-local status of this session.
+    ///
+    /// Surfaces read this instead of keeping a private "a prompt is running" flag.
+    /// A second exclusion mechanism can disagree with the registry, and the
+    /// registry is the one that actually admits turns.
+    #[must_use]
+    pub fn status(&self) -> SessionStatus {
+        self.registry.status(&self.session_id)
+    }
+
     /// Aborts whichever turn is live now, not the turn that created this handle.
     pub fn abort(&self, request: HardInterruptRequest) -> AbortDisposition {
         self.registry.abort(&self.session_id, request)

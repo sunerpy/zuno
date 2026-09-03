@@ -978,7 +978,11 @@ terminal activation. It opens an empty conversation shell directly instead of
 returning to the launch welcome surface, and it does not bypass this lazy
 materialization boundary.
 
-Drivers promote inputs in FIFO order. Promotion is transactional and can target one input identifier for a live soft interrupt. A malformed input records a session error and does not strand later queue entries.
+Drivers promote inputs in FIFO order. Promotion is transactional and can target one input identifier for a live soft interrupt. A row a driver owns but cannot decode records a session error and does not strand later queue entries.
+
+Admission never competes with the live-turn lease. One shared admission service commits the `session_input` row first and resolves how it reaches the model second, so every surface — TUI, ACP, HTTP, and the `run` host — reports one of three outcomes over an input that is already durable: the caller received the exclusive turn lease and drives the row itself; a running turn accepted the row as a soft interrupt and promotes it at its next safe point; or the row stays pending for the next FIFO promotion. Contending for the lease first and returning early when it is held is what loses a prompt with no durable trace, so a busy session is an outcome of admission rather than a failure of it. A caller whose own driver loop already owns every turn for the session never asks for the lease at all and is answered with the steered or pending outcome.
+
+Each surface decodes only the payload shapes it can drive, and every published shape has exactly one decoder. A pending row a driver cannot render — a queued terminal submission met by the HTTP prompt driver, an HTTP body carrying its own agent and model overrides met by the terminal driver — is stepped over in FIFO order and left pending for the surface that owns it, instead of being promoted and then settled as `failed`. Settled asynchronous reports and answered human requests carry plain text, so every prompt driver runs them. A payload no writer publishes is left pending for the same reason a foreign one is: a driver cannot tell an unrecognized shape apart from a shape it simply does not own, so the row is preserved and stays visible in the queue rather than destroyed. Mixing surfaces on one session therefore cannot let one row a driver does not own break that driver.
 
 User prompts and subagent reports share this protocol:
 
