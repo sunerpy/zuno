@@ -123,11 +123,18 @@ definitions overlap.
 ## Custom agents
 
 An agent is defined either in `zuno.json` under `agents.<name>` or as a Markdown file
-with frontmatter under `.zuno/agent/`:
+with frontmatter under `.zuno/agent/`. The file is the definition: Zuno has no command
+that writes one for you. Author `.zuno/agent/reviewer.md` yourself, then read the
+resolved definition back with `zuno agent list`.
 
-```sh
-zuno agent create --path .zuno/agent/reviewer.md --mode subagent \
-  --description "Review diffs for regressions" --model openai/gpt-5
+```markdown
+---
+description: Review diffs for regressions
+mode: subagent
+model: openai/gpt-5
+---
+
+Review the diff for regressions and report each one with its file and line.
 ```
 
 A configured or extension agent whose mode is `subagent` or `all` can join the delegation

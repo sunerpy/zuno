@@ -88,11 +88,16 @@ zuno debug permissions
 
 ## 自定义 Agent
 
-Agent 既可以在 `zuno.json` 的 `agents.<name>` 下定义，也可以作为 `.zuno/agent/` 下带 frontmatter 的 Markdown 文件定义：
+Agent 既可以在 `zuno.json` 的 `agents.<name>` 下定义，也可以作为 `.zuno/agent/` 下带 frontmatter 的 Markdown 文件定义。文件本身就是定义：Zuno 没有替你写出定义的命令。请自己写好 `.zuno/agent/reviewer.md`，再用 `zuno agent list` 读回解析后的定义。
 
-```sh
-zuno agent create --path .zuno/agent/reviewer.md --mode subagent \
-  --description "Review diffs for regressions" --model openai/gpt-5
+```markdown
+---
+description: Review diffs for regressions
+mode: subagent
+model: openai/gpt-5
+---
+
+审查 diff 中的回归，并逐条给出文件与行号。
 ```
 
 一个配置或扩展提供的 Agent，只要它的 mode 是 `subagent` 或 `all`，就可以加入委派阵容。仅为 `primary` 的 Agent 不能作为委派目标。完整字段清单见[自定义 Agent](/zh/config/custom-agents)，委派机制见[编排](/zh/guide/orchestration)。

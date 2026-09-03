@@ -143,10 +143,15 @@ agent route applies, then the parent session model. Presets are the better tool 
 routing a whole team — see [Model routing](/config/models) — because they keep model
 choices in one place instead of scattered across agent definitions.
 
-## Creating and inspecting
+## Inspecting a definition
+
+Zuno does not generate agent definitions. Author one by editing `zuno.json` or by
+writing a Markdown file under `.zuno/agent/` with the frontmatter shown in
+[Two definition surfaces](#two-definition-surfaces), then read back what Zuno
+resolved:
 
 ```sh
-zuno agent create --path .zuno/agent/reviewer.md --mode subagent
+zuno agent list
 zuno debug agent reviewer
 ```
 
