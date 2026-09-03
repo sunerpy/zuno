@@ -174,33 +174,17 @@ pub(super) fn execute(
     Ok(())
 }
 
+/// Reject the combinations this surface cannot honour.
+///
+/// Every remaining check is about two things the caller asked for at once. The
+/// checks that used to head this function refused a *single* flag — `--fork`,
+/// `--share`, `--attach`, `--port`, `--username`, `--password`, `--interactive`,
+/// `--auto` — and no invocation naming one of them could ever run, so they are no
+/// longer registered on [`RunArgs`]. `--auto` in particular has a real home:
+/// `tui --auto --prompt <message>`.
 fn validate_flags(args: &RunArgs) -> Result<(), String> {
-    if args.fork {
-        return Err(
-            "--fork requires a session-history fork API that is not available yet".to_owned(),
-        );
-    }
-    if args.share {
-        return Err("--share is not available in the local Rust runtime".to_owned());
-    }
     if args.command.is_some() && !args.file.is_empty() {
         return Err("--command and --file cannot be used together".to_owned());
-    }
-    if args.attach.is_some()
-        || args.port.is_some()
-        || args.username.is_some()
-        || args.password.is_some()
-    {
-        return Err("--attach/--port/--username/--password require the remote SDK client, which is not available yet".to_owned());
-    }
-    // Both are interactive-surface flags, and the interactive surface now honours
-    // them: `--auto` is `tui --auto`. Refusing here rather than quietly ignoring them
-    // keeps a scripted caller from believing a headless run auto-approved anything.
-    if args.interactive || args.auto {
-        return Err(
-            "--interactive and --auto belong to the interactive surface; run `tui --auto --prompt <message>` instead"
-                .to_owned(),
-        );
     }
     if args.r#continue && args.session.is_some() {
         return Err("--continue and --session cannot be used together".to_owned());
@@ -849,32 +833,30 @@ mod tests {
             command: None,
             r#continue: false,
             session: None,
-            fork: false,
-            share: false,
             model: None,
             agent: None,
             format: RunFormat::Default,
             show_reasoning: false,
             file: Vec::new(),
             title: None,
-            attach: None,
-            password: None,
-            username: None,
             dir: None,
-            port: None,
             variant: None,
             thinking: false,
-            interactive: false,
-            auto: false,
         }
     }
 
+    // Was `unsupported_remote_and_session_flags_are_rejected_before_side_effects`.
+    // The unsupported-remote half of that claim no longer exists: `--attach`,
+    // `--port`, `--username` and `--password` are not registered, so there is no
+    // invocation left to reject. Selecting two different sessions at once still is.
     #[test]
-    fn unsupported_remote_and_session_flags_are_rejected_before_side_effects() {
+    fn continuing_and_naming_a_session_cannot_both_select_the_turns_session() {
         let mut args = run_args();
         args.r#continue = true;
         args.session = Some("ses_x".to_owned());
-        assert!(validate_flags(&args).is_err());
+        let error = validate_flags(&args).expect_err("two session selections conflict");
+        assert!(error.contains("--continue"), "{error}");
+        assert!(error.contains("--session"), "{error}");
     }
 
     #[test]

@@ -5,9 +5,8 @@ line or from a file, runs it to completion, and writes the result to stdout. Thi
 form to use in scripts, CI jobs, and git hooks, where there is no interactive session to
 attach to and the output needs to be machine-readable.
 
-It can start a fresh session, continue the most recent one in the current directory,
-target an exact session id, or fork an existing session so the original transcript stays
-untouched.
+It can start a fresh session, continue the most recent one in the current directory, or
+target an exact session id.
 
 ## Synopsis
 
@@ -19,38 +18,37 @@ zuno run [OPTIONS] [message]...
 
 | Argument | Description |
 | --- | --- |
-| `[message]...` | |
+| `[message]...` | The message to run. Omit it to read the message from stdin |
 
 ## Options
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `--command <COMMAND>` | | |
+| `--command <COMMAND>` | Run this configured command, with the message as its arguments | |
 | `-v`, `--version` | Show the Zuno package version | |
-| `-c`, `--continue` | | |
+| `-c`, `--continue` | Continue the most recent session in this directory | |
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
-| `-s`, `--session <SESSION>` | | |
-| `--fork` | | |
+| `-s`, `--session <SESSION>` | Run in this exact session | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `--share` | | |
-| `-m`, `--model <MODEL>` | | |
-| `--agent <AGENT>` | | |
-| `--format <FORMAT>` | Possible values: `default`, `json` | `default` |
+| `-m`, `--model <MODEL>` | The model to use, as `provider/model` | |
+| `--agent <AGENT>` | The agent to use | |
+| `--format <FORMAT>` | Output format. Possible values: `default`, `json` | `default` |
 | `--show-reasoning` | Write provider-supplied reasoning deltas to stderr between stable markers | |
-| `-f`, `--file <FILE>` | | |
-| `--title <TITLE>` | | |
-| `--attach <ATTACH>` | | |
-| `-p`, `--password <PASSWORD>` | | |
-| `-u`, `--username <USERNAME>` | | |
-| `--dir <DIR>` | | |
-| `--port <PORT>` | | |
-| `--variant <VARIANT>` | | |
-| `--thinking` | | |
-| `-i`, `--interactive` | | |
-| `--auto` | | |
+| `-f`, `--file <FILE>` | Attach a text or image file to the message. Repeatable | |
+| `--title <TITLE>` | The title a newly created session gets | |
+| `--dir <DIR>` | Directory to run in. Defaults to the working directory | |
+| `--variant <VARIANT>` | Reasoning variant to request, for a model that publishes named variants. Cannot be combined with `--thinking` | |
+| `--thinking` | Request the model's own default thinking budget. Cannot be combined with `--variant` | |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
+
+`--fork`, `--share`, `--attach`, `--port`, `--username`, `--password`, `--interactive`, and
+`--auto` were accepted by earlier releases and rejected by every invocation that named
+one, because no implementation stood behind them. They are no longer accepted at all, so a
+script that passes one now fails while parsing instead of after the process starts.
+`--auto` has a working home on the interactive surface:
+`zuno tui --auto --prompt <message>`.
 
 ## Examples
 
@@ -85,10 +83,10 @@ reasoning are never rendered. Each block is delimited by
 ends with an error. `--show-reasoning` cannot be combined with `--format json`;
 JSON mode keeps the existing structured event stream.
 
-Fork an existing session with a specific agent, leaving the original transcript intact.
+Target an exact session and choose a different agent for this turn.
 
 ```sh
-zuno run --session ses_1a2b3c --fork --agent plan "what would a safe migration look like?"
+zuno run --session ses_1a2b3c --agent plan "what would a safe migration look like?"
 ```
 
 ## See also

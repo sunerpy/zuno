@@ -894,3 +894,50 @@ fn surface_export_no_longer_reports_a_pending_handler() {
         "export still reports a missing handler: {stderr}"
     );
 }
+
+/// The two `run` pages must not offer an option the parser now refuses.
+///
+/// Documentation is part of the surface contract: a table row or a copyable
+/// example is a promise that the flag works. Each of these had its own option row
+/// on both pages, and `--fork` also carried a worked example, so this test fails
+/// against the pages as they shipped. The paragraph that records the removal
+/// names the same flags on purpose, which is why the assertion looks at option
+/// rows and at `zuno run` command lines rather than at the whole page.
+#[test]
+fn surface_run_pages_do_not_offer_the_options_run_no_longer_accepts() {
+    const REMOVED: &[&str] = &[
+        "--fork",
+        "--share",
+        "--attach",
+        "--port",
+        "--username",
+        "--password",
+        "--interactive",
+        "--auto",
+    ];
+    const PAGES: &[(&str, &str)] = &[
+        ("docs/cli/run.md", include_str!("../../../docs/cli/run.md")),
+        (
+            "docs/zh/cli/run.md",
+            include_str!("../../../docs/zh/cli/run.md"),
+        ),
+    ];
+
+    for (page, text) in PAGES {
+        for (number, line) in text.lines().enumerate() {
+            let line = line.trim();
+            let offers_option = line.starts_with("| `-");
+            let offers_invocation = line.starts_with("zuno run");
+            if !offers_option && !offers_invocation {
+                continue;
+            }
+            for flag in REMOVED {
+                assert!(
+                    !line.contains(flag),
+                    "{page}:{} still offers {flag}: {line}",
+                    number + 1
+                );
+            }
+        }
+    }
+}

@@ -202,51 +202,54 @@ pub enum RunFormat {
     Json,
 }
 
+/// The headless turn's options.
+///
+/// Every field here reaches turn composition or rendering. A flag whose only
+/// possible outcome is a refusal is not registered: `--fork`, `--share`,
+/// `--attach`, `--password`, `--username`, `--port`, `--interactive` and `--auto`
+/// were all registered without a handler and are gone, because help text that
+/// lists an option the handler always rejects is help text that lies.
 #[derive(Debug, Clone, Args)]
 pub struct RunArgs {
+    /// The message to run. Omit it to read the message from stdin.
     #[arg(value_name = "message")]
     pub message: Vec<String>,
+    /// Run this configured command, with the message as its arguments.
     #[arg(long)]
     pub command: Option<String>,
+    /// Continue the most recent session in this directory.
     #[arg(short = 'c', long)]
     pub r#continue: bool,
+    /// Run in this exact session.
     #[arg(short = 's', long)]
     pub session: Option<String>,
-    #[arg(long)]
-    pub fork: bool,
-    #[arg(long)]
-    pub share: bool,
+    /// The model to use, as `provider/model`.
     #[arg(short = 'm', long)]
     pub model: Option<String>,
+    /// The agent to use.
     #[arg(long)]
     pub agent: Option<String>,
+    /// Output format.
     #[arg(long, value_enum, default_value_t)]
     pub format: RunFormat,
     /// Write provider-supplied reasoning deltas to stderr.
     #[arg(long, default_value_t = false)]
     pub show_reasoning: bool,
+    /// Attach a text or image file to the message. Repeatable.
     #[arg(short = 'f', long)]
     pub file: Vec<String>,
+    /// The title a newly created session gets.
     #[arg(long)]
     pub title: Option<String>,
-    #[arg(long)]
-    pub attach: Option<String>,
-    #[arg(short = 'p', long)]
-    pub password: Option<String>,
-    #[arg(short = 'u', long)]
-    pub username: Option<String>,
+    /// Directory to run in. Defaults to the working directory.
     #[arg(long)]
     pub dir: Option<String>,
-    #[arg(long)]
-    pub port: Option<u16>,
+    /// Reasoning variant to request, for a model that publishes named variants.
     #[arg(long, conflicts_with = "thinking")]
     pub variant: Option<String>,
+    /// Request the model's own default thinking budget.
     #[arg(long, conflicts_with = "variant")]
     pub thinking: bool,
-    #[arg(short = 'i', long, default_value_t = false)]
-    pub interactive: bool,
-    #[arg(long, default_value_t = false)]
-    pub auto: bool,
 }
 
 /// The interactive terminal application, which takes no arguments of its own.
@@ -1289,6 +1292,76 @@ mod tests {
     #[test]
     fn removed_pure_flag_is_rejected() {
         assert!(Cli::try_parse_from(["zuno", "--pure"]).is_err());
+    }
+
+    /// The `run` options whose only possible outcome was a refusal are gone.
+    ///
+    /// Each was registered on [`RunArgs`] over a `validate_flags` arm that rejected
+    /// the flag on its own, so no invocation naming one could ever reach a turn.
+    /// Help text that lists an option the handler always refuses is help text that
+    /// lies, and completion scripts propagated the lie further.
+    #[test]
+    fn run_no_longer_parses_the_options_it_could_only_refuse() {
+        for argv in [
+            vec!["zuno", "run", "--fork", "probe"],
+            vec!["zuno", "run", "--share", "probe"],
+            vec!["zuno", "run", "--attach", "ses_probe", "probe"],
+            vec!["zuno", "run", "--port", "4096", "probe"],
+            vec!["zuno", "run", "--username", "probe", "probe"],
+            vec!["zuno", "run", "-u", "probe", "probe"],
+            vec!["zuno", "run", "--password", "probe", "probe"],
+            vec!["zuno", "run", "-p", "probe", "probe"],
+            vec!["zuno", "run", "--interactive", "probe"],
+            vec!["zuno", "run", "-i", "probe"],
+            vec!["zuno", "run", "--auto", "probe"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{argv:?} must not parse"
+            );
+        }
+    }
+
+    /// `run` keeps every option that reaches turn composition or rendering.
+    ///
+    /// The companion to the removal above: the point was to drop the options that
+    /// could not work, not to narrow the surface that does.
+    #[test]
+    fn run_still_parses_every_option_that_reaches_the_turn() {
+        let cli = Cli::try_parse_from([
+            "zuno",
+            "run",
+            "--continue",
+            "--model",
+            "probe/probe",
+            "--agent",
+            "build",
+            "--format",
+            "json",
+            "--show-reasoning",
+            "--file",
+            "probe.txt",
+            "--title",
+            "probe",
+            "--dir",
+            ".",
+            "--thinking",
+            "probe",
+        ])
+        .expect("the surviving run options parse");
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.r#continue);
+        assert_eq!(args.model.as_deref(), Some("probe/probe"));
+        assert_eq!(args.agent.as_deref(), Some("build"));
+        assert_eq!(args.format, RunFormat::Json);
+        assert!(args.show_reasoning);
+        assert_eq!(args.file, vec!["probe.txt".to_owned()]);
+        assert_eq!(args.title.as_deref(), Some("probe"));
+        assert_eq!(args.dir.as_deref(), Some("."));
+        assert!(args.thinking);
+        assert_eq!(args.message, vec!["probe".to_owned()]);
     }
 
     /// `agent create` is no longer parsed.
