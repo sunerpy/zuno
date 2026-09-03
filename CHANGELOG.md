@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/sunerpy/zuno/compare/v0.7.0...v0.7.1) (2026-09-03)
+
+
+### Bug Fixes
+
+* batch 1 of the repository audit — durability, typed recovery, and boundary defects ([#97](https://github.com/sunerpy/zuno/issues/97)) ([45a7298](https://github.com/sunerpy/zuno/commit/45a7298c0533d6d3000540e8b95f1ac0924ee00d))
+
 ## [0.7.0](https://github.com/sunerpy/zuno/compare/v0.6.7...v0.7.0) (2026-09-02)
 
 
