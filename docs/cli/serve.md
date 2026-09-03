@@ -7,6 +7,10 @@ service, or a script that speaks the server API rather than the CLI.
 The server owner wraps `zuno_server::ServerBuilder` in-process. It does not spawn a
 separate `zuno-server` executable and does not duplicate listener behavior.
 
+A supervisor holds one process. The process it spawned is the one listening, so stopping
+that process releases the port and closes its pipes — see
+[One invocation, one process](/cli/#one-invocation-one-process).
+
 `ZUNO_SERVER_PASSWORD` enables HTTP Basic authentication;
 `ZUNO_SERVER_USERNAME` defaults to `zuno`. Without a non-empty password, Zuno
 refuses a hostname that resolves to any non-loopback address.

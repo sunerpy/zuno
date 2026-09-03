@@ -288,3 +288,72 @@ fn killing_a_spawned_serve_ends_the_command_and_closes_its_pipes() {
          process\nstderr:\n{logs}"
     );
 }
+
+/// **Both CLI references state the process guarantee, in both languages.**
+///
+/// The guarantee above is what a client integrates against, and the platform
+/// difference behind it — Unix replaces its own image, Windows keeps the resolved
+/// values inside the process — is the kind of detail that is only ever written down
+/// once. The pages that clients actually read are the CLI index and the two pages for
+/// the commands they launch, so a change that alters process lifetime has to leave all
+/// of them, and their Chinese mirrors, saying the same thing.
+#[test]
+fn the_cli_reference_states_the_process_guarantee_in_both_languages() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    let pages: [(&str, &[&str]); 6] = [
+        (
+            "docs/cli/index.md",
+            &[
+                "## One invocation, one process",
+                "one process per\ninvocation on every supported platform",
+                "replaces its own image once at startup, keeping the\nsame process id",
+                "Windows has no equivalent replacement",
+            ],
+        ),
+        (
+            "docs/zh/cli/index.md",
+            &[
+                "## 一次调用就是一个进程",
+                "每次调用都只得到\n一个进程",
+                "替换自身镜像一次（进程 id 不变）",
+                "Windows 没有等价的替换操作",
+            ],
+        ),
+        (
+            "docs/cli/acp.md",
+            &["[One invocation, one process](/cli/#one-invocation-one-process)"],
+        ),
+        (
+            "docs/cli/serve.md",
+            &["[One invocation, one process](/cli/#one-invocation-one-process)"],
+        ),
+        (
+            "docs/zh/cli/acp.md",
+            &["[一次调用就是一个进程](/zh/cli/#一次调用就是一个进程)"],
+        ),
+        (
+            "docs/zh/cli/serve.md",
+            &["[一次调用就是一个进程](/zh/cli/#一次调用就是一个进程)"],
+        ),
+    ];
+
+    let mut missing = Vec::new();
+    for (page, needles) in pages {
+        let path = root.join(page);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        for needle in needles {
+            if !text.contains(needle) {
+                missing.push(format!("{page} no longer states {needle:?}"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the CLI reference and its mirror have to describe the process lifetime this \
+         binary actually has:\n  {}",
+        missing.join("\n  ")
+    );
+}

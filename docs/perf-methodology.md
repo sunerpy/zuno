@@ -523,8 +523,9 @@ ZUNO_ENFORCE_STARTUP_BUDGET=1 \
 
 Phase attribution comes from `ZUNO_STARTUP_PROFILE=1`, which writes one
 `zuno-startup` line per process to **stderr** — never stdout, for the reason
-`zuno-observability`'s crate docs give. A dispatching invocation writes two lines,
-because it re-execs once to hand the command process its environment. Measured
+`zuno-observability`'s crate docs give. On Unix a dispatching invocation writes two
+lines, because it re-execs once to hand the command process its environment;
+elsewhere it writes one, because the invocation stays a single process. Measured
 phase split for `zuno session list`: parent `parse` 1,163 µs, `environment`
 293 µs; command process `logging` 796 µs, `dispatch` 28,385 µs.
 

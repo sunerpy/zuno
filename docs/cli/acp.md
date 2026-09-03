@@ -9,6 +9,10 @@ Because the protocol owns stdout, do not read that stream as human output. Use `
 when you only want to confirm the adapter is present, and `--print-logs` to route
 diagnostics to stderr where they will not corrupt the protocol stream.
 
+The editor launches one process and keeps it. That process is the one serving the
+protocol, so terminating it ends the session and its pipes reach end of file — see
+[One invocation, one process](/cli/#one-invocation-one-process).
+
 ## Agent, Mode, Plan, and file projection
 
 The Agent selector includes `plan`. `active_agent` is the authoritative state:

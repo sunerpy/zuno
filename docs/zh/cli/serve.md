@@ -6,6 +6,9 @@
 服务器 owner 在进程内包装 `zuno_server::ServerBuilder`。它不会派生一个单独的 `zuno-server`
 可执行文件，也不会重复实现监听器行为。
 
+监管方只持有一个进程。它派生的那个进程就是正在监听的进程，因此停止这个进程就会释放端口并
+关闭它的管道。参见[一次调用就是一个进程](/zh/cli/#一次调用就是一个进程)。
+
 `ZUNO_SERVER_PASSWORD` 启用 HTTP Basic Auth；`ZUNO_SERVER_USERNAME` 默认是 `zuno`。没有非空密码时，只要 hostname 解析结果中包含非回环地址，Zuno 就拒绝监听。
 
 这两个变量都不会交给 `shell` 工具，因此模型组装出来的命令读不到保护这个监听器的凭据。
