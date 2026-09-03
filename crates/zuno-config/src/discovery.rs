@@ -439,6 +439,69 @@ fn validate_layer_authority(
     if authority == SandboxLayerAuthority::Trusted {
         return Ok(());
     }
+
+    // A project layer that names an executable asks this machine to run something
+    // the checkout controls, with this user's authority. This batch reports each
+    // declaration as a warning so an operator can review the checkout; the explicit
+    // trust decision and the rejection path belong to the next release.
+    let mut host_commands: Vec<ConfigIssue> = Vec::new();
+    if config.shell.is_some() {
+        host_commands.push(ConfigIssue::new(
+            ["shell"],
+            "selects the shell that runs model-initiated commands",
+        ));
+    }
+    if let Some(servers) = &config.mcp {
+        for (name, server) in servers.iter() {
+            if matches!(server, crate::schema::mcp::McpServerConfig::Local(_)) {
+                host_commands.push(ConfigIssue::new(
+                    ["mcp", name, "command"],
+                    "declares a local MCP server command",
+                ));
+            }
+        }
+    }
+    if let Some(crate::schema::lsp::LspConfig::Servers(servers)) = &config.lsp {
+        for (id, entry) in servers.iter() {
+            if entry.command.is_some() && entry.disabled != Some(true) {
+                host_commands.push(ConfigIssue::new(
+                    ["lsp", id, "command"],
+                    "declares an LSP server command",
+                ));
+            }
+        }
+    }
+    if let Some(crate::schema::formatter::FormatterConfig::Formatters(formatters)) =
+        &config.formatter
+    {
+        for (name, entry) in formatters.iter() {
+            if entry.command.is_some() && entry.disabled != Some(true) {
+                host_commands.push(ConfigIssue::new(
+                    ["formatter", name, "command"],
+                    "declares a formatter command",
+                ));
+            }
+        }
+    }
+    if let Some(agents) = &config.product_agent {
+        for (name, agent) in agents.iter() {
+            if agent.command.is_some() {
+                host_commands.push(ConfigIssue::new(
+                    ["productAgent", name, "command"],
+                    "declares a product-agent executable",
+                ));
+            }
+        }
+    }
+    for issue in &host_commands {
+        tracing::warn!(
+            path = %path.display(),
+            key = %issue.key_path.join("."),
+            "project config {}; it runs on this machine with this user's authority, so review the checkout before trusting it",
+            issue.detail
+        );
+    }
+
     let Some(sandbox) = &config.sandbox else {
         return Ok(());
     };

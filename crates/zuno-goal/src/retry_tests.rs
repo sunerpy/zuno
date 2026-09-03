@@ -406,3 +406,155 @@ fn terminal_failure_disposition_never_retries_auth_or_permanent_failures() {
     );
     assert_eq!(store.retry_state(SESSION).expect("read retry"), None);
 }
+
+#[test]
+fn a_busy_database_schedules_a_persisted_retry_and_any_other_database_failure_blocks() {
+    let spill = tempfile::tempdir().expect("create spill directory");
+    let store = std::sync::Arc::new(
+        GoalStore::open_memory(spill.path().to_owned()).expect("open goal store"),
+    );
+    store
+        .create_goal(SESSION, "outlast a contended database", None)
+        .expect("create goal");
+    let continuation = crate::GoalContinuation::new(
+        std::sync::Arc::clone(&store),
+        zuno_engine::status::SessionRunRegistry::new(),
+    )
+    .with_retry_policy(policy());
+
+    let busy = GoalTerminalFailure::from_db_error(&zuno_error::DbError::Busy {
+        retry_after: Some(Duration::from_secs(7)),
+    });
+    assert_eq!(
+        busy,
+        GoalTerminalFailure::Retry {
+            reason: GoalRetryReason::DatabaseBusy,
+            retry_after: Some(Duration::from_secs(7)),
+        }
+    );
+    let GoalFailureDisposition::RetryScheduled(retry) = continuation
+        .record_terminal_failure_at(SESSION, busy, 1_000, 0)
+        .expect("record the busy database")
+    else {
+        panic!("another writer holding the lock is a retry, not a block");
+    };
+    assert_eq!(retry.reason, GoalRetryReason::DatabaseBusy);
+    assert_eq!(
+        retry.retry_at_ms, 8_000,
+        "the store's own delay becomes the deadline"
+    );
+    assert_eq!(
+        store.retry_state(SESSION).expect("read retry state"),
+        Some(retry),
+        "the deadline is durable, so a restart reconstructs it from SQLite"
+    );
+    assert_eq!(
+        store
+            .goal(SESSION)
+            .expect("read goal")
+            .expect("goal")
+            .status,
+        GoalStatus::Active
+    );
+
+    let permanent = [
+        zuno_error::DbError::Query {
+            source: Box::new(std::io::Error::other("disk I/O error")),
+        },
+        zuno_error::DbError::NotFound {
+            table: "goal".to_owned(),
+            id: SESSION.to_owned(),
+        },
+        zuno_error::DbError::Conflict {
+            table: "goal".to_owned(),
+            id: SESSION.to_owned(),
+            detail: "revision moved".to_owned(),
+        },
+        zuno_error::DbError::Decode {
+            table: "goal".to_owned(),
+            source: serde_json::from_str::<u8>("{}").unwrap_err(),
+        },
+        zuno_error::DbError::Open {
+            path: std::path::PathBuf::from("zuno.db"),
+            source: Box::new(std::io::Error::other("permission denied")),
+        },
+        zuno_error::DbError::Schema {
+            format: 7,
+            source: Box::new(std::io::Error::other("no such column")),
+        },
+        zuno_error::DbError::SchemaMismatch {
+            expected: 7,
+            observed: Some(9),
+        },
+    ];
+    for error in &permanent {
+        assert_eq!(
+            GoalTerminalFailure::from_db_error(error),
+            GoalTerminalFailure::Block(GoalBlockReason::DatabasePermanent),
+            "{error}"
+        );
+    }
+    let blocked = continuation
+        .record_terminal_failure_at(
+            SESSION,
+            GoalTerminalFailure::from_db_error(&permanent[0]),
+            2_000,
+            0,
+        )
+        .expect("record the permanent failure");
+    assert!(
+        matches!(blocked, GoalFailureDisposition::Blocked(ref goal) if goal.status == GoalStatus::Blocked),
+        "a statement failure no retry repairs blocks the goal: {blocked:?}"
+    );
+    assert!(
+        store
+            .retry_state(SESSION)
+            .expect("read retry state")
+            .is_none(),
+        "a blocked goal schedules nothing"
+    );
+}
+
+#[test]
+fn a_peer_delay_beyond_the_turn_deadline_becomes_the_goal_delay_clamped_to_the_ceiling() {
+    let policy = policy();
+    assert_eq!(
+        policy.delay(1, Some(Duration::from_secs(20)), 0),
+        Duration::from_secs(20),
+        "a peer delay under the ceiling is used as given, never the two-second local start"
+    );
+    assert_eq!(
+        policy.delay(1, Some(Duration::from_secs(400)), 0),
+        Duration::from_secs(30),
+        "a peer delay above the ceiling is clamped to it, never replaced by an earlier local delay"
+    );
+
+    let spill = tempfile::tempdir().expect("create spill directory");
+    let store = std::sync::Arc::new(
+        GoalStore::open_memory(spill.path().to_owned()).expect("open goal store"),
+    );
+    store
+        .create_goal(SESSION, "wait as long as the provider asks", None)
+        .expect("create goal");
+    let continuation = crate::GoalContinuation::new(
+        std::sync::Arc::clone(&store),
+        zuno_engine::status::SessionRunRegistry::new(),
+    )
+    .with_retry_policy(policy);
+    let GoalFailureDisposition::RetryScheduled(retry) = continuation
+        .record_terminal_failure_at(
+            SESSION,
+            GoalTerminalFailure::Retry {
+                reason: GoalRetryReason::RateLimited,
+                retry_after: Some(Duration::from_secs(400)),
+            },
+            1_000,
+            0,
+        )
+        .expect("schedule the rate limit")
+    else {
+        panic!("a rate limit is a retry");
+    };
+    assert_eq!(retry.delay_ms, 30_000);
+    assert_eq!(retry.retry_at_ms, 31_000);
+}

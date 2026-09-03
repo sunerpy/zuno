@@ -246,3 +246,108 @@ fn unknown_reply_target_leaves_state_unchanged() {
     assert_eq!(outcome, None);
     assert_eq!(engine.pending()[0].id, "per_existing");
 }
+
+#[test]
+fn a_runtime_always_grant_cannot_override_a_configured_deny() {
+    let mut engine = PermissionEngine::new();
+    let ask = [rule("shell", "*", PermissionAction::Ask)];
+    engine
+        .authorize(request("per_ask", "ses_a"), &ask)
+        .expect("ask creates a pending");
+    let outcome = engine
+        .reply(PermissionReply {
+            request_id: "per_ask".to_owned(),
+            reply: ReplyKind::Always,
+            message: None,
+        })
+        .expect("target pending exists");
+    assert_eq!(
+        outcome.installed_rules,
+        vec![rule("shell", "git *", PermissionAction::Allow)]
+    );
+
+    // The same runtime grant is now weighed against configuration that denies the
+    // command. Answering "always" is a decision about what the rules left at `ask`;
+    // it is not a way to revoke a prohibition the user wrote down.
+    let configured = [
+        rule("shell", "*", PermissionAction::Ask),
+        rule("shell", "git push*", PermissionAction::Deny),
+    ];
+
+    let error = engine
+        .authorize(request("per_after_deny", "ses_a"), &configured)
+        .expect_err("a configured deny outranks a runtime grant");
+
+    assert!(matches!(error, ToolError::Denied { ref tool } if tool == "shell"));
+    assert!(engine.pending().is_empty());
+    assert_eq!(
+        engine.approved_rules(),
+        [rule("shell", "git *", PermissionAction::Allow)],
+        "the grant survives for the patterns configuration did not deny"
+    );
+}
+
+#[test]
+fn a_runtime_grant_still_settles_what_configuration_left_at_ask() {
+    let mut engine = PermissionEngine::new();
+    let ask = [rule("shell", "*", PermissionAction::Ask)];
+    engine
+        .authorize(request("per_ask", "ses_a"), &ask)
+        .expect("ask creates a pending");
+    engine
+        .reply(PermissionReply {
+            request_id: "per_ask".to_owned(),
+            reply: ReplyKind::Always,
+            message: None,
+        })
+        .expect("target pending exists");
+
+    let outcome = engine
+        .authorize(request("per_repeat", "ses_a"), &ask)
+        .expect("the runtime grant covers this pattern");
+
+    assert_eq!(outcome, Authorization::Allowed);
+    assert!(engine.pending().is_empty());
+}
+
+#[test]
+fn a_request_naming_no_pattern_is_never_authorized_silently() {
+    let mut engine = PermissionEngine::new();
+    let mut input = request("per_empty", "ses_a");
+    input.patterns.clear();
+
+    let outcome = engine
+        .authorize(input, &[])
+        .expect("an empty pattern list is not a denial on its own");
+
+    assert_eq!(
+        outcome,
+        Authorization::Pending,
+        "no grant means ask, exactly as it does for a pattern nothing matched"
+    );
+    assert_eq!(
+        engine.pending()[0].patterns,
+        vec!["*".to_owned()],
+        "the request is recorded with the resource the rules can actually be written for"
+    );
+}
+
+#[test]
+fn a_request_naming_no_pattern_still_obeys_configuration() {
+    let mut denying = PermissionEngine::new();
+    let mut input = request("per_empty_deny", "ses_a");
+    input.patterns.clear();
+    let error = denying
+        .authorize(input, &[rule("shell", "*", PermissionAction::Deny)])
+        .expect_err("a catch-all deny covers a request that names nothing");
+    assert!(matches!(error, ToolError::Denied { ref tool } if tool == "shell"));
+    assert!(denying.pending().is_empty());
+
+    let mut allowing = PermissionEngine::new();
+    let mut input = request("per_empty_allow", "ses_a");
+    input.patterns.clear();
+    let outcome = allowing
+        .authorize(input, &[rule("shell", "*", PermissionAction::Allow)])
+        .expect("an explicit catch-all allow is a grant the user wrote");
+    assert_eq!(outcome, Authorization::Allowed);
+}

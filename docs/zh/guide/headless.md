@@ -119,18 +119,18 @@ zuno debug sandbox --mode workspace-write --network deny --check
       "read": "allow",
       "glob": "allow",
       "grep": "allow",
+      "edit": "deny",
       "shell": {
-        "git push*": "deny",
+        "*": "deny",
         "cargo test*": "allow",
-        "*": "deny"
-      },
-      "write": "deny"
+        "git push*": "deny"
+      }
     }
   }
 }
 ```
 
-规则按书写顺序求值，因此更窄的模式必须在更宽的模式之前。`--auto` 是为交互使用而存在的，在 strict 模式下它会让位给人类审批者；它不是策略的替代品。参见[权限与沙箱](/zh/guide/permissions)。
+最后一条匹配的规则胜出，因此 catch-all `*` 写在最前面，从它当中划出例外的窄模式写在最后面。如果顺序反过来，写在末尾的 `"*": "deny"` 会覆盖 `cargo test*`，这份配置本来要跑的测试就永远跑不起来。`edit` 这个键同时管 `write`、`edit` 和 `apply_patch` 三个工具，不存在单独的 `write` 规则键。`--auto` 是为交互使用而存在的，在 strict 模式下它会让位给人类审批者；它不是策略的替代品。参见[权限与沙箱](/zh/guide/permissions)。
 
 ## 示例：一个 CI 门禁
 
@@ -161,6 +161,8 @@ zuno acp --check
 ```
 
 Server 支持通过 `ZUNO_SERVER_PASSWORD` 启用 Basic Auth，也支持显式的回环专用 `--browser-auth` bootstrap。浏览器认证只打印一次启动 URI，token 只能消费一次，随后签发绑定 authority 的签名 Cookie；它绝不会让非回环监听变得可接受。对 ACP 来说，stdout 承载协议分帧，因此请用 `--print-logs` 把诊断信息送到 stderr。参见[编辑器与 ACP](/zh/guide/editors)。
+
+HTTP 界面有三处语义值得驱动会话的脚本了解。`POST /api/session/{id}/interrupt` 只取消正在运行的回合；对空闲会话它返回 `204` 且什么都不做，不会让下一个普通回合（包括对刻意排队输入的显式恢复）一开始就处于被中断状态。`GET /api/session/{id}/event` 对数据库中不存在的会话返回 `404`，错误码为 `not_found`，而不是打开一条永远不会产生事件的流。压缩持有会话租约期间接纳的 prompt 或 steer 输入会留在持久 inbox 中，并在压缩释放租约后立即被执行，而不是等到某个无关事件碰巧唤醒会话。
 
 ## 参见
 

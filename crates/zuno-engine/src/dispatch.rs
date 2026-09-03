@@ -426,14 +426,22 @@ impl ToolDispatcher for ToolRegistryDispatcher {
                     )
                     .await
                 {
-                    if result.interruption.is_some() {
-                        result
-                            .output
-                            .metadata
-                            .insert("afterHookError".to_owned(), json!({ "message": error }));
-                    } else {
-                        result = error_result(&tool_name, error);
-                    }
+                    // The tool has already run, so whatever it changed is real whether
+                    // or not a plugin managed to post-process the output. Rewriting a
+                    // settled result into a bare error would tell the model the effect
+                    // never happened and invite it to repeat a side effect; the result
+                    // keeps its own status and the hook failure travels with it.
+                    tracing::warn!(
+                        target: "zuno_engine::dispatch",
+                        tool = %tool_name,
+                        call_id = %call_id,
+                        error = %error,
+                        "tool after-hook failed; keeping the settled tool result"
+                    );
+                    result
+                        .output
+                        .metadata
+                        .insert("afterHookError".to_owned(), json!({ "message": error }));
                 }
                 finish_observation(lifecycle, &result);
                 result
@@ -924,9 +932,20 @@ fn tool_error_result(
             return blocked_result(tool, message, kind);
         }
         if let zuno_error::ToolError::Uncertain { applied_paths, .. } = error {
-            message.push_str(
-                "\n\nRecovery: this call changed authoritative state before losing its final outcome. Inspect the listed paths and continue from what is actually on disk; do not replay the call mechanically.",
-            );
+            // A call can lose its outcome without having observed which paths it
+            // touched — a supervisor that dies around a shell command, say. Pointing
+            // the model at "the listed paths" when the list is empty tells it to
+            // inspect nothing, so the empty case names the state to go looking for
+            // instead.
+            if applied_paths.is_empty() {
+                message.push_str(
+                    "\n\nRecovery: this call may have changed authoritative state before losing its final outcome, and it did not observe which. Inspect the state this call would have changed and continue from what is actually there; do not replay the call mechanically.",
+                );
+            } else {
+                message.push_str(
+                    "\n\nRecovery: this call changed authoritative state before losing its final outcome. Inspect the listed paths and continue from what is actually on disk; do not replay the call mechanically.",
+                );
+            }
             let presentation = UncertainMutationPresentation::new(applied_paths.clone());
             let mut output = ToolOutput::text(format!("{tool} uncertain"), message)
                 .with_metadata("outcome", "uncertain")
@@ -1162,6 +1181,51 @@ mod tests {
             result.output.presentation,
             Some(ToolResultPresentation::UncertainMutation(_))
         ));
+        assert!(
+            result
+                .output
+                .output
+                .contains("do not replay the call mechanically")
+        );
+        assert!(
+            result.output.output.contains("Inspect the listed paths"),
+            "a call that observed its paths must point at them: {}",
+            result.output.output
+        );
+    }
+
+    #[test]
+    fn an_uncertain_outcome_with_no_observed_paths_still_names_what_to_inspect() {
+        // The shell tool reaches this: when the child-process guard's own machinery
+        // fails, whether the command ran is unknown and so is what it touched.
+        let error = zuno_error::ToolError::Uncertain {
+            tool: "shell".to_owned(),
+            applied_paths: Vec::new(),
+            source: Box::new(std::io::Error::other("the child-process guard failed")),
+        };
+
+        let result = tool_error_result("shell", ToolReplayPolicy::Never, &error);
+
+        assert!(result.is_error);
+        assert_eq!(
+            result.recovery, None,
+            "an uncertain outcome is never replayed"
+        );
+        assert_eq!(result.output.metadata["uncertain"], true);
+        assert!(result.output.written_paths().is_empty());
+        assert!(
+            !result.output.output.contains("listed paths"),
+            "there is no list to inspect: {}",
+            result.output.output
+        );
+        assert!(
+            result
+                .output
+                .output
+                .contains("Inspect the state this call would have changed"),
+            "{}",
+            result.output.output
+        );
         assert!(
             result
                 .output

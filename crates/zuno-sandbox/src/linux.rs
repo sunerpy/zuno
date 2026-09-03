@@ -13,9 +13,62 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 const BACKEND_NAME: &str = "linux_bubblewrap";
+/// Every bubblewrap process this process has spawned to discover or verify a backend.
+static PROBE_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many bubblewrap probe processes this process has spawned so far.
+///
+/// Test instrumentation: a discovery that is served from the process-local cache
+/// must leave this number unchanged.
+#[doc(hidden)]
+#[must_use]
+pub fn probe_spawn_count() -> usize {
+    PROBE_SPAWNS.load(Ordering::SeqCst)
+}
+
+fn record_probe_spawn() {
+    PROBE_SPAWNS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Backends this process has already discovered, keyed by the inputs a fresh
+/// discovery would use. Never persisted: another process must prove the host again.
+static DISCOVERY_CACHE: Mutex<BTreeMap<DiscoveryKey, Arc<LinuxBubblewrapSandbox>>> =
+    Mutex::new(BTreeMap::new());
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DiscoveryKey {
+    workspace: PathBuf,
+    helper: PathBuf,
+}
+
+/// Serve `key` from `cache`, discovering only when there is no still-valid entry.
+///
+/// A failed discovery is returned and *not* remembered, so a transient probe
+/// failure cannot pin the process to "unavailable" — or, for a trusted
+/// `run-unconfined` deployment, to native execution — for the rest of its life.
+/// A cached entry that no longer passes `still_valid` is dropped and rediscovered,
+/// which is how a bubblewrap upgrade or a replaced helper is picked up.
+fn cached_or_discover<K: Ord, V, E>(
+    cache: &mut BTreeMap<K, Arc<V>>,
+    key: K,
+    still_valid: impl Fn(&V) -> bool,
+    discover: impl FnOnce(&K) -> Result<V, E>,
+) -> Result<Arc<V>, E> {
+    if let Some(existing) = cache.get(&key) {
+        if still_valid(existing) {
+            return Ok(Arc::clone(existing));
+        }
+        cache.remove(&key);
+    }
+    let discovered = Arc::new(discover(&key)?);
+    cache.insert(key, Arc::clone(&discovered));
+    Ok(discovered)
+}
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TRUSTED_BWRAP_CANDIDATES: &[&str] = &["/usr/bin/bwrap", "/bin/bwrap"];
 const TRUSTED_TRUE_CANDIDATES: &[&str] = &["/usr/bin/true", "/bin/true"];
@@ -75,6 +128,50 @@ impl LinuxBubblewrapSandbox {
     pub fn discover(workspace: &Path) -> Result<Self, SandboxError> {
         let current_exe = std::env::current_exe()?;
         Self::discover_with_helper(workspace, &current_exe)
+    }
+
+    /// Discovers the backend for `workspace`, reusing this process's earlier answer.
+    ///
+    /// The key is the canonical workspace plus the current executable, exactly what
+    /// [`Self::discover`] would use. A hit is handed out only after the trusted
+    /// launcher, the trusted no-op executable, and the helper are re-inspected on
+    /// disk; if any changed, the entry is discarded and the host is probed again.
+    /// Failures are never cached. The first discovery in a process still pays for
+    /// the `bwrap --help` and namespace probes; every turn host and child turn after
+    /// it does not.
+    pub fn discover_cached(workspace: &Path) -> Result<Arc<Self>, SandboxError> {
+        let key = DiscoveryKey {
+            workspace: canonical_directory(workspace, "workspace")?,
+            helper: std::env::current_exe()?,
+        };
+        let mut cache = DISCOVERY_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        cached_or_discover(
+            &mut cache,
+            key,
+            |backend| backend.still_trusted().is_ok(),
+            |key| Self::discover_with_helper(&key.workspace, &key.helper),
+        )
+    }
+
+    /// Re-inspect every host file this backend's trust rests on.
+    fn still_trusted(&self) -> Result<(), SandboxError> {
+        if let Some(launcher) = &self.launcher {
+            launcher.revalidate(&self.workspace)?;
+        }
+        if let Some(true_executable) = &self.true_executable {
+            true_executable.revalidate(&self.workspace)?;
+        }
+        let helper = validated_helper(&self.current_exe)?;
+        if helper != self.current_exe {
+            return Err(SandboxError::InvalidPath {
+                kind: "sandbox helper",
+                path: self.current_exe.clone(),
+                reason: format!("resolves to `{}` after discovery", helper.display()),
+            });
+        }
+        Ok(())
     }
 
     /// Discovers bubblewrap while using an explicit first-party helper executable.
@@ -610,6 +707,7 @@ fn validate_trusted_ancestors(path: &Path, require_root_owner: bool) -> Result<(
 }
 
 fn require_bwrap_options(bwrap: &Path) -> Result<(), SandboxError> {
+    record_probe_spawn();
     let output = Command::new(bwrap).arg("--help").output()?;
     if !output.status.success() {
         return Err(SandboxError::ProbeFailed {
@@ -639,6 +737,7 @@ fn run_prepared_probe(prepared: PreparedCommand) -> Result<(), SandboxError> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    record_probe_spawn();
     let mut child = command.spawn().map_err(|error| SandboxError::ProbeFailed {
         capability: "prepared sandbox helper execution",
         detail: error.to_string(),
@@ -725,6 +824,7 @@ fn run_probe(bwrap: &Path, true_executable: &Path, network: bool) -> Result<(), 
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    record_probe_spawn();
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     let deadline = Instant::now() + PROBE_TIMEOUT;
     loop {
@@ -1193,5 +1293,69 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod discovery_cache_tests {
+    use super::cached_or_discover;
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn a_second_lookup_for_the_same_key_does_not_discover_again() {
+        let mut cache = BTreeMap::new();
+        let discoveries = Cell::new(0);
+        let discover = |key: &&str| -> Result<String, ()> {
+            discoveries.set(discoveries.get() + 1);
+            Ok((*key).to_owned())
+        };
+        let first = cached_or_discover(&mut cache, "ws", |_| true, discover).expect("first");
+        let second = cached_or_discover(&mut cache, "ws", |_| true, discover).expect("second");
+        assert_eq!(discoveries.get(), 1);
+        assert!(Arc::ptr_eq(&first, &second));
+        let other = cached_or_discover(&mut cache, "other", |_| true, discover).expect("other");
+        assert_eq!(discoveries.get(), 2);
+        assert_eq!(*other, "other");
+    }
+
+    #[test]
+    fn a_failed_discovery_is_not_remembered() {
+        let mut cache: BTreeMap<&str, Arc<String>> = BTreeMap::new();
+        let attempts = Cell::new(0);
+        let flaky = |key: &&str| -> Result<String, &'static str> {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err("transient")
+            } else {
+                Ok((*key).to_owned())
+            }
+        };
+        assert_eq!(
+            cached_or_discover(&mut cache, "ws", |_| true, flaky),
+            Err("transient")
+        );
+        assert!(cache.is_empty(), "a failure must leave no entry behind");
+        let recovered = cached_or_discover(&mut cache, "ws", |_| true, flaky).expect("recovers");
+        assert_eq!(*recovered, "ws");
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn an_entry_that_is_no_longer_valid_is_rediscovered() {
+        let mut cache = BTreeMap::new();
+        let discoveries = Cell::new(0);
+        let discover = |key: &&str| -> Result<String, ()> {
+            discoveries.set(discoveries.get() + 1);
+            Ok(format!("{key}#{}", discoveries.get()))
+        };
+        let stale = cached_or_discover(&mut cache, "ws", |_| true, discover).expect("first");
+        let fresh = cached_or_discover(&mut cache, "ws", |_| false, discover).expect("second");
+        assert_eq!(*stale, "ws#1");
+        assert_eq!(*fresh, "ws#2");
+        assert_eq!(cache.len(), 1);
+        let reused = cached_or_discover(&mut cache, "ws", |_| true, discover).expect("third");
+        assert!(Arc::ptr_eq(&fresh, &reused));
     }
 }

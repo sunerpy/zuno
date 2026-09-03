@@ -44,6 +44,9 @@
       }
     ]
   },
+  "navigation": {
+    "codegraph": "advise"
+  },
   "references": {
     "shorthand": "github.com/sst/opencode",
     "gitform": {

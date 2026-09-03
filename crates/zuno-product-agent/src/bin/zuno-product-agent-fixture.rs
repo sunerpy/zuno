@@ -88,6 +88,8 @@ fn run_codex() -> Result<(), String> {
             .and_then(Value::as_str)
             .unwrap_or_default();
         match method {
+            // Never answer, so the caller is cancelled with the handshake outstanding.
+            "initialize" if mode == "hang-initialize" => return hang_with_child(),
             "initialize" if mode == "incompatible" => {
                 send(
                     &mut writer,
@@ -104,6 +106,9 @@ fn run_codex() -> Result<(), String> {
             "initialized" => {}
             "thread/start" => {
                 capture_request("threadStartRequests", &request)?;
+                if mode == "hang-thread-start" {
+                    return hang_with_child();
+                }
                 if mode == "legacy"
                     && request.pointer("/params/sandbox").and_then(Value::as_str)
                         == Some("workspaceWrite")
@@ -142,6 +147,11 @@ fn run_codex() -> Result<(), String> {
             }
             "turn/start" => {
                 capture_request("turnStartRequests", &request)?;
+                // The turn request has been accepted but its response is withheld, which is the
+                // one phase where the caller cannot know whether work started.
+                if mode == "hang-turn-start" {
+                    return hang_with_child();
+                }
                 send(
                     &mut writer,
                     json!({"id":request["id"],"result":{"turn":{"id":"turn_fixture"}}}),

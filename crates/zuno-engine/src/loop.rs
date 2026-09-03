@@ -53,8 +53,8 @@ use zuno_tool::{
 };
 
 use crate::budget::{
-    BudgetDecision, BudgetStop, NoopBudgetPolicy, ProviderRequestUsage, TurnBudgetPolicy,
-    TurnUsageSnapshot,
+    BudgetDecision, BudgetPolicyError, BudgetStop, NoopBudgetPolicy, ProviderRequestUsage,
+    TurnBudgetPolicy, TurnUsageSnapshot,
 };
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
 use crate::interrupt::{HardInterruptRequest, InterruptSignal, SoftInterruptMessage};
@@ -1249,6 +1249,20 @@ fn budget_hook_failure(hook: &'static str, message: String) -> TurnError {
     TurnError::Hook(format!("turn budget policy `{hook}` failed: {message}"))
 }
 
+/// Classify a budget policy's refusal to answer.
+///
+/// A storage failure keeps its type. The loop already knows that [`DbError::Busy`] is
+/// a retry with a persisted backoff and that every other [`DbError`] is permanent, so
+/// a `SQLITE_BUSY` met while charging the allowance ends the turn the way any other
+/// contended write does — a goal retry after backoff — instead of blocking the goal
+/// for good as a broken hook would.
+fn budget_policy_failure(hook: &'static str, error: BudgetPolicyError) -> TurnError {
+    match error {
+        BudgetPolicyError::Database(error) => TurnError::Database(error),
+        BudgetPolicyError::Permanent(message) => budget_hook_failure(hook, message),
+    }
+}
+
 /// Honour one [`BudgetDecision`], making any intervention visible before it lands.
 ///
 /// The notice is published before the failure returns so an allowance that ended a
@@ -1895,7 +1909,7 @@ async fn run_turn_in_span(
                 tool_calls_dispatched,
             })
             .await
-            .map_err(|message| budget_hook_failure("before_request", message))?;
+            .map_err(|error| budget_policy_failure("before_request", error))?;
         honour_budget_decision(&events, decision).await?;
         let prompt_receipt_id = if let Some(receipt_id) =
             prompt_traces.receipt_id(actual_projection)
@@ -2239,6 +2253,14 @@ async fn run_turn_in_span(
                 ProviderRetryError::DeadlineExceeded { attempt, elapsed } => {
                     Err(TurnError::ProviderRetryDeadlineExceeded { attempt, elapsed })
                 }
+                // The peer named a delay the same-request deadline cannot hold. The
+                // turn ends on the peer's own typed error so the goal controller
+                // schedules its retry from that `retry_after`, clamped to the
+                // configured ceiling, instead of from a local backoff the peer has
+                // already said is too soon.
+                ProviderRetryError::RetryAfterBeyondDeadline { source, .. } => {
+                    Err(TurnError::Provider(source))
+                }
                 ProviderRetryError::RollbackEmission { source } => Err(*source),
             },
             Err(ProviderRetryObservedError::Observation { source }) => Err(source),
@@ -2513,7 +2535,7 @@ async fn run_turn_in_span(
                 tool_calls_dispatched,
             })
             .await
-            .map_err(|message| budget_hook_failure("after_response", message))?;
+            .map_err(|error| budget_policy_failure("after_response", error))?;
         honour_budget_decision(&events, decision).await?;
 
         let calls = accumulator.calls.values().cloned().collect::<Vec<_>>();

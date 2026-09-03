@@ -1,3 +1,4 @@
+use super::anchor::{AnchoredDir, AnchoredFile, PublishFailure};
 use crate::format::{FormatFailure, FormatOutcome, METADATA_FAILURES_KEY};
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -291,7 +292,10 @@ impl FileToolRuntime {
                     .map(Path::to_owned)
                     .unwrap_or_else(|| canonical.clone())
             };
-            (Some(slash(&directory.join("*"))), Some(directory))
+            (
+                Some(crate::search_common::directory_grant_pattern(&directory)),
+                Some(directory),
+            )
         } else {
             (None, None)
         };
@@ -349,6 +353,75 @@ impl FileToolRuntime {
             },
         )
         .await
+    }
+
+    /// The directory the user's authorization actually covers.
+    ///
+    /// For a workspace path this is the canonical workspace root. For a path outside
+    /// it, it is the directory the `external_directory` prompt named, which is the only
+    /// place outside the workspace the user agreed to. Anchored resolution descends
+    /// from here, so no later change to any ancestor name can move the operation
+    /// somewhere the user did not approve.
+    pub(crate) fn authority_root<'a>(&'a self, target: &'a ResolvedPath) -> &'a Path {
+        target
+            .external_parent
+            .as_deref()
+            .unwrap_or(self.workspace.as_path())
+    }
+
+    /// Pin `target`'s parent directory and bind its file name, following no symlink.
+    ///
+    /// `create_parents` is for the tools that are allowed to make a missing directory
+    /// tree. A refusal here is a bad argument rather than a lost write: the path the
+    /// model asked for is not the path the user authorized, and re-running the same
+    /// call would not change that.
+    pub(crate) fn anchor_file(
+        &self,
+        tool: &str,
+        target: &ResolvedPath,
+        create_parents: bool,
+    ) -> Result<AnchoredFile, ToolError> {
+        AnchoredFile::open(
+            self.authority_root(target),
+            &target.canonical,
+            create_parents,
+        )
+        .map_err(|error| self.anchor_error(tool, target, error))
+    }
+
+    /// Pin `target` itself as a directory, following no symlink.
+    pub(crate) fn anchor_dir(
+        &self,
+        tool: &str,
+        target: &ResolvedPath,
+    ) -> Result<AnchoredDir, ToolError> {
+        let root = self.authority_root(target);
+        let relative = target
+            .canonical
+            .strip_prefix(root)
+            .unwrap_or(Path::new(""))
+            .to_owned();
+        AnchoredDir::descend(root, &relative, false)
+            .map_err(|error| self.anchor_error(tool, target, error))
+    }
+
+    /// Classify a failure to reach the authorized object.
+    ///
+    /// A missing path stays a plain failure so the existing not-found messages are
+    /// unchanged. Anything else means the path did not lead to the object the user
+    /// authorized, which the model must correct rather than retry.
+    fn anchor_error(&self, tool: &str, target: &ResolvedPath, error: io::Error) -> ToolError {
+        if error.kind() == io::ErrorKind::NotFound {
+            return failed(tool, error);
+        }
+        invalid(
+            tool,
+            format!(
+                "{} could not be reached from the authorized directory {}: {error}",
+                slash(&target.canonical),
+                slash(self.authority_root(target))
+            ),
+        )
     }
 
     pub(crate) fn title(&self, target: &ResolvedPath) -> String {
@@ -449,11 +522,18 @@ pub(crate) fn report_diff(
     output
 }
 
-pub(crate) fn write_with_dirs(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Turn a failed publication into the typed error its certainty deserves.
+///
+/// A publication that never replaced anything is a plain failure: the destination still
+/// holds its previous content and the caller may try again. A publication whose result
+/// was lost is an uncertain outcome, so the paths it may have touched travel with the
+/// error and the harness inspects authoritative state instead of replaying the call.
+pub(crate) fn publish_error(tool: &str, paths: &[PathBuf], failure: PublishFailure) -> ToolError {
+    if failure.is_uncertain() {
+        uncertain(tool, paths, failure.into_error())
+    } else {
+        failed(tool, failure.into_error())
     }
-    std::fs::write(path, bytes)
 }
 
 pub(crate) fn invalid(tool: &str, message: impl Into<String>) -> ToolError {

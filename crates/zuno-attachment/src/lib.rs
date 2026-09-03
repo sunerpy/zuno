@@ -347,40 +347,6 @@ impl AttachmentStore {
         })
     }
 
-    /// Remove unreferenced canonical and derived files from this database scope only.
-    pub fn garbage_collect<'a>(
-        &self,
-        live: impl IntoIterator<Item = &'a AttachmentId>,
-    ) -> Result<usize, AttachmentError> {
-        let live = live
-            .into_iter()
-            .map(AttachmentId::digest)
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut removed = 0;
-        for directory in [self.root.join("objects"), self.root.join("derived")] {
-            for path in walk_files(&directory)? {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default();
-                let digest = name
-                    .strip_prefix("sha256:")
-                    .unwrap_or(name)
-                    .split('-')
-                    .next()
-                    .unwrap_or_default();
-                if !live.contains(digest) {
-                    fs::remove_file(&path).map_err(|source| AttachmentError::Io {
-                        path: path.clone(),
-                        source,
-                    })?;
-                    removed += 1;
-                }
-            }
-        }
-        Ok(removed)
-    }
-
     fn object_path(&self, id: &AttachmentId) -> PathBuf {
         self.root
             .join("objects")
@@ -834,6 +800,12 @@ fn sync_directory(_path: &Path) -> Result<(), AttachmentError> {
     Ok(())
 }
 
+// Reclaiming objects is deliberately not a capability of this crate. Object lifetime is
+// decided by the database that references them, so the shipped collector lives in
+// `zuno-db::artifact_gc`, where liveness is read inside the same transaction that
+// publishes references and a filename is only a candidate when it is a bare 64-character
+// digest. Directory enumeration therefore only serves this crate's own tests.
+#[cfg(test)]
 fn walk_files(root: &Path) -> Result<Vec<PathBuf>, AttachmentError> {
     let mut files = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -1243,6 +1215,71 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn an_unfinished_object_is_never_reclaimed_and_never_reads_as_a_finished_one() {
+        // `AttachmentStore::garbage_collect` used to live here with no caller anywhere in the
+        // workspace. It deleted every file under `objects/` and `derived/` whose name did not
+        // match a caller-supplied live digest, so a `.tmp` object another process was still
+        // writing was its first victim by construction: a temporary name cannot match a live
+        // digest until the rename that publishes it. That reclaim path was deleted instead of
+        // rebuilt, and this test pins the two properties the shipped collector in
+        // `zuno-db::artifact_gc` depends on: an unfinished name can never be read as a finished
+        // object, and nothing in this crate removes a file it did not create.
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            AttachmentStore::new(root.path(), "database", ImageAdmissionPolicy::default()).unwrap();
+        let admitted = store.admit(&png(6, 4, false), None).unwrap();
+        let shard = store
+            .object_path(&admitted.id)
+            .parent()
+            .expect("object shard")
+            .to_path_buf();
+
+        // Exactly the spelling `write_atomic_private` gives a concurrent writer's object.
+        let pending = hex::encode([0xab_u8; 32]);
+        let in_progress = shard.join(format!(".{pending}.{}.{}.tmp", 4321, 7));
+        fs::write(&in_progress, b"the first half of a normalized object").unwrap();
+
+        let name = in_progress
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("temporary name");
+        assert!(name.starts_with('.') && name.ends_with(".tmp"));
+        assert!(AttachmentId::parse(name).is_err());
+        // `zuno-db::artifact_gc` only treats a file as a candidate when the first `-` segment of
+        // its name is a bare 64-character digest, which this name can never become.
+        let candidate = name
+            .strip_prefix("sha256:")
+            .unwrap_or(name)
+            .split('-')
+            .next()
+            .unwrap_or_default();
+        assert_ne!(candidate.len(), 64);
+
+        // Every public operation runs while the foreign write is still outstanding.
+        assert_eq!(
+            store.admit(&png(6, 4, false), None).unwrap().id,
+            admitted.id
+        );
+        store.read(&admitted).unwrap();
+        store
+            .resolve(&admitted, ImageRequestPolicy::default())
+            .unwrap();
+        AttachmentStore::new(root.path(), "database", ImageAdmissionPolicy::default())
+            .unwrap()
+            .read(&admitted)
+            .unwrap();
+
+        assert!(
+            in_progress.exists(),
+            "an unfinished object written by another process was reclaimed: {in_progress:?}"
+        );
+        assert_eq!(
+            fs::read(&in_progress).unwrap(),
+            b"the first half of a normalized object"
         );
     }
 }

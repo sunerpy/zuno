@@ -63,6 +63,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "server",
     "command",
     "skills",
+    "navigation",
     "references",
     "watcher",
     "snapshot",

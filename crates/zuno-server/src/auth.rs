@@ -66,13 +66,35 @@ impl AuthConfig {
         if !self.required() {
             return false;
         }
+        let Some(expected_password) = self.password.as_deref() else {
+            return false;
+        };
         let Some((username, password)) = basic_credentials(headers) else {
             return false;
         };
-        self.password
-            .as_ref()
-            .is_some_and(|expected| username == self.username && password == *expected)
+        // Both comparisons run to completion and are combined without
+        // short-circuiting, so how long a rejection takes does not reveal which of
+        // the two was wrong or how long a matching prefix was.
+        let username_matches = constant_time_eq(username.as_bytes(), self.username.as_bytes());
+        let password_matches = constant_time_eq(password.as_bytes(), expected_password.as_bytes());
+        username_matches & password_matches
     }
+}
+
+/// Compare two byte strings in time that depends only on their lengths.
+///
+/// Every position up to the longer length is visited, a missing byte compares as
+/// zero, and the length mismatch is folded into the same accumulator, so there is
+/// no early return for a mismatch to observe. Length itself is not hidden; hiding
+/// it would require padding the credential to a fixed size.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = u8::from(left.len() != right.len());
+    for index in 0..left.len().max(right.len()) {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= left_byte ^ right_byte;
+    }
+    std::hint::black_box(difference) == 0
 }
 
 impl Default for AuthConfig {
@@ -124,5 +146,42 @@ mod tests {
         );
         assert!(!rendered.contains("never-print-this"));
         assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn constant_time_eq_reports_equality_and_folds_length_into_the_result() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"Secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secret!"));
+        assert!(!constant_time_eq(b"secret!", b"secret"));
+        // A shorter input padded with zero bytes must not equal a longer one that
+        // really ends in zero bytes: the length fold is what catches this.
+        assert!(!constant_time_eq(b"", b"\0"));
+        assert!(!constant_time_eq(b"a\0", b"a"));
+    }
+
+    #[test]
+    fn basic_auth_requires_both_the_username_and_the_password_to_match() {
+        fn headers(username: &str, password: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            let encoded = STANDARD.encode(format!("{username}:{password}"));
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!("Basic {encoded}"))
+                    .expect("ascii header"),
+            );
+            headers
+        }
+
+        let auth = AuthConfig::new(Some("pw".to_owned()), Some("user".to_owned()));
+        assert!(auth.authorizes_basic(&headers("user", "pw")));
+        assert!(!auth.authorizes_basic(&headers("user", "pW")));
+        assert!(!auth.authorizes_basic(&headers("usel", "pw")));
+        assert!(!auth.authorizes_basic(&headers("user", "pw ")));
+        assert!(!auth.authorizes_basic(&headers("", "")));
+        assert!(!auth.authorizes_basic(&HeaderMap::new()));
+        assert!(!AuthConfig::new(None, None).authorizes_basic(&headers("zuno", "")));
     }
 }

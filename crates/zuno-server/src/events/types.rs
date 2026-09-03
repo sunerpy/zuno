@@ -148,6 +148,9 @@ pub enum EventStreamError {
     InvalidSessionId { value: String },
     #[error("invalid event type `{value}`")]
     InvalidEventType { value: String },
+    /// A session-scoped stream was requested for a session the database has never seen.
+    #[error("session `{session_id}` was not found")]
+    SessionNotFound { session_id: String },
     #[error("event database operation failed")]
     Database(#[from] DbError),
     #[error("event storage worker stopped")]

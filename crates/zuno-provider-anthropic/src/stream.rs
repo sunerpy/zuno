@@ -9,7 +9,9 @@ use zuno_error::ProviderError;
 use zuno_llm::event::{
     ConnectionPhase, FinishReason, PromptAccounting, RequestContentBlock, StreamEvent,
 };
-use zuno_llm::sse::{SseEvent, SseParser, append_tool_input, ensure_tool_input_size};
+use zuno_llm::sse::{
+    SseEvent, SseParser, append_tool_input, ensure_tool_input_size, upstream_stream_incomplete,
+};
 
 use crate::error::{AnthropicErrorBody, map_stream_error};
 
@@ -61,6 +63,19 @@ impl AnthropicDecoder {
         let frames = self.parser.finish();
         let mut output = self.decode_frames(frames);
         if self.state.failed {
+            return output;
+        }
+        if !self.state.message_ended {
+            // The byte stream ended before any terminator. That is a cut-off
+            // generation, not a finished turn, and it is retryable: reporting it
+            // as a typed stream failure lets the engine discard the partial
+            // output and replay the identical request instead of committing a
+            // truncated assistant message as history.
+            output.push(Err(upstream_stream_incomplete(
+                &self.state.provider,
+                &self.state.requested_model,
+            )));
+            self.state.failed = true;
             return output;
         }
         if !self.state.active.is_empty() {
@@ -138,19 +153,32 @@ impl AnthropicDecoder {
                 if let Some(usage) = usage {
                     self.state.usage.update(usage);
                 }
-                Ok(delta
-                    .stop_reason
-                    .map(|reason| StreamEvent::MessageEnd {
-                        stop_reason: Some(finish_reason(&reason)),
-                    })
-                    .into_iter()
-                    .collect())
+                let Some(reason) = delta.stop_reason else {
+                    return Ok(Vec::new());
+                };
+                self.state.message_ended = true;
+                Ok(vec![StreamEvent::MessageEnd {
+                    stop_reason: Some(finish_reason(&reason)),
+                }])
             }
             ApiEvent::Ping => Ok(vec![StreamEvent::ConnectionPhase {
                 phase: ConnectionPhase::Streaming,
             }]),
             ApiEvent::Error { error } => Err(map_stream_error(&self.state.provider, error)),
-            ApiEvent::MessageStop | ApiEvent::Unknown => Ok(Vec::new()),
+            ApiEvent::MessageStop => {
+                // `message_stop` closes the message even when no `message_delta`
+                // named a stop reason. The Vertex-hosted Anthropic decoder already
+                // treated it that way; the two speakers of this wire format must
+                // agree on what "the message ended" means.
+                if self.state.message_ended {
+                    return Ok(Vec::new());
+                }
+                self.state.message_ended = true;
+                Ok(vec![StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::Unknown),
+                }])
+            }
+            ApiEvent::Unknown => Ok(Vec::new()),
         }
     }
 
@@ -373,6 +401,10 @@ struct StreamState {
     active: BTreeMap<u64, ActiveBlock>,
     usage: Usage,
     failed: bool,
+    /// Whether a terminator arrived: a `message_delta` carrying `stop_reason`, or
+    /// a `message_stop`. Either one is enough; requiring both would break every
+    /// Anthropic-compatible endpoint that sends only one of them.
+    message_ended: bool,
 }
 
 impl StreamState {
@@ -384,6 +416,7 @@ impl StreamState {
             active: BTreeMap::new(),
             usage: Usage::default(),
             failed: false,
+            message_ended: false,
         }
     }
 }
@@ -646,6 +679,91 @@ mod tests {
             body.push_str("\n\n");
         }
         body.into_bytes()
+    }
+
+    #[test]
+    fn a_stream_cut_off_before_any_terminator_is_a_retryable_stream_failure() {
+        let bytes = authored_sse(&[
+            (
+                "message_start",
+                serde_json::json!({
+                    "type": "message_start",
+                    "message": { "model": "claude-sonnet-4-6", "usage": { "input_tokens": 12 } }
+                }),
+            ),
+            (
+                "content_block_start",
+                serde_json::json!({
+                    "type": "content_block_start", "index": 0,
+                    "content_block": { "type": "text", "text": "" }
+                }),
+            ),
+            (
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta", "index": 0,
+                    "delta": { "type": "text_delta", "text": "Deleting the old " }
+                }),
+            ),
+        ]);
+
+        let mut decoder = AnthropicDecoder::new("anthropic", "claude-sonnet-4-6");
+        let mut events = decoder.push(&bytes);
+        events.extend(decoder.finish());
+
+        let error = events
+            .into_iter()
+            .find_map(Result::err)
+            .expect("a truncated stream must not finish cleanly");
+        assert!(
+            matches!(
+                error,
+                ProviderError::Stream {
+                    code: zuno_error::ProviderStreamFailure::UpstreamStreamIncomplete,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            error.permits_partial_output_retry(),
+            "a truncated stream must let the engine discard the half-written text \
+             and replay the identical request"
+        );
+    }
+
+    #[test]
+    fn message_stop_alone_terminates_the_message() {
+        let bytes = authored_sse(&[
+            (
+                "message_start",
+                serde_json::json!({
+                    "type": "message_start",
+                    "message": { "model": "claude-sonnet-4-6", "usage": { "input_tokens": 4 } }
+                }),
+            ),
+            (
+                "message_stop",
+                serde_json::json!({ "type": "message_stop" }),
+            ),
+        ]);
+
+        let mut decoder = AnthropicDecoder::new("anthropic", "claude-sonnet-4-6");
+        let events = decoder
+            .push(&bytes)
+            .into_iter()
+            .chain(decoder.finish())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("a message_stop terminator is enough on its own");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::Unknown)
+                }
+            )),
+            "{events:?}"
+        );
     }
 
     #[test]

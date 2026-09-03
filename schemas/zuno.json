@@ -2602,7 +2602,7 @@
           "description": "Action when a confined backend is unavailable. Absence fails closed.\n\n`run-unconfined` is accepted only from a trusted configuration layer."
         },
         "protectedPaths": {
-          "description": "Paths reapplied read-only after writable roots are mounted.\n\nRelative paths resolve against the active workspace. Missing paths are\nignored until they exist.",
+          "description": "Paths reapplied read-only after writable roots are mounted.\n\nRelative paths resolve against the active workspace. Each entry must\nalready exist and must not be a symbolic link; deployment fails closed\nrather than starting an Agent whose protection was silently dropped.\nCannot be combined with `danger-full-access`, which has no confined\nbackend to enforce it.",
           "items": {
             "type": "string"
           },

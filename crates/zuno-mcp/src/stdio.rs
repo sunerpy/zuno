@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -31,7 +31,7 @@ use zuno_error::McpError;
 use crate::catalog::{PromptDefinition, ResourceContents, ResourceDefinition, ResourceTemplate};
 use crate::protocol::{
     ExchangeError, Pending, ReaderFailure, decode_error, decode_response, fail_pending, lock,
-    route_message,
+    oversized_frame_error, route_message,
 };
 
 /// Protocol version proven against the real server used by the live test.
@@ -43,6 +43,31 @@ pub const PROTOCOL_VERSION: &str = "2024-11-05";
 /// the executable path has used this 30-second constant since before connection.
 /// Runtime behavior wins over stale schema documentation.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Largest single stdio frame this client will accumulate before it stops reading.
+///
+/// One MCP message is one newline-terminated JSON value, so a peer that never emits a
+/// newline is asking this client to grow one allocation until the process dies. The
+/// bound therefore has to sit far above any response a server can plausibly mean to
+/// send. The largest is a `resources/read`: a blob up to
+/// [`crate::MAX_RESOURCE_BLOB_BYTES`] (10 MiB) arrives base64-encoded, which inflates
+/// it to roughly 13.4 MiB before the JSON envelope, and a `tools/list` page is three
+/// orders of magnitude smaller than that. 64 MiB leaves more than four times the
+/// largest attachment-eligible payload, so nothing legitimate is rejected; past it,
+/// "one JSON value" has stopped being a credible reading of the byte stream.
+///
+/// The precedent for bounding a record at all is
+/// `zuno-search/src/ripgrep.rs`'s `MAX_RECORD_BYTES`; only the number differs,
+/// because a ripgrep record is one match line and an MCP frame can carry a blob.
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// Largest stderr line kept for one `tracing` record.
+///
+/// Deliberately far smaller than [`MAX_FRAME_BYTES`], and enforced differently: see
+/// [`spawn_stderr_reader`]. Server stderr has no pending caller to fail and no
+/// framing contract to violate, so an over-long line is truncated rather than fatal.
+/// 8 KiB is generous for a diagnostic line and bounds the allocation.
+const MAX_STDERR_LINE_BYTES: usize = 8 * 1024;
 
 const MAX_LIST_PAGES: usize = 1_000;
 const NOTIFICATION_CAPACITY: usize = 64;
@@ -276,7 +301,14 @@ impl StdioClient {
             .take()
             .map(|stderr| spawn_stderr_reader(server.clone(), stderr));
         let process = ProcessControl::new(server.clone(), child, process_group);
-        let client = Self::from_io(server, stdout, stdin, timeout, Some(process));
+        let client = Self::from_io(
+            server,
+            stdout,
+            stdin,
+            timeout,
+            Some(process),
+            MAX_FRAME_BYTES,
+        );
         if let Some(stderr) = stderr {
             lock(&client.inner.tasks).stderr = Some(stderr);
         }
@@ -451,12 +483,16 @@ impl StdioClient {
         }
     }
 
+    /// `max_frame_bytes` is a parameter rather than a direct read of
+    /// [`MAX_FRAME_BYTES`] so a test can prove the bound is enforced without moving
+    /// 64 MiB through a pipe. Every production path passes the constant.
     fn from_io<R, W>(
         server: String,
         reader: R,
         writer: W,
         timeout: Duration,
         process: Option<ProcessControl>,
+        max_frame_bytes: usize,
     ) -> Self
     where
         R: AsyncRead + Send + 'static,
@@ -487,6 +523,7 @@ impl StdioClient {
             pending,
             notifications,
             refresh,
+            max_frame_bytes,
         ));
         let refresh_task = tokio::spawn(refresh_loop(Arc::downgrade(&inner), refresh_receiver));
         {
@@ -664,6 +701,10 @@ impl StdioClient {
                 server: self.inner.server.clone(),
                 source: decode_error(&line),
             },
+            ExchangeError::FrameTooLarge { bytes, limit } => McpError::Protocol {
+                server: self.inner.server.clone(),
+                source: oversized_frame_error(bytes, limit),
+            },
             error => McpError::Handshake {
                 server: self.inner.server.clone(),
                 source: Box::new(error),
@@ -680,6 +721,10 @@ impl StdioClient {
             ExchangeError::FrameDecode { line } => McpError::Protocol {
                 server: self.inner.server.clone(),
                 source: decode_error(&line),
+            },
+            ExchangeError::FrameTooLarge { bytes, limit } => McpError::Protocol {
+                server: self.inner.server.clone(),
+                source: oversized_frame_error(bytes, limit),
             },
             ExchangeError::DecodeResult(source) => McpError::Protocol {
                 server: self.inner.server.clone(),
@@ -701,6 +746,10 @@ impl StdioClient {
             ExchangeError::FrameDecode { line } => McpError::Protocol {
                 server: self.inner.server.clone(),
                 source: decode_error(&line),
+            },
+            ExchangeError::FrameTooLarge { bytes, limit } => McpError::Protocol {
+                server: self.inner.server.clone(),
+                source: oversized_frame_error(bytes, limit),
             },
             error => McpError::ToolCall {
                 server: self.inner.server.clone(),
@@ -805,19 +854,117 @@ impl Drop for ProcessControl {
     }
 }
 
+/// What one bounded frame read produced.
+enum Frame {
+    /// `buffer` holds one frame, terminator included when the peer sent one.
+    Line,
+    /// The stream ended with nothing buffered.
+    Eof,
+    /// The peer reached `bytes` without a terminator and passed the bound.
+    ///
+    /// `buffer` holds the prefix accepted before the bound, and the reader is left
+    /// at the byte that broke it.
+    TooLarge { bytes: usize },
+}
+
+/// One step of [`read_frame`], separated so the borrow of the reader's buffer ends
+/// before the matching `consume`.
+enum FrameStep {
+    Consumed { found: bool, take: usize },
+    TooLarge { bytes: usize },
+}
+
+/// Reads one newline-terminated frame into `buffer`, refusing to grow past `limit`.
+///
+/// `tokio::io::AsyncBufReadExt` has no bounded `read_line`: it appends to a `String`
+/// until a newline arrives or the process dies, which is exactly the defect this
+/// replaces. `fill_buf`/`consume` gives the same framing with the length checked
+/// before each chunk is copied, so a peer that never terminates a frame is stopped at
+/// `limit` bytes rather than at the memory limit.
+///
+/// The terminator is left in `buffer`, and a trailing frame that ends at
+/// end-of-stream is reported once as [`Frame::Line`] followed by [`Frame::Eof`] on the
+/// next call — the same sequence `read_line` produced, so callers keep their behavior.
+/// UTF-8 is deliberately *not* validated here: framing is byte-oriented, and the one
+/// caller that needs a `str` validates once.
+async fn read_frame<R>(reader: &mut R, buffer: &mut Vec<u8>, limit: usize) -> io::Result<Frame>
+where
+    R: AsyncBufRead + Unpin,
+{
+    buffer.clear();
+    loop {
+        let step = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok(if buffer.is_empty() {
+                    Frame::Eof
+                } else {
+                    Frame::Line
+                });
+            }
+            let (found, take) = match available.iter().position(|byte| *byte == b'\n') {
+                Some(index) => (true, index + 1),
+                None => (false, available.len()),
+            };
+            let bytes = buffer.len() + take;
+            if bytes > limit {
+                FrameStep::TooLarge { bytes }
+            } else {
+                buffer.extend_from_slice(&available[..take]);
+                FrameStep::Consumed { found, take }
+            }
+        };
+        match step {
+            FrameStep::TooLarge { bytes } => return Ok(Frame::TooLarge { bytes }),
+            FrameStep::Consumed { found, take } => {
+                reader.consume(take);
+                if found {
+                    return Ok(Frame::Line);
+                }
+            }
+        }
+    }
+}
+
+/// Discards bytes through the next newline, so a drain can resume at the next line.
+///
+/// Only sound where the byte stream carries no framing contract, which means stderr
+/// and not stdout: see [`spawn_stderr_reader`].
+async fn skip_to_newline<R>(reader: &mut R) -> io::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+{
+    loop {
+        let (found, take) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok(());
+            }
+            match available.iter().position(|byte| *byte == b'\n') {
+                Some(index) => (true, index + 1),
+                None => (false, available.len()),
+            }
+        };
+        reader.consume(take);
+        if found {
+            return Ok(());
+        }
+    }
+}
+
 async fn read_loop(
     server: String,
     reader: DynReader,
     pending: Pending,
     notifications: broadcast::Sender<Notification>,
     refresh: mpsc::Sender<()>,
+    max_frame_bytes: usize,
 ) {
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut frame = Vec::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => {
+        match read_frame(&mut reader, &mut frame, max_frame_bytes).await {
+            Ok(Frame::Eof) => {
                 // Every other arm of this match already reports itself; end-of-stream
                 // was the one server death that happened in silence. It is split by
                 // whether calls were outstanding because both a crash and an ordinary
@@ -837,13 +984,55 @@ async fn read_loop(
                 }
                 break;
             }
-            Ok(_) => {
-                let frame = line.trim_end_matches(['\r', '\n']);
-                if frame.is_empty() {
+            Ok(Frame::TooLarge { bytes }) => {
+                // A peer past the frame bound has left the byte stream at an unknown
+                // offset: the bytes read are a prefix of a value whose end was never
+                // announced, so the next newline cannot be trusted to begin a message
+                // rather than sit inside one. Resynchronising would route a fragment as
+                // a frame, so this ends the connection the way end-of-stream does —
+                // every outstanding call is failed with a typed reason, and the reader
+                // stops instead of guessing.
+                let in_flight = fail_pending(
+                    &pending,
+                    ReaderFailure::FrameTooLarge {
+                        bytes,
+                        limit: max_frame_bytes,
+                    },
+                );
+                tracing::warn!(
+                    %server,
+                    bytes,
+                    limit = max_frame_bytes,
+                    in_flight,
+                    "MCP server exceeded the stdio frame bound without a newline; \
+                     the connection was ended because the stream cannot be resynchronized"
+                );
+                break;
+            }
+            Ok(Frame::Line) => {
+                // `read_line` rejected invalid UTF-8 with an `InvalidData` read error
+                // and stopped. Framing is byte-oriented now, so that check lives here,
+                // at the one point that needs a `str`, and keeps the same outcome.
+                let text = match std::str::from_utf8(&frame) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        tracing::warn!(%server, %error, "MCP server emitted non-UTF-8 stdout");
+                        fail_pending(
+                            &pending,
+                            ReaderFailure::Io {
+                                kind: io::ErrorKind::InvalidData,
+                                message: Arc::from(error.to_string()),
+                            },
+                        );
+                        break;
+                    }
+                };
+                let text = text.trim_end_matches(['\r', '\n']);
+                if text.is_empty() {
                     tracing::warn!(%server, "MCP server emitted an empty stdout line");
                     continue;
                 }
-                match serde_json::from_str::<Value>(frame) {
+                match serde_json::from_str::<Value>(text) {
                     Ok(message) => {
                         route_message(&server, &pending, &notifications, &refresh, message);
                     }
@@ -857,7 +1046,7 @@ async fn read_loop(
                         fail_pending(
                             &pending,
                             ReaderFailure::Decode {
-                                line: Arc::from(frame),
+                                line: Arc::from(text),
                             },
                         );
                     }
@@ -962,23 +1151,49 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Drains a child's stderr into `tracing`, bounded per line.
+///
+/// # Why this truncates where the stdout reader disconnects
+///
+/// Both readers used an unbounded `read_line`, but the two streams answer to
+/// different contracts. A stdout frame is protocol: exceeding
+/// [`MAX_FRAME_BYTES`] means the client can no longer say where one message ends, so
+/// [`read_loop`] fails every pending call and stops. Stderr is diagnostics: it has no
+/// pending caller to fail, no framing to resynchronize, and ending the drain would be
+/// actively harmful, because a full stderr pipe blocks the child. So an over-long
+/// line is logged truncated, marked `truncated = true`, and its remainder discarded
+/// through the next newline, after which draining continues.
 fn spawn_stderr_reader<R>(server: String, stderr: R) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
+        let mut line = Vec::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => return,
-                Ok(_) => {
+            match read_frame(&mut reader, &mut line, MAX_STDERR_LINE_BYTES).await {
+                Ok(Frame::Eof) => return,
+                Ok(Frame::Line) => {
+                    let message = String::from_utf8_lossy(&line);
                     tracing::debug!(
                         %server,
-                        message = line.trim_end_matches(['\r', '\n']),
+                        message = message.trim_end_matches(['\r', '\n']),
                         "MCP server stderr"
                     );
+                }
+                Ok(Frame::TooLarge { bytes }) => {
+                    let message = String::from_utf8_lossy(&line);
+                    tracing::debug!(
+                        %server,
+                        bytes,
+                        limit = MAX_STDERR_LINE_BYTES,
+                        truncated = true,
+                        message = %message,
+                        "MCP server stderr line exceeded its bound and was truncated"
+                    );
+                    if skip_to_newline(&mut reader).await.is_err() {
+                        return;
+                    }
                 }
                 Err(error) => {
                     tracing::debug!(%server, %error, "could not drain MCP server stderr");
@@ -1045,10 +1260,29 @@ mod tests {
     const LIVE_TIMEOUT_MS: u32 = 30_000;
 
     fn memory_client(timeout: Duration) -> (StdioClient, DuplexStream) {
+        bounded_memory_client(timeout, MAX_FRAME_BYTES)
+    }
+
+    /// A memory client whose reader enforces `max_frame_bytes`.
+    ///
+    /// Exists so the frame bound can be proven at a few kilobytes instead of moving
+    /// [`MAX_FRAME_BYTES`] through a duplex pipe; the production bound itself is
+    /// pinned by `stdio_frame_bound_cannot_reject_a_maximum_resource_blob`.
+    fn bounded_memory_client(
+        timeout: Duration,
+        max_frame_bytes: usize,
+    ) -> (StdioClient, DuplexStream) {
         let (client, server) = duplex(256 * 1024);
         let (reader, writer) = split(client);
         (
-            StdioClient::from_io("fake".to_owned(), reader, writer, timeout, None),
+            StdioClient::from_io(
+                "fake".to_owned(),
+                reader,
+                writer,
+                timeout,
+                None,
+                max_frame_bytes,
+            ),
             server,
         )
     }
@@ -1181,6 +1415,153 @@ mod tests {
             .expect("line-oriented reading must not impose a small frame limit");
         assert_eq!(response, Value::String(expected));
         server.await.expect("fake server completed");
+    }
+
+    /// The bound is only safe if it cannot refuse a response a server means to send.
+    #[test]
+    fn stdio_frame_bound_cannot_reject_a_maximum_resource_blob() {
+        // A `resources/read` blob arrives base64-encoded: four output bytes per three
+        // input bytes, before the JSON envelope and any second content item.
+        let largest_blob = crate::MAX_RESOURCE_BLOB_BYTES;
+        let base64 = largest_blob.div_ceil(3) * 4;
+        assert!(
+            MAX_FRAME_BYTES > base64 * 4,
+            "the frame bound ({MAX_FRAME_BYTES}) must leave several times the largest \
+             attachment-eligible payload ({base64} base64 bytes) so no legitimate \
+             response is rejected"
+        );
+        // Both bounds are constants, so their ordering is a compile-time invariant.
+        const {
+            assert!(
+                MAX_STDERR_LINE_BYTES < MAX_FRAME_BYTES,
+                "a diagnostic line needs a far tighter bound than a protocol frame"
+            )
+        };
+    }
+
+    #[tokio::test]
+    async fn stdio_unterminated_frame_past_the_bound_fails_the_pending_caller() {
+        const LIMIT: usize = 4 * 1024;
+
+        let (client, server) = bounded_memory_client(Duration::from_secs(5), LIMIT);
+        let (server_reader, mut server_writer) = split(server);
+        let mut server_reader = BufReader::new(server_reader);
+        let server = tokio::spawn(async move {
+            let _request = read_message(&mut server_reader).await;
+            // A hostile or wedged peer: bytes forever, never a newline.
+            server_writer
+                .write_all(&vec![b'x'; LIMIT * 2])
+                .await
+                .expect("write the oversized frame");
+            std::future::pending::<()>().await;
+        });
+
+        let error = client
+            .list_tools()
+            .await
+            .expect_err("an unterminated frame past the bound must fail the pending call");
+        let McpError::Protocol {
+            server: named,
+            source,
+        } = &error
+        else {
+            panic!(
+                "an over-long frame is a framing violation, which must block rather than \
+                 look retryable: {error:?}"
+            );
+        };
+        assert_eq!(named, "fake");
+        assert!(
+            source.to_string().contains("without a newline"),
+            "the typed cause must say why the frame was refused: {source}"
+        );
+        assert!(
+            !error.is_retryable(),
+            "retrying a peer that cannot frame a message repeats the violation"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stdio_frame_just_under_the_bound_still_round_trips() {
+        const LIMIT: usize = 4 * 1024;
+
+        let (client, server) = bounded_memory_client(Duration::from_secs(5), LIMIT);
+        let (server_reader, mut server_writer) = split(server);
+        let mut server_reader = BufReader::new(server_reader);
+        let server = tokio::spawn(async move {
+            let request = read_message(&mut server_reader).await;
+            // Grow the payload until one more byte would exceed the bound, so this
+            // asserts the boundary rather than a comfortable margin.
+            let mut payload = String::new();
+            loop {
+                let candidate = json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": format!("{payload}x"),
+                });
+                let framed = serde_json::to_vec(&candidate)
+                    .expect("serialize fake-server response")
+                    .len()
+                    + 1;
+                if framed > LIMIT {
+                    break;
+                }
+                payload.push('x');
+            }
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": payload.clone(),
+            });
+            let framed = serde_json::to_vec(&response)
+                .expect("serialize fake-server response")
+                .len()
+                + 1;
+            assert!(
+                framed <= LIMIT,
+                "fixture must sit under the bound: {framed}"
+            );
+            assert!(
+                framed > LIMIT - 8,
+                "fixture must sit just under the bound, not far below it: {framed}"
+            );
+            send_message(&mut server_writer, &response).await;
+            payload
+        });
+
+        let response = client
+            .request("large", json!({}))
+            .await
+            .expect("a frame under the bound must still be delivered whole");
+        let payload = server.await.expect("fake server completed");
+        assert_eq!(response, Value::String(payload));
+    }
+
+    #[tokio::test]
+    async fn stderr_drain_truncates_an_over_long_line_and_keeps_draining() {
+        let (mut writer, reader) = duplex(4 * MAX_STDERR_LINE_BYTES);
+        let task = spawn_stderr_reader("fake".to_owned(), reader);
+        let writes = tokio::spawn(async move {
+            writer
+                .write_all(&vec![b'y'; MAX_STDERR_LINE_BYTES * 2])
+                .await
+                .expect("write the over-long stderr line");
+            writer
+                .write_all(b"\nstill draining\n")
+                .await
+                .expect("write the line after the truncated one");
+            drop(writer);
+        });
+
+        // Reaching end-of-stream is the assertion: an unbounded reader would have
+        // swallowed the whole line, and a reader that gave up on the bound the way
+        // stdout does would never see the line that follows it.
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the stderr drain must survive an over-long line and reach EOF")
+            .expect("stderr task does not panic");
+        writes.await.expect("stderr writer completed");
     }
 
     #[tokio::test(start_paused = true)]

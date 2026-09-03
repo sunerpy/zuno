@@ -31,6 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -41,10 +42,11 @@ use zuno_error::{McpError, ToolError};
 use zuno_llm::cache::{LockedTools, McpToolStatus, ToolSnapshot};
 use zuno_permission::Rule;
 use zuno_permission::visibility::retain_visible_tools;
-use zuno_tool::{Attachment, Tool, ToolContext, ToolEffect, ToolOutput};
+use zuno_tool::{Attachment, Tool, ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy};
 use zuno_tools::registry::{CustomTool, McpToolLoader, McpToolSnapshot};
 
 use crate::protocol::lock;
+use crate::remote::RemoteFailureKind;
 use crate::stdio::{ToolCallResult, ToolDefinition, tool_name};
 
 /// Tool id that lists resources across connected servers.
@@ -730,9 +732,10 @@ impl ConnectedServer for crate::StdioClient {
     }
 }
 
-/// Remote failures are re-wrapped as [`McpError::Connect`] so the catalog holds
-/// one error type. The `RemoteError` display already names the server and the
-/// transport, so nothing is lost by boxing it as the source.
+/// Remote failures are re-wrapped as an [`McpError`] so the catalog holds one
+/// error type. The wrapping is by variant, never by rendered message: see
+/// [`remote_error`] for the classification and why flattening every remote
+/// failure into one retryable variant was a defect.
 #[async_trait]
 impl ConnectedServer for crate::RemoteClient {
     fn server_name(&self) -> &str {
@@ -750,7 +753,7 @@ impl ConnectedServer for crate::RemoteClient {
     async fn list_tools(&self) -> Result<Vec<ToolDefinition>, McpError> {
         Self::list_tools(self)
             .await
-            .map_err(|error| remote_error(Self::server_name(self), error))
+            .map_err(|error| remote_error(Self::server_name(self), Self::timeout(self), error))
     }
 
     async fn call_tool(
@@ -760,38 +763,117 @@ impl ConnectedServer for crate::RemoteClient {
     ) -> Result<ToolCallResult, McpError> {
         Self::call_tool(self, tool, arguments)
             .await
-            .map_err(|error| remote_error(Self::server_name(self), error))
+            .map_err(|error| remote_error(Self::server_name(self), Self::timeout(self), error))
     }
 
     async fn list_resources(&self) -> Result<Vec<ResourceDefinition>, McpError> {
         Self::list_resources(self)
             .await
-            .map_err(|error| remote_error(Self::server_name(self), error))
+            .map_err(|error| remote_error(Self::server_name(self), Self::timeout(self), error))
     }
 
     async fn list_resource_templates(&self) -> Result<Vec<ResourceTemplate>, McpError> {
         Self::list_resource_templates(self)
             .await
-            .map_err(|error| remote_error(Self::server_name(self), error))
+            .map_err(|error| remote_error(Self::server_name(self), Self::timeout(self), error))
     }
 
     async fn read_resource(&self, uri: &str) -> Result<ResourceContents, McpError> {
         Self::read_resource(self, uri)
             .await
-            .map_err(|error| remote_error(Self::server_name(self), error))
+            .map_err(|error| remote_error(Self::server_name(self), Self::timeout(self), error))
     }
 
     async fn list_prompts(&self) -> Result<Vec<PromptDefinition>, McpError> {
         Self::list_prompts(self)
             .await
-            .map_err(|error| remote_error(Self::server_name(self), error))
+            .map_err(|error| remote_error(Self::server_name(self), Self::timeout(self), error))
     }
 }
 
-fn remote_error(server: &str, error: crate::RemoteError) -> McpError {
-    McpError::Connect {
-        server: server.to_owned(),
-        source: Box::new(error),
+/// Classifies one remote failure into the catalog's error type.
+///
+/// # Why this is not one variant
+///
+/// Every remote failure used to become [`McpError::Connect`], which
+/// [`zuno_error::McpError::recovery`] reports as retryable. That made a permanent
+/// 403, a `Config` fault, and `oauth: false` indistinguishable from a server that
+/// was still coming up, and any layer that honored the recovery would retry all of
+/// them forever. It also erased the one distinction that matters most for a
+/// mutating tool: a deadline leaves the call's outcome unknown, because the server
+/// may have run the side effect and lost the response.
+///
+/// `deadline` is the client's configured per-request timeout. It stands in for
+/// `elapsed` when a deadline is reported without a measurement — the same
+/// substitution the stdio transport makes for `ExchangeError::Timeout`.
+///
+/// A permanent failure becomes [`McpError::Handshake`] rather than
+/// [`McpError::Protocol`]: `Protocol` contracts for a real `serde_json::Error`
+/// whose line and column are the diagnostic, and a `RemoteError::Protocol`
+/// carries only a message about an HTTP or SSE violation. Fabricating a decode
+/// error there would poison the one variant whose value is a genuine parse
+/// position. `Handshake` is the honest permanent home: it already means "the
+/// transport came up and the exchange is unusable", which is what a bad URL,
+/// refused credentials, or a malformed SSE stream is.
+fn remote_error(server: &str, deadline: Duration, error: crate::RemoteError) -> McpError {
+    match error.failure_kind() {
+        RemoteFailureKind::Timeout => McpError::Timeout {
+            server: server.to_owned(),
+            elapsed: error.timeout_elapsed().unwrap_or(deadline),
+        },
+        RemoteFailureKind::Transient => McpError::Connect {
+            server: server.to_owned(),
+            source: Box::new(error),
+        },
+        RemoteFailureKind::Permanent => McpError::Handshake {
+            server: server.to_owned(),
+            source: Box::new(error),
+        },
+    }
+}
+
+/// Classifies one MCP failure as a tool failure, by variant and never by message.
+///
+/// # Why not one `Failed`
+///
+/// Every call here used to produce [`ToolError::Failed`], which
+/// [`zuno_error::ToolError::recovery`] reports as `Recovery::Fail`. The engine
+/// reads exactly that to decide whether a failed call schedules another attempt
+/// (`zuno-engine/src/dispatch.rs:902`), so a remote MCP server that timed out or
+/// had not finished starting ended the call as a hard failure with no backoff, and
+/// the model was never told the call's outcome was uncertain.
+///
+/// The mapping is exhaustive on purpose: a new [`McpError`] variant must be
+/// classified deliberately rather than inheriting a default.
+///
+/// Note what this does **not** do. It never sets `retry_after`, because no
+/// [`McpError`] variant carries a peer-supplied delay — a `429`'s `Retry-After`
+/// cannot survive this boundary today.
+fn tool_error(tool: &str, error: McpError) -> ToolError {
+    match error {
+        // The server may have run the side effect and lost the response. `Timeout`
+        // is what carries that uncertainty, and `elapsed` lets a policy widen the
+        // budget instead of guessing.
+        McpError::Timeout { elapsed, .. } => ToolError::Timeout {
+            tool: tool.to_owned(),
+            elapsed,
+        },
+        // A transport that would not come up. A server still starting is the common
+        // cause, so the identical call may succeed after a backoff.
+        error @ McpError::Connect { .. } => ToolError::Transient {
+            tool: tool.to_owned(),
+            retry_after: None,
+            source: Box::new(error),
+        },
+        // A framing or JSON-RPC violation, a failed handshake, and a tool the
+        // server itself rejected are all permanent here: retrying an invalid
+        // protocol exchange or an unusable configuration only repeats it.
+        error @ (McpError::Protocol { .. }
+        | McpError::Handshake { .. }
+        | McpError::ToolCall { .. }) => ToolError::Failed {
+            tool: tool.to_owned(),
+            source: Box::new(error),
+        },
     }
 }
 
@@ -873,6 +955,18 @@ impl Tool for McpToolProxy {
         self.schema.clone()
     }
 
+    /// Never replayable, stated rather than inherited.
+    ///
+    /// This proxy relays an arbitrary tool on an arbitrary server: it may create a
+    /// pull request, send a message, or write a row. A lost response therefore does
+    /// not prove nothing happened, and no schema this client can read says whether
+    /// the upstream call is idempotent. The default already says `Never`; it is
+    /// written out so that a future change to the default cannot quietly make every
+    /// remote side effect replayable.
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Never
+    }
+
     /// Relays the call under the server's **own** tool name.
     ///
     /// The namespaced id is an addressing detail of this process; splitting it
@@ -895,10 +989,7 @@ impl Tool for McpToolProxy {
             .server
             .call_tool(&self.tool, arguments)
             .await
-            .map_err(|source| ToolError::Failed {
-                tool: self.id.clone(),
-                source: Box::new(source),
-            })?;
+            .map_err(|source| tool_error(&self.id, source))?;
         if result.is_error {
             return Err(ToolError::Failed {
                 tool: self.id.clone(),
@@ -934,6 +1025,16 @@ impl Tool for ListResourcesTool {
 
     fn effect(&self, _args: &Value) -> ToolEffect {
         ToolEffect::ReadOnly
+    }
+
+    /// Safe to replay: the call issues `resources/list` and nothing else.
+    ///
+    /// [`Self::execute`] resolves the requested servers, calls
+    /// [`ConnectedServer::list_resources`] on each, sorts, and renders. There is no
+    /// write, no mutation of catalog state, and no server-side effect an identical
+    /// second call could duplicate.
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
     }
 
     async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
@@ -986,6 +1087,14 @@ impl Tool for ListResourceTemplatesTool {
 
     fn effect(&self, _args: &Value) -> ToolEffect {
         ToolEffect::ReadOnly
+    }
+
+    /// Safe to replay: the call issues `resources/templates/list` and nothing else.
+    ///
+    /// [`Self::execute`] resolves the requested servers, calls
+    /// [`ConnectedServer::list_resource_templates`] on each, sorts, and renders.
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
     }
 
     async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
@@ -1052,6 +1161,16 @@ impl Tool for ReadResourceTool {
         ToolEffect::ReadOnly
     }
 
+    /// Safe to replay: the call issues one `resources/read` and nothing else.
+    ///
+    /// [`Self::execute`] resolves the addressed server, calls
+    /// [`ConnectedServer::read_resource`] once, and renders the contents. MCP
+    /// defines `resources/read` as a read; a repeat returns the resource again
+    /// rather than applying anything a second time.
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
+    }
+
     async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         let server = required_string(self.id(), &args, "server")?;
         let uri = required_string(self.id(), &args, "uri")?;
@@ -1062,10 +1181,7 @@ impl Tool for ReadResourceTool {
         let contents = handle
             .read_resource(&uri)
             .await
-            .map_err(|source| ToolError::Failed {
-                tool: self.id().to_owned(),
-                source: Box::new(source),
-            })?;
+            .map_err(|source| tool_error(self.id(), source))?;
         let rendered = render_resource_contents(&server, &uri, &contents);
         let mut output = ToolOutput::text(format!("MCP resource: {uri}"), rendered.text);
         output.attachments = rendered.attachments;
@@ -1201,10 +1317,7 @@ fn list_of<T>(
 ) -> Result<Vec<T>, ToolError> {
     result.map_err(|source| {
         tracing::warn!(%server, %tool, "MCP list failed");
-        ToolError::Failed {
-            tool: tool.to_owned(),
-            source: Box::new(source),
-        }
+        tool_error(tool, source)
     })
 }
 
@@ -1437,5 +1550,248 @@ fn required_string(tool: &str, args: &Value, key: &str) -> Result<String, ToolEr
             tool: tool.to_owned(),
             source: Box::new(Message(format!("{key} must be a string"))),
         }),
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    //! The `RemoteError` -> `McpError` -> `ToolError` classification.
+    //!
+    //! Unit-level because `remote_error` and `tool_error` are private and take plain
+    //! values: a table this narrow is worth asserting without a transport. The
+    //! end-to-end shape — a server failure reaching a tool's `execute` — is asserted
+    //! in `tests/catalog.rs`.
+
+    use super::*;
+    use crate::RemoteTransport;
+    use reqwest::StatusCode;
+
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    fn status(status: u16) -> crate::RemoteError {
+        crate::RemoteError::Status {
+            server: "docs".to_owned(),
+            transport: RemoteTransport::StreamableHttp,
+            status: StatusCode::from_u16(status).expect("status fixture is a real code"),
+            challenge: None,
+        }
+    }
+
+    /// The whole chain for one wire failure, which is what a caller actually sees.
+    fn tool_of(error: crate::RemoteError) -> ToolError {
+        tool_error("docs_search", remote_error("docs", DEADLINE, error))
+    }
+
+    #[test]
+    fn a_remote_deadline_keeps_its_measured_elapsed_and_stays_retryable() {
+        let mcp = remote_error(
+            "docs",
+            DEADLINE,
+            crate::RemoteError::Timeout {
+                server: "docs".to_owned(),
+                elapsed: Duration::from_secs(7),
+            },
+        );
+        let McpError::Timeout { elapsed, server } = &mcp else {
+            panic!("a remote deadline must not be flattened into a connect failure: {mcp:?}");
+        };
+        assert_eq!(server, "docs");
+        assert_eq!(*elapsed, Duration::from_secs(7));
+
+        let tool = tool_error("docs_search", mcp);
+        let ToolError::Timeout {
+            tool: named,
+            elapsed,
+        } = &tool
+        else {
+            panic!("an MCP deadline must reach the tool layer as a timeout: {tool:?}");
+        };
+        assert_eq!(named, "docs_search");
+        assert_eq!(
+            *elapsed,
+            Duration::from_secs(7),
+            "the measured elapsed is what lets a policy widen the budget instead of guessing"
+        );
+        assert!(
+            tool.recovery().is_retry(),
+            "a timed-out MCP call is recoverable; `Failed` would end the goal"
+        );
+    }
+
+    #[test]
+    fn a_deadline_without_a_measurement_reports_the_configured_one() {
+        let mcp = remote_error(
+            "docs",
+            DEADLINE,
+            crate::RemoteError::Fallback {
+                streamable: Box::new(crate::RemoteError::Timeout {
+                    server: "docs".to_owned(),
+                    elapsed: Duration::from_secs(3),
+                }),
+                sse: Box::new(status(503)),
+            },
+        );
+        assert!(
+            matches!(mcp, McpError::Timeout { elapsed, .. } if elapsed == Duration::from_secs(3)),
+            "a pair with one measured deadline reports that measurement: {mcp:?}"
+        );
+
+        let unmeasured = remote_error(
+            "docs",
+            DEADLINE,
+            crate::RemoteError::Fallback {
+                streamable: Box::new(status(503)),
+                sse: Box::new(status(502)),
+            },
+        );
+        assert!(
+            matches!(unmeasured, McpError::Connect { .. }),
+            "two transient statuses are transient, not a deadline: {unmeasured:?}"
+        );
+    }
+
+    #[test]
+    fn a_connect_failure_becomes_a_retryable_transient_tool_error() {
+        let mcp = McpError::Connect {
+            server: "docs".to_owned(),
+            source: Box::new(std::io::Error::other("connection refused")),
+        };
+        let tool = tool_error("docs_search", mcp);
+        let ToolError::Transient {
+            tool: named,
+            retry_after,
+            ..
+        } = &tool
+        else {
+            panic!("a server that is still coming up is transient, not failed: {tool:?}");
+        };
+        assert_eq!(named, "docs_search");
+        assert_eq!(
+            *retry_after, None,
+            "no McpError variant carries a peer-supplied delay, so none is invented"
+        );
+        assert!(tool.recovery().is_retry());
+    }
+
+    #[test]
+    fn a_permanent_client_status_is_not_retryable() {
+        for code in [400_u16, 401, 403, 404, 405, 302] {
+            let tool = tool_of(status(code));
+            assert!(
+                matches!(tool, ToolError::Failed { .. }),
+                "HTTP {code} will fail identically forever; retrying it is a request storm: {tool:?}"
+            );
+            assert!(
+                !tool.recovery().is_retry(),
+                "HTTP {code} must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_status_and_the_two_retryable_client_codes_are_retryable() {
+        for code in [500_u16, 502, 503, 504, 408, 429] {
+            let tool = tool_of(status(code));
+            assert!(
+                tool.recovery().is_retry(),
+                "HTTP {code} is the peer saying a later attempt may work: {tool:?}"
+            );
+            assert!(
+                matches!(tool, ToolError::Transient { .. }),
+                "HTTP {code} did not reach a decision, so it is transient rather than \
+                 an uncertain timeout: {tool:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_and_configuration_failures_block_rather_than_retry() {
+        let cases = [
+            crate::RemoteError::OAuthDisabled {
+                server: "docs".to_owned(),
+            },
+            crate::RemoteError::OAuth {
+                server: "docs".to_owned(),
+                message: "token endpoint rejected the grant".to_owned(),
+            },
+            crate::RemoteError::Config {
+                server: "docs".to_owned(),
+                message: "url is not absolute".to_owned(),
+            },
+            crate::RemoteError::Protocol {
+                server: "docs".to_owned(),
+                transport: RemoteTransport::Sse,
+                message: "event stream ended without a response".to_owned(),
+            },
+        ];
+        for case in cases {
+            let rendered = case.to_string();
+            let mcp = remote_error("docs", DEADLINE, case);
+            assert!(
+                matches!(mcp, McpError::Handshake { .. }),
+                "{rendered} is permanent, and Handshake is its honest home: {mcp:?}"
+            );
+            let tool = tool_error("docs_search", mcp);
+            assert!(
+                matches!(tool, ToolError::Failed { .. }),
+                "{rendered} must not become retryable: {tool:?}"
+            );
+            assert!(
+                !tool.recovery().is_retry(),
+                "{rendered} must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fallback_pair_is_transient_only_when_neither_half_is_permanent() {
+        let poisoned = crate::RemoteError::Fallback {
+            streamable: Box::new(status(503)),
+            sse: Box::new(crate::RemoteError::OAuthDisabled {
+                server: "docs".to_owned(),
+            }),
+        };
+        let tool = tool_of(poisoned);
+        assert!(
+            !tool.recovery().is_retry(),
+            "one permanent half poisons the pair: the fault is shared by both transports: {tool:?}"
+        );
+
+        let hopeful = crate::RemoteError::Fallback {
+            streamable: Box::new(status(503)),
+            sse: Box::new(status(500)),
+        };
+        assert!(
+            tool_of(hopeful).recovery().is_retry(),
+            "two transient halves leave the pair worth another attempt"
+        );
+    }
+
+    #[test]
+    fn a_protocol_or_handshake_or_tool_call_failure_stays_permanent() {
+        let cases = [
+            McpError::Protocol {
+                server: "docs".to_owned(),
+                source: serde_json::from_str::<Value>("{\"jsonrpc\":").unwrap_err(),
+            },
+            McpError::Handshake {
+                server: "docs".to_owned(),
+                source: Box::new(std::io::Error::other("unsupported protocol version")),
+            },
+            McpError::ToolCall {
+                server: "docs".to_owned(),
+                tool: "search".to_owned(),
+                source: Box::new(std::io::Error::other("target closed")),
+            },
+        ];
+        for case in cases {
+            let rendered = case.to_string();
+            let tool = tool_error("docs_search", case);
+            assert!(
+                matches!(tool, ToolError::Failed { .. }),
+                "{rendered} must keep blocking: {tool:?}"
+            );
+            assert_eq!(tool.tool(), "docs_search");
+        }
     }
 }

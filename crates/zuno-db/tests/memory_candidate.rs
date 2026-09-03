@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use zuno_db::memory_candidate::{MemoryCandidateStore, NewMemoryCandidate};
 use zuno_db::{Pool, migration, session};
+use zuno_error::DbError;
 use zuno_paths::DbLocation;
 use zuno_types::{MemoryAction, MemoryCandidateStatus, MemoryScope, MemorySource};
 
@@ -159,4 +160,161 @@ fn deleting_the_source_session_retains_the_audit_record_without_a_dangling_owner
         retained.projection.source_message_id.as_deref(),
         Some("msg_memory")
     );
+}
+
+#[test]
+fn a_stale_reject_cannot_overwrite_an_in_flight_apply_and_a_settled_candidate_stays_settled() {
+    let store = MemoryCandidateStore::new(initialized());
+    let created = store
+        .create(candidate("mem_race"))
+        .expect("create candidate");
+    // Reviewer A read `pending` and started applying.
+    store
+        .begin_apply(created.id(), &[], &["run cargo test".to_owned()], 20)
+        .expect("begin apply");
+    // Reviewer B read the same `pending` row moments earlier and now rejects it.
+    let error = store
+        .set_status(created.id(), MemoryCandidateStatus::Rejected, None, 21)
+        .expect_err("a stale reject must not overwrite an in-flight apply");
+    assert!(
+        matches!(
+            error,
+            DbError::Conflict { ref table, ref id, .. }
+                if table == "memory_candidate" && id == "mem_race"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        store.get("mem_race").expect("read").projection.status,
+        MemoryCandidateStatus::Applying
+    );
+
+    // The in-flight writer still finishes exactly once.
+    let applied = store
+        .set_status(created.id(), MemoryCandidateStatus::Applied, None, 30)
+        .expect("finish apply");
+    assert_eq!(applied.projection.status, MemoryCandidateStatus::Applied);
+
+    // A restart reconciler that read `applying` before the finish must not
+    // downgrade the settled row.
+    let error = store
+        .set_status(
+            created.id(),
+            MemoryCandidateStatus::Uncertain,
+            Some("reconciled after process restart without replay"),
+            31,
+        )
+        .expect_err("a settled candidate is not rewritten");
+    assert!(matches!(error, DbError::Conflict { .. }), "{error:?}");
+    let record = store.get("mem_race").expect("read");
+    assert_eq!(record.projection.status, MemoryCandidateStatus::Applied);
+    assert_eq!(record.projection.error, None);
+    assert_eq!(record.time_applied, Some(30));
+    assert_eq!(record.projection.time_updated, 30);
+}
+
+#[test]
+fn two_racing_settlements_of_one_in_flight_candidate_commit_exactly_one() {
+    let pool = initialized();
+    let store = MemoryCandidateStore::new(Arc::clone(&pool));
+    store
+        .create(candidate("mem_race"))
+        .expect("create candidate");
+    store
+        .begin_apply("mem_race", &[], &["run cargo test".to_owned()], 20)
+        .expect("begin apply");
+
+    let barrier = Arc::new(Barrier::new(2));
+    let settle = |status: MemoryCandidateStatus, error: Option<&'static str>| {
+        let store = MemoryCandidateStore::new(Arc::clone(&pool));
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            barrier.wait();
+            store.set_status("mem_race", status, error, 30)
+        })
+    };
+    let applied = settle(MemoryCandidateStatus::Applied, None);
+    let failed = settle(MemoryCandidateStatus::Failed, Some("resident file changed"));
+    let outcomes = [
+        applied.join().expect("applied thread"),
+        failed.join().expect("failed thread"),
+    ];
+
+    let winners: Vec<_> = outcomes.iter().filter_map(|o| o.as_ref().ok()).collect();
+    assert_eq!(winners.len(), 1, "{outcomes:?}");
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| matches!(o, Err(DbError::Conflict { .. })))
+            .count(),
+        1,
+        "{outcomes:?}"
+    );
+    let record = store.get("mem_race").expect("read");
+    assert_eq!(record.projection.status, winners[0].projection.status);
+    assert_eq!(record.projection.error, winners[0].projection.error);
+}
+
+#[test]
+fn every_legal_settlement_path_still_succeeds_under_the_guard() {
+    let store = MemoryCandidateStore::new(initialized());
+    // pending -> failed (preview failed) -> failed (failed again) -> rejected
+    store.create(candidate("mem_reject")).expect("create");
+    store
+        .set_status(
+            "mem_reject",
+            MemoryCandidateStatus::Failed,
+            Some("preview"),
+            20,
+        )
+        .expect("pending may fail");
+    store
+        .set_status(
+            "mem_reject",
+            MemoryCandidateStatus::Failed,
+            Some("again"),
+            21,
+        )
+        .expect("a failed candidate may fail again");
+    store
+        .set_status("mem_reject", MemoryCandidateStatus::Rejected, None, 22)
+        .expect("a failed candidate may be rejected");
+
+    // pending -> applying -> failed -> applying -> applied -> undoing -> uncertain
+    store.create(candidate("mem_apply")).expect("create");
+    store
+        .begin_apply("mem_apply", &[], &["a".to_owned()], 30)
+        .expect("begin apply");
+    store
+        .set_status(
+            "mem_apply",
+            MemoryCandidateStatus::Failed,
+            Some("write"),
+            31,
+        )
+        .expect("applying may fail");
+    store
+        .begin_apply("mem_apply", &[], &["a".to_owned()], 32)
+        .expect("failed may be retried");
+    store
+        .set_status("mem_apply", MemoryCandidateStatus::Applied, None, 33)
+        .expect("applying may finish");
+    store
+        .begin_undo("mem_apply", 34)
+        .expect("applied may be undone");
+    let record = store
+        .set_status(
+            "mem_apply",
+            MemoryCandidateStatus::Uncertain,
+            Some("lost"),
+            35,
+        )
+        .expect("undoing may become uncertain");
+    assert_eq!(record.projection.status, MemoryCandidateStatus::Uncertain);
+
+    // A missing row is reported as absent, not as a lifecycle conflict.
+    let error = store
+        .set_status("mem_missing", MemoryCandidateStatus::Rejected, None, 40)
+        .expect_err("missing candidate");
+    assert!(matches!(error, DbError::NotFound { .. }), "{error:?}");
 }

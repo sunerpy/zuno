@@ -286,10 +286,18 @@ pub struct TuiArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {
-    #[arg(long, default_value_t = 0)]
-    pub port: u16,
-    #[arg(long, default_value = "127.0.0.1")]
-    pub hostname: String,
+    // Deliberately not a clap `default_value`: a default would be indistinguishable
+    // from an explicit `--port 0`, which is why a configured `server.port` could
+    // never be reached before. The reason belongs here rather than in the doc
+    // comment, which clap prints to users.
+    /// Port to listen on. Absent means `server.port` decides, and an unset key means
+    /// an operating-system assigned port.
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// Hostname to bind. Absent means `server.hostname` decides, and an unset key
+    /// means `127.0.0.1`.
+    #[arg(long)]
+    pub hostname: Option<String>,
     #[arg(long, default_value_t = false)]
     pub mdns: bool,
     #[arg(long, default_value = "zuno.local")]
@@ -786,10 +794,11 @@ pub enum Command {
     Run(RunArgs),
     /// Start the interactive terminal application. Also the default with no command.
     Tui(TuiArgs),
-    /// Start the headless server.
+    /// Start the headless HTTP server.
     ///
-    /// Its owner wraps [`zuno_server::ServerBuilder`] through a dependency added by
-    /// todo 56; it must not spawn `zuno-server` or duplicate listener behavior.
+    /// Serves the OpenAPI surface and the server-sent event stream in this
+    /// process. Use `--hostname` and `--port` to choose the listener, or set
+    /// `server.hostname` and `server.port` in configuration.
     Serve(ServeArgs),
     /// Manage sessions.
     Session(SessionArgs),
@@ -1083,7 +1092,7 @@ pub enum Action {
     },
 }
 
-/// Behavior supplied by todo 56 and later command-owning todos.
+/// Executes parsed commands. Implemented by the assembled CLI runtime.
 pub trait CommandDispatcher {
     /// Execute one already-parsed command under the resolved environment.
     fn dispatch(&mut self, request: DispatchRequest) -> Result<(), DispatchError>;

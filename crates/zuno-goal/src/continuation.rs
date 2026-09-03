@@ -212,6 +212,12 @@ impl GoalContinuation {
     /// owns neither signal. The process-local start slot closes the read/start race;
     /// [`SessionRunRegistry::begin_turn`] then provides the authoritative live-turn
     /// lease. This does not claim cross-process exclusion.
+    ///
+    /// A tick that lands inside a persisted backoff reads and returns. The one-shot
+    /// deferral is spent only once every backoff has passed, because spending it is a
+    /// write, and a surface polls this every 250 ms for the whole backoff: a 300 s
+    /// backoff that spent the deferral first would take the write lock 1200 times
+    /// against every other session sharing the database.
     pub fn prepare_if_idle(
         &self,
         session_id: &str,
@@ -264,11 +270,6 @@ impl GoalContinuation {
                 ContinuationSuppression::NoActiveGoal,
             ));
         }
-        if self.store.consume_continuation_deferral(session_id)? {
-            return Ok(ContinuationAttempt::Suppressed(
-                ContinuationSuppression::DeferredOnce,
-            ));
-        }
         let retry = self
             .store
             .retry_state(session_id)?
@@ -295,6 +296,11 @@ impl GoalContinuation {
                         u64::try_from(remaining_ms).unwrap_or(u64::MAX),
                     ),
                 },
+            ));
+        }
+        if self.store.consume_continuation_deferral(session_id)? {
+            return Ok(ContinuationAttempt::Suppressed(
+                ContinuationSuppression::DeferredOnce,
             ));
         }
 

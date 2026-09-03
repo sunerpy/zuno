@@ -500,7 +500,13 @@ pub struct CompactedTranscript {
     pub messages: Vec<Message>,
     pub boundary: CompactionBoundary,
     pub marker_part_id: String,
+    /// Whether the turn owner should synthesize a continuation turn.
     pub auto_continue: bool,
+    /// The auto-continue hook's failure, when it could not vote.
+    ///
+    /// The summary is durable by the time the hook runs, so its failure costs the
+    /// plugin its vote — `auto_continue` is `false` — and nothing else.
+    pub auto_continue_hook_failure: Option<String>,
 }
 
 /// Terminal reason for a compaction that cannot continue the turn.
@@ -719,7 +725,7 @@ where
     )?;
     cache.reset_after_compaction();
 
-    let auto_continue = if request.automatic {
+    let (auto_continue, auto_continue_hook_failure) = if request.automatic {
         match hooks
             .auto_continue(&AutoContinueHookInput {
                 session_id: request.session_id,
@@ -731,19 +737,26 @@ where
             })
             .await
         {
-            Ok(enabled) => enabled,
+            Ok(enabled) => (enabled, None),
             Err(message) => {
-                persist_failure(connection, &mut summary_message, &message)?;
-                state.mark_failed(message.clone(), Recovery::Fail);
-                return Ok(CompactionOutcome::Stopped {
-                    reason: CompactionStopReason::Hook,
-                    message,
-                    recovery: Recovery::Fail,
-                });
+                // The summary is already durable and the cache already reset. A hook
+                // that cannot vote does not un-compact the session: rewriting the
+                // persisted summary as a failure would discard work the model can
+                // already resume from, and marking the state failed would refuse
+                // every later compaction as `AlreadyFailed`. It loses only its vote,
+                // and a vote nobody cast grants no synthesized continuation.
+                tracing::warn!(
+                    target: "zuno_engine::compaction",
+                    session_id = request.session_id,
+                    error = %message,
+                    "auto-continue hook failed after a durable compaction; the summary \
+                     stands and no continuation turn is synthesized"
+                );
+                (false, Some(message))
             }
         }
     } else {
-        false
+        (false, None)
     };
 
     let mut messages = initial
@@ -759,6 +772,7 @@ where
         boundary,
         marker_part_id,
         auto_continue,
+        auto_continue_hook_failure,
     }))
 }
 

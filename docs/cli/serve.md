@@ -11,6 +11,10 @@ separate `zuno-server` executable and does not duplicate listener behavior.
 `ZUNO_SERVER_USERNAME` defaults to `zuno`. Without a non-empty password, Zuno
 refuses a hostname that resolves to any non-loopback address.
 
+Both variables are withheld from the `shell` tool, so a command the model composes
+cannot read the credential that protects this listener. See
+[Tools](/guide/tools#what-a-shell-command-inherits).
+
 `--browser-auth` is a separate explicit opt-in for local browser use. It is
 accepted only when every resolved listener address is loopback, even if Basic
 Auth is also configured. Startup prints one bootstrap URI containing a
@@ -30,9 +34,9 @@ zuno serve [OPTIONS]
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `--port <PORT>` | | `0` |
+| `--port <PORT>` | Port to listen on. Absent means `server.port` decides, and an unset key means an operating-system assigned port | |
 | `-v`, `--version` | Show the Zuno package version | |
-| `--hostname <HOSTNAME>` | | `127.0.0.1` |
+| `--hostname <HOSTNAME>` | Hostname to bind. Absent means `server.hostname` decides, and an unset key means `127.0.0.1` | |
 | `--mdns` | | |
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
@@ -42,6 +46,12 @@ zuno serve [OPTIONS]
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
+
+Neither `--port` nor `--hostname` has a default. The flag wins when it is present, then
+`server.port` and `server.hostname` from configuration, and only then the built-in
+`127.0.0.1` and an operating-system assigned port. `--port 0` is an explicit request for
+an assigned port, which is why it is distinguishable from omitting the flag. A configured
+port outside `0`-`65535` is refused by name rather than truncated.
 
 ## Examples
 

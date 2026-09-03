@@ -762,6 +762,133 @@ fn a_missing_root_advances_non_recursively_before_becoming_recursive() {
     );
 }
 
+/// Watch `requested` adaptively until it exists, then report what the watch is anchored to.
+///
+/// Shared by the two normalization tests so the symlink case and the Windows verbatim case assert
+/// the same invariant: the ignore filter is anchored to the path the subscription registers.
+fn adaptive_watch(requested: &Path) -> (Watcher, EventStream) {
+    let options = WatchOptions::new(requested)
+        .env(zuno_paths::Env::empty().with("ZUNO_EXPERIMENTAL_FILEWATCHER", "true"))
+        .watch_missing_ancestors()
+        .debounce(Duration::from_millis(20))
+        .max_wait(Duration::from_millis(100));
+    Watcher::start(options).expect("adaptive watch starts")
+}
+
+/// Create `requested`, advance the subscription onto it, and assert the anchors agree.
+fn reconcile_onto_requested(watcher: &mut Watcher, stream: &mut EventStream, requested: &Path) {
+    let accepted = watcher.accepted();
+    fs::create_dir(requested).expect("requested root");
+    assert!(
+        poll_until(Duration::from_secs(5), || watcher.accepted() > accepted),
+        "the ancestor watch never observed the requested root"
+    );
+    assert!(
+        watcher
+            .reconcile()
+            .expect("advance onto the requested root")
+    );
+    assert!(watcher.watches_recursively());
+    assert_eq!(
+        Some(watcher.filter().root()),
+        watcher.active_root(),
+        "the ignore filter must judge paths against the subscribed directory"
+    );
+    let _settle = drain_until_quiet(stream, Duration::from_millis(100), Duration::from_secs(2));
+}
+
+/// Assert that an ignored write under `root` is never published while a sibling write is.
+fn assert_ignored_write_is_not_published(stream: &mut EventStream, root: &Path) {
+    let ignored = root.join("node_modules/dep.js");
+    fs::create_dir_all(ignored.parent().expect("parent")).expect("ignored directory");
+    let kept = root.join("kept.txt");
+    let mut seen = BTreeSet::new();
+    assert!(
+        poll_until(Duration::from_secs(5), || {
+            fs::write(&ignored, b"dep").expect("ignored write");
+            fs::write(&kept, b"kept").expect("kept write");
+            let (events, _) =
+                drain_until_quiet(stream, Duration::from_millis(100), Duration::from_secs(1));
+            seen.extend(tally(&events).0.into_keys());
+            seen.iter().any(|path| path.ends_with("kept.txt"))
+        }),
+        "the recursive scope never reported the sibling write: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|path| {
+            path.components()
+                .any(|component| component.as_os_str() == "node_modules")
+        }),
+        "an ignored path was published, so the filter was not anchored to the subscription: \
+         {seen:?}"
+    );
+}
+
+/// A root reached through a symbolic link is subscribed in resolved form, so the ignore filter has
+/// to be anchored there too — otherwise every rule silently stops matching and ignored paths are
+/// published as events.
+#[cfg(unix)]
+#[test]
+fn ignore_rules_survive_a_root_reached_through_a_symlink() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().canonicalize().expect("canonical base");
+    let real = base.join("real");
+    fs::create_dir(&real).expect("real directory");
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+    let requested = link.join("skills");
+    let resolved = real.join("skills");
+    let (mut watcher, mut stream) = adaptive_watch(&requested);
+
+    assert_eq!(watcher.requested_root(), requested);
+    assert_eq!(
+        watcher.filter().root(),
+        resolved,
+        "the filter is anchored to the requested spelling, which no event will ever carry"
+    );
+    assert!(
+        watcher
+            .filter()
+            .is_ignored(&resolved.join("node_modules/dep.js"), false),
+        "a resolved path under an ignored directory must be ignored"
+    );
+
+    reconcile_onto_requested(&mut watcher, &mut stream, &requested);
+    assert_eq!(watcher.active_root(), Some(resolved.as_path()));
+    assert_ignored_write_is_not_published(&mut stream, &requested);
+}
+
+/// The same divergence without a link: `std::fs::canonicalize` answers with a `\\?\` verbatim path,
+/// which never prefix-matches the `C:\…` spelling a caller passes in.
+///
+/// Compiled and run only on Windows, and it is the case a Linux or macOS host cannot observe.
+#[cfg(windows)]
+#[test]
+fn ignore_rules_survive_a_verbatim_normalized_root() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    // Deliberately not canonicalized: this is the spelling a caller supplies.
+    let requested = dir.path().join("skills");
+    let (mut watcher, mut stream) = adaptive_watch(&requested);
+
+    let anchored = watcher.filter().root().to_path_buf();
+    assert!(
+        anchored.to_string_lossy().starts_with(r"\\?\"),
+        "the filter must be anchored to the verbatim path the subscription registers: {}",
+        anchored.display()
+    );
+    assert!(
+        watcher
+            .filter()
+            .is_ignored(&anchored.join("node_modules/dep.js"), false),
+        "a verbatim path under an ignored directory must be ignored"
+    );
+
+    reconcile_onto_requested(&mut watcher, &mut stream, &requested);
+    assert_eq!(watcher.active_root(), Some(anchored.as_path()));
+    assert_ignored_write_is_not_published(&mut stream, &requested);
+}
+
 #[test]
 fn dropping_the_watcher_closes_the_stream() {
     let fixture = Fixture::start(|options| options);

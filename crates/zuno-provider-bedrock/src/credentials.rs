@@ -549,7 +549,9 @@ fn parse_ini(path: &Path, text: &str) -> Result<Ini, CredentialError> {
     Ok(output)
 }
 
-#[derive(Debug, Deserialize)]
+// `Debug` is deliberately not derived: these fields carry live AWS secrets, and a
+// derived `Debug` would print them into any diagnostic that formats the value.
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SsoCacheToken {
     start_url: String,
@@ -615,13 +617,13 @@ fn parse_timestamp(value: &str) -> Option<OffsetDateTime> {
     })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SsoRoleResponse {
     role_credentials: SsoRoleCredentials,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SsoRoleCredentials {
     access_key_id: String,
@@ -630,7 +632,7 @@ struct SsoRoleCredentials {
     expiration: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct MetadataCredentials {
     access_key_id: String,

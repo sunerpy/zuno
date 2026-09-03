@@ -219,7 +219,11 @@ Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程�
 | `strict` | 每个有副作用的调用都要求一次新的决策。 |
 | `allow_all` | 跳过提示，但保留显式拒绝与沙箱校验。 |
 
-`permission.rules` 是有序的，按你书写的顺序求值。规则要么是对整个工具的一个动作，要么是按模式匹配的多个动作。
+`permission.rules` 是有序的，**最后一条匹配的规则胜出**。规则要么是对整个工具的一个动作，要么是按模式匹配的多个动作。因此 catch-all `*` 要写在最前面，从它当中划出例外的窄模式要写在最后面。`edit` 这个键同时管 `write`、`edit` 和 `apply_patch` 三个工具；不存在单独的 `write` 规则键。
+
+按目录授予的 `external_directory` 规则写成「目录加 `/*`」，使用正斜杠，去掉 Windows 的逐字
+`\\?\` 前缀，例如 `{"external_directory": {"C:/build-cache/*": "allow"}}`。所有工具都按
+这一种拼法发起请求，因此一条规则同时覆盖 shell 工具与文件、搜索工具。
 
 需要注意 `allow_all` **不会**做什么：它不关闭沙箱，也不覆盖写着 `deny` 的规则。显式拒绝在任何模式下都是终局的，包括这一个。
 
@@ -235,7 +239,7 @@ Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程�
 | `network` | `deny`、`allow` | 受限模式为 `deny`，`danger-full-access` 使用宿主网络 |
 | `onUnavailable` | `deny`、`run-unconfined` | `deny` |
 | `writableRoots` | 额外的现有可写目录数组 | 空 |
-| `protectedPaths` | 重新施加只读保护的路径数组 | 空 |
+| `protectedPaths` | 重新施加只读保护的路径数组，每一项在构建沙箱策略时必须已存在且不能是符号链接 | 空 |
 
 默认配置明确写出如下：
 
@@ -248,6 +252,14 @@ Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程�
   }
 }
 ```
+
+相对路径按当前工作区解析。`writableRoots` 的每一项必须已经是目录，且只在
+`workspace-write` 下被考虑。`protectedPaths` 会在挂载可写根目录之后重新施加只读保护。
+配置的每一项在构建沙箱策略时必须已存在且不能是符号链接；缺失或是链接的路径不会被忽略，
+而是让策略构建失败关闭，以免启动一个保护被静默丢弃的 Agent。内建保护的施加方式不同：
+`.zuno`、`.agents`、Git 元数据标记、解析出的外部 Git 元数据以及沙箱 helper 只在生成
+bubblewrap 参数的那一刻已存在时才被施加；策略构建之后才消失的已配置路径在这一步会被
+静默跳过，而符号链接仍然会被拒绝。配置可以增加保护，但不能关闭限制。
 
 `danger-full-access` 始终跳过受限后端发现，以 Zuno 用户的宿主文件系统、进程、凭据和网络
 权限原生执行，并把生效权限模式设为 `allow_all`。它不能与 `network: "deny"`、
@@ -282,6 +294,14 @@ ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined zuno
 
 用 `zuno debug sandbox` 查看请求/实际权限、降级资格、`resolutionKind` 和
 `fallbackReason`。`--check` 仍严格检查请求的约束是否可部署，不会因为允许降级而成功。
+
+来源同样约束本机命令，目前只是告警而不是拒绝。项目 `zuno.json[c]` 或 `.zuno` 层声明了
+`shell`、本地 `mcp.*.command`、未被禁用的 `lsp.*.command` 或 `formatter.*.command`，或
+`productAgent.*.command` 时，配置发现会逐个键记录一条指明文件与键名的警告。该层仍然被
+接受，取值原样保留；告警的原因是这些程序都以当前用户的权限在本机运行，而选择它们的是
+被检出的仓库，因此运维者应先审阅仓库再信任它。远程 MCP server 不在本机运行任何东西，
+不会被告警。未来版本会改为直接拒绝项目层的这些声明，请现在就把本机命令移到全局
+`zuno.json` 或其他受信层。
 
 ## 严格 HITL 授权
 

@@ -12,6 +12,7 @@ use zuno_auth::{
 };
 use zuno_error::ProviderError;
 use zuno_llm::event::StreamEvent;
+use zuno_llm::http::{HttpTimeouts, RequestDeadlines, read_error_body};
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
     ProviderStream, Spec, Unavailable, generation,
@@ -389,15 +390,18 @@ async fn start_stream(
     for (name, value) in &request.headers {
         outgoing = outgoing.header(name, value);
     }
-    let response = outgoing
-        .json(&body)
-        .send()
-        .await
+    // Without a response-header deadline a peer that accepts the connection and
+    // then never answers holds the turn open indefinitely; `send()` has no bound
+    // of its own.
+    let deadlines = RequestDeadlines::start(HttpTimeouts::native());
+    let response = deadlines
+        .headers(&provider, outgoing.json(&body).send())
+        .await?
         .map_err(ProviderError::transient)?;
     let status = response.status();
     if !status.is_success() {
         let headers = response.headers().clone();
-        let bytes = response.bytes().await.map_err(ProviderError::transient)?;
+        let bytes = read_error_body(&provider, response).await?.into_bytes();
         return Err(map_http_error(&provider, status.as_u16(), &headers, &bytes));
     }
     let state = ResponseState {

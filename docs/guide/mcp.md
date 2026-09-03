@@ -63,6 +63,14 @@ another configuration layer defined.
 The toggle form takes only `enabled`, which is how a project layer disables a globally
 defined server without repeating its definition.
 
+A local server's `command` is a host executable, and the layer that declares it matters.
+Declared in a project `zuno.json[c]` or `.zuno` file, it is logged as a warning naming the
+key, `mcp.<name>.command`, when the configuration is discovered, because the checkout would
+be choosing a program that runs on this machine with your authority. The server still
+starts. A remote server runs nothing locally and is not warned about. A future release will
+reject project-layer host commands instead, so keep local server definitions in the global
+`zuno.json` or another trusted layer and let the project layer use the toggle form.
+
 ## Authentication
 
 For a remote server that needs OAuth:
@@ -182,6 +190,25 @@ disconnect. The field accepts `1..=64`.
 
 For request timeouts, prefer the per-server `timeout`. An experimental global
 `experimental.mcp_timeout` also exists.
+
+A failed MCP call is classified by what failed, not by the fact that it failed. A
+5xx, 408, or 429 response and a dropped connection are recoverable, so the turn
+retries them with backoff. Every other 4xx — 400, 401, 403, 404, 405 — and an OAuth
+failure such as a server you set `"oauth": false` for blocks instead, because the
+identical request keeps failing until configuration changes.
+
+A client-side deadline is treated as a third case, because the request may already
+have taken effect on the server. The remote tool proxy declares itself
+non-replayable, so a timed-out call returns a recovery note saying the side effect
+may have happened and must not be replayed until authoritative external state proves
+it did not complete. The two resource-listing tools declare themselves replay-safe,
+since `resources/list` mutates nothing.
+
+Stdio framing is bounded. One JSON-RPC frame may be up to 64 MiB, over four times
+the largest base64 resource blob a server can legitimately send. A longer frame fails
+every pending call with a protocol error and closes the stream, because a stream cut
+mid-frame cannot be resynchronised. Server stderr is bounded at 8 KiB per line and
+truncated rather than treated as fatal, since it has no pending caller.
 
 ## When tools do not appear
 

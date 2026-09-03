@@ -644,3 +644,163 @@ async fn compaction_failure_marks_the_summary_message_and_never_reenters() {
         provider.requests().len()
     );
 }
+
+#[derive(Debug, Default)]
+struct FailingAutoContinueHooks;
+
+#[async_trait]
+impl CompactionHooks for FailingAutoContinueHooks {
+    async fn compacting(
+        &self,
+        _input: &CompactionHookInput<'_>,
+        _output: &mut CompactionPrompt,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn auto_continue(&self, _input: &AutoContinueHookInput<'_>) -> Result<bool, String> {
+        Err("autocontinue plugin crashed".to_owned())
+    }
+}
+
+fn summary_message(connection: &Connection) -> zuno_db::message::MessageWithParts {
+    MessageStore::new(connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate compaction records")
+        .into_iter()
+        .find(|message| {
+            message
+                .info
+                .data
+                .get("summary")
+                .is_some_and(|summary| summary == true)
+        })
+        .expect("the compaction summary message is persisted")
+}
+
+#[tokio::test]
+async fn an_auto_continue_hook_failure_keeps_the_durable_compaction() {
+    let mut connection = seeded();
+    let entries = valid_transcript(&[false, true, false, true]);
+    let provider = CassetteProvider::new(vec![
+        vec![
+            Ok(StreamEvent::TextDelta(SUMMARY.to_owned())),
+            Ok(StreamEvent::MessageEnd { stop_reason: None }),
+        ],
+        vec![
+            Ok(StreamEvent::TextDelta(SUMMARY.to_owned())),
+            Ok(StreamEvent::MessageEnd { stop_reason: None }),
+        ],
+    ]);
+    let config = CompactionConfig {
+        auto: Some(true),
+        tail_turns: Some(1),
+        preserve_recent_tokens: Some(20),
+        reserved: Some(20_000),
+        ..CompactionConfig::default()
+    };
+    let window = TokenWindow {
+        context: 100_000,
+        max_output: 4_096,
+    };
+    let request = CompactionRequest::new(
+        SESSION_ID,
+        "hookfail",
+        "build",
+        "cassette",
+        "small-cassette-model",
+        entries.clone(),
+        &config,
+        window,
+        CompactionTrigger::ContextLimit {
+            used_tokens: Some(101_000),
+            limit_tokens: Some(100_000),
+        },
+    );
+    let mut state = CompactionState::default();
+    let mut tracker = CacheTracker::new();
+    let mut locked_tools: LockedTools<String> = LockedTools::new();
+
+    let outcome = {
+        let mut cache = CompactionCache::new(&mut tracker, &mut locked_tools);
+        run_compaction(
+            &mut connection,
+            &provider,
+            &FailingAutoContinueHooks,
+            &mut state,
+            &mut cache,
+            request,
+        )
+        .await
+        .expect("the compaction itself persisted")
+    };
+
+    let CompactionOutcome::Compacted(CompactedTranscript {
+        summary,
+        auto_continue,
+        ..
+    }) = outcome
+    else {
+        panic!(
+            "a hook that could not vote on continuation must not discard a summary that is \
+             already durable: {outcome:?}"
+        );
+    };
+    assert_eq!(summary, SUMMARY);
+    assert!(
+        !auto_continue,
+        "a hook that failed to decide grants no synthesized continuation"
+    );
+
+    let persisted = summary_message(&connection);
+    assert_eq!(
+        persisted.info.data["finish"], "stop",
+        "the durable summary stays a success: {:#?}",
+        persisted.info.data
+    );
+    assert!(
+        persisted.info.data.get("error").is_none(),
+        "the summary message must not be rewritten as a failure: {:#?}",
+        persisted.info.data
+    );
+    assert!(
+        persisted
+            .parts
+            .iter()
+            .any(|part| part.data["text"] == SUMMARY),
+        "the summary text is still attached to the persisted message"
+    );
+
+    // The failed vote is not a failed compaction: a later attempt is not refused as
+    // `AlreadyFailed`.
+    let second = {
+        let mut cache = CompactionCache::new(&mut tracker, &mut locked_tools);
+        run_compaction(
+            &mut connection,
+            &provider,
+            &RecordingHooks::new(true),
+            &mut state,
+            &mut cache,
+            CompactionRequest::new(
+                SESSION_ID,
+                "hookfail-again",
+                "build",
+                "cassette",
+                "small-cassette-model",
+                entries,
+                &config,
+                window,
+                CompactionTrigger::ContextLimit {
+                    used_tokens: Some(101_000),
+                    limit_tokens: Some(100_000),
+                },
+            ),
+        )
+        .await
+        .expect("a second compaction persists")
+    };
+    assert!(
+        matches!(second, CompactionOutcome::Compacted(_)),
+        "the state must not remember the hook failure as a compaction failure: {second:?}"
+    );
+}

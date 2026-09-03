@@ -19,6 +19,13 @@ Harness 运行时是 Zuno 的核心：它决定一个回合如何组装、如何
 
 注册是一种副作用。挂载操作返回的 disposer 精确移除它注册过的东西；profile 替换是事务性的，失败时按相反顺序回滚。
 
+组件通过 `Component::stop_budget` 声明运行时等待其每个 disposer 的时长：默认的
+`StopBudget::Runtime` 沿用运行时配置的停止超时；必须终止并回收进程树、排空 socket 或
+等待 flush 的组件返回 `StopBudget::Bounded(时长)`，零值按 `Runtime` 处理。disposer 仍按
+注册的相反顺序逐个运行，预算只限定运行时等待每一个的时长。超出预算的 disposer 记为
+`TimedOut` 诊断但不会被取消：半途丢弃它会丢掉它正在回收的东西，比迟到的停止更糟，所以
+它被脱离并在后台继续回收。
+
 ## Agent 与提示词契约
 
 Agent 具有显式的正向职责、负向委派边界、权限以及结构化输出预期。
@@ -62,6 +69,8 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 
 图像入口在写入 inbox 前统一经过 `AttachmentStore`：规范化方向、像素与编码，原子发布当前数据库身份下的内容寻址对象，持久 part 只保存 `ImageAttachmentRef`。Provider 请求组装时才校验并内联对象；缺失或 digest 不符是永久持久状态失败，不回退原始路径。
 
+提交转录回退（`revert_commit`）会删除暂存边界消息 `(time_created, id)` 之后的投影 `session_message` 行与旧表 `message` 行，清空会话的 context epoch，并把所有 `queued`、`steering`、`promoted` 的收件箱输入经常规取消迁移退役，每条各记一条 `session.input.cancelled`；已消费（consumed）的输入是不可变历史，不受影响。回退永不删除收件箱行。随后追加一条 `session.reverted` 事件，字段为：`sessionID`（字符串）、`messageID`（字符串，回退后仍是转录尾部的边界消息）、`marker`（对象，暂存的回退 JSON 原样，如 `{"messageID": "...", "files": []}`）、`boundaryTimeCreated`（i64 毫秒）、`removedMessageCount`（u64，删除的投影行数）、`removedLegacyMessageCount`（u64，删除的旧表行数）、`cancelledInputIDs`（字符串数组，按准入顺序）、`contextEpochCleared`（布尔）、`timeUpdated`（i64 毫秒）。所有键始终存在。
+
 ## Plan 与 Work 状态迁移
 
 持久的 Goal、Plan、Todo、收件箱和 job 状态控制续跑，而不是自然语言。「接下来我会……」
@@ -91,6 +100,13 @@ ACP 通过会话级投影器订阅 `TurnHost::work_state_changes()`，而不是�
 ## 原生会话命令、压缩与硬中断
 
 会话命令、上下文压缩与硬中断都是原生能力，不依赖模型配合。
+
+自动压缩只在摘要落盘之后才咨询 auto-continue hook。该 hook 失败时会话保持
+`Compacted`：摘要保留，不合成续跑回合（没有人投票就不授予续跑），失败原因随压缩结果以
+`auto_continue_hook_failure` 记录并输出告警；会话不会被标记为失败，因此后续压缩不再被
+`AlreadyFailed` 拒绝。工具 after-hook 失败同理：工具已经运行，结果保持自身状态与
+`is_error`，hook 失败作为 `afterHookError` 元数据随结果返回，而不是被改写成一条会让模型
+以为副作用没有发生、进而重复执行的裸错误。
 
 ## 原生 History 与 Notes
 
@@ -124,9 +140,24 @@ observer 调度 active 根 Goal。恢复任务与普通 prompt 共用会话执�
 
 可恢复的 provider、网络、流、SQLite 争用、Agent 步数上限和符合条件的工具失败，会在等待前先持久化一次指数退避重试。进程重启后从 SQLite 重建截止时间。
 
-重试延迟是正数、有上限、带抖动，并且可被用户输入打断。有效的对端 `Retry-After` 会被限制到配置上限，且绝不会被更早的本地延迟替换。
+重试延迟是正数、有上限、带抖动，并且可被用户输入打断。有效的对端 `Retry-After` 会被限制到配置上限，且绝不会被更早的本地延迟替换。对端要求的延迟超过 180 秒同请求恢复期限时，回合以对端自身的类型化错误结束，Goal 级重试等待的是对端值按 `max_delay_ms` 截断后的结果，不再退回更短的本地退避。
 
 重试决策使用类型化错误，而非渲染后的消息。认证失败与用户中断导致暂停；无效协议、损坏的持久状态和永久性配置失败导致阻塞。
+
+读取或记账 Goal 预算时遇到 SQLite 争用（`SQLITE_BUSY`）会持久化一次 `database_busy` 指数退避重试，Goal 保持活跃，而不是以 `turn_budget` 暂停；其他数据库失败仍以 `usage_unknown` 停止回合并暂停 Goal；本构建无法读取的持久状态仍然阻塞。CLI 回合中的 Plan 对账驱动、human request 创建与重试上下文压缩标记路径也经同一 `GoalTerminalFailure::from_db_error` 规则分类：争用现在以 `database_busy` 重试，过去则以 `host_permanent` 阻塞。
+
+`timeout`、`headerTimeout`、`chunkTimeout` 只有 OpenAI-compatible 传输会读取，其默认值是
+330 秒响应头截止时间与 120 秒分片空闲上限。原生的 OpenAI、Anthropic、Google、Bedrock
+四个 provider 不读这三个键：它们固定采用 330 秒响应头截止时间，不设整请求截止时间（一个
+合理的长回合没有 provider 能事先知道的上限），分片阶段则沿用共享的 300 秒流空闲上限，
+该上限由 `ZUNO_STREAM_IDLE_TIMEOUT_SECS` 对所有 provider 统一调整。原生请求在收到第一个
+响应头之前卡住时，现在会在上限处以类型化错误失败，而不是一直等到用户中断。
+
+流在没有终止标记的情况下结束，属于上游流不完整，而不是一次完成的回答。每个原生解码器都会
+报出携带 `upstream_stream_incomplete` 的 `ProviderError::Stream`，因此它可重试并允许替换
+已产生的部分输出：引擎发出 `RetryRollback`，丢弃被截断的流写出的内容，然后重放原样的请求。
+一个终止标记就足够，所以只发 `finish_reason`、或只发 `[DONE]` 的 Chat Completions 流都算
+正常完成。
 
 - 被自身预算策略停下的回合以 `turn_budget` 暂停。额度属于单个回合，Goal 保留剩余的
   token 预算，但不会自动续跑：下一回合只会以同样的方式花掉同样的额度。这与 Goal 整体
@@ -142,9 +173,48 @@ observer 调度 active 根 Goal。恢复任务与普通 prompt 共用会话执�
   profile 才没有上限。每次停止都是类型化的 `TurnError::BudgetLimited`，并以 `notice` 事件
   （code 为 `budget.<kind>`）投影给客户端；压缩请求的 code 为 `budget.compact`。
 
+## 文件工具的路径权威
+
+`read`、`write`、`edit`、`apply_patch` 在授权时解析路径一次，随后通过解析过程保留下来的
+目录句柄执行操作。解析从授权边界开始 —— 工作区根目录，或一个被显式授予的外部目录 ——
+逐段向下，打开每一段时都不跟随符号链接并要求它是目录，且绝不第二次解析这个名字。这条
+性质是精确的：调用要么到达用户批准的那个目录对象，要么失败。最后一段是符号链接是唯一
+有意的例外：它在授权之前被跟随一次，因此用户批准的是目标文件，而链接本身在写入之后
+保留。
+
+两个更弱的修法被否决了。只拒绝跟随最后一段没有任何作用，因为被替换掉的对象是中间目录。
+在授权之后重新 canonicalize 仍然是「检查」与「使用」分离，窗口只是被挪了个位置。
+
+机制按平台不同，保证也不相等：
+
+| 目标平台 | 机制 | 窗口 |
+| --- | --- | --- |
+| Linux | 每一段都经 `/proc/self/fd/{fd}/{segment}` 打开，内核相对被固定的描述符解析 | 已关闭 |
+| macOS | 用 `O_NOFOLLOW_ANY` 打开 `root/relative`，发布之前再核对文件身份 | 收窄：`rename` 无法携带该标志 |
+| Windows | 带 `FILE_FLAG_OPEN_REPARSE_POINT` 逐段遍历，拒绝任何带 `FILE_ATTRIBUTE_REPARSE_POINT` 的分段，发布之前再核对卷序列号与文件索引 | 收窄 |
+| 其他目标平台 | 同样的逐段遍历，改用 `symlink_metadata` 拒绝，发布前做同样的复核 | 收窄 |
+
+只有 Linux 完全关闭了这个窗口，因为只有 Linux 提供了在不使用第一方 `unsafe`（本工作区
+禁止）的前提下相对一个打开的描述符命名路径的办法。因此 `openat2`、`renameat` 与
+`GetFinalPathNameByHandleW` 都没有使用。逐段拒绝 reparse point 同时覆盖 Windows 的目录
+junction 与符号链接，这一点很重要，因为 junction 在那里才是更常见的攻击形态。
+
+发布环节区分两种失败，因为它们不该拿到同一张收据。在「让新内容可见的那次 rename」之前
+发生的失败，目标文件仍然保有它原本的字节，报为普通的工具失败。那次 rename 部分完成后
+失败、或结果丢失，则报为 `Uncertain`，并带上已经生效的路径。这个结果不可重试、绝不重放：
+它要求检查权威状态，与快照存储对一次半途而废的恢复所采用的规则相同。当目标是符号链接时，
+替换还会拒绝长度超过 40 的链接链而不是继续跟随，因为到那个长度这已经是一个环，而不是
+有意的重定向。
+
 ## 原生搜索与 Shell 隔离
 
-搜索把遍历委托给 ripgrep 本身，Zuno 不维护第二个 ripgrep 兼容的遍历器。缺少 `rg` 是工具运行时的启动错误，而不是静默回退。
+搜索把遍历委托给 ripgrep 本身，Zuno 不维护第二个 ripgrep 兼容的遍历器。发现是惰性的，因此其他命令与工具不需要 ripgrep；只有在调用 `glob` 或 `grep` 时才要求 `PATH` 上有 14 或更新的主版本 `rg`（或由分发方随 Zuno 一起打包）。缺少或版本不受支持时是带类型的工具错误，而不是静默回退，也不会妨碍 Zuno 启动。
+
+发现结果会被缓存，但不对称。成功的解析保留整个进程生命周期，因此 session 重新挂载与
+子回合不会反复 spawn `rg --version`。失败只保留五秒，随后重新探测。这个不对称是有意的：
+ripgrep 只支撑 `glob` 与 `grep`，所以在会话进行中安装它的用户必须能不重启 Zuno 就让这
+两个工具可用；而一个在没装 `rg` 的机器上反复调用 `grep` 的模型，不能每次调用都 spawn
+一次探测。并发的首批调用方之间只做一次探测，探测过程 panic 也不会让 ripgrep 永久不可用。
 
 ## Skill catalog 热更新
 
@@ -159,6 +229,8 @@ Zuno 不监听 `~/.zuno` 或远端 Skill 缓存；缓存只在配置远端索引
 
 Shell 执行受 OS 沙箱约束。`read-only` 与 `workspace-write` 都要求一个已验证的约束后端，不可用时拒绝启动而非降级。详见 [权限与沙箱](/zh/guide/permissions)。
 
+Linux bubblewrap 后端的发现结果按进程缓存，键为规范化 workspace 加 helper 可执行文件；每次命中前重新校验可信 launcher、可信 `true` 与 helper 在磁盘上的身份，校验失败即逐出并重新探测；发现失败绝不缓存，缓存也不跨进程持久化。`zuno debug sandbox` 与部署报告绕过缓存，始终重新探测。
+
 ## 常驻进程约束
 
 常驻进程在声明的约束内运行，其生命周期由运行时拥有。
@@ -169,9 +241,21 @@ Unix PTY 通过前台守护进程拥有进程组与终端前台切换。Windows 
 转发终端输出；关闭 writer/master 后发布退出，显式停止通过 `taskkill /T` 终止完整
 子进程树。
 
+Windows 上的守护器不再轮询 `tasklist`，而是通过绝对路径
+`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe` 启动一个持有真实进程句柄、
+等待父进程退出的助手，armed 之后 PID 复用无法冒充父进程。助手在 payload 启动之前武装：
+无法启动时守护器以 125 关闭，payload 不会启动；助手启动后无判定地结束时只写一条诊断，
+payload 继续运行并仅监督其自身退出，丢失的助手绝不视为父进程已死。
+
 ## 后台命令执行
 
 后台命令有独立的生命周期与输出游标，父会话通过持久状态观察它们，而不是靠轮询。
+
+每次执行都在子进程守护器之后运行，因此退出码 125、126、127 可能属于守护器而非命令：125
+表示守护器自身失败、命令结局未知，shell 工具报告不确定结果且绝不重放；126、127 表示程序
+从未启动，退出码被记录但没有 exit authority。只有捕获输出中出现守护器自身的诊断行时，
+保留码才被读作守护器的判定，普通程序自行 `exit 125` 仍保留权威收据。信号致死时守护器在
+自身重放同一信号，收据没有退出码，显示为「killed by a signal」而不是 `exit 1`。
 
 ## 后台子 Agent 与产品 Agent
 

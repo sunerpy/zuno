@@ -78,6 +78,7 @@ already final.
 | `$1`, `$2`, `$3` and so on | That single tokenized argument |
 | The highest-numbered placeholder | Every remaining argument, joined by one space |
 | A placeholder past the end of the argument list | Empty string |
+| `$0` | Empty string; numbered placeholders start at `$1`, so `$0` names no argument |
 | `$ARGUMENTS` | The raw untokenized input, with quotes, spaces, and newlines intact |
 
 The greedy-highest rule is the one that surprises people: in `A=[$1] B=[$2]` with four
@@ -90,7 +91,12 @@ arguments rather than dropping them.
 
 `$ARGUMENTS` preserves the input exactly as typed, which is why it is the right choice
 for anything the model should see verbatim — a shell command, a diff, a quoted
-sentence.
+sentence. No character inside your input is treated as syntax: `$$` stays `$$`, and a
+`$&` stays `$&`.
+
+Expansion makes one pass over the template and never reads back what it wrote, so an
+argument that itself contains `$ARGUMENTS` or `$2` is inserted as text rather than
+expanded a second time.
 
 ### Which definition wins
 

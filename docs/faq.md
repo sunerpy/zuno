@@ -220,6 +220,38 @@ probes pass.
 - [Ubuntu AppArmor documentation](https://documentation.ubuntu.com/server/how-to/security/apparmor/)
 - [AppArmor `bwrap-userns-restrict` profile](https://gitlab.com/apparmor/apparmor/-/blob/master/profiles/apparmor/profiles/extras/bwrap-userns-restrict)
 
+## Why does a guarded program on Windows exit 125 before it runs?
+
+Every child process Zuno supervises on Windows — a Shell command, an LSP server, a
+plugin host, or a product agent — runs behind the child-process guard, and the
+guard must watch its own parent so that a tree it started never outlives the Zuno
+process that owns it. The workspace forbids `unsafe` code, so the guard cannot open
+a process handle itself. It instead starts one Windows PowerShell helper from
+`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, and that helper holds
+a real handle to the parent process and waits on it. A handle names the process
+object rather than its PID, so a PID reused after the parent exits cannot
+impersonate a living parent, and nothing is spawned per poll.
+
+The helper is started before the supervised program, because a guard that cannot
+watch its parent must not start work it could never clean up. If the helper cannot
+start, the guard fails closed with exit code `125` and writes a diagnostic to its
+stderr: `child-process guard failed: Windows PowerShell is required to watch the
+guard's parent process; <path> does not exist` when the executable is missing, or
+`child-process guard failed: cannot start the parent-process watch helper: <error>`
+when it exists but cannot be launched. The supervised program never runs. The path
+is resolved from `%SystemRoot%`, then `%windir%`, then the literal `C:\Windows`,
+never from `PATH`, so a workspace-controlled `PATH` cannot substitute its own
+helper; restore Windows PowerShell at that location and retry. The Shell tool reads a
+`125` accompanied by the guard's diagnostic as an uncertain outcome by contract, as
+described under [Tools](guide/tools.md), and the diagnostic is what tells you that
+in this case nothing ran.
+
+A helper that starts and later ends without a verdict is a different case. The
+guard logs one diagnostic, leaves the program running, and supervises it only for
+its own exit; an unknown parent state never kills a healthy command. Only an
+unambiguous verdict — the helper reporting that the parent has exited, or that the
+parent was already gone when the helper armed — terminates the supervised tree.
+
 ## Why does a Kiro prompt fail with `unsupported_content_block_projection`?
 
 The 2026-08-28 `kiro-provider` build accepts consecutive all-text Responses

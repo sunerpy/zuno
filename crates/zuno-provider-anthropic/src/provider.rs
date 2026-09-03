@@ -8,6 +8,7 @@ use serde_json::Value;
 use zuno_auth::{AuthStore, Credential, Secret};
 use zuno_error::ProviderError;
 use zuno_llm::event::StreamEvent;
+use zuno_llm::http::{HttpTimeouts, RequestDeadlines, read_error_body};
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
     ProviderStream, Spec, Unavailable, generation,
@@ -384,15 +385,18 @@ async fn start_stream(
             .header("anthropic-beta", OAUTH_BETA_HEADERS),
     };
 
-    let response = outgoing
-        .json(&body)
-        .send()
-        .await
+    // A response-header deadline is the difference between a stalled peer and a
+    // turn that never ends: a load balancer that accepts the connection and then
+    // loses its upstream sends nothing at all, and `send()` alone waits forever.
+    let deadlines = RequestDeadlines::start(HttpTimeouts::native());
+    let response = deadlines
+        .headers(&provider, outgoing.json(&body).send())
+        .await?
         .map_err(ProviderError::transient)?;
     let status = response.status();
     if !status.is_success() {
         let headers = response.headers().clone();
-        let bytes = response.bytes().await.map_err(ProviderError::transient)?;
+        let bytes = read_error_body(&provider, response).await?.into_bytes();
         return Err(map_http_error(&provider, status.as_u16(), &headers, &bytes));
     }
 

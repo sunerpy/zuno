@@ -775,3 +775,77 @@ async fn retry_provider_attempt_limit_returns_a_typed_error() {
     assert!(source.is_retryable());
     assert_eq!(rollback_count.get(), 2);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_after_beyond_the_deadline_is_surfaced_not_replaced_by_a_local_delay() {
+    let attempts = Rc::new(Cell::new(0_u32));
+    let seen = Rc::clone(&attempts);
+    let started = tokio::time::Instant::now();
+    let peer_delay = PROVIDER_RETRY_MAX_ELAPSED + Duration::from_secs(220);
+    let result = retry_provider(
+        policy(PROVIDER_RETRY_MAX_ATTEMPTS),
+        move |attempt| {
+            seen.set(attempt);
+            async move {
+                Err::<(), _>(ProviderError::RateLimited {
+                    retry_after: Some(peer_delay),
+                })
+            }
+        },
+        |_| ready(Ok::<(), std::io::Error>(())),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ProviderRetryError::RetryAfterBeyondDeadline {
+                attempt: 1,
+                retry_after,
+                source: ProviderError::RateLimited { retry_after: Some(named) },
+                ..
+            }) if retry_after == peer_delay && named == peer_delay
+        ),
+        "the peer's delay and its typed error must survive the refused replay: {result:?}"
+    );
+    assert_eq!(
+        attempts.get(),
+        1,
+        "no replay may start against a deadline the peer's delay already exceeds"
+    );
+    assert_eq!(
+        started.elapsed(),
+        Duration::ZERO,
+        "recovery neither sleeps the local delay nor waits for the deadline"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_local_delay_beyond_the_deadline_still_reports_the_deadline() {
+    let result = retry_provider(
+        ProviderRetryPolicy::with_timing(
+            NonZeroU32::new(PROVIDER_RETRY_MAX_ATTEMPTS).expect("non-zero"),
+            Duration::from_secs(1),
+            RETRY_INITIAL_DELAY,
+            RETRY_MAX_DELAY_WITHOUT_PROVIDER,
+            0,
+        )
+        .expect("one-second recovery budget"),
+        |_| async {
+            Err::<(), _>(ProviderError::Transient {
+                status: Some(503),
+                source: None,
+            })
+        },
+        |_| ready(Ok::<(), std::io::Error>(())),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ProviderRetryError::DeadlineExceeded { attempt: 1, .. })
+        ),
+        "without a peer delay there is nothing to surface but the deadline: {result:?}"
+    );
+}

@@ -95,8 +95,13 @@ zuno session delete [OPTIONS] <SESSION_ID>
 | --- | --- |
 | `<SESSION_ID>` | |
 
+Exactly one of the next two options is required. Deleting a session decides the fate of
+the Experience records derived from it, so the command refuses to guess.
+
 | Option | Description | Default |
 | --- | --- | --- |
+| `--keep-derived-experiences` | Keep Experience records and detach them from the deleted session | |
+| `--cleanup-derived-experiences` | Prepare reviewed Memory and Skill revocations and forget derived Experience records | |
 | `-v`, `--version` | Show the Zuno package version | |
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
@@ -125,10 +130,19 @@ without deleting anything.
 zuno session prune --older-than 30 --by created --all-projects
 ```
 
-Delete one session by id.
+Delete one session by id, keeping the Experience records it produced.
 
 ```sh
-zuno session delete ses_1a2b3c
+zuno session delete ses_1a2b3c --keep-derived-experiences
+```
+
+Forgetting the derived Experience records instead needs a live learning profile, so run
+it from the TUI and choose `clean learning`, or use ACP with
+`cleanupDerivedExperiences=true`. On the command line it succeeds only when the session
+subtree produced no Experience records at all.
+
+```sh
+zuno session delete ses_1a2b3c --cleanup-derived-experiences
 ```
 
 ## See also

@@ -13,8 +13,8 @@ use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SubmissionSta
 use zuno_db::message::{MessageRecord, MessageStore, PartKind, PartRecord};
 use zuno_db::{Connection, migration, open};
 use zuno_engine::budget::{
-    BudgetDecision, BudgetStopKind, NoopBudgetPolicy, ProviderRequestUsage, TurnBudgetPolicy,
-    TurnUsageSnapshot,
+    BudgetDecision, BudgetPolicyError, BudgetStopKind, NoopBudgetPolicy, ProviderRequestUsage,
+    TurnBudgetPolicy, TurnUsageSnapshot,
 };
 use zuno_engine::hooks::TurnHooks;
 use zuno_engine::interrupt::{InterruptSignal, SoftInterruptMessage, SoftInterruptSource};
@@ -4749,21 +4749,21 @@ impl ObservedUsage {
 /// about and stays silent about the rest.
 #[derive(Debug, Default)]
 struct ScriptedBudgetPolicy {
-    before: Mutex<VecDeque<Result<BudgetDecision, String>>>,
-    after: Mutex<VecDeque<Result<BudgetDecision, String>>>,
+    before: Mutex<VecDeque<Result<BudgetDecision, BudgetPolicyError>>>,
+    after: Mutex<VecDeque<Result<BudgetDecision, BudgetPolicyError>>>,
     observed_before: Mutex<Vec<ObservedUsage>>,
     observed_after: Mutex<Vec<ObservedUsage>>,
 }
 
 impl ScriptedBudgetPolicy {
-    fn deciding_before(decisions: Vec<Result<BudgetDecision, String>>) -> Arc<Self> {
+    fn deciding_before(decisions: Vec<Result<BudgetDecision, BudgetPolicyError>>) -> Arc<Self> {
         Arc::new(Self {
             before: Mutex::new(decisions.into()),
             ..Self::default()
         })
     }
 
-    fn deciding_after(decisions: Vec<Result<BudgetDecision, String>>) -> Arc<Self> {
+    fn deciding_after(decisions: Vec<Result<BudgetDecision, BudgetPolicyError>>) -> Arc<Self> {
         Arc::new(Self {
             after: Mutex::new(decisions.into()),
             ..Self::default()
@@ -4794,7 +4794,7 @@ impl TurnBudgetPolicy for ScriptedBudgetPolicy {
     async fn before_request(
         &self,
         snapshot: &TurnUsageSnapshot<'_>,
-    ) -> Result<BudgetDecision, String> {
+    ) -> Result<BudgetDecision, BudgetPolicyError> {
         self.observed_before
             .lock()
             .expect("before-request observation lock")
@@ -4809,7 +4809,7 @@ impl TurnBudgetPolicy for ScriptedBudgetPolicy {
     async fn after_response(
         &self,
         snapshot: &TurnUsageSnapshot<'_>,
-    ) -> Result<BudgetDecision, String> {
+    ) -> Result<BudgetDecision, BudgetPolicyError> {
         self.observed_after
             .lock()
             .expect("after-response observation lock")
@@ -5116,9 +5116,9 @@ async fn a_budget_policy_that_cannot_decide_fails_the_turn_from_either_hook() {
         "turn-budget-undecided-head",
         None,
         full_turn_responses(),
-        ScriptedBudgetPolicy::deciding_before(vec![Err(
-            "the allowance store is unreachable".to_owned()
-        )]),
+        ScriptedBudgetPolicy::deciding_before(vec![Err(BudgetPolicyError::Permanent(
+            "the allowance store is unreachable".to_owned(),
+        ))]),
     )
     .await;
 
@@ -5144,9 +5144,9 @@ async fn a_budget_policy_that_cannot_decide_fails_the_turn_from_either_hook() {
         "turn-budget-undecided-step",
         None,
         full_turn_responses(),
-        ScriptedBudgetPolicy::deciding_after(vec![Err(
-            "the allowance store is unreachable".to_owned()
-        )]),
+        ScriptedBudgetPolicy::deciding_after(vec![Err(BudgetPolicyError::Permanent(
+            "the allowance store is unreachable".to_owned(),
+        ))]),
     )
     .await;
 
@@ -5317,5 +5317,117 @@ async fn the_budget_snapshot_reports_the_turn_total_the_last_request_and_unrepor
         run.calls.len(),
         1,
         "the count the policy saw must match what the dispatcher actually ran"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn loop_surfaces_a_retry_after_that_outlives_the_recovery_deadline() {
+    let mut connection = seeded();
+    put_user(
+        &connection,
+        "msg_retry_after_beyond_deadline_user",
+        10,
+        "wait as long as the provider asks",
+    );
+    let peer_delay = Duration::from_secs(400);
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::failed(
+        Vec::new(),
+        ProviderError::RateLimited {
+            retry_after: Some(peer_delay),
+        },
+    )]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-retry-after-beyond-deadline"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+    let error = outcome.expect_err("the peer's delay cannot fit inside the recovery deadline");
+    assert_eq!(
+        error.recovery(),
+        TurnRecovery::Retry {
+            reason: zuno_engine::r#loop::TurnRetryReason::RateLimited,
+            after: Some(peer_delay),
+        },
+        "a Retry-After the same-request deadline cannot honour must reach the goal \
+         controller intact, not be dropped for a local backoff: {error:?}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "no replay may start against a deadline the peer's delay already exceeds"
+    );
+}
+
+#[tokio::test]
+async fn a_budget_policy_that_meets_a_locked_store_ends_the_turn_as_a_typed_database_retry() {
+    let busy = || {
+        BudgetPolicyError::Database(zuno_error::DbError::Busy {
+            retry_after: Some(Duration::from_secs(7)),
+        })
+    };
+    let expected = TurnRecovery::Retry {
+        reason: zuno_engine::r#loop::TurnRetryReason::DatabaseBusy,
+        after: Some(Duration::from_secs(7)),
+    };
+
+    let refused = run_turn_under_budget(
+        "turn-budget-busy-head",
+        None,
+        full_turn_responses(),
+        ScriptedBudgetPolicy::deciding_before(vec![Err(busy())]),
+    )
+    .await;
+    let error = refused
+        .outcome
+        .expect_err("a store nobody can charge must not be read as permission");
+    assert!(
+        matches!(
+            &error,
+            TurnError::Database(zuno_error::DbError::Busy { .. })
+        ),
+        "the store's failure must keep its type, not become a permanent hook failure: {error:?}"
+    );
+    assert_eq!(error.recovery(), expected);
+    assert!(
+        refused.requests.is_empty(),
+        "the turn spent a request on an allowance nobody could read"
+    );
+
+    let stalled = run_turn_under_budget(
+        "turn-budget-busy-step",
+        None,
+        full_turn_responses(),
+        ScriptedBudgetPolicy::deciding_after(vec![Err(busy())]),
+    )
+    .await;
+    let error = stalled
+        .outcome
+        .expect_err("a response that could not be charged must not be ignored");
+    assert!(
+        matches!(
+            &error,
+            TurnError::Database(zuno_error::DbError::Busy { .. })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.recovery(), expected);
+    assert_eq!(
+        stalled.requests.len(),
+        1,
+        "the turn continued past a response it could not charge"
     );
 }

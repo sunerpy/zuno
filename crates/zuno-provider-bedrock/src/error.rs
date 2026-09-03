@@ -2,8 +2,6 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde_json::Value;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc2822;
 use zuno_error::{BoxSource, ProviderError};
 
 pub const PROVIDER_ID: &str = "amazon-bedrock";
@@ -85,15 +83,13 @@ fn retry_after(headers: &BTreeMap<String, String>, body: Option<&Value>) -> Opti
     if from_body.is_some() {
         return from_body;
     }
+    // Bedrock's own `retryAfterSeconds` is the service's instruction and stays ahead
+    // of the transport header; the header itself is RFC 9110 §10.2.3 and is parsed by
+    // the one shared implementation so every provider reads both forms identically.
     let value = headers
         .iter()
         .find_map(|(name, value)| name.eq_ignore_ascii_case("retry-after").then_some(value))?;
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
-    }
-    let deadline = OffsetDateTime::parse(value, &Rfc2822).ok()?;
-    let now = OffsetDateTime::now_utc();
-    (deadline > now).then(|| Duration::from_secs((deadline - now).whole_seconds() as u64))
+    zuno_llm::http::parse_retry_after(value)
 }
 
 fn is_rate_limit_code(code: &str) -> bool {
@@ -172,5 +168,43 @@ mod tests {
     fn namespaced_aws_error_type_is_normalized_structurally() {
         let value = serde_json::json!({"__type": "com.amazonaws#ThrottlingException"});
         assert_eq!(error_code(&value), Some("ThrottlingException"));
+    }
+
+    #[test]
+    fn the_services_own_retry_after_seconds_outranks_the_transport_header() {
+        let headers = BTreeMap::from([("Retry-After".to_owned(), "5".to_owned())]);
+        let body = serde_json::json!({"__type": "ThrottlingException", "retryAfterSeconds": 30});
+        assert_eq!(
+            retry_after(&headers, Some(&body)),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn a_throttle_carries_the_http_date_form_of_retry_after() {
+        let headers = BTreeMap::from([(
+            "retry-after".to_owned(),
+            // One RFC 9110 IMF-fixdate far enough out that the delta stays positive
+            // for the lifetime of this repository.
+            "Sun, 06 Nov 2044 08:49:37 GMT".to_owned(),
+        )]);
+        let error = classify_bedrock_error(
+            429,
+            &headers,
+            br#"{"__type":"ThrottlingException","message":"slow down"}"#,
+        );
+        let ProviderError::RateLimited {
+            retry_after: Some(delay),
+        } = error
+        else {
+            panic!("expected a rate limit carrying the peer's deadline, got {error:?}");
+        };
+        assert!(!delay.is_zero(), "an HTTP-date deadline must survive");
+    }
+
+    #[test]
+    fn a_malformed_retry_after_is_dropped_rather_than_guessed() {
+        let headers = BTreeMap::from([("retry-after".to_owned(), "soon".to_owned())]);
+        assert_eq!(retry_after(&headers, None), None);
     }
 }

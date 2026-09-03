@@ -323,6 +323,9 @@ fn every_place_that_admits_a_turn_also_counts_the_session() {
     // Prompt admission starts one durable driver. That driver retains one count while it
     // drains the FIFO, including the later leases `continue_prompt_driver` obtains.
     // Compaction owns one synchronous lease and therefore owns its count directly.
+    // `resume_pending_inputs` runs the input that arrived while compaction held the
+    // lease, and it admits that turn the same way `prompt` does: it hands the lease
+    // straight to the counted durable driver rather than counting anything itself.
     const ADMISSION: &str = "services.runs.begin_turn(";
     let server = cli_source("../zuno-server/src/api/session.rs");
     let functions = functions(&server);
@@ -334,7 +337,12 @@ fn every_place_that_admits_a_turn_also_counts_the_session() {
     admitting.sort_unstable();
     assert_eq!(
         admitting,
-        ["compact_session", "continue_prompt_driver", "prompt"],
+        [
+            "compact_session",
+            "continue_prompt_driver",
+            "prompt",
+            "resume_pending_inputs"
+        ],
         "every new server run admission must declare which session-count lifetime owns it"
     );
 
@@ -360,6 +368,13 @@ fn every_place_that_admits_a_turn_also_counts_the_session() {
     assert!(
         squash_whitespace(driver).contains("continue_prompt_driver("),
         "the counted prompt driver no longer owns the FIFO continuation admissions"
+    );
+
+    let resumed = function("resume_pending_inputs");
+    assert!(
+        squash_whitespace(resumed).contains("spawn_prompt_driver("),
+        "`resume_pending_inputs` admits a turn without handing the lease to the counted \
+         durable driver"
     );
 
     let compact_session = function("compact_session");

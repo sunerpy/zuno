@@ -48,7 +48,19 @@ use crate::node_path;
 pub const APP: &str = "zuno";
 
 /// Node's `os.tmpdir()` POSIX fallback when none of the temp variables is set.
+#[cfg(not(windows))]
 pub const DEFAULT_TMPDIR: &str = "/tmp";
+
+/// The last-resort temporary directory on Windows.
+///
+/// A POSIX `/tmp` default is not merely unidiomatic on Windows, it is wrong in a way
+/// that matters: it resolves against the current drive root, so Zuno would put its
+/// temporary tree in `<drive>\tmp\zuno` — a directory it then grants itself a write
+/// allowance in, at the root of whichever drive happened to be current. Node's
+/// `os.tmpdir()` falls back to `%SystemRoot%\temp`, which [`tmpdir`] prefers; this
+/// literal is only reached when neither `SystemRoot` nor `windir` is set.
+#[cfg(windows)]
+pub const DEFAULT_TMPDIR: &str = r"C:\Windows\Temp";
 
 /// `$XDG_DATA_HOME`'s fallback, relative to home — `xdg-basedir@5.1.0`.
 const DEFAULT_DATA_SEGMENTS: [&str; 2] = [".local", "share"];
@@ -338,11 +350,33 @@ fn tmpdir(env: &Env) -> String {
         .truthy_value(TMPDIR)
         .or_else(|| env.truthy_value(TMP))
         .or_else(|| env.truthy_value(TEMP))
-        .unwrap_or(DEFAULT_TMPDIR);
-    if raw.len() > 1 && raw.ends_with('/') {
-        return raw[..raw.len() - 1].to_owned();
+        .map(str::to_owned)
+        .unwrap_or_else(|| default_tmpdir(env));
+    let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+    if raw.chars().count() > 1 && raw.ends_with(separators) {
+        let mut trimmed = raw;
+        trimmed.pop();
+        return trimmed;
     }
-    raw.to_owned()
+    raw
+}
+
+/// The temporary directory to use when none of the temp variables is set.
+#[cfg(not(windows))]
+fn default_tmpdir(_env: &Env) -> String {
+    DEFAULT_TMPDIR.to_owned()
+}
+
+/// The Windows system Temp directory, wherever Windows is installed.
+///
+/// Reading `SystemRoot` rather than assuming `C:` keeps a Windows installation on
+/// another drive working.
+#[cfg(windows)]
+fn default_tmpdir(env: &Env) -> String {
+    env.truthy_value(crate::env::SYSTEM_ROOT)
+        .or_else(|| env.truthy_value(crate::env::WINDIR))
+        .map(|root| format!(r"{root}\Temp"))
+        .unwrap_or_else(|| DEFAULT_TMPDIR.to_owned())
 }
 
 #[cfg(test)]
@@ -352,6 +386,16 @@ mod tests {
     fn layout(pairs: &[(&str, &str)]) -> Layout {
         let env = Env::from_pairs(pairs.iter().copied());
         Layout::resolve_with(&env, None)
+    }
+
+    /// The `tmp` entry a layout resolves when no temp variable is set.
+    ///
+    /// Windows has no `/tmp`, so the last resort there is the system Temp directory
+    /// rather than a POSIX literal. Reading it back through `tmpdir` keeps these tests
+    /// about the ladder and the join instead of about one platform's spelling.
+    fn resolved_default_temp() -> String {
+        let empty = Env::from_pairs(std::iter::empty::<(&str, &str)>());
+        node_path::join(&tmpdir(&empty), APP)
     }
 
     fn expected_debug_paths(entries: &[(&str, String)]) -> String {
@@ -396,7 +440,7 @@ mod tests {
                     "state",
                     node_path::join_all(["/config", ".local/state", APP]),
                 ),
-                ("tmp", node_path::join("/tmp", APP)),
+                ("tmp", resolved_default_temp()),
             ])
         );
     }
@@ -421,7 +465,7 @@ mod tests {
                 ("cache", node_path::join("/tmp/x/cache", APP)),
                 ("config", node_path::join("/tmp/x/config", APP)),
                 ("state", node_path::join("/tmp/x/state", APP)),
-                ("tmp", node_path::join("/tmp", APP)),
+                ("tmp", resolved_default_temp()),
             ])
         );
     }
@@ -453,7 +497,7 @@ mod tests {
         assert_eq!(layout(&[(TMPDIR, "/a")]).temp(), Path::new("/a/zuno"));
         assert_eq!(layout(&[(TMP, "/b")]).temp(), Path::new("/b/zuno"));
         assert_eq!(layout(&[(TEMP, "/c")]).temp(), Path::new("/c/zuno"));
-        assert_eq!(layout(&[]).temp(), Path::new("/tmp/zuno"));
+        assert_eq!(layout(&[]).temp(), Path::new(&resolved_default_temp()));
         // TMPDIR wins over TMP wins over TEMP.
         assert_eq!(
             layout(&[(TMPDIR, "/a"), (TMP, "/b"), (TEMP, "/c")]).temp(),

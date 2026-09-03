@@ -4,6 +4,7 @@ use crate::output_policy::OutputPolicy;
 use crate::risk::{
     GIT_REPOSITORY_ENVIRONMENT_VARIABLES, GateOutcome, RiskAssessment, RiskContext, assess_and_gate,
 };
+use crate::search_common::directory_grant_pattern;
 use crate::timeout::{
     background_started_output, normalize_foreground_timeout, timeout_promoted_output,
 };
@@ -20,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tree_sitter::{Node, Parser};
 use zuno_error::ToolError;
+use zuno_process::GuardExit;
 use zuno_pty::{
     BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionPurpose,
     BackgroundExecutionRetention, BackgroundExecutionService, BackgroundExecutionStatus,
@@ -284,6 +286,26 @@ impl ShellVerification {
             git_head: self.git_head.clone(),
             output_digest,
             detail: self.contract.limitation.clone(),
+        }
+    }
+
+    /// The receipt for a run whose program never started.
+    ///
+    /// The child-process guard reports its own reserved code in place of a payload
+    /// code it never got, so the interpreter's exit contract does not apply here:
+    /// nothing ran that could have decided anything. The code is still recorded,
+    /// because it is what the caller would see on a terminal, but the authority is
+    /// [`ExitAuthority::Absent`] so no reader can cite it as the command's verdict.
+    fn never_ran(&self, exit_code: i32, output: &[u8], detail: &str) -> VerificationReceipt {
+        VerificationReceipt {
+            summary: summarize_command(&self.command),
+            workdir: Some(self.workdir.clone()),
+            exit_code: Some(i64::from(exit_code)),
+            exit_authority: ExitAuthority::Absent,
+            outcome: ReceiptOutcome::Failed,
+            git_head: self.git_head.clone(),
+            output_digest: Some(crate::read::digest_bytes(output)),
+            detail: Some(detail.to_owned()),
         }
     }
 }
@@ -612,7 +634,7 @@ impl ShellTool {
         if !directories.is_empty() {
             let patterns: Vec<String> = directories
                 .iter()
-                .map(|directory| format!("{}{}*", directory.display(), std::path::MAIN_SEPARATOR))
+                .map(|directory| directory_grant_pattern(directory))
                 .collect();
             let mut metadata = Map::new();
             metadata.insert("command".to_owned(), Value::String(command.to_owned()));
@@ -689,11 +711,7 @@ impl ShellTool {
                     "this Agent's Shell policy is read-only and cannot modify Git metadata",
                 )));
             }
-            let git_pattern = format!(
-                "{}{}*",
-                self.workspace.join(".git").display(),
-                std::path::MAIN_SEPARATOR
-            );
+            let git_pattern = directory_grant_pattern(&self.workspace.join(".git"));
             let mut metadata = Map::new();
             metadata.insert("command".to_owned(), Value::String(command.to_owned()));
             metadata.insert(
@@ -723,7 +741,9 @@ impl ShellTool {
         cwd: &Path,
         ctx: &ToolContext,
     ) -> Result<BTreeMap<String, String>, ToolError> {
-        let mut env: BTreeMap<String, String> = std::env::vars().collect();
+        // Zuno's own secrets are removed before the hook runs, so a host that wants a
+        // credential in the tool environment can still put one back deliberately.
+        let mut env = withhold_zuno_secrets(std::env::vars());
         let extra = self
             .env_hook
             .env(ShellEnvInput {
@@ -822,8 +842,8 @@ impl ShellTool {
         // The digest covers the bytes the command produced, not the rendered
         // output: the placeholder below and any later size policy are presentation,
         // while a citation is checked for drift against what actually ran.
-        let receipt = verification.settled(execution.exit_code, &bytes);
         let mut full = String::from_utf8_lossy(&bytes).into_owned();
+        let receipt = Self::guard_aware_receipt(verification, execution.exit_code, &bytes, &full)?;
         if full.is_empty() {
             full = "(no output)".to_owned();
         }
@@ -844,6 +864,60 @@ impl ShellTool {
                 tool: TOOL_ID.to_owned(),
                 source: Box::new(error),
             })
+    }
+
+    /// The receipt for a finished run, reading a guard verdict as the guard's.
+    ///
+    /// Every background execution is launched behind [`zuno_process::guarded_argv`],
+    /// so three exit codes may belong to the guard rather than to the command:
+    ///
+    /// - `125` says the guard's own machinery failed, and says nothing about whether
+    ///   the command ran or what it changed. That is an uncertain outcome, not a
+    ///   failure: it must never be replayed mechanically, so it leaves as
+    ///   [`ToolError::Uncertain`] instead of a receipt claiming `Failed exit 125`.
+    /// - `126` and `127` say the program was never started, so the code is not the
+    ///   command's verdict and is recorded without authority.
+    ///
+    /// [`GuardExit::from_reported_run`] only reads a reserved code as the guard's when
+    /// the guard's diagnostic is in the captured output, which both streams of a
+    /// background execution carry, so a command that exits 125 of its own accord keeps
+    /// its ordinary authoritative receipt.
+    fn guard_aware_receipt(
+        verification: &ShellVerification,
+        exit_code: Option<i32>,
+        bytes: &[u8],
+        text: &str,
+    ) -> Result<VerificationReceipt, ToolError> {
+        let Some(code) = exit_code else {
+            return Ok(verification.settled(None, bytes));
+        };
+        match GuardExit::from_reported_run(code, text) {
+            GuardExit::GuardFailed => Err(ToolError::Uncertain {
+                tool: TOOL_ID.to_owned(),
+                applied_paths: Vec::new(),
+                source: Box::new(io::Error::other(format!(
+                    "the child-process guard failed around `{}`, so whether the command ran, and \
+                     what it changed, is unknown from its exit status; inspect the authoritative \
+                     state the command would have changed before deciding what to do next",
+                    summarize_command(&verification.command)
+                ))),
+            }),
+            GuardExit::NotFound => Ok(verification.never_ran(
+                code,
+                bytes,
+                "the program was never started because it could not be found, so this exit code \
+                 is the guard's and decides nothing about the command",
+            )),
+            GuardExit::NotExecutable => Ok(verification.never_ran(
+                code,
+                bytes,
+                "the program exists but could not be executed, so it never ran and this exit code \
+                 is the guard's",
+            )),
+            GuardExit::Exited(_) | GuardExit::Signaled(_) => {
+                Ok(verification.settled(Some(code), bytes))
+            }
+        }
     }
 }
 
@@ -1564,6 +1638,50 @@ const TWO_TOKEN_COMMANDS: &[&str] = &[
 ];
 const THREE_TOKEN_COMMANDS: &[&str] = &["aws", "az", "doctl", "gcloud", "gh", "sfdx"];
 
+/// Zuno's own secrets, withheld from every model-composed command.
+///
+/// These three are set for the Zuno process itself — the HTTP server's credentials and
+/// the provider auth store's contents — and no shell command a model writes has any
+/// use for them. Inheriting them meant one `env`, one `printenv`, or one curl of an
+/// attacker-chosen URL exfiltrated the operator's server password and every provider
+/// key in the auth store.
+///
+/// Everything else is still inherited on purpose. A wildcard `*_API_KEY` / `*_TOKEN`
+/// filter was rejected: it silently breaks `gh`, `aws`, `az`, and `gcloud` (see
+/// [`THREE_TOKEN_COMMANDS`]) along with every user who exports a token deliberately,
+/// and a tool that quietly removes the credentials a command needs is a worse failure
+/// than one that keeps them. A deployment that wants a credential in the tool
+/// environment supplies it through [`ShellEnvHook`], which runs after this removal, so
+/// the host — not this crate — stays the single place that decides.
+const WITHHELD_ENVIRONMENT: &[&str] = &[
+    "ZUNO_AUTH_CONTENT",
+    "ZUNO_SERVER_PASSWORD",
+    "ZUNO_SERVER_USERNAME",
+];
+
+/// Whether a variable name is one of Zuno's own secrets.
+///
+/// Compared case-insensitively because Windows environment variable names are
+/// case-insensitive, so `%zuno_server_password%` names the same secret there.
+fn is_withheld_variable(name: &str) -> bool {
+    WITHHELD_ENVIRONMENT
+        .iter()
+        .any(|withheld| name.eq_ignore_ascii_case(withheld))
+}
+
+/// The inherited environment with Zuno's own secrets removed.
+///
+/// Takes the variables as an argument so the decision is testable: setting a process
+/// environment variable is `unsafe`, which this workspace forbids.
+fn withhold_zuno_secrets(
+    variables: impl IntoIterator<Item = (String, String)>,
+) -> BTreeMap<String, String> {
+    variables
+        .into_iter()
+        .filter(|(name, _)| !is_withheld_variable(name))
+        .collect()
+}
+
 fn external_directories(
     analysis: &ShellAnalysis,
     cwd: &Path,
@@ -1772,6 +1890,40 @@ fn interrupted() -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zunos_own_secrets_never_reach_a_model_composed_command() {
+        let inherited = [
+            ("ZUNO_SERVER_PASSWORD", "hunter2"),
+            ("ZUNO_SERVER_USERNAME", "operator"),
+            ("ZUNO_AUTH_CONTENT", r#"{"anthropic":{"key":"sk-live"}}"#),
+            // Windows environment names are case-insensitive, so the same secret can
+            // arrive under any spelling.
+            ("zuno_auth_content", "{}"),
+            // Deliberately kept: a wildcard `*_TOKEN` / `*_API_KEY` filter would take
+            // these away and silently break `gh`, `aws`, `az`, and `gcloud`.
+            ("GITHUB_TOKEN", "gho_kept"),
+            ("AWS_ACCESS_KEY_ID", "AKIA_kept"),
+            ("OPENAI_API_KEY", "sk-kept"),
+            ("PATH", "/usr/bin"),
+            // Non-secret Zuno variables a command may legitimately need to see.
+            ("ZUNO_WORKSPACE_ID", "wsp_1"),
+        ]
+        .map(|(name, value)| (name.to_owned(), value.to_owned()));
+
+        let env = withhold_zuno_secrets(inherited);
+
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "AWS_ACCESS_KEY_ID",
+                "GITHUB_TOKEN",
+                "OPENAI_API_KEY",
+                "PATH",
+                "ZUNO_WORKSPACE_ID",
+            ]
+        );
+    }
 
     fn mutates(command: &str) -> bool {
         mutates_git_metadata(&analyze_command(command, ShellSyntax::Bash).expect("analysis"))
@@ -2160,5 +2312,101 @@ mod tests {
         assert!(!failed.proves_success());
         assert_eq!(failed.outcome, ReceiptOutcome::Failed);
         assert_eq!(failed.exit_code, Some(101));
+    }
+
+    #[test]
+    fn a_guard_failure_is_an_uncertain_outcome_rather_than_a_failed_exit_125() {
+        // Every background execution runs behind the child-process guard, so `exit 125`
+        // plus the guard's diagnostic means the guard's own machinery broke: the command
+        // may have run and changed anything. Rendering that as an authoritative
+        // `Failed exit 125` invites the model to replay a call that already had effects.
+        let verification = ShellVerification {
+            command: "cargo publish -p zuno".to_owned(),
+            workdir: "/workspace".to_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let output = format!(
+            "{}pidfd_open: Permission denied\n",
+            zuno_process::GUARD_DIAGNOSTIC_PREFIX
+        );
+
+        let error = ShellTool::guard_aware_receipt(
+            &verification,
+            Some(125),
+            output.as_bytes(),
+            output.as_str(),
+        )
+        .expect_err("a guard failure decides nothing");
+        assert!(matches!(error, ToolError::Uncertain { .. }), "{error:?}");
+        assert_eq!(error.recovery(), zuno_error::Recovery::Fail);
+        // `describe` is what the dispatcher renders for the model, so the reason has to
+        // survive the walk down the source chain.
+        let rendered = zuno_error::source::describe(&error);
+        assert!(
+            rendered.contains("authoritative state the command would have changed"),
+            "an uncertain outcome must ask for state inspection: {rendered}"
+        );
+
+        // The same code without the guard's diagnostic is the command's own choice.
+        let ordinary = ShellTool::guard_aware_receipt(
+            &verification,
+            Some(125),
+            b"make: *** [check] Error 125\n",
+            "make: *** [check] Error 125\n",
+        )
+        .expect("an ordinary failure is not uncertain");
+        assert_eq!(ordinary.exit_code, Some(125));
+        assert_eq!(ordinary.exit_authority, verification.contract.authority);
+        assert_eq!(ordinary.outcome, ReceiptOutcome::Failed);
+    }
+
+    #[test]
+    fn a_program_that_never_started_yields_a_code_with_no_authority() {
+        let verification = ShellVerification {
+            command: "cargo-nextest run".to_owned(),
+            workdir: "/workspace".to_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::All),
+        };
+        assert_eq!(
+            verification.contract.authority,
+            ExitAuthority::Authoritative,
+            "the point of the case is that the contract would otherwise claim authority"
+        );
+        let output = format!(
+            "{}guarded program could not be started: No such file or directory\n",
+            zuno_process::GUARD_DIAGNOSTIC_PREFIX
+        );
+
+        for (code, expected) in [(127, "could not be found"), (126, "could not be executed")] {
+            let receipt = ShellTool::guard_aware_receipt(
+                &verification,
+                Some(code),
+                output.as_bytes(),
+                output.as_str(),
+            )
+            .expect("a program that never ran is an ordinary failure");
+            assert!(!receipt.proves_success());
+            assert_eq!(receipt.exit_code, Some(i64::from(code)));
+            assert_eq!(
+                receipt.exit_authority,
+                ExitAuthority::Absent,
+                "a code the command never produced cannot be cited as its verdict"
+            );
+            assert_eq!(receipt.outcome, ReceiptOutcome::Failed);
+            assert!(
+                receipt
+                    .detail
+                    .as_ref()
+                    .is_some_and(|d| d.contains(expected)),
+                "{:?} does not say why nothing ran",
+                receipt.detail
+            );
+            assert_eq!(
+                receipt.output_digest,
+                Some(crate::read::digest_bytes(output.as_bytes()))
+            );
+        }
     }
 }

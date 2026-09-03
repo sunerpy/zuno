@@ -64,6 +64,14 @@ Database opening recognizes these states:
 6. **Any other state.** An older unsupported format, a future format, a missing marker,
    or a marker whose required tables are absent fails closed without modification.
 
+Two processes that open or upgrade the same database at the same time both decide from
+the format they saw before taking SQLite's write lock. The one that loses the lock does
+not fail: it re-reads the marker and validates, upgrades, or rejects what the winner
+actually committed, making at most four attempts in total. An unsupported format is still
+reported as a schema mismatch; a database whose format keeps changing under the opener
+fails closed with a conflict on the `zuno_schema` marker. Neither path writes to the
+database.
+
 ### Format 5, 6, or 7 to format 8
 
 The supported migration uses one SQLite `BEGIN IMMEDIATE` transaction:
@@ -103,8 +111,13 @@ Once a database format has shipped, a schema change must include:
 - a guarded forward migration from every format still declared supported;
 - one atomic transaction with the format marker updated last;
 - exact old-format fixtures rather than a current schema with only its marker edited,
-  except where the change is proven purely additive and the fixture removes every new
-  table and index;
+  with no exception for changes that look purely additive: a migration that reaches the
+  new shape through `ALTER TABLE` leaves columns in a different order than a freshly
+  created database, so a fixture reverse-engineered from the current schema does not
+  exercise the path a real user's database takes;
+- comparison by structural equivalence, meaning tables, columns, types, indexes, foreign
+  keys, and the marker, rather than by `sqlite_master` text, which legitimately differs
+  between a migrated and a freshly created database;
 - row-level before/after assertions for durable user data, including representative
   sessions, messages, and memory;
 - validation that future, unmarked, and structurally corrupt formats fail closed without

@@ -5,11 +5,16 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, PoisonError};
 
 use zuno_sandbox::{
     LinuxBubblewrapSandbox, NetworkAccess, PrepareRequest, SandboxBackend, SandboxError,
     SandboxMode, SandboxPolicy,
 };
+
+/// The probe-spawn counter is process-wide, so the tests that read it or spawn
+/// probes run one at a time.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Set by every gate that must produce native confinement evidence, currently
 /// `make test-sandbox-e2e` in the CI and release-candidate Linux jobs. When it is
@@ -109,6 +114,7 @@ fn run(
 
 #[test]
 fn real_bwrap_enforces_filesystem_network_capability_and_syscall_boundaries() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let helper = match e2e_helper() {
         Ok(helper) => helper,
         Err(reason) => return skip(&reason),
@@ -209,4 +215,39 @@ expect_eperm("process_vm_readv", lambda: libc.process_vm_readv(os.getpid(), 0, 0
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[test]
+fn system_backend_discovery_is_cached_within_the_process() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let root = tempfile::tempdir().expect("temporary discovery root");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+
+    // Given: one discovery for a workspace, which must probe bubblewrap.
+    let before = zuno_sandbox::probe_spawn_count();
+    let first = match zuno_sandbox::system_backend(&workspace, SandboxMode::WorkspaceWrite) {
+        Ok(backend) => backend,
+        Err(error) => match unavailable_backend(&error) {
+            Some(reason) => return skip(&reason),
+            None => panic!("Linux backend discovery failed: {error}"),
+        },
+    };
+    let after_first = zuno_sandbox::probe_spawn_count();
+    assert!(
+        after_first > before,
+        "the first discovery must probe bubblewrap ({before} -> {after_first})"
+    );
+
+    // When: the same workspace is discovered again in the same process.
+    let second = zuno_sandbox::system_backend(&workspace, SandboxMode::WorkspaceWrite)
+        .expect("a second discovery for the same workspace succeeds");
+
+    // Then: the answer is the same and no bubblewrap process was spawned to get it.
+    assert_eq!(
+        zuno_sandbox::probe_spawn_count(),
+        after_first,
+        "a repeated discovery for the same inputs must be served from the process cache"
+    );
+    assert_eq!(first.capabilities(), second.capabilities());
 }

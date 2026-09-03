@@ -118,6 +118,12 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
 启用它，只读 Agent 永远不会使用它，受管策略也可以把它强制改回 `deny`。精确的降级边界见
 [权限与沙箱](/zh/guide/permissions)。
 
+项目层声明本机命令时会收到告警。项目 `zuno.json[c]` 或 `.zuno` 中的 `shell`、本地
+`mcp.*.command`、未被禁用的 `lsp.*.command` 与 `formatter.*.command`，以及
+`productAgent.*.command`，都会在配置发现时逐个键记录一条警告；配置仍被接受，远程 MCP
+server 不受影响。未来版本会改为拒绝，请把本机命令放在全局 `zuno.json` 或其他受信层。详见
+[配置文件与优先级](/zh/config/files)。
+
 ## 编辑时的 schema 校验
 
 规范 schema 由反序列化配置的那套 Rust 类型生成，因此它无法与二进制实际接受的内容产生漂移：

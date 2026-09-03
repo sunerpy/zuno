@@ -37,6 +37,11 @@ The paths above come from one real host, so yours will differ. They follow the X
 variables: `config` is `$XDG_CONFIG_HOME/zuno`, `data` is `$XDG_DATA_HOME/zuno`, and `cache`
 is `$XDG_CACHE_HOME/zuno`.
 
+The temporary root follows `TMPDIR`, then `TMP`, then `TEMP`. On Windows the
+last-resort fallback is `%SystemRoot%\temp` rather than `/tmp`, because a POSIX
+default there resolves against whichever drive happens to be current and would put
+the temporary tree at that drive's root.
+
 ## Layer order
 
 Lowest precedence first:
@@ -122,6 +127,17 @@ A project layer cannot select a wider mode, grant host networking, or add extern
 roots. It also cannot enable `run-unconfined`. A checked-in repository configuration
 therefore cannot escalate its own confinement, which is the property that makes cloning an
 unfamiliar repository safe.
+
+A project layer may still name executables, and Zuno now says so. When a project
+`zuno.json[c]` or `.zuno` file sets `shell`, a local `mcp.*.command`, an `lsp.*.command`
+or `formatter.*.command` that is not disabled, or a `productAgent.*.command`, discovery
+writes one warning per key to the operational log, naming the file and the key. The layer
+is still accepted and the value is kept verbatim. The warning exists because each of those
+programs runs on this machine with your authority while the checkout is what chose it, so
+it is the cue to review the repository before trusting it. A remote MCP server runs nothing
+locally and is not warned about. A future release will reject these declarations from a
+project layer instead of warning, so move host commands to the global `zuno.json` or
+another trusted layer now.
 
 Use a trusted one-invocation override when a wider mode is genuinely wanted:
 

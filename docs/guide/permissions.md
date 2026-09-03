@@ -141,6 +141,17 @@ so a path can be carved out of a directory that is otherwise writable.
 }
 ```
 
+A configured entry must exist and must not be a symbolic link at the moment the
+sandbox policy is built, or building the policy fails closed before any command
+runs. The refusal is deliberate: a path Zuno cannot pin to a real directory would
+otherwise be dropped silently, and a link beneath a writable root cannot be
+protected safely. The built-in protections for `.zuno`, `.agents`, and the Git
+metadata markers work differently. They are applied to whichever of those paths
+exist at the moment the bubblewrap arguments are generated, so a repository without
+a `.agents` directory simply gets no such mount. That same step skips, without an
+error, a configured path that disappeared after the policy was built, while a
+symbolic link is still refused there.
+
 During an unavailable fallback, writable roots and protected paths remain part of the
 requested policy and diagnostics, but the host process backend cannot enforce them.
 
@@ -227,8 +238,8 @@ including this one.
 
 ## Per-tool rules
 
-`permission.rules` is ordered and evaluated in the order you write it. A rule is
-either one action for the whole tool, or per-pattern actions.
+`permission.rules` is ordered, and **the last matching rule wins**. A rule is either
+one action for the whole tool, or per-pattern actions.
 
 ```json
 {
@@ -236,20 +247,43 @@ either one action for the whole tool, or per-pattern actions.
     "mode": "standard",
     "rules": {
       "read": "allow",
-      "write": "ask",
+      "edit": "ask",
       "shell": {
-        "git push*": "deny",
+        "*": "ask",
         "git *": "allow",
-        "rm -rf*": "deny",
-        "*": "ask"
+        "git push*": "deny",
+        "rm -rf*": "deny"
       }
     }
   }
 }
 ```
 
-Order matters and the example depends on it: `git push*` has to precede `git *`, or
-the broader pattern would match first and a push would be allowed.
+Order matters and this example depends on it. Because later rules override earlier
+ones, the catch-all `*` goes **first** and the narrow patterns that carve exceptions
+out of it go **last**: `git *` overrides the catch-all, and `git push*` then overrides
+`git *` so a push is denied. Reversing the order does not merely change style; it
+removes the protection, because `*` written last would override every rule above it
+and turn `rm -rf /` back into a prompt.
+
+The `edit` key covers the `write`, `edit`, and `apply_patch` tools; all three request
+authorization under it. There is no separate `write` or `apply_patch` rule key, so a
+rule written under either name never matches anything.
+
+A path rule is matched against the path the call names and against its normalized
+spelling, so separators are unified and `.` segments and repeated separators are
+dropped: `./src/main.rs`, `src//main.rs`, and the backslash spelling `src\main.rs` all
+match a rule written `src/main.rs`. A `deny` deliberately reaches further. It also
+covers the `..`-resolved path, and a deny written with an absolute path covers the
+relative tail of that path as well, so a deny cannot be sidestepped by respelling the
+file. An `allow` never widens in either of those directions, because a widened allow
+would authorize a file the rule did not name.
+
+Plan an `allow` around that asymmetry. `read`, `edit`, `write`, and `apply_patch` are
+documented to take absolute paths, so `"read": {"src/main.rs": "allow"}` does not cover
+the absolute path a call actually passes, while the same pattern written as a `deny`
+does. Write the allow with `~`, `$HOME`, or the absolute prefix, or use `*` — which
+matches across separators — as in `{"*/src/*": "allow"}`.
 
 Print the resolved policy — the effective mode and every rule, after configuration
 and any agent contract have been applied:
@@ -273,6 +307,50 @@ way to confirm the guarantees above rather than take them on trust:
   ]
 }
 ```
+
+## What an authorized path guarantees
+
+Approving `write`, `edit`, `apply_patch`, or `read` for a path authorizes a
+filesystem object, not a string. Resolution starts at the authorization boundary —
+the workspace root, or the external directory you granted — and descends one segment
+at a time, holding an open handle to each directory and refusing every symlink it
+meets. The operation is then performed through the handle it kept, rather than by
+name from the filesystem root.
+
+The guarantee that buys is exact: the call reaches the directory object you
+approved, or it fails. Replacing an ancestor directory with a symlink after you
+approve cannot redirect the bytes, because the name is never resolved a second time.
+Renaming the authorized directory still only reaches the object you approved.
+Deleting it produces a failure, since a deleted directory accepts no new entries.
+
+A symlink as the final component is different, and it is followed deliberately,
+exactly once, before you are asked. You therefore authorize the file the link names
+rather than the link itself. A link that stays inside the workspace needs only the
+ordinary `edit` prompt. A link pointing outside it requires an `external_directory`
+grant naming the destination's directory, not the link's. The link itself always
+survives the write.
+
+An `external_directory` grant has one spelling everywhere. The pattern is the
+directory with `/*` appended, forward-slashed, with Windows' verbatim `\\?\` prefix
+dropped — `C:/build-cache/*`, never `\\?\C:\build-cache\*`. One standing grant
+therefore covers the shell tool and the file and search tools together, where each
+previously asked under a spelling the others could not match.
+
+Windows protection used to be absent rather than merely weaker, so upgrading changes
+what the risk gate refuses there. The gate read only `HOME`, which neither `cmd` nor
+PowerShell sets, so every home, profile, and credential rule switched itself off:
+`rm -rf ~/.ssh` and `rm -rf $HOME` were a confirmation prompt rather than a permanent
+refusal, and ran outright under `allow_all`. The home directory now falls back to the
+platform's own answer, with `HOME` still taking precedence where it is set, and
+`%USERPROFILE%` and `$env:USERPROFILE` expand. The verbatim `\\?\` and device `\\.\`
+root spellings and UNC share roots are matched as well, drive-letter and
+case-insensitively.
+
+The hard refusals for system locations also apply to absolutely spelled
+targets under PowerShell as well as Bash. Escaping is read from the shell's own
+syntax, so `C:\Users\you\.ssh` is no longer reduced to `C:Usersyou.ssh` on its way
+into the risk tables, and an absolute program path such as
+`C:\Windows\System32\rm.exe` reaches the destructive-command table it belongs in.
 
 ## How the two interact
 

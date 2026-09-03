@@ -37,6 +37,14 @@ provider sequence still ends in a recoverable error, the Goal controller writes 
 `goal_retry` row before waiting and likewise starts a fresh turn when its persisted deadline
 arrives.
 
+The two layers hand over cleanly when the peer names its own delay. The provider layer
+retries one request for at most 180 seconds; if a `Retry-After` is longer than what remains
+of that window, the request layer neither sleeps past its deadline nor substitutes a
+shorter local backoff, because the peer has already said that a local delay is too soon.
+The turn ends with the peer's typed error, and the Goal retry waits the peer's value clamped
+to `max_delay_ms`. Under the default policy a peer that asked for 400 seconds produces a 300
+second Goal wait, not a two second local retry.
+
 ```json
 {
   "goal": {
@@ -69,6 +77,19 @@ Recovery is selected from typed errors:
 
 Permanent runtime failures store a stable typed code and scrubbed explanation in
 `blocked_reason`; a blocked Goal is never left without a diagnosis.
+
+Durable storage is classified the same way, from the typed error and never from its
+message. SQLite contention met while the goal's budget is read or charged, or while the
+host writes Goal-owned state such as a Plan reconciliation or a human request, persists a
+`database_busy` retry and the Goal stays active, because a lock another writer holds is a
+condition that clears on its own; the delay is the store's own suggestion when it reports
+one and the exponential backoff otherwise. Any other database failure met while the budget
+is read or charged stops the turn with `usage_unknown` and pauses the Goal, so a person can
+look at the database instead of the run continuing unmeasured. Durable state this build
+cannot read at all, such as a value that will not decode or a format it does not know,
+blocks the Goal with a typed reason in `blocked_reason`, and a host write that fails for any
+reason other than contention blocks it as `database_permanent`. The `goal_retry` row is what
+a restarted process reads back, so a restart neither loses nor shortens the wait.
 
 Inspect and manage it with `/goal` in the terminal application:
 
@@ -227,6 +248,9 @@ afterwards.
 | Allowance spent | The turn stops and the Goal pauses with `turn_budget` |
 | Provider reported no usage | The turn stops; a budget you set that cannot be counted cannot be honoured |
 | Only the last tenth of the allowance is left | Compaction is requested, then the turn continues |
+| The database is busy while the goal is read or charged | The turn ends and the Goal schedules a `database_busy` retry |
+| The database fails in any other way while the goal is read or charged | The turn stops with `usage_unknown` and the Goal pauses until the database is readable |
+| The stored goal cannot be read by this build | The turn fails and the Goal blocks |
 
 The last tenth is held back deliberately. Compaction costs a request of its own and has to
 leave room for the summary plus the next real request, so asking for it exactly when the
@@ -401,6 +425,17 @@ Each collection is capped at 64 entries and the rendered section at 16 KiB. Verb
 shortened UTF-8-safely before whole tail entries are omitted, omitted counts stay explicit,
 and identity fields are retained. Assembly fails closed if even the identity fields cannot
 fit, because a work-state section that silently lost an identity would be worse than none.
+
+A transcript revert is the other operation that moves the transcript boundary, and it keeps
+the same rule for the inbox. Committing a revert discards the transcript rows after the
+staged boundary, but it never deletes an inbox row. Every `queued`, `steering`, or
+`promoted` input was aimed at the tail that is now gone, so each is retired through the
+ordinary cancellation transition and logs its own `session.input.cancelled`; an input that
+was already consumed is immutable history and is not touched. The commit then appends one
+`session.reverted` event recording the boundary, the removed-row counts, and the retired
+input ids, so the discarded tail stays reconstructable from the durable log. The full
+payload is listed under [Durable inputs](/harness-runtime#durable-inputs) in the runtime
+reference.
 
 ## Jobs
 

@@ -11,6 +11,9 @@
 
 use serde_json::json;
 use std::path::Path;
+use std::sync::Arc;
+use zuno_db::event_log::SessionEventLog;
+use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SubmissionState};
 use zuno_db::message::{MessageRecord, MessageStore};
 use zuno_db::session::{
     ArchivedFilter, Creation, ListQuery, ListScope, MessageUsage, SessionCreate, SessionSort,
@@ -116,6 +119,34 @@ fn insert_session_input(connection: &Connection, id: &str, session_id: &str, seq
             rusqlite::params![id, session_id, seq],
         )
         .expect("insert session_input");
+}
+
+/// A projected transcript row at an explicit position and creation time.
+fn insert_projected_message(
+    connection: &Connection,
+    id: &str,
+    session_id: &str,
+    seq: i64,
+    millis: i64,
+) {
+    connection
+        .execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, \
+             data) VALUES (?1, ?2, 'user', ?3, ?4, ?4, '{\"role\":\"user\"}')",
+            rusqlite::params![id, session_id, seq, millis],
+        )
+        .expect("insert projected message");
+}
+
+/// A legacy `message` row at an explicit creation time.
+fn insert_legacy_message(connection: &Connection, id: &str, session_id: &str, millis: i64) {
+    connection
+        .execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+             VALUES (?1, ?2, ?3, ?3, '{\"role\":\"user\"}')",
+            rusqlite::params![id, session_id, millis],
+        )
+        .expect("insert legacy message");
 }
 
 fn insert_context_epoch(connection: &Connection, session_id: &str) {
@@ -640,7 +671,7 @@ fn touch_of_a_missing_session_reports_not_found_rather_than_succeeding() {
 
 #[test]
 fn session_mutation_fields_and_revert_commit_are_atomic() {
-    let pool = pool();
+    let pool = Arc::new(pool());
     {
         let connection = pool.get().expect("check out a connection");
         insert_project(&connection, "prj_a", WORKTREE, None);
@@ -653,18 +684,55 @@ fn session_mutation_fields_and_revert_commit_are_atomic() {
         let connection = pool.get().expect("check out a connection");
         for (index, id) in ["msg_1", "msg_2", "msg_3"].iter().enumerate() {
             let seq = i64::try_from(index + 1).expect("small sequence");
-            connection
-                .execute(
-                    "INSERT INTO message (id, session_id, time_created, time_updated, data) \
-                     VALUES (?1, 'ses_a', ?2, ?2, '{\"role\":\"user\"}')",
-                    rusqlite::params![id, seq],
-                )
-                .expect("insert legacy message");
-            insert_session_message(&connection, id, "ses_a", seq);
-            insert_session_input(&connection, &format!("input_{seq}"), "ses_a", seq);
+            let millis = 1_000 + seq * 100;
+            insert_legacy_message(&connection, id, "ses_a", millis);
+            insert_projected_message(&connection, id, "ses_a", seq, millis);
         }
         insert_context_epoch(&connection, "ses_a");
     }
+    // Inputs enter through the real durable inbox, so every row carries its
+    // admission event and the sequences a driver would actually observe.
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    let consumed = inbox
+        .admit(NewSessionInput::new(
+            "input_consumed",
+            "ses_a",
+            json!({"text": "already answered"}),
+            InputDelivery::Queue,
+            1_150,
+        ))
+        .expect("admit the consumed input");
+    inbox
+        .admit(NewSessionInput::new(
+            "input_promoted",
+            "ses_a",
+            json!({"text": "claimed by a turn that never settled"}),
+            InputDelivery::Steer,
+            1_250,
+        ))
+        .expect("admit the orphaned input");
+    inbox
+        .admit(NewSessionInput::new(
+            "input_queued",
+            "ses_a",
+            json!({"text": "still waiting"}),
+            InputDelivery::Queue,
+            1_350,
+        ))
+        .expect("admit the queued input");
+    inbox
+        .promote_id("ses_a", "input_consumed")
+        .expect("promote")
+        .expect("claimed");
+    inbox
+        .mark_consumed("ses_a", "input_consumed")
+        .expect("consume")
+        .expect("settled");
+    inbox
+        .promote_id("ses_a", "input_promoted")
+        .expect("promote")
+        .expect("claimed");
+    assert_eq!(consumed.admitted_sequence, 0);
 
     store
         .switch_agent_at("ses_a", "msg_agent", "explore", 2_000)
@@ -711,7 +779,9 @@ fn session_mutation_fields_and_revert_commit_are_atomic() {
             "SELECT count(*) FROM session_message WHERE session_id = ?1",
             "ses_a"
         ),
-        2
+        2,
+        "the boundary message and everything before it survive; the switch \
+         markers after it do not"
     );
     assert_eq!(
         count_for(
@@ -719,7 +789,8 @@ fn session_mutation_fields_and_revert_commit_are_atomic() {
             "SELECT count(*) FROM session_input WHERE session_id = ?1",
             "ses_a"
         ),
-        2
+        3,
+        "a revert retires inbox rows; it never deletes admitted history"
     );
     assert_eq!(
         count_for(
@@ -730,6 +801,55 @@ fn session_mutation_fields_and_revert_commit_are_atomic() {
         0
     );
     drop(connection);
+
+    // The consumed input is immutable history: same state, same revision.
+    let consumed = inbox
+        .get("ses_a", "input_consumed")
+        .expect("read")
+        .expect("row");
+    assert_eq!(consumed.state, SubmissionState::Consumed);
+    assert_eq!(consumed.revision, 3);
+    // The orphaned promotion and the queued input are retired through the
+    // ordinary cancellation transition, so their revisions advance once.
+    let promoted = inbox
+        .get("ses_a", "input_promoted")
+        .expect("read")
+        .expect("row");
+    assert_eq!(promoted.state, SubmissionState::Cancelled);
+    assert_eq!(promoted.revision, 3);
+    let queued = inbox
+        .get("ses_a", "input_queued")
+        .expect("read")
+        .expect("row");
+    assert_eq!(queued.state, SubmissionState::Cancelled);
+    assert_eq!(queued.revision, 2);
+    assert!(inbox.pending("ses_a").expect("pending").is_empty());
+
+    // Every retirement and the revert itself are reconstructable from the log.
+    let events = SessionEventLog::new(Arc::clone(&pool))
+        .read_after("ses_a", None)
+        .expect("events");
+    let cancelled: Vec<&str> = events
+        .iter()
+        .filter(|event| event.event_type == "session.input.cancelled")
+        .map(|event| event.properties["inputID"].as_str().expect("input id"))
+        .collect();
+    assert_eq!(cancelled, ["input_promoted", "input_queued"]);
+    let reverted = events.last().expect("the revert is the newest event");
+    assert_eq!(reverted.event_type, "session.reverted");
+    assert_eq!(reverted.properties["sessionID"], "ses_a");
+    assert_eq!(reverted.properties["messageID"], "msg_2");
+    assert_eq!(reverted.properties["marker"], json!({"messageID": "msg_2"}));
+    assert_eq!(reverted.properties["boundaryTimeCreated"], 1_200);
+    assert_eq!(reverted.properties["removedMessageCount"], 3);
+    assert_eq!(reverted.properties["removedLegacyMessageCount"], 1);
+    assert_eq!(
+        reverted.properties["cancelledInputIDs"],
+        json!(["input_promoted", "input_queued"])
+    );
+    assert_eq!(reverted.properties["contextEpochCleared"], true);
+    assert_eq!(reverted.properties["timeUpdated"], 5_000);
+
     let session = store.get("ses_a").expect("session");
     assert_eq!(session.agent.as_deref(), Some("explore"));
     assert_eq!(session.model.as_deref(), Some(model.as_str()));
@@ -740,6 +860,161 @@ fn session_mutation_fields_and_revert_commit_are_atomic() {
             .commit_revert_at("ses_a", 6_000)
             .expect("guarded no-op")
     );
+    let events = SessionEventLog::new(Arc::clone(&pool))
+        .read_after("ses_a", None)
+        .expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "session.reverted")
+            .count(),
+        1,
+        "a guarded no-op commit must not log a second revert"
+    );
+}
+
+#[test]
+fn revert_retires_unconsumed_inputs_when_the_boundary_lives_only_in_the_legacy_transcript() {
+    let pool = Arc::new(pool());
+    {
+        let connection = pool.get().expect("check out a connection");
+        insert_project(&connection, "prj_a", WORKTREE, None);
+    }
+    let store = Store::new(&pool);
+    store
+        .create(&draft("ses_a", "prj_a", WORKTREE, "root").at(1_000))
+        .expect("create");
+    {
+        let connection = pool.get().expect("check out a connection");
+        for (index, id) in ["msg_1", "msg_2", "msg_3"].iter().enumerate() {
+            let millis = 1_000 + i64::try_from(index + 1).expect("small index") * 100;
+            insert_legacy_message(&connection, id, "ses_a", millis);
+        }
+    }
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    inbox
+        .admit(NewSessionInput::new(
+            "input_queued",
+            "ses_a",
+            json!({"text": "waiting"}),
+            InputDelivery::Queue,
+            1_150,
+        ))
+        .expect("admit");
+
+    store
+        .stage_revert_at("ses_a", "msg_2", r#"{"messageID":"msg_2"}"#, 4_000)
+        .expect("stage revert");
+    assert!(
+        store
+            .commit_revert_at("ses_a", 5_000)
+            .expect("commit revert")
+    );
+
+    let connection = pool.get().expect("check out a connection");
+    assert_eq!(
+        count_for(
+            &connection,
+            "SELECT count(*) FROM message WHERE session_id = ?1",
+            "ses_a"
+        ),
+        2
+    );
+    drop(connection);
+    let input = inbox
+        .get("ses_a", "input_queued")
+        .expect("read")
+        .expect("row");
+    assert_eq!(
+        input.state,
+        SubmissionState::Cancelled,
+        "a legacy-only boundary must retire pending inputs exactly like a projected one"
+    );
+    let events = SessionEventLog::new(Arc::clone(&pool))
+        .read_after("ses_a", None)
+        .expect("events");
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "session.input.admitted",
+            "session.input.cancelled",
+            "session.reverted"
+        ]
+    );
+    let reverted = events.last().expect("revert event");
+    assert_eq!(reverted.properties["removedMessageCount"], 0);
+    assert_eq!(reverted.properties["removedLegacyMessageCount"], 1);
+    assert_eq!(
+        reverted.properties["cancelledInputIDs"],
+        json!(["input_queued"])
+    );
+    assert_eq!(reverted.properties["contextEpochCleared"], false);
+}
+
+#[test]
+fn revert_applies_one_creation_time_boundary_to_both_transcript_tables() {
+    let pool = Arc::new(pool());
+    {
+        let connection = pool.get().expect("check out a connection");
+        insert_project(&connection, "prj_a", WORKTREE, None);
+    }
+    let store = Store::new(&pool);
+    store
+        .create(&draft("ses_a", "prj_a", WORKTREE, "root").at(1_000))
+        .expect("create");
+    {
+        let connection = pool.get().expect("check out a connection");
+        // The boundary is projected but was never written to the legacy table,
+        // while a later legacy-only row still exists.
+        insert_projected_message(&connection, "msg_1", "ses_a", 1, 1_100);
+        insert_projected_message(&connection, "msg_2", "ses_a", 2, 1_200);
+        insert_projected_message(&connection, "msg_3", "ses_a", 3, 1_300);
+        insert_legacy_message(&connection, "msg_1", "ses_a", 1_100);
+        insert_legacy_message(&connection, "msg_3", "ses_a", 1_300);
+    }
+
+    store
+        .stage_revert_at("ses_a", "msg_2", r#"{"messageID":"msg_2"}"#, 4_000)
+        .expect("stage revert");
+    assert!(
+        store
+            .commit_revert_at("ses_a", 5_000)
+            .expect("commit revert")
+    );
+
+    let connection = pool.get().expect("check out a connection");
+    assert_eq!(
+        count_for(
+            &connection,
+            "SELECT count(*) FROM session_message WHERE session_id = ?1",
+            "ses_a"
+        ),
+        2
+    );
+    assert_eq!(
+        count_for(
+            &connection,
+            "SELECT count(*) FROM message WHERE session_id = ?1",
+            "ses_a"
+        ),
+        1,
+        "the legacy row after the boundary must go even though the boundary \
+         itself was never a legacy row"
+    );
+    drop(connection);
+    let reverted = SessionEventLog::new(Arc::clone(&pool))
+        .read_after("ses_a", None)
+        .expect("events")
+        .pop()
+        .expect("revert event");
+    assert_eq!(reverted.event_type, "session.reverted");
+    assert_eq!(reverted.properties["removedMessageCount"], 1);
+    assert_eq!(reverted.properties["removedLegacyMessageCount"], 1);
+    assert_eq!(reverted.properties["cancelledInputIDs"], json!([]));
 }
 
 #[test]

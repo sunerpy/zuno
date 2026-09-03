@@ -3,7 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, RETRY_AFTER};
+use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
 use zuno_error::ProviderError;
@@ -28,21 +28,14 @@ struct ErrorEnvelope {
     error: Option<OpenAiErrorBody>,
 }
 
-/// Parse an OpenAI `retry-after` header expressed as seconds.
+/// Parse an OpenAI `retry-after` response header.
+///
+/// Delegates to the single shared parser in [`zuno_llm::http`], which accepts
+/// delta-seconds — integer or the fractional form OpenAI actually sends — and the
+/// RFC 9110 HTTP-date form this crate used to discard.
 #[must_use]
 pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let seconds = headers
-        .get(RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<f64>()
-        .ok()?;
-    if seconds.is_finite() && !seconds.is_sign_negative() {
-        Some(Duration::from_secs_f64(seconds))
-    } else {
-        None
-    }
+    zuno_llm::http::retry_after(headers)
 }
 
 /// Classify a non-success OpenAI HTTP response.
@@ -140,7 +133,7 @@ impl std::error::Error for OpenAiApiError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::header::HeaderValue;
+    use reqwest::header::{HeaderValue, RETRY_AFTER};
 
     #[test]
     fn rate_limit_preserves_fractional_retry_after() {

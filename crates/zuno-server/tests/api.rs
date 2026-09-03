@@ -3156,3 +3156,201 @@ async fn api_catalogue_projects_a_pinned_models_document_onto_the_v2_shape() {
         "OpenAI must also accept API keys: {methods:?}"
     );
 }
+
+/// Holds the compaction lease until released and records every prompt it is
+/// asked to run, so a test can prove that input admitted *during* a compaction
+/// is still driven once the lease is released.
+#[derive(Debug, Default)]
+struct CompactionLeaseExecutor {
+    compact_started: AtomicBool,
+    compact_started_notify: Notify,
+    compact_release: Arc<Notify>,
+    prompts: Mutex<Vec<SessionPromptExecution>>,
+    prompt_notify: Arc<Notify>,
+}
+
+impl CompactionLeaseExecutor {
+    async fn wait_until_compact_started(&self) {
+        loop {
+            let mut notified = std::pin::pin!(self.compact_started_notify.notified());
+            notified.as_mut().enable();
+            if self.compact_started.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn prompts(&self) -> Vec<SessionPromptExecution> {
+        self.prompts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    async fn wait_until_prompt_count(&self, count: usize) {
+        loop {
+            let mut notified = std::pin::pin!(self.prompt_notify.notified());
+            notified.as_mut().enable();
+            if self.prompts().len() >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl SessionMutationExecutor for CompactionLeaseExecutor {
+    fn prompt(
+        &self,
+        request: SessionPromptExecution,
+        guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        self.prompts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(request);
+        let notify = Arc::clone(&self.prompt_notify);
+        Box::pin(async move {
+            drop(guard);
+            notify.notify_waiters();
+            Ok(())
+        })
+    }
+
+    fn compact(
+        &self,
+        _request: SessionCompactExecution,
+        guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        self.compact_started.store(true, Ordering::SeqCst);
+        self.compact_started_notify.notify_waiters();
+        let release = Arc::clone(&self.compact_release);
+        Box::pin(async move {
+            release.notified().await;
+            drop(guard);
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn api_interrupt_on_an_idle_session_does_not_arm_the_next_turn() {
+    // Given: a session with no live turn.
+    let fixture = MutationApiFixture::new("ses_idle_interrupt");
+    let (app, services) = api_app_with_services(fixture.state.clone());
+    assert_eq!(
+        services.runs.status("ses_idle_interrupt"),
+        SessionStatus::Idle
+    );
+
+    // When: a client cancels while nothing is running.
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_idle_interrupt/interrupt",
+            None,
+        ))
+        .await
+        .expect("interrupt responds");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // Then: the next ordinary turn starts clean instead of being born interrupted.
+    let guard = services
+        .runs
+        .begin_turn("ses_idle_interrupt")
+        .expect("the idle session accepts a new turn");
+    assert_eq!(
+        guard.interrupt_request(),
+        None,
+        "an interrupt with no live turn must not leave a marker that cancels the next turn"
+    );
+    assert!(
+        !guard.interrupt_signal().is_set(),
+        "the new turn's cancellation signal must start unset"
+    );
+}
+
+#[tokio::test]
+async fn api_prompt_queued_during_compaction_runs_after_the_lease_is_released() {
+    // Given: a compaction that holds the session's live-turn lease.
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    state
+        .sessions()
+        .create(&SessionCreate::new(
+            "ses_compact_queue",
+            "ses_compact_queue",
+            "global",
+            "/repo",
+            "/repo",
+            "compact queue",
+            "test",
+        ))
+        .expect("fixture session inserts");
+    let executor = Arc::new(CompactionLeaseExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(state))
+        .router();
+    let mut compact_task = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(request(
+                Method::POST,
+                "/api/session/ses_compact_queue/compact",
+                None,
+            ))
+            .await
+            .expect("compact responds")
+        }
+    });
+    executor.wait_until_compact_started().await;
+    assert_eq!(
+        services.runs.status("ses_compact_queue"),
+        SessionStatus::Busy
+    );
+
+    // When: a prompt is admitted while the compaction owns the lease.
+    let admitted = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_compact_queue/prompt",
+            Some(json!({
+                "id": "msg_after_compaction",
+                "prompt": {"text": "continue after compaction", "files": [], "agents": []}
+            })),
+        ))
+        .await
+        .expect("prompt responds");
+    assert_eq!(admitted.status(), StatusCode::OK);
+    assert!(
+        executor.prompts().is_empty(),
+        "the prompt must wait for the compaction lease"
+    );
+
+    // And: the compaction finishes and releases the lease.
+    executor.compact_release.notify_one();
+    let response = tokio::time::timeout(Duration::from_secs(1), &mut compact_task)
+        .await
+        .expect("compact finishes after release")
+        .expect("compact task does not panic");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // Then: the durable input is driven without waiting for another external event.
+    tokio::time::timeout(Duration::from_secs(1), executor.wait_until_prompt_count(1))
+        .await
+        .expect("the queued prompt must run once the compaction lease is released");
+    assert_eq!(
+        executor
+            .prompts()
+            .iter()
+            .map(|prompt| prompt.message_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["msg_after_compaction"]
+    );
+    services.runs.wait_until_idle("ses_compact_queue").await;
+}

@@ -238,6 +238,14 @@ tree-sitter-typescript = "=0.23.2"
 tree-sitter-yaml = "=0.7.2"
 walkdir = "2.5.0"
 which = "8.0.5"
+# Windows file identity by handle is the one filesystem fact safe `std` does not
+# express on stable: `MetadataExt::{volume_serial_number, file_index}` are behind the
+# unstable `windows_by_handle` feature. This safe wrapper over
+# `GetFileInformationByHandle` supplies both, keeping the FFI outside first-party
+# crates so the workspace-wide `unsafe_code = "forbid"` guarantee remains intact.
+# Already in the lockfile under `ignore`, `walkdir`, and `termcolor`, so naming it
+# directly adds no crate and no new download.
+winapi-util = "0.1.11"
 # Windows replacement is the one filesystem boundary that safe `std` APIs do
 # not express: `std::fs::rename` uses MoveFileEx and can briefly remove an
 # existing destination. `winsafe` keeps the FFI outside first-party crates so

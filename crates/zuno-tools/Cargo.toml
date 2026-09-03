@@ -37,6 +37,10 @@ zuno-network = { workspace = true }
 zuno-orchestration = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
+# Only for `GuardExit`: every background execution runs behind the child-process
+# guard, so the shell tool must read a guard verdict as one instead of as the
+# command's own exit code.
+zuno-process = { workspace = true }
 zuno-pty = { workspace = true }
 zuno-search = { workspace = true }
 zuno-sandbox = { workspace = true }
@@ -62,6 +66,13 @@ tree-sitter-powershell = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 which = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# `read::anchor` re-verifies the pinned directory's `(volume_serial_number,
+# file_index)` identity through the open handle before it publishes a write. Both
+# fields are unstable in `std` (`windows_by_handle`), so the safe
+# `GetFileInformationByHandle` wrapper supplies them instead.
+winapi-util = { workspace = true }
 
 [dev-dependencies]
 zuno-testkit = { workspace = true }

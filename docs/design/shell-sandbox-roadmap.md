@@ -104,6 +104,22 @@ protected descendants, symlink escape denial, network denial, zero capabilities,
 `NoNewPrivs`, `ptrace`, and `process_vm_readv`. See the
 [sandbox FAQ](../faq.md).
 
+Backend discovery is cached per process. `system_backend` serves bubblewrap
+discovery from a process-local cache keyed by the canonical workspace and the
+helper executable, so the first Shell resolution in a process pays for the
+`bwrap --help` and namespace probes and later resolutions do not. A hit is handed
+out only after the trusted launcher, the trusted no-op executable, and the helper
+are re-inspected on disk; an entry that no longer passes is evicted and the host
+is probed again, which is how a bubblewrap upgrade or a replaced helper is picked
+up. A failed discovery is returned and never cached, so a transient probe failure
+cannot pin the process to "unavailable" or, under a trusted `run-unconfined`
+policy, to native execution. Nothing is persisted or shared across processes;
+another process must prove the host again. Two things deliberately stay outside
+the cache: deployment verification of the effective policy still runs per
+resolution, because it proves that this policy deploys rather than that the host
+is capable in general, and `probe_system_backend` bypasses the cache so the
+deployment report behind `zuno debug sandbox` describes the host as it is now.
+
 ### macOS
 
 Compile a deny-by-default SBPL profile and invoke the fixed

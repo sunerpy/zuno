@@ -1741,3 +1741,42 @@ async fn dispatch_hands_the_model_every_cause_beneath_a_failure() {
         "the innermost cause is the diagnosis and must not be truncated: {reported}"
     );
 }
+
+#[tokio::test]
+async fn a_failed_after_hook_keeps_a_settled_tool_result_and_its_status() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let dispatcher = dispatcher(
+        vec![Arc::new(RecordingTool::new("task", Arc::clone(&calls)))],
+        vec![allow_all_rule()],
+        Arc::new(RecordingApprover::default()),
+    )
+    .with_hooks(Arc::new(FailingAfterHooks));
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call_after_hook_settled",
+            "task",
+            json!({"command": "ls"}),
+        ))
+        .await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the tool ran, so whatever it changed is real"
+    );
+    assert!(
+        !result.is_error,
+        "a hook that failed to post-process the output must not report the tool itself as \
+         failed; the model would then repeat a side effect that already happened: {result:?}"
+    );
+    assert_eq!(
+        result.output.output, "\"ls\"",
+        "the tool's own output is what the model sees"
+    );
+    assert_eq!(
+        result.output.metadata["afterHookError"]["message"], "after hook failed",
+        "the hook failure travels with the result instead of replacing it"
+    );
+}

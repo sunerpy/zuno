@@ -421,7 +421,7 @@ impl Watcher {
     pub fn start(options: WatchOptions) -> Result<(Self, EventStream), WatchError> {
         let decision = flags::decide(&options.env);
         let filter = Arc::new(
-            FilterBuilder::new(options.root.clone())
+            FilterBuilder::new(filter_root(&options))
                 .extra_patterns(options.extra_ignore.iter().cloned())
                 .whitelist(options.whitelist.iter().cloned())
                 .gitignore(options.gitignore)
@@ -672,13 +672,68 @@ fn project_watch_scope(
     }))
 }
 
+/// The directory spelling every ignore judgement for this watch is anchored to.
+///
+/// [`Filter`] decides by stripping its root as a path prefix, so it is only correct when it is
+/// anchored to the same spelling the subscription registers — that spelling is the prefix every
+/// event path the platform backend reports actually carries. An adaptive subscription registers a
+/// *normalized* directory ([`adaptive_watch_scope`]), so the filter must be normalized with it. A
+/// fixed subscription registers the requested directory verbatim, so there the requested spelling
+/// is the subscription spelling and normalizing would create the very mismatch in reverse.
+fn filter_root(options: &WatchOptions) -> PathBuf {
+    if options.watch_missing_ancestors {
+        normalized_root(&options.root)
+    } else {
+        options.root.clone()
+    }
+}
+
+/// A requested directory in the form the adaptive subscription will register it.
+///
+/// Two distinct ways the requested spelling and the registered spelling diverge, and both make
+/// every ignore rule silently stop applying so that ignored paths are published as events:
+///
+/// - On any platform, a root reached through a symbolic link resolves to a different absolute
+///   path, and the resolved one is what the backend reports.
+/// - On Windows, [`std::fs::canonicalize`] returns a `\\?\` verbatim path. `\\?\C:\p` never
+///   prefix-matches `C:\p`, so a caller-supplied drive path and the registered path disagree even
+///   with no link involved. Canonicalizing both sides also settles component case, which
+///   [`Path::strip_prefix`] compares exactly for non-prefix components.
+///
+/// A directory that does not exist yet cannot be canonicalized, so the nearest existing ancestor
+/// is canonicalized and the missing components are re-appended: that is the path the adaptive
+/// subscription registers once the directory appears, so the filter stays anchored across
+/// [`Watcher::reconcile`] without being rebuilt. When nothing on the path can be canonicalized the
+/// requested spelling is returned unchanged, which is what the subscription falls back to as well.
+fn normalized_root(requested: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut candidate = requested.to_path_buf();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&candidate) {
+            return missing
+                .iter()
+                .rev()
+                .fold(canonical, |normalized, component| {
+                    normalized.join(component)
+                });
+        }
+        let Some(name) = candidate.file_name().map(std::ffi::OsStr::to_os_string) else {
+            return requested.to_path_buf();
+        };
+        missing.push(name);
+        if !candidate.pop() {
+            return requested.to_path_buf();
+        }
+    }
+}
+
 fn adaptive_watch_scope(requested: &Path) -> Option<WatchScope> {
-    let active = nearest_existing_directory(requested)?;
-    let requested = requested
-        .is_dir()
-        .then(|| std::fs::canonicalize(requested).unwrap_or_else(|_| requested.to_path_buf()));
+    // Normalized first, so the scope and [`filter_root`] cannot drift apart: this is the one
+    // function that decides what "the requested directory" means to the platform watcher.
+    let normalized = normalized_root(requested);
+    let active = nearest_existing_directory(&normalized)?;
     Some(WatchScope {
-        recursive: requested.as_ref() == Some(&active),
+        recursive: active == normalized,
         path: active,
     })
 }

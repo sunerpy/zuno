@@ -41,6 +41,44 @@ pub trait Component: Send + Sync {
 
     /// Prepare this component's services and deferred effects.
     async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError>;
+
+    /// How long the runtime waits for each of this component's effect disposers.
+    ///
+    /// The default defers to the runtime's timeout. A component whose disposer must
+    /// terminate and reap a process tree, drain a socket, or wait for a flush declares
+    /// the bound that work actually needs. Disposers still run in reverse registration
+    /// order, one at a time; the budget bounds only how long the runtime waits for each
+    /// before it reports the overrun and moves on. An overrunning disposer is detached,
+    /// never cancelled, so whatever it reclaims is still reclaimed.
+    fn stop_budget(&self) -> StopBudget {
+        StopBudget::Runtime
+    }
+}
+
+/// How long the runtime waits for one of a component's effect disposers.
+///
+/// Declared by the component, because only the component knows what its disposer has
+/// to reclaim: closing a channel is instantaneous, but terminating and reaping a
+/// process tree is not, and a runtime-wide timeout sized for the first reports the
+/// second as an overrun on every shutdown. See [`Component::stop_budget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopBudget {
+    /// The runtime's configured disposer timeout ([`RuntimeOptions::with_stop_timeout`]).
+    Runtime,
+    /// A component-declared bound for each of its disposers.
+    ///
+    /// A zero bound cannot prove that anything reached quiescence and is read as
+    /// [`Self::Runtime`].
+    Bounded(Duration),
+}
+
+impl StopBudget {
+    fn resolve(self, runtime_timeout: Duration) -> Duration {
+        match self {
+            Self::Bounded(bound) if !bound.is_zero() => bound,
+            Self::Bounded(_) | Self::Runtime => runtime_timeout,
+        }
+    }
 }
 
 /// Runtime lifecycle tuning.
@@ -1077,10 +1115,11 @@ impl HarnessRuntime {
             Err(failure) if !failure.cleanup_failures.is_empty() => {
                 let snapshots =
                     definition_snapshots(&failure.definition, LifecycleState::Uncertain);
+                let unresolved = failure.cleanup_failures.len();
                 let mut diagnostics = vec![failure.diagnostic.clone()];
                 diagnostics.extend(failure.cleanup_failures);
                 self.set_unresolved(snapshots, diagnostics);
-                Err(lifecycle_error(failure.diagnostic))
+                Err(unresolved_error(failure.diagnostic, unresolved))
             }
             Err(failure) => {
                 let candidate_error = lifecycle_error(failure.diagnostic.clone());
@@ -1120,19 +1159,37 @@ impl HarnessRuntime {
                         Err(candidate_error)
                     }
                     Err(restore_failure) => {
-                        let mut diagnostics = vec![failure.diagnostic];
-                        diagnostics.push(LifecycleDiagnostic {
-                            component_id: restore_failure.diagnostic.component_id.clone(),
-                            effect_id: restore_failure.diagnostic.effect_id.clone(),
+                        let restore_diagnostic = LifecycleDiagnostic {
+                            component_id: restore_failure.diagnostic.component_id,
+                            effect_id: restore_failure.diagnostic.effect_id,
                             phase: LifecyclePhase::Restore,
                             kind: restore_failure.diagnostic.kind,
-                            message: restore_failure.diagnostic.message.clone(),
-                        });
+                            message: restore_failure.diagnostic.message,
+                        };
+                        let unresolved = restore_failure.cleanup_failures.len();
+                        let mut diagnostics = vec![failure.diagnostic, restore_diagnostic.clone()];
                         diagnostics.extend(restore_failure.cleanup_failures);
-                        self.set_failed(&previous_definition, diagnostics);
+                        let restore = if unresolved == 0 {
+                            self.set_failed(&previous_definition, diagnostics);
+                            lifecycle_error(restore_diagnostic)
+                        } else {
+                            // The restore's own start failed deterministically, but
+                            // stopping what it had already started did not: one of
+                            // those effects may still be live. That is not a clean
+                            // failure, and a runtime that called it one would accept the
+                            // next mount on top of a resource nobody proved released.
+                            self.set_unresolved(
+                                definition_snapshots(
+                                    &previous_definition,
+                                    LifecycleState::Uncertain,
+                                ),
+                                diagnostics,
+                            );
+                            unresolved_error(restore_diagnostic, unresolved)
+                        };
                         Err(RuntimeError::RestoreFailed {
                             candidate: Box::new(candidate_error),
-                            restore: Box::new(lifecycle_error(restore_failure.diagnostic)),
+                            restore: Box::new(restore),
                         })
                     }
                 }
@@ -1386,29 +1443,54 @@ fn provided_names(
         .collect()
 }
 
+/// Dispose every effect of every component, newest component and newest effect first.
+///
+/// Reverse order is the rollback semantics of registration-as-effect and is not
+/// negotiable. Each disposer is spawned rather than awaited in place, so that an
+/// overrun does not cancel it: dropping a disposer's future mid-flight abandons
+/// whatever it was reclaiming — a child process half-terminated, a lock never
+/// released — which is the one outcome worse than a late stop. The runtime waits out
+/// the component's declared budget, reports an overrun as timed out, and lets the
+/// disposer finish in the background.
 async fn stop_components(
     mut components: Vec<ActiveComponent>,
-    timeout: Duration,
+    runtime_timeout: Duration,
 ) -> Vec<LifecycleDiagnostic> {
     let mut diagnostics = Vec::new();
     while let Some(mut component) = components.pop() {
+        let budget = component
+            .definition
+            .component
+            .stop_budget()
+            .resolve(runtime_timeout);
         while let Some(effect) = component.effects.pop() {
             let effect_id = effect.id;
-            match tokio::time::timeout(timeout, (effect.stop)()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => diagnostics.push(LifecycleDiagnostic {
+            let mut stopping = tokio::spawn((effect.stop)());
+            match tokio::time::timeout(budget, &mut stopping).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => diagnostics.push(LifecycleDiagnostic {
                     component_id: component.definition.id.clone(),
                     effect_id,
                     phase: LifecyclePhase::Stop,
                     kind: LifecycleFailureKind::Uncertain,
                     message: error.to_string(),
                 }),
+                Ok(Err(join_error)) => diagnostics.push(LifecycleDiagnostic {
+                    component_id: component.definition.id.clone(),
+                    effect_id,
+                    phase: LifecyclePhase::Stop,
+                    kind: LifecycleFailureKind::Uncertain,
+                    message: format!("effect stop did not finish: {join_error}"),
+                }),
                 Err(_elapsed) => diagnostics.push(LifecycleDiagnostic {
                     component_id: component.definition.id.clone(),
                     effect_id,
                     phase: LifecyclePhase::Stop,
                     kind: LifecycleFailureKind::TimedOut,
-                    message: format!("effect stop timed out after {} ms", timeout.as_millis()),
+                    message: format!(
+                        "effect stop exceeded its {} ms budget and was left running to completion",
+                        budget.as_millis()
+                    ),
                 }),
             }
         }
@@ -1567,6 +1649,24 @@ fn lifecycle_error(diagnostic: LifecycleDiagnostic) -> RuntimeError {
         phase: diagnostic.phase,
         kind: diagnostic.kind,
         message: diagnostic.message,
+    }
+}
+
+/// The error for a failure whose cleanup left effects unresolved.
+///
+/// The kind is [`LifecycleFailureKind::Uncertain`] rather than the failure's own,
+/// because the caller reads the error before it reads the snapshot, and a "failed"
+/// that hides a possibly live effect is the wrong first impression.
+fn unresolved_error(diagnostic: LifecycleDiagnostic, unresolved: usize) -> RuntimeError {
+    RuntimeError::Lifecycle {
+        component: diagnostic.component_id,
+        effect: diagnostic.effect_id,
+        phase: diagnostic.phase,
+        kind: LifecycleFailureKind::Uncertain,
+        message: format!(
+            "{}; cleanup left {unresolved} effect(s) unresolved",
+            diagnostic.message
+        ),
     }
 }
 

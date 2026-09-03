@@ -266,7 +266,7 @@ async fn run_codex(
     )
     .await
     .map_err(|error| incompatible("Codex", &agent.environment, error))?;
-    wait_for_response(
+    if let Err(error) = wait_for_response(
         &mut reader,
         &mut writer,
         CODEX_INITIALIZE_ID,
@@ -274,7 +274,9 @@ async fn run_codex(
         &cancellation,
     )
     .await
-    .map_err(|error| incompatible("Codex", &agent.environment, error))?;
+    {
+        return Err(handshake_failure("Codex", &mut child, &agent.environment, error).await);
+    }
     send_rpc(&mut writer, json!({"method":"initialized","params":{}}))
         .await
         .map_err(|error| incompatible("Codex", &agent.environment, error))?;
@@ -291,18 +293,29 @@ async fn run_codex(
     .await
     {
         Ok(thread) => thread,
-        Err(error) if error.invalid_params => start_codex_thread(
-            &mut reader,
-            &mut writer,
-            CODEX_LEGACY_THREAD_START_ID,
-            &request.directory,
-            agent.permission,
-            CodexProtocolDialect::Legacy,
-            &cancellation,
-        )
-        .await
-        .map_err(|error| incompatible("Codex", &agent.environment, error))?,
-        Err(error) => return Err(incompatible("Codex", &agent.environment, error)),
+        Err(error) if error.invalid_params => {
+            match start_codex_thread(
+                &mut reader,
+                &mut writer,
+                CODEX_LEGACY_THREAD_START_ID,
+                &request.directory,
+                agent.permission,
+                CodexProtocolDialect::Legacy,
+                &cancellation,
+            )
+            .await
+            {
+                Ok(thread) => thread,
+                Err(error) => {
+                    return Err(
+                        handshake_failure("Codex", &mut child, &agent.environment, error).await,
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            return Err(handshake_failure("Codex", &mut child, &agent.environment, error).await);
+        }
     };
     let thread_id = thread
         .pointer("/result/thread/id")
@@ -326,7 +339,7 @@ async fn run_codex(
     )
     .await
     .map_err(|error| uncertain("Codex", &agent.environment, error))?;
-    let turn = wait_for_response(
+    let turn = match wait_for_response(
         &mut reader,
         &mut writer,
         CODEX_TURN_START_ID,
@@ -334,7 +347,12 @@ async fn run_codex(
         &cancellation,
     )
     .await
-    .map_err(|error| uncertain("Codex", &agent.environment, error))?;
+    {
+        Ok(turn) => turn,
+        Err(error) => {
+            return Err(turn_start_failure("Codex", &mut child, &agent.environment, error).await);
+        }
+    };
     let turn_id = turn
         .pointer("/result/turn/id")
         .and_then(Value::as_str)
@@ -504,6 +522,13 @@ async fn run_claude_code(
     if agent.permission == ProductAgentPermissionMode::BypassPermissions {
         args.push(OsString::from("--dangerously-skip-permissions"));
     }
+    // The prompt is model-generated untrusted text, so it is passed as an operand rather than
+    // left where the product's own CLI parser can read it as options. Without this terminator a
+    // prompt beginning with `-` is parsed by the child: `--dangerously-skip-permissions`,
+    // `--mcp-config`, or `--resume` in the first characters of a prompt would each be honoured,
+    // which turns prompt text into a privilege and configuration decision. Every argument Zuno
+    // means as an option is already pushed above.
+    args.push(OsString::from("--"));
     args.push(OsString::from(request.prompt));
     let (program, guarded_args) = zuno_process::guarded_argv(&agent.command, &args);
     let mut command = contained_command(program, guarded_args, &request.directory);
@@ -660,6 +685,11 @@ enum ReadRpcError {
 struct RpcResponseError {
     message: String,
     invalid_params: bool,
+    /// The caller cancelled while this request was outstanding.
+    ///
+    /// Typed rather than recovered from `message`: retry and pause decisions read typed errors,
+    /// and a rendered string cannot distinguish a user interruption from a protocol failure.
+    cancelled: bool,
 }
 
 impl RpcResponseError {
@@ -667,6 +697,19 @@ impl RpcResponseError {
         Self {
             message: message.to_string(),
             invalid_params: false,
+            cancelled: false,
+        }
+    }
+
+    /// The caller cancelled before the response arrived.
+    ///
+    /// `invalid_params` stays false, so a cancellation can never be mistaken for the protocol
+    /// rejection that selects the legacy `thread/start` dialect.
+    fn cancelled() -> Self {
+        Self {
+            message: "invocation was cancelled".to_owned(),
+            invalid_params: false,
+            cancelled: true,
         }
     }
 }
@@ -770,9 +813,7 @@ where
     loop {
         let message = match read_rpc(reader, cancellation).await {
             Ok(message) => message,
-            Err(ReadRpcError::Cancelled) => {
-                return Err(RpcResponseError::transport("invocation was cancelled"));
-            }
+            Err(ReadRpcError::Cancelled) => return Err(RpcResponseError::cancelled()),
             Err(ReadRpcError::Io(error)) => return Err(RpcResponseError::transport(error)),
             Err(ReadRpcError::Malformed(error)) => {
                 return Err(RpcResponseError::transport(error));
@@ -791,6 +832,7 @@ where
             return Err(RpcResponseError {
                 message: format!("request {id} failed: {error}"),
                 invalid_params: error.get("code").and_then(Value::as_i64) == Some(-32602),
+                cancelled: false,
             });
         }
         return Ok(message);
@@ -915,4 +957,55 @@ fn uncertain(
         product,
         message: environment.safe(message.to_string()),
     }
+}
+
+/// Reap the tree and classify a failure raised before `turn/start` was written.
+///
+/// `initialize`, `initialized`, and `thread/start` request nothing of the user's workspace: an
+/// ephemeral thread runs no tools and writes no files, so at this phase a cancellation is a plain
+/// user interruption and nothing about the outcome is unknown. Reporting it as
+/// [`ProductAgentError::Incompatible`] would tell recovery that the installed product cannot speak
+/// the protocol, which blocks the goal permanently instead of pausing it, and would tell the user
+/// their Codex installation is broken because they pressed cancel. Any other failure at this phase
+/// really is a protocol incompatibility.
+async fn handshake_failure(
+    product: &'static str,
+    child: &mut Child,
+    environment: &ChildEnvironment,
+    error: RpcResponseError,
+) -> ProductAgentError {
+    terminate(child).await;
+    if error.cancelled {
+        ProductAgentError::Cancelled { product }
+    } else {
+        incompatible(product, environment, error)
+    }
+}
+
+/// Reap the tree and classify a failure raised while the `turn/start` response is outstanding.
+///
+/// This is the one phase where a cancellation stays uncertain, and the line is drawn by evidence
+/// rather than by intent. `turn/start` has already been flushed to the product, so it may already
+/// be running commands and editing files in the user's directory, and Zuno holds no turn id with
+/// which to address `turn/interrupt` and no stream event describing what ran. A lost response
+/// around a side effect is an uncertain outcome: it must be persisted for authoritative-state
+/// inspection and never mechanically replayed. Once the turn id is known the streaming loop
+/// interrupts that exact turn and reports [`ProductAgentError::Cancelled`], because there the
+/// outcome is observed rather than unknown.
+async fn turn_start_failure(
+    product: &'static str,
+    child: &mut Child,
+    environment: &ChildEnvironment,
+    error: RpcResponseError,
+) -> ProductAgentError {
+    terminate(child).await;
+    if error.cancelled {
+        return ProductAgentError::Uncertain {
+            product,
+            message: "invocation was cancelled while the turn/start response was outstanding; \
+                      the turn may already have started and changed the working directory"
+                .to_owned(),
+        };
+    }
+    uncertain(product, environment, error)
 }

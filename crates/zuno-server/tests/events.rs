@@ -5,8 +5,10 @@ use axum::body::{Body, BodyDataStream, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
+use tempfile::TempDir;
 use tower::ServiceExt;
 use zuno_db::Pool;
+use zuno_db::artifact_gc::ArtifactGcPaths;
 use zuno_db::session::SessionCreate;
 use zuno_engine::r#loop::TurnEvent;
 use zuno_llm::sse::SseParser;
@@ -28,6 +30,46 @@ fn event_service(capacity: usize) -> (Arc<Pool>, EventService) {
     let pool = Arc::new(Pool::open(&DbLocation::Memory).expect("open in-memory event database"));
     let events = EventService::new(Arc::clone(&pool), capacity);
     (pool, events)
+}
+
+/// Insert the project and session rows a session-scoped stream requires.
+///
+/// The session route answers `404` for a session the database has never seen, so
+/// every fixture that opens `/api/session/{id}/event` needs the row first.
+fn create_session(pool: &Pool, session_id: &str) {
+    {
+        let mut connection = pool.get().expect("pooled connection");
+        zuno_db::migration::apply(&mut connection).expect("schema applies");
+        connection
+            .execute(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('global', '/repo', '0', '0', '[]') ON CONFLICT (id) DO NOTHING",
+                (),
+            )
+            .expect("global project row inserts");
+    }
+    zuno_db::session::Store::new(pool)
+        .create(&SessionCreate::new(
+            session_id, session_id, "global", "/repo", "/repo", "events", "test",
+        ))
+        .expect("fixture session inserts");
+}
+
+/// One file-backed database shared by the API state and the event service, which is
+/// how `zuno serve` wires them: two pools, one durable store.
+fn shared_fixture(capacity: usize) -> (TempDir, ApiState, EventService) {
+    let temp = tempfile::tempdir().expect("temporary event fixture directory");
+    let location = DbLocation::File(temp.path().join("zuno.db"));
+    let state_pool = Pool::open(&location).expect("open API pool");
+    let events_pool = Arc::new(Pool::open(&location).expect("open event pool"));
+    let state = ApiState::from_pool(
+        state_pool,
+        "/repo",
+        ArtifactGcPaths::from_data_root(temp.path()),
+    )
+    .expect("initialize API state");
+    let events = EventService::new(events_pool, capacity);
+    (temp, state, events)
 }
 
 fn event_app(events: EventService) -> axum::Router {
@@ -159,7 +201,8 @@ async fn creating_a_session_is_observable_on_the_global_stream() {
 #[tokio::test]
 async fn session_event_stream_replays_after_last_event_id() {
     // Given: two committed events in one session and one event in another session.
-    let (_pool, events) = event_service(8);
+    let (pool, events) = event_service(8);
+    create_session(&pool, "ses_target");
     events
         .publish("ses_target", event(0))
         .await
@@ -196,8 +239,7 @@ async fn session_event_stream_replays_after_last_event_id() {
 #[tokio::test]
 async fn session_sse_never_outpaces_the_history_route() {
     // Given: a persisted session with its public SSE and history routes sharing one event service.
-    let (_pool, events) = event_service(8);
-    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    let (_temp, state, events) = shared_fixture(8);
     state
         .sessions()
         .create(&SessionCreate::new(
@@ -266,7 +308,8 @@ async fn session_sse_never_outpaces_the_history_route() {
 
 #[tokio::test]
 async fn dropping_the_only_session_observer_rejects_a_question() {
-    let (_pool, events) = event_service(8);
+    let (pool, events) = event_service(8);
+    create_session(&pool, "ses_observed");
     let requests = RequestBroker::default();
     let services = ServerServices::new(8).with_requests(requests.clone());
     let app = ServerBuilder::new(ServerConfig::default())
@@ -309,7 +352,8 @@ async fn dropping_the_only_session_observer_rejects_a_question() {
 #[tokio::test]
 async fn session_event_stream_replays_creation_at_sequence_zero() {
     // Given: a creation event at sequence zero and another public event after it.
-    let (_pool, events) = event_service(8);
+    let (pool, events) = event_service(8);
+    create_session(&pool, "ses_target");
     events
         .publish(
             "ses_target",
@@ -461,7 +505,8 @@ async fn events_reconnect_delivers_exactly_the_one_thousand_published_events() {
     // Given: one connected client and a deterministic non-boundary disconnect point.
     const TOTAL: u64 = 1_000;
     const DISCONNECT_AT: u64 = 437;
-    let (_pool, events) = event_service(64);
+    let (pool, events) = event_service(64);
+    create_session(&pool, "ses_stream");
     let app = event_app(events.clone());
     let mut first_connection = open_stream(&app, "ses_stream", None).await;
     let mut observed = Vec::with_capacity(TOTAL as usize);
@@ -499,7 +544,8 @@ async fn events_reconnect_delivers_exactly_the_one_thousand_published_events() {
 #[tokio::test]
 async fn events_two_concurrent_subscribers_receive_the_same_live_event() {
     // Given: two active streams for the same session.
-    let (_pool, events) = event_service(8);
+    let (pool, events) = event_service(8);
+    create_session(&pool, "ses_shared");
     let app = event_app(events.clone());
     let mut first = open_stream(&app, "ses_shared", None).await;
     let mut second = open_stream(&app, "ses_shared", None).await;
@@ -520,7 +566,8 @@ async fn events_two_concurrent_subscribers_receive_the_same_live_event() {
 #[tokio::test]
 async fn events_slow_subscriber_gets_a_diagnostic_then_disconnects() {
     // Given: a subscriber whose two-slot queue is not being polled.
-    let (_pool, events) = event_service(2);
+    let (pool, events) = event_service(2);
+    create_session(&pool, "ses_slow");
     let app = event_app(events.clone());
     let mut stalled = open_stream(&app, "ses_slow", None).await;
     for ordinal in 0..10 {
@@ -548,7 +595,8 @@ async fn events_slow_subscriber_gets_a_diagnostic_then_disconnects() {
 #[tokio::test]
 async fn events_idle_stream_emits_a_heartbeat_comment() {
     // Given: an idle stream with a short heartbeat interval.
-    let (_pool, events) = event_service(8);
+    let (pool, events) = event_service(8);
+    create_session(&pool, "ses_idle");
     let app = event_app(events.with_heartbeat_interval(Duration::from_millis(10)));
     let mut stream = open_stream(&app, "ses_idle", None).await;
 
@@ -559,4 +607,78 @@ async fn events_idle_stream_emits_a_heartbeat_comment() {
 
     // Then: an SSE comment keeps intermediaries alive without advancing the cursor.
     assert_eq!(frame, ": heartbeat\n\n");
+}
+
+#[tokio::test]
+async fn session_event_stream_rejects_an_unknown_session() {
+    // Given: an event service whose database has never seen the session.
+    let (_pool, events) = event_service(8);
+    let app = event_app(events.clone());
+
+    // When: a client opens the session-scoped stream for it.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/session/ses_missing/event")
+                .body(Body::empty())
+                .expect("the stream request is valid"),
+        )
+        .await
+        .expect("the event route responds");
+
+    // Then: the request is refused instead of opening a stream that can never produce.
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let bytes = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("error body is bounded");
+    let body: Value = serde_json::from_slice(&bytes).expect("error body is JSON");
+    assert_eq!(body["error"]["code"], "not_found");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("ses_missing")),
+        "the error names the session: {body}"
+    );
+    assert!(
+        format!("{events:?}").contains("sessions: 0"),
+        "a refused stream must not leave a per-session fan-out behind: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn session_fanout_is_released_when_the_last_subscriber_disconnects() {
+    // Given: two live subscribers on one session.
+    let (pool, events) = event_service(8);
+    create_session(&pool, "ses_release");
+    let app = event_app(events.clone());
+    let first = open_stream(&app, "ses_release", None).await;
+    let second = open_stream(&app, "ses_release", None).await;
+    assert!(
+        format!("{events:?}").contains("sessions: 1"),
+        "both subscribers share one fan-out: {events:?}"
+    );
+
+    // When: the subscribers disconnect one after the other.
+    drop(first);
+    assert!(
+        format!("{events:?}").contains("sessions: 1"),
+        "the fan-out must survive while a subscriber remains: {events:?}"
+    );
+    drop(second);
+
+    // Then: the per-session fan-out is released with its last subscriber.
+    assert!(
+        format!("{events:?}").contains("sessions: 0"),
+        "the fan-out must be released with its last subscriber: {events:?}"
+    );
+
+    // And: publishing to a session nobody observes does not allocate one.
+    events
+        .publish("ses_release", event(1))
+        .await
+        .expect("publish without subscribers");
+    assert!(
+        format!("{events:?}").contains("sessions: 0"),
+        "publishing must not allocate a fan-out for an unobserved session: {events:?}"
+    );
 }

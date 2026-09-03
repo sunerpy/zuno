@@ -13,9 +13,9 @@ use crate::types::{
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Oldest ripgrep major whose CLI and JSON stream Zuno accepts.
 pub const MINIMUM_RIPGREP_MAJOR: u64 = 14;
@@ -27,7 +27,89 @@ const MAX_RECORD_BYTES: usize = 64 * 1024;
 /// Cancellation polling interval while a child process is live.
 const CANCEL_POLL: Duration = Duration::from_millis(10);
 
-static SYSTEM_RIPGREP: OnceLock<Result<Discovery, DiscoveryFailure>> = OnceLock::new();
+/// How long one failed system discovery is reused before the next call re-probes.
+///
+/// A negative result must not last for the process lifetime: ripgrep is a backend
+/// dependency of `glob` and `grep` only, and a user who installs it mid-session has
+/// to get those tools working without restarting Zuno. It must not be re-probed on
+/// literally every call either, or a model looping on `grep` with no `rg` installed
+/// would spawn one `rg --version` per tool call. Five seconds is longer than the
+/// burst of search calls one turn issues and far shorter than any human install, so
+/// the recheck is effectively immediate for the user and negligible in process cost.
+const DISCOVERY_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
+
+static SYSTEM_RIPGREP: DiscoveryCache = DiscoveryCache::new();
+
+/// The process-wide result of resolving and version-checking `rg` on `PATH`.
+///
+/// A success is kept for the process lifetime because session remounts must not
+/// spawn `rg --version` repeatedly. A failure is kept only for
+/// [`DISCOVERY_RETRY_COOLDOWN`], which is what makes a missing `rg` recoverable
+/// without a restart while still bounding the probe rate.
+struct DiscoveryCache {
+    state: Mutex<Option<CachedDiscovery>>,
+}
+
+/// What a previous probe concluded, and until when that conclusion is reused.
+enum CachedDiscovery {
+    /// Resolved and accepted; reused for the process lifetime.
+    Ready(Discovery),
+    /// Failed; reused until `retry_at`, then re-probed.
+    Failed {
+        failure: DiscoveryFailure,
+        retry_at: Instant,
+    },
+}
+
+impl DiscoveryCache {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+        }
+    }
+
+    /// Resolve through the cache, probing only when nothing usable is cached.
+    ///
+    /// `probe` runs while the lock is held so that concurrent first callers make one
+    /// probe between them, which is the behaviour the previous `OnceLock` had. `now`
+    /// is a parameter rather than read here so the cooldown is testable without
+    /// sleeping, and `probe` is a parameter so the caching behaviour is testable
+    /// without depending on the host's `rg`.
+    fn resolve(
+        &self,
+        now: Instant,
+        probe: &dyn Fn() -> Result<Discovery, DiscoveryFailure>,
+    ) -> Result<Discovery, DiscoveryFailure> {
+        // A panicking probe must not make ripgrep permanently unavailable, so the
+        // poisoned guard is taken rather than propagated.
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.as_ref() {
+            Some(CachedDiscovery::Ready(discovery)) => return Ok(discovery.clone()),
+            Some(CachedDiscovery::Failed { failure, retry_at }) if now < *retry_at => {
+                return Err(failure.clone());
+            }
+            _ => {}
+        }
+        let probed = probe();
+        *state = Some(match &probed {
+            Ok(discovery) => CachedDiscovery::Ready(discovery.clone()),
+            Err(failure) => CachedDiscovery::Failed {
+                failure: failure.clone(),
+                // A clock too near the end of its range to hold the deadline
+                // re-probes immediately rather than panicking.
+                retry_at: now.checked_add(DISCOVERY_RETRY_COOLDOWN).unwrap_or(now),
+            },
+        });
+        probed
+    }
+}
+
+/// Resolve the process-wide `rg`, honouring the discovery cache.
+fn system_discovery() -> Result<Discovery, SearchError> {
+    SYSTEM_RIPGREP
+        .resolve(Instant::now(), &discover_system)
+        .map_err(DiscoveryFailure::into_search_error)
+}
 
 #[derive(Debug, Clone)]
 struct Discovery {
@@ -78,14 +160,13 @@ enum DiscoveryPolicy {
 impl Ripgrep {
     /// Resolve and validate the process-wide `rg` on `PATH`.
     ///
-    /// Discovery is cached because session remounts must not spawn `rg --version`
-    /// repeatedly. Zuno's bootstrap process fixes the command environment before
-    /// this value is first read.
+    /// A successful discovery is cached because session remounts must not spawn
+    /// `rg --version` repeatedly. Zuno's bootstrap process fixes the command
+    /// environment before this value is first read. A failed discovery is cached
+    /// only for a short cooldown, so ripgrep installed mid-session is picked up
+    /// without restarting Zuno.
     pub fn discover() -> Result<Self, SearchError> {
-        let discovery = SYSTEM_RIPGREP
-            .get_or_init(discover_system)
-            .clone()
-            .map_err(DiscoveryFailure::into_search_error)?;
+        let discovery = system_discovery()?;
         Ok(Self {
             program: discovery.program,
             version: Some(discovery.version),
@@ -98,7 +179,7 @@ impl Ripgrep {
     /// This keeps ripgrep an optional dependency of the `glob` and `grep` tools
     /// instead of an unrelated startup requirement. The first invocation still
     /// uses the same cached discovery and minimum-version validation as
-    /// [`Self::discover`].
+    /// [`Self::discover`], including its recheck of an earlier failure.
     #[must_use]
     pub fn deferred_system() -> Self {
         Self {
@@ -272,11 +353,9 @@ impl Ripgrep {
     fn execution_program(&self) -> Result<PathBuf, SearchError> {
         match self.discovery {
             DiscoveryPolicy::Explicit => Ok(self.program.clone()),
-            DiscoveryPolicy::DeferredSystem => SYSTEM_RIPGREP
-                .get_or_init(discover_system)
-                .clone()
-                .map(|discovery| discovery.program)
-                .map_err(DiscoveryFailure::into_search_error),
+            DiscoveryPolicy::DeferredSystem => {
+                system_discovery().map(|discovery| discovery.program)
+            }
         }
     }
 }
@@ -303,24 +382,31 @@ fn discover_system() -> Result<Discovery, DiscoveryFailure> {
         .unwrap_or_default()
         .trim()
         .to_owned();
-    let version = first
-        .strip_prefix("ripgrep ")
-        .and_then(|value| value.split_whitespace().next())
-        .unwrap_or_default();
-    let major = version
-        .split('.')
-        .next()
-        .and_then(|value| value.parse::<u64>().ok());
-    if major.is_none_or(|major| major < MINIMUM_RIPGREP_MAJOR) {
+    let Some(version) = accepted_version(&first) else {
         return Err(DiscoveryFailure::Version {
             program,
             found: first,
         });
-    }
-    Ok(Discovery {
-        program,
-        version: version.to_owned(),
-    })
+    };
+    let version = version.to_owned();
+    Ok(Discovery { program, version })
+}
+
+/// The version a `rg --version` first line reports, when Zuno accepts it.
+///
+/// Split out from [`discover_system`] so the gate is testable against real output
+/// shapes without an old binary on the host: the probe spawns a process, this does
+/// not. Anything that is not `ripgrep <major>[.…]` with a major of at least
+/// [`MINIMUM_RIPGREP_MAJOR`] is rejected, including a build-metadata suffix's own
+/// tokens, which are dropped rather than parsed.
+fn accepted_version(first_line: &str) -> Option<&str> {
+    let version = first_line
+        .trim()
+        .strip_prefix("ripgrep ")?
+        .split_whitespace()
+        .next()?;
+    let major = version.split('.').next()?.parse::<u64>().ok()?;
+    (major >= MINIMUM_RIPGREP_MAJOR).then_some(version)
 }
 
 fn validate_root(root: &Path) -> Result<(), SearchError> {
@@ -518,6 +604,18 @@ fn parse_match(line: &str) -> Result<Option<Match>, SearchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancel::NeverCancelled;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A program name no host provides, so any spawn would fail loudly and visibly.
+    const ABSENT_PROGRAM: &str = "zuno-definitely-not-a-real-ripgrep";
+
+    fn discovered(version: &str) -> Discovery {
+        Discovery {
+            program: PathBuf::from("rg"),
+            version: version.to_owned(),
+        }
+    }
 
     #[test]
     fn system_discovery_reports_a_supported_version() {
@@ -572,5 +670,177 @@ mod tests {
         assert!(is_invalid_regex("error parsing regex: bad"));
         assert!(is_invalid_glob("invalid glob pattern"));
         assert!(is_invalid_glob("error parsing glob: bad"));
+    }
+
+    #[test]
+    fn a_cached_successful_discovery_is_never_reprobed() {
+        let probes = AtomicUsize::new(0);
+        let probe = || -> Result<Discovery, DiscoveryFailure> {
+            probes.fetch_add(1, Ordering::SeqCst);
+            Ok(discovered("14.1.1"))
+        };
+        let cache = DiscoveryCache::new();
+        let start = Instant::now();
+
+        let first = cache.resolve(start, &probe).expect("the probe succeeds");
+        let much_later = cache
+            .resolve(start + DISCOVERY_RETRY_COOLDOWN * 100, &probe)
+            .expect("the cached success is reused");
+
+        assert_eq!(first.version, "14.1.1");
+        assert_eq!(much_later.program, first.program);
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_cached_failed_discovery_is_reprobed_after_the_cooldown() {
+        let probes = AtomicUsize::new(0);
+        let probe = || -> Result<Discovery, DiscoveryFailure> {
+            if probes.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(DiscoveryFailure::Missing)
+            } else {
+                Ok(discovered("14.1.1"))
+            }
+        };
+        let cache = DiscoveryCache::new();
+        let start = Instant::now();
+
+        let missing = cache
+            .resolve(start, &probe)
+            .expect_err("ripgrep is absent on the first probe");
+        assert!(matches!(
+            missing.into_search_error(),
+            SearchError::Unavailable { .. }
+        ));
+
+        // Inside the cooldown the failure is reused, so a model looping on `grep`
+        // cannot make Zuno spawn one `rg --version` per call.
+        assert!(
+            cache
+                .resolve(start + DISCOVERY_RETRY_COOLDOWN / 2, &probe)
+                .is_err()
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+        // Once it elapses the next call re-probes and sees the freshly installed
+        // binary, with no process restart.
+        let installed = cache
+            .resolve(start + DISCOVERY_RETRY_COOLDOWN, &probe)
+            .expect("ripgrep installed mid-session becomes usable");
+        assert_eq!(installed.version, "14.1.1");
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+
+        // And that success is cached for the process lifetime like any other.
+        cache
+            .resolve(start + DISCOVERY_RETRY_COOLDOWN * 100, &probe)
+            .expect("the recovered success is cached");
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_supported_version_line_is_accepted() {
+        assert_eq!(accepted_version("ripgrep 14.1.1"), Some("14.1.1"));
+        assert_eq!(accepted_version("ripgrep 15.0.0"), Some("15.0.0"));
+        // The exact shape `rg --version` prints when built from a revision.
+        assert_eq!(
+            accepted_version("ripgrep 15.1.0 (rev af60c2de9d)"),
+            Some("15.1.0")
+        );
+        assert_eq!(
+            accepted_version("ripgrep 14.1.1 (rev abcdef)"),
+            Some("14.1.1")
+        );
+    }
+
+    #[test]
+    fn an_unsupported_or_unrecognised_version_line_is_rejected() {
+        assert_eq!(accepted_version("ripgrep 13.0.0"), None);
+        assert_eq!(accepted_version(""), None);
+        assert_eq!(accepted_version("grep (GNU grep) 3.11"), None);
+        assert_eq!(accepted_version("rg 14.1.1"), None);
+        assert_eq!(accepted_version("ripgrep vNEXT"), None);
+    }
+
+    #[test]
+    fn an_unsupported_version_is_unavailable_rather_than_model_correctable() {
+        let error = DiscoveryFailure::Version {
+            program: PathBuf::from("/usr/bin/rg"),
+            found: "ripgrep 13.0.0".to_owned(),
+        }
+        .into_search_error();
+
+        assert!(matches!(error, SearchError::Unavailable { .. }));
+        assert!(!error.is_model_correctable());
+    }
+
+    #[test]
+    fn a_missing_search_root_is_typed() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let missing = dir.path().join("no-such-directory");
+
+        let error = validate_root(&missing).expect_err("a missing root fails");
+
+        assert!(matches!(&error, SearchError::RootMissing { root } if root == &missing));
+        assert!(!error.is_model_correctable());
+    }
+
+    #[test]
+    fn a_search_root_that_is_a_file_is_typed() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let file = dir.path().join("a.ts");
+        std::fs::write(&file, "needle\n").expect("a fixture file");
+
+        let error = validate_root(&file).expect_err("a file root fails");
+
+        assert!(matches!(&error, SearchError::RootNotDirectory { root } if root == &file));
+        assert!(error.is_model_correctable());
+    }
+
+    #[test]
+    fn a_directory_search_root_is_accepted() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        assert!(validate_root(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn glob_rejects_a_missing_root_before_spawning() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let missing = dir.path().join("no-such-directory");
+        let engine = Ripgrep::new(ABSENT_PROGRAM);
+
+        let error = engine
+            .glob(&GlobRequest::new(&missing, "**/*.ts", 10), &NeverCancelled)
+            .expect_err("a missing root fails");
+
+        // `RootMissing` rather than `Spawn` is the proof that validation runs before
+        // any process is started.
+        assert!(matches!(&error, SearchError::RootMissing { root } if root == &missing));
+    }
+
+    #[test]
+    fn grep_rejects_a_missing_root_before_spawning() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let missing = dir.path().join("no-such-directory");
+        let engine = Ripgrep::new(ABSENT_PROGRAM);
+
+        let error = engine
+            .grep(&GrepRequest::new(&missing, "needle", 10), &NeverCancelled)
+            .expect_err("a missing root fails");
+
+        assert!(matches!(&error, SearchError::RootMissing { root } if root == &missing));
+    }
+
+    #[test]
+    fn grep_rejects_a_file_root_before_spawning() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let file = dir.path().join("a.ts");
+        std::fs::write(&file, "needle\n").expect("a fixture file");
+        let engine = Ripgrep::new(ABSENT_PROGRAM);
+
+        let error = engine
+            .grep(&GrepRequest::new(&file, "needle", 10), &NeverCancelled)
+            .expect_err("a file root fails");
+
+        assert!(matches!(&error, SearchError::RootNotDirectory { root } if root == &file));
     }
 }

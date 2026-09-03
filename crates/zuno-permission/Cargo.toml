@@ -17,6 +17,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# `dirs` is already a dependency; the tests need it to state the exact expansion of
+# `$HOME` and `~` that `rules_from_config` performs.
+dirs = { workspace = true }
 proptest = { workspace = true }
 
 [lints]

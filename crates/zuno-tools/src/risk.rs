@@ -37,6 +37,7 @@
 //! to distinguish creation from replacement; that probe is not confinement.
 
 use crate::shell::{CommandResource, ShellSyntax, analyze_command};
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use zuno_error::ToolError;
 
@@ -130,6 +131,32 @@ const RECURSIVE_SYSTEM_PATHS: &[&str] = &[
     "/var/lib", "/System", "/Library",
 ];
 
+/// Windows locations that are catastrophic to remove exactly, drive-relative.
+///
+/// `users` is deliberately not recursive: `C:\Users\alice\project` is ordinary work,
+/// exactly as `/home` and `/Users` are equality-only above.
+const PROTECTED_WINDOWS_SUBPATHS: &[&str] = &["users", "users/public", "$recycle.bin"];
+
+/// Windows locations that are catastrophic to remove at or below, drive-relative.
+const RECURSIVE_WINDOWS_SUBPATHS: &[&str] = &[
+    "windows",
+    "program files",
+    "program files (x86)",
+    "programdata",
+    "boot",
+    "perflogs",
+    "system volume information",
+];
+
+/// Every spelling of "the user's home directory" that a Windows shell expands itself.
+///
+/// `cmd` uses `%USERPROFILE%` and PowerShell uses `$env:USERPROFILE`; neither sets
+/// `HOME`. All entries are lowercase because Windows environment variable names are
+/// case-insensitive and [`replace_ignoring_case`] folds the subject to match. The
+/// braced spelling precedes the bare one so the longer match wins.
+const WINDOWS_HOME_SPELLINGS: &[&str] =
+    &["%userprofile%", "${env:userprofile}", "$env:userprofile"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RiskLevel {
     Safe,
@@ -206,8 +233,9 @@ impl RiskAssessment {
 /// Environment facts needed for lexical path resolution.
 ///
 /// Keeping these as values makes lexical resolution deterministic.
-/// [`RiskContext::from_env`] snapshots only `HOME`; redirect assessment may still
-/// inspect one fully resolved static target to distinguish creation from replacement.
+/// [`RiskContext::from_env`] snapshots the home directory once; redirect assessment
+/// may still inspect one fully resolved static target to distinguish creation from
+/// replacement.
 #[derive(Debug, Clone, Default)]
 pub struct RiskContext {
     pub working_dir: Option<PathBuf>,
@@ -219,11 +247,27 @@ impl RiskContext {
     pub fn from_env(working_dir: Option<PathBuf>) -> Self {
         Self {
             working_dir,
-            home_dir: std::env::var_os("HOME")
-                .filter(|home| !home.is_empty())
-                .map(PathBuf::from),
+            home_dir: home_directory_from(std::env::var_os("HOME"), std::env::home_dir()),
         }
     }
+}
+
+/// The home directory to protect, preferring an explicit `HOME` over the platform's.
+///
+/// `HOME` alone is not enough. Neither `cmd` nor PowerShell sets it, so on Windows
+/// `home_dir` was `None`, and with it every home, credential, and profile rule below
+/// silently switched off: `rm -rf ~/.ssh` and `rm -rf $HOME` fell from a permanent
+/// refusal to a confirmation prompt, and executed outright under `allow_all`.
+/// [`std::env::home_dir`] reads `USERPROFILE` there. `HOME` still takes precedence so
+/// a user who deliberately relocates it keeps the behaviour they configured.
+///
+/// Taking both inputs as parameters keeps the decision testable without mutating
+/// process environment shared with every other test in the binary.
+fn home_directory_from(variable: Option<OsString>, platform: Option<PathBuf>) -> Option<PathBuf> {
+    variable
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or(platform)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,7 +327,11 @@ impl SimulatedLocation {
     }
 
     fn apply(&mut self, resource: &CommandResource, syntax: ShellSyntax, home: Option<&Path>) {
-        let Some(program) = resource.tokens.first().map(|token| command_name(token)) else {
+        let Some(program) = resource
+            .tokens
+            .first()
+            .map(|token| command_name(token, syntax))
+        else {
             self.cwd = None;
             return;
         };
@@ -303,7 +351,7 @@ impl SimulatedLocation {
                             (resource.tokens.len() == 1 && program != "set-location")
                                 .then(|| "~".to_owned())
                         })
-                        .and_then(|target| resolve_directory_target(&target, &context))
+                        .and_then(|target| resolve_directory_target(&target, &context, syntax))
                 };
             }
             "pushd" => {
@@ -314,7 +362,7 @@ impl SimulatedLocation {
                         self.cwd = if source_has_unknown_expansion {
                             None
                         } else {
-                            resolve_directory_target(&target, &context)
+                            resolve_directory_target(&target, &context, syntax)
                         };
                     }
                     None => self.swap_with_stack_top(),
@@ -326,7 +374,7 @@ impl SimulatedLocation {
                     self.cwd = if source_has_unknown_expansion {
                         None
                     } else {
-                        resolve_directory_target(&target, &context)
+                        resolve_directory_target(&target, &context, syntax)
                     };
                 }
             }
@@ -388,14 +436,18 @@ fn is_directory_stack_index(token: &str) -> bool {
         })
 }
 
-fn resolve_directory_target(raw: &str, context: &RiskContext) -> Option<PathBuf> {
+fn resolve_directory_target(
+    raw: &str,
+    context: &RiskContext,
+    syntax: ShellSyntax,
+) -> Option<PathBuf> {
     if matches!(static_brace_expansions(raw), BraceExpansions::Unknown)
         || (is_dynamic_path(raw) && !home_is_fully_expanded(raw, context))
     {
         return None;
     }
-    let expanded = expand_path(raw, context);
-    expanded.is_absolute().then(|| normalize_path(&expanded))
+    let expanded = expand_path(raw, context, syntax);
+    is_rooted(&expanded).then(|| normalize_path(&expanded))
 }
 
 #[must_use]
@@ -460,7 +512,7 @@ fn assess_resource(
     findings: &mut Vec<RiskFinding>,
 ) -> Result<(), ToolError> {
     for redirect in truncating_redirect_targets(&resource.source) {
-        assess_redirect_target(&redirect, context, findings);
+        assess_redirect_target(&redirect, context, syntax, findings);
     }
 
     let tokens = &resource.tokens;
@@ -471,7 +523,7 @@ fn assess_resource(
         ));
         return Ok(());
     }
-    let Some(program) = tokens.first().map(|token| command_name(token)) else {
+    let Some(program) = tokens.first().map(|token| command_name(token, syntax)) else {
         return Ok(());
     };
 
@@ -484,15 +536,15 @@ fn assess_resource(
     if program == "su" {
         return assess_su_script(tokens, syntax, context, depth, findings);
     }
-    if let Some(script) = env_split_script(tokens) {
+    if let Some(script) = env_split_script(tokens, syntax) {
         return assess_embedded_script(&script, syntax, context, depth, "env -S", findings);
     }
-    if env_without_child_command(tokens) {
+    if env_without_child_command(tokens, syntax) {
         return Ok(());
     }
 
-    let (tokens, wrapper) = unwrap_wrappers(tokens);
-    let Some(program) = tokens.first().map(|token| command_name(token)) else {
+    let (tokens, wrapper) = unwrap_wrappers(tokens, syntax);
+    let Some(program) = tokens.first().map(|token| command_name(token, syntax)) else {
         if let Some(wrapper) = wrapper {
             findings.push(unknown_target_finding(format!(
                 "`{wrapper}` runs a command that could not be identified statically"
@@ -513,7 +565,7 @@ fn assess_resource(
     if program == "find" {
         return assess_find(tokens, syntax, context, depth, findings);
     }
-    if program == "git" && assess_git(&resource.source, tokens, context, findings) {
+    if program == "git" && assess_git(&resource.source, tokens, syntax, context, findings) {
         return Ok(());
     }
 
@@ -533,7 +585,7 @@ fn assess_resource(
     }
     let absent_temp_file_cleanup = is_forced_non_recursive_rm(&program, tokens);
     for target in targets {
-        assess_destructive_target(&target, context, absent_temp_file_cleanup, findings);
+        assess_destructive_target(&target, context, syntax, absent_temp_file_cleanup, findings);
     }
     Ok(())
 }
@@ -541,10 +593,11 @@ fn assess_resource(
 fn assess_git(
     source: &str,
     tokens: &[String],
+    syntax: ShellSyntax,
     context: &RiskContext,
     findings: &mut Vec<RiskFinding>,
 ) -> bool {
-    let Some((subcommand, args)) = git_subcommand(tokens) else {
+    let Some((subcommand, args)) = git_subcommand(tokens, syntax) else {
         return false;
     };
     let repository_override =
@@ -641,10 +694,10 @@ fn git_uses_repository_override(tokens: &[String]) -> bool {
     false
 }
 
-fn git_subcommand(tokens: &[String]) -> Option<(String, &[String])> {
+fn git_subcommand(tokens: &[String], syntax: ShellSyntax) -> Option<(String, &[String])> {
     if tokens
         .first()
-        .is_none_or(|token| command_name(token) != "git")
+        .is_none_or(|token| command_name(token, syntax) != "git")
     {
         return None;
     }
@@ -746,10 +799,10 @@ fn exact_git_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn env_without_child_command(tokens: &[String]) -> bool {
+fn env_without_child_command(tokens: &[String], syntax: ShellSyntax) -> bool {
     if tokens
         .first()
-        .is_none_or(|token| command_name(token) != "env")
+        .is_none_or(|token| command_name(token, syntax) != "env")
     {
         return false;
     }
@@ -785,10 +838,10 @@ fn env_without_child_command(tokens: &[String]) -> bool {
     true
 }
 
-fn env_split_script(tokens: &[String]) -> Option<Vec<String>> {
+fn env_split_script(tokens: &[String], syntax: ShellSyntax) -> Option<Vec<String>> {
     if tokens
         .first()
-        .is_none_or(|token| command_name(token) != "env")
+        .is_none_or(|token| command_name(token, syntax) != "env")
     {
         return None;
     }
@@ -922,11 +975,14 @@ fn assess_embedded_script(
 /// Shared with [`crate::navigation`] so `env FOO=1 rg x` is `rg` under both gates;
 /// two wrapper tables would drift, and a wrapper only one of them knew would let a
 /// command through the other.
-pub(crate) fn unwrap_wrappers(tokens: &[String]) -> (&[String], Option<String>) {
+pub(crate) fn unwrap_wrappers(
+    tokens: &[String],
+    syntax: ShellSyntax,
+) -> (&[String], Option<String>) {
     let mut remaining = tokens;
     let mut last_wrapper = None;
     loop {
-        let Some(program) = remaining.first().map(|token| command_name(token)) else {
+        let Some(program) = remaining.first().map(|token| command_name(token, syntax)) else {
             return (remaining, last_wrapper);
         };
         if !WRAPPER_COMMANDS.contains(&program.as_str()) {
@@ -1061,7 +1117,7 @@ fn assess_find(
         return Ok(());
     }
     for root in roots {
-        assess_destructive_target(&root, context, false, findings);
+        assess_destructive_target(&root, context, syntax, false, findings);
     }
     for index in tokens.iter().enumerate().filter_map(|(index, token)| {
         matches!(unquote(token).as_str(), "-exec" | "-execdir").then_some(index)
@@ -1127,13 +1183,20 @@ fn option_consumes_value(program: &str, option: &str) -> bool {
 fn assess_destructive_target(
     raw: &str,
     context: &RiskContext,
+    syntax: ShellSyntax,
     absent_temp_file_cleanup: bool,
     findings: &mut Vec<RiskFinding>,
 ) {
     match static_brace_expansions(raw) {
         BraceExpansions::Expanded(targets) => {
             for target in targets {
-                assess_destructive_target(&target, context, absent_temp_file_cleanup, findings);
+                assess_destructive_target(
+                    &target,
+                    context,
+                    syntax,
+                    absent_temp_file_cleanup,
+                    findings,
+                );
             }
             return;
         }
@@ -1146,8 +1209,8 @@ fn assess_destructive_target(
         }
         BraceExpansions::Absent => {}
     }
-    let expanded = expand_path(raw, context);
-    if context.working_dir.is_none() && !expanded.is_absolute() {
+    let expanded = expand_path(raw, context, syntax);
+    if context.working_dir.is_none() && !is_rooted(&expanded) {
         findings.push(catastrophic_finding(
             "relative destructive target follows a directory change whose result is unknown"
                 .to_owned(),
@@ -1266,7 +1329,12 @@ fn static_brace_expansions(raw: &str) -> BraceExpansions {
     )
 }
 
-fn assess_redirect_target(raw: &str, context: &RiskContext, findings: &mut Vec<RiskFinding>) {
+fn assess_redirect_target(
+    raw: &str,
+    context: &RiskContext,
+    syntax: ShellSyntax,
+    findings: &mut Vec<RiskFinding>,
+) {
     let unquoted = unquote(raw);
     if matches!(
         unquoted.as_str(),
@@ -1283,7 +1351,7 @@ fn assess_redirect_target(raw: &str, context: &RiskContext, findings: &mut Vec<R
         ));
         return;
     }
-    let expanded = expand_path(&unquoted, context);
+    let expanded = expand_path(&unquoted, context, syntax);
     if is_catastrophic_target(&expanded, context) {
         findings.push(catastrophic_finding(
             "output redirection would overwrite a protected path or device node".to_owned(),
@@ -1398,12 +1466,12 @@ fn truncating_redirect_targets(source: &str) -> Vec<String> {
     targets
 }
 
-fn expand_path(raw: &str, context: &RiskContext) -> PathBuf {
-    let raw = static_shell_word(raw);
-    let expanded_home = context.home_dir.as_ref().map(|home| {
-        let home = home.to_string_lossy();
-        raw.replace("${HOME}", &home).replace("$HOME", &home)
-    });
+fn expand_path(raw: &str, context: &RiskContext, syntax: ShellSyntax) -> PathBuf {
+    let raw = static_shell_word(raw, syntax);
+    let expanded_home = context
+        .home_dir
+        .as_deref()
+        .map(|home| expand_home_spellings(&raw, home, &home.to_string_lossy()));
     let mut text = expanded_home.unwrap_or(raw);
     if let Some(home) = &context.home_dir {
         if text == "~" {
@@ -1413,13 +1481,51 @@ fn expand_path(raw: &str, context: &RiskContext) -> PathBuf {
         }
     }
     let path = PathBuf::from(text);
-    if path.is_absolute() {
+    if is_rooted(&path) {
         normalize_path(&path)
     } else if let Some(cwd) = &context.working_dir {
         normalize_path(&cwd.join(path))
     } else {
         normalize_path(&path)
     }
+}
+
+/// Replaces every shell spelling of the home directory with `replacement`.
+///
+/// The Windows spellings are applied only when the home directory is itself a Windows
+/// path: `%USERPROFILE%` is an ordinary literal in a POSIX shell, and expanding it
+/// there would invent a home reference the shell will never make.
+fn expand_home_spellings(raw: &str, home: &Path, replacement: &str) -> String {
+    let mut text = raw
+        .replace("${HOME}", replacement)
+        .replace("$HOME", replacement);
+    if windows_target(home).is_some() {
+        for spelling in WINDOWS_HOME_SPELLINGS {
+            text = replace_ignoring_case(&text, spelling, replacement);
+        }
+    }
+    text
+}
+
+/// Replaces every occurrence of a lowercase ASCII `needle`, ignoring case.
+///
+/// Windows environment variable names are case-insensitive, so `%UserProfile%` and
+/// `%USERPROFILE%` name the same directory and must expand the same way.
+/// [`str::to_ascii_lowercase`] changes no byte lengths, so the folded copy's match
+/// offsets index the original text exactly.
+fn replace_ignoring_case(text: &str, needle: &str, replacement: &str) -> String {
+    debug_assert_eq!(needle, needle.to_ascii_lowercase(), "needle must be folded");
+    let folded = text.to_ascii_lowercase();
+    let mut replaced = String::with_capacity(text.len());
+    let mut index = 0;
+    while let Some(offset) = folded[index..].find(needle) {
+        let start = index + offset;
+        replaced.push_str(&text[index..start]);
+        replaced.push_str(replacement);
+        index = start + needle.len();
+    }
+    replaced.push_str(&text[index..]);
+    replaced
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -1443,8 +1549,167 @@ fn normalize_path(path: &Path) -> PathBuf {
     }
 }
 
+/// A Windows absolute path split into the root it names and the part below that root.
+///
+/// The remainder is lowercased with `/` separators so the protected tables can be
+/// compared as text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WindowsTarget {
+    /// A drive-rooted path. `relative` is empty for the drive root itself.
+    Drive { relative: String },
+    /// A UNC share. `relative` is empty for the share root itself.
+    Share { relative: String },
+}
+
+/// Splits a Windows absolute path into its root and drive-relative remainder.
+///
+/// Returns `None` for anything that does not name a Windows root, so POSIX assessment
+/// is left exactly as it was.
+///
+/// This works on the rendered path rather than [`Path::components`] on purpose. Off
+/// Windows, `Path::new("C:/Windows")` yields no [`Component::Prefix`] at all, so a
+/// component-based matcher could not be exercised on a Linux or macOS host and would
+/// silently diverge from the code that ships. Rendering also folds the extended
+/// `\\?\` and `\\.\` prefixes and the verbatim `UNC\` form, which a caller can use to
+/// spell the same protected directory three ways.
+fn windows_target(path: &Path) -> Option<WindowsTarget> {
+    let unified = path.to_string_lossy().replace('\\', "/");
+    let (rooted, verbatim) = match unified
+        .strip_prefix("//?/")
+        .or_else(|| unified.strip_prefix("//./"))
+    {
+        Some(rest) => (rest, true),
+        None => (unified.as_str(), false),
+    };
+    if let Some(share) = strip_unc_root(rooted, verbatim) {
+        let mut segments = share.split('/').filter(|segment| !segment.is_empty());
+        let _server = segments.next()?;
+        let _share = segments.next()?;
+        return Some(WindowsTarget::Share {
+            relative: fold_segments(segments),
+        });
+    }
+    let mut segments = rooted.split('/');
+    if !is_drive_letter(segments.next()?) {
+        return None;
+    }
+    Some(WindowsTarget::Drive {
+        relative: fold_segments(segments.filter(|segment| !segment.is_empty())),
+    })
+}
+
+/// The `server/share/...` remainder of a UNC path, in either spelling.
+///
+/// The bare `UNC\` spelling is only accepted after a verbatim prefix was stripped:
+/// on its own, `unc/project/notes` is an ordinary relative POSIX path and must not be
+/// mistaken for a network share root.
+fn strip_unc_root(rooted: &str, verbatim: bool) -> Option<&str> {
+    if let Some(rest) = rooted.strip_prefix("//") {
+        return Some(rest);
+    }
+    if !verbatim {
+        return None;
+    }
+    rooted
+        .split_once('/')
+        .filter(|(head, _)| head.eq_ignore_ascii_case("UNC"))
+        .map(|(_, rest)| rest)
+}
+
+/// Whether a path names a root — on this platform, or on Windows.
+///
+/// [`Path::is_absolute`] answers only for the host. Off Windows, `C:\Windows` and
+/// `\\server\share` are ordinary relative names, so a Windows target would be joined
+/// onto a POSIX working directory and would stop matching the protected tables
+/// entirely. The assessor has to classify a path the way the shell that runs it will,
+/// and answering for both spellings also keeps the Windows rules exercisable by tests
+/// on any host, which a `cfg(windows)` branch would not.
+fn is_rooted(path: &Path) -> bool {
+    path.is_absolute() || windows_target(path).is_some()
+}
+
+fn is_drive_letter(segment: &str) -> bool {
+    let mut characters = segment.chars();
+    characters
+        .next()
+        .is_some_and(|letter| letter.is_ascii_alphabetic())
+        && characters.next() == Some(':')
+        && characters.next().is_none()
+}
+
+/// Joins path segments with `/` and folds case, matching the protected tables.
+fn fold_segments<'a>(segments: impl Iterator<Item = &'a str>) -> String {
+    segments
+        .filter(|segment| *segment != ".")
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The table spelling of a protected subpath: `/` separators, folded case.
+fn folded_subpath(subpath: &str) -> String {
+    subpath.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn is_at_or_below(relative: &str, protected: &str) -> bool {
+    relative == protected
+        || relative
+            .strip_prefix(protected)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether a Windows path names a protected system, profile, or credential location.
+///
+/// The home half reuses [`CREDENTIAL_SUBPATHS`] and [`PROTECTED_HOME_SUBPATHS`]
+/// because `.ssh`, `.aws`, and `.config/gh` are spelled identically under
+/// `C:\Users\alice`; only the comparison changes, since a Windows path is
+/// case-insensitive and can be written with either separator.
+fn is_catastrophic_windows_target(target: &WindowsTarget, context: &RiskContext) -> bool {
+    let relative = match target {
+        // A share root is the whole of someone else's filesystem. Nothing below it is
+        // classified here: a project checked out on a share is ordinary work.
+        WindowsTarget::Share { relative } => return relative.is_empty(),
+        WindowsTarget::Drive { relative } => relative.as_str(),
+    };
+    if relative.is_empty()
+        || PROTECTED_WINDOWS_SUBPATHS.contains(&relative)
+        || RECURSIVE_WINDOWS_SUBPATHS
+            .iter()
+            .any(|protected| is_at_or_below(relative, protected))
+    {
+        return true;
+    }
+    let Some(WindowsTarget::Drive { relative: home }) = context
+        .home_dir
+        .as_deref()
+        .map(normalize_path)
+        .as_deref()
+        .and_then(windows_target)
+    else {
+        return false;
+    };
+    if relative == home {
+        return true;
+    }
+    let Some(inside) = relative
+        .strip_prefix(home.as_str())
+        .and_then(|rest| rest.strip_prefix('/'))
+    else {
+        return false;
+    };
+    CREDENTIAL_SUBPATHS
+        .iter()
+        .any(|subpath| is_at_or_below(inside, &folded_subpath(subpath)))
+        || PROTECTED_HOME_SUBPATHS
+            .iter()
+            .any(|subpath| inside == folded_subpath(subpath))
+}
+
 fn is_catastrophic_target(path: &Path, context: &RiskContext) -> bool {
     let path = normalize_path(path);
+    if let Some(target) = windows_target(&path) {
+        return is_catastrophic_windows_target(&target, context);
+    }
     if PROTECTED_SYSTEM_PATHS
         .iter()
         .any(|protected| path == Path::new(protected))
@@ -1481,10 +1746,10 @@ fn glob_covers_protected_parent(expanded: &Path, context: &RiskContext) -> bool 
 }
 
 fn home_is_fully_expanded(raw: &str, context: &RiskContext) -> bool {
-    if context.home_dir.is_none() {
+    let Some(home) = context.home_dir.as_deref() else {
         return false;
-    }
-    let without_home = raw.replace("${HOME}", "").replace("$HOME", "");
+    };
+    let without_home = expand_home_spellings(raw, home, "");
     let has_other_expansion = without_home.contains('$') || raw.contains('`') || raw.contains("$(");
     let has_named_home = raw.starts_with('~') && raw != "~" && !raw.starts_with("~/");
     !has_other_expansion && !has_named_home
@@ -1502,25 +1767,92 @@ fn is_dynamic_path(path: &str) -> bool {
 }
 
 fn contains_glob(path: &str) -> bool {
+    let path = without_verbatim_prefix(path);
     path.contains('*') || path.contains('?')
+}
+
+/// The path with a Windows verbatim or device prefix removed.
+///
+/// `\\?\` and `\\.\` spell a root, so their `?` is not a wildcard. Leaving them in
+/// place made every verbatim path look like a glob, and `\\?\C:\Windows` was reported
+/// as an unknown blast radius instead of the protected directory it names. A `?`
+/// anywhere else is still a glob: Windows file names cannot contain one.
+fn without_verbatim_prefix(path: &str) -> &str {
+    let mut characters = path.chars();
+    let separator = |character: Option<char>| matches!(character, Some('/' | '\\'));
+    if separator(characters.next())
+        && separator(characters.next())
+        && matches!(characters.next(), Some('?' | '.'))
+        && separator(characters.next())
+    {
+        return &path[4..];
+    }
+    path
 }
 
 fn is_destructive_command(program: &str) -> bool {
     DESTRUCTIVE_COMMANDS.contains(&program) || program.starts_with("mkfs.")
 }
 
-/// The lowercase file name of a command token with shell quoting removed, so
-/// `"/usr/bin/RG"` names the same program as `rg`.
-pub(crate) fn command_name(token: &str) -> String {
-    let static_name = static_shell_word(token);
-    Path::new(&static_name)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(&static_name)
-        .to_ascii_lowercase()
+/// The lowercase program name a command token denotes, so `"/usr/bin/RG"` and
+/// `C:\Tools\RG.EXE` both name the same program as `rg`.
+///
+/// Which characters separate path segments is a property of the shell, not of the
+/// host: under PowerShell a backslash is a separator, while under Bash it is an escape
+/// (`r\m` runs `rm`). Reducing a PowerShell token with the POSIX rule turned
+/// `C:\Windows\System32\bash.exe` into `C:WindowsSystem32bash.exe`, which matches
+/// nothing, so an absolutely spelled nested shell escaped [`SHELL_COMMANDS`], a
+/// wrapper escaped [`WRAPPER_COMMANDS`], and a destructive program escaped
+/// [`DESTRUCTIVE_COMMANDS`] — on Windows only. [`Path::file_name`] is not used because
+/// it recognizes `\` as a separator only when compiled for Windows.
+///
+/// A `.exe` or `.com` suffix is dropped so `rm.exe` and `format.com` reach the same
+/// tables as `rm` and `format`. Script suffixes are deliberately left alone: a
+/// `deploy.cmd` is its own program, not the tool it happens to be named after.
+pub(crate) fn command_name(token: &str, syntax: ShellSyntax) -> String {
+    let literal = static_shell_word(token, syntax);
+    let separators: &[char] = match syntax {
+        ShellSyntax::Bash => &['/'],
+        ShellSyntax::PowerShell => &['/', '\\'],
+    };
+    let trimmed = literal.trim_end_matches(separators);
+    let name = match trimmed.rsplit(separators).next() {
+        Some(name) if !name.is_empty() => name,
+        _ => literal.as_str(),
+    }
+    .to_ascii_lowercase();
+    match name
+        .strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".com"))
+    {
+        Some(stem) if !stem.is_empty() => stem.to_owned(),
+        _ => name,
+    }
 }
 
-fn static_shell_word(text: &str) -> String {
+/// The literal a shell word denotes, with that shell's own escape character.
+///
+/// Escaping is per shell and the difference decides whether a Windows path survives
+/// assessment at all. Bash removes a backslash and keeps the next character; in
+/// PowerShell a backslash is never an escape — its escape character is a backtick —
+/// so a backslash there is a path separator. Reducing both with the POSIX rule
+/// rewrote `'C:\Users\alice\.ssh'` to `C:Usersalice.ssh`, which matches no protected
+/// directory, so the credential, profile, and system rules could not fire on the one
+/// platform that spells paths that way.
+fn static_shell_word(text: &str, syntax: ShellSyntax) -> String {
+    reduce_shell_word(text, Some(shell_escape(syntax)))
+}
+
+/// The escape character outside single quotes for each supported shell.
+fn shell_escape(syntax: ShellSyntax) -> char {
+    match syntax {
+        ShellSyntax::Bash => '\\',
+        ShellSyntax::PowerShell => '`',
+    }
+}
+
+/// Removes shell quoting, and `escape` characters when the shell has one.
+fn reduce_shell_word(text: &str, escape: Option<char>) -> String {
     let mut word = String::with_capacity(text.len());
     let mut quote = None;
     let mut escaped = false;
@@ -1530,7 +1862,7 @@ fn static_shell_word(text: &str) -> String {
             escaped = false;
             continue;
         }
-        if character == '\\' && quote != Some('\'') {
+        if Some(character) == escape && quote != Some('\'') {
             escaped = true;
             continue;
         }
@@ -1546,8 +1878,8 @@ fn static_shell_word(text: &str) -> String {
         }
         word.push(character);
     }
-    if escaped {
-        word.push('\\');
+    if let (true, Some(escape)) = (escaped, escape) {
+        word.push(escape);
     }
     word
 }
@@ -1600,4 +1932,150 @@ fn git_history_finding(reason: String) -> RiskFinding {
 
 fn unknown_target_finding(reason: String) -> RiskFinding {
     confirm_finding(reason, None)
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::*;
+
+    #[test]
+    fn an_explicit_home_variable_wins_over_the_platform_home() {
+        let home = home_directory_from(
+            Some(OsString::from("/opt/relocated")),
+            Some(PathBuf::from("/home/alice")),
+        );
+        assert_eq!(home, Some(PathBuf::from("/opt/relocated")));
+    }
+
+    #[test]
+    fn an_absent_or_empty_home_variable_falls_back_to_the_platform_home() {
+        // The Windows case: `cmd` and PowerShell set no `HOME`, so without the
+        // fallback every home and credential rule below switched itself off.
+        assert_eq!(
+            home_directory_from(None, Some(PathBuf::from(r"C:\Users\alice"))),
+            Some(PathBuf::from(r"C:\Users\alice"))
+        );
+        assert_eq!(
+            home_directory_from(
+                Some(OsString::new()),
+                Some(PathBuf::from(r"C:\Users\alice"))
+            ),
+            Some(PathBuf::from(r"C:\Users\alice"))
+        );
+        assert_eq!(home_directory_from(None, None), None);
+    }
+
+    #[test]
+    fn a_windows_root_is_recognized_in_every_spelling() {
+        for spelling in [
+            r"C:\Windows\System32",
+            "C:/Windows/System32",
+            r"c:/WINDOWS\system32",
+        ] {
+            assert_eq!(
+                windows_target(Path::new(spelling)),
+                Some(WindowsTarget::Drive {
+                    relative: "windows/system32".to_owned()
+                }),
+                "{spelling}"
+            );
+        }
+        for spelling in [r"C:\", "C:/", "C:"] {
+            assert_eq!(
+                windows_target(Path::new(spelling)),
+                Some(WindowsTarget::Drive {
+                    relative: String::new()
+                }),
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            windows_target(Path::new(r"\\?\C:\Windows")),
+            Some(WindowsTarget::Drive {
+                relative: "windows".to_owned()
+            })
+        );
+        assert_eq!(
+            windows_target(Path::new(r"\\server\share\project")),
+            Some(WindowsTarget::Share {
+                relative: "project".to_owned()
+            })
+        );
+        assert_eq!(
+            windows_target(Path::new(r"\\?\UNC\server\share")),
+            Some(WindowsTarget::Share {
+                relative: String::new()
+            })
+        );
+    }
+
+    #[test]
+    fn a_posix_path_is_never_read_as_a_windows_root() {
+        for path in ["/etc", "/", "relative/path", "unc/project/notes"] {
+            let normalized = normalize_path(Path::new(path));
+            assert_eq!(windows_target(&normalized), None, "{path}");
+        }
+    }
+
+    /// A leading `//` means whatever the host's own path parser says it means.
+    ///
+    /// `normalize_path` walks [`Path::components`], and prefix parsing there belongs to
+    /// the host: Windows reads the leading `//` as a UNC prefix and keeps the share,
+    /// while on Linux `//` collapses to `/` and the result is the ordinary directory
+    /// `/server/share`. Each answer is the one the shell that would run the command
+    /// makes, and classifying the target the way that shell does is the assessor's whole
+    /// job — so this case is pinned per host instead of being asserted away on one of
+    /// them.
+    #[test]
+    fn a_double_slash_root_is_classified_the_way_the_host_reads_it() {
+        let normalized = normalize_path(Path::new("//server/share"));
+        #[cfg(windows)]
+        assert_eq!(
+            windows_target(&normalized),
+            Some(WindowsTarget::Share {
+                relative: String::new()
+            })
+        );
+        #[cfg(not(windows))]
+        assert_eq!(windows_target(&normalized), None);
+    }
+
+    #[test]
+    fn the_windows_home_spellings_expand_only_when_home_is_a_windows_path() {
+        let windows = Path::new(r"C:\Users\alice");
+        for spelling in [
+            "%USERPROFILE%",
+            "%UserProfile%",
+            "$env:USERPROFILE",
+            "${env:userprofile}",
+        ] {
+            assert_eq!(
+                expand_home_spellings(&format!(r"{spelling}\.ssh"), windows, r"C:\Users\alice"),
+                r"C:\Users\alice\.ssh",
+                "{spelling}"
+            );
+        }
+        // In a POSIX shell `%USERPROFILE%` is an ordinary literal, and inventing a
+        // home reference the shell will never make would misreport the target.
+        assert_eq!(
+            expand_home_spellings(
+                "%USERPROFILE%/.ssh",
+                Path::new("/home/alice"),
+                "/home/alice"
+            ),
+            "%USERPROFILE%/.ssh"
+        );
+    }
+
+    #[test]
+    fn replacement_ignores_case_and_keeps_the_surrounding_text() {
+        assert_eq!(
+            replace_ignoring_case(r"X%UserProfile%Y%USERPROFILE%Z", "%userprofile%", "H"),
+            "XHYHZ"
+        );
+        assert_eq!(
+            replace_ignoring_case("nothing", "%userprofile%", "H"),
+            "nothing"
+        );
+    }
 }

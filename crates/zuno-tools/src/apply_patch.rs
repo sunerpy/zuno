@@ -4,7 +4,7 @@ use crate::format::FormatFailure;
 use crate::read::{
     FileReadConflictKind, FileReadReceipt, FileToolRuntime, IdenticalPatchConflict, PathKind,
     ResolvedPath, check_interrupt, decode_text, digest_bytes, encode_text, failed, interrupted,
-    invalid, report_formatting, slash, uncertain,
+    invalid, publish_error, report_formatting, slash, uncertain,
 };
 use async_trait::async_trait;
 use parser::{ChunkLine, PatchOperation, PatchParseError, UpdateChunk, parse_patch};
@@ -14,7 +14,6 @@ use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zuno_error::{ToolError, ToolMutationConflict, ToolMutationConflictKind};
@@ -172,6 +171,7 @@ impl TypedTool for ApplyPatchTool {
         )?;
 
         let mut authorized = HashSet::new();
+        let mut plan = Vec::new();
         for operation in &operations {
             check_interrupt("apply_patch", &ctx)?;
             let source = self
@@ -179,7 +179,7 @@ impl TypedTool for ApplyPatchTool {
                 .resolve(Path::new(operation.path()), PathKind::File)
                 .map_err(|error| failed("apply_patch", error))?;
             authorize_once(&self.runtime, &source, &ctx, &mut authorized).await?;
-            if let PatchOperation::Update {
+            let destination = if let PatchOperation::Update {
                 move_to: Some(move_to),
                 ..
             } = operation
@@ -189,11 +189,19 @@ impl TypedTool for ApplyPatchTool {
                     .resolve(Path::new(move_to), PathKind::File)
                     .map_err(|error| failed("apply_patch", error))?;
                 authorize_once(&self.runtime, &destination, &ctx, &mut authorized).await?;
-            }
+                Some(destination)
+            } else {
+                None
+            };
+            plan.push(AuthorizedOperation {
+                operation,
+                source,
+                destination,
+            });
         }
 
         let _guard = self.runtime.mutation.lock().await;
-        let changes = self.prepare_changes(&operations, &operation_digest, &ctx)?;
+        let changes = self.prepare_changes(&plan, &operation_digest, &ctx)?;
         self.runtime
             .state
             .clear_patch_conflict(&ctx.session_id, &operation_digest);
@@ -231,6 +239,7 @@ impl TypedTool for ApplyPatchTool {
                 ChangeKind::Add | ChangeKind::Update => {
                     after_effect(
                         write_verified(
+                            &self.runtime,
                             target,
                             &change.new_bytes,
                             change.target_digest.as_deref(),
@@ -251,6 +260,7 @@ impl TypedTool for ApplyPatchTool {
                     // does not protect the act.
                     after_effect(
                         verify_pre_image(
+                            &self.runtime,
                             &change.source,
                             change.source_digest.as_deref(),
                             &operation_digest,
@@ -259,6 +269,7 @@ impl TypedTool for ApplyPatchTool {
                     )?;
                     after_effect(
                         write_verified(
+                            &self.runtime,
                             target,
                             &change.new_bytes,
                             change.target_digest.as_deref(),
@@ -269,6 +280,7 @@ impl TypedTool for ApplyPatchTool {
                     applied.push(target_path.clone());
                     after_effect(
                         remove_verified(
+                            &self.runtime,
                             &change.source,
                             change.source_digest.as_deref(),
                             &operation_digest,
@@ -282,6 +294,7 @@ impl TypedTool for ApplyPatchTool {
                 ChangeKind::Delete => {
                     after_effect(
                         remove_verified(
+                            &self.runtime,
                             &change.source,
                             change.source_digest.as_deref(),
                             &operation_digest,
@@ -295,7 +308,13 @@ impl TypedTool for ApplyPatchTool {
             };
             if change.kind != ChangeKind::Delete {
                 let final_bytes = after_effect(
-                    std::fs::read(&target_path).map_err(|error| failed("apply_patch", error)),
+                    self.runtime
+                        .anchor_file("apply_patch", target, false)
+                        .and_then(|anchored| {
+                            anchored
+                                .read()
+                                .map_err(|error| failed("apply_patch", error))
+                        }),
                     &applied,
                 )?;
                 written.push(target_path.clone());
@@ -405,6 +424,19 @@ fn after_effect<T>(result: Result<T, ToolError>, applied: &[PathBuf]) -> Result<
     })
 }
 
+/// A patch operation whose paths were resolved exactly once, before authorization.
+///
+/// Resolving a path again after the permission prompt re-canonicalizes it, and a
+/// symlink planted in between then points the operation at a directory the user never
+/// approved — the same check-then-use gap the anchored write primitive exists to close,
+/// reopened one layer up. The resolution the user authorized is therefore the only one
+/// preparation and application use.
+struct AuthorizedOperation<'a> {
+    operation: &'a PatchOperation,
+    source: ResolvedPath,
+    destination: Option<ResolvedPath>,
+}
+
 impl ApplyPatchTool {
     /// Format one written file, accumulating any failure instead of raising it.
     ///
@@ -428,19 +460,17 @@ impl ApplyPatchTool {
 
     fn prepare_changes(
         &self,
-        operations: &[PatchOperation],
+        plan: &[AuthorizedOperation<'_>],
         operation_digest: &str,
         ctx: &ToolContext,
     ) -> Result<Vec<FileChange>, ToolError> {
         let mut prepared = Vec::new();
         let mut resources = Vec::new();
         let mut touched = HashSet::<PathBuf>::new();
-        for operation in operations {
+        for authorized in plan {
             check_interrupt("apply_patch", ctx)?;
-            let source = self
-                .runtime
-                .resolve(Path::new(operation.path()), PathKind::File)
-                .map_err(|error| failed("apply_patch", error))?;
+            let operation = authorized.operation;
+            let source = authorized.source.clone();
             if !touched.insert(source.canonical.clone()) {
                 return Err(invalid(
                     "apply_patch",
@@ -480,9 +510,7 @@ impl ApplyPatchTool {
                     resources.push((source.canonical.clone(), receipt));
                     prepared.push(PreparedOperation::Delete { source, old_bytes });
                 }
-                PatchOperation::Update {
-                    move_to, chunks, ..
-                } => {
+                PatchOperation::Update { chunks, .. } => {
                     ensure_regular_file(&source.canonical)?;
                     let old_bytes = std::fs::read(&source.canonical)
                         .map_err(|error| failed("apply_patch", error))?;
@@ -494,14 +522,10 @@ impl ApplyPatchTool {
                         operation_digest,
                     )?;
                     resources.push((source.canonical.clone(), receipt));
-                    let destination = move_to
-                        .as_ref()
-                        .map(|path| {
-                            self.runtime
-                                .resolve(Path::new(path), PathKind::File)
-                                .map_err(|error| failed("apply_patch", error))
-                        })
-                        .transpose()?;
+                    // The destination the user authorized, not a fresh resolution: a
+                    // symlink planted after the prompt must not be able to move the
+                    // write somewhere else.
+                    let destination = authorized.destination.clone();
                     if let Some(target) = &destination
                         && !touched.insert(target.canonical.clone())
                     {
@@ -757,42 +781,42 @@ fn require_patch_read(
 /// prepared image, whether it was modified, removed, or created after preparation
 /// found it absent. Nothing is written in that case, so the concurrent content
 /// survives. [`ToolError::Failed`] for any other filesystem failure, including a
-/// partial write, because such a write may have landed and must not be
-/// reclassified as a refusal.
+/// publication whose result was lost, which is [`ToolError::Uncertain`] instead,
+/// because those bytes may be on disk and re-running the patch must not be the way the
+/// harness finds out.
+///
+/// Every filesystem step runs through an anchor pinned to the directory the user
+/// authorized, so an ancestor replaced by a symlink after the permission prompt cannot
+/// redirect the write out of that directory.
 fn write_verified(
+    runtime: &FileToolRuntime,
     target: &ResolvedPath,
     bytes: &[u8],
     expected_digest: Option<&str>,
     operation_digest: &str,
 ) -> Result<(), ToolError> {
-    let path = target.canonical.as_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| failed("apply_patch", error))?;
-    }
+    let anchored = runtime.anchor_file("apply_patch", target, true)?;
+    let applied = [target.canonical.clone()];
     let Some(expected) = expected_digest else {
-        return match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(mut file) => file
-                .write_all(bytes)
-                .map_err(|error| failed("apply_patch", error)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(moved_pre_image(
-                target,
-                operation_digest,
-                None,
-                format!(
-                    "apply_patch refused to overwrite {}: the file was created after the patch was \
-                     verified against its absence; read the current file and submit a patch \
-                     against it",
-                    target.canonical.display()
-                ),
-            )),
-            Err(error) => Err(failed("apply_patch", error)),
+        return match anchored.create_new(bytes) {
+            Ok(()) => Ok(()),
+            Err(failure) if failure.error_kind() == io::ErrorKind::AlreadyExists => {
+                Err(moved_pre_image(
+                    target,
+                    operation_digest,
+                    None,
+                    format!(
+                        "apply_patch refused to overwrite {}: the file was created after the \
+                         patch was verified against its absence; read the current file and submit \
+                         a patch against it",
+                        target.canonical.display()
+                    ),
+                ))
+            }
+            Err(failure) => Err(publish_error("apply_patch", &applied, failure)),
         };
     };
-    let current = match std::fs::read(path) {
+    let current = match anchored.read() {
         Ok(current) => current,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(moved_pre_image(
@@ -821,7 +845,9 @@ fn write_verified(
             ),
         ));
     }
-    std::fs::write(path, bytes).map_err(|error| failed("apply_patch", error))
+    anchored
+        .publish(bytes)
+        .map_err(|failure| publish_error("apply_patch", &applied, failure))
 }
 
 /// Confirm `source` still holds the image its digest was taken from, without touching
@@ -850,6 +876,7 @@ fn write_verified(
 /// shown safe, and an unverifiable removal is refused rather than made blind. Any
 /// other filesystem failure is also [`ToolError::Failed`].
 fn verify_pre_image(
+    runtime: &FileToolRuntime,
     source: &ResolvedPath,
     expected_digest: Option<&str>,
     operation_digest: &str,
@@ -864,7 +891,8 @@ fn verify_pre_image(
             )),
         ));
     };
-    let current = match std::fs::read(path) {
+    let anchored = runtime.anchor_file("apply_patch", source, false)?;
+    let current = match anchored.read() {
         Ok(current) => current,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(moved_pre_image(
@@ -911,12 +939,16 @@ fn verify_pre_image(
 ///
 /// As [`verify_pre_image`], plus [`ToolError::Failed`] when the removal itself fails.
 fn remove_verified(
+    runtime: &FileToolRuntime,
     source: &ResolvedPath,
     expected_digest: Option<&str>,
     operation_digest: &str,
 ) -> Result<(), ToolError> {
-    verify_pre_image(source, expected_digest, operation_digest)?;
-    std::fs::remove_file(&source.canonical).map_err(|error| failed("apply_patch", error))
+    verify_pre_image(runtime, source, expected_digest, operation_digest)?;
+    runtime
+        .anchor_file("apply_patch", source, false)?
+        .remove()
+        .map_err(|error| failed("apply_patch", error))
 }
 
 /// The conflict for a pre-image that moved between preparation and the write or
@@ -1129,6 +1161,24 @@ mod tests {
         }
     }
 
+    /// A runtime whose authorization boundary is the temporary workspace, paired with
+    /// the spelling of that boundary the runtime itself uses.
+    ///
+    /// The anchored write primitive descends from this boundary, so a unit test of the
+    /// verified write and removal has to name it just as the tool does. `FileToolRuntime`
+    /// canonicalizes the boundary it is given, and `tempfile` reports whatever spelling
+    /// the platform handed it: on Windows that is the 8.3 short form
+    /// `C:\Users\ADMINI~1\...` of the directory whose canonical form is
+    /// `\\?\C:\Users\Administrator\...`. Production never mixes the two, because
+    /// `FileToolRuntime::resolve` canonicalizes the target as well, so these fixtures
+    /// build their targets from the canonical root rather than from the reported path.
+    fn runtime_at(workspace: &Path) -> (FileToolRuntime, PathBuf) {
+        let runtime =
+            FileToolRuntime::new(workspace, Arc::new(NoopFormatter)).expect("file tool runtime");
+        let root = workspace.canonicalize().expect("canonical workspace");
+        (runtime, root)
+    }
+
     fn conflict_of(error: &ToolError) -> &ToolMutationConflict {
         let ToolError::MutationConflict { conflict, .. } = error else {
             panic!("expected a typed mutation conflict, got {error:?}");
@@ -1139,12 +1189,14 @@ mod tests {
     #[test]
     fn a_file_changed_between_read_and_write_is_never_overwritten() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("raced.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("raced.txt");
         std::fs::write(&path, "prepared\n").expect("prepared image");
         let prepared = digest_bytes(b"prepared\n");
         std::fs::write(&path, "somebody else\n").expect("concurrent edit");
 
         let error = write_verified(
+            &runtime,
             &target(&path, "raced.txt"),
             b"patched\n",
             Some(&prepared),
@@ -1171,9 +1223,11 @@ mod tests {
     #[test]
     fn a_file_removed_between_read_and_write_is_reported_as_a_conflict() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("vanished.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("vanished.txt");
 
         let error = write_verified(
+            &runtime,
             &target(&path, "vanished.txt"),
             b"patched\n",
             Some(&digest_bytes(b"prepared\n")),
@@ -1190,11 +1244,13 @@ mod tests {
     #[test]
     fn an_add_whose_path_appeared_concurrently_is_never_overwritten() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("nested").join("added.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("nested").join("added.txt");
         std::fs::create_dir_all(path.parent().expect("a parent")).expect("nested directory");
         std::fs::write(&path, "somebody else\n").expect("concurrent create");
 
         let error = write_verified(
+            &runtime,
             &target(&path, "nested/added.txt"),
             b"added\n",
             None,
@@ -1214,11 +1270,13 @@ mod tests {
     #[test]
     fn a_target_that_still_holds_its_prepared_image_is_written() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let existing = workspace.path().join("update.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let existing = root.join("update.txt");
         std::fs::write(&existing, "prepared\n").expect("prepared image");
-        let created = workspace.path().join("new").join("added.txt");
+        let created = root.join("new").join("added.txt");
 
         write_verified(
+            &runtime,
             &target(&existing, "update.txt"),
             b"patched\n",
             Some(&digest_bytes(b"prepared\n")),
@@ -1226,6 +1284,7 @@ mod tests {
         )
         .expect("an unchanged target accepts the write");
         write_verified(
+            &runtime,
             &target(&created, "new/added.txt"),
             b"added\n",
             None,
@@ -1246,13 +1305,19 @@ mod tests {
     #[test]
     fn a_source_changed_between_read_and_removal_is_never_removed() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("raced.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("raced.txt");
         std::fs::write(&path, "prepared\n").expect("prepared image");
         let prepared = digest_bytes(b"prepared\n");
         std::fs::write(&path, "somebody else\n").expect("concurrent edit");
 
-        let error = remove_verified(&target(&path, "raced.txt"), Some(&prepared), "patch-digest")
-            .expect_err("a moved pre-image must refuse the removal");
+        let error = remove_verified(
+            &runtime,
+            &target(&path, "raced.txt"),
+            Some(&prepared),
+            "patch-digest",
+        )
+        .expect_err("a moved pre-image must refuse the removal");
 
         let conflict = conflict_of(&error);
         assert_eq!(conflict.kind, ToolMutationConflictKind::StaleRead);
@@ -1273,9 +1338,11 @@ mod tests {
     #[test]
     fn a_source_removed_between_read_and_removal_is_reported_as_a_conflict() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("vanished.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("vanished.txt");
 
         let error = remove_verified(
+            &runtime,
             &target(&path, "vanished.txt"),
             Some(&digest_bytes(b"prepared\n")),
             "patch-digest",
@@ -1291,11 +1358,17 @@ mod tests {
     #[test]
     fn a_removal_without_a_recorded_pre_image_is_refused_and_touches_nothing() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("unverified.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("unverified.txt");
         std::fs::write(&path, "somebody\n").expect("existing file");
 
-        let error = remove_verified(&target(&path, "unverified.txt"), None, "patch-digest")
-            .expect_err("a removal that cannot be verified is not made");
+        let error = remove_verified(
+            &runtime,
+            &target(&path, "unverified.txt"),
+            None,
+            "patch-digest",
+        )
+        .expect_err("a removal that cannot be verified is not made");
 
         assert!(matches!(error, ToolError::Failed { .. }), "{error:?}");
         assert_eq!(
@@ -1307,10 +1380,12 @@ mod tests {
     #[test]
     fn a_source_that_still_holds_its_prepared_image_is_removed() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("delete.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("delete.txt");
         std::fs::write(&path, "prepared\n").expect("prepared image");
 
         remove_verified(
+            &runtime,
             &target(&path, "delete.txt"),
             Some(&digest_bytes(b"prepared\n")),
             "patch-digest",

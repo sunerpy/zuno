@@ -170,6 +170,21 @@ local delay. Retry decisions come from typed errors, never rendered messages:
 authentication failures and user interruption pause, while invalid protocol, corrupt
 durable state, and permanent configuration failures block.
 
+Durable storage follows the same typed split. SQLite contention met while a Goal's budget
+is read or charged, or while the host writes Goal-owned state such as a Plan reconciliation
+or a human request, persists a `database_busy` retry and the Goal stays active, because a
+lock another writer holds is a condition that clears by itself. Any other database failure
+while the budget is read or charged stops the turn with `usage_unknown` and pauses the Goal
+so a person can inspect the database; durable state this build cannot read at all blocks
+the Goal. The persisted `goal_retry` row is what a restarted process reads back, so a
+restart neither loses nor shortens the wait.
+
+Clamping also decides what happens when a peer asks for more time than the same-request
+recovery has left. The provider layer retries one request for at most 180 seconds; a
+`Retry-After` longer than what remains of that window is neither slept through nor replaced
+by a shorter local backoff. The turn ends with the peer's error, and the Goal retry waits
+the peer's value clamped to `max_delay_ms`.
+
 ## Continuing and forking
 
 ```sh

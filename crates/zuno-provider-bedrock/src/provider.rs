@@ -8,9 +8,11 @@ use time::macros::format_description;
 use url::Url;
 use zuno_error::ProviderError;
 use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent};
+use zuno_llm::http::{HttpTimeouts, RequestDeadlines, read_error_body};
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Provider, ProviderStream, Spec, generation,
 };
+use zuno_llm::sse::{StreamIdleTimeout, upstream_stream_incomplete};
 
 use crate::credentials::{CredentialChainConfig, CredentialResolver};
 use crate::error::{PROVIDER_ID, classify_bedrock_error};
@@ -283,7 +285,15 @@ impl BedrockProvider {
                 builder = builder.header(name, value);
             }
         }
-        let response = builder.send().await.map_err(ProviderError::transient)?;
+        // A response-header deadline is the difference between a stalled peer and a
+        // turn that never ends: a load balancer that accepts the connection and then
+        // loses its upstream sends nothing at all, and `send()` alone waits forever.
+        let deadlines = RequestDeadlines::start(HttpTimeouts::native());
+        let provider = self.config.provider_id.clone();
+        let response = deadlines
+            .headers(&provider, builder.send())
+            .await?
+            .map_err(ProviderError::transient)?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let response_headers = response
@@ -296,7 +306,7 @@ impl BedrockProvider {
                         .map(|value| (name.as_str().to_owned(), value.to_owned()))
                 })
                 .collect();
-            let response_body = response.bytes().await.map_err(ProviderError::transient)?;
+            let response_body = read_error_body(&provider, response).await?.into_bytes();
             return Err(classify_bedrock_error(
                 status,
                 &response_headers,
@@ -319,21 +329,34 @@ impl BedrockProvider {
             decoder: BedrockEventDecoder::new(),
             queued: VecDeque::new(),
             finished: false,
+            message_ended: false,
+            provider,
+            model: request.model_id.clone(),
         };
         let output = stream::try_unfold(state, |mut state| async move {
             loop {
                 if let Some(event) = state.queued.pop_front() {
+                    if matches!(event, StreamEvent::MessageEnd { .. }) {
+                        state.message_ended = true;
+                    }
                     return Ok(Some((event, state)));
                 }
                 if state.finished {
+                    // An EventStream that stops without `messageStop` (Converse) or a
+                    // `message_delta` stop reason (`InvokeModelWithResponseStream`) is a
+                    // truncated turn, not a short one. Reporting the typed stream failure
+                    // lets the engine replay the identical request instead of committing
+                    // a partial assistant message as though the model had finished.
+                    if !state.message_ended {
+                        return Err(upstream_stream_incomplete(&state.provider, &state.model));
+                    }
                     return Ok(None);
                 }
-                match state
-                    .response
-                    .chunk()
-                    .await
-                    .map_err(ProviderError::transient)?
-                {
+                let chunk = StreamIdleTimeout::default()
+                    .wait(&state.provider, &state.model, state.response.chunk())
+                    .await?
+                    .map_err(ProviderError::transient)?;
+                match chunk {
                     Some(chunk) => {
                         state
                             .queued
@@ -390,6 +413,9 @@ struct ResponseState {
     decoder: BedrockEventDecoder,
     queued: VecDeque<StreamEvent>,
     finished: bool,
+    message_ended: bool,
+    provider: String,
+    model: String,
 }
 
 pub fn mantle_surface(model_id: &str) -> ApiSurface {

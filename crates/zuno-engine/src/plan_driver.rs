@@ -238,12 +238,15 @@ impl PlanReconciliationDriver {
     }
 
     /// Rebuild the latest machine phase from the existing session event log.
+    ///
+    /// The newest phase event is read through the `(aggregate_id, type, seq)`
+    /// index rather than by scanning the whole session log, and every stored
+    /// version of the type counts, so a projection rebuilt after an event-schema
+    /// bump still sees the phases an older release wrote.
     pub fn projection(&self, session_id: &str) -> Result<Option<DriverPhaseProjection>, DbError> {
-        let events = self.events.read_after(session_id, None)?;
-        Ok(events
-            .into_iter()
-            .rev()
-            .find(|event| event.event_type == DRIVER_PHASE_EVENT)
+        Ok(self
+            .events
+            .latest_of_type(session_id, DRIVER_PHASE_EVENT)?
             .and_then(|event| {
                 let phase =
                     serde_json::from_value::<DriverPhase>(event.properties.get("phase")?.clone())
@@ -272,9 +275,8 @@ impl PlanReconciliationDriver {
     fn attempts_for_cycle(&self, session_id: &str, cycle_id: &str) -> Result<u8, DbError> {
         let attempts = self
             .events
-            .read_after(session_id, None)?
+            .read_of_type_after(session_id, DRIVER_PHASE_EVENT, None)?
             .into_iter()
-            .filter(|event| event.event_type == DRIVER_PHASE_EVENT)
             .filter(|event| {
                 event.properties.get("cycleId").and_then(Value::as_str) == Some(cycle_id)
             })

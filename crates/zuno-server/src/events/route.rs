@@ -12,7 +12,10 @@ use serde_json::{Value, json};
 use crate::request_broker::SessionRequestObserver;
 use crate::{Delivery, ServerServices};
 
-use super::{EventCursor, EventService, EventStreamError, SessionSubscription, StreamEvent};
+use super::{
+    EventCursor, EventService, EventStreamError, LiveSessionSubscription, SessionSubscription,
+    StreamEvent,
+};
 
 /// Builds Zuno's global and session-scoped SSE operations.
 pub fn events_router(service: EventService) -> Router {
@@ -108,7 +111,7 @@ struct SessionStream {
     session_id: String,
     replay: VecDeque<StreamEvent>,
     boundary: i64,
-    live: crate::EventSubscription<StreamEvent>,
+    live: LiveSessionSubscription,
     last_cursor: Option<EventCursor>,
     finished: bool,
     _observer: SessionRequestObserver,
@@ -223,6 +226,7 @@ impl IntoResponse for EventStreamError {
                 "invalid_event_request",
                 self.to_string(),
             ),
+            Self::SessionNotFound { .. } => (StatusCode::NOT_FOUND, "not_found", self.to_string()),
             Self::Database(_) | Self::Worker { .. } | Self::Encode(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "event_stream_failed",

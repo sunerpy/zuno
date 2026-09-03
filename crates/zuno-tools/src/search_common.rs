@@ -113,6 +113,22 @@ pub enum TargetKind {
     File,
 }
 
+/// The one spelling of a directory grant pattern, shared by every tool.
+///
+/// [`zuno_paths::wire_path`] rather than a local separator replacement: it also drops
+/// Windows' verbatim `\\?\` prefix. The shell tool rendered a canonicalized directory
+/// with [`std::path::MAIN_SEPARATOR`] and so asked for `\\?\C:\dir\*`, while the file
+/// and search tools asked for `C:/dir/*` and a user rule could only be written one of
+/// those two ways. Every grant now names the same pattern, so one standing
+/// `external_directory` decision covers a directory for all of them.
+///
+/// The pattern is built by joining, not by concatenating a separator, so a grant on a
+/// filesystem root stays `/*` instead of becoming `//*`.
+#[must_use]
+pub fn directory_grant_pattern(directory: &Path) -> String {
+    zuno_paths::wire_path(&directory.join("*"))
+}
+
 /// Raises the `external_directory` escalation for a path outside the workspace.
 ///
 /// A faithful port of `tool/external-directory.ts:15-44`: the permission key is
@@ -139,7 +155,7 @@ pub async fn assert_external_directory(
         TargetKind::Directory => full.clone(),
         TargetKind::File => full.parent().unwrap_or(&full).to_path_buf(),
     };
-    let pattern = format!("{}/*", directory.to_string_lossy().replace('\\', "/"));
+    let pattern = directory_grant_pattern(&directory);
 
     let mut ask = PermissionAsk::new("external_directory", pattern.clone());
     ask.always = vec![pattern];
@@ -343,5 +359,38 @@ mod tests {
         );
         assert!(matches!(fatal, ToolError::Failed { .. }));
         assert!(!fatal.is_model_correctable());
+    }
+}
+
+#[cfg(test)]
+mod grant_pattern_tests {
+    use super::*;
+
+    #[test]
+    fn a_grant_pattern_uses_forward_slashes_and_one_wildcard_segment() {
+        let directory = Path::new("/srv").join("data").join("shared");
+        assert_eq!(directory_grant_pattern(&directory), "/srv/data/shared/*");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_grant_on_a_root_directory_does_not_double_its_separator() {
+        assert_eq!(directory_grant_pattern(Path::new("/")), "/*");
+    }
+
+    /// Native Windows evidence: a canonicalized directory must not leak `\\?\` into a
+    /// permission pattern, or the grant cannot match a rule the user wrote as
+    /// `C:/dir/*`. Only meaningful on Windows, where `wire_path` strips the prefix.
+    #[cfg(windows)]
+    #[test]
+    fn a_grant_pattern_drops_the_windows_verbatim_prefix() {
+        assert_eq!(
+            directory_grant_pattern(Path::new(r"\\?\C:\work\shared")),
+            "C:/work/shared/*"
+        );
+        assert_eq!(
+            directory_grant_pattern(Path::new(r"\\?\UNC\server\share\dir")),
+            "//server/share/dir/*"
+        );
     }
 }

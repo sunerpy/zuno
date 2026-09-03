@@ -30,6 +30,14 @@ use std::collections::BTreeMap;
 /// The HTTP Basic username used when `ZUNO_SERVER_USERNAME` is absent.
 pub const DEFAULT_SERVER_USERNAME: &str = "zuno";
 
+/// `SystemRoot`, the Windows installation directory.
+///
+/// [`Env`] uppercases keys on Windows, so the snapshot holds it under this spelling
+/// whichever casing the process was given.
+pub const SYSTEM_ROOT: &str = "SYSTEMROOT";
+/// `windir`, the older spelling of [`SYSTEM_ROOT`] that some hosts still set alone.
+pub const WINDIR: &str = "WINDIR";
+
 /// `XDG_DATA_HOME`.
 pub const XDG_DATA_HOME: &str = "XDG_DATA_HOME";
 /// `XDG_CACHE_HOME`.

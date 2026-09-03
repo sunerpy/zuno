@@ -7,7 +7,8 @@ Zuno assembles an agent from a native harness profile. A profile is a set of bun
 - `Component` is the lifecycle unit. `prepare` is side-effect-free: it stages typed
   services, requirements, and deferred effects in a `PrepareContext`.
 - An effect starts only after the complete candidate composition has prepared. Its
-  start returns the exact asynchronous disposer that must prove quiescence.
+  start returns the exact asynchronous disposer that must prove quiescence;
+  `Component::stop_budget` declares how long the runtime waits for that proof.
 - `ProfileBundle` groups components that are installed and replaced together.
 - `HarnessProfile` is the complete composition selected for a session.
 - `HarnessRuntime` owns `Profile`, `Session`, `Agent`, and `Turn` scopes. A child scope inherits services and may override them locally.
@@ -36,6 +37,21 @@ composition that could overlap the unresolved resource. Repeated shutdown
 preserves that terminal outcome. Parent shutdown closes child scopes first; parent
 recomposition rejects a still-live child consumer rather than silently leaving it
 bound to stale services.
+
+Each component declares how long the runtime waits for its disposers through
+`Component::stop_budget`. The default, `StopBudget::Runtime`, defers to the runtime's
+configured stop timeout; a component whose disposer must terminate and reap a process
+tree, drain a socket, or wait for a flush returns `StopBudget::Bounded(duration)` with
+the bound that work actually needs, because a runtime-wide timeout sized for closing a
+channel reports such a disposer as an overrun on every shutdown. A zero bound cannot
+prove that anything reached quiescence and is read as `Runtime`. Disposers still run
+last-in-first-out, one at a time; the budget bounds only how long the runtime waits for
+each before it records the overrun and moves on. A disposer that overruns its budget is
+reported as a `TimedOut` lifecycle diagnostic and is not cancelled: dropping it
+mid-flight would abandon whatever it was reclaiming, a half-terminated child process or
+a lock never released, which is the one outcome worse than a late stop, so it is
+detached and keeps reclaiming in the background. A disposer that returns an error or
+panics is reported as `Uncertain`.
 
 `RuntimeSnapshot` and `ComponentSnapshot` expose lifecycle state, effect ids,
 provided/required service types, and scrubbed diagnostics without coupling a
@@ -793,6 +809,24 @@ gateways should set their own upstream deadline below Zuno's matching phase
 deadline so their typed error reaches Zuno before the client cancels the
 connection.
 
+The four native providers — OpenAI, Anthropic, Google, and Bedrock — do not read
+those keys. Each applies one fixed 330-second response-header deadline and no
+whole-request deadline, because a legitimate long turn has no upper bound the
+provider can know in advance. Their streamed-chunk phase stays with the shared
+300-second stream idle allowance, which `ZUNO_STREAM_IDLE_TIMEOUT_SECS` raises or
+lowers for every provider. A native request that stalls before its first response
+header now fails typed at the ceiling instead of waiting for the user to
+interrupt it.
+
+A stream that ends without a terminator is an incomplete upstream stream, not a
+finished answer. Every native decoder reports `ProviderError::Stream` carrying
+`upstream_stream_incomplete` when the transport reaches end of input while a
+message is still open, so the failure is retryable and permits partial-output
+replacement: the engine emits `RetryRollback`, discards what the truncated stream
+produced, and replays the unchanged request. One terminator is sufficient, so a
+Chat Completions stream that sends only `finish_reason`, or only `[DONE]`,
+completes normally.
+
 ## Resident memory and user learning
 
 Resident Memory has one model-visible mutation boundary: `memory_propose`. It
@@ -1027,6 +1061,8 @@ context limit. It is replaced on each provider report rather than accumulated ac
 the session; cumulative disjoint token buckets remain available in the usage
 projection and sidebar.
 
+A transcript revert (`revert_commit`) discards the projected `session_message` rows and the legacy `message` rows after the staged message's `(time_created, id)` boundary, clears the session's context epoch, and retires every `queued`, `steering`, or `promoted` inbox input through the ordinary cancellation transition, so each retired input logs its own `session.input.cancelled`; consumed inputs are immutable history and are never touched. Inbox rows are never deleted by a revert. The commit then appends one `session.reverted` event whose properties are: `sessionID` (string), `messageID` (string, the boundary message that remains the transcript tail), `marker` (object, the staged revert JSON exactly as stored, e.g. `{"messageID": "...", "files": []}`), `boundaryTimeCreated` (i64 ms), `removedMessageCount` (u64, projected rows deleted), `removedLegacyMessageCount` (u64, legacy rows deleted), `cancelledInputIDs` (string[] in admission order), `contextEpochCleared` (bool), `timeUpdated` (i64 ms). Every key is always present.
+
 ## Plan and Work transitions
 
 `/plan` is the interactive mode switch. In Work mode it opens a confirmation in
@@ -1097,6 +1133,14 @@ Proactive compaction uses the validated `compaction.threshold_percent` of the
 usable model window and can be disabled with `compaction.auto: false`. A
 provider-confirmed context-limit failure retains its bounded recovery
 compaction, while a manual command is always eligible.
+
+An automatic compaction consults the auto-continue hook only after the summary is
+durable and the prompt cache has been reset. If that hook fails, the session stays
+`Compacted`: the persisted summary stands, no continuation turn is synthesized because
+a vote nobody cast grants none, and the failure travels with the compacted transcript as
+`auto_continue_hook_failure` and is logged as a warning. The session is not marked
+failed, so a later compaction is not refused as `AlreadyFailed`. Rewriting the durable
+summary as a failure would discard work the model can already resume from.
 
 Compaction changes the provider transcript boundary; it does not delete the
 durable Goal, Plan, Todo/WorkItem, Job, inbox, event log, or prompt receipts.
@@ -1186,6 +1230,14 @@ reason are persisted on `turn.interrupted` and, when an assistant checkpoint
 exists, inside its typed abort error. TUI and ACP replay reconstruct cancellation
 as session state rather than assistant prose or a normal task failure.
 
+The same rule protects an ordinary settled tool call. `ToolHooks::after` is an output
+post-processor, and the tool has already run by the time it fails, so whatever the tool
+changed is real whether or not a plugin managed to post-process the output. The result
+therefore keeps its own status and `is_error`; the hook failure travels with it as
+`afterHookError` metadata and is logged as a warning. Rewriting a settled result into a
+bare error would tell the model the effect never happened and invite it to repeat a side
+effect.
+
 Assistant checkpoints reconcile message usage and the session usage projection in the same
 transaction. Repeated checkpoints subtract the previous message snapshot before adding the new
 one. Provider accounting is persisted with each snapshot so cache tokens are counted exactly once;
@@ -1199,7 +1251,7 @@ An active goal uses two recovery layers. The provider request layer retries a bo
 
 The retry row is tied to the exact `goal_id` and stores the attempt, typed reason, selected delay, schedule time, and next eligible time. Reopening the same session reconstructs the wait from SQLite. ACP load and resume rebuild the runtime, replay the requested durable projections, then schedule any active root Goal through the detached continuation observer. This recovery path is process-owned and uses the same per-session execution gate as a prompt, so it cannot race a second Goal turn. Queued user input has priority over an automatic turn, and long waits are split by `poll_interval_ms` so an interactive surface can notice that input promptly.
 
-Local delays use exponential backoff with symmetric jitter and never collapse to zero. A valid provider `Retry-After` value is never shortened by jitter; it is clamped to the configured ceiling rather than replaced by an earlier local delay.
+Local delays use exponential backoff with symmetric jitter and never collapse to zero. A valid provider `Retry-After` value is never shortened by jitter; it is clamped to the configured ceiling rather than replaced by an earlier local delay. That holds across the same-request recovery deadline as well. When the peer's requested delay is at least as long as what remains of the 180 second deadline, the provider layer neither sleeps past its deadline nor substitutes a shorter local delay: the turn ends with the peer's own typed error, and the goal-level retry waits the peer's value clamped to `max_delay_ms`. A local backoff that would outlive the deadline still ends the turn as a provider retry deadline failure and follows the ordinary goal backoff.
 
 ```json
 {
@@ -1239,6 +1291,22 @@ Recovery is selected from typed errors, never rendered messages:
   Goal, usage the provider did not report stops the turn with `usage_unknown`; under the
   host default the turn keeps going and the default binds on what was counted. A ceiling
   wins over compaction or continuation and yields to a Goal stop.
+- The budget policy's own storage failures keep their type. Reading or accounting the
+  goal budget against a database another writer holds locked, a `SQLITE_BUSY` that
+  outlasted the pool's busy timeout, ends the turn with the same typed `DbError::Busy`
+  as any other contended write, so the Goal persists a `database_busy`
+  exponential-backoff retry and stays active instead of pausing with `turn_budget`. Any
+  other database failure while reading or accounting the budget still stops the turn
+  with `usage_unknown`, because the turn must not continue unmeasured, and the Goal
+  pauses until the database is readable again. Durable goal state this build cannot read
+  at all, such as an undecodable value, an unknown format, or a status outside the
+  closed set, still blocks the Goal, because no retry makes it readable. The turn host
+  classifies every durable-storage failure it meets through the same
+  `GoalTerminalFailure::from_db_error` rule rather than a rendered message, so contention
+  in the plan-reconciliation driver, in creating a human request, and in marking a
+  retry's context compaction now schedules a `database_busy` retry where it previously
+  blocked the Goal as `host_permanent`; every other `DbError` on those paths blocks as
+  `database_permanent`.
 - Invalid provider protocol, unsupported typed input such as an image sent to a text-only model, unavailable agent/model configuration, corrupt durable state, and other permanent failures block the goal. The same transaction stores a stable typed code and scrubbed explanation in `blocked_reason`; a permanent runtime failure never produces an unexplained blocked Goal.
 
 OpenAI and Compatible Responses decoders treat `response.failed` as a typed
@@ -1386,6 +1454,48 @@ queue instead of steering the in-flight model generation.
 
 Every value is validated in `1..=64`.
 
+## File tool path authority
+
+`read`, `write`, `edit`, and `apply_patch` resolve a path once, at authorization, and
+then operate through the directory handles that resolution retained. Resolution
+descends from the authorization boundary — the workspace root, or an explicitly
+granted external directory — one segment at a time, opens each segment without
+following symlinks and requires it to be a directory, and never resolves the name a
+second time. The property is exact: the call reaches the directory object the user
+approved, or it fails. A symlink as the final component is the one deliberate
+exception. It is followed once, before authorization, so the user approves the
+destination, and the link itself survives the write.
+
+Two weaker repairs were rejected. Refusing to follow the final component alone does
+nothing, because the substituted object is an intermediate directory. Re-canonicalizing
+after authorization is still a check followed by a separate use, so the window only
+moves.
+
+The mechanism is per-platform, and the guarantees are not equal:
+
+| Target | Mechanism | Window |
+| --- | --- | --- |
+| Linux | Each segment opened through `/proc/self/fd/{fd}/{segment}`, which the kernel resolves relative to the pinned descriptor | Closed |
+| macOS | `root/relative` opened with `O_NOFOLLOW_ANY`, plus a file-identity re-check before publishing | Narrowed: `rename` cannot carry the flag |
+| Windows | Segment walk with `FILE_FLAG_OPEN_REPARSE_POINT`, refusing any component carrying `FILE_ATTRIBUTE_REPARSE_POINT`, plus a volume-serial and file-index re-check before publishing | Narrowed |
+| Other targets | The same segment walk with a `symlink_metadata` refusal and the same pre-publish re-check | Narrowed |
+
+Only Linux closes the window completely, because only Linux offers a way to name a
+path relative to an open descriptor without first-party `unsafe`, which this workspace
+forbids. `openat2`, `renameat`, and `GetFinalPathNameByHandleW` are therefore not used.
+Refusing a reparse point per component covers Windows directory junctions as well as
+symlinks, which matters because a junction is the commoner attack shape there.
+
+Publication distinguishes two failures, because they do not deserve the same receipt.
+A failure before the rename that makes new content visible leaves the destination
+holding exactly its previous bytes and is reported as an ordinary tool failure. A
+rename that fails after partially completing, or whose result is lost, is reported as
+`Uncertain` carrying the paths already applied. That outcome is not retryable and is
+never replayed: it requires authoritative-state inspection, which is the same rule the
+snapshot store follows for a half-applied restore. A replacement whose destination is a
+symlink also refuses a chain longer than 40 links rather than following it, because at
+that length the chain is a loop rather than a deliberate redirection.
+
 ## Native search and shell isolation
 
 `glob` and `grep` use the official `rg` executable as their only search engine.
@@ -1395,6 +1505,15 @@ ripgrep-compatible walker. Discovery is lazy, so unrelated commands and tools do
 not require ripgrep. When either search tool is invoked, `rg` major version 14 or
 newer must be available on `PATH` (or packaged beside Zuno by a distributor);
 missing or unsupported ripgrep is a typed tool error, never a silent fallback.
+
+Discovery is cached, but not symmetrically. A successful resolution is kept for the
+process lifetime, so session remounts and child turns do not spawn `rg --version`
+repeatedly. A failure is kept for five seconds and then re-probed. The asymmetry is
+deliberate: ripgrep backs only `glob` and `grep`, so a user who installs it during a
+session has to get those tools working without restarting Zuno, while a model looping
+on `grep` with nothing installed must not spawn one probe per call. Concurrent first
+callers make a single probe between them, and a probe that panics does not make
+ripgrep permanently unavailable.
 
 The Shell tool is admitted through tree-sitter command analysis, the deterministic
 destructive-command gate, and permission checks, then compiled by the selected
@@ -1433,6 +1552,21 @@ roots, reapplies protected descendants, drops capabilities, sets `NoNewPrivs`,
 and installs seccomp in a first-party helper. Network is denied by default.
 The process layer accepts only `PreparedCommand`; it cannot spawn a
 confinement-required Shell call from raw argv.
+
+Bubblewrap discovery is cached for the life of the process. The cache key is the
+canonical workspace plus the helper executable, the current `zuno` binary, which are
+exactly the inputs a fresh discovery would use, so the first restricted-mode resolution
+in a process pays for the `bwrap --help` and namespace probes and every later turn host
+and child turn reuses that backend. A hit is served only after the trusted launcher, the
+trusted no-op executable, and the helper are re-inspected on disk; if any of them
+changed, the entry is evicted and the host is probed again, which is how a bubblewrap
+upgrade or a replaced binary is picked up. A failed discovery is never cached, so a
+transient probe failure cannot pin the process to unavailable, or under a trusted
+`run-unconfined` policy to native execution, for the rest of its life. The cache does
+not cross process boundaries: another process must prove the host again. The
+policy-specific `verify_deployment` probe that the `SandboxResolver` runs per resolution
+is kept, while `zuno debug sandbox` and the deployment report bypass the cache entirely
+so a diagnostic describes the host as it is now.
 
 `zuno debug sandbox --mode workspace-write --network deny --check` verifies the
 same deployment path. It rejects a non-root-owned, writable, special-bit, or
@@ -1526,6 +1660,27 @@ cleanup after an uncatchable owner `SIGKILL`. The pinned Codex comparison and th
 split ownership decision are recorded in
 [Resident process containment](design/process-containment.md).
 
+On Windows the guard watches its parent through a real process handle rather than by
+polling `tasklist` for the parent PID, which had two defects: a reused PID looked like a
+living parent, and a `tasklist` that failed to run looked like a dead one and killed a
+healthy payload. The workspace forbids `unsafe`, so the guard cannot open that handle
+itself; it starts one Windows PowerShell helper from the absolute path
+`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, so a
+workspace-controlled `PATH` cannot substitute it, and the helper's
+`Process.WaitForExit()` holds a `SYNCHRONIZE` handle to the parent's process object.
+Once the helper has reported that it is armed, PID reuse cannot impersonate the parent,
+and the guard spawns nothing per poll. The helper is armed before the payload exists: if
+it cannot start, including when PowerShell is absent, the guard fails closed with exit
+code 125 and its named diagnostic before the payload starts, because a guard that cannot
+watch its parent must not begin work it could never clean up. The helper's verdict is
+trusted only when it is unambiguous. A clean exit after arming, or an arm-time report
+that the PID named no process, means the parent has exited and the guard terminates the
+payload's Job Object. Any other ending, such as a crashed or killed helper, a non-zero
+exit, or an unobservable status, writes one diagnostic to the guard's stderr and leaves
+the payload running, supervised for its own exit only; a lost helper is never read as a
+dead parent. `tasklist` remains only in the idempotency check of `taskkill`-based tree
+termination.
+
 ## Background command execution
 
 `shell` registers a command with the process-owned
@@ -1556,6 +1711,25 @@ one action cancels a process tree. Cancellation reaches descendants through the
 shared process containment layer. A hard process ceiling records failure; a
 process restart converts a previously running row to `uncertain` and never
 replays it.
+
+Every execution the service launches runs behind the `__zuno_child_guard` process, so
+the exit status the shell tool reads is the guard's, and three codes may belong to the
+guard rather than to the command. The guard exits 125 when its own machinery failed.
+That says nothing about whether the command ran or what it changed, so the shell tool
+reports a typed uncertain outcome that requires authoritative-state inspection and is
+never replayed, instead of a receipt claiming `Failed exit 125`. It exits 126 when the
+program exists but could not be executed and 127 when the program could not be found;
+nothing ran in either case, so the receipt records the code as the guard's with no exit
+authority and a detail saying the command never started, and no reader can cite it as
+the command's verdict. The codes alone are ambiguous with an ordinary program that
+chooses to exit 125, 126, or 127, so a reserved code is read as the guard's only when
+the guard's own diagnostic line, prefixed `child-process guard failed: `, is present in
+the captured output, which both streams of an execution carry; a program that exits 125
+of its own accord keeps its ordinary authoritative receipt. Signal death is not mapped
+to a code at all: the guard re-raises the payload's signal on itself, so the execution
+records no exit code, the receipt has no exit authority, and it reads as killed by a
+signal rather than as `exit 1`. Windows native exit codes such as an NTSTATUS crash code
+pass through verbatim.
 
 `StartupEnvironment` shares one service per workspace across parent sessions,
 child turns, and in-process session switches. Client projections and `/ps` use
@@ -1771,8 +1945,10 @@ Registrations are effects: a component registers each acquisition in
 cancelled and joined, process trees are terminated and reaped, protocol sessions
 are closed before transports disappear, and registration handles remove exactly
 what they added. `Drop` is only a last-resort safety net and does not prove a
-successful unload. Deployment choices belong in profile configuration rather than
-hardcoded branches in the agent loop.
+successful unload. A component whose disposer needs longer than the runtime's stop
+timeout declares that bound through `Component::stop_budget` instead of relying on the
+timeout being raised for every component. Deployment choices belong in profile
+configuration rather than hardcoded branches in the agent loop.
 
 ## Client surfaces
 

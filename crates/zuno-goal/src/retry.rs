@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Goal, GoalPauseReason};
 use zuno_engine::r#loop::TurnRetryReason;
+use zuno_error::DbError;
 
 /// Initial delay for the first recoverable goal-turn failure.
 pub const DEFAULT_GOAL_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
@@ -300,6 +301,33 @@ pub enum GoalTerminalFailure {
     Pause(GoalPauseReason),
     /// Mark the goal blocked because repeating cannot repair the failure.
     Block(GoalBlockReason),
+}
+
+impl GoalTerminalFailure {
+    /// Classify a durable-storage failure that ended a goal turn.
+    ///
+    /// The one place a host may turn a [`DbError`] into goal state, so every path —
+    /// inside the engine loop or in the host around it — reaches the same answer:
+    /// [`DbError::Busy`] is another writer holding the lock and schedules a retry that
+    /// keeps the store's own delay; every other variant is permanent for this goal. A
+    /// host that renders the error and classifies the string instead blocks a goal for
+    /// good over one contended write.
+    #[must_use]
+    pub fn from_db_error(error: &DbError) -> Self {
+        match error {
+            DbError::Busy { retry_after } => Self::Retry {
+                reason: GoalRetryReason::DatabaseBusy,
+                retry_after: *retry_after,
+            },
+            DbError::Open { .. }
+            | DbError::Schema { .. }
+            | DbError::SchemaMismatch { .. }
+            | DbError::Query { .. }
+            | DbError::NotFound { .. }
+            | DbError::Conflict { .. }
+            | DbError::Decode { .. } => Self::Block(GoalBlockReason::DatabasePermanent),
+        }
+    }
 }
 
 /// Persisted result of applying one terminal failure.

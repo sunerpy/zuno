@@ -119,8 +119,10 @@ category; they do not contain an API key, authorization header, or full query.
 
 `glob` and `grep` drive the official `rg` executable, with Zuno contributing only typed
 arguments, cancellation, bounded decoding, and stable ordering. Ripgrep 14 or newer must
-be available; a missing one is a startup error for the tool runtime rather than a silent
-fallback to a slower walker.
+be available for those two tools. Discovery is lazy and scoped to them: a missing `rg`
+makes `glob` and `grep` report a typed tool error, and never a silent fallback to a
+slower walker, but it does not block Zuno from starting, reading configuration, reaching
+a provider, or opening its database.
 
 For a Shell command that only observes remote work, set
 `backgroundPurpose: "remoteObserver"`. This value is persisted with the background
@@ -174,6 +176,59 @@ nothing and keeps the configuration's verdict.
 A stored receipt is addressed by an id that appears in the tool result as
 `[verification rcp_…]`. That id, not a recollection of the transcript, is what
 satisfies a Goal completion criterion that requires evidence.
+
+### Exit codes the guard reserves
+
+Every `shell` command runs behind a child-process guard, the small supervisor that
+ties the command's process tree to Zuno's own lifetime. The guard reports through
+the same exit status as the command, so three codes may be the guard's rather than
+the command's, following the convention `timeout`, `env`, and `nohup` share: `125`
+means the guard itself failed, `126` means the program exists but could not be
+executed, and `127` means it could not be found.
+
+The three are read differently because they mean different things. A `125` says
+nothing about whether the command ran or what it changed, so the result is an
+uncertain outcome rather than a `Failed exit 125` receipt: it is never replayed
+automatically, and it asks for a look at the real state the command would have
+changed before anything else is decided. A `126` or `127` says the program never
+started, so the code is recorded but carries no authority over the command; nothing
+ran that could have decided anything.
+
+A command that chooses to exit `125` of its own accord keeps its ordinary receipt.
+A reserved code is read as the guard's only when the guard's own diagnostic is in
+the captured output, and only the guard writes that line, so a `make` that reports
+`Error 125` is still `make`'s verdict. A command killed by a signal has no exit code
+at all and is reported as killed by a signal, which likewise decides nothing about
+the work.
+
+## What a shell command inherits
+
+A `shell` call runs with the host environment the Zuno process itself has, minus
+Zuno's own secrets. Three variables are removed before the command is assembled:
+
+| Variable | What it holds |
+| --- | --- |
+| `ZUNO_AUTH_CONTENT` | Injected provider credentials, replacing the credential store |
+| `ZUNO_SERVER_PASSWORD` | The HTTP server's Basic authentication password |
+| `ZUNO_SERVER_USERNAME` | The account name that password belongs to |
+
+Names are compared case-insensitively, because Windows environment variable names
+are. Removal happens before any host-supplied environment hook, so the host stays
+the single place that decides what a model-composed command may read, and nothing
+in the shipped configuration puts these three back.
+
+Everything else is inherited on purpose. A wildcard filter over `*_API_KEY` and
+`*_TOKEN` was considered and rejected: it silently breaks `gh`, `aws`, `az`, and
+`gcloud`, along with every user who exports a token because a command needs it. A
+tool that quietly removes the credential a command requires fails worse than one
+that keeps it, because the removal surfaces later as an unexplained authentication
+error somewhere else.
+
+One consequence is worth stating plainly. A nested `zuno` launched from inside a
+`shell` call no longer inherits `ZUNO_AUTH_CONTENT`, so it resolves credentials the
+ordinary way and needs its own configuration or credential store. The interactive
+terminal is unaffected, because its shell is driven by you rather than composed by
+a model.
 
 ## Effect classification
 
@@ -287,8 +342,11 @@ worth knowing when reading a transcript: blocked means nothing happened.
 }
 ```
 
-Those are the defaults. Output beyond them is truncated rather than allowed to consume the
-model window.
+Those are the defaults. Output beyond either limit is withheld rather than allowed to
+consume the model window. Nothing is truncated and nothing is lost: the full output is
+saved to a file, and the model receives one refusal naming the measured size, the limit it
+crossed, and that file's path. A call can ask for the whole thing by repeating itself with
+`accept_large_output: true`.
 
 ## See also
 

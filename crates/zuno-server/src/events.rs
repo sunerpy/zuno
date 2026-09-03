@@ -15,7 +15,7 @@ use zuno_db::Pool;
 use zuno_engine::r#loop::TurnEvent;
 use zuno_llm::event::{ConnectionPhase, StreamEvent as ProviderEvent};
 
-use crate::{EventFanout, EventSubscription};
+use crate::{Delivery, EventFanout, EventSubscription};
 use store::{Page, Snapshot, Store};
 
 pub use route::events_router;
@@ -71,7 +71,9 @@ impl EventService {
         })
         .await
         .map_err(|source| EventStreamError::Worker { source })??;
-        self.fanout(&session_id).publish(stored.clone());
+        if let Some(fanout) = self.live_fanout(&session_id) {
+            fanout.publish(stored.clone());
+        }
         self.global.publish(stored.clone());
         Ok(stored)
     }
@@ -143,7 +145,15 @@ impl EventService {
     ) -> Result<SessionSubscription, EventStreamError> {
         let session_id = types::validate_session_id(session_id)?.to_owned();
         let after = types::checked_sequence(&session_id, cursor)?;
-        let live = self.fanout(&session_id).subscribe();
+        let store = Arc::clone(&self.store);
+        let checked_session = session_id.clone();
+        let exists = tokio::task::spawn_blocking(move || store.session_exists(&checked_session))
+            .await
+            .map_err(|source| EventStreamError::Worker { source })??;
+        if !exists {
+            return Err(EventStreamError::SessionNotFound { session_id });
+        }
+        let live = self.subscribe_live(&session_id);
         let store = Arc::clone(&self.store);
         let snapshot_session = session_id.clone();
         let Snapshot { events, boundary } =
@@ -159,11 +169,31 @@ impl EventService {
         })
     }
 
-    fn fanout(&self, session_id: &str) -> EventFanout<StreamEvent> {
-        self.lock_fanouts()
+    /// The fan-out for a session somebody is currently observing, if any.
+    ///
+    /// Publishing never creates one: an event for an unobserved session goes to the
+    /// durable store and the global stream, and a later subscriber replays it from
+    /// there.
+    fn live_fanout(&self, session_id: &str) -> Option<EventFanout<StreamEvent>> {
+        self.lock_fanouts().get(session_id).cloned()
+    }
+
+    /// Registers a live subscriber, creating the session's fan-out on first use.
+    ///
+    /// Creation and subscription happen under the map lock, and the matching removal
+    /// in [`LiveSessionSubscription::drop`] runs under the same lock, so a subscriber
+    /// can never attach to a fan-out that a concurrent last-unsubscribe is discarding.
+    fn subscribe_live(&self, session_id: &str) -> LiveSessionSubscription {
+        let live = self
+            .lock_fanouts()
             .entry(session_id.to_owned())
             .or_insert_with(|| EventFanout::with_capacity(self.store.subscriber_capacity()))
-            .clone()
+            .subscribe();
+        LiveSessionSubscription {
+            session_id: session_id.to_owned(),
+            live: Some(live),
+            fanouts: Arc::clone(&self.fanouts),
+        }
     }
 
     fn subscribe_global(&self) -> EventSubscription<StreamEvent> {
@@ -623,8 +653,40 @@ struct SessionSubscription {
     session_id: String,
     events: Vec<StreamEvent>,
     boundary: i64,
-    live: EventSubscription<StreamEvent>,
+    live: LiveSessionSubscription,
     cursor: Option<EventCursor>,
+}
+
+/// One session's live subscription plus the fan-out bookkeeping it owes on exit.
+///
+/// A session's fan-out entry exists exactly while that session has at least one
+/// live subscriber. Without the removal on drop, every session ever watched kept a
+/// queue registry alive for the rest of the process.
+struct LiveSessionSubscription {
+    session_id: String,
+    live: Option<EventSubscription<StreamEvent>>,
+    fanouts: Arc<Mutex<HashMap<String, EventFanout<StreamEvent>>>>,
+}
+
+impl LiveSessionSubscription {
+    async fn recv(&mut self) -> Option<Delivery<StreamEvent>> {
+        self.live.as_mut()?.recv().await
+    }
+}
+
+impl Drop for LiveSessionSubscription {
+    fn drop(&mut self) {
+        let mut fanouts = self.fanouts.lock().unwrap_or_else(PoisonError::into_inner);
+        // Unregister this queue while the map is locked, so no subscriber can attach
+        // between the count below and the removal.
+        drop(self.live.take());
+        if fanouts
+            .get(&self.session_id)
+            .is_some_and(|fanout| fanout.subscriber_count() == 0)
+        {
+            fanouts.remove(&self.session_id);
+        }
+    }
 }
 
 #[cfg(test)]

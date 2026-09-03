@@ -1350,6 +1350,19 @@ pub fn clear_revert_at(
 
 /// Permanently discard transcript rows after the staged boundary.
 ///
+/// The boundary is the staged message's `(time_created, id)` pair, read from the
+/// projected transcript when the message was projected and from the legacy
+/// `message` table otherwise. The same pair bounds the deletion in both tables, so
+/// a boundary that exists in only one of them still trims the other.
+///
+/// Inbox rows are never deleted. Every `queued`, `steering`, or `promoted` input
+/// was aimed at the discarded tail, so each is retired through the ordinary
+/// cancellation transition and logs its own `session.input.cancelled`; consumed
+/// rows are immutable history and stay untouched. The commit ends with one
+/// `session.reverted` event carrying the boundary, the removed-row counts, and the
+/// retired input identifiers, so the discarded tail is reconstructable from the
+/// durable log.
+///
 /// Returns `false` when the session exists but has no staged boundary. Callers use
 /// that result as the destructive-operation confirmation guard.
 pub fn commit_revert_at(
@@ -1361,74 +1374,134 @@ pub fn commit_revert_at(
     let Some(raw) = session.revert else {
         return Ok(false);
     };
-    let value: serde_json::Value =
+    let marker: serde_json::Value =
         serde_json::from_str(&raw).map_err(|source| DbError::Decode {
             table: TABLE.to_owned(),
             source,
         })?;
-    let message_id = value
+    let message_id = marker
         .get("messageID")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| DbError::Decode {
             table: TABLE.to_owned(),
             source: serde_json::from_str::<serde_json::Value>("{").expect_err("invalid JSON"),
-        })?;
+        })?
+        .to_owned();
 
-    let projected_seq = transaction
-        .query_row(
-            "SELECT seq FROM session_message WHERE session_id = ?1 AND id = ?2",
-            params![id, message_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(open::map_error)?;
-    let legacy_boundary = transaction
-        .query_row(
-            "SELECT time_created, id FROM message WHERE session_id = ?1 AND id = ?2",
-            params![id, message_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()
-        .map_err(open::map_error)?;
-    if projected_seq.is_none() && legacy_boundary.is_none() {
-        return Err(DbError::NotFound {
-            table: "message".to_owned(),
-            id: message_id.to_owned(),
-        });
+    let boundary = match revert_boundary(transaction, "session_message", id, &message_id)? {
+        Some(boundary) => boundary,
+        None => revert_boundary(transaction, "message", id, &message_id)?.ok_or_else(|| {
+            DbError::NotFound {
+                table: "message".to_owned(),
+                id: message_id.clone(),
+            }
+        })?,
+    };
+    let (boundary_created, boundary_id) = boundary;
+
+    let mut cancelled_input_ids = Vec::new();
+    for input in crate::inbox::unconsumed_in(transaction, id)? {
+        let retired = crate::inbox::transition_in(
+            transaction,
+            id,
+            &input.id,
+            &[
+                crate::inbox::SubmissionState::Queued,
+                crate::inbox::SubmissionState::Steering,
+                crate::inbox::SubmissionState::Promoted,
+            ],
+            crate::inbox::SubmissionState::Cancelled,
+            None,
+            "session.input.cancelled",
+        )?;
+        if retired.is_some() {
+            cancelled_input_ids.push(serde_json::Value::String(input.id));
+        }
     }
 
-    if let Some(seq) = projected_seq {
-        transaction
-            .execute(
-                "DELETE FROM session_message WHERE session_id = ?1 AND seq > ?2",
-                params![id, seq],
-            )
-            .map_err(open::map_error)?;
-        transaction
-            .execute(
-                "DELETE FROM session_input WHERE session_id = ?1 \
-                 AND (admitted_seq > ?2 OR promoted_seq > ?2)",
-                params![id, seq],
-            )
-            .map_err(open::map_error)?;
-    }
-    if let Some((created, boundary_id)) = legacy_boundary {
-        transaction
-            .execute(
-                "DELETE FROM message WHERE session_id = ?1 \
-                 AND (time_created > ?2 OR (time_created = ?2 AND id > ?3))",
-                params![id, created, boundary_id],
-            )
-            .map_err(open::map_error)?;
-    }
-    transaction
+    let removed_messages = transaction
+        .execute(
+            "DELETE FROM session_message WHERE session_id = ?1 \
+             AND (time_created > ?2 OR (time_created = ?2 AND id > ?3))",
+            params![id, boundary_created, boundary_id],
+        )
+        .map_err(open::map_error)?;
+    let removed_legacy_messages = transaction
+        .execute(
+            "DELETE FROM message WHERE session_id = ?1 \
+             AND (time_created > ?2 OR (time_created = ?2 AND id > ?3))",
+            params![id, boundary_created, boundary_id],
+        )
+        .map_err(open::map_error)?;
+    let cleared_epochs = transaction
         .execute(
             "DELETE FROM session_context_epoch WHERE session_id = ?1",
             params![id],
         )
         .map_err(open::map_error)?;
     clear_revert_at(transaction, id, millis)?;
+
+    let properties: serde_json::Map<String, serde_json::Value> = [
+        (
+            "sessionID".to_owned(),
+            serde_json::Value::String(id.to_owned()),
+        ),
+        (
+            "messageID".to_owned(),
+            serde_json::Value::String(message_id),
+        ),
+        ("marker".to_owned(), marker),
+        (
+            "boundaryTimeCreated".to_owned(),
+            serde_json::Value::Number(boundary_created.into()),
+        ),
+        (
+            "removedMessageCount".to_owned(),
+            serde_json::Value::Number(removed_messages.into()),
+        ),
+        (
+            "removedLegacyMessageCount".to_owned(),
+            serde_json::Value::Number(removed_legacy_messages.into()),
+        ),
+        (
+            "cancelledInputIDs".to_owned(),
+            serde_json::Value::Array(cancelled_input_ids),
+        ),
+        (
+            "contextEpochCleared".to_owned(),
+            serde_json::Value::Bool(cleared_epochs > 0),
+        ),
+        (
+            "timeUpdated".to_owned(),
+            serde_json::Value::Number(millis.into()),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    crate::event_log::append_in(
+        transaction,
+        id,
+        crate::event_log::NewSessionEvent::new("session.reverted", properties)?,
+    )?;
     Ok(true)
+}
+
+/// The `(time_created, id)` position of one message in `table`, if it is there.
+fn revert_boundary(
+    transaction: &Transaction<'_>,
+    table: &'static str,
+    session_id: &str,
+    message_id: &str,
+) -> Result<Option<(i64, String)>, DbError> {
+    debug_assert!(matches!(table, "session_message" | "message"));
+    transaction
+        .query_row(
+            &format!("SELECT time_created, id FROM {table} WHERE session_id = ?1 AND id = ?2"),
+            params![session_id, message_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(open::map_error)
 }
 
 fn update_session_column(
