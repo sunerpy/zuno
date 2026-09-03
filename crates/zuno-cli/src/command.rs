@@ -286,13 +286,16 @@ pub struct TuiArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {
-    /// Absent means `server.port` decides, and an unset key means an OS-assigned port.
-    ///
-    /// A clap `default_value` here would be indistinguishable from an explicit
-    /// `--port 0`, which is why the configured value could never be reached before.
+    // Deliberately not a clap `default_value`: a default would be indistinguishable
+    // from an explicit `--port 0`, which is why a configured `server.port` could
+    // never be reached before. The reason belongs here rather than in the doc
+    // comment, which clap prints to users.
+    /// Port to listen on. Absent means `server.port` decides, and an unset key means
+    /// an operating-system assigned port.
     #[arg(long)]
     pub port: Option<u16>,
-    /// Absent means `server.hostname` decides, and an unset key means `127.0.0.1`.
+    /// Hostname to bind. Absent means `server.hostname` decides, and an unset key
+    /// means `127.0.0.1`.
     #[arg(long)]
     pub hostname: Option<String>,
     #[arg(long, default_value_t = false)]

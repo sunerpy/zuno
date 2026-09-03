@@ -20,9 +20,9 @@ zuno serve [OPTIONS]
 
 | 选项 | 说明 | 默认值 |
 | --- | --- | --- |
-| `--port <PORT>` | | `0` |
+| `--port <PORT>` | 监听端口。不传时由 `server.port` 决定；该键也未设置时使用操作系统分配的端口 | |
 | `-v`, `--version` | 显示 Zuno 包版本 | |
-| `--hostname <HOSTNAME>` | | `127.0.0.1` |
+| `--hostname <HOSTNAME>` | 绑定的 hostname。不传时由 `server.hostname` 决定；该键也未设置时使用 `127.0.0.1` | |
 | `--mdns` | | |
 | `--print-logs` | 除结构化本地日志存储之外，同时把日志打印到 stderr | |
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
@@ -32,6 +32,11 @@ zuno serve [OPTIONS]
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
+
+`--port` 与 `--hostname` 都没有默认值。存在命令行参数时以它为准，其次是配置里的
+`server.port` 与 `server.hostname`，最后才是内置的 `127.0.0.1` 与操作系统分配的端口。
+`--port 0` 是显式要求一个由系统分配的端口，因此它与不传该参数是可区分的。配置里超出
+`0`-`65535` 的端口会被指名拒绝，而不是被截断。
 
 ## 示例
 
