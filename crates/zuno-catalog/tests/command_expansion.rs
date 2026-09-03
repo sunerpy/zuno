@@ -13,11 +13,10 @@
 //! - the result is trimmed, and expansion never fails or panics.
 //!
 //! Every expected value below is written from that contract and from the Rust
-//! implementation's own documentation. Where the implementation currently does
-//! something the contract does not describe, the test says so in its name and
-//! comment, pins the current output so that changing it is a deliberate edit of
-//! this file rather than a silent drift, and names the defect. Those pins are
-//! not the specification.
+//! implementation's own documentation. Two further rules the contract implies are
+//! specified here as well: a placeholder that names no argument expands to
+//! nothing, and a substituted argument is data rather than template syntax, so
+//! expansion never reads back what it just wrote.
 
 use zuno_catalog::command::{expand, hints, tokenize};
 
@@ -350,69 +349,84 @@ fn an_image_marker_needs_a_space_digits_and_a_closing_bracket() {
 }
 
 // ---------------------------------------------------------------------------
-// Current behaviour outside the documented contract
+// Placeholders that name no argument
 // ---------------------------------------------------------------------------
 
-/// `$0` is outside the documented contract, which starts at `$1`.
+/// `$0` names no argument, because the documented placeholders start at `$1`.
 ///
-/// The implementation currently renders `$0` as the literal text `undefined`
-/// whenever a higher-numbered placeholder exists, and as the *last* argument
-/// when `$0` is itself the highest placeholder. Neither output was ever
-/// specified for Zuno: both are artefacts of negative array indexing in the
-/// JavaScript the implementation was transcribed from (`args[-1]` stringifies
-/// to `undefined`; `slice(-1)` is the final element). A user who types `$0`
-/// into a template should not receive the word `undefined` in their prompt.
-/// This is a defect to be fixed in a separate change to
-/// `crates/zuno-catalog/src/command.rs` (`substitute_positional`); this test
-/// pins the current output so that fix is a deliberate edit here.
+/// It therefore expands to nothing, exactly like any position past the end of
+/// the argument list. Earlier releases rendered it as the literal text
+/// `undefined`, or as the last argument when `$0` was the highest placeholder in
+/// the template; both were artefacts of negative array indexing in the
+/// JavaScript the implementation was first transcribed from, and neither was
+/// ever part of Zuno's contract.
 #[test]
-fn dollar_zero_currently_renders_the_text_undefined_or_the_last_argument() {
+fn dollar_zero_expands_to_nothing_like_any_out_of_range_position() {
     assert_expands(&[
-        ("Z=[$0] ONE=[$1]", "one two", "Z=[undefined] ONE=[one two]"),
-        ("Z=[$00] ONE=[$1]", "one two", "Z=[undefined] ONE=[one two]"),
-        ("only: $0", "a b c", "only: c"),
+        ("Z=[$0] ONE=[$1]", "one two", "Z=[] ONE=[one two]"),
+        ("Z=[$00] ONE=[$1]", "one two", "Z=[] ONE=[one two]"),
+        ("only: $0", "a b c", "only:"),
         ("only: $0", "", "only:"),
+        // A high out-of-range placeholder does take the greedy highest slot, so
+        // `$1` stops being greedy and the remaining arguments expand nowhere.
+        // `$0` never does, because zero is below every real position.
+        ("Z=[$999] ONE=[$1]", "one two", "Z=[] ONE=[one]"),
+        ("Z=[$0] ONE=[$1]", "one two", "Z=[] ONE=[one two]"),
     ]);
-    // `hints` reports `$0` as an ordinary placeholder, so a picker would prompt
-    // for a value that expansion then discards or replaces with `undefined`.
+    // `hints` reports the template's placeholder inventory rather than deciding
+    // what resolves, so an out-of-range placeholder is still offered.
     assert_hints(&[
         ("Z=[$0] ONE=[$1]", &["$0", "$1"]),
         ("Z=[$00] ONE=[$1]", &["$00", "$1"]),
     ]);
 }
 
-/// The documented contract says `$ARGUMENTS` preserves the input exactly as
-/// typed.
+/// `$ARGUMENTS` inserts the input verbatim, as the documented contract says.
 ///
-/// The implementation currently performs that substitution through
-/// `js_replace_all`, which applies ECMA-262 string-replacement patterns to the
-/// *user's* input: `$$` collapses to `$`, `$&` re-inserts the literal text
-/// `$ARGUMENTS`, `` $` `` inserts the template text before the placeholder,
-/// and `$'` inserts the template text after it. A user who passes a shell
-/// snippet containing `$$` therefore does not get what they typed. This is a
-/// defect against the documented contract, to be fixed in a separate change
-/// to `crates/zuno-catalog/src/command.rs` (`expand`); this test pins the
-/// current output so that fix is a deliberate edit here. The positional path
-/// already treats the same input literally, which is the behaviour the
-/// contract describes.
+/// Every byte the user typed survives: `$$` stays `$$`, `$&` stays `$&`, and
+/// `` $` `` and `$'` cannot pull the surrounding template text into the
+/// substitution. Earlier releases performed this substitution through
+/// JavaScript's replacement-pattern machinery, which interpreted those sequences
+/// *inside the user's own input*, so someone passing a shell snippet containing
+/// `$$` did not get what they typed.
 #[test]
-fn arguments_substitution_currently_interprets_dollar_patterns_in_the_input() {
+fn arguments_inserts_the_input_verbatim() {
     assert_expands(&[
-        ("ALL=[$ARGUMENTS]", "cost $$ high", "ALL=[cost $ high]"),
-        ("ALL=[$ARGUMENTS]", "$& weird", "ALL=[$ARGUMENTS weird]"),
+        ("ALL=[$ARGUMENTS]", "cost $$ high", "ALL=[cost $$ high]"),
+        ("ALL=[$ARGUMENTS]", "$& weird", "ALL=[$& weird]"),
         (
             "pre ALL=[$ARGUMENTS] post",
             "x $` y",
-            "pre ALL=[x pre ALL=[ y] post",
+            "pre ALL=[x $` y] post",
         ),
         (
             "pre ALL=[$ARGUMENTS] post",
             "x $' y",
-            "pre ALL=[x ] post y] post",
+            "pre ALL=[x $' y] post",
         ),
-        // Positional substitution is literal, as the contract describes.
+        // Positional substitution is literal in the same way.
         ("P=[$1]", "$$ tail", "P=[$$ tail]"),
         ("P=[$1] Q=[$2]", "$& tail", "P=[$&] Q=[tail]"),
+    ]);
+}
+
+/// A substituted argument is data, not template syntax.
+///
+/// Expansion makes one left-to-right pass and never reads back what it wrote, so
+/// an argument that happens to contain `$ARGUMENTS` or `$2` is inserted as text.
+/// Rescanning would let the input duplicate itself: `$1` with the input
+/// `$ARGUMENTS x` used to expand to `$ARGUMENTS x x`.
+#[test]
+fn a_substituted_argument_is_never_expanded_again() {
+    assert_expands(&[
+        ("$1", "$ARGUMENTS x", "$ARGUMENTS x"),
+        ("A=[$1]", "$ARGUMENTS tail", "A=[$ARGUMENTS tail]"),
+        (
+            "A=[$1] B=[$2]",
+            "$ARGUMENTS tail",
+            "A=[$ARGUMENTS] B=[tail]",
+        ),
+        ("A=[$ARGUMENTS]", "$1 $2", "A=[$1 $2]"),
     ]);
 }
 

@@ -778,42 +778,44 @@ fn skill_command(skill: &SkillCommand) -> Info {
     }
 }
 
-/// One `$<digits>` occurrence found in a template.
-#[derive(Debug, Clone, Copy)]
-struct Placeholder<'a> {
-    /// Byte offset of the `$`.
-    start: usize,
-    /// Byte offset one past the last digit.
-    end: usize,
-    /// The whole match, `$` included, e.g. `$01`.
-    raw: &'a str,
-    /// The digits as a number, saturated. Saturation is unobservable: any
-    /// position past the argument count expands to empty regardless.
-    position: u64,
+/// What one placeholder occurrence in a template expands to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expansion {
+    /// `$1`, `$2`, and so on: one tokenized argument, or every remaining
+    /// argument when this is the highest-numbered placeholder in the template.
+    Positional(u64),
+    /// `$ARGUMENTS`: the raw, untokenized input, inserted verbatim.
+    RawArguments,
 }
 
-/// Find every `$<digits>` occurrence, in order.
+/// Every placeholder occurrence in `template`, as `(start, end, expansion)`
+/// byte spans in source order.
 ///
-/// Oracle: `session/prompt.ts:1595` — `/\$(\d+)/g`. `\d` is ASCII-only in
-/// JavaScript, so `$٣` is not a placeholder; confirmed against the oracle.
-fn scan_placeholders(template: &str) -> Vec<Placeholder<'_>> {
+/// Both placeholder forms are collected in one pass because substituted text
+/// must never be rescanned. An argument that itself contains `$ARGUMENTS` or
+/// `$2` is user data, not template syntax, and expanding it a second time would
+/// let the input rewrite the prompt around it.
+fn scan_expansions(template: &str) -> Vec<(usize, usize, Expansion)> {
     let bytes = template.as_bytes();
     let mut found = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'$' {
+            if template[index..].starts_with(ARGUMENTS_PLACEHOLDER) {
+                let end = index + ARGUMENTS_PLACEHOLDER.len();
+                found.push((index, end, Expansion::RawArguments));
+                index = end;
+                continue;
+            }
             let mut end = index + 1;
             while end < bytes.len() && bytes[end].is_ascii_digit() {
                 end += 1;
             }
             if end > index + 1 {
-                let raw = &template[index..end];
-                found.push(Placeholder {
-                    start: index,
-                    end,
-                    raw,
-                    position: raw[1..].parse::<u64>().unwrap_or(u64::MAX),
-                });
+                // Saturation is unobservable: any position past the argument
+                // count expands to empty regardless.
+                let position = template[index + 1..end].parse::<u64>().unwrap_or(u64::MAX);
+                found.push((index, end, Expansion::Positional(position)));
                 index = end;
                 continue;
             }
@@ -825,15 +827,21 @@ fn scan_placeholders(template: &str) -> Vec<Placeholder<'_>> {
 
 /// The placeholders a template mentions, for a picker to prompt on.
 ///
-/// Oracle: `command/index.ts:36-43`. Numbered placeholders are deduplicated
-/// (insertion-ordered `Set`) then sorted *lexicographically*, not numerically —
-/// so `$10` precedes `$2`, confirmed on the real binary. `$ARGUMENTS` is
-/// appended last when present. The raw spelling survives: `$01` stays `$01`.
+/// Numbered placeholders are deduplicated and then sorted *lexicographically*,
+/// not numerically, so `$10` precedes `$2`. The raw spelling survives: `$01`
+/// stays `$01`. `$ARGUMENTS` is appended last when present.
+///
+/// A placeholder that names no argument is still reported, because this is the
+/// template's inventory rather than a resolvability check: `$0` and `$999` are
+/// both offered and both expand to nothing.
 #[must_use]
 pub fn hints(template: &str) -> Vec<String> {
     let mut numbered: Vec<String> = Vec::new();
-    for placeholder in scan_placeholders(template) {
-        let raw = placeholder.raw.to_owned();
+    for (start, end, expansion) in scan_expansions(template) {
+        if expansion == Expansion::RawArguments {
+            continue;
+        }
+        let raw = template[start..end].to_owned();
         if !numbered.contains(&raw) {
             numbered.push(raw);
         }
@@ -975,69 +983,71 @@ fn trim_quotes(token: &str) -> &str {
 
 /// Substitute the user's arguments into a template.
 ///
-/// Oracle: `session/prompt.ts:1372-1395`, in five steps.
+/// The placeholders are the ones `docs/config/workflows.md` documents, and every
+/// occurrence is resolved in one left-to-right pass over the template:
 ///
-/// 1. **Tokenize** the raw input ([`tokenize`]).
-/// 2. **Find** every `$<digits>` and take `last` = the highest number, or `0`
-///    when there are none.
-/// 3. **Replace** each occurrence:
+/// 1. **Tokenize** the raw input ([`tokenize`]) for the numbered placeholders.
+/// 2. **Find** every placeholder occurrence and take `last` = the highest number
+///    among the numbered ones, or `0` when there are none.
+/// 3. **Substitute** each occurrence:
 ///    - past the end of the argument list → the empty string, which is why `$3`
 ///      with two arguments vanishes rather than erroring;
-///    - equal to `last` → *every remaining* argument joined by one space, so
-///      the highest placeholder in a template is greedy. `A=[$1] B=[$2]` with
-///      four arguments puts three of them in `B`;
+///    - equal to `last` → *every remaining* argument joined by one space, so the
+///      highest placeholder in a template is greedy. `A=[$1] B=[$2]` with four
+///      arguments puts three of them in `B`;
 ///    - otherwise → that one argument;
-///    - `$0` is a JavaScript artefact: `args[-1]` is `undefined`, so it renders
-///      the literal text `undefined` — unless `$0` is itself the highest
-///      placeholder, when `slice(-1)` makes it the *last* argument.
-/// 4. **Replace `$ARGUMENTS`** with the raw input — quotes, runs of spaces and
-///    newlines intact, since this is the untokenized string. This step goes
-///    through JavaScript's replacement-pattern machinery, so `$$`, `$&`,
-///    `` $` `` and `$'` *inside the user's arguments* are interpreted
-///    ([`js_replace_all`]). Step 3 uses a function replacer and does not.
-/// 5. **Append** the raw input after a blank line when the template mentions no
+///    - `$0` → the empty string. Zuno's numbered placeholders start at `$1`, so
+///      `$0` names no argument and is out of range exactly like `$999`;
+///    - `$ARGUMENTS` → the raw input verbatim, with quotes, runs of spaces and
+///      newlines intact, and no character inside it treated as syntax.
+/// 4. **Append** the raw input after a blank line when the template mentions no
 ///    placeholder at all and the input is not blank, then trim.
+///
+/// Substitution never reads back what it just wrote, so an argument containing
+/// `$ARGUMENTS` or `$1` is inserted as literal text rather than expanded again.
 ///
 /// Never fails and never panics: a template referencing `$999`, `$0`, a bare
 /// `$`, or `$5.00` all produce text.
 #[must_use]
 pub fn expand(template: &str, arguments: &str) -> String {
     let args = tokenize(arguments);
-    let placeholders = scan_placeholders(template);
-    let last = placeholders
+    let occurrences = scan_expansions(template);
+    let last = occurrences
         .iter()
-        .map(|placeholder| placeholder.position)
+        .filter_map(|&(_, _, expansion)| match expansion {
+            Expansion::Positional(position) => Some(position),
+            Expansion::RawArguments => None,
+        })
         .max()
         .unwrap_or(0);
 
-    let mut substituted = String::with_capacity(template.len());
+    let mut expanded = String::with_capacity(template.len());
     let mut cursor = 0;
-    for placeholder in &placeholders {
-        substituted.push_str(&template[cursor..placeholder.start]);
-        substituted.push_str(&substitute_positional(placeholder.position, last, &args));
-        cursor = placeholder.end;
+    for &(start, end, expansion) in &occurrences {
+        expanded.push_str(&template[cursor..start]);
+        match expansion {
+            Expansion::Positional(position) => {
+                expanded.push_str(&substitute_positional(position, last, &args));
+            }
+            Expansion::RawArguments => expanded.push_str(arguments),
+        }
+        cursor = end;
     }
-    substituted.push_str(&template[cursor..]);
+    expanded.push_str(&template[cursor..]);
 
-    let uses_arguments = template.contains(ARGUMENTS_PLACEHOLDER);
-    let mut expanded = js_replace_all(&substituted, ARGUMENTS_PLACEHOLDER, arguments);
-    if placeholders.is_empty() && !uses_arguments && !arguments.trim().is_empty() {
+    if occurrences.is_empty() && !arguments.trim().is_empty() {
         expanded.push_str("\n\n");
         expanded.push_str(arguments);
     }
     expanded.trim().to_owned()
 }
 
-/// One placeholder's replacement text (`session/prompt.ts:1383-1389`).
+/// One numbered placeholder's replacement text.
 fn substitute_positional(position: u64, last: u64, args: &[String]) -> String {
+    // Zuno's numbered placeholders start at `$1`, so `$0` names no argument and
+    // expands to nothing, the same as any position past the end of the list.
     if position == 0 {
-        // `argIndex` is -1, so the length guard never fires.
-        if position == last {
-            // `args.slice(-1)` — the final argument, or nothing.
-            return args.last().cloned().unwrap_or_default();
-        }
-        // `args[-1]` is `undefined`, which the replacer stringifies.
-        return "undefined".to_owned();
+        return String::new();
     }
     let index = position - 1;
     if index >= args.len() as u64 {
@@ -1050,84 +1060,4 @@ fn substitute_positional(position: u64, last: u64, args: &[String]) -> String {
         return args[index..].join(" ");
     }
     args[index].clone()
-}
-
-/// `String.prototype.replaceAll` with a string search *and* a string
-/// replacement, including the `$` substitution patterns that form implies.
-///
-/// The oracle reaches this at `session/prompt.ts:1391`. Because the replacement
-/// is a plain string rather than a function, ECMA-262 `GetSubstitution` runs
-/// over it: `$$` becomes `$`, `$&` becomes the matched text, `` $` `` becomes
-/// everything before the match, and `$'` becomes everything after it. There are
-/// no capture groups, so `$1` and `$<name>` are left alone. Every one of these
-/// was confirmed against the oracle's own JavaScript rather than inferred.
-#[must_use]
-pub fn js_replace_all(haystack: &str, needle: &str, replacement: &str) -> String {
-    if needle.is_empty() {
-        return haystack.to_owned();
-    }
-    let mut out = String::with_capacity(haystack.len());
-    let mut cursor = 0;
-    while let Some(offset) = haystack[cursor..].find(needle) {
-        let start = cursor + offset;
-        let end = start + needle.len();
-        out.push_str(&haystack[cursor..start]);
-        expand_substitution(
-            &mut out,
-            replacement,
-            needle,
-            &haystack[..start],
-            &haystack[end..],
-        );
-        cursor = end;
-    }
-    out.push_str(&haystack[cursor..]);
-    out
-}
-
-/// ECMA-262 `GetSubstitution` for a match with no capture groups.
-fn expand_substitution(
-    out: &mut String,
-    replacement: &str,
-    matched: &str,
-    before: &str,
-    after: &str,
-) {
-    let bytes = replacement.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'$' {
-            let c = replacement[index..]
-                .chars()
-                .next()
-                .unwrap_or_else(|| unreachable!("index is on a char boundary"));
-            out.push(c);
-            index += c.len_utf8();
-            continue;
-        }
-        match bytes.get(index + 1) {
-            Some(b'$') => {
-                out.push('$');
-                index += 2;
-            }
-            Some(b'&') => {
-                out.push_str(matched);
-                index += 2;
-            }
-            Some(b'`') => {
-                out.push_str(before);
-                index += 2;
-            }
-            Some(b'\'') => {
-                out.push_str(after);
-                index += 2;
-            }
-            // No capture groups, so `$1`, `$<name>`, and a trailing `$` are all
-            // literal.
-            _ => {
-                out.push('$');
-                index += 1;
-            }
-        }
-    }
 }

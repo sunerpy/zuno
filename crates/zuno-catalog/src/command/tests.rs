@@ -1,13 +1,14 @@
 //! Unit tests for command resolution.
 //!
-//! The precedence tests are the point of todo 15, so each level of the chain has
-//! a test that isolates it, and the skills-only-if-free rule has three: against
-//! a built-in, against a config command, and against an MCP prompt.
+//! Each level of the precedence chain has a test that isolates it, and the
+//! skills-only-if-free rule has three: against a built-in, against a config
+//! command, and against an MCP prompt.
 //!
-//! Every expected value here was observed on the real `opencode` binary
-//! (`GET /command`, version 1.18.12, source tree pinned `aefaf140c1` = v1.18.13)
-//! or produced by a verbatim transcription of its expansion code. Nothing is
-//! inferred. Transcripts: the task-15 verification transcript.
+//! Every expected value is written from Zuno's own contract, which for argument
+//! expansion is `docs/config/workflows.md` and the documentation on `expand`,
+//! `hints`, and `tokenize`. The end-to-end expansion specification lives in
+//! `tests/command_expansion.rs`; these tests cover the resolution paths that
+//! reach it.
 
 use super::*;
 
@@ -750,21 +751,23 @@ fn a_gap_in_the_numbering_does_not_shift_arguments() {
 }
 
 #[test]
-fn zero_renders_undefined_unless_it_is_the_highest() {
+fn zero_names_no_argument_and_expands_to_nothing() {
     assert_eq!(
         expand("Z=[$0] ONE=[$1]", "one two"),
-        "Z=[undefined] ONE=[one two]",
-        "args[-1] is undefined, which JavaScript stringifies"
+        "Z=[] ONE=[one two]",
+        "numbered placeholders start at $1, so $0 is out of range"
     );
     assert_eq!(
         expand("only: $0", "a b c"),
-        "only: c",
-        "as the highest placeholder, $0 becomes args.slice(-1) — the last argument"
+        "only:",
+        "$0 stays out of range even when it is the only placeholder"
     );
     assert_eq!(expand("only: $0", ""), "only:");
+    assert_eq!(expand("Z=[$00] ONE=[$1]", "one two"), "Z=[] ONE=[one two]");
     assert_eq!(
-        expand("Z=[$00] ONE=[$1]", "one two"),
-        "Z=[undefined] ONE=[one two]"
+        expand("Z=[$0] ONE=[$1] TWO=[$2]", "one two three"),
+        "Z=[] ONE=[one] TWO=[two three]",
+        "$0 is out of range, so it does not take the greedy highest slot"
     );
 }
 
@@ -831,27 +834,32 @@ fn arguments_keeps_the_raw_input_while_positionals_are_tokenized() {
 }
 
 #[test]
-fn dollar_patterns_inside_the_input_are_interpreted_for_arguments_only() {
+fn dollar_patterns_inside_the_input_stay_literal_everywhere() {
     assert_eq!(
         expand("ALL=[$ARGUMENTS]", "cost $$ high"),
-        "ALL=[cost $ high]",
-        "$$ collapses because replaceAll took a string replacement"
+        "ALL=[cost $$ high]",
+        "$ARGUMENTS inserts the input verbatim"
     );
     assert_eq!(
         expand("ALL=[$ARGUMENTS]", "$& weird"),
-        "ALL=[$ARGUMENTS weird]",
-        "$& re-inserts the matched placeholder text"
+        "ALL=[$& weird]",
+        "no character of the input is replacement syntax"
+    );
+    assert_eq!(
+        expand("pre ALL=[$ARGUMENTS] post", "x $` y"),
+        "pre ALL=[x $` y] post",
+        "the template around the placeholder cannot leak into the input"
+    );
+    assert_eq!(
+        expand("pre ALL=[$ARGUMENTS] post", "x $' y"),
+        "pre ALL=[x $' y] post"
     );
     assert_eq!(
         expand("P=[$1] Q=[$2]", "$& tail"),
         "P=[$&] Q=[tail]",
-        "positional substitution uses a function replacer, so $& is literal"
+        "positional substitution is literal too"
     );
-    assert_eq!(
-        expand("P=[$1]", "$$ tail"),
-        "P=[$$ tail]",
-        "and $$ is literal there too"
-    );
+    assert_eq!(expand("P=[$1]", "$$ tail"), "P=[$$ tail]");
 }
 
 #[test]
@@ -880,7 +888,7 @@ fn hints_are_deduplicated_and_sorted_lexicographically() {
 }
 
 #[test]
-fn tokenizing_follows_the_oracles_regex() {
+fn tokenizing_splits_on_whitespace_quotes_and_image_markers() {
     assert_eq!(tokenize("one two"), vec!["one", "two"]);
     assert_eq!(tokenize("one    two\tthree"), vec!["one", "two", "three"]);
     assert_eq!(
@@ -895,7 +903,7 @@ fn tokenizing_follows_the_oracles_regex() {
     assert_eq!(
         tokenize("[image 12] tail"),
         vec!["[image 12]", "tail"],
-        "the regex carries the i flag"
+        "an image marker is recognized case-insensitively"
     );
     assert_eq!(
         tokenize("\" second"),
@@ -961,22 +969,24 @@ fn arguments_is_case_sensitive() {
 }
 
 #[test]
-fn source_renders_the_oracles_wire_spelling() {
+fn source_renders_its_wire_spelling() {
     assert_eq!(Source::Command.to_string(), "command");
     assert_eq!(Source::Mcp.to_string(), "mcp");
     assert_eq!(Source::Skill.to_string(), "skill");
 }
 
 #[test]
-fn js_replace_all_leaves_capture_references_alone() {
+fn an_argument_is_inserted_as_data_not_as_template_syntax() {
     assert_eq!(
-        js_replace_all("a X b", "X", "$1 $<name>"),
-        "a $1 $<name> b",
-        "there are no capture groups, so these are literal"
+        expand("ALL=[$ARGUMENTS]", "$1 $ARGUMENTS $$ $& $`"),
+        "ALL=[$1 $ARGUMENTS $$ $& $`]",
+        "every character of the input survives, including placeholder spellings"
     );
-    assert_eq!(js_replace_all("a X b", "X", "trailing $"), "a trailing $ b");
-    assert_eq!(js_replace_all("no match", "", "ignored"), "no match");
-    assert_eq!(js_replace_all("XX", "X", "$&$&"), "XXXX");
+    assert_eq!(
+        expand("A=[$1] B=[$2]", "$ARGUMENTS tail"),
+        "A=[$ARGUMENTS] B=[tail]",
+        "a substituted argument is never rescanned for placeholders"
+    );
 }
 
 #[test]
