@@ -324,7 +324,8 @@ async fn claude_permission_denial_is_typed_and_malformed_output_redacts_secrets(
 
 #[tokio::test]
 async fn cancellation_reaps_the_guarded_process_tree_for_both_products() {
-    activate_guard();
+    // Mid-turn: the Codex turn id is known, so the streaming loop interrupts that exact turn, and
+    // Claude Code's one-shot stream is simply torn down. Both are observed cancellations.
     for (kind, permission) in [
         (ProductAgentKind::Codex, ProductAgentPermissionMode::Never),
         (
@@ -332,50 +333,168 @@ async fn cancellation_reaps_the_guarded_process_tree_for_both_products() {
             ProductAgentPermissionMode::DontAsk,
         ),
     ] {
-        let root = tempfile::tempdir().expect("temporary root");
-        let pid_path = root.path().join("child.pid");
-        let agent = configured(
-            "cancel",
-            &config(
-                kind,
-                permission,
-                "hang",
-                &root.path().join("capture.json"),
-                Some(&pid_path),
-            ),
-            &environment(),
-        )
-        .expect("configured agent");
-        let cancellation = CancellationToken::new();
-        let run = tokio::spawn({
-            let cancellation = cancellation.clone();
-            let directory = root.path().to_owned();
-            async move { agent.run(request(&directory), cancellation).await }
-        });
-        wait_for_path(&pid_path).await;
-        let pid = std::fs::read_to_string(&pid_path)
-            .expect("child pid")
-            .parse::<u32>()
-            .expect("numeric pid");
-        assert!(process_exists(pid), "fixture child never became live");
-
-        cancellation.cancel();
-        let error = tokio::time::timeout(Duration::from_secs(5), run)
-            .await
-            .expect("cancellation completed")
-            .expect("runner task")
-            .expect_err("cancelled invocation");
+        let (error, pid) = cancel_hanging_phase(kind, permission, "hang").await;
         assert!(
             matches!(error, ProductAgentError::Cancelled { .. }),
             "{error}"
         );
-        for _ in 0..100 {
-            if !process_exists(pid) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_process_reaped(pid).await;
+    }
+}
+
+/// Run one fixture mode to the point where it hangs, then cancel it.
+///
+/// Returns the failure and the pid of the fixture's own grandchild, so a caller can assert both
+/// the classification and that the guarded tree was reaped.
+async fn cancel_hanging_phase(
+    kind: ProductAgentKind,
+    permission: ProductAgentPermissionMode,
+    mode: &str,
+) -> (ProductAgentError, u32) {
+    activate_guard();
+    let root = tempfile::tempdir().expect("temporary root");
+    let pid_path = root.path().join("child.pid");
+    let agent = configured(
+        "cancel",
+        &config(
+            kind,
+            permission,
+            mode,
+            &root.path().join("capture.json"),
+            Some(&pid_path),
+        ),
+        &environment(),
+    )
+    .expect("configured agent");
+    let cancellation = CancellationToken::new();
+    let run = tokio::spawn({
+        let cancellation = cancellation.clone();
+        let directory = root.path().to_owned();
+        async move { agent.run(request(&directory), cancellation).await }
+    });
+    wait_for_path(&pid_path).await;
+    let pid = std::fs::read_to_string(&pid_path)
+        .expect("child pid")
+        .parse::<u32>()
+        .expect("numeric pid");
+    assert!(process_exists(pid), "fixture child never became live");
+
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("cancellation completed")
+        .expect("runner task")
+        .expect_err("cancelled invocation");
+    (error, pid)
+}
+
+async fn assert_process_reaped(pid: u32) {
+    for _ in 0..100 {
+        if !process_exists(pid) {
+            return;
         }
-        assert!(!process_exists(pid), "guarded child process {pid} survived");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("guarded child process {pid} survived");
+}
+
+#[tokio::test]
+async fn cancelling_before_the_turn_is_requested_is_reported_as_cancellation() {
+    // `initialize` and `thread/start` ask the product for nothing that touches the working
+    // directory, so a cancellation there is a user interruption that pauses, never a protocol
+    // incompatibility that would blame the user's installation and block the goal.
+    for mode in ["hang-initialize", "hang-thread-start"] {
+        let (error, pid) = cancel_hanging_phase(
+            ProductAgentKind::Codex,
+            ProductAgentPermissionMode::Never,
+            mode,
+        )
+        .await;
+        assert!(
+            matches!(error, ProductAgentError::Cancelled { .. }),
+            "{mode}: {error}"
+        );
+        assert!(!error.is_uncertain(), "{mode}: {error}");
+        assert_process_reaped(pid).await;
+    }
+}
+
+#[tokio::test]
+async fn cancelling_an_outstanding_turn_start_response_stays_uncertain() {
+    // The other side of the same line: `turn/start` is already flushed, so the product may have
+    // begun editing files and Zuno has no turn id to interrupt. The outcome is unknown and must
+    // not be replayed mechanically, so it is uncertain rather than a clean cancellation.
+    let (error, pid) = cancel_hanging_phase(
+        ProductAgentKind::Codex,
+        ProductAgentPermissionMode::Never,
+        "hang-turn-start",
+    )
+    .await;
+    assert!(error.is_uncertain(), "{error}");
+    assert!(
+        !matches!(error, ProductAgentError::Cancelled { .. }),
+        "{error}"
+    );
+    let rendered = error.to_string();
+    assert!(rendered.contains("cancelled"), "{rendered}");
+    assert!(rendered.contains("turn/start"), "{rendered}");
+    assert_process_reaped(pid).await;
+}
+
+#[tokio::test]
+async fn a_prompt_that_looks_like_an_option_is_passed_after_the_terminator() {
+    activate_guard();
+    for prompt in ["-not-an-option", "--dangerously-skip-permissions"] {
+        let root = tempfile::tempdir().expect("temporary root");
+        let capture_path = root.path().join("capture.json");
+        let agent = configured(
+            "claude",
+            &config(
+                ProductAgentKind::ClaudeCode,
+                ProductAgentPermissionMode::DontAsk,
+                "normal",
+                &capture_path,
+                None,
+            ),
+            &environment(),
+        )
+        .expect("configured Claude");
+        let result = agent
+            .run(
+                ProductAgentRequest {
+                    prompt: prompt.to_owned(),
+                    description: None,
+                    directory: root.path().to_owned(),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("Claude result");
+        assert_eq!(result.text, "claude final answer");
+
+        let captured = capture(&capture_path);
+        let args = captured["args"]
+            .as_array()
+            .expect("captured args")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let terminator = args
+            .iter()
+            .position(|argument| argument == "--")
+            .unwrap_or_else(|| panic!("no `--` terminator in {args:?}"));
+        assert_eq!(
+            args[terminator + 1..],
+            [prompt.to_owned()],
+            "the prompt must be the only operand: {args:?}"
+        );
+        // Nothing Zuno did not choose may be read as an option, so the prompt text must not
+        // appear anywhere the child would still parse flags.
+        assert!(
+            !args[..terminator].iter().any(|argument| argument == prompt),
+            "prompt text reached the option side of the argv: {args:?}"
+        );
     }
 }
 
