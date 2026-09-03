@@ -16,26 +16,40 @@ use zuno_error::ToolError;
 use zuno_tool::{NeverInterrupted, PermissionAsk, PermissionAsker, ToolContext};
 use zuno_tools::FileTools;
 
-/// A permission asker that replaces a directory with a symlink while it answers.
+/// A permission asker that replaces a directory with a link while it answers.
 ///
 /// `PermissionAsker::ask` is called from `FileToolRuntime::authorize`, so anything
 /// this does happens strictly after the tool decided the path was inside the
 /// workspace and strictly before the tool writes. That is the whole window the
 /// time-of-check/time-of-use defect lives in.
-struct SwapDirectoryForSymlink {
+///
+/// `plant` is the kind of link the attacker leaves behind, because the two Windows
+/// shapes are not equally available: a symlink needs a privilege, a junction does not.
+struct SwapDirectoryForLink {
     directory: PathBuf,
     target: PathBuf,
+    plant: fn(&Path, &Path) -> std::io::Result<()>,
     asks: Mutex<Vec<PermissionAsk>>,
     swapped: Mutex<bool>,
 }
 
-impl SwapDirectoryForSymlink {
+impl SwapDirectoryForLink {
     fn new(directory: PathBuf, target: PathBuf) -> Self {
         Self {
             directory,
             target,
+            plant: symlink_dir,
             asks: Mutex::new(Vec::new()),
             swapped: Mutex::new(false),
+        }
+    }
+
+    /// The same swap, planted as a directory junction rather than a symlink.
+    #[cfg(windows)]
+    fn junction(directory: PathBuf, target: PathBuf) -> Self {
+        Self {
+            plant: junction_dir,
+            ..Self::new(directory, target)
         }
     }
 
@@ -50,7 +64,7 @@ impl SwapDirectoryForSymlink {
 }
 
 #[async_trait]
-impl PermissionAsker for SwapDirectoryForSymlink {
+impl PermissionAsker for SwapDirectoryForLink {
     async fn ask(
         &self,
         _origin: zuno_tool::PermissionOrigin<'_>,
@@ -62,7 +76,7 @@ impl PermissionAsker for SwapDirectoryForSymlink {
         if !*swapped {
             *swapped = true;
             std::fs::remove_dir_all(&self.directory).expect("remove the authorized directory");
-            symlink_dir(&self.target, &self.directory).expect("plant the escaping symlink");
+            (self.plant)(&self.target, &self.directory).expect("plant the escaping link");
         }
         Ok(())
     }
@@ -76,6 +90,33 @@ fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_dir(target, link)
+}
+
+/// A directory junction, which is what an unprivileged Windows attacker actually has.
+///
+/// `std` cannot create one, and `mklink /J` is a `cmd` builtin rather than a program,
+/// so this shells out. A failure here is a broken fixture, not a skipped test: the
+/// caller unwraps it.
+#[cfg(windows)]
+fn junction_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    let output = std::process::Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(link)
+        .arg(target)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "mklink /J {} {} failed with {}: {}{}",
+        link.display(),
+        target.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    )))
 }
 
 fn context(permission: Arc<dyn PermissionAsker>) -> ToolContext {
@@ -96,7 +137,7 @@ async fn file_write_refuses_a_directory_swapped_for_a_symlink_after_authorizatio
     let authorized = workspace.path().join("docs");
     std::fs::create_dir(&authorized).expect("the directory the user authorizes");
     let tools = FileTools::new(workspace.path()).expect("file tools");
-    let permission = Arc::new(SwapDirectoryForSymlink::new(
+    let permission = Arc::new(SwapDirectoryForLink::new(
         authorized.clone(),
         outside.path().to_owned(),
     ));
@@ -117,6 +158,51 @@ async fn file_write_refuses_a_directory_swapped_for_a_symlink_after_authorizatio
         !escaped.exists(),
         "write escaped the workspace: {} exists after only a workspace authorization; \
          permissions asked were {:?}",
+        escaped.display(),
+        permission.permissions()
+    );
+    let error = result.expect_err("a swapped ancestor must refuse the write");
+    assert!(
+        matches!(error, ToolError::InvalidArgs { .. }),
+        "an ancestor that is not the authorized directory is a refusal, not a lost write: {error:?}"
+    );
+}
+
+/// The same swap as above, planted as a junction, which needs no Windows privilege.
+///
+/// A symlink swap is the shape the portable test uses, but on Windows it requires
+/// Developer Mode or `SeCreateSymbolicLinkPrivilege`. A directory junction requires
+/// neither, so it is the swap an ordinary process can actually perform, and it is the
+/// one the reparse-point refusal has to cover.
+#[cfg(windows)]
+#[tokio::test]
+async fn file_write_refuses_a_directory_swapped_for_a_junction_after_authorization() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let outside = tempfile::tempdir().expect("temporary external directory");
+    let authorized = workspace.path().join("docs");
+    std::fs::create_dir(&authorized).expect("the directory the user authorizes");
+    let tools = FileTools::new(workspace.path()).expect("file tools");
+    let permission = Arc::new(SwapDirectoryForLink::junction(
+        authorized.clone(),
+        outside.path().to_owned(),
+    ));
+
+    let result = tools
+        .write
+        .execute(
+            json!({
+                "filePath": authorized.join("escape.txt"),
+                "content": "exfiltrated\n",
+            }),
+            context(permission.clone()),
+        )
+        .await;
+
+    let escaped = outside.path().join("escape.txt");
+    assert!(
+        !escaped.exists(),
+        "write escaped the workspace through a junction: {} exists after only a \
+         workspace authorization; permissions asked were {:?}",
         escaped.display(),
         permission.permissions()
     );
@@ -206,7 +292,7 @@ async fn file_edit_refuses_a_directory_swapped_for_a_symlink_after_authorization
         .await
         .expect("read the file the edit is authorized against");
 
-    let permission = Arc::new(SwapDirectoryForSymlink::new(
+    let permission = Arc::new(SwapDirectoryForLink::new(
         authorized.clone(),
         outside.path().to_owned(),
     ));
@@ -241,7 +327,7 @@ async fn file_read_refuses_a_directory_swapped_for_a_symlink_after_authorization
     std::fs::write(outside.path().join("notes.md"), "private content\n").expect("the secret");
 
     let tools = FileTools::new(workspace.path()).expect("file tools");
-    let permission = Arc::new(SwapDirectoryForSymlink::new(
+    let permission = Arc::new(SwapDirectoryForLink::new(
         authorized.clone(),
         outside.path().to_owned(),
     ));
@@ -276,7 +362,7 @@ async fn apply_patch_refuses_a_directory_swapped_for_a_symlink_after_authorizati
     let authorized = workspace.path().join("docs");
     std::fs::create_dir(&authorized).expect("the directory the user authorizes");
     let tools = FileTools::new(workspace.path()).expect("file tools");
-    let permission = Arc::new(SwapDirectoryForSymlink::new(
+    let permission = Arc::new(SwapDirectoryForLink::new(
         authorized.clone(),
         outside.path().to_owned(),
     ));
