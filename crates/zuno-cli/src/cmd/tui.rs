@@ -464,7 +464,8 @@ fn execute_once(
     );
     let mcp_projection = McpProjection::new(project_mcp_snapshots(&mcp_controller.snapshots()));
     let mcp_dirty = Arc::new(AtomicBool::new(!initial_mcp_targets.is_empty()));
-    let reference_source = super::tui_reference::ProjectFiles::build(&reference_root)?;
+    let reference_source =
+        super::tui_reference::ProjectFiles::build(&reference_root, plan.config().watcher.as_ref())?;
     // Read before `TurnHost::open` consumes the plan, and before raw mode, so a slow
     // skill scan cannot delay the first frame of an already-entered alternate screen.
     let facts = runtime.block_on(SessionFacts::resolve(&plan, environment));

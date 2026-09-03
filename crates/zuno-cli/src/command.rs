@@ -286,10 +286,15 @@ pub struct TuiArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {
-    #[arg(long, default_value_t = 0)]
-    pub port: u16,
-    #[arg(long, default_value = "127.0.0.1")]
-    pub hostname: String,
+    /// Absent means `server.port` decides, and an unset key means an OS-assigned port.
+    ///
+    /// A clap `default_value` here would be indistinguishable from an explicit
+    /// `--port 0`, which is why the configured value could never be reached before.
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// Absent means `server.hostname` decides, and an unset key means `127.0.0.1`.
+    #[arg(long)]
+    pub hostname: Option<String>,
     #[arg(long, default_value_t = false)]
     pub mdns: bool,
     #[arg(long, default_value = "zuno.local")]

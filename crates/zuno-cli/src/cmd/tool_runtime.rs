@@ -60,7 +60,9 @@ use zuno_sandbox::{
     NetworkAccess, SandboxMode, SandboxPolicy, SandboxResolution, SandboxResolutionKind,
     SandboxResolver, SandboxUnavailableAction, SystemSandboxResolver,
 };
-use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolUiIntent, erase};
+use zuno_tool::{
+    OutputLimits, PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolUiIntent, erase,
+};
 use zuno_tools::FileTools;
 use zuno_tools::exposure::ExposureFlags;
 use zuno_tools::question::{QuestionAsker, QuestionTool};
@@ -266,7 +268,10 @@ pub(crate) fn assemble(
             execution_policy,
         )
         .map_err(to_string)
-        .map(|tool| tool.with_background_executions(Arc::clone(&selection.background_executions)))
+        .map(|tool| {
+            tool.with_background_executions(Arc::clone(&selection.background_executions))
+                .with_output_limits(OutputLimits::from_config(config.tool_output.as_ref()))
+        })
     });
     let shell = shell.transpose()?;
     if selection.interaction_policy.allows_question()

@@ -29,6 +29,8 @@ pub fn document() -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -39,6 +41,38 @@ mod tests {
             committed,
             document(),
             "regenerate with `cargo run -p zuno-config --example generate-schema > schemas/zuno.json`"
+        );
+    }
+
+    /// The published schema and the parser's whitelist are two hand-maintained
+    /// lists of the same thing. [`crate::schema::KNOWN_TOP_LEVEL_KEYS`] is what
+    /// actually rejects a key at parse time, so a property that the schema
+    /// publishes but the whitelist omits is a documented key that no user can
+    /// set.
+    #[test]
+    fn the_known_key_whitelist_matches_the_committed_schema_root_properties() {
+        let committed: Value = serde_json::from_str(include_str!("../../../schemas/zuno.json"))
+            .expect("committed schema is valid JSON");
+        let published: BTreeSet<&str> = committed["properties"]
+            .as_object()
+            .expect("the schema root declares its properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let whitelisted: BTreeSet<&str> = crate::schema::KNOWN_TOP_LEVEL_KEYS
+            .iter()
+            .copied()
+            .collect();
+
+        let rejected_but_published: Vec<&str> =
+            published.difference(&whitelisted).copied().collect();
+        let whitelisted_but_unpublished: Vec<&str> =
+            whitelisted.difference(&published).copied().collect();
+        assert!(
+            rejected_but_published.is_empty() && whitelisted_but_unpublished.is_empty(),
+            "schemas/zuno.json and KNOWN_TOP_LEVEL_KEYS disagree; \
+             published in the schema but rejected by the parser: {rejected_but_published:?}; \
+             whitelisted by the parser but absent from the schema: {whitelisted_but_unpublished:?}"
         );
     }
 

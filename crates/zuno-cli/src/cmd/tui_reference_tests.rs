@@ -25,7 +25,7 @@ fn displays(source: &ProjectFiles) -> Vec<String> {
 #[test]
 fn project_files_offer_real_files_and_directories_but_not_gitignored_entries() {
     let root = fixture();
-    let source = ProjectFiles::build(root.path()).expect("index project files");
+    let source = ProjectFiles::build(root.path(), None).expect("index project files");
     let offered = displays(&source);
 
     assert!(offered.contains(&"src/".to_owned()), "{offered:?}");
@@ -43,6 +43,35 @@ fn project_files_offer_real_files_and_directories_but_not_gitignored_entries() {
     );
 }
 
+/// `watcher.ignore` is documented configuration, and the only way to tell that the
+/// TUI read it is that a pattern set nowhere else changes what the index offers.
+/// `src/main.rs` is not gitignored and is offered when the block is absent, so its
+/// disappearance can only come from the configured pattern reaching the filter.
+#[test]
+fn project_files_honour_the_configured_watcher_ignore_patterns() {
+    let root = fixture();
+    let watcher = zuno_config::schema::WatcherConfig {
+        ignore: Some(vec!["src/main.rs".to_owned()]),
+    };
+
+    let unconfigured = displays(&ProjectFiles::build(root.path(), None).expect("default index"));
+    let configured =
+        displays(&ProjectFiles::build(root.path(), Some(&watcher)).expect("configured index"));
+
+    assert!(
+        unconfigured.contains(&"src/main.rs".to_owned()),
+        "the fixture file must be offered without a watcher block: {unconfigured:?}"
+    );
+    assert!(
+        !configured.contains(&"src/main.rs".to_owned()),
+        "`watcher.ignore` did not reach the reference filter: {configured:?}"
+    );
+    assert!(
+        configured.contains(&"src/".to_owned()),
+        "the pattern excluded more than it named: {configured:?}"
+    );
+}
+
 #[test]
 fn project_file_index_never_exceeds_its_candidate_cap() {
     let root = tempfile::tempdir().expect("temp project");
@@ -54,7 +83,7 @@ fn project_file_index_never_exceeds_its_candidate_cap() {
         .expect("fixture file");
     }
 
-    let source = ProjectFiles::build_with_limits(root.path(), 20, 3).expect("bounded index");
+    let source = ProjectFiles::build_with_limits(root.path(), None, 20, 3).expect("bounded index");
     assert_eq!(
         source.candidates(Trigger::Reference, "").len(),
         3,
@@ -74,7 +103,7 @@ fn project_file_index_stops_at_the_scan_cap_before_the_candidate_cap() {
     }
 
     assert_eq!(REFERENCE_SCAN_LIMIT, 20_000);
-    let source = ProjectFiles::build_with_limits(root.path(), 3, 20).expect("bounded scan");
+    let source = ProjectFiles::build_with_limits(root.path(), None, 3, 20).expect("bounded scan");
     assert_eq!(
         source.candidates(Trigger::Reference, "").len(),
         2,

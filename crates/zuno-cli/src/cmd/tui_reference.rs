@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+use zuno_config::schema::WatcherConfig;
 use zuno_llm::event::RequestContentBlock;
 use zuno_tui::views::autocomplete::{Candidate, CandidateKind, CompletionSource, Trigger};
 use zuno_tui::views::session::PromptSubmission;
@@ -25,12 +26,21 @@ pub(super) struct ProjectFiles {
 }
 
 impl ProjectFiles {
-    pub(super) fn build(root: &Path) -> Result<Self, String> {
-        Self::build_with_limits(root, REFERENCE_SCAN_LIMIT, REFERENCE_CANDIDATE_LIMIT)
+    /// `watcher` carries the project's `ignore` patterns, so the reference index has
+    /// to honour them: a path the user excluded from watching should not be offered
+    /// for `@`-completion either, and the patterns are relative to this same root.
+    pub(super) fn build(root: &Path, watcher: Option<&WatcherConfig>) -> Result<Self, String> {
+        Self::build_with_limits(
+            root,
+            watcher,
+            REFERENCE_SCAN_LIMIT,
+            REFERENCE_CANDIDATE_LIMIT,
+        )
     }
 
     fn build_with_limits(
         root: &Path,
+        watcher: Option<&WatcherConfig>,
         scan_limit: usize,
         candidate_limit: usize,
     ) -> Result<Self, String> {
@@ -42,6 +52,7 @@ impl ProjectFiles {
         }
         let filter = zuno_watch::FilterBuilder::new(root)
             .gitignore(true)
+            .watcher_config(watcher)
             .build()
             .map_err(|error| error.to_string())?;
         let mut candidates = Vec::new();

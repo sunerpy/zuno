@@ -4984,6 +4984,95 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
     assert_eq!(output.metadata["shell"], "sh");
 }
 
+/// `tool_output` is documented configuration, so a value set there has to reach the
+/// tool that truncates. The thresholds asserted below are far tighter than
+/// [`zuno_tool::OutputLimits::default`] (2000 lines, 51200 bytes), so two lines of
+/// output can only be refused when [`tool_runtime::assemble`] read the config block:
+/// drop the wiring and the command succeeds instead.
+#[cfg(unix)]
+#[tokio::test]
+async fn production_registry_wires_configured_output_limits_into_the_shell_tool() {
+    use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
+
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let config = zuno_config::schema::Config {
+        shell: Some("/bin/sh".to_owned()),
+        tool_output: Some(zuno_config::schema::ToolOutputConfig {
+            max_lines: std::num::NonZeroU32::new(1),
+            max_bytes: std::num::NonZeroU32::new(4096),
+        }),
+        ..Default::default()
+    };
+    let selected_agent = agent_profile(agent("build"), directory.path(), &config);
+    let runtime = tool_runtime::assemble(
+        directory.path(),
+        None,
+        &Env::empty(),
+        &config,
+        &selected_agent,
+        tool_runtime::ToolSelection {
+            provider_id: "provider",
+            model_id: "model",
+            manifest: Arc::new(zuno_harness::ToolManifest::standard()),
+            contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
+            question: None,
+            interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
+            background_executions: test_background_executions(directory.path()),
+            sandbox: test_sandbox(),
+            todo_store: Arc::new(
+                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
+            ),
+            work_observer: test_work_observer(),
+            goal_store: Arc::new(
+                GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
+            ),
+            mcp_loader: None,
+            skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            skill_catalog: None,
+            capability: test_capability(),
+            delegation: test_delegation(),
+            product_agents: test_product_agents(),
+            workflows: test_workflows(),
+            councils: test_councils(),
+            job_controller: test_job_controller(),
+            memory: None,
+            experience_search: None,
+            tool_authority: None,
+        },
+    )
+    .expect("production registry assembles");
+    let shell = runtime
+        .tools
+        .iter()
+        .find(|tool| tool.id() == "shell")
+        .expect("the build profile exposes the shell tool");
+
+    let refused = shell
+        .invoke(
+            serde_json::json!({"command": "printf 'one\\ntwo\\n'"}),
+            ToolContext::new(
+                "ses_tool_output",
+                "msg_tool_output",
+                "call_tool_output",
+                "build",
+                Arc::new(AllowAll),
+                Arc::new(NeverInterrupted),
+            ),
+        )
+        .await
+        .expect_err("two lines exceed the configured one-line ceiling");
+    let zuno_error::ToolError::Failed { source, .. } = refused else {
+        panic!("an oversized-output refusal is a terminal tool failure");
+    };
+    let message = source.to_string();
+    assert!(
+        message.contains("exceeds the configured limit of 4096 bytes or 1 lines"),
+        "the refusal did not report the configured thresholds; message: {message}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn explicit_full_access_uses_the_native_backend_and_retains_managed_lifecycle_metadata() {

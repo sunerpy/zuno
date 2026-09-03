@@ -550,9 +550,7 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             )
             .map_err(|error| error.to_string())?,
         );
-        let server_config = ServerConfig::default()
-            .with_hostname(&args.hostname)
-            .with_port(args.port)
+        let server_config = listen_config(args, harness_config.server.as_ref())?
             .with_auth(auth)
             .with_default_directory(&directory);
         let server_config = if args.browser_auth {
@@ -617,6 +615,52 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
     })
 }
 
+/// Resolve the bind address from the flags, then `server`, then the built-in defaults.
+///
+/// Precedence is flag, configuration, default. The flag wins because a scripted
+/// invocation is the more specific instruction, and configuration wins over the
+/// default because `server.port` and `server.hostname` are published keys: before this
+/// resolution existed, both `ServeArgs` fields carried clap defaults, so an explicit
+/// `--port 0` and an absent flag were indistinguishable and the configured value could
+/// never be reached. The built-in values stay in
+/// [`zuno_server::ServerConfig::default`] rather than being restated here.
+///
+/// # Errors
+///
+/// `server.port` is a [`std::num::NonZeroU32`] in the schema but a TCP port is 16 bits
+/// wide, so a configured value above 65535 is reported as a configuration error rather
+/// than truncated into a port the user never asked for.
+fn listen_config(
+    args: &ServeArgs,
+    config: Option<&zuno_config::schema::ServerConfig>,
+) -> Result<ServerConfig, String> {
+    let hostname = args
+        .hostname
+        .as_deref()
+        .or_else(|| config.and_then(|server| server.hostname.as_deref()));
+    let port = match args.port {
+        Some(port) => Some(port),
+        None => config
+            .and_then(|server| server.port)
+            .map(|port| {
+                u16::try_from(port.get()).map_err(|_| {
+                    format!(
+                        "invalid server configuration: `server.port` is {port}, above the maximum TCP port 65535"
+                    )
+                })
+            })
+            .transpose()?,
+    };
+    let mut listen = ServerConfig::default();
+    if let Some(hostname) = hostname {
+        listen = listen.with_hostname(hostname);
+    }
+    if let Some(port) = port {
+        listen = listen.with_port(port);
+    }
+    Ok(listen)
+}
+
 fn server_readiness_message(address: std::net::SocketAddr) -> String {
     format!("Zuno server listening on http://{address}")
 }
@@ -629,8 +673,99 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        PendingExtensionReservation, reserve_pending_extension_transition, server_readiness_message,
+        PendingExtensionReservation, listen_config, reserve_pending_extension_transition,
+        server_readiness_message,
     };
+    use crate::command::ServeArgs;
+
+    fn serve_args(port: Option<u16>, hostname: Option<&str>) -> ServeArgs {
+        ServeArgs {
+            port,
+            hostname: hostname.map(str::to_owned),
+            mdns: false,
+            mdns_domain: "zuno.local".to_owned(),
+            cors: Vec::new(),
+            browser_auth: false,
+        }
+    }
+
+    fn server_section(
+        port: Option<u32>,
+        hostname: Option<&str>,
+    ) -> zuno_config::schema::ServerConfig {
+        zuno_config::schema::ServerConfig {
+            port: port.and_then(std::num::NonZeroU32::new),
+            hostname: hostname.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    /// `server.port` and `server.hostname` are published keys, so an absent flag has to
+    /// land on the configured value and not on the built-in default.
+    #[test]
+    fn configured_server_address_is_used_when_the_flags_are_absent() {
+        let configured = server_section(Some(7331), Some("localhost"));
+
+        let listen = listen_config(&serve_args(None, None), Some(&configured))
+            .expect("an in-range configured port resolves");
+
+        assert_eq!(listen.port(), 7331);
+        assert_eq!(listen.hostname(), "localhost");
+    }
+
+    #[test]
+    fn serve_flags_win_over_configured_server_address() {
+        let configured = server_section(Some(7331), Some("localhost"));
+
+        let listen = listen_config(
+            &serve_args(Some(4096), Some("127.0.0.1")),
+            Some(&configured),
+        )
+        .expect("explicit flags resolve");
+
+        assert_eq!(listen.port(), 4096);
+        assert_eq!(listen.hostname(), "127.0.0.1");
+    }
+
+    /// An explicit `--port 0` still means "ask the kernel", which is the case a clap
+    /// `default_value_t = 0` made unrepresentable.
+    #[test]
+    fn an_explicit_zero_port_flag_overrides_the_configured_port() {
+        let configured = server_section(Some(7331), None);
+
+        let listen = listen_config(&serve_args(Some(0), None), Some(&configured))
+            .expect("an ephemeral port request resolves");
+
+        assert_eq!(listen.port(), 0);
+    }
+
+    #[test]
+    fn absent_flags_and_absent_configuration_keep_the_built_in_defaults() {
+        let listen = listen_config(&serve_args(None, None), None).expect("the defaults resolve");
+
+        assert_eq!(listen.port(), 0);
+        assert_eq!(listen.hostname(), "127.0.0.1");
+        assert_eq!(listen.port(), zuno_server::ServerConfig::default().port());
+        assert_eq!(
+            listen.hostname(),
+            zuno_server::ServerConfig::default().hostname()
+        );
+    }
+
+    /// A TCP port is 16 bits and the schema field is a `NonZeroU32`, so the out-of-range
+    /// value is named rather than truncated into a port nobody asked for.
+    #[test]
+    fn a_configured_port_above_the_tcp_range_is_refused_by_name() {
+        let configured = server_section(Some(70_000), None);
+
+        let error = listen_config(&serve_args(None, None), Some(&configured))
+            .expect_err("70000 is not a TCP port");
+
+        assert!(
+            error.contains("`server.port` is 70000") && error.contains("65535"),
+            "the refusal must name the key and the ceiling: {error}"
+        );
+    }
 
     #[test]
     fn readiness_message_presents_zunos_identity() {
