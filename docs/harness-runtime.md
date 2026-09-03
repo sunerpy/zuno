@@ -1404,6 +1404,48 @@ queue instead of steering the in-flight model generation.
 
 Every value is validated in `1..=64`.
 
+## File tool path authority
+
+`read`, `write`, `edit`, and `apply_patch` resolve a path once, at authorization, and
+then operate through the directory handles that resolution retained. Resolution
+descends from the authorization boundary — the workspace root, or an explicitly
+granted external directory — one segment at a time, opens each segment without
+following symlinks and requires it to be a directory, and never resolves the name a
+second time. The property is exact: the call reaches the directory object the user
+approved, or it fails. A symlink as the final component is the one deliberate
+exception. It is followed once, before authorization, so the user approves the
+destination, and the link itself survives the write.
+
+Two weaker repairs were rejected. Refusing to follow the final component alone does
+nothing, because the substituted object is an intermediate directory. Re-canonicalizing
+after authorization is still a check followed by a separate use, so the window only
+moves.
+
+The mechanism is per-platform, and the guarantees are not equal:
+
+| Target | Mechanism | Window |
+| --- | --- | --- |
+| Linux | Each segment opened through `/proc/self/fd/{fd}/{segment}`, which the kernel resolves relative to the pinned descriptor | Closed |
+| macOS | `root/relative` opened with `O_NOFOLLOW_ANY`, plus a file-identity re-check before publishing | Narrowed: `rename` cannot carry the flag |
+| Windows | Segment walk with `FILE_FLAG_OPEN_REPARSE_POINT`, refusing any component carrying `FILE_ATTRIBUTE_REPARSE_POINT`, plus a volume-serial and file-index re-check before publishing | Narrowed |
+| Other targets | The same segment walk with a `symlink_metadata` refusal and the same pre-publish re-check | Narrowed |
+
+Only Linux closes the window completely, because only Linux offers a way to name a
+path relative to an open descriptor without first-party `unsafe`, which this workspace
+forbids. `openat2`, `renameat`, and `GetFinalPathNameByHandleW` are therefore not used.
+Refusing a reparse point per component covers Windows directory junctions as well as
+symlinks, which matters because a junction is the commoner attack shape there.
+
+Publication distinguishes two failures, because they do not deserve the same receipt.
+A failure before the rename that makes new content visible leaves the destination
+holding exactly its previous bytes and is reported as an ordinary tool failure. A
+rename that fails after partially completing, or whose result is lost, is reported as
+`Uncertain` carrying the paths already applied. That outcome is not retryable and is
+never replayed: it requires authoritative-state inspection, which is the same rule the
+snapshot store follows for a half-applied restore. A replacement whose destination is a
+symlink also refuses a chain longer than 40 links rather than following it, because at
+that length the chain is a loop rather than a deliberate redirection.
+
 ## Native search and shell isolation
 
 `glob` and `grep` use the official `rg` executable as their only search engine.
@@ -1413,6 +1455,15 @@ ripgrep-compatible walker. Discovery is lazy, so unrelated commands and tools do
 not require ripgrep. When either search tool is invoked, `rg` major version 14 or
 newer must be available on `PATH` (or packaged beside Zuno by a distributor);
 missing or unsupported ripgrep is a typed tool error, never a silent fallback.
+
+Discovery is cached, but not symmetrically. A successful resolution is kept for the
+process lifetime, so session remounts and child turns do not spawn `rg --version`
+repeatedly. A failure is kept for five seconds and then re-probed. The asymmetry is
+deliberate: ripgrep backs only `glob` and `grep`, so a user who installs it during a
+session has to get those tools working without restarting Zuno, while a model looping
+on `grep` with nothing installed must not spawn one probe per call. Concurrent first
+callers make a single probe between them, and a probe that panics does not make
+ripgrep permanently unavailable.
 
 The Shell tool is admitted through tree-sitter command analysis, the deterministic
 destructive-command gate, and permission checks, then compiled by the selected

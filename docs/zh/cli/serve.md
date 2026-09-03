@@ -8,6 +8,9 @@
 
 `ZUNO_SERVER_PASSWORD` 启用 HTTP Basic Auth；`ZUNO_SERVER_USERNAME` 默认是 `zuno`。没有非空密码时，只要 hostname 解析结果中包含非回环地址，Zuno 就拒绝监听。
 
+这两个变量都不会交给 `shell` 工具，因此模型组装出来的命令读不到保护这个监听器的凭据。
+参见[工具](/zh/guide/tools#一条-shell-命令继承什么)。
+
 `--browser-auth` 是为本地浏览器显式启用的独立模式。即使同时配置了 Basic Auth，也只有全部解析地址都是回环时才接受。启动时会打印一个含 256-bit 单次 token 的 bootstrap URI；交换成功后设置 30 天有效、绑定 authority 的签名 `HttpOnly; SameSite=Strict; Path=/` Cookie，并 303 跳转到 `/health`。访问日志看不到 token query。Basic 凭据或浏览器 Cookie 任一有效即可授权；使用 Cookie 的非安全方法还必须携带与当前 authority 完全匹配的 `Origin`。
 
 ## 用法

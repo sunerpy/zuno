@@ -33,6 +33,10 @@ tmp        /tmp/zuno
 
 上面的路径来自一台真实宿主，所以你的会不同。它们遵循 XDG 变量：`config` 是 `$XDG_CONFIG_HOME/zuno`，`data` 是 `$XDG_DATA_HOME/zuno`，`cache` 是 `$XDG_CACHE_HOME/zuno`。
 
+临时根目录依次取 `TMPDIR`、`TMP`、`TEMP`。在 Windows 上，最后的回退是
+`%SystemRoot%\temp` 而不是 `/tmp`：POSIX 默认值在那里会相对「当前是哪个盘」解析，
+从而把临时目录树放到那个盘的根下。
+
 ## 层级顺序
 
 优先级最低的在前：

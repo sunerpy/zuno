@@ -37,6 +37,11 @@ The paths above come from one real host, so yours will differ. They follow the X
 variables: `config` is `$XDG_CONFIG_HOME/zuno`, `data` is `$XDG_DATA_HOME/zuno`, and `cache`
 is `$XDG_CACHE_HOME/zuno`.
 
+The temporary root follows `TMPDIR`, then `TMP`, then `TEMP`. On Windows the
+last-resort fallback is `%SystemRoot%\temp` rather than `/tmp`, because a POSIX
+default there resolves against whichever drive happens to be current and would put
+the temporary tree at that drive's root.
+
 ## Layer order
 
 Lowest precedence first:

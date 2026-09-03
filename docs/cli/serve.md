@@ -11,6 +11,10 @@ separate `zuno-server` executable and does not duplicate listener behavior.
 `ZUNO_SERVER_USERNAME` defaults to `zuno`. Without a non-empty password, Zuno
 refuses a hostname that resolves to any non-loopback address.
 
+Both variables are withheld from the `shell` tool, so a command the model composes
+cannot read the credential that protects this listener. See
+[Tools](/guide/tools#what-a-shell-command-inherits).
+
 `--browser-auth` is a separate explicit opt-in for local browser use. It is
 accepted only when every resolved listener address is loopback, even if Basic
 Auth is also configured. Startup prints one bootstrap URI containing a

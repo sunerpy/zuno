@@ -177,6 +177,35 @@ A stored receipt is addressed by an id that appears in the tool result as
 `[verification rcp_…]`. That id, not a recollection of the transcript, is what
 satisfies a Goal completion criterion that requires evidence.
 
+## What a shell command inherits
+
+A `shell` call runs with the host environment the Zuno process itself has, minus
+Zuno's own secrets. Three variables are removed before the command is assembled:
+
+| Variable | What it holds |
+| --- | --- |
+| `ZUNO_AUTH_CONTENT` | Injected provider credentials, replacing the credential store |
+| `ZUNO_SERVER_PASSWORD` | The HTTP server's Basic authentication password |
+| `ZUNO_SERVER_USERNAME` | The account name that password belongs to |
+
+Names are compared case-insensitively, because Windows environment variable names
+are. Removal happens before any host-supplied environment hook, so the host stays
+the single place that decides what a model-composed command may read, and nothing
+in the shipped configuration puts these three back.
+
+Everything else is inherited on purpose. A wildcard filter over `*_API_KEY` and
+`*_TOKEN` was considered and rejected: it silently breaks `gh`, `aws`, `az`, and
+`gcloud`, along with every user who exports a token because a command needs it. A
+tool that quietly removes the credential a command requires fails worse than one
+that keeps it, because the removal surfaces later as an unexplained authentication
+error somewhere else.
+
+One consequence is worth stating plainly. A nested `zuno` launched from inside a
+`shell` call no longer inherits `ZUNO_AUTH_CONTENT`, so it resolves credentials the
+ordinary way and needs its own configuration or credential store. The interactive
+terminal is unaffected, because its shell is driven by you rather than composed by
+a model.
+
 ## Effect classification
 
 Every invocation classifies as one of four effects, and the default is the strict one:

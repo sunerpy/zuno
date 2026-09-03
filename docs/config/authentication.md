@@ -96,6 +96,13 @@ containers, CI, a secret manager that injects at start. When credentials come fr
 that variable, Zuno does not persist rotated OAuth tokens back to disk, because
 there is no file it owns.
 
+The variable is withheld from the `shell` tool, so a command the model composes
+cannot read the injected credentials. A nested `zuno` started from inside such a
+command therefore does not inherit them and resolves credentials the ordinary way,
+which means it needs its own credential store or configuration. Plan for that in a
+container that supplies credentials only through the environment. See
+[Tools](/guide/tools#what-a-shell-command-inherits).
+
 Putting `apiKey` directly in `zuno.json` is supported but exposes a secret to
 configuration backups and source control. Prefer the credential store or an injected
 `ZUNO_AUTH_CONTENT`. If you do use `options.apiKey`, keep it out of any layer that

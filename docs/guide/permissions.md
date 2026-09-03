@@ -297,6 +297,50 @@ way to confirm the guarantees above rather than take them on trust:
 }
 ```
 
+## What an authorized path guarantees
+
+Approving `write`, `edit`, `apply_patch`, or `read` for a path authorizes a
+filesystem object, not a string. Resolution starts at the authorization boundary —
+the workspace root, or the external directory you granted — and descends one segment
+at a time, holding an open handle to each directory and refusing every symlink it
+meets. The operation is then performed through the handle it kept, rather than by
+name from the filesystem root.
+
+The guarantee that buys is exact: the call reaches the directory object you
+approved, or it fails. Replacing an ancestor directory with a symlink after you
+approve cannot redirect the bytes, because the name is never resolved a second time.
+Renaming the authorized directory still only reaches the object you approved.
+Deleting it produces a failure, since a deleted directory accepts no new entries.
+
+A symlink as the final component is different, and it is followed deliberately,
+exactly once, before you are asked. You therefore authorize the file the link names
+rather than the link itself. A link that stays inside the workspace needs only the
+ordinary `edit` prompt. A link pointing outside it requires an `external_directory`
+grant naming the destination's directory, not the link's. The link itself always
+survives the write.
+
+An `external_directory` grant has one spelling everywhere. The pattern is the
+directory with `/*` appended, forward-slashed, with Windows' verbatim `\\?\` prefix
+dropped — `C:/build-cache/*`, never `\\?\C:\build-cache\*`. One standing grant
+therefore covers the shell tool and the file and search tools together, where each
+previously asked under a spelling the others could not match.
+
+Windows protection used to be absent rather than merely weaker, so upgrading changes
+what the risk gate refuses there. The gate read only `HOME`, which neither `cmd` nor
+PowerShell sets, so every home, profile, and credential rule switched itself off:
+`rm -rf ~/.ssh` and `rm -rf $HOME` were a confirmation prompt rather than a permanent
+refusal, and ran outright under `allow_all`. The home directory now falls back to the
+platform's own answer, with `HOME` still taking precedence where it is set, and
+`%USERPROFILE%` and `$env:USERPROFILE` expand. The verbatim `\\?\` and device `\\.\`
+root spellings and UNC share roots are matched as well, drive-letter and
+case-insensitively.
+
+The hard refusals for system locations also apply to absolutely spelled
+targets under PowerShell as well as Bash. Escaping is read from the shell's own
+syntax, so `C:\Users\you\.ssh` is no longer reduced to `C:Usersyou.ssh` on its way
+into the risk tables, and an absolute program path such as
+`C:\Windows\System32\rm.exe` reaches the destructive-command table it belongs in.
+
 ## How the two interact
 
 A few combinations are worth being explicit about, because guessing wrong about

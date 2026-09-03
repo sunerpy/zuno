@@ -178,7 +178,7 @@ zuno
 
 | 现象 | 原因 | 修复 |
 | --- | --- | --- |
-| `rg` 缺失或版本过旧 | `glob` / `grep` 后端不可用 | 安装 ripgrep 14 或更新版本；Zuno 启动和无关核心功能仍可使用 |
+| `rg` 缺失或版本过旧 | `glob` / `grep` 后端不可用 | 安装 ripgrep 14 或更新版本；Zuno 启动和无关核心功能仍可使用，且正在运行的会话会在五秒内识别到新装的版本，无需重启 |
 | `no trusted system bubblewrap executable was found` | 没有约束后端 | 安装 bubblewrap 0.8.0 或更新版本、显式使用 `danger-full-access`，或为具备写能力的 Agent 启用受信的不可用降级 |
 | `OS sandbox is not implemented for platform` | 在 macOS 或 Windows 上使用受约束模式 | 显式使用 `danger-full-access`、为具备写能力的 Agent 启用受信的 `run-unconfined` 降级，或在 Linux 上运行 |
 | 校验错误指出某个被拒绝的顶层键 | 仅 TUI 使用的键（如 `theme`）写进了 `zuno.json` | 把它移到 `tui.json`。参见[配置文件与优先级](/zh/config/files) |

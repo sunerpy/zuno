@@ -221,6 +221,10 @@ Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程�
 
 `permission.rules` 是有序的，**最后一条匹配的规则胜出**。规则要么是对整个工具的一个动作，要么是按模式匹配的多个动作。因此 catch-all `*` 要写在最前面，从它当中划出例外的窄模式要写在最后面。`edit` 这个键同时管 `write`、`edit` 和 `apply_patch` 三个工具；不存在单独的 `write` 规则键。
 
+按目录授予的 `external_directory` 规则写成「目录加 `/*`」，使用正斜杠，去掉 Windows 的逐字
+`\\?\` 前缀，例如 `{"external_directory": {"C:/build-cache/*": "allow"}}`。所有工具都按
+这一种拼法发起请求，因此一条规则同时覆盖 shell 工具与文件、搜索工具。
+
 需要注意 `allow_all` **不会**做什么：它不关闭沙箱，也不覆盖写着 `deny` 的规则。显式拒绝在任何模式下都是终局的，包括这一个。
 
 完整说明与两个门禁如何交互见 [权限与沙箱](/zh/guide/permissions)。

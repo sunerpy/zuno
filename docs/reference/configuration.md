@@ -659,6 +659,12 @@ the shell and its external-path escalation:
 }
 ```
 
+A per-directory `external_directory` rule is written as the directory with `/*`
+appended, forward-slashed, without Windows' verbatim `\\?\` prefix, as in
+`{"external_directory": {"C:/build-cache/*": "allow"}}`. Every tool asks under that
+one spelling, so a single rule covers the shell tool and the file and search tools
+together.
+
 An explicit `deny` still wins in every mode. `allow_all` suppresses every Zuno
 tool-approval prompt, including confirmable Shell-risk requests; it does not
 bypass sandboxing, argument validation, explicit denies, or catastrophic Shell
@@ -781,7 +787,9 @@ trigger fallback. A read-only Agent never runs unconfined.
 Relative paths resolve from the active workspace. `writableRoots` entries must
 already be directories and are considered only in `workspace-write`.
 `protectedPaths` must exist, may not be symbolic links, and are reapplied
-read-only after writable mounts. Zuno protects existing `.git`, `.zuno`,
+read-only after writable mounts. A missing entry is not ignored: deployment
+fails closed rather than starting an Agent whose protection was silently
+dropped. Zuno protects existing `.git`, `.zuno`,
 `.agents`, resolved external Git metadata, and its sandbox helper; configuration
 can add protections but cannot disable confinement.
 

@@ -195,7 +195,7 @@ zuno
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `rg` is missing or too old | `glob` / `grep` backend is unavailable | Install ripgrep 14 or newer; Zuno startup and unrelated core features remain usable |
+| `rg` is missing or too old | `glob` / `grep` backend is unavailable | Install ripgrep 14 or newer; Zuno startup and unrelated core features remain usable, and the running session picks the new install up within five seconds without a restart |
 | `no trusted system bubblewrap executable was found` | No confinement backend | Install bubblewrap 0.8.0 or newer, use explicit `danger-full-access`, or enable trusted unavailable fallback for a write-capable Agent |
 | `OS sandbox is not implemented for platform` | Confined mode on macOS or Windows | Use explicit `danger-full-access`, trusted `run-unconfined` fallback for a write-capable Agent, or run on Linux |
 | A validation error naming a rejected top-level key | TUI-only key such as `theme` in `zuno.json` | Move it to `tui.json`. See [Files and precedence](/config/files) |
