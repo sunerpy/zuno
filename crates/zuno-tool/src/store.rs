@@ -28,7 +28,7 @@
 use crate::output::line_count;
 use std::path::{Path, PathBuf};
 use zuno_error::ToolError;
-use zuno_paths::Layout;
+use zuno_paths::{GeneratedDirectory, Layout};
 
 /// The filename prefix the oracle's cleanup requires. `tool-output-store.ts:180`.
 pub const FILE_PREFIX: &str = "tool_";
@@ -52,14 +52,53 @@ pub struct StoredOutput {
 /// [`ToolOutputStore::persist`] in `spawn_blocking`.
 #[derive(Debug, Clone)]
 pub struct ToolOutputStore {
-    root: PathBuf,
+    root: Root,
+}
+
+/// Which kind of directory a store writes into.
+///
+/// The distinction is not cosmetic: a store inside a checkout is generated project
+/// state that must never reach a commit, and the only reliable moment to say so is the
+/// call that creates the directory. A store under the shared data layout is outside
+/// every repository and has nothing to exclude itself from.
+#[derive(Debug, Clone)]
+enum Root {
+    /// A directory named outright by the caller.
+    Plain(PathBuf),
+    /// `<worktree>/.zuno/tool-output/`, which excludes itself as it is created.
+    Generated(GeneratedDirectory),
+}
+
+impl Root {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Plain(path) => path,
+            Self::Generated(directory) => directory.path(),
+        }
+    }
+
+    fn ensure(&self) -> Result<&Path, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        match self {
+            Self::Plain(path) => {
+                std::fs::create_dir_all(path)?;
+                Ok(path)
+            }
+            Self::Generated(directory) => Ok(directory.ensure()?),
+        }
+    }
 }
 
 impl ToolOutputStore {
     /// A store rooted at an explicit directory. Created on first write.
+    ///
+    /// For a directory outside every checkout. Inside one, use
+    /// [`ToolOutputStore::in_worktree`], which excludes the directory from git as it
+    /// creates it.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: Root::Plain(root.into()),
+        }
     }
 
     /// A store at `data()/tool-output`, the directory the oracle uses.
@@ -68,10 +107,26 @@ impl ToolOutputStore {
         Self::new(layout.tool_output())
     }
 
+    /// A store at `<worktree>/.zuno/tool-output/`, excluded from git on creation.
+    ///
+    /// `worktree` is the root of the checkout, which the caller resolves with
+    /// [`zuno_paths::generated_root`]; joining the project directory onto a session's
+    /// own working directory instead puts the store somewhere no exclude pattern
+    /// covers.
+    #[must_use]
+    pub fn in_worktree(worktree: &Path) -> Self {
+        Self {
+            root: Root::Generated(GeneratedDirectory::in_worktree(
+                worktree,
+                &zuno_paths::generated::TOOL_OUTPUT,
+            )),
+        }
+    }
+
     /// The directory holding persisted output.
     #[must_use]
     pub fn root(&self) -> &Path {
-        &self.root
+        self.root.path()
     }
 
     /// Writes `text` in full and returns where it went.
@@ -90,8 +145,11 @@ impl ToolOutputStore {
             source: Box::new(error),
         };
 
-        std::fs::create_dir_all(&self.root).map_err(failed)?;
-        let path = self.root.join(file_name(session_id));
+        let root = self.root.ensure().map_err(|source| ToolError::Failed {
+            tool: tool.to_owned(),
+            source,
+        })?;
+        let path = root.join(file_name(session_id));
 
         use std::io::Write as _;
         let mut file = std::fs::OpenOptions::new()
@@ -123,7 +181,7 @@ impl ToolOutputStore {
     /// creation time. Entries that do not carry the prefix are ignored, matching the
     /// oracle's cleanup filter.
     pub fn entries(&self, tool: &str) -> Result<Vec<PathBuf>, ToolError> {
-        let read = match std::fs::read_dir(&self.root) {
+        let read = match std::fs::read_dir(self.root()) {
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
@@ -325,5 +383,54 @@ mod tests {
 
         assert_eq!(error.tool(), "shell");
         assert!(matches!(error, ToolError::Failed { .. }));
+    }
+
+    #[test]
+    fn a_store_in_a_worktree_lives_under_the_project_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = ToolOutputStore::in_worktree(dir.path());
+
+        assert_eq!(
+            store.root(),
+            dir.path()
+                .join(zuno_paths::PROJECT_DIRECTORY)
+                .join("tool-output"),
+            "the store must sit where the exclude patterns are anchored"
+        );
+    }
+
+    #[test]
+    fn output_persisted_in_a_worktree_is_hidden_from_git_by_the_directory_itself() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = ToolOutputStore::in_worktree(dir.path());
+
+        let stored = store.persist("shell", "ses_abc", "hi").expect("persist");
+
+        let marker = store.root().join(zuno_paths::SELF_EXCLUDE_FILE);
+        assert!(
+            marker.is_file(),
+            "the write that created the directory must have excluded it"
+        );
+        assert!(
+            std::fs::read_to_string(&marker)
+                .expect("read marker")
+                .lines()
+                .any(|line| line == "*"),
+            "the exclusion has to cover every entry, including the persisted output"
+        );
+        assert!(stored.path.starts_with(store.root()));
+    }
+
+    #[test]
+    fn a_store_named_outright_is_not_excluded_from_anything() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = ToolOutputStore::new(dir.path().join("data"));
+
+        store.persist("shell", "ses_abc", "hi").expect("persist");
+
+        assert!(
+            !store.root().join(zuno_paths::SELF_EXCLUDE_FILE).exists(),
+            "the shared data layout is outside every repository"
+        );
     }
 }

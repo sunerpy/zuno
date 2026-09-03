@@ -270,6 +270,99 @@ async fn shell_reads_the_worktree_when_a_commit_stages_tracked_changes_itself() 
     );
 }
 
+/// Generated state is rooted at the worktree and hidden by the directory itself.
+///
+/// A session started in a subdirectory used to write `sub/.zuno/tool-output/`, which is
+/// neither covered by the repository-private exclude block — anchored at the worktree
+/// root — nor recognised by `classify`, so `git add -A` collected it and the delivery
+/// check did not object. Two things have to hold at once: the directory lands at the
+/// root, and it excludes itself as it is created, with no exclude block written here at
+/// all.
+#[cfg(unix)]
+#[tokio::test]
+async fn generated_state_from_a_session_in_a_subdirectory_is_rooted_and_hidden() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    initialize_git_repository(workspace.path());
+    let root = workspace
+        .path()
+        .canonicalize()
+        .expect("canonical workspace");
+    let session = root.join("sub");
+    std::fs::create_dir(&session).expect("session subdirectory");
+    let tool = support::sandbox::shell_tool(&session).with_output_limits(OutputLimits {
+        max_lines: 1,
+        max_bytes: 4,
+    });
+
+    let output = tool
+        .execute(
+            json!({
+                "command": "printf 'one\\ntwo\\n'",
+                ACCEPT_LARGE_OUTPUT_KEY: true,
+            }),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect("the command runs");
+
+    let paths = output.output_paths();
+    let stored = std::path::Path::new(paths.first().expect("stored output path"));
+    assert!(
+        stored.starts_with(root.join(".zuno").join("tool-output")),
+        "{}",
+        stored.display()
+    );
+    assert!(
+        !session.join(".zuno").exists(),
+        "the session's own directory is not where generated state goes"
+    );
+    for name in [".zuno/tool-output", ".zuno/background"] {
+        let marker = root.join(name).join(".gitignore");
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .unwrap_or_else(|error| panic!("{}: {error}", marker.display()))
+                .lines()
+                .filter(|line| !line.starts_with('#') && !line.is_empty())
+                .collect::<Vec<_>>(),
+            vec!["*"],
+            "{name} must exclude everything it holds"
+        );
+    }
+    assert_eq!(
+        git(&root, &["status", "--porcelain"]),
+        "",
+        "nothing wrote an exclude block here: the directories hide themselves"
+    );
+}
+
+/// The exclusion is republished on every start, because the service recreates its root.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_deleted_background_directory_comes_back_excluded() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    initialize_git_repository(workspace.path());
+    let root = workspace
+        .path()
+        .canonicalize()
+        .expect("canonical workspace");
+    let tool = support::sandbox::shell_tool(&root);
+    tool.run(params("true"), context(Arc::new(NeverInterrupted)))
+        .await
+        .expect("the first command runs");
+    let background = root.join(".zuno").join("background");
+    std::fs::remove_dir_all(&background).expect("a person cleaning up");
+
+    tool.run(params("true"), context(Arc::new(NeverInterrupted)))
+        .await
+        .expect("the second command runs");
+
+    assert!(
+        background.join(".gitignore").is_file(),
+        "the recreated directory must be excluded again"
+    );
+    assert_eq!(git(&root, &["status", "--porcelain"]), "");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn shell_history_rewrite_requires_the_fresh_approved_head() {

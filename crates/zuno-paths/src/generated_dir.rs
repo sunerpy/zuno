@@ -71,6 +71,21 @@ pub const SELF_EXCLUDE_CONTENT: &str = "\
 /// The filename git reads a directory's own exclusions from.
 pub const SELF_EXCLUDE_FILE: &str = ".gitignore";
 
+/// Where Zuno's generated directories go for a session working in `directory`.
+///
+/// The root of the worktree containing `directory`, or `directory` itself when it is in
+/// no repository. A caller resolving more than one generated directory should call this
+/// once and use [`GeneratedDirectory::in_worktree`], because resolving spawns git.
+///
+/// This exists so the fallback is written once. A writer that joined the project
+/// directory onto a session's own working directory produced `<worktree>/sub/.zuno/…`,
+/// which no exclude pattern covers, and every one of the writers had its own copy of
+/// that join.
+#[must_use]
+pub fn generated_root(directory: &Path) -> PathBuf {
+    worktree_root(directory).unwrap_or_else(|| directory.to_path_buf())
+}
+
 /// One of Zuno's generated directories, rooted at the worktree that owns it.
 ///
 /// Constructed cheaply and created lazily: nothing touches the filesystem until
@@ -86,7 +101,7 @@ impl GeneratedDirectory {
     /// The directory for `generated` in the worktree containing `directory`.
     ///
     /// `directory` is a session's working directory, anywhere inside the checkout. The
-    /// root comes from [`worktree_root`], which resolves it exactly as
+    /// root comes from [`generated_root`], which resolves it exactly as
     /// [`crate::project::resolve_project`] does — including rejecting a `.git` that git
     /// itself rejects. It spawns git, so resolve when a service is opened rather than
     /// per write. A `directory` in no repository keeps its own place: there is no
@@ -94,8 +109,7 @@ impl GeneratedDirectory {
     /// somewhere to write.
     #[must_use]
     pub fn resolve(directory: &Path, generated: &'static GeneratedPath) -> Self {
-        let root = worktree_root(directory).unwrap_or_else(|| directory.to_path_buf());
-        Self::in_worktree(&root, generated)
+        Self::in_worktree(&generated_root(directory), generated)
     }
 
     /// The directory for `generated` in `worktree`, for a caller that already resolved
@@ -106,6 +120,30 @@ impl GeneratedDirectory {
             .segments()
             .fold(worktree.to_path_buf(), |path, segment| path.join(segment));
         Self { path, generated }
+    }
+
+    /// The generated directory `path` already names, if it names one.
+    ///
+    /// For a caller that is handed a directory instead of resolving one: a service the
+    /// process opened elsewhere, whose root this then keeps excluded. `path` has to end
+    /// in `generated`'s own segments, so a root that is not that generated directory —
+    /// a temporary directory in a test, a location a deployment chose — reports `None`
+    /// and is left untouched. That check is what keeps a claimed directory from
+    /// becoming a second, unchecked spelling of where generated state lives.
+    #[must_use]
+    pub fn claim(path: &Path, generated: &'static GeneratedPath) -> Option<Self> {
+        let expected: Vec<&str> = generated.segments().collect();
+        let mut actual = path.components().rev();
+        for segment in expected.iter().rev() {
+            let component = actual.next()?;
+            if component.as_os_str() != std::ffi::OsStr::new(segment) {
+                return None;
+            }
+        }
+        Some(Self {
+            path: path.to_path_buf(),
+            generated,
+        })
     }
 
     /// Where the directory is, whether or not it exists yet.
@@ -189,7 +227,7 @@ impl std::error::Error for GeneratedDirectoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generated::{GOAL_PROJECTION, TOOL_OUTPUT, is_generated};
+    use crate::generated::{BACKGROUND_EXECUTIONS, GOAL_PROJECTION, TOOL_OUTPUT, is_generated};
     use std::process::Command;
 
     fn git(cwd: &Path, args: &[&str]) -> Option<String> {
@@ -403,5 +441,46 @@ mod tests {
         assert!(error.path.starts_with(&blocked), "{}", error.path.display());
         assert!(error.to_string().contains("generated directory"), "{error}");
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn a_claimed_root_is_the_generated_directory_it_spells() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join(".zuno").join("background");
+
+        let claimed = GeneratedDirectory::claim(&path, &BACKGROUND_EXECUTIONS)
+            .expect("that path is the background directory");
+
+        assert_eq!(claimed.path(), path);
+        assert_eq!(claimed.generated(), &BACKGROUND_EXECUTIONS);
+        assert_eq!(
+            claimed,
+            GeneratedDirectory::in_worktree(root.path(), &BACKGROUND_EXECUTIONS),
+            "claiming and resolving have to agree or there are two spellings"
+        );
+    }
+
+    #[test]
+    fn a_root_that_is_not_the_generated_directory_is_not_claimed() {
+        let root = tempfile::tempdir().expect("tempdir");
+
+        assert_eq!(
+            GeneratedDirectory::claim(root.path(), &BACKGROUND_EXECUTIONS),
+            None,
+            "a directory a caller chose outright is not Zuno's to exclude"
+        );
+        assert_eq!(
+            GeneratedDirectory::claim(
+                &root.path().join(".zuno").join("goal"),
+                &BACKGROUND_EXECUTIONS,
+            ),
+            None,
+            "one generated directory must not be claimed as another"
+        );
+        assert_eq!(
+            GeneratedDirectory::claim(Path::new("background"), &BACKGROUND_EXECUTIONS),
+            None,
+            "the project directory has to be there too"
+        );
     }
 }

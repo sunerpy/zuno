@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tree_sitter::{Node, Parser};
 use zuno_error::ToolError;
+use zuno_paths::GeneratedDirectory;
 use zuno_process::GuardExit;
 use zuno_pty::{
     BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionPurpose,
@@ -340,6 +341,10 @@ pub struct ShellTool {
     output_limits: OutputLimits,
     hard_ceiling: Duration,
     background_executions: Arc<BackgroundExecutionService>,
+    /// The generated directory the background service writes into, when its root is
+    /// one. `None` for a service a caller rooted somewhere of its own choosing, which
+    /// is not Zuno's generated state and not Zuno's to exclude.
+    background_directory: Option<GeneratedDirectory>,
     sandbox: Arc<dyn SandboxBackend>,
     sandbox_policy: SandboxPolicy,
 }
@@ -371,18 +376,21 @@ impl ShellTool {
     ) -> io::Result<Self> {
         let workspace = workspace.canonicalize()?;
         let shell = zuno_pty::shells::command(configured)?;
-        let output_store = ToolOutputStore::new(
-            workspace
-                .join(zuno_paths::PROJECT_DIRECTORY)
-                .join(zuno_paths::TOOL_OUTPUT_DIRECTORY),
+        // Generated state is rooted at the worktree, because that is where the exclude
+        // patterns are anchored and where `classify` looks; joining the project
+        // directory onto a session's own directory put it somewhere nothing covered.
+        // Resolved once because it spawns git, and only these two roots move: the
+        // workspace itself still decides the sandbox boundary, the default working
+        // directory, and what a relative `workdir` resolves against.
+        let generated_root = zuno_paths::generated_root(&workspace);
+        let output_store = ToolOutputStore::in_worktree(&generated_root);
+        let background_directory = GeneratedDirectory::in_worktree(
+            &generated_root,
+            &zuno_paths::generated::BACKGROUND_EXECUTIONS,
         );
         let background_executions = Arc::new(
-            BackgroundExecutionService::open(
-                workspace
-                    .join(zuno_paths::PROJECT_DIRECTORY)
-                    .join(zuno_paths::BACKGROUND_DIRECTORY),
-            )
-            .map_err(io::Error::other)?,
+            BackgroundExecutionService::open(background_directory.path())
+                .map_err(io::Error::other)?,
         );
         Ok(Self {
             workspace,
@@ -392,6 +400,7 @@ impl ShellTool {
             output_limits: OutputLimits::default(),
             hard_ceiling: crate::timeout::DEFAULT_HARD_CEILING,
             background_executions,
+            background_directory: Some(background_directory),
             sandbox,
             sandbox_policy,
         })
@@ -421,8 +430,17 @@ impl ShellTool {
         self
     }
 
+    /// Uses a background service the process already owns, instead of the one this tool
+    /// opened.
+    ///
+    /// The exclusion follows the service, because the directory that must stay out of a
+    /// commit is the one the service actually creates.
     #[must_use]
     pub fn with_background_executions(mut self, service: Arc<BackgroundExecutionService>) -> Self {
+        self.background_directory = GeneratedDirectory::claim(
+            service.root(),
+            &zuno_paths::generated::BACKGROUND_EXECUTIONS,
+        );
         self.background_executions = service;
         self
     }
@@ -522,6 +540,12 @@ impl ShellTool {
             lifecycle,
             &authorization,
         )?;
+        if let Some(directory) = &self.background_directory {
+            // Republished on every start, not once when the service was opened: the
+            // service creates its root whenever it is missing, so a root deleted
+            // mid-session has to come back excluded rather than come back bare.
+            directory.ensure().map_err(failed)?;
+        }
         let (execution, mut lease) = self
             .background_executions
             .start_leased(input)

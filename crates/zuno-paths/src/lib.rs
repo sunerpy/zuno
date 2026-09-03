@@ -113,7 +113,9 @@ pub use crate::generated::{
     PROJECT_STATE_PATTERN, StagedGeneratedPath, USER_OWNED_ENTRIES, is_generated,
     refuse_generated_state,
 };
-pub use crate::generated_dir::{GeneratedDirectory, GeneratedDirectoryError};
+pub use crate::generated_dir::{
+    GeneratedDirectory, GeneratedDirectoryError, SELF_EXCLUDE_FILE, generated_root,
+};
 pub use crate::layout::{APP, DEBUG_PATHS_KEYS, Layout};
 pub use crate::project::{GLOBAL_PROJECT_ID, Repository, ResolvedProject, Vcs};
 
