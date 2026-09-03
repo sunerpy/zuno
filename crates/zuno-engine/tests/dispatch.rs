@@ -1439,9 +1439,18 @@ async fn dispatch_records_an_undecided_cooperative_cancellation_as_uncertain() {
         result.interruption,
         Some(zuno_engine::r#loop::ToolInterruption::Cooperative)
     );
-    assert_eq!(
-        result.output.output, "partial progress",
-        "what the tool preserved is what the model reads"
+    assert!(
+        result.output.output.starts_with("partial progress"),
+        "what the tool preserved is what the model reads first: {}",
+        result.output.output
+    );
+    assert!(
+        result
+            .output
+            .output
+            .contains("inspect authoritative state before retrying"),
+        "an undecided cancellation has to say so in the text the model is answered with: {}",
+        result.output.output
     );
     assert_eq!(
         result.output.metadata["interruption"]["mode"],

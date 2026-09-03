@@ -1040,9 +1040,11 @@ fn error_result(tool: &str, message: String) -> ToolDispatchResult {
 /// decided outcome, or it may have been stopped between starting a side effect and
 /// observing it, and only the tool can tell those apart — so when its settled output
 /// carries [`CANCELLATION_METADATA_KEY`] saying the outcome is undecided, the recorded
-/// interruption says `uncertain` too. A tool that attaches nothing keeps the previous
-/// reading, and [`ToolInterruption::Forced`] stays exactly as uncertain as it was: the
-/// grace period elapsed, so nothing was observed at all.
+/// interruption says `uncertain` too and the settled report the model reads gains the
+/// sentence that asks for authoritative state to be inspected first. A tool that
+/// attaches nothing keeps the previous reading, text included, and
+/// [`ToolInterruption::Forced`] stays exactly as uncertain as it was: the grace period
+/// elapsed, so nothing was observed at all.
 fn interrupted_result(
     tool: &str,
     interruption: ToolInterruption,
@@ -1075,10 +1077,27 @@ fn interrupted_result(
             ),
         ),
     };
-    let mut output = settled.map_or_else(
-        || ToolOutput::text(format!("{tool} interrupted"), message),
-        |settled| settled.output,
-    );
+    let mut output = match settled {
+        // A settled call's own report is what the model reads, and only the tool can
+        // write it: it names the output the call produced and the effects the tool
+        // observed. What the tool cannot say is how the call ended, so an undecided
+        // cancellation appends the dispatcher's sentence instead of dropping it —
+        // recording `uncertain` in metadata alone would leave the model reading a
+        // half-finished report with no instruction to check real state.
+        Some(settled) => {
+            let mut output = settled.output;
+            if uncertain {
+                let report = output.output.trim_end().to_owned();
+                output.output = if report.is_empty() {
+                    message
+                } else {
+                    format!("{report}\n\n{message}")
+                };
+            }
+            output
+        }
+        None => ToolOutput::text(format!("{tool} interrupted"), message),
+    };
     output.metadata.insert(
         INTERRUPTION_METADATA_KEY.to_owned(),
         json!({
@@ -1354,9 +1373,18 @@ mod tests {
             "an uncertain outcome is not the same claim as a forced abort"
         );
         assert_eq!(result.interruption, Some(ToolInterruption::Cooperative));
-        assert_eq!(
-            result.output.output, "partial progress\n",
-            "the settled output the tool preserved is what the model reads"
+        assert!(
+            result.output.output.starts_with("partial progress"),
+            "the settled output the tool preserved is what the model reads first: {}",
+            result.output.output
+        );
+        assert!(
+            result
+                .output
+                .output
+                .contains("inspect authoritative state before retrying"),
+            "an undecided outcome the model can only see in metadata is not reported: {}",
+            result.output.output
         );
     }
 
@@ -1382,6 +1410,10 @@ mod tests {
                 "{:?}",
                 result.output.metadata
             );
+            assert_eq!(
+                result.output.output, "partial progress\n",
+                "a cancellation nobody called undecided keeps the tool's report verbatim"
+            );
         }
     }
 
@@ -1404,21 +1436,39 @@ mod tests {
         );
     }
 
-    /// The fallback message of an undecided cancellation asks for state inspection.
+    /// An undecided cancellation asks for state inspection in the text, not only in
+    /// metadata.
     ///
-    /// It is what the model reads when a tool reported uncertainty without leaving any
-    /// output of its own, so it must not repeat the old claim that cleanup completed.
+    /// A tool can declare its outcome undecided and still hand back a report that reads
+    /// like ordinary progress. The model is answered with that text, so the demand for
+    /// authoritative-state inspection has to be in it — whether or not the tool left
+    /// anything of its own to keep.
     #[test]
     fn an_undecided_cancellation_message_asks_for_authoritative_state() {
-        let mut settled = settled_with(serde_json::json!({
+        let mut silent = settled_with(serde_json::json!({
             "cancellation": { "uncertain": true }
         }));
-        settled.output.output = String::new();
-        let result = interrupted_result("shell", ToolInterruption::Cooperative, Some(settled));
+        silent.output.output = String::new();
+        let result = interrupted_result("shell", ToolInterruption::Cooperative, Some(silent));
         assert_eq!(interruption_facts(&result)["uncertain"], true);
+        assert!(
+            result
+                .output
+                .output
+                .contains("inspect authoritative state before retrying"),
+            "a tool that settled no text of its own must still be answered: {}",
+            result.output.output
+        );
+        assert!(
+            !result.output.output.contains("completed its cleanup"),
+            "an undecided outcome must not be described as finished cleanup: {}",
+            result.output.output
+        );
 
-        // The same branch, reached with nothing settled at all.
+        // Nothing settled at all is a different claim: no tool said anything, so the
+        // reading a cooperative return has always had is what is recorded.
         let empty = interrupted_result("shell", ToolInterruption::Cooperative, None);
+        assert_eq!(interruption_facts(&empty)["uncertain"], false);
         assert!(
             empty
                 .output
