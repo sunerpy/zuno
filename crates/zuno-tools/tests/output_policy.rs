@@ -9,6 +9,22 @@ use zuno_tool::{ACCEPT_LARGE_OUTPUT_KEY, OutputLimits, ToolOutput, ToolOutputSto
 use zuno_tool::{AllowAll, NeverInterrupted, Tool, ToolContext};
 use zuno_tools::output_policy::OutputPolicy;
 
+/// Every window of one artifact, joined, as a caller pages it back.
+fn read_all(store: &ToolOutputStore, session_id: &str, path: &std::path::Path) -> String {
+    let mut bytes = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let window = store
+            .read_window("shell", session_id, path, cursor, 4_096)
+            .expect("read window");
+        bytes.extend_from_slice(&window.bytes);
+        cursor = window.cursor;
+        if cursor >= window.total {
+            return String::from_utf8(bytes).expect("text artifact");
+        }
+    }
+}
+
 fn limits() -> OutputLimits {
     OutputLimits {
         max_lines: 1,
@@ -50,9 +66,7 @@ fn output_policy_refuses_oversized_output_after_persisting_every_byte() {
     assert_eq!(refusal.measurement.bytes, full.len());
     assert_eq!(refusal.measurement.lines, 3);
     assert_eq!(
-        store
-            .read("shell", &refusal.output_path)
-            .expect("persisted full output"),
+        read_all(&store, "ses_output_policy", &refusal.output_path),
         full
     );
 
@@ -88,9 +102,7 @@ fn output_policy_explicit_acceptance_returns_the_complete_output() {
     let paths = output.output_paths();
     let path = paths.first().expect("retrieval path");
     assert_eq!(
-        store
-            .read("shell", std::path::Path::new(path))
-            .expect("persisted full output"),
+        read_all(&store, "ses_output_policy", std::path::Path::new(path)),
         full
     );
 }

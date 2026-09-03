@@ -988,12 +988,20 @@ async fn shell_oversized_output_is_detected_and_persisted_in_the_shared_store() 
     assert_eq!(output.metadata["oversized"], true);
     let paths = output.output_paths();
     let path = paths.first().expect("stored output path");
+    let window = store
+        .read_window(
+            "shell",
+            &context(Arc::new(zuno_tool::NeverInterrupted)).session_id,
+            std::path::Path::new(path),
+            0,
+            4_096,
+        )
+        .expect("stored full output");
     assert_eq!(
-        store
-            .read("shell", std::path::Path::new(path))
-            .expect("stored full output"),
+        String::from_utf8(window.bytes).expect("text"),
         output.output
     );
+    assert_eq!(window.cursor, window.total);
 }
 
 #[cfg(unix)]

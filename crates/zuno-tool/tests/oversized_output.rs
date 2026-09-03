@@ -21,6 +21,25 @@ use zuno_tool::output::{
 };
 use zuno_tool::{OutputLimits, ToolOutput, ToolOutputStore};
 
+/// Every window of one artifact, joined.
+///
+/// Retrieval is windowed on purpose — an artifact exists because returning it whole was
+/// withheld — so a test that wants the complete text pages for it the way a caller does.
+fn read_all(store: &ToolOutputStore, session_id: &str, path: &std::path::Path) -> String {
+    let mut bytes = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let window = store
+            .read_window("shell", session_id, path, cursor, 4_096)
+            .expect("read window");
+        bytes.extend_from_slice(&window.bytes);
+        cursor = window.cursor;
+        if cursor >= window.total {
+            return String::from_utf8(bytes).expect("text artifact");
+        }
+    }
+}
+
 fn tiny() -> OutputLimits {
     OutputLimits {
         max_lines: 10,
@@ -63,7 +82,7 @@ fn oversized_output_is_detected_and_the_full_text_is_retrievable_afterwards() {
         .map(std::path::PathBuf::from)
         .expect("a recorded output path");
     assert_eq!(
-        store.read("shell", &path).expect("read back"),
+        read_all(&store, "ses_detect", &path),
         text,
         "the full text has to survive whatever the policy layer decides to show"
     );
@@ -117,7 +136,7 @@ fn detection_and_storage_leave_the_text_exactly_as_produced() {
     assert!(measurement.is_oversized());
     assert_eq!(output.output, text, "measuring must not truncate");
     assert_eq!(
-        store.read("shell", &stored.path).expect("read"),
+        read_all(&store, "ses_x", &stored.path),
         text,
         "persisting must not truncate"
     );
@@ -168,11 +187,7 @@ fn several_spills_in_one_result_are_all_retrievable() {
     let recovered: Vec<String> = output
         .output_paths()
         .into_iter()
-        .map(|path| {
-            store
-                .read("shell", std::path::Path::new(path))
-                .expect("read back")
-        })
+        .map(|path| read_all(&store, "ses_multi", std::path::Path::new(path)))
         .collect();
 
     assert_eq!(recovered, vec!["first spill", "second spill"]);

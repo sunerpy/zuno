@@ -2,10 +2,16 @@
 //!
 //! # What this owns
 //!
-//! Writing the complete text somewhere durable, and reading it back. Nothing here
-//! decides what the model sees instead; that is the output-policy layer's call
-//! (todo 72). The division matters: the full text must survive regardless of which
-//! policy is in force, so storage cannot be entangled with the policy that reads it.
+//! Writing the bytes a tool produced somewhere durable, and reading them back one
+//! bounded window at a time. Nothing here decides what the model sees instead; that is
+//! the output-policy layer's call (todo 72). The division matters: the full output must
+//! survive regardless of which policy is in force, so storage cannot be entangled with
+//! the policy that reads it.
+//!
+//! Both halves are load-bearing. A store that only wrote would leave the model with an
+//! artifact it can describe and cannot open — the shape that produced a truncated
+//! `tail -80` of an authoritative test summary and a needless re-run — so the read path
+//! is windowed, session-scoped, and addressed by the name this store minted.
 //!
 //! # Divergence from the oracle: the filename carries the session
 //!
@@ -25,7 +31,7 @@
 //! component is a UUIDv7, which keeps the ascending-by-creation ordering that
 //! `Identifier.ascending()` provides.
 
-use crate::output::line_count;
+use crate::output::line_count_of;
 use std::path::{Path, PathBuf};
 use zuno_error::ToolError;
 use zuno_paths::{GeneratedDirectory, Layout};
@@ -36,12 +42,23 @@ pub const FILE_PREFIX: &str = "tool_";
 /// A persisted copy of a tool's full output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredOutput {
-    /// Where the full text lives.
+    /// Where the full output lives.
     pub path: PathBuf,
-    /// UTF-8 bytes written.
+    /// Bytes written, exactly as the tool produced them.
     pub bytes: usize,
     /// Lines written, counted as [`crate::output::line_count`] does.
     pub lines: usize,
+}
+
+/// One window of a persisted artifact, and where the next window starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredWindow {
+    /// The bytes read: at most the requested length, and never more than remains.
+    pub bytes: Vec<u8>,
+    /// Absolute offset just past [`Self::bytes`]. The cursor the next read passes back.
+    pub cursor: u64,
+    /// What the artifact holds in total, so a caller can tell whether more remains.
+    pub total: u64,
 }
 
 /// The on-disk store for full tool output.
@@ -131,14 +148,33 @@ impl ToolOutputStore {
 
     /// Writes `text` in full and returns where it went.
     ///
-    /// `tool` names the tool for error reporting only. The file is created
-    /// exclusively — matching the oracle's `flag: "wx"` — so a name collision fails
-    /// loudly instead of overwriting another call's output.
+    /// Text-shaped convenience over [`Self::persist_bytes`], for output that was
+    /// produced as a string rather than decoded into one.
     pub fn persist(
         &self,
         tool: &str,
         session_id: &str,
         text: &str,
+    ) -> Result<StoredOutput, ToolError> {
+        self.persist_bytes(tool, session_id, text.as_bytes())
+    }
+
+    /// Writes `bytes` exactly as produced and returns where they went.
+    ///
+    /// `tool` names the tool for error reporting only. The file is created
+    /// exclusively — matching the oracle's `flag: "wx"` — so a name collision fails
+    /// loudly instead of overwriting another call's output.
+    ///
+    /// Bytes and not text, because a command's output is under no obligation to be
+    /// UTF-8 and this copy is the one that outlives the call. A caller that decoded
+    /// first would persist `U+FFFD` where the bytes were and the original would be
+    /// gone: the retrieval path could then only ever return the damage. Decoding for
+    /// display stays on the caller's side of this call.
+    pub fn persist_bytes(
+        &self,
+        tool: &str,
+        session_id: &str,
+        bytes: &[u8],
     ) -> Result<StoredOutput, ToolError> {
         let failed = |error: std::io::Error| ToolError::Failed {
             tool: tool.to_owned(),
@@ -157,21 +193,96 @@ impl ToolOutputStore {
             .create_new(true)
             .open(&path)
             .map_err(failed)?;
-        file.write_all(text.as_bytes()).map_err(failed)?;
+        file.write_all(bytes).map_err(failed)?;
         file.flush().map_err(failed)?;
 
         Ok(StoredOutput {
             path,
-            bytes: text.len(),
-            lines: line_count(text),
+            bytes: bytes.len(),
+            lines: line_count_of(bytes),
         })
     }
 
-    /// Reads persisted output back in full.
-    pub fn read(&self, tool: &str, path: &Path) -> Result<String, ToolError> {
-        std::fs::read_to_string(path).map_err(|error| ToolError::Failed {
+    /// Reads one window of an artifact this session produced.
+    ///
+    /// The window is at most `limit` bytes from `offset`, and [`StoredWindow::cursor`]
+    /// says where the next one begins, so a caller pages by handing that cursor back.
+    /// Windowed rather than whole-file because the reason output is in this store at all
+    /// is that returning it in full was withheld: a retrieval that could only return
+    /// everything would hand back exactly the payload the limits declined, and a caller
+    /// with no window would go back to slicing the file with a shell command.
+    ///
+    /// A window that stops short of the end is trimmed back to a UTF-8 boundary, so
+    /// paging a text artifact never splits a code point across two reads. A window that
+    /// reaches the end is returned byte for byte: there is no following read to align
+    /// with, and the artifact is not required to be text.
+    ///
+    /// `path` is resolved by filename against this store's own root, so no spelling of a
+    /// path — including one a model repeated back with a traversal in it — reads a file
+    /// this store did not write. `session_id` has to be the session the name records,
+    /// which is the reason the name carries it.
+    ///
+    /// # Errors
+    ///
+    /// [`ToolError::InvalidArgs`] when `path` does not name an artifact belonging to
+    /// `session_id`, which is a correctable call rather than a failure, and
+    /// [`ToolError::Failed`] when the named artifact cannot be read.
+    pub fn read_window(
+        &self,
+        tool: &str,
+        session_id: &str,
+        path: &Path,
+        offset: u64,
+        limit: usize,
+    ) -> Result<StoredWindow, ToolError> {
+        use std::io::{Read as _, Seek as _};
+
+        let invalid = |message: String| ToolError::InvalidArgs {
+            tool: tool.to_owned(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                message,
+            )),
+        };
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| name.starts_with(FILE_PREFIX))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "`{}` does not name persisted tool output",
+                    zuno_paths::wire_path(path)
+                ))
+            })?;
+        if session_of(Path::new(name)) != Some(sanitize(session_id).as_str()) {
+            return Err(invalid(format!(
+                "persisted output `{name}` was not written by this session"
+            )));
+        }
+
+        let failed = |error: std::io::Error| ToolError::Failed {
             tool: tool.to_owned(),
             source: Box::new(error),
+        };
+        let mut file = std::fs::File::open(self.root.path().join(name)).map_err(failed)?;
+        let total = file.metadata().map_err(failed)?.len();
+        let from = offset.min(total);
+        let length = usize::try_from(total - from)
+            .unwrap_or(usize::MAX)
+            .min(limit);
+        file.seek(std::io::SeekFrom::Start(from)).map_err(failed)?;
+        let mut bytes = Vec::with_capacity(length);
+        file.take(length as u64)
+            .read_to_end(&mut bytes)
+            .map_err(failed)?;
+        let read = bytes.len() as u64;
+        if from + read < total {
+            trim_incomplete_tail(&mut bytes);
+        }
+        Ok(StoredWindow {
+            cursor: from + bytes.len() as u64,
+            bytes,
+            total,
         })
     }
 
@@ -235,6 +346,22 @@ pub fn session_of(path: &Path) -> Option<&str> {
     Some(session)
 }
 
+/// Drops an incomplete UTF-8 sequence from the end of one window.
+///
+/// Only a tail that is the *prefix* of a longer sequence is dropped. Bytes that are
+/// invalid wherever they sit are left alone, because they are what the tool produced and
+/// no later read can repair them. The window is never emptied: a limit smaller than one
+/// code point still has to make progress, or a caller paging by the returned cursor
+/// would ask for the same window forever.
+fn trim_incomplete_tail(bytes: &mut Vec<u8>) {
+    if let Err(error) = std::str::from_utf8(bytes)
+        && error.error_len().is_none()
+        && error.valid_up_to() > 0
+    {
+        bytes.truncate(error.valid_up_to());
+    }
+}
+
 /// Replaces every character outside `[A-Za-z0-9_-]` with `-`.
 #[must_use]
 fn sanitize(value: &str) -> String {
@@ -254,6 +381,27 @@ fn sanitize(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Every window of one artifact, joined. Retrieval is windowed by design, so a test
+    /// that wants the whole thing pages for it exactly as a caller does.
+    fn read_all(store: &ToolOutputStore, session_id: &str, path: &Path, window: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let read = store
+                .read_window("shell", session_id, path, cursor, window)
+                .expect("read window");
+            bytes.extend_from_slice(&read.bytes);
+            cursor = read.cursor;
+            if cursor >= read.total {
+                return bytes;
+            }
+            assert!(
+                !read.bytes.is_empty(),
+                "a window short of the end must advance"
+            );
+        }
+    }
+
     #[test]
     fn persist_then_read_returns_the_full_text_unchanged() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -261,11 +409,161 @@ mod tests {
         let text = "line\n".repeat(5_000);
 
         let stored = store.persist("shell", "ses_abc", &text).expect("persist");
-        let back = store.read("shell", &stored.path).expect("read");
+        let back = read_all(&store, "ses_abc", &stored.path, 4_096);
 
-        assert_eq!(back, text, "the full text must survive byte for byte");
+        assert_eq!(
+            back,
+            text.as_bytes(),
+            "the full text must survive byte for byte"
+        );
         assert_eq!(stored.bytes, text.len());
         assert_eq!(stored.lines, 5_001);
+    }
+
+    #[test]
+    fn output_that_is_not_utf8_is_persisted_and_returned_byte_for_byte() {
+        // The bytes a command produced, not a decoding of them: `0x80` alone is no valid
+        // sequence, and a store that took `&str` would have kept `U+FFFD` instead.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = ToolOutputStore::new(dir.path());
+        let raw = [b'o', b'k', 0x80, b'\n', 0xff];
+
+        let stored = store
+            .persist_bytes("shell", "ses_raw", &raw)
+            .expect("persist");
+
+        assert_eq!(stored.bytes, 5);
+        assert_eq!(
+            stored.lines, 2,
+            "a newline counts wherever the bytes decode"
+        );
+        assert_eq!(read_all(&store, "ses_raw", &stored.path, 5), raw);
+    }
+
+    #[test]
+    fn a_window_reports_the_cursor_the_next_window_starts_at() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = ToolOutputStore::new(dir.path());
+        let stored = store
+            .persist("shell", "ses_page", "0123456789")
+            .expect("persist");
+
+        let first = store
+            .read_window("shell", "ses_page", &stored.path, 0, 4)
+            .expect("first window");
+        assert_eq!(first.bytes, b"0123");
+        assert_eq!(first.cursor, 4);
+        assert_eq!(first.total, 10);
+
+        let second = store
+            .read_window("shell", "ses_page", &stored.path, first.cursor, 4)
+            .expect("second window");
+        assert_eq!(second.bytes, b"4567");
+        assert_eq!(second.cursor, 8);
+
+        let last = store
+            .read_window("shell", "ses_page", &stored.path, second.cursor, 4)
+            .expect("last window");
+        assert_eq!(last.bytes, b"89");
+        assert_eq!(
+            last.cursor, last.total,
+            "reaching the end has to be observable without a further read"
+        );
+
+        let past = store
+            .read_window("shell", "ses_page", &stored.path, 99, 4)
+            .expect("a cursor past the end");
+        assert!(past.bytes.is_empty());
+        assert_eq!(
+            past.cursor, 10,
+            "the cursor is clamped, not the request rejected"
+        );
+    }
+
+    #[test]
+    fn paging_a_text_artifact_never_splits_a_code_point() {
+        // Four three-byte code points read four bytes at a time: every naive window
+        // would end mid-character and both sides of the split would decode as U+FFFD.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = ToolOutputStore::new(dir.path());
+        let text = "中文测试";
+        let stored = store.persist("shell", "ses_cjk", text).expect("persist");
+
+        let mut cursor = 0u64;
+        let mut decoded = String::new();
+        loop {
+            let window = store
+                .read_window("shell", "ses_cjk", &stored.path, cursor, 4)
+                .expect("window");
+            decoded.push_str(
+                std::str::from_utf8(&window.bytes).expect("each window decodes on its own"),
+            );
+            cursor = window.cursor;
+            if cursor >= window.total {
+                break;
+            }
+        }
+
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn a_window_at_the_end_keeps_bytes_that_are_not_a_split_code_point() {
+        // A trailing lead byte is what the tool produced. There is no next window to
+        // align with, so trimming it would silently lose output instead of aligning it.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = ToolOutputStore::new(dir.path());
+        let stored = store
+            .persist_bytes("shell", "ses_tail", &[b'a', 0xe4])
+            .expect("persist");
+
+        let window = store
+            .read_window("shell", "ses_tail", &stored.path, 0, 8)
+            .expect("window");
+
+        assert_eq!(window.bytes, [b'a', 0xe4]);
+        assert_eq!(window.cursor, window.total);
+    }
+
+    #[test]
+    fn an_artifact_another_session_wrote_is_not_readable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = ToolOutputStore::new(dir.path());
+        let stored = store
+            .persist("shell", "ses_owner", "secret")
+            .expect("persist");
+
+        let error = store
+            .read_window("shell", "ses_other", &stored.path, 0, 8)
+            .expect_err("attribution is enforced by the store, not by its callers");
+
+        assert!(matches!(error, ToolError::InvalidArgs { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn a_path_outside_the_store_cannot_be_read_by_naming_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("create");
+        let store = ToolOutputStore::new(dir.path().join("store"));
+        let stored = store.persist("shell", "ses_x", "mine").expect("persist");
+        let name = stored.path.file_name().expect("name").to_owned();
+        std::fs::write(elsewhere.join(&name), "theirs").expect("decoy");
+
+        let read = store
+            .read_window("shell", "ses_x", &elsewhere.join(&name), 0, 32)
+            .expect("a name this store minted resolves against this store");
+        assert_eq!(
+            read.bytes, b"mine",
+            "the directory in the request is ignored"
+        );
+
+        for outside in ["/etc/passwd", "../../etc/passwd"] {
+            let error = store
+                .read_window("shell", "ses_x", Path::new(outside), 0, 32)
+                .expect_err("only names this store minted are addressable");
+            assert!(matches!(error, ToolError::InvalidArgs { .. }), "{outside}");
+        }
     }
 
     #[test]
@@ -345,8 +643,8 @@ mod tests {
         let second = store.persist("shell", "ses_abc", "two").expect("second");
 
         assert_ne!(first.path, second.path);
-        assert_eq!(store.read("shell", &first.path).expect("read"), "one");
-        assert_eq!(store.read("shell", &second.path).expect("read"), "two");
+        assert_eq!(read_all(&store, "ses_abc", &first.path, 32), b"one");
+        assert_eq!(read_all(&store, "ses_abc", &second.path, 32), b"two");
     }
 
     #[test]
@@ -378,7 +676,7 @@ mod tests {
         let store = ToolOutputStore::new(dir.path());
 
         let error = store
-            .read("shell", &dir.path().join("tool_missing_0"))
+            .read_window("shell", "missing", &dir.path().join("tool_missing_0"), 0, 8)
             .expect_err("absent file");
 
         assert_eq!(error.tool(), "shell");
