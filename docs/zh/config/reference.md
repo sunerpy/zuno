@@ -269,6 +269,10 @@ Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程�
 都折叠到 `read`。这些键此前会被接受，却什么都不评估。其他键仍然合法，因为 MCP、插件与 Skill
 工具的名字在运行时才确定，键本身也可以是通配模式。
 
+顶层 `tools` 开关仍然按工具名索引，同一套折叠也适用于它：`{"tools": {"apply_patch": false}}`
+会变成一条优先级最低的 `edit` 拒绝，因此 `edit` 与 `write` 也会被一起关掉。如果这不是你想要的，
+请直接写那个起管辖作用的工具名。
+
 按目录授予的 `external_directory` 规则写成「目录加 `/*`」，使用正斜杠，去掉 Windows 的逐字
 `\\?\` 前缀，例如 `{"external_directory": {"C:/build-cache/*": "allow"}}`。所有工具都按
 这一种拼法发起请求，因此一条规则同时覆盖 shell 工具与文件、搜索工具。

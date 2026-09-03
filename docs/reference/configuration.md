@@ -721,6 +721,11 @@ fold into `read`. Those keys used to be accepted and evaluated nothing. Any othe
 key is still legitimate, because MCP, plugin, and Skill tools are named at runtime
 and a key may be a wildcard pattern.
 
+The top-level `tools` switch stays keyed by tool name, and the same folding applies
+to it: `{"tools": {"apply_patch": false}}` becomes a lowest-precedence `edit` deny,
+so it turns off `edit` and `write` as well. Name the governing tool when that is not
+what you meant.
+
 To run tool calls without Zuno HITL prompts, use `allow_all`:
 
 ```json

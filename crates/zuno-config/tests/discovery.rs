@@ -705,6 +705,54 @@ fn discovery_applies_permission_after_managed_preferences_and_tools_defaults_fir
     }
 }
 
+/// The `tools` switch is keyed by tool name, and several tool names are governed by
+/// another tool's permission key. Every such name has to reach the governing key,
+/// because a rule written under an alias is refused by `permission.rules`
+/// validation and would fail the whole load.
+#[test]
+fn the_tools_switch_disables_a_tool_under_the_key_that_governs_it() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("project");
+    fs::create_dir_all(project.join(".git")).expect("worktree marker");
+    let options = fixture_options(
+        temp.path(),
+        &project,
+        [(
+            "ZUNO_CONFIG_CONTENT".to_owned(),
+            r#"{"tools":{"apply_patch":false,"read_mcp_resource":false,"list_mcp_resources":false,"list_mcp_resource_templates":false,"webfetch":false}}"#
+                .to_owned(),
+        )],
+    );
+
+    let config = discover_with(&options).expect("a tools switch keyed by tool name loads");
+
+    let permission = config.permission.expect("permission policy").rules;
+    for governing in ["edit", "read"] {
+        assert_eq!(
+            permission.get(governing),
+            Some(&PermissionRule::Action(PermissionAction::Deny)),
+            "tools switch should land under {governing}"
+        );
+    }
+    assert_eq!(
+        permission.get("webfetch"),
+        Some(&PermissionRule::Action(PermissionAction::Deny)),
+        "a tool that governs itself keeps its own key"
+    );
+    for alias in [
+        "apply_patch",
+        "read_mcp_resource",
+        "list_mcp_resources",
+        "list_mcp_resource_templates",
+    ] {
+        assert_eq!(
+            permission.get(alias),
+            None,
+            "{alias} is an alias, so no rule may be synthesized under it"
+        );
+    }
+}
+
 #[test]
 fn discovery_preserves_permission_pattern_order() {
     let mut patterns = OrderedMap::new();

@@ -10,6 +10,7 @@
 use crate::Config;
 use crate::instructions::{DEFAULT_GLOBAL_INSTRUCTIONS, GLOBAL_INSTRUCTION_FILENAME};
 use crate::schema::JsonMap;
+use crate::schema::permission::permission_key;
 use crate::schema::sandbox::{SandboxMode, SandboxNetworkMode, SandboxUnavailableAction};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -787,6 +788,14 @@ fn merge_deep(target: &mut RawJson, source: RawJson) {
     }
 }
 
+/// Turn the top-level `tools` switch into the lowest-precedence permission rules.
+///
+/// The map is keyed by tool name, so every key has to be translated to the
+/// permission key that governs that tool before it becomes a rule: a synthesized
+/// key an alias collapses would be a rule nothing evaluates, and
+/// [`PermissionObject`](crate::schema::permission::PermissionObject) refuses one.
+/// [`permission_key`] is the single translation both this synthesis and that
+/// refusal use, so no third table can drift out of step with either.
 fn apply_tools_permissions(result: &mut RawJson) {
     let Some(RawJson::Object(tools)) = result.get("tools").cloned() else {
         return;
@@ -796,13 +805,8 @@ fn apply_tools_permissions(result: &mut RawJson) {
         let RawJson::Bool(enabled) = enabled else {
             continue;
         };
-        let key = if matches!(tool.as_str(), "write" | "edit" | "patch") {
-            "edit"
-        } else {
-            tool.as_str()
-        };
         defaults.insert(
-            key,
+            permission_key(&tool),
             RawJson::String(if enabled { "allow" } else { "deny" }.to_owned()),
         );
     }
