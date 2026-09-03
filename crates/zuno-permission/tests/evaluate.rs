@@ -449,3 +449,82 @@ proptest! {
         prop_assert_eq!(evaluate("shell", "git push", &[]), PermissionAction::Ask);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Path rules: an allow matches respellings of the same path, a deny reaches
+// further. `docs/guide/permissions.md`, section "Per-tool rules", tells users to
+// plan around this asymmetry, so it is pinned here.
+// ---------------------------------------------------------------------------
+
+fn path_rules(action: PermissionAction) -> Vec<Rule> {
+    vec![
+        rule("edit", "*", PermissionAction::Ask),
+        rule("edit", "src/main.rs", action),
+    ]
+}
+
+#[test]
+fn an_allow_covers_every_spelling_of_the_path_it_names() {
+    let rules = path_rules(PermissionAction::Allow);
+
+    for resource in [
+        "src/main.rs",
+        "./src/main.rs",
+        "src//main.rs",
+        "src\\main.rs",
+        "./src/./main.rs",
+    ] {
+        assert_eq!(
+            evaluate("edit", resource, &rules),
+            PermissionAction::Allow,
+            "{resource} is the same file the rule names, spelled differently"
+        );
+    }
+}
+
+#[test]
+fn an_allow_never_widens_to_a_path_the_rule_did_not_name() {
+    let rules = path_rules(PermissionAction::Allow);
+
+    // The documented `filePath` contract is an absolute path, so a relative allow
+    // does not cover the absolute one. Widening it would authorize a file outside
+    // the workspace that happens to share the tail, which is why the guide tells
+    // users to write an allow with `~`, `$HOME`, an absolute prefix, or a wildcard.
+    assert_eq!(
+        evaluate("edit", "/ws/src/main.rs", &rules),
+        PermissionAction::Ask
+    );
+    assert_eq!(
+        evaluate("edit", "other/src/main.rs", &rules),
+        PermissionAction::Ask
+    );
+    assert_eq!(
+        evaluate(
+            "edit",
+            "/ws/src/main.rs",
+            &rules_from_json(
+                r#"{"mode":"standard","rules":{"edit":{"*":"ask","*/src/*":"allow"}}}"#
+            )
+        ),
+        PermissionAction::Allow,
+        "the wildcard spelling the guide recommends does reach the absolute path"
+    );
+}
+
+#[test]
+fn a_deny_reaches_the_absolute_and_parent_resolved_spellings_too() {
+    let rules = path_rules(PermissionAction::Deny);
+
+    for resource in [
+        "src/main.rs",
+        "./src/main.rs",
+        "/ws/src/main.rs",
+        "src/../src/main.rs",
+    ] {
+        assert_eq!(
+            evaluate("edit", resource, &rules),
+            PermissionAction::Deny,
+            "a deny must not be sidestepped by respelling {resource}"
+        );
+    }
+}

@@ -259,6 +259,21 @@ The `edit` key covers the `write`, `edit`, and `apply_patch` tools; all three re
 authorization under it. There is no separate `write` or `apply_patch` rule key, so a
 rule written under either name never matches anything.
 
+A path rule is matched against the path the call names and against its normalized
+spelling, so separators are unified and `.` segments and repeated separators are
+dropped: `./src/main.rs`, `src//main.rs`, and the backslash spelling `src\main.rs` all
+match a rule written `src/main.rs`. A `deny` deliberately reaches further. It also
+covers the `..`-resolved path, and a deny written with an absolute path covers the
+relative tail of that path as well, so a deny cannot be sidestepped by respelling the
+file. An `allow` never widens in either of those directions, because a widened allow
+would authorize a file the rule did not name.
+
+Plan an `allow` around that asymmetry. `read`, `edit`, `write`, and `apply_patch` are
+documented to take absolute paths, so `"read": {"src/main.rs": "allow"}` does not cover
+the absolute path a call actually passes, while the same pattern written as a `deny`
+does. Write the allow with `~`, `$HOME`, or the absolute prefix, or use `*` — which
+matches across separators — as in `{"*/src/*": "allow"}`.
+
 Print the resolved policy — the effective mode and every rule, after configuration
 and any agent contract have been applied:
 
