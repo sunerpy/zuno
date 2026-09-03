@@ -6,7 +6,8 @@
 
 `--archive` 是**可逆**的。`--delete` 是**不可逆**的。
 
-- `--archive` 只写入一列：`session.time_archived`。什么都不会被移除。逆操作存在于库中
+- `--archive` 只写入一列：`session.time_archived`。不会移除任何 session、message、part
+  或 artifact 行。逆操作存在于库中
   （`zuno_db::prune::PruneRequest::restore_archive`，它把 `time_archived` 设回
   `NULL`），并由
   `crates/zuno-db/tests/prune.rs::prune_archive_is_reversible_without_deleting_session_data`
@@ -16,7 +17,29 @@
 
 大规模归档之前请注意一处不对称：**CLI 与 HTTP 界面能设置归档标记，但目前不能清除它。**
 今天要撤销一次归档，意味着从 Rust 调用 `restore_archive` 或者自己清空该列。可逆性是真实
-存在的，但它还不是一个命令行标志。
+存在的，但它还不是一个命令行标志。归档在运行中的服务上也并非没有副作用 —— 见
+[归档会终止该 session 的常驻 HTTP 授权](#归档会终止该-session-的常驻-http-授权)。
+
+## 归档会终止该 session 的常驻 HTTP 授权
+
+在数据库里可逆，不等于对一个正在运行的服务没有影响。`POST /api/session/prune` 带
+`action: "archive"` 时，与 `action: "delete"` 一样，会撤销被选中的这些 session 在那个
+`zuno serve` 进程里授予的每一条常驻 `always` 授权，且只撤销这些：一条 `always` 回复是
+某一个 session 的决定，因此它不会比给出它的那个 session 活得更久。
+
+没有任何持久状态丢失，因为这些授权从来就不是持久的。它们活在服务进程里，`zuno serve`
+重启同样会丢掉它们。变化之处在于：被恢复的 session 会再问一次 —— `restore_archive` 清空
+`time_archived`，它不会重新装回一条授权。
+
+对于依赖已保存 `always` 回复的无人值守 HTTP 客户端，由此有两点：
+
+- 通过 HTTP 时，存活性排除依据是服务进程自己那份「有回合在执行中」的 session 集合，
+  `includeRecent` 永远不会扩大它。因此一个空闲但仍可恢复、且早于 `olderThan` 的 session
+  是可被选中的；归档之后它的下一次权限询问会停下来等人，而自动化可能并没有人。请把这类
+  session 留在窗口之外，或者只在客户端用完之后再归档。
+- `zuno session prune --archive` 跑在它自己的进程里，不持有 request broker，所以 CLI 什么
+  都不会撤销。在 `zuno serve` 仍在运行时从 CLI 归档，会让那个服务的授权继续装着，直到某次
+  HTTP prune 选中同样的 session 或该进程退出。
 
 ## 永远先预览
 
@@ -193,6 +216,9 @@ curl -X POST localhost:PORT/api/session/prune \
 ```text
 session prune mutation requires `apply: true`; nothing was changed
 ```
+
+一次成功的 `archive` 或 `delete` 还会撤销它选中的每个 session 的常驻 HTTP 授权 ——
+见[归档会终止该 session 的常驻 HTTP 授权](#归档会终止该-session-的常驻-http-授权)。
 
 CLI 与 HTTP 的预览输出逐字节相同的 JSON ——
 `crates/zuno-cli/src/cmd/session_prune.rs::session_prune_cli_and_http_preview_json_are_byte_identical`

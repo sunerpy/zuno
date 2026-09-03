@@ -7,8 +7,9 @@ operations and the matching CLI command.
 
 `--archive` is **reversible**. `--delete` is **irreversible**.
 
-- `--archive` writes a single column: `session.time_archived`. Nothing is
-  removed. The reverse operation exists in the library
+- `--archive` writes a single column: `session.time_archived`. No session,
+  message, part, or artifact row is removed. The reverse operation exists in
+  the library
   (`zuno_db::prune::PruneRequest::restore_archive`, which sets `time_archived` back
   to `NULL`) and is covered by
   `crates/zuno-db/tests/prune.rs::prune_archive_is_reversible_without_deleting_session_data`.
@@ -19,7 +20,37 @@ operations and the matching CLI command.
 Be aware of one asymmetry before you archive at scale: **the CLI and HTTP surfaces
 can set the archive marker but cannot currently clear it.** Reversing an archive
 today means calling `restore_archive` from Rust or clearing the column yourself.
-The reversibility is real, but it is not yet a flag.
+The reversibility is real, but it is not yet a flag. Archiving is also not
+side-effect-free on a running server — see
+[Archiving ends a session's standing HTTP authorizations](#archiving-ends-a-sessions-standing-http-authorizations).
+
+## Archiving ends a session's standing HTTP authorizations
+
+Reversible in the database is not the same as without effect on a running
+server. `POST /api/session/prune` with `action: "archive"`, like
+`action: "delete"`, withdraws every standing `always` authorization that the
+selected sessions granted in that `zuno serve` process, and only those: an
+`always` reply is one session's decision, so it does not outlive the session
+that gave it.
+
+No durable state is lost, because those authorizations were never durable. They
+live in the serving process, and a `zuno serve` restart drops them too. What
+changes is that a restored session asks again — `restore_archive` clears
+`time_archived`, it does not reinstate an authorization.
+
+Two things follow for an unattended HTTP client that leans on saved `always`
+replies:
+
+- Over HTTP the liveness exclusion is the serving process's own set of sessions
+  with a turn in flight, and `includeRecent` never widens it. An idle but
+  resumable session older than `olderThan` is therefore eligible, and after the
+  archive its next permission ask parks for a human that the automation may not
+  have. Keep such sessions outside the window, or archive them only once the
+  client is finished with them.
+- `zuno session prune --archive` runs in its own process and holds no request
+  broker, so the CLI withdraws nothing. Archiving from the CLI while a
+  `zuno serve` is up leaves that server's authorizations installed until an HTTP
+  prune selects the same sessions or the process exits.
 
 ## Derived learning when deleting one session
 
@@ -213,6 +244,10 @@ Without it:
 ```text
 session prune mutation requires `apply: true`; nothing was changed
 ```
+
+A successful `archive` or `delete` also withdraws the standing HTTP
+authorizations of every session it selected —
+[Archiving ends a session's standing HTTP authorizations](#archiving-ends-a-sessions-standing-http-authorizations).
 
 The CLI and HTTP previews emit byte-identical JSON —
 `crates/zuno-cli/src/cmd/session_prune.rs::session_prune_cli_and_http_preview_json_are_byte_identical`

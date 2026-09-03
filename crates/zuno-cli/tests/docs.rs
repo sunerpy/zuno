@@ -53,6 +53,31 @@ fn session_retention_table_list_tracks_the_destructive_delete_order() {
 }
 
 #[test]
+fn retention_guide_states_that_archiving_withdraws_standing_http_authorizations() {
+    // Archiving is reversible in the database, yet it withdraws every standing `always`
+    // authorization the selected sessions granted and `restore_archive` does not bring one
+    // back. Both retention pages must say so beside their "nothing is removed" claim.
+    contains_all(
+        "docs/session-retention.md",
+        &[
+            "Archiving ends a session's standing HTTP authorizations",
+            "does not outlive the session",
+            "reinstate an authorization",
+            "the CLI withdraws nothing",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/session-retention.md",
+        &[
+            "归档会终止该 session 的常驻 HTTP 授权",
+            "不会比给出它的那个 session 活得更久",
+            "重新装回一条授权",
+            "不持有 request broker",
+        ],
+    );
+}
+
+#[test]
 fn harness_guide_documents_the_native_extension_contract() {
     contains_all(
         "docs/harness-runtime.md",
