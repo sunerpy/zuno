@@ -452,12 +452,14 @@ async fn a_commit_that_selects_its_own_repository_is_refused() {
     assert_eq!(git(elsewhere.path(), &["rev-parse", "HEAD"]), there);
 }
 
-/// `git add -A` collects nothing generated, whatever the delivery check saw.
+/// `git add -A` collects nothing generated, whatever the delivery check reads.
 ///
-/// The check reads the index before the command runs, so `git add -A && git commit` is
-/// past it by construction — as is a Makefile target, an alias, or a script the analyzer
-/// cannot see into. What holds instead is that each generated directory excludes itself
-/// as it is created, with no repository-private exclude block written here at all.
+/// The delivery check reads the reach of the staging it can see, and a Makefile target,
+/// an alias, or a script the analyzer cannot see into has no reach it can read. What
+/// holds without any reading is that each generated directory excludes itself as it is
+/// created, with no repository-private exclude block written here at all — so an
+/// untracked spill is invisible to `git add -A` in the first place, and the commit of
+/// source goes through.
 #[cfg(unix)]
 #[tokio::test]
 async fn staging_everything_collects_no_generated_state() {
@@ -500,6 +502,106 @@ async fn staging_everything_collects_no_generated_state() {
     assert_eq!(committed, "source.txt", "{committed}");
     assert!(root.join(".zuno").join("tool-output").is_dir());
     assert!(root.join(".zuno").join("background").is_dir());
+}
+
+/// A chain that stages before it commits is read from the worktree, not from the index.
+///
+/// The check runs before the command, so at that moment `git add -A && git commit -m
+/// wip` has staged nothing and the index says the commit is empty. The `add` is the
+/// whole delivery, and its reach is readable: everything tracked, plus everything
+/// untracked git does not ignore. This is the shape that matters, because no ignore rule
+/// applies to a path git already tracks — a goal document an earlier release committed
+/// is re-delivered by every `git add -A` until someone runs `git rm --cached` on it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_chain_that_stages_before_it_commits_is_refused_for_tracked_generated_state() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    initialize_git_repository(workspace.path());
+    let goal = workspace.path().join(".zuno").join("goal");
+    std::fs::create_dir_all(&goal).expect("goal directory");
+    std::fs::write(goal.join("ses_1.md"), b"# Objective\n").expect("goal document");
+    git(workspace.path(), &["add", "--force", ".zuno/goal/ses_1.md"]);
+    git(workspace.path(), &["commit", "--quiet", "-m", "residue"]);
+    let head = git(workspace.path(), &["rev-parse", "HEAD"]);
+    let tool = support::sandbox::shell_tool(workspace.path());
+    // What the goal projection does every time the plan moves.
+    std::fs::write(goal.join("ses_1.md"), b"# Objective\n\n- [x] step\n").expect("reprojected");
+
+    for command in [
+        "git add -A && git commit --quiet -m wip",
+        "git add -u && git commit --quiet -m wip",
+        "git add . && git commit --quiet -m wip",
+        "git add .zuno && git commit --quiet -m wip",
+        "git stage --update && git commit --quiet -m wip",
+    ] {
+        let refusal = tool
+            .run(params(command), context(Arc::new(NeverInterrupted)))
+            .await
+            .expect_err("what the chain stages is part of the delivery");
+        let rendered = format!("{refusal:?}");
+        assert!(
+            rendered.contains(".zuno/goal/ses_1.md"),
+            "{command}: {rendered}"
+        );
+        assert!(
+            rendered.contains("git rm --cached"),
+            "{command}: {rendered}"
+        );
+        assert_eq!(
+            git(workspace.path(), &["rev-parse", "HEAD"]),
+            head,
+            "{command}: the refusal must happen before the commit"
+        );
+    }
+
+    // A narrower pathspec is a narrower read: the same chain limited to source stages no
+    // generated state, so it commits.
+    std::fs::write(workspace.path().join("tracked.txt"), b"edited\n").expect("source edit");
+    tool.run(
+        params("git add tracked.txt && git commit --quiet -m source"),
+        context(Arc::new(NeverInterrupted)),
+    )
+    .await
+    .expect("a chain that stages only source is untouched");
+    let committed = git(
+        workspace.path(),
+        &["show", "--pretty=", "--name-only", "HEAD"],
+    );
+    assert_eq!(committed, "tracked.txt", "{committed}");
+}
+
+/// A `git add` after the last commit stages for the next call, not for this one.
+///
+/// Reading every `git add` in the command line regardless of order would refuse a commit
+/// of source because a later `add` reaches generated state that this commit never
+/// carried.
+#[cfg(unix)]
+#[tokio::test]
+async fn staging_after_the_last_commit_does_not_refuse_it() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let head = initialize_git_repository(workspace.path());
+    let goal = workspace.path().join(".zuno").join("goal");
+    std::fs::create_dir_all(&goal).expect("goal directory");
+    std::fs::write(goal.join("ses_1.md"), b"# Objective\n").expect("goal document");
+    git(workspace.path(), &["add", "--force", ".zuno/goal/ses_1.md"]);
+    git(workspace.path(), &["commit", "--quiet", "-m", "residue"]);
+    std::fs::write(goal.join("ses_1.md"), b"# Objective\n\n- [x] step\n").expect("reprojected");
+    std::fs::write(workspace.path().join("tracked.txt"), b"edited\n").expect("source edit");
+    let tool = support::sandbox::shell_tool(workspace.path());
+
+    tool.run(
+        params("git add tracked.txt && git commit --quiet -m source && git add -A"),
+        context(Arc::new(NeverInterrupted)),
+    )
+    .await
+    .expect("the commit carries source only");
+
+    let committed = git(
+        workspace.path(),
+        &["show", "--pretty=", "--name-only", "HEAD"],
+    );
+    assert_eq!(committed, "tracked.txt", "{committed}");
+    assert_ne!(git(workspace.path(), &["rev-parse", "HEAD"]), head);
 }
 
 #[cfg(unix)]

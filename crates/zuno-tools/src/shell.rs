@@ -1198,49 +1198,217 @@ fn commit_stages_tracked_changes(arguments: &[String]) -> bool {
     false
 }
 
-/// Every `git commit` in this command line, in the order they would run.
-///
-/// Every one of them, not the first: `git commit -m a && git commit -am b` delivers the
-/// worktree's tracked changes through its second commit, and reading only the first said
-/// the index was the whole delivery.
-fn commit_deliveries(analysis: &ShellAnalysis, syntax: ShellSyntax) -> Vec<CommitDelivery> {
-    analysis
-        .commands
-        .iter()
-        .filter_map(|resource| {
-            let (subcommand, arguments) = git_subcommand(&resource.tokens, syntax)?;
-            if subcommand != "commit" {
-                return None;
-            }
-            let retarget = if git_uses_repository_override(&resource.tokens) {
-                Some(Retarget::Option)
-            } else {
-                leading_assignments(&resource.source)
-                    .find(|name| {
-                        GIT_REPOSITORY_ENVIRONMENT_VARIABLES
-                            .iter()
-                            .any(|variable| name.eq_ignore_ascii_case(variable))
-                    })
-                    .map(|name| Retarget::Assignment(name.to_owned()))
-            };
-            Some(CommitDelivery {
-                stages_tracked_changes: commit_stages_tracked_changes(arguments),
-                retarget,
-            })
-        })
-        .collect()
+/// How much of the worktree a staging command reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StagedScope {
+    /// The whole worktree, because no pathspec narrows it or none can be read.
+    Worktree,
+    /// Only these pathspecs, spelled the way the command spelled them.
+    ///
+    /// Passed back to git as pathspecs rather than compared as text: they are relative
+    /// to where the command runs, and git's pathspec language is not the lexical
+    /// comparison [`zuno_paths::refuse_generated_state`] performs.
+    Paths(Vec<String>),
 }
 
-/// What a `git commit` in this command line is about to deliver.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CommitDelivery {
-    /// Whether the commit stages tracked modifications itself, as `-a` does.
+impl StagedScope {
+    /// The union of two reaches.
+    fn widen(&mut self, other: Self) {
+        match (&mut *self, other) {
+            (Self::Worktree, _) => {}
+            (_, Self::Worktree) => *self = Self::Worktree,
+            (Self::Paths(mine), Self::Paths(theirs)) => mine.extend(theirs),
+        }
+    }
+
+    /// The pathspec arguments that limit a git read to this reach.
     ///
-    /// The index alone is then not the whole delivery, so the worktree's tracked
-    /// changes have to be read as well.
-    stages_tracked_changes: bool,
-    /// How the commit names a repository other than the one this call inspects.
+    /// `:/` is git's spelling for the whole worktree, which is what a read has to say
+    /// when the command runs in a subdirectory: a bare `git diff` reports only the
+    /// paths below it.
+    fn pathspecs(&self) -> Vec<&str> {
+        match self {
+            Self::Worktree => vec![":/"],
+            Self::Paths(paths) => paths.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// What a command line puts in the index before a commit in it runs.
+///
+/// The check reads git before the command runs, so the index it can read is the index as
+/// it is *now*. A chain stages first — `git add -A && git commit -m wip` is the shape a
+/// model writes most — and everything that `add` collects is invisible to a read of the
+/// index taken before it. What the arguments do say is which part of the worktree the
+/// staging reaches, and that is enough to read the same paths from the worktree instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StagedWork {
+    /// Whether tracked modifications inside the reach are staged.
+    ///
+    /// This is the case no exclusion can answer. `.git/info/exclude` and a generated
+    /// directory's own `.gitignore` suppress only an *untracked* path, so a goal
+    /// document an earlier release committed is staged again by every `git add` that
+    /// reaches it.
+    tracked: bool,
+    /// Whether files git does not track yet, and does not ignore, are staged too.
+    ///
+    /// False for `git add -u` and `git commit -a`, which update only what git already
+    /// tracks.
+    untracked: bool,
+    /// How much of the worktree the staging reaches.
+    scope: Option<StagedScope>,
+}
+
+impl StagedWork {
+    /// Add everything `other` stages to what this already stages.
+    fn absorb(&mut self, other: Self) {
+        self.tracked |= other.tracked;
+        self.untracked |= other.untracked;
+        match (&mut self.scope, other.scope) {
+            (_, None) => {}
+            (Some(mine), Some(theirs)) => mine.widen(theirs),
+            (slot @ None, theirs) => *slot = theirs,
+        }
+    }
+}
+
+/// What this command line's commits would deliver, read in the order the commands run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ChainDelivery {
+    /// How the first commit that chooses its own repository chooses it.
     retarget: Option<Retarget>,
+    /// What the chain stages before, or as part of, a commit.
+    staged: StagedWork,
+}
+
+/// What every `git commit` in this command line would deliver, or `None` when it has
+/// none.
+///
+/// Every commit, not the first: `git commit -m a && git commit -am b` delivers the
+/// worktree's tracked changes through its second commit, and reading only the first said
+/// the index was the whole delivery.
+///
+/// Order is why this is a walk and not a filter. A `git add` before a commit is part of
+/// that commit's delivery; the same `git add` after the last commit is not, and reading
+/// it as one would refuse a commit of source over a file staged for the next one.
+fn chain_delivery(analysis: &ShellAnalysis, syntax: ShellSyntax) -> Option<ChainDelivery> {
+    let mut pending = StagedWork::default();
+    let mut delivery: Option<ChainDelivery> = None;
+    for resource in &analysis.commands {
+        let Some((subcommand, arguments)) = git_subcommand(&resource.tokens, syntax) else {
+            continue;
+        };
+        match subcommand.as_str() {
+            "add" | "stage" => pending.absorb(staged_by_add(arguments)),
+            "commit" => {
+                let chain = delivery.get_or_insert_default();
+                chain.staged.absorb(std::mem::take(&mut pending));
+                if commit_stages_tracked_changes(arguments) {
+                    chain.staged.absorb(StagedWork {
+                        tracked: true,
+                        untracked: false,
+                        scope: Some(StagedScope::Worktree),
+                    });
+                }
+                if chain.retarget.is_none() {
+                    chain.retarget = commit_retarget(resource);
+                }
+            }
+            _ => {}
+        }
+    }
+    delivery
+}
+
+/// How a `git commit` names a repository other than the one this call inspects, if it
+/// does at all.
+fn commit_retarget(resource: &CommandResource) -> Option<Retarget> {
+    if git_uses_repository_override(&resource.tokens) {
+        return Some(Retarget::Option);
+    }
+    leading_assignments(&resource.source)
+        .find(|name| {
+            GIT_REPOSITORY_ENVIRONMENT_VARIABLES
+                .iter()
+                .any(|variable| name.eq_ignore_ascii_case(variable))
+        })
+        .map(|name| Retarget::Assignment(name.to_owned()))
+}
+
+/// What one `git add` — or `git stage`, its alias — stages, read from its arguments.
+///
+/// A pathspec limits the reach; `-A` and `-u` without one reach the whole worktree; `-u`
+/// leaves untracked files alone. A pathspec carrying a glob or one of git's magic
+/// `:`-prefixed forms widens the reach to the worktree instead of being evaluated here,
+/// and so does `--pathspec-from-file`, whose list lives in a file or on standard input.
+/// Over-reporting the reach costs a refusal that names paths the caller can unstage;
+/// under-reporting costs the commit this check exists to prevent.
+///
+/// A `git add` with neither a pathspec nor `-A` or `-u` stages nothing — git refuses it
+/// — so it contributes nothing rather than everything.
+fn staged_by_add(arguments: &[String]) -> StagedWork {
+    let mut pathspecs: Vec<String> = Vec::new();
+    let mut all = false;
+    let mut update = false;
+    let mut unreadable = false;
+    let mut only_pathspecs = false;
+    let mut index = 0;
+    while let Some(raw) = arguments.get(index) {
+        let argument = unquote(raw);
+        index = index.saturating_add(1);
+        if only_pathspecs || !argument.starts_with('-') || argument == "-" {
+            pathspecs.push(argument);
+            continue;
+        }
+        if argument == "--" {
+            only_pathspecs = true;
+            continue;
+        }
+        if let Some(long) = argument.strip_prefix("--") {
+            match long.split('=').next().unwrap_or(long) {
+                "all" | "no-ignore-removal" => all = true,
+                "update" => update = true,
+                "pathspec-from-file" => unreadable = true,
+                "chmod" if !argument.contains('=') => index = index.saturating_add(1),
+                _ => {}
+            }
+            continue;
+        }
+        for flag in argument.chars().skip(1) {
+            match flag {
+                'A' => all = true,
+                'u' => update = true,
+                _ => {}
+            }
+        }
+    }
+    let scope = if unreadable || pathspecs.iter().any(|spec| widens_to_the_worktree(spec)) {
+        StagedScope::Worktree
+    } else if pathspecs.is_empty() {
+        if !(all || update) {
+            return StagedWork::default();
+        }
+        StagedScope::Worktree
+    } else {
+        StagedScope::Paths(pathspecs)
+    };
+    StagedWork {
+        tracked: true,
+        untracked: all || !update,
+        scope: Some(scope),
+    }
+}
+
+/// Whether a pathspec is one this check reads as the whole worktree rather than as a
+/// path.
+///
+/// `.` reaches everything below where the command runs, a `:`-prefixed pathspec is one
+/// of git's magic forms — `:/` for the whole tree, `:(glob)` and the rest — and a glob
+/// is a pattern git evaluates and this module does not.
+fn widens_to_the_worktree(spec: &str) -> bool {
+    spec.starts_with(':')
+        || spec.contains(['*', '?', '['])
+        || matches!(spec.trim_end_matches(['/', '\\']), "" | "." | "..")
 }
 
 /// How a commit points itself at a repository the check would not read.
@@ -1314,15 +1482,29 @@ fn git_reported_paths(
 /// reason from it, and the reasoning looks well founded because the files are in git.
 ///
 /// What is delivered is read from git rather than from the command line, because the
-/// command line does not know it: an alias, a `-a`, a `commit.template`, or a
-/// pre-commit hook that stages all put paths in a commit that no argument named. The
-/// index is always read, and a commit that stages tracked modifications itself has
-/// those read too.
+/// command line does not know it: an alias, a `-a`, a `commit.template`, or a pre-commit
+/// hook that stages all put paths in a commit that no argument named. The index is
+/// always read.
 ///
-/// Pathspecs are not classified. `git commit -- <path>` commits that path from the
-/// worktree, so a generated path spelled there would pass, and that is the accepted
-/// gap: a pathspec has to be typed deliberately, while the refusal for a
-/// mis-classified message or option would land on an ordinary commit.
+/// A chain that stages before it commits is read from the worktree instead. The check
+/// runs before the command, so `git add -A && git commit -m wip` has an index that says
+/// nothing yet; what its arguments do say is how much of the worktree the staging
+/// reaches, so the same reach is read as tracked modifications and as untracked
+/// unignored files. That is the shape that matters most: an exclude rule cannot hide a
+/// path git already tracks, so a `.zuno/goal` document an earlier release committed is
+/// picked up by every `git add -A` until someone runs `git rm --cached` on it, and this
+/// is the check that says so.
+///
+/// A pathspec is handed back to git as a pathspec, never compared as text. `git add
+/// .zuno` and `git add -- ':(glob)**/*.md'` mean whatever git means by them, and a
+/// lexical guess at that is how a check comes to report on paths a command never
+/// touched. A pathspec whose reach cannot be read narrowly widens to the whole
+/// worktree.
+///
+/// `git commit -- <path>` is still not classified: it commits that path from the
+/// worktree without staging it, and that is the accepted gap — a pathspec on the commit
+/// itself has to be typed deliberately, while the refusal for a mis-read message or
+/// option would land on an ordinary commit.
 ///
 /// A commit that chooses its own repository is refused instead of inspected. `-C`,
 /// `--git-dir`, `--work-tree`, `--namespace` and an inline `GIT_DIR=…` all point the
@@ -1330,29 +1512,25 @@ fn git_reported_paths(
 /// repository that is not the one being written. The repository belongs in the tool's
 /// `workdir`, where it is one fact both the check and the commit use.
 ///
-/// No repository, nothing delivered: when git cannot name a worktree the check does
-/// not run, and the commit fails on its own terms rather than through a refusal about
+/// No repository, nothing delivered: when git cannot name a worktree the check does not
+/// run, and the commit fails on its own terms rather than through a refusal about
 /// generated state.
 ///
 /// # Errors
 ///
 /// [`ToolError::InvalidArgs`] when a commit retargets its repository, and
-/// [`ToolError::Failed`] carrying every generated path with the reason it exists and
-/// the remedy, when a commit would deliver one.
+/// [`ToolError::Failed`] carrying every generated path with the reason it exists and the
+/// remedy, when a commit would deliver one.
 fn refuse_generated_delivery(
     analysis: &ShellAnalysis,
     syntax: ShellSyntax,
     cwd: &Path,
     env: &BTreeMap<String, String>,
 ) -> Result<(), ToolError> {
-    let deliveries = commit_deliveries(analysis, syntax);
-    if deliveries.is_empty() {
+    let Some(delivery) = chain_delivery(analysis, syntax) else {
         return Ok(());
-    }
-    if let Some(retarget) = deliveries
-        .iter()
-        .find_map(|delivery| delivery.retarget.as_ref())
-    {
+    };
+    if let Some(retarget) = &delivery.retarget {
         let chosen = match retarget {
             Retarget::Option => {
                 "a Git global option (`-C`, `--git-dir`, `--work-tree`, `--namespace`)".to_owned()
@@ -1360,7 +1538,10 @@ fn refuse_generated_delivery(
             Retarget::Assignment(name) => format!("`{name}`"),
         };
         return Err(invalid(format!(
-            "this `git commit` selects its repository with {chosen}, which points it at a              repository this call does not inspect, so the check for Zuno's own generated state              would report on a different one; select the repository with the Shell workdir instead"
+            "this `git commit` selects its repository with {chosen}, which points it at a \
+             repository this call does not inspect, so the check for Zuno's own generated \
+             state would report on a different one; select the repository with the Shell \
+             workdir instead"
         )));
     }
     let Some(worktree) = git_reported_paths(cwd, env, &["rev-parse", "--show-toplevel"])?
@@ -1385,18 +1566,35 @@ fn refuse_generated_delivery(
         ],
     )?
     .unwrap_or_default();
-    if deliveries
-        .iter()
-        .any(|delivery| delivery.stages_tracked_changes)
-    {
-        delivered.extend(
-            git_reported_paths(
-                cwd,
-                env,
-                &["-c", "diff.relative=false", "diff", "--name-only", "-z"],
-            )?
-            .unwrap_or_default(),
-        );
+    if let Some(scope) = &delivery.staged.scope {
+        let pathspecs = scope.pathspecs();
+        if delivery.staged.tracked {
+            let mut arguments = vec![
+                "-c",
+                "diff.relative=false",
+                "diff",
+                "--name-only",
+                "-z",
+                "--",
+            ];
+            arguments.extend(pathspecs.iter().copied());
+            delivered.extend(git_reported_paths(cwd, env, &arguments)?.unwrap_or_default());
+        }
+        if delivery.staged.untracked {
+            // `--full-name` for the same reason `diff.relative=false` is set above: without
+            // it `ls-files` answers relative to the current directory, and a path above it
+            // comes back with `../` segments that name no worktree entry.
+            let mut arguments = vec![
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "--full-name",
+                "-z",
+                "--",
+            ];
+            arguments.extend(pathspecs.iter().copied());
+            delivered.extend(git_reported_paths(cwd, env, &arguments)?.unwrap_or_default());
+        }
     }
     zuno_paths::refuse_generated_state(&worktree, &delivered).map_err(|refusal| {
         failed(io::Error::new(
@@ -2032,16 +2230,16 @@ mod tests {
         )
     }
 
-    fn deliveries(command: &str) -> Vec<CommitDelivery> {
-        deliveries_in(command, ShellSyntax::Bash)
+    fn delivery(command: &str) -> Option<ChainDelivery> {
+        delivery_in(command, ShellSyntax::Bash)
     }
 
-    fn deliveries_in(command: &str, syntax: ShellSyntax) -> Vec<CommitDelivery> {
-        commit_deliveries(&analyze_command(command, syntax).expect("analysis"), syntax)
+    fn delivery_in(command: &str, syntax: ShellSyntax) -> Option<ChainDelivery> {
+        chain_delivery(&analyze_command(command, syntax).expect("analysis"), syntax)
     }
 
-    fn delivery(command: &str) -> Option<CommitDelivery> {
-        deliveries(command).into_iter().next()
+    fn staged(command: &str) -> StagedWork {
+        delivery(command).expect("a commit").staged
     }
 
     #[test]
@@ -2061,15 +2259,20 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_that_stages_as_it_commits_is_recognised_in_every_spelling() {
+    fn a_commit_that_stages_as_it_commits_reaches_every_tracked_change() {
         for command in [
             "git commit -a -m done",
             "git commit -am done",
             "git commit --all -m done",
             "git commit -qam done",
         ] {
-            assert!(
-                delivery(command).expect("a commit").stages_tracked_changes,
+            assert_eq!(
+                staged(command),
+                StagedWork {
+                    tracked: true,
+                    untracked: false,
+                    scope: Some(StagedScope::Worktree),
+                },
                 "{command}"
             );
         }
@@ -2087,11 +2290,89 @@ mod tests {
             "git commit --file -a",
             "git commit -m done -- -a",
         ] {
-            assert!(
-                !delivery(command).expect("a commit").stages_tracked_changes,
+            assert_eq!(staged(command), StagedWork::default(), "{command}");
+        }
+    }
+
+    /// The index a commit delivers is the index after the `git add` in front of it, and
+    /// the check runs before either. Reading only the index said `git add -A && git
+    /// commit -m wip` delivered nothing, which is the shape a model writes most.
+    #[test]
+    fn what_a_chain_stages_before_it_commits_is_part_of_the_delivery() {
+        assert_eq!(
+            staged("git add -A && git commit -m wip"),
+            StagedWork {
+                tracked: true,
+                untracked: true,
+                scope: Some(StagedScope::Worktree),
+            }
+        );
+        assert_eq!(
+            staged("git add -u && git commit -m wip"),
+            StagedWork {
+                tracked: true,
+                untracked: false,
+                scope: Some(StagedScope::Worktree),
+            }
+        );
+        assert_eq!(
+            staged("git stage src/lib.rs; git commit -m wip"),
+            StagedWork {
+                tracked: true,
+                untracked: true,
+                scope: Some(StagedScope::Paths(vec!["src/lib.rs".to_owned()])),
+            }
+        );
+    }
+
+    /// A pathspec that reaches everything is not a path. `.` and git's magic forms
+    /// widen the read instead of being compared as text, because a lexical guess at
+    /// git's pathspec language reports on paths the command never touched.
+    #[test]
+    fn a_pathspec_that_reaches_everything_widens_the_read_to_the_worktree() {
+        for command in [
+            "git add . && git commit -m wip",
+            "git add ./ && git commit -m wip",
+            "git add :/ && git commit -m wip",
+            "git add ':(glob)**/*.md' && git commit -m wip",
+            "git add '*.md' && git commit -m wip",
+            "git add --pathspec-from-file=list && git commit -m wip",
+        ] {
+            assert_eq!(
+                staged(command).scope,
+                Some(StagedScope::Worktree),
                 "{command}"
             );
         }
+    }
+
+    /// A `git add` after the last commit stages for the next call, not for this one.
+    /// Absorbing it would refuse a commit of source over a file nobody delivered yet.
+    #[test]
+    fn staging_after_the_last_commit_is_not_part_of_the_delivery() {
+        assert_eq!(
+            staged("git commit -m done && git add -A"),
+            StagedWork::default()
+        );
+        assert_eq!(
+            staged("git add src/lib.rs && git commit -m first && git add -A"),
+            StagedWork {
+                tracked: true,
+                untracked: true,
+                scope: Some(StagedScope::Paths(vec!["src/lib.rs".to_owned()])),
+            }
+        );
+    }
+
+    /// `git add` needs a pathspec or `-A`/`-u`; without one git stages nothing, so
+    /// widening the read to the worktree would be a refusal about a command that did
+    /// not run.
+    #[test]
+    fn a_git_add_that_names_nothing_stages_nothing() {
+        assert_eq!(
+            staged("git add --dry-run && git commit -m done"),
+            StagedWork::default()
+        );
     }
 
     /// A check keyed on the program spelled `git` is a check a model steps around by
@@ -2105,15 +2386,14 @@ mod tests {
             "git.exe commit -m done",
             "/usr/local/bin/git.exe commit -m done",
         ] {
-            assert_eq!(deliveries(command).len(), 1, "{command}");
+            assert!(delivery(command).is_some(), "{command}");
         }
         for command in [
             r"C:\Program\git.exe commit -m done",
             r"C:\Program\GIT.EXE commit -m done",
         ] {
-            assert_eq!(
-                deliveries_in(command, ShellSyntax::PowerShell).len(),
-                1,
+            assert!(
+                delivery_in(command, ShellSyntax::PowerShell).is_some(),
                 "{command}"
             );
         }
@@ -2123,11 +2403,14 @@ mod tests {
     /// everything, while the `-a` that follows delivers the whole worktree.
     #[test]
     fn every_commit_in_a_chain_is_read_not_only_the_first() {
-        let chain = deliveries("git commit -m first && git commit -am second");
-
-        assert_eq!(chain.len(), 2);
-        assert!(!chain[0].stages_tracked_changes);
-        assert!(chain[1].stages_tracked_changes);
+        assert_eq!(
+            staged("git commit -m first && git commit -am second"),
+            StagedWork {
+                tracked: true,
+                untracked: false,
+                scope: Some(StagedScope::Worktree),
+            }
+        );
     }
 
     #[test]
