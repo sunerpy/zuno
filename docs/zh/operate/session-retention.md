@@ -117,6 +117,18 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno --test docs
 
 在表删除之后，没有存活 session 的 part 会被清扫，artifact 收集以删除模式运行。
 
+### 会清扫哪些 tool-output 根
+
+持久化的工具输出存放在两处，一次删除会覆盖两处：
+
+- `$DATA/tool-output`，由所有 session 共享；
+- `<worktree>/.zuno/tool-output`，对应被清理的数据库在 `project.worktree` 中记录的每个
+  检出目录 —— session 就在它正在修改的代码旁边写下这份存储。
+
+两处规则完全一致。文件名带着已删除 session 的文件会被回收；属于存活 session 的文件会保留，
+因为模型正是通过那条路径读回被输出上限扣留的内容；文件名完全不带 session 的文件，只有在超过
+七天之后才会被回收。没有任何 `project` 行指向的检出目录不会被扫描。
+
 ## 读懂 artifact 警告
 
 报告中可能带有：

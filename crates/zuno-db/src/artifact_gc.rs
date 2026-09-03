@@ -20,6 +20,9 @@ use crate::open;
 /// Default retention window for unattributable tool output.
 pub const DEFAULT_TOOL_OUTPUT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// The caller identity `zuno_tool`'s store reports in an error it raises for this pass.
+const TOOL_OUTPUT_READER: &str = "session_prune";
+
 /// Whether a pass only reports candidates or also removes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ArtifactGcMode {
@@ -31,11 +34,15 @@ pub enum ArtifactGcMode {
 }
 
 /// Explicit roots keep tests and callers away from process-global path state.
+///
+/// Tool output has a second class of root that no caller can name: the store inside each
+/// checkout. Those are read from the database being pruned, by
+/// [`tool_output_roots`], because `session prune` reclaims across every project at once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactGcPaths {
     /// `$DATA/snapshot`.
     pub snapshots: PathBuf,
-    /// `$DATA/tool-output`.
+    /// `$DATA/tool-output`, the store shared by every session.
     pub tool_output: PathBuf,
     /// `$DATA/attachments`.
     pub attachments: PathBuf,
@@ -265,7 +272,13 @@ pub fn execute(
 
     let mut candidates = Vec::new();
     discover_snapshot_candidates(paths, &survivors, &mut candidates)?;
-    discover_tool_output_candidates(paths, request, &deleted_session_ids, &mut candidates)?;
+    discover_tool_output_candidates(
+        &transaction,
+        paths,
+        request,
+        &deleted_session_ids,
+        &mut candidates,
+    )?;
     discover_attachment_candidates(&transaction, paths, &deleted_session_ids, &mut candidates)?;
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
 
@@ -407,49 +420,94 @@ fn discover_snapshot_candidates(
     Ok(())
 }
 
+/// Every directory that may hold persisted tool output for this database.
+///
+/// The shared root the caller named, then `<worktree>/.zuno/tool-output/` for every
+/// checkout the database has recorded. The in-checkout stores cannot be caller-supplied:
+/// `session prune` reclaims across every project at once, and only the `project` rows
+/// know which checkouts this database wrote into. Leaving them out is what made that
+/// store grow without bound — it has two writers and, until this pass covered it, no
+/// sweeper — while the shared root next to it was already swept.
+///
+/// Locating a store from `project.worktree` is the attribution
+/// [`discover_snapshot_candidates`] already relies on, and each root is the same
+/// `zuno_tool` store the writers open, so no second spelling of where artifacts live
+/// enters this module.
+fn tool_output_roots(
+    connection: &rusqlite::Transaction<'_>,
+    paths: &ArtifactGcPaths,
+) -> Result<Vec<PathBuf>, ArtifactGcError> {
+    let mut roots = BTreeSet::new();
+    roots.insert(paths.tool_output.clone());
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT worktree FROM project
+             WHERE worktree IS NOT NULL AND worktree <> ''
+             ORDER BY worktree ASC",
+        )
+        .map_err(open::map_error)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(open::map_error)?;
+    for row in rows {
+        let worktree = PathBuf::from(row.map_err(open::map_error)?);
+        roots.insert(
+            zuno_tool::ToolOutputStore::in_worktree(&worktree)
+                .root()
+                .to_path_buf(),
+        );
+    }
+    Ok(roots.into_iter().collect())
+}
+
 fn discover_tool_output_candidates(
+    connection: &rusqlite::Transaction<'_>,
     paths: &ArtifactGcPaths,
     request: &ArtifactGcRequest,
     deleted_session_ids: &BTreeSet<String>,
     candidates: &mut Vec<Candidate>,
 ) -> Result<(), ArtifactGcError> {
-    if !is_real_directory(&paths.tool_output)? {
-        return Ok(());
-    }
     let cutoff = request.now.checked_sub(request.tool_output_retention);
-    for entry in read_directory(&paths.tool_output)? {
-        let path = entry.path();
-        if !entry_is_regular_file(&entry)? {
+    for root in tool_output_roots(connection, paths)? {
+        if !is_real_directory(&root)? {
             continue;
         }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if !name.starts_with(zuno_tool::store::FILE_PREFIX) {
-            continue;
-        }
-        let reason = match zuno_tool::store::session_of(&path) {
-            Some(session_id) if deleted_session_ids.contains(session_id) => {
-                Some(ReclaimReason::DeletedSession(session_id.to_owned()))
+        // The store's own reader decides which names it minted, so every file this pass
+        // can remove is one that store would hand back to a retrieval call.
+        let entries = zuno_tool::ToolOutputStore::new(&root)
+            .entries(TOOL_OUTPUT_READER)
+            .map_err(|source| filesystem_error("scan", &root, std::io::Error::other(source)))?;
+        for path in entries {
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => return Err(filesystem_error("inspect", &path, source)),
+            };
+            if !metadata.file_type().is_file() {
+                continue;
             }
-            Some(_) => None,
-            None => {
-                let modified = entry
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .map_err(|source| filesystem_error("read metadata for", &path, source))?;
-                cutoff
-                    .filter(|cutoff| modified < *cutoff)
-                    .map(|_| ReclaimReason::UnattributedToolOutputExpired)
+            let reason = match zuno_tool::store::session_of(&path) {
+                Some(session_id) if deleted_session_ids.contains(session_id) => {
+                    Some(ReclaimReason::DeletedSession(session_id.to_owned()))
+                }
+                Some(_) => None,
+                None => {
+                    let modified = metadata
+                        .modified()
+                        .map_err(|source| filesystem_error("read metadata for", &path, source))?;
+                    cutoff
+                        .filter(|cutoff| modified < *cutoff)
+                        .map(|_| ReclaimReason::UnattributedToolOutputExpired)
+                }
+            };
+            if let Some(reason) = reason {
+                candidates.push(Candidate {
+                    path,
+                    target: Target::File,
+                    kind: ArtifactKind::ToolOutput,
+                    reason,
+                });
             }
-        };
-        if let Some(reason) = reason {
-            candidates.push(Candidate {
-                path,
-                target: Target::File,
-                kind: ArtifactKind::ToolOutput,
-                reason,
-            });
         }
     }
     Ok(())
@@ -586,13 +644,6 @@ fn read_directory(path: &Path) -> Result<Vec<fs::DirEntry>, ArtifactGcError> {
         .collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(fs::DirEntry::file_name);
     Ok(entries)
-}
-
-fn entry_is_regular_file(entry: &fs::DirEntry) -> Result<bool, ArtifactGcError> {
-    entry
-        .file_type()
-        .map(|kind| kind.is_file())
-        .map_err(|source| filesystem_error("inspect", &entry.path(), source))
 }
 
 fn is_real_directory(path: &Path) -> Result<bool, ArtifactGcError> {
@@ -931,6 +982,67 @@ mod tests {
             "old foreign output uses the backstop"
         );
         assert!(fresh_foreign.exists(), "fresh foreign output is retained");
+    }
+
+    /// The in-checkout store is swept by the same rules as the shared one, and only for
+    /// a checkout the database names. Before this pass it had two writers and no
+    /// sweeper, so every artifact ever written beside a working copy stayed forever.
+    #[test]
+    fn in_checkout_tool_output_is_swept_only_for_a_recorded_worktree() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
+        let recorded = temp.path().join("recorded");
+        let unrecorded = temp.path().join("unrecorded");
+        let root = zuno_tool::ToolOutputStore::in_worktree(&recorded)
+            .root()
+            .to_path_buf();
+        let deleted = root.join("tool_ses_deleted_00000000000000000000000000000001");
+        let live = root.join("tool_ses_live_00000000000000000000000000000002");
+        let old_foreign = root.join("tool_019abcdef0123456789ABCDEFG");
+        let fresh_foreign = root.join("tool_019abcdef0123456789ABCDEH");
+        let elsewhere = zuno_tool::ToolOutputStore::in_worktree(&unrecorded)
+            .root()
+            .join("tool_ses_deleted_00000000000000000000000000000003");
+        for path in [&deleted, &live, &old_foreign, &fresh_foreign, &elsewhere] {
+            write(path, b"in-checkout output");
+        }
+        backdate(&live, Duration::from_secs(30 * 24 * 60 * 60));
+        backdate(&old_foreign, Duration::from_secs(8 * 24 * 60 * 60));
+        backdate(&elsewhere, Duration::from_secs(30 * 24 * 60 * 60));
+
+        let mut connection = database();
+        insert_project(&connection, "project", &recorded);
+        insert_session(&connection, "ses_live", "project", &recorded);
+
+        let report = execute(
+            &mut connection,
+            &paths,
+            &ArtifactGcRequest::new(["ses_deleted"], SystemTime::now()).deleting(),
+        )
+        .expect("collect artifacts");
+
+        assert!(
+            !deleted.exists(),
+            "a deleted session's output is attributable"
+        );
+        assert!(live.exists(), "an attributed survivor is not age-swept");
+        assert!(
+            !old_foreign.exists(),
+            "an unattributed name uses the backstop"
+        );
+        assert!(
+            fresh_foreign.exists(),
+            "a fresh unattributed name is retained"
+        );
+        assert!(
+            elsewhere.is_file(),
+            "a checkout no project row names is not scanned at all"
+        );
+        assert!(report.artifacts.iter().any(|artifact| {
+            artifact.path == deleted
+                && artifact.kind == ArtifactKind::ToolOutput
+                && artifact.removed
+        }));
     }
 
     #[test]

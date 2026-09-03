@@ -148,6 +148,20 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno --test docs
 After the table deletes, parts with no surviving session are swept, and artifact
 collection runs in delete mode.
 
+### Which tool-output roots are swept
+
+Persisted tool output lives in two places, and a delete covers both:
+
+- `$DATA/tool-output`, shared by every session;
+- `<worktree>/.zuno/tool-output` for every checkout the pruned database records in
+  `project.worktree` — the store a session writes next to the code it is changing.
+
+The rules are identical in both. A file whose name carries a deleted session is
+reclaimed. A file that belongs to a surviving session is kept, because that path is how
+the model reads back output the size limits withheld. A file whose name carries no
+session at all is reclaimed only once it is older than seven days. A checkout that no
+`project` row names is not scanned.
+
 ## Reading the artifact warning
 
 A report may carry:

@@ -11,6 +11,7 @@ use zuno_db::session_prune::{
 use zuno_db::{Connection, Pool, migration};
 use zuno_paths::DbLocation;
 use zuno_snapshot::StoreKey;
+use zuno_tool::ToolOutputStore;
 
 const NOW: i64 = 200 * DAY_MILLIS;
 const OLD: i64 = 10 * DAY_MILLIS;
@@ -343,6 +344,62 @@ fn session_prune_with_a_selection_reclaims_its_unreferenced_snapshot_store() {
     }));
     assert!(!selected_store.path_in(&paths.snapshots).exists());
     assert_eq!(session_count(&connection), 1);
+}
+
+/// `session prune` is the sweeper for the store beside a working copy, not only for the
+/// shared one under `$DATA`. The artifact a surviving transcript still points at stays,
+/// because that path is how the model reads output the limits withheld.
+#[test]
+fn session_prune_reclaims_in_checkout_tool_output_and_keeps_a_survivors_artifact() {
+    let pool = Pool::open(&DbLocation::Memory).expect("open in-memory pool");
+    let mut connection = pool.get().expect("check out connection");
+    migration::apply(&mut connection).expect("apply schema");
+    let temp = tempfile::tempdir().expect("temporary artifact root");
+    let worktree = temp.path().join("checkout");
+    fs::create_dir_all(&worktree).expect("create checkout");
+    connection
+        .execute(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+             VALUES ('prj_a', ?1, 1, 1, '[]')",
+            rusqlite::params![worktree.to_string_lossy()],
+        )
+        .expect("insert project");
+    insert_session(&connection, "ses_old", "prj_a", None, OLD, false);
+    insert_session(&connection, "ses_live", "prj_a", None, NEW, false);
+    let store = ToolOutputStore::in_worktree(&worktree);
+    let selected = store
+        .persist("shell", "ses_old", "authoritative test summary")
+        .expect("persist the pruned session's output");
+    let survivor = store
+        .persist("shell", "ses_live", "output a live transcript still names")
+        .expect("persist the surviving session's output");
+    let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
+    let mut delete = request(SessionPruneAction::Delete);
+    delete.confirm_delete = true;
+
+    let report = execute(
+        &mut connection,
+        &paths,
+        &delete,
+        &Reachable,
+        &Remote,
+        &mut Progress::default(),
+    )
+    .expect("delete succeeds");
+
+    assert_eq!(report.selected_session_ids, ["ses_old"]);
+    assert!(!selected.path.exists());
+    assert!(survivor.path.is_file());
+    assert!(
+        report.artifacts.items.iter().any(|item| {
+            item.path == zuno_paths::wire_path(&selected.path)
+                && item.kind == "tool_output"
+                && item.reason == "deleted_session:ses_old"
+                && item.removed
+        }),
+        "{:?}",
+        report.artifacts.items
+    );
 }
 
 #[test]
