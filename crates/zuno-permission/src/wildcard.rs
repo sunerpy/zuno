@@ -38,15 +38,18 @@ fn matches_units(input: &str, pattern: &str) -> bool {
     let mut star_index = None;
     let mut star_input_index = 0;
 
+    // `*` is tested before the literal comparison on purpose. A `*` in the input is
+    // an ordinary character, so the literal branch would otherwise consume the
+    // pattern's star as a literal star and `rm *.txt` would escape `"rm *": "deny"`.
     while input_index < input.len() {
-        if pattern_index < pattern.len()
+        if pattern_index < pattern.len() && pattern[pattern_index] == STAR {
+            star_index = Some(pattern_index);
+            star_input_index = input_index;
+            pattern_index += 1;
+        } else if pattern_index < pattern.len()
             && (pattern[pattern_index] == QUESTION || pattern[pattern_index] == input[input_index])
         {
             input_index += 1;
-            pattern_index += 1;
-        } else if pattern_index < pattern.len() && pattern[pattern_index] == STAR {
-            star_index = Some(pattern_index);
-            star_input_index = input_index;
             pattern_index += 1;
         } else if let Some(star) = star_index {
             star_input_index += 1;

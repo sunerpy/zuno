@@ -1,3 +1,4 @@
+use proptest::prelude::*;
 use zuno_permission::wildcard_match;
 
 #[test]
@@ -43,4 +44,29 @@ fn case_sensitivity_matches_the_host_platform() {
     let matches = wildcard_match("/users/test/file", "/Users/test/*");
 
     assert_eq!(matches, cfg!(windows));
+}
+
+#[test]
+fn a_star_in_the_input_never_consumes_a_star_in_the_pattern() {
+    assert!(wildcard_match("rm *.txt", "rm *"));
+    assert!(wildcard_match("rm -rf x", "rm *"));
+    assert!(wildcard_match("*foo", "*"));
+    assert!(wildcard_match("/tmp/*x", "/tmp/*"));
+}
+
+proptest! {
+    /// `*` is the pattern every catch-all rule is written with, so it must match
+    /// every possible resource — including resources that contain `*` themselves.
+    #[test]
+    fn a_lone_star_matches_every_input(input in ".*") {
+        prop_assert!(wildcard_match(&input, "*"));
+    }
+
+    #[test]
+    fn a_star_matches_inputs_built_out_of_stars(stars in prop::collection::vec(Just('*'), 0..8)) {
+        let input: String = stars.into_iter().collect();
+        let command = format!("rm {input}");
+        prop_assert!(wildcard_match(&input, "*"));
+        prop_assert!(wildcard_match(&command, "rm *"));
+    }
 }

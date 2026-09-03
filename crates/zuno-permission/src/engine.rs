@@ -33,19 +33,35 @@ impl PermissionEngine {
 
     /// Evaluate a request and either authorize, deny, or store it as pending.
     ///
-    /// Runtime approvals are evaluated after the supplied ruleset, matching the
-    /// oracle's `evaluate(permission, pattern, ruleset, approved)` call.
+    /// Runtime approvals are evaluated after the supplied ruleset, so a later
+    /// "always" answer can settle what configuration left at `ask`. It can never
+    /// settle what configuration denied: `ruleset` is evaluated on its own first
+    /// and a `deny` there is terminal, however many runtime grants follow it.
+    /// Because that check runs on every call, an installed grant cannot outlive
+    /// or outrank the configured prohibition either.
+    ///
+    /// A request that names no pattern is a request for the resource the rules
+    /// spell `*`. It is normalized to that pattern rather than authorized
+    /// silently, so an empty pattern list still needs a grant.
     ///
     /// # Errors
     /// Returns [`ToolError::Denied`] as soon as any requested pattern evaluates
     /// to deny. A denied request is never inserted into pending state.
     pub fn authorize(
         &mut self,
-        request: PermissionRequest,
+        mut request: PermissionRequest,
         ruleset: &[Rule],
     ) -> Result<Authorization, ToolError> {
+        if request.patterns.is_empty() {
+            request.patterns.push("*".to_owned());
+        }
         let mut needs_ask = false;
         for pattern in &request.patterns {
+            if evaluate(&request.permission, pattern, ruleset) == PermissionAction::Deny {
+                return Err(ToolError::Denied {
+                    tool: request.permission.clone(),
+                });
+            }
             match evaluate_ordered(
                 &request.permission,
                 pattern,
