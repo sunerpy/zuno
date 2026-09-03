@@ -338,6 +338,15 @@ impl Builtin {
     /// denies delegation. `deep` is directly selectable and delegable but still has
     /// no child tools. `plan` may inspect and write only its plan document; the
     /// path-specific edit grants are added by the CLI composition root.
+    ///
+    /// Two grants are here because a deny-by-default overlay hides anything it does not
+    /// name, and both were unnamed. `bg` accompanies every `shell` grant: a background
+    /// execution is started through `shell` and read back only through `bg`, so an
+    /// overlay that granted one and not the other let an Agent start work it could not
+    /// inspect, and left a withheld oversized result with no retrieval path. `job` is
+    /// the mirror image — it resolves only a Job row whose parent session is the caller,
+    /// and only a `task` call creates one — so `build` denies it alongside `task` rather
+    /// than inheriting it from the common defaults.
     #[must_use]
     pub fn permission_overlay(&self) -> Option<PermissionConfig> {
         let rules: Vec<(&str, PermissionRule)> = match self.name {
@@ -351,6 +360,7 @@ impl Builtin {
             ],
             "build" => vec![
                 ("task", deny()),
+                ("job", deny()),
                 ("plan_enter", allow()),
                 ("plan_get", allow()),
                 ("plan_update", allow()),
@@ -364,6 +374,7 @@ impl Builtin {
                 ("grep", allow()),
                 ("lsp", allow()),
                 ("shell", allow()),
+                ("bg", allow()),
                 ("webfetch", allow()),
                 ("web_search", allow()),
                 ("question", allow()),
@@ -383,6 +394,7 @@ impl Builtin {
                 ("lsp", allow()),
                 ("edit", allow()),
                 ("shell", allow()),
+                ("bg", allow()),
                 ("webfetch", allow()),
                 ("web_search", allow()),
                 ("plan_get", allow()),
@@ -400,6 +412,7 @@ impl Builtin {
                 ("lsp", allow()),
                 ("edit", allow()),
                 ("shell", allow()),
+                ("bg", allow()),
                 ("webfetch", allow()),
                 ("web_search", allow()),
                 ("plan_get", allow()),
@@ -417,6 +430,7 @@ impl Builtin {
                 ("lsp", allow()),
                 ("edit", allow()),
                 ("shell", allow()),
+                ("bg", allow()),
                 ("plan_get", allow()),
                 ("todo_get", allow()),
                 ("skill", allow()),
@@ -428,6 +442,7 @@ impl Builtin {
                 ("grep", allow()),
                 ("lsp", allow()),
                 ("shell", allow()),
+                ("bg", allow()),
                 ("skill", allow()),
             ],
             "librarian" => vec![
@@ -437,6 +452,7 @@ impl Builtin {
                 ("grep", allow()),
                 ("lsp", allow()),
                 ("shell", allow()),
+                ("bg", allow()),
                 ("webfetch", allow()),
                 ("web_search", allow()),
                 ("skill", allow()),
@@ -448,6 +464,7 @@ impl Builtin {
                 ("grep", allow()),
                 ("lsp", allow()),
                 ("shell", allow()),
+                ("bg", allow()),
                 ("skill", allow()),
             ],
             "compaction" | "title" | "summary" | "council-synth" => vec![("*", deny())],
@@ -484,6 +501,8 @@ fn deny() -> PermissionRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zuno_permission::visibility::is_tool_visible;
+    use zuno_permission::{Rule, rules_from_config};
 
     #[test]
     fn native_names_and_definitions_are_one_table() {
@@ -552,6 +571,55 @@ mod tests {
                 builtin.name
             );
         }
+    }
+
+    /// The overlay decides `bg`, so the overlay is where the omission has to fail.
+    ///
+    /// Composed the way the composition root composes it: the common `"*": allow`
+    /// default first, then this overlay. That is the whole chain that decides `bg` and
+    /// `job`; the rest of the default set (`question`, `plan_enter`, `plan_exit`, the
+    /// `read` patterns) is in `zuno-cli`'s `default_rules` and does not name either id.
+    #[test]
+    fn a_native_that_may_start_background_work_may_read_it_back() {
+        for builtin in all() {
+            let rules = effective_rules(&builtin);
+            if !is_tool_visible("shell", &rules) {
+                continue;
+            }
+            assert!(
+                is_tool_visible("bg", &rules),
+                "{} may start a background execution it cannot read back",
+                builtin.name
+            );
+        }
+    }
+
+    /// A Job resolves only for the session that delegated it, so only the delegator
+    /// may inspect one.
+    #[test]
+    fn only_the_delegating_native_can_inspect_a_durable_job() {
+        for builtin in all() {
+            let rules = effective_rules(&builtin);
+            assert_eq!(
+                is_tool_visible("job", &rules),
+                builtin.name == "orchestrator",
+                "{} disagrees with the delegation boundary about `job`",
+                builtin.name
+            );
+        }
+    }
+
+    /// The two rule layers that decide whether a tool id reaches the model.
+    fn effective_rules(builtin: &Builtin) -> Vec<Rule> {
+        let mut rules = vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }];
+        if let Some(overlay) = builtin.permission_overlay() {
+            rules.extend(rules_from_config(&overlay));
+        }
+        rules
     }
 
     #[test]

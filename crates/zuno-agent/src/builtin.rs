@@ -35,6 +35,26 @@
 //! consumer exists. The three engine internals remain prompt-owned because their raw
 //! completions are consumed directly.
 //!
+//! # `job` follows the delegation boundary, `bg` follows `shell`
+//!
+//! Two default-surface tools were governed by nobody until this table named them, so
+//! it is worth stating which boundary each one belongs to.
+//!
+//! `job` reads one durable Job row, and it resolves that row only when the row's
+//! `parent_session_id` is the calling session. A Job row exists because a `task` call
+//! created it, so an agent that may not delegate can never name a Job it owns:
+//! offering it `job` advertises a tool whose every argument answers "not found for this
+//! session". [`ORCHESTRATOR`] is the one agent that may delegate, so it is the one
+//! agent that may inspect. `job_cancel` and `job_reconcile` are absent from
+//! [`GOVERNED_TOOL_IDS`] because they are not fixed default-surface slots — the
+//! composition root registers them as configured built-ins next to `job`.
+//!
+//! `bg` is the opposite case: it belongs wherever `shell` does, including the
+//! read-only lanes. A background execution is started by `shell`, and its output is
+//! reachable only through `bg`, so an agent with `shell` and no `bg` can start work it
+//! cannot read back — and a result withheld for being oversized has no retrieval path
+//! at all.
+//!
 //! # No model ids
 //!
 //! Nothing here names a model. Every agent inherits the session model until a
@@ -63,17 +83,29 @@ use zuno_permission::Rule;
 /// * `invalid` is the registry's placeholder for a tool that failed to load; it is
 ///   never a policy target.
 ///
+/// Everything else on the default surface has to be here, and the cross-crate
+/// assertion in `zuno-tools` now checks that direction too. It did not, and the cost
+/// was `bg` and `job`: both registered in `DEFAULT_BUILTINS`, both documented, and
+/// `bg` even gated in the engine's runtime prompt, while no permission set named
+/// either. A tool no set names has no allow rule, so
+/// [`Permissions::rules`]'s leading wildcard deny is the last rule that matches it
+/// and every deny-by-default agent was blind to it. Omission is not neutral here —
+/// it is a silent deny — so the omissions have to be the three named above and
+/// nothing else.
+///
 /// It is stated here rather than imported because the dependency edge runs the
 /// other way — see the note in this crate's `Cargo.toml`. The cross-crate
 /// assertion that these ids still match the registry belongs in `zuno-tools`, where
 /// todo 65's `task` tool already sees both crates.
-pub const GOVERNED_TOOL_IDS: [&str; 17] = [
+pub const GOVERNED_TOOL_IDS: [&str; 19] = [
     "shell",
+    "bg",
     "read",
     "glob",
     "grep",
     "edit",
     "task",
+    "job",
     "webfetch",
     "plan_get",
     "plan_update",
@@ -409,6 +441,7 @@ pub const INTERNAL_NAMES: [&str; 4] = ["compaction", "title", "summary", "counci
 const READ_ONLY_DENIED: &[&str] = &[
     "edit",
     "task",
+    "job",
     "question",
     "plan_update",
     "todo_update",
@@ -419,8 +452,15 @@ const READ_ONLY_DENIED: &[&str] = &[
 ];
 
 /// The inspection tools every read-only agent may call.
+///
+/// `bg` travels with `shell` rather than with the writers. A read-only agent that may
+/// start a command may start it in the background, and a background execution's output
+/// is reachable only through `bg`; without it the agent can launch work it cannot read
+/// back, and a withheld oversized result has no retrieval path at all. Every `bg`
+/// action a read-only agent needs is an inspection, and the only side-effecting one,
+/// `cancel`, can only reach an execution this session started.
 const READ_ONLY_ALLOWED: &[&str] = &[
-    "read", "glob", "grep", "lsp", "shell", "plan_get", "todo_get", "skill",
+    "read", "glob", "grep", "lsp", "shell", "bg", "plan_get", "todo_get", "skill",
 ];
 
 /// The default primary coordinator and the only Agent that may delegate.
@@ -449,7 +489,9 @@ pub const ORCHESTRATOR: Agent = Agent {
             "lsp",
             "edit",
             "shell",
+            "bg",
             "task",
+            "job",
             "webfetch",
             "web_search",
             "plan_get",
@@ -484,7 +526,7 @@ pub const BUILD: Agent = Agent {
     temperature: 0.1,
     output: OutputContract::Natural,
     permissions: Permissions {
-        denied: &["task", "plan_exit"],
+        denied: &["task", "job", "plan_exit"],
         allowed: &[
             "read",
             "glob",
@@ -492,6 +534,7 @@ pub const BUILD: Agent = Agent {
             "lsp",
             "edit",
             "shell",
+            "bg",
             "webfetch",
             "web_search",
             "plan_get",
@@ -527,7 +570,7 @@ pub const DEEP: Agent = Agent {
     temperature: 0.1,
     output: OutputContract::Natural,
     permissions: Permissions {
-        denied: &["task", "plan_exit"],
+        denied: &["task", "job", "plan_exit"],
         allowed: &[
             "read",
             "glob",
@@ -535,6 +578,7 @@ pub const DEEP: Agent = Agent {
             "lsp",
             "edit",
             "shell",
+            "bg",
             "webfetch",
             "web_search",
             "plan_get",
@@ -600,6 +644,7 @@ pub const LIBRARIAN: Agent = Agent {
         denied: &[
             "edit",
             "task",
+            "job",
             "question",
             "plan_update",
             "todo_update",
@@ -612,6 +657,7 @@ pub const LIBRARIAN: Agent = Agent {
             "grep",
             "lsp",
             "shell",
+            "bg",
             "webfetch",
             "web_search",
             "plan_get",
@@ -674,6 +720,7 @@ pub const FIXER: Agent = Agent {
     permissions: Permissions {
         denied: &[
             "task",
+            "job",
             "webfetch",
             "plan_update",
             "todo_update",
@@ -683,7 +730,7 @@ pub const FIXER: Agent = Agent {
             "plan_exit",
         ],
         allowed: &[
-            "read", "glob", "grep", "lsp", "edit", "shell", "plan_get", "todo_get", "skill",
+            "read", "glob", "grep", "lsp", "edit", "shell", "bg", "plan_get", "todo_get", "skill",
         ],
         extension_tools: ExtensionTools::Excluded,
     },
@@ -710,7 +757,7 @@ pub const GENERAL: Agent = Agent {
     temperature: 0.1,
     output: OutputContract::Natural,
     permissions: Permissions {
-        denied: &["task", "question", "plan_exit"],
+        denied: &["task", "job", "question", "plan_exit"],
         allowed: &[
             "read",
             "glob",
@@ -718,6 +765,7 @@ pub const GENERAL: Agent = Agent {
             "lsp",
             "edit",
             "shell",
+            "bg",
             "webfetch",
             "web_search",
             "plan_get",

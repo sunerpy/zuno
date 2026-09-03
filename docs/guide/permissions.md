@@ -374,6 +374,15 @@ authority, so selecting a read-only agent is a guarantee rather than a default t
 configuration can quietly reverse. It also means a read-only Agent never uses
 `run-unconfined`.
 
+An agent contract is deny-by-default, so a tool the contract does not name is *hidden*
+rather than merely unauthorized: the contract's leading `"*": "deny"` is the last rule
+that matches an unnamed id, and the model is never offered the tool at all. Two of the
+default grants follow from that. `bg` is granted wherever `shell` is, including the
+read-only roles, because a background execution is started by `shell` and read back only
+through `bg` — and so is a result too large to return in full. `job` is granted only to
+the delegating agent, because a Job resolves only for the session whose `task` call
+created it.
+
 ```sh
 # Cannot write, whatever sandbox.mode says.
 zuno run --agent plan "audit the retry policy"
