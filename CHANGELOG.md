@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/sunerpy/zuno/compare/v0.7.1...v0.8.0) (2026-09-03)
+
+
+### Features
+
+* opt-in encrypted reasoning replay for OpenAI Responses endpoints ([#99](https://github.com/sunerpy/zuno/issues/99)) ([6c5d932](https://github.com/sunerpy/zuno/commit/6c5d932ab2cc630951f0754ca8b341686faa726d))
+
 ## [0.7.1](https://github.com/sunerpy/zuno/compare/v0.7.0...v0.7.1) (2026-09-03)
 
 
