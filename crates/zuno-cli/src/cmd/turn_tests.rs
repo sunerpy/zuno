@@ -2023,6 +2023,48 @@ fn permanent_provider_failure_blocks_the_goal_with_a_typed_reason() {
 }
 
 #[test]
+fn a_contended_durable_write_retries_the_goal_instead_of_blocking_it() {
+    // Before this, every failure on the plan-driver, human-request, and
+    // retry-context paths reached the goal layer as a rendered string, so write
+    // contention that clears by itself was reported as a permanent host failure
+    // and the goal stopped for good.
+    let contended = TurnFailure::Database(DbError::Busy {
+        retry_after: Some(Duration::from_millis(250)),
+    });
+    assert_eq!(
+        contended.goal_failure(),
+        GoalTerminalFailure::Retry {
+            reason: zuno_goal::GoalRetryReason::DatabaseBusy,
+            retry_after: Some(Duration::from_millis(250)),
+        }
+    );
+
+    // Corruption is still permanent, and it names the database rather than the host.
+    let corrupt = TurnFailure::Database(DbError::SchemaMismatch {
+        expected: 8,
+        observed: Some(9),
+    });
+    assert_eq!(
+        corrupt.goal_failure(),
+        GoalTerminalFailure::Block(GoalBlockReason::DatabasePermanent)
+    );
+
+    // A GoalError keeps its database half on the way through, which is what lets
+    // the classification above happen at all.
+    assert!(matches!(
+        TurnFailure::goal(GoalError::Db(DbError::Busy { retry_after: None })),
+        TurnFailure::Database(DbError::Busy { retry_after: None })
+    ));
+    assert!(matches!(
+        TurnFailure::goal(GoalError::Db(DbError::Decode {
+            table: "goal".to_owned(),
+            source: serde_json::from_str::<Value>("{").expect_err("malformed JSON"),
+        })),
+        TurnFailure::Database(DbError::Decode { .. })
+    ));
+}
+
+#[test]
 fn prepared_user_message_persistence_preserves_database_busy() {
     let directory = tempfile::tempdir().expect("temporary database directory");
     let attachment_root = tempfile::tempdir().expect("temporary attachment directory");

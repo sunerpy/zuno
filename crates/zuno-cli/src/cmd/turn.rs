@@ -2124,6 +2124,14 @@ impl ExtensionOwnership {
 #[derive(Debug)]
 enum TurnFailure {
     Engine(TurnError),
+    /// A durable-state failure the goal layer must classify itself.
+    ///
+    /// Kept as the typed error rather than a rendered string so that
+    /// [`GoalTerminalFailure::from_db_error`] can tell SQLite contention, which
+    /// deserves a persisted backoff retry, apart from corruption, which must
+    /// block. A `Host(String)` here would make every database failure a
+    /// permanent host failure.
+    Database(DbError),
     Host(String),
     EventConsumer(String),
     GoalRecovery {
@@ -2135,6 +2143,14 @@ enum TurnFailure {
 impl TurnFailure {
     fn host(error: impl std::fmt::Display) -> Self {
         Self::Host(error.to_string())
+    }
+
+    /// Unwrap a [`GoalError`] so its database half keeps its variant.
+    fn goal(error: GoalError) -> Self {
+        match error {
+            GoalError::Db(error) => Self::Database(error),
+            other => Self::Host(other.to_string()),
+        }
     }
 
     fn event_consumer(error: impl std::fmt::Display) -> Self {
@@ -2151,6 +2167,7 @@ impl TurnFailure {
     fn rendered(&self, credential: Option<&str>) -> String {
         match self {
             Self::Engine(error) => describe_turn_failure(error, credential),
+            Self::Database(error) => error.to_string(),
             Self::Host(message)
             | Self::EventConsumer(message)
             | Self::GoalRecovery { message, .. } => message.clone(),
@@ -2161,11 +2178,14 @@ impl TurnFailure {
         if let Self::GoalRecovery { failure, .. } = self {
             return *failure;
         }
+        if let Self::Database(error) = self {
+            return GoalTerminalFailure::from_db_error(error);
+        }
         let recovery = match self {
             Self::Engine(error) => error.recovery(),
             Self::Host(_) => TurnRecovery::Fail,
             Self::EventConsumer(_) => TurnRecovery::Pause,
-            Self::GoalRecovery { .. } => unreachable!("handled above"),
+            Self::Database { .. } | Self::GoalRecovery { .. } => unreachable!("handled above"),
         };
         match recovery {
             TurnRecovery::Retry { reason, after } => GoalTerminalFailure::Retry {
@@ -2189,6 +2209,7 @@ impl TurnFailure {
                     zuno_goal::GoalPauseReason::TurnBudget
                 }
                 Self::Engine(_)
+                | Self::Database(_)
                 | Self::Host(_)
                 | Self::EventConsumer(_)
                 | Self::GoalRecovery { .. } => zuno_goal::GoalPauseReason::UserInterruption,
@@ -2227,6 +2248,7 @@ impl TurnFailure {
                 | TurnError::ToolSignatureWithoutStart { .. }
                 | TurnError::InvalidToolCalls { .. },
             ) => GoalBlockReason::InvalidTurnState,
+            Self::Database(_) => GoalBlockReason::DatabasePermanent,
             Self::Engine(_)
             | Self::Host(_)
             | Self::EventConsumer(_)
@@ -7110,7 +7132,7 @@ impl TurnHost {
                 self.recover_goal_context().await?;
                 self.goal_store
                     .mark_retry_context_compacted(&self.session_id)
-                    .map_err(TurnFailure::host)?;
+                    .map_err(TurnFailure::goal)?;
             }
             self.continue_goal_unaccounted(&prepared, events.clone())
                 .await
@@ -7209,7 +7231,7 @@ impl TurnHost {
         let cycle_id = self
             .plan_reconciliation
             .begin(&self.session_id, &proposed_cycle_id)
-            .map_err(TurnFailure::host)?;
+            .map_err(TurnFailure::Database)?;
         loop {
             let outcome = self
                 .execute_one_turn_unaccounted(dynamic_context, routing, guard, events.clone())
@@ -7228,7 +7250,7 @@ impl TurnHost {
             match self
                 .plan_reconciliation
                 .reconcile(&self.session_id, &cycle_id, input)
-                .map_err(TurnFailure::host)?
+                .map_err(TurnFailure::Database)?
             {
                 PlanReconciliationDecision::Finish | PlanReconciliationDecision::ContinueGoal => {
                     self.cancel_reconciled_plan_requests(&cycle_id)
@@ -7265,7 +7287,7 @@ impl TurnHost {
                             &cycle_id,
                             reason,
                         ))
-                        .map_err(TurnFailure::host)?;
+                        .map_err(TurnFailure::Database)?;
                     events
                         .publish(TurnEvent::TurnWaitingForHuman {
                             assistant_message_id: assistant_message_id.clone(),
@@ -7466,9 +7488,7 @@ impl TurnHost {
             .await
             .map(|_| ())
             .map_err(|error| match error {
-                CompactionSkipped::Database(error) => {
-                    TurnFailure::Engine(TurnError::Database(error))
-                }
+                CompactionSkipped::Database(error) => TurnFailure::Database(error),
                 CompactionSkipped::Reason(message) => TurnFailure::host(format!(
                     "goal context compaction could not start: {message}"
                 )),
