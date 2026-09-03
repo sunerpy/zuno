@@ -220,15 +220,47 @@ probe. It also says to record the claim before writing configuration, not after.
 
 ### Generated state stays out of the commit
 
-The goal document, spilled tool output, and background execution records are all generated,
-so their directories go into the repository-private `.git/info/exclude` rather than a
-tracked `.gitignore`. One registry supplies both that exclude block and the staging refusal
-below, so the two cannot disagree about which paths are generated.
+Everything directly under `.zuno/` is generated unless a person authors it. The goal
+document, spilled tool output, and background execution records are the ones Zuno registers
+by name; a directory a future release adds is generated too, without anybody updating a
+list. What is excepted is the configuration a person writes there — `zuno.json`,
+`zuno.jsonc`, `tui.json`, `tui.jsonc`, `RULES.md`, `agents/`, `commands/`, `extensions/`,
+`plans/`, `rules/`, and `skills/`, along with the singular `agent/`, `command/`, and
+`skill/` spellings Zuno also loads. Those stay visible to `git status` and belong in your
+commits.
 
-The exclude block only keeps them out of `git status`. A `git commit` that would deliver
-them anyway is refused before it runs, with the paths named and `git restore --staged` as
-the remedy. The check reads the index, and also the tracked working-tree changes when the
-command stages as it commits. Outside a repository there is nothing to check and nothing is
+The exclusion is written in two places, from that one registry. The pattern `**/.zuno/*`
+and one negation per authored entry go into the repository-private
+`.git/info/exclude`, not into a tracked `.gitignore`, because Zuno editing a file the
+repository's history owns would land as an unexplained diff in somebody else's next commit.
+Each generated directory also writes its own `.gitignore` containing `*` as it is created,
+which covers that file as well, so the directory stays hidden even where no exclude block
+was written — a fresh clone, a second worktree, or a repository whose block someone
+deleted. Every pattern is matched at every depth, so a `.zuno/` directory an older release
+left in a subdirectory is hidden as well; it is inert, and you can delete it.
+
+An ignore rule never applies to a path git already tracks, and that is why a refusal exists
+on top of the exclusions. A `git commit` that would deliver generated state anyway is
+refused before it runs, naming each path, why it counts as generated, and what to do:
+`git restore --staged` for a path that is merely staged, and `git rm --cached` for one git
+tracks, because untracking it is the only thing that stops the next `git add -A` from
+collecting it again.
+
+What a commit delivers is read from git, never from the command line, because the command
+line does not know it — an alias, a `commit.template`, or a pre-commit hook that stages can
+all put a path in a commit that no argument named. The index is always read. A command that
+stages before it commits is read from the worktree instead, across the part of it the
+staging reaches: when the check runs, `git add -A && git commit -m wip` has staged nothing
+yet, so what gets classified is that reach, meaning every tracked modification plus every
+untracked file git does not ignore. A narrower pathspec narrows the read to it. A pathspec
+whose reach cannot be read as a path — a glob, or one of git's `:`-prefixed magic forms —
+widens the read back to the whole worktree rather than being guessed at.
+
+A commit that selects its own repository is refused rather than inspected. `-C`,
+`--git-dir`, `--work-tree`, `--namespace`, and an inline `GIT_DIR=…` all name a repository
+these reads do not follow, so inspecting anyway would report on a tree other than the one
+being written. Name the repository in the Shell tool's `workdir`, where it is one fact the
+check and the commit share. Outside a repository there is nothing to check and nothing is
 refused.
 
 This exists because generated state that reaches the index is how an agent reports a dirty
