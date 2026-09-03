@@ -1161,12 +1161,22 @@ mod tests {
         }
     }
 
-    /// A runtime whose authorization boundary is the temporary workspace.
+    /// A runtime whose authorization boundary is the temporary workspace, paired with
+    /// the spelling of that boundary the runtime itself uses.
     ///
     /// The anchored write primitive descends from this boundary, so a unit test of the
-    /// verified write and removal has to name it just as the tool does.
-    fn runtime_at(workspace: &Path) -> FileToolRuntime {
-        FileToolRuntime::new(workspace, Arc::new(NoopFormatter)).expect("file tool runtime")
+    /// verified write and removal has to name it just as the tool does. `FileToolRuntime`
+    /// canonicalizes the boundary it is given, and `tempfile` reports whatever spelling
+    /// the platform handed it: on Windows that is the 8.3 short form
+    /// `C:\Users\ADMINI~1\...` of the directory whose canonical form is
+    /// `\\?\C:\Users\Administrator\...`. Production never mixes the two, because
+    /// `FileToolRuntime::resolve` canonicalizes the target as well, so these fixtures
+    /// build their targets from the canonical root rather than from the reported path.
+    fn runtime_at(workspace: &Path) -> (FileToolRuntime, PathBuf) {
+        let runtime =
+            FileToolRuntime::new(workspace, Arc::new(NoopFormatter)).expect("file tool runtime");
+        let root = workspace.canonicalize().expect("canonical workspace");
+        (runtime, root)
     }
 
     fn conflict_of(error: &ToolError) -> &ToolMutationConflict {
@@ -1179,13 +1189,14 @@ mod tests {
     #[test]
     fn a_file_changed_between_read_and_write_is_never_overwritten() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("raced.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("raced.txt");
         std::fs::write(&path, "prepared\n").expect("prepared image");
         let prepared = digest_bytes(b"prepared\n");
         std::fs::write(&path, "somebody else\n").expect("concurrent edit");
 
         let error = write_verified(
-            &runtime_at(workspace.path()),
+            &runtime,
             &target(&path, "raced.txt"),
             b"patched\n",
             Some(&prepared),
@@ -1212,10 +1223,11 @@ mod tests {
     #[test]
     fn a_file_removed_between_read_and_write_is_reported_as_a_conflict() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("vanished.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("vanished.txt");
 
         let error = write_verified(
-            &runtime_at(workspace.path()),
+            &runtime,
             &target(&path, "vanished.txt"),
             b"patched\n",
             Some(&digest_bytes(b"prepared\n")),
@@ -1232,12 +1244,13 @@ mod tests {
     #[test]
     fn an_add_whose_path_appeared_concurrently_is_never_overwritten() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("nested").join("added.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("nested").join("added.txt");
         std::fs::create_dir_all(path.parent().expect("a parent")).expect("nested directory");
         std::fs::write(&path, "somebody else\n").expect("concurrent create");
 
         let error = write_verified(
-            &runtime_at(workspace.path()),
+            &runtime,
             &target(&path, "nested/added.txt"),
             b"added\n",
             None,
@@ -1257,11 +1270,11 @@ mod tests {
     #[test]
     fn a_target_that_still_holds_its_prepared_image_is_written() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let existing = workspace.path().join("update.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let existing = root.join("update.txt");
         std::fs::write(&existing, "prepared\n").expect("prepared image");
-        let created = workspace.path().join("new").join("added.txt");
+        let created = root.join("new").join("added.txt");
 
-        let runtime = runtime_at(workspace.path());
         write_verified(
             &runtime,
             &target(&existing, "update.txt"),
@@ -1292,13 +1305,14 @@ mod tests {
     #[test]
     fn a_source_changed_between_read_and_removal_is_never_removed() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("raced.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("raced.txt");
         std::fs::write(&path, "prepared\n").expect("prepared image");
         let prepared = digest_bytes(b"prepared\n");
         std::fs::write(&path, "somebody else\n").expect("concurrent edit");
 
         let error = remove_verified(
-            &runtime_at(workspace.path()),
+            &runtime,
             &target(&path, "raced.txt"),
             Some(&prepared),
             "patch-digest",
@@ -1324,10 +1338,11 @@ mod tests {
     #[test]
     fn a_source_removed_between_read_and_removal_is_reported_as_a_conflict() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("vanished.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("vanished.txt");
 
         let error = remove_verified(
-            &runtime_at(workspace.path()),
+            &runtime,
             &target(&path, "vanished.txt"),
             Some(&digest_bytes(b"prepared\n")),
             "patch-digest",
@@ -1343,11 +1358,12 @@ mod tests {
     #[test]
     fn a_removal_without_a_recorded_pre_image_is_refused_and_touches_nothing() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("unverified.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("unverified.txt");
         std::fs::write(&path, "somebody\n").expect("existing file");
 
         let error = remove_verified(
-            &runtime_at(workspace.path()),
+            &runtime,
             &target(&path, "unverified.txt"),
             None,
             "patch-digest",
@@ -1364,11 +1380,12 @@ mod tests {
     #[test]
     fn a_source_that_still_holds_its_prepared_image_is_removed() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let path = workspace.path().join("delete.txt");
+        let (runtime, root) = runtime_at(workspace.path());
+        let path = root.join("delete.txt");
         std::fs::write(&path, "prepared\n").expect("prepared image");
 
         remove_verified(
-            &runtime_at(workspace.path()),
+            &runtime,
             &target(&path, "delete.txt"),
             Some(&digest_bytes(b"prepared\n")),
             "patch-digest",

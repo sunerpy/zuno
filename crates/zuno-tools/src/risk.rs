@@ -2011,16 +2011,33 @@ mod home_tests {
 
     #[test]
     fn a_posix_path_is_never_read_as_a_windows_root() {
-        for path in [
-            "/etc",
-            "/",
-            "relative/path",
-            "unc/project/notes",
-            "//server/share",
-        ] {
+        for path in ["/etc", "/", "relative/path", "unc/project/notes"] {
             let normalized = normalize_path(Path::new(path));
             assert_eq!(windows_target(&normalized), None, "{path}");
         }
+    }
+
+    /// A leading `//` means whatever the host's own path parser says it means.
+    ///
+    /// `normalize_path` walks [`Path::components`], and prefix parsing there belongs to
+    /// the host: Windows reads the leading `//` as a UNC prefix and keeps the share,
+    /// while on Linux `//` collapses to `/` and the result is the ordinary directory
+    /// `/server/share`. Each answer is the one the shell that would run the command
+    /// makes, and classifying the target the way that shell does is the assessor's whole
+    /// job — so this case is pinned per host instead of being asserted away on one of
+    /// them.
+    #[test]
+    fn a_double_slash_root_is_classified_the_way_the_host_reads_it() {
+        let normalized = normalize_path(Path::new("//server/share"));
+        #[cfg(windows)]
+        assert_eq!(
+            windows_target(&normalized),
+            Some(WindowsTarget::Share {
+                relative: String::new()
+            })
+        );
+        #[cfg(not(windows))]
+        assert_eq!(windows_target(&normalized), None);
     }
 
     #[test]

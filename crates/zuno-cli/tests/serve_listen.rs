@@ -8,9 +8,10 @@
 //! of the number, and reads the port out of the readiness line the user sees.
 
 use std::io::{BufRead as _, BufReader};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Long enough for a cold binary to open its database and bind, short enough that a
 /// regression fails the run instead of hanging it.
@@ -24,6 +25,43 @@ fn free_port() -> u16 {
         .local_addr()
         .expect("the bound fixture address")
         .port()
+}
+
+/// Collect a stream's lines on its own thread.
+///
+/// Both streams need a reader for the whole life of the child. `wait_with_output` would
+/// read them for us, but it returns only once every writer has closed its end, and on
+/// Windows that is not the same as the child having exited — see [`terminate_tree`]. A
+/// stream nobody reads is worse still: the child blocks forever on a full pipe.
+fn collect(stream: impl std::io::Read + Send + 'static, sink: mpsc::Sender<String>) {
+    std::thread::spawn(move || {
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            if sink.send(line).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// End the served tree, not only the process this fixture spawned.
+///
+/// `run_process` restarts the executable once with its bootstrap environment. On Unix
+/// that restart is an `exec`, so the child this fixture holds *is* the server. Windows
+/// has no `exec`, so the restart is a real child and the process this fixture holds is
+/// only its waiter: killing the waiter alone leaves the server running, still owning
+/// the inherited pipes, and the test would then hang instead of fail. `taskkill /T`
+/// ends the waiter and everything below it.
+fn terminate_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]
@@ -52,24 +90,35 @@ fn serve_binds_the_port_configured_in_zuno_json() {
         .env("ZUNO_DISABLE_AUTOUPDATE", "true")
         .env("ZUNO_DISABLE_MODELS_FETCH", "true")
         .env("ZUNO_DISABLE_LSP_DOWNLOAD", "true")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("the shipped binary must start");
 
-    let stdout = child.stdout.take().expect("piped stdout");
     let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if sender.send(line).is_err() {
-                break;
+    collect(child.stdout.take().expect("piped stdout"), sender.clone());
+    let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+    let (stderr_sender, stderr_receiver) = mpsc::channel();
+    collect(child.stderr.take().expect("piped stderr"), stderr_sender);
+    {
+        let stderr_lines = Arc::clone(&stderr_lines);
+        std::thread::spawn(move || {
+            for line in stderr_receiver {
+                stderr_lines.lock().expect("stderr transcript").push(line);
             }
-        }
-    });
+        });
+    }
 
+    // One deadline for the whole wait, not one per line: a binary that streams
+    // anything at all must not be able to hold the suite open indefinitely.
+    let deadline = Instant::now() + READINESS_TIMEOUT;
     let mut transcript = Vec::new();
     let readiness = loop {
-        match receiver.recv_timeout(READINESS_TIMEOUT) {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break None;
+        };
+        match receiver.recv_timeout(remaining) {
             Ok(line) => {
                 let matched = line.contains("listening on");
                 transcript.push(line.clone());
@@ -81,9 +130,8 @@ fn serve_binds_the_port_configured_in_zuno_json() {
         }
     };
 
-    let _ = child.kill();
-    let output = child.wait_with_output().expect("the server must be reaped");
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    terminate_tree(&mut child);
+    let stderr = stderr_lines.lock().expect("stderr transcript").join("\n");
 
     let readiness = readiness.unwrap_or_else(|| {
         panic!(

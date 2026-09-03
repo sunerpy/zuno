@@ -388,6 +388,16 @@ mod tests {
         Layout::resolve_with(&env, None)
     }
 
+    /// The `tmp` entry a layout resolves when no temp variable is set.
+    ///
+    /// Windows has no `/tmp`, so the last resort there is the system Temp directory
+    /// rather than a POSIX literal. Reading it back through `tmpdir` keeps these tests
+    /// about the ladder and the join instead of about one platform's spelling.
+    fn resolved_default_temp() -> String {
+        let empty = Env::from_pairs(std::iter::empty::<(&str, &str)>());
+        node_path::join(&tmpdir(&empty), APP)
+    }
+
     fn expected_debug_paths(entries: &[(&str, String)]) -> String {
         entries
             .iter()
@@ -430,7 +440,7 @@ mod tests {
                     "state",
                     node_path::join_all(["/config", ".local/state", APP]),
                 ),
-                ("tmp", node_path::join("/tmp", APP)),
+                ("tmp", resolved_default_temp()),
             ])
         );
     }
@@ -455,7 +465,7 @@ mod tests {
                 ("cache", node_path::join("/tmp/x/cache", APP)),
                 ("config", node_path::join("/tmp/x/config", APP)),
                 ("state", node_path::join("/tmp/x/state", APP)),
-                ("tmp", node_path::join("/tmp", APP)),
+                ("tmp", resolved_default_temp()),
             ])
         );
     }
@@ -487,7 +497,7 @@ mod tests {
         assert_eq!(layout(&[(TMPDIR, "/a")]).temp(), Path::new("/a/zuno"));
         assert_eq!(layout(&[(TMP, "/b")]).temp(), Path::new("/b/zuno"));
         assert_eq!(layout(&[(TEMP, "/c")]).temp(), Path::new("/c/zuno"));
-        assert_eq!(layout(&[]).temp(), Path::new("/tmp/zuno"));
+        assert_eq!(layout(&[]).temp(), Path::new(&resolved_default_temp()));
         // TMPDIR wins over TMP wins over TEMP.
         assert_eq!(
             layout(&[(TMPDIR, "/a"), (TMP, "/b"), (TEMP, "/c")]).temp(),
