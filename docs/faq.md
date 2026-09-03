@@ -266,17 +266,30 @@ Use the normal provider options:
 {
   "provider": {
     "kiro-local": {
+      "transport": "openai",
+      "surface": "responses",
       "options": {
         "baseURL": "http://127.0.0.1:8787/v1",
         "maxTokens": null,
         "timeout": false,
         "headerTimeout": 330000,
-        "chunkTimeout": 210000
+        "chunkTimeout": 210000,
+        "reasoningReplay": "encrypted",
+        "reasoningReplayMaxAge": 86400000
       }
     }
   }
 }
 ```
+
+`reasoningReplay: "encrypted"` is what makes the gateway seal reasoning and Zuno
+replay it. Without it every request still succeeds, but the gateway logs
+`reasoning_replay_locked: false` and multi-tool-call turns lose the model's own
+reasoning between steps. `reasoningReplayMaxAge` matches the gateway's 24-hour
+envelope validity. The explicit `transport` and `surface` are required for a
+gateway entry like this one: a provider whose endpoint comes from `baseURL`
+resolves to Chat Completions without a declared surface, and config validation
+refuses that combination. The catalog `openai` provider needs neither key.
 
 Remove a stale `responsesTextBlocks: "single"` setting when upgrading. That
 generic Zuno compatibility mode joins text with one blank line, so it changes

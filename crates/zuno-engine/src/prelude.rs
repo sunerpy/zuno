@@ -51,8 +51,9 @@ use crate::compaction::{
     TranscriptEntry, run_compaction, summary_safe_message_owned,
 };
 use crate::r#loop::{
-    ResolvedModel, hydrate_retained_history, map_project_history_owned_with_ids, project_history,
-    retained_history,
+    ReasoningReplayScope, ResolvedModel, hydrate_retained_history,
+    map_project_history_owned_with_ids, project_history, retained_history,
+    withhold_unreplayable_capsules,
 };
 use futures::StreamExt;
 
@@ -248,9 +249,12 @@ pub async fn generate_title(
     if !session::is_default_title(&session.title) {
         return Ok(None);
     }
-    let history = MessageStore::new(context.connection)
+    let mut history = MessageStore::new(context.connection)
         .hydrate_session(session_id)
         .map_err(TitleSkipped::Database)?;
+    // The title runs on its own model. A reasoning envelope the turn model sealed is
+    // a rejected request there, so it stays behind in the durable row.
+    withhold_unreplayable_capsules(&mut history, ReasoningReplayScope::None);
     let Some(opening) = opening_exchange(&history) else {
         return Ok(None);
     };
@@ -476,8 +480,11 @@ pub async fn summarize(
     session_id: &str,
     context: &mut PreludeContext<'_>,
 ) -> Result<String, String> {
-    let history = hydrate_retained_history(context.connection, session_id)
+    let mut history = hydrate_retained_history(context.connection, session_id)
         .map_err(|error| error.to_string())?;
+    // Same reason as the title request: the summary model did not seal these
+    // envelopes and cannot open them.
+    withhold_unreplayable_capsules(&mut history, ReasoningReplayScope::None);
     let agent = &context.internals.summary;
     let provider = context.providers.provider_for(agent)?;
     let mut messages = vec![Message::new(Role::System, agent.prompt.clone())];
@@ -600,9 +607,45 @@ pub fn transcript_owned(
 /// request itself a moment later with a far better message.
 #[must_use]
 pub fn estimate_tokens(message: &Message) -> u32 {
-    let length = serde_json::to_string(message).map_or(0, |json| json.len());
+    let length = billable_json_len(message);
     let rounded = (length + CHARS_PER_TOKEN / 2) / CHARS_PER_TOKEN;
     u32::try_from(rounded).unwrap_or(u32::MAX)
+}
+
+/// The serialized length of `value` with the tool-argument bytes counted once.
+///
+/// `RequestContentBlock::ToolUse` carries both the decoded `input` and the
+/// `raw_arguments` the provider emitted, because a Responses endpoint that seals
+/// reasoning fingerprints the argument text it sent. Only one of the two reaches the
+/// wire — every adapter writes a single `arguments` field — so charging both would
+/// roughly double the estimated cost of every tool call in history, and the escaped
+/// copy is the longer of the two. That inflated estimate is not cosmetic: it feeds
+/// `ensure_prompt_context_budget`, which refuses a turn that still fits, and
+/// `select_boundary`, which would retain half the history it should.
+pub(crate) fn billable_json_len<T: serde::Serialize>(value: &T) -> usize {
+    let Ok(mut json) = serde_json::to_value(value) else {
+        return 0;
+    };
+    strip_raw_arguments(&mut json);
+    serde_json::to_string(&json).map_or(0, |text| text.len())
+}
+
+/// Remove every `raw_arguments` entry from a serialized message tree.
+fn strip_raw_arguments(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove("raw_arguments");
+            for child in object.values_mut() {
+                strip_raw_arguments(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                strip_raw_arguments(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The opening exchange a title is generated from, when there is exactly one.

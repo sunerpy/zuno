@@ -1430,6 +1430,7 @@ fn lower_anthropic_block(
                 id,
                 name,
                 input,
+                raw_arguments: _,
                 thought_signature: None,
             },
         ) => Ok(json!({"type": "tool_use", "id": id, "name": name, "input": input})),

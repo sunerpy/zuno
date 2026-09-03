@@ -164,9 +164,31 @@ Codex 与 Claude Code 产品子 Agent 是一项独立能力。它们继承对应
 | `chunkTimeout` | 流式数据块之间的最大间隔（毫秒） |
 | `maxTokens`、`temperature`、`topP`、`toolChoice` | 由原生 provider 转发的生成控制项 |
 | `responsesTextBlocks` | Responses 文本投影：默认 `multiple`，对只暴露一个上游文本字段的网关使用 `single` |
+| `reasoningReplay` | 默认 `off`；对会封装推理的 Responses 端点使用 `encrypted` |
+| `reasoningReplayMaxAge` | Zuno 仍会重放的最旧封装推理信封年龄（毫秒） |
 | `extraBody` | 在受保护字段组装完成之后追加的请求字段 |
 
 `responsesTextBlocks: "single"` 是一项兼容性声明，不是从 provider id 推断出的模型能力。它让 Zuno 的持久提示词 part 保持类型化，但会在构建 compatible Responses 请求之前，用一个空行把它们的文本投影连接起来。内联图像仍然是独立的内容块。只有当目标端点拒绝一条消息中出现多个 `input_text` 块时才使用它；符合标准的端点应当保持默认的 `multiple` 行为。不要把它用于 2026-08-28 的 `kiro-provider` 构建：那个 provider 现在会把连续的全文本块逐字节拼接、不加分隔符，而这个选项会有意插入一个空行。
+
+### 加密推理重放
+
+`reasoningReplay: "encrypted"` 声明该端点会封装推理。此后 Zuno 会为该 provider 的每个 Responses 请求加上 `include: ["reasoning.encrypted_content"]`，把每个封装推理项持久化为独立的 part，并按模型产出时的位置逐字节重放这些项：每一项都紧挨在它所解释的输出之前。这是端点能力，不是 provider 身份；官方 Responses API 与本地回环网关用同一种方式声明它。
+
+这个选项是否生效取决于请求最终落在哪个 surface 上。目录里的 `openai` provider 什么都不用声明：它的 transport 来自目录，surface 保持 OpenAI adapter 的默认值，也就是 Responses。而端点来自 `options.baseURL` 或 `options.endpoint` 的网关必须同时声明 `"transport": "openai"` 与 `"surface": "responses"`，因为只要 provider 选项里带了端点、又没有声明 surface，就会解析成 Chat Completions；`openai-compatible` 则按 provider id 规则解析 surface，而不是按你声明的值。这两种情况下会话都会请求封装推理却永远拿不到，链路上也没有任何提示。
+
+配置校验只拒绝它能证明不可能承载封装项的路由，并指出出错键路径：transport 不是 `openai`、surface 不是 `responses`，或者带自定义端点却在任何层级都没有声明 surface。对本来就会解析成 Responses 的 provider，它不会要求多余的声明。`models.<id>.provider.surface`、`.transport` 与 `models.<id>.options.reasoningReplay` 会按模型逐个校验，因为决定请求走向的是模型自己的路由。
+
+封装信封绑定到铸造它的模型，并会在上游过期。Zuno 只会把信封重放给同一个目录 provider 与同一个模型，且只在它比 `reasoningReplayMaxAge` 更新时重放。其他情况下信封会离开 provider 请求，而持久行保留原密文，因此会话中途换模型只会降级质量，不会让这一轮失败。请把年龄上限设为端点自身的有效期，例如 24 小时写成 `86400000`；省略它则重放所有已存信封。标题、摘要、压缩以及其他辅助请求运行在不同的模型上，永远不会携带封装信封。
+
+重放还必须与端点的指纹一致。工具调用会用 provider 自己的 `arguments` 字节重放，而不是把解析后的值重新序列化，因为键顺序与空格也是被签名内容的一部分。如果某个步骤的封装项后面没有任何输出（例如步骤被打断，或整份输出预算都花在推理上），这一项会被扣留而不是单独发出，因为 Responses 端点会拒绝这种形状；它计入被扣留数，而不算作一次重放。项 id 不会回送：重放项只带 `type`、`summary`、`encrypted_content` 与 `status`。
+
+默认值 `off` 表示请求既不带 `include`，也不带任何封装项，包括同一会话在选项为 `encrypted` 时存下的信封。它并不承诺请求字节与既有版本一致：本次发布还会按模型流出的顺序发送每个 assistant 轮次的 Responses `input`，因此先写文本再调用工具的一轮，现在会先发文本项再发 function call —— 这对所有 Responses provider 生效，与 `reasoningReplay` 的取值无关。这个顺序正是封装端点会校验的内容；一次性代价是仅追加的提示词缓存前缀会失效一次。
+
+没有 `reasoningReplay: "encrypted"` 的 `reasoningReplayMaxAge` 同样会在配置期被拒绝。不要给会封装推理的端点添加 `reasoningSummary`，它会拒绝 `reasoning.summary`。
+
+信封是不透明的 provider 密文，Zuno 把它当作会话内容而不是可以脱敏的机密：它存放在推理 part 的 `metadata.providerReasoning` 中，会由 HTTP messages 端点返回，还会随一个完整携带密文的流事件转发：SSE 客户端看到的类型是 `provider.reasoning.item`，`zuno run --json` 打印的是 `provider_reasoning_item`，两者的密文都在 `encryptedContent` 字段里。Zuno 绝不会把它发给除封装者以外的模型，`session.provider.request` 事件只记录计数。能读取某个会话的消息或事件流，就等于能读取它的信封。
+
+每个前台请求都会在自己的 `session.provider.request` 事件上记录 `reasoningReplay`、`replayedReasoningCapsules` 与 `withheldReasoningCapsules`，这就是确认重放确实发生的依据。重放计数就是真正上链路的数量；历史提供了、但这次请求没有发出的信封都计入被扣留数，无论原因是别的模型铸造、已经过期，还是它后面没有任何输出。
 
 模型的 `options.reasoningEffort` 是当实时会话与所选 Agent 都没有选择级别时的默认值。在 Responses surface 上，`options.reasoningSummary` 会与它一起降级为 `reasoning: { effort, summary }`；Chat Completions 只收到 `reasoning_effort`，因为它没有推理摘要请求字段。对拒绝 `reasoning.summary` 的 compatible 端点，请省略 `reasoningSummary`；Zuno 不会基于 provider id 静默剥离一个被显式请求的控制项。
 

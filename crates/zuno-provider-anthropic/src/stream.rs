@@ -384,6 +384,7 @@ impl AnthropicDecoder {
                     id: id.clone(),
                     name,
                     input,
+                    raw_arguments: (!input_json.is_empty()).then_some(input_json),
                     thought_signature: None,
                 });
                 Ok(vec![StreamEvent::ToolUseEnd { id }])
@@ -932,12 +933,17 @@ mod tests {
                     id: "toolu_a".to_owned(),
                     name: "alpha".to_owned(),
                     input: serde_json::json!({ "x": 1 }),
+                    // The decoder keeps the bytes Anthropic streamed, even though
+                    // the Messages request echoes `input` as an object: the durable
+                    // record is what a Responses endpoint would need verbatim.
+                    raw_arguments: Some("{\"x\":1}".to_owned()),
                     thought_signature: None,
                 },
                 RequestContentBlock::ToolUse {
                     id: "toolu_b".to_owned(),
                     name: "beta".to_owned(),
                     input: serde_json::json!({ "y": 2 }),
+                    raw_arguments: Some("{\"y\":2}".to_owned()),
                     thought_signature: None,
                 },
             ]

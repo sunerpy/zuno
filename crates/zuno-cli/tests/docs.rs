@@ -78,6 +78,11 @@ fn harness_guide_documents_the_native_extension_contract() {
             "requestPurpose",
             "affinityAttached",
             "affinitySource",
+            "Encrypted reasoning replay",
+            "reasoningReplay",
+            "reasoning.encrypted_content",
+            "replayedReasoningCapsules",
+            "withheldReasoningCapsules",
             "durable inbox",
             "`Ctrl+Enter`",
             "`Shift+Enter`",
@@ -712,6 +717,31 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
             "metadata.zuno_session_id",
             "durable root or child session identity",
             "title, summary, compaction, learning extraction, and Council calls are isolated",
+            "`reasoningReplay`",
+            "`reasoningReplayMaxAge`",
+            "reasoning.encrypted_content",
+            // The routing rule, in the shape the validator actually enforces: the
+            // catalog `openai` provider needs no declaration, a gateway with its own
+            // endpoint needs both, and a model's override is checked per model.
+            "needs no declaration at all",
+            "must declare both",
+            "checked per model",
+            // Both spellings of the event that carries the envelope, because they
+            // differ per client surface: `zuno run --json` prints the snake_case one.
+            "provider.reasoning.item",
+            "provider_reasoning_item",
+            "encryptedContent",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/providers.md",
+        &[
+            "`reasoningReplay`",
+            "`reasoningReplayMaxAge`",
+            "reasoning.encrypted_content",
+            "provider.reasoning.item",
+            "provider_reasoning_item",
+            "encryptedContent",
         ],
     );
     contains_all(
@@ -730,6 +760,7 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
             "enable_legacy_chat_completions: false",
             "`previous_response_id`",
             "`store: true`",
+            "`reasoningReplay`",
             "`input_file` support",
             "remote image URLs",
             "one long-lived kiro-provider process",
@@ -779,6 +810,22 @@ fn multi_provider_example_routes_only_zuno_agents() {
             .get("responsesTextBlocks")
             .is_none(),
         "current kiro-provider preserves consecutive text blocks itself; Zuno's single-text compatibility projection would insert a blank line"
+    );
+    assert_eq!(
+        providers["kiro-local"]["options"]["reasoningReplay"], "encrypted",
+        "the documented Kiro preset must opt into sealed reasoning replay; without it the gateway returns unsealed reasoning that no later turn can replay"
+    );
+    assert_eq!(
+        providers["kiro-local"]["options"]["reasoningReplayMaxAge"], 86_400_000,
+        "the age limit must match the gateway's own 24-hour envelope validity"
+    );
+    assert_eq!(
+        (
+            providers["kiro-local"]["transport"].as_str(),
+            providers["kiro-local"]["surface"].as_str(),
+        ),
+        (Some("openai"), Some("responses")),
+        "encrypted replay is refused at config time without both declarations, because only this pair resolves to a Responses request"
     );
     assert_eq!(
         providers["kiro-local"]["models"]["claude-opus-5"]["limit"]["context"],
@@ -862,6 +909,45 @@ fn multi_provider_example_routes_only_zuno_agents() {
         );
     }
 
+    let design = read("docs/design/kiro-provider-native-integration.md");
+    assert!(
+        !design.contains("encrypted reasoning replay are internal provider lifecycle concerns"),
+        "the design doc still calls encrypted reasoning replay gateway-only, which is the assumption that left every request unsealed"
+    );
+    contains_all(
+        "docs/design/kiro-provider-native-integration.md",
+        &[
+            "reasoningReplay",
+            "reasoning.encrypted_content",
+            "reasoning_replay_context_mismatch",
+            "invalid_reasoning_replay",
+        ],
+    );
+
+    // The retracted claim. `off` sends no sealed item and no `include`, but the
+    // Responses input of every provider is now ordered as the model streamed it, so
+    // no guide may promise a request byte-identical to earlier releases.
+    for page in [
+        "docs/reference/providers.md",
+        "docs/reference/configuration.md",
+        "docs/harness-runtime.md",
+        "docs/zh/config/providers.md",
+        "docs/zh/operate/harness-runtime.md",
+    ] {
+        let text = read(page);
+        for claim in [
+            "byte-identical to earlier",
+            "sends exactly what earlier releases sent",
+            "request bytes are unchanged",
+            "与既有版本逐字节一致",
+            "请求字节保持不变",
+        ] {
+            assert!(
+                !text.contains(claim),
+                "{page} still promises unchanged request bytes for an `off` provider: {claim}"
+            );
+        }
+    }
     contains_all(
         "docs/reference/configuration.md",
         &[

@@ -142,6 +142,7 @@ fn tool_use(id: impl Into<String>, call_id: impl Into<String>, tokens: u32) -> T
                 id: call_id,
                 name: "read".to_owned(),
                 input: json!({ "filePath": "README.md" }),
+                raw_arguments: None,
                 thought_signature: None,
             }],
         ),

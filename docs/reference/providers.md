@@ -189,6 +189,8 @@ Important options include:
 | `chunkTimeout` | maximum gap between streamed chunks in milliseconds |
 | `maxTokens`, `temperature`, `topP`, `toolChoice` | generation controls forwarded by the native provider |
 | `responsesTextBlocks` | Responses text projection: `multiple` by default, or `single` for gateways that expose only one upstream text field |
+| `reasoningReplay` | `off` by default, or `encrypted` for a Responses endpoint that seals reasoning |
+| `reasoningReplayMaxAge` | oldest sealed reasoning envelope Zuno still replays, in milliseconds |
 | `extraBody` | additional request fields after protected fields are assembled |
 
 `timeout`, `headerTimeout`, and `chunkTimeout` are read only by the
@@ -210,6 +212,82 @@ the default `multiple` behavior. Do not use it with the 2026-08-28
 `kiro-provider` build: that provider now concatenates consecutive all-text
 blocks byte-for-byte with no separator, while this option intentionally inserts
 a blank line.
+
+### Encrypted reasoning replay
+
+`reasoningReplay: "encrypted"` declares that the endpoint seals reasoning. Zuno
+then adds `include: ["reasoning.encrypted_content"]` to every Responses request
+for that provider, persists each sealed reasoning item as its own durable part,
+and replays those items verbatim in the position the model produced them, each
+immediately before the output it explains. This is an endpoint capability, not a
+provider identity: the official Responses API and a loopback gateway declare it
+the same way.
+
+Whether the option is honored depends on where the request lands. The catalog
+`openai` provider needs no declaration at all: its transport comes from the
+catalog and its surface stays the OpenAI adapter's default, which is Responses. A
+gateway that supplies its endpoint through `options.baseURL` or
+`options.endpoint` must declare both `"transport": "openai"` and
+`"surface": "responses"`, because an omitted surface resolves to Chat Completions
+as soon as a provider option carries an endpoint, and `openai-compatible`
+resolves its surface from provider-id rules rather than from what you declared.
+Either of those would ask for sealed reasoning and never receive it, with nothing
+on the wire to say so.
+
+Config validation rejects the routing it can prove wrong and names the offending
+key path: a transport other than `openai`, a surface other than `responses`, or a
+custom endpoint with no surface declared anywhere. It does not demand redundant
+declarations from a provider that already resolves to Responses. A
+`models.<id>.provider.surface` or `.transport` override is checked per model,
+since a model's own routing is what decides its requests, and so is a
+`models.<id>.options.reasoningReplay`.
+
+A sealed envelope is bound to the model that minted it and expires upstream.
+Zuno replays one only to the same catalog provider and model, and only while it
+is newer than `reasoningReplayMaxAge`. Anything else leaves the provider request
+while the durable row keeps its ciphertext, so switching model mid-session
+degrades quality instead of failing the turn. Set the age limit to the endpoint's
+own validity window, for example `86400000` for 24 hours; omit it to replay every
+stored envelope. Title, summary, compaction, and every other auxiliary request
+run on a different model and never carry a sealed envelope.
+
+Replay also has to match what the endpoint fingerprints. A tool call is replayed
+with the provider's own `arguments` bytes rather than a re-serialization of the
+parsed value, because key order and spacing are part of what was signed. A sealed
+item whose step produced no following output, such as an interrupted step or one
+that spent its whole output allowance on reasoning, is withheld instead of being
+sent alone, which a Responses endpoint refuses, and it is counted as withheld
+rather than as a replay. The item id is not echoed: a
+replayed item carries `type`, `summary`, `encrypted_content`, and `status`.
+
+The default `off` is a request that carries neither `include` nor any sealed
+item, including envelopes an earlier session stored while the option was
+`encrypted`. It is not a promise that the request bytes match earlier releases.
+This release also sends each assistant turn's Responses `input` in the order the
+model streamed it, so a turn that wrote text and then called a tool now sends the
+text item before the function call, for every Responses provider and whatever
+`reasoningReplay` says. That ordering is what a sealing endpoint validates;
+the one-time cost is an invalidated append-only prompt-cache prefix.
+
+`reasoningReplayMaxAge` without `reasoningReplay: "encrypted"` is rejected at
+config time as well. Do not add `reasoningSummary` to a sealing endpoint, which
+rejects `reasoning.summary`.
+
+The envelope is opaque provider ciphertext, and Zuno treats it as session
+content rather than as a secret it can redact: it is stored in the reasoning
+part's `metadata.providerReasoning`, returned by the HTTP messages endpoint, and
+forwarded on a stream event that carries it in full — spelled
+`provider.reasoning.item` to an SSE client and `provider_reasoning_item` in
+`zuno run --json`, with the ciphertext under `encryptedContent` in both. Zuno never sends it to a model other than the one that
+sealed it, and the `session.provider.request` event records counts only. Anyone
+who can read a session's messages or event stream can read its envelopes.
+
+Each foreground request records `reasoningReplay`, `replayedReasoningCapsules`,
+and `withheldReasoningCapsules` on its `session.provider.request` event, which is
+how you confirm replay is actually happening. The replayed count is what reaches
+the wire; every envelope history offered that this request did not send is
+counted as withheld, whether another model minted it, it aged out, or nothing
+followed it.
 
 Model `options.reasoningEffort` is the default when neither the live session nor
 the selected agent chooses a level. On the Responses surface,

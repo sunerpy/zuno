@@ -533,7 +533,9 @@ scalar text boundary. Use:
   "maxTokens": null,
   "timeout": false,
   "headerTimeout": 330000,
-  "chunkTimeout": 210000
+  "chunkTimeout": 210000,
+  "reasoningReplay": "encrypted",
+  "reasoningReplayMaxAge": 86400000
 }
 ```
 
@@ -546,6 +548,17 @@ verify that Zed is reaching the newly built provider process.
 `headerTimeout` and `chunkTimeout` deliberately exceed kiro-provider's matching
 300-second request and 180-second stream-idle deadlines. This lets the gateway
 return its typed timeout before the ACP client closes the request.
+
+`reasoningReplay: "encrypted"` opts the route into sealed reasoning replay. An ACP
+session is where this matters most, because the editor drives long multi-step
+turns: without it the gateway reports `reasoning_replay_locked: false` on every
+request and each step starts without the previous step's reasoning. The provider
+entry around these options has to declare `"transport": "openai"` and
+`"surface": "responses"`, or the config is refused with the offending key path:
+its endpoint comes from `baseURL`, which resolves to Chat Completions on its own.
+Confirm replay from the `session.provider.request` event's
+`replayedReasoningCapsules`, which rises above zero from the second request of a
+session onward.
 
 `kiro-provider` v0.5.0 and later also distinguish retryable stream failures from
 fatal protocol failures. Zuno retries only

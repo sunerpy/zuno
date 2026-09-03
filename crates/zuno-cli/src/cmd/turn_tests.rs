@@ -9406,6 +9406,210 @@ fn model_defaults_reach_a_responses_request_as_reasoning_effort_and_summary() {
     assert_eq!(selected["reasoningSummary"], serde_json::json!("auto"));
 }
 
+/// The Responses body a configured gateway provider sends, from user-shaped JSON.
+///
+/// Deliberately routed through `zuno_config::schema::Config` and `model_spec`: a
+/// typed option that the config layer accepts but `forwarded_options` drops would
+/// still satisfy a test that built the `Spec` by hand.
+fn replay_body(options: serde_json::Value) -> serde_json::Value {
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "myopenai": {
+                "transport": "openai",
+                "surface": "responses",
+                "options": options,
+                "models": { "reasoner": { "reasoning": true } }
+            }
+        }
+    }))
+    .expect("gateway provider config");
+    let catalog = Catalog::resolve(
+        &zuno_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+    let model = catalog
+        .model("myopenai", "reasoner")
+        .expect("configured model");
+    let provider = zuno_provider_compatible::CompatibleProvider::new(
+        model_spec(&catalog, model, &Env::empty()).expect("provider spec"),
+        Arc::new(zuno_provider_compatible::ReqwestTransport::new(
+            "reasoning-replay",
+        )),
+        None,
+    )
+    .expect("compatible provider");
+    provider.body_for(&zuno_llm::registry::CompletionRequest::new(
+        model.api.id.clone(),
+        vec![zuno_llm::event::Message::new(
+            zuno_llm::event::Role::User,
+            "Solve this carefully.",
+        )],
+    ))
+}
+
+#[test]
+fn a_configured_reasoning_replay_reaches_the_responses_request_body() {
+    let body = replay_body(serde_json::json!({
+        "baseURL": "https://gateway.example/v1",
+        "reasoningReplay": "encrypted",
+        "reasoningReplayMaxAge": 86_400_000
+    }));
+
+    assert_eq!(
+        body["include"],
+        serde_json::json!(["reasoning.encrypted_content"]),
+        "without this the endpoint returns unsealed reasoning, so no later turn can \
+         replay it: {body}"
+    );
+    assert!(
+        body.get("input").is_some(),
+        "encrypted replay is a Responses feature and must not fall back to Chat: {body}"
+    );
+    assert!(
+        body["reasoning"].get("summary").is_none(),
+        "a sealing gateway rejects `reasoning.summary` with HTTP 400: {body}"
+    );
+}
+
+#[test]
+fn a_provider_that_declares_no_reasoning_replay_sends_no_include() {
+    let body = replay_body(serde_json::json!({
+        "baseURL": "https://gateway.example/v1"
+    }));
+
+    assert!(
+        body.get("include").is_none(),
+        "a provider that declared nothing must not be asked for an envelope: {body}"
+    );
+}
+
+/// The routing trap this feature is easiest to get wrong.
+///
+/// A gateway provider with a custom `baseURL` and no declared `surface` resolves to
+/// Chat Completions (`openai_surface` answers `Chat` as soon as a provider option
+/// carries an endpoint), and Chat has nowhere to put `include` or a sealed item. The
+/// request is refused with a message naming the fix rather than sent as a Chat request
+/// whose sealed reasoning silently disappears.
+#[test]
+fn an_omitted_surface_refuses_encrypted_replay_rather_than_dropping_it() {
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "myopenai": {
+                "transport": "openai",
+                "options": {
+                    "baseURL": "https://gateway.example/v1",
+                    "reasoningReplay": "encrypted"
+                },
+                "models": { "reasoner": { "reasoning": true } }
+            }
+        }
+    }))
+    .expect("gateway provider config");
+    let catalog = Catalog::resolve(
+        &zuno_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+    let model = catalog
+        .model("myopenai", "reasoner")
+        .expect("configured model");
+    let spec = model_spec(&catalog, model, &Env::empty()).expect("provider spec");
+    assert_eq!(
+        spec.surface,
+        ApiSurface::Chat,
+        "a custom base URL with no declared surface resolves to Chat"
+    );
+
+    let provider = zuno_provider_compatible::CompatibleProvider::new(
+        spec,
+        Arc::new(zuno_provider_compatible::ReqwestTransport::new(
+            "reasoning-replay",
+        )),
+        None,
+    )
+    .expect("compatible provider");
+    let failure = provider
+        .try_body_for(&zuno_llm::registry::CompletionRequest::new(
+            model.api.id.clone(),
+            vec![zuno_llm::event::Message::new(
+                zuno_llm::event::Role::User,
+                "Solve this carefully.",
+            )],
+        ))
+        .expect_err("encrypted replay on Chat must be refused");
+    // `ProviderError::Fatal` renders its category and keeps the detail one `source()`
+    // call away, which is exactly what `zuno_error::source::describe` exists to walk
+    // and what every CLI reporter shows a user.
+    let message = zuno_error::source::describe(&failure);
+    assert!(
+        message.contains("resolved to Chat Completions") && message.contains("surface"),
+        "the refusal must name the fix: {message}"
+    );
+}
+
+/// The official OpenAI provider needs no routing declarations at all.
+///
+/// `provider.openai` has no custom base URL, so the native transport comes from the
+/// catalog and its surface stays `Default`, which the OpenAI adapter resolves to
+/// Responses. Config validation must therefore not demand `transport` and `surface`
+/// here — the very endpoint the feature was built for would be rejected.
+#[test]
+fn the_catalog_openai_provider_seals_reasoning_without_declaring_a_surface() {
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "openai": {
+                "options": { "reasoningReplay": "encrypted" }
+            }
+        }
+    }))
+    .expect("the official provider needs no transport or surface");
+    // The published catalog entry, trimmed to what routing reads: the npm package the
+    // transport is inferred from and the provider's own `api`, which is not an option
+    // and therefore does not pin the surface to Chat.
+    let document = serde_json::from_str(
+        r#"{"openai":{"id":"openai","name":"OpenAI","env":["OPENAI_API_KEY"],
+             "npm":"@ai-sdk/openai","api":"https://api.openai.com/v1",
+             "models":{"gpt-5.2":{"id":"gpt-5.2","name":"GPT-5.2",
+               "reasoning":true,"limit":{"context":400000,"output":128000}}}}}"#,
+    )
+    .expect("catalog document");
+    let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
+    let model = catalog
+        .model("openai", "gpt-5.2")
+        .expect("a catalog OpenAI model");
+    let spec = model_spec(&catalog, model, &Env::empty()).expect("provider spec");
+    assert_eq!(spec.factory(), "openai", "the native transport is inferred");
+    assert_eq!(
+        spec.surface,
+        ApiSurface::Default,
+        "no declaration means the adapter chooses"
+    );
+    assert_eq!(
+        zuno_provider_openai::resolve_surface(spec.surface),
+        ApiSurface::Responses,
+        "the native OpenAI default is Responses, not Chat"
+    );
+
+    let provider_config =
+        zuno_provider_openai::OpenAiConfig::try_from_spec(spec).expect("openai config");
+    let body = zuno_provider_openai::build_request_body(
+        &zuno_llm::registry::CompletionRequest::new(
+            model.api.id.clone(),
+            vec![zuno_llm::event::Message::new(
+                zuno_llm::event::Role::User,
+                "Solve this carefully.",
+            )],
+        )
+        .on_surface(ApiSurface::Default),
+        &provider_config,
+    )
+    .expect("a Responses body");
+    assert_eq!(
+        body["include"],
+        serde_json::json!(["reasoning.encrypted_content"]),
+        "the forwarded option never reached the native adapter: {body}"
+    );
+}
+
 #[test]
 fn a_models_declared_output_limit_reaches_the_request_body() {
     let catalog = generation_catalog(

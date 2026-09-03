@@ -81,6 +81,12 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: Value,
+        /// The argument text the provider emitted, when it was captured verbatim.
+        ///
+        /// See [`tool_arguments_text`] for why the bytes and not only the decoded
+        /// value belong in durable history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_arguments: Option<String>,
         /// Gemini 3's signature for this specific function call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thought_signature: Option<ThoughtSignature>,
@@ -143,11 +149,13 @@ impl ContentBlock {
                 id,
                 name,
                 input,
+                raw_arguments,
                 thought_signature,
             } => Some(RequestContentBlock::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
                 input: input.clone(),
+                raw_arguments: raw_arguments.clone(),
                 thought_signature: thought_signature.clone(),
             }),
             Self::ToolResult {
@@ -217,6 +225,9 @@ pub enum RequestContentBlock {
         id: String,
         name: String,
         input: Value,
+        /// The argument text the provider emitted, replayed by [`tool_arguments_text`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_arguments: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thought_signature: Option<ThoughtSignature>,
     },
@@ -284,6 +295,39 @@ impl RequestContentBlock {
             | Self::Image { .. }
             | Self::ImageAttachment { .. } => None,
         }
+    }
+}
+
+/// The `arguments` text a tool call is replayed with.
+///
+/// A JSON value has no single encoding: key order and separators are lost the
+/// moment provider bytes are decoded. That normally does not matter, but an
+/// endpoint that seals reasoning binds the envelope to a fingerprint of the
+/// assistant output it explains — including the tool-argument bytes — so a
+/// re-serialization of the decoded value is a *different* turn as far as that
+/// endpoint is concerned, and the replay is rejected. Kiro's loopback gateway
+/// answers `HTTP 400 reasoning_replay_context_mismatch`.
+///
+/// `raw_arguments` is therefore used verbatim, but only when it decodes to exactly
+/// `input`. That guard keeps one decoded meaning on the wire: a truncated capture, a
+/// row written before the bytes were kept, or a message hook that rewrote a call's
+/// decoded arguments without rewriting the captured bytes falls back to re-serializing
+/// `input` rather than sending arguments that disagree with the decoded call.
+///
+/// What the guard does *not* police, because it cannot see it, is a tool hook.
+/// `ToolHooks::before` rewrites the dispatcher's own copy of the arguments, while
+/// durable history keeps the call the model emitted, so `input` and `raw_arguments`
+/// still agree and the model's bytes are what gets replayed. That is the correct wire
+/// value even when the tool ran with rewritten arguments: the endpoint sealed a
+/// fingerprint of what the model produced, and the tool result — not the call — is
+/// where the rewrite is recorded.
+#[must_use]
+pub fn tool_arguments_text(input: &Value, raw_arguments: Option<&str>) -> String {
+    match raw_arguments {
+        Some(raw) if serde_json::from_str::<Value>(raw).is_ok_and(|decoded| &decoded == input) => {
+            raw.to_owned()
+        }
+        Some(_) | None => input.to_string(),
     }
 }
 

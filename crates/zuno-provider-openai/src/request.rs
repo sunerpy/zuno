@@ -4,8 +4,8 @@ use std::fmt;
 
 use serde_json::{Map, Value, json};
 use zuno_error::ProviderError;
-use zuno_llm::event::{Message, RequestContentBlock, Role};
-use zuno_llm::registry::{ApiSurface, CompletionRequest};
+use zuno_llm::event::{Message, RequestContentBlock, Role, tool_arguments_text};
+use zuno_llm::registry::{ApiSurface, CompletionRequest, sealed_item_has_following_output};
 
 use crate::provider::OpenAiConfig;
 
@@ -71,6 +71,15 @@ pub fn build_request_body(
         .map_err(ProviderError::fatal)?;
     reject_reserved_session_metadata(request)?;
     let surface = resolve_surface(request.surface);
+    // An endpoint that seals its reasoning is a Responses endpoint: `include` and
+    // the sealed item exist nowhere on Chat Completions. Refusing here means the
+    // misconfiguration is a first-request error rather than a whole session that
+    // silently runs without the capability that was asked for.
+    if surface == ApiSurface::Chat && config.reasoning_replay().requests_encrypted() {
+        return Err(ProviderError::fatal(
+            RequestShapeError::EncryptedReasoningReplayOnChat,
+        ));
+    }
     let mut body = match surface {
         ApiSurface::Chat => build_chat_body(request, config),
         ApiSurface::Responses => build_responses_body(request, config),
@@ -80,6 +89,14 @@ pub fn build_request_body(
     }?;
     request.apply_parameters(&mut body, surface);
     if surface == ApiSurface::Responses {
+        // After `apply_parameters`, not before: a per-request parameter bag is a
+        // `Record<string, any>`, so a model variant may carry its own `include`, and
+        // a non-object value replaces whatever the body held. Re-merging here keeps
+        // the author's entries and restores the entry the declared capability cannot
+        // lose. `insert_include` is idempotent, so the earlier pass is not undone.
+        if let Value::Object(map) = &mut body {
+            config.reasoning_replay().insert_include(map);
+        }
         project_session_affinity(request, &mut body)?;
     }
     Ok(body)
@@ -200,6 +217,10 @@ fn build_responses_body(
     if let Some(text) = config.text() {
         root.insert("text".to_owned(), text.clone());
     }
+    // After the raw `include` passthrough above, so a declared sealing endpoint
+    // keeps the one entry that makes the envelope arrive at all. Merged, so a
+    // hand-written `include` keeps its other entries.
+    config.reasoning_replay().insert_include(&mut root);
     if let Some(max_tokens) = config.max_tokens() {
         root.insert("max_output_tokens".to_owned(), json!(max_tokens));
     }
@@ -338,11 +359,15 @@ fn chat_assistant(message: &Message) -> Result<Value, ProviderError> {
                 text.push_str(fragment.as_ref());
             }
             RequestContentBlock::ToolUse {
-                id, name, input, ..
+                id,
+                name,
+                input,
+                raw_arguments,
+                ..
             } => calls.push(json!({
                 "id": id,
                 "type": "function",
-                "function": { "name": name, "arguments": input.to_string() },
+                "function": { "name": name, "arguments": tool_arguments_text(input, raw_arguments.as_deref()) },
             })),
             RequestContentBlock::ProviderEncryptedReasoning { .. } => {
                 return Err(ProviderError::fatal(
@@ -390,10 +415,21 @@ fn responses_message(message: &Message) -> Result<Vec<Value>, ProviderError> {
     }
 }
 
+/// Project one assistant turn onto Responses `input` items, in source order.
+///
+/// # Why the text is flushed at its own position
+///
+/// A sealed reasoning envelope is bound to the output it produced, and a Responses
+/// endpoint validates the pairing positionally: the reasoning item has to sit
+/// immediately before that output. Accumulating every text block and appending it
+/// after the loop reordered the turn — `[reasoning, text, call]` went out as
+/// `[reasoning, call, text]` — which reads as a reasoning item that produced the
+/// wrong output. Flushing before each emitted item, and once at the end, keeps the
+/// wire order the order the model streamed.
 fn responses_assistant(message: &Message) -> Result<Vec<Value>, ProviderError> {
     let mut items = Vec::new();
     let mut output_content = Vec::new();
-    for block in &message.content {
+    for (index, block) in message.content.iter().enumerate() {
         match block {
             RequestContentBlock::Text { text } => {
                 output_content.push(json!({ "type": "output_text", "text": text }));
@@ -413,6 +449,11 @@ fn responses_assistant(message: &Message) -> Result<Vec<Value>, ProviderError> {
                 let encrypted_content = encrypted_content.as_ref().ok_or_else(|| {
                     ProviderError::fatal(RequestShapeError::MissingEncryptedReasoning)
                 })?;
+                // The endpoint validates the pairing positionally, so an item with no
+                // output after it is a permanent 400 rather than a degraded answer.
+                if !sealed_item_has_following_output(&message.content[index + 1..]) {
+                    continue;
+                }
                 let mut item = Map::new();
                 item.insert("type".to_owned(), json!("reasoning"));
                 item.insert(
@@ -428,16 +469,24 @@ fn responses_assistant(message: &Message) -> Result<Vec<Value>, ProviderError> {
                 if let Some(status) = status {
                     item.insert("status".to_owned(), json!(status));
                 }
+                flush_assistant_text(&mut items, &mut output_content);
                 items.push(Value::Object(item));
             }
             RequestContentBlock::ToolUse {
-                id, name, input, ..
-            } => items.push(json!({
-                "type": "function_call",
-                "call_id": id,
-                "name": name,
-                "arguments": input.to_string(),
-            })),
+                id,
+                name,
+                input,
+                raw_arguments,
+                ..
+            } => {
+                flush_assistant_text(&mut items, &mut output_content);
+                items.push(json!({
+                    "type": "function_call",
+                    "call_id": id,
+                    "name": name,
+                    "arguments": tool_arguments_text(input, raw_arguments.as_deref()),
+                }));
+            }
             RequestContentBlock::SignedThinking { .. } => {
                 return Err(ProviderError::fatal(RequestShapeError::ForeignThinking));
             }
@@ -449,10 +498,23 @@ fn responses_assistant(message: &Message) -> Result<Vec<Value>, ProviderError> {
             }
         }
     }
-    if !output_content.is_empty() {
-        items.push(json!({ "role": "assistant", "content": output_content }));
-    }
+    flush_assistant_text(&mut items, &mut output_content);
     Ok(items)
+}
+
+/// Emit the text collected so far as one assistant item, if there is any.
+///
+/// Called before each emitted item rather than before each non-text *block*, so a
+/// block that contributes nothing to the wire does not split the surrounding text
+/// into two assistant items.
+fn flush_assistant_text(items: &mut Vec<Value>, output_content: &mut Vec<Value>) {
+    if output_content.is_empty() {
+        return;
+    }
+    items.push(json!({
+        "role": "assistant",
+        "content": std::mem::take(output_content),
+    }));
 }
 
 fn responses_tool_results(message: &Message) -> Vec<Value> {
@@ -541,6 +603,7 @@ enum RequestShapeError {
     UnsupportedSurface,
     InvalidSampling { key: &'static str, value: f64 },
     EncryptedReasoningOnChat,
+    EncryptedReasoningReplayOnChat,
     MissingEncryptedReasoning,
     ForeignThinking,
     ReservedSessionMetadata,
@@ -561,6 +624,11 @@ impl fmt::Display for RequestShapeError {
             }
             Self::EncryptedReasoningOnChat => formatter.write_str(
                 "OpenAI encrypted Responses reasoning cannot be sent to Chat Completions",
+            ),
+            Self::EncryptedReasoningReplayOnChat => formatter.write_str(
+                "`reasoningReplay: \"encrypted\"` is an OpenAI Responses feature, but this \
+                 request resolved to Chat Completions; set `surface: \"responses\"` for this \
+                 provider or model",
             ),
             Self::MissingEncryptedReasoning => {
                 formatter.write_str("OpenAI reasoning replay has no encrypted_content")
@@ -585,7 +653,9 @@ mod tests {
     use super::*;
     use std::error::Error as _;
     use zuno_llm::event::RequestContentBlock;
-    use zuno_llm::registry::{ProviderRequestContext, ProviderSessionIdentity};
+    use zuno_llm::registry::{
+        ProviderRequestContext, ProviderSessionIdentity, ReasoningReplay, ReasoningReplayPolicy,
+    };
 
     fn main_turn_context() -> ProviderRequestContext {
         ProviderRequestContext::MainTurn(
@@ -763,6 +833,204 @@ mod tests {
         }
     }
 
+    fn sealing_config() -> OpenAiConfig {
+        OpenAiConfig::default().with_reasoning_replay(ReasoningReplayPolicy {
+            mode: ReasoningReplay::Encrypted,
+            max_age: None,
+        })
+    }
+
+    /// The request field without which no reasoning is ever replayable.
+    #[test]
+    fn a_sealing_endpoint_is_asked_for_the_encrypted_reasoning_envelope() {
+        let request =
+            CompletionRequest::new("gpt-5.6-sol", vec![Message::new(Role::User, "hello")])
+                .on_surface(ApiSurface::Responses);
+
+        let sealed = build_request_body(&request, &sealing_config()).expect("body");
+        assert_eq!(sealed["include"], json!(["reasoning.encrypted_content"]));
+
+        let plain = build_request_body(&request, &OpenAiConfig::default()).expect("body");
+        assert!(
+            plain.get("include").is_none(),
+            "an endpoint that did not declare the capability is never asked for an \
+             envelope: {plain}"
+        );
+    }
+
+    #[test]
+    fn a_declared_include_keeps_its_entries_and_gains_the_sealed_one() {
+        let request =
+            CompletionRequest::new("gpt-5.6-sol", vec![Message::new(Role::User, "hello")])
+                .on_surface(ApiSurface::Responses);
+        let config = sealing_config().with_include(vec![json!("file_search_call.results")]);
+
+        let body = build_request_body(&request, &config).expect("body");
+
+        assert_eq!(
+            body["include"],
+            json!(["file_search_call.results", "reasoning.encrypted_content"])
+        );
+    }
+
+    /// A model variant's own options cannot remove the sealed `include` entry.
+    ///
+    /// `models.<id>.variants.<effort>` is a free-form bag that reaches the request as
+    /// `parameters`, and `apply_parameters` replaces a non-object value outright. An
+    /// author who adds their own `include` would otherwise turn the declared
+    /// capability off for every request without any diagnostic.
+    #[test]
+    fn a_request_parameter_cannot_remove_the_sealed_include_entry() {
+        for parameter in [
+            json!(["message.output_text.logprobs"]),
+            json!(null),
+            json!("reasoning"),
+        ] {
+            let mut parameters = Map::new();
+            parameters.insert("include".to_owned(), parameter.clone());
+            let request =
+                CompletionRequest::new("gpt-5.6-sol", vec![Message::new(Role::User, "hello")])
+                    .on_surface(ApiSurface::Responses)
+                    .with_parameters(parameters);
+
+            let body = build_request_body(&request, &sealing_config()).expect("body");
+
+            let include = body["include"]
+                .as_array()
+                .unwrap_or_else(|| panic!("`include` stays an array for {parameter}: {body}"));
+            assert!(
+                include
+                    .iter()
+                    .any(|entry| entry == "reasoning.encrypted_content"),
+                "the declared capability survives `include: {parameter}`: {body}"
+            );
+        }
+    }
+
+    /// The author's own entries survive beside the sealed one.
+    #[test]
+    fn a_request_parameter_include_keeps_its_own_entries() {
+        let mut parameters = Map::new();
+        parameters.insert(
+            "include".to_owned(),
+            json!(["message.output_text.logprobs"]),
+        );
+        let request =
+            CompletionRequest::new("gpt-5.6-sol", vec![Message::new(Role::User, "hello")])
+                .on_surface(ApiSurface::Responses)
+                .with_parameters(parameters);
+
+        let body = build_request_body(&request, &sealing_config()).expect("body");
+
+        assert_eq!(
+            body["include"],
+            json!([
+                "message.output_text.logprobs",
+                "reasoning.encrypted_content"
+            ])
+        );
+    }
+
+    #[test]
+    fn encrypted_replay_on_the_chat_surface_is_refused_before_the_wire() {
+        let request = CompletionRequest::new("gpt-4o", vec![Message::new(Role::User, "hello")])
+            .on_surface(ApiSurface::Chat);
+
+        let error = build_request_body(&request, &sealing_config())
+            .expect_err("Chat Completions has no `include` and no sealed item shape");
+        let rendered = error
+            .source()
+            .expect("shape source is preserved")
+            .to_string();
+        assert!(
+            rendered.contains("responses"),
+            "the refusal must name the surface to set: {rendered}"
+        );
+    }
+
+    /// A sealed envelope is validated against the output that follows it.
+    ///
+    /// So an assistant turn that reasoned, spoke, called a tool, spoke again and
+    /// called a second tool has to reach the wire in exactly that order. Before this
+    /// fix every text block was accumulated and appended once after the loop, which
+    /// put both calls before all of the text.
+    #[test]
+    fn a_mixed_assistant_turn_keeps_its_streamed_order() {
+        let request = CompletionRequest::new(
+            "gpt-5.6-sol",
+            vec![Message::from_content(
+                Role::Assistant,
+                vec![
+                    RequestContentBlock::ProviderEncryptedReasoning {
+                        id: "rs_1".to_owned(),
+                        summary: Vec::new(),
+                        encrypted_content: Some("kr1_sealed".to_owned()),
+                        status: None,
+                    },
+                    RequestContentBlock::Text {
+                        text: "first I will read the file".to_owned(),
+                    },
+                    RequestContentBlock::ToolUse {
+                        id: "call_read".to_owned(),
+                        name: "read".to_owned(),
+                        input: json!({ "path": "a.rs" }),
+                        raw_arguments: None,
+                        thought_signature: None,
+                    },
+                    RequestContentBlock::Text {
+                        text: "now the second one".to_owned(),
+                    },
+                    RequestContentBlock::ToolUse {
+                        id: "call_grep".to_owned(),
+                        name: "grep".to_owned(),
+                        input: json!({ "pattern": "fn main" }),
+                        raw_arguments: None,
+                        thought_signature: None,
+                    },
+                ],
+            )],
+        )
+        .on_surface(ApiSurface::Responses);
+
+        let body = build_request_body(&request, &sealing_config()).expect("body");
+        let input = body["input"].as_array().expect("input array");
+
+        let shape: Vec<String> = input
+            .iter()
+            .map(|item| {
+                item["type"]
+                    .as_str()
+                    .map_or_else(|| format!("role:{}", item["role"]), ToOwned::to_owned)
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                "reasoning",
+                "role:\"assistant\"",
+                "function_call",
+                "role:\"assistant\"",
+                "function_call"
+            ],
+            "the sealed item must stay immediately before the output it produced: {body}"
+        );
+        assert_eq!(input[0]["encrypted_content"], json!("kr1_sealed"));
+        assert_eq!(
+            input[1]["content"][0]["text"],
+            json!("first I will read the file")
+        );
+        assert_eq!(input[2]["call_id"], json!("call_read"));
+        assert_eq!(input[3]["content"][0]["text"], json!("now the second one"));
+        assert_eq!(input[4]["call_id"], json!("call_grep"));
+    }
+
+    /// The sealed bytes are replayed; the endpoint's item identifier is not.
+    ///
+    /// The recorded OpenAI continuation
+    /// (`openai-responses-gpt-5-5-reasoning-continuation`) replays the item as
+    /// `type`, `summary` and `encrypted_content` only, and that request was accepted.
+    /// An `id` names an item on the endpoint's side, which a `store: false` endpoint
+    /// does not have.
     #[test]
     fn encrypted_reasoning_replays_byte_for_byte_without_item_id() {
         let ciphertext = "gAAAAA_exact_provider_bytes";
@@ -770,21 +1038,134 @@ mod tests {
             "gpt-5.5",
             vec![Message::from_content(
                 Role::Assistant,
-                vec![RequestContentBlock::ProviderEncryptedReasoning {
-                    id: "rs_not_replayed_when_store_false".to_owned(),
-                    summary: vec!["brief summary".to_owned()],
-                    encrypted_content: Some(ciphertext.to_owned()),
-                    status: None,
-                }],
+                vec![
+                    RequestContentBlock::ProviderEncryptedReasoning {
+                        id: "rs_sealed_item".to_owned(),
+                        summary: vec!["brief summary".to_owned()],
+                        encrypted_content: Some(ciphertext.to_owned()),
+                        status: None,
+                    },
+                    RequestContentBlock::Text {
+                        text: "the answer".to_owned(),
+                    },
+                ],
             )],
         );
-        let body =
-            build_request_body(&request, &OpenAiConfig::stateless_reasoning()).expect("body");
+        let config = OpenAiConfig::default()
+            .with_store(false)
+            .with_reasoning_replay(ReasoningReplayPolicy {
+                mode: ReasoningReplay::Encrypted,
+                max_age: None,
+            });
+        let body = build_request_body(&request, &config).expect("body");
         assert_eq!(body["input"][0]["encrypted_content"], ciphertext);
-        assert!(body["input"][0].get("id").is_none());
+        assert!(
+            body["input"][0].get("id").is_none(),
+            "the endpoint owns item identifiers, not Zuno: {body}"
+        );
         assert_eq!(
             body["input"][0]["summary"],
             json!([{ "type": "summary_text", "text": "brief summary" }])
         );
+    }
+
+    /// A sealed item with nothing after it is a permanent wire error, so it stays home.
+    ///
+    /// This is the durable shape a step interrupted right after its reasoning item
+    /// leaves behind. Replaying it would fail every later request to the same model
+    /// with `Item 'rs_...' of type 'reasoning' was provided without its required
+    /// following item`.
+    #[test]
+    fn a_sealed_item_with_no_following_output_is_not_replayed() {
+        let request = CompletionRequest::new(
+            "gpt-5.5",
+            vec![Message::from_content(
+                Role::Assistant,
+                vec![RequestContentBlock::ProviderEncryptedReasoning {
+                    id: "rs_lonely".to_owned(),
+                    summary: Vec::new(),
+                    encrypted_content: Some("gAAAAA".to_owned()),
+                    status: None,
+                }],
+            )],
+        );
+        let config = OpenAiConfig::default().with_reasoning_replay(ReasoningReplayPolicy {
+            mode: ReasoningReplay::Encrypted,
+            max_age: None,
+        });
+
+        let body = build_request_body(&request, &config).expect("body");
+
+        assert_eq!(
+            body["input"].as_array().expect("an input array").len(),
+            0,
+            "a sealed item with no output to explain must not reach the wire: {body}"
+        );
+    }
+
+    /// An endpoint that seals reasoning fingerprints the tool-argument BYTES.
+    ///
+    /// `input.to_string()` re-serializes the decoded value and drops the spacing
+    /// the endpoint hashed, which is why replaying it drew
+    /// `HTTP 400 reasoning_replay_context_mismatch` from kiro-provider on the very
+    /// request that carried the sealed envelope.
+    #[test]
+    fn a_replayed_tool_call_carries_the_provider_argument_bytes_verbatim() {
+        let raw = r#"{"command": "python3 -c \"print(1)\"", "intent": "compute"}"#;
+        let assistant = Message::from_content(
+            Role::Assistant,
+            vec![RequestContentBlock::ToolUse {
+                id: "call_shell".to_owned(),
+                name: "shell".to_owned(),
+                input: serde_json::from_str(raw).expect("the captured bytes decode"),
+                raw_arguments: Some(raw.to_owned()),
+                thought_signature: None,
+            }],
+        );
+        let config = OpenAiConfig::default();
+
+        let responses = build_request_body(
+            &CompletionRequest::new("gpt-5.5", vec![assistant.clone()]),
+            &config,
+        )
+        .expect("responses body");
+        assert_eq!(
+            responses["input"][0]["arguments"],
+            json!(raw),
+            "the sealed turn's fingerprint covers these bytes: {responses}"
+        );
+
+        let chat = build_request_body(
+            &CompletionRequest::new("gpt-4.1", vec![assistant]).on_surface(ApiSurface::Chat),
+            &config,
+        )
+        .expect("chat body");
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            json!(raw),
+            "the Chat surface replays the same bytes: {chat}"
+        );
+    }
+
+    /// Bytes that no longer decode to the executed value are not sent.
+    #[test]
+    fn a_rewritten_tool_call_replays_the_executed_value_not_the_stale_bytes() {
+        let request = CompletionRequest::new(
+            "gpt-5.5",
+            vec![Message::from_content(
+                Role::Assistant,
+                vec![RequestContentBlock::ToolUse {
+                    id: "call_shell".to_owned(),
+                    name: "shell".to_owned(),
+                    input: json!({"command": "ls"}),
+                    raw_arguments: Some(r#"{"command": "rm -rf /"}"#.to_owned()),
+                    thought_signature: None,
+                }],
+            )],
+        );
+
+        let body = build_request_body(&request, &OpenAiConfig::default()).expect("body");
+
+        assert_eq!(body["input"][0]["arguments"], json!(r#"{"command":"ls"}"#));
     }
 }

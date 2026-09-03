@@ -95,6 +95,7 @@
 
 mod error;
 mod provider;
+pub mod reasoning_replay;
 mod spec;
 
 pub use crate::registry::error::{Declined, FactoryOutcome, RegistryError, Unavailable};
@@ -102,6 +103,10 @@ pub use crate::registry::provider::{
     Capabilities, CompletionRequest, CredentialPresence, FinishReason,
     InvalidProviderSessionIdentity, Message, Provider, ProviderRequestContext,
     ProviderSessionIdentity, ProviderStream, RequestPurpose, Role, StreamEvent, ToolSchema,
+};
+pub use crate::registry::reasoning_replay::{
+    ENCRYPTED_REASONING_INCLUDE, InvalidReasoningReplayOption, ReasoningReplay,
+    ReasoningReplayPolicy, sealed_item_has_following_output,
 };
 pub use crate::registry::spec::{ApiSurface, Spec, generation};
 

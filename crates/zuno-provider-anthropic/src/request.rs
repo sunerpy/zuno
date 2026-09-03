@@ -347,6 +347,7 @@ mod tests {
                     id: "toolu_1".to_owned(),
                     name: "weather".to_owned(),
                     input: json!({ "city": "Paris" }),
+                    raw_arguments: None,
                     thought_signature: Some(ThoughtSignature::new("gemini-only")),
                 }],
             )],

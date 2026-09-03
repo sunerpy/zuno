@@ -35,8 +35,19 @@
 //! pure token cost, and a vendor that never sent the field may reject it. So the
 //! echo is gated on [`Quirks::reasoning_protocol`], and nothing else in the crate
 //! decides it.
+//!
+//! # Sealed reasoning is a declared option, never a provider-id rule
+//!
+//! [`Quirks::reasoning_replay`] is the one flag in this table that is *not* resolved
+//! here. It arrives already validated from [`CompatibleProvider::new`], because a
+//! misspelled `reasoningReplay` must decline construction rather than degrade to a
+//! session that silently never replays — the defect that gated this work. Reading it
+//! leniently in this module, the way [`responses_text_blocks`] reads its own key,
+//! would reintroduce exactly that silence.
+//!
+//! [`CompatibleProvider::new`]: crate::provider::CompatibleProvider::new
 
-use zuno_llm::registry::{ApiSurface, Capabilities, Spec};
+use zuno_llm::registry::{ApiSurface, Capabilities, ReasoningReplayPolicy, Spec};
 
 use crate::family::Profile;
 use crate::surface::resolve_surface;
@@ -113,6 +124,10 @@ pub struct Quirks {
     pub routes_upstreams: bool,
     /// How this endpoint accepts projected Responses text blocks.
     pub responses_text_blocks: ResponsesTextBlocks,
+    /// Whether this endpoint seals its reasoning and takes it back on replay.
+    ///
+    /// Validated at construction, not resolved here. See the module header.
+    pub reasoning_replay: ReasoningReplayPolicy,
 }
 
 impl Quirks {
@@ -124,6 +139,7 @@ impl Quirks {
         capabilities: Capabilities,
         model_id: &str,
         request_surface: ApiSurface,
+        reasoning_replay: ReasoningReplayPolicy,
     ) -> Self {
         Self {
             surface: resolve_surface(profile, spec, request_surface, model_id),
@@ -131,6 +147,7 @@ impl Quirks {
             reasoning_protocol: reasoning_protocol(spec, model_id),
             routes_upstreams: profile.routes_upstreams,
             responses_text_blocks: responses_text_blocks(spec),
+            reasoning_replay,
         }
     }
 
@@ -159,6 +176,16 @@ impl Quirks {
     #[must_use]
     pub const fn requires_single_response_text_block(&self) -> bool {
         matches!(self.responses_text_blocks, ResponsesTextBlocks::Single)
+    }
+
+    /// Whether this request asks the endpoint to seal its reasoning.
+    ///
+    /// True only on the Responses surface: the combination is refused before a
+    /// body is built, because Chat Completions has no `include` field to carry the
+    /// request and no item shape to carry the envelope back.
+    #[must_use]
+    pub const fn requests_encrypted_reasoning(&self) -> bool {
+        self.reasoning_replay.requests_encrypted()
     }
 }
 
@@ -277,7 +304,14 @@ mod tests {
         let profile = crate::family::claimed("groq").expect("groq is claimed");
         let spec = Spec::new("groq");
 
-        let permissive = Quirks::resolve(profile, &spec, caps(true), "o3", ApiSurface::Default);
+        let permissive = Quirks::resolve(
+            profile,
+            &spec,
+            caps(true),
+            "o3",
+            ApiSurface::Default,
+            ReasoningReplayPolicy::default(),
+        );
         assert!(permissive.accepts_sampling_params());
 
         let strict = Quirks::resolve(
@@ -286,6 +320,7 @@ mod tests {
             caps(false),
             "llama-3.3-70b",
             ApiSurface::Default,
+            ReasoningReplayPolicy::default(),
         );
         assert!(!strict.accepts_sampling_params());
     }

@@ -12,9 +12,10 @@ use crate::schema::mcp::{McpOauth, McpServerConfig};
 use crate::schema::ordered::False;
 use crate::schema::permission::{PermissionAction, PermissionMode, PermissionRule};
 use crate::schema::product_agent::{ProductAgentKind, ProductAgentPermissionMode};
-use crate::schema::provider::{ResponsesTextBlocks, Timeout};
+use crate::schema::provider::{ReasoningReplay, ResponsesTextBlocks, Timeout};
 use crate::schema::reference::ReferenceEntry;
 use serde_json::{Value, json};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use zuno_error::ConfigError;
 
@@ -1236,6 +1237,278 @@ fn responses_text_blocks_is_typed_and_rejects_unknown_modes() {
     }))
     .expect_err("unknown projection modes must fail validation");
     assert_eq!(issue_path(&error), "provider.p.options.responsesTextBlocks");
+}
+
+#[test]
+fn encrypted_reasoning_replay_is_typed_configuration() {
+    let config = parse_value(json!({
+        "provider": {
+            "kiro-local": {
+                "transport": "openai",
+                "surface": "responses",
+                "options": {
+                    "baseURL": "http://127.0.0.1:8787/v1",
+                    "reasoningReplay": "encrypted",
+                    "reasoningReplayMaxAge": 86_400_000
+                }
+            }
+        }
+    }))
+    .expect("an encrypted-replay Responses endpoint is valid");
+    let options = config
+        .provider
+        .as_ref()
+        .and_then(|providers| providers.get("kiro-local"))
+        .and_then(|provider| provider.options.as_ref())
+        .expect("options present");
+    assert_eq!(options.reasoning_replay, Some(ReasoningReplay::Encrypted));
+    assert_eq!(
+        options.reasoning_replay_max_age,
+        Some(NonZeroU64::new(86_400_000).expect("non-zero"))
+    );
+    assert!(
+        !options.extra.contains_key("reasoningReplay")
+            && !options.extra.contains_key("reasoningReplayMaxAge"),
+        "sealed-reasoning replay is validated configuration, not an unvalidated SDK extra"
+    );
+
+    let absent = parse_value(json!({ "provider": { "p": { "options": { "apiKey": "k" } } } }))
+        .expect("a provider that says nothing about replay is valid");
+    let absent = absent
+        .provider
+        .as_ref()
+        .and_then(|providers| providers.get("p"))
+        .and_then(|provider| provider.options.as_ref())
+        .expect("options present");
+    assert_eq!(
+        absent.reasoning_replay, None,
+        "replay stays unset so a provider that never opts in keeps its request bytes"
+    );
+}
+
+#[test]
+fn unknown_reasoning_replay_modes_fail_validation() {
+    let error = parse_value(json!({
+        "provider": { "p": { "options": { "reasoningReplay": "plaintext" } } }
+    }))
+    .expect_err("only the modes Zuno implements are accepted");
+    assert_eq!(issue_path(&error), "provider.p.options.reasoningReplay");
+
+    let zero = parse_value(json!({
+        "provider": {
+            "p": {
+                "surface": "responses",
+                "options": { "reasoningReplay": "encrypted", "reasoningReplayMaxAge": 0 }
+            }
+        }
+    }))
+    .expect_err("a zero max age would withhold every envelope it was meant to admit");
+    assert_eq!(
+        issue_path(&zero),
+        "provider.p.options.reasoningReplayMaxAge"
+    );
+}
+
+/// Only routing that provably sends sealed reasoning nowhere is rejected.
+///
+/// The surface Zuno sends on is resolved from `transport`, `surface`, and whether a
+/// provider option carries a custom endpoint. Silence is not automatically wrong: the
+/// catalog `openai` provider infers an OpenAI transport and keeps the adapter's default
+/// surface, which is Responses. Silence beside a custom endpoint *is* wrong, because
+/// `openai_surface` answers Chat Completions as soon as a provider option names one.
+#[test]
+fn encrypted_reasoning_replay_rejects_only_routing_that_cannot_carry_it() {
+    let wrong_surface = parse_value(json!({
+        "provider": {
+            "p": {
+                "transport": "openai",
+                "surface": "chat",
+                "options": { "reasoningReplay": "encrypted" }
+            }
+        }
+    }))
+    .expect_err("Chat Completions has no place to carry a sealed reasoning item");
+    assert_eq!(
+        issue_path(&wrong_surface),
+        "provider.p.options.reasoningReplay"
+    );
+    assert!(
+        issue_detail(&wrong_surface).contains("responses"),
+        "the issue must name the surface the option needs: {}",
+        issue_detail(&wrong_surface)
+    );
+
+    let omitted_surface_on_a_gateway = parse_value(json!({
+        "provider": {
+            "p": {
+                "transport": "openai",
+                "options": {
+                    "baseURL": "https://gateway.example/v1",
+                    "reasoningReplay": "encrypted"
+                }
+            }
+        }
+    }))
+    .expect_err("a custom endpoint with no declared surface resolves to Chat");
+    assert_eq!(
+        issue_path(&omitted_surface_on_a_gateway),
+        "provider.p.options.reasoningReplay"
+    );
+    assert!(
+        issue_detail(&omitted_surface_on_a_gateway).contains("responses"),
+        "the issue must name the surface the option needs: {}",
+        issue_detail(&omitted_surface_on_a_gateway)
+    );
+
+    // `openai-compatible` belongs in this list: it resolves its own surface from
+    // provider-id rules and never sees the declared one, so it lands on Chat.
+    for transport in ["anthropic", "google", "openrouter", "openai-compatible"] {
+        let wrong_transport = parse_value(json!({
+            "provider": {
+                "p": {
+                    "transport": transport,
+                    "surface": "responses",
+                    "options": { "reasoningReplay": "encrypted" }
+                }
+            }
+        }))
+        .expect_err("sealed reasoning replay is an OpenAI Responses feature");
+        assert_eq!(
+            issue_path(&wrong_transport),
+            "provider.p.options.reasoningReplay",
+            "transport `{transport}`"
+        );
+        assert!(
+            issue_detail(&wrong_transport).contains("openai"),
+            "the issue must name the transport the option needs: {}",
+            issue_detail(&wrong_transport)
+        );
+    }
+
+    parse_value(json!({
+        "provider": { "openai": { "options": { "reasoningReplay": "encrypted" } } }
+    }))
+    .expect(
+        "the official OpenAI provider infers an OpenAI transport and defaults to \
+         Responses, so demanding two redundant declarations would reject a working \
+         configuration",
+    );
+
+    parse_value(json!({
+        "provider": {
+            "p": {
+                "transport": "openai",
+                "surface": "responses",
+                "options": {
+                    "baseURL": "https://gateway.example/v1",
+                    "reasoningReplay": "encrypted"
+                }
+            }
+        }
+    }))
+    .expect("a declared OpenAI Responses gateway is the shape the feature was built for");
+}
+
+/// A model overrides its provider's routing, so the model is where a proof lands.
+#[test]
+fn a_models_own_routing_decides_whether_it_can_replay_sealed_reasoning() {
+    let overridden_to_chat = parse_value(json!({
+        "provider": {
+            "p": {
+                "transport": "openai",
+                "surface": "responses",
+                "options": { "reasoningReplay": "encrypted" },
+                "models": { "chatty": { "provider": { "surface": "chat" } } }
+            }
+        }
+    }))
+    .expect_err("a model that resolves to Chat can never replay a sealed item");
+    assert_eq!(issue_path(&overridden_to_chat), "provider.p.models.chatty");
+
+    let model_asks_on_a_chat_provider = parse_value(json!({
+        "provider": {
+            "p": {
+                "transport": "openai",
+                "surface": "chat",
+                "options": { "baseURL": "https://gateway.example/v1" },
+                "models": { "sealed": { "options": { "reasoningReplay": "encrypted" } } }
+            }
+        }
+    }))
+    .expect_err("a model option cannot opt into a surface the provider forbids");
+    assert_eq!(
+        issue_path(&model_asks_on_a_chat_provider),
+        "provider.p.models.sealed"
+    );
+
+    let unknown_mode = parse_value(json!({
+        "provider": {
+            "p": {
+                "transport": "openai",
+                "surface": "responses",
+                "models": { "sealed": { "options": { "reasoningReplay": "plaintext" } } }
+            }
+        }
+    }))
+    .expect_err("an untyped model option still owns the typed vocabulary");
+    assert_eq!(
+        issue_path(&unknown_mode),
+        "provider.p.models.sealed.options.reasoningReplay"
+    );
+
+    parse_value(json!({
+        "provider": {
+            "p": {
+                "transport": "openai",
+                "options": {
+                    "baseURL": "https://gateway.example/v1",
+                    "reasoningReplay": "encrypted"
+                },
+                "models": { "sealed": { "provider": { "surface": "responses" } } }
+            }
+        }
+    }))
+    .expect(
+        "the provider-level surface governs no model here, so the omission it would \
+         have been faulted for decides nothing",
+    );
+
+    parse_value(json!({
+        "provider": {
+            "p": {
+                "transport": "openai",
+                "surface": "responses",
+                "options": { "reasoningReplay": "encrypted" },
+                "models": { "plain": { "options": { "reasoningReplay": "off" } } }
+            }
+        }
+    }))
+    .expect("a model may switch replay off without switching its surface");
+}
+
+#[test]
+fn a_replay_max_age_without_encrypted_replay_is_rejected() {
+    let error = parse_value(json!({
+        "provider": { "p": { "options": { "reasoningReplayMaxAge": 86_400_000 } } }
+    }))
+    .expect_err("a max age alone would read as replay being on when it is off");
+    assert_eq!(
+        issue_path(&error),
+        "provider.p.options.reasoningReplayMaxAge"
+    );
+
+    let explicitly_off = parse_value(json!({
+        "provider": {
+            "p": {
+                "options": { "reasoningReplay": "off", "reasoningReplayMaxAge": 86_400_000 }
+            }
+        }
+    }))
+    .expect_err("an explicit off with a max age is the same contradiction");
+    assert_eq!(
+        issue_path(&explicitly_off),
+        "provider.p.options.reasoningReplayMaxAge"
+    );
 }
 
 #[test]

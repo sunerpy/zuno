@@ -61,6 +61,12 @@ pub trait TurnHooks: Send + Sync {
         Ok(())
     }
 
+    /// One contiguous run of assistant text, before it is persisted.
+    ///
+    /// This fires once per text segment of a step, not once per step: a step whose
+    /// text is interrupted by a tool call or a reasoning item is persisted as several
+    /// text parts in stream order, and `part_id` names the one segment handed over
+    /// (`prt_{turn}_{step}_{position}_text`). A hook rewrites exactly that segment.
     async fn text_complete(
         &self,
         _session_id: &str,

@@ -1173,6 +1173,41 @@ fn the_estimator_matches_upstreams_four_characters_per_token_rule() {
     assert_eq!(estimate_tokens(&message), expected);
 }
 
+#[test]
+fn a_tool_calls_arguments_are_estimated_once_not_twice() {
+    // Given: the same tool call with and without the provider's own argument bytes.
+    let arguments = r#"{"command": "echo hello", "intent": "greet the user"}"#;
+    let input: serde_json::Value = serde_json::from_str(arguments).expect("valid arguments");
+    let call = |raw: Option<&str>| {
+        Message::from_content(
+            Role::Assistant,
+            vec![RequestContentBlock::ToolUse {
+                id: "call_1".to_owned(),
+                name: "bash".to_owned(),
+                input: input.clone(),
+                raw_arguments: raw.map(str::to_owned),
+                thought_signature: None,
+            }],
+        )
+    };
+
+    // Then: capturing the bytes a Responses endpoint fingerprints costs nothing in the
+    // context budget, because only one `arguments` field ever reaches a request body.
+    assert_eq!(
+        estimate_tokens(&call(Some(arguments))),
+        estimate_tokens(&call(None)),
+        "raw_arguments is a second copy of `input`, not extra prompt content"
+    );
+    // And: the escaped copy would have been the larger of the two, so a naive estimate
+    // over the serialized message inflates every tool call in retained history.
+    let naive = serde_json::to_string(&call(Some(arguments))).expect("serializes");
+    let honest = serde_json::to_string(&call(None)).expect("serializes");
+    assert!(
+        naive.len() > honest.len() + arguments.len(),
+        "the escaped duplicate is longer than the arguments themselves"
+    );
+}
+
 #[tokio::test]
 async fn an_unreadable_session_is_the_one_condition_the_prelude_reports_upward() {
     let mut connection = seeded("New session - 2026-08-07T00:00:00.000Z", None);

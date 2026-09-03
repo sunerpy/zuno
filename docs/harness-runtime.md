@@ -743,6 +743,66 @@ Each foreground `session.provider.request` event records `requestPurpose`,
 `affinitySource: "durable-session"`. It does not persist the raw routing
 identity, credentials, or upstream account and conversation identifiers.
 
+### Encrypted reasoning replay
+
+Some Responses endpoints seal a step's reasoning into an opaque envelope bound to
+one model, one account, and one conversation. A provider declares that capability
+with `reasoningReplay: "encrypted"`, which is an endpoint option and never a rule
+inferred from a provider id. Zuno then adds
+`include: ["reasoning.encrypted_content"]` to every Responses request for that
+provider and echoes each sealed item back on later requests. The declaration is honored wherever the request
+resolves to a Responses surface: the catalog `openai` provider reaches it with no
+declaration, and a gateway whose endpoint comes from a provider option reaches it
+only by declaring `transport: "openai"` with `surface: "responses"`. Config
+validation refuses the routing that provably cannot carry a sealed item, per
+provider and per model, and accepts what already resolves to Responses.
+
+The default is `off`, which sends neither `include` nor any sealed item, including
+envelopes the same session stored while the option was `encrypted`. It is not a
+claim that the request bytes match earlier releases: the ordering fix below
+applies to every Responses provider regardless of the option, so a turn whose text
+preceded a tool call now sends the text item first. Each replayed tool call also
+carries the provider's own `arguments` bytes rather than a re-serialization,
+because the endpoint fingerprints the string it sent, and a sealed item whose step
+produced no following output is withheld rather than sent alone, counted as
+withheld rather than as a replay.
+
+A sealed envelope is durable state, so a step is persisted as a ledger of
+positioned parts instead of one text blob plus a trailing pile of tool calls. Each
+part id carries its position in the stream, `prt_{turn}_{step}_{position}_{kind}`,
+and every part of a step shares the assistant message's creation time, so
+hydration returns exactly the order the provider produced. A step that reasons,
+writes text, calls a tool, reasons again, and calls a second tool replays as that
+same sequence, each envelope immediately before the output it explains. That is
+what a sealing endpoint validates: a reordered or summary-only replay is refused
+on the wire.
+
+Replay is scoped, and the scope is enforced while the request is assembled, not
+when the row is written. An envelope is replayed only to the catalog provider and
+model recorded on the assistant message that produced it, and only while it is
+newer than `reasoningReplayMaxAge`. Anything else is withheld in memory for that
+one request while the durable row keeps its ciphertext, so returning to the
+original model resumes replay. Title, summary, compaction, learning extraction,
+and Council requests run on other models and receive no envelope at all, which
+also keeps the compaction transcript free of provider state.
+
+Each foreground `session.provider.request` event records `reasoningReplay`,
+`replayedReasoningCapsules`, and `withheldReasoningCapsules`. Those three fields
+are the evidence that replay is working: a session whose second and later requests
+report zero replayed capsules is not replaying, whatever the endpoint claims. The
+replayed count is what the adapter puts on the wire, so an envelope the pairing
+rule drops is reported under the withheld count and never as a replay. The
+request event records those counts only, never the envelope.
+
+The envelope itself is opaque provider ciphertext held as session content: it
+lives in the reasoning part's `metadata.providerReasoning`, is returned by the
+HTTP messages endpoint, and is forwarded on a stream event that carries it in
+full: `provider.reasoning.item` on the server's SSE stream, and
+`provider_reasoning_item` in `zuno run --json`, with the ciphertext under
+`encryptedContent` on both. It is durable state a later
+request needs, so it is not redacted; read access to a session's messages or
+event stream is read access to its envelopes.
+
 ### Provider timeout and retry boundaries
 
 An active provider request and recovery after a failed request are separate

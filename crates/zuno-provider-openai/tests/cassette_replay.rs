@@ -244,6 +244,9 @@ fn recorded_chat_tool_call_matches_request_and_exact_events() {
             id: "call_5wBV98AvGPwOyC6a2HtKh85w".to_owned(),
             name: "get_weather".to_owned(),
             input: json!({ "city": "Paris" }),
+            // The recorded provider bytes, kept so a replay of this call is
+            // byte-identical to what the endpoint fingerprinted.
+            raw_arguments: Some(r#"{"city":"Paris"}"#.to_owned()),
             thought_signature: None,
         }]
     );
@@ -439,6 +442,9 @@ fn recorded_responses_tool_call_matches_request_and_exact_events() {
             id: "call_ZAbAwsIFeJSyPqz3HaHRXBSn".to_owned(),
             name: "get_weather".to_owned(),
             input: json!({ "city": "Paris" }),
+            // The recorded provider bytes, kept so a replay of this call is
+            // byte-identical to what the endpoint fingerprinted.
+            raw_arguments: Some(r#"{"city":"Paris"}"#.to_owned()),
             thought_signature: None,
         }]
     );
@@ -503,7 +509,10 @@ fn recorded_encrypted_reasoning_survives_store_false_continuation() {
     );
     let second_body = build_request_body(&second_request, &second_config).expect("second request");
     assert_eq!(second_body["input"][1]["encrypted_content"], encrypted);
-    assert!(second_body["input"][1].get("id").is_none());
+    assert!(
+        second_body["input"][1].get("id").is_none(),
+        "the recorded request the endpoint accepted carries no item id"
+    );
     let second = player
         .next_http(&snapshot(
             "https://api.openai.com/v1/responses",
