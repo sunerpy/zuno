@@ -278,6 +278,10 @@ mod tests {
         open::open(&zuno_paths::DbLocation::Memory).expect("open memory database")
     }
 
+    // The helpers below synthesize an older shape by removing pieces of the current
+    // schema. They exercise each additive step in isolation; the exact databases the
+    // v0.0.3, v0.2.2, and v0.6.7 releases wrote live in `tests/fixtures/format-*.sql`
+    // and are upgraded end to end by `tests/migration_fixtures.rs`.
     fn remove_plan_stack_schema(connection: &Connection) {
         connection
             .execute_batch(

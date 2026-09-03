@@ -92,6 +92,17 @@ Linux 作业会安装发行版提供的 `bwrap-userns-restrict` AppArmor profile
 分别验证 user/mount/PID namespace 路径和 network namespace 路径。它不会关闭 Ubuntu
 宿主级的非特权 user namespace 限制。部署依据见[沙箱 FAQ](faq.md)。
 
+装上后端并不等于证明它真的做了限制，因此两个 Linux 门禁作业随后都会运行
+`make test-sandbox-e2e`。该 target 会构建沙箱所需的 `zuno` helper 可执行文件，并运行
+边界测试：在 `bwrap` 下执行一个真实进程，要求工作区内写入成功，而写入 `.git`、`.zuno`、
+`.agents`、工作区外目录以及指向工作区外的符号链接全部失败；要求有效 capability 集合与
+`NoNewPrivs` 与声明一致；要求 `AF_INET` socket、`ptrace`、`process_vm_readv` 返回
+`EPERM`，同时 `AF_UNIX` socketpair IPC 仍然可用；并要求 `read-only` 策略拒绝同一次写入。
+
+当宿主没有 bubblewrap 或没有 helper 可执行文件时，该测试会以具名原因 skip，因此在开发机
+上执行 `make test` 不会受影响。两个门禁作业都设置 `ZUNO_SANDBOX_E2E_REQUIRE=1`，把这种
+skip 变成失败。本地可用 `make test-sandbox-e2e` 运行同一道门禁，`make pre-ci` 已包含它。
+
 提交 CI 前，Linux 开发者运行 `make pre-ci`。它会执行主机侧源码门禁、构建并 smoke
 打包后的主机归档，并通过 Zig 对完整 workspace 执行 `x86_64-pc-windows-gnu` Clippy，
 随后通过 `cargo-zigbuild` 链接全部 Windows GNU 测试二进制但不执行。这条交叉检查可以在本地发现 Windows

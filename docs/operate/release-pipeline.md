@@ -123,6 +123,21 @@ prove both the user/mount/PID namespace path and the network namespace path befo
 running Zuno. They do not disable Ubuntu's host-wide unprivileged-user-namespace
 restriction. See the [sandbox FAQ](../faq.md) for the deployment rationale.
 
+Installing that backend is not the same as proving it confines anything, so both
+Linux gate jobs then run `make test-sandbox-e2e`. The target builds the `zuno`
+executable the sandbox needs as its helper and runs the boundary test, which
+executes a real process under `bwrap` and requires that the workspace write
+succeeds while writes to `.git`, `.zuno`, `.agents`, an outside directory, and a
+symlink pointing out of the workspace all fail, that the effective capability set
+and `NoNewPrivs` are as declared, that `AF_INET` sockets, `ptrace`, and
+`process_vm_readv` return `EPERM` while `AF_UNIX` socketpair IPC still works, and
+that a `read-only` policy refuses the same write.
+
+The test reports a named skip when the host has no bubblewrap or no helper
+executable, which keeps it harmless in `make test` on a developer machine. Both
+gate jobs set `ZUNO_SANDBOX_E2E_REQUIRE=1`, which turns that skip into a failure.
+Run the same gate locally with `make test-sandbox-e2e`; `make pre-ci` includes it.
+
 Before dispatching CI, Linux contributors run `make pre-ci`. It executes the host
 source gates, builds and smokes the packaged host archive, and uses Zig to Clippy
 the complete workspace for `x86_64-pc-windows-gnu`, then links every Windows GNU

@@ -1191,6 +1191,74 @@ fn linux_ci_loads_the_reviewed_bubblewrap_profile_without_weakening_user_namespa
     }
 }
 
+/// Installing bubblewrap proves nothing by itself. The only test that runs a real
+/// Zuno process inside bwrap and checks the filesystem, network, capability, and
+/// syscall boundaries needs host namespaces and a built executable, so it reports a
+/// named skip when either is missing. Both Linux gate jobs must therefore supply
+/// them and demand real evidence, and the test must stay out of `#[ignore]`.
+/// Otherwise the sandbox setup step installs a backend that nothing exercises, and
+/// a confinement regression reaches a release unnoticed.
+#[test]
+fn both_linux_gate_jobs_execute_the_real_bubblewrap_boundary_test() {
+    let makefile = std::fs::read_to_string(workspace_root().join("Makefile"))
+        .expect("the workspace has a Makefile");
+    let recipe: String = makefile
+        .lines()
+        .skip_while(|line| *line != "test-sandbox-e2e:")
+        .skip(1)
+        .take_while(|line| line.starts_with('\t'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !recipe.is_empty(),
+        "the Makefile's `test-sandbox-e2e` target has no recipe"
+    );
+    for required in [
+        "$(CARGO) build -p $(CLI_CRATE) --bin $(BINARY_NAME)",
+        "ZUNO_SANDBOX_E2E_HELPER=",
+        "$(CARGO) test -p zuno-sandbox --test linux_bubblewrap",
+    ] {
+        assert!(
+            recipe.contains(required),
+            "`make test-sandbox-e2e` no longer runs the confinement boundary test \
+             through {required:?}:\n{recipe}"
+        );
+    }
+
+    let boundary_test = std::fs::read_to_string(
+        workspace_root().join("crates/zuno-sandbox/tests/linux_bubblewrap.rs"),
+    )
+    .expect("the bubblewrap boundary test is readable");
+    assert!(
+        !boundary_test.contains("#[ignore"),
+        "the bubblewrap boundary test is ignored again, so no gate can execute it"
+    );
+    assert!(
+        boundary_test.contains("ZUNO_SANDBOX_E2E_REQUIRE"),
+        "the bubblewrap boundary test no longer distinguishes a skipped host from \
+         a gate that demands real confinement evidence"
+    );
+
+    for workflow_name in ["ci.yml", "release-candidate.yml"] {
+        let text = workflow(workflow_name);
+        let gate = text
+            .find("make test-sandbox-e2e")
+            .unwrap_or_else(|| panic!("{workflow_name} never runs `make test-sandbox-e2e`"));
+        let setup = text
+            .find(".github/scripts/setup-linux-sandbox.sh")
+            .unwrap_or_else(|| panic!("{workflow_name} never installs the sandbox backend"));
+        assert!(
+            setup < gate,
+            "{workflow_name} runs the confinement boundary gate before installing bwrap"
+        );
+        assert!(
+            text.contains("ZUNO_SANDBOX_E2E_REQUIRE"),
+            "{workflow_name} does not set ZUNO_SANDBOX_E2E_REQUIRE, so an unavailable \
+             bubblewrap backend would be reported as a passing gate"
+        );
+    }
+}
+
 #[test]
 fn ci_runs_before_the_protected_merge_without_a_duplicate_push_run() {
     let text = workflow("ci.yml");
@@ -2344,6 +2412,7 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
         "release",
         // Invoked by name from .github/workflows/ci.yml.
         "fmt-check",
+        "test-sandbox-e2e",
         "deny",
         "smoke-artifact",
     ] {
@@ -2370,7 +2439,13 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
         .lines()
         .find(|line| line.starts_with("pre-ci:"))
         .expect("the Makefile declares a `pre-ci` target");
-    for prerequisite in ["ci", "check", "smoke-artifact", "lint-windows-cross"] {
+    for prerequisite in [
+        "ci",
+        "check",
+        "test-sandbox-e2e",
+        "smoke-artifact",
+        "lint-windows-cross",
+    ] {
         assert!(
             pre_ci_line.contains(prerequisite),
             "`make pre-ci` does not run `{prerequisite}` ({pre_ci_line}); avoidable \

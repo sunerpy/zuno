@@ -246,6 +246,7 @@ jobs:
           make fmt-check
           make lint
           make test-nextest
+          ZUNO_SANDBOX_E2E_REQUIRE=1 make test-sandbox-e2e
 
   artifact:
     name: Build and smoke ${{ matrix.target }}

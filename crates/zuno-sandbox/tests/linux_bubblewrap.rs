@@ -7,14 +7,75 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use zuno_sandbox::{
-    LinuxBubblewrapSandbox, NetworkAccess, PrepareRequest, SandboxBackend, SandboxMode,
-    SandboxPolicy,
+    LinuxBubblewrapSandbox, NetworkAccess, PrepareRequest, SandboxBackend, SandboxError,
+    SandboxMode, SandboxPolicy,
 };
 
-fn e2e_helper() -> PathBuf {
-    std::env::var_os("ZUNO_SANDBOX_E2E_HELPER")
-        .map(PathBuf::from)
-        .expect("set ZUNO_SANDBOX_E2E_HELPER to a built zuno executable")
+/// Set by every gate that must produce native confinement evidence, currently
+/// `make test-sandbox-e2e` in the CI and release-candidate Linux jobs. When it is
+/// set, a prerequisite this suite cannot satisfy is a failure, so an unavailable
+/// backend can never be mistaken for enforced boundaries. When it is unset, the
+/// same situation is a skip with a named reason, which keeps developer hosts
+/// without bubblewrap usable.
+const REQUIRE_EVIDENCE: &str = "ZUNO_SANDBOX_E2E_REQUIRE";
+
+/// Report a prerequisite the host does not provide. Returns so the caller can
+/// stop; panics instead when the caller demanded real evidence.
+fn skip(reason: &str) {
+    assert!(
+        std::env::var_os(REQUIRE_EVIDENCE).is_none(),
+        "{REQUIRE_EVIDENCE} is set, so the bubblewrap boundary suite must run: {reason}"
+    );
+    eprintln!("skipping the bubblewrap boundary suite: {reason}");
+}
+
+fn e2e_helper() -> Result<PathBuf, String> {
+    let Some(helper) = std::env::var_os("ZUNO_SANDBOX_E2E_HELPER").map(PathBuf::from) else {
+        return Err(
+            "ZUNO_SANDBOX_E2E_HELPER is unset; point it at a built zuno \
+             executable, or run `make test-sandbox-e2e`"
+                .to_owned(),
+        );
+    };
+    if !helper.is_file() {
+        return Err(format!(
+            "ZUNO_SANDBOX_E2E_HELPER `{}` is not an executable file",
+            helper.display()
+        ));
+    }
+    Ok(helper)
+}
+
+/// The sandboxed program below runs `/bin/sh` and `/usr/bin/python3` by absolute
+/// path, because the sandbox gets a fixed `PATH`. A host missing either one
+/// cannot run the suite; that is a host gap, not a Zuno defect.
+fn missing_sandboxed_interpreter() -> Option<String> {
+    ["/bin/sh", "/usr/bin/python3"]
+        .into_iter()
+        .find(|path| !Path::new(path).is_file())
+        .map(|path| format!("the sandboxed program needs `{path}`, which this host lacks"))
+}
+
+/// Classify a discovery failure exactly as the crate itself does: the six causes
+/// that make `SandboxUnavailableCause::from_error` return a cause mean the host
+/// cannot deploy bubblewrap, and every other variant is a defect that must fail.
+fn unavailable_backend(error: &SandboxError) -> Option<String> {
+    match error {
+        SandboxError::UnsupportedPlatform(_)
+        | SandboxError::UnsupportedArchitecture(_)
+        | SandboxError::Wsl1Unsupported
+        | SandboxError::BubblewrapNotFound
+        | SandboxError::MissingBubblewrapCapability(_)
+        | SandboxError::UnavailableCapability { .. } => Some(error.to_string()),
+        SandboxError::UntrustedBubblewrap { .. }
+        | SandboxError::ProbeFailed { .. }
+        | SandboxError::UnsupportedPolicy { .. }
+        | SandboxError::InvalidPolicy(_)
+        | SandboxError::InvalidPath { .. }
+        | SandboxError::Seccomp(_)
+        | SandboxError::Helper(_)
+        | SandboxError::Io(_) => None,
+    }
 }
 
 fn run(
@@ -47,9 +108,14 @@ fn run(
 }
 
 #[test]
-#[ignore = "requires host bubblewrap namespaces and a built Zuno helper"]
 fn real_bwrap_enforces_filesystem_network_capability_and_syscall_boundaries() {
-    let helper = e2e_helper();
+    let helper = match e2e_helper() {
+        Ok(helper) => helper,
+        Err(reason) => return skip(&reason),
+    };
+    if let Some(reason) = missing_sandboxed_interpreter() {
+        return skip(&reason);
+    }
     let root = tempfile::tempdir().expect("temporary E2E root");
     let workspace = root.path().join("workspace");
     let outside = root.path().join("outside");
@@ -60,8 +126,13 @@ fn real_bwrap_enforces_filesystem_network_capability_and_syscall_boundaries() {
     }
     std::os::unix::fs::symlink(&outside, workspace.join("outside-link")).expect("outside symlink");
 
-    let backend =
-        LinuxBubblewrapSandbox::discover_with_helper(&workspace, &helper).expect("Linux backend");
+    let backend = match LinuxBubblewrapSandbox::discover_with_helper(&workspace, &helper) {
+        Ok(backend) => backend,
+        Err(error) => match unavailable_backend(&error) {
+            Some(reason) => return skip(&reason),
+            None => panic!("Linux backend discovery failed: {error}"),
+        },
+    };
     let python = r#"
 import ctypes, errno, os, socket
 
