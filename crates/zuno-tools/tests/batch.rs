@@ -6,14 +6,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use zuno_error::ToolError;
+use zuno_pty::BackgroundExecutionService;
 use zuno_tool::{
     NeverInterrupted, PermissionAsk, PermissionAsker, Tool, ToolContext, ToolEffect, ToolOutput,
-    erase,
+    ToolOutputStore, erase,
 };
 use zuno_tools::registry::{
     BuiltinSlot, CustomTool, RegistryFlags, ToolRegistry, ToolRegistryBuilder,
 };
-use zuno_tools::{FileTools, GrepTool, SearchTooling};
+use zuno_tools::{BackgroundTool, FileTools, GrepTool, SearchTooling};
 
 const MAX_CALLS: usize = 10;
 
@@ -676,4 +677,138 @@ async fn batch_a_failed_subcall_keeps_every_cause_beneath_it() {
         "the innermost cause is the diagnosis and must not be truncated: {reported}"
     );
     assert!(reported.contains("Completed: 0 succeeded, 1 failed"));
+}
+
+/// Retrieving withheld output inside a composition returns the bytes, or names them.
+///
+/// The retrieval already read a server-bounded window out of an artifact, so running it
+/// back through the composition's per-call share wrote a *subset* of that artifact into a
+/// second file and replaced the window with a notice naming the new path. A model paging
+/// withheld output through `execute` therefore collected one artifact per attempt and
+/// never reached the bytes. A window too large for this composition's share is now
+/// refused by name — the artifact it came from is where the bytes still are — and no
+/// second file is written.
+#[tokio::test]
+async fn a_retrieved_window_over_the_batch_share_names_its_artifact_and_writes_no_second_one() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let (registry, store, artifact) = retrieval_registry(root.path(), 40_000);
+    let (first, _) = probe("probe_one");
+    let (second, _) = probe("probe_two");
+    let (third, _) = probe("probe_three");
+    let registry = registry(vec![first, second, third]);
+
+    let output = registry
+        .execute(
+            "execute",
+            json!({
+                "tool_calls": [
+                    { "tool": "bg", "intent": "read withheld output",
+                      "action": "artifact", "outputPath": artifact },
+                    { "tool": "probe_one", "intent": "share the budget", "label": "one" },
+                    { "tool": "probe_two", "intent": "share the budget", "label": "two" },
+                    { "tool": "probe_three", "intent": "share the budget", "label": "three" }
+                ]
+            }),
+            context(Arc::new(zuno_tool::AllowAll)),
+        )
+        .await
+        .expect("the composition completes");
+
+    let reported = &output.output;
+    assert!(
+        reported.contains("Window not inlined"),
+        "an over-share window must be refused, not re-persisted: {reported}"
+    );
+    assert!(
+        reported.contains(&artifact),
+        "the refusal must name the artifact that already holds the bytes: {reported}"
+    );
+    assert!(
+        reported.contains("`limit: 12500`"),
+        "the refusal must say what would fit in this composition's share: {reported}"
+    );
+    assert_eq!(
+        store.entries("test").expect("store entries").len(),
+        1,
+        "a read must not create an artifact"
+    );
+    assert_eq!(output.output_paths(), vec![artifact.as_str()]);
+    assert!(
+        reported.contains("Completed: 4 succeeded, 0 failed"),
+        "{reported}"
+    );
+}
+
+/// A window that fits is inlined whole, and the composition still records its artifact.
+///
+/// Only the sub-call text reached the composed block, so the artifact a retrieval read
+/// survived as prose alone: the durable part of the composition carried no path a client
+/// or a later turn could act on.
+#[tokio::test]
+async fn a_retrieved_window_within_the_batch_share_is_inlined_with_its_artifact_recorded() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let (registry, store, artifact) = retrieval_registry(root.path(), 4_000);
+    let registry = registry(Vec::new());
+
+    let output = registry
+        .execute(
+            "execute",
+            json!({
+                "tool_calls": [
+                    { "tool": "bg", "intent": "read withheld output",
+                      "action": "artifact", "outputPath": artifact }
+                ]
+            }),
+            context(Arc::new(zuno_tool::AllowAll)),
+        )
+        .await
+        .expect("the composition completes");
+
+    let reported = &output.output;
+    assert!(
+        reported.contains(&"x".repeat(4_000)),
+        "a window inside the share is returned as it is: {} bytes",
+        reported.len()
+    );
+    assert!(!reported.contains("Window not inlined"), "{reported}");
+    assert_eq!(
+        store.entries("test").expect("store entries").len(),
+        1,
+        "a read must not create an artifact"
+    );
+    assert_eq!(output.output_paths(), vec![artifact.as_str()]);
+    assert!(
+        reported.contains("Completed: 1 succeeded, 0 failed"),
+        "{reported}"
+    );
+}
+
+/// A registry whose `bg` reads a persisted artifact of `bytes`, plus that artifact's path.
+///
+/// The store is the one the registry builds for `execute` itself, so a second artifact
+/// written by the composition would land in the same directory and be counted.
+#[allow(clippy::type_complexity)]
+fn retrieval_registry(
+    root: &Path,
+    bytes: usize,
+) -> (
+    impl FnOnce(Vec<CustomTool>) -> ToolRegistry,
+    ToolOutputStore,
+    String,
+) {
+    let store = ToolOutputStore::in_worktree(&zuno_paths::generated_root(root));
+    let stored = store
+        .persist_bytes("shell", "ses_batch", &vec![b'x'; bytes])
+        .expect("persist the withheld output");
+    let background = root.join("background");
+    std::fs::create_dir_all(&background).expect("background directory");
+    let service =
+        Arc::new(BackgroundExecutionService::open(&background).expect("background service"));
+    let bg = erase(BackgroundTool::new(service).with_output_store(store.clone()));
+    let root = root.to_owned();
+    let build = move |mut tools: Vec<CustomTool>| {
+        tools.insert(0, bg);
+        registry(&root, tools)
+    };
+    (build, store, zuno_paths::wire_path(&stored.path))
 }

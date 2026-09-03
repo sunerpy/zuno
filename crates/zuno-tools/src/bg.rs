@@ -19,7 +19,7 @@
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::path::Path;
 use std::sync::Arc;
@@ -53,15 +53,64 @@ pub const DEFAULT_WINDOW_BYTES: u64 = 16 * 1024;
 
 /// The largest window any read returns, whatever it asked for.
 ///
-/// Tied to the byte threshold at which the default output policy stops inlining output
-/// at all: a retrieval window can never exceed the amount that policy would have been
-/// willing to hand back in the first place. Clamped rather than refused, so a caller
-/// that guesses high still gets bytes and a cursor instead of an error.
+/// A fixed ceiling on one read, the same shape `read` applies to one file, and
+/// deliberately not a function of `toolOutput.maxBytes`: those limits govern how much of
+/// its own output a tool may put in the transcript automatically, while a window is a
+/// size the caller states and this tool then clamps. Sharing the default limit's number
+/// keeps the two comparable — no read can hand back more than the largest output that
+/// would have been inlined by default — without making an explicit read follow a
+/// threshold that was configured for automatic inlining. Clamped rather than refused, so
+/// a caller that guesses high still gets bytes and a cursor instead of an error.
 pub const MAX_WINDOW_BYTES: u64 = zuno_tool::output::DEFAULT_MAX_BYTES as u64;
+
+/// One window of a persisted artifact, under [`ARTIFACT_METADATA_KEY`].
+///
+/// One definition for both directions. The retrieval writes it, and a caller deciding
+/// what to do with a retrieval result reads it back: a result carrying this is already a
+/// bounded window of a file that holds every byte, so persisting it again would write a
+/// subset of an artifact that already exists and name the read that just happened as the
+/// way to recover it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactWindow {
+    /// The artifact read, in the spelling the caller passed and may pass again.
+    pub output_path: String,
+    /// Absolute offset of the window's first byte.
+    pub window_from: u64,
+    /// Absolute offset just past the window: the cursor the next read starts at.
+    pub cursor: u64,
+    /// Whether the artifact holds bytes after this window.
+    pub has_more: bool,
+    /// Whether the artifact holds bytes before this window.
+    pub has_earlier: bool,
+    /// Bytes in this window.
+    pub window_bytes: u64,
+    /// Bytes in the whole artifact.
+    pub total_bytes: u64,
+}
+
+impl ArtifactWindow {
+    /// The window a result describes, if it is a retrieval of a persisted artifact.
+    #[must_use]
+    pub fn of(output: &ToolOutput) -> Option<Self> {
+        output
+            .metadata
+            .get(ARTIFACT_METADATA_KEY)
+            .and_then(|facts| serde_json::from_value(facts.clone()).ok())
+    }
+
+    /// These facts as model- and client-facing metadata.
+    #[must_use]
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
 
 const TASK_ID: &str = "taskID";
 const CURSOR: &str = "cursor";
-const LIMIT: &str = "limit";
+
+/// The parameter naming a window size, for a caller that has to ask for a smaller one.
+pub const LIMIT: &str = "limit";
 const TIMEOUT: &str = "timeout";
 const OUTPUT_PATH: &str = "outputPath";
 
@@ -152,6 +201,13 @@ impl BackgroundTool {
     }
 
     /// One bounded window of an execution's output, from the requested cursor.
+    ///
+    /// No cursor asks for the newest window. A running command has no end to page toward,
+    /// so "wherever it is now" is the only reading of an absent cursor that a caller can
+    /// act on: it is what a terminal shows, it advances between polls, and it is where a
+    /// command reports what happened. The beginning is reached by naming `cursor: 0`,
+    /// which is also the request the service serves from the persisted file once the ring
+    /// has discarded that far.
     fn window(
         &self,
         id: &BackgroundExecutionId,
@@ -288,28 +344,32 @@ impl TypedTool for BackgroundTool {
                     from,
                     limit,
                 )?;
-                let has_more = window.cursor < window.total;
-                let facts = json!({
-                    "outputPath": requested,
-                    "cursor": window.cursor,
-                    "hasMore": has_more,
-                    "windowBytes": window.bytes.len(),
-                    "totalBytes": window.total,
-                });
+                let facts = ArtifactWindow {
+                    output_path: requested.clone(),
+                    window_from: from,
+                    cursor: window.cursor,
+                    has_more: window.cursor < window.total,
+                    has_earlier: from > 0,
+                    window_bytes: window.bytes.len() as u64,
+                    total_bytes: window.total,
+                };
                 // The bytes are the answer, so they are the output, not a JSON string
                 // field inside it: escaping every newline of a retrieved test summary
                 // would hand back something harder to read than what was withheld.
                 let mut body = String::from_utf8_lossy(&window.bytes).into_owned();
-                if has_more {
+                if facts.has_more {
                     body.push_str(&format!(
                         "\n[{} of {} bytes; call `{WIRE_ID}` again with `{CURSOR}: {}` for the rest]",
                         window.cursor, window.total, window.cursor
                     ));
                 }
-                Ok(
-                    ToolOutput::text(format!("withheld output {requested}"), body)
-                        .with_metadata(ARTIFACT_METADATA_KEY, facts),
-                )
+                let mut output = ToolOutput::text(format!("withheld output {requested}"), body)
+                    .with_metadata(ARTIFACT_METADATA_KEY, facts.to_value());
+                // The artifact this window came from is where the full text still is, so a
+                // client or a later turn finds it in `outputPaths` without parsing either
+                // the notice that withheld it or the hint that pages it.
+                output.record_output_path(Path::new(&requested));
+                Ok(output)
             }
         }
     }
@@ -346,17 +406,27 @@ fn window_bytes(requested: Option<u64>) -> usize {
     usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
+/// The facts of one window of an execution's output.
+///
+/// `windowFrom` and `hasEarlier` are stated rather than left to be derived: a read that
+/// named no cursor gets the newest window, so the only way for a caller to know that
+/// earlier output exists — and the offset to ask for it at — is to be told. Deriving it
+/// from `totalWritten` minus a window length is arithmetic a caller should not have to do
+/// to find the beginning of a log it just asked to see.
 fn render_window(window: &BackgroundExecutionOutput) -> Map<String, Value> {
+    let window_from = window.cursor.saturating_sub(window.bytes.len() as u64);
     let mut fields = Map::new();
     fields.insert(
         "output".to_owned(),
         Value::String(String::from_utf8_lossy(&window.bytes).into_owned()),
     );
+    fields.insert("windowFrom".to_owned(), json!(window_from));
     fields.insert("cursor".to_owned(), json!(window.cursor));
     fields.insert(
         "hasMore".to_owned(),
         Value::Bool(window.cursor < window.total_written),
     );
+    fields.insert("hasEarlier".to_owned(), Value::Bool(window_from > 0));
     fields.insert("fromDisk".to_owned(), Value::Bool(window.from_disk));
     fields.insert("retainedFrom".to_owned(), json!(window.retained_from));
     fields.insert("totalWritten".to_owned(), json!(window.total_written));

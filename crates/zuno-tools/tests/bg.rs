@@ -192,6 +192,90 @@ fn strict_effect_is_dynamic_for_background_actions() {
     );
 }
 
+/// A read that names no cursor gets the newest window, which is where a command reports.
+///
+/// This is the call shape the tool description teaches and the one a model makes while
+/// watching a build: no `cursor`, no `limit`. Serving it from the oldest retained bytes
+/// returned the same opening lines to every poll, put the failing assertion and the
+/// summary roughly 24 paging calls away, and left `shell` with `tail` the cheapest way to
+/// see what a command had just said — the incentive this tool exists to remove.
+#[tokio::test]
+async fn a_read_that_names_no_cursor_returns_the_newest_window() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let service =
+        Arc::new(BackgroundExecutionService::open(directory.path()).expect("background service"));
+    let filler = zuno_tools::bg::DEFAULT_WINDOW_BYTES + 4_096;
+    let execution = service
+        .start(input(
+            directory.path(),
+            "ses_owner",
+            &format!("printf 'OPENING LINE\\n'; head -c {filler} /dev/zero | tr '\\0' x; printf '\\nFAILED: 1 test\\n'"),
+        ))
+        .expect("background command");
+    service.wait(&execution.id, None).await.expect("settles");
+    let tool = BackgroundTool::new(Arc::clone(&service));
+
+    let window = tool
+        .run(
+            BackgroundParams {
+                action: BackgroundAction::Output,
+                task_id: Some(execution.id.as_str().to_owned()),
+                cursor: None,
+                limit: None,
+                timeout: None,
+                output_path: None,
+            },
+            context("ses_owner"),
+        )
+        .await
+        .expect("newest window");
+
+    let facts = &window.metadata[zuno_tools::bg::BACKGROUND_METADATA_KEY];
+    let text = facts["output"].as_str().expect("window text");
+    assert!(text.contains("FAILED: 1 test"), "the tail has to be in it");
+    assert!(
+        !text.contains("OPENING LINE"),
+        "a window this size cannot also hold the head"
+    );
+    assert_eq!(
+        facts["cursor"], facts["totalWritten"],
+        "nothing newer remains, so paging forward is finished"
+    );
+    assert_eq!(facts["hasMore"], false);
+    assert_eq!(facts["hasEarlier"], true);
+    assert!(
+        facts["windowFrom"].as_u64().expect("windowFrom") > 0,
+        "the window has to say where it began: {facts}"
+    );
+    assert_eq!(facts["discarded"], 0, "the ring dropped nothing here");
+
+    let beginning = tool
+        .run(
+            BackgroundParams {
+                action: BackgroundAction::Output,
+                task_id: Some(execution.id.as_str().to_owned()),
+                cursor: Some(0),
+                limit: Some(64),
+                timeout: None,
+                output_path: None,
+            },
+            context("ses_owner"),
+        )
+        .await
+        .expect("the beginning");
+    let facts = &beginning.metadata[zuno_tools::bg::BACKGROUND_METADATA_KEY];
+    assert!(
+        facts["output"]
+            .as_str()
+            .expect("window text")
+            .contains("OPENING LINE"),
+        "naming offset zero still reaches the head: {facts}"
+    );
+    assert_eq!(facts["windowFrom"], 0);
+    assert_eq!(facts["hasEarlier"], false);
+    assert_eq!(facts["hasMore"], true);
+}
+
 /// A read that names no size still gets a bounded window and a usable cursor.
 #[tokio::test]
 async fn an_output_read_returns_one_bounded_window_and_the_next_cursor() {
