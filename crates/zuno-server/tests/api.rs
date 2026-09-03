@@ -1072,6 +1072,278 @@ async fn api_publishes_no_saved_permission_routes_or_operations() {
     );
 }
 
+/// A shell permission request for one session, saving the given patterns.
+fn shell_permission(id: &str, session_id: &str, save: Vec<String>) -> PermissionRequest {
+    PermissionRequest {
+        id: id.to_owned(),
+        session_id: session_id.to_owned(),
+        action: "shell".to_owned(),
+        resources: vec!["git push".to_owned()],
+        save,
+        metadata: serde_json::Map::new(),
+        source: None,
+    }
+}
+
+/// Waits for `session_id` to have a request parked in the broker.
+async fn await_parked(requests: &RequestBroker, session_id: &str) {
+    while requests.permissions(Some(session_id)).is_empty() {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Asks, replies `always` once the ask parks, and returns what the asker received.
+async fn answer_with_always(requests: &RequestBroker, request: PermissionRequest) -> ReplyKind {
+    let session_id = request.session_id.clone();
+    let request_id = request.id.clone();
+    let mut asked = tokio::spawn({
+        let requests = requests.clone();
+        async move { requests.ask_permission(request).await }
+    });
+    await_parked(requests, &session_id).await;
+    assert!(
+        requests
+            .claim_permission(&session_id, &request_id)
+            .expect("the owning session claims its own request")
+            .resolve(ReplyKind::Always)
+    );
+    tokio::time::timeout(Duration::from_secs(1), &mut asked)
+        .await
+        .expect("the asker resumes")
+        .expect("the asker task does not panic")
+}
+
+/// Asserts that an ask waits for a human instead of being answered by a saved reply.
+async fn assert_parks_for_a_human(
+    requests: &RequestBroker,
+    request: PermissionRequest,
+    message: &str,
+) {
+    let session_id = request.session_id.clone();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), requests.ask_permission(request))
+            .await
+            .is_err(),
+        "{message}"
+    );
+    assert_eq!(
+        requests.permissions(Some(&session_id)).len(),
+        1,
+        "the ask should be waiting as a pending request"
+    );
+}
+
+/// A saved `always` belongs to the session that granted it.
+///
+/// The resident key used to be `(action, resources)` alone, so one session's saved
+/// reply pre-approved the identical call in every other session this process served,
+/// including sessions started later and sessions the replying client never saw. The
+/// granting session still reuses its own saved reply without asking again.
+#[tokio::test]
+async fn a_saved_permission_authorizes_only_the_session_that_granted_it() {
+    let requests = RequestBroker::default();
+    assert_eq!(
+        answer_with_always(
+            &requests,
+            shell_permission("per_grant", "ses_grant", vec!["git push".to_owned()]),
+        )
+        .await,
+        ReplyKind::Always
+    );
+
+    assert_eq!(
+        requests
+            .ask_permission(shell_permission(
+                "per_again",
+                "ses_grant",
+                vec!["git push".to_owned()],
+            ))
+            .await,
+        ReplyKind::Once,
+        "the granting session should reuse its own saved permission"
+    );
+    assert!(requests.permissions(None).is_empty());
+
+    assert_parks_for_a_human(
+        &requests,
+        shell_permission("per_other", "ses_other", vec!["git push".to_owned()]),
+        "another session's request was authorized by ses_grant's saved permission",
+    )
+    .await;
+}
+
+/// An ask that offered nothing to save never becomes a standing authorization.
+///
+/// An empty `save` means the surface presented no "always" option — a manual
+/// confirmation, for instance. Replying `always` to such a request used to install a
+/// resident grant anyway, so the next matching call in that session skipped the human
+/// the ask existed to reach.
+#[tokio::test]
+async fn replying_always_to_an_unsavable_request_installs_no_standing_authorization() {
+    let requests = RequestBroker::default();
+    assert_eq!(
+        answer_with_always(
+            &requests,
+            shell_permission("per_once", "ses_once", Vec::new()),
+        )
+        .await,
+        ReplyKind::Always
+    );
+
+    assert_parks_for_a_human(
+        &requests,
+        shell_permission("per_repeat", "ses_once", Vec::new()),
+        "a request with nothing to save installed a standing authorization",
+    )
+    .await;
+}
+
+/// An `always` reply that never reaches its asker saves nothing.
+///
+/// The saved permission comes from a delivered reply, not from the attempt. When the
+/// asking turn is already gone the call it asked about is denied, so keeping the
+/// authorization would authorize the *next* matching call on behalf of a tool call
+/// that never ran.
+#[tokio::test]
+async fn an_undelivered_always_reply_saves_no_permission() {
+    let requests = RequestBroker::default();
+    let asking = tokio::spawn({
+        let requests = requests.clone();
+        async move {
+            requests
+                .ask_permission(shell_permission(
+                    "per_gone",
+                    "ses_gone",
+                    vec!["git push".to_owned()],
+                ))
+                .await
+        }
+    });
+    await_parked(&requests, "ses_gone").await;
+    asking.abort();
+    assert!(
+        asking
+            .await
+            .expect_err("the asking turn is cancelled")
+            .is_cancelled()
+    );
+
+    assert!(
+        !requests
+            .claim_permission("ses_gone", "per_gone")
+            .expect("the reply claims the abandoned request")
+            .resolve(ReplyKind::Always),
+        "a reply with no asker left should report that it was not delivered"
+    );
+    assert_parks_for_a_human(
+        &requests,
+        shell_permission("per_next", "ses_gone", vec!["git push".to_owned()]),
+        "an undelivered always reply installed a standing authorization",
+    )
+    .await;
+}
+
+/// Archiving a session withdraws the permissions it saved, and only those.
+///
+/// A saved `always` lives exactly as long as the session that took it, so cleanup
+/// hangs off the session ending rather than off an event stream: an SSE client may
+/// disconnect and reconnect without losing its saved replies, while a pruned session
+/// takes them with it and a later session reusing the id inherits nothing. A preview
+/// mutates nothing and so withdraws nothing.
+#[tokio::test]
+async fn archiving_a_session_withdraws_its_saved_permissions() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    state
+        .sessions()
+        .create(
+            &SessionCreate::new(
+                "ses_old", "ses_old", "global", "/repo", "/repo", "old", "test",
+            )
+            .at(1),
+        )
+        .expect("old fixture session inserts");
+    state
+        .sessions()
+        .create(&SessionCreate::new(
+            "ses_live", "ses_live", "global", "/repo", "/repo", "live", "test",
+        ))
+        .expect("recent fixture session inserts");
+    let requests = RequestBroker::default();
+    let services = ServerServices::new(64).with_requests(requests.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services)
+        .with_routes(api::router(state))
+        .router();
+
+    for (request_id, session_id) in [("per_old", "ses_old"), ("per_live", "ses_live")] {
+        assert_eq!(
+            answer_with_always(
+                &requests,
+                shell_permission(request_id, session_id, vec!["git push".to_owned()]),
+            )
+            .await,
+            ReplyKind::Always
+        );
+    }
+
+    let preview = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/api/session/prune?olderThan=90&project=global",
+            None,
+        ))
+        .await
+        .expect("maintenance preview responds");
+    assert_eq!(preview.status(), StatusCode::OK);
+    assert_eq!(
+        requests
+            .ask_permission(shell_permission(
+                "per_preview",
+                "ses_old",
+                vec!["git push".to_owned()],
+            ))
+            .await,
+        ReplyKind::Once,
+        "a preview must not withdraw a saved permission"
+    );
+
+    let archive = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/prune",
+            Some(json!({
+                "olderThan": 90,
+                "project": "global",
+                "action": "archive",
+                "apply": true
+            })),
+        ))
+        .await
+        .expect("maintenance archive responds");
+    assert_eq!(archive.status(), StatusCode::OK);
+    assert_eq!(response_json(archive).await["changed_sessions"], 1);
+
+    assert_eq!(
+        requests
+            .ask_permission(shell_permission(
+                "per_survives",
+                "ses_live",
+                vec!["git push".to_owned()],
+            ))
+            .await,
+        ReplyKind::Once,
+        "archiving one session withdrew a session that was never selected"
+    );
+    assert_parks_for_a_human(
+        &requests,
+        shell_permission("per_after", "ses_old", vec!["git push".to_owned()]),
+        "the archived session's saved permission still authorized calls",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn api_reply_routes_validate_bodies_before_rejecting_cross_session_requests() {
     let state = ApiState::memory("/repo").expect("in-memory API state initializes");

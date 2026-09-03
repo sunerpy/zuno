@@ -582,6 +582,8 @@ fn architecture_documents_pin_the_native_harness_decisions() {
             "Last-Event-ID",
             "does not mount an unscoped `/event` adapter",
             "only when a real handler exists",
+            "scoped to the session that granted",
+            "a stream is not the session",
         ],
     );
     contains_all(

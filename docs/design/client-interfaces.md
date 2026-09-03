@@ -387,3 +387,14 @@ always-empty list and an always-successful delete — while a live grant kept
 authorizing matching calls, so a client auditing its grants was told there were none
 and a client revoking one was told it succeeded. A missing operation is honest; a
 published one that can only misreport is not.
+
+A standing authorization installed over HTTP is scoped to the session that granted
+it, exactly as the ACP one is. An `always` reply is one session's decision, so it
+pre-approves later calls only in that session, and only when the ask offered patterns
+to save: a manual confirmation offers none, is never satisfied by an existing
+authorization, and never installs one. The authorization appears only once the reply
+has reached the call that was waiting for it, and it is withdrawn when the session
+ends — archiving or deleting a session through `POST /api/session/prune` drops every
+authorization that session granted. An event-stream disconnect withdraws nothing,
+because a stream is not the session: a client that reconnects keeps what its user
+already approved.

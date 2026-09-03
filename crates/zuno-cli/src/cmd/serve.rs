@@ -259,12 +259,17 @@ impl PermissionAsker for ServerPermissionAsker {
         tool: &str,
         ask: PermissionAsk,
     ) -> Result<(), ToolError> {
+        // Only a reusable ask may offer a saved authorization. A manual ask is a
+        // deliberate one-time confirmation, and an ask with no `always` option has
+        // nothing to save; either way the request carries no `save`, so the broker
+        // neither installs a standing grant from it nor answers it with one.
+        let reusable = !ask.manual && !ask.always.is_empty();
         let request = PermissionRequest {
             id: format!("per_{}", Uuid::new_v4().simple()),
             session_id: origin.session_id().to_owned(),
             action: ask.permission,
             resources: ask.patterns,
-            save: ask.always,
+            save: if reusable { ask.always } else { Vec::new() },
             metadata: ask.metadata,
             source: None,
         };
@@ -704,9 +709,11 @@ mod tests {
     use std::sync::Arc;
 
     use serde_json::json;
+    use zuno_tool::{NeverInterrupted, ToolContext};
 
     use super::{
-        PendingExtensionReservation, listen_config, reserve_pending_extension_transition,
+        PendingExtensionReservation, PermissionAsk, PermissionAsker, PermissionRequest,
+        RequestBroker, ServerPermissionAsker, listen_config, reserve_pending_extension_transition,
         server_readiness_message,
     };
     use crate::command::ServeArgs;
@@ -853,5 +860,64 @@ mod tests {
             "a late old host must not enter while candidate preparation is reserved"
         );
         prepared.abort().expect("candidate fixture aborts cleanly");
+    }
+
+    /// Drives one ask through the HTTP asker and returns the request it parked.
+    ///
+    /// The ask has to park: nothing in the test answers it, so a returned reply would
+    /// mean the broker authorized the call without a human.
+    async fn parked_request(ask: PermissionAsk) -> PermissionRequest {
+        let requests = RequestBroker::default();
+        let asker: Arc<dyn PermissionAsker> = Arc::new(ServerPermissionAsker {
+            requests: requests.clone(),
+        });
+        let context = ToolContext::new(
+            "ses_ask",
+            "msg_ask",
+            "call_ask",
+            "build",
+            asker,
+            Arc::new(NeverInterrupted),
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                context.ask("shell", ask),
+            )
+            .await
+            .is_err(),
+            "the ask was answered without a human"
+        );
+        let mut parked = requests.permissions(Some("ses_ask"));
+        assert_eq!(parked.len(), 1);
+        parked.remove(0)
+    }
+
+    /// A manual ask offers nothing to save, so no saved permission can come from it.
+    ///
+    /// `PermissionAsk::manual` exists to force a fresh human decision. The HTTP asker
+    /// used to copy `always` onto the wire request regardless, so a manual prompt
+    /// answered with `always` installed a standing authorization and the next matching
+    /// call in that session was approved without anyone seeing it.
+    #[tokio::test]
+    async fn a_manual_permission_ask_offers_nothing_to_save() {
+        let reusable = PermissionAsk {
+            always: vec!["git push".to_owned()],
+            ..PermissionAsk::new("shell", "git push")
+        };
+        let manual = PermissionAsk {
+            manual: true,
+            ..reusable.clone()
+        };
+
+        assert_eq!(
+            parked_request(reusable).await.save,
+            vec!["git push".to_owned()],
+            "a reusable ask should still offer its saved patterns"
+        );
+        assert!(
+            parked_request(manual).await.save.is_empty(),
+            "a manual ask offered a saved authorization"
+        );
     }
 }
