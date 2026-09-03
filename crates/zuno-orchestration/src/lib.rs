@@ -158,7 +158,6 @@ const UI_DESIGN_PROFILES: &[&str] = &[
     "general",
     "oracle",
     "looker",
-    "designer",
 ];
 
 const NATIVE_PROVENANCE: SkillProvenance = SkillProvenance {
