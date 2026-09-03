@@ -1775,6 +1775,35 @@ fn cancellation_docs_pin_certainty_as_a_verdict_and_not_a_mode() {
     contains_all("docs/zh/guide/tools.md", &["对命令是否运行过一概不说"]);
 }
 
+/// Plan mode is a no-mutation boundary, not a shell-free one. Two guides said the opposite
+/// of the overlay two tests already pin, and a reader who believed them would treat Plan as
+/// a confidentiality boundary it never was.
+#[test]
+fn plan_mode_docs_do_not_claim_a_shell_free_boundary() {
+    for page in ["docs/guide/durable-state.md", "docs/guide/agents.md"] {
+        let text = read(page);
+        assert!(
+            !text.contains("denying shell"),
+            "{page} must not claim Plan mode denies shell"
+        );
+    }
+    contains_all(
+        "docs/guide/durable-state.md",
+        &["Plan mode is a no-mutation boundary, not a shell-free one"],
+    );
+    for page in ["docs/zh/guide/durable-state.md", "docs/zh/guide/agents.md"] {
+        let text = read(page);
+        assert!(
+            !text.contains("拒绝 shell"),
+            "{page} must not claim Plan mode denies shell"
+        );
+    }
+    contains_all(
+        "docs/zh/guide/durable-state.md",
+        &["是一条“不得修改”的边界，而不是一条“没有 shell”的边界"],
+    );
+}
+
 /// The claim a reader depends on is that the obligation outlives the pause row, and that
 /// one named action is what retires it. Both languages have to make it.
 #[test]

@@ -431,10 +431,12 @@ Rules that matter in practice:
   new Goal may supersede that step, but it does not settle or cancel the Job implicitly.
 
 Plan mode enforces the read-only side of this below the prompt: a deny-by-default overlay
-allows inspection, read-only search and LSP, questions, Skills, and typed
-Goal/Plan/Todo operations while denying shell and file mutation. Returning to Work mode
-requires a durable plan to exist, and the confirmation names its title, revision, and
-completed-step count.
+allows inspection, read-only search and LSP, `shell` and `bg`, questions, Skills, and typed
+Goal/Plan/Todo operations, while denying file mutation, delegation, `job`, and `execute`.
+Plan mode is a no-mutation boundary, not a shell-free one: the runtime forces any read-only
+role to `SandboxMode::ReadOnly`, so a command can gather evidence and cannot change the
+tree. Returning to Work mode requires a durable plan to exist, and the confirmation names
+its title, revision, and completed-step count.
 
 The default host owns classification and final reconciliation through typed planning
 services; the model owns strategic step creation through operation-based `plan_update`.
