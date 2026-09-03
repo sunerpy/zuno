@@ -18,6 +18,7 @@
 .PHONY: all help \
 		fmt fmt-check fmt-rust fmt-rust-check fmt-oxfmt fmt-oxfmt-check \
 		lint lint-windows-cross check test test-nextest test-zed-acp-schema test-par test-fast \
+		test-sandbox-e2e \
 		hook-fmt hook-test hooks ci pre-ci \
 		deny metadata \
         build release release-target package smoke smoke-artifact \
@@ -120,6 +121,29 @@ test-nextest:
 test-zed-acp-schema:
 	$(CARGO) test -p zuno-acp --features zed-schema-contract --test contract $(OFFLINE)
 
+# The one test that proves bubblewrap actually confines a real Zuno process needs
+# host user namespaces plus a built executable to run inside the sandbox, so it
+# skips itself with a named reason when either is missing. This target supplies
+# both and sets ZUNO_SANDBOX_E2E_REQUIRE, which turns that skip into a failure.
+# CI already installs and probes bwrap (.github/scripts/setup-linux-sandbox.sh),
+# so this is where the native confinement evidence comes from; without a gate
+# that demands it, an unavailable backend reads as a pass.
+test-sandbox-e2e:
+	@if [ "$$(uname -s)" != "Linux" ]; then \
+		echo "test-sandbox-e2e: skipped, bubblewrap confinement is Linux-only (host $$(uname -s))"; \
+		if [ -n "$$ZUNO_SANDBOX_E2E_REQUIRE" ]; then exit 1; fi; \
+		exit 0; \
+	fi; \
+	if ! command -v bwrap > /dev/null 2>&1; then \
+		echo "test-sandbox-e2e: skipped, bwrap is not on PATH"; \
+		if [ -n "$$ZUNO_SANDBOX_E2E_REQUIRE" ]; then exit 1; fi; \
+		exit 0; \
+	fi; \
+	set -e; \
+	$(CARGO) build -p $(CLI_CRATE) --bin $(BINARY_NAME) $(OFFLINE); \
+	ZUNO_SANDBOX_E2E_HELPER="$$PWD/$(CARGO_OUTPUT_DIR)/debug/$(HOST_BINARY)" \
+		$(CARGO) test -p zuno-sandbox --test linux_bubblewrap $(OFFLINE) -- --nocapture
+
 # Same non-ignored test surface as `test`, run concurrently. Prefer the maintained
 # cross-platform runner used by CI; retain the measured in-repository scheduler
 # as an offline fallback for developer machines without cargo-nextest.
@@ -173,7 +197,7 @@ ci: metadata fmt-check lint test-par deny
 
 # Local predictive gate before opening or updating a pull request. Native
 # Windows/MSVC execution and hosted-runner networking remain CI-only evidence.
-pre-ci: ci check smoke-artifact lint-windows-cross
+pre-ci: ci check test-sandbox-e2e smoke-artifact lint-windows-cross
 	@echo "OK    host CI + check + packaged smoke + Windows cfg/Clippy/link preflight"
 
 # ─── Build ──────────────────────────────────────────────────────────────────
@@ -271,6 +295,7 @@ help:
 	@echo "  test            cargo test --workspace --no-fail-fast"
 	@echo "  test-nextest    workspace tests concurrent across binaries + doctests"
 	@echo "  test-zed-acp-schema  decode ACP updates with current Zed's pinned schema crate"
+	@echo "  test-sandbox-e2e  real bwrap confinement boundaries (Linux; skips without bwrap)"
 	@echo "  test-par        nextest when installed; measured in-tree fallback otherwise"
 	@echo "  test-fast       focused docs/release tests + installer syntax"
 	@echo "  hook-fmt        commit-time formatting gate"

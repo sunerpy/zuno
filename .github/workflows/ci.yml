@@ -143,6 +143,12 @@ jobs:
       - name: Test suite
         run: make test-nextest
 
+      - name: Sandbox boundary suite
+        shell: bash
+        env:
+          ZUNO_SANDBOX_E2E_REQUIRE: "1"
+        run: make test-sandbox-e2e
+
   artifact:
     name: Artifact smoke (host)
     needs: classify
