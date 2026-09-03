@@ -191,6 +191,15 @@ Important options include:
 | `responsesTextBlocks` | Responses text projection: `multiple` by default, or `single` for gateways that expose only one upstream text field |
 | `extraBody` | additional request fields after protected fields are assembled |
 
+`timeout`, `headerTimeout`, and `chunkTimeout` are read only by the
+OpenAI-compatible transports, which default to a 330-second response-header
+deadline and a 120-second streamed-chunk idle allowance. The native `openai`,
+`anthropic`, `google`, and `bedrock` providers ignore all three. Each applies a
+fixed 330-second response-header deadline, no whole-request deadline, and the
+shared 300-second stream idle allowance that `ZUNO_STREAM_IDLE_TIMEOUT_SECS`
+overrides for every provider, so setting these keys on a native provider block
+does not change its deadlines.
+
 `responsesTextBlocks: "single"` is a compatibility declaration, not a model
 capability inferred from a provider id. It keeps Zuno's durable prompt parts
 typed, but joins their text projections with one blank line immediately before

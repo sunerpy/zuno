@@ -128,6 +128,19 @@ observer 调度 active 根 Goal。恢复任务与普通 prompt 共用会话执�
 
 重试决策使用类型化错误，而非渲染后的消息。认证失败与用户中断导致暂停；无效协议、损坏的持久状态和永久性配置失败导致阻塞。
 
+`timeout`、`headerTimeout`、`chunkTimeout` 只有 OpenAI-compatible 传输会读取，其默认值是
+330 秒响应头截止时间与 120 秒分片空闲上限。原生的 OpenAI、Anthropic、Google、Bedrock
+四个 provider 不读这三个键：它们固定采用 330 秒响应头截止时间，不设整请求截止时间（一个
+合理的长回合没有 provider 能事先知道的上限），分片阶段则沿用共享的 300 秒流空闲上限，
+该上限由 `ZUNO_STREAM_IDLE_TIMEOUT_SECS` 对所有 provider 统一调整。原生请求在收到第一个
+响应头之前卡住时，现在会在上限处以类型化错误失败，而不是一直等到用户中断。
+
+流在没有终止标记的情况下结束，属于上游流不完整，而不是一次完成的回答。每个原生解码器都会
+报出携带 `upstream_stream_incomplete` 的 `ProviderError::Stream`，因此它可重试并允许替换
+已产生的部分输出：引擎发出 `RetryRollback`，丢弃被截断的流写出的内容，然后重放原样的请求。
+一个终止标记就足够，所以只发 `finish_reason`、或只发 `[DONE]` 的 Chat Completions 流都算
+正常完成。
+
 - 被自身预算策略停下的回合以 `turn_budget` 暂停。额度属于单个回合，Goal 保留剩余的
   token 预算，但不会自动续跑：下一回合只会以同样的方式花掉同样的额度。这与 Goal 整体
   预算耗尽的 `budget_limited` 状态不同。

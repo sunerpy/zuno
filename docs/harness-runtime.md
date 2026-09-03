@@ -793,6 +793,24 @@ gateways should set their own upstream deadline below Zuno's matching phase
 deadline so their typed error reaches Zuno before the client cancels the
 connection.
 
+The four native providers — OpenAI, Anthropic, Google, and Bedrock — do not read
+those keys. Each applies one fixed 330-second response-header deadline and no
+whole-request deadline, because a legitimate long turn has no upper bound the
+provider can know in advance. Their streamed-chunk phase stays with the shared
+300-second stream idle allowance, which `ZUNO_STREAM_IDLE_TIMEOUT_SECS` raises or
+lowers for every provider. A native request that stalls before its first response
+header now fails typed at the ceiling instead of waiting for the user to
+interrupt it.
+
+A stream that ends without a terminator is an incomplete upstream stream, not a
+finished answer. Every native decoder reports `ProviderError::Stream` carrying
+`upstream_stream_incomplete` when the transport reaches end of input while a
+message is still open, so the failure is retryable and permits partial-output
+replacement: the engine emits `RetryRollback`, discards what the truncated stream
+produced, and replays the unchanged request. One terminator is sufficient, so a
+Chat Completions stream that sends only `finish_reason`, or only `[DONE]`,
+completes normally.
+
 ## Resident memory and user learning
 
 Resident Memory has one model-visible mutation boundary: `memory_propose`. It

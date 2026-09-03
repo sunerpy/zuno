@@ -91,6 +91,11 @@ export/import 会保留 Notes 及其幂等 ledger。sanitize export 会脱敏文
 
 可恢复的 provider、网络、流、SQLite 争用、Agent 步数上限以及符合条件的工具失败，会在等待之前先把一次指数退避重试落盘，因此进程重启后可以从 SQLite 重建截止时间。一个回合花完自己的 token、工具调用次数或墙上时间额度时不会重试：它以 `turn_budget` 暂停 Goal 并等待人工，因为下一回合只会以同样的方式花掉同样的额度。若花完的是 Goal 自己显式设定的 `token_budget`，Goal 则进入 `budget_limited`。
 
+上游流在没有终止标记的情况下结束也算这类可恢复失败：Zuno 不会把被截断的回答当成模型已经
+说完，而是丢弃这次已产生的部分输出并重放原样的请求。原生 provider 另有一道 330 秒的响应头
+截止时间和 300 秒的流空闲上限（可用 `ZUNO_STREAM_IDLE_TIMEOUT_SECS` 调整），所以一个卡住
+的请求会以类型化错误失败，而不是让会话无限等待。
+
 ```json
 {
   "goal": {
