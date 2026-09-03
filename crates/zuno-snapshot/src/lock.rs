@@ -4,10 +4,16 @@
 //! (`packages/opencode/src/snapshot/index.ts:53-64`) because `add`, `write-tree`
 //! and `read-tree` all mutate one shared index file. This is the same guard.
 //!
-//! It is deliberately *only* in-process. Two `opencode` processes sharing a store
-//! are serialized by Git's own `index.lock`, which is the correct mechanism for
-//! cross-process exclusion; adding a second, non-Git lock file on top would invent
-//! a protocol the TypeScript binary does not speak.
+//! It is deliberately *only* in-process. Cross-process exclusion is left to Git's
+//! own `index.lock`, which is the mechanism the store's on-disk format already
+//! implies; adding a second, non-Git lock file on top would invent a protocol the
+//! TypeScript binary does not speak.
+//!
+//! `index.lock` does not queue. When two processes reach the same store's index
+//! together the loser does not wait for its turn — git exits immediately with
+//! `Unable to create '<store>/index.lock': File exists.`, which this crate surfaces
+//! as [`crate::SnapshotError::Git`]. That is a correct fail-closed outcome, not
+//! serialization: the caller sees a failed capture rather than a delayed one.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

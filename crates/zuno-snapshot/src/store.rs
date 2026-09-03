@@ -28,8 +28,17 @@
 //! `checkout-index`, which makes `track()` return the empty string as if it were a
 //! hash and makes `restore()` a silent no-op. Both are reported as typed errors
 //! here: a snapshot hash that is silently empty breaks revert later, far away from
-//! the cause. Failures the oracle tolerates *by design* — a partially unreadable
-//! `git add`, a failed `diff`, a failed `gc` — stay tolerated.
+//! the cause.
+//!
+//! Staging diverges too. The oracle tolerates a failed `git add` on the theory that
+//! one unreadable file should not cost a whole snapshot; that theory is wrong,
+//! because `git add` writes its index once at the end and a single unreadable path
+//! aborts the command before it does, so *nothing* is staged. Zuno asks git for the
+//! behaviour the tolerance assumed — `--ignore-errors` — and treats any exit code
+//! other than 0 (clean) or 1 (some paths skipped) as a failure. See [`Store::stage`].
+//!
+//! Failures that genuinely cannot corrupt a capture — a failed `diff`, a failed `gc`
+//! — stay tolerated.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -57,6 +66,16 @@ pub const LARGE_FILE_LIMIT: u64 = 2 * 1024 * 1024;
 /// The `git gc` argument vector the hourly schedule runs, for assertions.
 pub const GC_ARGS: [&str; 2] = ["gc", "--prune=7.days"];
 
+/// The uncertain-restore record's file name inside a store's git directory.
+pub const UNCERTAIN_RESTORE_FILE: &str = "zuno-restore-uncertain.json";
+
+/// What the next `git add` will stage, and what it deliberately will not.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StagePlan {
+    stage: Vec<String>,
+    exclusions: CaptureExclusions,
+}
+
 /// A snapshot patch: the tree it was taken against and the absolute paths that
 /// changed since. Mirrors the oracle's `Patch` schema.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -65,6 +84,165 @@ pub struct Patch {
     pub hash: String,
     /// Absolute, forward-slashed paths of the changed files.
     pub files: Vec<String>,
+}
+
+/// The paths a capture deliberately left out of its tree.
+///
+/// Every path listed here is invisible to [`Store::restore_turn`]: it is in neither
+/// captured tree, so `/undo` and `/redo` cannot move it and will not mention it
+/// unless the client reports these fields. Exclusion is a design decision, not a
+/// failure — the point of recording it is that the user can be told.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CaptureExclusions {
+    #[serde(default)]
+    ignored: Vec<String>,
+    #[serde(default)]
+    oversized: Vec<String>,
+    #[serde(default)]
+    unreadable: Vec<String>,
+}
+
+impl CaptureExclusions {
+    /// Paths left out because the user's repository ignores them.
+    ///
+    /// Ignore rules are an ownership boundary: a file the repository declines to
+    /// track is one the snapshot store declines to own.
+    #[must_use]
+    pub fn ignored(&self) -> &[String] {
+        &self.ignored
+    }
+
+    /// Untracked paths left out for exceeding [`LARGE_FILE_LIMIT`].
+    #[must_use]
+    pub fn oversized(&self) -> &[String] {
+        &self.oversized
+    }
+
+    /// Paths `git add` could not read, and therefore skipped.
+    ///
+    /// The capture is still complete for every *other* path, which is why staging
+    /// runs with `--ignore-errors`; these paths simply keep whatever content the
+    /// tree held before.
+    #[must_use]
+    pub fn unreadable(&self) -> &[String] {
+        &self.unreadable
+    }
+
+    /// Whether anything at all was left out.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ignored.is_empty() && self.oversized.is_empty() && self.unreadable.is_empty()
+    }
+
+    /// Every excluded path exactly once, sorted.
+    #[must_use]
+    pub fn paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .ignored
+            .iter()
+            .chain(self.oversized.iter())
+            .chain(self.unreadable.iter())
+            .cloned()
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// A one-clause account of what was left out, or `None` when nothing was.
+    #[must_use]
+    pub fn summary(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut reasons: Vec<String> = Vec::new();
+        if !self.oversized.is_empty() {
+            reasons.push(format!(
+                "{} over the {} MiB untracked-file limit",
+                self.oversized.len(),
+                LARGE_FILE_LIMIT / (1024 * 1024)
+            ));
+        }
+        if !self.ignored.is_empty() {
+            reasons.push(format!("{} matching an ignore rule", self.ignored.len()));
+        }
+        if !self.unreadable.is_empty() {
+            reasons.push(format!("{} unreadable", self.unreadable.len()));
+        }
+        Some(format!(
+            "{} path(s) are outside this snapshot and were not restored: {}",
+            self.paths().len(),
+            reasons.join(", ")
+        ))
+    }
+
+    /// Fold another capture's exclusions in, keeping each path once.
+    pub(crate) fn merge(&mut self, other: Self) {
+        merge_paths(&mut self.ignored, other.ignored);
+        merge_paths(&mut self.oversized, other.oversized);
+        merge_paths(&mut self.unreadable, other.unreadable);
+    }
+}
+
+fn merge_paths(into: &mut Vec<String>, from: Vec<String>) {
+    into.extend(from);
+    into.sort();
+    into.dedup();
+}
+
+/// One tracked worktree capture: the tree that was written, and what it omits.
+///
+/// [`Store::track`] returns only the hash, which is what makes an incomplete
+/// capture easy to mistake for a complete one. This type keeps the two facts
+/// together so a caller that wants to report the omissions can.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Capture {
+    tree: String,
+    exclusions: CaptureExclusions,
+}
+
+impl Capture {
+    /// The tree hash `write-tree` produced.
+    #[must_use]
+    pub fn tree(&self) -> &str {
+        &self.tree
+    }
+
+    /// What this capture left out.
+    #[must_use]
+    pub const fn exclusions(&self) -> &CaptureExclusions {
+        &self.exclusions
+    }
+
+    /// Discard the exclusions and keep the hash.
+    #[must_use]
+    pub fn into_tree(self) -> String {
+        self.tree
+    }
+}
+
+/// A persisted record of a restore that rewrote files and then could not confirm
+/// the boundary it was moving to.
+///
+/// Written into the store's own directory as `zuno-restore-uncertain.json`. It is
+/// durable on purpose: the process that produced the uncertainty may not survive to
+/// explain it, and the worktree it describes is the user's.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UncertainRestore {
+    /// Which direction was being restored.
+    pub restore: TurnRestore,
+    /// The tree the worktree held before the transition started.
+    pub from: String,
+    /// The tree the transition was moving toward.
+    pub to: String,
+    /// The tree observed after the interrupted transition, when it could be read.
+    #[serde(default)]
+    pub observed: Option<String>,
+    /// The rendered failure that interrupted the transition, for the record.
+    pub cause: String,
+    /// Seconds since the Unix epoch, or `None` if the clock was unreadable.
+    #[serde(default)]
+    pub recorded_unix_seconds: Option<u64>,
 }
 
 /// The outcome of one garbage-collection pass.
@@ -93,10 +271,15 @@ pub struct Location {
     pub root: PathBuf,
     /// The project id, the first path component under the root.
     pub project_id: String,
-    /// The worktree root. Hashed to form the second path component.
+    /// The worktree root. Hashed to form the second path component, and the scope of
+    /// every capture: a snapshot tree always describes the whole worktree.
     pub worktree: PathBuf,
-    /// The directory operations are scoped to; a subdirectory of the worktree, or
-    /// the worktree itself.
+    /// The startup directory, which narrows the [`Store::patch`] *report* only.
+    ///
+    /// It deliberately does not narrow capture. `write-tree` takes no pathspec and
+    /// restoration diffs and applies across the whole worktree, so staging only this
+    /// directory would produce a whole-worktree tree that omitted every change
+    /// outside it — the checkpoint would describe a worktree that never existed.
     pub directory: PathBuf,
     /// Whether the project is backed by Git. `false` disables snapshots entirely,
     /// matching the oracle's `state.vcs !== "git"` guard.
@@ -147,7 +330,9 @@ impl Location {
         }
     }
 
-    /// Scope operations to a subdirectory of the worktree.
+    /// Narrow the [`Store::patch`] report to a subdirectory of the worktree.
+    ///
+    /// Captures stay whole-worktree; see [`Location::directory`].
     #[must_use]
     pub fn with_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.directory = directory.into();
@@ -226,7 +411,15 @@ impl Store {
     ///
     /// Returns the tree hash, or `None` when snapshots are disabled for this
     /// location. Creates and initializes the store on first use.
+    ///
+    /// The hash alone cannot say what the capture left out; use [`Store::capture`]
+    /// when that matters.
     pub fn track(&self) -> Result<Option<String>> {
+        Ok(self.capture()?.map(Capture::into_tree))
+    }
+
+    /// [`Store::track`], keeping the omissions alongside the tree hash.
+    pub fn capture(&self) -> Result<Option<Capture>> {
         if !self.enabled() {
             return Ok(None);
         }
@@ -238,13 +431,15 @@ impl Store {
     /// Capture the tree before one complete user turn.
     ///
     /// The caller must keep the returned value across every provider step and tool
-    /// call in that turn, then call [`TurnCapture::finish`] exactly once at the
-    /// terminal turn boundary. No capture is returned when snapshots are disabled.
+    /// call in that turn, then finish it exactly once at the terminal turn boundary
+    /// — including when the turn failed, which is what [`TurnCapture::finish_with`]
+    /// is for. No capture is returned when snapshots are disabled.
     pub fn begin_turn(&self) -> Result<Option<TurnCapture>> {
-        let Some(before) = self.track()? else {
+        let Some(before) = self.capture()? else {
             return Ok(None);
         };
-        Ok(Some(TurnCapture::new(self.clone(), before)))
+        let (tree, exclusions) = (before.tree().to_owned(), before.exclusions().clone());
+        Ok(Some(TurnCapture::new(self.clone(), tree, exclusions)))
     }
 
     /// Move one complete turn checkpoint backward or forward, but only when the
@@ -255,6 +450,16 @@ impl Store {
     /// files are never restored one-by-one around a conflict. The generated patch
     /// is applied through Git with both the private index and worktree checked, so
     /// additions and deletions are handled as well as content replacement.
+    ///
+    /// # Refusal versus uncertainty
+    ///
+    /// Every failure raised before the mutating `git apply` leaves the worktree
+    /// byte-for-byte untouched, and is returned as itself. Every failure at or after
+    /// it is wrapped in [`SnapshotError::RestoreUncertain`], persisted, and blocks
+    /// further restores until resolved — because `git apply --index --check` does not
+    /// test writability, so a patch that passes the preflight can still die
+    /// half-written. [`SnapshotError::worktree_untouched`] is the predicate a client
+    /// must use before saying "nothing changed".
     pub fn restore_turn(
         &self,
         checkpoint: &TurnCheckpoint,
@@ -264,13 +469,22 @@ impl Store {
             return Err(SnapshotError::SnapshotsDisabled);
         }
         let _guard = lock::acquire(&self.git_dir);
+        // An earlier uncertain outcome must be inspected before this store is allowed
+        // to rewrite user files again; the worktree it left behind matches neither
+        // boundary, so a second transition would compound the damage.
+        if self.uncertain_restore()?.is_some() {
+            return Err(SnapshotError::RestoreUnresolved {
+                restore,
+                evidence: self.uncertain_path(),
+            });
+        }
         let (expected, target) = checkpoint.transition(restore);
         let current = self.track_locked()?;
-        if current != expected {
+        if current.tree() != expected {
             return Err(SnapshotError::WorktreeDrift {
-                files: self.changed_paths(expected, &current)?,
+                files: self.changed_paths(expected, current.tree())?,
                 expected: expected.to_owned(),
-                actual: current,
+                actual: current.into_tree(),
             });
         }
 
@@ -282,36 +496,132 @@ impl Store {
             return Err(SnapshotError::IgnoredFiles { files: ignored });
         }
 
-        if !files.is_empty() {
+        let after = if files.is_empty() {
+            current
+        } else {
             let patch = self.transition_patch(expected, target)?;
-            self.apply_transition(&patch, true)?;
-            // `git apply --index` repeats this same precondition check. Running both
+            // `git apply --index` repeats this same content check. Running both
             // closes the ordinary check/apply window while retaining a no-mutation
             // preflight whose failure is guaranteed to leave every file untouched.
-            self.apply_transition(&patch, false)?;
-        }
+            self.apply_transition(&patch, true)?;
 
-        let actual = self.track_locked()?;
-        if actual != target {
+            // Past this line the worktree may already have been rewritten, so no
+            // failure can be reported as a refusal.
+            match self.apply_transition(&patch, false) {
+                Ok(()) => match self.track_locked() {
+                    Ok(after) if after.tree() == target => after,
+                    Ok(after) => {
+                        let observed = after.into_tree();
+                        return Err(self.record_uncertain(
+                            restore,
+                            expected,
+                            target,
+                            Some(observed.clone()),
+                            SnapshotError::RestoreVerification {
+                                expected: target.to_owned(),
+                                actual: observed,
+                            },
+                        ));
+                    }
+                    Err(cause) => {
+                        return Err(self.record_uncertain(restore, expected, target, None, cause));
+                    }
+                },
+                Err(cause) => {
+                    // The apply died part-way through writing. Capture whatever it
+                    // left so the persisted record names the real state, and so the
+                    // mixed tree survives as a recoverable object in the store.
+                    let observed = self.track_locked().ok().map(Capture::into_tree);
+                    return Err(self.record_uncertain(restore, expected, target, observed, cause));
+                }
+            }
+        };
+
+        if after.tree() != target {
+            // Only reachable when the transition had no files to apply, so nothing
+            // was written and this is a clean invariant failure.
             return Err(SnapshotError::RestoreVerification {
                 expected: target.to_owned(),
-                actual,
+                actual: after.into_tree(),
             });
         }
-        Ok(TurnRestoreReport::new(restore, expected, target, files))
+        // What the restore could not move is what neither boundary captured, so the
+        // report carries the checkpoint's own exclusions, widened by anything the
+        // verifying capture had to leave out as well.
+        let mut exclusions = checkpoint.exclusions().clone();
+        exclusions.merge(after.exclusions().clone());
+        Ok(TurnRestoreReport::new(
+            restore, expected, target, files, exclusions,
+        ))
     }
 
-    fn track_locked(&self) -> Result<String> {
+    /// The persisted uncertain-restore record for this store, if one exists.
+    ///
+    /// This is the authoritative-state inspection an uncertain outcome demands. A
+    /// record that cannot be decoded is reported as a failure rather than ignored:
+    /// unreadable recovery evidence is not the same as no incident.
+    pub fn uncertain_restore(&self) -> Result<Option<UncertainRestore>> {
+        let path = self.uncertain_path();
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(SnapshotError::Store {
+                    operation: "read",
+                    path,
+                    source,
+                });
+            }
+        };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|error| SnapshotError::Store {
+                operation: "parse",
+                path,
+                source: std::io::Error::other(error),
+            })
+    }
+
+    /// Discard the persisted uncertain-restore record, unblocking further restores.
+    ///
+    /// Call this only once the worktree has actually been inspected. Returns whether
+    /// a record was removed.
+    pub fn resolve_uncertain_restore(&self) -> Result<bool> {
+        let path = self.uncertain_path();
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "resolved uncertain restore");
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(SnapshotError::Store {
+                operation: "remove",
+                path,
+                source,
+            }),
+        }
+    }
+
+    /// Where the uncertain-restore record lives: inside the store, never inside the
+    /// user's repository.
+    #[must_use]
+    pub fn uncertain_path(&self) -> PathBuf {
+        self.git_dir.join(UNCERTAIN_RESTORE_FILE)
+    }
+
+    fn track_locked(&self) -> Result<Capture> {
         let existed = self.git_dir.is_dir();
         self.create_dir(&self.git_dir)?;
         if !existed {
             self.init()?;
         }
-        self.add()?;
+        let exclusions = self.add()?;
 
         let mut argv = self.scoped(&[]);
         argv.push("write-tree");
-        let output = self.run(&argv, &self.location.directory, None)?;
+        // `write-tree` has no pathspec: it always writes the whole index, so the
+        // worktree root is the only cwd that describes what this produces.
+        let output = self.run(&argv, &self.location.worktree, None)?;
         if !output.ok() {
             return Err(SnapshotError::git(
                 &argv.display(),
@@ -321,7 +631,80 @@ impl Store {
         }
         let hash = output.text(&argv.display())?.trim().to_owned();
         tracing::info!(hash = %hash, git_dir = %self.git_dir.display(), "tracking");
-        Ok(hash)
+        Ok(Capture {
+            tree: hash,
+            exclusions,
+        })
+    }
+
+    /// Persist what an interrupted transition left behind and classify it as
+    /// uncertain.
+    ///
+    /// Existing evidence is never overwritten — the first incident is the one that
+    /// explains the worktree. A failure to write the record cannot downgrade the
+    /// outcome, so it is logged and the uncertain error is returned regardless.
+    fn record_uncertain(
+        &self,
+        restore: TurnRestore,
+        from: &str,
+        to: &str,
+        observed: Option<String>,
+        cause: SnapshotError,
+    ) -> SnapshotError {
+        let path = self.uncertain_path();
+        tracing::error!(
+            restore = %restore,
+            from,
+            to,
+            observed = ?observed,
+            evidence = %path.display(),
+            cause = %cause,
+            "restore left the worktree in an uncertain state"
+        );
+        if !path.exists() {
+            let record = UncertainRestore {
+                restore,
+                from: from.to_owned(),
+                to: to.to_owned(),
+                observed: observed.clone(),
+                cause: cause.to_string(),
+                recorded_unix_seconds: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|since| since.as_secs()),
+            };
+            if let Err(error) = self.write_uncertain(&path, &record) {
+                tracing::error!(
+                    evidence = %path.display(),
+                    %error,
+                    "failed to persist uncertain restore evidence"
+                );
+            }
+        }
+        SnapshotError::RestoreUncertain {
+            restore,
+            expected: to.to_owned(),
+            actual: observed,
+            evidence: path,
+            source: Box::new(cause),
+        }
+    }
+
+    /// Write the record through a sibling temporary file so a crash mid-write cannot
+    /// leave a half-serialized record where a whole one is expected.
+    fn write_uncertain(&self, path: &Path, record: &UncertainRestore) -> Result<()> {
+        let text = serde_json::to_string_pretty(record).map_err(|error| SnapshotError::Store {
+            operation: "write",
+            path: path.to_path_buf(),
+            source: std::io::Error::other(error),
+        })?;
+        let staging = path.with_extension("json.new");
+        self.write(&staging, &format!("{text}\n"))?;
+        fs::rename(&staging, path).map_err(|source| SnapshotError::Store {
+            operation: "write",
+            path: path.to_path_buf(),
+            source,
+        })
     }
 
     fn changed_paths(&self, from: &str, to: &str) -> Result<Vec<String>> {
@@ -406,9 +789,14 @@ impl Store {
     }
 
     /// The files that changed since `hash`, as absolute forward-slashed paths.
+    ///
+    /// The *capture* covers the whole worktree; this report is narrowed to
+    /// [`Location::directory`].
     pub fn patch(&self, hash: &str) -> Result<Patch> {
         let _guard = lock::acquire(&self.git_dir);
-        self.add()?;
+        // Exclusions belong to the capture that produced a tree and reach callers
+        // through `Store::capture`; this is a reporting view over one.
+        drop(self.add()?);
 
         let mut argv = self.scoped(QUOTE);
         argv.extend(["diff", "--cached", "--no-ext-diff", "--name-only"])
@@ -447,7 +835,7 @@ impl Store {
     /// The unified diff of the worktree against `hash`.
     pub fn diff(&self, hash: &str) -> Result<String> {
         let _guard = lock::acquire(&self.git_dir);
-        self.add()?;
+        drop(self.add()?);
 
         let mut argv = self.scoped(QUOTE);
         argv.extend(["diff", "--cached", "--no-ext-diff"])
@@ -754,6 +1142,11 @@ impl Store {
     }
 
     /// Drop newly-ignored paths from the store's index so they are not re-added.
+    ///
+    /// `--ignore-unmatch` already makes "no such index entry" exit zero (verified on
+    /// git 2.43.0), so a non-zero exit is a real failure. Tolerating it would leave
+    /// the next `write-tree` describing a tree that contains a path the user's ignore
+    /// rules put out of bounds.
     fn drop_cached(&self, files: &[String]) -> Result<()> {
         if files.is_empty() {
             return Ok(());
@@ -773,22 +1166,43 @@ impl Store {
             Some(&git::top_level_literal_pathspecs(files)),
         )?;
         if !output.ok() {
-            tracing::warn!(code = ?output.code(), stderr = %output.stderr, "failed to drop snapshot files");
+            return Err(SnapshotError::git(
+                &argv.display(),
+                output.status,
+                output.stderr,
+            ));
         }
         Ok(())
     }
 
-    /// Stage exactly `files`. A partial failure is logged and tolerated, matching
-    /// the oracle: one unreadable file must not cost the whole snapshot.
-    fn stage(&self, files: &[String]) -> Result<()> {
+    /// Stage exactly `files`, and report which of them Git could not read.
+    ///
+    /// # Why this may not tolerate a failed `add`
+    ///
+    /// `git add` writes its index once, at the end. Without `--ignore-errors` a
+    /// single unreadable path aborts the whole command with exit 128 and the index is
+    /// never written, so *nothing* is staged — not the unreadable file, and not the
+    /// files the agent actually edited. A tolerated failure therefore does not cost
+    /// one file; it makes the following `write-tree` hand back the previous tree
+    /// while the caller believes it captured the current one, and a later `/undo`
+    /// restores the wrong content or reports no changes.
+    ///
+    /// So staging asks for exactly the behaviour the tolerance was pretending to
+    /// have: `--ignore-errors` skips the paths it cannot index and stages the rest,
+    /// reporting "some paths were skipped" as exit **1** while a genuine failure keeps
+    /// its own code. Verified on git 2.43.0: mode-000 file present, without the flag
+    /// exit 128 and the tree equals the baseline; with it exit 1 and the tree contains
+    /// every readable edit.
+    fn stage(&self, files: &[String]) -> Result<Vec<String>> {
         if files.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut argv = self.scoped(CFG);
         argv.extend([
             "add",
             "--all",
             "--sparse",
+            "--ignore-errors",
             "--pathspec-from-file=-",
             "--pathspec-file-nul",
         ]);
@@ -797,19 +1211,65 @@ impl Store {
             &self.location.worktree,
             Some(&git::top_level_literal_pathspecs(files)),
         )?;
-        if !output.ok() {
-            tracing::warn!(code = ?output.code(), stderr = %output.stderr, "failed to add snapshot files");
+        match output.code() {
+            Some(0) => Ok(Vec::new()),
+            Some(1) => {
+                // Which paths were skipped is read back from the index rather than
+                // parsed out of `stderr`: git's per-path error text is translated,
+                // and the index is authoritative in every locale.
+                let skipped = self.unstaged_among(files)?;
+                tracing::warn!(
+                    count = skipped.len(),
+                    stderr = %output.stderr,
+                    "git add skipped unreadable snapshot paths"
+                );
+                Ok(skipped)
+            }
+            _ => Err(SnapshotError::git(
+                &argv.display(),
+                output.status,
+                output.stderr,
+            )),
         }
-        Ok(())
     }
 
-    /// Bring the store's index up to date with the worktree.
-    fn add(&self) -> Result<()> {
-        self.sync(&[])?;
+    /// Which of `requested` still differ from the index after staging them.
+    fn unstaged_among(&self, requested: &[String]) -> Result<Vec<String>> {
+        let requested: HashSet<&String> = requested.iter().collect();
+        let (tracked, untracked) = self.list_changes()?;
+        let mut skipped: Vec<String> = tracked
+            .into_iter()
+            .chain(untracked)
+            .filter(|path| requested.contains(path))
+            .collect();
+        skipped.sort();
+        skipped.dedup();
+        Ok(skipped)
+    }
 
+    /// The worktree paths that differ from the store's index, and the ones the store
+    /// has never seen.
+    ///
+    /// # Why this is scoped to the worktree root
+    ///
+    /// `write-tree` takes no pathspec, so a capture is always a *whole-worktree*
+    /// tree, and [`Store::restore_turn`] diffs and applies across the whole worktree
+    /// too. Listing only the startup directory therefore did not produce a smaller
+    /// snapshot — it produced a whole-worktree tree that silently omitted every
+    /// change outside that directory, which is the same class of bug as a tolerated
+    /// `git add`. Both halves now use the root, so the tree means what the restore
+    /// path assumes it means.
+    fn list_changes(&self) -> Result<(Vec<String>, Vec<String>)> {
         let mut modified = self.scoped(QUOTE);
         modified.extend(["diff-files", "--name-only", "-z", "--", "."]);
-        let modified_out = self.run(&modified, &self.location.directory, None)?;
+        let modified_out = self.run(&modified, &self.location.worktree, None)?;
+        if !modified_out.ok() {
+            return Err(SnapshotError::git(
+                &modified.display(),
+                modified_out.status,
+                modified_out.stderr,
+            ));
+        }
 
         let mut others = self.scoped(QUOTE);
         others.extend([
@@ -821,19 +1281,25 @@ impl Store {
             "--",
             ".",
         ]);
-        let others_out = self.run(&others, &self.location.directory, None)?;
-
-        if !modified_out.ok() || !others_out.ok() {
-            tracing::warn!(
-                modified = ?modified_out.code(),
-                others = ?others_out.code(),
-                "failed to list snapshot files"
-            );
-            return Ok(());
+        let others_out = self.run(&others, &self.location.worktree, None)?;
+        if !others_out.ok() {
+            return Err(SnapshotError::git(
+                &others.display(),
+                others_out.status,
+                others_out.stderr,
+            ));
         }
 
-        let tracked = git::split_nul(&modified_out.text(&modified.display())?);
-        let untracked = git::split_nul(&others_out.text(&others.display())?);
+        Ok((
+            git::split_nul(&modified_out.text(&modified.display())?),
+            git::split_nul(&others_out.text(&others.display())?),
+        ))
+    }
+
+    /// What the next `add` will stage, and what it will leave out.
+    fn plan(&self) -> Result<StagePlan> {
+        self.sync(&[])?;
+        let (tracked, untracked) = self.list_changes()?;
         let untracked_set: HashSet<&String> = untracked.iter().collect();
 
         let mut seen = HashSet::new();
@@ -844,47 +1310,83 @@ impl Store {
             .cloned()
             .collect();
         if all.is_empty() {
-            return Ok(());
+            return Ok(StagePlan::default());
         }
 
-        let ignored = self.ignore(&all)?;
+        let ignored_set = self.ignore(&all)?;
+        let mut ignored: Vec<String> = all
+            .iter()
+            .filter(|item| ignored_set.contains(*item))
+            .cloned()
+            .collect();
+        ignored.sort();
         if !ignored.is_empty() {
-            let drop: Vec<String> = all
-                .iter()
-                .filter(|item| ignored.contains(*item))
-                .cloned()
-                .collect();
             tracing::info!(
-                count = drop.len(),
+                count = ignored.len(),
                 "removing gitignored files from snapshot"
             );
-            self.drop_cached(&drop)?;
+            self.drop_cached(&ignored)?;
         }
 
         let allow: Vec<String> = all
             .into_iter()
-            .filter(|item| !ignored.contains(item))
+            .filter(|item| !ignored_set.contains(item))
             .collect();
-        if allow.is_empty() {
-            return Ok(());
-        }
 
         // An untracked file over the limit is excluded rather than stored, so a
         // stray multi-gigabyte artifact cannot bloat the object database.
-        let block: Vec<String> = allow
+        let mut oversized: Vec<String> = allow
             .iter()
             .filter(|item| untracked_set.contains(*item) && self.is_large(item))
             .cloned()
             .collect();
-        self.sync(&block)?;
+        oversized.sort();
+        self.sync(&oversized)?;
 
-        let block: HashSet<&String> = block.iter().collect();
+        let blocked: HashSet<&String> = oversized.iter().collect();
         let stage: Vec<String> = allow
             .iter()
-            .filter(|item| !block.contains(*item))
+            .filter(|item| !blocked.contains(*item))
             .cloned()
             .collect();
-        self.stage(&stage)
+        Ok(StagePlan {
+            stage,
+            exclusions: CaptureExclusions {
+                ignored,
+                oversized,
+                unreadable: Vec::new(),
+            },
+        })
+    }
+
+    /// Bring the store's index up to date with the worktree, reporting what the
+    /// resulting tree does not contain.
+    fn add(&self) -> Result<CaptureExclusions> {
+        let mut plan = self.plan()?;
+        let skipped = match self.stage(&plan.stage) {
+            Ok(skipped) => skipped,
+            Err(first) => {
+                // A path listed a moment ago can vanish before `git add` reaches it —
+                // a build artifact, an editor temp file. `git add` then dies on the
+                // unmatched pathspec even under `--ignore-errors` (git 2.43.0). That
+                // is a stale plan, not a broken worktree, so the plan is rebuilt once
+                // from authoritative state; staging is idempotent, so replaying it is
+                // safe. If nothing moved, the failure is real and propagates.
+                let retry = self.plan()?;
+                if retry.stage == plan.stage {
+                    return Err(first);
+                }
+                tracing::warn!(
+                    error = %first,
+                    "retrying snapshot staging after the worktree changed underneath it"
+                );
+                plan = retry;
+                self.stage(&plan.stage)?
+            }
+        };
+        let mut exclusions = plan.exclusions;
+        merge_paths(&mut exclusions.unreadable, skipped);
+        Ok(exclusions)
     }
 
     fn is_large(&self, relative: &str) -> bool {

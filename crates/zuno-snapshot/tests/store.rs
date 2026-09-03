@@ -778,3 +778,503 @@ fn writable(original: &fs::Permissions) -> fs::Permissions {
     relaxed.set_readonly(false);
     relaxed
 }
+
+// -- unreadable paths must not silently rewind a checkpoint (F1) ---------------
+
+/// Set a Unix mode, returning the previous permissions so a test can put them back.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> fs::Permissions {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let previous = fs::metadata(path).expect("metadata").permissions();
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set mode");
+    previous
+}
+
+/// A file `git add` cannot open aborts the whole staging pass, so tolerating the
+/// failure did not cost one file — it silently rewound the entire checkpoint to the
+/// previous tree while reporting success.
+///
+/// Unix-only because the reproduction needs a file whose *content* is unreadable
+/// while its directory entry stays visible; Windows has no portable equivalent of
+/// mode 000 through `std::fs`.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_file_is_skipped_and_named_instead_of_rewinding_the_capture() {
+    let fixture = Fixture::new("wt");
+    let store = fixture.store();
+    let baseline = store.track().expect("track").expect("enabled");
+
+    fixture.write("a.txt", "hello\nworld\n");
+    fixture.write("locked.txt", "unreadable\n");
+    set_mode(&fixture.path("locked.txt"), 0o000);
+
+    let capture = store
+        .capture()
+        .expect("an unreadable path must not fail the capture")
+        .expect("enabled");
+    set_mode(&fixture.path("locked.txt"), 0o644);
+
+    assert_ne!(
+        capture.tree(),
+        baseline,
+        "the edit to a.txt must reach the tree; equality here is the silent rewind"
+    );
+    assert_eq!(
+        capture.exclusions().unreadable(),
+        ["locked.txt"],
+        "the skipped path must be named so a client can surface it"
+    );
+    assert!(capture.exclusions().oversized().is_empty());
+    assert!(capture.exclusions().ignored().is_empty());
+
+    let listed = git(
+        &fixture.worktree,
+        &[
+            "--git-dir",
+            &store.git_dir().to_string_lossy(),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            capture.tree(),
+        ],
+    );
+    assert!(listed.contains("a.txt"), "{listed}");
+    assert!(
+        !listed.contains("locked.txt"),
+        "the unreadable path is absent, not stale: {listed}"
+    );
+    assert_eq!(
+        git(
+            &fixture.worktree,
+            &[
+                "--git-dir",
+                &store.git_dir().to_string_lossy(),
+                "cat-file",
+                "-p",
+                &format!("{}:a.txt", capture.tree()),
+            ]
+        ),
+        "hello\nworld\n",
+        "the capture must hold the post-edit content"
+    );
+}
+
+/// An unreadable path is tolerated; a broken `git add` is not. `index.lock` reproduces
+/// a real hard failure — a second process holding the store's index — which exits 128
+/// and stages nothing at all.
+#[test]
+fn a_hard_git_add_failure_fails_the_capture_instead_of_returning_a_stale_tree() {
+    let fixture = Fixture::new("wt");
+    let store = fixture.store();
+    let baseline = store.track().expect("track").expect("enabled");
+
+    fixture.write("a.txt", "hello\nworld\n");
+    let lock = store.git_dir().join("index.lock");
+    fs::write(&lock, "").expect("create index.lock");
+
+    let error = store
+        .track()
+        .expect_err("a contended index must not be reported as a successful capture");
+    fs::remove_file(&lock).expect("release index.lock");
+
+    match error {
+        SnapshotError::Git { ref args, code, .. } => {
+            assert!(args.contains(&"add".to_owned()), "{args:?}");
+            assert_eq!(code, Some(128), "git refuses a held index.lock immediately");
+        }
+        other => panic!("unexpected failure: {other}"),
+    }
+    assert!(
+        error.worktree_untouched(),
+        "a failed capture cannot have modified the worktree"
+    );
+    assert_eq!(
+        store.track().expect("track").expect("enabled").len(),
+        40,
+        "the store stays usable once the lock is gone"
+    );
+    assert_ne!(
+        store.track().expect("track").expect("enabled"),
+        baseline,
+        "the recovered capture records the edit"
+    );
+}
+
+/// A failure to *list* the worktree is a failure to know what to capture, so it must
+/// not degrade into "nothing changed".
+#[test]
+fn a_failed_worktree_listing_fails_the_capture() {
+    let fixture = Fixture::new("wt");
+    let store = fixture.store();
+    store.track().expect("track").expect("enabled");
+
+    fixture.write("a.txt", "hello\nworld\n");
+    fs::write(store.git_dir().join("index"), b"not an index").expect("corrupt the store index");
+
+    let error = store
+        .track()
+        .expect_err("an unreadable index must not be reported as an empty change set");
+    match error {
+        SnapshotError::Git { ref args, .. } => assert!(
+            args.contains(&"diff-files".to_owned()) || args.contains(&"ls-files".to_owned()),
+            "{args:?}"
+        ),
+        other => panic!("unexpected failure: {other}"),
+    }
+}
+
+// -- a partly applied restore is uncertain, never refused (F2) -----------------
+
+/// `git apply --index --check` does not test whether the target paths are writable,
+/// so a patch that passes the preflight can still die half-written. The worktree is
+/// then a mixture of both boundaries, which is an uncertain outcome — never a
+/// refusal, and never something to replay.
+#[cfg(unix)]
+#[test]
+fn a_partly_applied_undo_is_persisted_as_uncertain_and_blocks_further_restores() {
+    let fixture = Fixture::new("wt");
+    fixture.write("zz/z.txt", "before z\n");
+    let store = fixture.store();
+    let turn = store
+        .begin_turn()
+        .expect("begin turn")
+        .expect("snapshots are enabled");
+    fixture.write("a.txt", "after a\n");
+    fixture.write("zz/z.txt", "after z\n");
+    let checkpoint = turn.finish().expect("finish turn");
+
+    // `a.txt` sorts before `zz/z.txt`, so the patch rewrites it and then cannot
+    // replace the file inside the read-only directory.
+    let previous = set_mode(&fixture.path("zz"), 0o555);
+    let error = store
+        .restore_turn(&checkpoint, TurnRestore::Undo)
+        .expect_err("a half-written apply must not be reported as success");
+    fs::set_permissions(fixture.path("zz"), previous).expect("restore directory permissions");
+
+    assert!(
+        !error.worktree_untouched(),
+        "the honest disposition is uncertainty, not refusal: {error}"
+    );
+    let evidence = match error {
+        SnapshotError::RestoreUncertain {
+            restore,
+            ref expected,
+            ref actual,
+            ref evidence,
+            ..
+        } => {
+            assert_eq!(restore, TurnRestore::Undo);
+            assert_eq!(expected, checkpoint.before());
+            let observed = actual.as_deref().expect("the mixed tree is observable");
+            assert_ne!(observed, checkpoint.before());
+            assert_ne!(observed, checkpoint.after());
+            evidence.clone()
+        }
+        other => panic!("unexpected failure: {other}"),
+    };
+    assert_eq!(
+        fixture.read("a.txt"),
+        "hello\n",
+        "the first file was already rewritten, which is why this is not a refusal"
+    );
+    assert_eq!(
+        fixture.read("zz/z.txt"),
+        "after z\n",
+        "the second file kept its post-turn content"
+    );
+
+    let record = store
+        .uncertain_restore()
+        .expect("read evidence")
+        .expect("an uncertain outcome is persisted");
+    assert_eq!(record.restore, TurnRestore::Undo);
+    assert_eq!(record.from, checkpoint.after());
+    assert_eq!(record.to, checkpoint.before());
+    assert!(record.observed.is_some());
+    assert!(record.cause.contains("apply"), "{}", record.cause);
+    assert!(
+        evidence.is_file() && evidence.starts_with(store.git_dir()),
+        "evidence lives inside the store, not the user's repository: {}",
+        evidence.display()
+    );
+
+    let refused = store
+        .restore_turn(&checkpoint, TurnRestore::Redo)
+        .expect_err("an unresolved uncertain outcome must block further restores");
+    assert!(
+        matches!(refused, SnapshotError::RestoreUnresolved { .. }),
+        "unexpected failure: {refused}"
+    );
+    assert!(
+        refused.worktree_untouched(),
+        "refusing on account of an earlier incident touches nothing"
+    );
+
+    assert!(
+        store.resolve_uncertain_restore().expect("resolve"),
+        "inspection is explicit, and clears exactly one record"
+    );
+    assert!(!store.resolve_uncertain_restore().expect("resolve"));
+    assert!(store.uncertain_restore().expect("read").is_none());
+    assert!(!evidence.exists());
+}
+
+/// Recovery evidence that cannot be decoded is not the same as no incident.
+#[test]
+fn an_undecodable_uncertain_record_fails_closed() {
+    let fixture = Fixture::new("wt");
+    let store = fixture.store();
+    let turn = store.begin_turn().expect("begin").expect("enabled");
+    fixture.write("a.txt", "after\n");
+    let checkpoint = turn.finish().expect("finish");
+
+    fs::write(store.uncertain_path(), b"{ not json").expect("write corrupt evidence");
+
+    let error = store
+        .restore_turn(&checkpoint, TurnRestore::Undo)
+        .expect_err("a corrupt record must not be ignored");
+    assert!(
+        matches!(
+            error,
+            SnapshotError::Store {
+                operation: "parse",
+                ..
+            }
+        ),
+        "unexpected failure: {error}"
+    );
+    assert_eq!(
+        fixture.read("a.txt"),
+        "after\n",
+        "failing closed leaves the worktree alone"
+    );
+}
+
+// -- capture covers the whole worktree, not the startup directory (F4) ---------
+
+/// A session started in a subdirectory still captures the whole worktree, because
+/// `write-tree` has no pathspec and restoration diffs and applies across the whole
+/// worktree: a subdirectory-scoped staging pass produced a whole-worktree tree that
+/// omitted every change outside it.
+#[test]
+fn a_session_started_in_a_subdirectory_still_captures_the_whole_worktree() {
+    let fixture = Fixture::new("wt");
+    fs::create_dir_all(fixture.path("nested")).expect("create nested");
+    fixture.write("nested/inside.txt", "before inside\n");
+    fixture.write("outside.txt", "before outside\n");
+    let store = Store::open(
+        Location::new(&fixture.root, "proj", &fixture.worktree)
+            .with_directory(fixture.path("nested")),
+    );
+    let turn = store
+        .begin_turn()
+        .expect("begin turn")
+        .expect("snapshots are enabled");
+
+    fixture.write("nested/inside.txt", "after inside\n");
+    fixture.write("outside.txt", "after outside\n");
+    let checkpoint = turn.finish().expect("finish turn");
+
+    let undo = store
+        .restore_turn(&checkpoint, TurnRestore::Undo)
+        .expect("undo");
+    assert_eq!(
+        undo.files()
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["nested/inside.txt", "outside.txt"],
+        "a change above the startup directory must be part of the checkpoint"
+    );
+    assert_eq!(fixture.read("outside.txt"), "before outside\n");
+    assert_eq!(fixture.read("nested/inside.txt"), "before inside\n");
+}
+
+// -- a failed turn still needs its checkpoint (F5) -----------------------------
+
+/// Whether a turn succeeded is independent of whether it wrote files, so the
+/// checkpoint has to be taken for a failed turn too.
+#[test]
+fn a_turn_that_ends_in_failure_still_produces_a_usable_checkpoint() {
+    let fixture = Fixture::new("wt");
+    let store = fixture.store();
+    let turn = store
+        .begin_turn()
+        .expect("begin turn")
+        .expect("snapshots are enabled");
+
+    fixture.write("a.txt", "written before the turn failed\n");
+    let failure: Result<(), String> = Err("the provider stream died".to_owned());
+    let (checkpoint, outcome) = turn.finish_with(failure);
+
+    assert_eq!(
+        outcome,
+        Err("the provider stream died".to_owned()),
+        "the turn's own verdict is handed back untouched"
+    );
+    let checkpoint = checkpoint.expect("a failed turn still has a post-turn tree");
+    assert_ne!(checkpoint.before(), checkpoint.after());
+
+    let undo = store
+        .restore_turn(&checkpoint, TurnRestore::Undo)
+        .expect("undo a failed turn");
+    assert_eq!(
+        undo.files()
+            .iter()
+            .map(|file| (file.path.as_str(), file.operation))
+            .collect::<Vec<_>>(),
+        vec![("a.txt", FileOperation::Modified)]
+    );
+    assert_eq!(fixture.read("a.txt"), "hello\n");
+}
+
+// -- success and exclusions are reportable (F3, F6) ---------------------------
+
+/// A successful restore carries its own unambiguous sentence, so no client has to
+/// invent success wording or publish it as a discardable advisory detail.
+#[test]
+fn a_successful_restore_reports_itself_unambiguously() {
+    let fixture = Fixture::new("wt");
+    fixture.write("gone.txt", "removed by the turn\n");
+    let store = fixture.store();
+    let turn = store.begin_turn().expect("begin").expect("enabled");
+    fixture.write("a.txt", "changed\n");
+    fixture.write("added.txt", "new\n");
+    fs::remove_file(fixture.path("gone.txt")).expect("delete");
+    let checkpoint = turn.finish().expect("finish");
+
+    let undo = store
+        .restore_turn(&checkpoint, TurnRestore::Undo)
+        .expect("undo");
+    assert_eq!(undo.counts(), (1, 1, 1));
+    let summary = undo.summary();
+    assert!(
+        summary.starts_with("undo complete: 3 file(s) restored"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("1 created, 1 modified, 1 deleted"),
+        "{summary}"
+    );
+    assert!(
+        !summary.starts_with("warning"),
+        "success must not be dressed as a warning to survive a filter: {summary}"
+    );
+    assert_eq!(summary, undo.to_string());
+    assert_eq!(TurnRestore::Undo.to_string(), "undo");
+    assert_eq!(TurnRestore::Redo.to_string(), "redo");
+
+    let redo = store
+        .restore_turn(&checkpoint, TurnRestore::Redo)
+        .expect("redo");
+    assert!(
+        redo.summary()
+            .starts_with("redo complete: 3 file(s) restored")
+    );
+}
+
+/// The two silent exclusions — an oversized untracked file and a path the repository
+/// ignores — stay excluded, but stop being silent.
+///
+/// `ignored.txt` is edited *before* the turn opens, so the drop happens during the
+/// pre-turn capture and the path is absent from both boundaries. That is the case a
+/// restore is allowed to proceed through; a path that is present in one boundary and
+/// then becomes ignored is a refusal instead
+/// (see `undo_refuses_an_affected_file_that_became_gitignored`).
+#[test]
+fn every_excluded_path_is_reported_through_the_checkpoint_and_the_restore_report() {
+    let fixture = Fixture::new("wt");
+    fixture.write(".gitignore", "ignored.txt\n");
+    fixture.write("ignored.txt", "tracked before it was ignored\n");
+    git(&fixture.worktree, &["add", "-Af"]);
+    git(&fixture.worktree, &["commit", "-qm", "ignore"]);
+    fixture.write("ignored.txt", "edited while ignored\n");
+
+    let store = fixture.store();
+    let turn = store.begin_turn().expect("begin").expect("enabled");
+    assert_eq!(
+        turn.exclusions().ignored(),
+        ["ignored.txt"],
+        "the pre-turn capture drops the newly-ignored path and says so"
+    );
+    fixture.write("a.txt", "changed\n");
+    fixture.write(
+        "huge.bin",
+        &"x".repeat(usize::try_from(zuno_snapshot::LARGE_FILE_LIMIT).expect("usize") + 1),
+    );
+    let checkpoint = turn.finish().expect("finish");
+
+    let exclusions = checkpoint.exclusions();
+    assert_eq!(exclusions.oversized(), ["huge.bin"]);
+    assert_eq!(exclusions.ignored(), ["ignored.txt"]);
+    assert_eq!(exclusions.paths(), vec!["huge.bin", "ignored.txt"]);
+    assert!(!exclusions.is_empty());
+    let summary = exclusions
+        .summary()
+        .expect("a non-empty exclusion set reads");
+    assert!(
+        summary.contains("2 path(s) are outside this snapshot and were not restored"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("1 over the 2 MiB untracked-file limit"),
+        "{summary}"
+    );
+    assert!(summary.contains("1 matching an ignore rule"), "{summary}");
+
+    let undo = store
+        .restore_turn(&checkpoint, TurnRestore::Undo)
+        .expect("undo");
+    assert_eq!(
+        undo.exclusions(),
+        exclusions,
+        "the restore report carries the checkpoint's exclusions"
+    );
+    assert!(
+        undo.summary().contains("outside this snapshot"),
+        "a client that prints the summary tells the user what undo did not cover: {}",
+        undo.summary()
+    );
+    assert_eq!(
+        fixture.read("ignored.txt"),
+        "edited while ignored\n",
+        "an excluded path keeps whatever content it had"
+    );
+    assert!(
+        fixture.path("huge.bin").is_file(),
+        "an excluded oversized file is left alone, not deleted"
+    );
+    assert_eq!(fixture.read("a.txt"), "hello\n");
+}
+
+/// A checkpoint stored before exclusions were recorded still decodes.
+#[test]
+fn a_checkpoint_without_recorded_exclusions_still_decodes() {
+    let decoded: TurnCheckpoint =
+        serde_json::from_str(r#"{"before":"tree-a","after":"tree-b"}"#).expect("decode");
+    assert_eq!(decoded, TurnCheckpoint::new("tree-a", "tree-b"));
+    assert!(decoded.exclusions().is_empty());
+}
+
+/// Every pre-application refusal must remain honest about having touched nothing.
+#[test]
+fn a_refusal_before_the_patch_is_applied_reports_an_untouched_worktree() {
+    for error in [
+        SnapshotError::SnapshotsDisabled,
+        SnapshotError::WorktreeDrift {
+            expected: "a".to_owned(),
+            actual: "b".to_owned(),
+            files: vec!["a.txt".to_owned()],
+        },
+        SnapshotError::IgnoredFiles {
+            files: vec!["a.txt".to_owned()],
+        },
+        SnapshotError::RestoreVerification {
+            expected: "a".to_owned(),
+            actual: "b".to_owned(),
+        },
+    ] {
+        assert!(error.worktree_untouched(), "{error}");
+    }
+}

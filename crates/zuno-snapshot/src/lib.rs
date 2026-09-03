@@ -48,7 +48,10 @@ pub use crate::refcount::{
     SessionRef, StoreKey, StoreReferences, discover_stores, is_worktree_hash, reference_counts,
     unreferenced_stores,
 };
-pub use crate::store::{GC_ARGS, GcOutcome, LARGE_FILE_LIMIT, Location, PRUNE, Patch, Store};
+pub use crate::store::{
+    Capture, CaptureExclusions, GC_ARGS, GcOutcome, LARGE_FILE_LIMIT, Location, PRUNE, Patch,
+    Store, UNCERTAIN_RESTORE_FILE, UncertainRestore,
+};
 pub use crate::turn::{
     FileOperation, RestoredFile, TurnCapture, TurnCheckpoint, TurnRestore, TurnRestoreReport,
 };

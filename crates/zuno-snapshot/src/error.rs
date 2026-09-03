@@ -16,6 +16,8 @@
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
+use crate::turn::TurnRestore;
+
 /// A snapshot-store failure.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
@@ -56,12 +58,66 @@ pub enum SnapshotError {
     /// Git reported success but the resulting tree did not equal the requested
     /// boundary. This is an invariant failure, not a result a caller may present as
     /// a successful partial undo.
+    ///
+    /// On its own this variant only ever escapes from a transition that applied no
+    /// patch at all; once a patch has been applied the same mismatch is wrapped in
+    /// [`SnapshotError::RestoreUncertain`], because by then files have moved.
     #[error("turn restore verification failed: expected tree {expected}, found {actual}")]
     RestoreVerification {
         /// Requested target tree.
         expected: String,
         /// Tree captured after applying the transition.
         actual: String,
+    },
+
+    /// Restoration rewrote worktree files and then could not confirm that the
+    /// requested boundary was reached.
+    ///
+    /// This is an **uncertain outcome**, not a refusal: some files hold their
+    /// pre-restore content and some hold their post-restore content, and the store
+    /// index may describe either. `git apply --index --check` does not test whether
+    /// the target paths are writable, so a patch that passes the preflight can still
+    /// die half-written (verified on git 2.43.0). A client must never render this as
+    /// "rejected", "refused" or "nothing changed", and nothing may replay the call:
+    /// the persisted evidence file exists so the next step is inspection of
+    /// authoritative worktree state.
+    #[error(
+        "{restore} rewrote files and then could not reach tree {expected} (worktree now {observed}); \
+         the worktree is in an uncertain state — inspect {evidence} before restoring again",
+        observed = actual.as_deref().unwrap_or("unknown"),
+        evidence = evidence.display()
+    )]
+    RestoreUncertain {
+        /// Which direction was being restored.
+        restore: TurnRestore,
+        /// The tree the transition was moving toward.
+        expected: String,
+        /// The tree observed afterward, or `None` when even that could not be read.
+        actual: Option<String>,
+        /// The persisted evidence record describing what was observed.
+        evidence: PathBuf,
+        /// The failure that interrupted the transition.
+        #[source]
+        source: Box<SnapshotError>,
+    },
+
+    /// An earlier restore against this store left an unresolved uncertain outcome.
+    ///
+    /// Refusing every later restore is the "require authoritative-state inspection"
+    /// half of handling an uncertain outcome: the worktree no longer matches either
+    /// captured boundary, so a second transition would compound the damage. Nothing
+    /// is modified, and the evidence stays on disk until it is explicitly resolved
+    /// through [`crate::Store::resolve_uncertain_restore`].
+    #[error(
+        "refusing to {restore}: an earlier restore left the worktree in an uncertain state; \
+         inspect {evidence} and resolve it before restoring again",
+        evidence = evidence.display()
+    )]
+    RestoreUnresolved {
+        /// The direction that was refused.
+        restore: TurnRestore,
+        /// The persisted evidence record that must be inspected.
+        evidence: PathBuf,
     },
 
     /// `git` could not be spawned at all — not installed, not executable, or the
@@ -102,10 +158,12 @@ pub enum SnapshotError {
     },
 
     /// A filesystem operation on the store itself failed — creating the object
-    /// directory, writing `info/exclude`, or seeding `objects/info/alternates`.
+    /// directory, writing `info/exclude`, seeding `objects/info/alternates`, or
+    /// reading back a persisted uncertain-restore record.
     #[error("failed to {operation} {}", path.display())]
     Store {
-        /// What was being attempted, as a verb phrase: `create`, `write`, `read`.
+        /// What was being attempted, as a verb phrase: `create`, `write`, `read`,
+        /// `parse`, `remove`.
         operation: &'static str,
         /// The path being operated on.
         path: PathBuf,
@@ -143,6 +201,20 @@ impl SnapshotError {
             code: status.code(),
             stderr,
         }
+    }
+
+    /// Whether this failure is *provably* free of worktree modification.
+    ///
+    /// A client may only say "refused", "rejected" or "nothing changed" when this
+    /// returns `true`. Every failure raised by
+    /// [`Store::restore_turn`](crate::Store::restore_turn) before the mutating
+    /// `git apply` is reported as itself, and every failure at or after it is
+    /// wrapped in [`SnapshotError::RestoreUncertain`] — so this single predicate is
+    /// the honest boundary between the two, and no client has to re-derive it from
+    /// rendered text.
+    #[must_use]
+    pub const fn worktree_untouched(&self) -> bool {
+        !matches!(self, Self::RestoreUncertain { .. })
     }
 }
 
