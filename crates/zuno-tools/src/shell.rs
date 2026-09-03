@@ -675,7 +675,14 @@ impl ShellTool {
                             error = %error,
                             "could not remove interrupted foreground execution"
                         );
-                        Vec::new()
+                        // The handoff is also how the captured bytes are read, so
+                        // failing it would discard them a second way. The artifact is
+                        // still there whenever the record is — the handoff removes it
+                        // only after reading it — so it is read directly before this
+                        // call gives up on the command's output.
+                        self.background_executions
+                            .complete_output(&execution.id)
+                            .unwrap_or_default()
                     }
                 };
                 lease.disarm();
@@ -1048,15 +1055,21 @@ impl ShellTool {
         accept_large_output: bool,
     ) -> Result<ToolOutput, ToolError> {
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        let reported = match execution.status {
-            BackgroundExecutionStatus::Completed | BackgroundExecutionStatus::Failed => {
-                execution.exit_code
-            }
-            BackgroundExecutionStatus::Cancelled
-            | BackgroundExecutionStatus::Running
-            | BackgroundExecutionStatus::Uncertain => None,
-        };
-        let certified = reported.and_then(|code| {
+        // Whatever the record holds, reported verbatim: a code that decides nothing is
+        // still what a terminal would have shown, and dropping it would leave the
+        // metadata disagreeing with the captured output.
+        let reported = execution.exit_code;
+        // Only `Completed` means the process reported a status of its own. Every other
+        // terminal status says the number beside it, when there is one, is not the
+        // command's verdict: `Cancelled` is the kill, a `Failed` is the hard ceiling or
+        // an output capture that broke after the process had already exited, `Uncertain`
+        // is a process that disappeared, and `Running` is the snapshot a failed terminal
+        // wait leaves behind. Reading a code out of any of those would certify an
+        // outcome the service explicitly declined to settle.
+        let decided = matches!(execution.status, BackgroundExecutionStatus::Completed)
+            .then_some(reported)
+            .flatten();
+        let certified = decided.and_then(|code| {
             Self::guard_aware_receipt(verification, Some(code), &bytes, &text)
                 .ok()
                 .map(|receipt| (code, receipt))
@@ -1079,16 +1092,16 @@ impl ShellTool {
                 )
             }
             None => {
-                let detail = "the command was cancelled while it was still running, so it \
-                              reported no outcome of its own and whatever it had already changed \
-                              is unknown from this result"
-                    .to_owned();
+                let reason = Self::undecided_cancellation_reason(execution, decided);
+                let detail = format!(
+                    "the command {reason}; whatever it had already changed is unknown from this \
+                     result"
+                );
                 let notice = format!(
-                    "Cancelled by the user. `{}` was still running and was killed, so it has no \
-                     exit status and this result decides nothing about what it changed. Whatever \
-                     output it had produced is below. Inspect the authoritative state this \
-                     command would have changed before deciding what to do next; it must not be \
-                     re-run on the assumption that it did nothing.",
+                    "Cancelled by the user. `{}` {reason}. Whatever output it had produced is \
+                     below. Inspect the authoritative state this command would have changed \
+                     before deciding what to do next; it must not be re-run on the assumption \
+                     that it did nothing.",
                     summarize_command(&verification.command)
                 );
                 (
@@ -1119,6 +1132,63 @@ impl ShellTool {
             .apply_bytes(TOOL_ID, session_id, output, &bytes, accept_large_output)?;
         output.output = format!("{notice}\n\n{}", output.output);
         Ok(output)
+    }
+
+    /// Why a cancelled call decided nothing, read off the record the service settled.
+    ///
+    /// The clause completes `` `<command>` … `` so the model-visible notice and the
+    /// receipt's detail can both state the reason without either one inventing a fact
+    /// the record does not carry. One fixed sentence cannot do that: an undecided
+    /// cancellation reaches this point with a code as often as without one — the guard's
+    /// own `125`, or the status a process had already reported before its output capture
+    /// broke — and claiming the command "has no exit status" contradicts the `exit`
+    /// metadata sitting beside it.
+    fn undecided_cancellation_reason(
+        execution: &BackgroundExecutionInfo,
+        decided: Option<i32>,
+    ) -> String {
+        // A code the process really reported that `guard_aware_receipt` still declined:
+        // the only outcome it declines is the guard's own failure.
+        if let Some(code) = decided {
+            return format!(
+                "reported exit {code}, but that code is the child-process guard's own failure \
+                 and says nothing about whether the command ran"
+            );
+        }
+        if execution.timed_out {
+            return "was still running at its hard ceiling and was killed there rather than \
+                    reporting an outcome of its own"
+                .to_owned();
+        }
+        if let Some(code) = execution.exit_code {
+            let settled = execution.status.as_str();
+            return match &execution.error {
+                Some(error) => format!(
+                    "reported exit {code}, but the execution settled as {settled} rather than as \
+                     the command's own outcome: {error}"
+                ),
+                None => format!(
+                    "reported exit {code}, but the execution settled as {settled} rather than as \
+                     the command's own outcome"
+                ),
+            };
+        }
+        match execution.status {
+            BackgroundExecutionStatus::Uncertain => {
+                "left no authoritative terminal result behind, because its process disappeared"
+                    .to_owned()
+            }
+            BackgroundExecutionStatus::Running => {
+                "was cancelled without this call observing it reach a terminal state, so nothing \
+                 about it was settled"
+                    .to_owned()
+            }
+            BackgroundExecutionStatus::Cancelled
+            | BackgroundExecutionStatus::Completed
+            | BackgroundExecutionStatus::Failed => {
+                "was still running and was killed, so it reported no outcome of its own".to_owned()
+            }
+        }
     }
 
     /// The receipt for a finished run, reading a guard verdict as the guard's.
@@ -3390,6 +3460,107 @@ mod tests {
             "the code is still recorded, it just proves nothing"
         );
         assert!(output.output.contains("Inspect the authoritative state"));
+        // The notice and the metadata are read together, so the notice must not deny a
+        // code the metadata reports. It says which claim the code cannot support.
+        assert!(
+            output
+                .output
+                .contains("that code is the child-process guard's own failure"),
+            "an undecided outcome that has a code has to say what the code fails to \
+             prove: {}",
+            output.output
+        );
+        assert!(
+            !output.output.contains("was still running and was killed"),
+            "the guard failed; the command was not observed being killed: {}",
+            output.output
+        );
+    }
+
+    /// A capture failure around a cancelled command is not the command's verdict.
+    ///
+    /// The background service reports the code a process had already given and then
+    /// settles the execution as `failed` when the output it captured was incomplete. An
+    /// ordinary completed run refuses to return that as a result at all, so cancellation
+    /// must not promote it to an authoritative `exit 0` with a receipt a later success
+    /// claim could cite.
+    #[test]
+    fn a_cancelled_command_whose_output_capture_broke_is_not_certified() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let tool = assembly_tool(workspace.path());
+        let verification = ShellVerification {
+            command: "cargo build --release".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let mut execution =
+            settled_execution(workspace.path(), BackgroundExecutionStatus::Failed, Some(0));
+        execution.error = Some("capturing command output failed: broken pipe".to_owned());
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                b"Compiling zuno v0.6.6\n".to_vec(),
+                "ses_cancel",
+                false,
+            )
+            .expect("a settled result, damaged capture and all");
+
+        let facts = cancellation_facts(&output);
+        assert_eq!(facts["uncertain"], true);
+        assert_eq!(facts["authoritative"], false);
+        assert_eq!(facts["exitCode"], 0);
+        assert!(
+            output.output.contains("capturing command output failed"),
+            "the reason the code cannot be cited belongs in the result: {}",
+            output.output
+        );
+        let receipt = VerificationReceipt::from_metadata(&output.metadata)
+            .expect("decodable receipt")
+            .expect("a cancelled result carries a receipt");
+        assert!(
+            !receipt.proves_success(),
+            "an exit 0 the service refused to settle must not prove success"
+        );
+        assert_eq!(receipt.exit_code, None);
+        assert_eq!(receipt.exit_authority, ExitAuthority::Absent);
+    }
+
+    /// A hard-ceiling kill during cancellation says which deadline ended the command.
+    #[test]
+    fn a_cancelled_command_killed_at_its_hard_ceiling_says_so() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let tool = assembly_tool(workspace.path());
+        let verification = ShellVerification {
+            command: "sleep 900".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let mut execution =
+            settled_execution(workspace.path(), BackgroundExecutionStatus::Failed, None);
+        execution.timed_out = true;
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                Vec::new(),
+                "ses_cancel",
+                false,
+            )
+            .expect("settled");
+
+        assert_eq!(cancellation_facts(&output)["uncertain"], true);
+        assert!(
+            output.output.contains("hard ceiling"),
+            "the deadline that ended the command is part of what it decided: {}",
+            output.output
+        );
     }
 
     /// Oversized cancelled output is withheld, exactly as a completed run's is.

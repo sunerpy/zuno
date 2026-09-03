@@ -252,8 +252,8 @@ of the two cancellations happened — because the two do not permit the same nex
 
 | What the interrupt found | Exit status | Verification receipt |
 | --- | --- | --- |
-| The process had already exited | Reported, with its usual authority | The receipt a completed run earns |
-| The process was still running | None: it was killed | `unknown`, with no exit code |
+| The command had exited and reported its own status | Reported, with its usual authority | The receipt a completed run earns |
+| Anything else | Reported when the record holds one, but it decides nothing | `unknown`, with no exit code |
 
 The first case is not uncertain. The kill landed on a process that was already gone, so
 the command's own verdict stands and the result is the one it had earned; it is marked as
@@ -266,9 +266,14 @@ retried. `shell` never replays a call on its own — a command can commit half a
 before the kill reaches it — so this outcome ends with a look at real state rather than
 with a second attempt.
 
-An `exit 125` that is the guard's own failure is read as the uncertain case even though a
-number arrived, for the reason given in [the reserved codes above](#exit-codes-the-guard-reserves):
-that code says nothing about whether the command ran.
+A number in the exit status does not by itself move a cancellation into the first case,
+and the result names what the number fails to prove instead of pretending there is none:
+
+- an `exit 125` that is the guard's own failure says nothing about whether the command
+  ran, for the reason given in [the reserved codes above](#exit-codes-the-guard-reserves);
+- a command that reached its hard ceiling was killed there rather than deciding anything;
+- a status the run reported but Zuno could not settle — an output capture that broke after
+  the process exited, say — is not a verdict the result will let anything cite.
 
 Preserved output goes through the ordinary [output limits](#output-limits). A cancelled
 command that produced more than the inline threshold has every byte saved and is handed
