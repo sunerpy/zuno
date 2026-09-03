@@ -564,3 +564,178 @@ fn only_the_acp_shape_carries_content_blocks_alongside_its_text() {
         }
     }
 }
+
+fn report(id: &str, job_id: &str, text: &str, time: i64) -> NewSessionInput {
+    NewSessionInput::new(
+        id,
+        SESSION_ID,
+        json!({
+            "kind": "subagentReport",
+            "jobID": job_id,
+            "childSessionID": "ses_child",
+            "status": "completed",
+            "text": text
+        }),
+        InputDelivery::Queue,
+        time,
+    )
+}
+
+#[test]
+fn one_batch_promotion_claims_every_settled_report_in_fifo_order() {
+    let pool = initialized(&DbLocation::Memory);
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    let log = SessionEventLog::new(pool);
+    inbox
+        .admit(report("report-1", "job_1", "first", 10))
+        .expect("first report");
+    inbox
+        .admit(report("report-2", "job_1", "second", 11))
+        .expect("second report");
+    inbox
+        .admit(report("report-3", "job_2", "third", 12))
+        .expect("third report");
+
+    let promoted = inbox
+        .promote_pending_async(SESSION_ID)
+        .expect("batch promotion");
+
+    assert_eq!(
+        promoted
+            .iter()
+            .map(|input| input.id.as_str())
+            .collect::<Vec<_>>(),
+        ["report-1", "report-2", "report-3"],
+        "the batch must stay in admission order so the newest report reads as newest"
+    );
+    for input in &promoted {
+        assert_eq!(input.state, SubmissionState::Promoted);
+        assert!(input.promoted_sequence.is_some());
+    }
+    assert_eq!(inbox.pending(SESSION_ID).expect("pending"), []);
+    let promotions = log
+        .read_after(SESSION_ID, None)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.event_type == "session.input.promoted")
+        .map(|event| event.properties["inputID"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        promotions,
+        ["report-1", "report-2", "report-3"],
+        "every report keeps its own promotion event; the batch merges nothing"
+    );
+}
+
+#[test]
+fn batch_promotion_leaves_live_submissions_for_their_own_driver() {
+    let pool = initialized(&DbLocation::Memory);
+    let inbox = SessionInbox::new(pool);
+    inbox
+        .admit(input("typed", "what changed?", InputDelivery::Queue, 10))
+        .expect("user submission");
+    inbox
+        .admit(report("report-1", "job_1", "done", 11))
+        .expect("report");
+    inbox
+        .admit(input("steered", "stop", InputDelivery::Steer, 12))
+        .expect("steer");
+
+    let promoted = inbox
+        .promote_pending_async(SESSION_ID)
+        .expect("batch promotion");
+
+    assert_eq!(
+        promoted
+            .iter()
+            .map(|input| input.id.as_str())
+            .collect::<Vec<_>>(),
+        ["report-1"]
+    );
+    assert_eq!(
+        inbox
+            .pending(SESSION_ID)
+            .expect("pending")
+            .into_iter()
+            .map(|input| input.id)
+            .collect::<Vec<_>>(),
+        ["typed", "steered"],
+        "a batched wake must not swallow input the user is still waiting on"
+    );
+}
+
+#[test]
+fn a_second_batch_promotion_finds_nothing_left_to_claim() {
+    let pool = initialized(&DbLocation::Memory);
+    let inbox = SessionInbox::new(pool);
+    inbox
+        .admit(report("report-1", "job_1", "first", 10))
+        .expect("first report");
+    inbox
+        .admit(report("report-2", "job_2", "second", 11))
+        .expect("second report");
+
+    assert_eq!(
+        inbox
+            .promote_pending_async(SESSION_ID)
+            .expect("batch promotion")
+            .len(),
+        2
+    );
+
+    assert_eq!(
+        inbox
+            .promote_pending_async(SESSION_ID)
+            .expect("repeat batch promotion"),
+        [],
+        "a losing wake must find an empty batch instead of replaying delivered reports"
+    );
+}
+
+#[test]
+fn two_concurrent_batch_promoters_split_the_reports_without_double_claiming() {
+    let pool = initialized(&DbLocation::Memory);
+    let inbox = SessionInbox::new(pool);
+    for index in 0..6 {
+        inbox
+            .admit(report(
+                &format!("report-{index}"),
+                &format!("job_{index}"),
+                "done",
+                10 + index,
+            ))
+            .expect("report admission");
+    }
+
+    let left = {
+        let inbox = inbox.clone();
+        std::thread::spawn(move || {
+            inbox
+                .promote_pending_async(SESSION_ID)
+                .expect("left batch promotion")
+        })
+    };
+    let right = {
+        let inbox = inbox.clone();
+        std::thread::spawn(move || {
+            inbox
+                .promote_pending_async(SESSION_ID)
+                .expect("right batch promotion")
+        })
+    };
+
+    let mut claimed = left.join().expect("left thread");
+    claimed.extend(right.join().expect("right thread"));
+    let mut ids = claimed
+        .into_iter()
+        .map(|input| input.id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        6,
+        "each report must be promoted exactly once across both batches"
+    );
+    assert_eq!(inbox.pending(SESSION_ID).expect("pending"), []);
+}

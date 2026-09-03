@@ -353,6 +353,45 @@ impl SessionInbox {
         })
     }
 
+    /// Promote every pending asynchronous report in one transaction, in FIFO order.
+    ///
+    /// The idle wake path drives a session's settled reports as one batch instead of
+    /// one turn per report. Claiming the whole batch in a single transaction is what
+    /// makes that turn's model-visible input complete: promoting row by row lets a
+    /// crash, or a second wake, split one batch across turns, and each of those turns
+    /// then notifies about a state a later report in the same batch already replaced.
+    ///
+    /// The batch is a claim boundary, not a new durable shape. Every row keeps its own
+    /// prompt and its own `session.input.promoted` event, nothing is merged, and rows
+    /// of any other kind stay pending for the driver that owns them.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the pending rows cannot be read, decoded, logged,
+    /// or updated. No promotion remains committed on failure.
+    pub fn promote_pending_async(&self, session_id: &str) -> Result<Vec<SessionInput>, DbError> {
+        self.pool.transaction(|transaction| {
+            let mut promoted = Vec::new();
+            for input in pending_in(transaction, session_id)? {
+                if !DurableInputKind::classify(&input.prompt)
+                    .is_some_and(DurableInputKind::is_asynchronous_report)
+                {
+                    continue;
+                }
+                let input_id = input.id.clone();
+                let claimed =
+                    promote_selected(transaction, session_id, Some(input))?.ok_or_else(|| {
+                        conflict(
+                            &input_id,
+                            "the pending report vanished while the batch was being promoted",
+                        )
+                    })?;
+                promoted.push(claimed);
+            }
+            Ok(promoted)
+        })
+    }
+
     /// Read pending inputs in FIFO order.
     ///
     /// # Errors
