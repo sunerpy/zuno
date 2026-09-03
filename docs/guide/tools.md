@@ -289,8 +289,11 @@ worth knowing when reading a transcript: blocked means nothing happened.
 }
 ```
 
-Those are the defaults. Output beyond them is truncated rather than allowed to consume the
-model window.
+Those are the defaults. Output beyond either limit is withheld rather than allowed to
+consume the model window. Nothing is truncated and nothing is lost: the full output is
+saved to a file, and the model receives one refusal naming the measured size, the limit it
+crossed, and that file's path. A call can ask for the whole thing by repeating itself with
+`accept_large_output: true`.
 
 ## See also
 

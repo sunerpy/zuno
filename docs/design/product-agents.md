@@ -79,6 +79,8 @@ Product jobs can be `running`, `completed`, `failed`, `cancelled`, or `uncertain
 
 Codex protocol loss and Claude Code stream loss after execution may have started are `uncertain`, not retryable failures. A process restart converts any still-running product job to `uncertain`, admits its promised report, and never launches the product again. Authoritative external state must be inspected before a user chooses another invocation.
 
+A user cancellation is classified by what Zuno can observe, so the same keypress is not reported the same way at every phase. Cancelling during process spawn, `initialize`, or `thread/start` is `cancelled`: those phases open a session in an ephemeral thread that runs no tool and writes no file, so nothing was at stake. Cancelling while the `turn/start` response is outstanding is `uncertain`: the request has already been flushed to the product, and Zuno holds neither a turn id to address `turn/interrupt` nor any stream event describing what ran. Once the turn id is known the streaming loop interrupts that exact turn and reports `cancelled` again, because from there the outcome is observed. Cancellation is a user interruption that pauses a goal; it is never reported as a protocol incompatibility, which would block the goal permanently.
+
 ## Client projection
 
 `ToolUiIntent::Subagent` is persisted with tool events, so clients recognize native and product subagents without hard-coding tool names. The TUI subagent view shows product or native target, objective, state, elapsed time, run/session id, job id, report delivery, result, and a safety diagnostic.
