@@ -1,6 +1,6 @@
 use crate::read::{
     FileToolRuntime, PathKind, check_interrupt, decode_text, encode_text, failed, invalid,
-    report_diff, report_formatting, report_post_write_warnings, uncertain, write_with_dirs,
+    publish_error, report_diff, report_formatting, report_post_write_warnings, uncertain,
 };
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -69,7 +69,9 @@ impl TypedTool for EditTool {
         let _guard = self.runtime.mutation.lock().await;
         check_interrupt("edit", &ctx)?;
 
-        let source = std::fs::read(&target.canonical).map_err(|error| failed("edit", error))?;
+        // `edit` never creates a directory tree: the file it edits must already exist.
+        let anchored = self.runtime.anchor_file("edit", &target, false)?;
+        let source = anchored.read().map_err(|error| failed("edit", error))?;
         self.runtime
             .state
             .require_current_read(&ctx.session_id, &target.canonical, &source)
@@ -111,8 +113,12 @@ impl TypedTool for EditTool {
             replacements = replacements.saturating_add(if edit.replace_all { matches } else { 1 });
         }
         let bytes = encode_text(&next, decoded.bom);
-        write_with_dirs(&target.canonical, &bytes).map_err(|error| failed("edit", error))?;
+        // Nothing has been published yet, so an interruption here loses no work.
+        check_interrupt("edit", &ctx)?;
         let applied = vec![target.canonical.clone()];
+        if let Err(failure) = anchored.publish(&bytes) {
+            return Err(publish_error("edit", &applied, failure));
+        }
         let mut warnings = Vec::new();
         if ctx.is_interrupted() {
             warnings.push(
@@ -139,8 +145,9 @@ impl TypedTool for EditTool {
                 }
             }
         };
-        let final_bytes =
-            std::fs::read(&target.canonical).map_err(|error| uncertain("edit", &applied, error))?;
+        let final_bytes = anchored
+            .read()
+            .map_err(|error| uncertain("edit", &applied, error))?;
         self.runtime
             .state
             .record_write(&ctx.session_id, &target.canonical, &final_bytes);

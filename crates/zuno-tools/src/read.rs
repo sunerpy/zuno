@@ -1,11 +1,14 @@
+mod anchor;
 mod support;
+
+use anchor::AnchoredDir;
 
 pub use support::{FileFormatter, NoopFormatter};
 pub(crate) use support::{
     FileReadConflictKind, FileReadReceipt, FileToolRuntime, IdenticalPatchConflict, PathKind,
     ResolvedPath, check_interrupt, decode_text, digest_bytes, encode_text, failed, interrupted,
-    invalid, report_diff, report_formatting, report_post_write_warnings, slash, uncertain,
-    write_with_dirs,
+    invalid, publish_error, report_diff, report_formatting, report_post_write_warnings, slash,
+    uncertain,
 };
 
 use async_trait::async_trait;
@@ -53,22 +56,18 @@ impl ReadTool {
 
     fn read_directory(
         &self,
+        anchored: &AnchoredDir,
         path: &Path,
         offset: usize,
         limit: usize,
         ctx: &ToolContext,
     ) -> Result<(String, Map<String, Value>), ToolError> {
-        let entries = std::fs::read_dir(path).map_err(|error| failed("read", error))?;
+        check_interrupt("read", ctx)?;
+        let entries = anchored.read_dir().map_err(|error| failed("read", error))?;
         let mut names = Vec::new();
-        for entry in entries {
+        for (file_name, is_directory) in entries {
             check_interrupt("read", ctx)?;
-            let entry = entry.map_err(|error| failed("read", error))?;
-            let mut name = entry.file_name().to_string_lossy().into_owned();
-            let is_directory = entry
-                .file_type()
-                .map(|kind| kind.is_dir())
-                .or_else(|_| entry.metadata().map(|metadata| metadata.is_dir()))
-                .unwrap_or(false);
+            let mut name = file_name.to_string_lossy().into_owned();
             if is_directory {
                 name.push('/');
             }
@@ -274,7 +273,11 @@ impl TypedTool for ReadTool {
         let title = self.runtime.title(&target);
 
         if metadata.is_dir() {
-            let (output, metadata) = self.read_directory(&target.canonical, offset, limit, &ctx)?;
+            // Pinning the directory before listing it means a symlink swapped in for an
+            // ancestor cannot turn an authorized listing into a listing of somewhere else.
+            let anchored = self.runtime.anchor_dir("read", &target)?;
+            let (output, metadata) =
+                self.read_directory(&anchored, &target.canonical, offset, limit, &ctx)?;
             return Ok(ToolOutput {
                 title,
                 output,
@@ -286,7 +289,8 @@ impl TypedTool for ReadTool {
         }
 
         check_interrupt("read", &ctx)?;
-        let bytes = std::fs::read(&target.canonical).map_err(|error| failed("read", error))?;
+        let anchored = self.runtime.anchor_file("read", &target, false)?;
+        let bytes = anchored.read().map_err(|error| failed("read", error))?;
         check_interrupt("read", &ctx)?;
         let mime = sniff_attachment_mime(&bytes, &target.canonical);
         if let Some(mime) = mime {

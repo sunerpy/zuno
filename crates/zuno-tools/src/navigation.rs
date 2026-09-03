@@ -433,8 +433,8 @@ fn resource_observations(
     syntax: ShellSyntax,
     depth: usize,
 ) -> Vec<Observation> {
-    let (tokens, _) = unwrap_wrappers(&resource.tokens);
-    let Some(program) = tokens.first().map(|token| program_name(token)) else {
+    let (tokens, _) = unwrap_wrappers(&resource.tokens, syntax);
+    let Some(program) = tokens.first().map(|token| program_name(token, syntax)) else {
         return vec![Observation::Other];
     };
     let arguments = &tokens[1..];
@@ -442,7 +442,9 @@ fn resource_observations(
     // `xargs` turns the pipe into arguments, so `git ls-files | xargs grep foo` still
     // reads the files it names rather than filtering the previous stage's text.
     let fed_by_pipe = resource.stdin_from_pipeline
-        && !wrappers.iter().any(|token| command_name(token) == "xargs");
+        && !wrappers
+            .iter()
+            .any(|token| command_name(token, syntax) == "xargs");
 
     if program == "eval" {
         let script = arguments
@@ -462,7 +464,7 @@ fn resource_observations(
             None => vec![Observation::Other],
         };
     }
-    if let Some(observation) = codegraph_observation(&program, arguments) {
+    if let Some(observation) = codegraph_observation(&program, arguments, syntax) {
         return vec![observation];
     }
     if let Some(observation) = navigation_observation(&program, arguments, fed_by_pipe) {
@@ -479,14 +481,18 @@ fn nested_script(script: &str, syntax: ShellSyntax, depth: usize) -> Vec<Observa
 }
 
 /// The CodeGraph executable, invoked directly or through a package runner.
-fn codegraph_observation(program: &str, arguments: &[String]) -> Option<Observation> {
+fn codegraph_observation(
+    program: &str,
+    arguments: &[String],
+    syntax: ShellSyntax,
+) -> Option<Observation> {
     let arguments = if program == CODEGRAPH_PROGRAM {
         arguments
     } else if PACKAGE_RUNNERS.contains(&program) {
         let index = arguments
             .iter()
             .position(|token| !unquote(token).starts_with('-'))?;
-        if program_name(&arguments[index]) != CODEGRAPH_PROGRAM {
+        if program_name(&arguments[index], syntax) != CODEGRAPH_PROGRAM {
             return None;
         }
         &arguments[index + 1..]
@@ -575,13 +581,9 @@ fn sed_edits_in_place(arguments: &[String]) -> bool {
     })
 }
 
-/// [`command_name`] without a Windows executable suffix, so `rg.exe` is `rg`.
-fn program_name(token: &str) -> String {
-    let name = command_name(token);
-    match name.strip_suffix(".exe") {
-        Some(stem) => stem.to_owned(),
-        None => name,
-    }
+/// [`command_name`], which already drops a Windows program suffix.
+fn program_name(token: &str, syntax: ShellSyntax) -> String {
+    command_name(token, syntax)
 }
 
 #[cfg(test)]

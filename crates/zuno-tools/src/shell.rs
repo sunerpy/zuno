@@ -4,6 +4,7 @@ use crate::output_policy::OutputPolicy;
 use crate::risk::{
     GIT_REPOSITORY_ENVIRONMENT_VARIABLES, GateOutcome, RiskAssessment, RiskContext, assess_and_gate,
 };
+use crate::search_common::directory_grant_pattern;
 use crate::timeout::{
     background_started_output, normalize_foreground_timeout, timeout_promoted_output,
 };
@@ -612,7 +613,7 @@ impl ShellTool {
         if !directories.is_empty() {
             let patterns: Vec<String> = directories
                 .iter()
-                .map(|directory| format!("{}{}*", directory.display(), std::path::MAIN_SEPARATOR))
+                .map(|directory| directory_grant_pattern(directory))
                 .collect();
             let mut metadata = Map::new();
             metadata.insert("command".to_owned(), Value::String(command.to_owned()));
@@ -689,11 +690,7 @@ impl ShellTool {
                     "this Agent's Shell policy is read-only and cannot modify Git metadata",
                 )));
             }
-            let git_pattern = format!(
-                "{}{}*",
-                self.workspace.join(".git").display(),
-                std::path::MAIN_SEPARATOR
-            );
+            let git_pattern = directory_grant_pattern(&self.workspace.join(".git"));
             let mut metadata = Map::new();
             metadata.insert("command".to_owned(), Value::String(command.to_owned()));
             metadata.insert(
@@ -723,7 +720,9 @@ impl ShellTool {
         cwd: &Path,
         ctx: &ToolContext,
     ) -> Result<BTreeMap<String, String>, ToolError> {
-        let mut env: BTreeMap<String, String> = std::env::vars().collect();
+        // Zuno's own secrets are removed before the hook runs, so a host that wants a
+        // credential in the tool environment can still put one back deliberately.
+        let mut env = withhold_zuno_secrets(std::env::vars());
         let extra = self
             .env_hook
             .env(ShellEnvInput {
@@ -1564,6 +1563,50 @@ const TWO_TOKEN_COMMANDS: &[&str] = &[
 ];
 const THREE_TOKEN_COMMANDS: &[&str] = &["aws", "az", "doctl", "gcloud", "gh", "sfdx"];
 
+/// Zuno's own secrets, withheld from every model-composed command.
+///
+/// These three are set for the Zuno process itself — the HTTP server's credentials and
+/// the provider auth store's contents — and no shell command a model writes has any
+/// use for them. Inheriting them meant one `env`, one `printenv`, or one curl of an
+/// attacker-chosen URL exfiltrated the operator's server password and every provider
+/// key in the auth store.
+///
+/// Everything else is still inherited on purpose. A wildcard `*_API_KEY` / `*_TOKEN`
+/// filter was rejected: it silently breaks `gh`, `aws`, `az`, and `gcloud` (see
+/// [`THREE_TOKEN_COMMANDS`]) along with every user who exports a token deliberately,
+/// and a tool that quietly removes the credentials a command needs is a worse failure
+/// than one that keeps them. A deployment that wants a credential in the tool
+/// environment supplies it through [`ShellEnvHook`], which runs after this removal, so
+/// the host — not this crate — stays the single place that decides.
+const WITHHELD_ENVIRONMENT: &[&str] = &[
+    "ZUNO_AUTH_CONTENT",
+    "ZUNO_SERVER_PASSWORD",
+    "ZUNO_SERVER_USERNAME",
+];
+
+/// Whether a variable name is one of Zuno's own secrets.
+///
+/// Compared case-insensitively because Windows environment variable names are
+/// case-insensitive, so `%zuno_server_password%` names the same secret there.
+fn is_withheld_variable(name: &str) -> bool {
+    WITHHELD_ENVIRONMENT
+        .iter()
+        .any(|withheld| name.eq_ignore_ascii_case(withheld))
+}
+
+/// The inherited environment with Zuno's own secrets removed.
+///
+/// Takes the variables as an argument so the decision is testable: setting a process
+/// environment variable is `unsafe`, which this workspace forbids.
+fn withhold_zuno_secrets(
+    variables: impl IntoIterator<Item = (String, String)>,
+) -> BTreeMap<String, String> {
+    variables
+        .into_iter()
+        .filter(|(name, _)| !is_withheld_variable(name))
+        .collect()
+}
+
 fn external_directories(
     analysis: &ShellAnalysis,
     cwd: &Path,
@@ -1772,6 +1815,40 @@ fn interrupted() -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zunos_own_secrets_never_reach_a_model_composed_command() {
+        let inherited = [
+            ("ZUNO_SERVER_PASSWORD", "hunter2"),
+            ("ZUNO_SERVER_USERNAME", "operator"),
+            ("ZUNO_AUTH_CONTENT", r#"{"anthropic":{"key":"sk-live"}}"#),
+            // Windows environment names are case-insensitive, so the same secret can
+            // arrive under any spelling.
+            ("zuno_auth_content", "{}"),
+            // Deliberately kept: a wildcard `*_TOKEN` / `*_API_KEY` filter would take
+            // these away and silently break `gh`, `aws`, `az`, and `gcloud`.
+            ("GITHUB_TOKEN", "gho_kept"),
+            ("AWS_ACCESS_KEY_ID", "AKIA_kept"),
+            ("OPENAI_API_KEY", "sk-kept"),
+            ("PATH", "/usr/bin"),
+            // Non-secret Zuno variables a command may legitimately need to see.
+            ("ZUNO_WORKSPACE_ID", "wsp_1"),
+        ]
+        .map(|(name, value)| (name.to_owned(), value.to_owned()));
+
+        let env = withhold_zuno_secrets(inherited);
+
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "AWS_ACCESS_KEY_ID",
+                "GITHUB_TOKEN",
+                "OPENAI_API_KEY",
+                "PATH",
+                "ZUNO_WORKSPACE_ID",
+            ]
+        );
+    }
 
     fn mutates(command: &str) -> bool {
         mutates_git_metadata(&analyze_command(command, ShellSyntax::Bash).expect("analysis"))

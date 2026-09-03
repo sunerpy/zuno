@@ -513,3 +513,121 @@ fn tool_context_with(permission: Arc<dyn PermissionAsker>) -> ToolContext {
         Arc::new(NeverInterrupted),
     )
 }
+
+/// A Windows host's context: `HOME` is unset there, so [`RiskContext::from_env`]
+/// takes the profile directory from `std::env::home_dir`, which reads `USERPROFILE`.
+fn windows_risk_context() -> RiskContext {
+    RiskContext {
+        working_dir: Some(PathBuf::from(r"C:\work\project")),
+        home_dir: Some(PathBuf::from(r"C:\Users\alice")),
+    }
+}
+
+fn windows_risk_gate(command: &str) -> GateOutcome {
+    let assessment = assess_command(command, ShellSyntax::PowerShell, &windows_risk_context())
+        .expect("the command must parse");
+    gate(&assessment)
+}
+
+fn assert_windows_denied(command: &str) {
+    let outcome = windows_risk_gate(command);
+    assert!(
+        matches!(outcome, GateOutcome::Deny { .. }),
+        "expected permanent denial for {command:?}, got {outcome:?}"
+    );
+}
+
+#[test]
+fn risk_denies_windows_system_locations_in_every_spelling() {
+    for target in [
+        r"C:\",
+        r"C:\Windows",
+        "C:/Windows",
+        r"c:\windows\system32",
+        r"C:\Program Files",
+        r"C:\Program Files (x86)\Vendor",
+        r"C:\ProgramData\Vendor",
+        r"D:\Windows",
+        r"\\?\C:\Windows",
+        r"\\server\share",
+    ] {
+        assert_windows_denied(&format!("Remove-Item -Recurse -Force '{target}'"));
+    }
+}
+
+#[test]
+fn risk_denies_the_windows_profile_and_its_credential_stores() {
+    for target in [
+        "~",
+        "$HOME",
+        "${HOME}",
+        r"C:\Users\alice",
+        r"C:\Users",
+        r"C:\Users\alice\.ssh",
+        r"C:\Users\alice\.ssh\id_rsa",
+        r"C:\Users\alice\.aws",
+        r"C:\Users\alice\.config\gh",
+        r"C:\Users\alice\Documents",
+        "~/.ssh",
+    ] {
+        assert_windows_denied(&format!("Remove-Item -Recurse -Force '{target}'"));
+    }
+}
+
+#[test]
+fn risk_denies_the_windows_profile_through_the_spellings_its_own_shells_use() {
+    // `%USERPROFILE%` and `$env:USERPROFILE` are how `cmd` and PowerShell name the
+    // profile directory; neither shell sets `HOME`, so before the home fallback all
+    // of these resolved to nothing and dropped to a confirmation prompt.
+    for target in [
+        "%USERPROFILE%",
+        r"%USERPROFILE%\.ssh",
+        r"%UserProfile%\.ssh",
+        "$env:USERPROFILE",
+        r"$env:USERPROFILE\.ssh",
+        r"${env:userprofile}\.gnupg",
+    ] {
+        assert_windows_denied(&format!("Remove-Item -Recurse -Force '{target}'"));
+    }
+}
+
+#[test]
+fn risk_still_confirms_ordinary_windows_project_work() {
+    for target in [
+        r"C:\work\project\target",
+        r"C:\Users\alice\project",
+        r"C:\Users\alice\.config\zuno-scratch",
+        r"\\server\share\project",
+        "build",
+    ] {
+        let command = format!("Remove-Item -Recurse -Force '{target}'");
+        let outcome = windows_risk_gate(&command);
+        assert!(
+            matches!(outcome, GateOutcome::Confirm { .. }),
+            "expected a confirmable operation for {command:?}, got {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn risk_reads_a_backslash_as_a_separator_under_powershell_and_an_escape_under_bash() {
+    // A backslash is a path separator in PowerShell and an escape in Bash. Reducing a
+    // PowerShell token with the POSIX rule turned every absolutely spelled program
+    // into a name that matched no table, so a nested shell and a destructive program
+    // both escaped assessment; reading it as a separator under Bash would let `r\m`
+    // through instead. Both spellings have to stay denied.
+    assert_windows_denied(r"C:\Tools\bash.exe -c 'rm -rf /'");
+    assert_windows_denied(r"rm.exe -rf C:\Users\alice\.ssh");
+    assert_windows_denied(r"C:\Windows\System32\format.com C:");
+    assert_risk_denied(r"r\m -rf /");
+    // A backtick is PowerShell's escape character rather than Bash's command
+    // substitution, so `C:\Wind`ows` in fact names `C:\Windows`. The assessor still
+    // reflects it as runtime-computed and requires confirmation instead of denying it:
+    // a documented over-approximation, pinned here so it stays a prompt and never
+    // becomes silence.
+    let outcome = windows_risk_gate("Remove-Item -Recurse -Force C:\\Wind`ows");
+    assert!(
+        matches!(outcome, GateOutcome::Confirm { .. }),
+        "a backtick target must still reach the user: {outcome:?}"
+    );
+}

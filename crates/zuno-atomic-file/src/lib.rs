@@ -19,6 +19,14 @@
 //! file is present. They do not retry permission, encoding, path, or device
 //! failures, and Unix reads remain a single system call.
 //!
+//! A destination that is a symlink is followed deliberately, to the file the link
+//! names, and the replacement is published in that file's own directory. Publishing at
+//! the link's own name would rename a regular file over the link and silently destroy
+//! it, which turns a user's deliberate redirection into a one-way data loss: the next
+//! read would see Zuno's document where the user expected their own location to be
+//! authoritative. Following matches the `fs::write` semantics this primitive replaced,
+//! so a caller that must not follow a link has to inspect the path itself first.
+//!
 //! The Windows provider is the safe `winsafe` wrapper. That wrapper accepts
 //! Unicode strings rather than arbitrary `OsStr` values, so an unrepresentable
 //! Windows path fails closed instead of silently falling back to the
@@ -26,7 +34,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::thread;
 #[cfg(windows)]
@@ -39,12 +47,20 @@ use uuid::Uuid;
 /// handle is closed before publication. A failed publication removes that
 /// temporary file and leaves an existing destination untouched.
 ///
+/// When `path` is a symlink, the link is followed to the file it names and the
+/// replacement is published there, so the link survives and keeps pointing where the
+/// user aimed it. A dangling link resolves to the location it names, which is then
+/// created.
+///
 /// # Errors
 ///
-/// Returns the underlying filesystem error. On Windows, a path that the safe
-/// `ReplaceFileW` wrapper cannot represent is rejected with
-/// [`io::ErrorKind::InvalidInput`].
+/// Returns the underlying filesystem error. A symlink chain longer than
+/// [`MAX_LINK_DEPTH`] is rejected with [`io::ErrorKind::InvalidInput`] rather than
+/// followed further. On Windows, a path that the safe `ReplaceFileW` wrapper cannot
+/// represent is rejected with the same kind.
 pub fn replace(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let resolved = follow_link_chain(path)?;
+    let path = resolved.as_path();
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -202,11 +218,55 @@ fn is_replacement_window(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(2 | 32))
 }
 
+/// Longest symlink chain a replacement will follow before it refuses.
+///
+/// Matches the `SYMLOOP_MAX` most platforms enforce, so a chain this primitive accepts
+/// is one the kernel would also have resolved.
+pub const MAX_LINK_DEPTH: usize = 40;
+
+/// The file a destination ultimately names, following symlinks deliberately.
+///
+/// A path that does not exist, or that exists and is not a link, is returned as it
+/// stands. A relative link target is joined to the directory holding the link, which is
+/// how the kernel resolves it.
+fn follow_link_chain(path: &Path) -> io::Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_LINK_DEPTH {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_symlink() => {}
+            Ok(_) => return Ok(current),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(current),
+            Err(error) => return Err(error),
+        }
+        let target = fs::read_link(&current)?;
+        current = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{} resolves through more than {MAX_LINK_DEPTH} symlinks, which is a loop rather \
+             than a redirection",
+            path.display()
+        ),
+    ))
+}
+
 #[cfg(not(windows))]
 fn publish(temporary: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(temporary, destination)
 }
 
+/// `destination` has already been resolved through any symlink by [`replace`], so the
+/// existence test below distinguishes a real file from an absent one rather than a link
+/// from its target.
 #[cfg(windows)]
 fn publish(temporary: &Path, destination: &Path) -> io::Result<()> {
     match fs::symlink_metadata(destination) {
@@ -418,5 +478,114 @@ mod tests {
         let path = std::path::PathBuf::from(OsString::from_wide(&[0xd800]));
         let error = unicode_path(&path).expect_err("unpaired surrogate is not UTF-8");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+#[cfg(test)]
+mod symlink_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn symlink(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[test]
+    fn a_replacement_through_a_symlink_keeps_the_link_and_writes_its_target() {
+        let root = tempfile::tempdir().expect("root");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let target = elsewhere.path().join("memory.md");
+        fs::write(&target, b"old").expect("seed");
+        let link = root.path().join("memory.md");
+        symlink(&target, &link).expect("the user's deliberate redirection");
+
+        replace(&link, b"new").expect("replace through the link");
+
+        assert!(
+            fs::symlink_metadata(&link).expect("metadata").is_symlink(),
+            "publishing must not turn the link into a regular file"
+        );
+        assert_eq!(fs::read(&target).expect("target"), b"new");
+        assert_eq!(read(&link).expect("read through the link"), b"new");
+        assert_eq!(
+            fs::read_dir(root.path()).expect("list").count(),
+            1,
+            "no temporary file may be left beside the link"
+        );
+    }
+
+    #[test]
+    fn a_relative_symlink_resolves_against_the_directory_holding_it() {
+        let root = tempfile::tempdir().expect("root");
+        let nested = root.path().join("data");
+        fs::create_dir(&nested).expect("nested directory");
+        let target = nested.join("real.md");
+        fs::write(&target, b"old").expect("seed");
+        let link = nested.join("link.md");
+        symlink(Path::new("real.md"), &link).expect("a relative link");
+
+        replace(&link, b"new").expect("replace through the relative link");
+
+        assert!(fs::symlink_metadata(&link).expect("metadata").is_symlink());
+        assert_eq!(fs::read(&target).expect("target"), b"new");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_chain_of_symlinks_resolves_to_the_file_at_its_end() {
+        let root = tempfile::tempdir().expect("root");
+        let target = root.path().join("real.md");
+        fs::write(&target, b"old").expect("seed");
+        let middle = root.path().join("middle.md");
+        symlink(&target, &middle).expect("first link");
+        let outer = root.path().join("outer.md");
+        symlink(&middle, &outer).expect("second link");
+
+        replace(&outer, b"new").expect("replace through the chain");
+
+        assert!(fs::symlink_metadata(&outer).expect("metadata").is_symlink());
+        assert!(
+            fs::symlink_metadata(&middle)
+                .expect("metadata")
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&target).expect("target"), b"new");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_loop_is_refused_rather_than_followed_forever() {
+        let root = tempfile::tempdir().expect("root");
+        let first = root.path().join("first.md");
+        let second = root.path().join("second.md");
+        symlink(&second, &first).expect("first half of the loop");
+        symlink(&first, &second).expect("second half of the loop");
+
+        let error = replace(&first, b"new").expect_err("a loop must be refused");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("loop"),
+            "the message must name the problem: {error}"
+        );
+    }
+
+    #[test]
+    fn a_dangling_symlink_publishes_at_the_location_it_names() {
+        let root = tempfile::tempdir().expect("root");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let target = elsewhere.path().join("absent.md");
+        let link = root.path().join("link.md");
+        symlink(&target, &link).expect("a dangling link");
+
+        replace(&link, b"new").expect("replace through the dangling link");
+
+        assert!(fs::symlink_metadata(&link).expect("metadata").is_symlink());
+        assert_eq!(fs::read(&target).expect("target"), b"new");
     }
 }

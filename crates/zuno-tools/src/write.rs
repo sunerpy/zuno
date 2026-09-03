@@ -1,6 +1,6 @@
 use crate::read::{
     FileToolRuntime, PathKind, check_interrupt, decode_text, encode_text, failed, invalid,
-    report_diff, report_formatting, report_post_write_warnings, uncertain, write_with_dirs,
+    publish_error, report_diff, report_formatting, report_post_write_warnings, uncertain,
 };
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -57,7 +57,12 @@ impl TypedTool for WriteTool {
         let _guard = self.runtime.mutation.lock().await;
         check_interrupt("write", &ctx)?;
 
-        let existing = match std::fs::read(&target.canonical) {
+        // Every filesystem step below runs through this anchor, which is pinned to the
+        // directory the user authorized. An ancestor swapped for a symlink after the
+        // permission prompt can no longer redirect the write.
+        let anchored = self.runtime.anchor_file("write", &target, true)?;
+
+        let existing = match anchored.read() {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) if error.kind() == std::io::ErrorKind::IsADirectory => {
@@ -86,8 +91,12 @@ impl TypedTool for WriteTool {
             .is_some_and(|file| file.bom);
         let (content, new_bom) = split_bom(&params.content);
         let bytes = encode_text(content, old_bom || new_bom);
-        write_with_dirs(&target.canonical, &bytes).map_err(|error| failed("write", error))?;
+        // Nothing has been published yet, so an interruption here loses no work.
+        check_interrupt("write", &ctx)?;
         let applied = vec![target.canonical.clone()];
+        if let Err(failure) = anchored.publish(&bytes) {
+            return Err(publish_error("write", &applied, failure));
+        }
         let mut warnings = Vec::new();
         if ctx.is_interrupted() {
             warnings.push(
@@ -114,7 +123,8 @@ impl TypedTool for WriteTool {
                 }
             }
         };
-        let final_bytes = std::fs::read(&target.canonical)
+        let final_bytes = anchored
+            .read()
             .map_err(|error| uncertain("write", &applied, error))?;
         self.runtime
             .state
