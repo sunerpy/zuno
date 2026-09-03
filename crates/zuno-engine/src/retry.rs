@@ -251,6 +251,23 @@ where
     },
     #[error("provider retry deadline exceeded on attempt {attempt} after {elapsed:?}")]
     DeadlineExceeded { attempt: u32, elapsed: Duration },
+    /// The peer asked for a longer delay than the recovery deadline had left.
+    ///
+    /// Recovery stops instead of sleeping past its deadline — and instead of
+    /// replacing the peer's delay with a shorter local one. `source` is the typed
+    /// error that named `retry_after`, so the turn owner can schedule its own retry
+    /// with the peer's delay, clamped to the configured ceiling, rather than fall back
+    /// to a local backoff the peer has already said is too soon.
+    #[error(
+        "provider asked to retry after {retry_after:?} on attempt {attempt}, beyond the recovery deadline after {elapsed:?}"
+    )]
+    RetryAfterBeyondDeadline {
+        attempt: u32,
+        elapsed: Duration,
+        retry_after: Duration,
+        #[source]
+        source: ProviderError,
+    },
     #[error("failed to emit RetryRollback before provider retry")]
     RollbackEmission {
         #[source]
@@ -555,9 +572,15 @@ where
                 let delay = policy.delay_after(attempt, &error, retry_entropy());
                 let next_attempt = attempt + 1;
                 if delay >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
-                    return Err(ProviderRetryError::DeadlineExceeded {
-                        attempt,
-                        elapsed: recovery_started.elapsed(),
+                    let elapsed = recovery_started.elapsed();
+                    return Err(match error.retry_after().filter(|after| !after.is_zero()) {
+                        Some(retry_after) => ProviderRetryError::RetryAfterBeyondDeadline {
+                            attempt,
+                            elapsed,
+                            retry_after,
+                            source: error,
+                        },
+                        None => ProviderRetryError::DeadlineExceeded { attempt, elapsed },
                     }
                     .into());
                 }

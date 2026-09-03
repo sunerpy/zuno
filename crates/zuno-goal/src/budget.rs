@@ -40,25 +40,30 @@
 //! reserve asks for it, exactly once, and the turn then continues on the smaller
 //! transcript until the allowance is spent.
 //!
-//! # Why a database failure pauses the turn instead of blocking the goal
+//! # Why a database failure is a retry, a pause, or a block — and which is which
 //!
-//! The engine turns a policy `Err` into a hook failure, and the host records a
-//! hook failure as a permanent block. A `SQLITE_BUSY` that outlasted the pool's
-//! busy timeout is rare but real under concurrent sessions, and it says nothing
-//! about the goal, so it must not end the goal for good. A failure to read or
-//! charge the goal is therefore a stop: the turn still ends without spending
-//! anything more and never continues unmeasured, but the goal pauses and can be
-//! resumed once the database is readable. Only durable state this build cannot
-//! read at all — a value the schema promises but cannot be decoded, a format this
-//! build does not know, a status outside the closed set — stays an `Err`, because
-//! no retry makes such state readable.
+//! A `SQLITE_BUSY` that outlasted the pool's busy timeout is rare but real under
+//! concurrent sessions, and it says nothing about the goal. It is reported as the
+//! typed [`BudgetPolicyError::Database`] it is, so the engine ends the turn with the
+//! same `DbError::Busy` any other contended write produces and the goal schedules a
+//! persisted retry with backoff — the goal stays active and resumes on its own.
+//! Every other database failure — a statement that failed for any other reason, I/O
+//! included, a file that would not open — is the environment and not the goal, and
+//! becomes a stop: the turn ends without spending anything more and never continues
+//! unmeasured, but the goal pauses and can be resumed once the database is readable.
+//! Only durable state this build cannot read at all — a value the schema promises but
+//! cannot be decoded, a format this build does not know, a status outside the closed
+//! set — is [`BudgetPolicyError::Permanent`], because no retry makes such state
+//! readable, and the host records it as a permanent block.
 
 use crate::error::GoalError;
 use crate::status::GoalStatus;
 use crate::store::{Goal, GoalStore};
 use async_trait::async_trait;
 use std::sync::Arc;
-use zuno_engine::budget::{BudgetDecision, TurnAllowance, TurnBudgetPolicy, TurnUsageSnapshot};
+use zuno_engine::budget::{
+    BudgetDecision, BudgetPolicyError, TurnAllowance, TurnBudgetPolicy, TurnUsageSnapshot,
+};
 use zuno_error::DbError;
 
 /// The reserve is the budget divided by this, so one tenth of the allowance.
@@ -84,9 +89,11 @@ pub const SOFT_RESERVE_DIVISOR: i64 = 10;
 /// A failure to read or charge the goal never becomes
 /// [`BudgetDecision::Continue`]: a policy that cannot see the budget does not
 /// know whether the turn may go on, and continuing on a database error would turn
-/// every outage into an unlimited run. It becomes a stop, so the goal pauses and
-/// resumes once the database is readable; only durable state this build cannot
-/// read at all is returned as `Err`, which the engine treats as a turn failure.
+/// every outage into an unlimited run. A contended write lock is returned as the
+/// typed database error it is, so the goal retries after a persisted backoff; any
+/// other database failure becomes a stop, so the goal pauses and resumes once the
+/// database is readable; only durable state this build cannot read at all is a
+/// permanent policy error, which the engine treats as a hook failure.
 #[derive(Debug, Clone)]
 pub struct GoalBudgetPolicy {
     store: Arc<GoalStore>,
@@ -163,19 +170,21 @@ impl TurnBudgetPolicy for GoalBudgetPolicy {
     ///
     /// # Errors
     ///
-    /// A message only when the stored goal is in a state this build cannot read,
-    /// or the read never finished. A database that merely cannot be reached is a
-    /// stop, not an error; see `store_failure`.
+    /// [`BudgetPolicyError::Permanent`] only when the stored goal is in a state this
+    /// build cannot read, or the read never finished; [`BudgetPolicyError::Database`]
+    /// when another writer held the lock. A database that merely cannot be reached is
+    /// a stop, not an error; see `store_failure`.
     async fn before_request(
         &self,
         snapshot: &TurnUsageSnapshot<'_>,
-    ) -> Result<BudgetDecision, String> {
+    ) -> Result<BudgetDecision, BudgetPolicyError> {
         let store = Arc::clone(&self.store);
         let session_id = snapshot.session_id.to_owned();
         let goal = match tokio::task::spawn_blocking(move || store.goal(&session_id))
             .await
-            .map_err(|error| format!("reading the goal did not finish: {error}"))?
-        {
+            .map_err(|error| {
+                BudgetPolicyError::Permanent(format!("reading the goal did not finish: {error}"))
+            })? {
             Ok(goal) => goal,
             Err(error) => return store_failure("reading the goal", error),
         };
@@ -191,26 +200,30 @@ impl TurnBudgetPolicy for GoalBudgetPolicy {
     ///
     /// # Errors
     ///
-    /// A message only when the stored goal is in a state this build cannot read,
-    /// the host clock is unusable, or the write never finished. A database that
-    /// merely cannot be reached is a stop, not an error; see `store_failure`.
+    /// [`BudgetPolicyError::Permanent`] only when the stored goal is in a state this
+    /// build cannot read, the host clock is unusable, or the write never finished;
+    /// [`BudgetPolicyError::Database`] when another writer held the lock. A database
+    /// that merely cannot be reached is a stop, not an error; see `store_failure`.
     async fn after_response(
         &self,
         snapshot: &TurnUsageSnapshot<'_>,
-    ) -> Result<BudgetDecision, String> {
+    ) -> Result<BudgetDecision, BudgetPolicyError> {
         let store = Arc::clone(&self.store);
         let session_id = snapshot.session_id.to_owned();
         let request_id = Self::request_id(snapshot);
         let tokens = i64::try_from(snapshot.last_request.total()).unwrap_or(i64::MAX);
         let measured = snapshot.last_request.accounted;
-        let at_ms = crate::store::now_ms()
-            .map_err(|error| format!("goal budget clock is unusable: {error}"))?;
+        let at_ms = crate::store::now_ms().map_err(|error| {
+            BudgetPolicyError::Permanent(format!("goal budget clock is unusable: {error}"))
+        })?;
         let recorded = match tokio::task::spawn_blocking(move || {
             store.record_request_usage(&session_id, &request_id, tokens, at_ms)
         })
         .await
         .map_err(|error| {
-            format!("recording the response against the goal did not finish: {error}")
+            BudgetPolicyError::Permanent(format!(
+                "recording the response against the goal did not finish: {error}"
+            ))
         })? {
             Ok(recorded) => recorded,
             Err(error) => {
@@ -260,34 +273,38 @@ enum Consulted {
 
 /// Turn a failure in the policy's own path into what the engine should do.
 ///
-/// `Err` becomes a hook failure, which the host records as a permanent block, so
-/// it is reserved for state no retry can make readable: a stored value the schema
-/// promises but this build cannot decode, a database in a format this build does
-/// not know, or a goal row whose status, kind or reason is outside the closed set.
-/// Every other database failure — the write lock held by another session, a
-/// statement that failed for any other reason, I/O included, a file that would not
-/// open — is the environment and not the goal, and becomes a stop instead: still
-/// fail-closed, because the turn ends without spending anything more and never
-/// continues unmeasured, but the goal pauses and can be resumed once the database
-/// is readable, rather than being blocked for good over a `SQLITE_BUSY` that
-/// happened to outlast the pool's busy timeout. That timeout is the bounded wait;
-/// retrying here again would only delay the pause.
-fn store_failure(doing: &str, error: GoalError) -> Result<BudgetDecision, String> {
+/// [`BudgetPolicyError::Permanent`] becomes a hook failure, which the host records as
+/// a permanent block, so it is reserved for state no retry can make readable: a
+/// stored value the schema promises but this build cannot decode, a database in a
+/// format this build does not know, or a goal row whose status, kind or reason is
+/// outside the closed set. A write lock held by another session is
+/// [`BudgetPolicyError::Database`] with the [`DbError::Busy`] it came from: the
+/// engine already classifies that as a retry, so the goal schedules a persisted
+/// backoff and stays active instead of pausing over a `SQLITE_BUSY` that happened to
+/// outlast the pool's busy timeout. Every other database failure — a statement that
+/// failed for any other reason, I/O included, a file that would not open — is the
+/// environment and not the goal, and becomes a stop: still fail-closed, because the
+/// turn ends without spending anything more and never continues unmeasured, but the
+/// goal pauses and can be resumed once the database is readable.
+fn store_failure(doing: &str, error: GoalError) -> Result<BudgetDecision, BudgetPolicyError> {
     match error {
         GoalError::Db(DbError::Decode { .. } | DbError::SchemaMismatch { .. })
         | GoalError::UnknownStatus { .. }
         | GoalError::UnknownRetryReason { .. }
         | GoalError::UnknownPauseReason { .. }
         | GoalError::UnknownCriterionStatus { .. }
-        | GoalError::UnknownGoalKind { .. } => Err(format!(
+        | GoalError::UnknownGoalKind { .. } => Err(BudgetPolicyError::Permanent(format!(
             "{doing} found durable goal state this build cannot read: {error}"
-        )),
+        ))),
+        GoalError::Db(busy @ DbError::Busy { .. }) => Err(BudgetPolicyError::Database(busy)),
         GoalError::Db(error) => Ok(BudgetDecision::stop_usage_unknown(format!(
             "the goal's budget cannot be honoured because {doing} failed ({error}); the turn \
              stops rather than continue unmeasured, and can resume once the database is \
              readable"
         ))),
-        other => Err(format!("{doing} failed: {other}")),
+        other => Err(BudgetPolicyError::Permanent(format!(
+            "{doing} failed: {other}"
+        ))),
     }
 }
 
@@ -1293,8 +1310,90 @@ mod tests {
             .expect_err("a status no retry can make readable is not something a resume can fix");
 
         assert!(
-            error.contains("from_the_future"),
-            "the failure names the unreadable value: {error}"
+            matches!(&error, BudgetPolicyError::Permanent(message) if message.contains("from_the_future")),
+            "the failure names the unreadable value and no retry can fix it: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_locked_database_is_a_typed_retry_not_an_unknown_usage_stop() {
+        let database = tempfile::tempdir().expect("database dir");
+        let spill = tempfile::tempdir().expect("spill dir");
+        let path = database.path().join("goal-busy.db");
+        let store =
+            Arc::new(GoalStore::open_at(&path, spill.path().to_owned()).expect("open store"));
+        store
+            .create_goal("ses_budget", "land the port", Some(1_000))
+            .expect("create goal");
+        // Every write below reuses the one idle pooled connection; a regression should
+        // fail in 50 ms, not after the production busy timeout.
+        {
+            let pooled = store.pool().get().expect("pooled connection");
+            pooled
+                .execute_batch("PRAGMA busy_timeout = 50")
+                .expect("shorten the busy timeout");
+        }
+        let writer = rusqlite::Connection::open(&path).expect("second writer");
+        writer
+            .execute_batch("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE")
+            .expect("hold the write lock");
+        let policy = GoalBudgetPolicy::new(Arc::clone(&store));
+
+        let outcome = policy
+            .after_response(&snapshot("turn-1", 0, 200, true))
+            .await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(BudgetPolicyError::Database(DbError::Busy { .. }))
+            ),
+            "SQLITE_BUSY is a transient the goal retries after a persisted backoff, not an \
+             unmeasurable allowance that pauses it: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_busy_database_is_a_typed_retry_and_the_rest_keep_their_disposition() {
+        let busy = store_failure(
+            "charging the goal",
+            GoalError::Db(DbError::Busy {
+                retry_after: Some(Duration::from_millis(50)),
+            }),
+        );
+        assert!(
+            matches!(
+                busy,
+                Err(BudgetPolicyError::Database(DbError::Busy {
+                    retry_after: Some(delay)
+                })) if delay == Duration::from_millis(50)
+            ),
+            "the store's own delay must survive into the typed error: {busy:?}"
+        );
+
+        let unreachable = store_failure(
+            "charging the goal",
+            GoalError::Db(DbError::Query {
+                source: Box::new(std::io::Error::other("disk I/O error")),
+            }),
+        )
+        .expect("a database that cannot be reached is a stop, not an error");
+        let detail = expect_stop(unreachable, BudgetStopKind::UsageUnknown);
+        assert!(
+            detail.contains("charging the goal failed (database statement failed)"),
+            "the stop names what failed: {detail}"
+        );
+
+        let corrupt = store_failure(
+            "reading the goal",
+            GoalError::Db(DbError::Decode {
+                table: "goal".to_owned(),
+                source: serde_json::from_str::<u8>("{}").unwrap_err(),
+            }),
+        );
+        assert!(
+            matches!(corrupt, Err(BudgetPolicyError::Permanent(_))),
+            "state no retry can make readable stays permanent: {corrupt:?}"
         );
     }
 }

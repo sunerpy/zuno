@@ -12,6 +12,7 @@
 use async_trait::async_trait;
 use std::num::NonZeroU32;
 use std::time::Duration;
+use zuno_error::DbError;
 
 /// Token counts attributable to provider requests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -166,6 +167,24 @@ impl BudgetDecision {
     }
 }
 
+/// Why a [`TurnBudgetPolicy`] could not answer.
+///
+/// Typed so the loop decides recovery from the variant and never from a rendered
+/// message. A policy that reads its allowance from durable storage reports the
+/// store's own failure, and the loop classifies it exactly as it classifies any
+/// other [`DbError`]: a writer that merely holds the lock is a retry with a
+/// persisted backoff, everything else is permanent. Anything that is not a storage
+/// failure is [`Self::Permanent`], and repeating the consultation will not change it.
+#[derive(Debug, thiserror::Error)]
+pub enum BudgetPolicyError {
+    /// The store behind the allowance failed while it was read or charged.
+    #[error(transparent)]
+    Database(#[from] DbError),
+    /// The policy cannot decide, and no retry can make it able to.
+    #[error("{0}")]
+    Permanent(String),
+}
+
 /// The limits a turn runs under, consulted while the turn is still running.
 ///
 /// Both hooks default to [`BudgetDecision::Continue`], so a host that installs no
@@ -176,12 +195,14 @@ pub trait TurnBudgetPolicy: Send + Sync {
     ///
     /// # Errors
     ///
-    /// A message when the policy cannot decide, which the loop treats as a turn
-    /// failure rather than as permission to continue.
+    /// [`BudgetPolicyError::Permanent`] when the policy cannot decide, which the loop
+    /// treats as a turn failure rather than as permission to continue, and
+    /// [`BudgetPolicyError::Database`] when the store behind the allowance failed, which
+    /// the loop classifies as it classifies any other database failure.
     async fn before_request(
         &self,
         _snapshot: &TurnUsageSnapshot<'_>,
-    ) -> Result<BudgetDecision, String> {
+    ) -> Result<BudgetDecision, BudgetPolicyError> {
         Ok(BudgetDecision::Continue)
     }
 
@@ -189,11 +210,12 @@ pub trait TurnBudgetPolicy: Send + Sync {
     ///
     /// # Errors
     ///
-    /// A message when the policy cannot record or evaluate the response.
+    /// As for [`Self::before_request`], when the policy cannot record or evaluate the
+    /// response.
     async fn after_response(
         &self,
         _snapshot: &TurnUsageSnapshot<'_>,
-    ) -> Result<BudgetDecision, String> {
+    ) -> Result<BudgetDecision, BudgetPolicyError> {
         Ok(BudgetDecision::Continue)
     }
 }

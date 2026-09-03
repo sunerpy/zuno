@@ -1,5 +1,7 @@
 use async_trait::async_trait;
+use std::collections::VecDeque;
 use std::future::pending;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -798,4 +800,269 @@ async fn duplicate_profile_component_ids_fail_without_starting_effects() {
 
     assert_eq!(error, RuntimeError::DuplicateComponent("same".to_owned()));
     assert!(log.lock().expect("lifecycle log").is_empty());
+}
+
+type Script = Arc<Mutex<VecDeque<Result<(), &'static str>>>>;
+
+/// A component whose effect start and stop outcomes are scripted per call, so a test
+/// can make exactly one transition of a multi-step recovery fail.
+struct Scripted {
+    id: &'static str,
+    starts: Script,
+    stops: Script,
+}
+
+fn scripted(
+    id: &'static str,
+    starts: Vec<Result<(), &'static str>>,
+    stops: Vec<Result<(), &'static str>>,
+) -> Scripted {
+    Scripted {
+        id,
+        starts: Arc::new(Mutex::new(starts.into())),
+        stops: Arc::new(Mutex::new(stops.into())),
+    }
+}
+
+#[async_trait]
+impl Component for Scripted {
+    fn id(&self) -> &str {
+        self.id
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        let starts = Arc::clone(&self.starts);
+        let stops = Arc::clone(&self.stops);
+        context.effect("scripted", move || async move {
+            let next_start = starts.lock().expect("start script").pop_front();
+            if let Some(Err(message)) = next_start {
+                return Err(EffectError::new(message));
+            }
+            Ok::<_, EffectError>(move || async move {
+                let next_stop = stops.lock().expect("stop script").pop_front();
+                match next_stop {
+                    Some(Err(message)) => Err(EffectError::new(message)),
+                    Some(Ok(())) | None => Ok(()),
+                }
+            })
+        })
+    }
+}
+
+struct SlowStop {
+    reclaimed: Arc<AtomicBool>,
+    delay: Duration,
+}
+
+#[async_trait]
+impl Component for SlowStop {
+    fn id(&self) -> &str {
+        "slow-stop"
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        let reclaimed = Arc::clone(&self.reclaimed);
+        let delay = self.delay;
+        context.effect("process-tree", move || async move {
+            Ok::<_, EffectError>(move || async move {
+                tokio::time::sleep(delay).await;
+                reclaimed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_failed_restore_whose_cleanup_fails_is_uncertain_not_failed() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let runtime = HarnessRuntime::new("root");
+    // p1 stops cleanly when the candidate is rolled back and fails when the restore is.
+    let p1 = scripted(
+        "p1",
+        vec![],
+        vec![Ok(()), Ok(()), Err("p1 disposer lost its child")],
+    );
+    // p2 starts for the profile and for the candidate, then refuses the restore's start.
+    let p2 = scripted(
+        "p2",
+        vec![Ok(()), Ok(()), Err("p2 cannot start again")],
+        vec![],
+    );
+    runtime
+        .activate_profile(
+            HarnessProfile::new("base").with_bundle(
+                ProfileBundle::new("core")
+                    .with_component(p1)
+                    .with_component(p2),
+            ),
+        )
+        .await
+        .expect("base profile activates");
+
+    let error = runtime
+        .mount(FailingStart { id: "candidate" })
+        .await
+        .expect_err("the candidate fails to start and the restore fails too");
+
+    assert!(
+        matches!(error, RuntimeError::RestoreFailed { .. }),
+        "{error:?}"
+    );
+    let snapshot = runtime.snapshot();
+    assert_eq!(
+        snapshot.state,
+        LifecycleState::Uncertain,
+        "p1's disposer failed during the restore's rollback, so an effect may still be \
+         live; reporting a clean failure hides that: {:#?}",
+        snapshot.diagnostics
+    );
+    assert!(
+        snapshot
+            .components
+            .iter()
+            .all(|component| component.state == LifecycleState::Uncertain),
+        "{:#?}",
+        snapshot.components
+    );
+    assert!(
+        snapshot.diagnostics.iter().any(|diagnostic| {
+            diagnostic.component_id == "p1"
+                && diagnostic.phase == LifecyclePhase::Stop
+                && diagnostic.kind == LifecycleFailureKind::Uncertain
+        }),
+        "the cleanup failure is retained as evidence: {:#?}",
+        snapshot.diagnostics
+    );
+    assert!(
+        snapshot.diagnostics.iter().any(|diagnostic| {
+            diagnostic.component_id == "p2" && diagnostic.phase == LifecyclePhase::Restore
+        }),
+        "the restore failure is retained as evidence: {:#?}",
+        snapshot.diagnostics
+    );
+    assert_eq!(
+        runtime
+            .mount(greeting("later", "later", &log))
+            .await
+            .expect_err("an uncertain runtime accepts no composition change"),
+        RuntimeError::NotOperational(LifecycleState::Uncertain)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_overrunning_disposer_is_reported_but_still_runs_to_completion() {
+    let reclaimed = Arc::new(AtomicBool::new(false));
+    let runtime = HarnessRuntime::with_options(
+        "root",
+        RuntimeOptions::default().with_stop_timeout(Duration::from_millis(25)),
+    );
+    runtime
+        .mount(SlowStop {
+            reclaimed: Arc::clone(&reclaimed),
+            delay: Duration::from_millis(100),
+        })
+        .await
+        .expect("component mounts");
+
+    let error = runtime
+        .unmount("slow-stop")
+        .await
+        .expect_err("an overrun is reported, not hidden");
+
+    assert!(error.to_string().contains("timed out"), "{error}");
+    assert!(
+        !reclaimed.load(Ordering::SeqCst),
+        "the budget elapsed before the reclaim finished"
+    );
+    let snapshot = runtime.snapshot();
+    assert_eq!(snapshot.state, LifecycleState::Uncertain);
+    assert_eq!(snapshot.diagnostics[0].kind, LifecycleFailureKind::TimedOut);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        reclaimed.load(Ordering::SeqCst),
+        "the runtime cancelled the disposer at its budget instead of letting it finish \
+         reclaiming what it owns"
+    );
+}
+
+struct PatientStop {
+    delay: Duration,
+    budget: zuno_runtime::StopBudget,
+}
+
+#[async_trait]
+impl Component for PatientStop {
+    fn id(&self) -> &str {
+        "patient-stop"
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        let delay = self.delay;
+        context.effect("reaper", move || async move {
+            Ok::<_, EffectError>(move || async move {
+                tokio::time::sleep(delay).await;
+                Ok(())
+            })
+        })
+    }
+
+    fn stop_budget(&self) -> zuno_runtime::StopBudget {
+        self.budget
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_component_declared_stop_budget_outranks_the_runtime_timeout() {
+    let runtime = HarnessRuntime::with_options(
+        "root",
+        RuntimeOptions::default().with_stop_timeout(Duration::from_millis(25)),
+    );
+    runtime
+        .mount(PatientStop {
+            delay: Duration::from_secs(1),
+            budget: zuno_runtime::StopBudget::Bounded(Duration::from_secs(2)),
+        })
+        .await
+        .expect("component mounts");
+
+    runtime
+        .unmount("patient-stop")
+        .await
+        .expect("a disposer inside its own declared budget is not an overrun");
+
+    let snapshot = runtime.snapshot();
+    assert_eq!(snapshot.state, LifecycleState::Stopped);
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_zero_stop_budget_falls_back_to_the_runtime_timeout() {
+    let runtime = HarnessRuntime::with_options(
+        "root",
+        RuntimeOptions::default().with_stop_timeout(Duration::from_millis(25)),
+    );
+    runtime
+        .mount(PatientStop {
+            delay: Duration::from_secs(1),
+            budget: zuno_runtime::StopBudget::Bounded(Duration::ZERO),
+        })
+        .await
+        .expect("component mounts");
+
+    let error = runtime
+        .unmount("patient-stop")
+        .await
+        .expect_err("a zero budget cannot prove quiescence and reads as the runtime default");
+
+    assert!(error.to_string().contains("timed out"), "{error}");
+    assert_eq!(
+        runtime.snapshot().diagnostics[0].kind,
+        LifecycleFailureKind::TimedOut
+    );
 }

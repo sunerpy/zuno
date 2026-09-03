@@ -696,3 +696,162 @@ fn goal_survives_two_consecutive_compactions_with_objective_and_counters_intact(
          the objective"
     );
 }
+
+#[test]
+fn backoff_ticks_read_without_taking_the_write_lock() {
+    let database = tempfile::tempdir().expect("create database directory");
+    let spill = tempfile::tempdir().expect("create spill directory");
+    let path = database.path().join("goal-backoff.db");
+    let store =
+        Arc::new(GoalStore::open_at(&path, spill.path().to_owned()).expect("open goal store"));
+    let runs = SessionRunRegistry::new();
+    let continuation = GoalContinuation::new(Arc::clone(&store), runs.clone());
+    store
+        .create_goal("ses_backoff", "outlast a contended database", None)
+        .expect("create goal");
+    let policy = crate::GoalRetryPolicy::new(
+        Duration::from_secs(300),
+        Duration::from_secs(300),
+        0,
+        Duration::from_millis(250),
+    )
+    .expect("valid policy");
+    let retry = store
+        .schedule_retry(
+            "ses_backoff",
+            crate::GoalRetryReason::ProviderTransient,
+            None,
+            policy,
+            1_000,
+            0,
+        )
+        .expect("schedule retry")
+        .expect("active goal");
+    assert_eq!(retry.retry_at_ms, 301_000);
+
+    // A regression must fail fast rather than after the production busy timeout: every
+    // read and write below reuses the one idle pooled connection, so shorten its wait.
+    {
+        let pooled = store.pool().get().expect("check out the pooled connection");
+        pooled
+            .execute_batch("PRAGMA busy_timeout = 50")
+            .expect("shorten the busy timeout");
+    }
+    // Another session holds the database's write lock for the whole backoff.
+    let writer = rusqlite::Connection::open(&path).expect("open a second writer");
+    writer
+        .execute_batch("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE")
+        .expect("hold the write lock");
+
+    let poll_ms = i64::try_from(policy.poll_interval().as_millis()).expect("poll interval fits");
+    let ticks = (retry.retry_at_ms - retry.scheduled_at_ms) / poll_ms;
+    assert_eq!(ticks, 1_200, "a 300 s backoff polled every 250 ms");
+    for tick in 0..ticks {
+        let now_ms = retry.scheduled_at_ms + tick * poll_ms;
+        let attempt = continuation
+            .prepare_if_idle_at(
+                "ses_backoff",
+                GoalTurnMode::Work,
+                QueuedUserInput::Absent,
+                now_ms,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "tick {tick} during backoff needed the write lock another session holds; \
+                     every such tick is one write transaction of contention: {error}"
+                )
+            });
+        assert!(
+            matches!(
+                attempt,
+                ContinuationAttempt::Suppressed(ContinuationSuppression::RetryBackoff { .. })
+            ),
+            "tick {tick}: {attempt:?}"
+        );
+    }
+
+    writer
+        .execute_batch("ROLLBACK")
+        .expect("release the write lock");
+    assert!(matches!(
+        continuation
+            .prepare_if_idle_at(
+                "ses_backoff",
+                GoalTurnMode::Work,
+                QueuedUserInput::Absent,
+                retry.retry_at_ms,
+            )
+            .expect("retry at the deadline"),
+        ContinuationAttempt::Prepared(_)
+    ));
+}
+
+#[test]
+fn a_deferral_waits_for_the_backoff_to_end_before_it_is_spent() {
+    let fixture = Fixture::new();
+    fixture.create("defer across a backoff");
+    fixture
+        .store
+        .schedule_retry(
+            "ses_goal",
+            crate::GoalRetryReason::ProviderTransient,
+            None,
+            crate::GoalRetryPolicy::new(
+                Duration::from_secs(2),
+                Duration::from_secs(30),
+                0,
+                Duration::from_millis(250),
+            )
+            .expect("valid policy"),
+            1_000,
+            0,
+        )
+        .expect("schedule retry")
+        .expect("active goal");
+    assert!(
+        fixture
+            .continuation
+            .defer_once("ses_goal")
+            .expect("defer once")
+    );
+
+    // A tick inside the backoff is not an eligible continuation, so it must neither
+    // spend the deferral nor need the write that spending it takes.
+    assert!(matches!(
+        fixture
+            .continuation
+            .prepare_if_idle_at(
+                "ses_goal",
+                GoalTurnMode::Work,
+                QueuedUserInput::Absent,
+                2_000
+            )
+            .expect("tick during backoff"),
+        ContinuationAttempt::Suppressed(ContinuationSuppression::RetryBackoff { .. })
+    ));
+    // The first eligible tick after the backoff is the one the deferral suppresses.
+    assert!(matches!(
+        fixture
+            .continuation
+            .prepare_if_idle_at(
+                "ses_goal",
+                GoalTurnMode::Work,
+                QueuedUserInput::Absent,
+                3_000
+            )
+            .expect("tick at the deadline"),
+        ContinuationAttempt::Suppressed(ContinuationSuppression::DeferredOnce)
+    ));
+    assert!(matches!(
+        fixture
+            .continuation
+            .prepare_if_idle_at(
+                "ses_goal",
+                GoalTurnMode::Work,
+                QueuedUserInput::Absent,
+                3_000
+            )
+            .expect("next tick"),
+        ContinuationAttempt::Prepared(_)
+    ));
+}

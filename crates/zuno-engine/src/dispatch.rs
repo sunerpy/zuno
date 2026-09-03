@@ -426,14 +426,22 @@ impl ToolDispatcher for ToolRegistryDispatcher {
                     )
                     .await
                 {
-                    if result.interruption.is_some() {
-                        result
-                            .output
-                            .metadata
-                            .insert("afterHookError".to_owned(), json!({ "message": error }));
-                    } else {
-                        result = error_result(&tool_name, error);
-                    }
+                    // The tool has already run, so whatever it changed is real whether
+                    // or not a plugin managed to post-process the output. Rewriting a
+                    // settled result into a bare error would tell the model the effect
+                    // never happened and invite it to repeat a side effect; the result
+                    // keeps its own status and the hook failure travels with it.
+                    tracing::warn!(
+                        target: "zuno_engine::dispatch",
+                        tool = %tool_name,
+                        call_id = %call_id,
+                        error = %error,
+                        "tool after-hook failed; keeping the settled tool result"
+                    );
+                    result
+                        .output
+                        .metadata
+                        .insert("afterHookError".to_owned(), json!({ "message": error }));
                 }
                 finish_observation(lifecycle, &result);
                 result
