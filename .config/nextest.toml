@@ -4,6 +4,21 @@
 # test binaries. Absolute budgets remain opt-in for stable hosts.
 nextest-version = "0.9.103"
 
+# A hung test must fail with a name, not burn the job timeout. Every test here
+# is expected to settle in seconds; without a ceiling a deadlocked driver test
+# blocks until the CI job's own `timeout-minutes`, which reports a job timeout
+# and never names the test. Report SLOW after 60s and terminate the process
+# after four periods (240s), so nextest attributes the kill to the test.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 4 }
+
 [[profile.default.overrides]]
 filter = 'binary(startup)'
 threads-required = "num-test-threads"
+
+# The 500-turn real-driver soak is `#[ignore]`d and documented to run for hours.
+# It is skipped by default; when it is explicitly requested the default ceiling
+# must not kill it, so this binary only ever reports as slow.
+[[profile.default.overrides]]
+filter = 'binary(soak)'
+slow-timeout = { period = "300s" }

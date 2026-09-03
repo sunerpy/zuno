@@ -2307,6 +2307,33 @@ fn the_ci_gate_requires_every_job_in_the_workflow() {
     );
 }
 
+/// A deadlocked test must fail with its own name.
+///
+/// Without a per-test ceiling a driver test that stops making progress blocks until the CI
+/// job's `timeout-minutes`, which reports a job timeout and never names the test — the exact
+/// failure this batch spent ten minutes diagnosing by hand. The ceiling lives in the default
+/// nextest profile so it covers every binary, and the `#[ignore]`d soak, which is documented
+/// to run for hours when explicitly requested, is exempted rather than killed.
+#[test]
+fn a_hung_test_is_terminated_with_its_own_name_instead_of_the_job_timeout() {
+    let config_path = workspace_root().join(".config/nextest.toml");
+    let config = std::fs::read_to_string(&config_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", config_path.display()));
+
+    for required in [
+        "[profile.default]",
+        r#"slow-timeout = { period = "60s", terminate-after = 4 }"#,
+        r#"filter = 'binary(soak)'"#,
+        r#"slow-timeout = { period = "300s" }"#,
+    ] {
+        assert!(
+            config.contains(required),
+            "the nextest per-test ceiling lost {required:?}; a hung test would burn the job \
+             timeout with no test name:\n{config}"
+        );
+    }
+}
+
 /// Startup telemetry is isolated so it remains useful, but ordinary hosted CI
 /// must not turn shared-runner wall-clock variance into a product failure.
 /// Stable hosts can opt into the absolute ceilings explicitly.

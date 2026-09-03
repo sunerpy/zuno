@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -20,7 +21,7 @@ use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SubmissionSta
 use zuno_db::session::SessionCreate;
 use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, TurnEventSender};
-use zuno_engine::status::{AbortDisposition, SessionStatus};
+use zuno_engine::status::{AbortDisposition, SessionRunRegistry, SessionStatus};
 use zuno_llm::event::RequestContentBlock;
 use zuno_paths::DbLocation;
 use zuno_permission::ReplyKind;
@@ -69,6 +70,69 @@ fn native_pty_command(script: &str) -> (String, Vec<String>) {
     ("sh".to_owned(), vec!["-c".to_owned(), script.to_owned()])
 }
 
+/// Upper bound for every test-support wait in this suite.
+///
+/// `#[tokio::test]` installs no default timeout, so an unbounded wait turns a
+/// driver regression into a hung suite instead of a failure: nothing is left to
+/// wake the waiter, no timer is pending, and the run burns the whole CI job
+/// without ever naming a test. Every wait below is satisfied by an in-process
+/// notify in microseconds, so this ceiling keeps orders of magnitude of headroom
+/// on a loaded host and fires only when the driver stopped making progress.
+const WAIT_LIMIT: Duration = Duration::from_secs(60);
+
+/// Awaits `wait`, or fails naming what was awaited and what `observed` reported.
+async fn bounded_wait<T>(
+    what: &str,
+    wait: impl Future<Output = T>,
+    observed: impl FnOnce() -> String,
+) -> T {
+    match tokio::time::timeout(WAIT_LIMIT, wait).await {
+        Ok(value) => value,
+        Err(_elapsed) => panic!(
+            "waited {WAIT_LIMIT:?} for {what} with no progress; observed {}",
+            observed()
+        ),
+    }
+}
+
+/// Spins until `ready` holds, under the same ceiling as [`bounded_wait`].
+async fn bounded_until(
+    what: &str,
+    mut ready: impl FnMut() -> bool,
+    observed: impl FnOnce() -> String,
+) {
+    bounded_wait(
+        what,
+        async {
+            while !ready() {
+                tokio::task::yield_now().await;
+            }
+        },
+        observed,
+    )
+    .await;
+}
+
+/// Waits for one session's live turn to end, bounded so a stuck driver fails.
+///
+/// [`SessionRunRegistry::wait_until_idle`] is deliberately unbounded, because a
+/// host waiting on a real turn must keep waiting. A test needs the opposite, so
+/// the ceiling belongs here rather than in the engine.
+async fn wait_until_session_idle(runs: &SessionRunRegistry, session_id: &str) {
+    bounded_wait(
+        &format!("session `{session_id}` to release its turn lease"),
+        runs.wait_until_idle(session_id),
+        || {
+            format!(
+                "status={:?}, active sessions={:?}",
+                runs.status(session_id),
+                runs.active_sessions()
+            )
+        },
+    )
+    .await;
+}
+
 #[derive(Debug, Default)]
 struct BlockingMutationExecutor {
     prompt_started: Arc<AtomicBool>,
@@ -80,14 +144,28 @@ struct BlockingMutationExecutor {
 
 impl BlockingMutationExecutor {
     async fn wait_until_prompt_started(&self) {
-        loop {
-            let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
-            notified.as_mut().enable();
-            if self.prompt_started.load(Ordering::SeqCst) {
-                return;
-            }
-            notified.await;
-        }
+        bounded_wait(
+            "the executor to start its first execution",
+            async {
+                loop {
+                    let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
+                    notified.as_mut().enable();
+                    if self.prompt_started.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    notified.await;
+                }
+            },
+            || {
+                format!(
+                    "started={}, prompts={:?}, report batches={:?}",
+                    self.prompt_started.load(Ordering::SeqCst),
+                    self.prompt_ids(),
+                    self.report_batch_sizes()
+                )
+            },
+        )
+        .await;
     }
 
     fn prompts(&self) -> Vec<SessionPromptExecution> {
@@ -98,14 +176,27 @@ impl BlockingMutationExecutor {
     }
 
     async fn wait_until_prompt_count(&self, count: usize) {
-        loop {
-            let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
-            notified.as_mut().enable();
-            if self.prompts().len() >= count {
-                return;
-            }
-            notified.await;
-        }
+        bounded_wait(
+            &format!("{count} started prompt execution(s)"),
+            async {
+                loop {
+                    let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
+                    notified.as_mut().enable();
+                    if self.prompts().len() >= count {
+                        return;
+                    }
+                    notified.await;
+                }
+            },
+            || {
+                format!(
+                    "prompts={:?}, report batches={:?}",
+                    self.prompt_ids(),
+                    self.report_batch_sizes()
+                )
+            },
+        )
+        .await;
     }
 
     fn report_batches(&self) -> Vec<SessionReportExecution> {
@@ -115,16 +206,45 @@ impl BlockingMutationExecutor {
             .clone()
     }
 
+    /// The admitted message id of every prompt this executor was asked to run.
+    fn prompt_ids(&self) -> Vec<String> {
+        self.prompts()
+            .into_iter()
+            .map(|prompt| prompt.message_id)
+            .collect()
+    }
+
+    /// How many reports each batch carried, in the order the batches arrived.
+    fn report_batch_sizes(&self) -> Vec<usize> {
+        self.report_batches()
+            .iter()
+            .map(|batch| batch.reports.len())
+            .collect()
+    }
+
     /// Wait for this many provider requests, counting a whole report batch as one.
     async fn wait_until_execution_count(&self, count: usize) {
-        loop {
-            let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
-            notified.as_mut().enable();
-            if self.prompts().len() + self.report_batches().len() >= count {
-                return;
-            }
-            notified.await;
-        }
+        bounded_wait(
+            &format!("{count} provider execution(s)"),
+            async {
+                loop {
+                    let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
+                    notified.as_mut().enable();
+                    if self.prompts().len() + self.report_batches().len() >= count {
+                        return;
+                    }
+                    notified.await;
+                }
+            },
+            || {
+                format!(
+                    "prompts={:?}, report batches={:?}",
+                    self.prompt_ids(),
+                    self.report_batch_sizes()
+                )
+            },
+        )
+        .await;
     }
 }
 
@@ -235,14 +355,26 @@ struct BlockingCompactMutationExecutor {
 
 impl BlockingCompactMutationExecutor {
     async fn wait_until_compact_started(&self) {
-        loop {
-            let mut notified = std::pin::pin!(self.compact_started_notify.notified());
-            notified.as_mut().enable();
-            if self.compact_started.load(Ordering::SeqCst) {
-                return;
-            }
-            notified.await;
-        }
+        bounded_wait(
+            "the executor to take the compaction lease",
+            async {
+                loop {
+                    let mut notified = std::pin::pin!(self.compact_started_notify.notified());
+                    notified.as_mut().enable();
+                    if self.compact_started.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    notified.await;
+                }
+            },
+            || {
+                format!(
+                    "compaction started={}",
+                    self.compact_started.load(Ordering::SeqCst)
+                )
+            },
+        )
+        .await;
     }
 
     fn release_compact(&self) {
@@ -1087,9 +1219,18 @@ fn shell_permission(id: &str, session_id: &str, save: Vec<String>) -> Permission
 
 /// Waits for `session_id` to have a request parked in the broker.
 async fn await_parked(requests: &RequestBroker, session_id: &str) {
-    while requests.permissions(Some(session_id)).is_empty() {
-        tokio::task::yield_now().await;
-    }
+    bounded_until(
+        &format!("session `{session_id}` to park a permission ask in the broker"),
+        || !requests.permissions(Some(session_id)).is_empty(),
+        || {
+            format!(
+                "parked for this session={}, parked overall={}",
+                requests.permissions(Some(session_id)).len(),
+                requests.permissions(None).len()
+            )
+        },
+    )
+    .await;
 }
 
 /// Asks, replies `always` once the ask parks, and returns what the asker received.
@@ -1369,9 +1510,12 @@ async fn api_reply_routes_validate_bodies_before_rejecting_cross_session_request
                 .await
         }
     });
-    while requests.permissions(None).is_empty() {
-        tokio::task::yield_now().await;
-    }
+    bounded_until(
+        "an unowned permission ask to park in the broker",
+        || !requests.permissions(None).is_empty(),
+        || format!("parked permissions={}", requests.permissions(None).len()),
+    )
+    .await;
 
     let malformed_permission = app
         .clone()
@@ -1428,9 +1572,12 @@ async fn api_reply_routes_validate_bodies_before_rejecting_cross_session_request
                 .await
         }
     });
-    while requests.questions(None).is_empty() {
-        tokio::task::yield_now().await;
-    }
+    bounded_until(
+        "an unowned question ask to park in the broker",
+        || !requests.questions(None).is_empty(),
+        || format!("parked questions={}", requests.questions(None).len()),
+    )
+    .await;
 
     let malformed_question = app
         .clone()
@@ -1538,9 +1685,12 @@ async fn malformed_owned_question_reply_rejects_and_removes_the_request() {
                 .await
         }
     });
-    while requests.questions(None).is_empty() {
-        tokio::task::yield_now().await;
-    }
+    bounded_until(
+        "an unowned question ask to park in the broker",
+        || !requests.questions(None).is_empty(),
+        || format!("parked questions={}", requests.questions(None).len()),
+    )
+    .await;
 
     let malformed = app
         .oneshot(request(
@@ -1584,6 +1734,9 @@ async fn permission_without_an_observer_is_rejected_by_the_deadline() {
                 .await
         }
     });
+    // A ceiling cannot help this spin: a `yield_now` loop keeps the runtime runnable,
+    // so this test's paused clock never auto-advances and a `timeout` here would never
+    // fire. `.config/nextest.toml`'s `terminate-after` is what names this test in CI.
     while requests.permissions(None).is_empty() {
         tokio::task::yield_now().await;
     }
@@ -1621,6 +1774,9 @@ async fn question_without_an_observer_is_rejected_by_the_deadline() {
                 .await
         }
     });
+    // A ceiling cannot help this spin: a `yield_now` loop keeps the runtime runnable,
+    // so this test's paused clock never auto-advances and a `timeout` here would never
+    // fire. `.config/nextest.toml`'s `terminate-after` is what names this test in CI.
     while requests.questions(None).is_empty() {
         tokio::task::yield_now().await;
     }
@@ -1844,7 +2000,17 @@ async fn api_interrupt_source_reaches_the_durable_turn_event() {
         .await
         .expect("prompt responds");
     assert_eq!(response.status(), StatusCode::OK);
-    executor.started.notified().await;
+    bounded_wait(
+        "the executor to report that the interrupted turn started",
+        executor.started.notified(),
+        || {
+            format!(
+                "session status={:?}",
+                services.runs.status("ses_interrupt_event")
+            )
+        },
+    )
+    .await;
 
     let interrupted = app
         .oneshot(request(
@@ -1855,7 +2021,7 @@ async fn api_interrupt_source_reaches_the_durable_turn_event() {
         .await
         .expect("interrupt responds");
     assert_eq!(interrupted.status(), StatusCode::NO_CONTENT);
-    services.runs.wait_until_idle("ses_interrupt_event").await;
+    wait_until_session_idle(&services.runs, "ses_interrupt_event").await;
 
     let event_log = SessionEventLog::new(fixture.pool);
     let properties = tokio::time::timeout(Duration::from_secs(1), async {
@@ -1996,7 +2162,7 @@ async fn api_busy_steer_is_durable_and_runs_after_the_active_prompt() {
         services.runs.abort("ses_queued", api_cancel()),
         AbortDisposition::Active
     );
-    services.runs.wait_until_idle("ses_queued").await;
+    wait_until_session_idle(&services.runs, "ses_queued").await;
 }
 
 #[tokio::test]
@@ -2071,7 +2237,7 @@ async fn api_prompt_driver_runs_a_durable_subagent_report_before_later_user_inpu
         services.runs.abort("ses_report", api_cancel()),
         AbortDisposition::Active
     );
-    services.runs.wait_until_idle("ses_report").await;
+    wait_until_session_idle(&services.runs, "ses_report").await;
 }
 
 /// Three settled reports must cost one provider request on this surface too, and the
@@ -2185,7 +2351,7 @@ async fn api_prompt_driver_runs_every_settled_report_as_one_request() {
         services.runs.abort("ses_batch", api_cancel()),
         AbortDisposition::Active
     );
-    services.runs.wait_until_idle("ses_batch").await;
+    wait_until_session_idle(&services.runs, "ses_batch").await;
 }
 
 /// A payload no writer publishes is left untouched instead of promoted and settled
@@ -2233,7 +2399,7 @@ async fn api_prompt_driver_skips_a_malformed_durable_input_without_stranding_the
         services.runs.abort("ses_malformed", api_cancel()),
         AbortDisposition::Active
     );
-    services.runs.wait_until_idle("ses_malformed").await;
+    wait_until_session_idle(&services.runs, "ses_malformed").await;
 
     let unrecognized = SessionInbox::new(Arc::clone(&fixture.pool))
         .get("ses_malformed", "input_malformed")
@@ -2292,7 +2458,7 @@ async fn api_prompt_driver_leaves_another_surfaces_pending_input_untouched() {
         services.runs.abort("ses_foreign", api_cancel()),
         AbortDisposition::Active
     );
-    services.runs.wait_until_idle("ses_foreign").await;
+    wait_until_session_idle(&services.runs, "ses_foreign").await;
 
     let terminal = inbox
         .get("ses_foreign", "input_tui")
@@ -2399,7 +2565,7 @@ async fn api_prompt_driver_fails_an_unreadable_report_and_runs_the_rest_of_the_b
         services.runs.abort("ses_unreadable", api_cancel()),
         AbortDisposition::Active
     );
-    services.runs.wait_until_idle("ses_unreadable").await;
+    wait_until_session_idle(&services.runs, "ses_unreadable").await;
 }
 
 /// Every asynchronous report shape reaches the model as plain text, and shapes that
@@ -2473,7 +2639,7 @@ async fn api_prompt_driver_delivers_every_asynchronous_report_shape() {
             AbortDisposition::Active
         );
     }
-    services.runs.wait_until_idle("ses_reports").await;
+    wait_until_session_idle(&services.runs, "ses_reports").await;
     let batches = executor.report_batches();
     assert_eq!(
         batches.len(),
@@ -3152,8 +3318,14 @@ async fn api_maintenance_preview_is_inert_and_emits_ordered_progress() {
     );
 
     let mut phases = Vec::new();
-    for _ in 0..5 {
-        let delivery = progress.recv().await.expect("progress stream remains open");
+    for expected in 1..=5 {
+        let delivery = bounded_wait(
+            &format!("maintenance progress event {expected} of 5"),
+            progress.recv(),
+            || format!("phases so far={phases:?}"),
+        )
+        .await
+        .expect("progress stream remains open");
         let Delivery::Event(event) = delivery else {
             panic!("progress must not lag");
         };
@@ -3925,14 +4097,27 @@ struct CompactionLeaseExecutor {
 
 impl CompactionLeaseExecutor {
     async fn wait_until_compact_started(&self) {
-        loop {
-            let mut notified = std::pin::pin!(self.compact_started_notify.notified());
-            notified.as_mut().enable();
-            if self.compact_started.load(Ordering::SeqCst) {
-                return;
-            }
-            notified.await;
-        }
+        bounded_wait(
+            "the executor to take the compaction lease",
+            async {
+                loop {
+                    let mut notified = std::pin::pin!(self.compact_started_notify.notified());
+                    notified.as_mut().enable();
+                    if self.compact_started.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    notified.await;
+                }
+            },
+            || {
+                format!(
+                    "compaction started={}, prompts={}",
+                    self.compact_started.load(Ordering::SeqCst),
+                    self.prompts().len()
+                )
+            },
+        )
+        .await;
     }
 
     fn prompts(&self) -> Vec<SessionPromptExecution> {
@@ -3943,14 +4128,27 @@ impl CompactionLeaseExecutor {
     }
 
     async fn wait_until_prompt_count(&self, count: usize) {
-        loop {
-            let mut notified = std::pin::pin!(self.prompt_notify.notified());
-            notified.as_mut().enable();
-            if self.prompts().len() >= count {
-                return;
-            }
-            notified.await;
-        }
+        bounded_wait(
+            &format!("{count} prompt execution(s) after the compaction lease"),
+            async {
+                loop {
+                    let mut notified = std::pin::pin!(self.prompt_notify.notified());
+                    notified.as_mut().enable();
+                    if self.prompts().len() >= count {
+                        return;
+                    }
+                    notified.await;
+                }
+            },
+            || {
+                format!(
+                    "compaction started={}, prompts={}",
+                    self.compact_started.load(Ordering::SeqCst),
+                    self.prompts().len()
+                )
+            },
+        )
+        .await;
     }
 }
 
@@ -4115,5 +4313,5 @@ async fn api_prompt_queued_during_compaction_runs_after_the_lease_is_released() 
             .collect::<Vec<_>>(),
         vec!["msg_after_compaction"]
     );
-    services.runs.wait_until_idle("ses_compact_queue").await;
+    wait_until_session_idle(&services.runs, "ses_compact_queue").await;
 }
