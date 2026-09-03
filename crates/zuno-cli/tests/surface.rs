@@ -1077,6 +1077,49 @@ fn surface_documentation_never_offers_a_run_option_the_parser_rejects() {
     assert!(offences.is_empty(), "{}", offences.join("\n"));
 }
 
+/// **No page offers a `zuno serve` option the parser rejects.**
+///
+/// `--mdns`, `--mdns-domain` and `--cors` were declared only so every invocation that
+/// used them could be refused, and this batch removed all six sites. The sibling guard
+/// above exists because the `run` half of that same removal left stale pages behind; the
+/// `serve` half had no guard at all, so nothing stopped the class from returning here.
+/// The one page per language that records the removal is allowed to name the options in
+/// prose, but not in an option table row, which is what a reader scans for a flag to use.
+#[test]
+fn surface_documentation_never_offers_a_serve_option_the_parser_rejects() {
+    /// The one page per language that says these options were removed.
+    const REMOVAL_RECORD: &[&str] = &["docs/cli/serve.md", "docs/zh/cli/serve.md"];
+    const REMOVED_SERVE_OPTIONS: &[&str] = &["--mdns", "--mdns-domain", "--cors"];
+
+    let mut offences = Vec::new();
+    for (page, text) in documentation_pages() {
+        let records_the_removal = REMOVAL_RECORD.contains(&page.as_str());
+        let mut invocation = false;
+        for (index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            let number = index + 1;
+            invocation = invocation || line.contains("zuno serve");
+            for option in REMOVED_SERVE_OPTIONS {
+                if invocation && line.contains(option) {
+                    offences.push(format!("{page}:{number} serves {option}: {line}"));
+                }
+                if records_the_removal && line.starts_with("| `") && line.contains(option) {
+                    offences.push(format!("{page}:{number} tabulates {option}: {line}"));
+                }
+                if !records_the_removal && line.contains(option) {
+                    offences.push(format!("{page}:{number} mentions {option}: {line}"));
+                }
+            }
+            invocation = invocation && line.ends_with('\\');
+        }
+    }
+    assert!(
+        offences.is_empty(),
+        "these pages still offer a `zuno serve` option the parser rejects:\n{}",
+        offences.join("\n")
+    );
+}
+
 /// **No page anywhere offers `zuno agent create`.**
 ///
 /// Authoring an agent is writing a Markdown file under `.zuno/agent/`, and the

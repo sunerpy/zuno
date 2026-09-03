@@ -527,16 +527,6 @@ fn finish_server_mutation(
 }
 
 pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Result<(), String> {
-    if args.mdns {
-        return Err("--mdns is not supported by the Rust server runtime yet".to_owned());
-    }
-    if args.mdns_domain != "zuno.local" {
-        return Err("--mdns-domain requires --mdns, which is not supported yet".to_owned());
-    }
-    if !args.cors.is_empty() {
-        return Err("--cors is not supported by the Rust server runtime yet".to_owned());
-    }
-
     let directory_path = std::env::current_dir().map_err(|error| error.to_string())?;
     let directory = directory_path.to_string_lossy().into_owned();
     let auth = AuthConfig::from_env();
@@ -722,9 +712,6 @@ mod tests {
         ServeArgs {
             port,
             hostname: hostname.map(str::to_owned),
-            mdns: false,
-            mdns_domain: "zuno.local".to_owned(),
-            cors: Vec::new(),
             browser_auth: false,
         }
     }
@@ -736,7 +723,6 @@ mod tests {
         zuno_config::schema::ServerConfig {
             port: port.and_then(std::num::NonZeroU32::new),
             hostname: hostname.map(str::to_owned),
-            ..Default::default()
         }
     }
 

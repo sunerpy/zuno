@@ -29,11 +29,8 @@ zuno serve [OPTIONS]
 | `--port <PORT>` | 监听端口。不传时由 `server.port` 决定；该键也未设置时使用操作系统分配的端口 | |
 | `-v`, `--version` | 显示 Zuno 包版本 | |
 | `--hostname <HOSTNAME>` | 绑定的 hostname。不传时由 `server.hostname` 决定；该键也未设置时使用 `127.0.0.1` | |
-| `--mdns` | | |
 | `--print-logs` | 除结构化本地日志存储之外，同时把日志打印到 stderr | |
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
-| `--mdns-domain <MDNS_DOMAIN>` | | `zuno.local` |
-| `--cors <CORS>` | | |
 | `--browser-auth` | 启用单次回环浏览器 bootstrap 与签名 session Cookie | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
@@ -78,7 +75,9 @@ ZUNO_SERVER_PASSWORD='replace-with-a-secret' \
 zuno serve --port 4096 --print-logs --log-level DEBUG
 ```
 
-`--mdns`、`--mdns-domain` 与 `--cors` 已保留，但当前 Rust server runtime 尚未实现。
+`--mdns`、`--mdns-domain` 与 `--cors` 在早先的版本里可以被接受，但每一次给出它们的调用都会
+被拒绝 —— 因为它们背后没有任何实现。现在它们完全不再被接受：脚本传入其中之一会在解析阶段就
+失败，而不是在进程启动之后。
 
 ## 参见
 

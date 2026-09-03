@@ -12,7 +12,7 @@
 //! Entering raw mode and the alternate screen on a pipe writes escape sequences
 //! into whatever is reading it and leaves no way to type the key that exits. The
 //! refusal names `run` because that is the surface a non-interactive caller wants,
-//! and it is the same reason `run` refuses `--interactive`.
+//! and it is the same reason `run` no longer accepts `--interactive` at all.
 //!
 //! # The turn runs beside the loop, never inside it
 //!

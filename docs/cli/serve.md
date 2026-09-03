@@ -41,11 +41,8 @@ zuno serve [OPTIONS]
 | `--port <PORT>` | Port to listen on. Absent means `server.port` decides, and an unset key means an operating-system assigned port | |
 | `-v`, `--version` | Show the Zuno package version | |
 | `--hostname <HOSTNAME>` | Hostname to bind. Absent means `server.hostname` decides, and an unset key means `127.0.0.1` | |
-| `--mdns` | | |
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
-| `--mdns-domain <MDNS_DOMAIN>` | | `zuno.local` |
-| `--cors <CORS>` | | |
 | `--browser-auth` | Enable one-time loopback browser bootstrap and signed session cookies | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
@@ -92,8 +89,10 @@ Watch the server's own log stream on stderr while diagnosing a client that fails
 zuno serve --port 4096 --print-logs --log-level DEBUG
 ```
 
-`--mdns`, `--mdns-domain`, and `--cors` are reserved but are not implemented by
-the current Rust server runtime.
+`--mdns`, `--mdns-domain`, and `--cors` were accepted by earlier releases and rejected
+by every invocation that named one, because no implementation stood behind them. They
+are no longer accepted at all, so a script that passes one now fails while parsing
+instead of after the process starts.
 
 ## See also
 

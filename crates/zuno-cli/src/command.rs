@@ -301,12 +301,6 @@ pub struct ServeArgs {
     /// means `127.0.0.1`.
     #[arg(long)]
     pub hostname: Option<String>,
-    #[arg(long, default_value_t = false)]
-    pub mdns: bool,
-    #[arg(long, default_value = "zuno.local")]
-    pub mdns_domain: String,
-    #[arg(long)]
-    pub cors: Vec<String>,
     /// Enable one-time loopback browser bootstrap and signed session cookies.
     #[arg(long, default_value_t = false)]
     pub browser_auth: bool,
@@ -1382,13 +1376,19 @@ mod tests {
         ));
     }
 
+    /// `serve` accepted `--mdns`, `--mdns-domain` and `--cors` in order to refuse every
+    /// invocation that named one. Nothing stood behind them, so they are gone and the
+    /// parser is where the caller now learns that — before a process opens a database.
     #[test]
-    fn serve_uses_the_zuno_mdns_domain_by_default() {
-        let cli = Cli::try_parse_from(["zuno", "serve"]).expect("serve parses");
-        let Some(Command::Serve(args)) = cli.command else {
-            panic!("expected serve command");
-        };
-        assert_eq!(args.mdns_domain, "zuno.local");
+    fn serve_rejects_the_options_it_could_only_refuse() {
+        for argv in [
+            ["zuno", "serve", "--mdns"].as_slice(),
+            ["zuno", "serve", "--mdns-domain", "example.local"].as_slice(),
+            ["zuno", "serve", "--cors", "https://example.test"].as_slice(),
+        ] {
+            let error = Cli::try_parse_from(argv).expect_err("serve rejects the option");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
     }
 
     #[test]
