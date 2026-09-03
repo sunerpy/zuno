@@ -1002,6 +1002,14 @@ pending for the next scan. Driving one turn per row instead made a fan-out that
 settled together arrive as a stream of turns, each announcing a state a later
 report in the same batch had already replaced.
 
+Admission never waits behind a delivery. A background command's completion is
+admitted as a durable inbox row before any turn is requested, and the watcher
+admits every settlement already waiting behind it in the same pass, so a group of
+background commands that finished together is one batch and a restarted process
+that finds several terminal commands delivers them as one batch too. A command
+that settles while a delivery turn is already running is admitted immediately and
+joins the next batch, because its report cannot exist before it settles.
+
 Reports are grouped by the work they describe when a batch is rendered. Where a
 batch carries several reports for one job or background execution, only the report
 whose work completed last is presented as that work's current state; the earlier
