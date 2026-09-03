@@ -70,6 +70,16 @@ The remote download cache is private state. It is created only when
 `skills.urls` actually downloads a file and is never installed as a filesystem
 watch root.
 
+A `skills.urls` index decides what goes into that cache, and it is remote input, so
+Zuno bounds what it may name. An index entry's
+`name` must be a single directory segment: an absolute name, one containing `..`, and one
+containing a path separator are all skipped with a warning, and nothing is downloaded for
+them. The rule matters because a versioned entry is refreshed by staging the download
+beside the target directory and then renaming the directory's current contents away and
+deleting them — an unchecked name could have aimed that at your own Skill directory
+instead of the cache. See
+[Remote Skill indexes](/config/authoring-skills#remote-skill-indexes).
+
 If a caller tries to load an old exact source after a rename, Zuno refreshes
 once and then returns `CatalogStale` with the current exact locators. It never
 guesses between duplicate names.

@@ -60,7 +60,7 @@ tmp        /tmp/zuno
 | --- | --- |
 | `ZUNO_CONFIG` | 把一个显式配置文件作为高优先级层加入 |
 | `ZUNO_CONFIG_DIR` | 把一个包含 `zuno.json[c]` 的目录作为可切换覆盖层加入 |
-| `ZUNO_CONFIG_CONTENT` | 以内联方式提供最后一层，用于受管或临时环境 |
+| `ZUNO_CONFIG_CONTENT` | 以内联方式提供最后一层，用于受管或临时环境。它与 `ZUNO_*` 命名空间的其余部分一样不会交给 `shell` 工具，因为这一层可以内联携带 `provider.<id>.options.apiKey` —— 参见[认证](/zh/config/authentication) |
 
 ```sh
 ZUNO_CONFIG="$HOME/audit/zuno.json" zuno debug config

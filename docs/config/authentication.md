@@ -97,10 +97,13 @@ that variable, Zuno does not persist rotated OAuth tokens back to disk, because
 there is no file it owns.
 
 The variable is withheld from the `shell` tool, so a command the model composes
-cannot read the injected credentials. A nested `zuno` started from inside such a
-command therefore does not inherit them and resolves credentials the ordinary way,
-which means it needs its own credential store or configuration. Plan for that in a
-container that supplies credentials only through the environment. See
+cannot read the injected credentials. The whole `ZUNO_*` namespace is withheld, not
+just this variable, which closes the same leak by the other route: an inline
+`provider.<id>.options.apiKey` supplied through `ZUNO_CONFIG_CONTENT` is a provider
+credential too, and it is withheld as well. A nested `zuno` started from inside such
+a command therefore inherits neither, and resolves configuration and credentials the
+ordinary way, which means it needs its own credential store or configuration. Plan
+for that in a container that supplies credentials only through the environment. See
 [Tools](/guide/tools#what-a-shell-command-inherits).
 
 Putting `apiKey` directly in `zuno.json` is supported but exposes a secret to

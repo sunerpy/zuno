@@ -284,31 +284,66 @@ than coming back blank.
 ## What a shell command inherits
 
 A `shell` call runs with the host environment the Zuno process itself has, minus
-Zuno's own secrets. Three variables are removed before the command is assembled:
+Zuno's own. `ZUNO_*` is Zuno's private configuration namespace, and the whole namespace
+is withheld from a model-composed command:
 
-| Variable | What it holds |
+| Variable | Treatment |
 | --- | --- |
-| `ZUNO_AUTH_CONTENT` | Injected provider credentials, replacing the credential store |
-| `ZUNO_SERVER_PASSWORD` | The HTTP server's Basic authentication password |
-| `ZUNO_SERVER_USERNAME` | The account name that password belongs to |
+| `ZUNO_*` | Withheld in full. Not one name in the namespace is inherited, including the ones that look like bare identity |
+| `ZUNO`, `AGENT` | Inherited. The bare markers saying a process was launched by Zuno are outside the namespace |
+| Everything else | Inherited |
 
-Names are compared case-insensitively, because Windows environment variable names
-are. Removal happens before any host-supplied environment hook, so the host stays
-the single place that decides what a model-composed command may read, and nothing
-in the shipped configuration puts these three back.
+This is a namespace rule rather than a list of the variables known to hold a secret,
+because a list has to stay right for every variable Zuno ever reads and was wrong once
+already. `ZUNO_AUTH_CONTENT` was withheld while `ZUNO_CONFIG_CONTENT` was not — the same
+injected-document shape, carrying the same provider keys under
+`provider.<id>.options.apiKey`, but it arrived as configuration rather than as
+credentials. Withholding the namespace has to be right once, and the next variable Zuno
+reads is withheld before anyone has to notice what it holds.
 
-Everything else is inherited on purpose. A wildcard filter over `*_API_KEY` and
-`*_TOKEN` was considered and rejected: it silently breaks `gh`, `aws`, `az`, and
-`gcloud`, along with every user who exports a token because a command needs it. A
-tool that quietly removes the credential a command requires fails worse than one
-that keeps it, because the removal surfaces later as an unexplained authentication
-error somewhere else.
+There is no allowlist. An earlier release inherited three names — `ZUNO_PID`,
+`ZUNO_CLIENT`, and `ZUNO_WORKSPACE_ID` — on the reasoning that a pid, a client surface,
+and a workspace identifier are none of them a document or a credential. That is true of
+each value and beside the point: the pid is the *address* of every document withheld
+above. On an unconfined path `tr '\0' '\n' < /proc/$ZUNO_PID/environ` on Linux, or
+`ps eww $ZUNO_PID` on macOS, reads the Zuno process environment straight back, so handing
+the pid to a model-composed command turned a discovery step into a one-liner. The other
+two went with it because nothing outside Zuno reads them: `ZUNO_CLIENT` is read by Zuno
+itself in process, and `ZUNO_WORKSPACE_ID` by nothing beyond the CLI's own flag snapshot.
+A script that only needs to know it is running under Zuno reads `ZUNO` or `AGENT`, which
+are outside the namespace and untouched.
 
-One consequence is worth stating plainly. A nested `zuno` launched from inside a
-`shell` call no longer inherits `ZUNO_AUTH_CONTENT`, so it resolves credentials the
-ordinary way and needs its own configuration or credential store. The interactive
-terminal is unaffected, because its shell is driven by you rather than composed by
-a model.
+Names are compared case-insensitively, because Windows environment variable names are, so
+`%zuno_server_password%` names the same secret there. The fold is only ever allowed to
+grow the withheld set: it decides what is *removed*, and there is no allowlist for it to
+collapse a name onto. That direction matters — with an allowlist, a Linux `ZUNO_Pid` is a
+different variable from `ZUNO_PID` and could hold anything, and a case-insensitive
+comparison would have inherited it for looking like an allowlisted name.
+
+Removal happens before any host-supplied environment hook, so the host stays the single
+place that decides what a model-composed command may read. A deployment that genuinely
+needs a value in the tool environment puts it back through that hook, deliberately;
+nothing in the shipped configuration puts one back.
+
+Everything outside the namespace is inherited on purpose. A wildcard filter over
+`*_API_KEY` and `*_TOKEN` was considered and rejected: it silently breaks `gh`, `aws`,
+`az`, and `gcloud`, along with every user who exports a token because a command needs it.
+A tool that quietly removes the credential a command requires fails worse than one that
+keeps it, because the removal surfaces later as an unexplained authentication error
+somewhere else.
+
+One consequence is worth stating plainly. A nested `zuno` launched from inside a `shell`
+call inherits none of that namespace — not `ZUNO_CONFIG_CONTENT`, `ZUNO_CONFIG`,
+`ZUNO_CONFIG_DIR`, `ZUNO_DB`, the `ZUNO_MODELS_*` variables, or the `ZUNO_SANDBOX_*`
+variables — so it resolves configuration, credentials, and its database the ordinary way,
+and needs its own. The interactive terminal is unaffected, because its shell is driven by
+you rather than composed by a model.
+
+Withholding is defence in depth, not a containment boundary. On an unconfined path the
+Zuno process environment is still readable from the host, so a variable being absent from
+the command's own environment raises the cost of reading it rather than guaranteeing it
+cannot be read. Sandboxing is what narrows that; this removal is what stops one `env` or
+one `printenv` from being enough.
 
 ## Effect classification
 

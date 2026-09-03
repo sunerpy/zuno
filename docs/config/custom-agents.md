@@ -44,6 +44,30 @@ Report findings as a list. Do not edit files.
 Prefer Markdown when the prompt is long enough that JSON string escaping hurts, and
 JSON when the definition is mostly capability fields.
 
+Frontmatter keeps the order you wrote it in, which matters for one field. A
+`permission.rules` block is evaluated last-match-wins over the author's key order, and
+frontmatter used to be alphabetized before the agent definition was built, so a deny
+that shadowed a catch-all could arrive shadowed by it instead. It no longer is: the
+rules reach the evaluator in the order the file states them.
+
+```markdown
+---
+description: Reviews a diff and reports findings without editing
+mode: subagent
+permission:
+  rules:
+    read:
+      "*": allow
+      "$HOME/.ssh/*": deny
+---
+
+Report findings as a list. Do not edit files.
+```
+
+That order is load-bearing. `$HOME/.ssh/*` sorts before `*`, so alphabetizing this block
+would put the deny above the catch-all and the catch-all would then win, which is the
+opposite of what the file says.
+
 ## Every field
 
 | Key | Type | Default | Description |
@@ -135,6 +159,15 @@ The `permission` object mirrors the global one:
 
 Explicit denies remain terminal in every mode, including `allow_all`. That asymmetry
 is the whole point: `allow_all` removes prompts, not restrictions.
+
+`rules` is ordered and the last matching rule wins, and an agent definition is often the
+overlay on top of another layer, so the merge order is worth knowing. The base layer's
+rule order is kept. A key both layers set is replaced where the base layer put it, and a
+key only the overlay sets is appended after the base layer's keys — so an overlay pattern
+outranks a base catch-all. That is the useful direction: an agent narrows a broad rule by
+naming the exception, without restating the broad rule. Merging used to re-sort those keys
+alphabetically whenever a second layer existed; it no longer does. Read the result back
+with `zuno debug agent <name>` rather than predicting it.
 
 ## Model routing for agents
 

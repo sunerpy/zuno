@@ -74,10 +74,12 @@ printf '%s' "$OPENAI_API_KEY" | zuno auth login openai --method api-key
 
 `ZUNO_AUTH_CONTENT` 是面向临时与受管环境的机制 —— 容器、CI，或者在启动时注入的密钥管理器。当凭据来自那个变量时，Zuno 不会把轮换后的 OAuth token 写回磁盘，因为它并不拥有任何文件。
 
-这个变量不会交给 `shell` 工具，因此模型组装出来的命令读不到注入的凭据。从这类命令内部
-启动的嵌套 `zuno` 也就不会继承它，而是按普通方式解析凭据，需要自己的凭据存储或配置。
-在只靠环境提供凭据的容器里要为这一点做好安排。参见
-[工具](/zh/guide/tools#一条-shell-命令继承什么)。
+这个变量不会交给 `shell` 工具，因此模型组装出来的命令读不到注入的凭据。被扣留的是整个
+`ZUNO_*` 命名空间，而不只是这一个变量，这同时把同一处泄漏的另一条路径也堵上了：通过
+`ZUNO_CONFIG_CONTENT` 内联提供的 `provider.<id>.options.apiKey` 同样是一份 provider
+凭据，它也会被扣留。因此从这类命令内部启动的嵌套 `zuno` 两者都不会继承，而是按普通方式
+解析配置与凭据，需要自己的凭据存储或配置。在只靠环境提供凭据的容器里要为这一点做好安排。
+参见[工具](/zh/guide/tools#一条-shell-命令继承什么)。
 
 把 `apiKey` 直接放进 `zuno.json` 是受支持的，但会把密钥暴露给配置备份与源码管理。优先使用凭据存储或注入的 `ZUNO_AUTH_CONTENT`。如果你确实要用 `options.apiKey`，请把它放在任何会被提交的层之外；改为从文件或环境读取值的做法见[变量与替换](/zh/config/variables)。
 

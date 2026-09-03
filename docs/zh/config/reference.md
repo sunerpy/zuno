@@ -266,6 +266,16 @@ Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程�
 
 `permission.rules` 是有序的，**最后一条匹配的规则胜出**。规则要么是对整个工具的一个动作，要么是按模式匹配的多个动作。因此 catch-all `*` 要写在最前面，从它当中划出例外的窄模式要写在最后面。`edit` 这个键同时管 `write`、`edit` 和 `apply_patch` 三个工具；不存在单独的 `write` 规则键。
 
+这个顺序就是你写下的顺序，而且它在此前会丢掉顺序的两个环节上都保住了。Markdown Agent 的
+`permission.rules` 会按 frontmatter 中的顺序到达评估器；合并两个配置层时，基础层的规则顺序
+会被保留，而不是重新排序。这两处此前都会把键按字母排序，而那是另一套策略，不是外观差异：
+`$HOME/.ssh/*` 排在 `*` 之前，所以给 `{"*": "allow", "$HOME/.ssh/*": "deny"}` 排序会把 deny
+挪到 catch-all 之上，「最后一条匹配的规则胜出」随后就把这层保护抹掉了。
+
+合并时，两层都设置的键在基础层给它的位置上被替换，只有覆盖层设置的键则追加在基础层各键
+之后。因此覆盖层的模式会压过基础层的 catch-all，而这正是有用的方向：项目层或 Agent 层
+可以收窄一条宽规则，而不必把它整条重写一遍。
+
 只用来别名另一个键的规则键是校验错误，并且错误会指出应当改用哪个键：`write` 与 `apply_patch`
 都折叠到 `edit`，`list_mcp_resources`、`list_mcp_resource_templates` 与 `read_mcp_resource`
 都折叠到 `read`。这些键此前会被接受，却什么都不评估。其他键仍然合法，因为 MCP、插件与 Skill
@@ -274,6 +284,24 @@ Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程�
 顶层 `tools` 开关仍然按工具名索引，同一套折叠也适用于它：`{"tools": {"apply_patch": false}}`
 会变成一条优先级最低的 `edit` 拒绝，因此 `edit` 与 `write` 也会被一起关掉。如果这不是你想要的，
 请直接写那个起管辖作用的工具名。
+
+正因为存在这套折叠，同一个配置层内的两个 `tools` 条目可能落到同一条合成规则上，此时
+它们必须一致。`{"tools": {"edit": false, "write": true}}` 会校验失败，错误信息会同时
+点名两种拼法和起管辖作用的那个键，并指出读到它们的那个文件：
+
+```text
+tools "edit" is false and tools "write" is true, but both are governed by permission "edit"; one rule cannot be both, so set them alike or write the rule under permission.rules.edit
+```
+
+把两个条目设成相同的值仍然可以加载。**这是一处不兼容变更**：这样自相矛盾的 `tools` 块此前
+是可以加载的，写在后面的那个条目会静默胜出，于是一个读起来像是禁用的块，实际上可能正在
+放开那个工具。请在 `permission.rules.<key>` 下把意图写一次，用错误信息点名的那个键。
+
+分处两层的分歧是另一回事：一层的 `tools` 条目与另一层的条目落到同一个键上时，
+这属于覆盖，而不是矛盾，解析方式和其他任何配置键一样——在点名了该 permission
+键的各层中，优先级最高的那一层胜出。所以全局的 `write: true` 与项目层的
+`edit: false` 都能加载，由项目层来决定。只有同一层内部的分歧没有顺序可以援引，
+因此只有它会被拒绝。
 
 按目录授予的 `external_directory` 规则写成「目录加 `/*`」，使用正斜杠，去掉 Windows 的逐字
 `\\?\` 前缀，例如 `{"external_directory": {"C:/build-cache/*": "allow"}}`。所有工具都按

@@ -230,7 +230,21 @@ OS sandbox is not implemented for platform `macos`
 
 顺序很关键，上面的例子依赖它。因为后面的规则会覆盖前面的规则，catch-all `*` 要写在**最前面**，而从它当中划出例外的窄模式要写在**最后面**：`git *` 覆盖 catch-all，`git push*` 再覆盖 `git *`，于是 push 被拒绝。把顺序倒过来不只是风格差异，它会让保护失效：写在最后的 `*` 会覆盖它上面的每一条规则，`rm -rf /` 会重新变成一次询问。
 
+既然顺序本身就是策略，Zuno 在此前会丢掉顺序的两个环节上都保住了你写下的顺序。Markdown Agent 的 `permission.rules` 会按 frontmatter 中的顺序到达评估器；把一个配置层合并到另一层之上时，基础层的规则顺序会被保留，而不是重新排序。这两个环节此前都会把键按字母排序，而把上面那个例子排一遍序就足以让它失效：`$HOME/.ssh/*` 排在 `*` 之前，所以排序后的 `{"*": "allow", "$HOME/.ssh/*": "deny"}` 会把 deny 放到 catch-all 之上，于是 catch-all 反而胜出。
+
+合并规则值得了解，因为你可以在 `zuno debug permissions` 的输出里看到它：两层都设置的键在基础层给它的位置上被替换，只有覆盖层设置的键则追加在基础层各键之后。因此覆盖层的模式会压过基础层的 catch-all：项目层或 Agent 层可以从一条宽规则里划出例外，而不必把那条宽规则重写一遍。
+
 `edit` 这个键同时管 `write`、`edit` 和 `apply_patch` 三个工具，它们都在这个键下申请授权。不存在单独的 `write` 或 `apply_patch` 规则键，而且 `permission.rules` 会直接拒绝它们：写在 `write`、`apply_patch`、`list_mcp_resources`、`list_mcp_resource_templates` 或 `read_mcp_resource` 下的规则会导致配置校验失败，并指出应当改用哪个键——前两个用 `edit`，三个 MCP 资源工具用 `read`。这五个键此前会被接受，却什么都不评估。其他键仍然合法，因为 MCP、插件与 Skill 工具的名字在运行时才确定，键本身也可以是通配模式。
+
+顶层 `tools` 开关按工具名索引，同一套折叠也适用于它，因此同一个配置层内的两个 `tools` 条目可能落到同一条合成规则上，此时它们必须一致。`{"tools": {"edit": false, "write": true}}` 会校验失败，错误信息会同时点名两种拼法和起管辖作用的那个键：
+
+```text
+tools "edit" is false and tools "write" is true, but both are governed by permission "edit"; one rule cannot be both, so set them alike or write the rule under permission.rules.edit
+```
+
+把两个条目设成相同的值仍然可以加载。**这是一处不兼容变更**：这样自相矛盾的 `tools` 块此前是可以加载的，写在后面的那个条目会静默胜出，于是一个读起来像是禁用的块，实际上可能正在放开那个工具。请在 `permission.rules.<key>` 下把意图写一次，用错误信息点名的那个键。
+
+分处两层的分歧则是另一回事：这属于覆盖，而不是矛盾，解析方式和其他任何配置键一样——在点名了该 permission 键的各层中，优先级最高的那一层胜出，所以项目层的 `edit: false` 会压过全局的 `write: true`。只有同一层内部的分歧没有顺序可以援引，因此只有它会被拒绝。
 
 路径规则会同时按调用给出的原样路径和它的规范化拼写来匹配：分隔符被统一，`.` 段与重复分隔符被去掉，因此 `./src/main.rs`、`src//main.rs` 以及反斜杠写法 `src\main.rs` 都能匹配一条写作 `src/main.rs` 的规则。`deny` 刻意伸得更远：它还覆盖 `..` 解析后的路径，而写成绝对路径的 deny 也覆盖该路径的相对尾段，所以 deny 无法靠改写路径拼法绕过。`allow` 在这两个方向上都不会被放宽，因为放宽一条 allow 就等于授权了规则没有点名的文件。
 

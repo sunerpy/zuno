@@ -718,6 +718,19 @@ first and the narrow patterns that carve exceptions out of it belong last. The
 `edit` key covers the `write`, `edit`, and `apply_patch` tools; there is no
 separate `write` rule key.
 
+That order is the order you wrote, and it survives the two places it used to be
+lost. A Markdown agent's `permission.rules` reaches the evaluator in frontmatter
+order, and merging two configuration layers keeps the base layer's rule order
+rather than re-sorting it. Both used to alphabetize the keys, which is a different
+policy and not a cosmetic difference: `$HOME/.ssh/*` sorts before `*`, so sorting
+`{"*": "allow", "$HOME/.ssh/*": "deny"}` moves the deny above the catch-all and
+last-match-wins then deletes the protection.
+
+On a merge, a key both layers set is replaced where the base layer put it, and a
+key only the overlay sets is appended after the base layer's keys. An overlay
+pattern therefore outranks a base catch-all, which is the useful direction: a
+project or agent layer narrows a broad rule without having to restate it.
+
 A rule key that only aliases another key is a validation error that names the key
 to use instead: `write` and `apply_patch` both fold into `edit`, and
 `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource` all
@@ -729,6 +742,28 @@ The top-level `tools` switch stays keyed by tool name, and the same folding appl
 to it: `{"tools": {"apply_patch": false}}` becomes a lowest-precedence `edit` deny,
 so it turns off `edit` and `write` as well. Name the governing tool when that is not
 what you meant.
+
+Because of that folding, two `tools` entries in one configuration layer can land on
+one synthesized rule, and they must then agree. `{"tools": {"edit": false, "write":
+true}}` fails validation with a message naming both spellings and the key that governs
+them, alongside the file it was read from:
+
+```text
+tools "edit" is false and tools "write" is true, but both are governed by permission "edit"; one rule cannot be both, so set them alike or write the rule under permission.rules.edit
+```
+
+Setting both entries to the same value still loads. **This is a breaking change**: a
+`tools` block that contradicted itself this way used to load, with whichever entry
+came last silently winning, so a block that read as a denial could have been granting
+the tool instead. State the intent once under `permission.rules.<key>`, using the key
+the message names.
+
+Two layers that disagree are a different case. A `tools` entry in one layer and an entry
+in another that fold onto the same key are an override rather than a contradiction, and
+they resolve the way every other config key does: the layer with the highest precedence
+that names the permission key wins. A global `write: true` and a project `edit: false`
+both load, and the project layer decides. Only a disagreement inside one layer has no
+ordering to appeal to, which is why that is the only one refused.
 
 To run tool calls without Zuno HITL prompts, use `allow_all`:
 

@@ -1848,3 +1848,136 @@ fn uncertain_side_effect_docs_pin_the_durable_obligation_and_its_recovery_action
         ],
     );
 }
+
+/// The clipboard ladder is a platform behavior, so a reader on any host has to be able to
+/// find out which helper their host reaches for and what happens when none is installed.
+///
+/// The `stdin` sentence is the one that matters most and the one most likely to be dropped
+/// as an implementation detail: it is the user-facing statement of why copying a transcript
+/// message cannot execute what that message contained.
+#[test]
+fn clipboard_docs_name_the_ladder_and_the_stdin_contract() {
+    contains_all(
+        "docs/guide/tui.md",
+        &[
+            "Copy prefers OSC 52",
+            "`pbcopy` on macOS",
+            "`wl-copy`, `xclip`, or `xsel` on Linux",
+            "`Set-Clipboard` through PowerShell on Windows",
+            "reports that no clipboard is\navailable instead of appearing to copy",
+            "never as a script to run",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/tui.md",
+        &[
+            "复制优先使用 OSC 52",
+            "macOS 上是 `pbcopy`",
+            "Linux 上是 `wl-copy`、`xclip` 或 `xsel`",
+            "Windows 上是通过 PowerShell 的 `Set-Clipboard`",
+            "报告没有可用剪贴板",
+            "绝不当作要执行的脚本",
+        ],
+    );
+}
+
+/// A remote `index.json` is untrusted input, and its entry `name` decides a directory that
+/// a versioned refresh renames aside and then deletes. The single-segment rule is what keeps
+/// that directory inside the download cache instead of anywhere the index chooses, so both
+/// languages have to state the rule, that a rejected entry downloads nothing, and the
+/// stage-and-swap reason the rule exists — a reader who only learns "names are validated"
+/// cannot tell that a lax name once reached their own `skill/` directory.
+///
+/// `:` is pinned alongside the two separators because it is the character whose meaning
+/// differs by platform: `C:evil` is drive-relative on Windows and an ordinary name on
+/// Linux, and `SKILL.md:$DATA` names a Windows alternate data stream with no drive letter
+/// in it. A page that lists only `/` and `\\` tells a reader the rule is about path
+/// separators, so an index author would reasonably expect a `:` name to work.
+#[test]
+fn remote_skill_index_docs_pin_the_single_segment_entry_name_rule() {
+    contains_all(
+        "docs/config/authoring-skills.md",
+        &[
+            "`name` must be a single directory segment",
+            "is not a single directory segment",
+            "nothing is downloaded for it",
+            "stages the download beside it",
+            "Both separators and `:` are refused on every platform",
+            "`SKILL.md:$DATA`",
+        ],
+    );
+    contains_all(
+        "docs/guide/skills.md",
+        &[
+            "`name` must be a single directory segment",
+            "nothing is downloaded for",
+            "/config/authoring-skills#remote-skill-indexes",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/authoring-skills.md",
+        &[
+            "`name` 必须是单个目录段",
+            "is not a single directory segment",
+            "不会为它下载任何东西",
+            "把下载内容暂存在旁边",
+            "两种分隔符与 `:` 在所有平台上都被拒绝",
+            "`SKILL.md:$DATA`",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/skills.md",
+        &[
+            "`name` 必须是单个目录段",
+            "不会为它们下载任何东西",
+            "/zh/config/authoring-skills#远端-skill-索引",
+        ],
+    );
+}
+
+/// Two `tools` entries that fold onto one permission key used to load, with whichever entry
+/// came last silently winning, so a block a reader took for a denial could have been granting
+/// the tool. It is now a validation error, which means a configuration that loaded before
+/// stops loading — the kind of change a reader has to find in the reference rather than in a
+/// failed startup. The refusal is scoped to one layer, and a reader who takes it for the
+/// merged view would conclude that a global `write` and a project `edit` cannot coexist, so
+/// pin the scope alongside the refusal text and the breaking-change notice in both languages.
+#[test]
+fn colliding_tools_keys_docs_pin_the_refusal_and_name_it_breaking() {
+    const MESSAGE: &str = "tools \"edit\" is false and tools \"write\" is true, but both are \
+                           governed by permission \"edit\"";
+    const REMEDY: &str =
+        "one rule cannot be both, so set them alike or write the rule under permission.rules.edit";
+    for page in [
+        "docs/reference/configuration.md",
+        "docs/guide/permissions.md",
+    ] {
+        contains_all(
+            page,
+            &[
+                MESSAGE,
+                REMEDY,
+                "**This is a breaking change**",
+                "State the intent once under",
+                "in one configuration layer",
+                "an override rather than a contradiction",
+            ],
+        );
+    }
+    for page in [
+        "docs/zh/config/reference.md",
+        "docs/zh/guide/permissions.md",
+    ] {
+        contains_all(
+            page,
+            &[
+                MESSAGE,
+                REMEDY,
+                "**这是一处不兼容变更**",
+                "把两个条目设成相同的值仍然可以加载",
+                "同一个配置层内",
+                "这属于覆盖，而不是矛盾",
+            ],
+        );
+    }
+}

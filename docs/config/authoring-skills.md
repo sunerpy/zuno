@@ -110,7 +110,7 @@ Zuno discovers Skills in this scope order:
 | 3 | Zuno's global and configured config directories | `{skill,skills}/**/SKILL.md` |
 | 4 | `$HOME/.agents` | `skills/**/SKILL.md` |
 | 5 | Each `skills.paths` entry | `**/SKILL.md` |
-| 6 | Each cache directory a `skills.urls` index produced | `**/SKILL.md` |
+| 6 | Each cache directory a `skills.urls` index produced, one directory per index entry | `**/SKILL.md` |
 
 Project scope is advertised before user-global scope. Zuno never scans `.claude`,
 `.opencode`, or another product's configuration directory implicitly. Add one through
@@ -167,7 +167,7 @@ which directories are watched.
 | `maxContextTokens` | positive integer \| `null` | 2% of model context; about 8,000 characters when unknown | Explicit approximate-token limit for the catalog. Values above 10,000 are clamped by the runtime |
 | `maxSelectedContextTokens` | positive integer \| `null` | 10% of known context, floor 2,000, ceiling 32,000; 8,000 when unknown | Maximum approximate tokens used by all fully selected Skill bodies in one session prompt. Values above the runtime ceiling are clamped |
 | `paths` | `string[]` \| `null` | none | Additional paths to skill folders |
-| `urls` | `string[]` \| `null` | none | URLs to fetch skills from |
+| `urls` | `string[]` \| `null` | none | URLs to fetch Skills from, each serving an `index.json`. See [Remote Skill indexes](#remote-skill-indexes) |
 | `config` | object[] \| `null` | none | Ordered per-path enablement and exposure overrides |
 
 ```json
@@ -219,6 +219,44 @@ dropping instructions, because a partially loaded Skill is worse than none.
 `includeInstructions: false` removes both the trigger policy and the catalog from
 model prompts. The `skill` tool still supports paged `list` and `search`, so explicit
 invocation keeps working; only implicit matching stops.
+
+## Remote Skill indexes
+
+Each `skills.urls` entry is a base URL serving an `index.json` that lists the Skills
+available there. Every entry in it has a `name`, the files to download, and optionally a
+`version`. Zuno downloads each entry into its own directory under the private remote
+cache, named after the entry.
+
+`name` must be a single directory segment. An absolute name, a name containing `..`, a
+name containing `/`, `\`, or `:`, and the degenerate `.` and `..` are all rejected: the
+entry is skipped, nothing is downloaded for it, and a warning names it.
+
+```text
+skill entry name `../../../.config/zuno/skill` is not a single directory segment: https://skills.example.com/index.json
+```
+
+Both separators and `:` are refused on every platform, so an index cannot mean one thing
+on Windows and another on Linux. `:` is in that list because `C:evil` is a drive-relative
+path on Windows and an ordinary directory name on Linux, and because a Windows alternate
+data stream is spelled the same way — `SKILL.md:$DATA` names one with no drive letter in
+it at all. Refusing the character outright decides both the same way everywhere. The same
+rule applies to each entry's `files`: a file whose name contains `:` is warned about and
+not downloaded, and if that removes the entry's `SKILL.md` the entry does not load. Other
+entries in the same index still load — one bad entry does not cost you the rest.
+
+The reason to be strict here is what `version` turns on. When an entry carries a
+`version` that differs from the copy already cached, the refresh does not download over
+the existing directory. It stages the download beside it, renames whatever currently
+occupies the target directory out of the way, moves the staged copy into place, and then
+deletes what it renamed. That is the right shape for a refresh that must not leave a
+half-updated Skill behind, but it means the resolved directory gets replaced and its
+previous contents removed. An unchecked `name` would let a remote index choose that
+directory freely — `"name": "../../../.config/zuno/skill"` would have pointed the
+stage-and-swap at your own Skill directory. The single-segment rule is what keeps the
+name inside the cache.
+
+Zuno does not watch the remote cache, so a `skills.urls` change is picked up at
+reconfiguration or restart rather than live.
 
 ## Progressive disclosure
 

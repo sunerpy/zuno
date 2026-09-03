@@ -289,6 +289,23 @@ being written. Name the repository in the Shell tool's `workdir`, where it is on
 check and the commit share. Outside a repository there is nothing to check and nothing is
 refused.
 
+Those reads are bounded, and the bound belongs to the check rather than to any one read.
+A single call makes up to five of them — the worktree root, the index, a staging reach, an
+untracked listing, and the `expected_head` comparison when the call supplies one — and they
+share one thirty-second ceiling in total. Five independent thirty-second ceilings would be
+two and a half minutes a model could spend by writing one command. When the ceiling
+expires, the command is refused before it runs and the refusal names the `git` invocation
+that did not answer, the ceiling it shared, and that the repository state the decision
+depends on is unknown. That is deliberate: a read that never answered is not an empty
+answer, and treating a hung read as "nothing to report" would turn it into permission to
+commit.
+
+The same reads race the session's interrupt, so `Esc` or a client cancel answers during the
+pre-flight phase and not only once git is done. Whatever git started is torn down on either
+exit — the expiry and the interrupt both stop the process group before the read is
+abandoned, because nothing else would. A `git commit` that has already started is never
+interrupted this way; the phase runs entirely before the command does.
+
 This exists because generated state that reaches the index is how an agent reports a dirty
 tree as evidence of a change it did not make, or delivers its own scratch output as part of
 the work.

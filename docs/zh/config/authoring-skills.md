@@ -94,7 +94,7 @@ Zuno 按这个作用域顺序发现 Skill：
 | 3 | Zuno 的全局与已配置的 config 目录 | `{skill,skills}/**/SKILL.md` |
 | 4 | `$HOME/.agents` | `skills/**/SKILL.md` |
 | 5 | 每个 `skills.paths` 条目 | `**/SKILL.md` |
-| 6 | 每个由 `skills.urls` 索引产生的缓存目录 | `**/SKILL.md` |
+| 6 | 每个由 `skills.urls` 索引产生的缓存目录，索引里每个条目一个目录 | `**/SKILL.md` |
 
 项目作用域会先于用户全局作用域被公布。Zuno 不会隐式扫描 `.claude`、
 `.opencode` 或其他产品的配置目录；只有确实需要共享时才通过 `skills.paths`
@@ -141,7 +141,7 @@ Prompt 元数据、`requiredSkills`、斜杠命令、`skill` 工具、TUI 与 AC
 | `maxContextTokens` | 正整数 \| `null` | 模型上下文的 2%；未知时约 8,000 个字符 | 目录的显式近似 Token 上限。超过 10,000 的值会被运行时夹住 |
 | `maxSelectedContextTokens` | 正整数 \| `null` | 已知上下文的 10%，下限 2,000，上限 32,000；未知时为 8,000 | 一个会话提示词中所有被完整选中的 Skill 正文使用的最大近似 Token 数。超过运行时上限的值会被夹住 |
 | `paths` | `string[]` \| `null` | 无 | 额外的 skill 文件夹路径 |
-| `urls` | `string[]` \| `null` | 无 | 用于抓取 skill 的 URL |
+| `urls` | `string[]` \| `null` | 无 | 用于抓取 skill 的 URL，每个 URL 提供一份 `index.json`。参见[远端 Skill 索引](#远端-skill-索引) |
 | `config` | object[] \| `null` | 无 | 按顺序应用的逐路径启停与暴露方式覆盖 |
 
 ```json
@@ -185,6 +185,38 @@ Prompt 元数据、`requiredSkills`、斜杠命令、`skill` 工具、TUI 与 AC
 这两份预算是刻意分开的。`maxContextTokens` 限定紧凑的元数据目录 —— 名称与描述。`maxSelectedContextTokens` 限定一个会话提示词中被完整加载的正文总量。如果被选中的正文装不下，加载或恢复会话会在 provider 请求之前失败，而不是静默丢弃指令，因为一个只加载了一部分的 Skill 比没有更糟。
 
 `includeInstructions: false` 会把触发策略和目录都从模型提示词中移除。`skill` 工具仍然支持分页的 `list` 与 `search`，因此显式调用继续可用；只有隐式匹配停止。
+
+## 远端 Skill 索引
+
+`skills.urls` 的每一项都是一个基础 URL，它提供一份 `index.json`，列出那里可用的 Skill。
+索引里的每个条目都有一个 `name`、一组要下载的文件，以及可选的 `version`。Zuno 会把每个
+条目下载到私有远端缓存下属于它自己的目录里，目录名就取自条目名。
+
+`name` 必须是单个目录段。绝对路径的名字、含 `..` 的名字、含 `/`、`\` 或 `:` 的名字，以及
+退化的 `.` 与 `..`，都会被拒绝：该条目被跳过，不会为它下载任何东西，并且会有一条 warning
+点名它。
+
+```text
+skill entry name `../../../.config/zuno/skill` is not a single directory segment: https://skills.example.com/index.json
+```
+
+两种分隔符与 `:` 在所有平台上都被拒绝，因此一份索引不会在 Windows 上是一个意思、在 Linux
+上又是另一个意思。`:` 之所以在列表里，是因为 `C:evil` 在 Windows 上是一个相对于驱动器的
+路径，在 Linux 上却只是一个普通目录名；而且 Windows 的备用数据流也是这么拼的 ——
+`SKILL.md:$DATA` 就是一个，里面连驱动器盘符都没有。直接拒掉这个字符，就让两种情况在所有
+平台上得到同一个判定。同一条规则也适用于每个条目的 `files`：名字里含 `:` 的文件会被
+warning 点名且不会下载，如果这样一来条目的 `SKILL.md` 被移除，该条目就不再加载。同一份
+索引里的其他条目仍会正常加载 —— 一个坏条目不会让你连带失去其余条目。
+
+这里之所以要严格，原因在于 `version` 会启用什么。当一个条目带着与已缓存副本不同的
+`version` 时，刷新不会直接覆盖已有目录写入，而是把下载内容暂存在旁边，把当前占据目标目录
+的东西改名挪走，再把暂存副本移动到位，最后删掉改名挪走的那份。对于「绝不能留下一个更新
+到一半的 Skill」的刷新来说，这是正确的形状，但它同时意味着解析出来的那个目录会被整体替换，
+原有内容会被删掉。若不校验 `name`，一份远端索引就能自由选定那个目录 ——
+`"name": "../../../.config/zuno/skill"` 会把这套「暂存加交换」对准你自己的 Skill 目录。
+单目录段这条规则，正是把名字限制在缓存之内的东西。
+
+Zuno 不监听远端缓存，所以 `skills.urls` 的改动是在重配或重启时生效，而不是运行中即时生效。
 
 ## 渐进式披露
 
