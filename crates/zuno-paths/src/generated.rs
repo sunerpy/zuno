@@ -229,7 +229,10 @@ pub const GENERATED_PATHS: &[GeneratedPath] =
 /// for `info/exclude` is the worktree root, so `.zuno/*` alone says nothing about
 /// `sub/.zuno/`. A leading `**/` is git's own spelling for "in any directory", and it
 /// still matches at the root, so one rendered set covers both depths.
-const ANY_DEPTH: &str = "**/";
+///
+/// Public because [`crate::exclude`] has to recognise a block line written before the
+/// patterns carried the prefix: the prefix says where git looks, not who wrote the line.
+pub const ANY_DEPTH: &str = "**/";
 
 /// The git pattern that excludes everything directly under a project directory.
 ///

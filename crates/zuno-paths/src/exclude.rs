@@ -45,7 +45,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::generated::{GENERATED_PATHS, IGNORE_PATTERNS};
+use crate::generated::{ANY_DEPTH, GENERATED_PATHS, IGNORE_PATTERNS};
 use crate::project::resolve_git_path;
 
 /// The exclude-file path, relative to the git directory, that git resolves for us.
@@ -476,7 +476,8 @@ fn managed_block(content: &[u8], entries: &[&str]) -> Option<Range<usize>> {
 /// releases: a block written before the pattern set became `.zuno/*` plus negations
 /// names `.zuno/goal/` and its siblings line by line. Those lines are Zuno's, and an
 /// upgrade has to absorb them into the block it rewrites instead of leaving them behind
-/// as if a person had typed them.
+/// as if a person had typed them. The same reason makes the comparison ignore
+/// [`ANY_DEPTH`], which the patterns did not always carry.
 fn is_block_content(text: &[u8], entries: &[&str]) -> bool {
     let registered = GENERATED_PATHS.iter().map(|generated| generated.pattern);
     text == MANAGED_BLOCK_BEGIN.as_bytes()
@@ -485,7 +486,27 @@ fn is_block_content(text: &[u8], entries: &[&str]) -> bool {
             .copied()
             .chain(IGNORE_PATTERNS.iter().copied())
             .chain(registered)
-            .any(|entry| entry.as_bytes().trim_ascii() == text)
+            .any(|entry| is_the_same_pattern(entry, text))
+}
+
+/// Whether a block line is this pattern, with or without git's any-depth prefix.
+///
+/// `**/.zuno/*` and `.zuno/*` are one line to this module, and so are `!**/.zuno/agents`
+/// and `!.zuno/agents`: the prefix decides where git looks, not who wrote the line. A
+/// block written before the patterns carried it spells every one of them without it, and
+/// a line Zuno wrote has to be absorbed into the block being rewritten rather than left
+/// behind as the user's.
+fn is_the_same_pattern(entry: &str, text: &[u8]) -> bool {
+    let entry = entry.as_bytes().trim_ascii();
+    if entry == text {
+        return true;
+    }
+    let (negation, rest) = match entry.split_first() {
+        Some((b'!', rest)) => (b"!".as_slice(), rest),
+        _ => (b"".as_slice(), entry),
+    };
+    rest.strip_prefix(ANY_DEPTH.as_bytes())
+        .is_some_and(|bare| text.strip_prefix(negation) == Some(bare))
 }
 
 /// The current bytes, or `None` when the exclude file does not exist yet.
@@ -1028,6 +1049,52 @@ mod tests {
             read(&path),
             format!("{MANAGED_BLOCK_BEGIN}\n{GENERATED}\n{MANAGED_BLOCK_END}\nmine/\n"),
             "every line Zuno ever wrote is absorbed into the block; the user's is not"
+        );
+    }
+
+    /// A block Zuno wrote before its patterns carried git's any-depth prefix spells
+    /// every one of them without it, and those lines are still Zuno's.
+    ///
+    /// Recognising them by the exact rendered text alone would leave `.zuno/*` and each
+    /// `!.zuno/<entry>` outside the rewritten block, where the next call reads them as
+    /// lines a person typed and preserves them forever — and a stale root-anchored
+    /// `.zuno/*` sitting after the block still excludes the configuration the negations
+    /// were there to bring back.
+    #[test]
+    fn a_block_written_without_the_any_depth_prefix_is_still_recognised_as_zunos() {
+        let root = repository();
+        let path = resolve_exclude_path(root.path()).expect("resolve the exclude path");
+        fs::create_dir_all(path.parent().expect("info directory")).expect("create info");
+        let mut truncated = format!("{MANAGED_BLOCK_BEGIN}\n");
+        for pattern in IGNORE_PATTERNS {
+            let bare = pattern
+                .strip_prefix('!')
+                .map_or_else(
+                    || pattern.strip_prefix(ANY_DEPTH).map(str::to_owned),
+                    |negated| {
+                        negated
+                            .strip_prefix(ANY_DEPTH)
+                            .map(|bare| format!("!{bare}"))
+                    },
+                )
+                .expect("every rendered pattern carries the any-depth prefix");
+            truncated.push_str(&bare);
+            truncated.push('\n');
+        }
+        truncated.push_str("mine/\n");
+        fs::write(&path, &truncated).expect("a truncated block from an older release");
+
+        let outcome = ensure_managed_block(root.path(), IGNORE_PATTERNS).expect("heal the block");
+
+        assert_eq!(outcome, ExcludeOutcome::Updated);
+        let healed = read(&path);
+        assert_eq!(
+            healed,
+            format!(
+                "{MANAGED_BLOCK_BEGIN}\n{}\n{MANAGED_BLOCK_END}\nmine/\n",
+                IGNORE_PATTERNS.join("\n")
+            ),
+            "{healed}"
         );
     }
 
