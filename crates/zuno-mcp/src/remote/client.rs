@@ -71,6 +71,16 @@ impl RemoteClient {
         self.inner.transport
     }
 
+    /// Deadline applied independently to every request.
+    ///
+    /// Mirrors [`crate::StdioClient::timeout`]. A remote deadline that `reqwest`
+    /// reports carries no measured elapsed time, so this is the honest substitute
+    /// when a timeout has to name how long the call waited.
+    #[must_use]
+    pub fn timeout(&self) -> std::time::Duration {
+        self.inner.timeout
+    }
+
     /// The **configured** server name, which is what namespacing and diagnostics
     /// use. Deliberately not `initialization().server_info.name`: that is the
     /// server's self-reported identity and two configured entries can share it.

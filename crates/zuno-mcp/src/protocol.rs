@@ -43,6 +43,8 @@ pub(crate) enum ExchangeError {
     DecodeResult(#[source] serde_json::Error),
     #[error("MCP stdout line was not JSON")]
     FrameDecode { line: Arc<str> },
+    #[error("MCP frame reached {bytes} bytes without a newline, past the {limit}-byte bound")]
+    FrameTooLarge { bytes: usize, limit: usize },
     #[error("MCP stdin write failed")]
     Write(#[source] io::Error),
     #[error("MCP stdout read failed")]
@@ -63,6 +65,15 @@ pub(crate) enum ReaderFailure {
     Decode {
         line: Arc<str>,
     },
+    /// The peer wrote a frame past the byte bound without terminating it.
+    ///
+    /// Distinct from [`Self::Decode`], which has a complete frame to show. Here the
+    /// bytes read are a prefix of a value whose end was never announced, so there is
+    /// no line worth reporting and no offset the reader may resume from.
+    FrameTooLarge {
+        bytes: usize,
+        limit: usize,
+    },
 }
 
 impl From<ReaderFailure> for ExchangeError {
@@ -73,6 +84,7 @@ impl From<ReaderFailure> for ExchangeError {
                 Self::Read(io::Error::new(kind, message.to_string()))
             }
             ReaderFailure::Decode { line } => Self::FrameDecode { line },
+            ReaderFailure::FrameTooLarge { bytes, limit } => Self::FrameTooLarge { bytes, limit },
         }
     }
 }
@@ -151,6 +163,22 @@ pub(crate) fn fail_pending(pending: &Pending, failure: ReaderFailure) -> usize {
         let _receiver = waiter.send(Err(failure.clone()));
     }
     in_flight
+}
+
+/// The framing violation an over-long frame is, expressed as a decode error.
+///
+/// [`zuno_error::McpError::Protocol`] is the variant this crate documents as the home
+/// for framing bugs, and it contracts for a `serde_json::Error`. An unterminated frame
+/// has no parse position to report, so this synthesizes the error from an
+/// `InvalidData` I/O cause the same way [`decode_error`] does for a reader that
+/// reported a decode failure it cannot reproduce.
+pub(crate) fn oversized_frame_error(bytes: usize, limit: usize) -> serde_json::Error {
+    serde_json::Error::io(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "MCP frame reached {bytes} bytes without a newline, past the {limit}-byte frame bound"
+        ),
+    ))
 }
 
 pub(crate) fn decode_error(line: &str) -> serde_json::Error {

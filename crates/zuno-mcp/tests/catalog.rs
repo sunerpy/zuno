@@ -20,7 +20,7 @@ use zuno_mcp::catalog::{
 };
 use zuno_permission::visibility::{READ_TOOLS, permission_key};
 use zuno_permission::{Rule, rules_from_config};
-use zuno_tool::{AllowAll, NeverInterrupted, Tool, ToolContext};
+use zuno_tool::{AllowAll, NeverInterrupted, Tool, ToolContext, ToolReplayPolicy};
 use zuno_tools::registry::McpToolLoader;
 
 struct FakeServer {
@@ -1167,6 +1167,205 @@ fn catalog_narrow_read_deny_leaves_the_resource_tools_visible() {
         assert!(
             visible.contains(&tool.to_owned()),
             "a pattern-scoped deny is enforced at call time, not by hiding {tool}: {visible:?}"
+        );
+    }
+}
+
+/// A server whose every method fails with one caller-chosen `McpError`.
+///
+/// Separate from [`FakeServer`], which exists to prove merge and rendering rules on a
+/// server that works. This one exists to prove that the *class* of a transport failure
+/// survives the trip to the tool layer.
+struct BrokenServer {
+    error: Box<dyn Fn() -> McpError + Send + Sync>,
+}
+
+impl BrokenServer {
+    fn new(error: impl Fn() -> McpError + Send + Sync + 'static) -> Self {
+        Self {
+            error: Box::new(error),
+        }
+    }
+
+    fn fail<T>(&self) -> Result<T, McpError> {
+        Err((self.error)())
+    }
+}
+
+#[async_trait]
+impl ConnectedServer for BrokenServer {
+    fn server_name(&self) -> &str {
+        "docs"
+    }
+
+    fn supports_resources(&self) -> bool {
+        true
+    }
+
+    fn supports_prompts(&self) -> bool {
+        false
+    }
+
+    async fn list_tools(&self) -> Result<Vec<zuno_mcp::ToolDefinition>, McpError> {
+        self.fail()
+    }
+
+    async fn call_tool(
+        &self,
+        _tool: &str,
+        _arguments: Map<String, Value>,
+    ) -> Result<zuno_mcp::ToolCallResult, McpError> {
+        self.fail()
+    }
+
+    async fn list_resources(&self) -> Result<Vec<ResourceDefinition>, McpError> {
+        self.fail()
+    }
+
+    async fn list_resource_templates(&self) -> Result<Vec<ResourceTemplate>, McpError> {
+        self.fail()
+    }
+
+    async fn read_resource(&self, _uri: &str) -> Result<ResourceContents, McpError> {
+        self.fail()
+    }
+
+    async fn list_prompts(&self) -> Result<Vec<PromptDefinition>, McpError> {
+        Ok(Vec::new())
+    }
+}
+
+fn broken_catalog(error: impl Fn() -> McpError + Send + Sync + 'static) -> Catalog {
+    let catalog = Catalog::new(["docs"]);
+    catalog.connected(
+        Arc::new(BrokenServer::new(error)) as Arc<dyn ConnectedServer>,
+        vec![definition("search")],
+    );
+    catalog
+}
+
+fn tool_named(catalog: &Catalog, id: &str) -> Arc<dyn Tool> {
+    catalog
+        .tools()
+        .into_iter()
+        .find(|tool| tool.id() == id)
+        .unwrap_or_else(|| panic!("{id} must be exposed"))
+}
+
+#[tokio::test]
+async fn catalog_relays_an_mcp_timeout_as_a_retryable_tool_timeout() {
+    let elapsed = std::time::Duration::from_secs(11);
+    let catalog = broken_catalog(move || McpError::Timeout {
+        server: "docs".to_owned(),
+        elapsed,
+    });
+
+    for id in ["docs_search", LIST_RESOURCES_TOOL, READ_RESOURCE_TOOL] {
+        let args = if id == READ_RESOURCE_TOOL {
+            json!({ "server": "docs", "uri": "mcp://a" })
+        } else {
+            json!({})
+        };
+        let error = tool_named(&catalog, id)
+            .execute(args, context())
+            .await
+            .expect_err("a timed-out server is a tool failure");
+        assert_eq!(error.tool(), id);
+        assert!(
+            matches!(&error, zuno_error::ToolError::Timeout { elapsed: seen, .. } if *seen == elapsed),
+            "{id} must preserve the elapsed time instead of flattening it into a failure: {error:?}"
+        );
+        assert!(
+            error.recovery().is_retry(),
+            "{id} timed out, which the engine must be able to schedule again"
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_relays_a_connect_failure_as_a_retryable_transient() {
+    let catalog = broken_catalog(|| McpError::Connect {
+        server: "docs".to_owned(),
+        source: Box::new(std::io::Error::other("connection refused")),
+    });
+
+    for id in ["docs_search", LIST_RESOURCE_TEMPLATES_TOOL] {
+        let error = tool_named(&catalog, id)
+            .execute(json!({}), context())
+            .await
+            .expect_err("an unreachable server is a tool failure");
+        assert!(
+            matches!(error, zuno_error::ToolError::Transient { .. }),
+            "{id} must report a server that is still coming up as transient: {error:?}"
+        );
+        assert!(error.recovery().is_retry());
+    }
+}
+
+#[tokio::test]
+async fn catalog_keeps_protocol_and_handshake_failures_permanent() {
+    let permanent: [Box<dyn Fn() -> McpError + Send + Sync>; 3] = [
+        Box::new(|| McpError::Protocol {
+            server: "docs".to_owned(),
+            source: serde_json::from_str::<Value>("{\"jsonrpc\":").unwrap_err(),
+        }),
+        Box::new(|| McpError::Handshake {
+            server: "docs".to_owned(),
+            source: Box::new(std::io::Error::other("unsupported protocol version")),
+        }),
+        Box::new(|| McpError::ToolCall {
+            server: "docs".to_owned(),
+            tool: "search".to_owned(),
+            source: Box::new(std::io::Error::other("target closed")),
+        }),
+    ];
+
+    for case in permanent {
+        let catalog = broken_catalog(case);
+        let error = tool_named(&catalog, "docs_search")
+            .execute(json!({}), context())
+            .await
+            .expect_err("a protocol or handshake failure is a tool failure");
+        assert!(
+            matches!(error, zuno_error::ToolError::Failed { .. }),
+            "an invalid exchange must block rather than be retried: {error:?}"
+        );
+        assert!(!error.recovery().is_retry());
+    }
+}
+
+#[test]
+fn catalog_relayed_server_tools_are_never_replayable_and_reads_are_safe() {
+    let catalog = Catalog::new(["docs"]);
+    connect(
+        &catalog,
+        FakeServer::new("docs", &["search"]).with_resources(vec![resource("mcp://a", "a")]),
+    );
+
+    let proxy = tool_named(&catalog, "docs_search");
+    assert_eq!(
+        proxy.replay_policy(),
+        ToolReplayPolicy::Never,
+        "a relayed server tool may create, send, or write; a lost response does not \
+         prove it did not happen"
+    );
+    assert_eq!(
+        proxy.replay_policy_for(&json!({ "query": "anything" })),
+        ToolReplayPolicy::Never,
+        "no argument shape makes an arbitrary upstream tool idempotent"
+    );
+
+    for id in RESOURCE_TOOLS {
+        let tool = tool_named(&catalog, id);
+        assert_eq!(
+            tool.replay_policy(),
+            ToolReplayPolicy::Safe,
+            "{id} only issues MCP reads, so an identical retry is safe"
+        );
+        assert_eq!(
+            tool.effect(&json!({})),
+            zuno_tool::ToolEffect::ReadOnly,
+            "{id} declares itself read-only, which is what makes the replay policy honest"
         );
     }
 }
