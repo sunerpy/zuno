@@ -30,7 +30,9 @@ use serde::Deserialize;
 use zuno_error::{ProviderError, ProviderProtocolFailure, ProviderStreamFailure};
 use zuno_llm::event::PromptAccounting;
 use zuno_llm::registry::{ApiSurface, FinishReason, StreamEvent};
-use zuno_llm::sse::{StreamLimits, append_tool_input, ensure_tool_input_size};
+use zuno_llm::sse::{
+    StreamLimits, append_tool_input, ensure_tool_input_size, upstream_stream_incomplete,
+};
 
 use crate::wire::{ChatChunk, ChunkDelta, DONE_SENTINEL, WireError};
 
@@ -83,7 +85,13 @@ impl SurfaceTranslator {
     }
 
     /// Close any protocol state left open at EOF.
-    pub fn finish(&mut self) -> Vec<StreamEvent> {
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError::Stream`] with
+    /// [`ProviderStreamFailure::UpstreamStreamIncomplete`] when the byte stream
+    /// ended before this surface's terminator arrived.
+    pub fn finish(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
         match self {
             Self::Chat(translator) => translator.finish(),
             Self::Responses(translator) => translator.finish(),
@@ -142,7 +150,16 @@ impl ChunkTranslator {
         }
         if trimmed == DONE_SENTINEL {
             self.done = true;
-            return Ok(self.close_open_blocks());
+            let mut events = self.close_open_blocks();
+            if !self.ended {
+                // `[DONE]` terminates the message on its own. Several
+                // OpenAI-compatible vendors send it without ever sending a
+                // `finish_reason`, so demanding both markers would turn every one
+                // of those providers into a permanent failure.
+                self.ended = true;
+                events.push(StreamEvent::MessageEnd { stop_reason: None });
+            }
+            return Ok(events);
         }
 
         let chunk: ChatChunk = serde_json::from_str(trimmed).map_err(|source| {
@@ -196,17 +213,21 @@ impl ChunkTranslator {
         Ok(events)
     }
 
-    /// Close whatever the stream left open when it ends without a finish reason.
+    /// Close whatever the stream left open when it ends.
     ///
-    /// A vendor that drops the connection after its last content chunk still has
-    /// to leave a consumer with balanced blocks.
-    pub fn finish(&mut self) -> Vec<StreamEvent> {
-        let mut events = self.close_open_blocks();
-        if !self.ended {
-            self.ended = true;
-            events.push(StreamEvent::MessageEnd { stop_reason: None });
+    /// # Errors
+    ///
+    /// [`ProviderError::Stream`] with
+    /// [`ProviderStreamFailure::UpstreamStreamIncomplete`] when neither a
+    /// `finish_reason` nor `[DONE]` ever arrived. A vendor that drops the
+    /// connection after its last content chunk has not produced a turn: this used
+    /// to synthesize `MessageEnd`, which made the engine commit the truncated half
+    /// of the assistant message as complete durable history with no retry.
+    pub fn finish(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
+        if self.ended {
+            return Ok(self.close_open_blocks());
         }
-        events
+        Err(upstream_stream_incomplete(&self.provider, &self.model))
     }
 
     fn delta(&mut self, delta: &ChunkDelta, events: &mut Vec<StreamEvent>) {
@@ -326,7 +347,12 @@ impl ResponsesTranslator {
         }
         if trimmed == DONE_SENTINEL {
             self.done = true;
-            return Ok(self.finish());
+            if self.ended {
+                return Ok(Vec::new());
+            }
+            // `[DONE]` also terminates this surface: a compatible vendor may send
+            // it in place of `response.completed`.
+            return Ok(self.terminal(ResponseEnvelope::default(), FinishReason::Unknown));
         }
         let event: ResponsesEvent = serde_json::from_str(trimmed).map_err(|source| {
             ProviderError::fatal(MalformedResponsesEvent {
@@ -408,13 +434,19 @@ impl ResponsesTranslator {
         }
     }
 
-    /// Close a Responses stream that ended without a terminal event.
-    pub fn finish(&mut self) -> Vec<StreamEvent> {
+    /// Close a Responses stream.
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError::Stream`] with
+    /// [`ProviderStreamFailure::UpstreamStreamIncomplete`] when none of
+    /// `response.completed`, `response.incomplete`, `response.failed`, or `[DONE]`
+    /// arrived before EOF.
+    pub fn finish(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
         if self.ended {
-            Vec::new()
-        } else {
-            self.terminal(ResponseEnvelope::default(), FinishReason::Unknown)
+            return Ok(Vec::new());
         }
+        Err(upstream_stream_incomplete(&self.provider, &self.model))
     }
 
     fn item_added(&mut self, item: ResponseItem) -> Result<Vec<StreamEvent>, ProviderError> {
@@ -768,12 +800,13 @@ impl std::error::Error for ReportedWireError {}
 
 /// Parse a `Retry-After` header value into a delay.
 ///
-/// Only the delta-seconds form is accepted; the HTTP-date form is rare from these
-/// vendors and a wrong parse would produce a worse backoff than none. Returning
-/// `None` lets the caller apply its own policy, which `zuno-error` already owns.
+/// Delegates to the single shared parser in [`zuno_llm::http`]. The HTTP-date form
+/// used to be discarded here, which silently replaced a peer's stated interval
+/// with local backoff; the shared parser accepts it, along with the integer and
+/// fractional delta-seconds forms.
 #[must_use]
 pub fn retry_after(value: &str) -> Option<Duration> {
-    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+    zuno_llm::http::parse_retry_after(value)
 }
 
 /// A frame that was not valid JSON.
@@ -811,7 +844,7 @@ mod tests {
         for frame in frames {
             events.extend(translator.frame(frame).expect("frame translates"));
         }
-        events.extend(translator.finish());
+        events.extend(translator.finish().expect("the stream terminates"));
         events
     }
 
@@ -821,8 +854,78 @@ mod tests {
         for frame in frames {
             events.extend(translator.frame(frame).expect("frame translates"));
         }
-        events.extend(translator.finish());
+        events.extend(translator.finish().expect("the stream terminates"));
         events
+    }
+
+    #[test]
+    fn a_chat_stream_cut_off_before_any_terminator_is_a_retryable_stream_failure() {
+        let mut translator = ChunkTranslator::new("groq", "llama-4-scout");
+        let events = translator
+            .frame(r#"{"choices":[{"delta":{"content":"partial"}}]}"#)
+            .expect("frame translates");
+        assert_eq!(events, vec![StreamEvent::TextDelta("partial".to_owned())]);
+
+        let error = translator
+            .finish()
+            .expect_err("a truncated chat stream must not be committed as a complete turn");
+        let ProviderError::Stream {
+            code: ProviderStreamFailure::UpstreamStreamIncomplete,
+            ..
+        } = &error
+        else {
+            panic!("expected a typed incomplete-stream failure, got {error:?}");
+        };
+        assert!(matches!(error.recovery(), Recovery::Retry { .. }));
+        assert!(error.permits_partial_output_retry());
+    }
+
+    #[test]
+    fn a_responses_stream_cut_off_before_any_terminator_is_a_retryable_stream_failure() {
+        let mut translator =
+            SurfaceTranslator::new("kiro-local", "gpt-5.6-sol", ApiSurface::Responses);
+        let events = translator
+            .frame(r#"{"type":"response.output_text.delta","delta":"partial"}"#)
+            .expect("frame translates");
+        assert_eq!(events, vec![StreamEvent::TextDelta("partial".to_owned())]);
+
+        let error = translator
+            .finish()
+            .expect_err("a truncated responses stream must not be committed as a complete turn");
+        assert!(matches!(
+            error,
+            ProviderError::Stream {
+                code: ProviderStreamFailure::UpstreamStreamIncomplete,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_chat_stream_with_only_a_done_sentinel_completes() {
+        let events = translate(&[r#"{"choices":[{"delta":{"content":"hi"}}]}"#, "[DONE]"]);
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta("hi".to_owned()),
+                StreamEvent::MessageEnd { stop_reason: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_chat_stream_with_only_a_finish_reason_completes() {
+        let events =
+            translate(&[r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#]);
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta("hi".to_owned()),
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::Stop),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1112,7 +1215,7 @@ mod tests {
             .frame(r#"{"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]}"#)
             .expect("chunk");
         events.extend(translator.frame(DONE_SENTINEL).expect("sentinel"));
-        events.extend(translator.finish());
+        events.extend(translator.finish().expect("the stream terminates"));
         assert!(translator.is_done());
         assert_eq!(
             events
@@ -1198,11 +1301,18 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_reads_only_delta_seconds() {
+    fn retry_after_reads_both_rfc_9110_forms() {
         assert_eq!(retry_after("30"), Some(Duration::from_secs(30)));
         assert_eq!(retry_after(" 5 "), Some(Duration::from_secs(5)));
-        assert_eq!(retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
         assert_eq!(retry_after(""), None);
+        assert_eq!(retry_after("soon"), None);
+        // The date form used to return `None` here, which discarded the interval
+        // the peer actually asked for.
+        assert_eq!(
+            retry_after("Fri, 01 Jan 2100 00:00:00 GMT"),
+            Some(zuno_llm::http::MAX_RETRY_AFTER)
+        );
+        assert_eq!(retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
     }
 
     #[test]

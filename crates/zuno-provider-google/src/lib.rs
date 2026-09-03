@@ -28,11 +28,17 @@ use zuno_llm::event::{
     FinishReason, Message, PromptAccounting, RequestContentBlock, Role, StreamEvent,
     ThoughtSignature,
 };
+use zuno_llm::http::{
+    HttpTimeouts, MAX_ERROR_BODY_BYTES, RequestDeadlines, map_messages_http_error,
+    map_messages_stream_error_value, read_error_body, truncated_body_error,
+};
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
     ProviderStream, Spec, Unavailable, generation,
 };
-use zuno_llm::sse::{SseEvent, SseParser, ensure_tool_input_size};
+use zuno_llm::sse::{
+    SseEvent, SseParser, StreamIdleTimeout, ensure_tool_input_size, upstream_stream_incomplete,
+};
 
 /// Registry identity for Google AI Studio's Generative Language API.
 pub const GOOGLE_PROVIDER_ID: &str = "google";
@@ -358,8 +364,10 @@ impl Provider for GoogleGenerativeAi {
                     client,
                     prepared,
                     Some(("x-goog-api-key", api_key)),
-                    GeminiStreamDecoder::new(GOOGLE_PROVIDER_ID, model),
+                    GeminiStreamDecoder::new(GOOGLE_PROVIDER_ID, model.clone()),
                     GOOGLE_PROVIDER_ID,
+                    model,
+                    classify_gemini_http_error,
                 )
                 .await
             })
@@ -458,8 +466,10 @@ impl Provider for VertexGemini {
                     client,
                     prepared,
                     Some(("authorization", format!("Bearer {token}"))),
-                    GeminiStreamDecoder::new(VERTEX_PROVIDER_ID, model),
+                    GeminiStreamDecoder::new(VERTEX_PROVIDER_ID, model.clone()),
                     VERTEX_PROVIDER_ID,
+                    model,
+                    classify_gemini_http_error,
                 )
                 .await
             })
@@ -864,9 +874,23 @@ impl GeminiStreamDecoder {
     }
 
     /// Finish UTF-8 and SSE framing and decode any trailing event.
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderStreamFailure::UpstreamStreamIncomplete`] when the byte stream
+    /// ended before any candidate carried a `finishReason`. Gemini closes every
+    /// completed generation with one, so its absence means the response was cut
+    /// short. Reporting it as a typed stream failure lets the caller replay the
+    /// identical request instead of committing a partial answer as a finished turn.
+    ///
+    /// [`ProviderStreamFailure::UpstreamStreamIncomplete`]: zuno_error::ProviderStreamFailure::UpstreamStreamIncomplete
     pub fn finish(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
         let frames = self.parser.finish().into_iter().collect::<Result<_, _>>()?;
-        self.decode_frames(frames)
+        let events = self.decode_frames(frames)?;
+        if !self.message_ended {
+            return Err(upstream_stream_incomplete(&self.provider, &self.model));
+        }
+        Ok(events)
     }
 
     fn decode_frames(&mut self, frames: Vec<SseEvent>) -> Result<Vec<StreamEvent>, ProviderError> {
@@ -1250,8 +1274,15 @@ impl Provider for VertexAnthropic {
                     client,
                     prepared,
                     Some(("authorization", format!("Bearer {token}"))),
-                    AnthropicStreamDecoder::new(VERTEX_ANTHROPIC_PROVIDER_ID, model),
+                    AnthropicStreamDecoder::new(VERTEX_ANTHROPIC_PROVIDER_ID, model.clone()),
                     VERTEX_ANTHROPIC_PROVIDER_ID,
+                    model,
+                    // Vertex-hosted Anthropic answers in the Anthropic Messages error
+                    // format, not Gemini's. Reading it through Gemini's classifier
+                    // recognised none of its `error.type` values, so an HTTP 400
+                    // `prompt_too_long` became an unrecoverable `Fatal` instead of a
+                    // request for compaction.
+                    map_messages_http_error,
                 )
                 .await
             })
@@ -1470,9 +1501,23 @@ impl AnthropicStreamDecoder {
     }
 
     /// Finish UTF-8 and SSE framing.
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderStreamFailure::UpstreamStreamIncomplete`] when neither
+    /// `message_stop` nor a `message_delta` stop reason arrived. Either one alone
+    /// terminates the message, so requiring both would permanently fail a peer
+    /// that sends only one; requiring neither committed a truncated turn as
+    /// though the model had finished.
+    ///
+    /// [`ProviderStreamFailure::UpstreamStreamIncomplete`]: zuno_error::ProviderStreamFailure::UpstreamStreamIncomplete
     pub fn finish(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
         let frames = self.parser.finish().into_iter().collect::<Result<_, _>>()?;
-        self.decode_frames(frames)
+        let events = self.decode_frames(frames)?;
+        if !self.message_ended {
+            return Err(upstream_stream_incomplete(&self.provider, &self.model));
+        }
+        Ok(events)
     }
 
     fn decode_frames(&mut self, frames: Vec<SseEvent>) -> Result<Vec<StreamEvent>, ProviderError> {
@@ -1503,7 +1548,15 @@ impl AnthropicStreamDecoder {
                     self.message_ended = true;
                 }
             }
-            Some("error") => return Err(classify_anthropic_stream_error(&self.provider, value)),
+            // The Anthropic Messages error vocabulary is shared with the first-party
+            // Anthropic provider, so it is classified by the one shared
+            // implementation. The local four-arm copy this replaced lost
+            // `prompt_too_long`, `context_window_exceeded`, `api_error`, and
+            // `refusal_error`, which turned a compactable context overflow into an
+            // unrecoverable failure.
+            Some("error") => {
+                return Err(map_messages_stream_error_value(&self.provider, value));
+            }
             Some(_) | None => {}
         }
         Ok(())
@@ -1632,24 +1685,6 @@ fn map_anthropic_finish_reason(reason: &str) -> FinishReason {
         "tool_use" => FinishReason::ToolCalls,
         "refusal" => FinishReason::ContentFilter,
         _ => FinishReason::Unknown,
-    }
-}
-
-fn classify_anthropic_stream_error(provider: &str, value: &Value) -> ProviderError {
-    match value["error"].get("type").and_then(Value::as_str) {
-        Some("rate_limit_error") => ProviderError::RateLimited { retry_after: None },
-        Some("overloaded_error") => ProviderError::Transient {
-            status: Some(529),
-            source: None,
-        },
-        Some("authentication_error" | "permission_error") => ProviderError::Auth {
-            provider: provider.to_owned(),
-            source: None,
-        },
-        _ => ProviderError::Fatal {
-            status: None,
-            source: None,
-        },
     }
 }
 
@@ -1805,7 +1840,8 @@ impl VertexCredentials {
             CredentialSource::ServiceAccount(credentials) => {
                 refresh_service_account(client, credentials).await?
             }
-            CredentialSource::MetadataServer => refresh_metadata_token(client).await?,
+            // Deliberately not the shared provider client: see `metadata_client`.
+            CredentialSource::MetadataServer => refresh_metadata_token().await?,
             CredentialSource::AccessToken(token) => {
                 return Ok(token.expose().to_owned());
             }
@@ -2090,8 +2126,31 @@ enum ServiceAccountSigningError {
     Join(#[source] tokio::task::JoinError),
 }
 
-async fn refresh_metadata_token(client: &Client) -> Result<CachedToken, ProviderError> {
-    let response = client
+/// How long the link-local metadata server gets to answer.
+///
+/// `metadata.google.internal` is one hop away on the host's own link, so a wait
+/// measured in minutes only ever means the endpoint is absent — the usual case on
+/// a developer laptop, where the name resolves to nothing.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A client that reaches the instance metadata server without a proxy.
+///
+/// The process proxy environment must not see this request. `HTTP_PROXY` is
+/// commonly set to a corporate or debugging proxy, and routing a
+/// `computeMetadata` token request through it hands a freshly minted GCP access
+/// token to a third party. It is also plain HTTP, so the token would travel in
+/// clear text to that proxy. `DirectPurpose::CloudMetadata` is the declared
+/// bypass for exactly this case.
+fn metadata_client() -> Result<Client, ProviderError> {
+    zuno_network::direct_client_builder(zuno_network::DirectPurpose::CloudMetadata)
+        .connect_timeout(METADATA_TIMEOUT)
+        .timeout(METADATA_TIMEOUT)
+        .build()
+        .map_err(ProviderError::transient)
+}
+
+async fn refresh_metadata_token() -> Result<CachedToken, ProviderError> {
+    let response = metadata_client()?
         .get(METADATA_TOKEN_URL)
         .header("metadata-flavor", "Google")
         .send()
@@ -2105,12 +2164,17 @@ async fn exchange_oauth_token(
     token_uri: &str,
     body: String,
 ) -> Result<CachedToken, ProviderError> {
-    let response = client
-        .post(token_uri)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(body)
-        .send()
-        .await
+    let deadlines = RequestDeadlines::start(HttpTimeouts::native());
+    let response = deadlines
+        .headers(
+            VERTEX_PROVIDER_ID,
+            client
+                .post(token_uri)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(body)
+                .send(),
+        )
+        .await?
         .map_err(ProviderError::transient)?;
     decode_token_response(response, VERTEX_PROVIDER_ID).await
 }
@@ -2131,9 +2195,18 @@ async fn decode_token_response(
     provider: &str,
 ) -> Result<CachedToken, ProviderError> {
     if !response.status().is_success() {
-        return Err(classify_http_error(response, provider).await);
+        return Err(classify_http_error(response, provider, classify_gemini_http_error).await);
     }
-    let token: OAuthTokenResponse = response.json().await.map_err(ProviderError::fatal)?;
+    // A token document is a few hundred bytes. Reading it with a size and time
+    // bound keeps a misrouted endpoint that streams forever from consuming the
+    // process instead of failing the refresh. Unlike an error body, this one has to
+    // be complete: half a token document must not be parsed as a token.
+    let body = read_error_body(provider, response).await?;
+    if body.truncated() {
+        return Err(truncated_body_error(provider, MAX_ERROR_BODY_BYTES));
+    }
+    let token: OAuthTokenResponse =
+        serde_json::from_slice(body.bytes()).map_err(ProviderError::fatal)?;
     Ok(CachedToken {
         value: SecretString::new(token.access_token),
         expires_at: SystemTime::now() + Duration::from_secs(token.expires_in),
@@ -2145,12 +2218,23 @@ trait WireDecoder: Send + 'static {
     fn finish_bytes(&mut self) -> Result<Vec<StreamEvent>, ProviderError>;
 }
 
+/// How one surface turns a non-success HTTP response into a typed failure.
+///
+/// The three providers in this crate do not speak one error format: Gemini
+/// returns `error.status`, while Vertex-hosted Anthropic returns the Anthropic
+/// Messages `error.type`. Passing the classifier in keeps each surface on the
+/// vocabulary it actually emits instead of reading one shape through the other's
+/// classifier.
+type HttpErrorClassifier = fn(&str, u16, &reqwest::header::HeaderMap, &[u8]) -> ProviderError;
+
 async fn open_json_stream<D>(
     client: Client,
     prepared: PreparedRequest,
     auth_header: Option<(&'static str, String)>,
     decoder: D,
     provider: &'static str,
+    model: String,
+    classify: HttpErrorClassifier,
 ) -> Result<ProviderStream<'static>, ProviderError>
 where
     D: WireDecoder,
@@ -2162,13 +2246,16 @@ where
     if let Some((name, value)) = auth_header {
         request = request.header(name, value);
     }
-    let response = request
-        .json(&prepared.body)
-        .send()
-        .await
+    // A response-header deadline is the difference between a stalled peer and a
+    // turn that never ends: a front end that accepts the connection and then
+    // loses its backend sends nothing at all, and `send()` alone waits forever.
+    let deadlines = RequestDeadlines::start(HttpTimeouts::native());
+    let response = deadlines
+        .headers(provider, request.json(&prepared.body).send())
+        .await?
         .map_err(ProviderError::transient)?;
     if !response.status().is_success() {
-        return Err(classify_http_error(response, provider).await);
+        return Err(classify_http_error(response, provider, classify).await);
     }
 
     let bytes = response.bytes_stream();
@@ -2180,33 +2267,50 @@ where
     );
     let stream = futures::stream::unfold(
         state,
-        |(mut bytes, mut decoder, mut pending, mut finished)| async move {
-            loop {
-                if !pending.is_empty() {
-                    let item = pending.remove(0);
-                    return Some((item, (bytes, decoder, pending, finished)));
-                }
-                if finished {
-                    return None;
-                }
-                match bytes.next().await {
-                    Some(Ok(chunk)) => match decoder.push_bytes(&chunk) {
-                        Ok(events) => pending.extend(events.into_iter().map(Ok)),
+        move |(mut bytes, mut decoder, mut pending, mut finished)| {
+            let model = model.clone();
+            async move {
+                loop {
+                    if !pending.is_empty() {
+                        let item = pending.remove(0);
+                        return Some((item, (bytes, decoder, pending, finished)));
+                    }
+                    if finished {
+                        return None;
+                    }
+                    // Without a per-chunk idle timeout a half-open connection holds the
+                    // turn open forever: TCP has nothing to report and the decoder has
+                    // nothing to decode.
+                    let chunk = match StreamIdleTimeout::default()
+                        .wait(provider, &model, bytes.next())
+                        .await
+                    {
+                        Ok(chunk) => chunk,
                         Err(error) => {
                             pending.push(Err(error));
                             finished = true;
+                            continue;
                         }
-                    },
-                    Some(Err(error)) => {
-                        pending.push(Err(ProviderError::transient(error)));
-                        finished = true;
-                    }
-                    None => {
-                        match decoder.finish_bytes() {
+                    };
+                    match chunk {
+                        Some(Ok(chunk)) => match decoder.push_bytes(&chunk) {
                             Ok(events) => pending.extend(events.into_iter().map(Ok)),
-                            Err(error) => pending.push(Err(error)),
+                            Err(error) => {
+                                pending.push(Err(error));
+                                finished = true;
+                            }
+                        },
+                        Some(Err(error)) => {
+                            pending.push(Err(ProviderError::transient(error)));
+                            finished = true;
                         }
-                        finished = true;
+                        None => {
+                            match decoder.finish_bytes() {
+                                Ok(events) => pending.extend(events.into_iter().map(Ok)),
+                                Err(error) => pending.push(Err(error)),
+                            }
+                            finished = true;
+                        }
                     }
                 }
             }
@@ -2215,27 +2319,44 @@ where
     Ok(Box::pin(stream))
 }
 
-async fn classify_http_error(response: reqwest::Response, provider: &str) -> ProviderError {
+/// Read a non-success response under a size and time bound, then classify it.
+///
+/// The body read is bounded because an error response is attacker- or
+/// accident-shaped: a proxy error page can be arbitrarily long, and
+/// `Response::json` would buffer all of it into the provider task.
+async fn classify_http_error(
+    response: reqwest::Response,
+    provider: &str,
+    classify: HttpErrorClassifier,
+) -> ProviderError {
     let status = response.status().as_u16();
-    let retry_after = response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs);
-    let body = response.json::<Value>().await.ok();
+    let headers = response.headers().clone();
+    match read_error_body(provider, response).await {
+        Ok(body) => classify(provider, status, &headers, body.bytes()),
+        // The status is the classification signal; a body that could not be read
+        // only costs the human-readable detail.
+        Err(_) => classify(provider, status, &headers, &[]),
+    }
+}
+
+/// Classify a non-success Gemini response from its structured `error.status`.
+fn classify_gemini_http_error(
+    provider: &str,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: &[u8],
+) -> ProviderError {
+    let body = serde_json::from_slice::<Value>(body).ok();
     let structured_code = body
         .as_ref()
-        .and_then(|value| {
-            value["error"]
-                .get("status")
-                .or_else(|| value["error"].get("type"))
-        })
+        .and_then(|value| value["error"].get("status"))
         .and_then(Value::as_str)
         .map(str::to_owned);
 
     if status == 429 {
-        return ProviderError::RateLimited { retry_after };
+        return ProviderError::RateLimited {
+            retry_after: zuno_llm::http::retry_after(headers),
+        };
     }
     if matches!(
         structured_code.as_deref(),
@@ -2679,6 +2800,161 @@ mod tests {
     /// by constructing `GeminiGenerationConfig`, because a test that filled the struct
     /// directly would keep passing while `from_spec` ignored the key the composition
     /// root writes. That is exactly how an accepted-and-ignored option survives.
+    fn sse_frame(value: serde_json::Value) -> Vec<u8> {
+        format!("data: {value}\n\n").into_bytes()
+    }
+
+    #[test]
+    fn a_gemini_stream_cut_off_before_a_finish_reason_is_a_retryable_stream_failure() {
+        let mut decoder = GeminiStreamDecoder::new(GOOGLE_PROVIDER_ID, "gemini-3-pro");
+        let events = decoder
+            .push(&sse_frame(
+                json!({"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}),
+            ))
+            .expect("the frame decodes");
+        assert_eq!(events, vec![StreamEvent::TextDelta("partial".to_owned())]);
+
+        let error = decoder
+            .finish()
+            .expect_err("a truncated Gemini stream must not be committed as a complete turn");
+        let ProviderError::Stream {
+            code: zuno_error::ProviderStreamFailure::UpstreamStreamIncomplete,
+            ..
+        } = &error
+        else {
+            panic!("expected a typed incomplete-stream failure, got {error:?}");
+        };
+        assert!(error.is_retryable(), "{error:?}");
+        assert!(error.permits_partial_output_retry(), "{error:?}");
+    }
+
+    #[test]
+    fn a_gemini_stream_that_reported_a_finish_reason_completes() {
+        let mut decoder = GeminiStreamDecoder::new(GOOGLE_PROVIDER_ID, "gemini-3-pro");
+        let mut events = decoder
+            .push(&sse_frame(json!({
+                "candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}]
+            })))
+            .expect("the frame decodes");
+        events.extend(decoder.finish().expect("a terminated stream finishes"));
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta("done".to_owned()),
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::Stop),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_vertex_anthropic_stream_cut_off_before_a_terminator_is_a_retryable_stream_failure() {
+        let mut decoder =
+            AnthropicStreamDecoder::new(VERTEX_ANTHROPIC_PROVIDER_ID, "claude-opus-4-5");
+        let events = decoder
+            .push(&sse_frame(json!({
+                "type":"content_block_delta",
+                "index":0,
+                "delta":{"type":"text_delta","text":"partial"}
+            })))
+            .expect("the frame decodes");
+        assert_eq!(events, vec![StreamEvent::TextDelta("partial".to_owned())]);
+
+        let error = decoder
+            .finish()
+            .expect_err("a truncated Messages stream must not be committed as a complete turn");
+        assert!(
+            matches!(
+                error,
+                ProviderError::Stream {
+                    code: zuno_error::ProviderStreamFailure::UpstreamStreamIncomplete,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn message_stop_alone_terminates_a_vertex_anthropic_stream() {
+        let mut decoder =
+            AnthropicStreamDecoder::new(VERTEX_ANTHROPIC_PROVIDER_ID, "claude-opus-4-5");
+        let mut events = decoder
+            .push(&sse_frame(json!({"type":"message_stop"})))
+            .expect("the frame decodes");
+        events.extend(decoder.finish().expect("a terminated stream finishes"));
+        assert_eq!(
+            events,
+            vec![StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Unknown),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_vertex_anthropic_context_overflow_asks_for_compaction_rather_than_failing() {
+        // The deciding case for finding F4. The four-arm classifier this replaced
+        // matched only `rate_limit_error`, `overloaded_error`, `authentication_error`
+        // and `permission_error`, so `prompt_too_long` fell into its `_` arm as
+        // `Fatal` — `Recovery::Fail`, with no compaction and no retry.
+        let mut decoder =
+            AnthropicStreamDecoder::new(VERTEX_ANTHROPIC_PROVIDER_ID, "claude-opus-4-5");
+        let error = decoder
+            .push(&sse_frame(json!({
+                "type":"error",
+                "error":{"type":"prompt_too_long","message":"prompt is too long"}
+            })))
+            .expect_err("an error event terminates the stream");
+        assert!(
+            matches!(error, ProviderError::ContextLimit { .. }),
+            "{error:?}"
+        );
+        assert!(matches!(error.recovery(), zuno_error::Recovery::Compact));
+    }
+
+    #[test]
+    fn a_vertex_anthropic_http_error_is_read_with_the_messages_vocabulary() {
+        let error = map_messages_http_error(
+            VERTEX_ANTHROPIC_PROVIDER_ID,
+            400,
+            &reqwest::header::HeaderMap::new(),
+            br#"{"type":"error","error":{"type":"prompt_too_long","message":"too long"}}"#,
+        );
+        assert!(
+            matches!(error, ProviderError::ContextLimit { .. }),
+            "the Gemini classifier returned Fatal for exactly this body: {error:?}"
+        );
+
+        let gemini = classify_gemini_http_error(
+            VERTEX_PROVIDER_ID,
+            400,
+            &reqwest::header::HeaderMap::new(),
+            br#"{"error":{"status":"INVALID_ARGUMENT","message":"bad request"}}"#,
+        );
+        assert!(matches!(gemini, ProviderError::Fatal { .. }), "{gemini:?}");
+    }
+
+    #[test]
+    fn a_gemini_throttle_keeps_the_peers_retry_after_in_both_forms() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("Sun, 06 Nov 2044 08:49:37 GMT"),
+        );
+        let error = classify_gemini_http_error(GOOGLE_PROVIDER_ID, 429, &headers, b"{}");
+        let ProviderError::RateLimited {
+            retry_after: Some(delay),
+        } = error
+        else {
+            panic!("expected a rate limit carrying the peer's deadline, got {error:?}");
+        };
+        assert!(
+            !delay.is_zero(),
+            "the HTTP-date form was previously dropped because only `parse::<u64>` was tried"
+        );
+    }
+
     fn gemini_body_from_options(options: serde_json::Value) -> Value {
         let mut spec = Spec::new("google");
         for (name, value) in options.as_object().expect("options are an object") {

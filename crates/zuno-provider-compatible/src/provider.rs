@@ -16,6 +16,7 @@
 //! and for the message the user gets.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,7 +82,12 @@ struct InvalidTimeoutOption {
 }
 
 /// An OpenAI-compatible provider.
-#[derive(Debug)]
+///
+/// [`fmt::Debug`] is written by hand rather than derived. Two fields hold live
+/// credentials — `credential` is the bearer token verbatim, and `spec.headers`
+/// carries whatever authorization header a custom profile configured — so a
+/// derived implementation put the user's API key into any log line, panic
+/// message, or error chain that formatted a provider.
 pub struct CompatibleProvider {
     spec: Spec,
     profile: Profile,
@@ -96,6 +102,36 @@ pub struct CompatibleProvider {
     idle: StreamIdleTimeout,
     timeouts: HttpTimeouts,
 }
+
+impl fmt::Debug for CompatibleProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompatibleProvider")
+            .field("provider", &self.spec.provider)
+            .field("profile", &self.profile)
+            .field("base_url", &self.base_url)
+            .field("surface", &self.spec.surface)
+            .field("capabilities", &self.capabilities)
+            .field("max_tokens", &self.max_tokens)
+            .field("sampling", &self.sampling)
+            .field("tool_choice", &self.tool_choice)
+            // Presence is diagnostic; the value never is.
+            .field("credential", &self.credential.as_ref().map(|_| REDACTED))
+            // Names only. A configured `Authorization` or `api-key` header value
+            // is exactly as sensitive as `credential`.
+            .field(
+                "configured_header_names",
+                &self.spec.headers.keys().collect::<Vec<_>>(),
+            )
+            .field("transport", &self.transport)
+            .field("idle", &self.idle)
+            .field("timeouts", &self.timeouts)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Stand-in for a credential in diagnostic output.
+const REDACTED: &str = "<redacted>";
 
 impl CompatibleProvider {
     /// Construct a provider for `spec`, or explain the refusal.
@@ -429,6 +465,9 @@ fn translate(
         model: String,
         idle: StreamIdleTimeout,
         drained: bool,
+        /// A terminal failure discovered at EOF, yielded only after every event
+        /// that legitimately arrived before it.
+        terminal: Option<ProviderError>,
     }
 
     let parser = SseParser::for_stream(provider.clone(), model.clone());
@@ -447,6 +486,7 @@ fn translate(
         model,
         idle,
         drained: false,
+        terminal: None,
     };
 
     futures::stream::unfold(Some(state), |maybe| async move {
@@ -456,7 +496,7 @@ fn translate(
                 return Some((Ok(event), Some(state)));
             }
             if state.drained {
-                return None;
+                return state.terminal.take().map(|error| (Err(error), None));
             }
 
             let next = state
@@ -495,7 +535,10 @@ fn translate(
             }
 
             if state.drained {
-                state.pending.extend(state.translator.finish());
+                match state.translator.finish() {
+                    Ok(events) => state.pending.extend(events),
+                    Err(error) => state.terminal = Some(error),
+                }
             }
         }
     })
@@ -731,6 +774,38 @@ mod tests {
             ProviderSessionIdentity::parse("ses_compatible_affinity")
                 .expect("valid session identity"),
         ))
+    }
+
+    #[test]
+    fn debug_output_never_contains_the_bearer_token_or_a_configured_header_value() {
+        let secret = "sk-live-do-not-log-2f9c";
+        let provider = CompatibleProvider::new(
+            Spec::new("groq")
+                .with_base_url("https://api.groq.com/openai/v1")
+                .with_header("authorization", format!("Bearer {secret}")),
+            Arc::new(NeverCalled),
+            Some(secret.to_owned()),
+        )
+        .expect("claimed");
+
+        let rendered = format!("{provider:?}");
+        assert!(
+            !rendered.contains(secret),
+            "the credential reached diagnostic output: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Bearer"),
+            "a configured authorization header value reached diagnostic output: {rendered}"
+        );
+        assert!(
+            rendered.contains(REDACTED),
+            "the credential's presence should still be visible: {rendered}"
+        );
+        assert!(
+            rendered.contains("authorization"),
+            "header names remain diagnostic: {rendered}"
+        );
+        assert!(rendered.contains("groq"), "{rendered}");
     }
 
     #[test]

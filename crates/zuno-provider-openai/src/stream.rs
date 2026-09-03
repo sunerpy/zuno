@@ -8,7 +8,9 @@ use serde_json::Value;
 use zuno_error::ProviderError;
 use zuno_llm::event::{FinishReason, PromptAccounting, RequestContentBlock, StreamEvent};
 use zuno_llm::registry::ApiSurface;
-use zuno_llm::sse::{SseEvent, SseParser, append_tool_input, ensure_tool_input_size};
+use zuno_llm::sse::{
+    SseEvent, SseParser, append_tool_input, ensure_tool_input_size, upstream_stream_incomplete,
+};
 
 use crate::error::{OpenAiErrorBody, map_stream_error};
 use crate::request::resolve_surface;
@@ -71,7 +73,13 @@ impl OpenAiDecoder {
         let frames = self.parser.finish();
         let mut output = self.decode_frames(frames);
         if !self.failed {
-            output.extend(self.protocol.finish().into_iter().map(Ok));
+            match self.protocol.finish() {
+                Ok(events) => output.extend(events.into_iter().map(Ok)),
+                Err(error) => {
+                    self.failed = true;
+                    output.push(Err(error));
+                }
+            }
         }
         output
     }
@@ -131,11 +139,11 @@ impl ProtocolDecoder {
         }
     }
 
-    fn finish(&mut self) -> Vec<StreamEvent> {
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
         match self {
             Self::Chat(decoder) => decoder.finish(),
             Self::Responses(decoder) => decoder.finish(),
-            Self::Unsupported => Vec::new(),
+            Self::Unsupported => Ok(Vec::new()),
         }
     }
 
@@ -250,8 +258,17 @@ impl ChatDecoder {
         Ok(events)
     }
 
-    fn finish(&mut self) -> Vec<StreamEvent> {
-        self.close_message(None)
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
+        if self.ended {
+            return Ok(Vec::new());
+        }
+        // Chat Completions ends a message with a `finish_reason`, a `[DONE]`
+        // sentinel, or both; `close_message` records whichever arrived first.
+        // Reaching EOF with neither means the connection dropped mid-generation.
+        // Synthesizing `MessageEnd` here is what let a truncated turn be committed
+        // as a complete one: the accumulated half of a tool-call argument became
+        // durable history and no retry was attempted.
+        Err(upstream_stream_incomplete(&self.provider, &self.model))
     }
 
     fn close_message(&mut self, reason: Option<FinishReason>) -> Vec<StreamEvent> {
@@ -526,12 +543,14 @@ impl ResponsesDecoder {
         events
     }
 
-    fn finish(&mut self) -> Vec<StreamEvent> {
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
         if self.ended {
-            Vec::new()
-        } else {
-            self.terminal_response(ResponseEnvelope::default(), FinishReason::Unknown)
+            return Ok(Vec::new());
         }
+        // The Responses surface terminates with `response.completed`,
+        // `response.incomplete`, or `response.failed`. None arrived, so the turn
+        // was cut off rather than finished.
+        Err(upstream_stream_incomplete(&self.provider, &self.model))
     }
 }
 
@@ -725,6 +744,110 @@ struct ToolInputError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn truncation_failure(events: Vec<Result<StreamEvent, ProviderError>>) -> ProviderError {
+        let error = events
+            .into_iter()
+            .find_map(Result::err)
+            .expect("a truncated stream must not finish cleanly");
+        assert!(
+            matches!(
+                error,
+                ProviderError::Stream {
+                    code: zuno_error::ProviderStreamFailure::UpstreamStreamIncomplete,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            error.permits_partial_output_retry(),
+            "the engine must be allowed to discard the partial output and replay"
+        );
+        error
+    }
+
+    #[test]
+    fn a_chat_stream_cut_off_mid_tool_arguments_is_a_retryable_stream_failure() {
+        let mut decoder = OpenAiDecoder::new("openai", "gpt-5", ApiSurface::Chat);
+        let frame = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_a",
+                            "function": { "name": "write", "arguments": "{\"path\":\"a.rs" }
+                        }]
+                    }
+                }]
+            })
+        );
+        let mut events = decoder.push(frame.as_bytes());
+        events.extend(decoder.finish());
+        truncation_failure(events);
+    }
+
+    #[test]
+    fn a_chat_stream_with_only_a_finish_reason_and_no_done_sentinel_completes() {
+        let mut decoder = OpenAiDecoder::new("groq", "llama-3.3-70b", ApiSurface::Chat);
+        let frame = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "done" },
+                    "finish_reason": "stop"
+                }]
+            })
+        );
+        let mut events = decoder.push(frame.as_bytes());
+        events.extend(decoder.finish());
+        let events = events
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("a finish_reason alone must terminate the stream");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::Stop)
+                }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_chat_stream_with_only_a_done_sentinel_completes() {
+        let mut decoder = OpenAiDecoder::new("together", "mixtral", ApiSurface::Chat);
+        let mut events = decoder.push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n");
+        events.extend(decoder.finish());
+        events
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("a [DONE] sentinel alone must terminate the stream");
+    }
+
+    #[test]
+    fn a_responses_stream_cut_off_before_completion_is_a_retryable_stream_failure() {
+        let mut decoder = OpenAiDecoder::new("openai", "gpt-5", ApiSurface::Responses);
+        let frame = format!(
+            "event: response.output_text.delta\ndata: {}\n\n",
+            json!({ "type": "response.output_text.delta", "delta": "half a sen" })
+        );
+        let mut events = decoder.push(frame.as_bytes());
+        events.extend(decoder.finish());
+        truncation_failure(events);
+    }
+
+    #[test]
+    fn an_empty_two_hundred_response_is_a_retryable_stream_failure() {
+        let mut decoder = OpenAiDecoder::new("openai", "gpt-5", ApiSurface::Responses);
+        truncation_failure(decoder.finish());
+    }
 
     #[test]
     fn responses_failed_preserves_the_structured_provider_error() {

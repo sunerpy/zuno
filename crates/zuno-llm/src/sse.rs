@@ -11,7 +11,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
-use zuno_error::ProviderError;
+use zuno_error::{ProviderError, ProviderStreamFailure};
 
 /// Environment override for the maximum gap between streamed chunks.
 pub const STREAM_IDLE_TIMEOUT_ENV: &str = "ZUNO_STREAM_IDLE_TIMEOUT_SECS";
@@ -622,6 +622,60 @@ impl fmt::Display for SseIdleTimeoutError {
 }
 
 impl StdError for SseIdleTimeoutError {}
+
+/// The typed failure for a provider stream that ended without a terminator.
+///
+/// # Why this is not a synthesized end
+///
+/// Every streaming wire protocol Zuno speaks marks the end of a message: OpenAI
+/// Chat sends a `finish_reason` and/or `[DONE]`, OpenAI Responses sends
+/// `response.completed`, Anthropic Messages sends `message_stop` or a
+/// `message_delta` carrying `stop_reason`, Gemini sends a candidate
+/// `finishReason`, and Bedrock sends `messageStop`. If the byte stream ends
+/// before any of those arrive, the turn was cut off mid-generation — by a dropped
+/// connection, a proxy timeout, or a killed upstream worker.
+///
+/// Synthesizing a `MessageEnd` there is the worst available answer: the engine
+/// then commits a truncated assistant message as a *complete* turn, so a
+/// half-written file edit or a half-emitted tool call becomes durable history and
+/// no retry is attempted. [`ProviderStreamFailure::UpstreamStreamIncomplete`]
+/// instead reports the truncation as what it is. Because it is a
+/// [`ProviderError::Stream`], it is retryable *and* it permits discarding the
+/// partial output, so the engine replaces the attempt with an identical request
+/// rather than appending a broken checkpoint.
+///
+/// One marker is enough. Requiring both a `finish_reason` and a `[DONE]` sentinel
+/// would permanently break every OpenAI-compatible vendor that sends only one of
+/// them, so each decoder sets its own "ended" flag on whichever terminator its
+/// protocol actually uses.
+#[must_use]
+pub fn upstream_stream_incomplete(provider: &str, model: &str) -> ProviderError {
+    ProviderError::Stream {
+        code: ProviderStreamFailure::UpstreamStreamIncomplete,
+        source: Some(Box::new(IncompleteStreamError {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+        })),
+    }
+}
+
+#[derive(Debug)]
+struct IncompleteStreamError {
+    provider: String,
+    model: String,
+}
+
+impl fmt::Display for IncompleteStreamError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "provider `{}` model `{}` ended the response stream before any completion marker; the assistant message was cut off mid-generation",
+            self.provider, self.model
+        )
+    }
+}
+
+impl StdError for IncompleteStreamError {}
 
 #[cfg(test)]
 mod tests {

@@ -355,7 +355,14 @@ fn decode_compatible(interaction: &HttpInteraction) -> Vec<StreamEvent> {
                 .expect("compatible frame translates"),
         );
     }
-    events.extend(translator.finish());
+    // A truncated recording must not replay as a finished turn: the translator now
+    // reports the typed incomplete-stream failure instead of synthesizing a
+    // `MessageEnd`, and a fixture that trips it is a broken fixture.
+    events.extend(
+        translator
+            .finish()
+            .expect("compatible fixture terminates its stream"),
+    );
     events
 }
 

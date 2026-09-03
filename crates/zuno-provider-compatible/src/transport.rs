@@ -21,7 +21,9 @@ use std::time::Duration;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
 use zuno_error::ProviderError;
-use zuno_llm::sse::{MAX_PROVIDER_WAIT, STREAM_IDLE_TIMEOUT_ENV, StreamIdleTimeout};
+use zuno_llm::sse::{MAX_PROVIDER_WAIT, StreamIdleTimeout};
+
+use zuno_llm::http::{RequestDeadlines, read_error_body};
 
 use crate::stream::retry_after;
 use crate::wire::ErrorEnvelope;
@@ -35,45 +37,11 @@ pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, ProviderError>>
 
 /// Per-request HTTP timeouts resolved from provider configuration.
 ///
-/// A whole-request timeout spans response headers and every streamed body chunk.
-/// Header and chunk timeouts are phase-specific; the earliest applicable
-/// deadline wins without changing the other phase's policy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct HttpTimeouts {
-    total: Option<Duration>,
-    header: Option<Duration>,
-    chunk: Option<Duration>,
-}
-
-impl HttpTimeouts {
-    #[must_use]
-    pub const fn new(
-        total: Option<Duration>,
-        header: Option<Duration>,
-        chunk: Option<Duration>,
-    ) -> Self {
-        Self {
-            total,
-            header,
-            chunk,
-        }
-    }
-
-    #[must_use]
-    pub const fn total(self) -> Option<Duration> {
-        self.total
-    }
-
-    #[must_use]
-    pub const fn header(self) -> Option<Duration> {
-        self.header
-    }
-
-    #[must_use]
-    pub const fn chunk(self) -> Option<Duration> {
-        self.chunk
-    }
-}
+/// The type, the deadline arithmetic, and the typed timeout failure now live in
+/// [`zuno_llm::http`] so the four native provider crates enforce the same policy.
+/// Only the *values* stay here: this profile keeps its own tighter liveness
+/// budget, while the native providers keep their longer stream-idle ceiling.
+pub use zuno_llm::http::HttpTimeouts;
 
 /// The default maximum silence between response-body chunks.
 ///
@@ -172,26 +140,19 @@ impl Transport for ReqwestTransport {
         let provider = self.provider.clone();
         let idle = self.idle;
         Box::pin(async move {
-            let started = tokio::time::Instant::now();
-            let total_deadline = request
-                .timeouts
-                .total()
-                .map(|duration| Deadline::after(started, duration, TimeoutPhase::WholeRequest));
-            let header_deadline = request
-                .timeouts
-                .header()
-                .map(|duration| Deadline::after(started, duration, TimeoutPhase::ResponseHeaders));
+            let deadlines = RequestDeadlines::start(HttpTimeouts::new(
+                request.timeouts.total(),
+                request.timeouts.header(),
+                Some(request.timeouts.chunk().unwrap_or_else(|| idle.duration())),
+            ));
             let mut builder = client.post(&request.url).json(&request.body);
             for (name, value) in &request.headers {
                 builder = builder.header(name, value);
             }
-            let response = wait_until(
-                &provider,
-                earliest(total_deadline, header_deadline),
-                builder.send(),
-            )
-            .await?
-            .map_err(ProviderError::transient)?;
+            let response = deadlines
+                .headers(&provider, builder.send())
+                .await?
+                .map_err(ProviderError::transient)?;
 
             let status = response.status();
             if !status.is_success() {
@@ -203,9 +164,10 @@ impl Transport for ReqwestTransport {
                 // Read as bytes and decode strictly: a non-UTF-8 error body loses
                 // its detail rather than being rendered with replacement
                 // characters that could be mistaken for the vendor's own text.
-                let bytes = wait_until(&provider, total_deadline, response.bytes())
-                    .await?
-                    .map_err(ProviderError::transient)?;
+                let bytes = deadlines
+                    .body(&provider, read_error_body(&provider, response))
+                    .await??
+                    .into_bytes();
                 let text = std::str::from_utf8(&bytes).ok().map(str::to_owned);
                 return Err(classify_response(
                     &provider,
@@ -216,131 +178,22 @@ impl Transport for ReqwestTransport {
             }
 
             let body = Box::pin(response.bytes_stream());
-            let chunk_timeout = request.timeouts.chunk().unwrap_or_else(|| idle.duration());
-            let chunks = futures::stream::unfold(
-                Some((body, provider, total_deadline, chunk_timeout)),
-                |state| async move {
-                    let (mut body, provider, total_deadline, chunk_timeout) = state?;
-                    let chunk_deadline = Deadline::after(
-                        tokio::time::Instant::now(),
-                        chunk_timeout,
-                        TimeoutPhase::ResponseChunk,
-                    );
-                    match wait_until(
-                        &provider,
-                        earliest(total_deadline, Some(chunk_deadline)),
-                        body.next(),
-                    )
-                    .await
-                    {
-                        Ok(Some(Ok(bytes))) => Some((
-                            Ok(bytes.to_vec()),
-                            Some((body, provider, total_deadline, chunk_timeout)),
-                        )),
+            let chunks =
+                futures::stream::unfold(Some((body, provider, deadlines)), |state| async move {
+                    let (mut body, provider, deadlines) = state?;
+                    match deadlines.chunk(&provider, body.next()).await {
+                        Ok(Some(Ok(bytes))) => {
+                            Some((Ok(bytes.to_vec()), Some((body, provider, deadlines))))
+                        }
                         Ok(Some(Err(error))) => Some((Err(ProviderError::transient(error)), None)),
                         Ok(None) => None,
                         Err(error) => Some((Err(error), None)),
                     }
-                },
-            );
+                });
             Ok(Box::pin(chunks) as ChunkStream)
         })
     }
 }
-
-#[derive(Debug, Clone, Copy)]
-struct Deadline {
-    at: tokio::time::Instant,
-    duration: Duration,
-    phase: TimeoutPhase,
-}
-
-impl Deadline {
-    fn after(started: tokio::time::Instant, duration: Duration, phase: TimeoutPhase) -> Self {
-        Self {
-            at: started + duration,
-            duration,
-            phase,
-        }
-    }
-}
-
-fn earliest(left: Option<Deadline>, right: Option<Deadline>) -> Option<Deadline> {
-    match (left, right) {
-        (Some(left), Some(right)) if left.at <= right.at => Some(left),
-        (Some(_), Some(right)) => Some(right),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
-}
-
-async fn wait_until<F, T>(
-    provider: &str,
-    deadline: Option<Deadline>,
-    future: F,
-) -> Result<T, ProviderError>
-where
-    F: Future<Output = T>,
-{
-    match deadline {
-        Some(deadline) => tokio::time::timeout_at(deadline.at, future)
-            .await
-            .map_err(|_| {
-                ProviderError::transient(HttpTimeoutError {
-                    provider: provider.to_owned(),
-                    duration: deadline.duration,
-                    phase: deadline.phase,
-                })
-            }),
-        None => Ok(future.await),
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum TimeoutPhase {
-    WholeRequest,
-    ResponseHeaders,
-    ResponseChunk,
-}
-
-impl TimeoutPhase {
-    const fn description(self) -> &'static str {
-        match self {
-            Self::WholeRequest => "whole request timeout",
-            Self::ResponseHeaders => "response headers timeout",
-            Self::ResponseChunk => "response stream idle timeout",
-        }
-    }
-}
-
-#[derive(Debug)]
-struct HttpTimeoutError {
-    provider: String,
-    duration: Duration,
-    phase: TimeoutPhase,
-}
-
-impl fmt::Display for HttpTimeoutError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "provider `{}` {} after {:?}",
-            self.provider,
-            self.phase.description(),
-            self.duration
-        )?;
-        if matches!(self.phase, TimeoutPhase::ResponseChunk) {
-            write!(
-                formatter,
-                "; raise provider options.chunkTimeout or {STREAM_IDLE_TIMEOUT_ENV} for slower providers"
-            )?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for HttpTimeoutError {}
 
 /// Classify a non-2xx response into the typed taxonomy.
 ///
