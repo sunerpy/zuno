@@ -1,7 +1,7 @@
 //! Append-only, per-session event log shared by runtime capabilities.
 
 use crate::{Pool, open};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde_json::{Map, Value};
 use std::error::Error;
 use std::sync::Arc;
@@ -31,16 +31,21 @@ impl NewSessionEvent {
         properties: Map<String, Value>,
     ) -> Result<Self, DbError> {
         let event_type = event_type.into();
-        if event_type.is_empty() || event_type.contains(['\r', '\n']) {
-            return Err(query_error(std::io::Error::other(
-                "invalid session event type",
-            )));
-        }
+        validate_event_type(&event_type)?;
         Ok(Self {
             event_type,
             properties,
         })
     }
+}
+
+fn validate_event_type(event_type: &str) -> Result<(), DbError> {
+    if event_type.is_empty() || event_type.contains(['\r', '\n']) {
+        return Err(query_error(std::io::Error::other(
+            "invalid session event type",
+        )));
+    }
+    Ok(())
 }
 
 /// One committed event in a session's monotonic stream.
@@ -109,20 +114,139 @@ impl SessionEventLog {
             )
             .map_err(open::map_error)?;
         let rows = statement
-            .query_map(params![session_id, sequence], |row| {
-                Ok(StoredEvent {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    sequence: row.get(2)?,
-                    stored_type: row.get(3)?,
-                    data: row.get(4)?,
-                })
-            })
+            .query_map(params![session_id, sequence], decode_stored_row)
             .map_err(open::map_error)?;
 
         rows.map(|row| row.map_err(open::map_error).and_then(decode_event))
             .collect()
     }
+
+    /// Read every stored version of one event type strictly after `sequence`,
+    /// or from the start for `None`.
+    ///
+    /// See [`read_of_type_after_in`] for the version rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when `event_type` is invalid, the query fails,
+    /// or a committed event cannot be decoded.
+    pub fn read_of_type_after(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        sequence: Option<i64>,
+    ) -> Result<Vec<SessionEvent>, DbError> {
+        let connection = self.pool.get()?;
+        read_of_type_after_in(&connection, session_id, event_type, sequence)
+    }
+
+    /// The newest event of one type across every stored version, if any.
+    ///
+    /// See [`latest_of_type_in`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when `event_type` is invalid, the query fails,
+    /// or a committed event cannot be decoded.
+    pub fn latest_of_type(
+        &self,
+        session_id: &str,
+        event_type: &str,
+    ) -> Result<Option<SessionEvent>, DbError> {
+        let connection = self.pool.get()?;
+        latest_of_type_in(&connection, session_id, event_type)
+    }
+}
+
+/// Read every stored version of `event_type` strictly after `sequence` through a
+/// caller-owned connection or transaction.
+///
+/// Stored types are `<type>.<version>`, so the query bounds the indexed `type`
+/// column to the `<type>.` prefix — served by the `(aggregate_id, type, seq)`
+/// index — and then keeps only rows whose decoded type is exactly `event_type`.
+/// Every version ever written for the type is returned, not only the version
+/// this build appends, so a projection rebuilt after an event-schema bump still
+/// sees the events an older release logged.
+///
+/// # Errors
+///
+/// Returns a database error when `event_type` is invalid, the query fails, or a
+/// committed event cannot be decoded.
+pub fn read_of_type_after_in(
+    connection: &Connection,
+    session_id: &str,
+    event_type: &str,
+    sequence: Option<i64>,
+) -> Result<Vec<SessionEvent>, DbError> {
+    let (lower, upper) = type_bounds(event_type)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, aggregate_id, seq, type, data \
+             FROM event \
+             WHERE aggregate_id = ?1 AND type >= ?2 AND type < ?3 \
+               AND seq > COALESCE(?4, -1) \
+             ORDER BY seq",
+        )
+        .map_err(open::map_error)?;
+    let rows = statement
+        .query_map(
+            params![session_id, lower, upper, sequence],
+            decode_stored_row,
+        )
+        .map_err(open::map_error)?;
+    rows.map(|row| row.map_err(open::map_error).and_then(decode_event))
+        .filter(|event| match event {
+            Ok(event) => event.event_type == event_type,
+            Err(_) => true,
+        })
+        .collect()
+}
+
+/// The newest event of `event_type` across every stored version, through a
+/// caller-owned connection or transaction.
+///
+/// Rows are visited newest first and the first whose decoded type is exactly
+/// `event_type` wins, so a sibling type that merely shares the prefix can never
+/// shadow the real latest event.
+///
+/// # Errors
+///
+/// Returns a database error when `event_type` is invalid, the query fails, or a
+/// committed event cannot be decoded.
+pub fn latest_of_type_in(
+    connection: &Connection,
+    session_id: &str,
+    event_type: &str,
+) -> Result<Option<SessionEvent>, DbError> {
+    let (lower, upper) = type_bounds(event_type)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, aggregate_id, seq, type, data \
+             FROM event \
+             WHERE aggregate_id = ?1 AND type >= ?2 AND type < ?3 \
+             ORDER BY seq DESC",
+        )
+        .map_err(open::map_error)?;
+    let rows = statement
+        .query_map(params![session_id, lower, upper], decode_stored_row)
+        .map_err(open::map_error)?;
+    for row in rows {
+        let event = decode_event(row.map_err(open::map_error)?)?;
+        if event.event_type == event_type {
+            return Ok(Some(event));
+        }
+    }
+    Ok(None)
+}
+
+/// The half-open `type` range holding every stored version of `event_type`.
+///
+/// `'/'` is the byte after `'.'`, so `[<type>., <type>/)` covers exactly the
+/// stored strings with the `<type>.` prefix under SQLite's default `BINARY`
+/// collation, whatever version suffix follows.
+fn type_bounds(event_type: &str) -> Result<(String, String), DbError> {
+    validate_event_type(event_type)?;
+    Ok((format!("{event_type}."), format!("{event_type}/")))
 }
 
 /// Append one event through a caller-owned connection.
@@ -152,6 +276,16 @@ struct StoredEvent {
     sequence: i64,
     stored_type: String,
     data: String,
+}
+
+fn decode_stored_row(row: &Row<'_>) -> rusqlite::Result<StoredEvent> {
+    Ok(StoredEvent {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        sequence: row.get(2)?,
+        stored_type: row.get(3)?,
+        data: row.get(4)?,
+    })
 }
 
 pub fn append_in(

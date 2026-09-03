@@ -155,6 +155,12 @@ impl ExperienceStore {
     }
 
     /// Persist an extractor response and settle its job in one atomic commit.
+    ///
+    /// This is [`Self::record_extraction`] followed by [`Self::finish_extraction`]
+    /// inside one transaction. A caller that must propose Memory from the recorded
+    /// experiences before the job may count as done uses the two steps directly,
+    /// so a failed proposal leaves a still-running job rather than a completed
+    /// job with no candidates.
     pub fn complete_extraction(
         &self,
         job_id: &str,
@@ -166,64 +172,59 @@ impl ExperienceStore {
         validate_batch(experiences)?;
         let result = serde_json::to_string(result).map_err(query_error)?;
         self.pool.transaction(|transaction| {
-            let (session_id, source_message_id) = transaction
-                .query_row(
-                    "SELECT session_id, source_message_id FROM learning_job
-                     WHERE id = ?1 AND owner_id = ?2 AND status = 'running'
-                       AND kind = 'extraction'",
-                    params![job_id, owner_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()
-                .map_err(open::map_error)?
-                .ok_or_else(|| {
-                    query_error(std::io::Error::other(format!(
-                        "extraction job `{job_id}` is not running for owner `{owner_id}`"
-                    )))
-                })?;
-
-            let mut stored = Vec::with_capacity(experiences.len());
-            for experience in experiences {
-                if experience.extraction_job_id.as_deref() != Some(job_id)
-                    || experience.session_id.as_deref() != Some(session_id.as_str())
-                    || experience.source_message_id.as_deref() != Some(source_message_id.as_str())
-                {
-                    return Err(query_error(std::io::Error::other(
-                        "extracted experience provenance does not match its job",
-                    )));
-                }
-                insert_experience(transaction, experience)?;
-                let record = read_required(transaction, &experience.id)?;
-                append_experience_event(transaction, &session_id, &record.projection)?;
-                stored.push(record);
-            }
-            let changed = transaction
-                .execute(
-                    "UPDATE learning_job
-                     SET status = 'completed', result = ?3, error = NULL, owner_id = NULL,
-                         lease_expires = NULL, time_updated = ?4, time_completed = ?4
-                     WHERE id = ?1 AND owner_id = ?2 AND status = 'running'",
-                    params![job_id, owner_id, result, now],
-                )
-                .map_err(open::map_error)?;
-            if changed != 1 {
-                return Err(query_error(std::io::Error::other(format!(
-                    "extraction job `{job_id}` lost its lease before commit"
-                ))));
-            }
-            let mut properties = Map::new();
-            properties.insert("jobID".to_owned(), Value::String(job_id.to_owned()));
-            properties.insert(
-                "sourceMessageID".to_owned(),
-                Value::String(source_message_id),
-            );
-            properties.insert("experienceCount".to_owned(), Value::from(stored.len()));
-            append_in(
-                transaction,
-                &session_id,
-                NewSessionEvent::new("learning.extraction.completed", properties)?,
-            )?;
+            let stored = record_extraction_in(transaction, job_id, owner_id, experiences)?;
+            finish_extraction_in(transaction, job_id, owner_id, &result, now)?;
             Ok(stored)
+        })
+    }
+
+    /// Store extracted experiences for a running job without settling the job.
+    ///
+    /// The job stays `running` under the caller's lease. Work that must follow —
+    /// proposing Memory from the recorded experiences — can therefore fail or
+    /// lose its process without ever producing a completed job that has no
+    /// candidates: the lease reconciler requeues the job instead. Repeating the
+    /// call for the same job and ordinals is idempotent and logs no second
+    /// `learning.experience.recorded` event.
+    ///
+    /// # Errors
+    ///
+    /// A database error when the job is not `running` under `owner_id`, when an
+    /// experience's provenance does not match the job, or when a retried ordinal
+    /// carries different content.
+    pub fn record_extraction(
+        &self,
+        job_id: &str,
+        owner_id: &str,
+        experiences: &[NewExperience],
+    ) -> Result<Vec<ExperienceRecord>, DbError> {
+        validate_batch(experiences)?;
+        self.pool.transaction(|transaction| {
+            record_extraction_in(transaction, job_id, owner_id, experiences)
+        })
+    }
+
+    /// Settle a running extraction job whose experiences and Memory proposals are recorded.
+    ///
+    /// Fails without mutation when the job is not `running` under `owner_id`, so a
+    /// worker whose lease was reconciled away cannot complete it. The
+    /// `learning.extraction.completed` event counts the experiences durably linked
+    /// to the job.
+    ///
+    /// # Errors
+    ///
+    /// A database error when the job is not `running` under `owner_id` or the
+    /// result cannot be encoded.
+    pub fn finish_extraction(
+        &self,
+        job_id: &str,
+        owner_id: &str,
+        result: &Value,
+        now: i64,
+    ) -> Result<(), DbError> {
+        let result = serde_json::to_string(result).map_err(query_error)?;
+        self.pool.transaction(|transaction| {
+            finish_extraction_in(transaction, job_id, owner_id, &result, now)
         })
     }
 
@@ -499,10 +500,106 @@ fn validate_new(experience: &NewExperience) -> Result<(), DbError> {
     Ok(())
 }
 
+/// The session and source message of a job that is `running` under `owner_id`.
+fn running_extraction_job(
+    transaction: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    owner_id: &str,
+) -> Result<(String, String), DbError> {
+    transaction
+        .query_row(
+            "SELECT session_id, source_message_id FROM learning_job
+             WHERE id = ?1 AND owner_id = ?2 AND status = 'running'
+               AND kind = 'extraction'",
+            params![job_id, owner_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(open::map_error)?
+        .ok_or_else(|| {
+            query_error(std::io::Error::other(format!(
+                "extraction job `{job_id}` is not running for owner `{owner_id}`"
+            )))
+        })
+}
+
+fn record_extraction_in(
+    transaction: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    owner_id: &str,
+    experiences: &[NewExperience],
+) -> Result<Vec<ExperienceRecord>, DbError> {
+    let (session_id, source_message_id) = running_extraction_job(transaction, job_id, owner_id)?;
+    let mut stored = Vec::with_capacity(experiences.len());
+    for experience in experiences {
+        if experience.extraction_job_id.as_deref() != Some(job_id)
+            || experience.session_id.as_deref() != Some(session_id.as_str())
+            || experience.source_message_id.as_deref() != Some(source_message_id.as_str())
+        {
+            return Err(query_error(std::io::Error::other(
+                "extracted experience provenance does not match its job",
+            )));
+        }
+        let inserted = insert_experience(transaction, experience)?;
+        let record = read_required(transaction, &experience.id)?;
+        if inserted {
+            append_experience_event(transaction, &session_id, &record.projection)?;
+        }
+        stored.push(record);
+    }
+    Ok(stored)
+}
+
+fn finish_extraction_in(
+    transaction: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    owner_id: &str,
+    result: &str,
+    now: i64,
+) -> Result<(), DbError> {
+    let (session_id, source_message_id) = running_extraction_job(transaction, job_id, owner_id)?;
+    let experience_count = transaction
+        .query_row(
+            "SELECT count(*) FROM experience_record WHERE extraction_job_id = ?1",
+            [job_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(open::map_error)?;
+    let changed = transaction
+        .execute(
+            "UPDATE learning_job
+             SET status = 'completed', result = ?3, error = NULL, owner_id = NULL,
+                 lease_expires = NULL, time_updated = ?4, time_completed = ?4
+             WHERE id = ?1 AND owner_id = ?2 AND status = 'running'",
+            params![job_id, owner_id, result, now],
+        )
+        .map_err(open::map_error)?;
+    if changed != 1 {
+        return Err(query_error(std::io::Error::other(format!(
+            "extraction job `{job_id}` lost its lease before commit"
+        ))));
+    }
+    let mut properties = Map::new();
+    properties.insert("jobID".to_owned(), Value::String(job_id.to_owned()));
+    properties.insert(
+        "sourceMessageID".to_owned(),
+        Value::String(source_message_id),
+    );
+    properties.insert("experienceCount".to_owned(), Value::from(experience_count));
+    append_in(
+        transaction,
+        &session_id,
+        NewSessionEvent::new("learning.extraction.completed", properties)?,
+    )?;
+    Ok(())
+}
+
+/// Insert one experience and its evidence; `Ok(false)` when the durable ordinal
+/// already holds this exact content from an earlier attempt.
 fn insert_experience(
     transaction: &rusqlite::Transaction<'_>,
     experience: &NewExperience,
-) -> Result<(), DbError> {
+) -> Result<bool, DbError> {
     let changed = transaction
         .execute(
             "INSERT INTO experience_record (
@@ -548,7 +645,7 @@ fn insert_experience(
                 "an extraction retry produced different content for a durable ordinal",
             )));
         }
-        return Ok(());
+        return Ok(false);
     }
     for evidence in &experience.evidence {
         if evidence.id.trim().is_empty()
@@ -576,7 +673,7 @@ fn insert_experience(
             )
             .map_err(open::map_error)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 fn append_experience_event(
@@ -780,6 +877,7 @@ fn require_changed(changed: usize, id: &str) -> Result<(), DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_log::SessionEventLog;
     use crate::learning_job::{LearningJobStore, NewLearningJob};
     use crate::migration;
     use serde_json::json;
@@ -867,6 +965,92 @@ mod tests {
             .expect("search");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].projection.id, "experience-1");
+    }
+
+    #[test]
+    fn recording_leaves_the_job_running_until_its_owner_finishes_it() {
+        let (pool, store) = fixture();
+        let jobs = LearningJobStore::new(pool.clone());
+        let log = SessionEventLog::new(pool);
+        jobs.enqueue(NewLearningJob::extraction(
+            "job-1",
+            "project-1",
+            "session-1",
+            "assistant-1",
+            "extractor-v1",
+            json!({}),
+            10,
+        ))
+        .expect("enqueue");
+        jobs.claim_due("worker-1", 11, 30)
+            .expect("claim")
+            .expect("job");
+
+        let records = store
+            .record_extraction("job-1", "worker-1", &[extracted(ExperienceKind::Procedure)])
+            .expect("record");
+        assert_eq!(records.len(), 1);
+        assert_eq!(jobs.get("job-1").expect("job").status.as_str(), "running");
+        // A replay of the same ordinal is idempotent and logs nothing new.
+        store
+            .record_extraction("job-1", "worker-1", &[extracted(ExperienceKind::Procedure)])
+            .expect("replay");
+        let event_types = |log: &SessionEventLog| -> Vec<String> {
+            log.read_after("session-1", None)
+                .expect("events")
+                .into_iter()
+                .map(|event| event.event_type)
+                .collect()
+        };
+        assert_eq!(event_types(&log), ["learning.experience.recorded"]);
+
+        // Nobody but the lease owner may finish, and a lost lease requeues the
+        // job instead of leaving it completed without its Memory proposals.
+        store
+            .finish_extraction("job-1", "worker-2", &json!({}), 22)
+            .expect_err("another owner cannot finish the job");
+        assert_eq!(jobs.get("job-1").expect("job").status.as_str(), "running");
+        assert_eq!(jobs.reconcile_expired(30).expect("reconcile").requeued, 1);
+        store
+            .finish_extraction("job-1", "worker-1", &json!({}), 31)
+            .expect_err("a reconciled lease cannot finish the job");
+        assert_eq!(jobs.get("job-1").expect("job").status.as_str(), "queued");
+
+        // The retry records the same content again and then finishes.
+        jobs.claim_due("worker-2", 32, 60)
+            .expect("reclaim")
+            .expect("job");
+        store
+            .record_extraction("job-1", "worker-2", &[extracted(ExperienceKind::Procedure)])
+            .expect("record on retry");
+        store
+            .finish_extraction("job-1", "worker-2", &json!({"count": 1}), 40)
+            .expect("finish");
+        let job = jobs.get("job-1").expect("job");
+        assert_eq!(job.status.as_str(), "completed");
+        assert_eq!(job.result, Some(json!({"count": 1})));
+        assert_eq!(
+            event_types(&log),
+            [
+                "learning.experience.recorded",
+                "learning.extraction.completed"
+            ]
+        );
+        let completed = log
+            .latest_of_type("session-1", "learning.extraction.completed")
+            .expect("read")
+            .expect("completion event");
+        assert_eq!(completed.properties["jobID"], "job-1");
+        assert_eq!(completed.properties["experienceCount"], 1);
+        assert_eq!(
+            store
+                .get("experience-1")
+                .expect("experience")
+                .evidence
+                .len(),
+            1,
+            "the retry must not duplicate evidence"
+        );
     }
 
     #[test]

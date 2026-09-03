@@ -208,7 +208,9 @@ impl MemoryCandidateStore {
                     ],
                 )
                 .map_err(open::map_error)?;
-            require_changed(changed, id)?;
+            if changed == 0 {
+                return Err(guard_failure(transaction, id, "edit", EDITABLE));
+            }
             read_required(transaction, id)
         })
     }
@@ -232,7 +234,9 @@ impl MemoryCandidateStore {
                     params![id, before, after, time_updated],
                 )
                 .map_err(open::map_error)?;
-            require_changed(changed, id)?;
+            if changed == 0 {
+                return Err(guard_failure(transaction, id, "begin_apply", EDITABLE));
+            }
             read_required(transaction, id)
         })
     }
@@ -251,11 +255,32 @@ impl MemoryCandidateStore {
                     params![id, time_updated],
                 )
                 .map_err(open::map_error)?;
-            require_changed(changed, id)?;
+            if changed == 0 {
+                return Err(guard_failure(
+                    transaction,
+                    id,
+                    "begin_undo",
+                    &[MemoryCandidateStatus::Applied],
+                ));
+            }
             read_required(transaction, id)
         })
     }
 
+    /// Settle a candidate into `status` from a state that may reach it.
+    ///
+    /// This is a compare-and-set on the durable `status` column: the row is
+    /// rewritten only while it is still in one of the states `status` may be
+    /// entered from (see [`settlement_sources`]). Two writers that both read the
+    /// same earlier state — a reviewer rejecting while an apply is in flight, or
+    /// a restart reconciler finishing a candidate the live writer already settled
+    /// — therefore cannot overwrite each other; the loser receives
+    /// [`DbError::Conflict`] and the winner's row stands.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::NotFound`] when no candidate has `id`, [`DbError::Conflict`]
+    /// when the candidate exists in a state `status` may not be written from.
     pub fn set_status(
         &self,
         id: &str,
@@ -263,20 +288,95 @@ impl MemoryCandidateStore {
         error: Option<&str>,
         time_updated: i64,
     ) -> Result<MemoryCandidateRecord, DbError> {
+        let sources = settlement_sources(status);
+        let operation = format!("set_status({})", status.as_str());
+        let source_list = sources
+            .iter()
+            .map(|source| format!("'{}'", source.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
         self.pool.transaction(|transaction| {
+            if sources.is_empty() {
+                return Err(guard_failure(transaction, id, &operation, sources));
+            }
             let applied = matches!(status, MemoryCandidateStatus::Applied).then_some(time_updated);
             let changed = transaction
                 .execute(
-                    "UPDATE memory_candidate
-                     SET status = ?2, error = ?3, time_updated = ?4,
-                         time_applied = COALESCE(?5, time_applied)
-                     WHERE id = ?1",
+                    &format!(
+                        "UPDATE memory_candidate
+                         SET status = ?2, error = ?3, time_updated = ?4,
+                             time_applied = COALESCE(?5, time_applied)
+                         WHERE id = ?1 AND status IN ({source_list})"
+                    ),
                     params![id, status.as_str(), error, time_updated, applied],
                 )
                 .map_err(open::map_error)?;
-            require_changed(changed, id)?;
+            if changed == 0 {
+                return Err(guard_failure(transaction, id, &operation, sources));
+            }
             read_required(transaction, id)
         })
+    }
+}
+
+/// States an edit or `begin_apply` may start from.
+const EDITABLE: &[MemoryCandidateStatus] = &[
+    MemoryCandidateStatus::Pending,
+    MemoryCandidateStatus::Failed,
+];
+
+/// The lifecycle states `target` may be written from through [`MemoryCandidateStore::set_status`].
+///
+/// `pending` exists only through insertion and `applying`/`undoing` only through
+/// `begin_apply`/`begin_undo`, so they have no settlement source. The remaining
+/// edges follow the documented state machine: an in-flight apply or undo settles
+/// to `applied`, `undone`, `failed`, or `uncertain` depending on what the resident
+/// file shows; a `pending` or `failed` candidate may be rejected or fail again.
+fn settlement_sources(target: MemoryCandidateStatus) -> &'static [MemoryCandidateStatus] {
+    use MemoryCandidateStatus as Status;
+    match target {
+        Status::Applied | Status::Uncertain => &[Status::Applying, Status::Undoing],
+        Status::Undone => &[Status::Undoing],
+        Status::Failed => &[Status::Pending, Status::Failed, Status::Applying],
+        Status::Rejected => &[Status::Pending, Status::Failed],
+        Status::Pending | Status::Applying | Status::Undoing => &[],
+    }
+}
+
+/// Explain a guarded update that changed no row: the candidate is either absent
+/// or in a state `operation` may not proceed from.
+fn guard_failure(
+    connection: &rusqlite::Connection,
+    id: &str,
+    operation: &str,
+    expected: &[MemoryCandidateStatus],
+) -> DbError {
+    let current = connection
+        .query_row(
+            &format!("SELECT status FROM {TABLE} WHERE id = ?1"),
+            [id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(open::map_error);
+    match current {
+        Ok(Some(status)) => DbError::Conflict {
+            table: TABLE.to_owned(),
+            id: id.to_owned(),
+            detail: format!(
+                "{operation} requires status in [{}], found `{status}`",
+                expected
+                    .iter()
+                    .map(|status| status.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
+        Ok(None) => DbError::NotFound {
+            table: TABLE.to_owned(),
+            id: id.to_owned(),
+        },
+        Err(error) => error,
     }
 }
 
@@ -445,15 +545,6 @@ fn decode_entries(value: Option<String>) -> Result<Option<Vec<String>>, DbError>
             })
         })
         .transpose()
-}
-
-fn require_changed(changed: usize, id: &str) -> Result<(), DbError> {
-    if changed == 0 {
-        return Err(query_error(std::io::Error::other(format!(
-            "memory candidate {id} is not in a mutable state"
-        ))));
-    }
-    Ok(())
 }
 
 fn query_error(error: impl std::error::Error + Send + Sync + 'static) -> DbError {

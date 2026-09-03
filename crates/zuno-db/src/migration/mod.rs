@@ -25,6 +25,22 @@ CREATE TABLE zuno_schema (
   format integer NOT NULL
 )";
 
+/// How many times one opener re-reads the format after losing a write-lock race
+/// before it reports the database as unsettled instead of looping.
+const MAX_DISPATCH_ATTEMPTS: u32 = 4;
+
+/// Outcome of one dispatch attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dispatch {
+    /// The database is at [`CURRENT_FORMAT`] and structurally valid.
+    Settled,
+    /// The write lock arrived after another opener changed the format, so the
+    /// decision taken from the pre-lock inventory is stale and must be made
+    /// again. `observed` is the marker seen inside the write transaction, `None`
+    /// when the database has none.
+    Moved { observed: Option<u32> },
+}
+
 /// Ensure that `connection` uses the current all-at-once schema.
 ///
 /// Empty databases are initialized. Every supported older format advances to
@@ -32,18 +48,58 @@ CREATE TABLE zuno_schema (
 /// remaining additive step in order, with the marker changed only after every
 /// new object exists. Other existing formats are only validated or rejected.
 ///
+/// The format is inventoried before the write lock is taken, so two processes
+/// opening or upgrading the same file at once both decide from the same old
+/// state and one of them finds a different format once it holds the lock. That
+/// opener does not fail: it re-reads and dispatches again, at most
+/// [`MAX_DISPATCH_ATTEMPTS`] times, and settles on validating the schema the
+/// winner committed. Only a format no step can handle is a mismatch.
+///
 /// # Errors
 ///
 /// [`DbError::SchemaMismatch`] for another unsupported format,
-/// [`DbError::Schema`] for invalid DDL or marker storage, and [`DbError::Busy`]
-/// while another writer owns SQLite's write lock.
+/// [`DbError::Schema`] for invalid DDL or marker storage, [`DbError::Busy`]
+/// while another writer owns SQLite's write lock past the busy timeout, and
+/// [`DbError::Conflict`] on the `zuno_schema` marker when the format kept
+/// changing under every dispatch attempt.
 pub fn apply(connection: &mut Connection) -> Result<(), DbError> {
+    apply_with(connection, dispatch_once)
+}
+
+/// Run `dispatch` until it settles, giving up after [`MAX_DISPATCH_ATTEMPTS`].
+fn apply_with(
+    connection: &mut Connection,
+    mut dispatch: impl FnMut(&mut Connection) -> Result<Dispatch, DbError>,
+) -> Result<(), DbError> {
+    let mut last_observed = None;
+    for _ in 0..MAX_DISPATCH_ATTEMPTS {
+        match dispatch(connection)? {
+            Dispatch::Settled => return Ok(()),
+            Dispatch::Moved { observed } => last_observed = observed,
+        }
+    }
+    let last_observed = last_observed.map_or_else(|| "no marker".to_owned(), |f| f.to_string());
+    Err(DbError::Conflict {
+        table: FORMAT_TABLE.to_owned(),
+        id: "1".to_owned(),
+        detail: format!(
+            "the format marker changed under {MAX_DISPATCH_ATTEMPTS} consecutive opener \
+             dispatches; last observed {last_observed} while expecting {CURRENT_FORMAT}"
+        ),
+    })
+}
+
+/// Inventory the database once and run the step that state calls for.
+fn dispatch_once(connection: &mut Connection) -> Result<Dispatch, DbError> {
     let tables = table_names(connection)?;
     if tables.is_empty() {
         return create_current(connection);
     }
     match observed_format(connection, &tables)? {
-        Some(CURRENT_FORMAT) => validate_current(connection, &tables),
+        Some(CURRENT_FORMAT) => {
+            validate_current(connection, &tables)?;
+            Ok(Dispatch::Settled)
+        }
         Some(LEARNING_UPGRADE_FROM) => migrate_learning(connection),
         Some(PLAN_STACK_UPGRADE_FROM) => migrate_plan_stack(connection),
         Some(VERIFICATION_UPGRADE_FROM) => migrate_verification(connection),
@@ -96,16 +152,20 @@ fn observed_format(connection: &Connection, tables: &[String]) -> Result<Option<
 }
 
 /// Create the current schema and format marker atomically.
-fn create_current(connection: &mut Connection) -> Result<(), DbError> {
+///
+/// A database that is no longer empty once the write lock is held was populated
+/// by another opener in the meantime. Nothing is ever created over it; the
+/// decision goes back to [`apply`], which re-reads the marker and validates,
+/// upgrades, or rejects what is actually there.
+fn create_current(connection: &mut Connection) -> Result<Dispatch, DbError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_error)?;
     let tables = transaction_table_names(&transaction)?;
     if !tables.is_empty() {
-        return Err(failure(std::io::Error::other(format!(
-            "refusing to create the current schema over an existing database: {}",
-            tables.join(", ")
-        ))));
+        return Ok(Dispatch::Moved {
+            observed: observed_format(&transaction, &tables)?,
+        });
     }
     schema::up(&transaction)?;
     transaction.execute(FORMAT_SQL, []).map_err(map_error)?;
@@ -115,21 +175,19 @@ fn create_current(connection: &mut Connection) -> Result<(), DbError> {
             params![CURRENT_FORMAT],
         )
         .map_err(map_error)?;
-    transaction.commit().map_err(map_error)
+    transaction.commit().map_err(map_error)?;
+    Ok(Dispatch::Settled)
 }
 
 /// Add every post-format-5 additive object without rewriting any historical row.
-fn migrate_learning(connection: &mut Connection) -> Result<(), DbError> {
+fn migrate_learning(connection: &mut Connection) -> Result<Dispatch, DbError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_error)?;
     let tables = transaction_table_names(&transaction)?;
     let observed = observed_format(&transaction, &tables)?;
     if observed != Some(LEARNING_UPGRADE_FROM) {
-        return Err(DbError::SchemaMismatch {
-            expected: LEARNING_UPGRADE_FROM,
-            observed,
-        });
+        return Ok(Dispatch::Moved { observed });
     }
     if !tables.iter().any(|table| table == "session") {
         return Err(failure(std::io::Error::other(
@@ -150,21 +208,19 @@ fn migrate_learning(connection: &mut Connection) -> Result<(), DbError> {
             "format-5 marker changed while the learning migration was running",
         )));
     }
-    transaction.commit().map_err(map_error)
+    transaction.commit().map_err(map_error)?;
+    Ok(Dispatch::Settled)
 }
 
 /// Add durable Plan frames without rewriting any format-6 row.
-fn migrate_plan_stack(connection: &mut Connection) -> Result<(), DbError> {
+fn migrate_plan_stack(connection: &mut Connection) -> Result<Dispatch, DbError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_error)?;
     let tables = transaction_table_names(&transaction)?;
     let observed = observed_format(&transaction, &tables)?;
     if observed != Some(PLAN_STACK_UPGRADE_FROM) {
-        return Err(DbError::SchemaMismatch {
-            expected: PLAN_STACK_UPGRADE_FROM,
-            observed,
-        });
+        return Ok(Dispatch::Moved { observed });
     }
     if !tables.iter().any(|table| table == "work_plan") {
         return Err(failure(std::io::Error::other(
@@ -184,21 +240,19 @@ fn migrate_plan_stack(connection: &mut Connection) -> Result<(), DbError> {
             "format-6 marker changed while the Plan-stack migration was running",
         )));
     }
-    transaction.commit().map_err(map_error)
+    transaction.commit().map_err(map_error)?;
+    Ok(Dispatch::Settled)
 }
 
 /// Add the tool-verification receipt ledger without rewriting any format-7 row.
-fn migrate_verification(connection: &mut Connection) -> Result<(), DbError> {
+fn migrate_verification(connection: &mut Connection) -> Result<Dispatch, DbError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(map_error)?;
     let tables = transaction_table_names(&transaction)?;
     let observed = observed_format(&transaction, &tables)?;
     if observed != Some(VERIFICATION_UPGRADE_FROM) {
-        return Err(DbError::SchemaMismatch {
-            expected: VERIFICATION_UPGRADE_FROM,
-            observed,
-        });
+        return Ok(Dispatch::Moved { observed });
     }
     if !tables.iter().any(|table| table == "session") {
         return Err(failure(std::io::Error::other(
@@ -217,7 +271,8 @@ fn migrate_verification(connection: &mut Connection) -> Result<(), DbError> {
             "format-7 marker changed while the verification migration was running",
         )));
     }
-    transaction.commit().map_err(map_error)
+    transaction.commit().map_err(map_error)?;
+    Ok(Dispatch::Settled)
 }
 
 fn table_names(connection: &Connection) -> Result<Vec<String>, DbError> {
@@ -996,21 +1051,165 @@ mod tests {
         );
     }
 
+    /// Two connections to one file, so the second opener contends for SQLite's
+    /// write lock exactly the way a second process would.
+    fn file_pair() -> (tempfile::TempDir, Connection, Connection) {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("zuno.db");
+        let winner = open::open_at(&path).expect("open the winning connection");
+        let loser = open::open_at(&path).expect("open the losing connection");
+        (dir, winner, loser)
+    }
+
+    /// Run `apply` on a connection that first inventories the database, then
+    /// blocks on `BEGIN IMMEDIATE` behind `held`, which commits after a pause.
+    fn apply_behind(
+        mut loser: Connection,
+        held: Transaction<'_>,
+    ) -> (Result<(), DbError>, Connection) {
+        let loser_thread = std::thread::spawn(move || {
+            let outcome = apply(&mut loser);
+            (outcome, loser)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        held.commit().expect("the winner commits");
+        loser_thread.join().expect("the losing opener thread")
+    }
+
+    fn marker(connection: &Connection) -> u32 {
+        connection
+            .query_row(
+                "SELECT format FROM zuno_schema WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the format marker")
+    }
+
     #[test]
-    fn create_current_refuses_any_non_empty_database() {
+    fn a_first_open_that_loses_the_write_lock_validates_the_winner_instead_of_refusing() {
+        let (_dir, mut winner, loser) = file_pair();
+        let held = winner
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("the winner reserves the writer");
+        schema::up(&held).expect("the winner creates the schema");
+        held.execute(FORMAT_SQL, [])
+            .expect("the winner creates the marker table");
+        held.execute(
+            "INSERT INTO zuno_schema (singleton, format) VALUES (1, ?1)",
+            params![CURRENT_FORMAT],
+        )
+        .expect("the winner writes the marker");
+
+        let (outcome, loser) = apply_behind(loser, held);
+
+        outcome.expect("the loser must validate the schema the winner created");
+        assert_eq!(marker(&loser), CURRENT_FORMAT);
+        let rows: i64 = loser
+            .query_row("SELECT count(*) FROM zuno_schema", [], |row| row.get(0))
+            .expect("count marker rows");
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn a_concurrent_upgrade_that_loses_the_write_lock_validates_instead_of_mismatching() {
+        let (_dir, mut winner, loser) = file_pair();
+        apply(&mut winner).expect("create the current schema");
+        remove_verification_schema(&winner);
+        winner
+            .execute(
+                "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1",
+                params![VERIFICATION_UPGRADE_FROM],
+            )
+            .expect("rewind the marker to format 7");
+
+        let held = winner
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("the winner reserves the writer");
+        schema::up_verification(&held).expect("the winner adds the verification ledger");
+        held.execute(
+            "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
+            params![CURRENT_FORMAT, VERIFICATION_UPGRADE_FROM],
+        )
+        .expect("the winner advances the marker");
+
+        let (outcome, loser) = apply_behind(loser, held);
+
+        outcome.expect("the loser must accept the upgrade the winner committed");
+        assert_eq!(marker(&loser), CURRENT_FORMAT);
+        assert!(
+            table_names(&loser)
+                .expect("inventory")
+                .iter()
+                .any(|table| table == "verification_receipt")
+        );
+    }
+
+    #[test]
+    fn create_current_never_writes_over_a_non_empty_database() {
         let mut connection = memory();
         connection
             .execute_batch("CREATE TABLE something_else (id text PRIMARY KEY)")
             .expect("create unrelated table");
 
-        let error = create_current(&mut connection).expect_err("must refuse");
-        let source = std::error::Error::source(&error)
-            .expect("schema error carries source")
-            .to_string();
-        assert!(source.contains("something_else"), "{source}");
+        assert_eq!(
+            create_current(&mut connection).expect("hands the decision back"),
+            Dispatch::Moved { observed: None }
+        );
         assert_eq!(
             table_names(&connection).expect("inventory"),
             ["something_else"]
         );
+
+        // Through the entry point the same file is a foreign, unmarked layout:
+        // the redispatch classifies it instead of looping or creating over it.
+        let error = apply(&mut connection).expect_err("foreign layout must be refused");
+        assert!(
+            matches!(
+                error,
+                DbError::SchemaMismatch {
+                    expected: CURRENT_FORMAT,
+                    observed: None
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            table_names(&connection).expect("inventory"),
+            ["something_else"]
+        );
+    }
+
+    #[test]
+    fn dispatch_is_bounded_and_exhaustion_is_a_conflict_not_a_mismatch() {
+        let mut connection = memory();
+        let mut attempts = 0;
+        let error = apply_with(&mut connection, |_| {
+            attempts += 1;
+            Ok(Dispatch::Moved {
+                observed: Some(CURRENT_FORMAT),
+            })
+        })
+        .expect_err("a format that keeps moving must not loop forever");
+        assert_eq!(attempts, MAX_DISPATCH_ATTEMPTS);
+        assert!(
+            matches!(
+                error,
+                DbError::Conflict { ref table, ref id, .. } if table == FORMAT_TABLE && id == "1"
+            ),
+            "{error:?}"
+        );
+
+        let mut attempts = 0;
+        apply_with(&mut connection, |_| {
+            attempts += 1;
+            Ok(if attempts == 1 {
+                Dispatch::Moved { observed: None }
+            } else {
+                Dispatch::Settled
+            })
+        })
+        .expect("one lost race followed by a settled read succeeds");
+        assert_eq!(attempts, 2);
     }
 }

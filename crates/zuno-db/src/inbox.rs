@@ -659,6 +659,31 @@ pub fn pending_in(
         .collect()
 }
 
+/// Read every input that has not yet become model-visible history, in admission order.
+///
+/// This covers `queued`, `steering`, and `promoted` rows: everything a transcript
+/// revert must retire because its prompt was aimed at the discarded tail.
+/// Consumed, cancelled, and failed rows are settled history and are excluded.
+pub(crate) fn unconsumed_in(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<SessionInput>, DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
+                    promoted_seq, error, time_created, time_updated \
+             FROM session_input \
+             WHERE session_id = ?1 AND state IN ('queued', 'steering', 'promoted') \
+             ORDER BY admitted_seq",
+        )
+        .map_err(open::map_error)?;
+    let rows = statement
+        .query_map([session_id], decode_stored_input)
+        .map_err(open::map_error)?;
+    rows.map(|row| row.map_err(open::map_error).and_then(decode_input))
+        .collect()
+}
+
 fn edit_pending_in(
     transaction: &Transaction<'_>,
     session_id: &str,
@@ -760,7 +785,14 @@ fn require_pending_revision(
     Ok(input)
 }
 
-fn transition_in(
+/// Move one input to `target` when it is currently in an `allowed` state.
+///
+/// The transition logs `event_type` and advances the row's revision under an
+/// optimistic guard. It returns `None` when the row is missing or not in an
+/// allowed state, so callers that sweep a session — a transcript revert retiring
+/// every unconsumed input, for example — can skip settled history without a
+/// second read.
+pub(crate) fn transition_in(
     transaction: &Transaction<'_>,
     session_id: &str,
     input_id: &str,
