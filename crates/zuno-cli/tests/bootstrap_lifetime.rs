@@ -357,3 +357,192 @@ fn the_cli_reference_states_the_process_guarantee_in_both_languages() {
         missing.join("\n  ")
     );
 }
+
+/// **The pipes and the port really do stay held when the supervised pid is a waiter.**
+///
+/// [`killing_a_spawned_serve_ends_the_command_and_closes_its_pipes`] passes on Unix
+/// before the change as well as after it, because the Unix bootstrap always `exec`ed.
+/// That leaves the question a green Linux run cannot answer: *can* those assertions
+/// fail? So this reconstructs the shape the Windows bootstrap had — a supervised
+/// process that spawns the command and waits for it — and observes the two symptoms a
+/// client reported: ending the supervised pid neither closes the inherited pipes nor
+/// releases the listening socket. `sh` stands in for the waiter because the shape is
+/// what matters, not what builds it.
+///
+/// It is a control, not a regression test: it fails if the assertions above stop being
+/// able to see an orphan, which is how a tree kill or a lost deadline would defeat them.
+#[cfg(unix)]
+#[test]
+fn a_supervised_waiter_leaves_the_command_holding_the_pipes_and_the_port() {
+    /// How long a surviving command is given to prove it survived. The orphan outlives
+    /// any bound, so this only has to be long enough to not be a race.
+    const ORPHAN_OBSERVATION: Duration = Duration::from_secs(5);
+
+    let root = tempfile::tempdir().expect("private serve root");
+    let port = free_port();
+    std::fs::write(
+        root.path().join("zuno.json"),
+        format!("{{\n  \"server\": {{ \"port\": {port} }}\n}}\n"),
+    )
+    .expect("project configuration");
+
+    // Given: `serve` under a process that only waits for it, holding the same pipes.
+    let mut waiter = isolated(&mut Command::new("sh"), root.path())
+        .args([
+            "-c",
+            "\"$0\" --print-logs serve & wait",
+            env!("CARGO_BIN_EXE_zuno"),
+        ])
+        .spawn()
+        .expect("a POSIX shell must start");
+    let supervised = waiter.id();
+    let stdout = collect(waiter.stdout.take().expect("piped stdout"));
+    let stderr = collect(waiter.stderr.take().expect("piped stderr"));
+
+    let readiness = Instant::now() + READINESS_TIMEOUT;
+    let mut transcript = Vec::new();
+    let mut ready = false;
+    while !ready {
+        let Some(remaining) = readiness.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match stdout.recv_timeout(remaining) {
+            Ok(StreamEvent::Line(line)) => {
+                ready = line.contains("listening on");
+                transcript.push(line);
+            }
+            Ok(StreamEvent::Eof) | Err(_) => break,
+        }
+    }
+
+    // The waiter's own pid is not the one running the command, which is what makes
+    // this the old shape rather than a second copy of the current one.
+    let mut diagnostics = Vec::new();
+    let logged = Instant::now() + SHUTDOWN_TIMEOUT;
+    let mut worker = None;
+    while worker.is_none() {
+        let Some(remaining) = logged.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match stderr.recv_timeout(remaining) {
+            Ok(StreamEvent::Line(line)) => {
+                diagnostics.push(line);
+                worker = logged_pid(&diagnostics.join("\n"));
+            }
+            Ok(StreamEvent::Eof) | Err(_) => break,
+        }
+    }
+
+    // When: the client ends the only process it has a handle to.
+    let _ = waiter.kill();
+    let status = waiter.wait();
+
+    // Then: nothing that the client can see has finished. Observed before cleanup so
+    // that a failure here still leaves the machine as it found it.
+    let closed = await_eof(
+        &stdout,
+        Instant::now() + ORPHAN_OBSERVATION,
+        &mut transcript,
+    );
+    let released = TcpListener::bind(("127.0.0.1", port)).is_ok();
+
+    if let Some(pid) = worker {
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+    let reaped = Instant::now() + SHUTDOWN_TIMEOUT;
+    while TcpListener::bind(("127.0.0.1", port)).is_err() && Instant::now() < reaped {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        ready,
+        "the waiter's `serve` never reported a listening address, so this control \
+         never reached the shape it is about; stdout: {transcript:?}; stderr: \
+         {diagnostics:?}"
+    );
+    assert_ne!(
+        worker, None,
+        "no process reported its pid, so this control cannot clean up after itself; \
+         stderr: {diagnostics:?}"
+    );
+    assert_ne!(
+        worker,
+        Some(supervised),
+        "the command ran under the supervised pid {supervised}, so `sh` did not \
+         produce a waiter and this control proves nothing; stderr: {diagnostics:?}"
+    );
+    assert!(
+        !closed,
+        "stdout reached end of file although the command process outlived the \
+         supervised pid {supervised} ({status:?}), so the end-of-file assertion in \
+         `killing_a_spawned_serve_ends_the_command_and_closes_its_pipes` can no longer \
+         see an orphan"
+    );
+    assert!(
+        !released,
+        "port {port} was rebindable although the command process outlived the \
+         supervised pid {supervised}, so the released-port assertion in \
+         `killing_a_spawned_serve_ends_the_command_and_closes_its_pipes` can no longer \
+         see an orphan"
+    );
+}
+
+/// **No fixture in this crate ends a `zuno` it spawned by killing a process tree.**
+///
+/// A tree kill is the shape of a workaround for this defect: `serve_listen` carried a
+/// Windows `taskkill /T /F` because the process it held was only the waiter for the one
+/// doing the work. With one process per invocation the pid a fixture spawned is the
+/// whole command, and keeping the workaround would be worse than redundant — a tree
+/// kill also ends a reintroduced second process, so the fixture that first exposed the
+/// orphan would go green again while a client still hung on the inherited pipes.
+#[test]
+fn no_cli_fixture_ends_a_zuno_by_killing_a_process_tree() {
+    /// Programs whose job is to end something other than the pid they are given.
+    const TREE_KILLERS: &[&str] = &["taskkill", "pkill", "killall"];
+
+    fn walk(directory: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let entries = std::fs::read_dir(directory)
+            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()));
+        for entry in entries {
+            let path = entry.expect("fixture directory entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                out.push((path.display().to_string(), text));
+            }
+        }
+    }
+
+    let mut fixtures = Vec::new();
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"),
+        &mut fixtures,
+    );
+    assert!(
+        fixtures.len() > 5,
+        "the fixture walk found only {} files; it is looking in the wrong place",
+        fixtures.len()
+    );
+
+    let mut offences = Vec::new();
+    for (path, text) in fixtures {
+        for (index, line) in text.lines().enumerate() {
+            for killer in TREE_KILLERS {
+                if line.contains(&format!("Command::new(\"{killer}\")")) {
+                    offences.push(format!("{path}:{} runs {killer}", index + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offences.is_empty(),
+        "a CLI fixture ends more than the process it spawned; one invocation is one \
+         process, so kill that pid and let a surviving second process fail the \
+         test:\n  {}",
+        offences.join("\n  ")
+    );
+}
