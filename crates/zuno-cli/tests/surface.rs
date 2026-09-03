@@ -1077,24 +1077,33 @@ fn surface_documentation_never_offers_a_run_option_the_parser_rejects() {
     assert!(offences.is_empty(), "{}", offences.join("\n"));
 }
 
-/// **The CLI reference never offers `zuno agent create`.**
+/// **No page anywhere offers `zuno agent create`.**
 ///
 /// Authoring an agent is writing a Markdown file under `.zuno/agent/`, and the
-/// subcommand that claimed to generate one is gone. This is the reference tree,
-/// where a removed subcommand would otherwise keep its synopsis, its option table
-/// and its worked example long after the parser stopped accepting it.
+/// subcommand that claimed to generate one is gone. The reference tree is not where a
+/// removed subcommand does the most damage: it keeps a synopsis and an option table
+/// there, but a guide keeps a *walkthrough*, and a walkthrough is what a reader copies
+/// into a terminal. Its sibling above had to learn that the stale pages are the ones
+/// nobody thought to name, so this walks every page too.
+///
+/// Two shapes name the subcommand on a page: the invocation a reader copies and the
+/// code span that refers to it. Prose that merely contains the words — "let the plan
+/// agent create one" — names nothing and is left alone.
 #[test]
-fn surface_cli_reference_never_offers_the_removed_agent_create() {
+fn surface_documentation_never_offers_the_removed_agent_create() {
     let mut offences = Vec::new();
     for (page, text) in documentation_pages() {
-        if !page.starts_with("docs/cli/") && !page.starts_with("docs/zh/cli/") {
-            continue;
-        }
         for (index, line) in text.lines().enumerate() {
-            if line.contains("agent create") {
+            if line.contains("zuno agent create") || line.contains("`agent create`") {
                 offences.push(format!("{page}:{} offers {line}", index + 1));
             }
         }
     }
-    assert!(offences.is_empty(), "{}", offences.join("\n"));
+    assert!(
+        offences.is_empty(),
+        "these pages still teach a subcommand the parser rejects; the supported path is \
+         to author the Markdown file under `.zuno/agent/` and read it back with `zuno \
+         agent list`:\n  {}",
+        offences.join("\n  ")
+    );
 }
