@@ -3603,7 +3603,20 @@ impl TurnHost {
         let selected_skill_prompt_budget =
             selected_skill_prompt_budget(skill_context_window, skill_config.as_ref());
         let commands = plan.command_registry(env, mcp.as_ref());
-        let profile_runtime = HarnessRuntime::new("profile");
+        // The deployment's stop ceiling is resolved here because this is the only
+        // production root runtime: `zuno-runtime` does not depend on `zuno-config`, so
+        // the value can only reach `RuntimeOptions` at the composition root, and every
+        // child scope inherits the options from this root.
+        let runtime_options = match plan
+            .config
+            .runtime
+            .as_ref()
+            .and_then(zuno_config::schema::RuntimeConfig::max_component_stop)
+        {
+            Some(ceiling) => zuno_runtime::RuntimeOptions::default().with_max_stop_timeout(ceiling),
+            None => zuno_runtime::RuntimeOptions::default(),
+        };
+        let profile_runtime = HarnessRuntime::with_options("profile", runtime_options);
         let profile = plan.profile;
         if let Err(error) = profile_runtime.activate_profile(profile).await {
             let shutdown = profile_runtime.shutdown().await;
@@ -3804,8 +3817,8 @@ impl TurnHost {
                     // Silent when nothing changed: re-asserting the same block on every
                     // session is the normal case and does not need reporting.
                     Ok(outcome) if outcome.changed() => notes.push(format!(
-                        "excluded {} from git in {}",
-                        zuno_paths::IGNORE_PATTERNS.join(", "),
+                        "excluded Zuno's generated state under {} from git in {}",
+                        zuno_paths::PROJECT_DIRECTORY,
                         worktree.display()
                     )),
                     Ok(_) => {}
