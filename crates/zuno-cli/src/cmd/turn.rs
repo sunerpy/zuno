@@ -3689,6 +3689,60 @@ impl TurnHost {
             }
         }
         let project_id = plan.project.id.clone();
+        // Both of these spawn git and block the calling thread, and every entry point
+        // that reaches this function drives a `new_current_thread` runtime, so on that
+        // runtime a blocked thread is the whole reactor: a `.git` on a stalled mount
+        // would freeze the session's timers, its cancellation, and its stream reads for
+        // the full ceiling. `assembled` below is a synchronous closure and cannot await,
+        // so they are resolved here, in the async frame, in the same order the closure
+        // used to reach them.
+        //
+        // `generated_root` is not resolved again at all. `worktree` above is
+        // `plan.project.directory` whenever git recognised a repository, and
+        // `plan.project` came from `resolve_project(&plan.directory)` — the same
+        // `discover_repository` call `zuno_paths::generated_root` would make from the same
+        // start path — so the answer is already in hand and asking for it costs three more
+        // `git rev-parse` calls for a value we hold. Outside a repository `generated_root`
+        // returns the directory itself, and `ShellTool` canonicalizes its workspace before
+        // resolving, so that branch canonicalizes too: both consumers then anchor their
+        // generated state at one spelling instead of the two they used to pick
+        // independently. Inside a repository the two spellings already agree, because
+        // `git rev-parse --show-toplevel` reports the physical top level whether it is
+        // asked through a symlinked path or through the real one.
+        let generated_root = match worktree.clone() {
+            Some(root) => root,
+            None => tokio::fs::canonicalize(&plan.directory)
+                .await
+                .unwrap_or_else(|_| plan.directory.clone()),
+        };
+        let exclude_note = match worktree.clone() {
+            None => None,
+            Some(root) => {
+                let outcome = tokio::task::spawn_blocking({
+                    let root = root.clone();
+                    move || zuno_paths::ensure_managed_block(&root, zuno_paths::IGNORE_PATTERNS)
+                })
+                .await
+                .map_err(to_string)?;
+                match outcome {
+                    // Silent when nothing changed: re-asserting the same block on every
+                    // session is the normal case and does not need reporting.
+                    Ok(outcome) if outcome.changed() => Some(format!(
+                        "excluded Zuno's generated state under {} from git in {}",
+                        zuno_paths::PROJECT_DIRECTORY,
+                        root.display()
+                    )),
+                    Ok(_) => None,
+                    // A note, never a failure. Running outside a repository is ordinary,
+                    // and a machine without git still deserves a working session; the
+                    // cost of not writing the block is a generated file the user sees in
+                    // `git status`, which is a nuisance and not a correctness problem.
+                    Err(error) => Some(format!(
+                        "warning: could not exclude generated paths from git: {error}"
+                    )),
+                }
+            }
+        };
         let assembled = (|| -> Result<Self, String> {
             let _profile_id = profile_runtime
                 .active_profile_id()
@@ -3811,26 +3865,10 @@ impl TurnHost {
             // `.gitignore`, because Zuno editing a file the repository's history owns
             // would land as an unexplained diff in somebody else's next commit. Once
             // per host: the call spawns git, and the block is idempotent, so a turn
-            // loop would pay for it repeatedly to learn nothing.
-            if let Some(worktree) = worktree.as_deref() {
-                match zuno_paths::ensure_managed_block(worktree, zuno_paths::IGNORE_PATTERNS) {
-                    // Silent when nothing changed: re-asserting the same block on every
-                    // session is the normal case and does not need reporting.
-                    Ok(outcome) if outcome.changed() => notes.push(format!(
-                        "excluded Zuno's generated state under {} from git in {}",
-                        zuno_paths::PROJECT_DIRECTORY,
-                        worktree.display()
-                    )),
-                    Ok(_) => {}
-                    // A note, never a failure. Running outside a repository is ordinary,
-                    // and a machine without git still deserves a working session; the
-                    // cost of not writing the block is a generated file the user sees in
-                    // `git status`, which is a nuisance and not a correctness problem.
-                    Err(error) => notes.push(format!(
-                        "warning: could not exclude generated paths from git: {error}"
-                    )),
-                }
-            }
+            // loop would pay for it repeatedly to learn nothing. It ran off-reactor
+            // above, in the async frame this closure cannot await from; all that is left
+            // here is to report it in the position the note has always occupied.
+            notes.extend(exclude_note);
             let learning = match plan.learning_model.take() {
                 Some(learning_model) if learning_settings.enabled => {
                     let model = learning_model.model;
@@ -3992,6 +4030,7 @@ impl TurnHost {
             let runtime_tools = super::tool_runtime::assemble(
                 &plan.directory,
                 worktree.as_deref(),
+                Some(generated_root.as_path()),
                 env,
                 &plan.config,
                 &plan.agent,

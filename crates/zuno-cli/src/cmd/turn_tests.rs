@@ -295,6 +295,7 @@ async fn hiding_plan_update_does_not_create_a_private_host_plan() {
     let visible = tool_runtime::assemble(
         directory.path(),
         None,
+        None,
         &Env::empty(),
         &config,
         &selected_agent,
@@ -4937,6 +4938,7 @@ fn production_registry_exposes_all_three_goal_tools() {
     let runtime = tool_runtime::assemble(
         directory.path(),
         None,
+        None,
         &Env::empty(),
         &config,
         &selected_agent,
@@ -5005,6 +5007,7 @@ fn interaction_tool_ids(
     });
     tool_runtime::assemble(
         directory.path(),
+        None,
         None,
         &Env::empty(),
         &config,
@@ -5104,6 +5107,131 @@ fn goal_request_projection_requires_the_active_goal() {
     assert!(!human_request_belongs_to_goal(None, None));
 }
 
+/// The resolved generated root has to reach the tools, not just the signature.
+///
+/// [`tool_runtime::assemble`] is synchronous and its sole production caller is not, which
+/// is the whole reason the root is passed in: resolving it spawns up to three `git
+/// rev-parse` calls, each bounded at ten seconds inside `zuno_paths` and none of them off
+/// the calling thread, and `zuno run`, `zuno acp` and `zuno serve` all drive a
+/// `new_current_thread` runtime where that thread is the only one there is. A `.git` on a
+/// stalled mount therefore froze the session's timers, its cancellation and its stream
+/// reads for the whole ceiling. `zuno-tools` already pins that each consumer honours a
+/// supplied root; what could still be wrong here — and was — is that this function held the
+/// answer and handed neither consumer anything, so both resolved it again on the reactor.
+///
+/// Pinned as the observable consequence rather than as the absence of a call: an oversized
+/// command's artefact lands under the supplied root, and under the default it does not,
+/// which is exactly what would happen if the parameter were ignored.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_supplied_generated_root_reaches_the_assembled_shell_tool() {
+    use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
+
+    async fn spilled_output_path(
+        directory: &std::path::Path,
+        generated_root: Option<&std::path::Path>,
+    ) -> String {
+        let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+        let config = zuno_config::schema::Config {
+            shell: Some("/bin/sh".to_owned()),
+            // Far under `OutputLimits::default`, so two short lines are enough to spill.
+            tool_output: Some(zuno_config::schema::ToolOutputConfig {
+                max_lines: std::num::NonZeroU32::new(1),
+                max_bytes: std::num::NonZeroU32::new(4),
+            }),
+            ..Default::default()
+        };
+        let selected_agent = agent_profile(agent("build"), directory, &config);
+        let runtime = tool_runtime::assemble(
+            directory,
+            None,
+            generated_root,
+            &Env::empty(),
+            &config,
+            &selected_agent,
+            tool_runtime::ToolSelection {
+                provider_id: "provider",
+                model_id: "model",
+                manifest: Arc::new(zuno_harness::ToolManifest::standard()),
+                contributions: Arc::new(zuno_harness::ToolContributions::default()),
+                public_http: Arc::new(zuno_network::PublicHttpClient::new()),
+                question: None,
+                interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
+                background_executions: test_background_executions(directory),
+                sandbox: test_sandbox(),
+                todo_store: Arc::new(
+                    zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
+                        .expect("in-memory todo store"),
+                ),
+                work_observer: test_work_observer(),
+                goal_store: Arc::new(
+                    GoalStore::open_memory(goal_spill.path().to_owned())
+                        .expect("in-memory goal store"),
+                ),
+                mcp_loader: None,
+                skills: Arc::new(zuno_catalog::skill::Skills::default()),
+                skill_catalog: None,
+                capability: test_capability(),
+                delegation: test_delegation(),
+                product_agents: test_product_agents(),
+                workflows: test_workflows(),
+                councils: test_councils(),
+                job_controller: test_job_controller(),
+                memory: None,
+                experience_search: None,
+                tool_authority: None,
+            },
+        )
+        .expect("production registry assembles");
+        let shell = runtime
+            .tools
+            .iter()
+            .find(|tool| tool.id() == "shell")
+            .expect("the build profile exposes the shell tool");
+        let output = shell
+            .invoke(
+                serde_json::json!({
+                    "command": "printf 'one\\ntwo\\n'",
+                    zuno_tool::ACCEPT_LARGE_OUTPUT_KEY: true,
+                }),
+                ToolContext::new(
+                    "ses_generated_root",
+                    "msg_generated_root",
+                    "call_generated_root",
+                    "build",
+                    Arc::new(AllowAll),
+                    Arc::new(NeverInterrupted),
+                ),
+            )
+            .await
+            .expect("an explicitly accepted oversized command succeeds");
+        output
+            .output_paths()
+            .first()
+            .expect("the oversized output was stored somewhere")
+            .to_string()
+    }
+
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let elsewhere = tempfile::TempDir::new().expect("supplied generated root");
+
+    let injected = spilled_output_path(directory.path(), Some(elsewhere.path())).await;
+    let expected = elsewhere.path().join(".zuno").join("tool-output");
+    assert!(
+        std::path::Path::new(&injected).starts_with(&expected),
+        "{injected} is not under the generated root that was supplied ({})",
+        expected.display()
+    );
+
+    // Unset, the tools resolve the root themselves, which for a workspace in no
+    // repository is the workspace: the parameter changed where the artefact went.
+    let default = spilled_output_path(directory.path(), None).await;
+    assert!(
+        !std::path::Path::new(&default).starts_with(elsewhere.path()),
+        "{default} landed under the supplied root without anyone supplying it"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn production_registry_wires_configured_shell_into_the_shell_tool() {
@@ -5118,6 +5246,7 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
     let selected_agent = agent_profile(agent("build"), directory.path(), &config);
     let runtime = tool_runtime::assemble(
         directory.path(),
+        None,
         None,
         &Env::empty(),
         &config,
@@ -5202,6 +5331,7 @@ async fn production_registry_wires_configured_output_limits_into_the_shell_tool(
     let selected_agent = agent_profile(agent("build"), directory.path(), &config);
     let runtime = tool_runtime::assemble(
         directory.path(),
+        None,
         None,
         &Env::empty(),
         &config,
@@ -5302,6 +5432,7 @@ async fn explicit_full_access_uses_the_native_backend_and_retains_managed_lifecy
     let selected_agent = agent_profile(agent("build"), directory.path(), &config);
     let runtime = tool_runtime::assemble(
         directory.path(),
+        None,
         None,
         &Env::empty(),
         &config,
@@ -5405,6 +5536,7 @@ async fn unavailable_fallback_is_visible_and_keeps_managed_shell_guards_and_auth
     let background_executions = test_background_executions(directory.path());
     let runtime = tool_runtime::assemble(
         directory.path(),
+        None,
         None,
         &Env::empty(),
         &config,
@@ -5582,6 +5714,7 @@ fn read_only_agent_refuses_unavailable_fallback_even_when_trusted_config_allows_
     let error = tool_runtime::assemble(
         directory.path(),
         None,
+        None,
         &Env::empty(),
         &config,
         &selected_agent,
@@ -5704,6 +5837,7 @@ async fn a_read_only_agent_contract_narrows_a_full_access_invocation() {
     let runtime = tool_runtime::assemble(
         directory.path(),
         None,
+        None,
         &Env::empty(),
         &config,
         &selected_agent,
@@ -5772,6 +5906,7 @@ fn production_registry_exposes_council_only_to_a_delegating_profile() {
         let selected_agent = agent_profile(agent(agent_name), directory.path(), &config);
         let runtime = tool_runtime::assemble(
             directory.path(),
+            None,
             None,
             &Env::empty(),
             &config,
@@ -5879,6 +6014,7 @@ fn production_registry_uses_the_frozen_profile_rules() {
     );
     let runtime = tool_runtime::assemble(
         directory.path(),
+        None,
         None,
         &Env::empty(),
         &zuno_config::schema::Config::default(),
@@ -7442,6 +7578,7 @@ mod production_registry {
         let runtime = tool_runtime::assemble(
             directory.path(),
             None,
+            None,
             &Env::empty(),
             &config,
             &selected_agent,
@@ -7931,6 +8068,7 @@ mod production_registry {
         let selected_agent = agent_profile(agent("build"), directory.path(), &config);
         let runtime = tool_runtime::assemble(
             directory.path(),
+            None,
             None,
             &Env::empty(),
             &config,

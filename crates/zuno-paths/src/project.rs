@@ -426,6 +426,52 @@ mod tests {
         );
     }
 
+    /// A caller that already resolved the project holds the generated root.
+    ///
+    /// `TurnHost::open_with_runtime_mcp_and_observers` composes a turn's tools from a
+    /// synchronous closure it cannot await in, so it cannot call
+    /// [`crate::generated_root`] there — the call spawns `git rev-parse`, and every CLI
+    /// entry point drives a current-thread runtime where a blocked thread is the whole
+    /// reactor. What it does instead is read the root out of the `ResolvedProject` it
+    /// already has, which is only correct while these two functions answer from the same
+    /// discovery. Pinned here, in the crate that owns both, because the caller cannot
+    /// pin it: reading it there would just restate the derivation.
+    #[test]
+    fn a_resolved_project_already_names_the_generated_root() {
+        let root = repository();
+        let nested = root.path().join("a").join("b");
+        fs::create_dir_all(&nested).expect("create nested");
+
+        for directory in [root.path(), nested.as_path()] {
+            let project = resolve_project(directory);
+            assert!(
+                project.vcs.is_some(),
+                "{} is in a repository, so the project must carry a vcs",
+                directory.display()
+            );
+            // Exactly the derivation the caller performs: the project directory when a
+            // vcs was detected, the session directory otherwise.
+            let derived = project
+                .vcs
+                .as_ref()
+                .map_or_else(|| directory.to_path_buf(), |_| project.directory.clone());
+            assert_same_path(&derived, &crate::generated_root(directory));
+        }
+
+        let outside = tempfile::tempdir().expect("tempdir");
+        let project = resolve_project(outside.path());
+        assert_eq!(
+            project.vcs, None,
+            "a tempdir outside a checkout has no vcs, and the caller then keeps its own \
+             directory rather than the `/` this function reports as the project directory"
+        );
+        let derived = project
+            .vcs
+            .as_ref()
+            .map_or_else(|| outside.path().to_path_buf(), |_| project.directory);
+        assert_same_path(&derived, &crate::generated_root(outside.path()));
+    }
+
     /// A directory with no repository above it, and — as a shared `/tmp` on a build
     /// machine can have — one with a `.git` git itself does not accept, both have to
     /// answer the same way [`resolve_project`] does: there is no worktree here.
