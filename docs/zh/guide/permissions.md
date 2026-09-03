@@ -248,6 +248,8 @@ tools "edit" is false and tools "write" is true, but both are governed by permis
 
 路径规则会同时按调用给出的原样路径和它的规范化拼写来匹配：分隔符被统一，`.` 段与重复分隔符被去掉，因此 `./src/main.rs`、`src//main.rs` 以及反斜杠写法 `src\main.rs` 都能匹配一条写作 `src/main.rs` 的规则。`deny` 刻意伸得更远：它还覆盖 `..` 解析后的路径，而写成绝对路径的 deny 也覆盖该路径的相对尾段，所以 deny 无法靠改写路径拼法绕过。`allow` 在这两个方向上都不会被放宽，因为放宽一条 allow 就等于授权了规则没有点名的文件。
 
+按这种方式处理的键是 `read`、`edit`、`write`、`list` 与 `lsp`。`lsp` 也在其中，是因为它的资源同样是一个文件：语言服务器工具会把该文件命名为相对于包含本次会话的工作区的路径，而当会话目录与工作区不构成嵌套关系时，则回退为解析后的绝对路径。因此写作 `{"lsp": {"secrets.rs": "deny"}}` 的 deny 在两种布局下都能覆盖这个文件。
+
 写 `allow` 时要照这个不对称来规划。`read`、`edit`、`write`、`apply_patch` 的文档约定接收绝对路径，所以 `"read": {"src/main.rs": "allow"}` 覆盖不到调用实际传入的绝对路径，而同样的模式写成 `deny` 却能覆盖。请用 `~`、`$HOME` 或绝对前缀来写 allow，或者用 `*`（它可以跨分隔符匹配），例如 `{"*/src/*": "allow"}`。
 
 打印解析后的策略 —— 即在配置和任何 Agent 契约都已应用之后，生效的模式与每一条规则：

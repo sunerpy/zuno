@@ -268,3 +268,60 @@ fn opaque_resources_are_matched_verbatim() {
         PermissionAction::Ask
     );
 }
+
+#[test]
+fn an_lsp_deny_reaches_both_spellings_the_tool_sends() {
+    // `zuno-lsp` names the requested file relative to the worktree containing the
+    // session, and falls back to the resolved absolute path where the session
+    // directory and the worktree do not nest. Both spellings are production, so a
+    // deny an author writes the way the repository reads it has to cover both — the
+    // author cannot know which layout the session will have.
+    let rules =
+        rules_from_json(r#"{"mode":"standard","rules":{"lsp":{"*":"allow","secrets.rs":"deny"}}}"#);
+
+    assert_eq!(
+        evaluate("lsp", "secrets.rs", &rules),
+        PermissionAction::Deny,
+        "the nested layout sends the worktree-relative spelling"
+    );
+    assert_eq!(
+        evaluate("lsp", "/home/u/proj/secrets.rs", &rules),
+        PermissionAction::Deny,
+        "the non-nested fallback sends the resolved absolute path for the same file"
+    );
+    assert_eq!(
+        evaluate("lsp", "./secrets.rs", &rules),
+        PermissionAction::Deny,
+        "`./` is the same spelling, not a different resource"
+    );
+    assert_eq!(
+        evaluate("lsp", "src/main.rs", &rules),
+        PermissionAction::Allow,
+        "widening the deny must stop at the file it names"
+    );
+}
+
+#[test]
+fn an_lsp_allow_still_needs_the_spelling_the_author_wrote() {
+    // The suffix widening is deny-only, and adding `lsp` to the path keys must not
+    // move it. This crate is not told the worktree root, so relating an absolute
+    // request to a relative grant would be a guess, and a guess that widens a grant
+    // authorizes a file nobody named.
+    let rules =
+        rules_from_json(r#"{"mode":"standard","rules":{"lsp":{"*":"ask","src/*":"allow"}}}"#);
+
+    assert_eq!(
+        evaluate("lsp", "src/main.rs", &rules),
+        PermissionAction::Allow
+    );
+    assert_eq!(
+        evaluate("lsp", "/ws/src/main.rs", &rules),
+        PermissionAction::Ask,
+        "an absolute request is not the relative grant's resource"
+    );
+    assert_eq!(
+        evaluate("lsp", "/etc/src/main.rs", &rules),
+        PermissionAction::Ask,
+        "and least of all when the suffix matches somewhere else entirely"
+    );
+}

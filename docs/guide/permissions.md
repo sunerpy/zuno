@@ -341,6 +341,12 @@ relative tail of that path as well, so a deny cannot be sidestepped by respellin
 file. An `allow` never widens in either of those directions, because a widened allow
 would authorize a file the rule did not name.
 
+The keys treated this way are `read`, `edit`, `write`, `list`, and `lsp`. `lsp` is one
+of them because its resource is a file as well: the language-server tool names the file
+relative to the worktree containing the session, and falls back to the resolved absolute
+path where the session directory and the worktree do not nest. A deny written
+`{"lsp": {"secrets.rs": "deny"}}` therefore covers the file under either layout.
+
 Plan an `allow` around that asymmetry. `read`, `edit`, `write`, and `apply_patch` are
 documented to take absolute paths, so `"read": {"src/main.rs": "allow"}` does not cover
 the absolute path a call actually passes, while the same pattern written as a `deny`

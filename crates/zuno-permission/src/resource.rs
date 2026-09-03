@@ -91,7 +91,17 @@ use zuno_config::schema::permission::PermissionAction;
 const SHELL_PERMISSIONS: [&str; 1] = ["shell"];
 
 /// Permission keys whose resource is a filesystem path.
-const PATH_PERMISSIONS: [&str; 4] = ["read", "edit", "write", "list"];
+///
+/// `lsp` is here because its resource is one too: `zuno-lsp` resolves the requested
+/// file and names it relative to the worktree that contains the session, falling back
+/// to the resolved absolute path where the two roots do not nest. Both spellings
+/// therefore reach this crate for the same file, which is exactly the situation the
+/// path treatment exists for — without it an `lsp` deny written the way a repository
+/// is read, `"src/main.rs"`, misses the absolute spelling and degrades to an ask.
+///
+/// Membership is what a rule may match, not what the tool may touch: an `lsp` request
+/// is confined by `zuno-lsp` before it reaches a rule at all.
+const PATH_PERMISSIONS: [&str; 5] = ["read", "edit", "write", "list", "lsp"];
 
 /// What kind of thing the resource of one permission is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
