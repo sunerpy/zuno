@@ -29,7 +29,7 @@ zuno <command> --help
 | 命令 | 用途 |
 | --- | --- |
 | [`zuno session`](/zh/cli/session) | 列出、按期清理与删除持久 session。 |
-| [`zuno agent`](/zh/cli/agent) | 创建 Agent 定义，并列出当前解析出的 Agent。 |
+| [`zuno agent`](/zh/cli/agent) | 列出当前配置链解析出的 Agent。 |
 | [`zuno db`](/zh/cli/db) | 对本地 session 数据库执行查询。 |
 | [`zuno export`](/zh/cli/export) | 把配置、Skill、扩展与 Agent 写入一个可移植 bundle。 |
 | [`zuno import`](/zh/cli/import) | 把一个可移植 bundle 还原到本机的用户环境中。 |

@@ -429,31 +429,17 @@ pub struct AgentArgs {
     pub command: Option<AgentCommand>,
 }
 
+/// `agent`'s subcommands.
+///
+/// `create` used to be registered here over a handler that refused every
+/// invocation, so the only thing it could do was print a message about a
+/// generator that does not exist. Writing an agent definition is editing a
+/// Markdown file under `.zuno/agent/`, which `docs/config/custom-agents.md`
+/// documents; a subcommand is not registered until its behavior exists.
 #[derive(Debug, Clone, Subcommand)]
 pub enum AgentCommand {
-    Create(AgentCreateArgs),
+    /// List the agents the current configuration chain resolves.
     List,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum AgentMode {
-    All,
-    Primary,
-    Subagent,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct AgentCreateArgs {
-    #[arg(long)]
-    pub path: Option<String>,
-    #[arg(long)]
-    pub description: Option<String>,
-    #[arg(long, value_enum)]
-    pub mode: Option<AgentMode>,
-    #[arg(long, visible_alias = "tools")]
-    pub permissions: Option<String>,
-    #[arg(short = 'm', long)]
-    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -802,7 +788,7 @@ pub enum Command {
     Serve(ServeArgs),
     /// Manage sessions.
     Session(SessionArgs),
-    /// Manage agents.
+    /// List the agents visible from this directory.
     Agent(AgentArgs),
     /// List available models.
     Models(ModelsArgs),
@@ -1303,6 +1289,24 @@ mod tests {
     #[test]
     fn removed_pure_flag_is_rejected() {
         assert!(Cli::try_parse_from(["zuno", "--pure"]).is_err());
+    }
+
+    /// `agent create` is no longer parsed.
+    ///
+    /// It was registered over a handler that could only report the absence of a
+    /// model-backed generator. Authoring an agent is writing a Markdown file under
+    /// `.zuno/agent/`, which `docs/config/custom-agents.md` documents.
+    #[test]
+    fn agent_no_longer_parses_the_removed_create_subcommand() {
+        assert!(Cli::try_parse_from(["zuno", "agent", "create"]).is_err());
+        assert!(Cli::try_parse_from(["zuno", "agent", "create", "--name", "probe"]).is_err());
+        let cli = Cli::try_parse_from(["zuno", "agent", "list"]).expect("agent list parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Agent(AgentArgs {
+                command: Some(AgentCommand::List),
+            }))
+        ));
     }
 
     #[test]

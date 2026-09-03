@@ -18,10 +18,6 @@ pub(super) fn execute(args: &AgentArgs, environment: &StartupEnvironment) -> Res
         .ok_or("agent subcommand is required")?
     {
         AgentCommand::List => list(environment),
-        AgentCommand::Create(_) => Err(
-            "agent creation requires the model-backed generator, which is not available yet"
-                .to_owned(),
-        ),
     }
 }
 

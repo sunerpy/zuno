@@ -31,7 +31,7 @@ A small set of options is accepted by every subcommand. They are documented once
 | Command | Purpose |
 | --- | --- |
 | [`zuno session`](/cli/session) | List, prune, and delete durable sessions. |
-| [`zuno agent`](/cli/agent) | Create agent definitions and list the agents currently resolved. |
+| [`zuno agent`](/cli/agent) | List the agents the current configuration chain resolves. |
 | [`zuno db`](/cli/db) | Run a query against the local session database. |
 | [`zuno export`](/cli/export) | Write configuration, Skills, extensions, and Agents into a portable bundle. |
 | [`zuno import`](/cli/import) | Restore a portable bundle into this machine's user environment. |

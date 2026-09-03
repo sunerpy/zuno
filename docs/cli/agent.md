@@ -1,10 +1,12 @@
 # zuno agent
 
 Agents carry their own prompt, model, permissions, and delegation boundaries. `zuno agent`
-is the surface for authoring one and for checking what the current configuration chain
-actually resolves to, which matters when global and project definitions overlap.
+is the surface for checking what the current configuration chain actually resolves to,
+which matters when global and project definitions overlap.
 
-`create` writes a new agent definition; `list` reports the agents visible from here.
+`list` reports the agents visible from here, each with the permission rules this build
+enforces for it. Authoring an agent is writing a Markdown file under `.zuno/agent/`; see
+[custom agents](/config/custom-agents) for the front matter that file takes.
 
 ## Synopsis
 
@@ -27,29 +29,8 @@ zuno agent [OPTIONS] <COMMAND>
 
 | Subcommand | Description |
 | --- | --- |
-| [`create`](#zuno-agent-create) | |
-| [`list`](#zuno-agent-list) | |
+| [`list`](#zuno-agent-list) | List the agents the current configuration chain resolves |
 | `help` | Print this message or the help of the given subcommand(s) |
-
-### zuno agent create
-
-```sh
-zuno agent create [OPTIONS]
-```
-
-| Option | Description | Default |
-| --- | --- | --- |
-| `--path <PATH>` | | |
-| `-v`, `--version` | Show the Zuno package version | |
-| `--description <DESCRIPTION>` | | |
-| `--mode <MODE>` | Possible values: `all`, `primary`, `subagent` | |
-| `--print-logs` | Print logs to stderr in addition to the structured local log store | |
-| `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
-| `--permissions <PERMISSIONS>` | Alias: `--tools` | |
-| `-m`, `--model <MODEL>` | | |
-| `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
-| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
-| `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno agent list
 
@@ -74,13 +55,8 @@ List the agents resolved from the current configuration chain.
 zuno agent list
 ```
 
-Create a subagent definition at an explicit path with a description and a pinned model.
-
-```sh
-zuno agent create --path .zuno/agent/reviewer.md --mode subagent --description "Review diffs for regressions" --model openai/gpt-5
-```
-
-Inspect one agent's fully resolved definition after creating it.
+Inspect one agent's fully resolved definition, after writing
+`.zuno/agent/reviewer.md`.
 
 ```sh
 zuno debug agent reviewer
