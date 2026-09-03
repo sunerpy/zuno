@@ -628,6 +628,11 @@ Zuno accepts one permission shape only: `permission.mode` selects the HITL
 policy and `permission.rules` carries ordered per-tool rules. Legacy string,
 direct-rule, and `authorization.strict` forms are rejected.
 
+Rules are ordered and **the last matching rule wins**, so a catch-all belongs
+first and the narrow patterns that carve exceptions out of it belong last. The
+`edit` key covers the `write`, `edit`, and `apply_patch` tools; there is no
+separate `write` rule key.
+
 To run tool calls without Zuno HITL prompts, use `allow_all`:
 
 ```json

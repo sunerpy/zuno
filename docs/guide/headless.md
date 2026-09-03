@@ -147,20 +147,24 @@ prompts that cannot be answered:
       "read": "allow",
       "glob": "allow",
       "grep": "allow",
+      "edit": "deny",
       "shell": {
-        "git push*": "deny",
+        "*": "deny",
         "cargo test*": "allow",
-        "*": "deny"
-      },
-      "write": "deny"
+        "git push*": "deny"
+      }
     }
   }
 }
 ```
 
-Rules are evaluated in the order written, so a narrow pattern must precede a broader one.
-`--auto` exists for interactive use and yields to the human broker in strict mode; it is
-not a substitute for a policy. See [Permissions and sandboxing](/guide/permissions).
+The last matching rule wins, so the catch-all `*` comes first and the narrow patterns that
+carve exceptions out of it come last. Written the other way round, the trailing `"*": "deny"`
+would override `cargo test*` and the suite this configuration exists to run would never
+start. The `edit` key covers the `write`, `edit`, and `apply_patch` tools; there is no
+separate `write` rule key. `--auto` exists for interactive use and yields to the human
+broker in strict mode; it is not a substitute for a policy. See
+[Permissions and sandboxing](/guide/permissions).
 
 ## Example: a CI gate
 

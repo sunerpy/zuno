@@ -119,18 +119,18 @@ zuno debug sandbox --mode workspace-write --network deny --check
       "read": "allow",
       "glob": "allow",
       "grep": "allow",
+      "edit": "deny",
       "shell": {
-        "git push*": "deny",
+        "*": "deny",
         "cargo test*": "allow",
-        "*": "deny"
-      },
-      "write": "deny"
+        "git push*": "deny"
+      }
     }
   }
 }
 ```
 
-规则按书写顺序求值，因此更窄的模式必须在更宽的模式之前。`--auto` 是为交互使用而存在的，在 strict 模式下它会让位给人类审批者；它不是策略的替代品。参见[权限与沙箱](/zh/guide/permissions)。
+最后一条匹配的规则胜出，因此 catch-all `*` 写在最前面，从它当中划出例外的窄模式写在最后面。如果顺序反过来，写在末尾的 `"*": "deny"` 会覆盖 `cargo test*`，这份配置本来要跑的测试就永远跑不起来。`edit` 这个键同时管 `write`、`edit` 和 `apply_patch` 三个工具，不存在单独的 `write` 规则键。`--auto` 是为交互使用而存在的，在 strict 模式下它会让位给人类审批者；它不是策略的替代品。参见[权限与沙箱](/zh/guide/permissions)。
 
 ## 示例：一个 CI 门禁
 

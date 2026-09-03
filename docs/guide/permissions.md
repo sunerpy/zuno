@@ -227,8 +227,8 @@ including this one.
 
 ## Per-tool rules
 
-`permission.rules` is ordered and evaluated in the order you write it. A rule is
-either one action for the whole tool, or per-pattern actions.
+`permission.rules` is ordered, and **the last matching rule wins**. A rule is either
+one action for the whole tool, or per-pattern actions.
 
 ```json
 {
@@ -236,20 +236,28 @@ either one action for the whole tool, or per-pattern actions.
     "mode": "standard",
     "rules": {
       "read": "allow",
-      "write": "ask",
+      "edit": "ask",
       "shell": {
-        "git push*": "deny",
+        "*": "ask",
         "git *": "allow",
-        "rm -rf*": "deny",
-        "*": "ask"
+        "git push*": "deny",
+        "rm -rf*": "deny"
       }
     }
   }
 }
 ```
 
-Order matters and the example depends on it: `git push*` has to precede `git *`, or
-the broader pattern would match first and a push would be allowed.
+Order matters and this example depends on it. Because later rules override earlier
+ones, the catch-all `*` goes **first** and the narrow patterns that carve exceptions
+out of it go **last**: `git *` overrides the catch-all, and `git push*` then overrides
+`git *` so a push is denied. Reversing the order does not merely change style; it
+removes the protection, because `*` written last would override every rule above it
+and turn `rm -rf /` back into a prompt.
+
+The `edit` key covers the `write`, `edit`, and `apply_patch` tools; all three request
+authorization under it. There is no separate `write` or `apply_patch` rule key, so a
+rule written under either name never matches anything.
 
 Print the resolved policy — the effective mode and every rule, after configuration
 and any agent contract have been applied:

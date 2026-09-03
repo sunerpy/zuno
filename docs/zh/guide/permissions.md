@@ -196,7 +196,7 @@ OS sandbox is not implemented for platform `macos`
 
 ## 逐工具规则
 
-`permission.rules` 是有序的，并按你书写的顺序求值。一条规则要么是对整个工具的单一动作，要么是按模式匹配的多个动作。
+`permission.rules` 是有序的，**最后一条匹配的规则胜出**。一条规则要么是对整个工具的单一动作，要么是按模式匹配的多个动作。
 
 ```json
 {
@@ -204,19 +204,21 @@ OS sandbox is not implemented for platform `macos`
     "mode": "standard",
     "rules": {
       "read": "allow",
-      "write": "ask",
+      "edit": "ask",
       "shell": {
-        "git push*": "deny",
+        "*": "ask",
         "git *": "allow",
-        "rm -rf*": "deny",
-        "*": "ask"
+        "git push*": "deny",
+        "rm -rf*": "deny"
       }
     }
   }
 }
 ```
 
-顺序很关键，上面的例子依赖它：`git push*` 必须在 `git *` 之前，否则更宽的模式会先匹配，push 就会被允许。
+顺序很关键，上面的例子依赖它。因为后面的规则会覆盖前面的规则，catch-all `*` 要写在**最前面**，而从它当中划出例外的窄模式要写在**最后面**：`git *` 覆盖 catch-all，`git push*` 再覆盖 `git *`，于是 push 被拒绝。把顺序倒过来不只是风格差异，它会让保护失效：写在最后的 `*` 会覆盖它上面的每一条规则，`rm -rf /` 会重新变成一次询问。
+
+`edit` 这个键同时管 `write`、`edit` 和 `apply_patch` 三个工具，它们都在这个键下申请授权。不存在单独的 `write` 或 `apply_patch` 规则键，因此写成这两个名字的规则永远不会匹配到任何东西。
 
 打印解析后的策略 —— 即在配置和任何 Agent 契约都已应用之后，生效的模式与每一条规则：
 
