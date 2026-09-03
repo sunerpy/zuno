@@ -129,6 +129,18 @@ ZUNO_DOCS_REGENERATE=1 cargo test -p zuno --test docs
 因为模型正是通过那条路径读回被输出上限扣留的内容；文件名完全不带 session 的文件，只有在超过
 七天之后才会被回收。没有任何 `project` 行指向的检出目录不会被扫描。
 
+读不到的根会被跳过，而不是让整轮失败 —— 例如离线的网络挂载、已经不在的卷上的检出、权限被改过
+的目录，或者检出曾经所在的路径。它的文件会原样留在那里，其他每个根仍然照常清扫，报告中会为每个
+被跳过的根带上一条警告：
+
+```text
+tool output under /mnt/nas/repo/.zuno/tool-output was not swept: could not inspect /mnt/nas/repo/.zuno/tool-output (No such device)
+```
+
+这条警告是那些文件唯一的记录。删除模式在清扫运行之前就已经移除了 session 行，因此后续的清理
+无法再把一个以不存在 session 命名的文件归属到任何 session 上，而七天规则只适用于完全不带
+session 的文件。如果需要回收这部分空间，请在该路径重新可访问之后自行删除。
+
 ## 读懂 artifact 警告
 
 报告中可能带有：

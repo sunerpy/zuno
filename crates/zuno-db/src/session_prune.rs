@@ -276,12 +276,12 @@ pub fn execute(
         ProgressPhase::Artifacts,
         Some(selected_count),
     ));
-    let artifacts = match request.action {
-        SessionPruneAction::Archive { .. } => SessionPruneArtifactImpact::default(),
+    let (artifacts, skipped_roots) = match request.action {
+        SessionPruneAction::Archive { .. } => (SessionPruneArtifactImpact::default(), Vec::new()),
         SessionPruneAction::Preview | SessionPruneAction::Delete
             if outcome.preview.session_ids.is_empty() =>
         {
-            SessionPruneArtifactImpact::default()
+            (SessionPruneArtifactImpact::default(), Vec::new())
         }
         SessionPruneAction::Preview | SessionPruneAction::Delete => {
             let mut artifact_request = ArtifactGcRequest::new(
@@ -293,7 +293,15 @@ pub fn execute(
             }
             let report = artifact_gc::execute(connection, paths, &artifact_request)
                 .map_err(SessionPruneError::Artifacts)?;
-            artifact_impact(report)
+            // A root the pass could not read is reported, not swallowed: those files were
+            // left in place, and after a delete the sessions that own them are already
+            // gone from the database, so this line is the only record that names them.
+            let skipped = report
+                .skipped_roots
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            (artifact_impact(report), skipped)
         }
     };
 
@@ -301,6 +309,7 @@ pub fn execute(
     if let Some(warning) = visibility_warning {
         warnings.push(warning);
     }
+    warnings.extend(skipped_roots);
     let report = SessionPruneReport {
         action: request.action,
         selected_session_ids: outcome.preview.session_ids.clone(),

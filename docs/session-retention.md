@@ -162,6 +162,21 @@ the model reads back output the size limits withheld. A file whose name carries 
 session at all is reclaimed only once it is older than seven days. A checkout that no
 `project` row names is not scanned.
 
+A root that cannot be read — a network mount that is offline, a checkout on a volume that
+is gone, a directory whose permissions changed, a path where a checkout used to be — is
+skipped, not fatal. Its files are left exactly as they are, every other root is still
+swept, and the report carries one warning per skipped root:
+
+```text
+tool output under /mnt/nas/repo/.zuno/tool-output was not swept: could not inspect /mnt/nas/repo/.zuno/tool-output (No such device)
+```
+
+That warning is the only record those files will get. A delete has already removed the
+session rows by the time the sweep runs, so a later prune cannot attribute a file named
+after a session that no longer exists, and the seven-day rule applies only to files that
+carry no session at all. If you need the space, remove that path yourself once it is
+reachable again.
+
 ## Reading the artifact warning
 
 A report may carry:
