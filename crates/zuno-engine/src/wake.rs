@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use zuno_db::inbox::{DurableInputKind, SessionInbox, SessionInput};
 
 use crate::interrupt::{SoftInterruptMessage, SoftInterruptSource};
+use crate::report::ReportBatch;
 use crate::status::{SessionRunGuard, SessionRunRegistry};
 
 /// Opens and drives one idle session from an already persisted input.
@@ -114,6 +115,10 @@ impl SessionWakeCoordinator {
     /// settled batch would still become a stream of turns that each announce a state a
     /// later report had already replaced.
     ///
+    /// The batch is offered in admission order and carries the same render-time grouping
+    /// the idle path uses, so a report the batch supersedes reads as superseded here too
+    /// instead of arriving as a live state the parent must chase.
+    ///
     /// The woken row's own delivery decides the outcome; the batch mates are offered
     /// best-effort, because each of them keeps its own durable row and its own wake.
     /// Reports the active turn never reaches stay pending for the next scan.
@@ -124,30 +129,52 @@ impl SessionWakeCoordinator {
         woken: &SessionInput,
         message: &SoftInterruptMessage,
     ) -> bool {
-        if self
-            .runs
-            .queue_soft_interrupt(session_id, message.clone())
-            .is_err()
-        {
-            return false;
-        }
         if !is_settled_report(woken) {
-            return true;
+            return self
+                .runs
+                .queue_soft_interrupt(session_id, message.clone())
+                .is_ok();
         }
-        for mate in pending.iter().filter(|input| input.id != woken.id) {
-            let Some(message) = settled_report_message(mate) else {
-                continue;
+        let batch = ReportBatch::project(pending);
+        let mut woken_queued = None;
+        for report in batch.reports() {
+            let is_woken = report.input_id == woken.id;
+            let queued = if is_woken {
+                SoftInterruptMessage {
+                    content: report.text.clone(),
+                    ..message.clone()
+                }
+            } else {
+                SoftInterruptMessage {
+                    input_id: Some(report.input_id.clone()),
+                    content: report.text.clone(),
+                    images: Vec::new(),
+                    attachments: Vec::new(),
+                    urgent: false,
+                    source: SoftInterruptSource::BackgroundTask,
+                }
             };
-            if let Err(error) = self.runs.queue_soft_interrupt(session_id, message) {
+            let outcome = self.runs.queue_soft_interrupt(session_id, queued);
+            if is_woken {
+                woken_queued = Some(outcome.is_ok());
+            }
+            if let Err(error) = outcome {
                 tracing::debug!(
                     session_id,
-                    input_id = %mate.id,
+                    input_id = %report.input_id,
                     %error,
-                    "leaving a batch mate pending for the next wake"
+                    "leaving a batch member pending for the next wake"
                 );
             }
         }
-        true
+        // A report the projection cannot render is not part of the batch, but its own
+        // delivery still decides this outcome, so it is offered exactly as its caller
+        // built it rather than through content this coordinator invented.
+        woken_queued.unwrap_or_else(|| {
+            self.runs
+                .queue_soft_interrupt(session_id, message.clone())
+                .is_ok()
+        })
     }
 
     fn pending_input(
@@ -165,26 +192,6 @@ impl SessionWakeCoordinator {
 /// Whether this row is a settled report the wake path batches.
 fn is_settled_report(input: &SessionInput) -> bool {
     DurableInputKind::classify(&input.prompt).is_some_and(DurableInputKind::is_asynchronous_report)
-}
-
-/// Project one pending report onto the message an active turn injects for it.
-///
-/// Only a shape whose whole model-visible text is already durable can be steered this
-/// way. A row this refuses keeps its own wake instead of reaching the model through
-/// content the coordinator invented.
-fn settled_report_message(input: &SessionInput) -> Option<SoftInterruptMessage> {
-    let kind = DurableInputKind::classify(&input.prompt)?;
-    if !kind.is_asynchronous_report() {
-        return None;
-    }
-    Some(SoftInterruptMessage {
-        input_id: Some(input.id.clone()),
-        content: kind.plain_text(&input.prompt)?.to_owned(),
-        images: Vec::new(),
-        attachments: Vec::new(),
-        urgent: false,
-        source: SoftInterruptSource::BackgroundTask,
-    })
 }
 
 struct WakeLease {

@@ -365,8 +365,9 @@ async fn a_busy_parent_is_offered_the_whole_report_batch_at_one_safe_point() {
             .iter()
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>(),
-        ["report input_1", "input_2", "input_3"],
-        "a batch mate is steered with its own durable text, never invented content"
+        ["input_1", "input_2", "input_3"],
+        "every batch member is steered from its own durable row, so the running turn \
+         reads exactly what an idle turn would have driven"
     );
     inbox
         .promote_pending_async(SESSION)
@@ -433,5 +434,133 @@ async fn a_typed_submission_wake_never_drags_settled_reports_into_the_running_tu
             .map(|input| input.id)
             .collect::<Vec<_>>(),
         ["input_1"]
+    );
+}
+
+fn admit_job_report(inbox: &SessionInbox, id: &str, job_id: &str, text: &str, completed: i64) {
+    inbox
+        .admit(NewSessionInput::new(
+            id,
+            SESSION,
+            json!({
+                "kind": "subagentReport",
+                "jobID": job_id,
+                "childSessionID": "ses_child",
+                "status": "completed",
+                "text": text
+            }),
+            InputDelivery::Queue,
+            completed,
+        ))
+        .expect("admit report");
+}
+
+#[tokio::test]
+async fn a_busy_parent_reads_a_superseded_report_as_superseded() {
+    let (_pool, inbox) = initialized();
+    admit_job_report(&inbox, "input_early", "job_1", "child is halfway", 10);
+    admit_job_report(&inbox, "input_late", "job_1", "child finished", 20);
+    let runs = SessionRunRegistry::new();
+    let guard = runs.begin_turn(SESSION).expect("active parent");
+    let driver = Arc::new(BatchDriver::new(inbox.clone()));
+    let coordinator = SessionWakeCoordinator::new(inbox.clone(), runs, driver.clone());
+    let delivery = tokio::spawn(async move {
+        coordinator
+            .deliver(SESSION, "input_early", message("input_early"))
+            .await
+    });
+
+    let queued = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let delivery = guard.take_soft_interrupts_at_safe_point();
+            if delivery.messages.len() == 2 {
+                break delivery.messages;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both reports for one job arrive together");
+
+    assert_eq!(
+        queued[0].input_id.as_deref(),
+        Some("input_early"),
+        "the batch keeps admission order"
+    );
+    assert!(
+        queued[0].content.starts_with("[superseded report]"),
+        "the running turn must not read a replaced state as live: {}",
+        queued[0].content
+    );
+    assert!(
+        queued[0].content.ends_with("child is halfway"),
+        "annotation is a prefix on the durable text, never a rewrite: {}",
+        queued[0].content
+    );
+    assert!(
+        queued[1].content.starts_with("[current report]"),
+        "the newest report for the job is the one marked current: {}",
+        queued[1].content
+    );
+    assert!(queued[1].content.ends_with("child finished"));
+    inbox
+        .promote_pending_async(SESSION)
+        .expect("the active turn claims the batch");
+    drop(guard);
+
+    assert_eq!(
+        delivery.await.expect("delivery task").expect("delivery"),
+        WakeOutcome::ClaimedByActiveTurn
+    );
+}
+
+#[tokio::test]
+async fn a_report_the_projection_cannot_render_still_steers_its_own_wake() {
+    let (_pool, inbox) = initialized();
+    inbox
+        .admit(NewSessionInput::new(
+            "input_broken",
+            SESSION,
+            json!({"kind": "subagentReport", "jobID": "job_1", "status": "completed"}),
+            InputDelivery::Queue,
+            10,
+        ))
+        .expect("admit report");
+    let runs = SessionRunRegistry::new();
+    let guard = runs.begin_turn(SESSION).expect("active parent");
+    let driver = Arc::new(BatchDriver::new(inbox.clone()));
+    let coordinator = SessionWakeCoordinator::new(inbox.clone(), runs, driver.clone());
+    let delivery = tokio::spawn(async move {
+        coordinator
+            .deliver(SESSION, "input_broken", message("input_broken"))
+            .await
+    });
+
+    let queued = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let delivery = guard.take_soft_interrupts_at_safe_point();
+            if let Some(message) = delivery.messages.into_iter().next() {
+                break message;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the wake still reaches the running turn");
+
+    assert_eq!(queued.input_id.as_deref(), Some("input_broken"));
+    assert_eq!(
+        queued.content, "report input_broken",
+        "a row the projection drops is offered exactly as its caller built it"
+    );
+    inbox
+        .promote_id(SESSION, "input_broken")
+        .expect("promote report")
+        .expect("pending report");
+    drop(guard);
+
+    assert_eq!(
+        delivery.await.expect("delivery task").expect("delivery"),
+        WakeOutcome::ClaimedByActiveTurn
     );
 }

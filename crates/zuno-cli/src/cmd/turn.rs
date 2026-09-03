@@ -69,6 +69,7 @@ use zuno_engine::prelude::{
     compact_requested, run_prelude,
 };
 use zuno_engine::prompt::{PromptAssembly, RuntimePromptPolicy};
+use zuno_engine::report::ProjectedReport;
 use zuno_engine::session_command::SessionCommand;
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_error::{DbError, ProviderError, Recovery};
@@ -1921,21 +1922,6 @@ struct DriveInputOptions<'a> {
     persistence: UserInputPersistence,
     planning_source: PlanningInputSource,
     routing: Option<PromptRouting>,
-}
-
-/// One settled report already promoted by the wake that claimed the batch.
-///
-/// The projection that builds these decides which report the model must treat as the
-/// current state of its work; the host only persists and drives what it is handed.
-pub(crate) struct PromotedReport<'a> {
-    /// Durable inbox id, reused as this report's user message id.
-    pub(crate) message_id: &'a str,
-    /// Exact model-visible text, already carrying the batch's render projection.
-    pub(crate) text: &'a str,
-    /// Which planning origin this report seeds.
-    pub(crate) source: PlanningInputSource,
-    /// Whether this report is the newest terminal state the batch carries.
-    pub(crate) current: bool,
 }
 
 impl<'a> DriveInputOptions<'a> {
@@ -6842,27 +6828,30 @@ impl TurnHost {
     /// state cannot reopen work the newest report already finished.
     pub(crate) async fn drive_promoted_reports_with_guard(
         &mut self,
-        reports: &[PromotedReport<'_>],
+        reports: &[ProjectedReport],
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
-        let current = reports
+        let newest = reports
             .iter()
-            .find(|report| report.current)
+            .find(|report| report.newest)
             .or_else(|| reports.last())
             .ok_or_else(|| "a batched report turn needs one promoted report".to_owned())?;
         debug_assert!(matches!(
-            current.source,
+            newest.source,
             PlanningInputSource::ChildReport | PlanningInputSource::BackgroundReport
         ));
-        let planning_prompt = current.text.to_owned();
-        let planning_source = current.source;
+        let planning_prompt = newest.text.clone();
+        let planning_source = newest.source;
         self.require_active_extension_composition()?;
-        let prompts = reports.iter().map(|report| report.text).collect::<Vec<_>>();
+        let prompts = reports
+            .iter()
+            .map(|report| report.text.as_str())
+            .collect::<Vec<_>>();
         self.preload_turn_skills(&prompts, &events).await?;
         for report in reports {
             let (message, parts) =
-                self.prepare_turn_user_message(report.text, Some(report.message_id), None)?;
+                self.prepare_turn_user_message(&report.text, Some(report.input_id.as_str()), None)?;
             self.persist_promoted_user_input(&message, &parts)?;
         }
         self.drive_prepared(&planning_prompt, planning_source, None, None, guard, events)

@@ -1013,12 +1013,19 @@ joins the next batch, because its report cannot exist before it settles.
 Reports are grouped by the work they describe when a batch is rendered. Where a
 batch carries several reports for one job or background execution, only the report
 whose work completed last is presented as that work's current state; the earlier
-ones are marked superseded in the text the model reads, and Plan reconciliation is
-seeded from the newest report in the batch. Grouping is a projection over durable
-rows: nothing is merged, reordered, dropped, or given a new inbox state, and a
-delivery carrying one report per unit of work is presented exactly as its writers
-wrote it. A promoted report whose durable prompt carries no model-visible text is
-settled `failed` with that reason rather than stalling the reports behind it.
+ones are marked superseded in the text the model reads. The projection belongs to
+the engine rather than to one client, so the batch a wake drives as a new turn and
+the batch a wake offers to a running turn carry identical text: a replaced state
+reads as superseded whether the parent was idle or busy when the newer report
+arrived, and every present and future client surface reaches the same decision from
+the same durable rows. Plan reconciliation is seeded from the newest report of a
+batch the wake drives as its own turn; a batch admitted into a turn that is already
+running enters as durable user input and that turn keeps the planning source it
+started with. Grouping is a projection over durable rows: nothing is merged,
+reordered, dropped, or given a new inbox state, and a delivery carrying one report
+per unit of work is presented exactly as its writers wrote it. A promoted report
+whose durable prompt carries no model-visible text is settled `failed` with that
+reason rather than stalling the reports behind it.
 
 The same boundary now covers every asynchronous continuation source:
 `subagentReport`, `productAgentReport`, `workflowReport`, `councilReport`, and

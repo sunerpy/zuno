@@ -13,6 +13,7 @@ pub mod plan_driver;
 pub mod planning;
 pub mod prelude;
 pub mod prompt;
+pub mod report;
 pub mod retry;
 pub mod session_command;
 pub mod status;
