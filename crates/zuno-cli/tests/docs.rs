@@ -250,6 +250,12 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "\"onUnavailable\": \"run-unconfined\"",
             "ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined",
             "read-only Agent never uses",
+            // A saved `always` is session-scoped, in memory, and unaffected by a
+            // dropped stream. All three are easy to re-document as global, which is
+            // what the batch-2 fix stopped being true.
+            "belongs to one session",
+            "not in the database",
+            "a stream is not the session",
         ],
     );
     contains_all(
@@ -259,6 +265,8 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "\"onUnavailable\": \"run-unconfined\"",
             "ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined",
             "只读 Agent 永远不会使用",
+            "只属于一个 session",
+            "而不在数据库里",
         ],
     );
     contains_all(

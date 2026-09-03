@@ -102,6 +102,12 @@ ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined zuno run "run the local build"
 `zuno.json`，通常是 `$XDG_CONFIG_HOME/zuno/zuno.json` 或
 `~/.config/zuno/zuno.json`。
 
+仓库点名的程序同理：项目层设置 `shell`、本地 `mcp.*.command`、`lsp.*.command`、
+`formatter.*.command` 以及 `productAgent.*.command` 都会被直接拒绝，把该条目用
+`enabled: false` 或 `disabled: true` 关掉也没有区别，因为这个开关就在检出自己控制的
+那一层里。只有受信层里的 `trust.project_host_commands` 能接纳那个检出。
+详见[配置文件与优先级](/zh/config/files)。
+
 ### 网络权限
 
 `sandbox.network` 取 `deny` 或 `allow`。在受约束模式下默认为 `deny`，它会创建一个私有网络命名空间并拒绝网络系统调用 —— 不是一条能被执意而为的进程绕过的防火墙规则。
@@ -194,6 +200,12 @@ OS sandbox is not implemented for platform `macos`
 
 注意 `allow_all` **不会**做什么。它不会关闭沙箱，也不会覆盖一条 `deny` 规则。显式拒绝在任何模式下都是终态的，包括这一种。
 
+## 一条已保存的 “always” 只属于一个 session
+
+用 **always** 回答一次询问，保存的是你回答的那个 session 的决定，而不是整个进程的决定。同样的调用在另一个 session 里 —— 包括之后才创建的 session，以及另一个客户端在驱动的 session —— 仍会再问一次。一次没有可保存模式的一次性确认既不会装上任何授权，也永远不会被先前的 `always` 满足。
+
+一条已保存的 `always` 活在运行中的进程里，而不在数据库里，并且随 session 结束而结束。通过 HTTP 时，用 `POST /api/session/prune` 归档或删除一个 session 会撤销该 session 授予的每一条授权，重启 `zuno serve` 会清空全部；断开再重连事件流不会丢失它们，因为一条流不等于那个 session。想让一个决定活得比一个 session 更久，应该写进 `permission.rules`。参见[会话保留](/zh/operate/session-retention#归档会终止该-session-的常驻-http-授权)。
+
 ## 逐工具规则
 
 `permission.rules` 是有序的，**最后一条匹配的规则胜出**。一条规则要么是对整个工具的单一动作，要么是按模式匹配的多个动作。
@@ -218,7 +230,7 @@ OS sandbox is not implemented for platform `macos`
 
 顺序很关键，上面的例子依赖它。因为后面的规则会覆盖前面的规则，catch-all `*` 要写在**最前面**，而从它当中划出例外的窄模式要写在**最后面**：`git *` 覆盖 catch-all，`git push*` 再覆盖 `git *`，于是 push 被拒绝。把顺序倒过来不只是风格差异，它会让保护失效：写在最后的 `*` 会覆盖它上面的每一条规则，`rm -rf /` 会重新变成一次询问。
 
-`edit` 这个键同时管 `write`、`edit` 和 `apply_patch` 三个工具，它们都在这个键下申请授权。不存在单独的 `write` 或 `apply_patch` 规则键，因此写成这两个名字的规则永远不会匹配到任何东西。
+`edit` 这个键同时管 `write`、`edit` 和 `apply_patch` 三个工具，它们都在这个键下申请授权。不存在单独的 `write` 或 `apply_patch` 规则键，而且 `permission.rules` 会直接拒绝它们：写在 `write`、`apply_patch`、`list_mcp_resources`、`list_mcp_resource_templates` 或 `read_mcp_resource` 下的规则会导致配置校验失败，并指出应当改用哪个键——前两个用 `edit`，三个 MCP 资源工具用 `read`。这五个键此前会被接受，却什么都不评估。其他键仍然合法，因为 MCP、插件与 Skill 工具的名字在运行时才确定，键本身也可以是通配模式。
 
 路径规则会同时按调用给出的原样路径和它的规范化拼写来匹配：分隔符被统一，`.` 段与重复分隔符被去掉，因此 `./src/main.rs`、`src//main.rs` 以及反斜杠写法 `src\main.rs` 都能匹配一条写作 `src/main.rs` 的规则。`deny` 刻意伸得更远：它还覆盖 `..` 解析后的路径，而写成绝对路径的 deny 也覆盖该路径的相对尾段，所以 deny 无法靠改写路径拼法绕过。`allow` 在这两个方向上都不会被放宽，因为放宽一条 allow 就等于授权了规则没有点名的文件。
 

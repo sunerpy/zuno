@@ -256,6 +256,14 @@ untracked file git does not ignore. A narrower pathspec narrows the read to it. 
 whose reach cannot be read as a path — a glob, or one of git's `:`-prefixed magic forms —
 widens the read back to the whole worktree rather than being guessed at.
 
+Every `git commit` on the line is read, not only the first: a chain like
+`git commit -m a && git commit -am b` delivers the worktree's tracked changes through
+its second commit, and a `git add` counts towards the commit that follows it rather
+than one that already ran. Git is recognised however the program is spelled — `GIT`, a
+path-qualified `/usr/bin/git`, a `.exe` suffix — and git's own global options are
+skipped the way git skips them, so no spelling walks past a check keyed on the
+subcommand.
+
 A commit that selects its own repository is refused rather than inspected. `-C`,
 `--git-dir`, `--work-tree`, `--namespace`, and an inline `GIT_DIR=…` all name a repository
 these reads do not follow, so inspecting anyway would report on a tree other than the one

@@ -53,6 +53,12 @@ a lock never released, which is the one outcome worse than a late stop, so it is
 detached and keeps reclaiming in the background. A disposer that returns an error or
 panics is reported as `Uncertain`.
 
+A deployment may bound every one of those waits with `runtime.max_component_stop_ms`,
+which the runtime applies as `min(declared, ceiling)`; absent or `0` means this host
+imposes no ceiling, which is the default. The ceiling only shortens the wait — the
+disposer is still detached rather than cancelled, so a clamped process-tree reap still
+runs to completion in the background.
+
 `RuntimeSnapshot` and `ComponentSnapshot` expose lifecycle state, effect ids,
 provided/required service types, and scrubbed diagnostics without coupling a
 client to the runtime implementation. The TUI projects this inventory today; the
@@ -1784,6 +1790,20 @@ the payload running, supervised for its own exit only; a lost helper is never re
 dead parent. `tasklist` remains only in the idempotency check of `taskkill`-based tree
 termination.
 
+Starting `zuno` itself inserts nothing into that tree, and the CLI's own startup is not
+a guarded process. A client that spawns `zuno acp`, `zuno serve`, or any other
+invocation supervises exactly one process on every supported platform: the process it
+spawned runs the command, ending that process ends the command, and the command's
+`stdout` and `stderr` reach end of file when it exits. Startup resolves global options
+and `ZUNO_*` variables into one in-process value; on Unix it additionally replaces its
+own image once, keeping the same process id, so launched processes inherit the resolved
+values, and a platform without image replacement dispatches in the process the caller
+spawned rather than starting a second one. No `zuno` invocation starts a second `zuno`
+to carry that environment, so starting Zuno never arms the PowerShell parent-watch
+helper above, and Windows PowerShell remains a backend dependency of that guard rather
+than of running the CLI. See
+[One invocation, one process](cli/index.md#one-invocation-one-process).
+
 ## Background command execution
 
 `shell` registers a command with the process-owned
@@ -1809,11 +1829,27 @@ always-durable format are discarded on first open; an old running row is
 conservatively rewritten as `uncertain` and is never replayed.
 
 The `bg` tool supports `list`, `output`, `wait`, and `cancel` for executions owned
-by the current session. The complete tool has `ToolReplayPolicy::Never` because
-one action cancels a process tree. Cancellation reaches descendants through the
-shared process containment layer. A hard process ceiling records failure; a
-process restart converts a previously running row to `uncertain` and never
-replays it.
+by the current session, and `artifact` for output a size limit withheld from any tool
+in that session. `output`, `wait`, and `artifact` take an optional `limit` beside
+`cursor` and return the cursor the next window starts at, so a caller pages by handing
+that cursor back instead of slicing a file with a shell command. `output` and `wait`
+with no cursor return the newest window; `artifact` names the `outputPath` the withheld
+result carries and starts at the beginning. A window is 16,384 bytes when the call
+states no size, and the server clamps any window to 51,200 bytes — the default output
+byte limit's number, fixed rather than a function of the configured
+`tool_output.max_bytes` — so retrieval can never hand back more than an inline result
+would have, and an oversized request is clamped rather than refused. A cursor that
+predates the 2 MiB live ring falls through to a window of the execution's on-disk
+`.output` file and reports `fromDisk`, which makes a discarded prefix reachable again
+instead of clamping the request forward. `artifact` is the retrieval the withholding
+notice names, and the only call that pages those bytes without re-running the call that
+produced them and without passing the window back through the output limits that
+withheld it: an agent profile that hides `bg` leaves its own withheld output reachable
+only through `accept_large_output: true`, which re-runs that call. The complete tool
+has `ToolReplayPolicy::Never` because one action cancels a process tree. Cancellation
+reaches descendants through the shared process containment layer. A hard process
+ceiling records failure; a process restart converts a previously running row to
+`uncertain` and never replays it.
 
 Every execution the service launches runs behind the `__zuno_child_guard` process, so
 the exit status the shell tool reads is the guard's, and three codes may belong to the

@@ -43,6 +43,25 @@ change. ACP carries the same value in `_meta.zuno.learning` during replay and
 live updates. Neither surface invokes extraction or pattern mining while reading
 the projection.
 
+## Process lifetime
+
+One invocation of the `zuno` executable is one process on every supported platform. A
+client that spawns it — an editor over ACP, a service supervising the HTTP server, a
+script — holds the pid that runs the command: ending that process ends the command, and
+its `stdout` and `stderr` reach end of file when it exits. No platform hides a second
+process behind the pid the client holds, so no client has to discover a second pid or
+terminate a process tree to stop one invocation.
+
+Startup resolves global options and `ZUNO_*` variables into one value the command reads
+directly, so completing that resolution never requires writing the process environment.
+Unix additionally replaces the image once, keeping the same pid, so launched processes
+inherit the resolved values. Windows has no equivalent operation, so there the values
+stay process-local and a program Zuno launches does not read them from its own
+environment. A platform without `exec` must not buy inheritance by spawning a second
+process: the client would then hold a waiter, killing it would leave the command running
+with the inherited pipe write ends, and the client's read would never reach end of file.
+See [One invocation, one process](../cli/index.md#one-invocation-one-process).
+
 ## Client capabilities
 
 A client handshake should advertise only presentation and transport capabilities:
