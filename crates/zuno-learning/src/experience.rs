@@ -115,9 +115,15 @@ impl ExperienceService {
 
         let result = serde_json::to_value(&extraction)
             .expect("LearningExtraction derives a total Serialize implementation");
-        let experiences =
-            self.store
-                .complete_extraction(job_id, owner_id, &new_experiences, &result, now)?;
+        // The experiences are recorded first and the job is settled last, with the
+        // Memory proposals in between. A proposal that fails or loses its process
+        // therefore leaves a still-`running` job under this worker's lease, which
+        // the lease reconciler requeues, instead of a completed job with no
+        // candidates. `record_extraction` is idempotent for the same job and
+        // ordinals, so the requeued attempt is safe.
+        let experiences = self
+            .store
+            .record_extraction(job_id, owner_id, &new_experiences)?;
         let mut memory_promotions = Vec::with_capacity(extraction.memories.len());
         for memory in extraction.memories {
             let linked = &experiences[memory.experience_ordinal];
@@ -195,6 +201,8 @@ impl ExperienceService {
                 rejected_reason: None,
             });
         }
+        self.store
+            .finish_extraction(job_id, owner_id, &result, now)?;
         Ok(ExtractionPersistence {
             experiences,
             memory_promotions,
@@ -774,6 +782,68 @@ mod tests {
                 .map(|entry| entry.content)
                 .collect::<Vec<_>>(),
             ["Project high-confidence rule."]
+        );
+    }
+
+    #[test]
+    fn a_failed_memory_proposal_leaves_the_extraction_job_running_for_its_lease_holder() {
+        let (_directory, pool, service, _memory) = memory_fixture(PromotionPolicy::Review);
+        let jobs = LearningJobStore::new(Arc::clone(&pool));
+        jobs.enqueue(NewLearningJob::extraction(
+            "job-unsettled",
+            "project-1",
+            "session-1",
+            "assistant-1",
+            "extractor-v1",
+            json!({}),
+            10,
+        ))
+        .expect("enqueue");
+        jobs.claim_due("worker-1", 11, 30)
+            .expect("claim")
+            .expect("job");
+
+        let failure = service
+            .persist_extraction(
+                "job-unsettled",
+                "worker-1",
+                LearningExtraction {
+                    experiences: vec![extracted(
+                        ExtractedExperienceKind::Procedure,
+                        "Recorded before the proposal ran",
+                        Some("Keep the recorded experience."),
+                    )],
+                    memories: vec![ExtractedMemory {
+                        experience_ordinal: 0,
+                        scope: ExtractedMemoryScope::Project,
+                        action: ExtractedMemoryAction::Add,
+                        content: Some("Never proposed.".to_owned()),
+                        old_text: None,
+                        reason: "the confidence is out of range".to_owned(),
+                        confidence: 1.5,
+                    }],
+                },
+                20,
+            )
+            .expect_err("an out-of-range proposal confidence fails the call");
+        assert!(
+            failure.to_string().contains("memories.confidence"),
+            "unexpected failure: {failure}"
+        );
+
+        assert_eq!(
+            ExperienceStore::new(Arc::clone(&pool))
+                .list_for_project("project-1", 10)
+                .expect("experiences")
+                .len(),
+            1,
+            "the extracted experience is recorded before any Memory is proposed"
+        );
+        assert_eq!(
+            jobs.get("job-unsettled").expect("job").status,
+            zuno_db::learning_job::LearningJobStatus::Running,
+            "a job whose Memory proposals failed stays running under its lease so the \
+             reconciler requeues it instead of leaving it completed with no candidates"
         );
     }
 

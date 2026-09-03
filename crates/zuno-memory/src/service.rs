@@ -7,6 +7,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 use zuno_db::Pool;
 use zuno_db::memory_candidate::{MemoryCandidateRecord, MemoryCandidateStore, NewMemoryCandidate};
+use zuno_error::DbError;
 use zuno_types::{
     MemoryAction, MemoryCandidateProjection, MemoryCandidateStatus, MemoryEntryProjection,
     MemoryScope, MemorySource,
@@ -436,20 +437,18 @@ impl MemoryService {
         let project = self.paths.wire_path(Scope::Project);
         for candidate in self.store.list_inflight_for_paths(&global, &project)? {
             let Some(before) = candidate.before_entries.as_deref() else {
-                self.store.set_status(
+                self.settle_reconciled(
                     candidate.id(),
                     MemoryCandidateStatus::Uncertain,
-                    Some("applying candidate has no before snapshot"),
-                    zuno_db::message::now_millis(),
+                    "applying candidate has no before snapshot",
                 )?;
                 continue;
             };
             let Some(after) = candidate.after_entries.as_deref() else {
-                self.store.set_status(
+                self.settle_reconciled(
                     candidate.id(),
                     MemoryCandidateStatus::Uncertain,
-                    Some("applying candidate has no after snapshot"),
-                    zuno_db::message::now_millis(),
+                    "applying candidate has no after snapshot",
                 )?;
                 continue;
             };
@@ -472,15 +471,39 @@ impl MemoryService {
                 }
                 _ => unreachable!("only in-flight memory candidates were queried"),
             };
-            self.store.set_status(
+            self.settle_reconciled(
                 candidate.id(),
                 status,
-                Some("reconciled after process restart without replay"),
-                zuno_db::message::now_millis(),
+                "reconciled after process restart without replay",
             )?;
         }
         self.notify();
         Ok(())
+    }
+
+    /// Settle one reconciled candidate, yielding to a live writer that got there first.
+    ///
+    /// `set_status` is a compare-and-set on `status`, so a candidate that an active
+    /// process settled between `list_inflight_for_paths` and this write reports
+    /// `DbError::Conflict`, and one that was pruned reports `DbError::NotFound`.
+    /// Both mean this pass has nothing left to settle for that row: the live writer
+    /// observed the resident file itself, which is better evidence than a restart
+    /// reconciler has. Skip the row and keep reconciling the rest rather than
+    /// failing the whole pass and leaving later candidates in flight.
+    fn settle_reconciled(
+        &self,
+        id: &str,
+        status: MemoryCandidateStatus,
+        detail: &str,
+    ) -> Result<(), MemoryServiceError> {
+        match self
+            .store
+            .set_status(id, status, Some(detail), zuno_db::message::now_millis())
+        {
+            Ok(_) => Ok(()),
+            Err(DbError::Conflict { .. } | DbError::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn records(&self) -> Result<Vec<MemoryCandidateRecord>, MemoryServiceError> {
@@ -603,4 +626,106 @@ fn proposal_fingerprint(proposal: &MemoryProposal) -> Result<Option<String>, Mem
 
 fn normalize_fingerprint_text(value: Option<&str>) -> &str {
     value.map_or("", str::trim)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn fixture(directory: &TempDir) -> (Arc<Pool>, MemoryService) {
+        let pool = Arc::new(Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
+        let mut connection = pool.open_connection().expect("database connection");
+        zuno_db::migration::apply(&mut connection).expect("initialize schema");
+        drop(connection);
+        let service = MemoryService::new(
+            Arc::clone(&pool),
+            crate::ScopePaths::at(
+                directory.path().join("global").join("MEMORY.md"),
+                directory.path().join("project").join("RULES.md"),
+            ),
+            ScopeLimits::default(),
+            crate::PromotionPolicy::Review,
+        );
+        (pool, service)
+    }
+
+    fn proposal() -> MemoryProposal {
+        MemoryProposal {
+            scope: MemoryScope::Project,
+            action: MemoryAction::Add,
+            content: Some("durable entry".to_owned()),
+            old_text: None,
+            reason: "verified repository rule".to_owned(),
+            confidence: 1.0,
+            source: MemorySource::User,
+            source_session_id: None,
+            source_message_id: None,
+        }
+    }
+
+    #[test]
+    fn reconciling_yields_to_a_writer_that_already_settled_the_candidate() {
+        let directory = TempDir::new().expect("temp dir");
+        let (pool, service) = fixture(&directory);
+        let store = MemoryCandidateStore::new(pool);
+        let candidate = service.propose(proposal()).expect("proposal");
+        store
+            .begin_apply(candidate.id(), &[], &["durable entry".to_owned()], 20)
+            .expect("record an interrupted apply");
+
+        // A live writer observes the resident file and settles the candidate first.
+        store
+            .set_status(candidate.id(), MemoryCandidateStatus::Applied, None, 30)
+            .expect("live settlement");
+
+        // The bare compare-and-set is what makes the tolerance necessary: `Applied` is
+        // not a state `Failed` may be entered from, so the write is refused outright.
+        let conflict = store
+            .set_status(candidate.id(), MemoryCandidateStatus::Failed, None, 31)
+            .expect_err("the compare-and-set refuses an already settled candidate");
+        assert!(
+            matches!(conflict, DbError::Conflict { .. }),
+            "unexpected error: {conflict}"
+        );
+
+        // The restart reconciler decided from the stale in-flight snapshot. It must
+        // neither overwrite that settlement nor fail the pass it is in the middle of.
+        service
+            .settle_reconciled(
+                candidate.id(),
+                MemoryCandidateStatus::Failed,
+                "reconciled after process restart without replay",
+            )
+            .expect("a lost settlement race is not an error");
+        assert_eq!(
+            store
+                .get(candidate.id())
+                .expect("candidate")
+                .projection
+                .status,
+            MemoryCandidateStatus::Applied
+        );
+    }
+
+    #[test]
+    fn reconciling_a_pruned_candidate_is_not_an_error() {
+        let directory = TempDir::new().expect("temp dir");
+        let (pool, service) = fixture(&directory);
+        let missing = "mem_pruned_between_the_query_and_the_write";
+        let absent = MemoryCandidateStore::new(pool)
+            .set_status(missing, MemoryCandidateStatus::Failed, None, 31)
+            .expect_err("the compare-and-set reports a row that is not there");
+        assert!(
+            matches!(absent, DbError::NotFound { .. }),
+            "unexpected error: {absent}"
+        );
+        service
+            .settle_reconciled(
+                missing,
+                MemoryCandidateStatus::Failed,
+                "reconciled after process restart without replay",
+            )
+            .expect("a candidate that no longer exists has nothing to settle");
+    }
 }
