@@ -127,10 +127,19 @@ impl TypedTool for GrepTool {
         let request = GrepRequest::new(&cwd, &params.pattern, RESULT_LIMIT)
             .with_include(params.include.clone());
         let cancel = InterruptCancellation::from_context(&ctx);
-        let results = self
-            .tooling
-            .ripgrep
-            .grep(&request, &cancel)
+        // `Ripgrep::grep` blocks the calling thread for as long as `rg` runs, and says
+        // so in its own documentation. `zuno run`, `zuno acp` and `zuno serve` all
+        // build a `new_current_thread` runtime, so calling it here would park the only
+        // reactor thread for the whole search: streaming stops, timers fire late, and
+        // the task that would raise the interrupt the user just pressed cannot run — so
+        // the search's own 10 ms cancellation poll never observes it either.
+        let engine = self.tooling.ripgrep.clone();
+        let results = tokio::task::spawn_blocking(move || engine.grep(&request, &cancel))
+            .await
+            .map_err(|error| ToolError::Failed {
+                tool: self.id().to_owned(),
+                source: Box::new(error),
+            })?
             .map_err(|error| map_search_error(self.id(), error))?;
 
         if results.items.is_empty() {
@@ -424,6 +433,98 @@ mod tests {
             output
                 .output
                 .ends_with("(Results truncated. Consider using a more specific path or pattern.)")
+        );
+    }
+
+    /// A stand-in for `rg` that never finishes on its own.
+    ///
+    /// `exec` so the process the engine kills is the one that sleeps, leaving nothing
+    /// behind; exit 1 is ripgrep's "no matches", which is what makes the regressed
+    /// behaviour a clean `Ok` rather than a second kind of failure.
+    ///
+    /// Unix-only because the fake is a shell script. What it pins is not
+    /// platform-specific — the change under test is one `spawn_blocking` — so the
+    /// Windows arm rides the same call site rather than a second fake.
+    #[cfg(unix)]
+    fn never_finishing_rg(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let program = dir.join("never-finishing-rg");
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 30\n").expect("the fake engine");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("the fake engine is executable");
+        program
+    }
+
+    /// An interrupt a spawned task raises after the search is already in flight.
+    ///
+    /// This is the whole point: an interrupt that is already set when the call starts
+    /// is caught by the engine's pre-check and proves nothing about the reactor.
+    #[cfg(unix)]
+    struct DelayedInterrupt(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl zuno_tool::InterruptHandle for DelayedInterrupt {
+        fn is_set(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        async fn notified(&self) {}
+    }
+
+    /// `zuno run`, `zuno acp` and `zuno serve` all drive a `new_current_thread`
+    /// runtime, so a search that runs on the reactor holds the only thread that could
+    /// deliver the interrupt the user just pressed — and the engine's own 10 ms
+    /// cancellation poll then never observes it. The fake engine never exits, so the
+    /// only way this call can return at all is if the timer task ran while the search
+    /// was in flight.
+    ///
+    /// Before the fix the timer never fires: the call blocks until the fake's own
+    /// `sleep` ends and then reports "no matches", so `expect_err` fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_grep_leaves_the_reactor_free_to_deliver_the_interrupt() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let fired = Arc::new(AtomicBool::new(false));
+        let tooling = SearchTooling {
+            scope: crate::search_common::SearchScope::new(dir.path()),
+            ripgrep: zuno_search::Ripgrep::new(never_finishing_rg(dir.path())),
+        };
+        let ctx = ToolContext::new(
+            "ses_1",
+            "msg_1",
+            "call_1",
+            "build",
+            Arc::new(AllowAll),
+            Arc::new(DelayedInterrupt(Arc::clone(&fired))),
+        );
+        tokio::spawn({
+            let fired = Arc::clone(&fired);
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                fired.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let started = Instant::now();
+        let error = erase(GrepTool::new(tooling))
+            .execute(json!({ "pattern": "needle" }), ctx)
+            .await
+            .expect_err("an interrupt raised during the search must cancel it");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            std::error::Error::source(&error)
+                .expect("the cause chains")
+                .to_string(),
+            "search was cancelled"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the interrupt was delivered while the search ran, not after it: {elapsed:?}"
         );
     }
 }
