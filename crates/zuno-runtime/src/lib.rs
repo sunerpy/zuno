@@ -49,7 +49,9 @@ pub trait Component: Send + Sync {
     /// the bound that work actually needs. Disposers still run in reverse registration
     /// order, one at a time; the budget bounds only how long the runtime waits for each
     /// before it reports the overrun and moves on. An overrunning disposer is detached,
-    /// never cancelled, so whatever it reclaims is still reclaimed.
+    /// never cancelled, so whatever it reclaims is still reclaimed. A deployment may
+    /// bound what a component asks for with
+    /// [`RuntimeOptions::with_max_stop_timeout`].
     fn stop_budget(&self) -> StopBudget {
         StopBudget::Runtime
     }
@@ -68,15 +70,28 @@ pub enum StopBudget {
     /// A component-declared bound for each of its disposers.
     ///
     /// A zero bound cannot prove that anything reached quiescence and is read as
-    /// [`Self::Runtime`].
+    /// [`Self::Runtime`]. A bound above the deployment's
+    /// [`RuntimeOptions::with_max_stop_timeout`] ceiling is clamped to it.
     Bounded(Duration),
 }
 
 impl StopBudget {
-    fn resolve(self, runtime_timeout: Duration) -> Duration {
-        match self {
+    /// The wait this budget asks for, bounded by the deployment's ceiling.
+    ///
+    /// A component declares what its disposer needs; the deployment declares the
+    /// longest it is willing to wait for any single disposer. The smaller of the
+    /// two wins, so neither side can lengthen shutdown past what the other
+    /// accepted. Clamping changes only how long the runtime *waits*: the disposer
+    /// itself is spawned, never cancelled, so a clamped process-tree reap still
+    /// runs to completion in the background.
+    fn resolve(self, options: RuntimeOptions) -> Duration {
+        let declared = match self {
             Self::Bounded(bound) if !bound.is_zero() => bound,
-            Self::Bounded(_) | Self::Runtime => runtime_timeout,
+            Self::Bounded(_) | Self::Runtime => options.stop_timeout,
+        };
+        match options.max_stop_timeout {
+            Some(ceiling) => declared.min(ceiling),
+            None => declared,
         }
     }
 }
@@ -85,6 +100,7 @@ impl StopBudget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeOptions {
     stop_timeout: Duration,
+    max_stop_timeout: Option<Duration>,
 }
 
 impl RuntimeOptions {
@@ -100,12 +116,43 @@ impl RuntimeOptions {
         self.stop_timeout = timeout;
         self
     }
+
+    /// Bound every per-disposer wait, including budgets components declare.
+    ///
+    /// Without a ceiling a component's [`Component::stop_budget`] alone decides how
+    /// long shutdown may block, which a deployment cannot see or bound. With one,
+    /// the runtime waits `min(declared, ceiling)` for each disposer, reports the
+    /// overrun, and leaves the disposer running to completion — clamping the wait
+    /// never abandons the work.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `ceiling` is zero: a zero ceiling would forbid waiting for any
+    /// cleanup at all, which cannot prove quiescence for anything. Callers that
+    /// resolve the value from configuration express "no ceiling" by not calling
+    /// this at all.
+    #[must_use]
+    pub fn with_max_stop_timeout(mut self, ceiling: Duration) -> Self {
+        assert!(
+            !ceiling.is_zero(),
+            "effect stop ceiling must be positive; omit it for no ceiling"
+        );
+        self.max_stop_timeout = Some(ceiling);
+        self
+    }
+
+    /// The configured ceiling on one disposer's wait, if a deployment set one.
+    #[must_use]
+    pub fn max_stop_timeout(&self) -> Option<Duration> {
+        self.max_stop_timeout
+    }
 }
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
             stop_timeout: DEFAULT_STOP_TIMEOUT,
+            max_stop_timeout: None,
         }
     }
 }
@@ -1095,7 +1142,7 @@ impl HarnessRuntime {
             .iter()
             .map(|component| component.snapshot(LifecycleState::Uncertain))
             .collect::<Vec<_>>();
-        let stop_failures = stop_components(previous_active, self.inner.options.stop_timeout).await;
+        let stop_failures = stop_components(previous_active, self.inner.options).await;
         if !stop_failures.is_empty() {
             self.set_unresolved(previous_snapshots, stop_failures.clone());
             return Err(lifecycle_error(stop_failures[0].clone()));
@@ -1107,7 +1154,7 @@ impl HarnessRuntime {
             state.components =
                 definition_snapshots(&prepared.definition, LifecycleState::Preparing);
         }
-        match start_composition(prepared, self.inner.options.stop_timeout).await {
+        match start_composition(prepared, self.inner.options).await {
             Ok(started) => {
                 self.publish(started);
                 Ok(())
@@ -1130,9 +1177,7 @@ impl HarnessRuntime {
                 )
                 .await;
                 let restored = match restore {
-                    Ok(prepared) => {
-                        start_composition(prepared, self.inner.options.stop_timeout).await
-                    }
+                    Ok(prepared) => start_composition(prepared, self.inner.options).await,
                     Err(error) => {
                         self.set_failed(
                             &previous_definition,
@@ -1365,7 +1410,7 @@ struct StartFailure {
 
 async fn start_composition(
     prepared: PreparedComposition,
-    stop_timeout: Duration,
+    options: RuntimeOptions,
 ) -> Result<StartedComposition, Box<StartFailure>> {
     let definition = prepared.definition;
     let mut active = Vec::<ActiveComponent>::new();
@@ -1394,7 +1439,7 @@ async fn start_composition(
                         provides: provided_names(&component_services, &component_capabilities),
                         requirements: requirements.clone(),
                     });
-                    let cleanup_failures = stop_components(active, stop_timeout).await;
+                    let cleanup_failures = stop_components(active, options).await;
                     return Err(Box::new(StartFailure {
                         definition,
                         diagnostic: LifecycleDiagnostic {
@@ -1454,7 +1499,7 @@ fn provided_names(
 /// disposer finish in the background.
 async fn stop_components(
     mut components: Vec<ActiveComponent>,
-    runtime_timeout: Duration,
+    options: RuntimeOptions,
 ) -> Vec<LifecycleDiagnostic> {
     let mut diagnostics = Vec::new();
     while let Some(mut component) = components.pop() {
@@ -1462,7 +1507,7 @@ async fn stop_components(
             .definition
             .component
             .stop_budget()
-            .resolve(runtime_timeout);
+            .resolve(options);
         while let Some(effect) = component.effects.pop() {
             let effect_id = effect.id;
             let mut stopping = tokio::spawn((effect.stop)());
@@ -1546,7 +1591,7 @@ fn shutdown_inner(inner: Arc<HarnessRuntimeInner>) -> BoxFuture<'static, Vec<Lif
             let mut state = inner.state.lock().expect("runtime state poisoned");
             std::mem::take(&mut state.active)
         };
-        let local_failures = stop_components(active, inner.options.stop_timeout).await;
+        let local_failures = stop_components(active, inner.options).await;
         new_diagnostics.extend(local_failures.iter().cloned());
 
         let mut state = inner.state.lock().expect("runtime state poisoned");

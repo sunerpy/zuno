@@ -1042,6 +1042,156 @@ async fn a_component_declared_stop_budget_outranks_the_runtime_timeout() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_deployment_ceiling_bounds_a_component_declared_budget() {
+    // The deployment is willing to wait 50 ms for any one disposer; the component
+    // asks for two seconds. The wait is clamped and reported, and the disposer is
+    // still left running to completion rather than cancelled.
+    let reclaimed = Arc::new(AtomicBool::new(false));
+    let runtime = HarnessRuntime::with_options(
+        "root",
+        RuntimeOptions::default()
+            .with_stop_timeout(Duration::from_millis(25))
+            .with_max_stop_timeout(Duration::from_millis(50)),
+    );
+    runtime
+        .mount(CountedPatientStop {
+            reclaimed: Arc::clone(&reclaimed),
+            delay: Duration::from_millis(500),
+            budget: zuno_runtime::StopBudget::Bounded(Duration::from_secs(2)),
+        })
+        .await
+        .expect("component mounts");
+
+    let error = runtime
+        .unmount("patient-stop")
+        .await
+        .expect_err("the ceiling, not the declared budget, decides how long we wait");
+
+    assert!(error.to_string().contains("timed out"), "{error}");
+    let snapshot = runtime.snapshot();
+    assert_eq!(snapshot.diagnostics[0].kind, LifecycleFailureKind::TimedOut);
+    assert!(
+        snapshot.diagnostics[0].message.contains("50 ms"),
+        "the diagnostic must report the wait that actually elapsed: {}",
+        snapshot.diagnostics[0].message
+    );
+    assert!(
+        !reclaimed.load(Ordering::SeqCst),
+        "the clamped wait elapsed before the reclaim finished"
+    );
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        reclaimed.load(Ordering::SeqCst),
+        "clamping the wait must not cancel the disposer's own work"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_ceiling_above_the_declared_budget_changes_nothing() {
+    let reclaimed = Arc::new(AtomicBool::new(false));
+    let runtime = HarnessRuntime::with_options(
+        "root",
+        RuntimeOptions::default()
+            .with_stop_timeout(Duration::from_millis(25))
+            .with_max_stop_timeout(Duration::from_secs(30)),
+    );
+    runtime
+        .mount(CountedPatientStop {
+            reclaimed: Arc::clone(&reclaimed),
+            delay: Duration::from_secs(1),
+            budget: zuno_runtime::StopBudget::Bounded(Duration::from_secs(2)),
+        })
+        .await
+        .expect("component mounts");
+
+    runtime
+        .unmount("patient-stop")
+        .await
+        .expect("a disposer inside both its budget and the ceiling is not an overrun");
+
+    assert_eq!(runtime.snapshot().state, LifecycleState::Stopped);
+    assert!(reclaimed.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_ceiling_also_bounds_components_that_declare_no_budget() {
+    // `StopBudget::Runtime` resolves to the runtime timeout, and the ceiling bounds
+    // that too, so one deployment value bounds every disposer's wait.
+    let runtime = HarnessRuntime::with_options(
+        "root",
+        RuntimeOptions::default()
+            .with_stop_timeout(Duration::from_secs(5))
+            .with_max_stop_timeout(Duration::from_millis(20)),
+    );
+    runtime
+        .mount(PatientStop {
+            delay: Duration::from_secs(1),
+            budget: zuno_runtime::StopBudget::Runtime,
+        })
+        .await
+        .expect("component mounts");
+
+    let error = runtime
+        .unmount("patient-stop")
+        .await
+        .expect_err("the ceiling bounds the runtime default as well");
+
+    assert!(error.to_string().contains("timed out"), "{error}");
+    assert!(
+        runtime.snapshot().diagnostics[0].message.contains("20 ms"),
+        "{:#?}",
+        runtime.snapshot().diagnostics
+    );
+}
+
+#[test]
+#[should_panic(expected = "effect stop ceiling must be positive")]
+fn a_zero_ceiling_is_refused_rather_than_read_as_no_wait() {
+    let _ = RuntimeOptions::default().with_max_stop_timeout(Duration::ZERO);
+}
+
+#[test]
+fn no_ceiling_is_the_default() {
+    assert_eq!(RuntimeOptions::default().max_stop_timeout(), None);
+    assert_eq!(
+        RuntimeOptions::default()
+            .with_max_stop_timeout(Duration::from_secs(9))
+            .max_stop_timeout(),
+        Some(Duration::from_secs(9))
+    );
+}
+
+struct CountedPatientStop {
+    reclaimed: Arc<AtomicBool>,
+    delay: Duration,
+    budget: zuno_runtime::StopBudget,
+}
+
+#[async_trait]
+impl Component for CountedPatientStop {
+    fn id(&self) -> &str {
+        "patient-stop"
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        let delay = self.delay;
+        let reclaimed = Arc::clone(&self.reclaimed);
+        context.effect("reaper", move || async move {
+            Ok::<_, EffectError>(move || async move {
+                tokio::time::sleep(delay).await;
+                reclaimed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        })
+    }
+
+    fn stop_budget(&self) -> zuno_runtime::StopBudget {
+        self.budget
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_zero_stop_budget_falls_back_to_the_runtime_timeout() {
     let runtime = HarnessRuntime::with_options(
         "root",
