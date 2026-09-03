@@ -6750,6 +6750,7 @@ dependencies = [
  "wiremock",
  "zuno-error",
  "zuno-network",
+ "zuno-observability",
  "zuno-paths",
  "zuno-testkit",
 ]
@@ -7449,6 +7450,7 @@ dependencies = [
  "zuno-orchestration",
  "zuno-paths",
  "zuno-permission",
+ "zuno-process",
  "zuno-pty",
  "zuno-sandbox",
  "zuno-search",

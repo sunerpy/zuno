@@ -31,6 +31,15 @@ pub const GUARD_NOT_EXECUTABLE_EXIT_CODE: u8 = 126;
 /// The guard's exit status when the payload program could not be found.
 pub const GUARD_NOT_FOUND_EXIT_CODE: u8 = 127;
 
+/// The prefix of the diagnostic the guard writes to its own stderr before it exits
+/// with one of the three reserved codes above.
+///
+/// The codes alone are ambiguous with a payload that exits 125, 126, or 127 of its
+/// own accord. A consumer that captured the run's output can settle that ambiguity
+/// exactly, because only the guard writes this line: see
+/// [`GuardExit::from_reported_run`].
+pub const GUARD_DIAGNOSTIC_PREFIX: &str = "child-process guard failed: ";
+
 /// What a guard's exit status says about the payload it supervised.
 ///
 /// The three reserved codes are ambiguous with a payload that chooses to exit
@@ -63,11 +72,41 @@ impl GuardExit {
             }
         }
         match status.code() {
-            Some(code) if code == i32::from(GUARD_FAILURE_EXIT_CODE) => Self::GuardFailed,
-            Some(code) if code == i32::from(GUARD_NOT_EXECUTABLE_EXIT_CODE) => Self::NotExecutable,
-            Some(code) if code == i32::from(GUARD_NOT_FOUND_EXIT_CODE) => Self::NotFound,
-            Some(code) => Self::Exited(code),
+            Some(code) => Self::from_code(code),
             None => Self::GuardFailed,
+        }
+    }
+
+    /// Classify a reported exit code from a guarded run.
+    ///
+    /// For a consumer that kept the code rather than the whole `ExitStatus`. Signal
+    /// death has no code, so it is that consumer's own separate channel.
+    #[must_use]
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            code if code == i32::from(GUARD_FAILURE_EXIT_CODE) => Self::GuardFailed,
+            code if code == i32::from(GUARD_NOT_EXECUTABLE_EXIT_CODE) => Self::NotExecutable,
+            code if code == i32::from(GUARD_NOT_FOUND_EXIT_CODE) => Self::NotFound,
+            code => Self::Exited(code),
+        }
+    }
+
+    /// Classify a finished guarded run from its exit code and the output it produced.
+    ///
+    /// A reserved code is read as the guard's own verdict only when the guard's
+    /// diagnostic is in `output`; otherwise the payload chose that code and it is
+    /// reported verbatim. A consumer that discards the guard's stderr therefore reads
+    /// every reserved code as the payload's, which is the conservative direction: it
+    /// never manufactures an uncertain outcome for an ordinary `exit 125`.
+    #[must_use]
+    pub fn from_reported_run(code: i32, output: &str) -> Self {
+        match Self::from_code(code) {
+            Self::GuardFailed | Self::NotFound | Self::NotExecutable
+                if !output.contains(GUARD_DIAGNOSTIC_PREFIX) =>
+            {
+                Self::Exited(code)
+            }
+            classified => classified,
         }
     }
 }
@@ -366,7 +405,7 @@ pub fn run_guard_from_args() -> Option<ExitCode> {
         {
             Ok(status) => payload_exit_code(status),
             Err(error) => {
-                eprintln!("child-process guard failed: {error}");
+                eprintln!("{GUARD_DIAGNOSTIC_PREFIX}{error}");
                 error.exit_code()
             }
         },
@@ -1546,6 +1585,57 @@ mod tests {
         assert!(
             unnamed.contains("cannot name"),
             "an unattributable refusal must not read as an empty one: {unnamed}"
+        );
+    }
+
+    #[test]
+    fn a_reserved_code_without_the_guard_diagnostic_is_the_payload_s_own() {
+        // `exit 125` is an ordinary choice for an ordinary program, and the reserved
+        // codes are only the guard's when the guard also said so on its stderr.
+        assert_eq!(
+            GuardExit::from_reported_run(125, "make: *** [check] Error 125\n"),
+            GuardExit::Exited(125)
+        );
+        assert_eq!(
+            GuardExit::from_reported_run(127, "bash: line 1: nope: command not found\n"),
+            GuardExit::Exited(127)
+        );
+    }
+
+    #[test]
+    fn a_reserved_code_with_the_guard_diagnostic_is_the_guard_s_verdict() {
+        let failed = format!("{GUARD_DIAGNOSTIC_PREFIX}pidfd_open: Permission denied\n");
+        assert_eq!(
+            GuardExit::from_reported_run(125, &failed),
+            GuardExit::GuardFailed
+        );
+
+        let missing = format!(
+            "{GUARD_DIAGNOSTIC_PREFIX}guarded program could not be started: No such file or \
+             directory\n"
+        );
+        assert_eq!(
+            GuardExit::from_reported_run(127, &missing),
+            GuardExit::NotFound
+        );
+        assert_eq!(
+            GuardExit::from_reported_run(126, &missing),
+            GuardExit::NotExecutable
+        );
+    }
+
+    #[test]
+    fn an_unreserved_code_is_reported_verbatim_either_way() {
+        let noisy = format!("{GUARD_DIAGNOSTIC_PREFIX}anything at all\n");
+        assert_eq!(GuardExit::from_reported_run(0, ""), GuardExit::Exited(0));
+        assert_eq!(
+            GuardExit::from_reported_run(101, &noisy),
+            GuardExit::Exited(101)
+        );
+        // Windows native codes exceed a byte and must not be folded into a reserved one.
+        assert_eq!(
+            GuardExit::from_reported_run(-1_073_741_819, &noisy),
+            GuardExit::Exited(-1_073_741_819)
         );
     }
 }

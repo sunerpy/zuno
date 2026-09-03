@@ -1,9 +1,7 @@
 //! A project-layer config that names a host executable is a warning, not a rejection.
 //!
-//! The behavior belongs to `zuno-config`'s discovery. The test lives in this crate
-//! because it is the first consumer that links both config discovery and the
-//! process-wide log sink through which the warning becomes observable; moving it
-//! next to the other discovery tests is a pure relocation.
+//! The warning is only observable through the process-wide log sink, so this file owns
+//! the subscriber for its own test binary and reads the plaintext log back.
 
 use std::fs;
 

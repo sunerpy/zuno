@@ -24,6 +24,9 @@ tracing = { workspace = true }
 walkdir = { workspace = true }
 
 [dev-dependencies]
+# `tests/host_command_warning.rs` asserts through the shipped log sink, because a
+# warning nobody can read is not the behavior being claimed.
+zuno-observability = { workspace = true }
 zuno-testkit = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }

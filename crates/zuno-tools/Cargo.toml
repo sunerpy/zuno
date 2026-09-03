@@ -37,6 +37,10 @@ zuno-network = { workspace = true }
 zuno-orchestration = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
+# Only for `GuardExit`: every background execution runs behind the child-process
+# guard, so the shell tool must read a guard verdict as one instead of as the
+# command's own exit code.
+zuno-process = { workspace = true }
 zuno-pty = { workspace = true }
 zuno-search = { workspace = true }
 zuno-sandbox = { workspace = true }
