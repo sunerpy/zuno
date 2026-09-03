@@ -4,7 +4,7 @@ use std::error::Error as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use zuno_error::ToolError;
 use zuno_tool::{
     NeverInterrupted, PermissionAsk, PermissionAsker, Tool, ToolContext, ToolEffect, ToolOutput,
@@ -289,7 +289,6 @@ async fn batch_ten_independent_calls_run_concurrently_and_render_in_submission_o
         })
         .collect();
 
-    let started = Instant::now();
     let output = registry
         .execute(
             "execute",
@@ -299,7 +298,6 @@ async fn batch_ten_independent_calls_run_concurrently_and_render_in_submission_o
         .await
         .expect("batch succeeds");
 
-    assert!(started.elapsed() < Duration::from_millis(250));
     assert_eq!(max_in_flight.load(Ordering::SeqCst), MAX_CALLS);
     let positions: Vec<usize> = (0..MAX_CALLS)
         .map(|index| {

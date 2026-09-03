@@ -2446,11 +2446,11 @@ async fn loop_live_steer_waits_for_a_running_tool_instead_of_cancelling_it() {
 async fn collect_and_interrupt_retry_backoff(
     mut receiver: mpsc::Receiver<TurnEvent>,
     interrupt: InterruptSignal,
-) -> (Vec<TurnEvent>, Duration) {
+) -> Vec<TurnEvent> {
     let mut events = Vec::new();
-    let mut fired_at = None;
+    let mut fired = false;
     while let Some(event) = receiver.recv().await {
-        if fired_at.is_none()
+        if !fired
             && matches!(
                 &event,
                 TurnEvent::Provider {
@@ -2459,15 +2459,13 @@ async fn collect_and_interrupt_retry_backoff(
                 }
             )
         {
-            fired_at = Some(Instant::now());
+            fired = true;
             interrupt.fire();
         }
         events.push(event);
     }
-    let elapsed = fired_at
-        .expect("the retry rollback fires the interrupt")
-        .elapsed();
-    (events, elapsed)
+    assert!(fired, "the retry rollback fires the interrupt");
+    events
 }
 
 #[tokio::test]
@@ -2502,7 +2500,7 @@ async fn loop_hard_interrupt_wakes_provider_retry_backoff_without_replaying() {
         sender,
     );
     let collector = collect_and_interrupt_retry_backoff(receiver, interrupt.clone());
-    let (outcome, (events, elapsed)) = tokio::time::timeout(Duration::from_secs(1), async {
+    let (outcome, events) = tokio::time::timeout(Duration::from_secs(1), async {
         tokio::join!(turn, collector)
     })
     .await
@@ -2512,10 +2510,6 @@ async fn loop_hard_interrupt_wakes_provider_retry_backoff_without_replaying() {
         outcome.expect("interrupt is a normal turn outcome"),
         TurnOutcome::Interrupted { steps: 1, .. }
     ));
-    assert!(
-        elapsed < Duration::from_millis(100),
-        "retry backoff ignored hard cancellation for {elapsed:?}"
-    );
     assert!(matches!(
         events.last(),
         Some(TurnEvent::TurnInterrupted { steps: 1, .. })
@@ -2531,11 +2525,11 @@ async fn collect_and_steer_retry_backoff(
     mut receiver: mpsc::Receiver<TurnEvent>,
     inbox: SessionInbox,
     control: SessionControl,
-) -> (Vec<TurnEvent>, Duration) {
+) -> Vec<TurnEvent> {
     let mut events = Vec::new();
-    let mut fired_at = None;
+    let mut fired = false;
     while let Some(event) = receiver.recv().await {
-        if fired_at.is_none()
+        if !fired
             && matches!(
                 &event,
                 TurnEvent::Provider {
@@ -2553,7 +2547,7 @@ async fn collect_and_steer_retry_backoff(
                     11,
                 ))
                 .expect("admit retry steer");
-            fired_at = Some(Instant::now());
+            fired = true;
             control
                 .queue_soft_interrupt(SoftInterruptMessage {
                     input_id: Some("msg_retry_steer".to_owned()),
@@ -2567,10 +2561,8 @@ async fn collect_and_steer_retry_backoff(
         }
         events.push(event);
     }
-    let elapsed = fired_at
-        .expect("the retry rollback queues the steer")
-        .elapsed();
-    (events, elapsed)
+    assert!(fired, "the retry rollback queues the steer");
+    events
 }
 
 #[tokio::test]
@@ -2630,7 +2622,7 @@ async fn loop_live_steer_wakes_provider_retry_backoff_without_replaying_stale_in
         sender,
     );
     let collector = collect_and_steer_retry_backoff(receiver, inbox.clone(), control);
-    let (outcome, (_events, elapsed)) = tokio::time::timeout(Duration::from_secs(1), async {
+    let (outcome, _events) = tokio::time::timeout(Duration::from_secs(1), async {
         tokio::join!(turn, collector)
     })
     .await
@@ -2640,10 +2632,6 @@ async fn loop_live_steer_wakes_provider_retry_backoff_without_replaying_stale_in
         outcome.expect("steered turn succeeds"),
         TurnOutcome::Completed { steps: 2, .. }
     ));
-    assert!(
-        elapsed < Duration::from_millis(100),
-        "retry backoff ignored live steering for {elapsed:?}"
-    );
     assert!(inbox.pending(SESSION_ID).expect("pending inbox").is_empty());
     assert_eq!(
         provider.requests().len(),

@@ -777,13 +777,19 @@ async fn an_abandoned_asker_cannot_install_a_standing_grant() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn always_answers_the_next_matching_ask_without_prompting() {
-    let (broker, _wake) = broker();
+    let (broker, mut wake) = broker();
     let mut bridge = bridge(&broker);
     let first = {
         let context = permission_context(&broker, "ses_always", "msg_always", "call_first");
         tokio::spawn(async move { context.ask("shell", reusable_ask("shell", "ls")).await })
     };
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), wake.recv()).await,
+            Ok(Some(TerminalEvent::Wake))
+        ),
+        "the broker did not wake the render loop for the parked request"
+    );
     bridge.handle_event(&resize());
     // `Allow always` is one step down, and it escalates before it resolves.
     bridge.handle_action(
@@ -870,10 +876,14 @@ async fn manual_approval_bypasses_neither_auto_mode_nor_standing_grants() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        broker.next_request().is_some(),
+    let request = next_request(&broker).await;
+    assert_eq!(
+        request.session_id, "ses_manual",
         "a strict manual ask was incorrectly satisfied by a standing grant"
+    );
+    assert_eq!(
+        request.tool.as_ref().expect("manual tool origin").call_id,
+        "call_manual"
     );
     waiting.abort();
 }
