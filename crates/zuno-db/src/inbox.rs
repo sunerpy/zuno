@@ -97,6 +97,127 @@ impl SubmissionState {
     }
 }
 
+/// The published shape of one durable inbox prompt payload.
+///
+/// Every writer of `session_input.prompt` produces exactly one of these kinds.
+/// Drivers match on the classification instead of re-deriving `kind` string tests,
+/// so a surface that cannot run a shape can skip that row instead of failing the
+/// whole session, and a new writer is a compile-visible addition here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableInputKind {
+    /// A terminal-UI submission carrying its own structured payload.
+    TuiPrompt,
+    /// An ACP `session/prompt` submission carrying text plus content blocks.
+    AcpPrompt,
+    /// An HTTP prompt body, including its agent and model overrides.
+    User,
+    /// A settled subagent job report.
+    SubagentReport,
+    /// A settled product-agent report.
+    ProductAgentReport,
+    /// A settled workflow report.
+    WorkflowReport,
+    /// A settled council report.
+    CouncilReport,
+    /// A settled background execution report.
+    BackgroundExecutionReport,
+    /// An answered durable human request routed back into the session.
+    HumanRequestAnswer,
+    /// A turn host message admitted, promoted, and consumed in one transaction.
+    ///
+    /// This shape carries no `kind` and is never observed pending.
+    HostMessage,
+}
+
+impl DurableInputKind {
+    /// Classify one durable prompt payload, or `None` when no writer publishes it.
+    #[must_use]
+    pub fn classify(prompt: &Value) -> Option<Self> {
+        match prompt.get("kind").and_then(Value::as_str) {
+            Some("tuiPrompt") => Some(Self::TuiPrompt),
+            Some("acpPrompt") => Some(Self::AcpPrompt),
+            Some("user") => Some(Self::User),
+            Some("subagentReport") => Some(Self::SubagentReport),
+            Some("productAgentReport") => Some(Self::ProductAgentReport),
+            Some("workflowReport") => Some(Self::WorkflowReport),
+            Some("councilReport") => Some(Self::CouncilReport),
+            Some("backgroundExecutionReport") => Some(Self::BackgroundExecutionReport),
+            Some("humanRequestAnswer") => Some(Self::HumanRequestAnswer),
+            Some(_) => None,
+            None => prompt.get("message").is_some().then_some(Self::HostMessage),
+        }
+    }
+
+    /// The `kind` discriminator this shape writes, when it has one.
+    #[must_use]
+    pub const fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::TuiPrompt => Some("tuiPrompt"),
+            Self::AcpPrompt => Some("acpPrompt"),
+            Self::User => Some("user"),
+            Self::SubagentReport => Some("subagentReport"),
+            Self::ProductAgentReport => Some("productAgentReport"),
+            Self::WorkflowReport => Some("workflowReport"),
+            Self::CouncilReport => Some("councilReport"),
+            Self::BackgroundExecutionReport => Some("backgroundExecutionReport"),
+            Self::HumanRequestAnswer => Some("humanRequestAnswer"),
+            Self::HostMessage => None,
+        }
+    }
+
+    /// Whether this shape is a settled report delivered by the idle wake path.
+    #[must_use]
+    pub const fn is_asynchronous_report(self) -> bool {
+        matches!(
+            self,
+            Self::SubagentReport
+                | Self::ProductAgentReport
+                | Self::WorkflowReport
+                | Self::CouncilReport
+                | Self::BackgroundExecutionReport
+        )
+    }
+
+    /// The whole model-visible text of this shape, when it is one plain string.
+    ///
+    /// Shapes that carry structured payloads only their own surface can render
+    /// return `None`. `user` is deliberately excluded: its row also carries agent
+    /// and model overrides, so driving it as bare text would silently drop them.
+    #[must_use]
+    pub fn plain_text(self, prompt: &Value) -> Option<&str> {
+        match self {
+            Self::AcpPrompt
+            | Self::HumanRequestAnswer
+            | Self::SubagentReport
+            | Self::ProductAgentReport
+            | Self::WorkflowReport
+            | Self::CouncilReport
+            | Self::BackgroundExecutionReport => prompt.get("text").and_then(Value::as_str),
+            Self::TuiPrompt | Self::User | Self::HostMessage => None,
+        }
+    }
+
+    /// The structured content blocks carried alongside [`Self::plain_text`].
+    ///
+    /// Encoded as opaque JSON here because the block type belongs to the model
+    /// layer. A driver that ignores these blocks would drop admitted images.
+    #[must_use]
+    pub fn content_blocks(self, prompt: &Value) -> Option<&Vec<Value>> {
+        match self {
+            Self::AcpPrompt => prompt.get("content").and_then(Value::as_array),
+            Self::TuiPrompt
+            | Self::User
+            | Self::HostMessage
+            | Self::HumanRequestAnswer
+            | Self::SubagentReport
+            | Self::ProductAgentReport
+            | Self::WorkflowReport
+            | Self::CouncilReport
+            | Self::BackgroundExecutionReport => None,
+        }
+    }
+}
+
 /// One input waiting to be admitted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewSessionInput {

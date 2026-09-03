@@ -1,7 +1,9 @@
 use serde_json::json;
 use std::sync::Arc;
 use zuno_db::event_log::{NewSessionEvent, SessionEventLog};
-use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SubmissionState};
+use zuno_db::inbox::{
+    DurableInputKind, InputDelivery, NewSessionInput, SessionInbox, SubmissionState,
+};
 use zuno_db::{Pool, migration, session};
 use zuno_paths::DbLocation;
 
@@ -356,4 +358,209 @@ fn failed_inputs_leave_the_pending_queue_with_a_diagnostic() {
             .to_string()
             .contains("already failed")
     );
+}
+
+/// Every published `session_input.prompt` shape, with the keys its writer emits.
+///
+/// A driver that cannot run a shape must be able to recognize and skip it. Deriving
+/// that from ad-hoc `kind` string tests is what let one foreign row fail a surface
+/// permanently, so the classification is pinned here against the real payloads.
+fn published_prompt_shapes() -> Vec<(DurableInputKind, serde_json::Value)> {
+    vec![
+        (
+            DurableInputKind::TuiPrompt,
+            json!({
+                "kind": "tuiPrompt",
+                "submission": {"kind": "text", "data": "hello"},
+                "origin": "tui_keybinding"
+            }),
+        ),
+        (
+            DurableInputKind::AcpPrompt,
+            json!({
+                "kind": "acpPrompt",
+                "text": "hello",
+                "content": [{"type": "text", "text": "hello"}]
+            }),
+        ),
+        (
+            DurableInputKind::User,
+            json!({
+                "kind": "user",
+                "prompt": {"text": "hello", "files": [], "agents": []},
+                "agent": null,
+                "model": null
+            }),
+        ),
+        (
+            DurableInputKind::SubagentReport,
+            json!({
+                "kind": "subagentReport",
+                "jobID": "job_1",
+                "childSessionID": "ses_child",
+                "status": "completed",
+                "text": "done"
+            }),
+        ),
+        (
+            DurableInputKind::ProductAgentReport,
+            json!({
+                "kind": "productAgentReport",
+                "jobID": "job_1",
+                "runID": "run_1",
+                "product": "review",
+                "instance": "default",
+                "tool": "review_run",
+                "status": "completed",
+                "text": "done"
+            }),
+        ),
+        (
+            DurableInputKind::WorkflowReport,
+            json!({
+                "kind": "workflowReport",
+                "jobID": "job_1",
+                "runID": "run_1",
+                "workflow": "release",
+                "status": "completed",
+                "text": "done"
+            }),
+        ),
+        (
+            DurableInputKind::CouncilReport,
+            json!({
+                "kind": "councilReport",
+                "jobID": "job_1",
+                "runID": "run_1",
+                "preset": "review",
+                "status": "completed",
+                "text": "done"
+            }),
+        ),
+        (
+            DurableInputKind::BackgroundExecutionReport,
+            json!({
+                "kind": "backgroundExecutionReport",
+                "executionID": "bge_1",
+                "status": "completed",
+                "title": "cargo build",
+                "command": "cargo build",
+                "purpose": "build",
+                "requiresAuthoritativeRefresh": false,
+                "exitCode": 0,
+                "timedOut": false,
+                "error": null,
+                "text": "done"
+            }),
+        ),
+        (
+            DurableInputKind::HumanRequestAnswer,
+            json!({
+                "kind": "humanRequestAnswer",
+                "requestID": "hrq_1",
+                "humanRequestKind": "input",
+                "text": "answer",
+                "request": {"question": "which?"},
+                "response": {"answer": "this one"}
+            }),
+        ),
+        (
+            DurableInputKind::HostMessage,
+            json!({"message": {"id": "msg_1"}, "parts": []}),
+        ),
+    ]
+}
+
+#[test]
+fn every_published_prompt_shape_classifies_to_exactly_one_kind() {
+    for (expected, prompt) in published_prompt_shapes() {
+        assert_eq!(
+            DurableInputKind::classify(&prompt),
+            Some(expected),
+            "published shape {prompt} must classify"
+        );
+    }
+}
+
+#[test]
+fn a_prompt_shape_no_writer_publishes_is_recognized_as_undrivable() {
+    for prompt in [
+        json!({"kind": "somethingLater", "text": "hello"}),
+        json!({"text": "hello"}),
+        json!({}),
+        json!({"kind": 7}),
+        json!("hello"),
+    ] {
+        assert_eq!(
+            DurableInputKind::classify(&prompt),
+            None,
+            "shape {prompt} has no writer, so a driver must be able to skip it"
+        );
+    }
+}
+
+#[test]
+fn the_kind_discriminator_round_trips_for_every_shape_that_writes_one() {
+    for (kind, prompt) in published_prompt_shapes() {
+        assert_eq!(
+            kind.as_str(),
+            prompt.get("kind").and_then(serde_json::Value::as_str),
+            "{kind:?} must report the discriminator its writer serializes"
+        );
+    }
+}
+
+#[test]
+fn only_settled_reports_are_delivered_by_the_idle_wake_path() {
+    let asynchronous = published_prompt_shapes()
+        .into_iter()
+        .filter(|(kind, _)| kind.is_asynchronous_report())
+        .map(|(kind, _)| kind)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        asynchronous,
+        [
+            DurableInputKind::SubagentReport,
+            DurableInputKind::ProductAgentReport,
+            DurableInputKind::WorkflowReport,
+            DurableInputKind::CouncilReport,
+            DurableInputKind::BackgroundExecutionReport,
+        ],
+        "a live user submission must never be batched as a settled report"
+    );
+}
+
+#[test]
+fn a_shape_whose_payload_is_not_plain_text_refuses_to_be_read_as_text() {
+    for (kind, prompt) in published_prompt_shapes() {
+        let text = kind.plain_text(&prompt);
+        match kind {
+            DurableInputKind::TuiPrompt
+            | DurableInputKind::User
+            | DurableInputKind::HostMessage => assert_eq!(
+                text, None,
+                "{kind:?} carries structured payload only its own surface renders"
+            ),
+            _ => assert!(
+                text.is_some(),
+                "{kind:?} is delivered as text, so its text must be reachable"
+            ),
+        }
+    }
+}
+
+#[test]
+fn only_the_acp_shape_carries_content_blocks_alongside_its_text() {
+    for (kind, prompt) in published_prompt_shapes() {
+        let blocks = kind.content_blocks(&prompt);
+        if kind == DurableInputKind::AcpPrompt {
+            assert_eq!(
+                blocks.map(Vec::len),
+                Some(1),
+                "dropping ACP content blocks would drop admitted images"
+            );
+        } else {
+            assert_eq!(blocks, None, "{kind:?} publishes no content blocks");
+        }
+    }
 }
