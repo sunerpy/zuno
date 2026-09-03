@@ -939,9 +939,17 @@ mod tests {
             Duration::from_secs(60),
             deadlines.headers(
                 "silent-fixture",
-                reqwest::Client::new()
-                    .post(format!("http://{address}/v1/messages"))
-                    .send(),
+                // The fixture listens on loopback, so it takes the one client policy
+                // that cannot be sent through an ambient proxy. Constructing reqwest
+                // directly here would also opt this file out of the workspace's
+                // network-construction guard.
+                zuno_network::direct_client_builder(
+                    zuno_network::DirectPurpose::LoopbackControlPlane,
+                )
+                .build()
+                .expect("loopback fixture client")
+                .post(format!("http://{address}/v1/messages"))
+                .send(),
             ),
         )
         .await
