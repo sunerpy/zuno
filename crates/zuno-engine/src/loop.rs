@@ -31,7 +31,7 @@ use zuno_db::message::{
     TASK_REPORT_METADATA_KEY, created_after, now_millis,
 };
 use zuno_db::{Connection, open, session};
-use zuno_error::{DbError, ProviderError};
+use zuno_error::{DbError, ProviderError, UncertainCause};
 use zuno_llm::cache::{CacheViolation, DynamicContext, McpToolStatus, PreparedTurn, PromptCache};
 use zuno_llm::event::{
     FinishReason, Message, PromptAccounting, RequestContentBlock, Role, StreamEvent,
@@ -526,6 +526,28 @@ pub struct ToolFailureRecovery {
     pub retry_after: Option<Duration>,
 }
 
+/// What a call left behind when it could not settle what it had changed.
+///
+/// Carried separately from [`ToolDispatchResult::recovery`] on purpose, and the
+/// separation is the whole point. `recovery` says an identical call may be issued
+/// again once a backoff has passed; an uncertain outcome never permits that, so
+/// putting the two in one field would make every consumer re-derive which kind it
+/// was holding. The dispatcher decides this once, from the typed error or the
+/// tool's own cancellation verdict, and everything downstream reads the decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncertainOutcome {
+    /// Tool whose call lost its authoritative final state.
+    pub tool: String,
+    /// Paths the call was observed to have changed, when it observed any.
+    ///
+    /// Evidence for inspection, never permission to replay. An empty list is a
+    /// real answer: a supervisor that died around a command lost the outcome
+    /// without ever learning which paths the command had reached.
+    pub applied_paths: Vec<String>,
+    /// How the call arrived at an undecided outcome.
+    pub cause: UncertainCause,
+}
+
 /// A classified failure of the turn spine.
 #[derive(Debug, thiserror::Error)]
 pub enum TurnError {
@@ -976,6 +998,8 @@ pub struct ToolDispatchResult {
     pub blocked: Option<ToolBlockKind>,
     /// Present only when an already-running call settled after a hard interruption.
     pub interruption: Option<ToolInterruption>,
+    /// Present only when the call changed state it could not then account for.
+    pub uncertain: Option<UncertainOutcome>,
 }
 
 impl ToolDispatchResult {
@@ -987,6 +1011,7 @@ impl ToolDispatchResult {
             recovery: None,
             blocked: None,
             interruption: None,
+            uncertain: None,
         }
     }
 
@@ -998,6 +1023,7 @@ impl ToolDispatchResult {
             recovery: None,
             blocked: None,
             interruption: None,
+            uncertain: None,
         }
     }
 
@@ -1009,6 +1035,7 @@ impl ToolDispatchResult {
             recovery: None,
             blocked: Some(kind),
             interruption: None,
+            uncertain: None,
         }
     }
 
@@ -1020,7 +1047,19 @@ impl ToolDispatchResult {
             recovery: None,
             blocked: None,
             interruption: Some(interruption),
+            uncertain: None,
         }
+    }
+
+    /// Record that this call changed authoritative state it could not account for.
+    ///
+    /// A builder rather than a constructor because the outcome is orthogonal to how
+    /// the call ended: a lost response produces an error result, and a hard
+    /// interruption produces an interrupted one, and both may be uncertain.
+    #[must_use]
+    pub fn with_uncertain_outcome(mut self, uncertain: UncertainOutcome) -> Self {
+        self.uncertain = Some(uncertain);
+        self
     }
 
     #[must_use]
@@ -1031,6 +1070,7 @@ impl ToolDispatchResult {
             recovery: Some(recovery),
             blocked: None,
             interruption: None,
+            uncertain: None,
         }
     }
 }
@@ -5244,6 +5284,26 @@ fn persist_tool_result(
     if let Some(kind) = dispatch.blocked {
         state["outcome"] = Value::String("blocked".to_owned());
         state["blockKind"] = Value::String(kind.as_str().to_owned());
+    }
+    // The dispatcher's own verdict, recorded where a reader looks for the call's
+    // disposition rather than only inside the tool-authored metadata blob. It cannot
+    // collide with `blocked`: a blocked call was refused before its effect ran, so it
+    // has nothing to be uncertain about.
+    //
+    // This field is what closes the crash window. The turn may end, or the process may
+    // die, between this write and the Goal accounting for it, so the obligation to
+    // inspect authoritative state has to survive in the tool record itself — the same
+    // single write that makes the result model-visible. `reconciledAtMs` is absent
+    // until a human acts on it, and its absence is the pending state.
+    if let Some(uncertain) = &dispatch.uncertain {
+        state["outcome"] = Value::String("uncertain".to_owned());
+        state["uncertain"] = json!({
+            "tool": uncertain.tool,
+            "callID": identity.call.id,
+            "appliedPaths": uncertain.applied_paths,
+            "cause": uncertain.cause.as_str(),
+            "observedAtMs": now_millis(),
+        });
     }
     if dispatch.is_error {
         state["error"] = Value::String(dispatch.output.output.clone());

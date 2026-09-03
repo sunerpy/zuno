@@ -193,6 +193,15 @@ observer 调度 active 根 Goal。恢复任务与普通 prompt 共用会话执�
 
 重试决策使用类型化错误，而非渲染后的消息。认证失败与用户中断导致暂停；无效协议、损坏的持久状态和永久性配置失败导致阻塞。
 
+围绕不可重放副作用的超时或响应丢失以 `uncertain_side_effect` 暂停：恢复必须检查权威状态，
+绝不自动再次调用该工具。这份义务落在工具记录上，而不是 pause 上——dispatcher 在让结果对
+模型可见的同一条语句里写入 `state.outcome = "uncertain"` 与 `state.uncertain`（工具名、
+call id、该调用报告已改动的路径、类型化 `cause` 取 `lost_outcome` 或 `interrupted`，以及
+`observedAtMs`）。进程若死在这次写入之后、pause 行落盘之前，Goal 仍然拒绝运行：下一次
+continuation 会查询当前目标下仍待处理的记录并再次暂停。`state.uncertain.reconciledAtMs`
+缺失的时长，恰好等于这次检查被拖欠的时长；查询范围由 Goal 自己的 `created_at_ms` 界定，
+所以新目标不会继承上一个目标的义务。
+
 读取或记账 Goal 预算时遇到 SQLite 争用（`SQLITE_BUSY`）会持久化一次 `database_busy` 指数退避重试，Goal 保持活跃，而不是以 `turn_budget` 暂停；其他数据库失败仍以 `usage_unknown` 停止回合并暂停 Goal；本构建无法读取的持久状态仍然阻塞。CLI 回合中的 Plan 对账驱动、human request 创建与重试上下文压缩标记路径也经同一 `GoalTerminalFailure::from_db_error` 规则分类：争用现在以 `database_busy` 重试，过去则以 `host_permanent` 阻塞。
 
 `timeout`、`headerTimeout`、`chunkTimeout` 只有 OpenAI-compatible 传输会读取，其默认值是

@@ -88,9 +88,10 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Row, params_from_iter};
+use serde::Serialize;
 use serde::de::Error as _;
 use serde_json::{Map, Value};
-use zuno_error::DbError;
+use zuno_error::{DbError, UncertainCause};
 
 use crate::open::map_error;
 
@@ -98,6 +99,101 @@ use crate::open::map_error;
 pub type JsonObject = Map<String, Value>;
 
 /// The `message` table, named once.
+/// One tool call that changed authoritative state without settling what it changed.
+///
+/// Read back out of the tool record by
+/// [`MessageStore::pending_uncertain_tool_calls`]. Every field is evidence for
+/// deciding where to look; none of it is permission to issue the call again.
+/// Serialized for the status surface a human reads when a goal will not resume, so
+/// the field spellings match the durable tool record they came out of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UncertainToolCall {
+    /// Durable id of the tool part holding this call's result.
+    ///
+    /// The handle [`MessageStore::reconcile_uncertain_tool_calls`] takes.
+    #[serde(rename = "partID")]
+    pub part_id: String,
+    /// Assistant message the call belongs to.
+    #[serde(rename = "messageID")]
+    pub message_id: String,
+    /// Provider-assigned call id, as the model and the transcript both spell it.
+    #[serde(rename = "callID")]
+    pub call_id: String,
+    /// Tool that ran.
+    pub tool: String,
+    /// Paths the call was observed to have changed, in the order it reported them.
+    ///
+    /// Empty when the call lost its outcome without observing anything.
+    pub applied_paths: Vec<String>,
+    /// How the call arrived at an undecided outcome.
+    #[serde(serialize_with = "serialize_uncertain_cause")]
+    pub cause: UncertainCause,
+    /// When the dispatcher recorded the disposition, in Unix milliseconds.
+    pub observed_at_ms: i64,
+}
+
+/// [`UncertainCause`] serializes as its durable spelling, not as a Rust variant name.
+fn serialize_uncertain_cause<S>(cause: &UncertainCause, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(cause.as_str())
+}
+
+impl UncertainToolCall {
+    /// Rebuild one pending call from its extracted columns.
+    fn from_row(row: &Row<'_>) -> Result<Self, DbError> {
+        let part_id: String = row.get(0).map_err(map_error)?;
+        let message_id: String = row.get(1).map_err(map_error)?;
+        let call_id: Option<String> = row.get(2).map_err(map_error)?;
+        let tool: Option<String> = row.get(3).map_err(map_error)?;
+        let applied_paths: Option<String> = row.get(4).map_err(map_error)?;
+        let cause: Option<String> = row.get(5).map_err(map_error)?;
+        let observed_at_ms: Option<i64> = row.get(6).map_err(map_error)?;
+        let unreadable = |detail: String| DbError::Decode {
+            table: PART_TABLE.to_owned(),
+            source: serde_json::Error::custom(format!(
+                "part `{part_id}` records an uncertain outcome with {detail}"
+            )),
+        };
+        let call_id = call_id.ok_or_else(|| unreadable("no call id".to_owned()))?;
+        let tool = tool.ok_or_else(|| unreadable("no tool name".to_owned()))?;
+        let cause = cause.ok_or_else(|| unreadable("no cause".to_owned()))?;
+        let cause = UncertainCause::parse(&cause)
+            .ok_or_else(|| unreadable(format!("unknown cause `{cause}`")))?;
+        let observed_at_ms =
+            observed_at_ms.ok_or_else(|| unreadable("no observation time".to_owned()))?;
+        let applied_paths = match applied_paths {
+            None => Vec::new(),
+            Some(raw) => match serde_json::from_str::<Value>(&raw) {
+                Ok(Value::Array(entries)) => entries
+                    .iter()
+                    .map(|entry| {
+                        entry.as_str().map(str::to_owned).ok_or_else(|| {
+                            unreadable("an applied path that is not a string".to_owned())
+                        })
+                    })
+                    .collect::<Result<Vec<String>, DbError>>()?,
+                Ok(_) | Err(_) => {
+                    return Err(unreadable(
+                        "an `appliedPaths` that is not an array".to_owned(),
+                    ));
+                }
+            },
+        };
+        Ok(Self {
+            part_id,
+            message_id,
+            call_id,
+            tool,
+            applied_paths,
+            cause,
+            observed_at_ms,
+        })
+    }
+}
+
 const MESSAGE_TABLE: &str = "message";
 /// The `part` table, named once.
 const PART_TABLE: &str = "part";
@@ -1195,6 +1291,105 @@ impl<'conn> MessageStore<'conn> {
             parts.push(row.map_err(map_error)??);
         }
         Ok(parts)
+    }
+
+    /// Tool calls that changed authoritative state and never accounted for it.
+    ///
+    /// A tool call becomes pending the moment its result is persisted with
+    /// `state.outcome = "uncertain"`, and it stays pending until something records
+    /// that a human inspected the state it may have changed. That is the whole point
+    /// of reading it back from here: the obligation is written in the same statement
+    /// that makes the result model-visible, so it survives the turn ending, the
+    /// process dying, and the database being reopened by a different client.
+    ///
+    /// `since_ms` scopes the answer to one goal instance. Pass the goal's
+    /// `created_at_ms`: a call whose outcome was lost before this objective existed
+    /// is evidence about the previous objective, and pausing a fresh goal for it
+    /// would make every new objective inherit an obligation it never incurred. Pass
+    /// `0` to ask about the whole session.
+    ///
+    /// Filtering in SQLite is deliberate. A completed tool output is commonly the
+    /// largest blob in the database, and the pending set is normally empty, so this
+    /// decodes the six fields of the rows that matched and never the outputs of the
+    /// ones that did not.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Decode`] when a matching row carries an unreadable disposition —
+    /// a missing call id or tool, an `appliedPaths` that is not an array of strings,
+    /// or a cause outside [`UncertainCause`]. That is reported rather than skipped:
+    /// silently dropping a row here would report an inspected outcome for a call
+    /// nobody inspected. [`DbError::Query`] or [`DbError::Busy`] from SQLite.
+    pub fn pending_uncertain_tool_calls(
+        &self,
+        session_id: &str,
+        since_ms: i64,
+    ) -> Result<Vec<UncertainToolCall>, DbError> {
+        let mut statement = self.prepare(
+            "SELECT id, message_id, \
+                    json_extract(data, '$.state.uncertain.callID'), \
+                    json_extract(data, '$.state.uncertain.tool'), \
+                    json_extract(data, '$.state.uncertain.appliedPaths'), \
+                    json_extract(data, '$.state.uncertain.cause'), \
+                    json_extract(data, '$.state.uncertain.observedAtMs') \
+             FROM part \
+             WHERE session_id = ?1 AND json_extract(data, '$.type') = 'tool' \
+             AND json_extract(data, '$.state.outcome') = 'uncertain' \
+             AND json_extract(data, '$.state.uncertain.reconciledAtMs') IS NULL \
+             AND coalesce(json_extract(data, '$.state.uncertain.observedAtMs'), 0) >= ?2 \
+             ORDER BY time_created ASC, id ASC",
+        )?;
+        let rows = statement
+            .query_map((session_id, since_ms), |row| {
+                Ok(UncertainToolCall::from_row(row))
+            })
+            .map_err(map_error)?;
+        let mut pending = Vec::new();
+        for row in rows {
+            pending.push(row.map_err(map_error)??);
+        }
+        Ok(pending)
+    }
+
+    /// Record that authoritative state was inspected for exactly these calls.
+    ///
+    /// Takes the part ids the caller read back from
+    /// [`Self::pending_uncertain_tool_calls`] rather than a session, and that
+    /// narrowness is the guarantee: a call whose outcome was lost between the read
+    /// and this write stays pending, because nobody inspected it. Reconciling by
+    /// session would mark it inspected on the strength of a report that predates it.
+    ///
+    /// The marker is written onto the tool record itself, beside the evidence,
+    /// leaving one authoritative row per call rather than a shadow table that can
+    /// disagree with it. Already-reconciled calls are left alone, so a repeated
+    /// recovery action is harmless and the returned count is the number of calls
+    /// this call actually retired.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Query`] or [`DbError::Busy`] from SQLite.
+    pub fn reconcile_uncertain_tool_calls(
+        &self,
+        part_ids: &[String],
+        now: i64,
+    ) -> Result<usize, DbError> {
+        if part_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut statement = self.prepare(
+            "UPDATE part \
+             SET data = json_set(data, '$.state.uncertain.reconciledAtMs', ?2), \
+                 time_updated = ?2 \
+             WHERE id = ?1 \
+             AND json_extract(data, '$.state.outcome') = 'uncertain' \
+             AND json_extract(data, '$.state.uncertain.reconciledAtMs') IS NULL",
+        )?;
+        let mut reconciled = 0_usize;
+        for part_id in part_ids {
+            reconciled =
+                reconciled.saturating_add(statement.execute((part_id, now)).map_err(map_error)?);
+        }
+        Ok(reconciled)
     }
 
     /// Attach parts to messages already in hand.

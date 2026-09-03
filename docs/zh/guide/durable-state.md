@@ -96,6 +96,16 @@ Goal、但尚未准入首个 user turn 就停止的会话。
 这些词开头，请用 `/goal create <目标>` 或 `/goal edit <目标>` 消歧。`/goal help`
 可以查看精简用法。
 
+Goal 状态同时给出类型化 pause、跨回合重试、provider 退避检查点、待处理人工请求，以及
+本目标下仍欠一次权威状态检查的调用。只要还有未结束的 Plan 步骤、WorkItem、Job、
+next-step 报告或 Goal 所属人工请求，完成就会被拒绝。
+
+一次暂停只有在指明该看什么时才是可操作的。`/goal show` 给出 `pendingUncertainCalls`：
+每条不确定调用一项，带工具名、call id、该调用自己报告已改动的路径、类型化原因和观察
+时刻。`/goal resume` 就是“这些状态已经检查过了”这句话本身：它只结清自己列出的那些调用，
+以 `reconciledUncertainCalls` 回显，然后才让 Goal 重新运行。`/goal pause` 与
+`/goal cancel` 不结清任何一条，因为它们都没有声称检查已经发生。
+
 ### 成功标准与证据
 
 一个会改动工作区的 Goal，不能仅凭断言完成。散文里的“测试通过了”是对工作区状态的一个
@@ -305,6 +315,18 @@ Plan 模式在提示词之下强制执行其只读的一面：一层默认拒绝
 客户端投影与重启恢复仍然保留。
 
 普通的非 Goal Work 不会获得同步 `question` 工具。它会根据证据采用可逆且安全的默认值继续执行；只有当一个无法查明的选择会实质改变结果、且不存在安全默认值时，Agent 才会在相关副作用发生前结束当前回合，并直接提出一个简短问题。Plan 继续保留结构化提问，用于形成决策完整的计划。
+
+有副作用的工具丢失响应，就是一次不确定结局。Goal 以 `uncertain_side_effect` 暂停，要求
+检查权威状态，绝不机械重放那次调用；只有显式标记为只读或幂等的工具才可以使用安全重试。
+一次在结算自己结果之前就被取消的调用属于同一类结局，只是类型化原因不同：响应从未到达是
+`lost_outcome`，中断留下未结算声明是 `interrupted`。
+
+这份义务是落在工具记录上的持久证据，而不是 pause 的一个字段。dispatcher 在让结果对模型
+可见的同一条语句里写入 `state.outcome = "uncertain"` 与 `state.uncertain`（`tool`、
+`callID`、`appliedPaths`、`cause`、`observedAtMs`），因此记录先于任何关于 Goal 的判定
+存在。正是这个次序让恢复能扛过崩溃：进程若死在工具写入之后、pause 行之前，pause 缺失而
+义务仍在，下一次 continuation 读到它并再次暂停。`state.uncertain.reconciledAtMs` 会一直
+缺失，直到某个显式恢复动作结清该调用。
 
 ```text
 /plan

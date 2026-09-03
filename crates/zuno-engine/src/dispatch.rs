@@ -29,7 +29,7 @@ use crate::deferred_tools::DeferredToolCatalog;
 use crate::hooks::{NoopHooks, PermissionHookDecision, ToolHooks};
 use crate::r#loop::{
     AvailableTools, DispatchRequest, PreparedToolDispatch, ToolBlockKind, ToolDispatchResult,
-    ToolDispatcher, ToolInterruption,
+    ToolDispatcher, ToolInterruption, UncertainOutcome,
 };
 
 const TOOL_INTERRUPT_SETTLE_GRACE: Duration = Duration::from_secs(2);
@@ -1008,7 +1008,11 @@ fn tool_error_result(
             for path in applied_paths {
                 output = output.with_written_path(Path::new(path));
             }
-            return ToolDispatchResult::error(output);
+            return ToolDispatchResult::error(output).with_uncertain_outcome(UncertainOutcome {
+                tool: tool.to_owned(),
+                applied_paths: applied_paths.clone(),
+                cause: zuno_error::UncertainCause::LostOutcome,
+            });
         }
         return error_result(tool, message);
     }
@@ -1107,7 +1111,26 @@ fn interrupted_result(
             "graceMs": TOOL_INTERRUPT_SETTLE_GRACE.as_millis(),
         }),
     );
-    ToolDispatchResult::interrupted(output, interruption)
+    let result = ToolDispatchResult::interrupted(output, interruption);
+    if !uncertain {
+        return result;
+    }
+    // The paths come from the settled report rather than from the interruption,
+    // because only the tool observed them: a cooperative return carries whatever it
+    // had already written, and a forced abort carries nothing because the grace
+    // period elapsed before the tool could say. An empty list is therefore a real
+    // answer here and is recorded as one.
+    let applied_paths = result
+        .output
+        .written_paths()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    result.with_uncertain_outcome(UncertainOutcome {
+        tool: tool.to_owned(),
+        applied_paths,
+        cause: zuno_error::UncertainCause::Interrupted,
+    })
 }
 
 fn blocked_result(tool: &str, message: String, kind: ToolBlockKind) -> ToolDispatchResult {
@@ -1266,6 +1289,17 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(result.blocked, None);
         assert_eq!(result.recovery, None);
+        // The typed disposition and `recovery` are separate fields for a reason: this
+        // call must be inspected, and `recovery` is the field that says a call may be
+        // issued again. Holding one must never be readable as holding the other.
+        assert_eq!(
+            result.uncertain,
+            Some(UncertainOutcome {
+                tool: "apply_patch".to_owned(),
+                applied_paths: vec!["/workspace/src/lib.rs".to_owned()],
+                cause: zuno_error::UncertainCause::LostOutcome,
+            })
+        );
         assert_eq!(result.output.metadata["outcome"], "uncertain");
         assert_eq!(result.output.metadata["uncertain"], true);
         assert_eq!(result.output.written_paths(), vec!["/workspace/src/lib.rs"]);
@@ -1302,6 +1336,15 @@ mod tests {
         assert_eq!(
             result.recovery, None,
             "an uncertain outcome is never replayed"
+        );
+        assert_eq!(
+            result.uncertain,
+            Some(UncertainOutcome {
+                tool: "shell".to_owned(),
+                applied_paths: Vec::new(),
+                cause: zuno_error::UncertainCause::LostOutcome,
+            }),
+            "observing no paths is a real answer, not an absent disposition"
         );
         assert_eq!(result.output.metadata["uncertain"], true);
         assert!(result.output.written_paths().is_empty());
@@ -1373,6 +1416,15 @@ mod tests {
             "an uncertain outcome is not the same claim as a forced abort"
         );
         assert_eq!(result.interruption, Some(ToolInterruption::Cooperative));
+        assert_eq!(
+            result.uncertain,
+            Some(UncertainOutcome {
+                tool: "shell".to_owned(),
+                applied_paths: Vec::new(),
+                cause: zuno_error::UncertainCause::Interrupted,
+            }),
+            "the same obligation an undecided outcome carries, in the same typed field"
+        );
         assert!(
             result.output.output.starts_with("partial progress"),
             "the settled output the tool preserved is what the model reads first: {}",
@@ -1414,6 +1466,10 @@ mod tests {
                 result.output.output, "partial progress\n",
                 "a cancellation nobody called undecided keeps the tool's report verbatim"
             );
+            assert_eq!(
+                result.uncertain, None,
+                "a read-only call that stopped cleanly owes nobody an inspection"
+            );
         }
     }
 
@@ -1426,6 +1482,14 @@ mod tests {
         assert_eq!(facts["mode"], "forced");
         assert_eq!(facts["forced"], true);
         assert_eq!(facts["uncertain"], true);
+        assert_eq!(
+            result.uncertain,
+            Some(UncertainOutcome {
+                tool: "shell".to_owned(),
+                applied_paths: Vec::new(),
+                cause: zuno_error::UncertainCause::Interrupted,
+            })
+        );
         assert!(
             result
                 .output

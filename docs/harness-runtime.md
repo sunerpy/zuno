@@ -1407,7 +1407,16 @@ Recovery is selected from typed errors, never rendered messages:
   input and permission waits carry the durable request id in the pause row.
 - A timeout or lost response around a non-replayable side effect pauses with
   `uncertain_side_effect`; recovery requires authoritative-state inspection and never
-  automatically invokes the tool again.
+  automatically invokes the tool again. The obligation is durable on the tool record
+  rather than on the pause: the dispatcher writes `state.outcome = "uncertain"` and
+  `state.uncertain` with the tool id, the call id, the paths the call reported having
+  applied, a typed `cause` of `lost_outcome` or `interrupted`, and `observedAtMs`, in the
+  same statement that makes the result model-visible. A process that dies after that write
+  and before the pause row is recorded still refuses to run the Goal: the next
+  continuation consults the pending records of the current objective and pauses again.
+  `state.uncertain.reconciledAtMs` is absent for exactly as long as the inspection is
+  owed, and the Goal's `created_at_ms` scopes the query, so a new objective does not
+  inherit the previous objective's obligations.
 - A turn stopped by its own budget policy pauses with `turn_budget`. The allowance
   belongs to one turn, so the Goal keeps whatever token budget remains, but execution
   does not resume automatically: the next turn would spend the same allowance the same

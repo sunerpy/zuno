@@ -134,8 +134,17 @@ If an objective itself starts with one of those words, use `/goal create <object
 summary.
 
 Goal status also shows the typed pause, cross-turn retry, provider backoff checkpoint,
-and pending human requests. Completion is rejected while any Plan step, WorkItem, Job,
+pending human requests, and the calls of this objective that still owe an
+authoritative-state inspection. Completion is rejected while any Plan step, WorkItem, Job,
 next-step report, or Goal-owned human request remains unfinished.
+
+A pause is only actionable if it names what to look at. `/goal show` reports
+`pendingUncertainCalls`, one entry per uncertain call with the tool, the call id, the paths
+the call reported having applied, the typed cause, and when it was observed. `/goal resume`
+is the explicit statement that those states were inspected: it retires exactly the calls it
+listed, reports them as `reconciledUncertainCalls`, and only then lets the Goal run again.
+`/goal pause` and `/goal cancel` retire nothing, because neither claims an inspection
+happened.
 
 ### Success criteria and evidence
 
@@ -371,7 +380,18 @@ forms for decision-complete planning.
 A side-effecting tool whose response is lost has an uncertain outcome. The Goal pauses with
 `uncertain_side_effect`, requires authoritative-state inspection, and never mechanically
 replays that invocation. Only tools explicitly marked read-only or idempotent may use safe
-retry behavior.
+retry behavior. A call cancelled before it settled its own result is the same kind of
+outcome under a different typed cause: `lost_outcome` for a response that never arrived,
+`interrupted` for a claim the interruption left unsettled.
+
+The obligation is durable evidence on the tool record, not a field of the pause. The
+dispatcher writes `state.outcome = "uncertain"` together with `state.uncertain`
+(`tool`, `callID`, `appliedPaths`, `cause`, `observedAtMs`) in the statement that makes the
+result model-visible, so the record exists before anything about the Goal is decided. That
+ordering is what makes recovery survive a crash: a process that died between the tool write
+and the pause row leaves the pause missing and the obligation intact, and the next
+continuation reads the obligation and pauses again. `state.uncertain.reconciledAtMs` stays
+absent until an explicit recovery action retires the call.
 
 ## Plan
 

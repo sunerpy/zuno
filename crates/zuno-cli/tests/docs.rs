@@ -1774,3 +1774,48 @@ fn cancellation_docs_pin_certainty_as_a_verdict_and_not_a_mode() {
     );
     contains_all("docs/zh/guide/tools.md", &["对命令是否运行过一概不说"]);
 }
+
+/// The claim a reader depends on is that the obligation outlives the pause row, and that
+/// one named action is what retires it. Both languages have to make it.
+#[test]
+fn uncertain_side_effect_docs_pin_the_durable_obligation_and_its_recovery_action() {
+    contains_all(
+        "docs/harness-runtime.md",
+        &[
+            "The obligation is durable on the tool record",
+            "`state.uncertain` with the tool id, the call id",
+            "`lost_outcome` or `interrupted`",
+            "A process that dies after that write",
+            "does not\n  inherit the previous objective's obligations",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/harness-runtime.md",
+        &[
+            "这份义务落在工具记录上，而不是 pause 上",
+            "`lost_outcome` 或 `interrupted`",
+            "进程若死在这次写入之后、pause 行落盘之前",
+            "所以新目标不会继承上一个目标的义务",
+        ],
+    );
+    contains_all(
+        "docs/guide/durable-state.md",
+        &[
+            "`pendingUncertainCalls`, one entry per uncertain call",
+            "`/goal resume`\nis the explicit statement that those states were inspected",
+            "retire nothing, because neither claims an inspection\nhappened",
+            "`interrupted` for a claim the interruption left unsettled",
+            "leaves the pause missing and the obligation intact",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/durable-state.md",
+        &[
+            "`/goal show` 给出 `pendingUncertainCalls`",
+            "就是“这些状态已经检查过了”这句话本身",
+            "不结清任何一条，因为它们都没有声称检查已经发生",
+            "中断留下未结算声明是 `interrupted`",
+            "pause 缺失而\n义务仍在",
+        ],
+    );
+}

@@ -1069,3 +1069,154 @@ fn message_real_typescript_rows_hydrate_when_a_fixture_is_supplied() {
         "hydrating real rows must still be two statements"
     );
 }
+
+/// A tool part whose call lost its authoritative outcome, exactly as
+/// `zuno-engine`'s `persist_tool_result` writes one.
+fn uncertain_tool_part(part_id: &str, call_id: &str, observed_at_ms: i64) -> Value {
+    json!({
+        "id": part_id,
+        "sessionID": SESSION_ID,
+        "messageID": MESSAGE_ID,
+        "type": "tool",
+        "callID": call_id,
+        "tool": "shell",
+        "state": {
+            "status": "error",
+            "outcome": "uncertain",
+            "uncertain": {
+                "tool": "shell",
+                "callID": call_id,
+                "appliedPaths": ["src/lib.rs", "src/main.rs"],
+                "cause": "lost_outcome",
+                "observedAtMs": observed_at_ms,
+            },
+            "input": { "command": "cargo publish" },
+            "error": "tool shell has an uncertain outcome",
+            "title": "shell uncertain",
+            "metadata": { "outcome": "uncertain", "uncertain": true },
+            "time": { "start": observed_at_ms, "end": observed_at_ms },
+        },
+    })
+}
+
+#[test]
+fn an_uncertain_tool_call_stays_pending_until_exactly_it_is_reconciled() {
+    let connection = seeded();
+    let store = MessageStore::new(&connection);
+    store
+        .put_message(&MessageRecord::from_json(user_message(MESSAGE_ID, 1)).expect("user message"))
+        .expect("store the message the parts hang off");
+
+    // A completed call, an uncertain one, and a second uncertain one observed later.
+    store
+        .put_part(
+            &PartRecord::from_json(
+                part_payload(PartKind::Tool, "prt_certain0000000000000000000"),
+                1,
+            )
+            .expect("completed tool part"),
+        )
+        .expect("store the completed call");
+    for (part_id, call_id, observed) in [
+        ("prt_uncertain1000000000000000000", "toolu_lost1", 500_i64),
+        ("prt_uncertain2000000000000000000", "toolu_lost2", 900_i64),
+    ] {
+        store
+            .put_part(
+                &PartRecord::from_json(uncertain_tool_part(part_id, call_id, observed), observed)
+                    .expect("uncertain tool part"),
+            )
+            .expect("store the uncertain call");
+    }
+
+    let pending = store
+        .pending_uncertain_tool_calls(SESSION_ID, 0)
+        .expect("read the pending set");
+    assert_eq!(
+        pending
+            .iter()
+            .map(|call| call.call_id.as_str())
+            .collect::<Vec<_>>(),
+        ["toolu_lost1", "toolu_lost2"],
+        "a completed call is never pending, and the pending ones come back in order"
+    );
+    assert_eq!(pending[0].tool, "shell");
+    assert_eq!(pending[0].applied_paths, ["src/lib.rs", "src/main.rs"]);
+    assert_eq!(pending[0].cause, zuno_error::UncertainCause::LostOutcome);
+    assert_eq!(pending[0].observed_at_ms, 500);
+    assert_eq!(pending[0].message_id, MESSAGE_ID);
+
+    // `since_ms` scopes the answer to one goal instance: a call observed before this
+    // objective existed is evidence about the previous one.
+    assert_eq!(
+        store
+            .pending_uncertain_tool_calls(SESSION_ID, 600)
+            .expect("read the scoped pending set")
+            .iter()
+            .map(|call| call.call_id.as_str())
+            .collect::<Vec<_>>(),
+        ["toolu_lost2"]
+    );
+
+    // Reconciling names exactly the calls that were inspected. The second one was
+    // not, so it stays pending — this is the whole reason the API takes part ids.
+    assert_eq!(
+        store
+            .reconcile_uncertain_tool_calls(&[pending[0].part_id.clone()], 1_000)
+            .expect("reconcile the first call"),
+        1
+    );
+    assert_eq!(
+        store
+            .pending_uncertain_tool_calls(SESSION_ID, 0)
+            .expect("read the pending set again")
+            .iter()
+            .map(|call| call.call_id.as_str())
+            .collect::<Vec<_>>(),
+        ["toolu_lost2"]
+    );
+
+    // A repeated recovery action retires nothing a second time.
+    assert_eq!(
+        store
+            .reconcile_uncertain_tool_calls(&[pending[0].part_id.clone()], 2_000)
+            .expect("reconcile again"),
+        0
+    );
+
+    // The evidence survives reconciliation; only the marker is added, and it is
+    // added to the tool record itself rather than to a table that could disagree.
+    let reconciled = store.part(&pending[0].part_id).expect("read the part back");
+    let state = reconciled.to_json()["state"].clone();
+    assert_eq!(state["outcome"], json!("uncertain"));
+    assert_eq!(state["uncertain"]["reconciledAtMs"], json!(1_000));
+    assert_eq!(
+        state["uncertain"]["appliedPaths"],
+        json!(["src/lib.rs", "src/main.rs"])
+    );
+}
+
+#[test]
+fn an_unreadable_uncertain_disposition_is_reported_and_never_skipped() {
+    let connection = seeded();
+    let store = MessageStore::new(&connection);
+    store
+        .put_message(&MessageRecord::from_json(user_message(MESSAGE_ID, 1)).expect("user message"))
+        .expect("store the message the parts hang off");
+
+    let mut payload = uncertain_tool_part("prt_unreadable00000000000000000", "toolu_bad", 500);
+    payload["state"]["uncertain"]["cause"] = json!("probably_fine");
+    store
+        .put_part(&PartRecord::from_json(payload, 500).expect("part with an unknown cause"))
+        .expect("store it");
+
+    // Skipping the row would report an inspected outcome for a call nobody inspected.
+    let error = store
+        .pending_uncertain_tool_calls(SESSION_ID, 0)
+        .expect_err("an unknown cause is reported");
+    assert!(
+        matches!(error, DbError::Decode { .. }),
+        "expected a decode failure naming the row, got {error}"
+    );
+    assert!(error.to_string().contains("part"), "{error}");
+}

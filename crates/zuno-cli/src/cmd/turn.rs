@@ -4571,6 +4571,28 @@ impl TurnHost {
                     "cancel" => zuno_goal::SystemStatus::Cancelled,
                     _ => unreachable!("closed goal system action"),
                 };
+                // Resuming is the explicit recovery action an uncertain side effect
+                // waits for, so it retires exactly the calls it can name. Without this
+                // the resume would not resume: the pending obligation is durable, and
+                // the next continuation tick would read it and pause again.
+                //
+                // Pausing and cancelling retire nothing. Neither claims anything was
+                // inspected, and a cancelled goal's evidence is still the evidence.
+                let reconciled = if action == "resume" {
+                    let pending = self
+                        .pending_uncertain_side_effects()
+                        .map_err(SessionCommandError::internal)?;
+                    let part_ids = pending
+                        .iter()
+                        .map(|call| call.part_id.clone())
+                        .collect::<Vec<_>>();
+                    zuno_db::message::MessageStore::new(&self.connection)
+                        .reconcile_uncertain_tool_calls(&part_ids, zuno_db::message::now_millis())
+                        .map_err(SessionCommandError::internal)?;
+                    pending
+                } else {
+                    Vec::new()
+                };
                 let expected_revision = self
                     .goal_store
                     .goal(&self.session_id)
@@ -4591,7 +4613,17 @@ impl TurnHost {
                         )
                     })?;
                 changed = true;
-                serde_json::to_value(goal).map_err(SessionCommandError::internal)?
+                let mut output =
+                    serde_json::to_value(goal).map_err(SessionCommandError::internal)?;
+                if !reconciled.is_empty()
+                    && let Some(object) = output.as_object_mut()
+                {
+                    object.insert(
+                        "reconciledUncertainCalls".to_owned(),
+                        serde_json::to_value(&reconciled).map_err(SessionCommandError::internal)?,
+                    );
+                }
+                output
             }
             "block" => {
                 if value.is_empty() {
@@ -4762,13 +4794,21 @@ impl TurnHost {
             .into_iter()
             .filter(|request| human_request_belongs_to_goal(request.goal_id.as_deref(), goal_id))
             .collect::<Vec<_>>();
+        // A goal paused for `uncertain_side_effect` will not resume until someone
+        // inspects the state its call may have changed. Naming those calls, and the
+        // paths they reported, is what makes the pause actionable instead of a dead
+        // end — the reason is the diagnosis and this is the evidence.
+        let pending_uncertain_calls = self
+            .pending_uncertain_side_effects()
+            .map_err(SessionCommandError::internal)?;
         Ok(json!({
             "revision": goal.as_ref().map(|goal| goal.revision),
             "goal": goal,
             "pause": pause,
             "retry": retry,
             "providerBackoff": provider_backoff,
-            "pendingHumanRequests": pending_human_requests
+            "pendingHumanRequests": pending_human_requests,
+            "pendingUncertainCalls": pending_uncertain_calls
         }))
     }
 
@@ -7155,6 +7195,18 @@ impl TurnHost {
         } else {
             QueuedUserInput::Absent
         };
+        // Ahead of every start guard, because this one survives a process that died
+        // before it could record the pause: the guards read goal status and retry
+        // state, and neither was written by the turn that lost its outcome.
+        match self.pause_for_uncertain_side_effects()? {
+            UncertainSideEffects::None => {}
+            UncertainSideEffects::JustPaused => {
+                self.write_goal_projection()?;
+                self.work_changes.changed();
+                return Ok(false);
+            }
+            UncertainSideEffects::AlreadyPaused => return Ok(false),
+        }
         let prepared = match self
             .goal_continuation
             .prepare_if_idle(&self.session_id, mode, queued_input)
@@ -7605,7 +7657,14 @@ impl TurnHost {
                 unresolved_tool_failures,
                 ..
             }) => {
-                if let Some(failure) = goal_tool_failure(unresolved_tool_failures) {
+                // Ordered ahead of the retry decision on purpose. A turn can end
+                // holding both a retryable failure and a call that changed state it
+                // could not account for, and scheduling the retry would be the one
+                // thing an uncertain outcome forbids.
+                if self.pause_for_uncertain_side_effects()?.blocks_execution() {
+                    // Nothing else to record: the pause is terminal for this turn, and
+                    // a retry scheduled underneath it would outlive the pause.
+                } else if let Some(failure) = goal_tool_failure(unresolved_tool_failures) {
                     self.goal_continuation
                         .record_terminal_failure(&self.session_id, failure)
                         .map_err(to_string)?;
@@ -7938,6 +7997,65 @@ impl TurnHost {
     /// Writes the criteria with the goal rather than the goal alone: the document is
     /// what a human reads to see where the run stands, and a checklist that never
     /// appears there makes an evidence-gated goal look like it is waiting on nothing.
+    /// Tool calls of the active goal instance that owe an inspection.
+    ///
+    /// Read from the durable tool records rather than from the turn that produced
+    /// them, and that is the point. A call's disposition is written in the same
+    /// statement that makes its result model-visible, so this answer is the same
+    /// whether the turn just ended, the process died between persisting the result
+    /// and accounting for it, or a different client opened the database afterwards.
+    /// Recomputing it from a live signal would give the pause a second source of
+    /// truth that can disagree with the record — the failure this whole path exists
+    /// to prevent.
+    ///
+    /// Empty when no goal is active: an uncertain call still demands inspection, but
+    /// it demands it of the human reading the transcript, and there is no automatic
+    /// execution to suspend. Scoped to the goal instance so a fresh objective does
+    /// not inherit an obligation the previous one incurred.
+    fn pending_uncertain_side_effects(
+        &self,
+    ) -> Result<Vec<zuno_db::message::UncertainToolCall>, String> {
+        let Some(goal) = self.goal_store.goal(&self.session_id).map_err(to_string)? else {
+            return Ok(Vec::new());
+        };
+        zuno_db::message::MessageStore::new(&self.connection)
+            .pending_uncertain_tool_calls(&self.session_id, goal.created_at_ms)
+            .map_err(to_string)
+    }
+
+    /// Suspend automatic execution while any call of this goal owes an inspection.
+    ///
+    /// Called from both ends of the window: at the end of the turn that produced the
+    /// call, so the status surface is right immediately, and before any later turn may
+    /// start, which is what closes the crash window between those two points. Both read
+    /// the same durable set, so the second is a backstop rather than a second opinion.
+    fn pause_for_uncertain_side_effects(&mut self) -> Result<UncertainSideEffects, String> {
+        let pending = self.pending_uncertain_side_effects()?;
+        if pending.is_empty() {
+            return Ok(UncertainSideEffects::None);
+        }
+        // Whether the pause is already recorded has to be answered before recording it,
+        // and not as an optimization. A continuation driver asks this question on every
+        // idle tick, so a guard that rewrote the row and republished the projection each
+        // time would turn one stopped goal into an unbounded stream of identical client
+        // notifications — the goal would look busy precisely because it is not.
+        let recorded = self
+            .goal_store
+            .pause_state(&self.session_id)
+            .map_err(to_string)?
+            .is_some_and(|pause| pause.reason == zuno_goal::GoalPauseReason::UncertainSideEffect);
+        if recorded {
+            return Ok(UncertainSideEffects::AlreadyPaused);
+        }
+        self.goal_continuation
+            .record_terminal_failure(
+                &self.session_id,
+                GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::UncertainSideEffect),
+            )
+            .map_err(to_string)?;
+        Ok(UncertainSideEffects::JustPaused)
+    }
+
     fn write_goal_projection(&self) -> Result<(), String> {
         if let Some(goal) = self.goal_store.goal(&self.session_id).map_err(to_string)? {
             let criteria = self
@@ -8107,6 +8225,28 @@ fn human_request_summary(payload: &Value) -> Option<String> {
         })
         .or_else(|| payload.get("action").and_then(Value::as_str))
         .map(str::to_owned)
+}
+
+/// What the durable pending set decided about letting the goal run.
+///
+/// Three states rather than a boolean because the callers need different halves of the
+/// answer: every caller has to know whether execution may proceed, and only the caller
+/// that publishes to clients has to know whether anything actually changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UncertainSideEffects {
+    /// No call of this goal owes an inspection.
+    None,
+    /// A call owes an inspection and the durable pause already says so.
+    AlreadyPaused,
+    /// A call owes an inspection and this consultation is what recorded the pause.
+    JustPaused,
+}
+
+impl UncertainSideEffects {
+    /// Whether automatic execution must stay suspended.
+    const fn blocks_execution(self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 fn goal_tool_failure(recoveries: &[ToolFailureRecovery]) -> Option<GoalTerminalFailure> {
