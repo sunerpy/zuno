@@ -1331,8 +1331,23 @@ an observed result and is never mechanically replayed. A running tool receives a
 two-second cooperative cleanup window. Settling in that window produces a typed
 `cooperative` cancellation and preserves the tool's terminal report; expiry
 force-aborts the invocation and records `forced` plus `uncertain`, requiring
-authoritative-state inspection before retry. Post-tool hooks may add diagnostics
-but cannot rewrite either cancellation outcome as an ordinary failure.
+authoritative-state inspection before retry. A cooperative settlement is not
+automatically certain. A tool that was stopped before its work reached a
+decided outcome declares that on its settled result under the `cancellation`
+metadata key, and the dispatcher records `uncertain` for that call too, with
+the same authoritative-state requirement; a tool that declares nothing keeps
+the certain cooperative reading. `shell` carries both readings: a command that
+had already exited when the cancellation was serviced reports its own exit
+status with the receipt a completed run earns and is cancelled but not
+uncertain, while a command that was still running and was killed preserves its
+captured output, carries an unresolved receipt with no exit code, and is
+uncertain. Neither is ever mechanically replayed. The resolved verdict travels
+on the `ToolDispatchInterrupted` runtime event and not only in the durable
+record, so the SSE `tool.dispatch.interrupted` payload, the ACP session update,
+and `zuno run` publish the same `uncertain` a replayed session reconstructs from
+durable metadata, while `forced` keeps meaning only that the grace window
+expired. Post-tool hooks may add diagnostics but cannot rewrite either
+cancellation outcome as an ordinary failure.
 `TurnInterrupted` adds a separate session-owned
 `Conversation interrupted by user.` row to the live transcript. The source and
 reason are persisted on `turn.interrupted` and, when an assistant checkpoint

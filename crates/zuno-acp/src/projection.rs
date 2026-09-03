@@ -283,6 +283,7 @@ impl TurnEventProjector {
                 title,
                 output,
                 interruption,
+                uncertain,
                 ..
             } => {
                 let raw_input = self
@@ -307,6 +308,7 @@ impl TurnEventProjector {
                         metadata: None,
                     },
                     *interruption,
+                    *uncertain,
                 ))
             }
             TurnEvent::ToolResultPresented {
@@ -544,16 +546,20 @@ fn set_question_continuation_pending(update: &mut Value, pending: bool) {
     }
 }
 
+/// Projects a cancelled call, presenting the certainty its caller resolved.
+///
+/// `uncertain` is a separate argument from `interruption` because the mode does not
+/// decide it: a cooperative return whose tool says its work never reached a decided
+/// outcome is uncertain too. The live caller passes the field the engine publishes and
+/// replay reconstructs it from durable metadata, so both paths present one verdict —
+/// which is what `outcome`, a `task` subagent's state, and a `question`'s status say.
 pub(crate) fn interrupted_tool_update(
     input: CompletedToolUpdate<'_>,
     interruption: ToolInterruption,
+    uncertain: bool,
 ) -> Value {
     let mut metadata = input.metadata.cloned().unwrap_or_default();
-    let presentation_state = if interruption.uncertain() {
-        "uncertain"
-    } else {
-        "cancelled"
-    };
+    let presentation_state = if uncertain { "uncertain" } else { "cancelled" };
     match input.name {
         "task" => {
             let subagent = metadata
@@ -584,18 +590,13 @@ pub(crate) fn interrupted_tool_update(
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .expect("zuno tool metadata is an object");
-    zuno.insert(
-        "outcome".to_owned(),
-        json!(if interruption.uncertain() {
-            "uncertain"
-        } else {
-            "cancelled"
-        }),
-    );
+    zuno.insert("outcome".to_owned(), json!(presentation_state));
     zuno.insert("cancelled".to_owned(), json!(true));
     zuno.insert("interruptionMode".to_owned(), json!(interruption.as_str()));
-    zuno.insert("forced".to_owned(), json!(interruption.uncertain()));
-    zuno.insert("uncertain".to_owned(), json!(interruption.uncertain()));
+    // The mode alone: the grace window expired. Only `uncertain` answers whether
+    // authoritative state has to be inspected.
+    zuno.insert("forced".to_owned(), json!(interruption.is_forced()));
+    zuno.insert("uncertain".to_owned(), json!(uncertain));
     update
 }
 

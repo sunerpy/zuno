@@ -48,6 +48,12 @@ const TOOL_INTERRUPT_SETTLE_GRACE: Duration = Duration::from_secs(2);
 /// spelling is pinned by a test on each side rather than shared through an import.
 const CANCELLATION_METADATA_KEY: &str = "cancellation";
 
+/// The metadata key under which [`interrupted_result`] records the resolved verdict.
+///
+/// The durable record of one interrupted call: its mode, whether the grace window
+/// expired, the certainty the dispatcher resolved, and the window it allowed.
+const INTERRUPTION_METADATA_KEY: &str = "interruption";
+
 /// Whether a settled result says its cancelled outcome needs authoritative inspection.
 ///
 /// Absent, malformed, or unset metadata answers `false`: a tool that makes no claim
@@ -60,6 +66,26 @@ fn cancellation_is_uncertain(output: &ToolOutput) -> bool {
         .and_then(|facts| facts.get("uncertain"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// The certainty verdict this dispatch result recorded for an interrupted call.
+///
+/// The dispatcher resolves the verdict once, against the tool's own claim, and writes it
+/// to the result's durable metadata. This is how the runtime reads it back so the live
+/// event publishes the same fact the durable record keeps, instead of every surface
+/// re-deriving certainty from the interruption mode and disagreeing with storage.
+///
+/// `None` when the result carries no readable verdict — a result that was not
+/// interrupted, or one produced before the dispatcher recorded one. The caller falls
+/// back to the mode, which is the reading those results were written under.
+#[must_use]
+pub fn recorded_interruption_uncertainty(result: &ToolDispatchResult) -> Option<bool> {
+    result
+        .output
+        .metadata
+        .get(INTERRUPTION_METADATA_KEY)?
+        .get("uncertain")?
+        .as_bool()
 }
 
 pub use crate::deferred_tools::TOOL_SEARCH_ID;
@@ -1054,7 +1080,7 @@ fn interrupted_result(
         |settled| settled.output,
     );
     output.metadata.insert(
-        "interruption".to_owned(),
+        INTERRUPTION_METADATA_KEY.to_owned(),
         json!({
             "mode": interruption.as_str(),
             "forced": forced,
@@ -1401,6 +1427,62 @@ mod tests {
             "a tool that settled nothing has made no claim: {}",
             empty.output.output
         );
+    }
+
+    /// The runtime reads back exactly the verdict the dispatcher recorded.
+    ///
+    /// This is the read the turn loop performs before it publishes
+    /// `TurnEvent::ToolDispatchInterrupted`, so a live client presents the certainty
+    /// stored on the tool result instead of re-deriving one from the interruption mode.
+    #[test]
+    fn a_recorded_interruption_verdict_is_readable_by_the_runtime() {
+        let undecided = interrupted_result(
+            "shell",
+            ToolInterruption::Cooperative,
+            Some(settled_with(serde_json::json!({
+                "cancellation": { "uncertain": true }
+            }))),
+        );
+        assert_eq!(recorded_interruption_uncertainty(&undecided), Some(true));
+
+        let decided = interrupted_result(
+            "shell",
+            ToolInterruption::Cooperative,
+            Some(settled_with(Value::Null)),
+        );
+        assert_eq!(recorded_interruption_uncertainty(&decided), Some(false));
+
+        let forced = interrupted_result("shell", ToolInterruption::Forced, None);
+        assert_eq!(recorded_interruption_uncertainty(&forced), Some(true));
+    }
+
+    /// A result carrying no verdict answers `None` so the caller falls back to the mode.
+    ///
+    /// The fallback is what keeps a result produced before this record existed readable:
+    /// its mode is the reading it was written under.
+    #[test]
+    fn a_result_without_a_recorded_verdict_leaves_the_reading_to_its_caller() {
+        assert_eq!(
+            recorded_interruption_uncertainty(&ToolDispatchResult::success(ToolOutput::text(
+                "shell", "done"
+            ))),
+            None
+        );
+
+        let mut malformed = ToolDispatchResult::interrupted(
+            ToolOutput::text("shell", "partial").with_metadata(
+                INTERRUPTION_METADATA_KEY,
+                serde_json::json!({ "mode": "cooperative", "uncertain": "yes" }),
+            ),
+            ToolInterruption::Cooperative,
+        );
+        assert_eq!(recorded_interruption_uncertainty(&malformed), None);
+
+        malformed.output.metadata.insert(
+            INTERRUPTION_METADATA_KEY.to_owned(),
+            Value::String("cooperative".to_owned()),
+        );
+        assert_eq!(recorded_interruption_uncertainty(&malformed), None);
     }
 
     /// The metadata key is a cross-crate contract, so its spelling is pinned here.

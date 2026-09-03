@@ -362,6 +362,7 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             title,
             output,
             interruption,
+            uncertain,
         } => (
             "tool.dispatch.interrupted",
             object(json!({
@@ -372,8 +373,13 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
                 "title": title,
                 "output": output,
                 "mode": interruption.as_str(),
-                "forced": interruption.uncertain(),
-                "uncertain": interruption.uncertain(),
+                // `forced` is the mode and nothing else: the grace window expired. It
+                // rode on the certainty helper, which is now a per-call verdict a
+                // cooperative return can also carry, so pin it to the mode explicitly.
+                "forced": interruption.is_forced(),
+                // The verdict the dispatcher resolved and stored, so a live SSE
+                // consumer reads the same certainty as the durable tool result.
+                "uncertain": uncertain,
             })),
         ),
         TurnEvent::ToolResultPresented {
@@ -753,11 +759,33 @@ mod tests {
             title: "Inspect repository".to_owned(),
             output: "child did not stop before the deadline".to_owned(),
             interruption: zuno_engine::r#loop::ToolInterruption::Forced,
+            uncertain: true,
         });
 
         assert_eq!(interrupted.event_type, "tool.dispatch.interrupted");
         assert_eq!(interrupted.properties["mode"], "forced");
         assert_eq!(interrupted.properties["forced"], true);
+        assert_eq!(interrupted.properties["uncertain"], true);
+    }
+
+    #[test]
+    fn a_cooperative_cancellation_publishes_its_resolved_uncertainty_without_forcing() {
+        let interrupted = turn_event(&TurnEvent::ToolDispatchInterrupted {
+            step: 2,
+            call_id: "call_shell".to_owned(),
+            display_name: "zsh".to_owned(),
+            name: "shell".to_owned(),
+            title: "shell cancelled".to_owned(),
+            output: "partial output".to_owned(),
+            interruption: zuno_engine::r#loop::ToolInterruption::Cooperative,
+            uncertain: true,
+        });
+
+        assert_eq!(interrupted.event_type, "tool.dispatch.interrupted");
+        assert_eq!(interrupted.properties["mode"], "cooperative");
+        // The grace window never expired, so nothing was forced; the outcome is still
+        // undecided, which is the only fact that asks for state inspection.
+        assert_eq!(interrupted.properties["forced"], false);
         assert_eq!(interrupted.properties["uncertain"], true);
     }
 

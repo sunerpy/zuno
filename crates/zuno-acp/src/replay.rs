@@ -478,10 +478,9 @@ fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
         presentation: None,
         metadata: Some(&metadata),
     };
-    let interruption = metadata
-        .get("interruption")
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("mode"))
+    let interruption_facts = metadata.get("interruption").and_then(Value::as_object);
+    let interruption = interruption_facts
+        .and_then(|facts| facts.get("mode"))
         .and_then(Value::as_str)
         .and_then(|mode| match mode {
             "cooperative" => Some(ToolInterruption::Cooperative),
@@ -489,7 +488,17 @@ fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
             _ => None,
         });
     let mut completed = match interruption {
-        Some(interruption) => interrupted_tool_update(completed_input, interruption),
+        Some(interruption) => {
+            // The dispatcher recorded the certainty it resolved next to the mode, so a
+            // replayed session presents the verdict the live session published rather
+            // than re-deriving one from the mode. A row written before that verdict
+            // existed has only the mode, which is the reading it was stored under.
+            let uncertain = interruption_facts
+                .and_then(|facts| facts.get("uncertain"))
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| interruption.uncertain());
+            interrupted_tool_update(completed_input, interruption, uncertain)
+        }
         None => completed_tool_update(completed_input),
     };
     if let Some(content) = completed.get_mut("content").and_then(Value::as_array_mut) {
@@ -789,6 +798,83 @@ mod tests {
         assert_eq!(cancelled["_meta"]["zuno"]["outcome"], "uncertain");
         assert_eq!(cancelled["_meta"]["zuno"]["interruptionMode"], "forced");
         assert_eq!(cancelled["_meta"]["zuno"]["uncertain"], true);
+    }
+
+    #[test]
+    fn replay_presents_a_recorded_undecided_cooperative_cancellation_as_uncertain() {
+        let root = tempfile::tempdir().expect("replay root");
+        let assistant = message(
+            "msg-assistant",
+            "assistant",
+            vec![part(
+                "p-tool",
+                "msg-assistant",
+                json!({
+                    "type": "tool",
+                    "callID": "call-shell",
+                    "tool": "shell",
+                    "displayName": "zsh",
+                    "state": {
+                        "status": "error",
+                        "title": "shell cancelled",
+                        "error": "partial output",
+                        "metadata": {
+                            "interruption": {
+                                "mode": "cooperative",
+                                "forced": false,
+                                "uncertain": true
+                            }
+                        }
+                    }
+                }),
+            )],
+        );
+
+        let replay = durable_updates(&[assistant], &ReplayPolicy::for_workspace(root.path()), 0);
+        let cancelled = &replay.updates[1];
+        // The same verdict the live event publishes for this call, not one re-derived
+        // from the mode.
+        assert_eq!(cancelled["_meta"]["zuno"]["outcome"], "uncertain");
+        assert_eq!(cancelled["_meta"]["zuno"]["uncertain"], true);
+        assert_eq!(cancelled["_meta"]["zuno"]["forced"], false);
+        assert_eq!(
+            cancelled["_meta"]["zuno"]["interruptionMode"],
+            "cooperative"
+        );
+    }
+
+    #[test]
+    fn replay_of_a_row_with_no_recorded_verdict_keeps_the_mode_reading() {
+        let root = tempfile::tempdir().expect("replay root");
+        let assistant = message(
+            "msg-assistant",
+            "assistant",
+            vec![part(
+                "p-tool",
+                "msg-assistant",
+                json!({
+                    "type": "tool",
+                    "callID": "call-task",
+                    "tool": "task",
+                    "displayName": "Delegate",
+                    "state": {
+                        "status": "error",
+                        "title": "Inspect repository",
+                        "error": "child supervisor settled",
+                        "metadata": { "interruption": { "mode": "cooperative" } }
+                    }
+                }),
+            )],
+        );
+
+        let replay = durable_updates(&[assistant], &ReplayPolicy::for_workspace(root.path()), 0);
+        let cancelled = &replay.updates[1];
+        assert_eq!(cancelled["_meta"]["zuno"]["outcome"], "cancelled");
+        assert_eq!(cancelled["_meta"]["zuno"]["uncertain"], false);
+        assert_eq!(
+            cancelled["_meta"]["zuno"]["interruptionMode"],
+            "cooperative"
+        );
     }
 
     #[test]

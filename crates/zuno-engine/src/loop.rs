@@ -334,6 +334,18 @@ pub enum TurnEvent {
         title: String,
         output: String,
         interruption: ToolInterruption,
+        /// Whether this call's final side-effect state requires authoritative
+        /// inspection before anything is retried.
+        ///
+        /// Carried as its own fact because the mode cannot answer it. A tool that
+        /// observed cancellation and returned may still have been stopped between
+        /// starting a side effect and observing it, and only the tool knows which, so
+        /// the dispatcher resolves the verdict per call from the settled result's
+        /// `cancellation` claim and records it in the durable tool metadata. A surface
+        /// that re-derived certainty from `interruption` alone would tell the user a
+        /// cooperative return "completed its cleanup" while the durable record for the
+        /// same call said the outcome was undecided.
+        uncertain: bool,
     },
     /// A typed client presentation supplied by the tool that owns the result
     /// semantics.
@@ -450,7 +462,24 @@ impl ToolInterruption {
         }
     }
 
-    /// Whether the final side-effect state requires authoritative inspection.
+    /// Whether the grace window expired before the tool returned.
+    ///
+    /// A property of the mode alone, and the only thing `forced` ever means on a
+    /// client surface. It is deliberately not a certainty verdict: a cooperative
+    /// return can be uncertain too.
+    #[must_use]
+    pub const fn is_forced(self) -> bool {
+        matches!(self, Self::Forced)
+    }
+
+    /// The mode-only reading of whether the side-effect state needs inspection.
+    ///
+    /// A fallback, not the published verdict. The verdict a call actually resolved to
+    /// is carried by [`TurnEvent::ToolDispatchInterrupted`] in its `uncertain` field
+    /// and recorded in the tool result's durable `interruption` metadata, because a
+    /// cooperative return is uncertain whenever the tool says its work never reached a
+    /// decided outcome. Use this only where no resolved verdict is available — a
+    /// durable row written before the dispatcher recorded one.
     #[must_use]
     pub const fn uncertain(self) -> bool {
         matches!(self, Self::Forced)
@@ -2849,6 +2878,14 @@ async fn run_turn_in_span(
                             .await?;
                     }
                     if let Some(interruption) = dispatch.interruption {
+                        // The dispatcher already resolved this call's certainty against
+                        // the tool's own claim and recorded it; recomputing it from the
+                        // mode here is what made the live surfaces contradict the
+                        // durable record. The mode is only the fallback for a result
+                        // that carries no readable verdict.
+                        let uncertain =
+                            crate::dispatch::recorded_interruption_uncertainty(&dispatch)
+                                .unwrap_or_else(|| interruption.uncertain());
                         events
                             .send(TurnEvent::ToolDispatchInterrupted {
                                 step,
@@ -2858,6 +2895,7 @@ async fn run_turn_in_span(
                                 title: dispatch.output.title.clone(),
                                 output: dispatch.output.output.clone(),
                                 interruption,
+                                uncertain,
                             })
                             .await?;
                     } else {

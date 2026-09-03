@@ -416,19 +416,19 @@ where
                     if is_error { "failed" } else { "completed" }
                 )
                 .map_err(to_string)?,
+                // `uncertain` is the verdict the dispatcher resolved for this call, not
+                // a property of the interruption mode: a cooperative cancellation is
+                // uncertain whenever the tool says its work never reached a decided
+                // outcome.
                 TurnEvent::ToolDispatchInterrupted {
                     display_name,
                     title,
-                    interruption,
+                    uncertain,
                     ..
                 } => writeln!(
                     stderr,
                     "[{display_name}] cancelled{}: {title}",
-                    if interruption.uncertain() {
-                        " (uncertain)"
-                    } else {
-                        ""
-                    }
+                    if uncertain { " (uncertain)" } else { "" }
                 )
                 .map_err(to_string)?,
                 _ => {}
@@ -595,6 +595,7 @@ fn event_json(event: TurnEvent) -> Value {
             title,
             output,
             interruption,
+            uncertain,
         } => {
             json!({
                 "type":"tool_dispatch_interrupted",
@@ -605,8 +606,10 @@ fn event_json(event: TurnEvent) -> Value {
                 "title":title,
                 "output":output,
                 "mode":interruption.as_str(),
-                "forced":interruption.uncertain(),
-                "uncertain":interruption.uncertain(),
+                // The mode: the grace window expired. Certainty is the resolved
+                // verdict beside it, which a cooperative cancellation can also fail.
+                "forced":interruption.is_forced(),
+                "uncertain":uncertain,
             })
         }
         TurnEvent::ToolResultPresented {
@@ -1154,6 +1157,80 @@ mod tests {
                 command: zuno_engine::session_command::SessionCommand::Compact,
             }),
             json!({"type":"session_command_completed","command":"compact"})
+        );
+    }
+
+    #[test]
+    fn run_cancelled_tool_json_carries_the_resolved_certainty_not_the_mode() {
+        assert_eq!(
+            event_json(TurnEvent::ToolDispatchInterrupted {
+                step: 3,
+                call_id: "call-1".to_owned(),
+                display_name: "zsh".to_owned(),
+                name: "shell".to_owned(),
+                title: "shell cancelled".to_owned(),
+                output: "partial output".to_owned(),
+                interruption: zuno_engine::r#loop::ToolInterruption::Cooperative,
+                uncertain: true,
+            }),
+            json!({
+                "type":"tool_dispatch_interrupted",
+                "step":3,
+                "callID":"call-1",
+                "name":"shell",
+                "displayName":"zsh",
+                "title":"shell cancelled",
+                "output":"partial output",
+                "mode":"cooperative",
+                "forced":false,
+                "uncertain":true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_tool_line_marks_only_an_undecided_outcome_as_uncertain() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        for (call_id, title, uncertain) in [
+            ("call-decided", "read cancelled", false),
+            ("call-undecided", "shell cancelled", true),
+        ] {
+            sender
+                .send(TurnEvent::ToolDispatchInterrupted {
+                    step: 1,
+                    call_id: call_id.to_owned(),
+                    display_name: "zsh".to_owned(),
+                    name: "shell".to_owned(),
+                    title: title.to_owned(),
+                    output: "partial output".to_owned(),
+                    interruption: zuno_engine::r#loop::ToolInterruption::Cooperative,
+                    uncertain,
+                })
+                .await
+                .expect("renderer remains connected");
+        }
+        drop(sender);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        render_events_to(
+            receiver,
+            RunFormat::Default,
+            false,
+            &mut stdout,
+            &mut stderr,
+            false,
+            None,
+        )
+        .await
+        .expect("cancelled tools render");
+
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).expect("utf8"),
+            concat!(
+                "[zsh] cancelled: read cancelled\n",
+                "[zsh] cancelled (uncertain): shell cancelled\n",
+            )
         );
     }
 

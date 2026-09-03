@@ -310,6 +310,8 @@ PowerShell 仍然只是那个守护器的后端依赖，而不是运行 CLI 的�
 
 副作用附近的超时或响应丢失属于结果不确定。这种情况会被持久化，要求检查权威状态，绝不机械重放调用。
 
+协作式取消并不自动等于结果确定。工作尚未得出结论就被停下的工具，会在其已结算结果的 `cancellation` metadata 键上声明这一点，dispatcher 也会把该次调用记为 `uncertain`，并适用同样的权威状态检查要求；没有作出声明的工具保持原有的确定读法。`shell` 同时承载两种读法：取消被处理时已经退出的命令，报告它自己的退出状态并拿到正常完成的运行所应得的凭据，只标记为已取消而不是不确定；仍在运行而被杀掉的命令保留已捕获的输出，携带没有退出码的 unresolved 凭据，属于不确定。两者都绝不会被机械重放。解析出的判定随 `ToolDispatchInterrupted` 运行时事件一起发布，而不只是写入持久记录，因此 SSE 的 `tool.dispatch.interrupted` 载荷、ACP session update 与 `zuno run` 发布的 `uncertain` 与重放会话从持久 metadata 重建出的判定一致，而 `forced` 只表示宽限窗口已耗尽。
+
 `subagent_model_selection` 默认关闭。开启后，精确 model allowlist 会在 profile 激活时解析，并按 session 持久冻结为带 digest 的策略；`task` 才会出现可选 `model`/`effort`。续跑不能改变首次冻结的模型或强度。
 
 ## 并发网络搜索

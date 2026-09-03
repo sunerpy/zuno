@@ -1121,6 +1121,12 @@ impl Transcript {
                     *status = ToolStatus::Blocked;
                 }
             }),
+            // The event's resolved `uncertain` verdict is deliberately not read here.
+            // `ToolStatus` has one cancelled state and no way to say that a
+            // cancellation's side effects still need authoritative inspection, and
+            // inventing a status is a presentation change of its own; the replay path in
+            // `zuno_cli::cmd::tui_replay` collapses the same distinction, so the
+            // transcript is at least consistent between live and resumed sessions.
             TurnEvent::ToolDispatchInterrupted {
                 call_id,
                 display_name,
