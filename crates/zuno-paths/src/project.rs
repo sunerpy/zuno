@@ -27,15 +27,16 @@
 //! out. Both entry points below are synchronous and both run during startup, some of
 //! them from inside a current-thread runtime, so an unbounded wait there is not one
 //! slow answer but a process that never gets any further. Every call is therefore
-//! bounded by `GIT_TIMEOUT`, and a call that outstays it is killed and reported the
-//! way a missing git already is: `None`, so no caller had to learn a new outcome.
+//! bounded by [`bounded::GIT_TIMEOUT`], and a call that outstays it is killed and
+//! reported the way a missing git already is: `None`, so no caller had to learn a new
+//! outcome. [`crate::bounded`] holds that machinery, because [`crate::exclude`] asks
+//! git too and must not grow a second copy of it.
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
+use crate::bounded::{self, GIT_TIMEOUT};
 use crate::node_path;
 use crate::sha1;
 use crate::walk;
@@ -312,47 +313,6 @@ pub(crate) fn resolve_git_path(cwd: &str, value: &str) -> String {
     node_path::resolve(cwd, &[&normalized])
 }
 
-/// The ceiling on one `git` invocation.
-///
-/// Every call this module makes is a small local metadata read — `rev-parse`,
-/// `remote get-url`, `rev-list --max-parents=0` — so the only thing that can make
-/// one slow is the filesystem underneath `.git`. A `.git` on an unresponsive network
-/// mount leaves `git` blocked in the kernel with nothing to time it out, and both
-/// entry points here are synchronous: [`resolve_project`] and [`worktree_root`] run
-/// during startup, including from inside a current-thread tokio runtime, where an
-/// unbounded wait is not one slow task but a wedged process.
-///
-/// Ten seconds, because the ceiling has to clear the slowest *healthy* call rather
-/// than the typical one. `rev-list --max-parents=0 HEAD` walks the whole history,
-/// which on a million-commit repository without a commit-graph is measured in
-/// seconds, and a first `rev-parse` against a live-but-slow mount costs far more
-/// than the milliseconds it costs locally. Cutting a healthy repository off would
-/// not report an error — it would quietly resolve a different project id, and with
-/// it a different snapshot store and a different session bucket — so a smaller
-/// number trades a visible hang for an invisible identity change. It is not larger
-/// because this wait cannot be cancelled and [`discover_repository`] makes three
-/// calls, so ten seconds already admits half a minute of unresponsive startup
-/// against a dead mount; past that a user cannot tell a bounded wait from the hang
-/// it replaces.
-const GIT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How often a child is re-checked while this thread is waiting for it to exit.
-///
-/// End of file on stdout is not the same as having exited, so the status is polled
-/// under the same deadline rather than blocked on in `wait`, which would be
-/// unbounded again. A millisecond is far below the cost of the spawn itself, so the
-/// poll cannot show up in the healthy path.
-const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(1);
-
-/// How long a killed `git` is given to be reaped before it is abandoned.
-///
-/// `SIGKILL` does not land promptly on a process blocked in an uninterruptible read
-/// on a dead mount — exactly the case this ceiling exists for — so the reap is
-/// polled briefly and then given up on. An abandoned child costs one process entry
-/// until Zuno exits; blocking in `wait` to be tidy would hand the hang straight
-/// back.
-const KILL_REAP_GRACE: Duration = Duration::from_millis(100);
-
 /// Run `git` in `cwd`, returning stdout on success and `None` on any failure —
 /// non-zero exit, non-UTF-8 output, the binary being absent, or the call outstaying
 /// [`GIT_TIMEOUT`].
@@ -370,98 +330,28 @@ fn git(cwd: &str, args: &[&str]) -> Option<String> {
 /// Run `command` under `ceiling`, returning its stdout bytes when it exits
 /// successfully in time, and `None` otherwise — after killing it if it did not.
 ///
-/// # Why this is not `Command::output`
-///
-/// `output()` waits with no ceiling at all, which is the defect. The obvious
-/// replacement is worse than what it replaces: spawn with a piped stdout, poll
-/// `try_wait` until the child exits, then read the pipe — and a child that fills the
-/// pipe buffer blocks writing while this thread waits for an exit that can no longer
-/// come, turning a fast success into a deadlock and then into a timeout. The pipe is
-/// therefore drained by a thread that owns it, over an [`mpsc`] channel, while this
-/// thread keeps the [`Child`], because only whoever holds the `Child` can kill it.
+/// [`crate::bounded::output`] does the work, including why this cannot be
+/// [`Command::output`] and why both pipes are drained before anything is reaped. This
+/// module needs none of what that reports: stderr is dropped, because git's
+/// complaints must never reach Zuno's own stderr where they would land in the middle
+/// of a TUI frame, and the three failures collapse into `None` because a machine
+/// without git, a git that objected and a git that never answered all mean the same
+/// thing to a project id — fall back to `global`.
 ///
 /// Bytes come back rather than text because nothing here may reshape the output: the
-/// caller decides what a non-UTF-8 answer means, and `resolve_git_path` strips a
+/// caller decides what a non-UTF-8 answer means, and [`resolve_git_path`] strips a
 /// trailing newline and nothing else, since a path may legally end in a space.
 fn bounded_stdout(command: &mut Command, ceiling: Duration) -> Option<Vec<u8>> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        // `output()` captured stderr and this module dropped it; `null` keeps that
-        // property — git's complaints never reach Zuno's own stderr, where they
-        // would land in the middle of a TUI frame — without a second thread to
-        // drain a pipe nobody reads.
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + ceiling;
-
-    let Some(mut pipe) = child.stdout.take() else {
-        // Unreachable while stdout is piped above, and still not a reason to leave a
-        // child running.
-        abandon(&mut child);
-        return None;
-    };
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let outcome = match pipe.read_to_end(&mut bytes) {
-            Ok(_) => Some(bytes),
-            Err(_) => None,
-        };
-        // The receiver is gone whenever this thread lost the race with the ceiling.
-        // There is nobody left to tell, and the pipe closes as the thread ends.
-        let _ = sender.send(outcome);
-    });
-
-    let Ok(Some(bytes)) = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-    else {
-        // The ceiling, a failed read, or a reader that panicked: all three are
-        // failures, and all three leave a child that has to go.
-        abandon(&mut child);
-        return None;
-    };
-
-    // Closing stdout is not exiting — a child may do the first and keep running — so
-    // the status is collected under the same deadline as the output was.
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success().then_some(bytes),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(EXIT_POLL_INTERVAL),
-            _ => {
-                abandon(&mut child);
-                return None;
-            }
-        }
-    }
-}
-
-/// Kill `child`, and reap it if it dies within [`KILL_REAP_GRACE`].
-///
-/// The reader thread is deliberately not joined. It is blocked in `read_to_end`
-/// until the pipe closes, so joining it would restore the unbounded wait in the one
-/// case that matters — a child the kernel will not let die. Killing closes the write
-/// end, so the thread finishes on its own wherever the child can die at all.
-///
-/// The kill reaches `git` and not anything `git` started. That is sound for the calls
-/// this module makes, which are local reads that spawn no helper; it would not be
-/// sound for a fetch.
-fn abandon(child: &mut Child) {
-    let _ = child.kill();
-    let deadline = Instant::now() + KILL_REAP_GRACE;
-    loop {
-        match child.try_wait() {
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(EXIT_POLL_INTERVAL),
-            _ => return,
-        }
-    }
+    let collected = bounded::output(command, ceiling).ok()?;
+    collected.status.success().then_some(collected.stdout)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
 
     fn run(cwd: &Path, args: &[&str]) {
         let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };

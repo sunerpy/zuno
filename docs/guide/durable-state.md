@@ -244,9 +244,18 @@ and one negation per authored entry go into the repository-private
 repository's history owns would land as an unexplained diff in somebody else's next commit.
 Each generated directory also writes its own `.gitignore` containing `*` as it is created,
 which covers that file as well, so the directory stays hidden even where no exclude block
-was written — a fresh clone, a second worktree, or a repository whose block someone
-deleted. Every pattern is matched at every depth, so a `.zuno/` directory an older release
-left in a subdirectory is hidden as well; it is inert, and you can delete it.
+was written — a fresh clone, a second worktree, a repository whose block someone deleted,
+or a checkout where the query below did not answer in time. Every pattern is matched at
+every depth, so a `.zuno/` directory an older release left in a subdirectory is hidden as
+well; it is inert, and you can delete it.
+
+Writing the block first asks git where its exclude file lives, and that question is bounded
+at about ten seconds. If git does not answer — an unresponsive mount is the usual reason —
+the session starts anyway and carries a warning naming the timeout and the worktree, and
+Zuno runs without the block. Generated state that lives in a directory of its own is still
+hidden by that directory's `.gitignore`, and the delivery refusal below still holds, so what
+the timeout costs is the exclusion of anything directly under `.zuno/` that is not a
+directory Zuno created.
 
 An ignore rule never applies to a path git already tracks, and that is why a refusal exists
 on top of the exclusions. A `git commit` that would deliver generated state anyway is
