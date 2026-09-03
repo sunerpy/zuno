@@ -235,7 +235,7 @@ Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程�
 | `network` | `deny`、`allow` | 受限模式为 `deny`，`danger-full-access` 使用宿主网络 |
 | `onUnavailable` | `deny`、`run-unconfined` | `deny` |
 | `writableRoots` | 额外的现有可写目录数组 | 空 |
-| `protectedPaths` | 重新施加只读保护的路径数组 | 空 |
+| `protectedPaths` | 重新施加只读保护的路径数组，每一项必须已存在且不能是符号链接 | 空 |
 
 默认配置明确写出如下：
 
@@ -248,6 +248,12 @@ Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程�
   }
 }
 ```
+
+相对路径按当前工作区解析。`writableRoots` 的每一项必须已经是目录，且只在
+`workspace-write` 下被考虑。`protectedPaths` 的每一项必须已存在且不能是符号链接，会在挂载
+可写根目录之后重新施加只读保护；缺失的路径不会被忽略，而是让部署失败关闭，以免启动一个
+保护被静默丢弃的 Agent。Zuno 自身始终保护已存在的 `.git`、`.zuno`、`.agents`、解析出的
+外部 Git 元数据以及它的沙箱 helper；配置可以增加保护，但不能关闭限制。
 
 `danger-full-access` 始终跳过受限后端发现，以 Zuno 用户的宿主文件系统、进程、凭据和网络
 权限原生执行，并把生效权限模式设为 `allow_all`。它不能与 `network: "deny"`、

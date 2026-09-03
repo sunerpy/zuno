@@ -111,8 +111,11 @@ pub struct SandboxConfig {
     pub writable_roots: Option<Vec<String>>,
     /// Paths reapplied read-only after writable roots are mounted.
     ///
-    /// Relative paths resolve against the active workspace. Missing paths are
-    /// ignored until they exist.
+    /// Relative paths resolve against the active workspace. Each entry must
+    /// already exist and must not be a symbolic link; deployment fails closed
+    /// rather than starting an Agent whose protection was silently dropped.
+    /// Cannot be combined with `danger-full-access`, which has no confined
+    /// backend to enforce it.
     #[serde(rename = "protectedPaths", skip_serializing_if = "Option::is_none")]
     pub protected_paths: Option<Vec<String>>,
 }
