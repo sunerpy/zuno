@@ -189,16 +189,31 @@ impl ScrollbackBuffer {
     /// only where to start: a 2 MiB replay is a legitimate answer to "everything since
     /// my cursor" and a ruinous one to hand a model in a single tool result.
     ///
+    /// Bounding [`ReplayCursor::Full`] keeps the newest bytes, not the oldest. This ring
+    /// is a tail of a stream with no end: its head is wherever retention happened to
+    /// begin, while its end is where the command is now — the failing assertion, the
+    /// summary line, the prompt something is waiting at. Cutting a bounded "everything
+    /// still retained" from the head instead returned the same opening bytes to every
+    /// poll, so a caller watching a running command saw no progress and reaching the end
+    /// cost one call per window. A caller that wants the beginning asks for
+    /// [`ReplayCursor::From`] `(0)`, which is also the request that reaches a persisted
+    /// file for what this ring has already discarded.
+    ///
     /// A window that stops short of the end is trimmed back to a UTF-8 boundary, so
     /// paging never splits a code point across two reads for the same reason the head
     /// is realigned after a discard. A window that reaches the end is returned as it
     /// is: there is no following read to align with, and a PTY also carries binary.
+    /// A bounded `Full` window is the one case where this ring, rather than a caller,
+    /// chose where a window starts, so its head is realigned too; [`Replay::cursor`]
+    /// still names the byte just past the window, so the window's first byte is always
+    /// `cursor - bytes.len()`.
     #[must_use]
     pub fn replay_window(&self, cursor: ReplayCursor, limit: Option<usize>) -> Replay {
-        let requested = match cursor {
-            ReplayCursor::Full => 0,
-            ReplayCursor::Tail => self.end_cursor,
-            ReplayCursor::From(value) => value,
+        let requested = match (cursor, limit) {
+            (ReplayCursor::Full, Some(limit)) => self.end_cursor.saturating_sub(limit as u64),
+            (ReplayCursor::Full, None) => 0,
+            (ReplayCursor::Tail, _) => self.end_cursor,
+            (ReplayCursor::From(value), _) => value,
         };
         let from = requested.clamp(self.start_cursor, self.end_cursor);
         let offset = usize::try_from(from - self.start_cursor).unwrap_or(self.len);
@@ -209,8 +224,12 @@ impl ScrollbackBuffer {
             bytes.truncate(limit);
             trim_incomplete_tail(&mut bytes);
         }
+        let next = from + bytes.len() as u64;
+        if matches!(cursor, ReplayCursor::Full) && from > self.start_cursor {
+            trim_incomplete_head(&mut bytes);
+        }
         Replay {
-            cursor: from + bytes.len() as u64,
+            cursor: next,
             bytes,
         }
     }
@@ -385,6 +404,23 @@ pub(crate) fn trim_incomplete_tail(bytes: &mut Vec<u8>) {
     }
 }
 
+/// Drops a split code point from the front of a window this ring itself cut.
+///
+/// [`ScrollbackBuffer::align_head`] applied to a window rather than to the ring, and only
+/// where the ring chose the cut: a bounded [`ReplayCursor::Full`] read starts `limit`
+/// bytes before the end, which lands mid-sequence as readily as a discard does, and the
+/// first thing a client does with a window is decode it. A window whose start a caller
+/// named is never trimmed — those bytes were asked for by absolute offset, and dropping
+/// them would silently lose output at the seam between two reads.
+fn trim_incomplete_head(bytes: &mut Vec<u8>) {
+    let skip = bytes
+        .iter()
+        .take(MAX_CONTINUATION_BYTES)
+        .take_while(|byte| is_continuation(**byte))
+        .count();
+    bytes.drain(..skip);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,7 +551,10 @@ mod tests {
         let mut buffer = ScrollbackBuffer::with_limit(32);
         buffer.push(b"0123456789");
 
-        let first = buffer.replay_window(ReplayCursor::Full, Some(4));
+        // `From(0)` rather than `Full`: a bounded `Full` window is now the newest bytes,
+        // so the request that means "start at the beginning and page forward" is the one
+        // that names offset zero.
+        let first = buffer.replay_window(ReplayCursor::From(0), Some(4));
         assert_eq!(first.bytes, b"0123");
         assert_eq!(first.cursor, 4, "an unbounded replay ended at 10");
 
@@ -532,6 +571,57 @@ mod tests {
                 .bytes,
             b"",
             "a cursor at the end returns nothing rather than repeating the tail"
+        );
+    }
+
+    /// A bounded "everything still retained" is the newest bytes a command produced.
+    ///
+    /// The head is where retention began and carries nothing a caller asked for; the end
+    /// is where the command is now. Cutting from the head returned the same opening bytes
+    /// to every poll, so a caller watching a running command never saw it advance.
+    #[test]
+    fn a_bounded_full_window_returns_the_newest_bytes_and_ends_at_the_stream_end() {
+        let mut buffer = ScrollbackBuffer::with_limit(32);
+        buffer.push(b"0123456789");
+
+        let window = buffer.replay_window(ReplayCursor::Full, Some(4));
+
+        assert_eq!(window.bytes, b"6789");
+        assert_eq!(
+            window.cursor,
+            buffer.end_cursor(),
+            "a tail window leaves nothing newer to page toward"
+        );
+        assert_eq!(
+            window.cursor - window.bytes.len() as u64,
+            6,
+            "the window's first byte is always cursor minus its length"
+        );
+        assert_eq!(
+            buffer.replay_window(ReplayCursor::From(0), Some(4)).bytes,
+            b"0123",
+            "the beginning stays reachable by naming offset zero"
+        );
+    }
+
+    /// The one window this ring cuts itself starts on a code point.
+    #[test]
+    fn a_bounded_full_window_realigns_the_head_it_chose() {
+        let mut buffer = ScrollbackBuffer::with_limit(64);
+        buffer.push("中文测试".as_bytes());
+
+        // Eight bytes back from the end lands one byte inside 测 (three bytes each).
+        let window = buffer.replay_window(ReplayCursor::Full, Some(8));
+
+        assert_eq!(
+            std::str::from_utf8(&window.bytes).expect("a realigned window decodes alone"),
+            "测试"
+        );
+        assert_eq!(window.cursor, buffer.end_cursor());
+        assert_eq!(
+            window.cursor - window.bytes.len() as u64,
+            6,
+            "trimming the split head moves the window's first byte, not its end"
         );
     }
 

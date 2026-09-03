@@ -658,7 +658,9 @@ impl BackgroundExecutionService {
     /// complete on disk, and the only way to see it was a shell command slicing the file
     /// by hand. [`ReplayCursor::Full`] still means "everything still retained" and never
     /// reaches for the file: it is the tail request every client surface makes, and a
-    /// caller that wants the beginning says `From(0)`.
+    /// caller that wants the beginning says `From(0)`. Bounded, it stays a tail request —
+    /// the newest `limit` bytes, ending at [`BackgroundExecutionOutput::total_written`] —
+    /// so the window's first byte is `cursor - bytes.len()` however it was served.
     ///
     /// A file that is gone — an ephemeral foreground command cleans up after itself —
     /// replays as no bytes rather than as a failure, the same tolerance restoring a

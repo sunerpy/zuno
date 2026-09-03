@@ -303,6 +303,40 @@ async fn a_window_limit_bounds_one_replay_without_moving_the_cursor_space() {
     assert_eq!(second.cursor, 8);
 }
 
+/// A bounded read of "everything still retained" is the newest window, not the oldest.
+///
+/// This is the request a caller makes when it names no cursor at all. Serving it from the
+/// head returned an execution's opening bytes forever: every poll of a running command
+/// came back identical, and the summary the caller was waiting for was one call per window
+/// away.
+#[tokio::test]
+async fn a_bounded_retained_read_returns_the_newest_window_of_an_execution() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let service = BackgroundExecutionService::open(directory.path()).expect("background service");
+    let info = service
+        .start(input(
+            directory.path(),
+            "printf '0123456789'".to_owned(),
+            Duration::from_secs(5),
+        ))
+        .expect("command starts");
+    service.wait(&info.id, None).await.expect("settles");
+
+    let window = service
+        .output(&info.id, ReplayCursor::Full, Some(4))
+        .expect("newest window");
+
+    assert_eq!(window.bytes, b"6789");
+    assert_eq!(
+        window.cursor, window.total_written,
+        "a tail window leaves nothing newer to page toward"
+    );
+    assert!(
+        !window.from_disk,
+        "the newest bytes are always still retained"
+    );
+}
+
 #[tokio::test]
 async fn terminal_retention_removes_the_oldest_state_and_both_files() {
     let directory = tempfile::tempdir().expect("workspace");
