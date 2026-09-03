@@ -206,7 +206,14 @@ resolves the tool as a typed denial and never fabricates an answer.
 
 With `mouse` absent or `true`, Zuno captures button, drag, release, and wheel events.
 Releasing a drag copies the selection through the configured clipboard and leaves the
-highlight visible. Transcript copy uses semantic message content: speaker labels, borders,
+highlight visible. Copy prefers OSC 52, so the text reaches the terminal you are actually
+looking at even over SSH or inside a multiplexer; when that write fails Zuno falls back to
+one local helper — `pbcopy` on macOS, `wl-copy`, `xclip`, or `xsel` on Linux, and
+`Set-Clipboard` through PowerShell on Windows — and reports both failures together rather
+than only the first. A host with no helper installed reports that no clipboard is
+available instead of appearing to copy. Every helper receives the selection on its
+standard input as clipboard data, never as a script to run, so a copy can never execute
+what the transcript contained. Transcript copy uses semantic message content: speaker labels, borders,
 padding, and terminal soft wraps are omitted; only explicit source newlines become
 clipboard newlines. Selection stays clamped rather than crossing into the sidebar,
 disclosure rows are clickable, and an overflowing conversation mounts a draggable scrollbar.
