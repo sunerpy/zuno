@@ -372,10 +372,19 @@ worth knowing when reading a transcript: blocked means nothing happened.
 ```
 
 Those are the defaults. Output beyond either limit is withheld rather than allowed to
-consume the model window. Nothing is truncated and nothing is lost: the full output is
-saved to a file, and the model receives one refusal naming the measured size, the limit it
-crossed, and that file's path. A call can ask for the whole thing by repeating itself with
-`accept_large_output: true`.
+consume the model window. Nothing is truncated and nothing is lost, and the call still
+succeeds: every byte is saved first — for `shell`, exactly the bytes the command wrote
+rather than a decoded copy of them — and what the model receives in place of the output is
+a notice naming the measured size, the limit it crossed, the artifact and its size, and
+the read that gets it back, which is `bg` with `action: "artifact"`.
+
+Withholding is an outcome, not a failure. The exit code, the verification receipt, and
+the sandbox facts of the command are all still on the result, and the artifact is recorded
+on the durable tool part twice over: in `outputPaths`, and in a typed `withheldOutput`
+object, so a client surface or a later turn can offer retrieval without parsing the
+notice. Sending the output back inline is still possible with `accept_large_output: true`,
+but that re-runs the call and spends the context this limit protects, so it is a
+deliberate back door rather than the first thing the notice suggests.
 
 ## See also
 

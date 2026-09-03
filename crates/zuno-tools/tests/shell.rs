@@ -1004,6 +1004,109 @@ async fn shell_oversized_output_is_detected_and_persisted_in_the_shared_store() 
     assert_eq!(window.cursor, window.total);
 }
 
+/// A command that succeeded and produced too much output is still a successful result.
+///
+/// Withholding used to be returned as a tool failure, which threw away the exit code,
+/// the verification receipt, and the artifact reference of a command that had run
+/// perfectly, and left the model with prose telling it to re-run a call `shell` declares
+/// must never be replayed.
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_withheld_output_keeps_the_receipt_and_offers_the_windowed_read() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store_dir = tempfile::tempdir().expect("store dir");
+    let store = ToolOutputStore::new(store_dir.path());
+    let tool = support::sandbox::shell_tool(dir.path())
+        .with_output_store(store.clone())
+        .with_output_limits(OutputLimits {
+            max_lines: 1,
+            max_bytes: 4,
+        });
+
+    let output = tool
+        .execute(
+            json!({ "command": "printf 'one\\ntwo\\n'" }),
+            context(Arc::new(zuno_tool::NeverInterrupted)),
+        )
+        .await
+        .expect("a command that ran does not fail because its output was large");
+
+    assert_eq!(output.metadata["exit"], 0);
+    assert_eq!(
+        output.metadata[VERIFICATION_METADATA_KEY]["exitAuthority"],
+        "authoritative"
+    );
+    assert_eq!(output.metadata["oversized"], true);
+    assert!(
+        output.output.contains("Tool output withheld"),
+        "{}",
+        output.output
+    );
+    assert!(output.output.contains("`bg`"), "{}", output.output);
+
+    let paths = output.output_paths();
+    let path = paths.first().expect("stored output path");
+    let window = store
+        .read_window(
+            "shell",
+            &context(Arc::new(zuno_tool::NeverInterrupted)).session_id,
+            std::path::Path::new(path),
+            0,
+            4_096,
+        )
+        .expect("stored full output");
+    assert_eq!(String::from_utf8(window.bytes).expect("text"), "one\ntwo\n");
+}
+
+/// The artifact holds the command's own bytes, even when they are not text.
+///
+/// The foreground handoff removes the execution's `.output` file as it hands the bytes
+/// back, so the artifact written here is the only copy that outlives the call. Decoding
+/// before persisting made that copy a record of the damage instead of the output.
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_persists_the_bytes_a_command_wrote_not_their_lossy_decoding() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store_dir = tempfile::tempdir().expect("store dir");
+    let store = ToolOutputStore::new(store_dir.path());
+    let tool = support::sandbox::shell_tool(dir.path())
+        .with_output_store(store.clone())
+        .with_output_limits(OutputLimits {
+            max_lines: 1,
+            max_bytes: 4,
+        });
+
+    let output = tool
+        .execute(
+            json!({ "command": r"printf 'a\nb\377\376\n'" }),
+            context(Arc::new(zuno_tool::NeverInterrupted)),
+        )
+        .await
+        .expect("withheld");
+
+    let paths = output.output_paths();
+    let path = paths.first().expect("stored output path");
+    let window = store
+        .read_window(
+            "shell",
+            &context(Arc::new(zuno_tool::NeverInterrupted)).session_id,
+            std::path::Path::new(path),
+            0,
+            4_096,
+        )
+        .expect("stored full output");
+    assert!(
+        window.bytes.contains(&0xff) && window.bytes.contains(&0xfe),
+        "the artifact must keep the bytes, not U+FFFD: {:?}",
+        window.bytes
+    );
+    assert!(
+        !output.output.contains('\u{fffd}'),
+        "the notice replaces the decoded text entirely: {}",
+        output.output
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_failing_stage_in_a_pipeline_is_reported_as_a_failure() {

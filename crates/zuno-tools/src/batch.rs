@@ -312,6 +312,10 @@ fn render(mut results: Vec<Invocation>, session_id: &str, store: &ToolOutputStor
                 ));
             }
             Ok(output) => {
+                // A sub-call whose output was withheld for size still succeeded, and its
+                // rendered block is the notice naming the artifact and the windowed read.
+                // Only a store that could not be written arrives here as an error, and
+                // that is the one case where this batch really lost the output.
                 match policy.apply(&result.tool, session_id, output, result.accept_large_output) {
                     Ok(output) => {
                         succeeded += 1;

@@ -573,8 +573,14 @@ async fn batch_forwards_only_the_arguments_the_model_supplied_to_a_strict_subtoo
     assert!(output.output.contains("Completed: 1 succeeded, 0 failed"));
 }
 
+/// A sub-call over the per-call budget keeps its output whole and still counts as done.
+///
+/// The expectation changed with the behaviour: withholding output for size used to be
+/// returned as an error, so a sub-call that ran perfectly was tallied as a failure and
+/// the batch reported `0 succeeded, 1 failed` for work that had in fact succeeded. What
+/// stays pinned is that nothing is truncated and the block says where the output went.
 #[tokio::test]
-async fn batch_oversized_subcall_output_is_persisted_and_refused_not_truncated() {
+async fn batch_oversized_subcall_output_is_withheld_whole_and_still_counts_as_succeeded() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let registry = registry(root.path(), vec![Arc::new(LargeTool)]);
 
@@ -587,11 +593,16 @@ async fn batch_oversized_subcall_output_is_persisted_and_refused_not_truncated()
             context(Arc::new(zuno_tool::AllowAll)),
         )
         .await
-        .expect("the batch reports a per-call refusal");
+        .expect("the batch reports a per-call withheld notice");
 
-    assert!(output.output.contains("Full output saved to"));
+    assert!(
+        output.output.contains("Every byte was saved to"),
+        "{}",
+        output.output
+    );
+    assert!(output.output.contains("`bg`"), "{}", output.output);
     assert!(!output.output.contains("(truncated)"));
-    assert!(output.output.contains("Completed: 0 succeeded, 1 failed"));
+    assert!(output.output.contains("Completed: 1 succeeded, 0 failed"));
 }
 
 /// A sub-tool that fails with a cause two links deep, like an MCP proxy relaying a

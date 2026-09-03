@@ -883,12 +883,18 @@ impl ShellTool {
                 .with_verification(&receipt),
             &execution.authority,
         );
-        OutputPolicy::new(self.output_store.clone(), self.output_limits)
-            .apply(TOOL_ID, session_id, output, accept_large_output)
-            .map_err(|error| ToolError::Failed {
-                tool: TOOL_ID.to_owned(),
-                source: Box::new(error),
-            })
+        // The bytes, not the lossy string: what a size policy persists is the copy that
+        // outlives this call, and the ephemeral `<id>.output` file was already removed by
+        // the foreground handoff above. Persisting the decoded text would have made the
+        // artifact a copy of the damage — `U+FFFD` where the command's bytes were — with
+        // no original left anywhere to page back.
+        OutputPolicy::new(self.output_store.clone(), self.output_limits).apply_bytes(
+            TOOL_ID,
+            session_id,
+            output,
+            &bytes,
+            accept_large_output,
+        )
     }
 
     /// The receipt for a finished run, reading a guard verdict as the guard's.

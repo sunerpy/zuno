@@ -21,7 +21,8 @@
 //! with [`zuno_pty::BackgroundExecutionService`] before spawn. Ordinary foreground
 //! state is consumed and removed at completion; explicit background mode and a
 //! foreground timeout retain that same execution durably. [`output_policy`] persists
-//! oversized foreground output before requiring explicit context-cost acceptance.
+//! oversized foreground output byte for byte, then withholds it behind a notice naming
+//! the windowed read that gets it back.
 //! [`risk`] adds a deterministic destructive-command tripwire before any foreground
 //! or background spawn. This is **not a sandbox**: shell commands retain the user's
 //! full filesystem, network, and credentials. A confinement layer is a named future
