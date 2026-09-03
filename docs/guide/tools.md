@@ -142,23 +142,36 @@ time. There are two kinds, and one cursor convention:
 | `bg artifact` | Output a size limit withheld | `outputPath` |
 
 `cursor` is an absolute byte offset and `limit` is the size of the window. Both reads
-return the cursor the next window starts at, plus `hasMore`, so you page by handing that
-cursor back rather than by guessing an offset. `limit` defaults to 16384 bytes and is
-clamped to 51200 — the byte threshold at which output stops being inlined at all — so a
-window can never be larger than what would have been returned inline. A window is bounded
-before anything is read, and asking for more than the ceiling is clamped rather than
-refused.
+return the cursor the next window starts at, plus `hasMore`, so you page forward by
+handing that cursor back rather than by guessing an offset. Both also return `windowFrom`
+and `hasEarlier`, the same two facts pointing backwards, so a window states where it
+begins instead of leaving you to subtract its length from its cursor. `limit` defaults to
+16384 bytes and is clamped to 51200. That ceiling is fixed — one window of `bg` is bounded
+the way one `read` of a file is — and it is deliberately not a function of
+`tool_output.max_bytes`: lowering the inline threshold does not shrink a retrieval window,
+because a retrieval is how output that threshold withheld is read back. A window is
+bounded before anything is read, and asking for more than the ceiling is clamped rather
+than refused.
 
 A running command retains its most recent 2 MiB in memory while its complete output stays
 on disk. A `cursor` older than what is still retained is served from that file, so the
 beginning of a long-running command's output stays reachable through `bg` instead of
 requiring a shell command to slice the file by hand. `fromDisk` reports which copy
-answered. Omitting `cursor` means "what is retained now", which is the tail a terminal
-renders and never a file read.
+answered.
+
+`bg output` and `bg wait` without a `cursor` return the newest window: the tail a terminal
+renders, ending at `totalWritten`, because that is where a command says what happened.
+Polling a running command that way keeps showing new bytes, and `windowFrom` is where to
+page backwards from. `bg artifact` is the other way round — a withheld artifact is not
+growing, and the notice that withheld it already stated its total size — so a read with no
+cursor starts at byte 0 and pages forward.
 
 Retrieval never re-runs the command that produced the output, and never goes through the
 output limits: a retrieved window is already bounded, and passing it through the limits
-would withhold it a second time.
+would withhold it a second time. That holds inside `execute`, where the sub-calls share
+one 50000-byte budget: a window larger than this composition's share is neither inlined
+nor persisted again. The block names the artifact that still holds every byte and the
+`limit` that would fit, so the next read is smaller rather than aimed at a new file.
 
 ## What a shell exit status proves
 
