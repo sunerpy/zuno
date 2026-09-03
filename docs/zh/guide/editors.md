@@ -148,7 +148,7 @@ zuno models
 4. 如果当前 Zuno profile 暴露了多个模型，选择想要的那个；
 5. 当所选模型公布了推理能力时，选择一个推理级别。
 
-Plan 模式总是激活只读的 `plan` Agent。回到 Build 模式会恢复所选的实现类 Agent。Agent 与模型的更改是会话本地的，并且在提示词正在运行时会被拒绝。
+Plan 模式总是激活只读的 `plan` Agent。回到 Build 模式会恢复所选的实现类 Agent。Agent 与模型的更改是会话本地的，并且在会话有工作在飞时会被拒绝：一个提示词请求、一个活跃回合，或由 `session/load` 恢复的后台续跑。
 
 `zuno acp` 不接受 `--agent` 启动参数。Agent 选择是一个 ACP 会话配置操作，不是第二个进程级配置面。
 
@@ -211,6 +211,39 @@ Zed 呈现权限与征询请求，但策略拥有者仍然是 Zuno：
 历史重放会为将来的 provider 请求保持 provider 推理胶囊持久，但当同一条消息已经包含它可见的推理摘要时，不会再渲染一份完全相同的胶囊副本。仅存在于 provider 侧的推理仍然可见，因此重放去重不会隐藏唯一可用的思考内容。
 
 Shell 工具调用的标题是提交时的确切命令，而不是加了解释器前缀的伪命令。例如，Zed 收到的可复制标题是 `git diff --check`，而解析出的 `zsh` 身份单独通过 `_meta.zuno.interpreter` 提供。完成与历史重放保留同样的形态。
+
+### 同一会话中的并发提示词
+
+一个会话同一时刻只跑一个回合，但在回合运行期间发出的提示词绝不会被丢掉。Zuno 先把它提交到该会话的持久输入 inbox，然后才决定由谁来跑：
+
+- 正常情况下它会被转向进正在运行的那个回合。模型在该回合的下一个安全点收到它 —— provider 请求之间，或在进行中的工具调用之后 —— 并在同一个回合里继续工作；
+- 如果正在运行的回合在转向落地之前就结束了，这条提示词会持久地留在队列中，由该会话的下一个回合按接纳顺序提升。
+
+ACP v1 没有「已接纳，但本请求没有跑任何回合」的成功形态：`stopReason` 是一个封闭枚举，任何取值都会把本请求从未拥有过的回合说错。因此 Zuno 用实现自定义区间内的一个 JSON-RPC 错误回答第二个 `session/prompt`，并把接纳事实放在 `error.data` 里：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "error": {
+    "code": -32001,
+    "message": "session ses_x is running a turn; this prompt was admitted durably and steered into it",
+    "data": {
+      "sessionId": "ses_x",
+      "admission": "steered",
+      "inputId": "msg_1f2e",
+      "admittedSequence": 42,
+      "delivery": "steer"
+    }
+  }
+}
+```
+
+当正在运行的回合接纳了这条提示词时，`data.admission` 为 `steered`；当它在等待下一个回合时为 `queued`。`delivery` 与 `admittedSequence` 就是那条持久 inbox 行自己的字段，`inputId` 指名该行。被接纳的提示词对应的 `user_message_chunk`、助手输出与 `stopReason` 全部到达拥有该回合的那个请求，所以一个忽略 `data` 的 v1 客户端仍然能看到这些工作 —— 它看到的是错误消息文本，而不是第二个 `stopReason`。
+
+斜杠命令不同。它要对宿主命令目录解析，并作为自己的回合运行，因此无法被转向进已经在飞的工作里。Zuno 用同一个错误码拒绝它，`admission` 为 `"rejected"`，`reason` 为 `"commandRequiresIdleSession"`，并且不写入任何持久内容；等会话空闲后重新发送即可。
+
+取消遵循同一条归属规则。对拥有回合的那个请求发 `$/cancel_request` 会中断该回合；取消一个已经以 `admission: "steered"` 或 `"queued"` 回答过的请求不会中断任何东西：它已经被回答过了，而它的提示词喂入的那个回合属于另一个请求。要不论归属地停掉会话的活跃回合，使用 `session/cancel`。
 
 ### 被委派的子会话
 

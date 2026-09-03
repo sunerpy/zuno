@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -9,10 +9,11 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use zuno_engine::admission::{InputAdmission, SessionInputAdmission, SteeringContent, TurnLease};
 use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
 use zuno_engine::session_command::SessionCommand;
-use zuno_engine::status::{SessionControl, SessionRunRegistry};
+use zuno_engine::status::{SessionControl, SessionRunGuard, SessionRunRegistry, SessionStatus};
 use zuno_llm::event::{FinishReason, RequestContentBlock};
 use zuno_tool::PermissionAsker;
 
@@ -123,7 +124,7 @@ impl zuno_acp::Agent for ProductionAcpAgent {
         };
         let session = self.state.sessions.lock().await.get(session_id).cloned();
         if let Some(session) = session {
-            session.cancel(HardInterruptReason::RequestCancelled);
+            session.cancel_request(params);
         }
     }
 }
@@ -402,7 +403,7 @@ impl ProductionAcpAgent {
         let prompt = parse_prompt(params)?;
         self.session(&session_id)
             .await?
-            .prompt(prompt, self.state.as_ref(), client)
+            .prompt(prompt, params, self.state.as_ref(), client)
             .await
     }
 
@@ -565,10 +566,14 @@ impl ProductionAcpAgent {
         .map_err(zuno_acp::RpcError::internal)?;
         let id = resources.host.session_id().to_owned();
         let control = resources.host.control();
+        let durable = SessionDurableHandles::from_resources(&resources, &self.state.runs);
         Ok(Arc::new(AcpSession {
             id,
             control,
-            prompt_active: AtomicBool::new(false),
+            runs: self.state.runs.clone(),
+            durable: std::sync::Mutex::new(Some(durable)),
+            turn_owner: std::sync::Mutex::new(None),
+            prompts_in_flight: AtomicUsize::new(0),
             replayed: AtomicBool::new(replayed),
             closed: AtomicBool::new(false),
             replay_gate: Mutex::new(()),
@@ -615,7 +620,10 @@ impl ProductionAcpAgent {
         Ok(Arc::new(AcpSession {
             id: session_id.clone(),
             control: self.state.runs.control(session_id),
-            prompt_active: AtomicBool::new(false),
+            runs: self.state.runs.clone(),
+            durable: std::sync::Mutex::new(None),
+            turn_owner: std::sync::Mutex::new(None),
+            prompts_in_flight: AtomicUsize::new(0),
             replayed: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             replay_gate: Mutex::new(()),
@@ -655,7 +663,24 @@ impl ProductionAcpAgent {
 struct AcpSession {
     id: String,
     control: SessionControl,
-    prompt_active: AtomicBool,
+    runs: SessionRunRegistry,
+    /// Durable handles reachable without the turn-exclusive resources mutex.
+    ///
+    /// A prompt that arrives during a live turn must reach the durable inbox
+    /// without waiting on the lock that turn holds, so admission state is lifted
+    /// out of [`SessionResources`] when the session activates.
+    durable: std::sync::Mutex<Option<SessionDurableHandles>>,
+    /// Params of the `session/prompt` request that owns the live turn, if any.
+    ///
+    /// `Agent::request_cancelled` reports only a withdrawn request's method and
+    /// params, so this is what distinguishes cancelling the running turn from
+    /// cancelling some other prompt request that never took the lease.
+    turn_owner: std::sync::Mutex<Option<Value>>,
+    /// How many `session/prompt` requests are currently being served.
+    ///
+    /// This counts requests; it never rejects one. Turn exclusion belongs to
+    /// [`SessionRunRegistry`] alone so two mechanisms cannot disagree.
+    prompts_in_flight: AtomicUsize,
     replayed: AtomicBool,
     closed: AtomicBool,
     replay_gate: Mutex<()>,
@@ -688,6 +713,22 @@ struct SessionResources {
     permission_asker: Arc<zuno_acp::AcpPermissionAsker>,
     configuration: SessionConfiguration,
     mcp_configuration_digest: String,
+}
+
+/// Durable state a prompt reaches before contending for the live-turn lease.
+#[derive(Clone)]
+struct SessionDurableHandles {
+    admission: SessionInputAdmission,
+    attachments: Arc<zuno_attachment::AttachmentStore>,
+}
+
+impl SessionDurableHandles {
+    fn from_resources(resources: &SessionResources, runs: &SessionRunRegistry) -> Self {
+        Self {
+            admission: SessionInputAdmission::new(resources.host.session_inbox(), runs.clone()),
+            attachments: resources.host.attachment_store(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1347,13 +1388,11 @@ impl AcpSession {
             )
         };
         loop {
-            let active = match ActivePrompt::begin(&self.prompt_active) {
-                Ok(active) => active,
-                Err(_) => {
-                    // A prompt that won the race owns the same continuation path.
-                    return Ok(());
-                }
-            };
+            if self.control.status() == SessionStatus::Busy {
+                // A prompt or another driver won the lease and owns the same
+                // continuation path.
+                return Ok(());
+            }
             let (events, mut receiver) = event_channel();
             let drive = async {
                 let mut resources = self.resources.lock().await;
@@ -1374,7 +1413,6 @@ impl AcpSession {
             };
             let (continued, ()) = tokio::join!(drive, project);
             let continued = continued?;
-            drop(active);
             if !continued {
                 break;
             }
@@ -1414,9 +1452,9 @@ impl AcpSession {
         if self.closed.load(Ordering::Acquire) {
             return Err(self.closed_error());
         }
-        if self.prompt_active.load(Ordering::Acquire) {
+        if self.has_work_in_flight() {
             return Err(zuno_acp::RpcError::invalid_params(format!(
-                "session {} has an active prompt and cannot be deleted",
+                "session {} has work in flight and cannot be deleted",
                 self.id
             )));
         }
@@ -1516,6 +1554,7 @@ impl AcpSession {
         .await;
         match rollback {
             Ok(resources) => {
+                self.install_durable_handles(&resources);
                 *slot = Some(resources);
                 zuno_acp::RpcError::internal(rollback_context.cause)
             }
@@ -1601,9 +1640,9 @@ impl AcpSession {
     ) -> Result<SessionConfiguration, zuno_acp::RpcError> {
         let reconfiguration_started = Instant::now();
         let change_kind = change.kind();
-        if !prompt_owns_session && self.prompt_active.load(Ordering::Acquire) {
+        if !prompt_owns_session && self.has_work_in_flight() {
             return Err(zuno_acp::RpcError::invalid_params(
-                "session configuration cannot change while a prompt is active",
+                "session configuration cannot change while work is in flight",
             ));
         }
         let mount = self.mount_gate.lock().await;
@@ -1769,6 +1808,7 @@ impl AcpSession {
             candidate.mcp = retained_mcp.take();
         }
         let configuration = candidate.configuration.clone();
+        self.install_durable_handles(&candidate);
         *slot = Some(candidate);
         drop(slot);
         drop(_composition);
@@ -1820,12 +1860,13 @@ impl AcpSession {
 
     async fn prompt(
         &self,
-        mut prompt: AcpPrompt,
+        prompt: AcpPrompt,
+        params: &Value,
         state: &AcpState,
         client: zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
+        let _in_flight = InFlightPrompt::enter(&self.prompts_in_flight);
         let native_session = prompt.slash_text().and_then(resolve_session_slash_prompt);
-        let _active = ActivePrompt::begin(&self.prompt_active)?;
         if self.closed.load(Ordering::Acquire) {
             return Err(self.closed_error());
         }
@@ -1839,29 +1880,56 @@ impl AcpSession {
         if activated {
             self.defer_available_commands(&client).await?;
         }
-        {
-            let resources = self.resources.lock().await;
-            let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
-            prompt.admit_images(resources.host.attachment_store().as_ref())?;
+        let handles = self.durable_handles()?;
+        match self.resolve_invocation(&prompt).await? {
+            Some(invocation) => self.drive_invocation(invocation, params, &client).await,
+            None => {
+                self.admit_and_drive_content(prompt, &handles, params, &client)
+                    .await
+            }
         }
-        self.recover_pending_human_requests(&client).await?;
-        let (context_size, invocation) = {
-            let resources = self.resources.lock().await;
-            let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
-            let invocation = prompt.slash_text().and_then(|text| {
-                resolve_slash_prompt(
-                    text,
-                    resources.host.commands(),
-                    &resources.host.slash_skills(),
-                )
-            });
-            (resources.configuration.context_size, invocation)
+    }
+
+    /// Resolve a command invocation without making a plain prompt wait on the turn.
+    ///
+    /// [`resolve_slash_prompt`] returns `None` for text that does not begin with
+    /// `/`, so the lexical test alone decides whether the host command catalog —
+    /// and the resources mutex a live turn holds — is needed at all.
+    async fn resolve_invocation(
+        &self,
+        prompt: &AcpPrompt,
+    ) -> Result<Option<SlashInvocation>, zuno_acp::RpcError> {
+        if !prompt
+            .slash_text()
+            .is_some_and(|text| text.starts_with('/'))
+        {
+            return Ok(None);
+        }
+        let resources = match self.resources.try_lock() {
+            Ok(resources) => resources,
+            Err(_) if self.control.status() == SessionStatus::Busy => {
+                return Err(command_requires_idle_session(&self.id));
+            }
+            Err(_) => self.resources.lock().await,
         };
-        let skill_selection_only = matches!(
-            &invocation,
-            Some(SlashInvocation::Skill { arguments, .. }) if arguments.is_empty()
-        );
-        if let Some(SlashInvocation::Session { command, arguments }) = &invocation
+        let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
+        Ok(prompt.slash_text().and_then(|text| {
+            resolve_slash_prompt(
+                text,
+                resources.host.commands(),
+                &resources.host.slash_skills(),
+            )
+        }))
+    }
+
+    /// Run one resolved slash invocation as this request's own turn.
+    async fn drive_invocation(
+        &self,
+        invocation: SlashInvocation,
+        params: &Value,
+        client: &zuno_acp::ClientConnection,
+    ) -> Result<Value, zuno_acp::RpcError> {
+        if let SlashInvocation::Session { command, arguments } = &invocation
             && !command.accepts_arguments()
             && !arguments.is_empty()
         {
@@ -1870,12 +1938,24 @@ impl AcpSession {
                 command.name()
             )));
         }
+        let skill_selection_only = matches!(
+            &invocation,
+            SlashInvocation::Skill { arguments, .. } if arguments.is_empty()
+        );
+        let Some(_owner) = self.claim_turn(params) else {
+            return Err(command_requires_idle_session(&self.id));
+        };
+        {
+            let guard = self.begin_turn()?;
+            self.recover_pending_human_requests(client, &guard).await?;
+        }
+        let context_size = self.context_size().await?;
         let (events, receiver) = event_channel();
         let drive = async {
             let mut resources = self.resources.lock().await;
             let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
             let outcome = match &invocation {
-                Some(SlashInvocation::Session { command, arguments }) => match command {
+                SlashInvocation::Session { command, arguments } => match command {
                     SessionCommand::Compact
                     | SessionCommand::Goal
                     | SessionCommand::Learn
@@ -1891,23 +1971,18 @@ impl AcpSession {
                         command.name()
                     ))),
                 },
-                Some(SlashInvocation::Command { name, arguments }) => resources
+                SlashInvocation::Command { name, arguments } => resources
                     .host
                     .drive_command(name, arguments, events.clone())
                     .await
                     .map_err(zuno_acp::RpcError::internal),
-                Some(SlashInvocation::Skill {
+                SlashInvocation::Skill {
                     name,
                     source,
                     arguments,
-                }) => resources
+                } => resources
                     .host
                     .drive_skill(name, source, arguments, events.clone())
-                    .await
-                    .map_err(zuno_acp::RpcError::internal),
-                None => resources
-                    .host
-                    .drive_content(&prompt.text, &prompt.content, events.clone())
                     .await
                     .map_err(zuno_acp::RpcError::internal),
             };
@@ -1916,16 +1991,96 @@ impl AcpSession {
         };
         let projection = project_turn(&self.id, context_size, receiver, client.clone());
         let (driven, projected) = tokio::join!(drive, projection);
-        let projected = projected?;
-        let mut driven = driven;
-        let mut projected = projected;
+        self.settle_turn(driven, projected?, skill_selection_only, client)
+            .await
+    }
+
+    /// Admit one content prompt durably, then drive it only if it owns the turn.
+    ///
+    /// The durable row is written before the live-turn lease is contended for. A
+    /// prompt that arrives while this session is busy is therefore recorded and
+    /// injected into the running turn instead of being refused with nothing kept.
+    async fn admit_and_drive_content(
+        &self,
+        mut prompt: AcpPrompt,
+        handles: &SessionDurableHandles,
+        params: &Value,
+        client: &zuno_acp::ClientConnection,
+    ) -> Result<Value, zuno_acp::RpcError> {
+        prompt.admit_images(handles.attachments.as_ref())?;
+        let row = zuno_db::inbox::NewSessionInput::new(
+            format!("msg_{}", uuid::Uuid::new_v4().simple()),
+            self.id.clone(),
+            acp_prompt_payload(&prompt)?,
+            zuno_db::inbox::InputDelivery::Steer,
+            zuno_db::message::now_millis(),
+        );
+        // A prompt that arrives while another request is still serving this
+        // session never contends for the lease that request releases between its
+        // turns: it is admitted durably and steered into the turn already running.
+        let owner = self.claim_turn(params);
+        let lease = if owner.is_some() {
+            TurnLease::Acquire
+        } else {
+            TurnLease::Deferred
+        };
+        let admitted = handles
+            .admission
+            .admit(row, lease, Some(steering_content(&prompt)))
+            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+        let (input, guard) = match admitted {
+            InputAdmission::Drive { input, guard } => (input, guard),
+            InputAdmission::Steered { input } => {
+                return Err(admitted_without_turn(&self.id, &input, true));
+            }
+            InputAdmission::Pending { input } => {
+                return Err(admitted_without_turn(&self.id, &input, false));
+            }
+        };
+        // `owner` is held for the rest of this request: releasing it earlier would
+        // let a second prompt claim the session between this request's turns.
+        self.recover_pending_human_requests(client, &guard).await?;
+        // The turn is driven from the durable row rather than from the request
+        // that wrote it, and the oldest queued prompt is promoted first. A prompt
+        // admitted while this session was busy is therefore delivered in
+        // admission order instead of behind whatever arrived after it.
+        let Some((driven, projected)) = self
+            .drive_next_durable_input(client, &guard, DurableInputScope::Prompts)
+            .await?
+        else {
+            // Another driver claimed the row between admission and promotion. It
+            // is durable there, so this request has no turn of its own to report.
+            return Err(admitted_without_turn(&self.id, &input, false));
+        };
+        // Goal continuation takes its own lease, so this one must be released first.
+        drop(guard);
+        self.settle_turn(driven, projected, false, client).await
+    }
+
+    /// Project one prompt request's turns until the request has a stop reason.
+    async fn settle_turn(
+        &self,
+        mut driven: Result<(), zuno_acp::RpcError>,
+        mut projected: ProjectedTurn,
+        skill_selection_only: bool,
+        client: &zuno_acp::ClientConnection,
+    ) -> Result<Value, zuno_acp::RpcError> {
         loop {
             self.flush_subagents().await?;
-            self.project_work_state(&client).await?;
+            self.project_work_state(client).await?;
             match projected {
                 ProjectedTurn::Completed(stop_reason) => {
                     driven?;
-                    if let Some(next) = self.drive_goal_continuation(&client).await? {
+                    if let Some(next) = self.drive_goal_continuation(client).await? {
+                        (driven, projected) = next;
+                        continue;
+                    }
+                    // A prompt admitted while this session was busy stays durably
+                    // queued when the running turn ended before reaching a safe
+                    // point. The request that just finished a turn drains it, so
+                    // a queued admission is a promise this surface keeps rather
+                    // than a row nothing ever claims.
+                    if let Some(next) = self.drain_queued_prompts(client).await? {
                         (driven, projected) = next;
                         continue;
                     }
@@ -1936,7 +2091,11 @@ impl AcpSession {
                     if !self.answer_pending_human_request(&request_id).await? {
                         return Ok(json!({ "stopReason": "end_turn" }));
                     }
-                    let Some(next) = self.drive_next_durable_input(&client).await? else {
+                    let guard = self.begin_turn()?;
+                    let Some(next) = self
+                        .drive_next_durable_input(client, &guard, DurableInputScope::Answers)
+                        .await?
+                    else {
                         return Err(zuno_acp::RpcError::internal(format!(
                             "answered human request `{request_id}` did not admit durable input"
                         )));
@@ -2006,9 +2165,14 @@ impl AcpSession {
         }
     }
 
+    /// Settle durable work that outlived an earlier process before this turn.
+    ///
+    /// `guard` is the caller's live-turn lease. Recovery runs inside it so a
+    /// recovered input cannot race the prompt that triggered recovery.
     async fn recover_pending_human_requests(
         &self,
         client: &zuno_acp::ClientConnection,
+        guard: &SessionRunGuard,
     ) -> Result<(), zuno_acp::RpcError> {
         loop {
             let pending_request_id = {
@@ -2030,7 +2194,10 @@ impl AcpSession {
                 return Ok(());
             }
 
-            let Some((driven, projected)) = self.drive_next_durable_input(client).await? else {
+            let Some((driven, projected)) = self
+                .drive_next_durable_input(client, guard, DurableInputScope::Answers)
+                .await?
+            else {
                 return Ok(());
             };
             match projected {
@@ -2056,23 +2223,42 @@ impl AcpSession {
         }
     }
 
+    /// Promote and drive the oldest pending row `scope` entitles this drive to run.
+    ///
+    /// A row outside the scope — a queued TUI submission, an HTTP body with its own
+    /// agent override, a settled report the wake path owns — is left pending and
+    /// skipped. Failing the request instead would make one foreign row brick every
+    /// later prompt in the session.
     async fn drive_next_durable_input(
         &self,
         client: &zuno_acp::ClientConnection,
+        guard: &SessionRunGuard,
+        scope: DurableInputScope,
     ) -> Result<Option<(Result<(), zuno_acp::RpcError>, ProjectedTurn)>, zuno_acp::RpcError> {
-        let (input_id, text, context_size) = {
+        let (input_id, drivable, context_size) = {
             let resources = self.resources.lock().await;
             let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
             let inbox = resources.host.session_inbox();
-            let Some(input) = inbox
+            let pending = inbox
                 .pending(resources.host.session_id())
-                .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
-                .into_iter()
-                .next()
-            else {
+                .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+            let Some((input, drivable)) = pending.into_iter().find_map(|input| {
+                match scope.admits(&input) {
+                    Some(drivable) => Some((input, drivable)),
+                    None => {
+                        tracing::debug!(
+                            target: "zuno::acp::inbox",
+                            session_id = %self.id,
+                            input_id = %input.id,
+                            scope = ?scope,
+                            "pending durable input is outside this drive's scope; leaving it queued"
+                        );
+                        None
+                    }
+                }
+            }) else {
                 return Ok(None);
             };
-            let text = durable_input_text(&input)?;
             let promoted = inbox
                 .promote_id(resources.host.session_id(), &input.id)
                 .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
@@ -2082,22 +2268,72 @@ impl AcpSession {
                         input.id
                     ))
                 })?;
-            (promoted.id, text, resources.configuration.context_size)
+            (promoted.id, drivable, resources.configuration.context_size)
         };
         let (events, receiver) = event_channel();
         let drive = async {
             let mut resources = self.resources.lock().await;
             let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
-            let outcome = resources
-                .host
-                .drive_promoted(&text, &input_id, events.clone())
-                .await;
+            let outcome = if drivable.content.is_empty() {
+                resources
+                    .host
+                    .drive_promoted_with_guard(&drivable.text, &input_id, guard, events.clone())
+                    .await
+            } else {
+                resources
+                    .host
+                    .drive_promoted_content_with_guard(
+                        &drivable.text,
+                        &drivable.content,
+                        &input_id,
+                        guard,
+                        events.clone(),
+                    )
+                    .await
+            };
             drop(events);
             outcome.map_err(zuno_acp::RpcError::internal)
         };
         let projection = project_turn(&self.id, context_size, receiver, client.clone());
         let (driven, projected) = tokio::join!(drive, projection);
         Ok(Some((driven, projected?)))
+    }
+
+    /// Drive the oldest prompt this surface admitted that is still queued.
+    ///
+    /// The lease is taken here instead of being held from the previous turn
+    /// because goal continuation acquires its own: a lease held across it
+    /// suppresses continuation entirely. Losing the lease is not a failure —
+    /// whoever holds it drains the same queue.
+    async fn drain_queued_prompts(
+        &self,
+        client: &zuno_acp::ClientConnection,
+    ) -> Result<Option<(Result<(), zuno_acp::RpcError>, ProjectedTurn)>, zuno_acp::RpcError> {
+        if !self.has_queued_prompt().await? {
+            return Ok(None);
+        }
+        let Ok(guard) = self.runs.begin_turn(self.id.clone()) else {
+            return Ok(None);
+        };
+        let next = self
+            .drive_next_durable_input(client, &guard, DurableInputScope::Prompts)
+            .await?;
+        drop(guard);
+        Ok(next)
+    }
+
+    /// Whether a prompt this surface admitted is still waiting in the inbox.
+    async fn has_queued_prompt(&self) -> Result<bool, zuno_acp::RpcError> {
+        let resources = self.resources.lock().await;
+        let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
+        let pending = resources
+            .host
+            .session_inbox()
+            .pending(resources.host.session_id())
+            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+        Ok(pending
+            .iter()
+            .any(|input| DurableInputScope::Prompts.admits(input).is_some()))
     }
 
     async fn drive_goal_continuation(
@@ -2205,6 +2441,16 @@ impl AcpSession {
         state: &AcpState,
         client: zuno_acp::ClientConnection,
     ) -> Result<bool, zuno_acp::RpcError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(self.closed_error());
+        }
+        // Durable handles are installed after the resources they come from, so
+        // observing them means activation finished. Checking before the mount gate
+        // keeps a steering prompt off both that gate and the resources mutex a live
+        // turn holds for the whole turn.
+        if self.durable_installed() {
+            return Ok(false);
+        }
         let _mount = self.mount_gate.lock().await;
         if self.closed.load(Ordering::Acquire) {
             return Err(self.closed_error());
@@ -2258,6 +2504,7 @@ impl AcpSession {
                 self.id
             )));
         }
+        self.install_durable_handles(&resources);
         *self.resources.lock().await = Some(resources);
         Ok(true)
     }
@@ -2295,12 +2542,108 @@ impl AcpSession {
         Ok(())
     }
 
+    /// Interrupt the session's live turn on behalf of a session-scoped cancel.
+    ///
+    /// The armed-next disposition is deliberate: a cancel that arrives between a
+    /// prompt being accepted and its lease being taken still stops that turn.
     fn cancel(&self, reason: HardInterruptReason) {
-        if self.prompt_active.load(Ordering::Acquire) {
-            let _disposition = self
-                .control
-                .abort(HardInterruptRequest::new(HardInterruptSource::Acp, reason));
+        if !self.has_work_in_flight() {
+            return;
         }
+        let _disposition = self
+            .control
+            .abort(HardInterruptRequest::new(HardInterruptSource::Acp, reason));
+    }
+
+    /// Interrupt only when the withdrawn request is the one that owns the turn.
+    ///
+    /// A prompt admitted as steering was already answered, and a prompt still
+    /// waiting for a lease has nothing running to interrupt. Aborting for either
+    /// would destroy a turn that belongs to a different request.
+    fn cancel_request(&self, params: &Value) {
+        let owns_turn = self
+            .turn_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            == Some(params);
+        if owns_turn {
+            self.cancel(HardInterruptReason::RequestCancelled);
+        }
+    }
+
+    /// Whether any prompt request or process-local turn is still running.
+    fn has_work_in_flight(&self) -> bool {
+        self.prompts_in_flight.load(Ordering::Acquire) > 0
+            || self.control.status() == SessionStatus::Busy
+    }
+
+    /// Durable admission state, available once the session is active.
+    fn durable_handles(&self) -> Result<SessionDurableHandles, zuno_acp::RpcError> {
+        self.durable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| self.closed_error())
+    }
+
+    /// Republish durable handles for a newly installed set of resources.
+    ///
+    /// Reconfiguration rebuilds the host, so handles taken from the previous one
+    /// must not outlive it.
+    fn install_durable_handles(&self, resources: &SessionResources) {
+        *self
+            .durable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(SessionDurableHandles::from_resources(resources, &self.runs));
+    }
+
+    fn durable_installed(&self) -> bool {
+        self.durable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    /// Acquire this session's exclusive live-turn lease.
+    fn begin_turn(&self) -> Result<SessionRunGuard, zuno_acp::RpcError> {
+        self.runs.begin_turn(self.id.clone()).map_err(|_| {
+            zuno_acp::RpcError::session_busy(format!(
+                "session {} is already running a turn, so this request cannot own one",
+                self.id
+            ))
+            .with_data(json!({ "sessionId": self.id, "admission": "rejected" }))
+        })
+    }
+
+    /// Claim the right to serve this session's turns for one prompt request.
+    ///
+    /// Exactly one prompt request serves a session at a time, and only that
+    /// request takes a live-turn lease. Between its turns the lease is briefly
+    /// free — goal continuation takes its own — so without this claim a second
+    /// request could win a lease inside that window, leaving a cancellation
+    /// unable to say which request the running turn belongs to.
+    fn claim_turn(&self, params: &Value) -> Option<PromptTurnOwner<'_>> {
+        let mut owner = self
+            .turn_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if owner.is_some() {
+            return None;
+        }
+        *owner = Some(params.clone());
+        drop(owner);
+        Some(PromptTurnOwner { session: self })
+    }
+
+    async fn context_size(&self) -> Result<u64, zuno_acp::RpcError> {
+        let resources = self.resources.lock().await;
+        Ok(resources
+            .as_ref()
+            .ok_or_else(|| self.closed_error())?
+            .configuration
+            .context_size)
     }
 
     async fn replay(
@@ -2404,7 +2747,7 @@ impl AcpSession {
 
     async fn shutdown(&self) -> Result<(), String> {
         self.closed.store(true, Ordering::Release);
-        if self.prompt_active.load(Ordering::Acquire) {
+        if self.prompts_in_flight.load(Ordering::Acquire) > 0 {
             let _disposition = self.control.abort(HardInterruptRequest::new(
                 HardInterruptSource::Lifecycle,
                 HardInterruptReason::SessionClose,
@@ -2434,6 +2777,10 @@ impl AcpSession {
         };
         self.control.wait_until_idle().await;
         self.dormant.lock().await.take();
+        self.durable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         let resources = self.resources.lock().await.take();
         let resources_result = if let Some(resources) = resources {
             let (background_jobs, session_id) = resources.host.background_job_scope();
@@ -3009,26 +3356,36 @@ const fn reasoning_effort_name(effort: zuno_llm::effort::ReasoningEffort) -> &'s
     }
 }
 
-struct ActivePrompt<'a> {
-    active: &'a AtomicBool,
+/// Marks the request whose turn a `session/prompt` cancellation should abort.
+struct PromptTurnOwner<'a> {
+    session: &'a AcpSession,
 }
 
-impl<'a> ActivePrompt<'a> {
-    fn begin(active: &'a AtomicBool) -> Result<Self, zuno_acp::RpcError> {
-        active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| {
-                zuno_acp::RpcError::invalid_params(
-                    "a prompt is already active for this ACP session",
-                )
-            })?;
-        Ok(Self { active })
+impl Drop for PromptTurnOwner<'_> {
+    fn drop(&mut self) {
+        *self
+            .session
+            .turn_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 
-impl Drop for ActivePrompt<'_> {
+/// Counts one in-flight `session/prompt` request for its whole lifetime.
+struct InFlightPrompt<'a> {
+    count: &'a AtomicUsize,
+}
+
+impl<'a> InFlightPrompt<'a> {
+    fn enter(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self { count }
+    }
+}
+
+impl Drop for InFlightPrompt<'_> {
     fn drop(&mut self) {
-        self.active.store(false, Ordering::Release);
+        self.count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -3510,26 +3867,126 @@ async fn project_turn(
     Ok(ProjectedTurn::Missing)
 }
 
-fn durable_input_text(input: &zuno_db::inbox::SessionInput) -> Result<String, zuno_acp::RpcError> {
-    if super::background_notification::is_async_notification(&input.prompt)
-        || input.prompt.get("kind").and_then(Value::as_str) == Some("humanRequestAnswer")
-    {
-        return input
-            .prompt
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                zuno_acp::RpcError::internal(format!(
-                    "durable input `{}` has no string `text`",
-                    input.id
-                ))
-            });
+/// The durable payload written for one ACP content prompt.
+///
+/// `text` is the model-visible projection the turn renders; `content` keeps the
+/// typed blocks so a replayed row still carries its resource links and admitted
+/// image references instead of only the prose rendering.
+fn acp_prompt_payload(prompt: &AcpPrompt) -> Result<Value, zuno_acp::RpcError> {
+    let content = serde_json::to_value(&prompt.content)
+        .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+    Ok(json!({
+        "kind": zuno_db::inbox::DurableInputKind::AcpPrompt
+            .as_str()
+            .unwrap_or_default(),
+        "text": prompt.text,
+        "content": content,
+    }))
+}
+
+/// The projection a live turn injects when this prompt does not own the turn.
+fn steering_content(prompt: &AcpPrompt) -> SteeringContent {
+    let attachments = prompt
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            RequestContentBlock::ImageAttachment { reference } => Some(reference.clone()),
+            _ => None,
+        })
+        .collect();
+    SteeringContent::user(prompt.text.clone()).with_attachments(attachments)
+}
+
+/// Report a prompt that is durable but is not this request's own turn.
+///
+/// ACP v1 has no success shape for "accepted into another request's turn":
+/// `stopReason` is a closed enum, so every member would misdescribe a turn this
+/// request never ran. The admission facts therefore travel in `data`, under a
+/// JSON-RPC implementation-defined server error code.
+fn admitted_without_turn(
+    session_id: &str,
+    input: &zuno_db::inbox::SessionInput,
+    steered: bool,
+) -> zuno_acp::RpcError {
+    let message = if steered {
+        format!(
+            "session {session_id} is running a turn; this prompt was admitted durably and \
+             steered into it"
+        )
+    } else {
+        format!(
+            "session {session_id} is running a turn; this prompt was admitted durably and is \
+             queued for the next turn"
+        )
+    };
+    zuno_acp::RpcError::session_busy(message).with_data(json!({
+        "sessionId": session_id,
+        "admission": if steered { "steered" } else { "queued" },
+        "inputId": input.id,
+        "admittedSequence": input.admitted_sequence,
+        "delivery": match input.delivery {
+            zuno_db::inbox::InputDelivery::Queue => "queue",
+            zuno_db::inbox::InputDelivery::Steer => "steer",
+        },
+    }))
+}
+
+/// Report a command invocation that needs a turn this session cannot give it yet.
+///
+/// A slash command is resolved against the host catalog and runs as its own turn,
+/// so unlike a content prompt it cannot be steered into work already in flight.
+/// Nothing durable is written, and `admission: "rejected"` says so.
+fn command_requires_idle_session(session_id: &str) -> zuno_acp::RpcError {
+    zuno_acp::RpcError::session_busy(format!(
+        "session {session_id} is running a turn, so a command invocation cannot be resolved yet"
+    ))
+    .with_data(json!({
+        "sessionId": session_id,
+        "admission": "rejected",
+        "reason": "commandRequiresIdleSession",
+    }))
+}
+
+/// One durable input the ACP surface can drive as a turn.
+struct AcpDurableInput {
+    text: String,
+    content: Vec<RequestContentBlock>,
+}
+
+/// Which pending durable rows one ACP drive is entitled to claim.
+///
+/// Promoting a row this surface cannot run would strand it, and running a row
+/// that belongs to different work would misattribute it, so each call site names
+/// the shapes it owns instead of taking whichever row happens to be oldest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableInputScope {
+    /// Answers to durable human requests, settled by the surface that asked.
+    Answers,
+    /// Prompts this surface admitted, which only it drains.
+    Prompts,
+}
+
+impl DurableInputScope {
+    /// Decode `input` when this scope owns its shape, or `None` to skip the row.
+    ///
+    /// Returning `None` rather than an error is the point: one row this drive
+    /// must not claim cannot be allowed to fail every later prompt in the session.
+    fn admits(self, input: &zuno_db::inbox::SessionInput) -> Option<AcpDurableInput> {
+        let kind = zuno_db::inbox::DurableInputKind::classify(&input.prompt)?;
+        let owned = match self {
+            Self::Answers => kind == zuno_db::inbox::DurableInputKind::HumanRequestAnswer,
+            Self::Prompts => kind == zuno_db::inbox::DurableInputKind::AcpPrompt,
+        };
+        if !owned {
+            return None;
+        }
+        let text = kind.plain_text(&input.prompt)?.to_owned();
+        let content = match kind.content_blocks(&input.prompt) {
+            Some(blocks) => serde_json::from_value(Value::Array(blocks.clone())).ok()?,
+            None => Vec::new(),
+        };
+        Some(AcpDurableInput { text, content })
     }
-    Err(zuno_acp::RpcError::internal(format!(
-        "durable input `{}` has an unsupported ACP prompt shape",
-        input.id
-    )))
 }
 
 fn lifecycle_directory(params: &Value) -> Result<PathBuf, zuno_acp::RpcError> {

@@ -9,6 +9,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRea
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
+/// JSON-RPC code for a prompt admitted durably without owning its own turn.
+pub const SESSION_BUSY_CODE: i64 = -32001;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("ACP request failed ({code}): {message}")]
 pub struct RpcError {
@@ -41,6 +44,25 @@ impl RpcError {
     #[must_use]
     pub fn cancelled(message: impl Into<String>) -> Self {
         Self::new(-32800, message)
+    }
+
+    /// The session already owns a live turn, so this request is not its own turn.
+    ///
+    /// ACP v1 has no success shape for "accepted into a different request's turn":
+    /// `stopReason` is a closed enum, and every member would be a false claim about
+    /// a turn this request never ran. JSON-RPC reserves -32000 through -32099 for
+    /// implementation-defined server errors, so the outcome is reported there with
+    /// machine-readable [`Self::data`] describing the durable admission.
+    #[must_use]
+    pub fn session_busy(message: impl Into<String>) -> Self {
+        Self::new(SESSION_BUSY_CODE, message)
+    }
+
+    /// Attach machine-readable detail to this error response.
+    #[must_use]
+    pub fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(data);
+        self
     }
 
     fn new(code: i64, message: impl Into<String>) -> Self {

@@ -23,6 +23,16 @@ connection concurrency are unchanged, avoiding an unnecessary network or
 subprocess handshake. Structural MCP changes still reconnect. Reconfiguration
 logs include phase timings but omit selected values and credentials.
 
+A `session/prompt` that arrives while the session is already running a turn is
+committed to the durable input inbox first and then steered into that turn, so
+the model receives it without the running work being interrupted. That second
+request is answered with JSON-RPC error `-32001` whose `data` reports `admission`
+(`steered`, `queued`, or `rejected`), `sessionId`, and the durable `inputId`; the
+streamed output and the `stopReason` stay on the request that owns the turn. A
+slash command cannot be steered and is refused with
+`reason: "commandRequiresIdleSession"` and nothing durable written. See
+[Zed ACP integration](/reference/zed-acp) for the full shape.
+
 Plan projection is driven by durable work-state revisions, not by recognizing a
 `plan_update` tool call. Each session reads and publishes the authoritative
 complete Plan after a change, deduplicates by `(plan_id, revision)`, flushes the

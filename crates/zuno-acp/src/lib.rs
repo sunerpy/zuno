@@ -23,7 +23,9 @@ pub use replay::{
     durable_usage_update, durable_work_updates,
 };
 pub use routing::{AcpSessionRoute, RoutedSession};
-pub use transport::{Agent, ClientConnection, RpcError, ServeError, serve_stdio};
+pub use transport::{
+    Agent, ClientConnection, RpcError, SESSION_BUSY_CODE, ServeError, serve_stdio,
+};
 
 pub const IMPLEMENTED_METHODS: [&str; 11] = [
     "initialize",

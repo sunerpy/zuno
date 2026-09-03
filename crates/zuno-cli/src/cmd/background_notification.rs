@@ -348,17 +348,13 @@ async fn deliver_pending_inputs(session_id: &str, target: &NotificationTarget) {
     }
 }
 
+/// Whether this durable prompt is a settled report the idle wake path delivers.
+///
+/// The published shapes live in one classifier so a new writer cannot silently
+/// escape this test.
 pub(super) fn is_async_notification(prompt: &Value) -> bool {
-    matches!(
-        prompt.get("kind").and_then(Value::as_str),
-        Some(
-            "subagentReport"
-                | "productAgentReport"
-                | "workflowReport"
-                | "councilReport"
-                | "backgroundExecutionReport"
-        )
-    )
+    zuno_db::inbox::DurableInputKind::classify(prompt)
+        .is_some_and(zuno_db::inbox::DurableInputKind::is_asynchronous_report)
 }
 
 async fn wake_with_retry(wake: &dyn ParentReportWake, input: SessionInput) {
