@@ -1143,8 +1143,44 @@ pub(crate) async fn compact_session(
         );
         outcome
     };
+    // The lease is released either way. Input admitted while the compaction held it
+    // has been waiting in the durable inbox; drive it now instead of leaving it for
+    // whichever external event happens to wake the session next.
+    resume_pending_inputs(&state, &services, Arc::clone(executor), &session_id).await;
     outcome.map_err(ApiError::MutationFailed)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Start a prompt driver for input admitted while another lease holder (a
+/// compaction) owned the session.
+///
+/// Losing `begin_turn` to a concurrent prompt is fine: that prompt's driver drains
+/// the same FIFO. The idle wait covers an executor that releases its guard a moment
+/// after returning.
+async fn resume_pending_inputs(
+    state: &ApiState,
+    services: &ServerServices,
+    executor: Arc<dyn crate::SessionMutationExecutor>,
+    session_id: &str,
+) {
+    match SessionInbox::new(state.pool_arc()).pending(session_id) {
+        Ok(pending) if pending.is_empty() => return,
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("session input inspection failed for `{session_id}`: {error}");
+            return;
+        }
+    }
+    services.runs.wait_until_idle(session_id).await;
+    if let Ok(guard) = services.runs.begin_turn(session_id) {
+        spawn_prompt_driver(
+            state.clone(),
+            services.clone(),
+            executor,
+            session_id.to_owned(),
+            guard,
+        );
+    }
 }
 
 pub async fn wait(
@@ -1163,7 +1199,11 @@ pub async fn interrupt(
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     state.sessions().get(&session_id)?;
-    services.runs.abort(
+    // Only a live turn can be interrupted. With nothing running there is nothing to
+    // cancel, and arming the registry instead would leave a marker with no expiry
+    // that cancels whichever ordinary turn starts next — including an explicit
+    // `resume` of input that was deliberately queued.
+    let _interrupted_live_turn = services.runs.abort_active(
         &session_id,
         HardInterruptRequest::new(HardInterruptSource::Api, HardInterruptReason::UserCancel),
     );

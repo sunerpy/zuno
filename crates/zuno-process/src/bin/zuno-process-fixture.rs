@@ -29,6 +29,7 @@ fn run() -> io::Result<()> {
     let stop = arguments.next();
     match mode.as_str() {
         "parent" => parent(Path::new(&ready), stop.as_deref().map(Path::new)),
+        "dying-parent" => dying_parent(Path::new(&ready)),
         "payload" => payload(Path::new(&ready)),
         "exiting-payload" => exiting_payload(Path::new(&ready)),
         "grandchild" => grandchild(),
@@ -59,6 +60,29 @@ fn parent(ready: &Path, stop: Option<&Path>) -> io::Result<()> {
     zuno_process::request_contained_process_shutdown(child.id())?;
     let _status = child.wait()?;
     Ok(())
+}
+
+/// Launch a guarded payload, wait until it has published its PIDs, then exit without
+/// stopping anything. The guard must notice its parent is gone and reap the tree.
+fn dying_parent(ready: &Path) -> io::Result<()> {
+    let executable = std::env::current_exe()?;
+    zuno_process::activate_guard_executable(&executable)?;
+    let (program, arguments) =
+        zuno_process::guarded_argv(&executable, ["payload".as_ref(), ready.as_os_str()]);
+    let _guard = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let started = std::time::Instant::now();
+    while !ready.exists() {
+        if started.elapsed() > Duration::from_secs(10) {
+            return Err(io::Error::other("payload never published its PIDs"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::process::exit(0)
 }
 
 fn payload(ready: &Path) -> io::Result<()> {

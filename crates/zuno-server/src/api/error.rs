@@ -232,6 +232,11 @@ impl IntoResponse for ApiError {
             Self::ProviderNotFound(_) | Self::MissingQueryKey(_) => {
                 unreachable!("the upstream-shaped failures return before the local envelope")
             }
+            Self::Event(EventStreamError::SessionNotFound { session_id }) => (
+                StatusCode::NOT_FOUND,
+                "not_found",
+                format!("session `{session_id}` was not found"),
+            ),
             Self::Event(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "event_stream_failed",

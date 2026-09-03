@@ -1,6 +1,7 @@
 //! Process-tree containment shared by every resident external host.
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
@@ -14,6 +15,107 @@ use std::time::Instant;
 /// Public only so tests build guard argv from this definition rather than
 /// repeating the literal.
 pub const GUARD_MARKER: &str = "__zuno_child_guard";
+
+/// The guard's exit status when the guard itself failed.
+///
+/// This is the wrapper-utility convention shared with `timeout`, `env`, `nice`,
+/// and `nohup`: the supervised command's outcome is unknown from this status alone.
+/// A consumer must treat it as an infrastructure or uncertain failure, never as the
+/// command reporting `exit 125` itself. Signal death is not mapped to a code at
+/// all: the guard re-raises the payload's signal on itself so the consumer's
+/// `ExitStatus::signal()` is the truth, and Windows native exit codes are passed
+/// through verbatim.
+pub const GUARD_FAILURE_EXIT_CODE: u8 = 125;
+/// The guard's exit status when the payload program exists but could not be run.
+pub const GUARD_NOT_EXECUTABLE_EXIT_CODE: u8 = 126;
+/// The guard's exit status when the payload program could not be found.
+pub const GUARD_NOT_FOUND_EXIT_CODE: u8 = 127;
+
+/// What a guard's exit status says about the payload it supervised.
+///
+/// The three reserved codes are ambiguous with a payload that chooses to exit
+/// with 125, 126, or 127 itself; that ambiguity is inherent to an exit-status
+/// channel and is the same one every shell accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardExit {
+    /// The payload exited with this code, reported verbatim.
+    Exited(i32),
+    /// The payload was killed by this signal, which the guard re-raised on itself.
+    Signaled(i32),
+    /// The payload program could not be found; nothing ran.
+    NotFound,
+    /// The payload program exists but could not be executed; nothing ran.
+    NotExecutable,
+    /// The guard itself failed. Whether the payload ran is unknown from this status.
+    GuardFailed,
+}
+
+impl GuardExit {
+    /// Classify the exit status of a process launched through [`guarded_argv`].
+    #[must_use]
+    pub fn classify(status: &ExitStatus) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+
+            if let Some(signal) = status.signal() {
+                return Self::Signaled(signal);
+            }
+        }
+        match status.code() {
+            Some(code) if code == i32::from(GUARD_FAILURE_EXIT_CODE) => Self::GuardFailed,
+            Some(code) if code == i32::from(GUARD_NOT_EXECUTABLE_EXIT_CODE) => Self::NotExecutable,
+            Some(code) if code == i32::from(GUARD_NOT_FOUND_EXIT_CODE) => Self::NotFound,
+            Some(code) => Self::Exited(code),
+            None => Self::GuardFailed,
+        }
+    }
+}
+
+/// Why a guard run ended without a payload status.
+#[derive(Debug)]
+enum GuardError {
+    /// The payload never started: its program could not be spawned or exec'd.
+    PayloadSpawn(io::Error),
+    /// The guard's own machinery failed, before or after the payload started.
+    Guard(io::Error),
+}
+
+impl GuardError {
+    fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::PayloadSpawn(error) if error.kind() == io::ErrorKind::NotFound => {
+                ExitCode::from(GUARD_NOT_FOUND_EXIT_CODE)
+            }
+            Self::PayloadSpawn(_) => ExitCode::from(GUARD_NOT_EXECUTABLE_EXIT_CODE),
+            Self::Guard(_) => ExitCode::from(GUARD_FAILURE_EXIT_CODE),
+        }
+    }
+}
+
+impl fmt::Display for GuardError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadSpawn(error) => {
+                write!(formatter, "guarded program could not be started: {error}")
+            }
+            Self::Guard(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl From<io::Error> for GuardError {
+    fn from(error: io::Error) -> Self {
+        Self::Guard(error)
+    }
+}
+
+#[cfg(unix)]
+impl From<rustix::io::Errno> for GuardError {
+    fn from(error: rustix::io::Errno) -> Self {
+        Self::Guard(error.into())
+    }
+}
 const SUPERVISE_MODE: &str = "supervise";
 const SUPERVISE_FOREGROUND_MODE: &str = "supervise-foreground";
 const MONITOR_FOREGROUND_MODE: &str = "monitor-foreground";
@@ -257,13 +359,18 @@ pub fn run_guard_from_args() -> Option<ExitCode> {
     if arguments.get(1).and_then(|value| value.to_str()) != Some(GUARD_MARKER) {
         return None;
     }
-    Some(match parse_guard(&arguments).and_then(run_guard) {
-        Ok(status) => exit_code(status),
-        Err(error) => {
-            eprintln!("child-process guard failed: {error}");
-            ExitCode::FAILURE
-        }
-    })
+    Some(
+        match parse_guard(&arguments)
+            .map_err(GuardError::Guard)
+            .and_then(run_guard)
+        {
+            Ok(status) => payload_exit_code(status),
+            Err(error) => {
+                eprintln!("child-process guard failed: {error}");
+                error.exit_code()
+            }
+        },
+    )
 }
 
 fn validate_process_id(pid: u32) -> io::Result<u32> {
@@ -350,7 +457,7 @@ fn parse_guard(arguments: &[OsString]) -> io::Result<GuardRequest> {
     })
 }
 
-fn run_guard(request: GuardRequest) -> io::Result<ExitStatus> {
+fn run_guard(request: GuardRequest) -> Result<ExitStatus, GuardError> {
     match request.mode {
         SUPERVISE_MODE => supervise_resident(request),
         SUPERVISE_FOREGROUND_MODE => supervise_foreground(request),
@@ -361,7 +468,7 @@ fn run_guard(request: GuardRequest) -> io::Result<ExitStatus> {
 }
 
 #[cfg(unix)]
-fn supervise_resident(request: GuardRequest) -> io::Result<ExitStatus> {
+fn supervise_resident(request: GuardRequest) -> Result<ExitStatus, GuardError> {
     #[cfg(target_os = "linux")]
     {
         supervise_resident_linux(request)
@@ -373,7 +480,7 @@ fn supervise_resident(request: GuardRequest) -> io::Result<ExitStatus> {
 }
 
 #[cfg(target_os = "linux")]
-fn supervise_resident_linux(request: GuardRequest) -> io::Result<ExitStatus> {
+fn supervise_resident_linux(request: GuardRequest) -> Result<ExitStatus, GuardError> {
     use std::sync::atomic::Ordering;
 
     use rustix::event::{PollFd, PollFlags, Timespec};
@@ -382,12 +489,10 @@ fn supervise_resident_linux(request: GuardRequest) -> io::Result<ExitStatus> {
     let terminate = termination_flag()?;
     rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))?;
     if parent_pid() != Some(request.expected_parent) {
-        return Err(io::Error::other(
-            "guard parent exited before containment was armed",
-        ));
+        return Err(io::Error::other("guard parent exited before containment was armed").into());
     }
 
-    let mut child = spawn_resident_payload(&request)?;
+    let mut child = spawn_resident_payload(&request).map_err(GuardError::PayloadSpawn)?;
     let child_pid = child.id();
     let child_process = rustix::process::Pid::from_raw(child_pid as i32)
         .ok_or_else(|| io::Error::other("resident payload PID is invalid"))?;
@@ -399,7 +504,9 @@ fn supervise_resident_linux(request: GuardRequest) -> io::Result<ExitStatus> {
             return Ok(status);
         }
         if terminate.load(Ordering::Acquire) || parent_pid() != Some(request.expected_parent) {
-            return terminate_guarded_process_group(&mut child, child_pid, false);
+            return Ok(terminate_guarded_process_group(
+                &mut child, child_pid, false,
+            )?);
         }
 
         let Some(pidfd) = pidfd.as_ref() else {
@@ -413,22 +520,21 @@ fn supervise_resident_linux(request: GuardRequest) -> io::Result<ExitStatus> {
                 return Err(with_cleanup_error(
                     error.into(),
                     terminate_guarded_process_group(&mut child, child_pid, false),
-                ));
+                )
+                .into());
             }
         }
     }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn supervise_resident_with_parent_poll(request: GuardRequest) -> io::Result<ExitStatus> {
+fn supervise_resident_with_parent_poll(request: GuardRequest) -> Result<ExitStatus, GuardError> {
     let terminate = termination_flag()?;
     if parent_pid() != Some(request.expected_parent) {
-        return Err(io::Error::other(
-            "guard parent exited before containment was armed",
-        ));
+        return Err(io::Error::other("guard parent exited before containment was armed").into());
     }
 
-    let mut child = spawn_resident_payload(&request)?;
+    let mut child = spawn_resident_payload(&request).map_err(GuardError::PayloadSpawn)?;
     let child_pid = child.id();
     loop {
         if let Some(status) = observe_resident_payload(&mut child, child_pid)? {
@@ -437,7 +543,9 @@ fn supervise_resident_with_parent_poll(request: GuardRequest) -> io::Result<Exit
         if terminate.load(std::sync::atomic::Ordering::Acquire)
             || parent_pid() != Some(request.expected_parent)
         {
-            return terminate_guarded_process_group(&mut child, child_pid, false);
+            return Ok(terminate_guarded_process_group(
+                &mut child, child_pid, false,
+            )?);
         }
         std::thread::sleep(PARENT_POLL_INTERVAL);
     }
@@ -477,14 +585,12 @@ fn spawn_resident_payload(request: &GuardRequest) -> io::Result<std::process::Ch
 }
 
 #[cfg(unix)]
-fn supervise_foreground(request: GuardRequest) -> io::Result<ExitStatus> {
+fn supervise_foreground(request: GuardRequest) -> Result<ExitStatus, GuardError> {
     #[cfg(target_os = "linux")]
     rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))?;
     let terminate = termination_flag()?;
     if parent_pid() != Some(request.expected_parent) {
-        return Err(io::Error::other(
-            "guard parent exited before containment was armed",
-        ));
+        return Err(io::Error::other("guard parent exited before containment was armed").into());
     }
 
     let executable = std::env::current_exe()?;
@@ -509,30 +615,29 @@ fn supervise_foreground(request: GuardRequest) -> io::Result<ExitStatus> {
             || parent_pid() != Some(request.expected_parent)
         {
             terminate_process(child_pid);
-            return child.wait();
+            return Ok(child.wait()?);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
 }
 
 #[cfg(unix)]
-fn monitor_foreground(request: GuardRequest) -> io::Result<ExitStatus> {
+fn monitor_foreground(request: GuardRequest) -> Result<ExitStatus, GuardError> {
     use std::io::IsTerminal as _;
 
     #[cfg(target_os = "linux")]
     rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))?;
     let terminate = termination_flag()?;
     if parent_pid() != Some(request.expected_parent) {
-        return Err(io::Error::other(
-            "guard supervisor exited before monitor was armed",
-        ));
+        return Err(io::Error::other("guard supervisor exited before monitor was armed").into());
     }
 
     let transfer_foreground = std::io::stdin().is_terminal();
     if transfer_foreground && !terminal_foreground_is_process_group_of(request.expected_parent)? {
         return Err(io::Error::other(
             "guard supervisor does not own the terminal foreground process group",
-        ));
+        )
+        .into());
     }
     let executable = std::env::current_exe()?;
     let mut child = Command::new(executable)
@@ -555,7 +660,8 @@ fn monitor_foreground(request: GuardRequest) -> io::Result<ExitStatus> {
         return Err(with_cleanup_error(
             error,
             terminate_guarded_process_group(&mut child, child_pid, true),
-        ));
+        )
+        .into());
     }
 
     loop {
@@ -570,20 +676,25 @@ fn monitor_foreground(request: GuardRequest) -> io::Result<ExitStatus> {
                 return Err(with_cleanup_error(
                     error,
                     terminate_guarded_process_group(&mut child, child_pid, transfer_foreground),
-                ));
+                )
+                .into());
             }
         }
         if terminate.load(std::sync::atomic::Ordering::Acquire)
             || parent_pid() != Some(request.expected_parent)
         {
-            return terminate_guarded_process_group(&mut child, child_pid, transfer_foreground);
+            return Ok(terminate_guarded_process_group(
+                &mut child,
+                child_pid,
+                transfer_foreground,
+            )?);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
 }
 
 #[cfg(unix)]
-fn exec_guarded(request: GuardRequest) -> io::Result<ExitStatus> {
+fn exec_guarded(request: GuardRequest) -> Result<ExitStatus, GuardError> {
     use std::os::unix::process::CommandExt as _;
 
     let foreground = request.mode == EXEC_FOREGROUND_MODE;
@@ -595,23 +706,21 @@ fn exec_guarded(request: GuardRequest) -> io::Result<ExitStatus> {
         rustix::process::Signal::KILL
     }))?;
     if parent_pid() != Some(request.expected_parent) {
-        return Err(io::Error::other(
-            "guard supervisor exited before exec was armed",
-        ));
+        return Err(io::Error::other("guard supervisor exited before exec was armed").into());
     }
     if foreground {
         return run_foreground_guard(request, terminate.expect("foreground guard has a flag"));
     }
     rustix::process::setpgid(None, None)?;
     let error = Command::new(request.program).args(request.arguments).exec();
-    Err(error)
+    Err(GuardError::PayloadSpawn(error))
 }
 
 #[cfg(unix)]
 fn run_foreground_guard(
     request: GuardRequest,
     terminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> io::Result<ExitStatus> {
+) -> Result<ExitStatus, GuardError> {
     let original_process_group = rustix::process::getpgrp();
     rustix::process::setpgid(None, None)?;
     let guarded_process_group = rustix::process::getpgrp();
@@ -619,9 +728,9 @@ fn run_foreground_guard(
     rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::STOP)?;
 
     let result = if rustix::termios::tcgetpgrp(std::io::stdin())? != guarded_process_group {
-        Err(io::Error::other(
+        Err(GuardError::Guard(io::Error::other(
             "guarded child resumed before terminal foreground handoff",
-        ))
+        )))
     } else {
         run_foreground_payload(request, terminate)
     };
@@ -632,13 +741,14 @@ fn run_foreground_guard(
 fn run_foreground_payload(
     request: GuardRequest,
     terminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> io::Result<ExitStatus> {
+) -> Result<ExitStatus, GuardError> {
     let mut child = Command::new(request.program)
         .args(request.arguments)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .spawn()?;
+        .spawn()
+        .map_err(GuardError::PayloadSpawn)?;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
@@ -657,7 +767,8 @@ fn run_foreground_payload(
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "guarded foreground child did not exit after termination",
-            ));
+            )
+            .into());
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -684,14 +795,15 @@ impl TerminalForegroundRestoration {
         Ok(())
     }
 
-    fn finish<T>(mut self, result: io::Result<T>) -> io::Result<T> {
+    fn finish<T>(mut self, result: Result<T, GuardError>) -> Result<T, GuardError> {
         match (result, self.restore()) {
             (Ok(value), Ok(())) => Ok(value),
             (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
             (Err(error), Err(restore_error)) => Err(io::Error::other(format!(
                 "{error}; restoring the terminal foreground process group failed: {restore_error}"
-            ))),
+            ))
+            .into()),
         }
     }
 }
@@ -982,19 +1094,23 @@ fn with_cleanup_error(error: io::Error, cleanup: io::Result<ExitStatus>) -> io::
 }
 
 #[cfg(windows)]
-fn supervise_resident(request: GuardRequest) -> io::Result<ExitStatus> {
+fn supervise_resident(request: GuardRequest) -> Result<ExitStatus, GuardError> {
     supervise_windows(request)
 }
 
 #[cfg(windows)]
-fn supervise_foreground(request: GuardRequest) -> io::Result<ExitStatus> {
+fn supervise_foreground(request: GuardRequest) -> Result<ExitStatus, GuardError> {
     supervise_windows(request)
 }
 
 #[cfg(windows)]
-fn supervise_windows(request: GuardRequest) -> io::Result<ExitStatus> {
+fn supervise_windows(request: GuardRequest) -> Result<ExitStatus, GuardError> {
     use process_wrap::std::{CommandWrap, JobObject};
 
+    // Arm before the payload exists: a guard that cannot watch its parent must not
+    // start work it could never clean up. This failure is the guard's, not the
+    // command's, and it reports as such.
+    let mut parent = ParentWatch::arm(request.expected_parent)?;
     let mut command = Command::new(request.program);
     command
         .args(request.arguments)
@@ -1003,7 +1119,7 @@ fn supervise_windows(request: GuardRequest) -> io::Result<ExitStatus> {
         .stderr(Stdio::inherit());
     let mut command = CommandWrap::from(command);
     command.wrap(JobObject);
-    let mut child = command.spawn()?;
+    let mut child = command.spawn().map_err(GuardError::PayloadSpawn)?;
     loop {
         if let Some(status) = child.try_wait()? {
             // process-wrap 9.0.1's std JobObject is not kill-on-close. The
@@ -1012,22 +1128,177 @@ fn supervise_windows(request: GuardRequest) -> io::Result<ExitStatus> {
             let _reaped_status = child.wait()?;
             return Ok(status);
         }
-        if !windows_process_exists(request.expected_parent) {
-            child.start_kill()?;
-            return child.wait();
+        match parent.observe() {
+            ParentLiveness::Alive | ParentLiveness::Unwatched => {}
+            ParentLiveness::Exited => {
+                child.start_kill()?;
+                return Ok(child.wait()?);
+            }
         }
         std::thread::sleep(PARENT_POLL_INTERVAL);
     }
 }
 
 #[cfg(windows)]
-fn monitor_foreground(_request: GuardRequest) -> io::Result<ExitStatus> {
-    Err(io::Error::other("monitor guard mode is Unix-only"))
+fn monitor_foreground(_request: GuardRequest) -> Result<ExitStatus, GuardError> {
+    Err(io::Error::other("monitor guard mode is Unix-only").into())
 }
 
 #[cfg(windows)]
-fn exec_guarded(_request: GuardRequest) -> io::Result<ExitStatus> {
-    Err(io::Error::other("exec guard mode is Unix-only"))
+fn exec_guarded(_request: GuardRequest) -> Result<ExitStatus, GuardError> {
+    Err(io::Error::other("exec guard mode is Unix-only").into())
+}
+
+/// The parent-watch helper's exit status when the parent PID named no process at
+/// the moment the helper armed. Unlike a helper crash, that is a positive answer.
+#[cfg(windows)]
+const PARENT_GONE_AT_ARM_EXIT_CODE: i32 = 3;
+
+/// What the parent watch currently knows.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentLiveness {
+    Alive,
+    Exited,
+    /// The helper ended without a verdict. The payload keeps running and is
+    /// supervised for its own exit only; an unknown parent state never kills it.
+    Unwatched,
+}
+
+/// Watches the guard's parent through a process handle held by a helper.
+///
+/// The guard cannot open a process handle itself: this workspace forbids `unsafe`,
+/// and no safe standard-library API waits on an arbitrary process. Polling
+/// `tasklist` by PID was the previous answer and had two defects — a reused PID
+/// looked like a living parent, and a `tasklist` that failed to run looked like a
+/// dead one, which killed a healthy payload. Windows PowerShell's
+/// `Process.WaitForExit()` holds a real `SYNCHRONIZE` handle to the process
+/// object, so once the helper has armed, PID reuse cannot fool it, and the guard
+/// spawns nothing per poll. The helper's verdict is trusted only when it is
+/// unambiguous; every other ending is "unknown", and unknown never kills.
+#[cfg(windows)]
+struct ParentWatch {
+    helper: Option<std::process::Child>,
+    armed: Option<std::thread::JoinHandle<bool>>,
+    reported: bool,
+}
+
+#[cfg(windows)]
+impl ParentWatch {
+    fn arm(parent_pid: u32) -> io::Result<Self> {
+        use std::io::Read as _;
+        use std::os::windows::process::CommandExt as _;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'; \
+             try {{ $parent = [System.Diagnostics.Process]::GetProcessById({parent_pid}) }} \
+             catch {{ exit {PARENT_GONE_AT_ARM_EXIT_CODE} }}; \
+             [Console]::Out.WriteLine('armed'); [Console]::Out.Flush(); \
+             $parent.WaitForExit(); exit 0"
+        );
+        let mut helper = Command::new(windows_powershell()?)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-NoLogo",
+                "-Command",
+                &script,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot start the parent-process watch helper: {error}"),
+                )
+            })?;
+        let mut stdout = helper
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("parent-process watch helper has no stdout"))?;
+        let armed = std::thread::spawn(move || {
+            let mut output = String::new();
+            let _read = stdout.read_to_string(&mut output);
+            output.lines().any(|line| line.trim() == "armed")
+        });
+        Ok(Self {
+            helper: Some(helper),
+            armed: Some(armed),
+            reported: false,
+        })
+    }
+
+    fn observe(&mut self) -> ParentLiveness {
+        let Some(helper) = self.helper.as_mut() else {
+            return ParentLiveness::Unwatched;
+        };
+        let observed = match helper.try_wait() {
+            Ok(None) => return ParentLiveness::Alive,
+            Ok(Some(status)) => Ok(status),
+            Err(error) => Err(error),
+        };
+        self.helper = None;
+        let armed = self
+            .armed
+            .take()
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or(false);
+        match observed {
+            Ok(status) if status.code() == Some(0) && armed => ParentLiveness::Exited,
+            Ok(status) if status.code() == Some(PARENT_GONE_AT_ARM_EXIT_CODE) => {
+                ParentLiveness::Exited
+            }
+            Ok(status) => self.unwatched(&format!("helper exited with {status}, armed: {armed}")),
+            Err(error) => self.unwatched(&format!("helper could not be observed: {error}")),
+        }
+    }
+
+    fn unwatched(&mut self, reason: &str) -> ParentLiveness {
+        if !self.reported {
+            self.reported = true;
+            eprintln!(
+                "child-process guard: the parent-process watch ended without a verdict \
+                 ({reason}); the payload keeps running and is supervised for its own exit only"
+            );
+        }
+        ParentLiveness::Unwatched
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ParentWatch {
+    fn drop(&mut self) {
+        if let Some(mut helper) = self.helper.take() {
+            let _killed = helper.kill();
+            let _reaped = helper.wait();
+        }
+    }
+}
+
+/// Windows PowerShell as shipped in every supported Windows, by absolute path so a
+/// workspace-controlled `PATH` cannot substitute it.
+#[cfg(windows)]
+fn windows_powershell() -> io::Result<PathBuf> {
+    let system_root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+    let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    if powershell.is_file() {
+        Ok(powershell)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "Windows PowerShell is required to watch the guard's parent process; `{}` does not exist",
+                powershell.display()
+            ),
+        ))
+    }
 }
 
 #[cfg(windows)]
@@ -1041,11 +1312,35 @@ fn windows_process_exists(pid: u32) -> bool {
         })
 }
 
-fn exit_code(status: ExitStatus) -> ExitCode {
-    status
-        .code()
-        .and_then(|code| u8::try_from(code).ok())
-        .map_or(ExitCode::FAILURE, ExitCode::from)
+/// Turn the payload's status into the guard's own exit without changing its class.
+fn payload_exit_code(status: ExitStatus) -> ExitCode {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        if let Some(signal) = status.signal() {
+            // Die the way the payload died, so the consumer's `ExitStatus::signal()`
+            // is the truth rather than a collapsed `exit 1`. This resets the guard's
+            // own handler first and only returns when the default action for
+            // `signal` is not to terminate; 128+n is the shell convention for that
+            // remainder.
+            let _reraised = signal_hook::low_level::emulate_default_handler(signal);
+            return ExitCode::from(128u8.wrapping_add(u8::try_from(signal).unwrap_or(0)));
+        }
+    }
+    match status.code() {
+        Some(code) => match u8::try_from(code) {
+            Ok(code) => ExitCode::from(code),
+            // A Windows native code (an NTSTATUS such as 0xC0000005) does not fit the
+            // portable `ExitCode`; hand the raw value to `ExitProcess` so the consumer
+            // sees the crash code the payload produced instead of a collapsed `1`.
+            #[cfg(windows)]
+            Err(_) => std::process::exit(code),
+            #[cfg(not(windows))]
+            Err(_) => ExitCode::from(GUARD_FAILURE_EXIT_CODE),
+        },
+        None => ExitCode::from(GUARD_FAILURE_EXIT_CODE),
+    }
 }
 
 /// Returns whether `path` names the active guard executable.

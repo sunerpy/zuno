@@ -92,6 +92,13 @@ impl Store {
         })
     }
 
+    /// Whether the session table has a row for `session_id`.
+    pub(super) fn session_exists(&self, session_id: &str) -> Result<bool, EventStreamError> {
+        self.ensure_initialized()?;
+        let connection = self.pool.get()?;
+        Ok(zuno_db::session::find(&connection, session_id)?.is_some())
+    }
+
     pub(super) fn replay(
         &self,
         session_id: &str,

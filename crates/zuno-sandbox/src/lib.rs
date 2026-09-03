@@ -18,7 +18,7 @@ use std::sync::Arc;
 mod linux;
 
 #[cfg(target_os = "linux")]
-pub use linux::LinuxBubblewrapSandbox;
+pub use linux::{LinuxBubblewrapSandbox, probe_spawn_count};
 
 /// Hidden argv marker used by the in-sandbox seccomp helper.
 pub const HELPER_MARKER: &str = "--zuno-sandbox-helper";
@@ -888,8 +888,40 @@ impl SandboxBackend for DangerFullAccessSandbox {
 
 /// Selects the native backend for the effective policy.
 ///
-/// Restricted modes never fall back to [`DangerFullAccessSandbox`].
+/// Restricted modes never fall back to [`DangerFullAccessSandbox`]. Bubblewrap
+/// discovery is served from a process-local cache keyed by the canonical workspace
+/// and the helper executable (see [`LinuxBubblewrapSandbox::discover_cached`]): the
+/// first call for a workspace probes the host, later calls reuse that backend after
+/// re-checking the trusted files on disk, and failures are never cached. Use
+/// [`probe_system_backend`] for a diagnostic that must describe the host as it is now.
 pub fn system_backend(
+    workspace: &Path,
+    mode: SandboxMode,
+) -> Result<Box<dyn SandboxBackend>, SandboxError> {
+    if mode == SandboxMode::DangerFullAccess {
+        return Ok(Box::new(DangerFullAccessSandbox::new(workspace)?));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(SharedBackend(
+            LinuxBubblewrapSandbox::discover_cached(workspace)?,
+        )))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(SandboxError::UnsupportedPlatform(
+            std::env::consts::OS.to_owned(),
+        ))
+    }
+}
+
+/// Discovers the native backend without consulting or updating the process cache.
+///
+/// Deployment reports use this so a diagnostic describes the host as it is now,
+/// not as it was when the process first probed it.
+pub fn probe_system_backend(
     workspace: &Path,
     mode: SandboxMode,
 ) -> Result<Box<dyn SandboxBackend>, SandboxError> {
@@ -907,6 +939,29 @@ pub fn system_backend(
         Err(SandboxError::UnsupportedPlatform(
             std::env::consts::OS.to_owned(),
         ))
+    }
+}
+
+/// A process-cached backend handed to one caller.
+///
+/// Every caller gets its own `Box`, as before, while the probes behind it are
+/// shared; the delegation keeps [`system_backend`]'s signature stable for callers.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct SharedBackend(Arc<LinuxBubblewrapSandbox>);
+
+#[cfg(target_os = "linux")]
+impl SandboxBackend for SharedBackend {
+    fn capabilities(&self) -> &SandboxCapabilities {
+        self.0.capabilities()
+    }
+
+    fn prepare(&self, request: PrepareRequest) -> Result<PreparedCommand, SandboxError> {
+        self.0.prepare(request)
+    }
+
+    fn verify_deployment(&self, policy: &SandboxPolicy) -> Result<(), SandboxError> {
+        self.0.verify_deployment(policy)
     }
 }
 
@@ -1009,7 +1064,7 @@ pub fn deployment_report_with_action(
         ));
     }
 
-    match system_backend(policy.workspace(), mode) {
+    match probe_system_backend(policy.workspace(), mode) {
         Ok(backend) => {
             let capabilities = backend.capabilities();
             if report.launcher.is_none() {
