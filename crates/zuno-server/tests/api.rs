@@ -29,7 +29,7 @@ use zuno_server::api::{self, ApiState};
 use zuno_server::{
     Delivery, EventService, NewEvent, PermissionRequest, QuestionDecision, QuestionRequest,
     RequestBroker, ServerBuilder, ServerConfig, ServerServices, SessionCompactExecution,
-    SessionMutationExecutor, SessionMutationFuture, SessionPromptExecution,
+    SessionMutationExecutor, SessionMutationFuture, SessionPromptExecution, SessionReportExecution,
 };
 
 fn api_app(state: ApiState) -> Router {
@@ -74,6 +74,7 @@ struct BlockingMutationExecutor {
     prompt_started: Arc<AtomicBool>,
     prompt_started_notify: Arc<Notify>,
     prompts: Mutex<Vec<SessionPromptExecution>>,
+    report_batches: Mutex<Vec<SessionReportExecution>>,
     compact_calls: AtomicUsize,
 }
 
@@ -106,6 +107,25 @@ impl BlockingMutationExecutor {
             notified.await;
         }
     }
+
+    fn report_batches(&self) -> Vec<SessionReportExecution> {
+        self.report_batches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Wait for this many provider requests, counting a whole report batch as one.
+    async fn wait_until_execution_count(&self, count: usize) {
+        loop {
+            let mut notified = std::pin::pin!(self.prompt_started_notify.notified());
+            notified.as_mut().enable();
+            if self.prompts().len() + self.report_batches().len() >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl SessionMutationExecutor for BlockingMutationExecutor {
@@ -116,6 +136,26 @@ impl SessionMutationExecutor for BlockingMutationExecutor {
         _events: TurnEventSender,
     ) -> SessionMutationFuture {
         self.prompts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(request);
+        let started = Arc::clone(&self.prompt_started);
+        let started_notify = Arc::clone(&self.prompt_started_notify);
+        Box::pin(async move {
+            started.store(true, Ordering::SeqCst);
+            started_notify.notify_waiters();
+            guard.interrupt_signal().notified().await;
+            Ok(())
+        })
+    }
+
+    fn reports(
+        &self,
+        request: SessionReportExecution,
+        guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        self.report_batches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(request);
@@ -167,6 +207,15 @@ impl SessionMutationExecutor for InterruptEventExecutor {
         })
     }
 
+    fn reports(
+        &self,
+        _request: SessionReportExecution,
+        _guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        Box::pin(async { Err("a report batch is not expected in this test".to_owned()) })
+    }
+
     fn compact(
         &self,
         _request: SessionCompactExecution,
@@ -209,6 +258,15 @@ impl SessionMutationExecutor for BlockingCompactMutationExecutor {
         _events: TurnEventSender,
     ) -> SessionMutationFuture {
         Box::pin(async { Err("prompt is not expected in this test".to_owned()) })
+    }
+
+    fn reports(
+        &self,
+        _request: SessionReportExecution,
+        _guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        Box::pin(async { Err("a report batch is not expected in this test".to_owned()) })
     }
 
     fn compact(
@@ -1682,30 +1740,154 @@ async fn api_prompt_driver_runs_a_durable_subagent_report_before_later_user_inpu
         .expect("user prompt responds");
     assert_eq!(response.status(), StatusCode::OK);
 
-    executor.wait_until_prompt_count(1).await;
-    assert_eq!(executor.prompts()[0].message_id, "input_report");
-    assert_eq!(executor.prompts()[0].prompt, "background result");
+    executor.wait_until_execution_count(1).await;
+    let batches = executor.report_batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0]
+            .reports
+            .iter()
+            .map(|report| (report.input_id.clone(), report.text.clone()))
+            .collect::<Vec<_>>(),
+        [("input_report".to_owned(), "background result".to_owned())]
+    );
+    assert!(
+        executor.prompts().is_empty(),
+        "a settled report runs as a report batch, not as a user prompt"
+    );
     assert_eq!(
         services.runs.abort("ses_report", api_cancel()),
         AbortDisposition::Active
     );
-    executor.wait_until_prompt_count(2).await;
+    executor.wait_until_execution_count(2).await;
     assert_eq!(
         executor
             .prompts()
             .into_iter()
             .map(|request| (request.message_id, request.prompt))
             .collect::<Vec<_>>(),
-        [
-            ("input_report".to_owned(), "background result".to_owned()),
-            ("msg_user".to_owned(), "user input".to_owned())
-        ]
+        [("msg_user".to_owned(), "user input".to_owned())]
     );
+    assert_eq!(executor.report_batches().len(), 1);
     assert_eq!(
         services.runs.abort("ses_report", api_cancel()),
         AbortDisposition::Active
     );
     services.runs.wait_until_idle("ses_report").await;
+}
+
+/// Three settled reports must cost one provider request on this surface too, and the
+/// state a later report in the same batch replaced must read as superseded. Driving
+/// one row per turn is what made a fan-out that settled together arrive as a stream of
+/// turns, each announcing work the newest report had already finished.
+#[tokio::test]
+async fn api_prompt_driver_runs_every_settled_report_as_one_request() {
+    let fixture = MutationApiFixture::new("ses_batch");
+    let inbox = SessionInbox::new(Arc::clone(&fixture.pool));
+    for (input_id, job, text, created) in [
+        ("input_early", "job_1", "job one is halfway", 1),
+        ("input_other", "job_2", "job two finished", 2),
+        ("input_late", "job_1", "job one finished", 3),
+    ] {
+        inbox
+            .admit(NewSessionInput::new(
+                input_id,
+                "ses_batch",
+                json!({
+                    "kind": "subagentReport",
+                    "jobID": job,
+                    "childSessionID": "ses_child",
+                    "status": "completed",
+                    "text": text
+                }),
+                InputDelivery::Queue,
+                created,
+            ))
+            .expect("admit settled report");
+    }
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_batch/prompt",
+            Some(json!({
+                "id": "msg_user",
+                "prompt": {"text": "user input", "files": [], "agents": []},
+                "delivery": "queue"
+            })),
+        ))
+        .await
+        .expect("user prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    executor.wait_until_execution_count(1).await;
+    let batches = executor.report_batches();
+    assert_eq!(
+        batches.len(),
+        1,
+        "three settled reports must cost one provider request, not three"
+    );
+    let reports = &batches[0].reports;
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report.input_id.as_str())
+            .collect::<Vec<_>>(),
+        ["input_early", "input_other", "input_late"],
+        "the batch keeps durable admission order"
+    );
+    assert!(
+        reports[0].text.starts_with("[superseded report]"),
+        "the replaced state must not read as live: {}",
+        reports[0].text
+    );
+    assert!(reports[0].text.ends_with("job one is halfway"));
+    assert_eq!(
+        reports[1].text, "job two finished",
+        "a report that is the only one for its work carries no annotation"
+    );
+    assert!(
+        reports[2].text.starts_with("[current report]"),
+        "the newest report for a job is the one marked current: {}",
+        reports[2].text
+    );
+    assert!(reports[2].newest, "Plan reconciliation is seeded from it");
+    assert_eq!(
+        inbox
+            .pending("ses_batch")
+            .expect("pending reads")
+            .into_iter()
+            .map(|input| input.id)
+            .collect::<Vec<_>>(),
+        ["msg_user"],
+        "the whole report batch is promoted in one transaction"
+    );
+
+    assert_eq!(
+        services.runs.abort("ses_batch", api_cancel()),
+        AbortDisposition::Active
+    );
+    executor.wait_until_execution_count(2).await;
+    assert_eq!(executor.report_batches().len(), 1);
+    assert_eq!(
+        executor
+            .prompts()
+            .into_iter()
+            .map(|request| request.message_id)
+            .collect::<Vec<_>>(),
+        ["msg_user"]
+    );
+    assert_eq!(
+        services.runs.abort("ses_batch", api_cancel()),
+        AbortDisposition::Active
+    );
+    services.runs.wait_until_idle("ses_batch").await;
 }
 
 /// A payload no writer publishes is left untouched instead of promoted and settled
@@ -1822,9 +2004,110 @@ async fn api_prompt_driver_leaves_another_surfaces_pending_input_untouched() {
     assert_eq!(terminal.error, None);
 }
 
-/// Every asynchronous report shape reaches the model as plain text. Only
-/// `subagentReport` used to decode, so a workflow, council, product-agent, or
-/// background-execution report was promoted and then failed instead of delivered.
+/// A promoted report carrying no model-visible text is settled `failed` on this surface
+/// too, and the rest of its batch still runs. Failing the whole batch would hold every
+/// other settled report out of the transcript because one writer published a row that
+/// cannot become a user message.
+#[tokio::test]
+async fn api_prompt_driver_fails_an_unreadable_report_and_runs_the_rest_of_the_batch() {
+    let fixture = MutationApiFixture::new("ses_unreadable");
+    let inbox = SessionInbox::new(Arc::clone(&fixture.pool));
+    inbox
+        .admit(NewSessionInput::new(
+            "input_broken",
+            "ses_unreadable",
+            json!({
+                "kind": "subagentReport",
+                "jobID": "job_1",
+                "childSessionID": "ses_child",
+                "status": "completed"
+            }),
+            InputDelivery::Queue,
+            1,
+        ))
+        .expect("admit unreadable report");
+    inbox
+        .admit(NewSessionInput::new(
+            "input_ok",
+            "ses_unreadable",
+            json!({
+                "kind": "subagentReport",
+                "jobID": "job_2",
+                "childSessionID": "ses_child",
+                "status": "completed",
+                "text": "job two finished"
+            }),
+            InputDelivery::Queue,
+            2,
+        ))
+        .expect("admit report");
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_unreadable/prompt",
+            Some(json!({
+                "id": "msg_user",
+                "prompt": {"text": "user input", "files": [], "agents": []},
+                "delivery": "queue"
+            })),
+        ))
+        .await
+        .expect("user prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    executor.wait_until_execution_count(1).await;
+    let batches = executor.report_batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0]
+            .reports
+            .iter()
+            .map(|report| report.input_id.as_str())
+            .collect::<Vec<_>>(),
+        ["input_ok"],
+        "the readable report still runs"
+    );
+    let broken = inbox
+        .get("ses_unreadable", "input_broken")
+        .expect("unreadable report reads")
+        .expect("unreadable report still exists");
+    assert_eq!(broken.state, SubmissionState::Failed);
+    assert_eq!(
+        broken.error.as_deref(),
+        Some("persisted session input `input_broken` carries no model-visible text")
+    );
+
+    assert_eq!(
+        services.runs.abort("ses_unreadable", api_cancel()),
+        AbortDisposition::Active
+    );
+    executor.wait_until_execution_count(2).await;
+    assert_eq!(
+        executor
+            .prompts()
+            .into_iter()
+            .map(|request| request.message_id)
+            .collect::<Vec<_>>(),
+        ["msg_user"]
+    );
+    assert_eq!(
+        services.runs.abort("ses_unreadable", api_cancel()),
+        AbortDisposition::Active
+    );
+    services.runs.wait_until_idle("ses_unreadable").await;
+}
+
+/// Every asynchronous report shape reaches the model as plain text, and shapes that
+/// differ still share one batch. Only `subagentReport` used to decode, so a workflow,
+/// council, product-agent, or background-execution report was promoted and then failed
+/// instead of delivered.
 #[tokio::test]
 async fn api_prompt_driver_delivers_every_asynchronous_report_shape() {
     let fixture = MutationApiFixture::new("ses_reports");
@@ -1885,25 +2168,38 @@ async fn api_prompt_driver_delivers_every_asynchronous_report_shape() {
         .expect("user prompt responds");
     assert_eq!(response.status(), StatusCode::OK);
 
-    for expected in 1..=3 {
-        executor.wait_until_prompt_count(expected).await;
+    for expected in 1..=2 {
+        executor.wait_until_execution_count(expected).await;
         assert_eq!(
             services.runs.abort("ses_reports", api_cancel()),
             AbortDisposition::Active
         );
     }
     services.runs.wait_until_idle("ses_reports").await;
+    let batches = executor.report_batches();
+    assert_eq!(
+        batches.len(),
+        1,
+        "reports of different shapes still share one provider request"
+    );
+    assert_eq!(
+        batches[0]
+            .reports
+            .iter()
+            .map(|report| (report.input_id.clone(), report.text.clone()))
+            .collect::<Vec<_>>(),
+        [
+            ("input_workflow".to_owned(), "workflow finished".to_owned()),
+            ("input_council".to_owned(), "council finished".to_owned())
+        ]
+    );
     assert_eq!(
         executor
             .prompts()
             .into_iter()
             .map(|request| (request.message_id, request.prompt))
             .collect::<Vec<_>>(),
-        [
-            ("input_workflow".to_owned(), "workflow finished".to_owned()),
-            ("input_council".to_owned(), "council finished".to_owned()),
-            ("msg_user".to_owned(), "user input".to_owned())
-        ]
+        [("msg_user".to_owned(), "user input".to_owned())]
     );
 }
 
@@ -3377,6 +3673,15 @@ impl SessionMutationExecutor for CompactionLeaseExecutor {
             notify.notify_waiters();
             Ok(())
         })
+    }
+
+    fn reports(
+        &self,
+        _request: SessionReportExecution,
+        _guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        Box::pin(async { Err("a report batch is not expected in this test".to_owned()) })
     }
 
     fn compact(

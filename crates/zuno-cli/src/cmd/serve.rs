@@ -12,7 +12,7 @@ use zuno_server::{
     AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventFanout, EventService, NewEvent,
     PermissionRequest, QuestionDecision, QuestionRequest, QuestionToolCall, RequestBroker,
     ServerBuilder, ServerConfig, ServerServices, SessionCompactExecution, SessionMutationExecutor,
-    SessionMutationFuture, SessionPromptExecution, events_router,
+    SessionMutationFuture, SessionPromptExecution, SessionReportExecution, events_router,
 };
 use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin};
 use zuno_tools::question::{QuestionAsker, QuestionOutcome};
@@ -124,6 +124,32 @@ impl ServerSessionMutationExecutor {
                 None
             }
         }
+    }
+
+    /// Close one server-driven turn: publish its final work state, shut the host down,
+    /// and reconcile a staged extension transition.
+    ///
+    /// Every mutation this executor runs ends the same way, so the sequence lives here
+    /// rather than being repeated per entry point where one step could drift.
+    async fn finish_hosted(
+        &self,
+        spec: &ServerHostSpec,
+        mut host: TurnHost,
+        outcome: Result<(), String>,
+    ) -> Result<(), String> {
+        if let Some(work) = self.final_work_state(&host, &spec.session_id) {
+            self.detached_observer
+                .work_state(&spec.session_id, &work)
+                .await;
+        }
+        let extension_scope = host.extension_scope().clone();
+        let shutdown = host.shutdown().await;
+        let reconciliation = if shutdown.is_ok() {
+            self.reconcile_extensions(spec, &extension_scope).await
+        } else {
+            Ok(())
+        };
+        finish_server_mutation(outcome, shutdown, reconciliation)
     }
 
     /// Publish a staged extension mutation once all request hosts on the old revision
@@ -406,21 +432,39 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 Ok(())
             }
             .await;
-            let work = executor.final_work_state(&host, &spec.session_id);
-            if let Some(work) = work {
-                executor
-                    .detached_observer
-                    .work_state(&spec.session_id, &work)
-                    .await;
-            }
-            let extension_scope = host.extension_scope().clone();
-            let shutdown = host.shutdown().await;
-            let reconciliation = if shutdown.is_ok() {
-                executor.reconcile_extensions(&spec, &extension_scope).await
-            } else {
-                Ok(())
+            executor.finish_hosted(&spec, host, outcome).await
+        })
+    }
+
+    fn reports(
+        &self,
+        request: SessionReportExecution,
+        guard: SessionRunGuard,
+        events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        let executor = self.clone();
+        Box::pin(async move {
+            let spec = ServerHostSpec {
+                session_id: request.session_id.clone(),
+                directory: request.directory,
+                agent: request.agent,
+                model: request.model,
             };
-            finish_server_mutation(outcome, shutdown, reconciliation)
+            let mut host = executor.open_active(&spec).await?;
+            let outcome = async {
+                host.drive_promoted_reports_with_guard(&request.reports, &guard, events.clone())
+                    .await?;
+                // Goal continuation acquires its own lease, so this batch's lease
+                // must be released before it runs or continuation is suppressed.
+                drop(guard);
+                while host
+                    .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
+                    .await?
+                {}
+                Ok(())
+            }
+            .await;
+            executor.finish_hosted(&spec, host, outcome).await
         })
     }
 
@@ -449,21 +493,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 Ok(())
             }
             .await;
-            let work = executor.final_work_state(&host, &spec.session_id);
-            if let Some(work) = work {
-                executor
-                    .detached_observer
-                    .work_state(&spec.session_id, &work)
-                    .await;
-            }
-            let extension_scope = host.extension_scope().clone();
-            let shutdown = host.shutdown().await;
-            let reconciliation = if shutdown.is_ok() {
-                executor.reconcile_extensions(&spec, &extension_scope).await
-            } else {
-                Ok(())
-            };
-            finish_server_mutation(outcome, shutdown, reconciliation)
+            executor.finish_hosted(&spec, host, outcome).await
         })
     }
 }

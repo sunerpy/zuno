@@ -1000,7 +1000,10 @@ the session busy offers the whole pending report batch to the running turn's nex
 safe point for the same reason, and a report that turn never reaches stays
 pending for the next scan. Driving one turn per row instead made a fan-out that
 settled together arrive as a stream of turns, each announcing a state a later
-report in the same batch had already replaced.
+report in the same batch had already replaced. The HTTP prompt driver claims the
+same batch in the same transaction, so a session holding three settled reports
+produces one assistant turn on that surface too, while a typed prompt still runs as
+its own request with its own agent and model overrides.
 
 Admission never waits behind a delivery. A background command's completion is
 admitted as a durable inbox row before any turn is requested, and the watcher
