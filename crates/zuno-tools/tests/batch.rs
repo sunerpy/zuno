@@ -787,7 +787,13 @@ async fn a_retrieved_window_within_the_batch_share_is_inlined_with_its_artifact_
 ///
 /// The store is the one the registry builds for `execute` itself, so a second artifact
 /// written by the composition would land in the same directory and be counted.
-#[allow(clippy::type_complexity)]
+#[allow(
+    clippy::type_complexity,
+    reason = "the fixture hands back the registry builder, its store and the artifact path \
+             together on purpose: a second artifact written by the composition has to land in \
+             the same store to be counted, so splitting the tuple would let the test assert \
+             against a different directory than the one under test"
+)]
 fn retrieval_registry(
     root: &Path,
     bytes: usize,

@@ -5244,7 +5244,11 @@ async fn production_registry_wires_configured_output_limits_into_the_shell_tool(
         .find(|tool| tool.id() == "shell")
         .expect("the build profile exposes the shell tool");
 
-    let refused = shell
+    // Oversized output is withheld, not refused: the whole payload is persisted and the
+    // model receives a notice naming the limits it crossed. What this test pins is that the
+    // production registry hands the *configured* ceilings to the shell tool, so the assertion
+    // is on the numbers in that notice and in its typed metadata, not on the result's kind.
+    let withheld = shell
         .invoke(
             serde_json::json!({"command": "printf 'one\\ntwo\\n'"}),
             ToolContext::new(
@@ -5257,14 +5261,27 @@ async fn production_registry_wires_configured_output_limits_into_the_shell_tool(
             ),
         )
         .await
-        .expect_err("two lines exceed the configured one-line ceiling");
-    let zuno_error::ToolError::Failed { source, .. } = refused else {
-        panic!("an oversized-output refusal is a terminal tool failure");
-    };
-    let message = source.to_string();
+        .expect("two lines over the configured ceiling are withheld, not refused");
     assert!(
-        message.contains("exceeds the configured limit of 4096 bytes or 1 lines"),
-        "the refusal did not report the configured thresholds; message: {message}"
+        withheld
+            .output
+            .contains("exceeds the configured limit of 4096 bytes or 1 lines"),
+        "the withholding notice did not report the configured thresholds; output: {}",
+        withheld.output
+    );
+    let facts = withheld
+        .metadata
+        .get("withheldOutput")
+        .expect("a withheld result carries the typed facts a reader needs");
+    assert_eq!(
+        facts.get("limitBytes").and_then(serde_json::Value::as_u64),
+        Some(4096),
+        "the byte ceiling in the metadata is not the configured one; facts: {facts}"
+    );
+    assert_eq!(
+        facts.get("limitLines").and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the line ceiling in the metadata is not the configured one; facts: {facts}"
     );
 }
 
