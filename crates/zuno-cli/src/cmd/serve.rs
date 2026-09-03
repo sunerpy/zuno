@@ -382,7 +382,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                     host.drive_promoted_with_guard(
                         &request.prompt,
                         &request.message_id,
-                        guard,
+                        &guard,
                         events.clone(),
                     )
                     .await?;
@@ -391,11 +391,14 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                         &request.prompt,
                         &request.content,
                         &request.message_id,
-                        guard,
+                        &guard,
                         events.clone(),
                     )
                     .await?;
                 }
+                // Goal continuation acquires its own lease, so this prompt's lease
+                // must be released before it runs or continuation is suppressed.
+                drop(guard);
                 while host
                     .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
                     .await?

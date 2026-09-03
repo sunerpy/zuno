@@ -6182,6 +6182,15 @@ impl TurnHost {
         self.inbox.clone()
     }
 
+    /// Durable-first input admission shared by every client surface.
+    ///
+    /// Clients admit through this instead of writing the inbox and contending for
+    /// the live-turn lease themselves; the service keeps the durable write ahead of
+    /// the lease so a busy session never discards input.
+    pub(crate) fn input_admission(&self) -> zuno_engine::admission::SessionInputAdmission {
+        zuno_engine::admission::SessionInputAdmission::new(self.inbox.clone(), self.runs.clone())
+    }
+
     /// Database pool shared with independently driven child-session input.
     pub(crate) fn database_pool(&self) -> Arc<zuno_db::pool::Pool> {
         Arc::clone(&self.database)
@@ -6458,7 +6467,7 @@ impl TurnHost {
         &mut self,
         prompt: &str,
         message_id: Option<&str>,
-        guard: SessionRunGuard,
+        guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
         self.drive_input(
@@ -6469,7 +6478,7 @@ impl TurnHost {
                 UserInputPersistence::AdmitAndPromote,
                 PlanningInputSource::User,
             ),
-            &guard,
+            guard,
             events,
         )
         .await
@@ -6480,7 +6489,7 @@ impl TurnHost {
         &mut self,
         prompt: &str,
         message_id: &str,
-        guard: SessionRunGuard,
+        guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
         self.drive_input(
@@ -6491,7 +6500,7 @@ impl TurnHost {
                 UserInputPersistence::AlreadyPromoted,
                 PlanningInputSource::User,
             ),
-            &guard,
+            guard,
             events,
         )
         .await
@@ -6503,7 +6512,7 @@ impl TurnHost {
         prompt: &str,
         content: &[RequestContentBlock],
         message_id: &str,
-        guard: SessionRunGuard,
+        guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
         self.drive_input(
@@ -6514,7 +6523,7 @@ impl TurnHost {
                 UserInputPersistence::AlreadyPromoted,
                 PlanningInputSource::User,
             ),
-            &guard,
+            guard,
             events,
         )
         .await
@@ -6526,7 +6535,7 @@ impl TurnHost {
         prompt: &str,
         message_id: &str,
         source: PlanningInputSource,
-        guard: SessionRunGuard,
+        guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
         debug_assert!(matches!(
@@ -6541,7 +6550,7 @@ impl TurnHost {
                 UserInputPersistence::AlreadyPromoted,
                 source,
             ),
-            &guard,
+            guard,
             events,
         )
         .await

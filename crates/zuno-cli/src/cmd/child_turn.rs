@@ -2134,11 +2134,11 @@ async fn drive_and_drain(
     let drive = async {
         let outcome = match (guard, message_id, planning_source) {
             (Some(guard), Some(message_id), _) => {
-                host.drive_promoted_with_guard(prompt, message_id, guard, sender.clone())
+                host.drive_promoted_with_guard(prompt, message_id, &guard, sender.clone())
                     .await
             }
             (Some(guard), None, _) => {
-                host.drive_with_message_id_and_guard(prompt, None, guard, sender.clone())
+                host.drive_with_message_id_and_guard(prompt, None, &guard, sender.clone())
                     .await
             }
             (None, Some(message_id), _) => {
@@ -2175,7 +2175,7 @@ async fn drive_detached_and_drain(
                     prompt,
                     message_id,
                     planning_source,
-                    guard,
+                    &guard,
                     sender.clone(),
                 )
                 .await
@@ -2185,7 +2185,7 @@ async fn drive_detached_and_drain(
                     .await
             }
             (Some(guard), None) => {
-                host.drive_with_message_id_and_guard(prompt, None, guard, sender.clone())
+                host.drive_with_message_id_and_guard(prompt, None, &guard, sender.clone())
                     .await
             }
             (None, None) => {
