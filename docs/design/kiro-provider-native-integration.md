@@ -17,8 +17,13 @@ The current integration is functionally usable, with one upstream limitation:
 - Claude Opus 5 and GPT 5.6 Sol complete real Zuno turns;
 - tools, streaming, effort, usage, cancellation, and durable Zuno history flow
   through the normal provider interface;
-- the gateway owns OpenCode-shared authentication, account selection,
-  encrypted reasoning replay, and upstream transport pools;
+- the gateway owns OpenCode-shared authentication, account selection, reasoning
+  envelope sealing and validation, and upstream transport pools;
+- encrypted reasoning replay is a shared contract rather than a gateway-only
+  concern: the gateway mints and validates the envelope, while Zuno must ask for
+  `include: ["reasoning.encrypted_content"]` and echo every sealed item back
+  verbatim in the order it was produced. Zuno declares that per provider with
+  `reasoningReplay: "encrypted"`;
 - Zuno sends each foreground root or child durable session id through standard
   Responses `metadata.zuno_session_id`, and keeps lifecycle model calls
   isolated;
@@ -249,6 +254,36 @@ correctly rejects that field because no lossless Kiro equivalent is proven.
 `reasoning.effort` remains supported. This boundary is configuration, not a
 reason for provider-id special casing or a field-stripping plugin.
 
+Encrypted reasoning replay is the one provider capability that does require Zuno
+adaptation, because half of the contract is the client's. A gateway that seals
+reasoning still returns unsealed items to a client that never sends `include`, and
+it rejects an echo whose items are summary-only or out of order. Zuno therefore
+asks for the envelope, persists each sealed item as its own positioned durable
+part, and replays the items in the position the model produced them, scoped to the
+model that sealed them and to the endpoint's validity window. See
+[Harness runtime](../harness-runtime.md#encrypted-reasoning-replay).
+
+Two details of the gateway's validation decide whether a replay is accepted, and
+both are client obligations:
+
+- the envelope is bound to a SHA-256 fingerprint of the turn it sealed, computed
+  over the assistant text plus each tool call's `id`, `name`, and its `arguments`
+  string **as the gateway sent it**. Re-serializing the parsed arguments changes
+  key order and spacing, which is why Zuno persists the provider's own bytes on
+  the tool part and replays those, and answers a mismatch with
+  `400 reasoning_replay_context_mismatch`;
+- a reasoning item with no following output in the same turn is
+  `400 invalid_reasoning_replay`, because there is nothing to fingerprint. Durable
+  history reaches that shape honestly, so Zuno withholds such an item instead of
+  replaying it and failing every later request to that model.
+
+Zuno's own routing adds a third obligation. `reasoningReplay: "encrypted"` is
+accepted only beside `transport: "openai"` and `surface: "responses"`: a custom
+`baseURL` under the `openai-compatible` transport resolves its surface from
+provider-id rules and lands on Chat Completions, where the option can never take
+effect. Config validation refuses the silent combinations rather than running a
+whole session that asks for sealing and never gets it.
+
 The remaining 2026-08-28 provider changes do not require Zuno adaptation:
 
 - live model catalogs and per-account eligibility are routing facts owned by
@@ -256,8 +291,8 @@ The remaining 2026-08-28 provider changes do not require Zuno adaptation:
   capability declaration;
 - history-lineage affinity is a provider fallback for clients without metadata;
   Zuno continues to send the stronger durable `metadata.zuno_session_id`;
-- singleton SQLite ownership, transport/client pools, completion witnesses,
-  and encrypted reasoning replay are internal provider lifecycle concerns;
+- singleton SQLite ownership, transport/client pools, and completion witnesses
+  are internal provider lifecycle concerns;
 - GPT 5.6 Sol placeholder suppression is response semantics owned by the
   provider and must not be duplicated in Zuno rendering.
 
@@ -271,6 +306,10 @@ The remaining 2026-08-28 provider changes do not require Zuno adaptation:
 - Both OpenAI Responses adapters test exact metadata projection, collision
   rejection, unrelated metadata preservation, and absence on Chat where
   applicable.
+- Encrypted replay is proven from user-shaped config through the request body,
+  and in the engine from a streamed sealed item through persistence to an
+  ordered multi-item replay, model-switch withholding, envelope expiry, and the
+  three durable evidence fields.
 - A real CLI loopback integration captures title plus a two-request tool loop,
   proves the title is isolated, proves identical foreground metadata, and
   proves the raw identity never enters `instructions` or `input`.

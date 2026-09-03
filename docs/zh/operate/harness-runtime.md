@@ -59,6 +59,20 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 
 提示词组装使用稳定的分段标识、确切来源、有序内容和内容摘要。实际经过 hook 之后的提示词在 provider 请求发出之前落盘。
 
+## 加密推理重放
+
+有些 Responses 端点会把一个步骤的推理封装成不透明信封，并绑定到单一模型、账户与会话。provider 用 `reasoningReplay: "encrypted"` 声明这项能力：它是端点选项，绝不是从 provider id 推断出来的规则。此后 Zuno 会为该 provider 的每个 Responses 请求加上 `include: ["reasoning.encrypted_content"]`，并在后续请求中逐字节回送每个封装项。只要请求解析到 Responses surface，这项声明就会生效：目录里的 `openai` provider 不需要任何声明就能到达那里，而端点来自 provider 选项的网关只有声明 `transport: "openai"` 搭配 `surface: "responses"` 才能到达。配置校验会按 provider 和按模型拒绝那些确实无法承载封装项的路由，并接受本来就会解析成 Responses 的配置。
+
+默认值是 `off`：请求既不带 `include`，也不带任何封装项，包括同一会话在选项为 `encrypted` 时存下的信封。它并不表示请求字节与既有版本一致：下面的顺序修正对所有 Responses provider 生效，与该选项无关，因此先写文本再调用工具的一轮现在会先发文本项。每个重放的工具调用也会带上 provider 自己的 `arguments` 字节而不是重新序列化的结果，因为端点对它发出的那个字符串做指纹；而某个步骤的封装项后面没有任何输出时，这一项会被扣留而不是单独发出，并计入被扣留数而不算作一次重放。
+
+封装信封属于持久状态，因此一个步骤会被持久化成带位置的 part 账本，而不是一段文本加上尾部堆积的工具调用。每个 part id 携带它在流中的位置 `prt_{turn}_{step}_{position}_{kind}`，且同一步骤的所有 part 共享 assistant 消息的创建时间，于是水合出来的顺序就是 provider 的产出顺序。一个先推理、写文本、调用工具、再推理、再调用第二个工具的步骤，会按同样的次序重放，每个信封都紧挨在它所解释的输出之前。这正是封装端点会校验的内容：顺序被打乱或只回送摘要都会在链路上被拒绝。
+
+重放是有作用域的，而且作用域在组装请求时生效，不是在写行时生效。信封只会被重放给产出它的那条 assistant 消息上记录的目录 provider 与模型，并且只在它比 `reasoningReplayMaxAge` 更新时重放。其他情况下它只在这一次请求的内存里被扣留，持久行保留原密文，因此换回原模型即可恢复重放。标题、摘要、压缩、反思与 Council 请求运行在其他模型上，完全不会收到信封，这也让压缩转录中不含 provider 状态。
+
+每个前台 `session.provider.request` 事件都会记录 `reasoningReplay`、`replayedReasoningCapsules` 与 `withheldReasoningCapsules`。这三个字段就是重放确实生效的依据：如果一个会话从第二个请求起报告的重放信封数仍然是零，那它就没有在重放，无论端点怎么声称。重放计数就是 adapter 真正放到链路上的数量，因此被配对规则丢弃的信封会计入被扣留数，绝不会算作一次重放。请求事件只记录这些计数，不记录信封本身。
+
+信封本身是不透明的 provider 密文，作为会话内容保存：它存放在推理 part 的 `metadata.providerReasoning` 中，会由 HTTP messages 端点返回，还会随一个完整携带密文的流事件转发：服务器 SSE 流上的类型是 `provider.reasoning.item`，`zuno run --json` 打印的是 `provider_reasoning_item`，两者的密文都在 `encryptedContent` 字段里。它是后续请求需要的持久状态，因此不会被脱敏；能读取某个会话的消息或事件流，就等于能读取它的信封。
+
 ## 可审计的记忆与反思
 
 记忆写入是提议而非直接生效。候选进入待评审状态，由人决定是否提升为常驻记忆，并且可以撤销。

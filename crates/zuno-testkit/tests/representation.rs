@@ -610,11 +610,13 @@ fn message_payload_bytes(message: &Message) -> usize {
                 id,
                 name,
                 input,
+                raw_arguments,
                 thought_signature,
             } => {
                 id.len()
                     + name.len()
                     + json_payload_bytes(input)
+                    + raw_arguments.as_ref().map_or(0, String::len)
                     + thought_signature
                         .as_ref()
                         .map_or(0, |signature| signature.as_str().len())

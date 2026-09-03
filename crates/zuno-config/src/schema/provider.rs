@@ -10,7 +10,7 @@ use crate::schema::ordered::{False, OrderedMap};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
 /// One entry of the `provider` map (`config/provider.ts:82-126`).
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -154,9 +154,42 @@ pub struct ProviderOptions {
         skip_serializing_if = "Option::is_none"
     )]
     pub responses_text_blocks: Option<ResponsesTextBlocks>,
+    /// Whether an OpenAI Responses endpoint is asked for provider-sealed reasoning.
+    ///
+    /// `encrypted` adds `include: ["reasoning.encrypted_content"]` to every Responses
+    /// request and echoes each sealed reasoning item back verbatim on later requests.
+    /// Endpoints that seal reasoning bind the envelope to a model and a conversation,
+    /// so replay is scoped to the model that minted it.
+    #[serde(rename = "reasoningReplay", skip_serializing_if = "Option::is_none")]
+    pub reasoning_replay: Option<ReasoningReplay>,
+    /// Oldest sealed reasoning envelope, in milliseconds, that Zuno still replays.
+    ///
+    /// A sealed envelope usually expires upstream. An expired envelope stays in
+    /// durable history and leaves the provider request instead of being rejected on
+    /// the wire. Requires [`ProviderOptions::reasoning_replay`] to be `encrypted`.
+    #[serde(
+        rename = "reasoningReplayMaxAge",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reasoning_replay_max_age: Option<NonZeroU64>,
     /// Every other option, passed through to the provider SDK.
     #[serde(flatten)]
     pub extra: JsonMap,
+}
+
+/// Whether Zuno requests and replays provider-sealed reasoning
+/// (`include: ["reasoning.encrypted_content"]`).
+///
+/// This is an endpoint capability, not a provider identity: a loopback gateway and
+/// the official OpenAI Responses API both declare it through this option.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningReplay {
+    /// Never ask for a sealed reasoning envelope. Reasoning stays history only.
+    #[default]
+    Off,
+    /// Ask for `reasoning.encrypted_content` and echo sealed items back verbatim.
+    Encrypted,
 }
 
 /// Text-block shape accepted by an OpenAI Responses-compatible endpoint.

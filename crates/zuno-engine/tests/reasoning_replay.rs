@@ -12,7 +12,9 @@
 
 use serde_json::{Value, json};
 use zuno_db::message::{MessageRecord, MessageWithParts, PartRecord};
-use zuno_engine::r#loop::{project_history, project_history_owned};
+use zuno_engine::r#loop::{
+    ReasoningReplayScope, project_history, project_history_owned, withhold_unreplayable_capsules,
+};
 use zuno_llm::event::{Message, RequestContentBlock, Role};
 
 const SESSION_ID: &str = "ses_reasoning_replay";
@@ -432,6 +434,134 @@ fn plain_reasoning_with_no_signature_or_capsule_stays_history_only() {
     );
 }
 
+/// One assistant turn whose reasoning the provider sealed, stamped at `created`.
+fn sealed_history(created: i64) -> Vec<MessageWithParts> {
+    let id = "msg_replay_scope";
+    vec![MessageWithParts {
+        info: assistant_info(id, created, "stop"),
+        parts: vec![
+            native_reasoning_part(
+                "prt_scope_capsule",
+                id,
+                "rs_scope_0001",
+                &["Scoping the replay"],
+                "SEALED-ENVELOPE",
+            ),
+            text_part("prt_scope_text", id, "Answer."),
+        ],
+    }]
+}
+
+const HOUR_MS: i64 = 60 * 60 * 1000;
+
+#[test]
+fn the_model_that_sealed_a_capsule_replays_it() {
+    let mut history = sealed_history(10);
+    let withheld = withhold_unreplayable_capsules(
+        &mut history,
+        ReasoningReplayScope::Model {
+            provider_id: "fake",
+            model_id: "fake-model",
+            now: 10 + HOUR_MS,
+            max_age: None,
+        },
+    );
+
+    assert_eq!(withheld, 0, "the sealing model must keep its own envelope");
+    assert_eq!(
+        replayable_reasoning(&projected(&history)).len(),
+        1,
+        "scoping withheld a capsule from the model that minted it"
+    );
+}
+
+#[test]
+fn a_capsule_another_model_sealed_is_withheld() {
+    // The envelope is bound to a model. Echoing it to a different one fails the
+    // whole request, so it has to leave the projection before the request is built —
+    // switching model mid-session is a normal thing to do.
+    for (provider_id, model_id) in [("fake", "other-model"), ("other", "fake-model")] {
+        let mut history = sealed_history(10);
+        let withheld = withhold_unreplayable_capsules(
+            &mut history,
+            ReasoningReplayScope::Model {
+                provider_id,
+                model_id,
+                now: 10,
+                max_age: None,
+            },
+        );
+
+        assert_eq!(
+            withheld, 1,
+            "a capsule sealed by fake/fake-model must not travel to {provider_id}/{model_id}"
+        );
+        let messages = projected(&history);
+        assert!(
+            replayable_reasoning(&messages).is_empty(),
+            "the withheld capsule still reached {provider_id}/{model_id}: {messages:#?}"
+        );
+        let assistant = messages
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .expect("an assistant message is projected");
+        assert_eq!(
+            assistant.content,
+            vec![RequestContentBlock::Text {
+                text: "Answer.".to_owned()
+            }],
+            "withholding a capsule must not disturb the rest of the turn"
+        );
+    }
+}
+
+#[test]
+fn an_expired_capsule_is_withheld_and_a_fresh_one_is_not() {
+    let mut expired = sealed_history(10);
+    assert_eq!(
+        withhold_unreplayable_capsules(
+            &mut expired,
+            ReasoningReplayScope::Model {
+                provider_id: "fake",
+                model_id: "fake-model",
+                now: 10 + 2 * HOUR_MS,
+                max_age: Some(std::time::Duration::from_millis(HOUR_MS as u64)),
+            },
+        ),
+        1,
+        "an envelope older than the configured age must leave the request"
+    );
+    assert!(replayable_reasoning(&projected(&expired)).is_empty());
+
+    let mut fresh = sealed_history(10);
+    assert_eq!(
+        withhold_unreplayable_capsules(
+            &mut fresh,
+            ReasoningReplayScope::Model {
+                provider_id: "fake",
+                model_id: "fake-model",
+                now: 10 + 2 * HOUR_MS,
+                max_age: Some(std::time::Duration::from_millis(3 * HOUR_MS as u64)),
+            },
+        ),
+        0,
+        "an envelope inside the configured age must still be replayed"
+    );
+    assert_eq!(replayable_reasoning(&projected(&fresh)).len(), 1);
+}
+
+#[test]
+fn an_auxiliary_request_replays_no_capsule_at_all() {
+    // Title, summary and compaction run on their own model. None of them sealed
+    // anything, so every envelope is withheld rather than gambled on.
+    let mut history = sealed_history(10);
+    assert_eq!(
+        withhold_unreplayable_capsules(&mut history, ReasoningReplayScope::None),
+        1
+    );
+    assert!(replayable_reasoning(&projected(&history)).is_empty());
+}
+
 /// A capsule the provider streamed must come back out of the database.
 ///
 /// Every fixture above starts from a hand-written `PartRecord`, which is why they
@@ -452,7 +582,7 @@ mod production_round_trip {
 
     use async_trait::async_trait;
     use futures::stream;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::sync::mpsc;
     use zuno_db::message::{MessageRecord, MessageStore, PartKind, PartRecord};
     use zuno_db::{Connection, migration, open};
@@ -472,6 +602,7 @@ mod production_round_trip {
 
     const CAPSULE_ID: &str = "rs_production_capsule";
     const CIPHERTEXT: &str = "ENCRYPTED-CAPSULE-PRODUCTION-PATH";
+    const OTHER_MODEL: &str = "other-model";
 
     #[derive(Debug)]
     struct ScriptedProvider(Mutex<VecDeque<Vec<Result<StreamEvent, ProviderError>>>>);
@@ -496,8 +627,45 @@ mod production_round_trip {
         }
     }
 
+    /// The resolver, carrying the replay options the provider spec declares.
+    ///
+    /// The options are a field rather than a constant because the engine reads them
+    /// from the resolved model's spec on every step: that read is the wiring between
+    /// configuration and the request, and a suite that hard-codes one value cannot
+    /// tell whether the wiring exists.
     #[derive(Debug)]
-    struct Resolver;
+    struct Resolver {
+        /// The `reasoningReplay` value, or `None` for a spec that omits the key.
+        replay: Option<Value>,
+        /// The `reasoningReplayMaxAge` value in milliseconds, if declared.
+        max_age: Option<u64>,
+    }
+
+    impl Resolver {
+        /// A declared sealing endpoint with no configured envelope age.
+        fn encrypted() -> Self {
+            Self {
+                replay: Some(json!("encrypted")),
+                max_age: None,
+            }
+        }
+
+        /// A provider that has switched replay back off.
+        fn off() -> Self {
+            Self {
+                replay: Some(json!("off")),
+                max_age: None,
+            }
+        }
+
+        /// A sealing endpoint whose envelopes expire after `millis`.
+        fn expiring(millis: u64) -> Self {
+            Self {
+                replay: Some(json!("encrypted")),
+                max_age: Some(millis),
+            }
+        }
+    }
 
     impl AgentModelResolver for Resolver {
         fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
@@ -508,13 +676,20 @@ mod production_round_trip {
         }
 
         fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
-            (provider_id == "scripted" && model_id == "scripted-model").then(|| {
-                ResolvedModel::new(
-                    Spec::new("scripted"),
-                    "scripted-model",
-                    ApiSurface::Responses,
-                )
-            })
+            // Two models on one sealing endpoint, which is what makes a switch
+            // mid-session expressible: the envelope one of them minted is worthless
+            // to the other.
+            (provider_id == "scripted" && (model_id == "scripted-model" || model_id == OTHER_MODEL))
+                .then(|| {
+                    let mut spec = Spec::new("scripted");
+                    if let Some(replay) = self.replay.clone() {
+                        spec = spec.with_option("reasoningReplay", replay);
+                    }
+                    if let Some(max_age) = self.max_age {
+                        spec = spec.with_option("reasoningReplayMaxAge", json!(max_age));
+                    }
+                    ResolvedModel::new(spec, model_id, ApiSurface::Responses)
+                })
         }
     }
 
@@ -573,6 +748,87 @@ mod production_round_trip {
         connection
     }
 
+    /// One more user message, so the next turn has something to answer.
+    fn seed_user(connection: &Connection, message_id: &str, model_id: &str, created: i64) {
+        let store = MessageStore::new(connection);
+        let user = MessageRecord::from_json(json!({
+            "id": message_id,
+            "sessionID": SESSION_ID,
+            "role": "user",
+            "time": { "created": created },
+            "agent": "build",
+            "model": { "providerID": "scripted", "modelID": model_id }
+        }))
+        .expect("valid user message");
+        store
+            .put_message_at(&user, created)
+            .expect("store user message");
+        let part = PartRecord::from_json(
+            json!({
+                "id": format!("prt_{message_id}"),
+                "sessionID": SESSION_ID,
+                "messageID": message_id,
+                "type": "text",
+                "text": "Carry on."
+            }),
+            created,
+        )
+        .expect("valid text part");
+        store.put_part_at(&part, created).expect("store user part");
+    }
+
+    /// The `started` provider-request events of one session, oldest first.
+    ///
+    /// One request appends two events under the same type, a `started` and a terminal
+    /// one; the replay evidence lives on the first.
+    fn provider_requests(connection: &Connection) -> Vec<serde_json::Value> {
+        let mut statement = connection
+            .prepare(
+                "SELECT data FROM event \
+                 WHERE aggregate_id = ?1 AND type = 'session.provider.request.1' ORDER BY seq",
+            )
+            .expect("prepare provider request events");
+        statement
+            .query_map([SESSION_ID], |row| row.get::<_, String>(0))
+            .expect("query provider request events")
+            .map(|row| {
+                serde_json::from_str::<serde_json::Value>(&row.expect("provider request event"))
+                    .expect("provider request JSON")
+            })
+            .filter(|event: &serde_json::Value| event["status"] == "started")
+            .collect()
+    }
+
+    /// Every part of one message, in the order the hydrator yields it.
+    fn part_ids(connection: &Connection, message_id: &str) -> Vec<String> {
+        MessageStore::new(connection)
+            .hydrate_session(SESSION_ID)
+            .expect("hydrate session")
+            .into_iter()
+            .filter(|message| message.info.id == message_id)
+            .flat_map(|message| message.parts)
+            .map(|part| part.id)
+            .collect()
+    }
+
+    /// The sealed envelope stored on one part, if it still has one.
+    fn stored_envelope(connection: &Connection, part_id: &str) -> Option<String> {
+        MessageStore::new(connection)
+            .hydrate_session(SESSION_ID)
+            .expect("hydrate session")
+            .into_iter()
+            .flat_map(|message| message.parts)
+            .find(|part| part.id == part_id)
+            .and_then(|part| {
+                part.data
+                    .get("metadata")?
+                    .get("providerReasoning")?
+                    .get("encryptedContent")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+    }
+
     async fn drain(mut receiver: mpsc::Receiver<TurnEvent>) {
         while receiver.recv().await.is_some() {}
     }
@@ -597,7 +853,7 @@ mod production_round_trip {
             let provider = Arc::clone(&provider);
             providers.register("scripted", move |_spec| provider.clone());
         }
-        let resolver = Resolver;
+        let resolver = Resolver::encrypted();
         let dispatcher = NoTools;
         let interrupt = InterruptSignal::new();
         let (sender, receiver) = event_channel();
@@ -670,5 +926,473 @@ mod production_round_trip {
                 assistant.content
             ),
         }
+    }
+
+    /// Wrap scripted events as one provider response.
+    fn ok(events: Vec<StreamEvent>) -> Vec<Result<StreamEvent, ProviderError>> {
+        events.into_iter().map(Ok).collect()
+    }
+
+    /// One sealed reasoning item, as a sealing endpoint streams it.
+    fn sealed(id: &str, envelope: &str) -> StreamEvent {
+        StreamEvent::ProviderReasoningItem {
+            id: id.to_owned(),
+            summary: Vec::new(),
+            encrypted_content: Some(envelope.to_owned()),
+            status: Some("completed".to_owned()),
+        }
+    }
+
+    /// One complete tool call: start, arguments, end.
+    fn call(id: &str, path: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolUseStart {
+                id: id.to_owned(),
+                name: "write".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: id.to_owned(),
+                delta: format!("{{\"filePath\":\"{path}\"}}"),
+            },
+            StreamEvent::ToolUseEnd { id: id.to_owned() },
+        ]
+    }
+
+    /// A step that seals one capsule and answers with prose.
+    fn sealing_step(id: &str, envelope: &str) -> Vec<Result<StreamEvent, ProviderError>> {
+        ok(vec![
+            sealed(id, envelope),
+            StreamEvent::TextDelta("Answering.".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ])
+    }
+
+    /// A step that answers with prose alone.
+    fn plain_step() -> Vec<Result<StreamEvent, ProviderError>> {
+        ok(vec![
+            StreamEvent::TextDelta("Carrying on.".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ])
+    }
+
+    /// Run one real turn against a declared sealing endpoint.
+    async fn run_scripted(
+        connection: &mut Connection,
+        turn_id: &str,
+        responses: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+    ) {
+        run_scripted_as(connection, turn_id, responses, &Resolver::encrypted()).await;
+    }
+
+    /// Run one real turn, with the provider's stream and its replay options scripted.
+    async fn run_scripted_as(
+        connection: &mut Connection,
+        turn_id: &str,
+        responses: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        resolver: &Resolver,
+    ) {
+        let provider = Arc::new(ScriptedProvider(Mutex::new(VecDeque::from(responses))));
+        let mut providers = ProviderRegistry::new();
+        providers.register("scripted", move |_spec| provider.clone());
+        let dispatcher = NoTools;
+        let interrupt = InterruptSignal::new();
+        let (sender, receiver) = event_channel();
+        let turn = run_turn(
+            RunTurnRequest::new(SESSION_ID, turn_id, DynamicContext::default()),
+            TurnContext::new(connection, &providers, resolver, &dispatcher, &interrupt),
+            sender,
+        );
+        let (outcome, ()) = tokio::join!(turn, drain(receiver));
+        outcome.expect("the turn completes");
+    }
+
+    /// Run one turn whose provider response is expected to fail the turn.
+    ///
+    /// A step that streams a sealed reasoning item and then nothing else has no
+    /// assistant content, which the engine reports rather than persisting an empty
+    /// message. The checkpoint still runs, so the capsule reaches the database — the
+    /// durable shape this module's unpaired-capsule test needs.
+    async fn run_scripted_failing(
+        connection: &mut Connection,
+        turn_id: &str,
+        responses: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+    ) {
+        let provider = Arc::new(ScriptedProvider(Mutex::new(VecDeque::from(responses))));
+        let mut providers = ProviderRegistry::new();
+        providers.register("scripted", move |_spec| provider.clone());
+        let dispatcher = NoTools;
+        let resolver = Resolver::encrypted();
+        let interrupt = InterruptSignal::new();
+        let (sender, receiver) = event_channel();
+        let turn = run_turn(
+            RunTurnRequest::new(SESSION_ID, turn_id, DynamicContext::default()),
+            TurnContext::new(connection, &providers, &resolver, &dispatcher, &interrupt),
+            sender,
+        );
+        let (outcome, ()) = tokio::join!(turn, drain(receiver));
+        outcome.expect_err("a step with no assistant content cannot complete");
+    }
+
+    /// The projected shape of the first assistant message, block kind by block kind.
+    fn assistant_shape(connection: &Connection) -> Vec<String> {
+        let history = MessageStore::new(connection)
+            .hydrate_session(SESSION_ID)
+            .expect("hydrate session");
+        let messages = project_history_owned(SYSTEM, history);
+        let assistant = messages
+            .into_iter()
+            .find(|message| message.role == Role::Assistant)
+            .expect("the turn persisted an assistant message");
+        assistant
+            .content
+            .iter()
+            .map(|block| match block {
+                RequestContentBlock::ProviderEncryptedReasoning { id, .. } => {
+                    format!("capsule:{id}")
+                }
+                RequestContentBlock::Text { text } => format!("text:{text}"),
+                RequestContentBlock::ToolUse { id, .. } => format!("call:{id}"),
+                other => format!("unexpected:{other:?}"),
+            })
+            .collect()
+    }
+
+    /// A step that reasons twice and calls a tool after each reasoning item.
+    ///
+    /// The sealing endpoints reject a replayed conversation whose reasoning items are
+    /// not in the order they were produced, each immediately before the output it
+    /// explains. A step is therefore persisted as a ledger of positioned parts, not as
+    /// one text blob plus a trailing pile of tool calls.
+    #[tokio::test]
+    async fn a_multi_item_step_is_persisted_and_replayed_in_stream_order() {
+        let mut connection = seeded();
+        let mut first = vec![
+            sealed("rs_first", "SEALED-ONE"),
+            StreamEvent::TextDelta("Writing the first file.".to_owned()),
+        ];
+        first.extend(call("call_one", "a.txt"));
+        first.push(sealed("rs_second", "SEALED-TWO"));
+        first.push(StreamEvent::TextDelta(
+            "Writing the second file.".to_owned(),
+        ));
+        first.extend(call("call_two", "b.txt"));
+        first.push(StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::ToolCalls),
+        });
+        run_scripted(&mut connection, "turn-order", vec![ok(first), plain_step()]).await;
+
+        let ids = part_ids(&connection, "msg_turn-order_0001");
+        assert_eq!(
+            ids.iter().map(String::as_str).collect::<Vec<&str>>(),
+            vec![
+                "prt_turn-order_0001_0000_reasoning_capsule",
+                "prt_turn-order_0001_0001_text",
+                "prt_turn-order_0001_0002_tool",
+                "prt_turn-order_0001_0003_reasoning_capsule",
+                "prt_turn-order_0001_0004_text",
+                "prt_turn-order_0001_0005_tool",
+            ],
+            "the step's parts must be stored in the order the provider streamed them"
+        );
+        assert_eq!(
+            assistant_shape(&connection),
+            vec![
+                "capsule:rs_first",
+                "text:Writing the first file.",
+                "call:call_one",
+                "capsule:rs_second",
+                "text:Writing the second file.",
+                "call:call_two",
+            ],
+            "each capsule must be replayed immediately before the output it explains"
+        );
+    }
+
+    /// A capsule the current model did not seal leaves the request, not the database.
+    #[tokio::test]
+    async fn switching_model_withholds_the_capsule_but_keeps_it_stored() {
+        let mut connection = seeded();
+        run_scripted(
+            &mut connection,
+            "turn-seal",
+            vec![sealing_step(CAPSULE_ID, CIPHERTEXT)],
+        )
+        .await;
+        seed_user(&connection, "msg_capsule_user_2", OTHER_MODEL, 20);
+        run_scripted(&mut connection, "turn-switch", vec![plain_step()]).await;
+
+        let events = provider_requests(&connection);
+        assert_eq!(events.len(), 2, "one started event per foreground request");
+        assert_eq!(events[0]["reasoningReplay"], json!("encrypted"));
+        assert_eq!(events[0]["replayedReasoningCapsules"], json!(0));
+        assert_eq!(
+            events[1]["withheldReasoningCapsules"],
+            json!(1),
+            "the other model's envelope is worthless to this one and must be withheld"
+        );
+        assert_eq!(events[1]["replayedReasoningCapsules"], json!(0));
+        assert_eq!(
+            stored_envelope(&connection, "prt_turn-seal_0001_0000_reasoning_capsule"),
+            Some(CIPHERTEXT.to_owned()),
+            "withholding is a request-time decision; the durable row is never rewritten"
+        );
+    }
+
+    /// The model that sealed a capsule replays it on its next request.
+    #[tokio::test]
+    async fn the_sealing_model_replays_its_own_capsule_on_the_next_request() {
+        let mut connection = seeded();
+        run_scripted(
+            &mut connection,
+            "turn-seal",
+            vec![sealing_step(CAPSULE_ID, CIPHERTEXT)],
+        )
+        .await;
+        seed_user(&connection, "msg_capsule_user_2", "scripted-model", 20);
+        run_scripted(&mut connection, "turn-again", vec![plain_step()]).await;
+
+        let events = provider_requests(&connection);
+        assert_eq!(events.len(), 2, "one started event per foreground request");
+        assert_eq!(
+            events[1]["replayedReasoningCapsules"],
+            json!(1),
+            "the sealing model must get its own envelope back"
+        );
+        assert_eq!(events[1]["withheldReasoningCapsules"], json!(0));
+    }
+
+    /// An envelope with nothing after it is counted as withheld, not as replayed.
+    ///
+    /// A Responses endpoint validates the pairing positionally, so both adapters drop
+    /// a sealed item that no output follows rather than earn a permanent HTTP 400.
+    /// Durable history reaches that shape honestly: a step that streams its reasoning
+    /// item and then ends leaves an assistant message whose only part is the capsule.
+    /// The engine counts with the adapters' own rule, because a count that ignored it
+    /// reported `replayedReasoningCapsules: 1` for the rest of the session while every
+    /// request carried no reasoning item at all — and that count is what the operator
+    /// documentation says to trust.
+    #[tokio::test]
+    async fn an_envelope_no_output_follows_is_counted_as_withheld() {
+        let mut connection = seeded();
+        run_scripted_failing(
+            &mut connection,
+            "turn-lonely",
+            vec![ok(vec![
+                sealed(CAPSULE_ID, CIPHERTEXT),
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::Stop),
+                },
+            ])],
+        )
+        .await;
+        assert_eq!(
+            part_ids(&connection, "msg_turn-lonely_0001"),
+            vec!["prt_turn-lonely_0001_0000_reasoning_capsule".to_owned()],
+            "the capsule is the whole assistant message"
+        );
+
+        seed_user(&connection, "msg_capsule_user_2", "scripted-model", 20);
+        run_scripted(&mut connection, "turn-after", vec![plain_step()]).await;
+
+        let events = provider_requests(&connection);
+        let last = events.last().expect("a second foreground request");
+        assert_eq!(
+            last["replayedReasoningCapsules"],
+            json!(0),
+            "the adapter cannot send an unpaired item, so the count must not claim it did"
+        );
+        assert_eq!(
+            last["withheldReasoningCapsules"],
+            json!(1),
+            "the same envelope is reported once, as withheld"
+        );
+        assert_eq!(
+            stored_envelope(&connection, "prt_turn-lonely_0001_0000_reasoning_capsule"),
+            Some(CIPHERTEXT.to_owned()),
+            "the durable row keeps the envelope either way"
+        );
+    }
+
+    /// Switching replay off withholds the envelopes an earlier session sealed.
+    ///
+    /// `off` is not "stop asking for new envelopes", it is "no sealed item on the
+    /// wire". A provider that once sealed has envelopes in durable history, and an
+    /// endpoint that is no longer sent `include: ["reasoning.encrypted_content"]`
+    /// must not be sent a `reasoning` item with ciphertext either: the item is
+    /// unrequested, and the request event would otherwise claim
+    /// `reasoningReplay: "off"` beside a non-zero replay count.
+    #[tokio::test]
+    async fn switching_replay_off_withholds_a_capsule_the_same_model_sealed() {
+        let mut connection = seeded();
+        run_scripted(
+            &mut connection,
+            "turn-seal",
+            vec![sealing_step(CAPSULE_ID, CIPHERTEXT)],
+        )
+        .await;
+        seed_user(&connection, "msg_capsule_user_2", "scripted-model", 20);
+        run_scripted_as(
+            &mut connection,
+            "turn-off",
+            vec![plain_step()],
+            &Resolver::off(),
+        )
+        .await;
+
+        let events = provider_requests(&connection);
+        assert_eq!(events.len(), 2, "one started event per foreground request");
+        assert_eq!(events[1]["reasoningReplay"], json!("off"));
+        assert_eq!(
+            events[1]["replayedReasoningCapsules"],
+            json!(0),
+            "an endpoint that is not asked for sealed reasoning must not receive it"
+        );
+        assert_eq!(events[1]["withheldReasoningCapsules"], json!(1));
+        assert_eq!(
+            stored_envelope(&connection, "prt_turn-seal_0001_0000_reasoning_capsule"),
+            Some(CIPHERTEXT.to_owned()),
+            "turning replay off is a request-time decision, not a deletion"
+        );
+    }
+
+    /// The configured envelope age reaches the request, not just the scope helper.
+    ///
+    /// `reasoningReplayMaxAge` exists to drop an envelope Zuno believes has expired
+    /// upstream before the endpoint rejects the whole request. Nothing else in the
+    /// suite reads it out of a `Spec`, so without this test the option could be wired
+    /// to nothing and every check would stay green.
+    #[tokio::test]
+    async fn the_configured_max_age_withholds_an_aged_capsule() {
+        let mut connection = seeded();
+        run_scripted_as(
+            &mut connection,
+            "turn-seal",
+            vec![sealing_step(CAPSULE_ID, CIPHERTEXT)],
+            &Resolver::expiring(1),
+        )
+        .await;
+        // The stamp compared against the age is the assistant message's own, so the
+        // envelope has to be measurably older than the one millisecond it is allowed.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        seed_user(&connection, "msg_capsule_user_2", "scripted-model", 20);
+        run_scripted_as(
+            &mut connection,
+            "turn-aged",
+            vec![plain_step()],
+            &Resolver::expiring(1),
+        )
+        .await;
+
+        let events = provider_requests(&connection);
+        assert_eq!(events.len(), 2, "one started event per foreground request");
+        assert_eq!(events[1]["reasoningReplay"], json!("encrypted"));
+        assert_eq!(
+            events[1]["withheldReasoningCapsules"],
+            json!(1),
+            "an envelope past the configured age must leave the request"
+        );
+        assert_eq!(events[1]["replayedReasoningCapsules"], json!(0));
+    }
+
+    /// The same history, inside a generous configured age, is still replayed.
+    ///
+    /// Paired with the test above so a max age that withheld everything — or one read
+    /// as zero — would fail here instead of reading as correct expiry.
+    #[tokio::test]
+    async fn a_capsule_inside_the_configured_max_age_is_replayed() {
+        let mut connection = seeded();
+        run_scripted_as(
+            &mut connection,
+            "turn-seal",
+            vec![sealing_step(CAPSULE_ID, CIPHERTEXT)],
+            &Resolver::expiring(86_400_000),
+        )
+        .await;
+        seed_user(&connection, "msg_capsule_user_2", "scripted-model", 20);
+        run_scripted_as(
+            &mut connection,
+            "turn-fresh",
+            vec![plain_step()],
+            &Resolver::expiring(86_400_000),
+        )
+        .await;
+
+        let events = provider_requests(&connection);
+        assert_eq!(events.len(), 2, "one started event per foreground request");
+        assert_eq!(
+            events[1]["replayedReasoningCapsules"],
+            json!(1),
+            "a day-old ceiling must not withhold an envelope sealed moments ago"
+        );
+        assert_eq!(events[1]["withheldReasoningCapsules"], json!(0));
+    }
+
+    /// The provider's own argument bytes survive the database, key order and all.
+    ///
+    /// A sealing endpoint fingerprints the turn it sealed, and the tool call's
+    /// `arguments` string is part of that fingerprint. Re-serializing the parsed value
+    /// is a different string — this workspace sorts object keys and drops the
+    /// provider's spacing — so the envelope would no longer match what the endpoint
+    /// sealed and the request would be refused. The executed value stays the parsed
+    /// one; only the replayed text is the provider's.
+    #[tokio::test]
+    async fn a_tool_calls_provider_bytes_survive_the_database_verbatim() {
+        const ARGUMENTS: &str = r#"{"filePath": "a.txt", "content": "hi"}"#;
+
+        let mut connection = seeded();
+        let step = ok(vec![
+            sealed(CAPSULE_ID, CIPHERTEXT),
+            StreamEvent::ToolUseStart {
+                id: "call_raw".to_owned(),
+                name: "write".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call_raw".to_owned(),
+                delta: ARGUMENTS.to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call_raw".to_owned(),
+            },
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::ToolCalls),
+            },
+        ]);
+        run_scripted(&mut connection, "turn-raw", vec![step, plain_step()]).await;
+
+        let history = MessageStore::new(&connection)
+            .hydrate_session(SESSION_ID)
+            .expect("hydrate session");
+        let calls: Vec<RequestContentBlock> = project_history_owned(SYSTEM, history)
+            .into_iter()
+            .flat_map(|message| message.content)
+            .filter(|block| matches!(block, RequestContentBlock::ToolUse { .. }))
+            .collect();
+        let RequestContentBlock::ToolUse {
+            input,
+            raw_arguments,
+            ..
+        } = calls.first().expect("the call is projected back")
+        else {
+            unreachable!("filtered to tool calls")
+        };
+        assert_eq!(
+            raw_arguments.as_deref(),
+            Some(ARGUMENTS),
+            "the bytes the provider streamed must come back out of the database"
+        );
+        assert_eq!(
+            zuno_llm::event::tool_arguments_text(input, raw_arguments.as_deref()),
+            ARGUMENTS,
+            "the replayed arguments must be the provider's text, not a re-serialization"
+        );
+        assert_ne!(
+            input.to_string(),
+            ARGUMENTS,
+            "this fixture is only evidence while re-serializing the value differs"
+        );
     }
 }

@@ -5,7 +5,7 @@ use std::mem::discriminant;
 use serde_json::{Value, json};
 use zuno_llm::event::{
     ConnectionPhase, ContentBlock, PromptAccounting, RequestContentBlock, Role, StreamEvent,
-    ThoughtSignature, TranscriptMessage,
+    ThoughtSignature, TranscriptMessage, tool_arguments_text,
 };
 use zuno_llm::stream::StreamAccumulator;
 
@@ -118,6 +118,7 @@ fn event_per_tool_thought_signature_survives_storage_and_request_conversion() {
             id: "call-7".to_owned(),
             name: "read".to_owned(),
             input: json!({ "path": "README.md" }),
+            raw_arguments: None,
             thought_signature: Some(ThoughtSignature::new("gemini-signature-7")),
         }],
     );
@@ -290,4 +291,116 @@ fn tool_input_accumulator_rejects_json_over_its_cap() {
     assert!(detail.contains("9 bytes"), "{detail}");
     assert!(detail.contains("limit 8 bytes"), "{detail}");
     assert!(accumulator.tool_calls()[0].raw_input.is_empty());
+}
+
+#[test]
+fn tool_arguments_replay_the_provider_bytes_when_they_decode_to_the_same_value() {
+    let input = json!({ "command": "ls -a", "intent": "list" });
+    let raw = r#"{"command": "ls -a", "intent": "list"}"#;
+
+    let replayed = tool_arguments_text(&input, Some(raw));
+
+    assert_eq!(replayed, raw);
+    assert_ne!(
+        replayed,
+        input.to_string(),
+        "a re-serialization would drop the separators the endpoint fingerprinted"
+    );
+}
+
+#[test]
+fn tool_arguments_replay_the_provider_key_order_not_the_sorted_order() {
+    let raw = r#"{"intent":"list","command":"ls -a"}"#;
+    let input: Value = serde_json::from_str(raw).expect("provider bytes decode");
+
+    assert_eq!(tool_arguments_text(&input, Some(raw)), raw);
+}
+
+#[test]
+fn tool_arguments_fall_back_to_the_decoded_call_when_the_bytes_disagree() {
+    let input = json!({ "command": "ls -a" });
+    // Bytes that decode to a different call than the one in history: a mispaired row,
+    // never a tool hook, which rewrites the dispatcher's copy and leaves history alone.
+    let unrelated_bytes = r#"{"command": "rm -rf /"}"#;
+
+    let replayed = tool_arguments_text(&input, Some(unrelated_bytes));
+
+    assert_eq!(replayed, input.to_string());
+    assert!(
+        !replayed.contains("rm -rf"),
+        "the wire must carry the call durable history recorded: {replayed}"
+    );
+}
+
+#[test]
+fn tool_arguments_fall_back_to_the_executed_value_for_unusable_bytes() {
+    let input = json!({ "command": "ls -a" });
+
+    assert_eq!(
+        tool_arguments_text(&input, Some(r#"{"command": "ls -a""#)),
+        input.to_string(),
+        "a truncated capture is not valid JSON"
+    );
+    assert_eq!(
+        tool_arguments_text(&input, Some("")),
+        input.to_string(),
+        "an empty capture carries no arguments"
+    );
+    assert_eq!(
+        tool_arguments_text(&input, None),
+        input.to_string(),
+        "a call with no captured bytes re-serializes the value"
+    );
+}
+
+#[test]
+fn event_tool_use_carries_the_provider_argument_bytes_into_the_request() {
+    let raw = r#"{"command": "ls -a"}"#;
+    let stored = TranscriptMessage::new(
+        Role::Assistant,
+        vec![ContentBlock::ToolUse {
+            id: "call-9".to_owned(),
+            name: "shell".to_owned(),
+            input: json!({ "command": "ls -a" }),
+            raw_arguments: Some(raw.to_owned()),
+            thought_signature: None,
+        }],
+    );
+    let encoded = serde_json::to_string(&stored).expect("transcript serializes");
+    let decoded: TranscriptMessage =
+        serde_json::from_str(&encoded).expect("transcript deserializes");
+
+    let request = decoded.to_request();
+
+    assert!(matches!(
+        &request.content[0],
+        RequestContentBlock::ToolUse {
+            raw_arguments: Some(bytes),
+            ..
+        } if bytes == raw
+    ));
+}
+
+#[test]
+fn event_tool_use_without_provider_argument_bytes_stays_absent_on_the_wire_shape() {
+    let stored = TranscriptMessage::new(
+        Role::Assistant,
+        vec![ContentBlock::ToolUse {
+            id: "call-10".to_owned(),
+            name: "shell".to_owned(),
+            input: json!({ "command": "ls -a" }),
+            raw_arguments: None,
+            thought_signature: None,
+        }],
+    );
+
+    let encoded = serde_json::to_string(&stored).expect("transcript serializes");
+
+    assert!(
+        !encoded.contains("raw_arguments"),
+        "an absent capture must not grow every stored tool part: {encoded}"
+    );
+    let decoded: TranscriptMessage =
+        serde_json::from_str(&encoded).expect("older stored rows decode without the field");
+    assert_eq!(decoded, stored);
 }

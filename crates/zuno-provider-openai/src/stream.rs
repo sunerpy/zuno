@@ -289,6 +289,7 @@ impl ChatDecoder {
                 id: tool.id,
                 name: tool.name,
                 input,
+                raw_arguments: (!tool.arguments.is_empty()).then_some(tool.arguments),
                 thought_signature: None,
             });
             events.push(StreamEvent::ToolUseEnd { id });
@@ -495,6 +496,7 @@ impl ResponsesDecoder {
                     id: call_id.clone(),
                     name: active.name,
                     input,
+                    raw_arguments: (!arguments.is_empty()).then_some(arguments),
                     thought_signature: None,
                 });
                 Ok(vec![StreamEvent::ToolUseEnd { id: call_id }])

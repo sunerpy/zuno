@@ -2420,6 +2420,26 @@
           ],
           "description": "Response-header timeout in milliseconds, or `false` for none."
         },
+        "reasoningReplay": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReasoningReplay"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether an OpenAI Responses endpoint is asked for provider-sealed reasoning.\n\n`encrypted` adds `include: [\"reasoning.encrypted_content\"]` to every Responses\nrequest and echoes each sealed reasoning item back verbatim on later requests.\nEndpoints that seal reasoning bind the envelope to a model and a conversation,\nso replay is scoped to the model that minted it."
+        },
+        "reasoningReplayMaxAge": {
+          "description": "Oldest sealed reasoning envelope, in milliseconds, that Zuno still replays.\n\nA sealed envelope usually expires upstream. An expired envelope stays in\ndurable history and leaves the provider request instead of being rejected on\nthe wire. Requires [`ProviderOptions::reasoning_replay`] to be `encrypted`.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "responsesTextBlocks": {
           "anyOf": [
             {
@@ -2518,6 +2538,21 @@
         {
           "const": "openrouter",
           "description": "OpenRouter's OpenAI-compatible transport and reasoning options.",
+          "type": "string"
+        }
+      ]
+    },
+    "ReasoningReplay": {
+      "description": "Whether Zuno requests and replays provider-sealed reasoning\n(`include: [\"reasoning.encrypted_content\"]`).\n\nThis is an endpoint capability, not a provider identity: a loopback gateway and\nthe official OpenAI Responses API both declare it through this option.",
+      "oneOf": [
+        {
+          "const": "off",
+          "description": "Never ask for a sealed reasoning envelope. Reasoning stays history only.",
+          "type": "string"
+        },
+        {
+          "const": "encrypted",
+          "description": "Ask for `reasoning.encrypted_content` and echo sealed items back verbatim.",
           "type": "string"
         }
       ]

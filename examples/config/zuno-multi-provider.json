@@ -149,7 +149,9 @@
         "maxTokens": null,
         "timeout": false,
         "headerTimeout": 330000,
-        "chunkTimeout": 210000
+        "chunkTimeout": 210000,
+        "reasoningReplay": "encrypted",
+        "reasoningReplayMaxAge": 86400000
       },
       "models": {
         "claude-opus-5": {

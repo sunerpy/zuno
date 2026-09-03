@@ -141,7 +141,8 @@ Responses surface is also preserved for title, compaction, summary, Council
 synthesis, and learning extraction requests; those internal Agents do not
 silently fall back to Chat Completions.
 
-Set the provider options to:
+Set the provider entry's `transport` to `openai` and its `surface` to
+`responses`, then set the provider options to:
 
 ```json
 {
@@ -149,7 +150,9 @@ Set the provider options to:
   "maxTokens": null,
   "timeout": false,
   "headerTimeout": 330000,
-  "chunkTimeout": 210000
+  "chunkTimeout": 210000,
+  "reasoningReplay": "encrypted",
+  "reasoningReplayMaxAge": 86400000
 }
 ```
 
@@ -167,6 +170,31 @@ When omitted, `headerTimeout` defaults to 330 seconds and `chunkTimeout` keeps
 the compatible transport's 120-second idle default. Set `headerTimeout: false`
 only when the endpoint has an authoritative upstream deadline and an unbounded
 header wait is intentional.
+
+`reasoningReplay: "encrypted"` opts this provider into sealed reasoning: Zuno
+asks for `include: ["reasoning.encrypted_content"]` and echoes each sealed
+reasoning item back verbatim, in the position the model produced it, on every
+later request of the same session. Without it the gateway returns unsealed
+reasoning that no later turn can replay, which costs multi-tool-call quality even
+though every request still succeeds. `reasoningReplayMaxAge` is the endpoint's own
+validity window in milliseconds, `86400000` for kiro-provider's 24 hours; an older
+envelope, or one another model sealed, leaves the request while the durable row
+keeps its ciphertext.
+
+This gateway entry must declare `"transport": "openai"` and
+`"surface": "responses"`, because a provider whose endpoint comes from
+`options.baseURL` resolves to Chat Completions when no surface is declared, and
+config validation rejects that combination by key path. The catalog `openai`
+provider needs neither declaration: it already resolves to Responses, and
+validation does not ask it for them. `reasoningReplay` defaults to `off`, which sends neither `include`
+nor any sealed item. That default is not a promise of unchanged request bytes:
+this release sends every Responses provider's assistant turns in streamed order,
+so text that preceded a tool call now precedes it on the wire too. See
+[Providers](providers.md#encrypted-reasoning-replay) for the full contract.
+
+Encrypted replay is stateless on the endpoint's side: the sealed item travels in
+`input`, so it needs neither `store: true` nor `previous_response_id`, both of
+which remain unsupported below.
 
 These transport limits are independent from provider retry recovery. Zuno anchors
 the retry recovery deadline when the original provider request starts. The

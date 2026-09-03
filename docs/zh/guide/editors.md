@@ -311,13 +311,17 @@ dev: open acp logs
   "maxTokens": null,
   "timeout": false,
   "headerTimeout": 330000,
-  "chunkTimeout": 210000
+  "chunkTimeout": 210000,
+  "reasoningReplay": "encrypted",
+  "reasoningReplayMaxAge": 86400000
 }
 ```
 
 移除过期的 `responsesTextBlocks: "single"` 选项：Zuno 的通用兼容模式会插入一个空行，那会改变当前 provider 的确切投影。文本与非文本块混合、且 Kiro 无法保留其顺序时，仍然会失败即拒绝。如果纯文本仍然产生旧的错误，请确认 Zed 确实连到了新构建的 provider 进程。
 
 `headerTimeout` 与 `chunkTimeout` 刻意超过 kiro-provider 对应的 300 秒请求超时与 180 秒流空闲超时。这让网关能在 ACP 客户端关闭请求之前返回它自己的类型化超时。
+
+`reasoningReplay: "encrypted"` 让这条路由启用封装推理重放。ACP 会话最需要它，因为编辑器会驱动很长的多步骤轮次：没有它时网关会在每个请求上报告 `reasoning_replay_locked: false`，每个步骤都会在缺少上一步推理的情况下开始。包住这些选项的 provider 条目必须声明 `"transport": "openai"` 与 `"surface": "responses"`，否则配置会带着出错键路径被拒绝：它的端点来自 `baseURL`，本身会解析成 Chat Completions。可以从 `session.provider.request` 事件的 `replayedReasoningCapsules` 确认，从一个会话的第二个请求起它就会大于零。
 
 `kiro-provider` v0.5.0 及以后版本还会区分可重试的流失败与致命的协议失败。Zuno 只重试 `upstream_stream_error`、`upstream_stream_incomplete`、`upstream_stream_idle_timeout`、`malformed_upstream_tool_arguments` 和 `request_deadline_exceeded`；旧式的通用 `upstream_error` 不足以授权重试。provider 只能在模型已经完成工具调用、但参数载荷不是合法 JSON 时使用 `malformed_upstream_tool_arguments`；工具调用的结构性错误仍须使用永久失败的 `invalid_upstream_tool_call`。每次调用都记录在 `session.provider.attempt.1` 之下，并复用同一份持久会话亲和性。由于 ACP 无法撤回一个已追加的消息块，Zuno 只在该次尝试被打上检查点之后才提交 provider 文本、推理和待处理的工具行。一次失败的部分尝试会被丢弃，而不是与它的替代者拼接在一起。
 

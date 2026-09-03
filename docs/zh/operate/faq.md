@@ -220,17 +220,27 @@ to watch the guard's parent process; <path> does not exist`，存在但无法启
 {
   "provider": {
     "kiro-local": {
+      "transport": "openai",
+      "surface": "responses",
       "options": {
         "baseURL": "http://127.0.0.1:8787/v1",
         "maxTokens": null,
         "timeout": false,
         "headerTimeout": 330000,
-        "chunkTimeout": 210000
+        "chunkTimeout": 210000,
+        "reasoningReplay": "encrypted",
+        "reasoningReplayMaxAge": 86400000
       }
     }
   }
 }
 ```
+
+`reasoningReplay: "encrypted"` 才会让网关封装推理、让 Zuno 重放它。没有它时每个请求依然成功，
+但网关会记录 `reasoning_replay_locked: false`，多次工具调用的一轮会在步骤之间丢掉模型自己的推理。
+`reasoningReplayMaxAge` 对应网关 24 小时的信封有效期。像这样的网关条目必须显式写出 `transport` 与 `surface`：端点来自 `baseURL` 的 provider
+在没有声明 surface 时会解析成 Chat Completions，配置校验会拒绝这种组合。目录里的
+`openai` provider 两个键都不需要。
 
 升级时请移除过时的 `responsesTextBlocks: "single"` 设置。那个通用的 Zuno 兼容模式会用一个
 空行连接文本，因此相比 Provider 当前的无损投影，它改变了字节内容。

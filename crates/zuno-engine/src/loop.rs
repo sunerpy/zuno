@@ -38,7 +38,8 @@ use zuno_llm::event::{
     ThoughtSignature,
 };
 use zuno_llm::registry::{
-    ApiSurface, ProviderRegistry, ProviderRequestContext, ProviderSessionIdentity, Spec, ToolSchema,
+    ApiSurface, ProviderRegistry, ProviderRequestContext, ProviderSessionIdentity,
+    ReasoningReplayPolicy, Spec, ToolSchema,
 };
 use zuno_llm::sse::{StreamLimits, append_tool_input};
 use zuno_observability::span;
@@ -1323,15 +1324,40 @@ struct ToolBuilder {
     ordinal: usize,
 }
 
+/// One reasoning item of a step: its plaintext, its signature, and the provider's
+/// sealed envelope when the endpoint sends one.
+#[derive(Debug, Default)]
+struct ReasoningSlot {
+    text: String,
+    signature: String,
+    capsule: Option<RequestContentBlock>,
+}
+
+/// One piece of a step's output, in the order the provider streamed it.
+///
+/// Order is load-bearing beyond presentation. An OpenAI Responses endpoint that
+/// seals its reasoning validates the *position* of every echoed item, so a sealed
+/// capsule has to be replayed immediately before the output it produced. Keeping one
+/// concatenated text field, one reasoning field and a separate capsule list cannot
+/// express `[reasoning, text, tool, reasoning, tool]`, so the step keeps a ledger
+/// instead of one field per kind.
+#[derive(Debug)]
+enum StepItem {
+    /// A contiguous run of assistant text.
+    Text(String),
+    /// One reasoning item.
+    Reasoning(ReasoningSlot),
+    /// A tool call, named by the ordinal that owns its arguments in
+    /// [`StepAccumulator::calls`] or [`StepAccumulator::active_tools`].
+    Call { ordinal: usize },
+}
+
 #[derive(Debug)]
 struct StepAccumulator {
     provider: String,
     stream: String,
     tool_input_limit: usize,
-    text: String,
-    reasoning: String,
-    reasoning_signature: String,
-    provider_reasoning: Vec<RequestContentBlock>,
+    items: Vec<StepItem>,
     calls: BTreeMap<usize, ToolCall>,
     active_tools: BTreeMap<String, ToolBuilder>,
     next_tool_ordinal: usize,
@@ -1350,10 +1376,7 @@ impl StepAccumulator {
             provider,
             stream,
             tool_input_limit,
-            text: String::new(),
-            reasoning: String::new(),
-            reasoning_signature: String::new(),
-            provider_reasoning: Vec::new(),
+            items: Vec::new(),
             calls: BTreeMap::new(),
             active_tools: BTreeMap::new(),
             next_tool_ordinal: 0,
@@ -1369,7 +1392,7 @@ impl StepAccumulator {
 
     fn apply(&mut self, step: u32, event: &StreamEvent) -> Result<(), TurnError> {
         match event {
-            StreamEvent::TextDelta(text) => self.text.push_str(text),
+            StreamEvent::TextDelta(text) => self.push_text(text),
             StreamEvent::ToolUseStart { id, name } => {
                 if self.active_tools.contains_key(id)
                     || self.calls.values().any(|call| call.id == *id)
@@ -1381,6 +1404,7 @@ impl StepAccumulator {
                 }
                 let ordinal = self.next_tool_ordinal;
                 self.next_tool_ordinal = self.next_tool_ordinal.saturating_add(1);
+                self.items.push(StepItem::Call { ordinal });
                 self.active_tools.insert(
                     id.clone(),
                     ToolBuilder {
@@ -1429,36 +1453,33 @@ impl StepAccumulator {
             | StreamEvent::SessionId(_)
             | StreamEvent::Compaction { .. }
             | StreamEvent::UpstreamProvider { .. } => {}
+            // A step may reason more than once. Each `ReasoningStart` opens its own
+            // slot instead of clearing the previous one, so a step that reasons,
+            // calls a tool, then reasons again keeps both reasoning items.
             StreamEvent::ReasoningStart => {
-                self.reasoning.clear();
-                self.reasoning_signature.clear();
+                self.items
+                    .push(StepItem::Reasoning(ReasoningSlot::default()));
             }
-            StreamEvent::ReasoningDelta(delta) => self.reasoning.push_str(delta),
+            StreamEvent::ReasoningDelta(delta) => {
+                self.reasoning_slot().text.push_str(delta);
+            }
             StreamEvent::ReasoningSignatureDelta(delta) => {
-                self.reasoning_signature.push_str(delta);
+                self.reasoning_slot().signature.push_str(delta);
             }
             StreamEvent::ProviderReasoningItem {
                 id,
                 summary,
                 encrypted_content,
                 status,
-            } => self
-                .provider_reasoning
-                .push(RequestContentBlock::ProviderEncryptedReasoning {
-                    id: id.clone(),
-                    summary: summary.clone(),
-                    encrypted_content: encrypted_content.clone(),
-                    status: status.clone(),
-                }),
-            StreamEvent::ReasoningEnd => {
-                if !self.reasoning_signature.is_empty() {
-                    self.provider_reasoning
-                        .push(RequestContentBlock::SignedThinking {
-                            thinking: self.reasoning.clone(),
-                            signature: self.reasoning_signature.clone(),
-                        });
-                }
-            }
+            } => self.seal_reasoning(RequestContentBlock::ProviderEncryptedReasoning {
+                id: id.clone(),
+                summary: summary.clone(),
+                encrypted_content: encrypted_content.clone(),
+                status: status.clone(),
+            }),
+            // Nothing to close: the signature and the sealed envelope already live
+            // on the slot this reasoning item opened.
+            StreamEvent::ReasoningEnd => {}
             StreamEvent::MessageEnd { stop_reason } => {
                 let mut active = self
                     .active_tools
@@ -1493,6 +1514,7 @@ impl StepAccumulator {
             } => {
                 let ordinal = self.next_tool_ordinal;
                 self.next_tool_ordinal = self.next_tool_ordinal.saturating_add(1);
+                self.items.push(StepItem::Call { ordinal });
                 self.calls.insert(
                     ordinal,
                     ToolCall {
@@ -1533,7 +1555,68 @@ impl StepAccumulator {
         Ok(())
     }
 
-    fn checkpoint_calls(&self) -> Vec<ToolCall> {
+    /// Append streamed text to the run in progress, opening one when the previous
+    /// item was reasoning or a tool call.
+    fn push_text(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        match self.items.last_mut() {
+            Some(StepItem::Text(text)) => text.push_str(delta),
+            _ => self.items.push(StepItem::Text(delta.to_owned())),
+        }
+    }
+
+    /// The reasoning slot deltas belong to, opened here if the provider streamed a
+    /// delta without an opening event.
+    fn reasoning_slot(&mut self) -> &mut ReasoningSlot {
+        if !matches!(self.items.last(), Some(StepItem::Reasoning(_))) {
+            self.items
+                .push(StepItem::Reasoning(ReasoningSlot::default()));
+        }
+        match self.items.last_mut() {
+            Some(StepItem::Reasoning(slot)) => slot,
+            _ => unreachable!("a reasoning slot was just opened"),
+        }
+    }
+
+    /// Attach a sealed reasoning envelope to the oldest slot still missing one.
+    ///
+    /// A provider finishes one reasoning item before opening the next, so the
+    /// envelopes arrive in slot order. Attaching to the *newest* slot would move a
+    /// capsule past the tool call it was streamed before, and position is exactly
+    /// what an endpoint that signs reasoning validates on replay.
+    fn seal_reasoning(&mut self, capsule: RequestContentBlock) {
+        let unsealed = self.items.iter_mut().find_map(|item| match item {
+            StepItem::Reasoning(slot) if slot.capsule.is_none() => Some(slot),
+            _ => None,
+        });
+        match unsealed {
+            Some(slot) => slot.capsule = Some(capsule),
+            None => self.items.push(StepItem::Reasoning(ReasoningSlot {
+                capsule: Some(capsule),
+                ..ReasoningSlot::default()
+            })),
+        }
+    }
+
+    /// The ledger position of the item that carries `ordinal`.
+    fn call_position(&self, ordinal: usize) -> usize {
+        self.items
+            .iter()
+            .position(|item| matches!(item, StepItem::Call { ordinal: item } if *item == ordinal))
+            .expect("every recorded tool call pushed its ledger item first")
+    }
+
+    /// The ledger position of each call, in the order `self.calls.values()` yields.
+    fn call_positions(&self) -> Vec<usize> {
+        self.calls
+            .keys()
+            .map(|ordinal| self.call_position(*ordinal))
+            .collect()
+    }
+
+    fn checkpoint_calls(&self) -> BTreeMap<usize, ToolCall> {
         let mut calls = self.calls.clone();
         for tool in self.active_tools.values() {
             let raw = tool.raw_input.trim();
@@ -1550,14 +1633,11 @@ impl StepAccumulator {
                 },
             );
         }
-        calls.into_values().collect()
+        calls
     }
 
     fn reset_generated(&mut self) {
-        self.text.clear();
-        self.reasoning.clear();
-        self.reasoning_signature.clear();
-        self.provider_reasoning.clear();
+        self.items.clear();
         self.calls.clear();
         self.active_tools.clear();
         self.next_tool_ordinal = 0;
@@ -1570,25 +1650,28 @@ impl StepAccumulator {
         self.prompt_accounting = None;
     }
 
-    fn provider_reasoning_capsules(&self) -> impl Iterator<Item = &RequestContentBlock> {
-        self.provider_reasoning.iter().filter(|block| {
-            matches!(
-                block,
-                RequestContentBlock::ProviderEncryptedReasoning { .. }
-            )
-        })
-    }
-
+    /// Whether any byte of this step reached the user or the transcript, including a
+    /// tool call whose arguments are still streaming.
     fn has_generated_output(&self) -> bool {
-        !self.text.is_empty()
-            || !self.reasoning.is_empty()
-            || !self.provider_reasoning.is_empty()
-            || !self.calls.is_empty()
-            || !self.active_tools.is_empty()
+        self.items.iter().any(|item| match item {
+            StepItem::Text(text) => !text.is_empty(),
+            StepItem::Reasoning(slot) => {
+                !slot.text.is_empty() || !slot.signature.is_empty() || slot.capsule.is_some()
+            }
+            StepItem::Call { .. } => true,
+        }) || !self.active_tools.is_empty()
     }
 
+    /// Whether the step produced a part worth an assistant message.
+    ///
+    /// A sealed capsule alone does not: it is provider bookkeeping, not content the
+    /// user asked for, so a step that returns nothing else is still empty.
     fn has_assistant_parts(&self) -> bool {
-        !self.text.is_empty() || !self.reasoning.is_empty() || !self.calls.is_empty()
+        self.items.iter().any(|item| match item {
+            StepItem::Text(text) => !text.is_empty(),
+            StepItem::Reasoning(slot) => !slot.text.is_empty(),
+            StepItem::Call { ordinal } => self.calls.contains_key(ordinal),
+        })
     }
 }
 
@@ -1711,6 +1794,28 @@ async fn run_turn_in_span(
             &model.catalog_provider_id,
             &model.catalog_model_id,
         );
+        // Scoped before anything reads `history`, so the hook path and the direct
+        // projection see the same request. The option is read from the resolved
+        // model's spec: a declared endpoint capability, never a provider-id rule.
+        let reasoning_replay = ReasoningReplayPolicy::from_options(&model.provider.options)
+            .map_err(|error| TurnError::Provider(ProviderError::fatal(error)))?;
+        // `off` withholds everything, not merely the envelopes a scope rejects. A
+        // session that once ran with replay on has envelopes in durable history, and
+        // an endpoint that is no longer asked for `reasoning.encrypted_content` is an
+        // endpoint that must not receive a sealed item either: it would be an
+        // unrequested item on the wire, and the request event would report
+        // `reasoningReplay: "off"` beside a non-zero replay count.
+        let scope = if reasoning_replay.requests_encrypted() {
+            ReasoningReplayScope::Model {
+                provider_id: &model.catalog_provider_id,
+                model_id: &model.catalog_model_id,
+                now: now_millis(),
+                max_age: reasoning_replay.max_age,
+            }
+        } else {
+            ReasoningReplayScope::None
+        };
+        let withheld_reasoning_capsules = withhold_unreplayable_capsules(&mut history, scope);
 
         let step_limit_finalization = agent.max_steps.filter(|max_steps| steps >= max_steps.get());
         if let Some(max_steps) = step_limit_finalization {
@@ -1774,6 +1879,9 @@ async fn run_turn_in_span(
             project_history_owned_with_system_messages(&system, history)
         };
         let assistant_id = assistant.id.clone();
+        // Every part of this step is stamped with the message's creation time, so the
+        // part id decides the order inside the message.
+        let assistant_time_created = assistant.time_created;
         MessageStore::new(context.connection).put_message(&assistant)?;
         last_assistant_id = Some(assistant_id.clone());
         events
@@ -1948,6 +2056,7 @@ async fn run_turn_in_span(
             .messages
             .len()
             .saturating_add(completion.developer_context.len());
+        let capsules = tally_capsules(&completion.messages);
         let orchestration_snapshot = Arc::new(attempt_snapshot(AttemptSnapshotInput {
             request: &request,
             session: &session,
@@ -1976,6 +2085,10 @@ async fn run_turn_in_span(
                 prompt_receipt_id: Some(&prompt_receipt_id),
                 message_count,
                 estimated_prompt_tokens,
+                reasoning_replay,
+                replayed_reasoning_capsules: capsules.replayed,
+                withheld_reasoning_capsules: withheld_reasoning_capsules
+                    .saturating_add(capsules.unpaired),
                 assistant_message_id: &assistant_id,
                 orchestration_snapshot: &orchestration_snapshot,
                 request_context: completion
@@ -2311,45 +2424,54 @@ async fn run_turn_in_span(
             }
         };
 
-        if !accumulator.text.is_empty() {
-            let hook_result = context
-                .hooks
-                .text_complete(
-                    &request.session_id,
-                    &assistant_id,
-                    &text_part_id(&request.turn_id, step),
-                    &mut accumulator.text,
-                )
-                .await;
-            if let Err(message) = hook_result {
-                let error = TurnError::Hook(message);
-                append_provider_request_terminal(
-                    context.connection,
-                    &request,
-                    step,
-                    &request_id,
-                    "failed",
-                    &assistant_id,
-                    Some(&error),
-                )?;
-                checkpoint_assistant(
-                    context.connection,
-                    &request,
-                    step,
-                    &mut assistant,
-                    &accumulator,
-                    &locked_tools,
-                    AssistantCheckpointDisposition::Failed(&error),
-                )?;
-                events
-                    .send(TurnEvent::AssistantCheckpointed {
-                        step,
-                        message_id: assistant_id,
-                        interrupted: false,
-                    })
-                    .await?;
-                return Err(error);
+        // One call per contiguous text segment, each with the part id that segment
+        // will be persisted under. A step whose text is split by a tool call or a
+        // reasoning item is several parts, and a hook rewrites exactly the segment
+        // it was handed.
+        let mut hook_failure = None;
+        for (position, item) in accumulator.items.iter_mut().enumerate() {
+            let StepItem::Text(text) = item else { continue };
+            if text.is_empty() {
+                continue;
             }
+            let part_id = positional_part_id(&request.turn_id, step, position, PART_KIND_TEXT);
+            if let Err(message) = context
+                .hooks
+                .text_complete(&request.session_id, &assistant_id, &part_id, text)
+                .await
+            {
+                hook_failure = Some(message);
+                break;
+            }
+        }
+        if let Some(message) = hook_failure {
+            let error = TurnError::Hook(message);
+            append_provider_request_terminal(
+                context.connection,
+                &request,
+                step,
+                &request_id,
+                "failed",
+                &assistant_id,
+                Some(&error),
+            )?;
+            checkpoint_assistant(
+                context.connection,
+                &request,
+                step,
+                &mut assistant,
+                &accumulator,
+                &locked_tools,
+                AssistantCheckpointDisposition::Failed(&error),
+            )?;
+            events
+                .send(TurnEvent::AssistantCheckpointed {
+                    step,
+                    message_id: assistant_id,
+                    interrupted: false,
+                })
+                .await?;
+            return Err(error);
         }
 
         if provider_exit == ProviderStreamExit::Interrupted {
@@ -2539,6 +2661,10 @@ async fn run_turn_in_span(
         honour_budget_decision(&events, decision).await?;
 
         let calls = accumulator.calls.values().cloned().collect::<Vec<_>>();
+        // Where each call sat in the stream. The part id carries that position, not
+        // the dispatch index, so a call keeps its place among the text and reasoning
+        // parts of the same step.
+        let call_positions = accumulator.call_positions();
         if !calls.is_empty()
             && let Some(max_steps) = step_limit_finalization
         {
@@ -2704,7 +2830,8 @@ async fn run_turn_in_span(
                         &request,
                         ToolPartIdentity {
                             step,
-                            call_index,
+                            position: call_positions[call_index],
+                            message_time_created: assistant_time_created,
                             message_id: &assistant_id,
                             call: &call,
                             display_name: &display_name,
@@ -3815,6 +3942,144 @@ fn append_reasoning_owned(content: &mut Vec<RequestContentBlock>, mut data: Map<
     }
 }
 
+/// Which sealed reasoning envelopes a request is allowed to replay.
+#[derive(Debug, Clone, Copy)]
+pub enum ReasoningReplayScope<'a> {
+    /// None of them. The auxiliary requests — title, summary, compaction — run on
+    /// their own model, and an envelope minted for the turn model is a rejected
+    /// request there, not a better summary.
+    None,
+    /// Only an envelope this provider and model minted, and only while it is younger
+    /// than `max_age`.
+    Model {
+        /// The catalog provider id of the model about to be called.
+        provider_id: &'a str,
+        /// The catalog model id of the model about to be called.
+        model_id: &'a str,
+        /// The clock this request reads, in milliseconds.
+        now: i64,
+        /// How old an envelope may be, or `None` to let the endpoint decide.
+        max_age: Option<Duration>,
+    },
+}
+
+/// Drop sealed reasoning envelopes this request cannot replay, in memory only.
+///
+/// An envelope is bound to the model that minted it and expires upstream, so echoing
+/// one to a different model — or after it has expired — fails the whole request
+/// rather than degrading one answer. Removing `encryptedContent` from the hydrated
+/// copy leaves the capsule as history-only content, which is exactly what
+/// [`push_provider_reasoning_owned`] already does with a capsule the provider never
+/// sealed. The durable row is not touched: the envelope stays available to the model
+/// that can still use it, and to recovery evidence.
+///
+/// Returns how many envelopes were withheld, for the durable request event.
+pub fn withhold_unreplayable_capsules(
+    history: &mut [MessageWithParts],
+    scope: ReasoningReplayScope<'_>,
+) -> usize {
+    let mut withheld = 0_usize;
+    for message in history {
+        if admits_sealed_reasoning(message, scope) {
+            continue;
+        }
+        for part in &mut message.parts {
+            if withhold_capsule(part) {
+                withheld = withheld.saturating_add(1);
+            }
+        }
+    }
+    withheld
+}
+
+/// Whether `scope` lets this message's envelopes travel with the next request.
+fn admits_sealed_reasoning(message: &MessageWithParts, scope: ReasoningReplayScope<'_>) -> bool {
+    let ReasoningReplayScope::Model {
+        provider_id,
+        model_id,
+        now,
+        max_age,
+    } = scope
+    else {
+        return false;
+    };
+    let recorded = |key: &str| message.info.data.get(key).and_then(Value::as_str);
+    if recorded("providerID") != Some(provider_id) || recorded("modelID") != Some(model_id) {
+        return false;
+    }
+    let Some(max_age) = max_age else {
+        return true;
+    };
+    let Ok(max_age) = i64::try_from(max_age.as_millis()) else {
+        return true;
+    };
+    // A stamp in the future is a clock that moved, not an expired envelope.
+    now.saturating_sub(message.info.time_created) <= max_age
+}
+
+/// Remove one part's sealed envelope. Returns whether there was one to remove.
+fn withhold_capsule(part: &mut PartRecord) -> bool {
+    let Some(Value::Object(metadata)) = part.data.get_mut("metadata") else {
+        return false;
+    };
+    let Some(Value::Object(capsule)) = metadata.get_mut(PROVIDER_REASONING_KEY) else {
+        return false;
+    };
+    let sealed = capsule
+        .get("encryptedContent")
+        .and_then(Value::as_str)
+        .is_some_and(|envelope| !envelope.is_empty());
+    if !sealed {
+        return false;
+    }
+    capsule.remove("encryptedContent");
+    true
+}
+
+/// What became of the sealed reasoning envelopes this request carried.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CapsuleTally {
+    /// Envelopes the adapter puts on the wire.
+    replayed: usize,
+    /// Envelopes the adapter drops because nothing in the message follows them.
+    unpaired: usize,
+}
+
+/// Count the sealed reasoning envelopes this request replays, and those it cannot.
+///
+/// Counted over the messages as they leave the engine, after the hooks have run, so
+/// the number is what the adapter echoes rather than what history offered. The
+/// pairing rule is the adapter's own
+/// [`sealed_item_has_following_output`](zuno_llm::registry::sealed_item_has_following_output),
+/// not a second implementation of it: a step that was interrupted right after its
+/// reasoning item leaves an assistant message whose only content is the envelope,
+/// both Responses adapters drop that item rather than earn a permanent HTTP 400, and
+/// a count that ignored the rule reported replay working for the rest of the session
+/// while nothing was replayed.
+fn tally_capsules(messages: &[Message]) -> CapsuleTally {
+    let mut tally = CapsuleTally::default();
+    for message in messages {
+        for (index, block) in message.content.iter().enumerate() {
+            let sealed = matches!(
+                block,
+                RequestContentBlock::ProviderEncryptedReasoning {
+                    encrypted_content: Some(envelope),
+                    ..
+                } if !envelope.is_empty()
+            );
+            if !sealed {
+                continue;
+            }
+            if zuno_llm::registry::sealed_item_has_following_output(&message.content[index + 1..]) {
+                tally.replayed = tally.replayed.saturating_add(1);
+            } else {
+                tally.unpaired = tally.unpaired.saturating_add(1);
+            }
+        }
+    }
+    tally
+}
+
 /// The `metadata` key the stream projection stores a native reasoning capsule under.
 ///
 /// Named once because the writer and this reader disagreeing about it silently drops
@@ -3872,6 +4137,7 @@ fn append_tool_pair_owned(
     let Some(Value::Object(mut state)) = data.remove("state") else {
         return;
     };
+    let raw_arguments = take_string(&mut state, "raw");
     let input = match state.remove("input") {
         Some(Value::Object(input)) => Value::Object(input),
         Some(_) => {
@@ -3894,6 +4160,7 @@ fn append_tool_pair_owned(
         id: call_id.clone(),
         name,
         input,
+        raw_arguments,
         thought_signature,
     });
 
@@ -3978,6 +4245,7 @@ fn append_tool_pair(
         return;
     };
     let input = state.get("input").cloned().unwrap_or_else(|| json!({}));
+    let raw_arguments = state.get("raw").and_then(Value::as_str).map(str::to_owned);
     let thought_signature = part
         .data
         .get("metadata")
@@ -3989,6 +4257,7 @@ fn append_tool_pair(
         id: call_id.to_owned(),
         name: name.to_owned(),
         input,
+        raw_arguments,
         thought_signature,
     });
 
@@ -4069,6 +4338,16 @@ struct ProviderRequestStart<'a> {
     prompt_receipt_id: Option<&'a str>,
     message_count: usize,
     estimated_prompt_tokens: u64,
+    /// What this endpoint declared about sealed reasoning.
+    reasoning_replay: ReasoningReplayPolicy,
+    /// Sealed envelopes this request replays. The envelopes themselves are never
+    /// written to the event log; the count is what makes a silent replay failure
+    /// visible without them.
+    replayed_reasoning_capsules: usize,
+    /// Sealed envelopes history offered that this request withheld: another model
+    /// minted them, they aged out, or nothing in their message follows them, which is
+    /// the one shape a Responses endpoint refuses outright.
+    withheld_reasoning_capsules: usize,
     assistant_message_id: &'a str,
     orchestration_snapshot: &'a AttemptSnapshot,
     request_context: &'a ProviderRequestContext,
@@ -4113,6 +4392,18 @@ fn append_provider_request_started(
         (
             "affinityAttached".to_owned(),
             Value::Bool(start.request_context.session_identity().is_some()),
+        ),
+        (
+            "reasoningReplay".to_owned(),
+            Value::String(start.reasoning_replay.as_str().to_owned()),
+        ),
+        (
+            "replayedReasoningCapsules".to_owned(),
+            Value::from(start.replayed_reasoning_capsules),
+        ),
+        (
+            "withheldReasoningCapsules".to_owned(),
+            Value::from(start.withheld_reasoning_capsules),
         ),
     ]);
     if start.request_context.session_identity().is_some() {
@@ -4484,7 +4775,10 @@ fn append_provider_request_terminal(
 }
 
 fn estimate_completion_prompt_tokens(completion: &zuno_llm::registry::CompletionRequest) -> u64 {
-    let message_bytes = serde_json::to_vec(&completion.messages).map_or(0, |value| value.len());
+    // `billable_json_len` counts each tool call's arguments once. The blocks carry
+    // both the decoded `input` and the provider's own `raw_arguments` bytes; only one
+    // of the two is ever written to a request body.
+    let message_bytes = crate::prelude::billable_json_len(&completion.messages);
     let developer_bytes = completion
         .developer_context
         .iter()
@@ -4645,53 +4939,6 @@ fn checkpoint_assistant(
         .find_message(&assistant.id)?
         .map(|message| session::MessageUsage::from_data(&message.data));
     store.put_message_at(assistant, completed)?;
-    if !accumulator.text.is_empty() {
-        let text = PartRecord::from_json(
-            json!({
-                "id": text_part_id(&request.turn_id, step),
-                "sessionID": request.session_id,
-                "messageID": assistant.id,
-                "type": "text",
-                "text": accumulator.text,
-                "time": { "start": assistant.time_created, "end": completed }
-            }),
-            assistant.time_created,
-        )?;
-        store.put_part_at(&text, completed)?;
-    }
-    if !accumulator.reasoning.is_empty() {
-        let mut metadata = Map::new();
-        if !accumulator.reasoning_signature.is_empty() {
-            metadata.insert(
-                "signature".to_owned(),
-                Value::String(accumulator.reasoning_signature.clone()),
-            );
-        }
-        let reasoning = PartRecord::from_json(
-            json!({
-                "id": reasoning_part_id(&request.turn_id, step),
-                "sessionID": request.session_id,
-                "messageID": assistant.id,
-                "type": "reasoning",
-                "text": accumulator.reasoning,
-                "metadata": metadata,
-                "time": { "start": assistant.time_created, "end": completed }
-            }),
-            assistant.time_created,
-        )?;
-        store.put_part_at(&reasoning, completed)?;
-    }
-    for (capsule_index, capsule) in accumulator.provider_reasoning_capsules().enumerate() {
-        let part = provider_reasoning_part(
-            request,
-            step,
-            capsule_index,
-            assistant,
-            completed,
-            capsule.clone(),
-        )?;
-        store.put_part_at(&part, completed)?;
-    }
     let tool_failure = match &disposition {
         AssistantCheckpointDisposition::Completed => None,
         AssistantCheckpointDisposition::Interrupted(_) => Some(INTERRUPTED_TOOL_RESULT),
@@ -4702,21 +4949,90 @@ fn checkpoint_assistant(
             Some("[Tool execution skipped because the turn failed]")
         }
     };
-    for (call_index, call) in accumulator.checkpoint_calls().iter().enumerate() {
-        let display_name = tool_display_name(locked_tools, &call.name);
-        let tool = checkpoint_tool_part(
-            request,
-            ToolPartIdentity {
-                step,
-                call_index,
-                message_id: &assistant.id,
-                call,
-                display_name: &display_name,
-                ui_intent: tool_ui_intent(locked_tools, &call.name),
-            },
-            tool_failure,
-        )?;
-        store.put_part_at(&tool, completed)?;
+    // One pass over the ledger, in stream order. Every part shares the message's
+    // creation time, so `positional_part_id` alone decides the order the hydrator
+    // and every client see — which is the order the provider produced.
+    let calls = accumulator.checkpoint_calls();
+    for (position, item) in accumulator.items.iter().enumerate() {
+        match item {
+            StepItem::Text(text) => {
+                if text.is_empty() {
+                    continue;
+                }
+                let part = PartRecord::from_json(
+                    json!({
+                        "id": positional_part_id(&request.turn_id, step, position, PART_KIND_TEXT),
+                        "sessionID": request.session_id,
+                        "messageID": assistant.id,
+                        "type": "text",
+                        "text": text,
+                        "time": { "start": assistant.time_created, "end": completed }
+                    }),
+                    assistant.time_created,
+                )?;
+                store.put_part_at(&part, completed)?;
+            }
+            StepItem::Reasoning(slot) => {
+                if !slot.text.is_empty() {
+                    let mut metadata = Map::new();
+                    if !slot.signature.is_empty() {
+                        metadata.insert(
+                            "signature".to_owned(),
+                            Value::String(slot.signature.clone()),
+                        );
+                    }
+                    let part = PartRecord::from_json(
+                        json!({
+                            "id": positional_part_id(
+                                &request.turn_id,
+                                step,
+                                position,
+                                PART_KIND_REASONING,
+                            ),
+                            "sessionID": request.session_id,
+                            "messageID": assistant.id,
+                            "type": "reasoning",
+                            "text": slot.text,
+                            "metadata": metadata,
+                            "time": { "start": assistant.time_created, "end": completed }
+                        }),
+                        assistant.time_created,
+                    )?;
+                    store.put_part_at(&part, completed)?;
+                }
+                if let Some(capsule) = &slot.capsule {
+                    let part = provider_reasoning_part(
+                        request,
+                        step,
+                        position,
+                        assistant,
+                        completed,
+                        capsule.clone(),
+                    )?;
+                    store.put_part_at(&part, completed)?;
+                }
+            }
+            StepItem::Call { ordinal } => {
+                let Some(call) = calls.get(ordinal) else {
+                    continue;
+                };
+                let display_name = tool_display_name(locked_tools, &call.name);
+                let tool = checkpoint_tool_part(
+                    request,
+                    ToolPartIdentity {
+                        step,
+                        position,
+                        message_time_created: assistant.time_created,
+                        message_id: &assistant.id,
+                        call,
+                        display_name: &display_name,
+                        ui_intent: tool_ui_intent(locked_tools, &call.name),
+                    },
+                    tool_failure,
+                )?;
+                store.put_part_at(&tool, completed)?;
+            }
+        }
     }
     session::reconcile_usage(
         &transaction,
@@ -4760,7 +5076,7 @@ fn update_usage(data: &mut Map<String, Value>, accumulator: &StepAccumulator) {
 fn provider_reasoning_part(
     request: &RunTurnRequest,
     step: u32,
-    capsule_index: usize,
+    position: usize,
     assistant: &MessageRecord,
     completed: i64,
     capsule: RequestContentBlock,
@@ -4772,11 +5088,16 @@ fn provider_reasoning_part(
         status,
     } = capsule
     else {
-        unreachable!("provider_reasoning_capsules yields only encrypted reasoning blocks");
+        unreachable!("a reasoning slot holds only an encrypted reasoning capsule");
     };
     PartRecord::from_json(
         json!({
-            "id": provider_reasoning_part_id(&request.turn_id, step, capsule_index),
+            "id": positional_part_id(
+                &request.turn_id,
+                step,
+                position,
+                PART_KIND_REASONING_CAPSULE,
+            ),
             "sessionID": request.session_id,
             "messageID": assistant.id,
             "type": "reasoning",
@@ -4803,7 +5124,8 @@ fn checkpoint_tool_part(
 ) -> Result<PartRecord, TurnError> {
     let ToolPartIdentity {
         step,
-        call_index,
+        position,
+        message_time_created,
         message_id,
         call,
         display_name,
@@ -4829,7 +5151,7 @@ fn checkpoint_tool_part(
         state["inputError"] = Value::String(error.clone());
     }
     let mut payload = json!({
-        "id": tool_part_id(&request.turn_id, step, call_index),
+        "id": positional_part_id(&request.turn_id, step, position, PART_KIND_TOOL),
         "sessionID": request.session_id,
         "messageID": message_id,
         "type": "tool",
@@ -4842,12 +5164,19 @@ fn checkpoint_tool_part(
     if let Some(signature) = &call.thought_signature {
         payload["metadata"] = json!({ "thoughtSignature": signature.as_str() });
     }
-    PartRecord::from_json(payload, now_millis()).map_err(TurnError::from)
+    PartRecord::from_json(payload, message_time_created).map_err(TurnError::from)
 }
 
+/// Everything a tool part needs beyond the call itself.
+///
+/// `position` is the call's place in the step's stream, not its dispatch index, and
+/// `message_time_created` is the assistant message's stamp: both the pending part
+/// written at checkpoint and the result written after dispatch use them, so the row
+/// keeps one id and one creation time as its state advances.
 struct ToolPartIdentity<'a> {
     step: u32,
-    call_index: usize,
+    position: usize,
+    message_time_created: i64,
     message_id: &'a str,
     call: &'a ToolCall,
     display_name: &'a str,
@@ -4884,7 +5213,12 @@ fn persist_tool_result(
         state["output"] = Value::String(dispatch.output.output.clone());
     }
     let mut payload = json!({
-        "id": tool_part_id(&request.turn_id, identity.step, identity.call_index),
+        "id": positional_part_id(
+            &request.turn_id,
+            identity.step,
+            identity.position,
+            PART_KIND_TOOL,
+        ),
         "sessionID": request.session_id,
         "messageID": identity.message_id,
         "type": "tool",
@@ -4897,9 +5231,8 @@ fn persist_tool_result(
     if let Some(signature) = &identity.call.thought_signature {
         payload["metadata"] = json!({ "thoughtSignature": signature.as_str() });
     }
-    let now = now_millis();
-    let part = PartRecord::from_json(payload, now)?;
-    MessageStore::new(connection).put_part_at(&part, now)?;
+    let part = PartRecord::from_json(payload, identity.message_time_created)?;
+    MessageStore::new(connection).put_part_at(&part, now_millis())?;
     Ok(())
 }
 
@@ -4924,24 +5257,25 @@ fn assistant_message_id(turn_id: &str, step: u32) -> String {
     format!("msg_{turn_id}_{step:04}")
 }
 
-fn text_part_id(turn_id: &str, step: u32) -> String {
-    format!("prt_{turn_id}_{step:04}_text")
-}
+/// The part kinds [`positional_part_id`] spells.
+const PART_KIND_TEXT: &str = "text";
+const PART_KIND_REASONING: &str = "reasoning";
+const PART_KIND_REASONING_CAPSULE: &str = "reasoning_capsule";
+const PART_KIND_TOOL: &str = "tool";
 
-fn reasoning_part_id(turn_id: &str, step: u32) -> String {
-    format!("prt_{turn_id}_{step:04}_reasoning")
-}
-
-/// Parts with the same creation time use their id as the stable tie-break
-/// (`zuno-db/src/message.rs`). This id has to sort *before* [`text_part_id`] and
-/// [`tool_part_id`] so the capsule is replayed as the assistant message's opening
-/// content — the only position the provider accepts it in. `"reasoning_"` &lt;
-/// `"text"` &lt; `"tool_"` holds, and the zero-padded index keeps several capsules
-/// in stream order.
-fn provider_reasoning_part_id(turn_id: &str, step: u32, capsule_index: usize) -> String {
-    format!("prt_{turn_id}_{step:04}_reasoning_{capsule_index:04}")
-}
-
-fn tool_part_id(turn_id: &str, step: u32, call_index: usize) -> String {
-    format!("prt_{turn_id}_{step:04}_tool_{call_index:04}")
+/// The durable id of one part of one step, carrying its place in the stream.
+///
+/// Parts with the same creation time are ordered by id (`zuno-db/src/message.rs`)
+/// and every part of a step shares the assistant message's stamp, so this id is the
+/// whole ordering. The position comes before the kind on purpose:
+/// `..._0000_reasoning` &lt; `..._0001_text` &lt; `..._0002_tool` reproduces the
+/// order the provider streamed, however the kinds interleave.
+///
+/// That matters for a sealed reasoning capsule. It is replayed in the position it
+/// was streamed — immediately before the output it produced — because an endpoint
+/// that signs reasoning validates the position of every echoed item and rejects a
+/// request that moves one. Sorting every capsule to the front of the message would
+/// be right only for a step that reasons once.
+fn positional_part_id(turn_id: &str, step: u32, position: usize, kind: &str) -> String {
+    format!("prt_{turn_id}_{step:04}_{position:04}_{kind}")
 }

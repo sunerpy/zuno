@@ -796,69 +796,71 @@ pub fn build_summary_prompt(previous_summary: Option<&str>, context: &[String]) 
         .join("\n\n")
 }
 
+/// Reshape one projected message into something the summarizer can be sent.
+///
+/// The summarizer runs on the session's small model, which is usually not the model
+/// that produced the transcript. That is why a sealed reasoning envelope is dropped
+/// here instead of passed through: the envelope is bound to the model that minted it,
+/// so echoing it to another model fails the whole summary request and latches this
+/// session's compaction failure. Nothing model-visible is lost — the envelope is
+/// provider bookkeeping, and plaintext reasoning travels as its own block.
 pub(crate) fn summary_safe_message_owned(message: Message) -> Message {
     Message::from_content(
         message.role,
         message
             .content
             .into_iter()
-            .map(|block| match block {
+            .filter_map(|block| match block {
                 RequestContentBlock::ToolResult {
                     tool_use_id,
                     content,
                     is_error,
-                } => RequestContentBlock::ToolResult {
+                } => Some(RequestContentBlock::ToolResult {
                     tool_use_id,
                     content: truncate_tool_output_owned(content),
                     is_error,
-                },
+                }),
                 RequestContentBlock::Image {
                     filename,
                     media_type,
                     ..
-                } => RequestContentBlock::Text {
+                } => Some(RequestContentBlock::Text {
                     text: filename.map_or_else(
                         || format!("[Attached {media_type}]"),
                         |filename| format!("[Attached {filename} ({media_type})]"),
                     ),
-                },
-                RequestContentBlock::ImageAttachment { reference } => RequestContentBlock::Text {
-                    text: reference.filename.map_or_else(
-                        || format!("[Attached {}]", reference.media_type),
-                        |filename| format!("[Attached {filename} ({})]", reference.media_type),
-                    ),
-                },
-                RequestContentBlock::Text { text } => RequestContentBlock::Text { text },
-                link @ RequestContentBlock::ResourceLink { .. } => link,
+                }),
+                RequestContentBlock::ImageAttachment { reference } => {
+                    Some(RequestContentBlock::Text {
+                        text: reference.filename.map_or_else(
+                            || format!("[Attached {}]", reference.media_type),
+                            |filename| format!("[Attached {filename} ({})]", reference.media_type),
+                        ),
+                    })
+                }
+                RequestContentBlock::Text { text } => Some(RequestContentBlock::Text { text }),
+                link @ RequestContentBlock::ResourceLink { .. } => Some(link),
                 RequestContentBlock::SignedThinking {
                     thinking,
                     signature,
-                } => RequestContentBlock::SignedThinking {
+                } => Some(RequestContentBlock::SignedThinking {
                     thinking,
                     signature,
-                },
-                RequestContentBlock::ProviderEncryptedReasoning {
-                    id,
-                    summary,
-                    encrypted_content,
-                    status,
-                } => RequestContentBlock::ProviderEncryptedReasoning {
-                    id,
-                    summary,
-                    encrypted_content,
-                    status,
-                },
+                }),
+                RequestContentBlock::ProviderEncryptedReasoning { .. } => None,
                 RequestContentBlock::ToolUse {
                     id,
                     name,
                     input,
+                    raw_arguments,
                     thought_signature,
-                } => RequestContentBlock::ToolUse {
+                } => Some(RequestContentBlock::ToolUse {
                     id,
                     name,
                     input,
+                    raw_arguments,
                     thought_signature,
-                },
+                }),
             })
             .collect(),
     )

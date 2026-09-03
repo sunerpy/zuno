@@ -25,7 +25,7 @@ use serde_json::{Map, Value};
 use zuno_error::ProviderError;
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
-    ProviderStream, Spec, StreamEvent, ToolSchema, Unavailable, generation,
+    ProviderStream, ReasoningReplayPolicy, Spec, StreamEvent, ToolSchema, Unavailable, generation,
 };
 use zuno_llm::sse::{SseParser, StreamIdleTimeout};
 
@@ -71,6 +71,12 @@ enum RequestShapeError {
         "OpenAI-compatible request parameter `metadata` must be an object when Zuno session affinity is attached"
     )]
     MetadataMustBeObject,
+    #[error(
+        "provider `{provider}` model `{model}`: `reasoningReplay: \"encrypted\"` is an OpenAI \
+         Responses feature, but this request resolved to Chat Completions; set \
+         `surface: \"responses\"` for this provider or model"
+    )]
+    EncryptedReasoningReplayOnChat { provider: String, model: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -101,6 +107,7 @@ pub struct CompatibleProvider {
     transport: Arc<dyn Transport>,
     idle: StreamIdleTimeout,
     timeouts: HttpTimeouts,
+    reasoning_replay: ReasoningReplayPolicy,
 }
 
 impl fmt::Debug for CompatibleProvider {
@@ -183,6 +190,11 @@ impl CompatibleProvider {
             presence_penalty: numeric_option(&spec, &["presencePenalty", "presence_penalty"]),
         };
         let tool_choice = first_option(&spec, generation::TOOL_CHOICE_KEYS).cloned();
+        // Fail closed, exactly as a malformed timeout does below: a provider whose
+        // declared reasoning capability cannot be read must not construct and then
+        // quietly behave as if the capability were absent.
+        let reasoning_replay = ReasoningReplayPolicy::from_spec(&spec)
+            .map_err(|error| Declined::Failed(ProviderError::fatal(error)))?;
         let timeouts = http_timeouts(&spec).map_err(Declined::Failed)?;
         let idle = timeouts
             .chunk()
@@ -202,6 +214,7 @@ impl CompatibleProvider {
             transport,
             idle,
             timeouts,
+            reasoning_replay,
         })
     }
 
@@ -243,6 +256,7 @@ impl CompatibleProvider {
             self.capabilities_for(model_id),
             model_id,
             request_surface,
+            self.reasoning_replay,
         )
     }
 
@@ -289,6 +303,18 @@ impl CompatibleProvider {
     /// into an object-shaped metadata value.
     pub fn try_body_for(&self, request: &CompletionRequest) -> Result<Value, ProviderError> {
         let quirks = self.quirks_for(&request.model_id, request.surface);
+        // Refuse rather than send a request that cannot honour the declaration.
+        // `include` and the sealed reasoning item both exist only on Responses, so
+        // an encrypted-replay endpoint resolved onto Chat Completions would drop
+        // the capability on every request while reporting success.
+        if quirks.requests_encrypted_reasoning() && quirks.surface != ApiSurface::Responses {
+            return Err(ProviderError::fatal(
+                RequestShapeError::EncryptedReasoningReplayOnChat {
+                    provider: self.spec.provider.clone(),
+                    model: request.model_id.clone(),
+                },
+            ));
+        }
         let mut body = RequestBody::new(request.model_id.clone(), request.messages.clone());
         body.developer_context
             .clone_from(&request.developer_context);
@@ -303,6 +329,15 @@ impl CompatibleProvider {
         // `/chat/completions` or `/responses`. The endpoint is built from the same
         // resolved value on the next line of `http_request`.
         request.apply_parameters(&mut body, quirks.surface);
+        // Rule 5 again, and this is the pass that decides it: a per-request
+        // parameter bag is a `Record<string, any>`, so a model variant may carry its
+        // own `include` and `apply_parameters` replaces a non-object value outright.
+        // Re-merging after it keeps the author's entries and restores the one entry
+        // the declared capability cannot lose. `insert_include` is idempotent, so
+        // running it twice adds nothing.
+        if let Value::Object(map) = &mut body {
+            quirks.reasoning_replay.insert_include(map);
+        }
         project_session_affinity(&self.extra_body, request, quirks.surface, &mut body)?;
         Ok(body)
     }
@@ -1025,6 +1060,175 @@ mod tests {
             )],
         );
         assert_eq!(provider.body_for(&request)["service_tier"], json!("flex"));
+    }
+
+    #[test]
+    fn a_declared_sealing_endpoint_asks_for_the_reasoning_envelope() {
+        let provider = build(
+            Spec::new("kiro-local")
+                .with_base_url("http://127.0.0.1:8787/v1")
+                .with_surface(ApiSurface::Responses)
+                .with_option(crate::family::TRANSPORT_OPTION, json!("openai-compatible"))
+                .with_option("reasoningReplay", json!("encrypted"))
+                .with_option("reasoningReplayMaxAge", json!(86_400_000)),
+        )
+        .expect("a declared sealing Responses endpoint constructs");
+        let request = CompletionRequest::new(
+            "claude-opus-5",
+            vec![zuno_llm::event::Message::new(
+                zuno_llm::event::Role::User,
+                "hi",
+            )],
+        );
+
+        assert_eq!(
+            provider.body_for(&request)["include"],
+            json!(["reasoning.encrypted_content"])
+        );
+        assert!(
+            provider
+                .quirks_for("claude-opus-5", ApiSurface::Default)
+                .requests_encrypted_reasoning()
+        );
+    }
+
+    /// A model variant's own options cannot remove the sealed `include` entry.
+    ///
+    /// `models.<id>.variants.<effort>` is a free-form bag that arrives as the
+    /// request's `parameters` and is applied after the body is built, and a
+    /// non-object value replaces what is already there. An author who declares
+    /// their own `include` would otherwise silently turn the endpoint capability
+    /// off for every request of that variant.
+    #[test]
+    fn a_request_parameter_cannot_remove_the_sealed_include_entry() {
+        let provider = build(
+            Spec::new("kiro-local")
+                .with_base_url("http://127.0.0.1:8787/v1")
+                .with_surface(ApiSurface::Responses)
+                .with_option(crate::family::TRANSPORT_OPTION, json!("openai-compatible"))
+                .with_option("reasoningReplay", json!("encrypted")),
+        )
+        .expect("a declared sealing Responses endpoint constructs");
+
+        for parameter in [
+            json!(["message.output_text.logprobs"]),
+            json!(null),
+            json!("reasoning"),
+        ] {
+            let mut parameters = serde_json::Map::new();
+            parameters.insert("include".to_owned(), parameter.clone());
+            let request = CompletionRequest::new(
+                "claude-opus-5",
+                vec![zuno_llm::event::Message::new(
+                    zuno_llm::event::Role::User,
+                    "hi",
+                )],
+            )
+            .with_parameters(parameters);
+
+            let body = provider.body_for(&request);
+            let include = body["include"]
+                .as_array()
+                .unwrap_or_else(|| panic!("`include` stays an array for {parameter}: {body}"));
+            assert!(
+                include
+                    .iter()
+                    .any(|entry| entry == "reasoning.encrypted_content"),
+                "the declared capability survives `include: {parameter}`: {body}"
+            );
+        }
+    }
+
+    /// The author's own entries survive beside the sealed one.
+    #[test]
+    fn a_request_parameter_include_keeps_its_own_entries() {
+        let provider = build(
+            Spec::new("kiro-local")
+                .with_base_url("http://127.0.0.1:8787/v1")
+                .with_surface(ApiSurface::Responses)
+                .with_option(crate::family::TRANSPORT_OPTION, json!("openai-compatible"))
+                .with_option("reasoningReplay", json!("encrypted")),
+        )
+        .expect("a declared sealing Responses endpoint constructs");
+        let mut parameters = serde_json::Map::new();
+        parameters.insert(
+            "include".to_owned(),
+            json!(["message.output_text.logprobs"]),
+        );
+        let request = CompletionRequest::new(
+            "claude-opus-5",
+            vec![zuno_llm::event::Message::new(
+                zuno_llm::event::Role::User,
+                "hi",
+            )],
+        )
+        .with_parameters(parameters);
+
+        assert_eq!(
+            provider.body_for(&request)["include"],
+            json!([
+                "message.output_text.logprobs",
+                "reasoning.encrypted_content"
+            ])
+        );
+    }
+
+    /// Failing closed, because the failure mode of guessing is invisible.
+    ///
+    /// A provider that constructed with an unreadable `reasoningReplay` would run a
+    /// whole session at degraded quality while reporting success. The user only ever
+    /// sees the missing capability in the endpoint's own logs.
+    #[test]
+    fn an_unreadable_reasoning_replay_option_declines_construction() {
+        let declined = build(
+            Spec::new("kiro-local")
+                .with_base_url("http://127.0.0.1:8787/v1")
+                .with_surface(ApiSurface::Responses)
+                .with_option(crate::family::TRANSPORT_OPTION, json!("openai-compatible"))
+                .with_option("reasoningReplay", json!("encrypted_content")),
+        )
+        .expect_err("a near-miss mode must not read as off");
+        let Declined::Failed(error) = declined else {
+            panic!("expected a permanent local failure, got {declined:?}");
+        };
+        let source = error.source().expect("the option failure is preserved");
+        assert!(
+            source.to_string().contains("reasoningReplay"),
+            "the refusal must name the option: {source}"
+        );
+    }
+
+    #[test]
+    fn encrypted_replay_on_a_chat_surface_is_refused_before_the_wire() {
+        let provider = build(
+            Spec::new("groq")
+                .with_base_url("https://api.groq.com/openai/v1")
+                .with_option("reasoningReplay", json!("encrypted")),
+        )
+        .expect("construction succeeds; the surface is a per-request question");
+        let request = CompletionRequest::new(
+            "llama-3.3-70b",
+            vec![zuno_llm::event::Message::new(
+                zuno_llm::event::Role::User,
+                "hi",
+            )],
+        );
+
+        let error = provider
+            .try_body_for(&request)
+            .expect_err("Chat Completions cannot carry a sealed reasoning item");
+        let rendered = error
+            .source()
+            .expect("request-shape source is preserved")
+            .to_string();
+        assert!(
+            rendered.contains("responses") && rendered.contains("llama-3.3-70b"),
+            "the refusal must name the surface to set and the model: {rendered}"
+        );
+        assert!(
+            matches!(error.recovery(), zuno_error::Recovery::Fail),
+            "a request shape that cannot be sent is permanent, not retried"
+        );
     }
 
     #[test]

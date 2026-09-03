@@ -15,7 +15,7 @@ use zuno_llm::event::StreamEvent;
 use zuno_llm::http::{HttpTimeouts, RequestDeadlines, read_error_body};
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
-    ProviderStream, Spec, Unavailable, generation,
+    ProviderStream, ReasoningReplayPolicy, Spec, Unavailable, generation,
 };
 use zuno_llm::sse::StreamIdleTimeout;
 
@@ -40,6 +40,7 @@ pub struct OpenAiConfig {
     include: Option<Vec<Value>>,
     reasoning: Option<Value>,
     text: Option<Value>,
+    reasoning_replay: ReasoningReplayPolicy,
     headers: BTreeMap<String, String>,
 }
 
@@ -57,6 +58,7 @@ impl Default for OpenAiConfig {
             include: None,
             reasoning: None,
             text: None,
+            reasoning_replay: ReasoningReplayPolicy::default(),
             headers: BTreeMap::new(),
         }
     }
@@ -64,8 +66,17 @@ impl Default for OpenAiConfig {
 
 impl OpenAiConfig {
     /// Convert a registry spec into OpenAI options.
-    #[must_use]
-    pub fn from_spec(spec: Spec) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError::Fatal`] when the spec declares a sealed-reasoning replay
+    /// option this crate cannot interpret. Reading it as
+    /// [`ReasoningReplay::Off`](zuno_llm::registry::ReasoningReplay::Off) instead
+    /// would run the whole session without the capability the user asked for, and
+    /// nothing on the Zuno side would say so.
+    pub fn try_from_spec(spec: Spec) -> Result<Self, ProviderError> {
+        let reasoning_replay =
+            ReasoningReplayPolicy::from_spec(&spec).map_err(ProviderError::fatal)?;
         let mut config = Self {
             provider: if spec.provider.is_empty() {
                 DEFAULT_PROVIDER.to_owned()
@@ -103,18 +114,15 @@ impl OpenAiConfig {
             .cloned();
         config.reasoning = spec.options.get("reasoning").cloned();
         config.text = spec.options.get("text").cloned();
-        config
+        config.reasoning_replay = reasoning_replay;
+        Ok(config)
     }
 
-    /// Configuration used for stateless reasoning replay.
+    /// Declare whether this endpoint seals its reasoning for replay.
     #[must_use]
-    pub fn stateless_reasoning() -> Self {
-        Self::default()
-            .with_store(false)
-            .with_include(vec![Value::String(
-                "reasoning.encrypted_content".to_owned(),
-            )])
-            .with_reasoning(serde_json::json!({ "effort": "medium", "summary": "auto" }))
+    pub const fn with_reasoning_replay(mut self, reasoning_replay: ReasoningReplayPolicy) -> Self {
+        self.reasoning_replay = reasoning_replay;
+        self
     }
 
     /// Set the output-token ceiling.
@@ -228,6 +236,11 @@ impl OpenAiConfig {
     pub const fn text(&self) -> Option<&Value> {
         self.text.as_ref()
     }
+    /// Whether this endpoint seals its reasoning and takes it back on replay.
+    #[must_use]
+    pub const fn reasoning_replay(&self) -> ReasoningReplayPolicy {
+        self.reasoning_replay
+    }
 }
 
 /// Genuine OpenAI implementation of the shared provider trait.
@@ -281,7 +294,7 @@ impl OpenAiProvider {
     /// Returns an authentication error when storage cannot be read or no OpenAI
     /// credential exists.
     pub fn from_auth_store(store: &AuthStore, spec: Spec) -> Result<Self, ProviderError> {
-        let config = OpenAiConfig::from_spec(spec);
+        let config = OpenAiConfig::try_from_spec(spec)?;
         let credential = store
             .get(config.provider())
             .map_err(|source| ProviderError::Auth {
@@ -342,7 +355,7 @@ where
     move |spec| {
         let credential = credentials(&spec.provider)
             .ok_or(Declined::Unavailable(Unavailable::MissingCredential))?;
-        let config = OpenAiConfig::from_spec(spec);
+        let config = OpenAiConfig::try_from_spec(spec).map_err(Declined::Failed)?;
         let provider = OpenAiProvider::from_credential_and_store(credential, config, store.clone())
             .map_err(Declined::Failed)?;
         Ok(Arc::new(provider) as Arc<dyn Provider>)

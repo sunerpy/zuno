@@ -37,6 +37,17 @@
 //!    both text and tool calls is replayed this way, for every provider on this
 //!    surface.
 //!
+//! 5. **`include: ["reasoning.encrypted_content"]` is merged, never assigned, and
+//!    only on Responses.** An endpoint that seals its reasoning returns the envelope
+//!    only when the request asked for it, so this entry is the difference between a
+//!    session that replays reasoning and one that cannot. It is written after
+//!    `extra_body` for the same reason `thinking` is — an options bag may add other
+//!    `include` entries but may not remove the one the declared capability needs —
+//!    and it is written only when [`Quirks::requests_encrypted_reasoning`] says the
+//!    endpoint declared the capability. [`build_chat`](RequestBody::build_chat) never
+//!    writes it: Chat Completions has no `include` field, and that combination is
+//!    refused before a body is built.
+//!
 //! # What `extra_body` may not overwrite
 //!
 //! [`PROTECTED_KEYS`] is the same set the reference implementation protects
@@ -45,8 +56,8 @@
 //! transcript and the wire disagree silently.
 
 use serde_json::{Map, Value, json};
-use zuno_llm::event::{Message, RequestContentBlock, Role};
-use zuno_llm::registry::ApiSurface;
+use zuno_llm::event::{Message, RequestContentBlock, Role, tool_arguments_text};
+use zuno_llm::registry::{ApiSurface, sealed_item_has_following_output};
 
 use crate::quirks::Quirks;
 
@@ -297,6 +308,9 @@ impl RequestBody {
             body.insert(key.clone(), value.clone());
         }
 
+        // Rule 5: after `extra_body`, so the declared capability is the final word.
+        quirks.reasoning_replay.insert_include(&mut body);
+
         Value::Object(body)
     }
 }
@@ -367,7 +381,7 @@ fn translate_response_message(message: &Message, quirks: &Quirks) -> Vec<Value> 
 fn translate_response_assistant(message: &Message) -> Vec<Value> {
     let mut items = Vec::new();
     let mut content = Vec::new();
-    for block in &message.content {
+    for (index, block) in message.content.iter().enumerate() {
         match block {
             RequestContentBlock::Text { text } => {
                 content.push(json!({"type": "output_text", "text": text}));
@@ -387,6 +401,11 @@ fn translate_response_assistant(message: &Message) -> Vec<Value> {
                 let Some(encrypted_content) = encrypted_content else {
                     continue;
                 };
+                // The endpoint validates the pairing positionally, so an item with no
+                // output after it is a permanent 400 rather than a degraded answer.
+                if !sealed_item_has_following_output(&message.content[index + 1..]) {
+                    continue;
+                }
                 let mut item = Map::new();
                 item.insert("type".to_owned(), json!("reasoning"));
                 item.insert(
@@ -406,14 +425,18 @@ fn translate_response_assistant(message: &Message) -> Vec<Value> {
                 items.push(Value::Object(item));
             }
             RequestContentBlock::ToolUse {
-                id, name, input, ..
+                id,
+                name,
+                input,
+                raw_arguments,
+                ..
             } => {
                 flush_response_assistant_text(&mut items, &mut content);
                 items.push(json!({
                     "type": "function_call",
                     "call_id": id,
                     "name": name,
-                    "arguments": input.to_string(),
+                    "arguments": tool_arguments_text(input, raw_arguments.as_deref()),
                 }));
             }
             RequestContentBlock::SignedThinking { .. }
@@ -663,11 +686,15 @@ fn translate_assistant(message: &Message, quirks: &Quirks) -> Vec<Value> {
                 }
             }
             RequestContentBlock::ToolUse {
-                id, name, input, ..
+                id,
+                name,
+                input,
+                raw_arguments,
+                ..
             } => tool_calls.push(json!({
                 "id": id,
                 "type": "function",
-                "function": { "name": name, "arguments": input.to_string() }
+                "function": { "name": name, "arguments": tool_arguments_text(input, raw_arguments.as_deref()) }
             })),
             RequestContentBlock::ToolResult { .. } | RequestContentBlock::Image { .. } => {}
             RequestContentBlock::ImageAttachment { .. } => {
@@ -753,7 +780,9 @@ mod tests {
     use zuno_llm::effort::{
         DeclaredVariants, EffortCapabilities, ProviderFamily, ReasoningEffort, resolve_effort,
     };
-    use zuno_llm::registry::{ApiSurface, Capabilities, CompletionRequest};
+    use zuno_llm::registry::{
+        ApiSurface, Capabilities, CompletionRequest, ReasoningReplay, ReasoningReplayPolicy,
+    };
 
     fn quirks(reasoning_protocol: bool, sampling: bool) -> Quirks {
         Quirks {
@@ -768,6 +797,7 @@ mod tests {
             reasoning_protocol,
             routes_upstreams: false,
             responses_text_blocks: crate::quirks::ResponsesTextBlocks::Multiple,
+            reasoning_replay: ReasoningReplayPolicy::default(),
         }
     }
 
@@ -775,6 +805,17 @@ mod tests {
         Quirks {
             surface: ApiSurface::Responses,
             ..quirks(false, true)
+        }
+    }
+
+    /// A Responses endpoint that declared it seals its reasoning.
+    fn sealing_responses_quirks() -> Quirks {
+        Quirks {
+            reasoning_replay: ReasoningReplayPolicy {
+                mode: ReasoningReplay::Encrypted,
+                max_age: None,
+            },
+            ..responses_quirks()
         }
     }
 
@@ -1044,6 +1085,66 @@ mod tests {
         assert!(built.get("max_tokens").is_none());
     }
 
+    /// The one request field that decides whether reasoning can ever be replayed.
+    ///
+    /// A sealing endpoint returns `reasoning` items with an `encrypted_content`
+    /// envelope only when the request asked for it. Without this entry the items
+    /// arrive summary-only, nothing durable is replayable, and the session degrades
+    /// silently — measured as 104 consecutive requests with replay never locked.
+    #[test]
+    fn a_sealing_endpoint_is_asked_for_the_encrypted_reasoning_envelope() {
+        let body = RequestBody::new("claude-opus-5", vec![Message::new(Role::User, "hello")]);
+
+        let sealing = body.build(&sealing_responses_quirks());
+        assert_eq!(sealing["include"], json!(["reasoning.encrypted_content"]));
+
+        let plain = body.build(&responses_quirks());
+        assert!(
+            plain.get("include").is_none(),
+            "an endpoint that did not declare the capability is never asked for an \
+             envelope: {plain}"
+        );
+    }
+
+    #[test]
+    fn extra_body_may_add_include_entries_but_not_remove_the_sealed_one() {
+        let mut body = RequestBody::new("claude-opus-5", vec![Message::new(Role::User, "hello")]);
+        body.extra_body.insert(
+            "include".to_owned(),
+            json!(["file_search_call.results", "message.output_text.logprobs"]),
+        );
+
+        let built = body.build(&sealing_responses_quirks());
+
+        assert_eq!(
+            built["include"],
+            json!([
+                "file_search_call.results",
+                "message.output_text.logprobs",
+                "reasoning.encrypted_content"
+            ]),
+            "rule 5: the declared capability is the final word, and the author keeps their entries"
+        );
+    }
+
+    #[test]
+    fn a_chat_body_never_carries_an_include_field() {
+        let body = RequestBody::new("claude-opus-5", vec![Message::new(Role::User, "hello")]);
+
+        let built = body.build(&Quirks {
+            reasoning_replay: ReasoningReplayPolicy {
+                mode: ReasoningReplay::Encrypted,
+                max_age: None,
+            },
+            ..quirks(false, true)
+        });
+
+        assert!(
+            built.get("include").is_none(),
+            "Chat Completions has no `include` field; the combination is refused, never sent: {built}"
+        );
+    }
+
     /// The Responses `input` list must preserve the assistant turn's source order.
     ///
     /// The content is exactly what `project_history_owned` hands over for a turn
@@ -1074,6 +1175,7 @@ mod tests {
                     id: "call_read".to_owned(),
                     name: "read".to_owned(),
                     input: json!({"filePath": "/tmp/fixture.txt"}),
+                    raw_arguments: None,
                     thought_signature: None,
                 },
             ],
@@ -1119,6 +1221,7 @@ mod tests {
                     id: "call_first".to_owned(),
                     name: "read".to_owned(),
                     input: json!({}),
+                    raw_arguments: None,
                     thought_signature: None,
                 },
                 RequestContentBlock::Text {
@@ -1178,6 +1281,7 @@ mod tests {
                 id: "call_1".to_owned(),
                 name: "get_weather".to_owned(),
                 input: json!({"city": "Paris"}),
+                raw_arguments: None,
                 thought_signature: None,
             }],
         );
@@ -1208,6 +1312,7 @@ mod tests {
                     id: id.to_owned(),
                     name: "shell".to_owned(),
                     input: json!({"command": "command -v go"}),
+                    raw_arguments: None,
                     thought_signature: None,
                 },
             ],
@@ -1280,6 +1385,7 @@ mod tests {
                     id: "call_1".to_owned(),
                     name: "shell".to_owned(),
                     input: json!({"command": "command -v go"}),
+                    raw_arguments: None,
                     thought_signature: None,
                 },
             ],
@@ -1373,5 +1479,206 @@ mod tests {
         let mut incapable = quirks(false, true);
         incapable.capabilities.tool_calls = false;
         assert!(body.build(&incapable).get("tools").is_none());
+    }
+
+    /// The gateway that seals reasoning fingerprints the tool-argument BYTES.
+    ///
+    /// `input.to_string()` is a different encoding of the same value: no space
+    /// after `:` or `,`. Replaying it made kiro-provider answer
+    /// `HTTP 400 reasoning_replay_context_mismatch` on the request that carried
+    /// the sealed envelope, because the fingerprint it had stored covered the
+    /// upstream's spacing.
+    #[test]
+    fn a_replayed_tool_call_carries_the_provider_argument_bytes_verbatim() {
+        let raw = r#"{"command": "python3 -c \"print(1)\"", "intent": "compute"}"#;
+        let message = Message::from_content(
+            Role::Assistant,
+            vec![RequestContentBlock::ToolUse {
+                id: "call_shell".to_owned(),
+                name: "shell".to_owned(),
+                input: serde_json::from_str(raw).expect("the captured bytes decode"),
+                raw_arguments: Some(raw.to_owned()),
+                thought_signature: None,
+            }],
+        );
+
+        let built = RequestBody::new("claude-opus-5", vec![message.clone()])
+            .build(&sealing_responses_quirks());
+
+        assert_eq!(
+            built["input"][0]["arguments"],
+            json!(raw),
+            "the sealed turn's fingerprint covers these bytes: {built}"
+        );
+        let chat = RequestBody::new("claude-opus-5", vec![message]).build(&quirks(false, true));
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            json!(raw),
+            "the Chat surface replays the same bytes: {chat}"
+        );
+    }
+
+    /// Bytes that no longer mean what the tool ran with are not sent.
+    #[test]
+    fn a_rewritten_tool_call_replays_the_executed_value_not_the_stale_bytes() {
+        let message = Message::from_content(
+            Role::Assistant,
+            vec![RequestContentBlock::ToolUse {
+                id: "call_shell".to_owned(),
+                name: "shell".to_owned(),
+                input: json!({"command": "ls"}),
+                raw_arguments: Some(r#"{"command": "rm -rf /"}"#.to_owned()),
+                thought_signature: None,
+            }],
+        );
+
+        let built =
+            RequestBody::new("claude-opus-5", vec![message]).build(&sealing_responses_quirks());
+
+        assert_eq!(built["input"][0]["arguments"], json!(r#"{"command":"ls"}"#));
+    }
+
+    /// The item identifier is not replayed.
+    ///
+    /// The recorded OpenAI Responses continuation
+    /// (`openai-responses-gpt-5-5-reasoning-continuation`) replays a sealed item as
+    /// `type`, `summary` and `encrypted_content` only, and kiro-provider accepts the
+    /// same shape. An `id` names an item on the endpoint's side, and a `store: false`
+    /// endpoint has no such item, so Zuno does not claim one.
+    #[test]
+    fn a_replayed_sealed_reasoning_item_does_not_carry_an_item_id() {
+        let message = Message::from_content(
+            Role::Assistant,
+            vec![
+                RequestContentBlock::ProviderEncryptedReasoning {
+                    id: "rs_0c718e10".to_owned(),
+                    summary: Vec::new(),
+                    encrypted_content: Some("kr1_sealed".to_owned()),
+                    status: Some("completed".to_owned()),
+                },
+                RequestContentBlock::Text {
+                    text: "the answer".to_owned(),
+                },
+            ],
+        );
+
+        let built =
+            RequestBody::new("claude-opus-5", vec![message]).build(&sealing_responses_quirks());
+
+        assert_eq!(built["input"][0]["type"], json!("reasoning"));
+        assert_eq!(built["input"][0]["encrypted_content"], json!("kr1_sealed"));
+        assert!(
+            built["input"][0].get("id").is_none(),
+            "the endpoint owns item identifiers, not Zuno: {built}"
+        );
+    }
+
+    /// A sealed item with nothing after it is a permanent wire error, so it stays home.
+    ///
+    /// This is the durable shape a step interrupted right after its reasoning item
+    /// leaves behind. Replaying it would fail every later request to the same model.
+    #[test]
+    fn a_sealed_item_with_no_following_output_is_not_replayed() {
+        let lonely = Message::from_content(
+            Role::Assistant,
+            vec![RequestContentBlock::ProviderEncryptedReasoning {
+                id: "rs_lonely".to_owned(),
+                summary: vec!["thinking".to_owned()],
+                encrypted_content: Some("kr1_sealed".to_owned()),
+                status: Some("completed".to_owned()),
+            }],
+        );
+
+        let built =
+            RequestBody::new("claude-opus-5", vec![lonely]).build(&sealing_responses_quirks());
+
+        assert_eq!(
+            built["input"].as_array().expect("an input array").len(),
+            0,
+            "a sealed item with no output to explain must not reach the wire: {built}"
+        );
+    }
+
+    /// Trailing text that is empty is not output either.
+    #[test]
+    fn a_sealed_item_followed_only_by_empty_text_is_not_replayed() {
+        let message = Message::from_content(
+            Role::Assistant,
+            vec![
+                RequestContentBlock::ProviderEncryptedReasoning {
+                    id: "rs_lonely".to_owned(),
+                    summary: Vec::new(),
+                    encrypted_content: Some("kr1_sealed".to_owned()),
+                    status: None,
+                },
+                RequestContentBlock::Text {
+                    text: String::new(),
+                },
+            ],
+        );
+
+        let built =
+            RequestBody::new("claude-opus-5", vec![message]).build(&sealing_responses_quirks());
+        let items = built["input"].as_array().expect("an input array");
+
+        assert!(
+            items.iter().all(|item| item["type"] != json!("reasoning")),
+            "an empty text block is not the output the endpoint requires: {built}"
+        );
+    }
+
+    /// Text that precedes the item is not the output it explains.
+    #[test]
+    fn a_sealed_item_after_the_turns_only_text_is_not_replayed() {
+        let message = Message::from_content(
+            Role::Assistant,
+            vec![
+                RequestContentBlock::Text {
+                    text: "here is the answer".to_owned(),
+                },
+                RequestContentBlock::ProviderEncryptedReasoning {
+                    id: "rs_trailing".to_owned(),
+                    summary: Vec::new(),
+                    encrypted_content: Some("kr1_sealed".to_owned()),
+                    status: None,
+                },
+            ],
+        );
+
+        let built =
+            RequestBody::new("claude-opus-5", vec![message]).build(&sealing_responses_quirks());
+        let items = built["input"].as_array().expect("an input array");
+
+        assert_eq!(items.len(), 1, "only the assistant text remains: {built}");
+        assert_eq!(items[0]["role"], json!("assistant"));
+    }
+
+    /// A tool call is output the endpoint accepts as the item's pair.
+    #[test]
+    fn a_sealed_item_followed_by_a_tool_call_is_replayed() {
+        let message = Message::from_content(
+            Role::Assistant,
+            vec![
+                RequestContentBlock::ProviderEncryptedReasoning {
+                    id: "rs_paired".to_owned(),
+                    summary: Vec::new(),
+                    encrypted_content: Some("kr1_sealed".to_owned()),
+                    status: None,
+                },
+                RequestContentBlock::ToolUse {
+                    id: "call_read".to_owned(),
+                    name: "read".to_owned(),
+                    input: json!({}),
+                    raw_arguments: None,
+                    thought_signature: None,
+                },
+            ],
+        );
+
+        let built =
+            RequestBody::new("claude-opus-5", vec![message]).build(&sealing_responses_quirks());
+
+        assert_eq!(built["input"][0]["type"], json!("reasoning"));
+        assert_eq!(built["input"][1]["type"], json!("function_call"));
     }
 }
