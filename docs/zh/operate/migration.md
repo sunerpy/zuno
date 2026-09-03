@@ -58,6 +58,11 @@ zuno session list
 6. **其他任何状态。** 不受支持的更旧格式、未来格式、缺少 marker，或 marker 与必需
    表不匹配，都会失败关闭且不修改文件。
 
+两个进程同时打开或升级同一个数据库时，都按拿到 SQLite 写锁之前看到的 format 做决定。
+拿锁失败的一方不会报错：它会重新读取 marker，对赢家实际提交的结果做校验、升级或拒绝，
+总共最多尝试四次。不支持的 format 仍然报告为 schema 不匹配；如果 format 在打开过程中
+持续变化，则以 `zuno_schema` marker 上的冲突失败关闭。两种路径都不会写库。
+
 ### Format 5、6 或 7 到 format 8
 
 受支持的迁移使用一个 SQLite `BEGIN IMMEDIATE` 事务：

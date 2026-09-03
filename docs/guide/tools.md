@@ -177,6 +177,30 @@ A stored receipt is addressed by an id that appears in the tool result as
 `[verification rcp_…]`. That id, not a recollection of the transcript, is what
 satisfies a Goal completion criterion that requires evidence.
 
+### Exit codes the guard reserves
+
+Every `shell` command runs behind a child-process guard, the small supervisor that
+ties the command's process tree to Zuno's own lifetime. The guard reports through
+the same exit status as the command, so three codes may be the guard's rather than
+the command's, following the convention `timeout`, `env`, and `nohup` share: `125`
+means the guard itself failed, `126` means the program exists but could not be
+executed, and `127` means it could not be found.
+
+The three are read differently because they mean different things. A `125` says
+nothing about whether the command ran or what it changed, so the result is an
+uncertain outcome rather than a `Failed exit 125` receipt: it is never replayed
+automatically, and it asks for a look at the real state the command would have
+changed before anything else is decided. A `126` or `127` says the program never
+started, so the code is recorded but carries no authority over the command; nothing
+ran that could have decided anything.
+
+A command that chooses to exit `125` of its own accord keeps its ordinary receipt.
+A reserved code is read as the guard's only when the guard's own diagnostic is in
+the captured output, and only the guard writes that line, so a `make` that reports
+`Error 125` is still `make`'s verdict. A command killed by a signal has no exit code
+at all and is reported as killed by a signal, which likewise decides nothing about
+the work.
+
 ## What a shell command inherits
 
 A `shell` call runs with the host environment the Zuno process itself has, minus

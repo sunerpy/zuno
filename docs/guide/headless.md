@@ -204,6 +204,17 @@ makes a non-loopback listener acceptable. For ACP, stdout carries protocol
 framing, so send diagnostics to stderr with `--print-logs`. See
 [Editors and ACP](/reference/zed-acp).
 
+Three details of the HTTP surface matter to a script that drives sessions.
+`POST /api/session/{id}/interrupt` cancels only a live turn; on an idle session it
+answers `204` and does nothing, so it never leaves the next ordinary turn — including
+an explicit resume of input that was deliberately queued — starting already
+interrupted. `GET /api/session/{id}/event` answers `404` with the error code
+`not_found` for a session the database has never seen, rather than opening a stream
+that could never produce an event. And a prompt or steering input admitted while a
+compaction holds the session lease waits in the durable inbox and is driven as soon
+as the compaction releases the lease, instead of sitting there until some unrelated
+event happens to wake the session.
+
 ## See also
 
 - [zuno run](/cli/run)

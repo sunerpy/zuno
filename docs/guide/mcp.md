@@ -63,6 +63,14 @@ another configuration layer defined.
 The toggle form takes only `enabled`, which is how a project layer disables a globally
 defined server without repeating its definition.
 
+A local server's `command` is a host executable, and the layer that declares it matters.
+Declared in a project `zuno.json[c]` or `.zuno` file, it is logged as a warning naming the
+key, `mcp.<name>.command`, when the configuration is discovered, because the checkout would
+be choosing a program that runs on this machine with your authority. The server still
+starts. A remote server runs nothing locally and is not warned about. A future release will
+reject project-layer host commands instead, so keep local server definitions in the global
+`zuno.json` or another trusted layer and let the project layer use the toggle form.
+
 ## Authentication
 
 For a remote server that needs OAuth:

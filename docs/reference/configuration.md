@@ -786,12 +786,16 @@ trigger fallback. A read-only Agent never runs unconfined.
 
 Relative paths resolve from the active workspace. `writableRoots` entries must
 already be directories and are considered only in `workspace-write`.
-`protectedPaths` must exist, may not be symbolic links, and are reapplied
-read-only after writable mounts. A missing entry is not ignored: deployment
-fails closed rather than starting an Agent whose protection was silently
-dropped. Zuno protects existing `.git`, `.zuno`,
-`.agents`, resolved external Git metadata, and its sandbox helper; configuration
-can add protections but cannot disable confinement.
+`protectedPaths` are reapplied read-only after writable mounts. Each configured
+entry must exist and must not be a symbolic link when the sandbox policy is
+built; a missing or linked entry is not ignored, and policy construction fails
+closed rather than starting an Agent whose protection was silently dropped. The
+built-in protections for `.zuno`, `.agents`, the Git metadata markers, resolved
+external Git metadata, and the sandbox helper are applied differently: they
+cover whichever of those paths exist at the moment the bubblewrap arguments are
+generated, and that same step skips, without an error, a configured path that
+disappeared after the policy was built, while a symbolic link is still refused.
+Configuration can add protections but cannot disable confinement.
 
 Sandbox authority follows configuration provenance. Trusted global, explicit
 config, managed, environment, and CLI layers may select any mode. Project
@@ -810,6 +814,18 @@ zuno --sandbox-on-unavailable run-unconfined
 The environment equivalent is `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`.
 Managed policy has later precedence and may still replace either override with
 `deny`.
+
+Provenance also governs host commands, for now with a warning rather than a
+refusal. A project `zuno.json[c]` or `.zuno` layer that sets `shell`, a local
+`mcp.*.command`, an `lsp.*.command` or `formatter.*.command` that is not
+disabled, or a `productAgent.*.command` is logged as a warning naming the file
+and each such key when configuration is discovered. The layer is still accepted
+and the values are kept verbatim; the warning exists because every one of those
+programs runs on this machine with the current user's authority while the
+checkout chose it, so the operator should review the repository before trusting
+it. A remote MCP server runs nothing locally and is not warned about. A future
+release will reject these declarations from a project layer instead of warning,
+so move host commands to the global `zuno.json` or another trusted layer now.
 
 On Linux, confined Shell registration requires a trusted system bubblewrap plus
 successful user, mount, PID, UTS, IPC, seccomp, and—when `network` is

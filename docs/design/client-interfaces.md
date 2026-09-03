@@ -30,6 +30,11 @@ The server exposes cursor-based replay followed by live delivery. A reconnect se
 
 The only HTTP event operations are `GET /api/event` for live process-wide notifications and `GET /api/session/{sessionID}/event` for durable session replay plus live delivery. The session operation emits `sessionID:sequence` as the SSE id and accepts that value through `Last-Event-ID` on reconnect. Zuno does not mount an unscoped `/event` adapter or a second event envelope.
 
+Subscribing to the session stream of a session the database has never seen is a
+`404` with the error code `not_found`, not a `200` with an empty stream. A stream
+that could never produce an event would leave a client waiting on a session that
+does not exist, with no way to tell that wait from a healthy idle one.
+
 Routes and OpenAPI operations exist only when a real handler exists. Optional provider, credential, or client capabilities register their operations with their implementation rather than exposing a permanent placeholder that can only fail.
 
 Learning uses the same rule. `GET /api/session/{sessionID}/learning` reads the
@@ -70,6 +75,16 @@ output without ending the turn, and starts the next model step with the promoted
 input. It does not cancel a side-effecting tool already in flight. A steer that
 misses the final safe point stays durably pending and becomes the next FIFO turn;
 client channel capacity or reconnect timing never decides its fate.
+
+An explicit interrupt applies to a live turn only. `POST /api/session/{sessionID}/interrupt`
+on an idle session is a `204` no-op; it never arms the next turn, because a marker
+with no expiry would cancel whichever ordinary turn starts next, including an
+explicit resume of deliberately queued input.
+
+Input admitted while a compaction holds the session lease stays in the durable inbox
+and is driven as soon as the compaction releases the lease. A compaction is a lease
+holder like any turn, so the input it delays needs no unrelated external event to
+wake the session.
 
 The TUI projects committed pending inputs into a fixed FIFO dock above the root
 composer. Queue admission is not rendered as transcript history. Each row states

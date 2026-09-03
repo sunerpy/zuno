@@ -128,6 +128,17 @@ roots. It also cannot enable `run-unconfined`. A checked-in repository configura
 therefore cannot escalate its own confinement, which is the property that makes cloning an
 unfamiliar repository safe.
 
+A project layer may still name executables, and Zuno now says so. When a project
+`zuno.json[c]` or `.zuno` file sets `shell`, a local `mcp.*.command`, an `lsp.*.command`
+or `formatter.*.command` that is not disabled, or a `productAgent.*.command`, discovery
+writes one warning per key to the operational log, naming the file and the key. The layer
+is still accepted and the value is kept verbatim. The warning exists because each of those
+programs runs on this machine with your authority while the checkout is what chose it, so
+it is the cue to review the repository before trusting it. A remote MCP server runs nothing
+locally and is not warned about. A future release will reject these declarations from a
+project layer instead of warning, so move host commands to the global `zuno.json` or
+another trusted layer now.
+
 Use a trusted one-invocation override when a wider mode is genuinely wanted:
 
 ```sh

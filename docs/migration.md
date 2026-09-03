@@ -64,6 +64,14 @@ Database opening recognizes these states:
 6. **Any other state.** An older unsupported format, a future format, a missing marker,
    or a marker whose required tables are absent fails closed without modification.
 
+Two processes that open or upgrade the same database at the same time both decide from
+the format they saw before taking SQLite's write lock. The one that loses the lock does
+not fail: it re-reads the marker and validates, upgrades, or rejects what the winner
+actually committed, making at most four attempts in total. An unsupported format is still
+reported as a schema mismatch; a database whose format keeps changing under the opener
+fails closed with a conflict on the `zuno_schema` marker. Neither path writes to the
+database.
+
 ### Format 5, 6, or 7 to format 8
 
 The supported migration uses one SQLite `BEGIN IMMEDIATE` transaction:

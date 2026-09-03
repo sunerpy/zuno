@@ -239,7 +239,7 @@ Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程�
 | `network` | `deny`、`allow` | 受限模式为 `deny`，`danger-full-access` 使用宿主网络 |
 | `onUnavailable` | `deny`、`run-unconfined` | `deny` |
 | `writableRoots` | 额外的现有可写目录数组 | 空 |
-| `protectedPaths` | 重新施加只读保护的路径数组，每一项必须已存在且不能是符号链接 | 空 |
+| `protectedPaths` | 重新施加只读保护的路径数组，每一项在构建沙箱策略时必须已存在且不能是符号链接 | 空 |
 
 默认配置明确写出如下：
 
@@ -254,10 +254,12 @@ Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程�
 ```
 
 相对路径按当前工作区解析。`writableRoots` 的每一项必须已经是目录，且只在
-`workspace-write` 下被考虑。`protectedPaths` 的每一项必须已存在且不能是符号链接，会在挂载
-可写根目录之后重新施加只读保护；缺失的路径不会被忽略，而是让部署失败关闭，以免启动一个
-保护被静默丢弃的 Agent。Zuno 自身始终保护已存在的 `.git`、`.zuno`、`.agents`、解析出的
-外部 Git 元数据以及它的沙箱 helper；配置可以增加保护，但不能关闭限制。
+`workspace-write` 下被考虑。`protectedPaths` 会在挂载可写根目录之后重新施加只读保护。
+配置的每一项在构建沙箱策略时必须已存在且不能是符号链接；缺失或是链接的路径不会被忽略，
+而是让策略构建失败关闭，以免启动一个保护被静默丢弃的 Agent。内建保护的施加方式不同：
+`.zuno`、`.agents`、Git 元数据标记、解析出的外部 Git 元数据以及沙箱 helper 只在生成
+bubblewrap 参数的那一刻已存在时才被施加；策略构建之后才消失的已配置路径在这一步会被
+静默跳过，而符号链接仍然会被拒绝。配置可以增加保护，但不能关闭限制。
 
 `danger-full-access` 始终跳过受限后端发现，以 Zuno 用户的宿主文件系统、进程、凭据和网络
 权限原生执行，并把生效权限模式设为 `allow_all`。它不能与 `network: "deny"`、
@@ -292,6 +294,14 @@ ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined zuno
 
 用 `zuno debug sandbox` 查看请求/实际权限、降级资格、`resolutionKind` 和
 `fallbackReason`。`--check` 仍严格检查请求的约束是否可部署，不会因为允许降级而成功。
+
+来源同样约束本机命令，目前只是告警而不是拒绝。项目 `zuno.json[c]` 或 `.zuno` 层声明了
+`shell`、本地 `mcp.*.command`、未被禁用的 `lsp.*.command` 或 `formatter.*.command`，或
+`productAgent.*.command` 时，配置发现会逐个键记录一条指明文件与键名的警告。该层仍然被
+接受，取值原样保留；告警的原因是这些程序都以当前用户的权限在本机运行，而选择它们的是
+被检出的仓库，因此运维者应先审阅仓库再信任它。远程 MCP server 不在本机运行任何东西，
+不会被告警。未来版本会改为直接拒绝项目层的这些声明，请现在就把本机命令移到全局
+`zuno.json` 或其他受信层。
 
 ## 严格 HITL 授权
 

@@ -186,6 +186,28 @@ WSL1 不受支持。WSL2 是一台 Linux 虚拟机，只有在相同的 user、m
 - [Ubuntu AppArmor documentation](https://documentation.ubuntu.com/server/how-to/security/apparmor/)
 - [AppArmor `bwrap-userns-restrict` profile](https://gitlab.com/apparmor/apparmor/-/blob/master/profiles/apparmor/profiles/extras/bwrap-userns-restrict)
 
+## 为什么 Windows 上受 guard 保护的程序在运行前就以 125 退出？
+
+Zuno 在 Windows 上监督的每个子进程——Shell 命令、LSP server、插件宿主或产品 Agent——都
+运行在子进程 guard 之后，而 guard 必须盯住自己的父进程，才能保证它启动的进程树不会活过
+拥有它的那个 Zuno 进程。工作区禁止 `unsafe` 代码，guard 自己打不开进程句柄，于是它从
+`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe` 启动一个 Windows
+PowerShell 助手，由助手持有父进程的真实句柄并在其上等待。句柄指向进程对象而不是 PID，
+所以父进程退出后被复用的 PID 冒充不了活着的父进程，每次轮询也不再产生新进程。
+
+助手在被监督的程序之前启动，因为一个看不住父进程的 guard 不能开始它无法收尾的工作。如果
+助手无法启动，guard 会在运行任何东西之前以退出码 `125` 失败关闭，并向 stderr 写出一条
+具名诊断：可执行文件缺失时是 `child-process guard failed: Windows PowerShell is required
+to watch the guard's parent process; <path> does not exist`，存在但无法启动时是
+`child-process guard failed: cannot start the parent-process watch helper: <error>`。
+被监督的程序从未运行。路径依次从 `%SystemRoot%`、`%windir%`、字面的 `C:\Windows`
+解析，从不查 `PATH`，因此工作区控制的 `PATH` 无法换入自己的助手；把 Windows PowerShell
+恢复到该位置后重试即可。
+
+助手已启动、随后却没有给出判定就结束，是另一种情况。guard 只记录一条诊断，让程序继续
+运行，并只监督它自身的退出；未知的父进程状态绝不会杀死一条健康的命令。只有明确的判定——
+助手报告父进程已退出，或在助手武装时父进程已经不在——才会终止被监督的进程树。
+
 ## 为什么一次 Kiro 提示词会以 `unsupported_content_block_projection` 失败？
 
 2026-08-28 的 `kiro-provider` 构建接受连续的纯文本 Responses 块。它在自己的规范化请求中

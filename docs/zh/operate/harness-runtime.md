@@ -19,6 +19,13 @@ Harness 运行时是 Zuno 的核心：它决定一个回合如何组装、如何
 
 注册是一种副作用。挂载操作返回的 disposer 精确移除它注册过的东西；profile 替换是事务性的，失败时按相反顺序回滚。
 
+组件通过 `Component::stop_budget` 声明运行时等待其每个 disposer 的时长：默认的
+`StopBudget::Runtime` 沿用运行时配置的停止超时；必须终止并回收进程树、排空 socket 或
+等待 flush 的组件返回 `StopBudget::Bounded(时长)`，零值按 `Runtime` 处理。disposer 仍按
+注册的相反顺序逐个运行，预算只限定运行时等待每一个的时长。超出预算的 disposer 记为
+`TimedOut` 诊断但不会被取消：半途丢弃它会丢掉它正在回收的东西，比迟到的停止更糟，所以
+它被脱离并在后台继续回收。
+
 ## Agent 与提示词契约
 
 Agent 具有显式的正向职责、负向委派边界、权限以及结构化输出预期。
@@ -62,6 +69,8 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 
 图像入口在写入 inbox 前统一经过 `AttachmentStore`：规范化方向、像素与编码，原子发布当前数据库身份下的内容寻址对象，持久 part 只保存 `ImageAttachmentRef`。Provider 请求组装时才校验并内联对象；缺失或 digest 不符是永久持久状态失败，不回退原始路径。
 
+提交转录回退（`revert_commit`）会删除暂存边界消息 `(time_created, id)` 之后的投影 `session_message` 行与旧表 `message` 行，清空会话的 context epoch，并把所有 `queued`、`steering`、`promoted` 的收件箱输入经常规取消迁移退役，每条各记一条 `session.input.cancelled`；已消费（consumed）的输入是不可变历史，不受影响。回退永不删除收件箱行。随后追加一条 `session.reverted` 事件，字段为：`sessionID`（字符串）、`messageID`（字符串，回退后仍是转录尾部的边界消息）、`marker`（对象，暂存的回退 JSON 原样，如 `{"messageID": "...", "files": []}`）、`boundaryTimeCreated`（i64 毫秒）、`removedMessageCount`（u64，删除的投影行数）、`removedLegacyMessageCount`（u64，删除的旧表行数）、`cancelledInputIDs`（字符串数组，按准入顺序）、`contextEpochCleared`（布尔）、`timeUpdated`（i64 毫秒）。所有键始终存在。
+
 ## Plan 与 Work 状态迁移
 
 持久的 Goal、Plan、Todo、收件箱和 job 状态控制续跑，而不是自然语言。「接下来我会……」
@@ -91,6 +100,13 @@ ACP 通过会话级投影器订阅 `TurnHost::work_state_changes()`，而不是�
 ## 原生会话命令、压缩与硬中断
 
 会话命令、上下文压缩与硬中断都是原生能力，不依赖模型配合。
+
+自动压缩只在摘要落盘之后才咨询 auto-continue hook。该 hook 失败时会话保持
+`Compacted`：摘要保留，不合成续跑回合（没有人投票就不授予续跑），失败原因随压缩结果以
+`auto_continue_hook_failure` 记录并输出告警；会话不会被标记为失败，因此后续压缩不再被
+`AlreadyFailed` 拒绝。工具 after-hook 失败同理：工具已经运行，结果保持自身状态与
+`is_error`，hook 失败作为 `afterHookError` 元数据随结果返回，而不是被改写成一条会让模型
+以为副作用没有发生、进而重复执行的裸错误。
 
 ## 原生 History 与 Notes
 
@@ -124,9 +140,11 @@ observer 调度 active 根 Goal。恢复任务与普通 prompt 共用会话执�
 
 可恢复的 provider、网络、流、SQLite 争用、Agent 步数上限和符合条件的工具失败，会在等待前先持久化一次指数退避重试。进程重启后从 SQLite 重建截止时间。
 
-重试延迟是正数、有上限、带抖动，并且可被用户输入打断。有效的对端 `Retry-After` 会被限制到配置上限，且绝不会被更早的本地延迟替换。
+重试延迟是正数、有上限、带抖动，并且可被用户输入打断。有效的对端 `Retry-After` 会被限制到配置上限，且绝不会被更早的本地延迟替换。对端要求的延迟超过 180 秒同请求恢复期限时，回合以对端自身的类型化错误结束，Goal 级重试等待的是对端值按 `max_delay_ms` 截断后的结果，不再退回更短的本地退避。
 
 重试决策使用类型化错误，而非渲染后的消息。认证失败与用户中断导致暂停；无效协议、损坏的持久状态和永久性配置失败导致阻塞。
+
+读取或记账 Goal 预算时遇到 SQLite 争用（`SQLITE_BUSY`）会持久化一次 `database_busy` 指数退避重试，Goal 保持活跃，而不是以 `turn_budget` 暂停；其他数据库失败仍以 `usage_unknown` 停止回合并暂停 Goal；本构建无法读取的持久状态仍然阻塞。CLI 回合中的 Plan 对账驱动、human request 创建与重试上下文压缩标记路径也经同一 `GoalTerminalFailure::from_db_error` 规则分类：争用现在以 `database_busy` 重试，过去则以 `host_permanent` 阻塞。
 
 `timeout`、`headerTimeout`、`chunkTimeout` 只有 OpenAI-compatible 传输会读取，其默认值是
 330 秒响应头截止时间与 120 秒分片空闲上限。原生的 OpenAI、Anthropic、Google、Bedrock
@@ -211,6 +229,8 @@ Zuno 不监听 `~/.zuno` 或远端 Skill 缓存；缓存只在配置远端索引
 
 Shell 执行受 OS 沙箱约束。`read-only` 与 `workspace-write` 都要求一个已验证的约束后端，不可用时拒绝启动而非降级。详见 [权限与沙箱](/zh/guide/permissions)。
 
+Linux bubblewrap 后端的发现结果按进程缓存，键为规范化 workspace 加 helper 可执行文件；每次命中前重新校验可信 launcher、可信 `true` 与 helper 在磁盘上的身份，校验失败即逐出并重新探测；发现失败绝不缓存，缓存也不跨进程持久化。`zuno debug sandbox` 与部署报告绕过缓存，始终重新探测。
+
 ## 常驻进程约束
 
 常驻进程在声明的约束内运行，其生命周期由运行时拥有。
@@ -221,9 +241,21 @@ Unix PTY 通过前台守护进程拥有进程组与终端前台切换。Windows 
 转发终端输出；关闭 writer/master 后发布退出，显式停止通过 `taskkill /T` 终止完整
 子进程树。
 
+Windows 上的守护器不再轮询 `tasklist`，而是通过绝对路径
+`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe` 启动一个持有真实进程句柄、
+等待父进程退出的助手，armed 之后 PID 复用无法冒充父进程。助手在 payload 启动之前武装：
+无法启动时守护器以 125 关闭，payload 不会启动；助手启动后无判定地结束时只写一条诊断，
+payload 继续运行并仅监督其自身退出，丢失的助手绝不视为父进程已死。
+
 ## 后台命令执行
 
 后台命令有独立的生命周期与输出游标，父会话通过持久状态观察它们，而不是靠轮询。
+
+每次执行都在子进程守护器之后运行，因此退出码 125、126、127 可能属于守护器而非命令：125
+表示守护器自身失败、命令结局未知，shell 工具报告不确定结果且绝不重放；126、127 表示程序
+从未启动，退出码被记录但没有 exit authority。只有捕获输出中出现守护器自身的诊断行时，
+保留码才被读作守护器的判定，普通程序自行 `exit 125` 仍保留权威收据。信号致死时守护器在
+自身重放同一信号，收据没有退出码，显示为「killed by a signal」而不是 `exit 1`。
 
 ## 后台子 Agent 与产品 Agent
 

@@ -141,6 +141,17 @@ so a path can be carved out of a directory that is otherwise writable.
 }
 ```
 
+A configured entry must exist and must not be a symbolic link at the moment the
+sandbox policy is built, or building the policy fails closed before any command
+runs. The refusal is deliberate: a path Zuno cannot pin to a real directory would
+otherwise be dropped silently, and a link beneath a writable root cannot be
+protected safely. The built-in protections for `.zuno`, `.agents`, and the Git
+metadata markers work differently. They are applied to whichever of those paths
+exist at the moment the bubblewrap arguments are generated, so a repository without
+a `.agents` directory simply gets no such mount. That same step skips, without an
+error, a configured path that disappeared after the policy was built, while a
+symbolic link is still refused there.
+
 During an unavailable fallback, writable roots and protected paths remain part of the
 requested policy and diagnostics, but the host process backend cannot enforce them.
 
