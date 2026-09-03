@@ -136,6 +136,27 @@ ACP 通过会话级投影器订阅 `TurnHost::work_state_changes()`，而不是�
 `is_error`，hook 失败作为 `afterHookError` 元数据随结果返回，而不是被改写成一条会让模型
 以为副作用没有发生、进而重复执行的裸错误。
 
+### 工具取消的确定性
+
+硬中断到来时，正在运行的工具会得到两秒的协作式清理窗口。在该窗口内结算，产生一次带类型的
+`cooperative` 取消并保留工具自己的最终报告；窗口耗尽则强制中止该次调用，记为 `forced` 加
+`uncertain`，重试前必须检查权威状态。`forced` 只表示宽限窗口已耗尽。
+
+协作式取消并不自动等于结果确定。工作尚未得出结论就被停下的工具，会在其已结算结果的
+`cancellation` metadata 键上声明这一点，dispatcher 也会把该次调用记为 `uncertain`，并把要求
+检查权威状态的那句话追加到模型读到的报告里；没有作出声明的工具保持原有的确定读法，文本也不
+改动。`shell` 同时承载两种读法，而区分它们的是服务是否把某个状态结算为命令自己的判定，而不
+只是进程有没有退出：取消被处理之前就已完成并报告了自己判定的运行，报告该退出状态并拿到正常
+完成的运行所应得的凭据，只标记为已取消而不是不确定。其余每一次被取消的运行都保留已捕获的
+输出、携带没有 exit authority 的 unresolved 凭据，并且属于不确定——包括那些确实报告了数字的
+情况：属于子进程守护器自身失败的 `exit 125`、在硬上限处被杀掉的运行，以及运行报告过但被结算
+为并非命令自身结局的状态。报告出的退出码仍留在结果里，因为那正是终端会显示的内容，所以一次
+不确定的取消也可能给出退出码；拒绝为它背书的是凭据。两种读法都绝不会被机械重放。
+
+解析出的判定随 `ToolDispatchInterrupted` 运行时事件一起发布，而不只是写入持久记录，因此
+SSE 的 `tool.dispatch.interrupted` 载荷、ACP session update 与 `zuno run` 发布的 `uncertain`
+与重放会话从持久 metadata 重建出的判定一致。
+
 ## 原生 History 与 Notes
 
 `zuno-continuity` 是通过 `ProfileBundle` 与 `ToolContributions` 挂载的原生组件，默认关闭。
@@ -309,8 +330,6 @@ PowerShell 仍然只是那个守护器的后端依赖，而不是运行 CLI 的�
 工具执行默认是至多一次。`ToolReplayPolicy::Never` 是默认值；只有显式声明为只读或幂等的工具才可以声明 `Safe`。
 
 副作用附近的超时或响应丢失属于结果不确定。这种情况会被持久化，要求检查权威状态，绝不机械重放调用。
-
-协作式取消并不自动等于结果确定。工作尚未得出结论就被停下的工具，会在其已结算结果的 `cancellation` metadata 键上声明这一点，dispatcher 也会把该次调用记为 `uncertain`，并适用同样的权威状态检查要求；没有作出声明的工具保持原有的确定读法。`shell` 同时承载两种读法：取消被处理时已经退出的命令，报告它自己的退出状态并拿到正常完成的运行所应得的凭据，只标记为已取消而不是不确定；仍在运行而被杀掉的命令保留已捕获的输出，携带没有退出码的 unresolved 凭据，属于不确定。两者都绝不会被机械重放。解析出的判定随 `ToolDispatchInterrupted` 运行时事件一起发布，而不只是写入持久记录，因此 SSE 的 `tool.dispatch.interrupted` 载荷、ACP session update 与 `zuno run` 发布的 `uncertain` 与重放会话从持久 metadata 重建出的判定一致，而 `forced` 只表示宽限窗口已耗尽。
 
 `subagent_model_selection` 默认关闭。开启后，精确 model allowlist 会在 profile 激活时解析，并按 session 持久冻结为带 digest 的策略；`task` 才会出现可选 `model`/`effort`。续跑不能改变首次冻结的模型或强度。
 

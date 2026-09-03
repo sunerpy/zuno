@@ -1737,3 +1737,40 @@ fn tui_docs_pin_the_input_discarded_when_the_terminal_is_released() {
         &["再丢弃尚未读取的输入", "`0;54;31M` 这类残留报文"],
     );
 }
+
+/// A cancellation's certainty is the fact this batch found easiest to re-document wrongly.
+///
+/// Both pages once said a cooperative return was certain and that an uncertain cancellation
+/// reports no exit code, and both claims were false — the second one for a guard `exit 125`
+/// that had already exited and still decides nothing. These needles pin the corrected
+/// contract in both languages, including that the demand reaches the model's own text.
+#[test]
+fn cancellation_docs_pin_certainty_as_a_verdict_and_not_a_mode() {
+    contains_all(
+        "docs/harness-runtime.md",
+        &[
+            "A cooperative settlement is not",
+            "demand to the settled report the model reads",
+            "keeps the certain cooperative reading, text included.",
+            "not merely whether the process had exited",
+            "Every other cancelled run preserves its captured output",
+            "uncertain cancellation may still name an exit code",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/harness-runtime.md",
+        &[
+            "### 工具取消的确定性",
+            "协作式取消并不自动等于结果确定。",
+            "检查权威状态的那句话追加到模型读到的报告里",
+            "区分它们的是服务是否把某个状态结算为命令自己的判定",
+            "不确定的取消也可能给出退出码",
+            "两种读法都绝不会被机械重放。",
+        ],
+    );
+    contains_all(
+        "docs/guide/tools.md",
+        &["says nothing about whether the command"],
+    );
+    contains_all("docs/zh/guide/tools.md", &["对命令是否运行过一概不说"]);
+}
