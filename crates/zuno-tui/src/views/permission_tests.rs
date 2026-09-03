@@ -500,6 +500,57 @@ fn views_permission_describe_covers_every_oracle_branch() {
 }
 
 #[test]
+fn views_permission_lsp_names_the_resolved_path_not_the_argument() {
+    // `lsp` decides on the path the kernel actually reaches, so the prompt has to
+    // name that path. The argument is the attacker-controlled spelling: it can
+    // still read `lnk/../file.rs` while the boundary authorized `outside/file.rs`.
+    let mut inner = request("lsp");
+    inner.patterns = vec![String::from("outside/file.rs")];
+    inner.metadata.insert(
+        String::from("filepath"),
+        serde_json::Value::String(String::from("outside/file.rs")),
+    );
+    let input = json!({"filePath": "lnk/../file.rs", "line": 1, "character": 0});
+    let subject = describe(&inner, &input);
+    assert_eq!(subject.icon, "→");
+    assert_eq!(
+        subject.title, "LSP outside/file.rs",
+        "the prompt named the argument instead of the resolved path"
+    );
+    assert!(
+        !subject.title.contains("lnk"),
+        "the raw argument leaked into the prompt: {}",
+        subject.title
+    );
+    let joined = render(
+        PermissionPrompt::new(ViewContext::defaults(), inner, &input),
+        90,
+        20,
+    )
+    .join("\n");
+    assert!(
+        joined.contains("LSP outside/file.rs"),
+        "lsp did not render its subject:\n{joined}"
+    );
+    assert!(
+        !joined.contains("Call tool lsp"),
+        "lsp fell through to the catch-all:\n{joined}"
+    );
+}
+
+#[test]
+fn views_permission_lsp_falls_back_to_the_authorized_pattern() {
+    // A permission ask can arrive before the metadata is attached; the fallback is
+    // the pattern the boundary itself authorized, never the tool argument.
+    let mut inner = request("lsp");
+    inner.patterns = vec![String::from("src/main.rs")];
+    let input = json!({"filePath": "lnk/../elsewhere.rs"});
+    let subject = describe(&inner, &input);
+    assert_eq!(subject.title, "LSP src/main.rs");
+    assert!(!subject.title.contains("elsewhere"));
+}
+
+#[test]
 fn views_permission_external_directory_renders_a_non_empty_subject() {
     let mut inner = request("external_directory");
     inner.patterns = vec![String::from("/tmp/work/**")];

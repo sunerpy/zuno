@@ -165,6 +165,24 @@ pub fn describe(request: &PermissionRequest, input: &Value) -> Subject {
                 detail: detail("Path", &path),
             }
         }
+        "lsp" => {
+            // The resolved path, never the argument. `lsp` canonicalizes through
+            // symlinks before it authorizes, so the raw `filePath` can still spell
+            // `lnk/../file.rs` and name a different file from the one the boundary
+            // decided. `edit_path` prefers that argument, so it is not usable here.
+            let path = [
+                meta("filepath"),
+                request.patterns.first().cloned().unwrap_or_default(),
+            ]
+            .into_iter()
+            .find(|candidate| !candidate.is_empty())
+            .unwrap_or_default();
+            Subject {
+                icon: "→",
+                title: format!("LSP {path}"),
+                detail: detail("Path", &path),
+            }
+        }
         "glob" => {
             let pattern = arg("pattern");
             Subject {
