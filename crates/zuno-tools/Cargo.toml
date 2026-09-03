@@ -63,6 +63,13 @@ url = { workspace = true }
 uuid = { workspace = true }
 which = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# `read::anchor` re-verifies the pinned directory's `(volume_serial_number,
+# file_index)` identity through the open handle before it publishes a write. Both
+# fields are unstable in `std` (`windows_by_handle`), so the safe
+# `GetFileInformationByHandle` wrapper supplies them instead.
+winapi-util = { workspace = true }
+
 [dev-dependencies]
 zuno-testkit = { workspace = true }
 tempfile = { workspace = true }

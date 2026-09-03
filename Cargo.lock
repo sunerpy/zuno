@@ -7435,6 +7435,7 @@ dependencies = [
  "url",
  "uuid",
  "which",
+ "winapi-util",
  "wiremock",
  "zuno-agent",
  "zuno-catalog",

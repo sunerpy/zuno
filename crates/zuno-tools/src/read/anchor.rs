@@ -52,9 +52,16 @@
 //! # Why no `openat2`, `renameat` or `GetFinalPathNameByHandleW`
 //!
 //! The workspace forbids first-party `unsafe` (`[workspace.lints.rust] unsafe_code =
-//! "forbid"` in the root `Cargo.toml`), so those syscalls can only be reached through
-//! a wrapper crate, and adding a dependency edge to `zuno-tools` rewrites
-//! `Cargo.lock`. Everything here is therefore plain `std`.
+//! "forbid"` in the root `Cargo.toml`), so those syscalls are reachable only through a
+//! wrapper crate. None of the three has one this workspace already builds, so each
+//! would add a crate to the graph to narrow a window the segment walk already narrows.
+//!
+//! Windows file identity is the one exception, because safe `std` cannot express it on
+//! stable at all: `MetadataExt::{volume_serial_number, file_index}` sit behind the
+//! unstable `windows_by_handle` feature. `winapi-util` returns the same two fields from
+//! `GetFileInformationByHandle` through a safe wrapper, and the workspace already
+//! compiles that crate for Windows under `ignore`, `walkdir`, and `termcolor`, so the
+//! edge costs no new dependency. Everything else here is plain `std`.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata};
@@ -111,34 +118,44 @@ struct DirIdentity {
     #[cfg(unix)]
     inode: u64,
     #[cfg(windows)]
-    volume: u32,
+    volume: u64,
     #[cfg(windows)]
     index: u64,
     #[cfg(not(any(unix, windows)))]
     unavailable: (),
 }
 
+/// Read the identity through the open handle rather than by name.
+///
+/// The handle is the point: asking the filesystem about the path again would defeat
+/// the anchor, because the name is the part an attacker controls.
 #[cfg(unix)]
-fn identity_of(metadata: &Metadata) -> Option<DirIdentity> {
+fn identity_of(handle: &File) -> io::Result<Option<DirIdentity>> {
     use std::os::unix::fs::MetadataExt as _;
-    Some(DirIdentity {
+    let metadata = handle.metadata()?;
+    Ok(Some(DirIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
-    })
+    }))
 }
 
+/// `std::os::windows::fs::MetadataExt::{volume_serial_number, file_index}` are still
+/// unstable (`windows_by_handle`, rust-lang/rust#63010), so the identity is read from
+/// `GetFileInformationByHandle` through `winapi-util`'s safe wrapper. That keeps the
+/// FFI outside first-party code, so the workspace `unsafe_code = "forbid"` guarantee
+/// still holds, and it reads the same two fields the unstable API would return.
 #[cfg(windows)]
-fn identity_of(metadata: &Metadata) -> Option<DirIdentity> {
-    use std::os::windows::fs::MetadataExt as _;
-    Some(DirIdentity {
-        volume: metadata.volume_serial_number()?,
-        index: metadata.file_index()?,
-    })
+fn identity_of(handle: &File) -> io::Result<Option<DirIdentity>> {
+    let information = winapi_util::file::information(handle)?;
+    Ok(Some(DirIdentity {
+        volume: information.volume_serial_number(),
+        index: information.file_index(),
+    }))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn identity_of(_metadata: &Metadata) -> Option<DirIdentity> {
-    None
+fn identity_of(_handle: &File) -> io::Result<Option<DirIdentity>> {
+    Ok(None)
 }
 
 /// A directory pinned by an open handle, together with the boundary it descends from.
@@ -166,7 +183,7 @@ impl AnchoredDir {
             relative: PathBuf::new(),
             identity: None,
         };
-        current.identity = identity_of(&current.handle.metadata()?);
+        current.identity = identity_of(&current.handle)?;
         for segment in segments {
             current = current.child(&segment, create)?;
         }
@@ -190,7 +207,7 @@ impl AnchoredDir {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),
             Err(error) => return Err(refused_segment(self, name, error)),
         };
-        let identity = identity_of(&handle.metadata()?);
+        let identity = identity_of(&handle)?;
         Ok(Self {
             handle,
             root: self.root.clone(),
@@ -612,7 +629,7 @@ mod platform {
 
     pub(super) fn revalidate_anchor(dir: &AnchoredDir) -> io::Result<()> {
         let reopened = open_root(&dir.path())?;
-        let identity = super::identity_of(&reopened.metadata()?);
+        let identity = super::identity_of(&reopened)?;
         if identity.is_some() && identity == dir.identity {
             return Ok(());
         }
