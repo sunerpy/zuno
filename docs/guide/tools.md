@@ -243,6 +243,39 @@ the captured output, and only the guard writes that line, so a `make` that repor
 at all and is reported as killed by a signal, which likewise decides nothing about
 the work.
 
+## Cancelling a running command
+
+Interrupting a turn cancels the `shell` command it was waiting on, and what comes back is
+a settled result rather than a bare error. Everything the command had written is
+preserved, the exit information is reported when there is any, and the result states which
+of the two cancellations happened — because the two do not permit the same next step.
+
+| What the interrupt found | Exit status | Verification receipt |
+| --- | --- | --- |
+| The process had already exited | Reported, with its usual authority | The receipt a completed run earns |
+| The process was still running | None: it was killed | `unknown`, with no exit code |
+
+The first case is not uncertain. The kill landed on a process that was already gone, so
+the command's own verdict stands and the result is the one it had earned; it is marked as
+cancelled and nothing else changes.
+
+The second case is uncertain, and says so in its first line: the command decided nothing,
+and what it had already changed cannot be read off this result. It asks for the
+authoritative state the command would have changed to be inspected before anything is
+retried. `shell` never replays a call on its own — a command can commit half a write
+before the kill reaches it — so this outcome ends with a look at real state rather than
+with a second attempt.
+
+An `exit 125` that is the guard's own failure is read as the uncertain case even though a
+number arrived, for the reason given in [the reserved codes above](#exit-codes-the-guard-reserves):
+that code says nothing about whether the command ran.
+
+Preserved output goes through the ordinary [output limits](#output-limits). A cancelled
+command that produced more than the inline threshold has every byte saved and is handed
+the notice naming the windowed read, with the cancellation statement still in front of it.
+Nothing is truncated, and a cancelled command that wrote nothing says `(no output)` rather
+than coming back blank.
+
 ## What a shell command inherits
 
 A `shell` call runs with the host environment the Zuno process itself has, minus

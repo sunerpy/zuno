@@ -794,15 +794,70 @@ async fn shell_cancellation_kills_the_shell_and_its_whole_process_group() {
     let child = read_pid(&child_file);
 
     interrupt.fire();
-    let error = tokio::time::timeout(Duration::from_secs(2), running)
+    let output = tokio::time::timeout(Duration::from_secs(2), running)
         .await
         .expect("cancellation must finish promptly")
         .expect("task join")
-        .expect_err("an interrupted command is not successful");
+        .expect("a cancelled command settles rather than failing");
 
-    assert!(matches!(error, ToolError::Failed { .. }));
+    // Killing the tree is the behaviour under test; the result shape is asserted here
+    // only so that a future change cannot go back to reporting the kill as a clean,
+    // certain cancellation.
+    assert_eq!(output.metadata["cancellation"]["uncertain"], true);
     wait_for_process_exit(parent).await;
     wait_for_process_exit(child).await;
+}
+
+/// Cancelling a running command hands back what it had already written.
+///
+/// Everything the command produced used to be discarded on the way out, and the model
+/// was told the tool had completed its cleanup — a clean, certain, effect-free reading
+/// of a command that was killed mid-flight. The bytes, the absent exit status, and the
+/// demand for state inspection all have to survive.
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_cancellation_returns_the_bytes_the_command_had_already_written() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let marker = dir.path().join("printed");
+    // An external `echo` rather than the shell's builtin: an exited process has flushed
+    // its bytes into the pipe, so what the test waits for is what the capture holds.
+    let command = format!(
+        "/bin/echo 'partial progress'; : > '{}'; sleep 30",
+        marker.display()
+    );
+    let interrupt = Arc::new(FirableInterrupt::default());
+    let tool = support::sandbox::shell_tool(dir.path());
+    let run_context = context(interrupt.clone());
+
+    let running = tokio::spawn(async move { tool.run(params(command), run_context).await });
+    wait_for_file(&marker).await;
+    interrupt.fire();
+    let output = tokio::time::timeout(Duration::from_secs(2), running)
+        .await
+        .expect("cancellation must finish promptly")
+        .expect("task join")
+        .expect("a cancelled command is a settled result, not a failure");
+
+    assert!(
+        output.output.contains("partial progress"),
+        "cancellation must preserve captured output: {}",
+        output.output
+    );
+    assert!(
+        output.output.contains("Inspect the authoritative state"),
+        "a killed command's outcome is not certain: {}",
+        output.output
+    );
+    assert_eq!(output.metadata["cancellation"]["cancelled"], true);
+    assert_eq!(output.metadata["cancellation"]["uncertain"], true);
+    assert_eq!(output.metadata["cancellation"]["authoritative"], false);
+    assert_eq!(output.metadata["exit"], serde_json::Value::Null);
+
+    let receipt = receipt(&output);
+    assert!(!receipt.proves_success());
+    assert_eq!(receipt.outcome, ReceiptOutcome::Unknown);
+    assert_eq!(receipt.exit_authority, ExitAuthority::Absent);
+    assert_eq!(receipt.exit_code, None);
 }
 
 #[cfg(unix)]

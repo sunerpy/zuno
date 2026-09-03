@@ -367,6 +367,48 @@ impl Tool for CooperativeInterruptTool {
     }
 }
 
+/// A tool that settles a cancelled call whose outcome it cannot decide.
+///
+/// `shell` is the real one: a command killed between starting a write and reporting it
+/// has produced output but decided nothing. The tool says so on its result, and the
+/// dispatcher is expected to record the interruption as uncertain rather than as a
+/// clean cooperative return.
+struct UndecidedCancellationTool {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl Tool for UndecidedCancellationTool {
+    fn id(&self) -> &str {
+        "task"
+    }
+
+    fn description(&self) -> &str {
+        "A tool that preserves what it produced and admits its outcome is undecided."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, _args: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        self.started.notify_one();
+        ctx.interrupt.notified().await;
+        Ok(ToolOutput::text("task", "partial progress").with_metadata(
+            "cancellation",
+            json!({
+                "cancelled": true,
+                "authoritative": false,
+                "uncertain": true,
+            }),
+        ))
+    }
+}
+
 struct IgnoringInterruptTool {
     started: Arc<Notify>,
 }
@@ -1362,6 +1404,54 @@ async fn dispatch_interrupt_waits_for_cooperative_tool_cleanup() {
         "cooperative"
     );
     assert_eq!(result.output.metadata["interruption"]["uncertain"], false);
+}
+
+/// A cooperative return is not automatically a certain one.
+///
+/// The dispatcher used to record every cooperative cancellation as certain, so a tool
+/// that had been stopped partway through a side effect was reported as having completed
+/// its cleanup. The claim now travels from the tool to the recorded interruption.
+#[tokio::test]
+async fn dispatch_records_an_undecided_cooperative_cancellation_as_uncertain() {
+    let started = Arc::new(Notify::new());
+    let dispatcher = Arc::new(dispatcher(
+        vec![Arc::new(UndecidedCancellationTool {
+            started: Arc::clone(&started),
+        })],
+        vec![allow_all_rule()],
+        Arc::new(RecordingApprover::default()),
+    ));
+    let call = request(&dispatcher, "call_undecided", "task", json!({}));
+    let interrupt = call.interrupt.clone();
+    let task = {
+        let dispatcher = Arc::clone(&dispatcher);
+        tokio::spawn(async move { dispatcher.dispatch(call).await })
+    };
+
+    started.notified().await;
+    interrupt.fire();
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("cooperative cleanup must finish inside the grace period")
+        .expect("dispatch task");
+
+    assert_eq!(
+        result.interruption,
+        Some(zuno_engine::r#loop::ToolInterruption::Cooperative)
+    );
+    assert_eq!(
+        result.output.output, "partial progress",
+        "what the tool preserved is what the model reads"
+    );
+    assert_eq!(
+        result.output.metadata["interruption"]["mode"],
+        "cooperative"
+    );
+    assert_eq!(result.output.metadata["interruption"]["uncertain"], true);
+    assert_eq!(
+        result.output.metadata["interruption"]["forced"], false,
+        "an undecided outcome is not the same claim as a forced abort"
+    );
 }
 
 #[tokio::test]

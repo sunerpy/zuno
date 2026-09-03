@@ -11,7 +11,7 @@ use crate::timeout::{
 };
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -312,6 +312,79 @@ impl ShellVerification {
     }
 }
 
+/// The metadata key carrying what a cancelled call still proved.
+///
+/// A cancelled `shell` result is a settled result, not an error, so a reader has to be
+/// able to tell the two cancellations apart without parsing the notice: one where the
+/// process had already exited and reported its own status, and one where it was killed
+/// mid-flight and decided nothing. [`zuno_engine`]'s dispatcher reads `uncertain` from
+/// here to decide whether the interruption it records needs authoritative inspection.
+///
+/// The engine does not depend on this crate, so the key is spelled once here and once
+/// there; the contract is the JSON shape below, and both sides pin the spelling in a
+/// test.
+pub const METADATA_CANCELLATION_KEY: &str = "cancellation";
+
+/// What a call the caller's interrupt ended is allowed to claim.
+///
+/// Serialized onto the result under [`METADATA_CANCELLATION_KEY`], beside — never
+/// instead of — the notice a model reads, so a client surface and a later turn can act
+/// on the facts without re-reading a sentence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelledExecution {
+    /// Always true: this key exists only on a result cancellation produced.
+    pub cancelled: bool,
+    /// Whether the reported facts decide what the command did.
+    ///
+    /// True only when the process exited on its own before the kill landed, so the
+    /// exit status is the command's own verdict rather than the kill's.
+    pub authoritative: bool,
+    /// Whether the final side-effect state has to be inspected before anything else.
+    ///
+    /// The negation of [`Self::authoritative`], carried explicitly because it is the
+    /// field a consumer acts on and a reader must not have to invert a claim to find
+    /// it.
+    pub uncertain: bool,
+    /// The exit status the process reported before the kill landed, when it exited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The background service's terminal status for this execution.
+    pub status: String,
+    /// Why the outcome is, or is not, the command's own.
+    pub detail: String,
+}
+
+impl CancelledExecution {
+    /// The facts of a command that had already exited when the interrupt was serviced.
+    fn exited(status: BackgroundExecutionStatus, exit_code: i32, detail: String) -> Self {
+        Self {
+            cancelled: true,
+            authoritative: true,
+            uncertain: false,
+            exit_code: Some(exit_code),
+            status: status.as_str().to_owned(),
+            detail,
+        }
+    }
+
+    /// The facts of a command that was still running and was killed.
+    fn killed(status: BackgroundExecutionStatus, exit_code: Option<i32>, detail: String) -> Self {
+        Self {
+            cancelled: true,
+            authoritative: false,
+            uncertain: true,
+            exit_code,
+            status: status.as_str().to_owned(),
+            detail,
+        }
+    }
+
+    fn to_metadata_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellEnvInput {
     pub cwd: PathBuf,
@@ -574,16 +647,46 @@ impl ShellTool {
             }
             () = ctx.interrupt.notified() => {
                 let _cancelled = self.background_executions.cancel(&execution.id);
-                let _settled = self.background_executions.wait(&execution.id, None).await;
-                if let Err(error) = self.background_executions.finish_foreground(&execution.id) {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        error = %error,
-                        "could not remove interrupted foreground execution"
-                    );
-                }
+                // The settled info and the captured bytes are the whole point of this
+                // arm: a cancelled command has usually already written something, and
+                // the process may even have exited before the kill landed. Discarding
+                // both used to turn a side effect that really happened into a bare
+                // "interrupted" error.
+                let settled = match self.background_executions.wait(&execution.id, None).await {
+                    Ok(outcome) => outcome.info,
+                    Err(error) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            error = %error,
+                            "could not observe the terminal state of an interrupted \
+                             foreground execution"
+                        );
+                        // The launch snapshot is still `Running`, which
+                        // `cancelled_output` reads as an undecided outcome — exactly
+                        // what a failed terminal wait leaves behind.
+                        execution.clone()
+                    }
+                };
+                let captured = match self.background_executions.finish_foreground(&execution.id) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            error = %error,
+                            "could not remove interrupted foreground execution"
+                        );
+                        Vec::new()
+                    }
+                };
                 lease.disarm();
-                return Err(interrupted());
+                return self.cancelled_output(
+                    &verification,
+                    foreground_timeout_ms,
+                    &settled,
+                    captured,
+                    &ctx.session_id,
+                    accept_large_output,
+                );
             }
         };
         if waited.timed_out {
@@ -838,7 +941,19 @@ impl ShellTool {
     ) -> Result<ToolOutput, ToolError> {
         match execution.status {
             BackgroundExecutionStatus::Completed => {}
-            BackgroundExecutionStatus::Cancelled => return Err(interrupted()),
+            // A terminal wait that returns a cancelled execution has the same facts the
+            // interrupt arm has, and loses them the same way if it answers with an
+            // error: the command ran, wrote output, and may have changed state.
+            BackgroundExecutionStatus::Cancelled => {
+                return self.cancelled_output(
+                    verification,
+                    foreground_timeout_ms,
+                    &execution,
+                    bytes,
+                    session_id,
+                    accept_large_output,
+                );
+            }
             BackgroundExecutionStatus::Failed if execution.timed_out => {
                 return Err(ToolError::Timeout {
                     tool: TOOL_ID.to_owned(),
@@ -895,6 +1010,115 @@ impl ShellTool {
             &bytes,
             accept_large_output,
         )
+    }
+
+    /// The settled result of a foreground call the caller's interrupt ended.
+    ///
+    /// Cancellation used to answer with a bare error, which threw away everything the
+    /// command had written and told the model the tool had "completed its cleanup" —
+    /// a clean, certain, effect-free reading of a command that may have been killed
+    /// halfway through a write. This returns `Ok` instead, and separates the two
+    /// cancellations that differ in what the model may do next:
+    ///
+    /// - the process had already exited when the interrupt was serviced, so its status
+    ///   is its own verdict; the call is `cancelled` but not `uncertain`, and the
+    ///   receipt is the one a completed run would have earned;
+    /// - the process was killed, so it decided nothing; the receipt is
+    ///   [`ShellVerification::unresolved`] and the notice says authoritative state has
+    ///   to be inspected before anything is retried.
+    ///
+    /// A guard failure — `exit 125` with the guard's own diagnostic — is the second
+    /// case even though a code exists, because that code says nothing about whether
+    /// the command ran. [`Self::guard_aware_receipt`] already encodes that rule, so it
+    /// is asked rather than re-derived: an outcome it declines to certify is exactly an
+    /// outcome that cannot be cited.
+    ///
+    /// The preserved bytes go through [`OutputPolicy`], the same size policy a
+    /// completed run uses, so oversized cancelled output is persisted byte for byte and
+    /// withheld behind the windowed read rather than inlined or truncated. The notice
+    /// is prepended after that decision, so it survives withholding and never counts
+    /// against the threshold the command's own output is measured by.
+    fn cancelled_output(
+        &self,
+        verification: &ShellVerification,
+        foreground_timeout_ms: u64,
+        execution: &BackgroundExecutionInfo,
+        bytes: Vec<u8>,
+        session_id: &str,
+        accept_large_output: bool,
+    ) -> Result<ToolOutput, ToolError> {
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let reported = match execution.status {
+            BackgroundExecutionStatus::Completed | BackgroundExecutionStatus::Failed => {
+                execution.exit_code
+            }
+            BackgroundExecutionStatus::Cancelled
+            | BackgroundExecutionStatus::Running
+            | BackgroundExecutionStatus::Uncertain => None,
+        };
+        let certified = reported.and_then(|code| {
+            Self::guard_aware_receipt(verification, Some(code), &bytes, &text)
+                .ok()
+                .map(|receipt| (code, receipt))
+        });
+        let (facts, receipt, notice) = match certified {
+            Some((code, receipt)) => {
+                let detail = format!(
+                    "the command had already exited with status {code} when the cancellation was \
+                     serviced, so this is its own outcome and the kill changed nothing about it"
+                );
+                let notice = format!(
+                    "Cancelled by the user. The command had already exited with status {code} \
+                     before the cancellation was serviced, so this result is the command's own \
+                     outcome and the output below is complete."
+                );
+                (
+                    CancelledExecution::exited(execution.status, code, detail),
+                    receipt,
+                    notice,
+                )
+            }
+            None => {
+                let detail = "the command was cancelled while it was still running, so it \
+                              reported no outcome of its own and whatever it had already changed \
+                              is unknown from this result"
+                    .to_owned();
+                let notice = format!(
+                    "Cancelled by the user. `{}` was still running and was killed, so it has no \
+                     exit status and this result decides nothing about what it changed. Whatever \
+                     output it had produced is below. Inspect the authoritative state this \
+                     command would have changed before deciding what to do next; it must not be \
+                     re-run on the assumption that it did nothing.",
+                    summarize_command(&verification.command)
+                );
+                (
+                    CancelledExecution::killed(execution.status, reported, detail.clone()),
+                    verification.unresolved(detail),
+                    notice,
+                )
+            }
+        };
+        let body = if text.is_empty() {
+            "(no output)".to_owned()
+        } else {
+            text
+        };
+        let output = with_sandbox_metadata(
+            ToolOutput::text(verification.command.as_str(), body)
+                .with_metadata("exit", json!(facts.exit_code))
+                .with_metadata("truncated", false)
+                .with_metadata("background", false)
+                .with_metadata("task_id", execution.id.as_str())
+                .with_metadata("shell", self.shell.name())
+                .with_metadata("timeout", json!(foreground_timeout_ms))
+                .with_metadata(METADATA_CANCELLATION_KEY, facts.to_metadata_value())
+                .with_verification(&receipt),
+            &execution.authority,
+        );
+        let mut output = OutputPolicy::new(self.output_store.clone(), self.output_limits)
+            .apply_bytes(TOOL_ID, session_id, output, &bytes, accept_large_output)?;
+        output.output = format!("{notice}\n\n{}", output.output);
+        Ok(output)
     }
 
     /// The receipt for a finished run, reading a guard verdict as the guard's.
@@ -2883,5 +3107,405 @@ mod tests {
                 Some(crate::read::digest_bytes(output.as_bytes()))
             );
         }
+    }
+
+    /// A sandbox that exists only to satisfy the constructor.
+    ///
+    /// Assembling a cancelled result never spawns anything: it reads a settled
+    /// execution record and the bytes that were captured. A backend that refuses
+    /// `prepare` therefore keeps the test honest — reaching it would mean the
+    /// assembly path had started a command.
+    #[derive(Debug)]
+    struct NeverSpawningSandbox(zuno_sandbox::SandboxCapabilities);
+
+    impl NeverSpawningSandbox {
+        fn new() -> Self {
+            Self(zuno_sandbox::SandboxCapabilities {
+                backend: "test_never_spawning".to_owned(),
+                executable: None,
+                read_only: true,
+                workspace_write: true,
+                danger_full_access: true,
+                network_isolation: true,
+            })
+        }
+    }
+
+    impl SandboxBackend for NeverSpawningSandbox {
+        fn capabilities(&self) -> &zuno_sandbox::SandboxCapabilities {
+            &self.0
+        }
+
+        fn prepare(
+            &self,
+            _request: PrepareRequest,
+        ) -> Result<zuno_sandbox::PreparedCommand, zuno_sandbox::SandboxError> {
+            unreachable!("assembling a cancelled result must not launch a command")
+        }
+    }
+
+    fn assembly_tool(workspace: &Path) -> ShellTool {
+        let policy = SandboxPolicy::new(
+            workspace,
+            SandboxMode::WorkspaceWrite,
+            NetworkAccess::Allowed,
+        )
+        .expect("test sandbox policy");
+        ShellTool::with_sandbox_backend(
+            workspace,
+            None,
+            Arc::new(NeverSpawningSandbox::new()),
+            policy,
+        )
+        .expect("shell tool")
+    }
+
+    fn test_authority(workspace: &Path) -> ExecutionAuthority {
+        ExecutionAuthority {
+            schema_version: 3,
+            backend: "test_never_spawning".to_owned(),
+            backend_executable: None,
+            workspace: workspace.to_owned(),
+            mode: SandboxMode::WorkspaceWrite,
+            network: NetworkAccess::Allowed,
+            requested_mode: None,
+            requested_network: None,
+            resolution_kind: SandboxResolutionKind::ExplicitNative,
+            fallback_reason: None,
+            writable_roots: vec![workspace.to_owned()],
+            protected_paths: Vec::new(),
+            cwd: workspace.to_owned(),
+            command_sha256: String::new(),
+            environment_keys: Vec::new(),
+            approval_mode: "never".to_owned(),
+            reviewer_policy_sha256: String::new(),
+        }
+    }
+
+    /// A settled execution record, as the terminal wait in the interrupt arm returns one.
+    fn settled_execution(
+        workspace: &Path,
+        status: BackgroundExecutionStatus,
+        exit_code: Option<i32>,
+    ) -> BackgroundExecutionInfo {
+        BackgroundExecutionInfo {
+            id: zuno_pty::BackgroundExecutionId::parse(format!("bg_{}", "a".repeat(32)))
+                .expect("a well-formed execution id"),
+            session_id: "ses_cancel".to_owned(),
+            title: "cargo test --workspace".to_owned(),
+            command: "cargo test --workspace".to_owned(),
+            purpose: BackgroundExecutionPurpose::Command,
+            cwd: workspace.to_owned(),
+            status,
+            pid: None,
+            exit_code,
+            timed_out: false,
+            time_created: 0,
+            time_updated: 0,
+            time_completed: Some(0),
+            error: None,
+            output_file: workspace.join("execution.output"),
+            status_file: workspace.join("execution.status"),
+            authority: test_authority(workspace),
+        }
+    }
+
+    fn cancellation_facts(output: &ToolOutput) -> &Value {
+        output
+            .metadata
+            .get(METADATA_CANCELLATION_KEY)
+            .expect("a cancelled result states what it proved")
+    }
+
+    /// Cancelling a command keeps what it wrote, and says the outcome is undecided.
+    ///
+    /// The bytes and the exit information used to be discarded on the way out, leaving
+    /// the model an "interrupted" error for a command that had already written output
+    /// and may have been killed mid-write.
+    #[test]
+    fn a_killed_command_keeps_its_output_and_reports_an_undecided_outcome() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let tool = assembly_tool(workspace.path());
+        let verification = ShellVerification {
+            command: "cargo test --workspace".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let execution =
+            settled_execution(workspace.path(), BackgroundExecutionStatus::Cancelled, None);
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                b"running 3 tests\ntest one ... ok\n".to_vec(),
+                "ses_cancel",
+                false,
+            )
+            .expect("a cancelled command is a settled result, not a failure");
+
+        assert!(
+            output.output.contains("running 3 tests\ntest one ... ok\n"),
+            "every captured byte has to survive cancellation: {}",
+            output.output
+        );
+        assert!(
+            output.output.contains("Inspect the authoritative state"),
+            "an undecided outcome must ask for state inspection: {}",
+            output.output
+        );
+        let facts = cancellation_facts(&output);
+        assert_eq!(facts["cancelled"], true);
+        assert_eq!(facts["uncertain"], true);
+        assert_eq!(facts["authoritative"], false);
+        assert_eq!(facts["status"], "cancelled");
+        assert!(facts.get("exitCode").is_none());
+        assert_eq!(output.metadata["exit"], Value::Null);
+
+        // The receipt is the part a later success claim is checked against, so a killed
+        // command must not leave one that could be cited.
+        let receipt = VerificationReceipt::from_metadata(&output.metadata)
+            .expect("decodable receipt")
+            .expect("a cancelled result carries a receipt");
+        assert_eq!(receipt.outcome, ReceiptOutcome::Unknown);
+        assert_eq!(receipt.exit_authority, ExitAuthority::Absent);
+        assert_eq!(receipt.exit_code, None);
+        assert!(!receipt.proves_success());
+        assert!(
+            receipt
+                .detail
+                .is_some_and(|detail| detail.contains("still running")),
+            "the receipt has to say why nothing was decided"
+        );
+    }
+
+    /// A command that had already exited keeps its own verdict.
+    ///
+    /// The kill lands on a process that is already gone, so nothing about the command
+    /// changed: the exit status is authoritative and the call is `cancelled` without
+    /// being `uncertain`. Reporting it as undecided would send the model to inspect
+    /// state that the command itself already reported on.
+    #[test]
+    fn a_command_that_exited_before_the_kill_landed_reports_its_own_exit_status() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let tool = assembly_tool(workspace.path());
+        let verification = ShellVerification {
+            command: "cargo test --workspace".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: Some("c".repeat(40)),
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let execution = settled_execution(
+            workspace.path(),
+            BackgroundExecutionStatus::Completed,
+            Some(101),
+        );
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                b"test result: FAILED. 2 passed; 1 failed\n".to_vec(),
+                "ses_cancel",
+                false,
+            )
+            .expect("an exited command is a settled result");
+
+        assert!(
+            output
+                .output
+                .contains("test result: FAILED. 2 passed; 1 failed")
+        );
+        assert!(
+            output.output.contains("already exited with status 101"),
+            "{}",
+            output.output
+        );
+        assert!(
+            !output.output.contains("Inspect the authoritative state"),
+            "a decided outcome must not send the model looking for state: {}",
+            output.output
+        );
+        let facts = cancellation_facts(&output);
+        assert_eq!(facts["cancelled"], true);
+        assert_eq!(facts["uncertain"], false);
+        assert_eq!(facts["authoritative"], true);
+        assert_eq!(facts["exitCode"], 101);
+        assert_eq!(output.metadata["exit"], 101);
+
+        let receipt = VerificationReceipt::from_metadata(&output.metadata)
+            .expect("decodable receipt")
+            .expect("a cancelled result carries a receipt");
+        assert_eq!(receipt.outcome, ReceiptOutcome::Failed);
+        assert_eq!(receipt.exit_code, Some(101));
+        assert_eq!(receipt.exit_authority, ExitAuthority::Authoritative);
+        assert_eq!(receipt.git_head, verification.git_head);
+    }
+
+    /// A guard failure is undecided even though an exit code exists.
+    ///
+    /// `exit 125` with the guard's own diagnostic says the supervisor broke, so it
+    /// decides nothing about whether the command ran. Cancellation must read it the way
+    /// a completed run does rather than promote it to an authoritative verdict just
+    /// because a number arrived.
+    #[test]
+    fn a_guard_failure_during_cancellation_is_still_an_undecided_outcome() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let tool = assembly_tool(workspace.path());
+        let verification = ShellVerification {
+            command: "cargo publish -p zuno".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let execution = settled_execution(
+            workspace.path(),
+            BackgroundExecutionStatus::Completed,
+            Some(125),
+        );
+        let captured = format!(
+            "{}pidfd_open: Permission denied\n",
+            zuno_process::GUARD_DIAGNOSTIC_PREFIX
+        );
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                captured.into_bytes(),
+                "ses_cancel",
+                false,
+            )
+            .expect("a guard failure is a settled result too");
+
+        let facts = cancellation_facts(&output);
+        assert_eq!(facts["uncertain"], true);
+        assert_eq!(facts["authoritative"], false);
+        assert_eq!(
+            facts["exitCode"], 125,
+            "the code is still recorded, it just proves nothing"
+        );
+        assert!(output.output.contains("Inspect the authoritative state"));
+    }
+
+    /// Oversized cancelled output is withheld, exactly as a completed run's is.
+    ///
+    /// Cancellation is not a second truncation path: the bytes are persisted whole and
+    /// the model is handed the notice that names the windowed read, with the
+    /// cancellation statement still in front of it.
+    #[test]
+    fn oversized_cancelled_output_is_withheld_rather_than_truncated() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let store_dir = tempfile::tempdir().expect("store dir");
+        let store = ToolOutputStore::new(store_dir.path());
+        let tool = assembly_tool(workspace.path())
+            .with_output_store(store.clone())
+            .with_output_limits(OutputLimits {
+                max_lines: 1,
+                max_bytes: 4,
+            });
+        let verification = ShellVerification {
+            command: "cargo test --workspace".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let execution =
+            settled_execution(workspace.path(), BackgroundExecutionStatus::Cancelled, None);
+        let captured = b"one\ntwo\n";
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                captured.to_vec(),
+                "ses_cancel",
+                false,
+            )
+            .expect("oversized output is an outcome, not a failure");
+
+        assert_eq!(output.metadata["oversized"], true);
+        assert!(
+            output.output.contains("Tool output withheld"),
+            "{}",
+            output.output
+        );
+        assert!(
+            output.output.starts_with("Cancelled by the user."),
+            "withholding must not swallow the cancellation statement: {}",
+            output.output
+        );
+        assert!(
+            !output.output.contains("one\ntwo\n"),
+            "withheld output is not inlined: {}",
+            output.output
+        );
+        assert_eq!(cancellation_facts(&output)["uncertain"], true);
+
+        let paths = output.output_paths();
+        let path = paths.first().expect("the artifact holding every byte");
+        let window = store
+            .read_window("shell", "ses_cancel", Path::new(path), 0, 4_096)
+            .expect("stored cancelled output");
+        assert_eq!(
+            window.bytes, captured,
+            "cancellation persists the bytes byte for byte"
+        );
+    }
+
+    /// A cancelled command that wrote nothing says so instead of returning empty text.
+    #[test]
+    fn a_cancelled_command_with_no_output_still_returns_a_readable_result() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let tool = assembly_tool(workspace.path());
+        let verification = ShellVerification {
+            command: "sleep 30".to_owned(),
+            workdir: workspace.path().to_string_lossy().into_owned(),
+            git_head: None,
+            contract: contract(CommandShellKind::Posix, "bash", ExitPolicy::Pipefail),
+        };
+        let execution =
+            settled_execution(workspace.path(), BackgroundExecutionStatus::Cancelled, None);
+
+        let output = tool
+            .cancelled_output(
+                &verification,
+                120_000,
+                &execution,
+                Vec::new(),
+                "ses_cancel",
+                false,
+            )
+            .expect("settled");
+
+        assert!(output.output.ends_with("(no output)"), "{}", output.output);
+        assert_eq!(cancellation_facts(&output)["uncertain"], true);
+    }
+
+    /// The metadata key is a cross-crate contract, so its spelling is pinned here.
+    ///
+    /// `zuno-engine` reads `uncertain` out of this object to decide whether a
+    /// cooperative interruption needs authoritative inspection, and it cannot import
+    /// the constant: dispatch is the layer this crate's tools are handed to. Renaming
+    /// the key silently would leave the dispatcher reading a key nothing writes.
+    #[test]
+    fn the_cancellation_metadata_key_is_the_one_the_dispatcher_reads() {
+        assert_eq!(METADATA_CANCELLATION_KEY, "cancellation");
+        let facts = CancelledExecution::killed(
+            BackgroundExecutionStatus::Cancelled,
+            None,
+            "killed".to_owned(),
+        );
+        let value = facts.to_metadata_value();
+        assert_eq!(value["uncertain"], true);
+        assert_eq!(value["cancelled"], true);
+        assert_eq!(value["authoritative"], false);
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(value["detail"], "killed");
     }
 }

@@ -34,6 +34,34 @@ use crate::r#loop::{
 
 const TOOL_INTERRUPT_SETTLE_GRACE: Duration = Duration::from_secs(2);
 
+/// The metadata key a tool uses to say what its cancelled call still proved.
+///
+/// A tool that observes cancellation can settle in two ways that are not equally safe.
+/// It can hand back a decided outcome — the process had already exited, the write had
+/// already been committed — or it can hand back the fragment of a call that was stopped
+/// partway through a side effect. Only the tool knows which, so it says so here and the
+/// dispatcher reads it; the alternative is the dispatcher guessing, which is how every
+/// cooperative cancellation came to be reported as certain.
+///
+/// The producer side is `zuno_tools::shell::METADATA_CANCELLATION_KEY`. This crate does
+/// not depend on `zuno-tools` — dispatch is the layer the tools are handed to — so the
+/// spelling is pinned by a test on each side rather than shared through an import.
+const CANCELLATION_METADATA_KEY: &str = "cancellation";
+
+/// Whether a settled result says its cancelled outcome needs authoritative inspection.
+///
+/// Absent, malformed, or unset metadata answers `false`: a tool that makes no claim
+/// keeps the reading cooperative cancellation has always had, so this cannot turn every
+/// cancellation uncertain by default.
+fn cancellation_is_uncertain(output: &ToolOutput) -> bool {
+    output
+        .metadata
+        .get(CANCELLATION_METADATA_KEY)
+        .and_then(|facts| facts.get("uncertain"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 pub use crate::deferred_tools::TOOL_SEARCH_ID;
 
 /// Executable tools plus the policy collaborators needed at the dispatch boundary.
@@ -980,12 +1008,31 @@ fn error_result(tool: &str, message: String) -> ToolDispatchResult {
     ToolDispatchResult::error(ToolOutput::text(format!("{tool} error"), message))
 }
 
+/// The dispatch result of a call a hard turn interruption stopped.
+///
+/// A cooperative return is not automatically a certain one. The tool may have settled a
+/// decided outcome, or it may have been stopped between starting a side effect and
+/// observing it, and only the tool can tell those apart — so when its settled output
+/// carries [`CANCELLATION_METADATA_KEY`] saying the outcome is undecided, the recorded
+/// interruption says `uncertain` too. A tool that attaches nothing keeps the previous
+/// reading, and [`ToolInterruption::Forced`] stays exactly as uncertain as it was: the
+/// grace period elapsed, so nothing was observed at all.
 fn interrupted_result(
     tool: &str,
     interruption: ToolInterruption,
     settled: Option<ToolDispatchResult>,
 ) -> ToolDispatchResult {
+    let settled_is_uncertain = settled
+        .as_ref()
+        .is_some_and(|settled| cancellation_is_uncertain(&settled.output));
     let (forced, uncertain, message) = match interruption {
+        ToolInterruption::Cooperative if settled_is_uncertain => (
+            false,
+            true,
+            format!(
+                "Tool `{tool}` acknowledged cancellation, but it was stopped before its work reached a decided outcome. Its final side-effect state is uncertain; inspect authoritative state before retrying.",
+            ),
+        ),
         ToolInterruption::Cooperative => (
             false,
             false,
@@ -1232,5 +1279,144 @@ mod tests {
                 .output
                 .contains("do not replay the call mechanically")
         );
+    }
+
+    /// A settled tool result, as the cooperative arm hands one to `interrupted_result`.
+    fn settled_with(metadata: Value) -> ToolDispatchResult {
+        let mut output = ToolOutput::text("shell", "partial progress\n");
+        if let Value::Object(entries) = metadata {
+            for (key, value) in entries {
+                output.metadata.insert(key, value);
+            }
+        }
+        ToolDispatchResult::success(output)
+    }
+
+    fn interruption_facts(result: &ToolDispatchResult) -> &Value {
+        result
+            .output
+            .metadata
+            .get("interruption")
+            .expect("an interrupted result records how it was interrupted")
+    }
+
+    /// A tool that says its cancelled outcome is undecided is recorded as uncertain.
+    ///
+    /// Cooperative return used to mean certain, unconditionally: a `shell` command
+    /// killed between starting a write and observing it was reported as having
+    /// "completed its cleanup". The tool is the only layer that knows which of the two
+    /// cancellations happened, so the dispatcher reads its claim instead of assuming.
+    #[test]
+    fn a_cooperative_cancellation_of_an_undecided_call_is_recorded_as_uncertain() {
+        let result = interrupted_result(
+            "shell",
+            ToolInterruption::Cooperative,
+            Some(settled_with(serde_json::json!({
+                "cancellation": {
+                    "cancelled": true,
+                    "authoritative": false,
+                    "uncertain": true,
+                }
+            }))),
+        );
+
+        let facts = interruption_facts(&result);
+        assert_eq!(facts["mode"], "cooperative");
+        assert_eq!(facts["uncertain"], true);
+        assert_eq!(
+            facts["forced"], false,
+            "an uncertain outcome is not the same claim as a forced abort"
+        );
+        assert_eq!(result.interruption, Some(ToolInterruption::Cooperative));
+        assert_eq!(
+            result.output.output, "partial progress\n",
+            "the settled output the tool preserved is what the model reads"
+        );
+    }
+
+    /// A tool that makes no cancellation claim keeps the reading it always had.
+    ///
+    /// Turning every cooperative cancellation uncertain would send the model to inspect
+    /// authoritative state after a read-only call that stopped cleanly.
+    #[test]
+    fn a_cooperative_cancellation_without_a_claim_is_not_uncertain() {
+        for settled in [
+            settled_with(Value::Null),
+            settled_with(serde_json::json!({
+                "cancellation": { "cancelled": true, "uncertain": false }
+            })),
+            // A malformed claim is absent evidence, not a claim of uncertainty.
+            settled_with(serde_json::json!({ "cancellation": "yes" })),
+            settled_with(serde_json::json!({ "cancellation": { "uncertain": "yes" } })),
+        ] {
+            let result = interrupted_result("read", ToolInterruption::Cooperative, Some(settled));
+            assert_eq!(
+                interruption_facts(&result)["uncertain"],
+                false,
+                "{:?}",
+                result.output.metadata
+            );
+        }
+    }
+
+    /// A forced abort stays exactly as uncertain as it was.
+    #[test]
+    fn a_forced_interruption_is_uncertain_with_no_settled_output_to_read() {
+        let result = interrupted_result("shell", ToolInterruption::Forced, None);
+
+        let facts = interruption_facts(&result);
+        assert_eq!(facts["mode"], "forced");
+        assert_eq!(facts["forced"], true);
+        assert_eq!(facts["uncertain"], true);
+        assert!(
+            result
+                .output
+                .output
+                .contains("inspect authoritative state before retrying"),
+            "{}",
+            result.output.output
+        );
+    }
+
+    /// The fallback message of an undecided cancellation asks for state inspection.
+    ///
+    /// It is what the model reads when a tool reported uncertainty without leaving any
+    /// output of its own, so it must not repeat the old claim that cleanup completed.
+    #[test]
+    fn an_undecided_cancellation_message_asks_for_authoritative_state() {
+        let mut settled = settled_with(serde_json::json!({
+            "cancellation": { "uncertain": true }
+        }));
+        settled.output.output = String::new();
+        let result = interrupted_result("shell", ToolInterruption::Cooperative, Some(settled));
+        assert_eq!(interruption_facts(&result)["uncertain"], true);
+
+        // The same branch, reached with nothing settled at all.
+        let empty = interrupted_result("shell", ToolInterruption::Cooperative, None);
+        assert!(
+            empty
+                .output
+                .output
+                .contains("completed its cleanup before returning"),
+            "a tool that settled nothing has made no claim: {}",
+            empty.output.output
+        );
+    }
+
+    /// The metadata key is a cross-crate contract, so its spelling is pinned here.
+    ///
+    /// The producer is `zuno_tools::shell::METADATA_CANCELLATION_KEY`, which this crate
+    /// cannot import: dispatch is the layer those tools are handed to. Both sides pin
+    /// the same string so a rename fails a test instead of silently disconnecting the
+    /// claim from the reader.
+    #[test]
+    fn the_cancellation_metadata_key_is_the_one_the_shell_tool_writes() {
+        assert_eq!(CANCELLATION_METADATA_KEY, "cancellation");
+        assert!(cancellation_is_uncertain(
+            &ToolOutput::text("shell", "").with_metadata(
+                CANCELLATION_METADATA_KEY,
+                serde_json::json!({ "uncertain": true })
+            )
+        ));
     }
 }
