@@ -26,8 +26,6 @@ pub const OPERATIONS: &[(&str, &str)] = &[
     ("/api/pty/{ptyID}/connect-token", "post"),
     ("/api/pty/{ptyID}/connect", "get"),
     ("/api/permission/request", "get"),
-    ("/api/permission/saved", "get"),
-    ("/api/permission/saved/{id}", "delete"),
     ("/api/session/{sessionID}/permission", "get"),
     (
         "/api/session/{sessionID}/permission/{requestID}/reply",
@@ -172,11 +170,6 @@ const BODY_SCHEMA_GAPS: &[BodySchemaGap] = &[
         "the response upgrades to WebSocket frames and has no JSON body model",
     ),
     (
-        "/api/permission/saved",
-        "get",
-        "Data<Vec<Value>> leaves each saved permission payload untyped",
-    ),
-    (
         "/api/session/prune",
         "get",
         "SessionPruneReport does not derive JsonSchema",
@@ -240,7 +233,6 @@ pub(crate) const fn body_schema_gaps() -> &'static [BodySchemaGap] {
 #[cfg(test)]
 const BODYLESS_OPERATIONS: &[(&str, &str)] = &[
     ("/api/pty/{ptyID}", "delete"),
-    ("/api/permission/saved/{id}", "delete"),
     (
         "/api/session/{sessionID}/question/{requestID}/reject",
         "post",
@@ -403,12 +395,12 @@ mod tests {
     fn every_operation_is_bound_bodyless_or_a_reasoned_frozen_gap() {
         assert_eq!(
             BODY_SCHEMA_GAPS.len(),
-            33,
+            32,
             "review and re-freeze every gap change"
         );
         assert_eq!(
             BODYLESS_OPERATIONS.len(),
-            8,
+            7,
             "review and re-freeze every bodyless change"
         );
 

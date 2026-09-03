@@ -11,7 +11,7 @@ mod state;
 
 use axum::Json;
 use axum::Router;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -117,11 +117,6 @@ pub fn router(state: ApiState) -> Router {
             post(request::question_reject),
         )
         .route("/api/permission/request", get(request::permission_requests))
-        .route("/api/permission/saved", get(request::saved_permissions))
-        .route(
-            "/api/permission/saved/{id}",
-            delete(request::remove_saved_permission),
-        )
         .route("/api/question/request", get(request::question_requests))
         .route("/api/pty", get(pty::list).post(pty::create))
         .route(

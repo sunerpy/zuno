@@ -543,8 +543,10 @@ fn fixture_operations(document: &Value) -> BTreeSet<(String, String)> {
 fn api_openapi_contains_only_registered_zuno_operations() {
     let generated = api::openapi();
     let actual = fixture_operations(&generated);
-    assert_eq!(actual.len(), 51, "the registered Zuno API surface changed");
+    assert_eq!(actual.len(), 49, "the registered Zuno API surface changed");
     for operation in [
+        ("/api/permission/saved", "get"),
+        ("/api/permission/saved/{id}", "delete"),
         ("/api/integration/{integrationID}/connect/key", "post"),
         ("/api/integration/{integrationID}/connect/oauth", "post"),
         ("/api/integration/attempt/{attemptID}", "get"),
@@ -1023,7 +1025,6 @@ async fn api_permission_and_question_read_routes_match_the_empty_process_state()
     for path in [
         "/api/permission/request",
         "/api/question/request",
-        "/api/permission/saved",
         "/api/session/ses_empty/question",
     ] {
         let response = app
@@ -1034,16 +1035,41 @@ async fn api_permission_and_question_read_routes_match_the_empty_process_state()
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         assert_eq!(response_json(response).await["data"], json!([]), "{path}");
     }
+}
 
-    let removed = app
-        .oneshot(request(
-            Method::DELETE,
-            "/api/permission/saved/per_missing",
-            None,
-        ))
-        .await
-        .expect("saved permission delete responds");
-    assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+/// Zuno publishes no saved-permission surface.
+///
+/// `GET /api/permission/saved` and `DELETE /api/permission/saved/{id}` used to be
+/// fixed-response stubs: the list always reported an empty grant set and the delete
+/// always reported success, while a live standing authorization kept auto-approving
+/// matching calls. An unregistered route is honest about that; a route that can only
+/// lie is not.
+#[tokio::test]
+async fn api_publishes_no_saved_permission_routes_or_operations() {
+    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    let app = api_app(state);
+
+    for (method, path) in [
+        (Method::GET, "/api/permission/saved"),
+        (Method::DELETE, "/api/permission/saved/per_missing"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(method.clone(), path, None))
+            .await
+            .expect("the router answers an unregistered path");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+    }
+
+    let document = api::openapi();
+    assert!(
+        document["paths"]["/api/permission/saved"].is_null(),
+        "the removed list operation is still advertised"
+    );
+    assert!(
+        document["paths"]["/api/permission/saved/{id}"].is_null(),
+        "the removed revoke operation is still advertised"
+    );
 }
 
 #[tokio::test]

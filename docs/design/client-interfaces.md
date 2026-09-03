@@ -379,3 +379,11 @@ The HTTP question and permission list/reply operations publish concrete OpenAPI
 schemas. Their responses represent the same durable request rows used by TUI and
 ACP, including recovered requests; they are not merely a snapshot of live
 in-process waiters.
+
+That contract does not extend to standing authorizations, which are process-local
+rather than durable request rows. Zuno therefore publishes no `/api/permission/saved`
+list and no `/api/permission/saved/{id}` revoke. Both were fixed responses — an
+always-empty list and an always-successful delete — while a live grant kept
+authorizing matching calls, so a client auditing its grants was told there were none
+and a client revoking one was told it succeeded. A missing operation is honest; a
+published one that can only misreport is not.
