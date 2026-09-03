@@ -94,8 +94,13 @@ zuno session delete [OPTIONS] <SESSION_ID>
 | --- | --- |
 | `<SESSION_ID>` | |
 
+下面两个选项必须且只能选一个。删除 session 会决定由它派生的 Experience 记录的归属，
+因此本命令不做猜测。
+
 | 选项 | 说明 | 默认值 |
 | --- | --- | --- |
+| `--keep-derived-experiences` | 保留 Experience 记录，并把它们与被删除的 session 解除关联 | |
+| `--cleanup-derived-experiences` | 准备经过复核的 Memory/Skill 撤回，并遗忘派生的 Experience 记录 | |
 | `-v`, `--version` | 显示 Zuno 包版本 | |
 | `--print-logs` | 除结构化本地日志存储之外，同时把日志打印到 stderr | |
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
@@ -123,10 +128,18 @@ zuno session list --no-roots --archived --format json
 zuno session prune --older-than 30 --by created --all-projects
 ```
 
-按 id 删除一个 session。
+按 id 删除一个 session，并保留它产生的 Experience 记录。
 
 ```sh
-zuno session delete ses_1a2b3c
+zuno session delete ses_1a2b3c --keep-derived-experiences
+```
+
+改为遗忘派生的 Experience 记录需要一个在线的 learning profile，因此请在 TUI 中执行并选择
+`clean learning`，或通过 ACP 传入 `cleanupDerivedExperiences=true`。在命令行上，只有当该
+session 子树没有产生任何 Experience 记录时它才会成功。
+
+```sh
+zuno session delete ses_1a2b3c --cleanup-derived-experiences
 ```
 
 ## 参见

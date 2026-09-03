@@ -786,10 +786,11 @@ pub enum Command {
     Run(RunArgs),
     /// Start the interactive terminal application. Also the default with no command.
     Tui(TuiArgs),
-    /// Start the headless server.
+    /// Start the headless HTTP server.
     ///
-    /// Its owner wraps [`zuno_server::ServerBuilder`] through a dependency added by
-    /// todo 56; it must not spawn `zuno-server` or duplicate listener behavior.
+    /// Serves the OpenAPI surface and the server-sent event stream in this
+    /// process. Use `--hostname` and `--port` to choose the listener, or set
+    /// `server.hostname` and `server.port` in configuration.
     Serve(ServeArgs),
     /// Manage sessions.
     Session(SessionArgs),
@@ -1083,7 +1084,7 @@ pub enum Action {
     },
 }
 
-/// Behavior supplied by todo 56 and later command-owning todos.
+/// Executes parsed commands. Implemented by the assembled CLI runtime.
 pub trait CommandDispatcher {
     /// Execute one already-parsed command under the resolved environment.
     fn dispatch(&mut self, request: DispatchRequest) -> Result<(), DispatchError>;
