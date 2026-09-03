@@ -220,7 +220,12 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
         .respond(tool_response(
             "create-goal",
             "goal_propose",
-            json!({"objective": "publish the release and confirm it landed"}),
+            json!({
+                "objective": "publish the release and confirm it landed",
+                // Required on a model-proposed goal. This scenario ends on a guard
+                // failure and never completes the goal, so nothing has to settle it.
+                "success_criteria": ["the release URL returns the new version"]
+            }),
         ))
         .respond(tool_response(
             "guard-failure",

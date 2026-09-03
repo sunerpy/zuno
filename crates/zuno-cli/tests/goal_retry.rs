@@ -131,7 +131,13 @@ async fn active_goal_survives_request_retry_exhaustion_and_completes_automatical
             "create-goal",
             "goal_propose",
             json!({
-                "objective": "finish after a transient provider outage"
+                "objective": "finish after a transient provider outage",
+                // Required since a model-proposed goal must carry a checklist. The
+                // probe proves recovery through the transcript, so the criterion is
+                // waived below rather than satisfied by a receipt it never records.
+                "success_criteria": [
+                    "the run resumes after the transient outage and reports GOAL-RECOVERED"
+                ]
             }),
         ))
         .respond(transient_failure())
@@ -160,7 +166,16 @@ async fn active_goal_survives_request_retry_exhaustion_and_completes_automatical
                 // revision alone: a model that read the goal and then completes it
                 // must not lose the race to its own token accounting.
                 "expected_revision": 1,
-                "status": "complete"
+                "status": "complete",
+                // The criterion this scenario cannot satisfy by evidence: it has no
+                // recorded receipt to cite, so the completion audit is settled by an
+                // explicit waiver rather than by a fabricated receipt id.
+                "waive_criteria": [
+                    {
+                        "criterionId": "c1",
+                        "reason": "the probe asserts recovery through the transcript, not through a recorded check"
+                    }
+                ]
             }),
         ))
         .respond(text_response("GOAL-RECOVERED"));
