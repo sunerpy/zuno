@@ -144,7 +144,7 @@ observer 调度 active 根 Goal。恢复任务与普通 prompt 共用会话执�
 
 ## 原生搜索与 Shell 隔离
 
-搜索把遍历委托给 ripgrep 本身，Zuno 不维护第二个 ripgrep 兼容的遍历器。缺少 `rg` 是工具运行时的启动错误，而不是静默回退。
+搜索把遍历委托给 ripgrep 本身，Zuno 不维护第二个 ripgrep 兼容的遍历器。发现是惰性的，因此其他命令与工具不需要 ripgrep；只有在调用 `glob` 或 `grep` 时才要求 `PATH` 上有 14 或更新的主版本 `rg`（或由分发方随 Zuno 一起打包）。缺少或版本不受支持时是带类型的工具错误，而不是静默回退，也不会妨碍 Zuno 启动。
 
 ## Skill catalog 热更新
 

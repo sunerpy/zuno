@@ -103,8 +103,13 @@ Once a database format has shipped, a schema change must include:
 - a guarded forward migration from every format still declared supported;
 - one atomic transaction with the format marker updated last;
 - exact old-format fixtures rather than a current schema with only its marker edited,
-  except where the change is proven purely additive and the fixture removes every new
-  table and index;
+  with no exception for changes that look purely additive: a migration that reaches the
+  new shape through `ALTER TABLE` leaves columns in a different order than a freshly
+  created database, so a fixture reverse-engineered from the current schema does not
+  exercise the path a real user's database takes;
+- comparison by structural equivalence, meaning tables, columns, types, indexes, foreign
+  keys, and the marker, rather than by `sqlite_master` text, which legitimately differs
+  between a migrated and a freshly created database;
 - row-level before/after assertions for durable user data, including representative
   sessions, messages, and memory;
 - validation that future, unmarked, and structurally corrupt formats fail closed without

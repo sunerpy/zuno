@@ -91,7 +91,7 @@ phase 与 elapsed。
 
 `web_search` 不会把 provider 凭据或完整 wire URL 放进错误与日志。诊断只标识 provider、scheme、host、path、状态与错误类别，不包含 API key、认证头或完整 query。
 
-`glob` 与 `grep` 驱动官方的 `rg` 可执行文件，Zuno 只贡献带类型的参数、取消、有界解码和稳定排序。必须有 ripgrep 14 或更新版本可用；缺失时工具运行时报启动错误，而不是静默回退到更慢的遍历器。
+`glob` 与 `grep` 驱动官方的 `rg` 可执行文件，Zuno 只贡献带类型的参数、取消、有界解码和稳定排序。这两个工具需要 ripgrep 14 或更新版本。发现是惰性的，且只作用于它们：缺少 `rg` 时 `glob` 与 `grep` 会报出带类型的工具错误，而不是静默回退到更慢的遍历器，但它不会妨碍 Zuno 启动、读取配置、访问 provider 或打开数据库。
 
 ## Shell 退出状态能证明什么
 

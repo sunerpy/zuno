@@ -119,8 +119,10 @@ category; they do not contain an API key, authorization header, or full query.
 
 `glob` and `grep` drive the official `rg` executable, with Zuno contributing only typed
 arguments, cancellation, bounded decoding, and stable ordering. Ripgrep 14 or newer must
-be available; a missing one is a startup error for the tool runtime rather than a silent
-fallback to a slower walker.
+be available for those two tools. Discovery is lazy and scoped to them: a missing `rg`
+makes `glob` and `grep` report a typed tool error, and never a silent fallback to a
+slower walker, but it does not block Zuno from starting, reading configuration, reaching
+a provider, or opening its database.
 
 For a Shell command that only observes remote work, set
 `backgroundPurpose: "remoteObserver"`. This value is persisted with the background
