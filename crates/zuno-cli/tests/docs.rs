@@ -640,6 +640,8 @@ fn architecture_documents_pin_the_native_harness_decisions() {
             "subagent_claude_code",
             "app-server",
             "stream-json",
+            "permission_denials",
+            "codexErrorInfo",
             "ToolReplayPolicy::Never",
             "JobSubject",
             "uncertain",
