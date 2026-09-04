@@ -92,7 +92,7 @@ use super::turn::{
     SessionChoice, SessionTitleSink, TurnHost, TurnHostRuntimeDependencies, TurnOptions, TurnPlan,
     background_execution_projections, persisted_session_agent,
 };
-use crate::command::{CliSandboxUnavailableAction, TuiArgs};
+use crate::command::{CliSandboxBackend, TuiArgs};
 use crate::environment::StartupEnvironment;
 
 /// How many prompts may wait for durable admission.
@@ -329,11 +329,11 @@ fn sandbox_decision(plan: &TurnPlan, interactive: bool) -> UnsupportedPlatformDe
 ///
 /// Typed end to end: the preflight resolves the same Shell policy assembly will, with
 /// the manifest the default profile registers, and the decision reads the configured
-/// `sandbox.onUnavailable` as the `Option` it is — `None` is "nobody chose", which is
-/// the only state an interactive start may ask about. `probe` is the seam both callers
-/// of [`sandbox_decision`] are otherwise undrivable through: a Linux test host always
-/// answers its own platform, so only an injected probe can stand in for a Windows or
-/// macOS one.
+/// `sandbox.onUnavailable` and `sandbox.backend` as the `Option`s they are — `None` is
+/// "nobody chose", which is the only state an interactive start may ask about. `probe`
+/// is the seam both callers of [`sandbox_decision`] are otherwise undrivable through:
+/// a Linux test host always answers its own platform, so only an injected probe can
+/// stand in for a Windows or macOS one.
 pub(super) fn decide_for_plan(
     plan: &TurnPlan,
     probe: &dyn Fn(&zuno_sandbox::SandboxPolicy) -> Result<(), zuno_sandbox::SandboxError>,
@@ -346,12 +346,19 @@ pub(super) fn decide_for_plan(
         &zuno_harness::ToolManifest::standard(),
         probe,
     );
-    let configured = plan
-        .config()
-        .sandbox
-        .as_ref()
-        .and_then(|sandbox| sandbox.on_unavailable);
+    let configured = super::tool_runtime::ConfiguredNativeChoices::from_config(plan.config());
     super::tool_runtime::decide_unsupported_platform(refusal.as_ref(), configured, interactive)
+}
+
+/// The environment this process runs under once the user accepted the offer.
+///
+/// One mechanism for every request: acceptance selects the native backend
+/// (`ZUNO_SANDBOX_BACKEND=native`, the path `--sandbox-backend native` takes) rather
+/// than the write-capable-only `run-unconfined` fallback, so the answer also covers a
+/// later switch to a read-only Agent and every composition of this process records
+/// `trusted_native`.
+pub(super) fn accept_native_execution(environment: &StartupEnvironment) -> StartupEnvironment {
+    environment.with_sandbox_backend(CliSandboxBackend::Native)
 }
 
 fn permission_mode_name(config: &zuno_config::schema::Config) -> &'static str {
@@ -453,11 +460,18 @@ fn execute_once(
     if terminal.is_none() {
         match sandbox_decision(&plan, super::terminal_prompt::is_interactive()) {
             UnsupportedPlatformDecision::Proceed => {}
-            UnsupportedPlatformDecision::OfferNativeExecution { platform } => {
+            UnsupportedPlatformDecision::OfferNativeExecution {
+                platform,
+                requested_mode,
+            } => {
                 let permission_mode = permission_mode_name(plan.config());
                 eprintln!(
                     "{}",
-                    super::tool_runtime::native_execution_offer(&platform, permission_mode)
+                    super::tool_runtime::native_execution_offer(
+                        &platform,
+                        requested_mode,
+                        permission_mode
+                    )
                 );
                 let accepted = super::terminal_prompt::confirm(&format!(
                     "Run this session natively without OS confinement? Your permission mode \
@@ -466,11 +480,10 @@ fn execute_once(
                 if !accepted {
                     return Err(super::tool_runtime::unsupported_platform_refusal(
                         &platform,
-                        zuno_sandbox::SandboxMode::WorkspaceWrite,
+                        requested_mode,
                     ));
                 }
-                *environment = environment
-                    .with_sandbox_on_unavailable(CliSandboxUnavailableAction::RunUnconfined);
+                *environment = accept_native_execution(environment);
                 plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
             }
             UnsupportedPlatformDecision::Refuse { message } => return Err(message),

@@ -62,6 +62,8 @@ zuno tui --agent orchestrator
 zuno run --agent plan "audit the retry policy"
 ```
 
+这项保证只有在受约束后端真正运行的地方才由 OS 强制执行。在受信的 `sandbox.backend: native` 选择之下——那是只读 Agent 在 macOS 与 Windows 上唯一的原生路径——同样的 `read-only` 请求会被记录但不由 OS 强制执行，此时“只读”是一道由工具白名单、权限规则与 Shell 风险门禁构成的角色边界，而不是 OS 边界。
+
 ## 只读是角色边界，不只是沙箱模式
 
 `explorer` 的只读来自角色，而不只是沙箱模式。它的默认工具面是 `read`、`glob`、`grep`、只读的 `lsp`、`skill`，以及在只读角色始终获得的只读文件系统策略下的 `shell` 与 `bg`；编辑、委派、`job` 和网络调研都被拒绝。因此 `du`、`stat`、`file` 可以用来取证，而任何会写入的操作都在提示词之下被拒绝，而不是靠提示词劝阻。

@@ -111,18 +111,25 @@ zuno debug sandbox --mode workspace-write \
 | `--mode <MODE>` | `read-only`、`workspace-write`、`danger-full-access` | `workspace-write` |
 | `--network <NETWORK>` | `deny`、`allow` | 受约束模式为 `deny`，`danger-full-access` 为 `allow` |
 | `--sandbox-on-unavailable <ACTION>` | `deny`、`run-unconfined` | `deny` |
+| `--sandbox-backend <BACKEND>` | `auto`、`native` | `auto` |
 | `--check` | 当请求的策略无法部署时以非成功状态退出 | |
 
 受限模式会验证 bubblewrap 的部署情况，因此这条命令能区分「我的配置错了」和「这台宿主
 无法强制我所要求的模式」。在 CI 或健康检查中使用 `--check`，因为那里非零退出码比输出更有用。
 
 JSON 报告会把请求策略与执行解析分开。重点检查 `requestedMode`、`requestedNetwork`、
-`effectiveMode`、`effectiveNetwork`、`fallbackEligible`、`resolutionKind` 和
-`fallbackReason`。因此一次符合条件的 `run-unconfined` 结果可以对请求的约束报告
-`ready: false`，同时显示 `resolutionKind: "unavailable_fallback"` 与实际宿主权限。
+`effectiveMode`、`effectiveNetwork`、`fallbackEligible`、`backendSelection`、
+`resolutionKind` 和 `fallbackReason`。因此一次符合条件的 `run-unconfined` 结果可以对请求的
+约束报告 `ready: false`，同时显示 `resolutionKind: "unavailable_fallback"` 与实际宿主权限。
+受信的 `native` 后端选择（`--sandbox-backend native`、`ZUNO_SANDBOX_BACKEND=native`，或
+受信层里的 `sandbox.backend`）不做任何探测，报告 `backendSelection: "native"`、
+`resolutionKind: "trusted_native"`、`nativeExecutionBypass: true`、`fallbackEligible: false`，
+并对受约束的请求模式保持 `ready: false`；`policy` 检查通过，`launcher_trust`、
+`backend_discovery` 与 `execution_self_test` 标记为 skipped，`error` 里写明是这个选择导致
+请求的约束没有被部署。
 
-`--check` 始终保持严格：只要请求的约束无法部署，它就以失败退出，即使运行时允许降级。
-因此它仍可以安全地作为部署门禁，而不会误把一台无沙箱宿主验证为合格。
+`--check` 始终保持严格：只要请求的约束无法部署，它就以失败退出，即使运行时允许降级或
+选择了原生后端。因此它仍可以安全地作为部署门禁，而不会误把一台无沙箱宿主验证为合格。
 
 约束语义本身见 [权限与沙箱](/zh/guide/permissions)。
 

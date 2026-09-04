@@ -28,6 +28,7 @@ zuno tui [OPTIONS]
 | `-s`, `--session <SESSION>` | Talk in this exact session | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
 | `--auto` | Approve every permission that is not explicitly denied, without asking. Upstream's own description ends in "(dangerous!)" and it means it: this replaces the human at the permission prompt, so a tool call the default ruleset would have stopped to ask about proceeds unattended | |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 

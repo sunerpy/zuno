@@ -58,12 +58,15 @@ another.
 
 On Linux, `read-only` and `workspace-write` use bubblewrap, capability dropping, and
 seccomp. If the requested confinement cannot be deployed, Zuno refuses the command by
-default. Trusted configuration can select `danger-full-access` directly or allow
-`workspace-write` to fall back only for eligible sandbox-availability failures.
-Read-only agents never use that fallback.
+default. Trusted configuration can select `danger-full-access` directly, select the
+native backend for every agent with `sandbox.backend: native` while keeping the
+permission mode, or allow `workspace-write` to fall back only for eligible
+sandbox-availability failures. Read-only agents never use that fallback.
 
-The confined backend is not yet implemented on macOS or Windows. Write-capable agents
-can use an explicit native-execution choice on those platforms.
+The confined backend is not yet implemented on macOS or Windows. Every agent can use an
+explicit trusted native-execution choice on those platforms; for a read-only agent that
+choice is `sandbox.backend: native`, under which its read-only contract is a
+role boundary rather than an OS boundary.
 
 See [Permissions and sandboxing](/guide/permissions).
 

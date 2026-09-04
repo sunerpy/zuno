@@ -30,6 +30,7 @@ zuno run [OPTIONS] [message]...
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
 | `-m`, `--model <MODEL>` | 要使用的模型，写成 `provider/model` | |
 | `--agent <AGENT>` | 要使用的 Agent | |
 | `--format <FORMAT>` | 输出格式。可选值：`default`、`json` | `default` |

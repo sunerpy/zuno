@@ -72,8 +72,9 @@ cargo install --git https://github.com/sunerpy/zuno zuno --locked
 
 ripgrep 14 或更新版本只是 `glob` 与 `grep` 工具的后端，不是 Zuno 启动或核心运行
 依赖。bubblewrap 0.8.0 或更新版本也只用于 Linux 上受约束的 `read-only` 与
-`workspace-write` Shell。显式 `danger-full-access`，以及符合条件且受信的
-`workspace-write` `run-unconfined` 降级，都走原生执行。macOS 与 Windows 当前没有
+`workspace-write` Shell。显式 `danger-full-access`、符合条件且受信的
+`workspace-write` `run-unconfined` 降级，以及对每个 Agent 生效的受信
+`sandbox.backend: native` 选择，都走原生执行。macOS 与 Windows 当前没有
 受约束后端。安装器会使用 `SHA256SUMS` 校验所选 release 的归档。
 
 ## 开始运行

@@ -39,13 +39,17 @@ zuno run \
   --sandbox workspace-write \
   --sandbox-on-unavailable run-unconfined \
   "run the local build"
+
+# 让每个 Agent（包括只读 Agent）都原生运行，同时保留权限模式。
+zuno run --sandbox-backend native "run the local build"
 ```
 
 降级形式只适用于具备写能力的 `workspace-write` Agent。没有受限后端时，只读 Agent 仍会
-拒绝。`danger-full-access` 在 Linux、macOS 与 Windows 上都是原生后端，并完全跳过
-约束探测。在 macOS 与 Windows 上，符合条件且受信的 `workspace-write` 降级同样解析为
-原生执行，它不是约束。参见
-[权限与沙箱](/zh/guide/permissions)。
+拒绝，除非显式选择了原生后端。`danger-full-access` 在 Linux、macOS 与 Windows 上都是
+原生后端，完全跳过约束探测，并把生效权限模式设为 `allow_all`；`--sandbox-backend native`
+同样跳过探测，但保留你的权限模式，并把每个 Agent 请求的契约记录为未强制执行。在 macOS 与
+Windows 上，符合条件且受信的 `workspace-write` 降级同样解析为原生执行。以上都不是约束。
+参见[权限与沙箱](/zh/guide/permissions)。
 
 只有需要这些工具时才单独检查 ripgrep：
 
@@ -149,17 +153,17 @@ zuno run --agent plan "summarize how configuration precedence works in this repo
 无关。在约束后端可用的宿主上，它是端到端确认整条路径能走通的最安全方式。只读 Agent
 刻意不会使用 `run-unconfined`。
 
-在 macOS 或 Windows 上，需要 Shell 的受信首个任务必须使用具备写能力的 Agent，并显式
-选择原生路径：
+在 macOS 或 Windows 上，需要 Shell 的受信首个任务必须显式选择原生路径。`plan` 也可以走
+这条路径，权限模式保持不变：
 
 ```powershell
-zuno run --agent build `
-  --sandbox workspace-write `
-  --sandbox-on-unavailable run-unconfined `
+zuno run --agent plan `
+  --sandbox-backend native `
   "summarize this repository without changing files"
 ```
 
-由于这两个平台尚无受约束后端，该命令会原生执行。只有在接受 Zuno 进程用户的宿主权限时
+由于这两个平台尚无受约束后端，该命令会原生执行；`plan` 依然只读，但那是角色层面的
+只读——工具白名单、你的权限规则与 Shell 风险门禁——而不是 OS 保证。只有在接受 Zuno 进程用户的宿主权限时
 才这样使用。
 
 运行一个可写任务：
@@ -180,8 +184,8 @@ zuno
 | --- | --- | --- |
 | `rg` 缺失或版本过旧 | `glob` / `grep` 后端不可用 | 安装 ripgrep 14 或更新版本；Zuno 启动和无关核心功能仍可使用，且正在运行的会话会在五秒内识别到新装的版本，无需重启 |
 | `no trusted system bubblewrap executable was found` | 没有约束后端 | 安装 bubblewrap 0.8.0 或更新版本、显式使用 `danger-full-access`，或为具备写能力的 Agent 启用受信的不可用降级 |
-| `OS sandbox is not implemented for platform` | 在 macOS 或 Windows 上使用受约束模式 | 拒绝信息会点明平台，并列出对该次请求适用的补救方式：显式使用 `danger-full-access`、为具备写能力的 Agent 启用受信的 `run-unconfined` 降级，或在 Linux 上运行 |
-| 直接运行 `zuno` 时被问 `Run this session natively without OS confinement?` | 在 macOS 或 Windows 上、Agent 具备写能力，且没有任何配置层设置过 `sandbox.onUnavailable` | 回答 `y` 以原生方式运行本次会话（权限模式保持不变），回答 `n` 则以该拒绝信息退出。想提前决定，可用 `--sandbox-on-unavailable run-unconfined`、`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`，或在受信层设置 `sandbox.onUnavailable` |
+| `OS sandbox is not implemented for platform` | 在 macOS 或 Windows 上使用受约束模式 | 拒绝信息会点明平台，并列出对该次请求适用的补救方式：对任何 Agent 都适用且保留权限模式的受信 `--sandbox-backend native`、为具备写能力的 Agent 启用受信的 `run-unconfined` 降级、显式使用 `danger-full-access`，或在 Linux 上运行 |
+| 直接运行 `zuno` 时被问 `Run this session natively without OS confinement?` | 在 macOS 或 Windows 上、请求无法被这台主机约束（只读 Agent 也包括在内），且没有任何配置层设置过 `sandbox.onUnavailable` 或 `sandbox.backend` | 回答 `y` 以原生方式运行本次会话（权限模式保持不变，并为本进程选择 `sandbox.backend: native`），回答 `n` 则以该拒绝信息退出。想提前决定，可用 `--sandbox-backend native`、`ZUNO_SANDBOX_BACKEND=native`，或在受信层设置 `sandbox.backend` |
 | 校验错误指出某个被拒绝的顶层键 | 仅 TUI 使用的键（如 `theme`）写进了 `zuno.json` | 把它移到 `tui.json`。参见[配置文件与优先级](/zh/config/files) |
 | 切换构建后会话列表为空 | 源码构建与发布构建打开的是不同的数据库文件 | 参见[数据库生命周期](/zh/operate/migration) |
 | 找不到某个模型 id | 目录在该 provider 添加之前就已缓存 | `zuno models --refresh` |

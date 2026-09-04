@@ -77,10 +77,13 @@ Shell has an additional security layer before this lifecycle ownership begins.
 `PreparedCommand`; `zuno-pty` accepts only that prepared value. In `read-only`
 and `workspace-write` on Linux, the prepared launch enters bubblewrap and a
 first-party seccomp helper before the requested interpreter executes. In
-explicit `danger-full-access`, the native backend preserves the requested
-program and arguments while still attaching durable authority and using the same
-process-tree lifecycle. Process containment therefore owns cancellation,
-timeouts, output, and restart reconciliation in every mode. The OS sandbox owns
+explicit `danger-full-access`, under a trusted `sandbox.backend: native`
+selection, and in the eligible `run-unconfined` fallback, the native backend
+preserves the requested program and arguments while still attaching durable
+authority — which records the requested contract and how the backend was
+selected — and using the same process-tree lifecycle. Process containment
+therefore owns cancellation, timeouts, output, and restart reconciliation in
+every mode. The OS sandbox owns
 filesystem, network, capability, and syscall authority only in confined modes;
 the native backend does not pretend to provide that boundary.
 

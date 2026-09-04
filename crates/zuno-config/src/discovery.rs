@@ -11,7 +11,9 @@ use crate::Config;
 use crate::instructions::{DEFAULT_GLOBAL_INSTRUCTIONS, GLOBAL_INSTRUCTION_FILENAME};
 use crate::schema::JsonMap;
 use crate::schema::permission::permission_key;
-use crate::schema::sandbox::{SandboxMode, SandboxNetworkMode, SandboxUnavailableAction};
+use crate::schema::sandbox::{
+    SandboxBackendSelection, SandboxMode, SandboxNetworkMode, SandboxUnavailableAction,
+};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -30,6 +32,7 @@ const ZUNO_CONFIG_CONTENT: &str = "ZUNO_CONFIG_CONTENT";
 const ZUNO_PERMISSION: &str = "ZUNO_PERMISSION";
 const ZUNO_SANDBOX_MODE: &str = "ZUNO_SANDBOX_MODE";
 const ZUNO_SANDBOX_ON_UNAVAILABLE: &str = "ZUNO_SANDBOX_ON_UNAVAILABLE";
+const ZUNO_SANDBOX_BACKEND: &str = "ZUNO_SANDBOX_BACKEND";
 const ZUNO_DISABLE_AUTOCOMPACT: &str = "ZUNO_DISABLE_AUTOCOMPACT";
 const ZUNO_DISABLE_PRUNE: &str = "ZUNO_DISABLE_PRUNE";
 const ZUNO_TEST_MANAGED_CONFIG_DIR: &str = "ZUNO_TEST_MANAGED_CONFIG_DIR";
@@ -281,6 +284,17 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
                 )],
             })?;
         apply_sandbox_unavailable_override(&mut result, action);
+    }
+    if let Some(value) = options.env.truthy_value(ZUNO_SANDBOX_BACKEND) {
+        let backend =
+            SandboxBackendSelection::parse(value).ok_or_else(|| ConfigError::Invalid {
+                path: PathBuf::from(ZUNO_SANDBOX_BACKEND),
+                issues: vec![ConfigIssue::new(
+                    ["sandbox", "backend"],
+                    "expected auto or native",
+                )],
+            })?;
+        apply_sandbox_backend_override(&mut result, backend);
     }
 
     // config.ts:516-522.
@@ -577,6 +591,12 @@ fn validate_layer_authority(
             "project config cannot permit unconfined Shell fallback; use a trusted global, managed, environment, or CLI layer",
         ));
     }
+    if sandbox.backend == Some(SandboxBackendSelection::Native) {
+        issues.push(ConfigIssue::new(
+            ["sandbox", "backend"],
+            "project config cannot select the native Shell backend; use a trusted global, managed, environment, or CLI layer",
+        ));
+    }
     if sandbox
         .writable_roots
         .as_ref()
@@ -695,6 +715,12 @@ fn apply_sandbox_unavailable_override(config: &mut RawJson, action: SandboxUnava
     config
         .entry_or_insert("sandbox", RawJson::empty_object())
         .insert("onUnavailable", RawJson::String(action.as_str().to_owned()));
+}
+
+fn apply_sandbox_backend_override(config: &mut RawJson, backend: SandboxBackendSelection) {
+    config
+        .entry_or_insert("sandbox", RawJson::empty_object())
+        .insert("backend", RawJson::String(backend.as_str().to_owned()));
 }
 
 fn raw_from_config(path: &Path, config: &Config) -> Result<RawJson, ConfigError> {

@@ -63,8 +63,9 @@ cargo install --git https://github.com/sunerpy/zuno zuno --locked
 it is not a Zuno startup or core-runtime dependency. Bubblewrap 0.8.0 or newer is
 required only for confined `read-only` and `workspace-write` Shell execution on
 Linux. Explicit `danger-full-access` runs natively, as can an eligible, trusted
-`workspace-write` `run-unconfined` fallback. macOS and Windows currently use those
-native paths because no confined backend is implemented there. See
+`workspace-write` `run-unconfined` fallback, and a trusted `sandbox.backend: native`
+selection runs every Agent natively with the permission mode kept. macOS and Windows
+currently use those native paths because no confined backend is implemented there. See
 [Installation](./docs/guide/installation.md) for platform tools, configuration
 paths, release targets, checksum verification, and source-build prerequisites.
 

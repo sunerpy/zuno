@@ -696,6 +696,86 @@ fn surface_agent_create_is_not_registered() {
     assert_eq!(subcommands, vec!["list"]);
 }
 
+/// `zuno debug sandbox` under a trusted `native` backend selection reports the
+/// selection instead of probing the host.
+///
+/// Read-only is the mode that had no native route before the selection existed, so
+/// it is the one probed. The report is the same shape on a host without bubblewrap
+/// because a trusted native selection discovers nothing, and `--check` still fails:
+/// the requested confinement is exactly what a `native` selection does not deploy,
+/// which keeps the check a strict deployment gate.
+#[test]
+fn surface_debug_sandbox_reports_a_trusted_native_selection_without_probing() {
+    let root = tempfile::tempdir().expect("probe root");
+    let argv = [
+        "debug",
+        "sandbox",
+        "--sandbox-backend",
+        "native",
+        "--mode",
+        "read-only",
+    ];
+
+    let output = probe_binary(&argv, root.path());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the report itself succeeds; only --check turns unready into failure: {stderr}"
+    );
+    for fragment in [
+        "\"requestedMode\": \"read-only\"",
+        "\"backendSelection\": \"native\"",
+        "\"effectiveMode\": \"danger-full-access\"",
+        "\"resolutionKind\": \"trusted_native\"",
+        "\"nativeExecutionBypass\": true",
+        "\"fallbackEligible\": false",
+        "\"ready\": false",
+    ] {
+        assert!(stdout.contains(fragment), "missing {fragment} in {stdout}");
+    }
+    let report: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("the report is one JSON document");
+    let status = |name: &str| {
+        report["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|check| check["name"] == name)
+            .map(|check| check["status"].clone())
+            .unwrap_or_else(|| panic!("check {name} is reported: {stdout}"))
+    };
+    assert_eq!(
+        status("policy"),
+        "passed",
+        "the requested policy itself is valid"
+    );
+    for probe in ["launcher_trust", "backend_discovery", "execution_self_test"] {
+        assert_eq!(
+            status(probe),
+            "skipped",
+            "{probe} is not probed under a native selection: {stdout}"
+        );
+    }
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("sandbox.backend: native")),
+        "the unready reason names the selection: {stdout}"
+    );
+
+    let checked = probe_binary(&[&argv[..], &["--check"]].concat(), root.path());
+    let checked_stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(
+        !checked.status.success(),
+        "--check stays a strict gate for the requested confinement"
+    );
+    assert!(
+        checked_stderr.contains("sandbox.backend: native"),
+        "the check names why the requested confinement is not deployed: {checked_stderr}"
+    );
+}
+
 /// Every disposition-table command owns at least one probed leaf.
 ///
 /// The table and the parser are compared by

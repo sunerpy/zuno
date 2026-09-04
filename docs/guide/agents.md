@@ -75,6 +75,12 @@ confinement even when the invocation selected `workspace-write` or
 zuno run --agent plan "audit the retry policy"
 ```
 
+That guarantee is OS-enforced only where a confined backend runs. Under a trusted
+`sandbox.backend: native` selection — the one native route a read-only Agent has on
+macOS and Windows — the same `read-only` request is recorded but not OS-enforced, and
+"read-only" is then a role boundary made of the tool allowlist, the permission rules,
+and the Shell risk gate rather than an OS boundary.
+
 ## Read-only is a role boundary, not just a sandbox mode
 
 `explorer` is read-only by role, not merely by sandbox mode. Its default surface is

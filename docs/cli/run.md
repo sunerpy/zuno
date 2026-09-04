@@ -32,6 +32,7 @@ zuno run [OPTIONS] [message]...
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
 | `-m`, `--model <MODEL>` | The model to use, as `provider/model` | |
 | `--agent <AGENT>` | The agent to use | |
 | `--format <FORMAT>` | Output format. Possible values: `default`, `json` | `default` |

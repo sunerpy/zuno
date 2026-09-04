@@ -48,8 +48,8 @@ use zuno_agent::profile::ShellFilesystemAccess;
 use zuno_config::schema::Config;
 use zuno_config::schema::permission::PermissionMode;
 use zuno_config::schema::sandbox::{
-    SandboxMode as ConfigSandboxMode, SandboxNetworkMode,
-    SandboxUnavailableAction as ConfigSandboxUnavailableAction,
+    SandboxBackendSelection as ConfigSandboxBackendSelection, SandboxMode as ConfigSandboxMode,
+    SandboxNetworkMode, SandboxUnavailableAction as ConfigSandboxUnavailableAction,
 };
 use zuno_error::ToolError;
 use zuno_orchestration::{CapabilitySnapshot, ToolSchemaIdentity, sha256_json};
@@ -57,8 +57,9 @@ use zuno_paths::Env;
 use zuno_permission::Rule;
 use zuno_permission::visibility::permission_key;
 use zuno_sandbox::{
-    NetworkAccess, SandboxError, SandboxMode, SandboxPolicy, SandboxResolution,
-    SandboxResolutionKind, SandboxResolver, SandboxUnavailableAction, SystemSandboxResolver,
+    NetworkAccess, SandboxBackendRequest, SandboxBackendSelection, SandboxError, SandboxMode,
+    SandboxPolicy, SandboxResolution, SandboxResolutionKind, SandboxResolver,
+    SandboxUnavailableAction, SystemSandboxResolver,
 };
 use zuno_tool::{
     OutputLimits, PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolUiIntent, erase,
@@ -87,7 +88,9 @@ pub(crate) struct ToolRuntime {
     /// a defect a user must see, but which surface can say so — stderr, a transcript
     /// line — is the host's decision, not the registry's.
     pub(crate) suppressions: Vec<String>,
-    /// Durable model-visible notice and one-time host warning for native fallback.
+    /// Durable model-visible notice and one-time host warning for a Shell that runs
+    /// natively under a confined request: the trusted `run-unconfined` fallback or an
+    /// explicit `sandbox.backend: native` selection.
     pub(crate) sandbox_notice: Option<String>,
 }
 
@@ -258,9 +261,9 @@ pub(crate) fn assemble(
             .clone()
             .unwrap_or_else(|| Arc::new(SystemSandboxResolver));
         let resolution = resolver
-            .resolve(policy, sandbox_unavailable_action(config))
+            .resolve(policy, sandbox_backend_request(config))
             .map_err(|error| render_sandbox_error(error, requested_mode))?;
-        sandbox_notice = fallback_notice(&resolution);
+        sandbox_notice = native_notice(&resolution);
         let (backend, execution_policy) = resolution.into_execution();
         zuno_tools::shell::ShellTool::with_sandbox_backend(
             directory,
@@ -569,28 +572,66 @@ pub(crate) fn sandbox_unavailable_action(config: &Config) -> SandboxUnavailableA
     }
 }
 
-fn fallback_notice(resolution: &SandboxResolution) -> Option<String> {
-    if resolution.kind() != SandboxResolutionKind::UnavailableFallback {
-        return None;
+pub(crate) fn sandbox_backend_selection(config: &Config) -> SandboxBackendSelection {
+    match config.sandbox_backend() {
+        ConfigSandboxBackendSelection::Auto => SandboxBackendSelection::Auto,
+        ConfigSandboxBackendSelection::Native => SandboxBackendSelection::Native,
     }
+}
+
+/// The trusted resolver inputs a composition hands the sandbox resolver.
+///
+/// Both come from `config`, which discovery has already narrowed to what trusted
+/// layers may say: a project layer cannot select `native` or `run-unconfined`.
+pub(crate) fn sandbox_backend_request(config: &Config) -> SandboxBackendRequest {
+    SandboxBackendRequest::new(
+        sandbox_unavailable_action(config),
+        sandbox_backend_selection(config),
+    )
+}
+
+/// The durable notice for a Shell that runs natively under a confined request.
+///
+/// Two resolutions produce one: the trusted `run-unconfined` fallback after an
+/// eligible discovery failure, and the explicit `sandbox.backend: native` selection.
+/// Each names its own cause first, then says the same thing about what is and is
+/// not enforced, because the model and the user read this before trusting a
+/// command's isolation. A confined resolution and an explicit `danger-full-access`
+/// request carry no notice: the first is enforced, the second was asked for by name.
+fn native_notice(resolution: &SandboxResolution) -> Option<String> {
     let requested = resolution.requested_policy();
     let effective = resolution.execution_policy();
-    let reason = resolution
-        .fallback_reason()
-        .expect("fallback resolution has a typed reason");
+    let opening = match resolution.kind() {
+        SandboxResolutionKind::UnavailableFallback => {
+            let reason = resolution
+                .fallback_reason()
+                .expect("fallback resolution has a typed reason");
+            format!(
+                "The requested OS sandbox is unavailable ({code}: {reason}).",
+                code = reason.code()
+            )
+        }
+        SandboxResolutionKind::TrustedNative => {
+            "The native Shell backend was selected explicitly (sandbox.backend: native).".to_owned()
+        }
+        SandboxResolutionKind::Confined
+        | SandboxResolutionKind::ExplicitNative
+        | SandboxResolutionKind::Legacy => return None,
+    };
     Some(format!(
-        "The requested OS sandbox is unavailable ({code}: {reason}). Shell commands are running \
-         without OS isolation using the Zuno process user's host authority. Requested authority: \
-         mode={requested_mode}, network={requested_network}. Effective authority: \
-         mode={effective_mode}, network={effective_network}. Requested network denial, writable \
-         root limits, and protected paths cannot be enforced by the OS sandbox in this state. \
-         Permission rules, approvals, catastrophic-command refusals, timeouts, and cancellation \
-         still apply. Do not describe shell execution as sandboxed.",
-        code = reason.code(),
+        "{opening} Shell commands are running without OS isolation using the Zuno process \
+         user's host authority. Requested authority: mode={requested_mode}, \
+         network={requested_network}. Effective authority: mode={effective_mode}, \
+         network={effective_network}. The requested `{requested_mode}` authority is recorded \
+         but not OS-enforced: its write restrictions, network denial, writable-root limits, \
+         and protected paths cannot be enforced by an OS sandbox in this state. Permission mode \
+         `{permission_mode}`, permission rules, approvals, catastrophic-command refusals, \
+         timeouts, and cancellation still apply. Do not describe shell execution as sandboxed.",
         requested_mode = requested.mode().as_str(),
         requested_network = requested.network().as_str(),
         effective_mode = effective.mode().as_str(),
         effective_network = effective.network().as_str(),
+        permission_mode = effective.approval_mode(),
     ))
 }
 
@@ -613,9 +654,11 @@ fn render_sandbox_error(error: SandboxError, requested_mode: SandboxMode) -> Str
 ///
 /// Names the platform, says whether the trusted fallback would apply to this request,
 /// and lists every remedy with the layer that may set it. A write-capable request may
-/// take the `run-unconfined` fallback; a read-only request never falls back, so for it
-/// only an explicit `danger-full-access` request runs natively. Neither is confinement,
-/// and the text says so rather than letting a remedy read like a fix.
+/// take the `run-unconfined` fallback; a read-only request never falls back, and for
+/// it the remedy is the explicit trusted `sandbox.backend: native` selection, which
+/// keeps the permission mode and records the read-only contract as unenforced. None
+/// of the remedies is confinement, and the text says so rather than letting one read
+/// like a fix.
 #[must_use]
 pub(crate) fn unsupported_platform_refusal(platform: &str, requested_mode: SandboxMode) -> String {
     let opening = format!(
@@ -628,12 +671,14 @@ pub(crate) fn unsupported_platform_refusal(platform: &str, requested_mode: Sandb
         return format!(
             "{opening} A read-only request never falls back: `zuno --sandbox-on-unavailable \
              run-unconfined`, `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`, and a trusted \
-             `\"sandbox\": {{\"onUnavailable\": \"run-unconfined\"}}` do not apply to it. Only an \
-             explicit `danger-full-access` request runs natively (`zuno --sandbox \
-             danger-full-access`, or `sandbox.mode` in a trusted global, managed, environment, \
-             or CLI layer; a project layer cannot select it), and only an Agent whose contract \
-             is write-capable can make that request. That is not confinement: commands run \
-             with the Zuno process user's host authority."
+             `\"sandbox\": {{\"onUnavailable\": \"run-unconfined\"}}` do not apply to it. To run \
+             this Agent's Shell natively while keeping your permission mode, select the native \
+             backend explicitly: `zuno --sandbox-backend native`, `ZUNO_SANDBOX_BACKEND=native`, \
+             or `\"sandbox\": {{\"backend\": \"native\"}}` in a trusted global, managed, \
+             environment, or CLI configuration layer (a project layer cannot select it). The \
+             requested `read-only` authority is then recorded but not OS-enforced: the Agent's \
+             tool contract, your permission rules, and the Shell risk gate are what remain. \
+             That is not confinement: commands run with the Zuno process user's host authority."
         );
     }
     format!(
@@ -643,22 +688,37 @@ pub(crate) fn unsupported_platform_refusal(platform: &str, requested_mode: Sandb
          --sandbox-on-unavailable run-unconfined`, set \
          `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`, or set `\"sandbox\": \
          {{\"onUnavailable\": \"run-unconfined\"}}` in a trusted global, managed, environment, or \
-         CLI configuration layer (a project layer cannot enable it); `zuno --sandbox \
-         danger-full-access` runs natively as well. None of these is confinement."
+         CLI configuration layer (a project layer cannot enable it). `zuno --sandbox-backend \
+         native` (or `ZUNO_SANDBOX_BACKEND=native`, or a trusted `\"sandbox\": {{\"backend\": \
+         \"native\"}}`) selects the native backend for every Agent of this process, read-only \
+         ones included, with your permission mode kept; `zuno --sandbox danger-full-access` \
+         runs natively as well and additionally makes the effective permission mode \
+         `allow_all`. None of these is confinement."
     )
 }
 
 /// The situation an interactive TUI start prints before asking its one question.
+///
+/// Made for every request the host cannot confine, read-only included: accepting
+/// selects the native backend for this process, which is the one remedy that applies
+/// to both. The text says what a read-only contract becomes under it.
 #[must_use]
-pub(crate) fn native_execution_offer(platform: &str, permission_mode: &str) -> String {
+pub(crate) fn native_execution_offer(
+    platform: &str,
+    requested_mode: SandboxMode,
+    permission_mode: &str,
+) -> String {
     format!(
         "OS sandbox is not implemented for platform `{platform}`: {platform} has no confined \
-         sandbox backend. The requested `workspace-write` authority is write-capable, so this \
-         session can instead run Shell natively with the Zuno process user's host authority \
-         under permission mode `{permission_mode}`; that is not confinement. Headless runs \
-         choose this with `zuno --sandbox-on-unavailable run-unconfined` or \
-         `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`, and `zuno --sandbox \
-         danger-full-access` runs natively as well."
+         sandbox backend. The requested `{requested}` authority cannot be confined here, so \
+         this session can instead run Shell natively with the Zuno process user's host \
+         authority under permission mode `{permission_mode}`; that is not confinement, and a \
+         read-only Agent's contract then remains a tool and permission boundary, not an OS \
+         boundary. Accepting selects the native backend (`sandbox.backend: native`) for every \
+         Agent this process composes. Headless runs choose this with `zuno --sandbox-backend \
+         native` or `ZUNO_SANDBOX_BACKEND=native`; `zuno --sandbox danger-full-access` runs \
+         natively as well and additionally makes the effective permission mode `allow_all`.",
+        requested = requested_mode.as_str(),
     )
 }
 
@@ -677,35 +737,63 @@ pub(crate) struct UnsupportedPlatformRefusal {
 pub(crate) enum UnsupportedPlatformDecision {
     /// Nothing is pending; compose as usual.
     Proceed,
-    /// Ask the user, once, whether this process may run natively.
-    OfferNativeExecution { platform: String },
+    /// Ask the user, once, whether this process may run natively under this request.
+    OfferNativeExecution {
+        platform: String,
+        requested_mode: SandboxMode,
+    },
     /// Refuse with the actionable text; nothing may prompt.
     Refuse { message: String },
 }
 
+/// What trusted layers already chose about native execution, read as the `Option`s
+/// they are: `None` is "nobody chose", the only state an interactive start may ask
+/// about.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ConfiguredNativeChoices {
+    pub(crate) on_unavailable: Option<ConfigSandboxUnavailableAction>,
+    pub(crate) backend: Option<ConfigSandboxBackendSelection>,
+}
+
+impl ConfiguredNativeChoices {
+    pub(crate) fn from_config(config: &Config) -> Self {
+        let sandbox = config.sandbox.as_ref();
+        Self {
+            on_unavailable: sandbox.and_then(|sandbox| sandbox.on_unavailable),
+            backend: sandbox.and_then(|sandbox| sandbox.backend),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.on_unavailable.is_some() || self.backend.is_some()
+    }
+}
+
 /// Decide what an unsupported platform means for the surface about to compose.
 ///
-/// The offer is made only when every guard holds: the request is write-capable (the
-/// fallback never covers read-only), nobody configured `sandbox.onUnavailable` (an
-/// explicit `deny` from any layer is honoured, and an explicit `run-unconfined` would
-/// already have resolved), and the surface can actually ask. Everything else refuses
-/// with the same text the headless surfaces print.
+/// The offer is made for every request the host cannot confine, read-only included,
+/// because acceptance selects the native backend and that remedy applies to both.
+/// Every other guard still holds: nobody configured `sandbox.onUnavailable` or
+/// `sandbox.backend` (an explicit `deny` or `auto` from any layer is honoured, and an
+/// explicit `run-unconfined` or `native` that could resolve would already have done
+/// so), and the surface can actually ask. Everything else refuses with the same text
+/// the headless surfaces print.
 #[must_use]
 pub(crate) fn decide_unsupported_platform(
     refusal: Option<&UnsupportedPlatformRefusal>,
-    configured: Option<ConfigSandboxUnavailableAction>,
+    configured: ConfiguredNativeChoices,
     interactive: bool,
 ) -> UnsupportedPlatformDecision {
     let Some(refusal) = refusal else {
         return UnsupportedPlatformDecision::Proceed;
     };
     let message = unsupported_platform_refusal(&refusal.platform, refusal.requested_mode);
-    if refusal.requested_mode != SandboxMode::WorkspaceWrite || configured.is_some() || !interactive
-    {
+    if configured.any() || !interactive {
         return UnsupportedPlatformDecision::Refuse { message };
     }
     UnsupportedPlatformDecision::OfferNativeExecution {
         platform: refusal.platform.clone(),
+        requested_mode: refusal.requested_mode,
     }
 }
 
@@ -719,12 +807,13 @@ pub(crate) fn system_sandbox_probe(policy: &SandboxPolicy) -> Result<(), Sandbox
 
 /// Whether assembling `selected_profile` would refuse Shell for want of a platform backend.
 ///
-/// Runs ahead of [`assemble`] with the same policy, unavailable action and Shell
+/// Runs ahead of [`assemble`] with the same policy, backend request and Shell
 /// visibility, so the TUI can ask before raw mode and an agent switch can keep its
 /// host. `probe` stands in for backend discovery so a Linux test can act as a Windows
 /// host. Every other outcome is `None` and reaches assembly unchanged: Shell not
 /// visible, an unbuildable policy, a different failure, an explicit `danger-full-access`
-/// request, or a trusted fallback that would resolve.
+/// request, a trusted `native` backend selection (which never discovers), or a trusted
+/// fallback that would resolve.
 pub(crate) fn sandbox_preflight(
     directory: &Path,
     config: &Config,
@@ -743,7 +832,9 @@ pub(crate) fn sandbox_preflight(
     )
     .ok()?;
     let requested_mode = policy.mode();
-    if requested_mode == SandboxMode::DangerFullAccess {
+    if requested_mode == SandboxMode::DangerFullAccess
+        || sandbox_backend_selection(config) == SandboxBackendSelection::Native
+    {
         return None;
     }
     let fallback_would_resolve = requested_mode == SandboxMode::WorkspaceWrite

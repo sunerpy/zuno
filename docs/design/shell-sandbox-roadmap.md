@@ -19,7 +19,12 @@ The stable modes are `read-only`, `workspace-write`, and
 layer may independently set `sandbox.onUnavailable` to `run-unconfined`, allowing
 only a `workspace-write` request with a typed deployment-unavailable failure to
 use the native backend. The default remains `deny`, and read-only Agent contracts
-never fall back.
+never fall back. A trusted layer may also select the backend outright with
+`sandbox.backend: native`: every request, read-only included, then resolves to the
+native backend before any discovery as `SandboxResolutionKind::TrustedNative`,
+with the requested contract recorded as unenforced and the configured permission
+mode kept. That is an explicit host declaration, not a fallback, and a project
+layer cannot make it.
 
 The comparison baseline is OpenAI Codex commit
 [`a26f1806a`](https://github.com/openai/codex/commit/a26f1806a4f4b8cfec2ea1be129963815a61e58c)
@@ -127,7 +132,9 @@ Compile a deny-by-default SBPL profile and invoke the fixed
 interpolation. Writable-root symlink traversal and network endpoints require
 explicit tests. Until this backend lands, confined modes fail closed by default.
 A trusted `run-unconfined` policy may allow a write-capable Agent to use the
-native process backend, while read-only Agents still refuse.
+native process backend, while read-only Agents still refuse; a trusted
+`sandbox.backend: native` selection runs every Agent natively with the permission
+mode kept.
 
 ### Windows
 
@@ -137,7 +144,8 @@ or requested network restrictions must reject the profile. WSL2 uses the Linux
 backend; WSL1 remains unsupported. Until the restricted backend lands, confined
 modes fail closed by default; a trusted `run-unconfined` policy may opt a
 write-capable Agent into native execution and records the unsupported platform
-as its fallback reason.
+as its fallback reason, and a trusted `sandbox.backend: native` selection opts
+every Agent into native execution with no fallback reason to record.
 
 ## Registration gate
 
@@ -155,7 +163,9 @@ local process execution is read-only:
   durable tool events still work through `PreparedCommand`;
 - unavailable backends produce either a clear startup/tool-registration error or
   a trusted native fallback with a host warning and durable `runtime.sandbox`
-  section; read-only profiles always take the error path.
+  section; read-only profiles always take the error path unless a trusted layer
+  selected `sandbox.backend: native`, which is not a fallback and carries the same
+  warning and durable section with `trusted_native` in the record.
 
 The Linux gate now passes on the verified host. Read-only Agent contracts compile
 to `SandboxMode::ReadOnly`; write-capable Agents receive at most the trusted
@@ -166,7 +176,8 @@ capabilities, and namespace/container-policy denial are eligible for trusted
 fallback. An untrusted launcher, invalid policy/path, seccomp/helper/internal
 failure, generic process I/O failure, and command preparation/execution failure
 remain terminal. `danger-full-access` skips confinement discovery because the
-user selected that separate authority explicitly.
+user selected that separate authority explicitly, and `sandbox.backend: native`
+skips it because a trusted layer selected the backend explicitly.
 
 ## Delivery phases
 

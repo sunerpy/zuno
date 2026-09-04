@@ -1322,15 +1322,16 @@ impl TurnPlan {
             &rules,
         ) {
             Ok(policy) => {
-                let deployment = zuno_sandbox::deployment_report_with_action(
+                let deployment = zuno_sandbox::deployment_report_with_request(
                     policy.workspace(),
                     policy.mode(),
                     policy.network(),
-                    super::tool_runtime::sandbox_unavailable_action(&self.config),
+                    super::tool_runtime::sandbox_backend_request(&self.config),
                 );
                 json!({
                     "configuredMode": self.config.sandbox_mode(),
                     "configuredOnUnavailable": self.config.sandbox_on_unavailable(),
+                    "configuredBackend": self.config.sandbox_backend(),
                     "requestedMode": policy.mode(),
                     "requestedNetwork": policy.network(),
                     "effectiveMode": deployment.effective_mode,
@@ -11046,6 +11047,7 @@ fn sandbox_capability_descriptor(
             zuno_config::schema::sandbox::SandboxNetworkMode::Allow => "allow",
         }
         .to_owned(),
+        backend: config.sandbox_backend().as_str().to_owned(),
         writable_roots,
         protected_paths,
     }

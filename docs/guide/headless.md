@@ -110,13 +110,20 @@ zuno run --sandbox danger-full-access "run in a deliberately unconfined containe
 zuno run --sandbox workspace-write \
   --sandbox-on-unavailable run-unconfined \
   "prefer confinement, but allow eligible unavailable fallback"
+zuno run --agent plan --sandbox-backend native \
+  "run natively on a host without an OS sandbox, permission mode kept"
 ```
 
 An agent contract may still narrow this. A read-only agent receives `read-only` even when
 the invocation asked for something wider, and read-only Agents never use unavailable
-fallback. `danger-full-access` always selects the native backend. `run-unconfined`
-preserves the configured permission mode and hard denials, but requested filesystem and
-network restrictions are not OS-enforced during fallback.
+fallback. `danger-full-access` always selects the native backend and makes the effective
+permission mode `allow_all`. `run-unconfined` preserves the configured permission mode and
+hard denials, but requested filesystem and network restrictions are not OS-enforced during
+fallback. `--sandbox-backend native` (or `ZUNO_SANDBOX_BACKEND=native`, or
+`sandbox.backend: native` in a trusted layer) selects the native backend for every Agent
+of the invocation, read-only ones included, with the permission mode kept; headless runs
+never prompt, so on macOS and Windows this flag, the variable, or a trusted layer is how a
+read-only Agent gets Shell at all.
 
 Verify deployability before depending on it in CI, and let the exit status gate the job:
 
