@@ -336,6 +336,22 @@ Structured `question` calls use ACP form controls rather than a generic prompt:
 - submitting `Other` takes precedence over selected options, matching the Zuno
   TUI, while an empty optional form is reported as unanswered.
 
+A form the user dismisses, one that expires, and one whose reply Zuno cannot
+read are decided outcomes, not lost work: the question tool reports the
+withdrawal to the model and the session's Goal keeps running. The durable record
+separates the two facts — the request is settled, and no answer was given — by
+storing an empty answer list together with an `outcome` of `cancelled`,
+`expired`, or `failed`. Permission dialogs follow the same rule: a dismissed
+reply, or one naming an option this dialog never offered, is recorded as
+`reject` together with the `outcome` that produced it, so a client bug cannot
+later be replayed as a deliberate rejection by the user.
+
+When Zuno re-presents a question or permission left pending by an earlier
+process and the client cannot be reached at all, nothing is recorded. The
+request stays pending and answerable from the TUI or the HTTP API, this
+`session/prompt` ends with `stopReason: end_turn`, and sending another prompt
+presents it again.
+
 After a form answer is accepted, Zuno immediately updates the same question
 tool call as `in_progress`. Its typed metadata records the authoritative
 `answered` outcome and sets `continuationPending: true`, so Zed keeps a visible

@@ -1415,7 +1415,16 @@ Recovery is selected from typed errors, never rendered messages:
   input and permission waits carry the durable request id in the pause row.
 - A timeout or lost response around a non-replayable side effect pauses with
   `uncertain_side_effect`; recovery requires authoritative-state inspection and never
-  automatically invokes the tool again.
+  automatically invokes the tool again. The obligation is durable on the tool record
+  rather than on the pause: the dispatcher writes `state.outcome = "uncertain"` and
+  `state.uncertain` with the tool id, the call id, the paths the call reported having
+  applied, a typed `cause` of `lost_outcome` or `interrupted`, and `observedAtMs`, in the
+  same statement that makes the result model-visible. A process that dies after that write
+  and before the pause row is recorded still refuses to run the Goal: the next
+  continuation consults the pending records of the current objective and pauses again.
+  `state.uncertain.reconciledAtMs` is absent for exactly as long as the inspection is
+  owed, and the Goal's `created_at_ms` scopes the query, so a new objective does not
+  inherit the previous objective's obligations.
 - A turn stopped by its own budget policy pauses with `turn_budget`. The allowance
   belongs to one turn, so the Goal keeps whatever token budget remains, but execution
   does not resume automatically: the next turn would spend the same allowance the same
@@ -1866,15 +1875,29 @@ caller consumes the terminal result. A command is made durable only when
 the still-running process.
 
 Durable commands keep a bounded 2 MiB live tail, persist complete output
-separately, and record status under `.zuno/background`. The service retains at
-most 32 terminal commands per workspace and removes the oldest row together with
-its `.status.json` and `.output` files. Running commands are never evicted.
+separately, and record status under `.zuno/background`. Each execution owns
+four names there: `<id>.status.json`, the `<id>.status.json.tmp` it is staged
+through, `<id>.output`, and `<id>.lock` — an advisory ownership claim the
+owning process holds open for as long as it owns the row. The service retains
+at most 32 terminal commands per workspace and removes the oldest row together
+with its `.status.json`, `.status.json.tmp`, and `.output` files. Running
+commands are never evicted, and neither is a row another process still owns.
 Consequently ordinary `shell` calls no longer accumulate files, while `/ps`,
 `bg`, and restart reconciliation keep the state they actually require. Other
 tools such as `read`, `grep`, `glob`, and web search never use this directory.
-Because the product is still pre-release, terminal rows written by the old
-always-durable format are discarded on first open; an old running row is
-conservatively rewritten as `uncertain` and is never replayed.
+
+A second Zuno process opening the same worktree reconciles only what it can
+prove. A `running` row whose `<id>.lock` it can acquire had an owner that is
+gone, so it is rewritten as `uncertain` and never replayed. A row whose claim a
+live process holds, and a row that records having run without a claim at all,
+are both left exactly as they are. Rows written by Zuno 0.6.6 and earlier carry
+no claim marker and have no `<id>.lock`, so a claim can prove nothing about
+them: such a row is rewritten as `uncertain` only when the process it recorded
+is provably gone. Where that cannot be established — no usable pid, or a
+platform with no process-existence query, which today means Windows — the row
+stays `running`, stays readable, and stays out of retention rather than being
+settled on a guess. Terminal rows written by the older always-durable format
+are still discarded on first open.
 
 The `bg` tool supports `list`, `output`, `wait`, and `cancel` for executions owned
 by the current session, and `artifact` for output a size limit withheld from any tool
@@ -1896,8 +1919,9 @@ withheld it: an agent profile that hides `bg` leaves its own withheld output rea
 only through `accept_large_output: true`, which re-runs that call. The complete tool
 has `ToolReplayPolicy::Never` because one action cancels a process tree. Cancellation
 reaches descendants through the shared process containment layer. A hard process
-ceiling records failure; a process restart converts a previously running row to
-`uncertain` and never replays it.
+ceiling records failure; a process restart converts a running row this process
+owned, or one whose ownership claim it can take, to `uncertain` and never
+replays it.
 
 Every execution the service launches runs behind the `__zuno_child_guard` process, so
 the exit status the shell tool reads is the guard's, and three codes may belong to the

@@ -132,6 +132,12 @@ remote unshare failed for shared session <id>: <detail>; local rows were deleted
 | 20 | `verification_receipt` |
 <!-- generated:END prune-tables -->
 
+上面这张表是删除操作中有顺序的那一部分。在它之后，同一个事务还会清扫当前 schema 中所有以
+session 为键、且该键上没有外键的表 —— 目前是 `human_request` 和 `provider_retry_backoff`。这个
+集合在运行时从 schema 推导，并且与 `zuno session delete` 共用，因此以后新增的表不会只被两条删除
+路径中的一条覆盖。预览同样会统计这些行，所以 JSON 报告里的 `database.tables` 可能比上面这张表
+多出几项。
+
 用以下命令重新生成：
 
 ```sh
@@ -169,12 +175,29 @@ session 的文件。如果需要回收这部分空间，请在该路径重新可
 报告中可能带有：
 
 ```text
-`<database>` contains <n> sessions; artifact reclamation is skipped because shared snapshot stores cannot be attributed and may belong to another channel's database.
+`<database>` retains <n> sessions after this operation; snapshot store reclamation is skipped because a shared artifact cannot be attributed to a surviving session and may belong to another channel's database.
 ```
 
-这不是失败。它是说这次运行无法证明某个快照存储属于正在被清理的那些 session，因此没有动那些
-字节。最常见的原因是用源码构建去访问某个发布版安装的数据目录 —— 两者选择的是不同的数据库
+这不是失败，也不是需要你去处理的待办。它是说这次运行无法证明某个快照存储属于正在被清理的
+那些 session，因此没有动那些字节；同一轮仍然会回收 tool output 和 attachment 对象，并在报告中
+给出它们的字节数。预览与 `--delete` 会给出完全相同的这条记录，因此你确认的投影就是实际执行的
+操作。你不需要手动做任何事：下一次在这个数据库上运行、且至少还有一个 session 存活的清理，会
+重新评估快照这一类并回收它。请不要自己删除 `$ZUNO_DATA/snapshot` 下的任何目录 —— 该目录是
+共享的，其中的存储可能属于另一个 channel 的数据库，而判断它到底属于谁，正是这次运行拒绝做的
+那个判断。最常见的原因是用源码构建去访问某个发布版安装的数据目录 —— 两者选择的是不同的数据库
 文件。参见 [migration.md](/zh/operate/migration#channel-数据库)。
+
+报告中还可能带有：
+
+```text
+`<database>` kept 12 attachment objects whose 12 digests surviving rows name only as free text; model- or tool-authored content can produce that spelling, so those bytes are not reclaimable while such a row survives.
+```
+
+只要还有存活的行提到某个 attachment 的 digest，该对象就会被保留 —— 包括 digest 只是作为消息或
+工具结果里的普通文本出现的情况。这个方向是刻意选择的：删除某个排队中的 prompt 仍然引用的对象
+的唯一副本是不可恢复的；但这也意味着模型或工具产生的内容可以把 attachment 字节一直留在磁盘上。
+这条警告就是让你看见它：只有当确实有字节因此被扣留，或者某个 payload 行既不是文本也不是
+blob、完全无法扫描时，它才会出现。删除持有那一行的 session，下一轮就会释放这些对象。
 
 如果你确知某个数据库里有 session，而这里的 `n` 是 `0`，那说明你看的是错误的数据库，而不是
 你的 session 丢了。

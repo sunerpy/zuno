@@ -260,19 +260,19 @@ impl ChunkTranslator {
                     self.reasoning_open = false;
                     events.push(StreamEvent::ReasoningEnd);
                 }
-                let id = call.id.clone().unwrap_or_default();
+                let id = tool_call_identity(call.id.clone(), index);
                 let name = name.unwrap_or_default().to_owned();
                 events.push(StreamEvent::ToolUseStart {
                     id: id.clone(),
                     name: name.clone(),
                 });
                 self.tools.insert(index, ActiveChatTool { id });
-            } else if let Some(tool) = self.tools.get_mut(&index)
-                && let Some(id) = call.id.as_deref()
-                && !id.is_empty()
-            {
-                tool.id = id.to_owned();
             }
+            // An id arriving on a later fragment does not rename the call. `ToolUseStart`
+            // already went out under the identity chosen above, and the engine correlates
+            // every later `ToolInputDelta` and `ToolUseEnd` by that exact string, so a
+            // rename would turn the rest of this call into events for a call nobody
+            // started and fail the turn.
             if let Some(arguments) = function.and_then(|function| function.arguments.as_deref())
                 && !arguments.is_empty()
                 && let Some(tool) = self.tools.get(&index)
@@ -305,7 +305,25 @@ pub struct ResponsesTranslator {
     model: String,
     tool_input_limit: usize,
     reasoning: BTreeMap<String, ActiveReasoning>,
-    tools: BTreeMap<String, ActiveTool>,
+    /// Open function-call items, keyed by the position their call identity was chosen
+    /// from: the item's own id, or the ordinal of an item whose id is empty. The identity
+    /// and the key are derived from one value on purpose — keying by the raw item id let
+    /// two id-less items collide on `""`, so the second overwrote the first and every
+    /// later event for either landed on whichever had been added last. The two kinds of
+    /// position are distinct variants rather than two spellings of one string, because a
+    /// gateway may issue an item id spelled exactly like a synthesized position
+    /// (`item-1`) and then the wire item and the first id-less item collided the same way.
+    tools: BTreeMap<ToolKey, ActiveTool>,
+    /// Function-call items seen whose own `id` was empty, so a synthesized call identity
+    /// for them is numbered rather than derived from an item id two items could share.
+    unnamed_items: u32,
+    /// The ordinal of the one open function-call item whose own id is empty: its key in
+    /// `tools` is [`ToolKey::Unnamed`] of this value.
+    ///
+    /// Its arguments delta and its `done` arrive under `item_id: ""`, which can only be
+    /// routed while exactly one such item is open. A second id-less item opening before
+    /// this one closes is refused as a protocol failure rather than guessed at.
+    open_unnamed_item: Option<u32>,
     saw_tool: bool,
     ended: bool,
     done: bool,
@@ -333,6 +351,8 @@ impl ResponsesTranslator {
             tool_input_limit,
             reasoning: BTreeMap::new(),
             tools: BTreeMap::new(),
+            unnamed_items: 0,
+            open_unnamed_item: None,
             saw_tool: false,
             ended: false,
             done: false,
@@ -398,7 +418,9 @@ impl ResponsesTranslator {
             }
             ResponsesEvent::OutputItemAdded { item } => self.item_added(item),
             ResponsesEvent::FunctionCallArgumentsDelta { item_id, delta } => {
-                if let Some(tool) = self.tools.get_mut(&item_id) {
+                if let Some(key) = self.tool_key(&item_id)
+                    && let Some(tool) = self.tools.get_mut(&key)
+                {
                     append_tool_input(
                         &mut tool.arguments,
                         &delta,
@@ -457,8 +479,21 @@ impl ResponsesTranslator {
             }
             "function_call" => {
                 self.saw_tool = true;
-                let item_id = item.id;
-                let call_id = item.call_id.unwrap_or_default();
+                let unnamed = item.id.is_empty();
+                if unnamed && self.open_unnamed_item.is_some() {
+                    return Err(self.unresolvable_function_call_item(
+                        "a second function_call item with an empty id was added while \
+                         another is still open, so their arguments and completions cannot \
+                         be told apart",
+                    ));
+                }
+                let key = if unnamed {
+                    self.unnamed_items = self.unnamed_items.saturating_add(1);
+                    ToolKey::Unnamed(self.unnamed_items)
+                } else {
+                    ToolKey::Wire(item.id)
+                };
+                let call_id = tool_call_identity(item.call_id, &key);
                 let name = item.name.unwrap_or_default();
                 let arguments = item.arguments.unwrap_or_default();
                 ensure_tool_input_size(
@@ -467,8 +502,11 @@ impl ResponsesTranslator {
                     &self.model,
                     self.tool_input_limit,
                 )?;
+                if let ToolKey::Unnamed(ordinal) = key {
+                    self.open_unnamed_item = Some(ordinal);
+                }
                 self.tools.insert(
-                    item_id,
+                    key,
                     ActiveTool {
                         call_id: call_id.clone(),
                         arguments,
@@ -510,13 +548,53 @@ impl ResponsesTranslator {
                         self.tool_input_limit,
                     )?;
                 }
-                let call_id = self
-                    .tools
-                    .remove(&item.id)
-                    .map_or_else(|| item.call_id.unwrap_or_default(), |tool| tool.call_id);
+                let tracked = self
+                    .tool_key(&item.id)
+                    .and_then(|key| self.tools.remove(&key));
+                if item.id.is_empty() {
+                    self.open_unnamed_item = None;
+                }
+                let call_id = match tracked {
+                    Some(tool) => tool.call_id,
+                    // An item the stream never added still names its call through its
+                    // own id, which is the protocol's correlation key. One with no id at
+                    // all names nothing: before, this fell through to
+                    // `tool_call_identity(call_id, "")` and ended `zuno-unnamed-call-`,
+                    // the bare prefix, for a call nobody started.
+                    None if item.id.is_empty() => {
+                        return Err(self.unresolvable_function_call_item(
+                            "a function_call item with an empty id was completed while no \
+                             such item is open",
+                        ));
+                    }
+                    None => tool_call_identity(item.call_id, &item.id),
+                };
                 Ok(vec![StreamEvent::ToolUseEnd { id: call_id }])
             }
             _ => Ok(Vec::new()),
+        }
+    }
+
+    /// The `tools` key an event's `item_id` refers to.
+    ///
+    /// A non-empty item id is its own key. The empty id can only mean the one open
+    /// id-less item, and means nothing when there is none.
+    fn tool_key(&self, item_id: &str) -> Option<ToolKey> {
+        if item_id.is_empty() {
+            self.open_unnamed_item.map(ToolKey::Unnamed)
+        } else {
+            Some(ToolKey::Wire(item_id.to_owned()))
+        }
+    }
+
+    fn unresolvable_function_call_item(&self, detail: &'static str) -> ProviderError {
+        ProviderError::Protocol {
+            code: ProviderProtocolFailure::InvalidUpstreamToolCall,
+            source: Some(Box::new(UnresolvableFunctionCallItem {
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+                detail,
+            })),
         }
     }
 
@@ -569,6 +647,31 @@ struct ActiveChatTool {
 struct ActiveTool {
     call_id: String,
     arguments: String,
+}
+
+/// The position a Responses function-call item is tracked under, and the value its
+/// synthesized identity is spelled from when the gateway sent no `call_id`.
+///
+/// A wire item id and a synthesized ordinal are different variants, not two spellings of
+/// one string: an item id is whatever the gateway chose, so no string could be reserved for
+/// the ordinals without a gateway being able to send it. The `Display` spelling of an
+/// ordinal is `item-<n>`, the same position text as before, so the identity an id-less
+/// call carries into the engine — `zuno-unnamed-call-item-<n>` — is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ToolKey {
+    /// The item's own non-empty `id`.
+    Wire(String),
+    /// The 1-based ordinal of an item whose `id` was empty, in order of arrival.
+    Unnamed(u32),
+}
+
+impl std::fmt::Display for ToolKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wire(id) => formatter.write_str(id),
+            Self::Unnamed(ordinal) => write!(formatter, "item-{ordinal}"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -830,6 +933,59 @@ impl std::fmt::Display for MalformedChunk {
 impl std::error::Error for MalformedChunk {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
+    }
+}
+
+/// A Responses function_call item whose events cannot be correlated with a call.
+///
+/// The item id is the protocol's own correlation key. When it is empty, the stream can
+/// still be followed while exactly one such item is open; the shapes described by
+/// `detail` have no reading that does not misattribute an arguments delta or a
+/// completion, so they are refused as a typed protocol failure instead of guessed at.
+#[derive(Debug)]
+struct UnresolvableFunctionCallItem {
+    provider: String,
+    model: String,
+    detail: &'static str,
+}
+
+impl std::fmt::Display for UnresolvableFunctionCallItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "provider `{}` model `{}` sent a Responses stream this client cannot follow: {}",
+            self.provider, self.model, self.detail
+        )
+    }
+}
+
+impl std::error::Error for UnresolvableFunctionCallItem {}
+
+/// Prefix of the identity synthesized for a tool call whose gateway supplied no id.
+///
+/// Distinct from anything a gateway issues (`call_…`, `fc_…`, `toolu_…`) so a synthesized
+/// identity can never be mistaken for a real one in a durable row or a log, and never
+/// collides with one in the same response.
+const SYNTHESIZED_TOOL_CALL_ID_PREFIX: &str = "zuno-unnamed-call-";
+
+/// The identity a tool call carries into the engine and into its durable row.
+///
+/// A gateway that omits the id, or sends it empty, still gets a call that can name
+/// itself. The engine correlates `ToolInputDelta` and `ToolUseEnd` with `ToolUseStart`
+/// by this exact string, persists it as the row's `callID`, and replays it on both sides
+/// of the next request — `tool_calls[].id` with `tool_call_id`, or `call_id` on both
+/// Responses items — so a value invented here is self-consistent on the wire and needs
+/// no echo from the peer. Before, an empty id was admitted as `""`: two such calls in one
+/// response collided and failed the turn as a duplicate start, and the durable row could
+/// not name its own call. `position` is the stream's own correlation key for the call
+/// (the chat `index`, or the Responses [`ToolKey`] — the item id, spelled `item-<n>` for
+/// the n-th item whose id is empty), and on the Responses surface it is also the key the
+/// call is tracked under, so each synthesized identity is distinct within the response
+/// and stable for every event of the call.
+fn tool_call_identity(wire: Option<String>, position: impl std::fmt::Display) -> String {
+    match wire {
+        Some(id) if !id.is_empty() => id,
+        _ => format!("{SYNTHESIZED_TOOL_CALL_ID_PREFIX}{position}"),
     }
 }
 
@@ -1206,6 +1362,332 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The reviewer's input: a gateway that sends no id, absent on one call and the empty
+    /// string on the other. Both calls must still name themselves, distinctly, and under
+    /// the same identity on every one of their events. Before, both opened as `""` and
+    /// the engine refused the second start as a duplicate of the first.
+    #[test]
+    fn a_chat_tool_call_without_an_id_gets_a_distinct_stable_synthesized_identity() {
+        let events = translate(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"x\":1}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"","function":{"name":"g","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let first = format!("{SYNTHESIZED_TOOL_CALL_ID_PREFIX}0");
+        let second = format!("{SYNTHESIZED_TOOL_CALL_ID_PREFIX}1");
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolUseStart {
+                    id: first.clone(),
+                    name: "f".to_owned()
+                },
+                StreamEvent::ToolInputDelta {
+                    id: first.clone(),
+                    delta: "{\"x\":1}".to_owned(),
+                },
+                StreamEvent::ToolUseStart {
+                    id: second.clone(),
+                    name: "g".to_owned()
+                },
+                StreamEvent::ToolInputDelta {
+                    id: second.clone(),
+                    delta: "{}".to_owned(),
+                },
+                StreamEvent::ToolUseEnd { id: first },
+                StreamEvent::ToolUseEnd { id: second },
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::ToolCalls)
+                },
+            ]
+        );
+        assert_no_empty_tool_call_id(&events);
+    }
+
+    /// An id that only arrives on a later fragment does not rename a call the stream has
+    /// already announced; the engine would read the renamed events as a call nobody
+    /// started.
+    #[test]
+    fn a_late_chat_tool_call_id_does_not_rename_the_call_already_announced() {
+        let events = translate(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_late","function":{"arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let id = format!("{SYNTHESIZED_TOOL_CALL_ID_PREFIX}0");
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolUseStart {
+                    id: id.clone(),
+                    name: "f".to_owned()
+                },
+                StreamEvent::ToolInputDelta {
+                    id: id.clone(),
+                    delta: "{}".to_owned(),
+                },
+                StreamEvent::ToolUseEnd { id },
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::ToolCalls)
+                },
+            ]
+        );
+    }
+
+    /// A gateway-issued id is carried through untouched: synthesis is a fallback, never a
+    /// rewrite of an identity the peer will recognise.
+    #[test]
+    fn a_gateway_issued_tool_call_id_is_never_replaced() {
+        let events = translate(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_real","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        assert!(
+            events.iter().all(|event| match event {
+                StreamEvent::ToolUseStart { id, .. }
+                | StreamEvent::ToolInputDelta { id, .. }
+                | StreamEvent::ToolUseEnd { id } => id == "call_real",
+                _ => true,
+            }),
+            "{events:#?}"
+        );
+    }
+
+    /// The Responses surface has the same hole: `call_id` empty on one item and absent
+    /// on the next. The item id is the protocol's own correlation key, so it seeds the
+    /// synthesized identity; an item whose own id is also empty is numbered instead.
+    #[test]
+    fn a_responses_function_call_without_a_call_id_gets_a_stable_synthesized_identity() {
+        let events = translate_responses(&[
+            r#"{"type":"response.output_item.added","item":{"id":"fc_9","type":"function_call","call_id":"","name":"lookup","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_9","delta":"{\"q\":1}"}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"fc_9","type":"function_call","call_id":"","name":"lookup","arguments":"{\"q\":1}"}}"#,
+            r#"{"type":"response.output_item.added","item":{"id":"fc_10","type":"function_call","name":"lookup","arguments":""}}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"fc_10","type":"function_call","name":"lookup","arguments":"{}"}}"#,
+            r#"{"type":"response.output_item.added","item":{"id":"","type":"function_call","call_id":"","name":"lookup","arguments":""}}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"","type":"function_call","call_id":"","name":"lookup","arguments":"{}"}}"#,
+            r#"{"type":"response.completed","response":{}}"#,
+        ]);
+        let first = format!("{SYNTHESIZED_TOOL_CALL_ID_PREFIX}fc_9");
+        let second = format!("{SYNTHESIZED_TOOL_CALL_ID_PREFIX}fc_10");
+        let third = format!("{SYNTHESIZED_TOOL_CALL_ID_PREFIX}item-1");
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolUseStart {
+                    id: first.clone(),
+                    name: "lookup".to_owned(),
+                },
+                StreamEvent::ToolInputDelta {
+                    id: first.clone(),
+                    delta: "{\"q\":1}".to_owned(),
+                },
+                StreamEvent::ToolUseEnd { id: first },
+                StreamEvent::ToolUseStart {
+                    id: second.clone(),
+                    name: "lookup".to_owned(),
+                },
+                StreamEvent::ToolUseEnd { id: second },
+                StreamEvent::ToolUseStart {
+                    id: third.clone(),
+                    name: "lookup".to_owned(),
+                },
+                StreamEvent::ToolUseEnd { id: third },
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::ToolCalls),
+                },
+            ]
+        );
+        assert_no_empty_tool_call_id(&events);
+    }
+
+    /// The reviewer's batched shape: two function_call items whose own ids are both empty
+    /// are opened before either closes. Their arguments delta and their completions all
+    /// arrive under `item_id: ""`, so nothing in the stream says which call each belongs
+    /// to. Before, the tracking map was keyed by that raw empty id: the second item
+    /// overwrote the first, the delta landed on the wrong call, the first `done` ended the
+    /// second call, and the second `done` fell through to an `End` for
+    /// `zuno-unnamed-call-` — an identity nobody started. An ambiguity the protocol cannot
+    /// resolve is refused as a typed failure at the moment it arises, never guessed.
+    #[test]
+    fn a_second_open_function_call_item_without_an_id_is_a_typed_protocol_failure() {
+        let (events, error) = translate_responses_until_error(&[
+            r#"{"type":"response.output_item.added","item":{"id":"","type":"function_call","call_id":"","name":"a","arguments":""}}"#,
+            r#"{"type":"response.output_item.added","item":{"id":"","type":"function_call","call_id":"","name":"b","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"","delta":"{\"for\":\"a\"}"}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"","type":"function_call","call_id":"","name":"a","arguments":"{\"for\":\"a\"}"}}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"","type":"function_call","call_id":"","name":"b","arguments":"{}"}}"#,
+        ]);
+        assert_eq!(
+            events,
+            vec![StreamEvent::ToolUseStart {
+                id: format!("{SYNTHESIZED_TOOL_CALL_ID_PREFIX}item-1"),
+                name: "a".to_owned(),
+            }],
+            "only the first, unambiguous item may open"
+        );
+        let error = error.expect("a second open id-less item cannot be told from the first");
+        assert!(
+            matches!(
+                error,
+                ProviderError::Protocol {
+                    code: ProviderProtocolFailure::InvalidUpstreamToolCall,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.recovery(), Recovery::Fail);
+    }
+
+    /// The same id-less items one after the other are unambiguous: while exactly one
+    /// id-less item is open, `item_id: ""` can only mean that one, so its delta and its
+    /// `done` are routed to it, and the next id-less item gets the next number.
+    #[test]
+    fn sequential_function_call_items_without_ids_are_routed_to_the_one_open_item() {
+        let events = translate_responses(&[
+            r#"{"type":"response.output_item.added","item":{"id":"","type":"function_call","call_id":"","name":"a","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"","delta":"{\"for\":\"a\"}"}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"","type":"function_call","call_id":"","name":"a","arguments":"{\"for\":\"a\"}"}}"#,
+            r#"{"type":"response.output_item.added","item":{"id":"","type":"function_call","call_id":"","name":"b","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"","delta":"{\"for\":\"b\"}"}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"","type":"function_call","call_id":"","name":"b","arguments":"{\"for\":\"b\"}"}}"#,
+            r#"{"type":"response.completed","response":{}}"#,
+        ]);
+        let first = format!("{SYNTHESIZED_TOOL_CALL_ID_PREFIX}item-1");
+        let second = format!("{SYNTHESIZED_TOOL_CALL_ID_PREFIX}item-2");
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolUseStart {
+                    id: first.clone(),
+                    name: "a".to_owned(),
+                },
+                StreamEvent::ToolInputDelta {
+                    id: first.clone(),
+                    delta: "{\"for\":\"a\"}".to_owned(),
+                },
+                StreamEvent::ToolUseEnd { id: first },
+                StreamEvent::ToolUseStart {
+                    id: second.clone(),
+                    name: "b".to_owned(),
+                },
+                StreamEvent::ToolInputDelta {
+                    id: second.clone(),
+                    delta: "{\"for\":\"b\"}".to_owned(),
+                },
+                StreamEvent::ToolUseEnd { id: second },
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::ToolCalls),
+                },
+            ]
+        );
+        assert_no_empty_tool_call_id(&events);
+    }
+
+    /// The reviewer's collision: a gateway whose real item id is literally `item-1` — the
+    /// spelling the translator synthesizes for the first id-less item — is open alongside
+    /// an id-less item. Before, both were tracked under the one string `"item-1"`: the
+    /// id-less item overwrote the wire one, `a`'s arguments delta and `done` landed on
+    /// `b`'s synthesized identity, and `b`'s own `done` then found nothing open and failed
+    /// the turn. A wire id and a synthesized position are different variants of one typed
+    /// key, so no spelling a gateway can send is equal to a synthesized one. `b` is the
+    /// first id-less item, so it is `item-1` in its own namespace regardless of what the
+    /// wire ids around it are called.
+    #[test]
+    fn a_wire_item_id_spelled_like_a_synthesized_position_does_not_collide_with_it() {
+        let events = translate_responses(&[
+            r#"{"type":"response.output_item.added","item":{"id":"item-1","type":"function_call","call_id":"call_a","name":"a","arguments":""}}"#,
+            r#"{"type":"response.output_item.added","item":{"id":"","type":"function_call","name":"b","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"item-1","delta":"{\"for\":\"a\"}"}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"item-1","type":"function_call","call_id":"call_a","name":"a","arguments":"{\"for\":\"a\"}"}}"#,
+            r#"{"type":"response.output_item.done","item":{"id":"","type":"function_call","name":"b","arguments":"{}"}}"#,
+            r#"{"type":"response.completed","response":{}}"#,
+        ]);
+        let unnamed = format!("{SYNTHESIZED_TOOL_CALL_ID_PREFIX}item-1");
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolUseStart {
+                    id: "call_a".to_owned(),
+                    name: "a".to_owned(),
+                },
+                StreamEvent::ToolUseStart {
+                    id: unnamed.clone(),
+                    name: "b".to_owned(),
+                },
+                StreamEvent::ToolInputDelta {
+                    id: "call_a".to_owned(),
+                    delta: "{\"for\":\"a\"}".to_owned(),
+                },
+                StreamEvent::ToolUseEnd {
+                    id: "call_a".to_owned(),
+                },
+                StreamEvent::ToolUseEnd { id: unnamed },
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::ToolCalls),
+                },
+            ]
+        );
+        assert_no_empty_tool_call_id(&events);
+    }
+
+    /// A `done` for an id-less function_call item while no id-less item is open names a
+    /// call the stream never started. Before, it fell through to
+    /// `tool_call_identity("", "")` and emitted `ToolUseEnd { id: "zuno-unnamed-call-" }`:
+    /// the bare prefix, ending a call under an identity nobody announced.
+    #[test]
+    fn a_done_for_an_unnamed_function_call_item_nobody_opened_is_a_typed_protocol_failure() {
+        let (events, error) = translate_responses_until_error(&[
+            r#"{"type":"response.output_item.done","item":{"id":"","type":"function_call","call_id":"","name":"lookup","arguments":"{}"}}"#,
+        ]);
+        assert_eq!(
+            events,
+            Vec::new(),
+            "nothing was started, so nothing may end"
+        );
+        let error = error.expect("an unnamed item nobody opened cannot be closed");
+        assert!(
+            matches!(
+                error,
+                ProviderError::Protocol {
+                    code: ProviderProtocolFailure::InvalidUpstreamToolCall,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    fn translate_responses_until_error(
+        frames: &[&str],
+    ) -> (Vec<StreamEvent>, Option<ProviderError>) {
+        let mut translator = SurfaceTranslator::new("test", "model", ApiSurface::Responses);
+        let mut events = Vec::new();
+        for frame in frames {
+            match translator.frame(frame) {
+                Ok(batch) => events.extend(batch),
+                Err(error) => return (events, Some(error)),
+            }
+        }
+        (events, None)
+    }
+
+    fn assert_no_empty_tool_call_id(events: &[StreamEvent]) {
+        for event in events {
+            if let StreamEvent::ToolUseStart { id, .. }
+            | StreamEvent::ToolInputDelta { id, .. }
+            | StreamEvent::ToolUseEnd { id } = event
+            {
+                assert!(
+                    !id.is_empty(),
+                    "an empty tool-call id reached the engine: {event:?}"
+                );
+            }
+        }
     }
 
     #[test]

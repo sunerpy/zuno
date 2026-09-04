@@ -1,5 +1,5 @@
 use super::*;
-use crate::{GoalError, GoalKind, GoalStatus, GoalStore, SystemStatus};
+use crate::{GoalError, GoalKind, GoalStatus, GoalStore, ModelStatus, SystemStatus};
 use tempfile::TempDir;
 use zuno_db::verification::{ExitAuthority, NewVerificationReceipt, ReceiptOutcome};
 
@@ -56,6 +56,22 @@ impl Fixture {
             },
         )
         .expect("record verification receipt");
+    }
+
+    /// Rewrite the stored `created_at_ms` of the session's goal.
+    ///
+    /// A goal stamps its creation from the wall clock while these tests record probes
+    /// at small synthetic times, so a fixture that needs "the probe ran after the goal
+    /// was proposed" has to move the goal rather than the clock.
+    fn backdate_goal(&self, created_at_ms: i64) {
+        let connection = self.store.pool().get().expect("check out connection");
+        let updated = connection
+            .execute(
+                "UPDATE goal SET created_at_ms = ?2 WHERE session_id = ?1",
+                rusqlite::params![SESSION, created_at_ms],
+            )
+            .expect("backdate the goal");
+        assert_eq!(updated, 1, "the fixture has a goal to backdate");
     }
 
     fn passing_receipt(&self, id: &str, time_created: i64) {
@@ -324,6 +340,9 @@ fn a_probe_receipt_older_than_the_last_workspace_change_is_refused_as_stale() {
         .store
         .create_goal(SESSION, "enable structured output", None)
         .expect("create goal");
+    // The probe has to have run after the goal was proposed, or the earlier bound
+    // refuses it first and this test would never reach the staleness one.
+    fixture.backdate_goal(1_000);
     fixture.passing_receipt("rec_probe", 2_000);
     fixture
         .store
@@ -350,6 +369,55 @@ fn a_probe_receipt_older_than_the_last_workspace_change_is_refused_as_stale() {
         "{refusal}"
     );
     assert!(fixture.claims().is_empty());
+}
+
+/// The sibling of the criterion citation, sharing the same receipt lookup: a probe that
+/// ran before the goal was proposed describes a configuration the goal never touched,
+/// and after a replacement it is the *previous* goal's probe. The mutation mark cannot
+/// catch it, because replacement clears the mark.
+#[test]
+fn a_probe_receipt_from_before_the_goal_cannot_be_recorded_under_it() {
+    let fixture = Fixture::in_memory();
+    fixture.passing_receipt("rec_before", 2_000);
+    let goal = fixture
+        .store
+        .create_goal(SESSION, "enable structured output", None)
+        .expect("create goal");
+    assert!(
+        goal.created_at_ms > 2_000,
+        "the goal is stamped from the clock, so the probe is genuinely older"
+    );
+
+    let refusal = fixture
+        .claim(
+            CapabilityClaimState::Probed,
+            &[],
+            Some("rec_before"),
+            goal.created_at_ms + 1,
+        )
+        .expect_err("a probe that ran before this goal is not an observation about it");
+    assert!(
+        matches!(
+            &refusal,
+            GoalError::CapabilityProbePredatesGoal { receipt_id, receipt_at_ms, .. }
+                if receipt_id == "rec_before" && *receipt_at_ms == 2_000
+        ),
+        "{refusal}"
+    );
+    assert!(refusal.is_model_refusal(), "{refusal}");
+    assert!(fixture.claims().is_empty(), "no refused probe left a row");
+
+    // The remedy: probe again under this goal.
+    fixture.passing_receipt("rec_now", goal.created_at_ms + 2);
+    let probed = fixture
+        .claim(
+            CapabilityClaimState::Probed,
+            &[],
+            Some("rec_now"),
+            goal.created_at_ms + 3,
+        )
+        .expect("a probe that ran under this goal is an observation about it");
+    assert_eq!(probed.claim.state, CapabilityClaimState::Probed);
 }
 
 #[test]
@@ -391,6 +459,93 @@ fn inferred_and_unknown_claims_are_always_accepted_and_never_relied_on() {
         .expect("not having looked is recordable too");
     assert!(!unknown.claim.state.may_be_relied_on());
     assert_eq!(fixture.claims().len(), 2);
+}
+
+/// The predicate the criterion statements and waiver reasons share, on the fields that
+/// name what blocks a completion. `record_capability_claim` kept `trim().is_empty()`, so
+/// a claim of "\u{200b}" of "\u{feff}" was recorded and then rendered as blank text in
+/// the `CapabilityUnverified` refusal — a blocker naming nothing anybody can clear, and
+/// there is no CLI verb to clear the ledger by hand.
+#[test]
+fn a_capability_or_subject_that_renders_as_nothing_is_refused_before_anything_is_written() {
+    let fixture = Fixture::in_memory();
+    for invisible in ["\u{200b}", "\u{feff}", "\u{2060}", "\u{00ad}", "\u{3164}"] {
+        for (capability, subject, field) in [
+            (invisible, SUBJECT, "capability"),
+            (CAPABILITY, invisible, "subject"),
+        ] {
+            let refusal = fixture
+                .store
+                .record_capability_claim(
+                    SESSION,
+                    &NewCapabilityClaim {
+                        capability: capability.to_owned(),
+                        subject: subject.to_owned(),
+                        state: CapabilityClaimState::Inferred,
+                        sources: Vec::new(),
+                        probe_receipt_id: None,
+                    },
+                    1_000,
+                )
+                .expect_err("a claim that renders as nothing claims nothing");
+            assert!(
+                matches!(
+                    &refusal,
+                    GoalError::EmptyCapabilityClaimField { field: refused } if *refused == field
+                ),
+                "{:?}: {refusal}",
+                invisible.escape_unicode().to_string()
+            );
+            assert!(refusal.is_model_refusal(), "{refusal}");
+        }
+    }
+    assert!(
+        fixture.claims().is_empty(),
+        "the predicate runs before the write, so the ledger is untouched"
+    );
+
+    // The sources list filtered on `is_empty` for the same reason, so a `documented`
+    // claim could cite a citation nobody can read. It is undocumented instead.
+    let refusal = fixture
+        .store
+        .record_capability_claim(
+            SESSION,
+            &NewCapabilityClaim {
+                capability: CAPABILITY.to_owned(),
+                subject: SUBJECT.to_owned(),
+                state: CapabilityClaimState::Documented,
+                sources: vec!["\u{200b}".to_owned(), "  \u{feff} ".to_owned()],
+                probe_receipt_id: None,
+            },
+            1_000,
+        )
+        .expect_err("a source that renders as nothing is not a citation");
+    assert!(
+        matches!(
+            &refusal,
+            GoalError::CapabilityUndocumented { capability, subject }
+                if capability == CAPABILITY && subject == SUBJECT
+        ),
+        "{refusal}"
+    );
+    assert!(fixture.claims().is_empty());
+
+    // Visible text beside an invisible character is a claim, and the source counts.
+    let recorded = fixture
+        .store
+        .record_capability_claim(
+            SESSION,
+            &NewCapabilityClaim {
+                capability: format!("\u{200b}{CAPABILITY}"),
+                subject: SUBJECT.to_owned(),
+                state: CapabilityClaimState::Documented,
+                sources: vec!["\u{200b}".to_owned(), VENDOR_DOC.to_owned()],
+                probe_receipt_id: None,
+            },
+            1_000,
+        )
+        .expect("a claim with visible text is a claim");
+    assert_eq!(recorded.claim.sources, [VENDOR_DOC]);
 }
 
 #[test]
@@ -663,32 +818,156 @@ fn a_probed_claim_whose_receipt_was_superseded_stops_counting() {
     }
 }
 
+/// A claim is recorded by the session itself, so auditing it needs no tool to report
+/// what it wrote. That makes the claim audit the one half of the completion gate that
+/// can run on a goal with no checklist and no reported change — the shape a run that
+/// edits through `shell` presents — and it must for the *run's own* sign-off, because
+/// the guess is the reliance that outlives the run.
+///
+/// The human is not held to it. A user-created, criteria-free goal carrying a
+/// model-written guess is the one shape where the model can write a row the human has
+/// no verb to clear, so while both authorities shared one audit the human's own
+/// `/goal complete` had no way past a claim the model invented. The model still cannot
+/// get past it, through either of its doors.
 #[test]
-fn a_question_goal_completes_regardless_of_unverified_claims() {
+fn a_model_written_guess_blocks_the_runs_own_completion_but_not_the_humans() {
+    for state in [
+        CapabilityClaimState::Inferred,
+        CapabilityClaimState::Unknown,
+    ] {
+        let fixture = Fixture::in_memory();
+        let goal = fixture
+            .store
+            .create_goal(SESSION, "does model a support structured output?", None)
+            .expect("create goal");
+        fixture
+            .claim(state, &[], None, goal.created_at_ms + 1)
+            .expect("record the guess");
+        assert_eq!(
+            fixture.store.kind(SESSION).expect("read kind"),
+            GoalKind::Question,
+            "nothing reported a written path, so the kind cannot see the configuration write"
+        );
+        assert!(
+            fixture
+                .store
+                .criteria(SESSION)
+                .expect("read criteria")
+                .is_empty(),
+            "and there is no checklist to carry the audit either"
+        );
+
+        for refusal in [
+            fixture
+                .store
+                .complete_as_model_checked(SESSION, goal.revision)
+                .expect_err("the run cannot sign off on a claim nobody checked"),
+            fixture
+                .store
+                .update_status_as_model(SESSION, ModelStatus::Complete)
+                .expect_err("and the unchecked door runs the same audit"),
+        ] {
+            assert!(
+                matches!(&refusal, GoalError::CapabilityUnverified { claims } if claims.len() == 1),
+                "the refusal names the reliance it will not accept: {refusal}"
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .goal(SESSION)
+                    .expect("read goal")
+                    .expect("goal exists")
+                    .status,
+                GoalStatus::Active,
+                "and the run is still going, so the claim can still be replaced"
+            );
+        }
+
+        let completed = fixture
+            .store
+            .complete_checked(SESSION, goal.revision)
+            .expect("the human is not trapped by a row the model wrote")
+            .expect("goal exists");
+        assert_eq!(completed.status, GoalStatus::Complete, "{state:?}");
+        assert_eq!(
+            fixture.claims()[0].state,
+            state,
+            "and the guess is still on the record, still unverified"
+        );
+    }
+}
+
+/// The other direction of the same branch: a goal with no checklist and no claims is
+/// not held to evidence, because there is nothing recorded that could be verified and
+/// a run that was only ever asked a question must be able to finish.
+#[test]
+fn a_goal_with_no_criteria_and_no_claims_completes_on_the_same_path() {
     let fixture = Fixture::in_memory();
     let goal = fixture
         .store
         .create_goal(SESSION, "does model a support structured output?", None)
         .expect("create goal");
+
+    let completed = fixture
+        .store
+        .complete_checked(SESSION, goal.revision)
+        .expect("nothing was recorded that could be audited")
+        .expect("goal exists");
+
+    assert_eq!(completed.status, GoalStatus::Complete);
+}
+
+/// The claim audit rides on the evidence audit, so it inherits the same reporting
+/// gap: a run that edited through a tool reporting no written paths never escalates,
+/// and gating on the kind alone would let the guess through with the goal.
+#[test]
+fn a_goal_with_a_checklist_cannot_complete_on_a_guess_without_being_escalated() {
+    let fixture = Fixture::in_memory();
+    let created = fixture
+        .store
+        .create_goal_with_criteria(
+            SESSION,
+            "enable structured output for model a",
+            &["the provider request succeeds".to_owned()],
+            None,
+        )
+        .expect("create goal with criteria");
+    let goal = created.goal;
+    fixture.passing_receipt("rec_request", goal.created_at_ms + 1);
+    let satisfied = fixture
+        .store
+        .satisfy_criterion(
+            SESSION,
+            goal.revision,
+            "c1",
+            "rec_request",
+            goal.created_at_ms + 2,
+        )
+        .expect("prove the only criterion")
+        .goal;
     fixture
         .claim(
             CapabilityClaimState::Inferred,
             &[],
             None,
-            goal.created_at_ms + 1,
+            goal.created_at_ms + 3,
         )
         .expect("record the guess");
     assert_eq!(
         fixture.store.kind(SESSION).expect("read kind"),
-        GoalKind::Question
+        GoalKind::Question,
+        "nothing reported a written path, so nothing escalated the goal"
     );
 
-    let completed = fixture
+    let refusal = fixture
         .store
-        .complete_checked(SESSION, goal.revision)
-        .expect("nothing was written that could rest on the claim")
-        .expect("goal exists");
-    assert_eq!(completed.status, GoalStatus::Complete);
+        .complete_checked(SESSION, satisfied.revision)
+        .expect_err("the configuration this goal wrote rests on a guess");
+
+    assert!(
+        matches!(&refusal, GoalError::CapabilityUnverified { claims } if claims.len() == 1),
+        "the refusal names the claim it will not rely on: {refusal}"
+    );
 }
 
 #[test]

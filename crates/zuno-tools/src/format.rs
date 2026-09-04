@@ -57,8 +57,9 @@
 //! command string to parse in the first place — `rm -rf` cannot appear as a side
 //! effect of word splitting when there is no word splitting. What is borrowed from
 //! [`crate::shell`] is the hygiene rather than the policy: `stdin` closed, both
-//! output streams captured, `kill_on_drop`, a process group on Unix, and a hard
-//! ceiling.
+//! output streams captured, Zuno's own environment withheld, a group of its own on
+//! Unix, and a hard ceiling whose expiry kills that whole group rather than only its
+//! leader — see [`bounded_child_output`].
 
 pub mod builtin;
 
@@ -66,6 +67,7 @@ pub use builtin::{Availability, DEFINITIONS, Definition, Environment};
 
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -713,16 +715,19 @@ impl Formatters {
         process
             .arg("--help")
             .current_dir(&self.directory)
+            .env_clear()
+            .envs(formatter_environment(None))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // A group of its own, so an availability probe that hangs is torn down with
+        // whatever it started rather than beside it: see [`bounded_child_output`].
         #[cfg(unix)]
         process.process_group(0);
         let child = process.spawn().ok()?;
-        let output = tokio::time::timeout(self.ceiling, child.wait_with_output())
-            .await
-            .ok()?
+        let output = bounded_child_output(child, self.ceiling, "a formatter availability probe")
+            .await?
             .ok()?;
         if !output.status.success() {
             return None;
@@ -744,13 +749,17 @@ impl Formatters {
         process
             .args(arguments)
             .current_dir(&self.directory)
-            .envs(&entry.environment)
+            .env_clear()
+            .envs(formatter_environment(Some(&entry.environment)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        // A dedicated group so a formatter that spawns helpers is torn down with
-        // them, for the reason `shell.rs` does the same.
+        // A dedicated group so the formatter leads one, which is what lets
+        // [`bounded_child_output`] stop a formatter that spawned helpers of its own —
+        // a language server, a `node` daemon, a wrapper script's `sleep` — together with
+        // it. `kill_on_drop` on its own reaches the direct child and nothing else, and a
+        // group of its own is also outside Zuno's, so nothing else would ever signal it.
         #[cfg(unix)]
         process.process_group(0);
 
@@ -758,10 +767,8 @@ impl Formatters {
             Ok(child) => child,
             Err(error) => return Err((FailureKind::NotSpawned, error.to_string())),
         };
-        // `kill_on_drop` terminates the child when this future is dropped at the
-        // timeout, which is why the ceiling needs no separate kill path.
-        let output = match tokio::time::timeout(self.ceiling, child.wait_with_output()).await {
-            Err(_) => {
+        let output = match bounded_child_output(child, self.ceiling, "a hung formatter").await {
+            None => {
                 return Err((
                     FailureKind::TimedOut {
                         after_seconds: self.ceiling.as_secs(),
@@ -769,8 +776,8 @@ impl Formatters {
                     String::new(),
                 ));
             }
-            Ok(Err(error)) => return Err((FailureKind::NotSpawned, error.to_string())),
-            Ok(Ok(output)) => output,
+            Some(Err(error)) => return Err((FailureKind::NotSpawned, error.to_string())),
+            Some(Ok(output)) => output,
         };
         if output.status.success() {
             return Ok(());
@@ -825,6 +832,68 @@ impl crate::FileFormatter for Formatters {
     }
 }
 
+/// The environment a formatter child receives.
+///
+/// The same rule the `shell` tool applies, for the same reason: a formatter argv comes
+/// from configuration, and configuration is writable from inside the workspace, so these
+/// children are not obviously less model-reachable than a composed command. They were
+/// inheriting Zuno's whole `ZUNO_*` namespace — `ZUNO_CONFIG_CONTENT` with an inline
+/// provider `apiKey`, `ZUNO_AUTH_CONTENT`, `ZUNO_SERVER_PASSWORD` — because nothing here
+/// cleared it. Nothing in the formatter surface reads a `ZUNO_*` variable, so removing the
+/// namespace costs it nothing.
+///
+/// `entry` goes on top, so a formatter definition that deliberately sets a variable still
+/// wins; the host stays the one place that decides what a child may see.
+/// `OsString`, and `vars_os` rather than `vars`: `std::env::vars` **panics** on an entry
+/// whose name or value is not Unicode, and it panicked here on the `format` path, which
+/// runs after every successful `edit`, `write`, and `apply_patch`. A non-UTF-8 environment
+/// variable is ordinary on Linux — a Latin-1 filename in `LESSOPEN`, a locale-encoded
+/// `PS1` — and normal on Windows, and the panic did not stay inside the format call: it
+/// unwound the turn. Representing the environment as it really is means there is no entry
+/// to drop and no lossy spelling to hand a child, so nothing is silently changed about the
+/// environment a formatter runs in.
+fn formatter_environment(entry: Option<&BTreeMap<String, String>>) -> BTreeMap<OsString, OsString> {
+    let mut environment = crate::shell::withhold_zuno_environment(std::env::vars_os());
+    if let Some(entry) = entry {
+        environment.extend(
+            entry
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+        );
+    }
+    environment
+}
+
+/// Wait for one formatter child, and stop its whole group if the wait expires.
+///
+/// `None` when the ceiling passed. The group is killed *before* the wait future is
+/// dropped, because dropping it runs `kill_on_drop`, which `SIGKILL`s **and reaps** the
+/// leader — and a reaped leader's pid no longer names a group, so a kill issued afterwards
+/// would be aimed at nothing. See [`crate::child_process`] for the rest of the reasoning,
+/// including why the teardown runs off the reactor and why its bound is carved out of
+/// `ceiling` instead of being a second one.
+async fn bounded_child_output(
+    child: tokio::process::Child,
+    ceiling: Duration,
+    what: &'static str,
+) -> Option<std::io::Result<std::process::Output>> {
+    let group = crate::child_process::group_of(&child);
+    let wait = child.wait_with_output();
+    tokio::pin!(wait);
+    match tokio::time::timeout(crate::child_process::work_window(ceiling), &mut wait).await {
+        Ok(output) => Some(output),
+        Err(_) => {
+            crate::child_process::stop_process_group(
+                group,
+                crate::child_process::teardown_ceiling(ceiling),
+                what,
+            )
+            .await;
+            None
+        }
+    }
+}
+
 /// Cap stderr at [`MAX_STDERR_BYTES`], on a character boundary.
 fn cap(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
@@ -836,4 +905,80 @@ fn cap(bytes: &[u8]) -> String {
         end -= 1;
     }
     format!("{}\n(stderr truncated)", &text[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    /// A formatter child does not inherit Zuno's own environment either.
+    ///
+    /// Unit level, because putting a real `ZUNO_CONFIG_CONTENT` in this process is
+    /// `unsafe`. What makes it more than a restatement of the `shell` rule is that both
+    /// formatter spawns now build their environment here: `env_clear()` plus this map, so
+    /// there is no path left that hands a formatter the inherited namespace.
+    #[test]
+    fn a_formatter_child_does_not_inherit_zunos_own_environment() {
+        let entry = BTreeMap::from([
+            ("RUFF_CACHE_DIR".to_owned(), "/tmp/ruff".to_owned()),
+            // A formatter definition that deliberately asks for one still gets it: the
+            // host, not this crate, is the place that decides.
+            ("ZUNO_DELIBERATE".to_owned(), "wanted".to_owned()),
+        ]);
+
+        let environment = formatter_environment(Some(&entry));
+
+        assert_eq!(
+            environment
+                .get(OsStr::new("RUFF_CACHE_DIR"))
+                .map(|value| value.to_string_lossy()),
+            Some(std::borrow::Cow::Borrowed("/tmp/ruff"))
+        );
+        assert_eq!(
+            environment
+                .get(OsStr::new("ZUNO_DELIBERATE"))
+                .map(|value| value.to_string_lossy()),
+            Some(std::borrow::Cow::Borrowed("wanted"))
+        );
+        assert!(
+            !environment.keys().any(|name| {
+                let name = name.to_string_lossy();
+                name.len() > "ZUNO_".len()
+                    && name.as_bytes()[.."ZUNO_".len()].eq_ignore_ascii_case(b"ZUNO_")
+                    && name != "ZUNO_DELIBERATE"
+            }),
+            "a ZUNO_* variable reached a formatter: {:?}",
+            environment.keys().collect::<Vec<_>>()
+        );
+        // The inherited environment is still there; only Zuno's namespace left.
+        assert!(
+            environment.contains_key(OsStr::new("PATH")),
+            "PATH must survive"
+        );
+    }
+
+    /// The real environment of this process reaches a formatter without panicking.
+    ///
+    /// `std::env::vars` panics on an entry that is not Unicode, and this call is on the
+    /// path of every successful `edit`, `write`, and `apply_patch`. The assertion is that
+    /// the call returns at all: a non-UTF-8 entry in the environment of the process running
+    /// this test used to unwind the turn from here. `crates/zuno-tools/tests/format.rs`
+    /// puts a real non-UTF-8 variable in a child process and formats a file through it,
+    /// which is the input that panicked.
+    #[test]
+    fn the_processs_real_environment_reaches_a_formatter_without_panicking() {
+        let environment = formatter_environment(None);
+
+        assert!(
+            !environment.keys().any(|name| {
+                let name = name.to_string_lossy();
+                name.as_bytes()
+                    .get(.."ZUNO_".len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"ZUNO_"))
+            }),
+            "a ZUNO_* variable reached a formatter: {:?}",
+            environment.keys().collect::<Vec<_>>()
+        );
+    }
 }

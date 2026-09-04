@@ -134,8 +134,17 @@ If an objective itself starts with one of those words, use `/goal create <object
 summary.
 
 Goal status also shows the typed pause, cross-turn retry, provider backoff checkpoint,
-and pending human requests. Completion is rejected while any Plan step, WorkItem, Job,
+pending human requests, and the calls of this objective that still owe an
+authoritative-state inspection. Completion is rejected while any Plan step, WorkItem, Job,
 next-step report, or Goal-owned human request remains unfinished.
+
+A pause is only actionable if it names what to look at. `/goal show` reports
+`pendingUncertainCalls`, one entry per uncertain call with the tool, the call id, the paths
+the call reported having applied, the typed cause, and when it was observed. `/goal resume`
+is the explicit statement that those states were inspected: it retires exactly the calls it
+listed, reports them as `reconciledUncertainCalls`, and only then lets the Goal run again.
+`/goal pause` and `/goal cancel` retire nothing, because neither claims an inspection
+happened.
 
 ### Success criteria and evidence
 
@@ -144,9 +153,21 @@ in prose is a claim about the workspace, and the whole reason a goal exists is t
 made mid-run are the ones most likely to be wrong. So a change goal carries success
 criteria, and each one closes only against a recorded exit status.
 
-`goal_propose` takes `success_criteria`, a list of concrete checks. Each becomes a row with
-a short id such as `c1`, echoed once in the result. The model cannot rewrite them later:
-criteria that could be edited to match whatever happened are not criteria.
+`goal_propose` requires `success_criteria`, a list of concrete checks: a proposal that names
+none is refused, and criteria cannot be added afterwards. Each becomes a row with a short id
+such as `c1`, echoed once in the result. The model cannot rewrite them later: criteria that
+could be edited to match whatever happened are not criteria. A proposal may name at most 32
+criteria, each at most 500 characters, and a statement with no visible character —
+whitespace, or a format character such as U+200B — is not a criterion, because a checklist
+that is populated in the database and empty on screen is not an audit surface.
+`/goal create` is the human's own path and is not held to a checklist; these bounds apply
+when a proposal is written, so a goal an earlier version stored with a longer checklist
+still reads, still renders and still completes.
+
+A goal a 0.6.x release proposed keeps its criteria in the goal row. Opening the database
+mints the criterion rows `c1`..`cN`, open, for every such goal that is not complete or
+cancelled; a finished goal is left reading as it did, and is backfilled the same way if it
+is made live again.
 
 Two things close a criterion, both through `goal_update`:
 
@@ -169,9 +190,13 @@ swallowed by a later `grep` produces a zero exit status that proves nothing, so 
 recorded and refused rather than quietly accepted. See
 [Shell exit status](tools.md#what-a-shell-exit-status-proves).
 
-Evidence expires. Every tool call that writes files stamps the goal with the time of the
-change, which retires any criterion whose receipt is older than that stamp. The retirement
-is reported in the tool result, at the moment of the write:
+Evidence is bounded at both ends. A cited receipt must have been recorded after the goal
+was proposed: a check that ran earlier proves nothing about work the goal had not yet
+described, and after a goal is replaced its predecessor's receipts are exactly that. The
+refusal prints both times and asks for the check to be run again. At the other end, every
+tool call that writes files stamps the goal with the time of the change, which retires any
+criterion whose receipt is older than that stamp. The retirement is reported in the tool
+result, at the moment of the write:
 
 ```text
 [goal evidence] 2 satisfied criteria went back to open, because this change came
@@ -185,10 +210,16 @@ predates the last write each produce a different sentence, and the stale case pr
 timestamps so the mismatch is visible. Completing with criteria still open reports which
 ids are unproven.
 
-A goal that only answers a question is not gated: it has nothing to verify. The first tool
-call that writes a file turns a question goal into a change goal, so the gate applies to
-the run that turned out to modify the workspace even though it did not start out planning
-to.
+A goal that only answers a question is not gated on a checklist: it has nothing to verify.
+The first tool call that writes a file turns a question goal into a change goal, so the gate
+applies to the run that turned out to modify the workspace even though it did not start out
+planning to. One thing is audited on every completion the run itself reports, checklist or
+not: a capability claim it recorded and never verified (see below). Your own
+`/goal complete` on a goal with no checklist is not refused over such a claim — the claim
+is the model's record, and there is no command that clears one — but the run cannot carry
+it out with the goal. There is also no command yet to satisfy or waive a criterion from the
+CLI, so a goal whose checklist is still open is finished by the run or cancelled with
+`/goal cancel`.
 
 The rendered goal document lists the criteria with their state, so a human reads the same
 gate the model is held to.
@@ -235,9 +266,18 @@ and one negation per authored entry go into the repository-private
 repository's history owns would land as an unexplained diff in somebody else's next commit.
 Each generated directory also writes its own `.gitignore` containing `*` as it is created,
 which covers that file as well, so the directory stays hidden even where no exclude block
-was written — a fresh clone, a second worktree, or a repository whose block someone
-deleted. Every pattern is matched at every depth, so a `.zuno/` directory an older release
-left in a subdirectory is hidden as well; it is inert, and you can delete it.
+was written — a fresh clone, a second worktree, a repository whose block someone deleted,
+or a checkout where the query below did not answer in time. Every pattern is matched at
+every depth, so a `.zuno/` directory an older release left in a subdirectory is hidden as
+well; it is inert, and you can delete it.
+
+Writing the block first asks git where its exclude file lives, and that question is bounded
+at about ten seconds. If git does not answer — an unresponsive mount is the usual reason —
+the session starts anyway and carries a warning naming the timeout and the worktree, and
+Zuno runs without the block. Generated state that lives in a directory of its own is still
+hidden by that directory's `.gitignore`, and the delivery refusal below still holds, so what
+the timeout costs is the exclusion of anything directly under `.zuno/` that is not a
+directory Zuno created.
 
 An ignore rule never applies to a path git already tracks, and that is why a refusal exists
 on top of the exclusions. A `git commit` that would deliver generated state anyway is
@@ -270,6 +310,23 @@ these reads do not follow, so inspecting anyway would report on a tree other tha
 being written. Name the repository in the Shell tool's `workdir`, where it is one fact the
 check and the commit share. Outside a repository there is nothing to check and nothing is
 refused.
+
+Those reads are bounded, and the bound belongs to the check rather than to any one read.
+A single call makes up to five of them — the worktree root, the index, a staging reach, an
+untracked listing, and the `expected_head` comparison when the call supplies one — and they
+share one thirty-second ceiling in total. Five independent thirty-second ceilings would be
+two and a half minutes a model could spend by writing one command. When the ceiling
+expires, the command is refused before it runs and the refusal names the `git` invocation
+that did not answer, the ceiling it shared, and that the repository state the decision
+depends on is unknown. That is deliberate: a read that never answered is not an empty
+answer, and treating a hung read as "nothing to report" would turn it into permission to
+commit.
+
+The same reads race the session's interrupt, so `Esc` or a client cancel answers during the
+pre-flight phase and not only once git is done. Whatever git started is torn down on either
+exit — the expiry and the interrupt both stop the process group before the read is
+abandoned, because nothing else would. A `git commit` that has already started is never
+interrupted this way; the phase runs entirely before the command does.
 
 This exists because generated state that reaches the index is how an agent reports a dirty
 tree as evidence of a change it did not make, or delivers its own scratch output as part of
@@ -360,7 +417,12 @@ TUI, HTTP, and ACP list and answer the same rows. An answer transaction settles 
 and admits its model-visible response to the durable FIFO inbox together. Goal resumption is
 a later idempotent step, so a crash after the answer commit cannot lose the response or
 duplicate it. On restart, clients re-present pending requests from SQLite. Their in-process
-channels only wake already-running consumers.
+channels only wake already-running consumers. Every reply a client actually gives is a
+settlement, including a withdrawal. Because Goal resumption accepts only an answered
+request, a dismissed, expired, or unreadable reply is stored as a settled request whose
+response records no answers and names the `outcome` that ended it; the response, not the
+state column, is where the record says whether a human answered. A dialog that never
+reached a client is not settled at all and stays pending for another surface.
 
 Ordinary non-Goal Work likewise does not receive the synchronous question tool. It uses
 evidence-backed reversible defaults and continues. If an undiscoverable choice has no safe
@@ -371,7 +433,67 @@ forms for decision-complete planning.
 A side-effecting tool whose response is lost has an uncertain outcome. The Goal pauses with
 `uncertain_side_effect`, requires authoritative-state inspection, and never mechanically
 replays that invocation. Only tools explicitly marked read-only or idempotent may use safe
-retry behavior.
+retry behavior. A call cancelled before it settled its own result is the same kind of
+outcome under a different typed cause: `lost_outcome` for a response that never arrived,
+`interrupted` for a claim the interruption left unsettled.
+
+The obligation is durable evidence on the tool record, not a field of the pause. The
+dispatcher writes `state.outcome = "uncertain"` together with `state.uncertain`
+(`tool`, `callID`, `appliedPaths`, `cause`, `observedAtMs`) in the statement that makes the
+result model-visible, so the record exists before anything about the Goal is decided. That
+ordering is what makes recovery survive a crash: a process that died between the tool write
+and the pause row leaves the pause missing and the obligation intact, and the next
+continuation reads the obligation and pauses again. `state.uncertain.reconciledAtMs` stays
+absent until an explicit recovery action retires the call.
+
+Not every unanswered tool row earns that obligation, and the difference is durable rather
+than inferred. A checkpointed call carries `state.dispatchTracked` from the moment it is
+persisted, and `state.dispatchedAtMs` from the moment it is handed to the executor, each
+committed on its own. Restart repair reads the pair and produces one of three outcomes:
+
+- `dispatchTracked` and no `dispatchedAtMs` — the call provably never reached a tool. The
+  row closes as an interrupted call with no `state.outcome`, and nothing is queued for
+  inspection.
+- `dispatchedAtMs` present — the call reached a tool and its answer was lost. The row
+  closes with the uncertain outcome above.
+- Neither field — the row was written by a build that did not record hand-off, so the
+  hand-off cannot be ruled out, and the row closes as uncertain.
+
+The third class is why the first goal continuation after an upgrade from any release up
+to and including 0.9.0 can pause with `uncertain_side_effect` for a call the older process
+had only queued: every released build through 0.9.0 persisted exactly `status`, `input`,
+and `raw` for a call it then handed to the executor, so the older row does not say which of
+the two happened, and reporting a decided failure the model is free to reissue is the worse
+of the two errors. Those rows are read exactly as stored — there is no migration and no
+backfill — and the class takes no new members once this build is the one writing the rows.
+
+A dispatched call whose own record cannot name it still owes an inspection. When a provider
+or gateway supplies an empty call id or tool name, `state.uncertain.tool` and
+`state.uncertain.callID` record `<unnamed>` rather than dropping the obligation, and
+`/goal resume` retires it by part id like any other. `<unnamed>` cannot collide with a real
+tool name, and its presence is itself the report that the provider's tool-call identity was
+unusable.
+
+A tool call that arrives from an OpenAI-compatible chat or Responses gateway without an
+id, or with an empty one, is given a synthesized identity before it reaches the engine:
+`zuno-unnamed-call-<position>`, where `<position>` is the stream's own correlation key
+for the call — the chat `tool_calls[].index`, or the Responses item id, with an item whose
+own id is also empty numbered instead. The engine correlates the call's events by that
+exact string, persists it as the row's `callID`, and replays it on both sides of the next
+request, so the value is self-consistent on the wire and needs no echo from the peer. The
+prefix is distinct from anything a gateway issues (`call_…`, `fc_…`, `toolu_…`), so a
+synthesized identity is never mistaken for a real one in a durable row or a log, and two
+id-less calls in one response no longer collide as a duplicate start. `<unnamed>` above
+remains the recorded identity only for a call that still reaches the engine with an empty
+id or an empty tool name.
+
+On the Responses surface that numbered position is also the key the call is tracked under,
+so two id-less items can never share an entry. An arguments delta or a completion that
+arrives with `item_id: ""` is routed to the one open id-less item. Two shapes have no
+reading that does not misattribute an event, and both are refused as a typed
+`invalid_upstream_tool_call` protocol failure rather than guessed at: a second id-less
+`function_call` item added while another is still open, and a completion for an id-less
+item when none is open. A protocol failure is terminal for the turn; it is not retried.
 
 ## Plan
 
@@ -413,10 +535,12 @@ Rules that matter in practice:
   new Goal may supersede that step, but it does not settle or cancel the Job implicitly.
 
 Plan mode enforces the read-only side of this below the prompt: a deny-by-default overlay
-allows inspection, read-only search and LSP, questions, Skills, and typed
-Goal/Plan/Todo operations while denying shell and file mutation. Returning to Work mode
-requires a durable plan to exist, and the confirmation names its title, revision, and
-completed-step count.
+allows inspection, read-only search and LSP, `shell` and `bg`, questions, Skills, and typed
+Goal/Plan/Todo operations, while denying file mutation, delegation, `job`, and `execute`.
+Plan mode is a no-mutation boundary, not a shell-free one: the runtime forces any read-only
+role to `SandboxMode::ReadOnly`, so a command can gather evidence and cannot change the
+tree. Returning to Work mode requires a durable plan to exist, and the confirmation names
+its title, revision, and completed-step count.
 
 The default host owns classification and final reconciliation through typed planning
 services; the model owns strategic step creation through operation-based `plan_update`.
@@ -427,6 +551,11 @@ Entering Plan while a Goal is active atomically records `paused(plan_mode)`. Sta
 resumes only that exact pause and does so once, even after a process restart. It deliberately
 does not clear pauses owned by authentication repair, a pending human request, permission,
 manual interruption, or uncertain side effects.
+
+A Goal that an older release parked on a request it recorded as cancelled, expired, or
+failed cannot be resumed by Start Work, because that request can no longer become
+answered. Recover the session with `/goal cancel` followed by `/goal create <objective>`;
+the request row is left intact as evidence.
 
 ```text
 /plan

@@ -1242,12 +1242,12 @@ async fn answer_with_always(requests: &RequestBroker, request: PermissionRequest
         async move { requests.ask_permission(request).await }
     });
     await_parked(requests, &session_id).await;
-    assert!(
-        requests
-            .claim_permission(&session_id, &request_id)
-            .expect("the owning session claims its own request")
-            .resolve(ReplyKind::Always)
-    );
+    requests
+        .claim_permission(&session_id, &request_id)
+        .expect("the owning session claims its own request")
+        .settle(ReplyKind::Always)
+        .await
+        .expect("the reply reaches the waiting ask");
     tokio::time::timeout(Duration::from_secs(1), &mut asked)
         .await
         .expect("the asker resumes")
@@ -1345,6 +1345,13 @@ async fn replying_always_to_an_unsavable_request_installs_no_standing_authorizat
 /// asking turn is already gone the call it asked about is denied, so keeping the
 /// authorization would authorize the *next* matching call on behalf of a tool call
 /// that never ran.
+///
+/// The asker here is gone *before* the claim, which is why `Gone` is still the answer:
+/// nothing was written or published, so there is nothing for a `404` to contradict. The
+/// asker that disappears *after* the write is a different outcome, and
+/// `request_broker::tests::a_reply_whose_asker_disappears_mid_commit_is_recorded_not_refused`
+/// pins it: a committed reply reports `Settled { delivered: false, .. }` rather than a
+/// failure, and saves nothing either.
 #[tokio::test]
 async fn an_undelivered_always_reply_saves_no_permission() {
     let requests = RequestBroker::default();
@@ -1370,10 +1377,14 @@ async fn an_undelivered_always_reply_saves_no_permission() {
     );
 
     assert!(
-        !requests
-            .claim_permission("ses_gone", "per_gone")
-            .expect("the reply claims the abandoned request")
-            .resolve(ReplyKind::Always),
+        matches!(
+            requests
+                .claim_permission("ses_gone", "per_gone")
+                .expect("the reply claims the abandoned request")
+                .settle(ReplyKind::Always)
+                .await,
+            Err(zuno_server::SettleError::Gone)
+        ),
         "a reply with no asker left should report that it was not delivered"
     );
     assert_parks_for_a_human(
@@ -2974,6 +2985,124 @@ async fn api_agent_model_compact_and_revert_mutations_are_guarded_and_persisted(
 }
 
 #[tokio::test]
+async fn api_session_switch_publishes_no_event_when_its_write_fails() {
+    let fixture = ReadApiFixture::new();
+    fixture.seed_session_messages(1, -1);
+    let (app, _services) = api_app_with_services(fixture.state.clone());
+    // Both switch writes append their projected message inside one transaction, so
+    // taking the table away is a write that fails after the request is otherwise valid.
+    fixture
+        .pool
+        .get()
+        .expect("fixture database connection")
+        .execute(
+            "ALTER TABLE session_message RENAME TO session_message_moved",
+            (),
+        )
+        .expect("the projected-message table is renamed out from under the write");
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_reads/agent",
+            Some(json!({"agent": "explorer"})),
+        ))
+        .await
+        .expect("agent switch responds");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let history = app
+        .oneshot(request(Method::GET, "/api/session/ses_reads/history", None))
+        .await
+        .expect("history responds after the failed switch");
+    assert_eq!(history.status(), StatusCode::OK);
+    let history = response_json(history).await;
+    assert_eq!(
+        history["data"],
+        json!([]),
+        "a durable event must not claim a switch the write never made: {history}"
+    );
+    assert_eq!(
+        fixture
+            .state
+            .sessions()
+            .get("ses_reads")
+            .expect("session reads")
+            .agent,
+        None,
+        "the rolled-back write must leave the selection alone"
+    );
+}
+
+/// The other half of the same lie: a committed switch the event stream cannot show.
+///
+/// Publishing after the write turns "an event with no write" into "a write with no
+/// event", which leaves a client that reconstructs state from durable events unable to
+/// see a selection the session is now running with. `publish_with` puts both halves in
+/// one transaction, so a failed event insert must take the selection with it.
+#[tokio::test]
+async fn api_session_switch_makes_no_write_when_its_event_fails() {
+    let fixture = ReadApiFixture::new();
+    fixture.seed_session_messages(1, -1);
+    let (app, _services) = api_app_with_services(fixture.state.clone());
+    let connection = fixture.pool.get().expect("fixture database connection");
+    // Taking the event table away is the publish half failing after a request that is
+    // otherwise valid; the write half has no reason to fail.
+    connection
+        .execute("ALTER TABLE event RENAME TO event_moved", ())
+        .expect("the durable event table is renamed out from under the publish");
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_reads/model",
+            Some(json!({"model": {"providerID": "provider", "id": "model"}})),
+        ))
+        .await
+        .expect("model switch responds");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        fixture
+            .state
+            .sessions()
+            .get("ses_reads")
+            .expect("session reads")
+            .model,
+        None,
+        "a mutation no durable event can describe must not be committed"
+    );
+    let projected: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM session_message WHERE session_id = 'ses_reads' \
+             AND type = 'model-switched'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count projected messages");
+    assert_eq!(
+        projected, 0,
+        "the projected switch message rolls back with the selection"
+    );
+
+    connection
+        .execute("ALTER TABLE event_moved RENAME TO event", ())
+        .expect("restore the durable event table");
+    let history = app
+        .oneshot(request(Method::GET, "/api/session/ses_reads/history", None))
+        .await
+        .expect("history responds after the failed switch");
+    assert_eq!(history.status(), StatusCode::OK);
+    let history = response_json(history).await;
+    assert_eq!(
+        history["data"],
+        json!([]),
+        "neither half of the switch survives: {history}"
+    );
+}
+
+#[tokio::test]
 async fn api_pty_list_and_create_use_the_real_pty_service() {
     let state = ApiState::memory("/repo").expect("in-memory API state initializes");
     let app = api_app(state);
@@ -3343,6 +3472,69 @@ async fn api_maintenance_preview_is_inert_and_emits_ordered_progress() {
     );
 }
 
+/// The prune must need a blocking thread, not the reactor.
+///
+/// Built by hand instead of with `#[tokio::test]` because that is only observable on a
+/// runtime whose blocking pool the test can fill: `zuno serve` polls this router on a
+/// single-threaded runtime, so a scan left in the handler future freezes every SSE
+/// stream in the process, the progress stream this endpoint feeds included.
+#[test]
+fn api_maintenance_prune_runs_off_the_reactor() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_time()
+        .build()
+        .expect("single-blocking-thread runtime builds");
+    runtime.block_on(async {
+        let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+        state
+            .sessions()
+            .create(
+                &SessionCreate::new(
+                    "ses_old", "ses_old", "global", "/repo", "/repo", "old", "test",
+                )
+                .at(1),
+            )
+            .expect("old fixture session inserts");
+        let (app, _services) = api_app_with_services(state);
+        let (started, occupied) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = tokio::task::spawn_blocking(move || {
+            started
+                .send(())
+                .expect("the test waits for the blocking pool to fill");
+            let _closed = released.recv();
+        });
+        occupied
+            .await
+            .expect("the only blocking thread is taken before the request starts");
+
+        let mut preview = tokio::spawn(app.oneshot(request(
+            Method::GET,
+            "/api/session/prune?olderThan=90&project=global",
+            None,
+        )));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut preview)
+                .await
+                .is_err(),
+            "the prune must wait for a blocking thread rather than run on the reactor"
+        );
+        drop(release);
+        let response = bounded_wait(
+            "the prune to answer once a blocking thread is free",
+            preview,
+            || "the request is still pending".to_owned(),
+        )
+        .await
+        .expect("prune task does not panic")
+        .expect("maintenance preview responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        holder.await.expect("the holding task does not panic");
+    });
+}
+
 #[tokio::test]
 async fn api_maintenance_mutation_requires_apply_true() {
     let state = ApiState::memory("/repo").expect("in-memory API state initializes");
@@ -3632,6 +3824,11 @@ async fn api_fs_find_stays_inside_the_session_directory_and_honours_its_limit() 
         json["data"],
         json!([{"path": "nested/deep.txt", "type": "file"}])
     );
+    assert_eq!(
+        json["truncated"],
+        json!(false),
+        "a walk that finished inside its ceilings reports a complete answer: {json}"
+    );
 
     let state = ApiState::memory(directory.clone()).expect("API state");
     let (_, body) = fs_body(state, "/api/fs/find?query=secret").await;
@@ -3658,6 +3855,104 @@ async fn api_fs_find_stays_inside_the_session_directory_and_honours_its_limit() 
         StatusCode::BAD_REQUEST,
         "a non-positive limit is a request error, not a silent default"
     );
+}
+
+#[tokio::test]
+async fn api_fs_find_stops_descending_at_its_depth_ceiling() {
+    let (_root, directory) = fs_fixture();
+    let mut deep = std::path::PathBuf::from(&directory);
+    // Deeper than the walk descends, so this marker is reachable only by a descent
+    // nothing bounds.
+    for level in 0..20 {
+        deep.push(format!("step-{level}"));
+    }
+    std::fs::create_dir_all(&deep).expect("create the deep fixture tree");
+    std::fs::write(deep.join("marker.txt"), b"deep\n").expect("write the deep marker");
+    std::fs::write(
+        std::path::Path::new(&directory).join("marker.txt"),
+        b"shallow\n",
+    )
+    .expect("write the shallow marker");
+    let state = ApiState::memory(directory).expect("API state");
+
+    let (status, body) = fs_body(state, "/api/fs/find?query=marker").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_slice(&body).expect("results are JSON");
+    assert_eq!(
+        json["data"],
+        json!([{"path": "marker.txt", "type": "file"}]),
+        "the walk itself must stop at its ceiling, not only the answer"
+    );
+    // The deep marker exists at depth 21. Answering with only the shallow one and no
+    // signal would report a file that is there as absent.
+    assert_eq!(
+        json["truncated"],
+        json!(true),
+        "a walk that gave up must say so instead of implying the rest is absent: {json}"
+    );
+}
+
+#[tokio::test]
+async fn api_fs_read_refuses_a_file_past_its_size_ceiling() {
+    let (_root, directory) = fs_fixture();
+    let oversize = std::path::Path::new(&directory).join("oversize.bin");
+    // Sparse: only the declared length matters to a ceiling that exists to stop the
+    // response body from being buffered whole.
+    std::fs::File::create(&oversize)
+        .expect("create the oversize fixture")
+        .set_len(32 * 1024 * 1024 + 1)
+        .expect("declare a length past the read ceiling");
+    let state = ApiState::memory(directory).expect("API state");
+
+    let response = api_app(state)
+        .oneshot(request(Method::GET, "/api/fs/read/oversize.bin", None))
+        .await
+        .expect("filesystem read responds");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "an unbounded read is refused before the body is buffered"
+    );
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "file_too_large"
+    );
+}
+
+/// The bound queues concurrent reads; it must not drop or starve any of them.
+///
+/// The other direction of the concurrency ceiling added for the memory bound: with
+/// four slots and far more callers than slots, every caller still gets its bytes.
+#[tokio::test]
+async fn api_fs_read_answers_every_caller_when_far_more_arrive_than_can_run() {
+    const CALLERS: usize = 32;
+    let (_root, directory) = fs_fixture();
+    let state = ApiState::memory(directory).expect("API state");
+    let app = api_app(state);
+
+    let mut inflight = Vec::with_capacity(CALLERS);
+    for _ in 0..CALLERS {
+        inflight.push(
+            app.clone()
+                .oneshot(request(Method::GET, "/api/fs/read/visible.txt", None)),
+        );
+    }
+    let answered = futures::future::join_all(inflight).await;
+
+    for response in answered {
+        let response = response.expect("filesystem read responds");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a queued read must still be served"
+        );
+        let bytes = to_bytes(response.into_body(), 4 * 1024)
+            .await
+            .expect("body is bounded");
+        assert_eq!(bytes.as_ref(), b"in-root\n");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4314,4 +4609,258 @@ async fn api_prompt_queued_during_compaction_runs_after_the_lease_is_released() 
         vec!["msg_after_compaction"]
     );
     wait_until_session_idle(&services.runs, "ses_compact_queue").await;
+}
+
+/// A request that outlived its asker, exactly as a restart leaves it behind.
+fn recovered_request(
+    pool: &Arc<Pool>,
+    id: &str,
+    kind: zuno_db::human_request::HumanRequestKind,
+    payload: Value,
+) {
+    zuno_db::human_request::HumanRequestStore::new(Arc::clone(pool))
+        .create(zuno_db::human_request::NewHumanRequest {
+            id: id.to_owned(),
+            session_id: "ses_reads".to_owned(),
+            goal_id: None,
+            kind,
+            payload,
+            message_id: None,
+            call_id: None,
+            time_created: 1,
+        })
+        .expect("the recovered request row inserts");
+}
+
+/// A router whose broker persists requests and publishes to the fixture's event log.
+fn durable_request_app(fixture: &ReadApiFixture) -> (Router, RequestBroker) {
+    let requests = RequestBroker::with_events(fixture.events.clone()).with_store(
+        zuno_db::human_request::HumanRequestStore::new(Arc::clone(&fixture.pool)),
+    );
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(ServerServices::new(64).with_requests(requests.clone()))
+        .with_routes(api::router(fixture.state.clone()))
+        .router();
+    (app, requests)
+}
+
+/// How many events of one type the durable log holds for the fixture session.
+async fn durable_event_count(fixture: &ReadApiFixture, event_type: &str) -> usize {
+    fixture
+        .events
+        .replay("ses_reads", None)
+        .await
+        .expect("the durable event log replays")
+        .iter()
+        .filter(|event| event.event_type() == event_type)
+        .count()
+}
+
+/// Two replies to one recovered permission leave one decision and one event.
+///
+/// The input is the one the review named: a pending `human_request` permission row with
+/// no live asker in this process — what `zuno serve` finds after a restart — replied to
+/// twice, `always` and `reject`. The recovered branch used to have no live entry to
+/// consult and no dedup, so both replies held a claim before either wrote, and
+/// publishing `permission.v2.replied` before the write committed two contradictory
+/// authorization decisions to the log that clients rebuild state from while only one of
+/// them reached the audit row.
+///
+/// The write lock below is what makes the overlap deterministic: the first reply parks
+/// inside its transaction, so the second one arrives while the row is still `pending`.
+/// A claim is now a single transition, so the second reply is refused *there* — without
+/// waiting for a write it will not perform — and only one decision, one event and one
+/// audit row exist afterwards.
+#[tokio::test]
+async fn api_two_replies_to_one_recovered_permission_publish_one_decision() {
+    let fixture = ReadApiFixture::new();
+    fixture.seed_session_messages(0, -1);
+    let (app, _requests) = durable_request_app(&fixture);
+    recovered_request(
+        &fixture.pool,
+        "per_recovered",
+        zuno_db::human_request::HumanRequestKind::Permission,
+        json!({
+            "id": "per_recovered",
+            // `zuno_permission::PermissionRequest` is `camelCase`, so this is the exact
+            // key `write_permission_row` stores and the recovery path reads.
+            "sessionId": "ses_reads",
+            "permission": "shell",
+            "patterns": ["git push"],
+            "metadata": {},
+            "always": [],
+        }),
+    );
+
+    // Holding the database's write lock is what makes the overlap deterministic: the
+    // first reply reaches its write and parks there, so the second reply claims the same
+    // pending row before any decision has been committed. That is the state two
+    // concurrent HTTP replies race into, without depending on thread timing.
+    let blocker = fixture.pool.get().expect("blocking connection");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("the test holds the write lock");
+    let mut always = std::pin::pin!(app.clone().oneshot(request(
+        Method::POST,
+        "/api/session/ses_reads/permission/per_recovered/reply",
+        Some(json!({"reply": "always"})),
+    )));
+    let mut reject = std::pin::pin!(app.clone().oneshot(request(
+        Method::POST,
+        "/api/session/ses_reads/permission/per_recovered/reply",
+        Some(json!({"reply": "reject"})),
+    )));
+    assert!(
+        futures::poll!(always.as_mut()).is_pending(),
+        "the first reply parks on its durable write"
+    );
+    // The second reply answers while the first is still inside its transaction, so the
+    // refusal comes from the claim itself rather than from a second write racing the
+    // first one.
+    let ceiling = std::time::Instant::now() + Duration::from_secs(60);
+    let losing = loop {
+        if let std::task::Poll::Ready(response) = futures::poll!(reject.as_mut()) {
+            break response.expect("the second reply responds");
+        }
+        assert!(
+            futures::poll!(always.as_mut()).is_pending(),
+            "the first reply must still hold the row while the second is refused"
+        );
+        assert!(
+            std::time::Instant::now() < ceiling,
+            "the second reply never answered"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    assert_eq!(
+        losing.status(),
+        StatusCode::NOT_FOUND,
+        "a request another reply already owns has to be refused, not settled a second time"
+    );
+    blocker
+        .execute_batch("ROLLBACK")
+        .expect("the test releases the write lock");
+    drop(blocker);
+    assert_eq!(
+        always.await.expect("the first reply responds").status(),
+        StatusCode::NO_CONTENT,
+        "the reply that owns the request must still be accepted"
+    );
+    assert_eq!(
+        durable_event_count(&fixture, "permission.v2.replied").await,
+        1,
+        "a published reply must describe a write that landed"
+    );
+    let settled = zuno_db::human_request::HumanRequestStore::new(Arc::clone(&fixture.pool))
+        .get("per_recovered")
+        .expect("the audit row reads")
+        .expect("the recovered request is still on disk");
+    assert_eq!(
+        settled.state,
+        zuno_db::human_request::HumanRequestState::Answered
+    );
+    let published = fixture
+        .events
+        .replay("ses_reads", None)
+        .await
+        .expect("the durable event log replays")
+        .into_iter()
+        .find(|event| event.event_type() == "permission.v2.replied")
+        .expect("the accepted reply published its event");
+    assert_eq!(
+        published.properties().get("reply"),
+        settled
+            .response
+            .as_ref()
+            .and_then(|response| response.get("reply")),
+        "the event and the audit row must agree on which reply won"
+    );
+}
+
+/// The same input against `question_reply`, which the review called identical.
+///
+/// A recovered question is answered through `answer_with_input`, so its write and its
+/// model-visible inbox input commit together and the event follows the write. Two
+/// claims still publish only one `question.v2.replied`.
+#[tokio::test]
+async fn api_two_answers_to_one_recovered_question_publish_one_decision() {
+    let fixture = ReadApiFixture::new();
+    fixture.seed_session_messages(0, -1);
+    let (app, _requests) = durable_request_app(&fixture);
+    recovered_request(
+        &fixture.pool,
+        "que_recovered",
+        zuno_db::human_request::HumanRequestKind::Input,
+        json!({
+            "source": "question",
+            "questions": [{
+                "question": "Which channel?",
+                "header": "Channel",
+                "options": [],
+                "multiple": false,
+                "custom": true
+            }],
+            "tool": null,
+        }),
+    );
+
+    // See the permission case: the lock parks the first answer inside its transaction,
+    // so the second one arrives while the row is still `pending`.
+    let blocker = fixture.pool.get().expect("blocking connection");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("the test holds the write lock");
+    let mut first = std::pin::pin!(app.clone().oneshot(request(
+        Method::POST,
+        "/api/session/ses_reads/question/que_recovered/reply",
+        Some(json!({"answers": [["first"]]})),
+    )));
+    let mut second = std::pin::pin!(app.clone().oneshot(request(
+        Method::POST,
+        "/api/session/ses_reads/question/que_recovered/reply",
+        Some(json!({"answers": [["second"]]})),
+    )));
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    let ceiling = std::time::Instant::now() + Duration::from_secs(60);
+    let losing = loop {
+        if let std::task::Poll::Ready(response) = futures::poll!(second.as_mut()) {
+            break response.expect("the second answer responds");
+        }
+        assert!(
+            futures::poll!(first.as_mut()).is_pending(),
+            "the first answer must still hold the question while the second is refused"
+        );
+        assert!(
+            std::time::Instant::now() < ceiling,
+            "the second answer never responded"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    assert_eq!(
+        losing.status(),
+        StatusCode::NOT_FOUND,
+        "a question another answer already owns has to be refused, not answered twice"
+    );
+    blocker
+        .execute_batch("ROLLBACK")
+        .expect("the test releases the write lock");
+    drop(blocker);
+    assert_eq!(
+        first.await.expect("the first answer responds").status(),
+        StatusCode::NO_CONTENT,
+        "the answer that owns the question must still be accepted"
+    );
+    assert_eq!(
+        durable_event_count(&fixture, "question.v2.replied").await,
+        1,
+        "a published answer must describe a write that landed"
+    );
+    assert_eq!(
+        SessionInbox::new(Arc::clone(&fixture.pool))
+            .pending("ses_reads")
+            .expect("the durable inbox reads")
+            .len(),
+        1,
+        "the answer that lost must not also become model-visible input"
+    );
 }

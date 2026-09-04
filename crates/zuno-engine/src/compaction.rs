@@ -220,6 +220,13 @@ pub struct CompactionBoundary {
 /// Providers reject that orphaned shape: on OpenAI-compatible APIs a `tool`
 /// message must immediately follow an assistant message carrying the matching
 /// `tool_calls`, otherwise the request receives a 400 response.
+///
+/// The returned boundary always addresses an existing entry: the retained tail is
+/// what the durable compaction marker names by message id, so a tail that starts
+/// past the end of the transcript is not a representable answer. A zero
+/// `tail_turns`, a zero `preserve_recent_tokens`, or one newest entry larger than
+/// the whole tail budget therefore still keeps that newest entry rather than
+/// selecting an empty tail.
 #[must_use]
 pub fn select_boundary(
     entries: &[TranscriptEntry],
@@ -233,9 +240,10 @@ pub fn select_boundary(
     if initial_context_end >= entries.len() {
         return None;
     }
+    let newest = entries.len() - 1;
 
     let earliest_tail_turn = if tail_turns == 0 {
-        entries.len()
+        newest
     } else {
         entries
             .iter()
@@ -246,7 +254,7 @@ pub fn select_boundary(
             .map_or(initial_context_end, |(index, _)| index)
     };
 
-    let mut raw_retained_from = entries.len();
+    let mut raw_retained_from = newest;
     let mut retained_tokens = 0_u64;
     let budget = u64::from(preserve_recent_tokens);
     for index in (earliest_tail_turn..entries.len()).rev() {
@@ -257,7 +265,6 @@ pub fn select_boundary(
         retained_tokens = next;
         raw_retained_from = index;
     }
-    raw_retained_from = raw_retained_from.max(earliest_tail_turn);
 
     let retained_from = walk_back_over_tool_pairs(entries, raw_retained_from, initial_context_end);
     (retained_from > initial_context_end).then_some(CompactionBoundary {

@@ -349,6 +349,495 @@ fn a_shell_deny_survives_the_command_builtin() {
 }
 
 #[test]
+fn a_shell_deny_survives_quoting_and_escaping_inside_the_program_token() {
+    // Reversing a surrounding quote pair and a leading `\` covered `'rm'` and `\rm`
+    // and nothing else, so every line below reached the catch-all and ran the
+    // command the user had explicitly denied.
+    for command in [
+        "r\\m -rf /tmp/build",
+        "\\r\\m -rf /tmp/build",
+        "rm\"\" -rf /tmp/build",
+        "\"\"rm -rf /tmp/build",
+        "r\"m\" -rf /tmp/build",
+        "\"r\"m -rf /tmp/build",
+        "'r'm -rf /tmp/build",
+        "r'm' -rf /tmp/build",
+        "r''m -rf /tmp/build",
+        "'r'\"m\" -rf /tmp/build",
+        "command r\\m -rf /tmp/build",
+        "'\\rm' -rf /tmp/build",
+        // cmd escapes with `^` and PowerShell with a backtick. A deny has to hold
+        // whichever interpreter runs the line.
+        "r^m -rf /tmp/build",
+        "r`m -rf /tmp/build",
+        // The program here is the single word `rm -rf`, which no host has. Refusing
+        // it anyway is the reading that fails safe.
+        "rm\" \"-rf /tmp/build",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &deny_rm_rf()),
+            PermissionAction::Deny,
+            "`{command}` is the denied command respelled"
+        );
+    }
+}
+
+#[test]
+fn a_shell_deny_survives_quoting_and_escaping_inside_an_argument() {
+    // Per-character quote removal used to be applied to the program token only, so
+    // under the configuration the permissions guide itself publishes the broad
+    // `git *` allow matched the raw line while the narrow `git push*` deny did not,
+    // and every row below evaluated to **Allow** — a silent grant, not even a
+    // prompt. Measured with a fake `git` on `PATH`: bash, dash and zsh all run each
+    // of them as `git push --force`.
+    let rules = rules_from_json(DOCUMENTED_INTERACTIVE_CONFIG);
+    for command in [
+        "git p''ush --force",
+        "git p\"ush\" --force",
+        // `\` escapes under every POSIX shell; a deny reads that dialect on every host.
+        "git pu\\sh --force",
+        "git 'push' --force",
+        "git \"push --force\"",
+        "git \"p\"ush --force",
+        "git p'us'h --force",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &rules),
+            PermissionAction::Deny,
+            "`{command}` runs `git push --force`, which the guide's example denies"
+        );
+    }
+    // An empty word is dropped: `rm '' -rf /tmp/build` passes an empty operand that
+    // `rm` reports and ignores before it removes `/tmp/build` (measured).
+    assert_eq!(
+        evaluate("shell", "rm '' -rf /tmp/build", &deny_rm_rf()),
+        PermissionAction::Deny
+    );
+    assert_eq!(
+        evaluate(
+            "shell",
+            "rm -rf 'a b'",
+            &rules_from_json(
+                r#"{"mode":"standard","rules":{"shell":{"*":"ask","rm -rf a b":"deny"}}}"#
+            )
+        ),
+        PermissionAction::Deny,
+        "a deny written unquoted reaches the quoted argument"
+    );
+    // The bounds. The reduction is deny-only, so the allow side is unchanged: the
+    // documented `git *` still grants, an allow-only ruleset still grants
+    // `git push --force`, and a rule that quotes an argument means it as written.
+    assert_eq!(
+        evaluate("shell", "git status", &rules),
+        PermissionAction::Allow
+    );
+    assert_eq!(
+        evaluate("shell", "git 'status'", &rules),
+        PermissionAction::Allow
+    );
+    let allow_only =
+        rules_from_json(r#"{"mode":"standard","rules":{"shell":{"*":"ask","git *":"allow"}}}"#);
+    assert_eq!(
+        evaluate("shell", "git push --force", &allow_only),
+        PermissionAction::Allow,
+        "without a deny, `git push --force` is exactly what `git *` grants"
+    );
+    assert_eq!(
+        evaluate("shell", "git p''ush --force", &allow_only),
+        PermissionAction::Allow
+    );
+    let quoted = rules_from_json(
+        r#"{"mode":"standard","rules":{"shell":{"*":"ask","rm -rf 'a b'":"allow","git commit -m *":"allow"}}}"#,
+    );
+    assert_eq!(
+        evaluate("shell", "rm -rf 'a b'", &quoted),
+        PermissionAction::Allow
+    );
+    assert_eq!(
+        evaluate("shell", "rm -rf a b", &quoted),
+        PermissionAction::Ask,
+        "a grant that quotes an argument does not cover the unquoted line"
+    );
+    assert_eq!(
+        evaluate("shell", "git commit -m 'x y'", &quoted),
+        PermissionAction::Allow
+    );
+}
+
+#[test]
+fn a_shell_deny_survives_an_unquoted_expansion_anywhere_in_the_line() {
+    // An unquoted parameter expansion is word-split on whitespace and an unset one
+    // vanishes, so bash and dash run every row below as the denied command (measured
+    // with fake programs on `PATH`). Under the guide's own example `git ${IFS}push
+    // --force` was a silent **Allow** — the broad `git *` matched the raw line, the
+    // narrow `git push*` did not — and with argument tokens present the
+    // program-position rows were an ask. A deny now also reads the line with each
+    // unquoted expansion as whitespace and as nothing.
+    let documented = rules_from_json(DOCUMENTED_INTERACTIVE_CONFIG);
+    for command in [
+        "git ${IFS}push --force",
+        "git${IFS}push --force",
+        "git$IFS'push' --force",
+        "git p$X''ush --force",
+        "$EMPTY git push --force",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &documented),
+            PermissionAction::Deny,
+            "`{command}` runs `git push --force`"
+        );
+    }
+    for command in [
+        "rm${IFS}-rf /tmp/build",
+        "rm$IFS-rf /tmp/build",
+        "rm -rf$IFS/tmp/build",
+        "$EMPTY rm -rf /tmp/build",
+        "`true` rm -rf /tmp/build",
+        "$PROG ${IFS}-rf /tmp/build",
+        "rm ${IFS}-rf /tmp/build",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &deny_rm_rf()),
+            PermissionAction::Deny,
+            "`{command}` runs `rm -rf /tmp/build`"
+        );
+    }
+    // The bounds. The reading is deny-only and it reads the expansion as *absent*,
+    // so an expansion that is not standing in for the denied words changes nothing:
+    // the guide's `git *` still grants ordinary variable use, and a program the
+    // shell alone can resolve is still an ask when its arguments do not fit the rule.
+    for command in [
+        "git checkout $branch",
+        "git commit -m \"$message\"",
+        "git log $range --oneline",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &documented),
+            PermissionAction::Allow,
+            "`{command}` is what `git *` grants"
+        );
+    }
+    assert_eq!(
+        evaluate("shell", "$PROG status", &deny_rm_rf()),
+        PermissionAction::Ask
+    );
+    assert_eq!(
+        evaluate("shell", "rm $file", &deny_rm_rf()),
+        PermissionAction::Ask,
+        "`rm $file` is not `rm -rf`; the reading does not turn `rm -rf*` into `rm *`"
+    );
+}
+
+#[test]
+fn a_shell_deny_survives_a_windows_style_program_path() {
+    // `\` separates a Windows path, so the file name it ends with is reached the same
+    // way `/bin/rm` is reduced to `rm`.
+    let rules =
+        rules_from_json(r#"{"mode":"standard","rules":{"shell":{"*":"ask","rm.exe *":"deny"}}}"#);
+
+    assert_eq!(
+        evaluate("shell", r"C:\Windows\System32\rm.exe -rf C:\build", &rules),
+        PermissionAction::Deny
+    );
+    assert_eq!(
+        evaluate("shell", r".\rm.exe -rf C:\build", &rules),
+        PermissionAction::Deny
+    );
+}
+
+#[test]
+fn a_shell_deny_survives_dollar_quoting_in_the_program_token() {
+    // `$'...'` is bash/zsh ANSI-C quoting and `$"..."` is bash locale quoting. Both
+    // are *quoting*, not expansion, so every line below runs `rm` under bash —
+    // measured with a fake `rm` on `PATH` — while `$` was read as an ordinary
+    // literal here and the explicit deny degraded to the catch-all `ask`.
+    for command in [
+        "r$'m' -rf /tmp/build",
+        "r$\"m\" -rf /tmp/build",
+        "rm$'' -rf /tmp/build",
+        "$'rm' -rf /tmp/build",
+        "$\"rm\" -rf /tmp/build",
+        // `\x72\x6d` spells `rm` only once it is decoded. The program is reported as
+        // unresolvable instead of guessed, and the deny fails closed on it.
+        "$'\\x72\\x6d' -rf /tmp/build",
+        // The `command` builtin can be spelled the same way.
+        "com$'m'and rm -rf /tmp/build",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &deny_rm_rf()),
+            PermissionAction::Deny,
+            "`{command}` is the denied command respelled"
+        );
+    }
+}
+
+#[test]
+fn a_shell_deny_survives_a_glob_in_the_program_token() {
+    // `bash` expands `/bin/r?` to `/bin/rm` and runs it, and the matcher reads a `?`
+    // in a *resource* as a literal character, so a program written as a glob used to
+    // match no rule at all. A program this crate cannot resolve now fails closed on
+    // the deny side instead.
+    for command in [
+        "/bin/r? -rf /tmp/build",
+        "/bin/r[m] -rf /tmp/build",
+        "/bin/r* -rf /tmp/build",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &deny_rm_rf()),
+            PermissionAction::Deny,
+            "`{command}` can expand to the denied command"
+        );
+    }
+}
+
+#[test]
+fn a_shell_deny_survives_an_unquoted_expansion_that_word_splits() {
+    // An *unquoted* expansion, substitution or glob is word-split, so its result
+    // supplies the program *and* its arguments. Measured with a fake `rm` and a fake
+    // `git` on `PATH`: bash and dash both print `FAKE-RM invoked with args: -rf
+    // /tmp/build` for the first two rows and for both quoting spellings of the
+    // program, `FAKE-GIT invoked with args: push --force` for the `git` row below,
+    // and bash, dash and zsh all run the two substitution rows. Every one of them is
+    // a single token here, so reporting only the *program* as unresolvable let the
+    // deny retry compare the bare rule program (`rm`) against `rm -rf*` and match
+    // nothing, and the explicit prohibition degraded to `ask`.
+    //
+    // The `rm'` row is the one spelling of the five that no shell runs -- bash says
+    // "unexpected EOF while looking for matching `''", dash "Unterminated quoted
+    // string", zsh "unmatched '", and pwsh exits 1 without running anything. A token
+    // no dialect can read is still not statically resolvable, and answering `ask`
+    // because of that would be the same silent non-match, so it fails closed too.
+    for command in [
+        "rm${IFS}-rf${IFS}/tmp/build",
+        "rm$IFS-rf$IFS/tmp/build",
+        "rm'${IFS}-rf${IFS}/tmp/build",
+        "$(echo rm -rf /tmp/build)",
+        "`echo rm -rf /tmp/build`",
+        "rm''${IFS}-rf${IFS}/tmp/build",
+        "r$'m'${IFS}-rf${IFS}/tmp/build",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &deny_rm_rf()),
+            PermissionAction::Deny,
+            "`{command}` runs the denied command, and a line this crate cannot read \
+             at all has to assume it does"
+        );
+    }
+    // It is not `rm`-specific.
+    let deny_push =
+        rules_from_json(r#"{"mode":"standard","rules":{"shell":{"*":"ask","git push*":"deny"}}}"#);
+    assert_eq!(
+        evaluate("shell", "git${IFS}push${IFS}--force", &deny_push),
+        PermissionAction::Deny
+    );
+    // The bound. A *quoted* run is one word however it expands, so it supplies the
+    // program only, and where argument tokens follow the run they are still the words
+    // the shell will pass: both keep the retry that makes the arguments fit the rule.
+    for command in ["$PROG status", "\"$PROG\"", "$'\\x72\\x6d'"] {
+        assert_eq!(
+            evaluate("shell", command, &deny_rm_rf()),
+            PermissionAction::Ask,
+            "`{command}` cannot run `rm -rf ...`, so `rm -rf*` is not a deny-everything"
+        );
+    }
+}
+
+#[test]
+fn authorizing_a_long_unresolvable_command_line_stays_linear() {
+    // `merge_open_substitution` re-scanned the whole accumulated program token once
+    // per argument, which is quadratic in text the model controls, on a synchronous
+    // path inside async authorization: 1 KB took 1.1 ms here, 40 KB took 1.19 s and
+    // 120 KB took 9.59 s, all of it blocking the runtime. The scan is now carried
+    // across tokens. The ceiling is deliberately generous so a loaded box does not
+    // fail it; the quadratic version misses it by two orders of magnitude.
+    let unit = "rm -rf /tmp/build ";
+    let command = format!("`echo {}", unit.repeat(120 * 1024 / unit.len() + 1));
+    assert!(command.len() > 120 * 1024, "the fixture is 120 KB of text");
+
+    let started = std::time::Instant::now();
+    let action = evaluate("shell", &command, &deny_rm_rf());
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        action,
+        PermissionAction::Deny,
+        "an unterminated substitution is one unresolvable token, so the deny fails \
+         closed on it"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "authorizing {} bytes took {elapsed:?}",
+        command.len()
+    );
+}
+
+#[test]
+fn a_program_this_crate_cannot_resolve_fails_closed_only_where_the_rule_fits() {
+    // An expansion or a substitution can name anything, so a deny is retried with the
+    // program the *rule* names. That deliberately over-refuses — `$PROG -rf x` is
+    // refused by `rm -rf*` — but it must not degrade into denying every command.
+    let rules = deny_rm_rf();
+
+    for command in [
+        "$PROG -rf /tmp/build",
+        "`which rm` -rf /tmp/build",
+        "$(which rm) -rf /tmp/build",
+        "${RM} -rf /tmp/build",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &rules),
+            PermissionAction::Deny,
+            "`{command}` could be the denied command, and a deny that cannot tell \
+             has to assume it is"
+        );
+    }
+    assert_eq!(
+        evaluate("shell", "$PROG status", &rules),
+        PermissionAction::Ask,
+        "the arguments still have to fit the rule; `rm -rf*` is not a deny-everything"
+    );
+    assert_eq!(
+        evaluate("shell", "git commit -m \"$message\"", &rules),
+        PermissionAction::Ask,
+        "an expansion in an *argument* says nothing about which program ran"
+    );
+}
+
+#[test]
+fn an_allow_is_never_widened_by_a_dialect_the_host_may_not_be() {
+    // `$'...'` runs `rm` under bash and zsh; dash reads `r$'m'` as the program `r$m`
+    // and `$"rm"` as `$rm` (measured). A grant may not guess which of those the
+    // configured interpreter is, and it may not guess at a glob either.
+    let rules =
+        rules_from_json(r#"{"mode":"standard","rules":{"shell":{"*":"ask","rm -rf x":"allow"}}}"#);
+
+    for command in [
+        "r$'m' -rf x",
+        "$\"rm\" -rf x",
+        "rm$'' -rf x",
+        "$'\\x72\\x6d' -rf x",
+        "/bin/r? -rf x",
+    ] {
+        assert_eq!(
+            evaluate("shell", command, &rules),
+            PermissionAction::Ask,
+            "`{command}` names `rm` only under some interpreters, so it may widen a \
+             deny and never a grant"
+        );
+    }
+}
+
+#[test]
+fn an_allow_never_governs_a_program_word_that_re_partitions_the_rule() {
+    // Quote removal inside the program token is identity-preserving only while the
+    // word stays one token. A word that contains whitespace can line up with the
+    // rule's own program/argument boundary, and the matcher compares one flattened
+    // command line, so the reduction would hand the grant to a *different* file: the
+    // one literally named `/bin/rm -rf`, `./tool.sh evil` or `/usr/bin/git commit`,
+    // each of them plantable with `cp evil.sh "./tool.sh evil"` in a directory the
+    // agent can already write. Being path-shaped is orthogonal to that, so no shape
+    // of a space-containing word reaches an `allow`.
+    for (resource, pattern) in [
+        ("\"./tool.sh evil\"", "./tool.sh *"),
+        ("\"./tool.sh evil\" arg", "./tool.sh *"),
+        ("\"/bin/rm -rf\" /", "/bin/rm -rf *"),
+        ("'/bin/rm -rf' /", "/bin/rm -rf *"),
+        ("\"/usr/bin/git commit\" -m x", "/usr/bin/git commit -m *"),
+        ("\"/opt/my tool/rm\" -rf x", "/opt/my tool/rm -rf *"),
+        ("'/opt/my tool/rm' -rf x", "/opt/my tool/rm -rf *"),
+        ("\"git evil\"", "git *"),
+    ] {
+        let allow = vec![
+            rule("shell", "*", PermissionAction::Ask),
+            rule("shell", pattern, PermissionAction::Allow),
+        ];
+        assert_eq!(
+            evaluate("shell", resource, &allow),
+            PermissionAction::Ask,
+            "`{pattern}` must not grant `{resource}`, whose program word contains a \
+             space"
+        );
+        let deny = vec![
+            rule("shell", "*", PermissionAction::Ask),
+            rule("shell", pattern, PermissionAction::Deny),
+        ];
+        assert_eq!(
+            evaluate("shell", resource, &deny),
+            PermissionAction::Deny,
+            "the same respelling is still refused by a deny"
+        );
+    }
+    // The bound: the ordinary spelling of each of those rules still grants.
+    let rules = rules_from_json(
+        r#"{"mode":"standard","rules":{"shell":{"*":"ask","./tool.sh *":"allow","/opt/my tool/rm -rf *":"allow"}}}"#,
+    );
+    assert_eq!(
+        evaluate("shell", "./tool.sh evil", &rules),
+        PermissionAction::Allow,
+        "`./tool.sh` really is the program the rule names"
+    );
+    assert_eq!(
+        evaluate("shell", "/opt/my tool/rm -rf x", &rules),
+        PermissionAction::Allow,
+        "a rule whose own program path contains a space still matches the unquoted \
+         command line the caller wrote"
+    );
+}
+
+#[test]
+fn an_allow_does_not_cover_a_bare_program_name_that_contains_a_space() {
+    // `"git commit"` is looked up on `PATH`, where an executable literally named
+    // `git commit` could otherwise inherit the grant. Only a *path* is admitted.
+    let rules = rules_from_json(
+        r#"{"mode":"standard","rules":{"shell":{"*":"ask","git commit -m *":"allow"}}}"#,
+    );
+
+    assert_eq!(
+        evaluate("shell", "git commit -m x", &rules),
+        PermissionAction::Allow
+    );
+    assert_eq!(
+        evaluate("shell", "\"git commit\" -m x", &rules),
+        PermissionAction::Ask
+    );
+    assert_eq!(
+        evaluate(
+            "shell",
+            "\"git commit\" -m x",
+            &rules_from_json(
+                r#"{"mode":"standard","rules":{"shell":{"*":"ask","git commit -m *":"deny"}}}"#
+            )
+        ),
+        PermissionAction::Deny,
+        "the same respelling is still refused by a deny"
+    );
+}
+
+#[test]
+fn an_allow_rule_does_not_inherit_a_spelling_only_a_deny_may_see() {
+    let rules =
+        rules_from_json(r#"{"mode":"standard","rules":{"shell":{"*":"ask","rm -rf x":"allow"}}}"#);
+
+    assert_eq!(
+        evaluate("shell", "'r'm -rf x", &rules),
+        PermissionAction::Allow,
+        "quote removal names the same program whichever shell reads the line"
+    );
+    assert_eq!(
+        evaluate("shell", "r^m -rf x", &rules),
+        PermissionAction::Ask,
+        "removing cmd's escape character guesses the interpreter, so it may only \
+         widen a deny"
+    );
+    assert_eq!(
+        evaluate("shell", "rm\" \"-rf x", &rules),
+        PermissionAction::Ask,
+        "a grant covers the program the user named, not a different word that \
+         re-tokenizes into it"
+    );
+}
+
+#[test]
 fn the_raw_spelling_keeps_matching_the_rules_written_for_it() {
     // Normalization only ever adds spellings. A rule written against the exact text
     // a user sees in their terminal must keep working.
@@ -471,7 +960,6 @@ fn an_allow_covers_every_spelling_of_the_path_it_names() {
         "src/main.rs",
         "./src/main.rs",
         "src//main.rs",
-        "src\\main.rs",
         "./src/./main.rs",
     ] {
         assert_eq!(
@@ -480,6 +968,181 @@ fn an_allow_covers_every_spelling_of_the_path_it_names() {
             "{resource} is the same file the rule names, spelled differently"
         );
     }
+    // `\` is a separator under Windows and an ordinary character in a file name
+    // under Linux and macOS, where `src\main.rs` is a different file the agent can
+    // plant. So the backslash spelling is the same file only on Windows; a deny
+    // reads it as the same file everywhere. Both hosts are pinned from one build in
+    // `src/resource.rs` (`the_host_decides_whether_a_backslash_separates_a_path`).
+    let same_file_on_this_host = if cfg!(windows) {
+        PermissionAction::Allow
+    } else {
+        PermissionAction::Ask
+    };
+    assert_eq!(
+        evaluate("edit", "src\\main.rs", &rules),
+        same_file_on_this_host
+    );
+    assert_eq!(
+        evaluate("edit", "src\\main.rs", &path_rules(PermissionAction::Deny)),
+        PermissionAction::Deny
+    );
+}
+
+#[test]
+fn an_allow_never_governs_a_path_with_a_parent_segment() {
+    // `canonical_path_resource` keeps `..` — resolving it lexically is a guess about
+    // symlinks — and `*` spans separators, so allow `docs/*` governed
+    // `docs/../src/secret` (measured Allow for `read`): a grant scoped to one
+    // directory read a file in another. A resource with a `..` segment now satisfies
+    // no grant at all, and a deny still reads the resolved path.
+    let rules = rules_from_json(
+        r#"{"mode":"standard","rules":{"read":{"*":"ask","docs/*":"allow","src/a/b":"allow"}}}"#,
+    );
+    for resource in [
+        "docs/../src/secret",
+        "docs/x/../y",
+        "docs/../docs/a",
+        "src/a/../a/b",
+        "./docs/../src/a/b",
+    ] {
+        assert_eq!(
+            evaluate("read", resource, &rules),
+            PermissionAction::Ask,
+            "`{resource}` contains a `..` segment, so no grant names it"
+        );
+    }
+    assert_eq!(
+        evaluate("read", "docs/a", &rules),
+        PermissionAction::Allow,
+        "the bound: the directory the grant names is still granted"
+    );
+    assert_eq!(
+        evaluate(
+            "read",
+            "docs/../x",
+            &rules_from_json(r#"{"mode":"standard","rules":{"read":"allow"}}"#)
+        ),
+        PermissionAction::Ask,
+        "even a catch-all allow does not name a `..` path; it is asked about"
+    );
+    let deny = rules_from_json(
+        r#"{"mode":"standard","rules":{"read":{"*":"allow","src/*":"deny","/etc/ssh/*":"deny"}}}"#,
+    );
+    for resource in [
+        "docs/../src/secret",
+        "src/../src/secret",
+        "/etc/ssh/../ssh/id",
+        "/tmp/../etc/ssh/id",
+    ] {
+        assert_eq!(
+            evaluate("read", resource, &deny),
+            PermissionAction::Deny,
+            "a deny reads `{resource}` with `..` resolved as well"
+        );
+    }
+}
+
+#[test]
+fn separator_equivalence_is_identity_on_windows_and_deny_only_elsewhere() {
+    // The matcher used to read `\` as `/` on both sides for every action on every
+    // platform, so on Linux allow `src/a/b` governed the distinct, plantable file
+    // literally named `src/a\b`, and allow `rm -rf /tmp/x` governed
+    // `rm -rf \tmp\x`, which bash runs as `rm -rf tmpx` (measured). A path is one
+    // file under either separator on Windows only; a shell line never is, because
+    // bash removes the backslash and cmd reads `/s` as a switch.
+    let paths = rules_from_json(
+        r#"{"mode":"standard","rules":{"read":{"*":"ask","src/a/b":"allow","secrets/*":"deny"}}}"#,
+    );
+    let same_file_on_this_host = if cfg!(windows) {
+        PermissionAction::Allow
+    } else {
+        PermissionAction::Ask
+    };
+    for resource in ["src/a\\b", "src\\a\\b"] {
+        assert_eq!(
+            evaluate("read", resource, &paths),
+            same_file_on_this_host,
+            "`{resource}` names the granted file only where `\\` is a separator"
+        );
+    }
+    for resource in ["secrets\\x", "secrets/a\\b"] {
+        assert_eq!(
+            evaluate("read", resource, &paths),
+            PermissionAction::Deny,
+            "a deny reads `\\` as `/` on every platform"
+        );
+    }
+    let shell = rules_from_json(
+        r#"{"mode":"standard","rules":{"shell":{"*":"ask","rm -rf /tmp/x":"allow","rm -rf /tmp/y":"deny"}}}"#,
+    );
+    assert_eq!(
+        evaluate("shell", "rm -rf /tmp/x", &shell),
+        PermissionAction::Allow
+    );
+    assert_eq!(
+        evaluate("shell", "rm -rf \\tmp\\x", &shell),
+        PermissionAction::Ask,
+        "bash runs this as `rm -rf tmpx`, a different file, so the grant does not reach it"
+    );
+    assert_eq!(
+        evaluate("shell", "rm -rf \\tmp\\y", &shell),
+        PermissionAction::Deny,
+        "the deny still reads the other separator"
+    );
+}
+
+#[test]
+fn a_deny_folds_case_on_every_platform_and_an_allow_never_does() {
+    // Case folding used to be applied under `cfg(windows)` only, and there to both
+    // sides. macOS's default volume is case-insensitive, so `RM -rf /` ran `/bin/rm`
+    // past a deny written `rm -rf*`; and on Windows the fold on the identity side
+    // widened an allow inside a case-sensitive NTFS directory. A case-folded spelling
+    // is a deny-side spelling on every platform and an identity spelling on none —
+    // an allow on Windows that used to match by case now needs the exact case.
+    for command in ["RM -rf /", "Rm -Rf /", "rM -RF /tmp/build"] {
+        assert_eq!(
+            evaluate("shell", command, &deny_rm_rf()),
+            PermissionAction::Deny,
+            "`{command}` runs the denied command on a case-insensitive volume"
+        );
+    }
+    let allow =
+        rules_from_json(r#"{"mode":"standard","rules":{"shell":{"*":"ask","rm -rf x":"allow"}}}"#);
+    assert_eq!(
+        evaluate("shell", "rm -rf x", &allow),
+        PermissionAction::Allow
+    );
+    for command in ["RM -rf x", "rm -RF X"] {
+        assert_eq!(
+            evaluate("shell", command, &allow),
+            PermissionAction::Ask,
+            "`{command}` is not the spelling the grant names, on any host"
+        );
+    }
+    let paths = rules_from_json(
+        r#"{"mode":"standard","rules":{"read":{"*":"ask","src/a/b":"allow","secrets/*":"deny"}}}"#,
+    );
+    assert_eq!(evaluate("read", "src/a/b", &paths), PermissionAction::Allow);
+    assert_eq!(evaluate("read", "SRC/A/B", &paths), PermissionAction::Ask);
+    assert_eq!(
+        evaluate("read", "SECRETS/x", &paths),
+        PermissionAction::Deny
+    );
+    assert_eq!(
+        evaluate("read", "Secrets/X", &paths),
+        PermissionAction::Deny
+    );
+}
+
+#[test]
+fn a_rule_key_is_folded_for_a_deny_only() {
+    // The permission key goes through the same primitive, so it follows the same
+    // rule: a prohibition written `Shell` holds on every platform, a grant written
+    // that way governs nothing.
+    let deny = rules_from_json(r#"{"mode":"standard","rules":{"Shell":{"*":"deny"}}}"#);
+    assert_eq!(evaluate("shell", "rm -rf /", &deny), PermissionAction::Deny);
+    let allow = rules_from_json(r#"{"mode":"standard","rules":{"Shell":{"*":"allow"}}}"#);
+    assert_eq!(evaluate("shell", "ls", &allow), PermissionAction::Ask);
 }
 
 #[test]

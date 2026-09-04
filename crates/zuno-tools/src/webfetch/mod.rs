@@ -133,6 +133,37 @@ enum WebFetchTransport {
     Raw(reqwest::Client),
 }
 
+impl WebFetchTransport {
+    /// This transport with its connection-establishment budget derived from `budget`,
+    /// the caller's whole allowance for one call.
+    ///
+    /// The shared client carries the 10-second per-address default, which is unrelated
+    /// to what the caller can afford: a `timeout: 5` call against a host whose first
+    /// address completes TCP and then goes silent spent all five seconds on that
+    /// address and never reached the healthy second one — an outcome the owner of any
+    /// DNS zone the model is told to read can produce on demand. One address may now
+    /// spend a third of the budget, so a second and a third address are still reachable
+    /// inside it; `with_establish_timeout` clamps into `[100ms, 10s]`, so a caller can
+    /// only tighten the shared default, never widen it, and the clone is cheap — the TLS
+    /// configuration and the resolver are shared, only the `Duration` differs.
+    fn for_budget(&self, budget: Duration) -> Self {
+        match self {
+            Self::Public(client) => Self::Public(std::sync::Arc::new(
+                PublicHttpClient::clone(client).with_establish_timeout(establish_share(budget)),
+            )),
+            Self::Raw(client) => Self::Raw(client.clone()),
+        }
+    }
+}
+
+/// The share of a call's budget one address may spend establishing a connection.
+///
+/// A third, so that when the first validated address stalls the client still has two
+/// more attempts inside the same budget rather than a timeout with nothing tried.
+fn establish_share(budget: Duration) -> Duration {
+    budget / 3
+}
+
 enum FetchResponse {
     Public(PublicHttpResponse),
     Raw(reqwest::Response),
@@ -255,20 +286,20 @@ impl WebFetchTool {
     /// because the browser user agent does not match this client's TLS fingerprint,
     /// so claiming to be Chrome is what triggers the block.
     async fn send(
-        &self,
+        transport: &WebFetchTransport,
         target: &PublicTarget,
         format: Format,
         ctx: &ToolContext,
     ) -> Result<FetchResponse, WebError> {
-        let first = self.get(target, format, BROWSER_USER_AGENT, ctx).await?;
+        let first = Self::get(transport, target, format, BROWSER_USER_AGENT, ctx).await?;
         if is_cloudflare_challenge(&first) {
-            return self.get(target, format, HONEST_USER_AGENT, ctx).await;
+            return Self::get(transport, target, format, HONEST_USER_AGENT, ctx).await;
         }
         Ok(first)
     }
 
     async fn get(
-        &self,
+        transport: &WebFetchTransport,
         target: &PublicTarget,
         format: Format,
         user_agent: &str,
@@ -289,7 +320,7 @@ impl WebFetchTool {
             reqwest::header::HeaderValue::from_static("en-US,en;q=0.9"),
         );
         let request = async {
-            match &self.transport {
+            match transport {
                 WebFetchTransport::Public(client) => client
                     .get(target.clone(), headers)
                     .await
@@ -314,14 +345,17 @@ impl WebFetchTool {
     }
 
     /// Everything after argument validation and permission, under one time budget.
+    ///
+    /// `transport` is the per-call transport from [`WebFetchTransport::for_budget`], not
+    /// the shared one, so the establishment budget it carries is the caller's.
     async fn fetch(
-        &self,
+        transport: &WebFetchTransport,
         params: &WebFetchParams,
         target: &PublicTarget,
         ctx: &ToolContext,
         progress: &FetchProgress,
     ) -> Result<ToolOutput, WebError> {
-        let response = self.send(target, params.format, ctx).await?;
+        let response = Self::send(transport, target, params.format, ctx).await?;
         progress.set_route(response.route());
 
         let status = response.status();
@@ -412,7 +446,8 @@ impl TypedTool for WebFetchTool {
         .await?;
 
         let budget = resolve_timeout(params.timeout);
-        let initial_route = match &self.transport {
+        let transport = self.transport.for_budget(budget);
+        let initial_route = match &transport {
             WebFetchTransport::Public(client) => client
                 .route_label(&target)
                 .unwrap_or("proxy_configuration")
@@ -420,7 +455,12 @@ impl TypedTool for WebFetchTool {
             WebFetchTransport::Raw(_) => "direct_test".to_owned(),
         };
         let progress = FetchProgress::new(initial_route);
-        match tokio::time::timeout(budget, self.fetch(&params, &target, &ctx, &progress)).await {
+        match tokio::time::timeout(
+            budget,
+            Self::fetch(&transport, &params, &target, &ctx, &progress),
+        )
+        .await
+        {
             Ok(result) => result.map_err(failed),
             Err(_elapsed) => Err(ToolError::NetworkTimeout {
                 tool: ID.to_owned(),
@@ -689,5 +729,59 @@ mod tests {
     #[test]
     fn the_content_type_parameters_are_stripped_from_the_mime() {
         assert_eq!(mime_of("Text/HTML; charset=UTF-8"), "text/html");
+    }
+
+    fn establish_timeout_of(transport: &WebFetchTransport) -> String {
+        let WebFetchTransport::Public(client) = transport else {
+            panic!("the shipped tool uses the public transport");
+        };
+        let rendered = format!("{client:?}");
+        let start = rendered
+            .find("establish_timeout: ")
+            .expect("the transport reports its establishment budget");
+        rendered[start + "establish_timeout: ".len()..]
+            .split([',', ' ', '}'])
+            .next()
+            .expect("a duration follows the field name")
+            .to_owned()
+    }
+
+    /// `with_establish_timeout` had a provider and tests but no production caller, so
+    /// every real fetch ran with the 10-second per-address default whatever the caller's
+    /// `timeout`. The per-call transport carries a third of the budget instead.
+    #[test]
+    fn the_establishment_budget_follows_the_callers_timeout() {
+        let tool = WebFetchTool::new();
+        assert_eq!(establish_timeout_of(&tool.transport), "10s");
+
+        let five_seconds = tool.transport.for_budget(resolve_timeout(Some(5)));
+        assert!(
+            establish_timeout_of(&five_seconds).starts_with("1.666"),
+            "a 5s call gives one address a third of it: {}",
+            establish_timeout_of(&five_seconds)
+        );
+
+        let thirty_seconds = tool.transport.for_budget(resolve_timeout(None));
+        assert_eq!(
+            establish_timeout_of(&thirty_seconds),
+            "10s",
+            "the default 30s budget cannot widen the 10s shared ceiling"
+        );
+
+        let maximum = tool.transport.for_budget(resolve_timeout(Some(600)));
+        assert_eq!(establish_timeout_of(&maximum), "10s");
+
+        let one_second = tool.transport.for_budget(Duration::from_secs(1));
+        assert!(
+            establish_timeout_of(&one_second).starts_with("333.333"),
+            "{}",
+            establish_timeout_of(&one_second)
+        );
+
+        assert_eq!(
+            establish_timeout_of(&tool.transport),
+            "10s",
+            "deriving a per-call transport leaves the shared client untouched"
+        );
     }
 }

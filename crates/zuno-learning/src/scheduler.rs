@@ -11,6 +11,22 @@ use zuno_db::learning_job::{
     LeaseReconciliation, NewLearningJob,
 };
 
+/// How many times one learning job may be handed to a worker before it is settled
+/// `Failed` instead of claimed again.
+///
+/// `LearningJobStore::claim_due` increments `attempt` and never reads it, and
+/// `reconcile_expired` requeues any expired `running` extraction unconditionally, so
+/// without a cap a job that can never succeed is re-claimed on every lease cycle —
+/// and each cycle of an extraction job is a full paid model call. Three is chosen so
+/// the genuinely recoverable causes still recover (SQLite contention, a lost lease
+/// across a restart, one provider hiccup) while a permanent failure that the worker
+/// reports without settling stops costing tokens.
+///
+/// This is the consumer-side half of the bound. The store-side half — refusing to
+/// requeue or claim an over-cap row in SQL, so a caller that bypasses this scheduler
+/// is bounded too — is an integrator seam in `zuno-db`, which this lane does not own.
+const MAX_JOB_ATTEMPTS: u32 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletedTaskSignals {
     pub completed: bool,
@@ -180,17 +196,19 @@ impl LearningScheduler {
         })
     }
 
+    /// Claim the next due job, unless it has already exhausted [`MAX_JOB_ATTEMPTS`].
     pub fn claim_due(
         &self,
         owner_id: &str,
         now: i64,
         lease_expires: i64,
     ) -> Result<Option<LearningJobRecord>> {
-        self.jobs
-            .claim_due(owner_id, now, lease_expires)
-            .map_err(Into::into)
+        let claimed = self.jobs.claim_due(owner_id, now, lease_expires)?;
+        self.bound_attempts(claimed, owner_id, now)
     }
 
+    /// Claim the next due job for one project, unless it has already exhausted
+    /// [`MAX_JOB_ATTEMPTS`].
     pub fn claim_due_for_project(
         &self,
         project_id: &str,
@@ -198,11 +216,13 @@ impl LearningScheduler {
         now: i64,
         lease_expires: i64,
     ) -> Result<Option<LearningJobRecord>> {
-        self.jobs
-            .claim_due_for_project(project_id, owner_id, now, lease_expires)
-            .map_err(Into::into)
+        let claimed = self
+            .jobs
+            .claim_due_for_project(project_id, owner_id, now, lease_expires)?;
+        self.bound_attempts(claimed, owner_id, now)
     }
 
+    /// Claim one known job, unless it has already exhausted [`MAX_JOB_ATTEMPTS`].
     pub fn claim(
         &self,
         job_id: &str,
@@ -210,9 +230,50 @@ impl LearningScheduler {
         now: i64,
         lease_expires: i64,
     ) -> Result<Option<LearningJobRecord>> {
-        self.jobs
-            .claim(job_id, owner_id, now, lease_expires)
-            .map_err(Into::into)
+        let claimed = self.jobs.claim(job_id, owner_id, now, lease_expires)?;
+        self.bound_attempts(claimed, owner_id, now)
+    }
+
+    /// Settle a job that has been handed out too many times instead of running it
+    /// again.
+    ///
+    /// The check runs after the claim because `attempt` is incremented by the claim
+    /// itself and because settling requires holding the lease. `None` is returned for
+    /// a capped job, which every caller already treats as "no work", so no worker
+    /// spends a model call on it.
+    fn bound_attempts(
+        &self,
+        claimed: Option<LearningJobRecord>,
+        owner_id: &str,
+        now: i64,
+    ) -> Result<Option<LearningJobRecord>> {
+        let Some(record) = claimed else {
+            return Ok(None);
+        };
+        if record.attempt <= MAX_JOB_ATTEMPTS {
+            return Ok(Some(record));
+        }
+        // Best effort by construction: if settling fails the row stays `running`, the
+        // reconciler requeues it, and this cap refuses it again on the next claim, so
+        // the failure cannot turn into work. Reporting the settle error instead would
+        // replace a bounded, silent no-op with an error the callers treat as fatal.
+        let _ = self.jobs.settle(
+            &record.id,
+            owner_id,
+            LearningJobStatus::Failed,
+            None,
+            Some(&format!(
+                "learning job stopped after {} attempts without a durable result; the last \
+                 recorded error was {}",
+                record.attempt,
+                record
+                    .error
+                    .as_deref()
+                    .unwrap_or("not recorded by the worker"),
+            )),
+            now,
+        );
+        Ok(None)
     }
 
     pub fn fail(&self, job_id: &str, owner_id: &str, error: &str, now: i64) -> Result<()> {
@@ -376,6 +437,99 @@ mod tests {
                 .expect("existing"),
             LearningScheduleOutcome::Existing(_)
         ));
+    }
+
+    /// The second half of the unbounded-requeue fix, independent of whether the
+    /// worker settles the row.
+    ///
+    /// `LearningJobStore::claim_due` only increments `attempt` and never reads it, and
+    /// `reconcile_expired` requeues an expired `running` extraction unconditionally,
+    /// so a worker that reports a failure without settling (the live post-turn path
+    /// only logs it) produced `requeued: 1` with `attempt` climbing 2, 3, 4, 5 and
+    /// status still `Running`, each cycle a full paid model extraction. The cap
+    /// settles the row instead of handing it out again.
+    #[test]
+    fn a_job_that_exhausts_its_attempts_is_settled_instead_of_reclaimed() {
+        let pool = Arc::new(zuno_db::Pool::open(&DbLocation::Memory).expect("pool"));
+        {
+            let mut connection = pool.get().expect("connection");
+            migration::apply(&mut connection).expect("schema");
+            connection
+                .execute_batch(
+                    "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+                     VALUES ('project-1', '/workspace', 1, 1, '[]');
+                     INSERT INTO session
+                       (id, project_id, slug, directory, title, version, time_created, time_updated)
+                     VALUES ('session-1', 'project-1', 'slug', '/workspace', 'title', '1', 1, 1);
+                     INSERT INTO message (id, session_id, time_created, time_updated, data)
+                     VALUES ('assistant-1', 'session-1', 1, 1, '{\"role\":\"assistant\"}');",
+                )
+                .expect("fixture");
+        }
+        let scheduler = LearningScheduler::new(
+            Arc::clone(&pool),
+            ResolvedLearningConfig {
+                enabled: true,
+                extractor_model: Some("provider/extractor-v1".to_owned()),
+                ..ResolvedLearningConfig::default()
+            },
+        );
+        let jobs = LearningJobStore::new(pool);
+        jobs.enqueue(NewLearningJob::extraction(
+            "job-capped",
+            "project-1",
+            "session-1",
+            "assistant-1",
+            "extractor-v1",
+            json!({}),
+            10,
+        ))
+        .expect("enqueue");
+
+        // A worker that never settles the row: claim, let the lease expire, requeue.
+        let mut now = 11_i64;
+        let mut claimed_attempts = Vec::new();
+        for _ in 0..6 {
+            if let Some(record) = scheduler
+                .claim_due("worker-1", now, now + 10)
+                .expect("claim")
+            {
+                claimed_attempts.push(record.attempt);
+            }
+            now += 20;
+            scheduler.reconcile_expired(now).expect("reconcile");
+            now += 1;
+        }
+
+        assert_eq!(
+            claimed_attempts,
+            vec![1, 2, 3],
+            "a job may only be handed to a worker MAX_JOB_ATTEMPTS times"
+        );
+        let job = jobs.get("job-capped").expect("job");
+        assert_eq!(job.status, LearningJobStatus::Failed);
+        assert!(job.owner_id.is_none());
+        assert!(
+            job.error
+                .as_deref()
+                .is_some_and(|error| error.contains("stopped after 4 attempts")),
+            "unexpected settled error: {:?}",
+            job.error
+        );
+        // Terminal, so the reconciler has nothing left to requeue.
+        assert_eq!(
+            scheduler
+                .reconcile_expired(now + 100)
+                .expect("reconcile")
+                .requeued,
+            0
+        );
+        assert!(
+            scheduler
+                .claim_due("worker-1", now + 101, now + 200)
+                .expect("claim")
+                .is_none()
+        );
     }
 
     #[test]

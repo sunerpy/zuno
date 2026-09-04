@@ -792,14 +792,25 @@ impl Store {
     ///
     /// The *capture* covers the whole worktree; this report is narrowed to
     /// [`Location::directory`].
+    ///
+    /// # Errors
+    ///
+    /// Refused with [`SnapshotError::UndecodableWorktree`] when the worktree root's
+    /// bytes are not valid UTF-8. These paths are absolute, so a lossy root would name
+    /// files that do not exist; capture, restore and undo emit no absolute path and
+    /// keep working. See [`Store::worktree_text`].
     pub fn patch(&self, hash: &str) -> Result<Patch> {
+        // Decoded before anything else, so a root that cannot be rendered refuses the
+        // report instead of naming files that do not exist — and refuses it before
+        // `add` writes the store index. See `Store::worktree_text`.
+        let worktree = self.worktree_text()?;
         let _guard = lock::acquire(&self.git_dir);
         // Exclusions belong to the capture that produced a tree and reach callers
         // through `Store::capture`; this is a reporting view over one.
         drop(self.add()?);
 
         let mut argv = self.scoped(QUOTE);
-        argv.extend(["diff", "--cached", "--no-ext-diff", "--name-only"])
+        argv.extend(["diff", "--cached", "--no-ext-diff", "--name-only", "-z"])
             .push(hash)
             .extend(["--", "."]);
         let output = self.run(&argv, &self.location.directory, None)?;
@@ -811,23 +822,28 @@ impl Store {
             });
         }
 
-        let files: Vec<String> = output
-            .text(&argv.display())?
-            .trim()
-            .split('\n')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_owned)
-            .collect();
+        // NUL separation for the same reason as `diff_paths` and `list_changes`: a
+        // line-wise read of `--name-only` receives one C-quoted field for a path
+        // holding a newline or a quote, so the report would name a file that does not
+        // exist and omit the one that changed.
+        let files = git::split_nul(&output.text(&argv.display())?);
         let ignored = self.ignore(&files)?;
-        let worktree = self.location.worktree.to_string_lossy().into_owned();
 
         Ok(Patch {
             hash: hash.to_owned(),
             files: files
                 .into_iter()
                 .filter(|item| !ignored.contains(item))
-                .map(|item| node_path::join(&worktree, &item).replace('\\', "/"))
+                .map(|item| {
+                    // `node_path::join` re-emits the native separator, and this report
+                    // is documented as forward-slashed, so only the *platform*
+                    // separator may be rewritten. A literal `\` is an ordinary
+                    // filename character on Unix and macOS: replacing it there named
+                    // `<worktree>/we/ird.txt` for a modified `we\ird.txt` — a path
+                    // that does not exist — and lost the file that changed. On Windows
+                    // `MAIN_SEPARATOR` is `\`, so this is byte-identical there.
+                    node_path::join(&worktree, &item).replace(std::path::MAIN_SEPARATOR, "/")
+                })
                 .collect(),
         })
     }
@@ -911,6 +927,41 @@ impl Store {
     }
 
     // -- internals ----------------------------------------------------------
+
+    /// The worktree root as text, refused rather than lossily substituted.
+    ///
+    /// # Why the substitution had to go
+    ///
+    /// [`Store::patch`] is the one report built by joining this root onto Git's
+    /// worktree-relative paths, so `to_string_lossy` here reported paths that do not
+    /// exist. The comment this replaces claimed the case was unreachable because
+    /// [`Store::sync`] decodes an absolute path *containing* the root first, through
+    /// `rev-parse --path-format=absolute --git-path info/exclude`. It does not:
+    /// `info/exclude` resolves to `$GIT_COMMON_DIR`, which for a linked worktree or a
+    /// submodule lives under the **main** repository and holds none of the worktree
+    /// root's bytes. Measured on git 2.43.0 in a linked worktree named `wt\xff`: that
+    /// pre-flight returned `<main>/.git/info/exclude` and decoded fine, `track` and
+    /// `capture` both succeeded, and `patch` reported two `U+FFFD` absolute paths
+    /// whose `Path::exists()` was false. [`Store::ignore`] cannot intercept them
+    /// either — `--git-dir <worktree>/.git` is a *file* in a linked worktree, so that
+    /// probe fails and yields an empty set. Zuno itself develops in linked worktrees
+    /// and `zuno debug snapshot patch` reaches this, so the root is decoded here and
+    /// both repository shapes now fail closed the same way.
+    ///
+    /// `OsStr::as_encoded_bytes` is exactly the UTF-8 of every root that decodes and a
+    /// superset of it otherwise, so this is the decision `to_str` makes, keeping the
+    /// failure position for the message. The bytes themselves never reach the message.
+    fn worktree_text(&self) -> Result<String> {
+        let raw = self
+            .location
+            .worktree
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec();
+        String::from_utf8(raw).map_err(|error| SnapshotError::UndecodableWorktree {
+            valid_up_to: error.utf8_error().valid_up_to(),
+        })
+    }
 
     /// `[...flags, "--git-dir", gitdir, "--work-tree", worktree]`, the prefix the
     /// oracle builds as `[...quote, ...args([...])]`.
@@ -1065,30 +1116,51 @@ impl Store {
         Ok(Some(path))
     }
 
-    /// Mirror the source repository's `info/exclude` into the store, plus one
-    /// `/`-anchored entry per path in `extra`.
-    fn sync(&self, extra: &[String]) -> Result<()> {
-        let source = self.rev_parse_path(&["--git-path", "info/exclude"])?;
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(file) = source {
-            let text = fs::read_to_string(&file).unwrap_or_default();
-            let trimmed = text.trim_end();
-            if !trimmed.is_empty() {
-                parts.push(trimmed.to_owned());
-            }
-        }
-        for item in extra {
-            parts.push(format!("/{}", item.replace('\\', "/")));
-        }
+    /// Mirror the source repository's `info/exclude` into the store, and nothing else.
+    ///
+    /// # Why no entry is derived from a filename
+    ///
+    /// The store's exclude file holds exactly the user's own patterns. An earlier
+    /// version appended one `/`-anchored entry per oversized untracked path, which let
+    /// one file's *name* exclude a different file: the file is wildmatch and
+    /// line-separated, so `\`, `*`, `?`, `[`, `]` and a space are operators and a name
+    /// holding a newline became two patterns — an oversized `big<LF>file.bin` wrote
+    /// `/big` and `file.bin` and the user's changed `file.bin` left the capture.
+    ///
+    /// Escaping those operators is not a fix, only a narrower version of the same bug.
+    /// Git folds case while matching `info/exclude` whenever `core.ignorecase` is on —
+    /// the value `git init` writes for itself on APFS and NTFS, so it is the default on
+    /// macOS and Windows, and one a user may set globally on any platform. Measured on
+    /// git 2.43.0: with `/HUGE.BIN` in `info/exclude`, `ls-files --others
+    /// --exclude-standard` returns `huge.bin keep.txt` under `core.ignorecase=false`
+    /// and only `keep.txt` under `true`. So an oversized `HUGE.BIN` silently removed a
+    /// changed `huge.bin` from the capture, and the loss was unreportable by
+    /// construction: [`Store::stage`]'s `git add` refuses an explicitly named,
+    /// now-ignored path with exit 1, and the read-back that decides what to report,
+    /// [`Store::unstaged_among`], re-runs the same filtered `ls-files`.
+    ///
+    /// Nothing is lost by dropping the entries, because they were never what kept an
+    /// oversized file out of the tree: [`Store::plan`] removes such a path from the
+    /// staged set by exact name and [`Store::stage`] passes only `:(top,literal)`
+    /// pathspecs, so the file is never offered to `git add` in the first place. The
+    /// user's own `info/exclude` remains the one lever that adds a pattern here, and it
+    /// can no longer be shadowed by a generated one.
+    fn sync(&self) -> Result<()> {
+        let mirrored = match self.rev_parse_path(&["--git-path", "info/exclude"])? {
+            // A source file that cannot be read is the same as an empty one: these are
+            // the user's optional local patterns, not durable store state.
+            Some(file) => fs::read_to_string(&file).unwrap_or_default(),
+            None => String::new(),
+        };
+        let trimmed = mirrored.trim_end();
+        let contents = if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}\n")
+        };
 
         let info = self.git_dir.join("info");
         self.create_dir(&info)?;
-        let text = parts.join("\n");
-        let contents = if text.is_empty() {
-            String::new()
-        } else {
-            format!("{text}\n")
-        };
         self.write(&info.join("exclude"), &contents)
     }
 
@@ -1298,7 +1370,7 @@ impl Store {
 
     /// What the next `add` will stage, and what it will leave out.
     fn plan(&self) -> Result<StagePlan> {
-        self.sync(&[])?;
+        self.sync()?;
         let (tracked, untracked) = self.list_changes()?;
         let untracked_set: HashSet<&String> = untracked.iter().collect();
 
@@ -1334,14 +1406,16 @@ impl Store {
             .collect();
 
         // An untracked file over the limit is excluded rather than stored, so a
-        // stray multi-gigabyte artifact cannot bloat the object database.
+        // stray multi-gigabyte artifact cannot bloat the object database. The whole
+        // guarantee is this exact-name filter plus `stage`'s `:(top,literal)`
+        // pathspecs: no `info/exclude` pattern is derived from these names, because a
+        // pattern built from one name can match a different file. See `sync`.
         let mut oversized: Vec<String> = allow
             .iter()
             .filter(|item| untracked_set.contains(*item) && self.is_large(item))
             .cloned()
             .collect();
         oversized.sort();
-        self.sync(&oversized)?;
 
         let blocked: HashSet<&String> = oversized.iter().collect();
         let stage: Vec<String> = allow

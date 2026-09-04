@@ -1758,10 +1758,24 @@ pub fn subtree(connection: &Connection, id: &str) -> Result<Vec<String>, DbError
 ///    `session_input`, `session_context_epoch`, `session_share`, `agent_job`,
 ///    `work_plan`, `work_plan_archive`, `work_item`, and reflection delivery
 ///    rows, and reaches `part` through `message`;
-/// 2. `DELETE FROM part WHERE session_id = ?`, the sweep for parts the cascade
-///    could not see;
-/// 3. `DELETE FROM event_sequence`, then `DELETE FROM event`, keyed by
-///    `aggregate_id` (`event.ts:513-523`).
+/// 2. `DELETE FROM event`, keyed by `aggregate_id` (`event.ts:513-523`), which the
+///    `event_sequence` sweep below also cascades to whenever the `foreign_keys`
+///    pragma is on, and which is named anyway so this does not depend on it;
+/// 3. the sweep over every session-keyed table no foreign key covers, which
+///    [`crate::session_keys::uncascaded`] reads out of the live schema: today
+///    `event_sequence`, `human_request`, `part`, `provider_retry_backoff`, and
+///    `verification_receipt`.
+///
+/// The enumeration is not written down here, and it is not written down twice.
+/// Sweeping four of the five such tables is what leaked the user's own text —
+/// `human_request.payload` and `response` hold a question and the answer given to it —
+/// for every deleted session, and the same list had to be, and was not, kept in step
+/// with [`crate::prune`], which is the path retention actually takes. Both paths now
+/// sweep the set SQLite reports, so a table added later with a session key and no
+/// foreign key cannot land in only one of them.
+/// `tests/session.rs::removing_a_session_sweeps_every_table_no_cascade_reaches` and
+/// `tests/prune.rs::prune_delete_sweeps_every_session_keyed_table_no_cascade_reaches`
+/// both derive their expectation from the schema and fail until such a table is seeded.
 ///
 /// Background-job cancellation (`session.ts:618`) is deliberately absent: the
 /// job registry is not in this crate. The returned ids are what a caller needs
@@ -1779,18 +1793,10 @@ pub fn remove(transaction: &Transaction<'_>, id: &str) -> Result<Vec<String>, Db
         });
     }
     let removed = subtree(transaction, id)?;
+    let uncascaded = crate::session_keys::uncascaded(transaction)?;
     for current in &removed {
         transaction
             .execute("DELETE FROM session WHERE id = ?1", params![current])
-            .map_err(open::map_error)?;
-        transaction
-            .execute("DELETE FROM part WHERE session_id = ?1", params![current])
-            .map_err(open::map_error)?;
-        transaction
-            .execute(
-                "DELETE FROM event_sequence WHERE aggregate_id = ?1",
-                params![current],
-            )
             .map_err(open::map_error)?;
         transaction
             .execute(
@@ -1798,6 +1804,7 @@ pub fn remove(transaction: &Transaction<'_>, id: &str) -> Result<Vec<String>, Db
                 params![current],
             )
             .map_err(open::map_error)?;
+        crate::session_keys::sweep_one(transaction, &uncascaded, current)?;
     }
     Ok(removed)
 }

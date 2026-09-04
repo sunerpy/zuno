@@ -252,6 +252,156 @@ fn openai_login_prompts_for_the_authentication_method() {
     assert!(output.contains("provider login cancelled"), "{output}");
 }
 
+/// A URL login shows the remote-chosen command and waits for an explicit Yes.
+///
+/// Enter on the untouched prompt is "No": the first row declines, so a user who
+/// reflexively confirms a prompt they did not read runs nothing.
+#[test]
+fn url_login_shows_the_remote_command_and_enter_declines_it() {
+    let root = tempfile::tempdir().expect("temporary login environment");
+    let data = root.path().join("data");
+    let config = root.path().join("config");
+    let cache = root.path().join("cache");
+    let home = root.path().join("home");
+    for directory in [&data, &config, &cache, &home] {
+        fs::create_dir_all(directory).expect("create isolated directory");
+    }
+    let marker = root.path().join("remote-command-ran");
+    let fixture = WellKnownFixture::serve(serde_json::json!({
+        "auth": {
+            "command": ["sh", "-c", format!("echo spawned > '{}' && echo TOKEN", marker.display())],
+            "env": "ACME_TOKEN"
+        }
+    }));
+
+    let mut terminal = TestPty::spawn_with_args(
+        root.path(),
+        &[fixture.base_url.as_str()],
+        &[
+            ("HOME", home.as_path()),
+            ("XDG_DATA_HOME", data.as_path()),
+            ("XDG_CONFIG_HOME", config.as_path()),
+            ("XDG_CACHE_HOME", cache.as_path()),
+        ],
+    );
+    assert!(
+        terminal.wait_for_frame("Run this command"),
+        "{}",
+        terminal.output()
+    );
+    let shown = terminal.output();
+    assert!(shown.contains("program: \"sh\""), "{shown}");
+    assert!(shown.contains("echo spawned"), "{shown}");
+    assert!(shown.contains("the remote host did"), "{shown}");
+    assert!(
+        !marker.exists(),
+        "the command ran before the prompt was answered"
+    );
+
+    terminal.write(b"\r");
+    let (status, output) = terminal.finish();
+    assert!(!status.success(), "{output}");
+    assert!(output.contains("Run this command: No"), "{output}");
+    assert!(
+        output.contains("well-known provider login cancelled"),
+        "{output}"
+    );
+    assert!(
+        !marker.exists(),
+        "declining the prompt must not run the command"
+    );
+    assert!(
+        !data.join("zuno/auth.json").exists(),
+        "declining the prompt must not store a credential"
+    );
+    assert_eq!(
+        fixture.hits(),
+        1,
+        "the document is fetched once, to show the command"
+    );
+}
+
+/// A loopback `/.well-known/zuno` server that counts the requests it answered.
+struct WellKnownFixture {
+    base_url: String,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl WellKnownFixture {
+    fn serve(document: serde_json::Value) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("poll the fixture listener");
+        let port = listener.local_addr().expect("fixture address").port();
+        let body = serde_json::to_vec(&document).expect("serialize well-known document");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let hits = Arc::clone(&hits);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_nonblocking(false)
+                                .expect("blocking fixture stream");
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .expect("fixture read timeout");
+                            let mut request = Vec::new();
+                            let mut buffer = [0_u8; 1024];
+                            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                match stream.read(&mut buffer) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(read) => request.extend_from_slice(&buffer[..read]),
+                                }
+                            }
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(&body);
+                            let _ = stream.flush();
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        Self {
+            base_url: format!("http://127.0.0.1:{port}"),
+            hits,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for WellKnownFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Last line of every `terminal_prompt` frame, and so the point at which one is complete.
 const FRAME_END: &str = "esc cancel";
 
@@ -264,6 +414,15 @@ struct TestPty {
 
 impl TestPty {
     fn spawn(cwd: &std::path::Path, variables: &[(&str, &std::path::Path)]) -> Self {
+        Self::spawn_with_args(cwd, &[], variables)
+    }
+
+    /// Spawn `zuno auth login <args...>` in a fresh PTY.
+    fn spawn_with_args(
+        cwd: &std::path::Path,
+        args: &[&str],
+        variables: &[(&str, &std::path::Path)],
+    ) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -274,6 +433,7 @@ impl TestPty {
             .expect("open authentication PTY");
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_zuno"));
         command.args(["auth", "login"]);
+        command.args(args);
         command.env_clear();
         command.env("TERM", "xterm-256color");
         command.env("ZUNO_DISABLE_PROJECT_CONFIG", "1");

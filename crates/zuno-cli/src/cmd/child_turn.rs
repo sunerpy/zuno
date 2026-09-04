@@ -1128,7 +1128,7 @@ impl ChildSessionHost {
             self.job_store
                 .settle(&job.id, settlement)
                 .map_err(to_string)?;
-            tracing::info!(job_id = %job.id, %status, %message, "reconciled interrupted child job");
+            tracing::info!(job_id = %job.id, %status, reason = %message, "reconciled interrupted child job");
             recovered = recovered.saturating_add(1);
         }
         Ok(recovered)

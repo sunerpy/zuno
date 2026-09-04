@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -21,6 +22,11 @@ use crate::PluginRuntime;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
 const STOP_WAIT: Duration = Duration::from_secs(2);
+/// Ceiling on one blocking process-control call dispatched off the runtime worker.
+///
+/// A fixed constant, never derived from a plugin manifest or a peer response: exceeding it
+/// reports a stop that was not confirmed, which only ever adds uncertainty to the outcome.
+const PROCESS_CONTROL_LIMIT: Duration = Duration::from_secs(2);
 
 pub(super) async fn start(spec: RuntimeSpec) -> Result<Arc<dyn PluginHost>, PluginHostError> {
     let PluginRuntime::Process {
@@ -65,8 +71,8 @@ pub(super) async fn start(spec: RuntimeSpec) -> Result<Arc<dyn PluginHost>, Plug
     let capabilities = spec.capability_names();
     let host = Arc::new(ProcessPluginHost {
         package: spec.package.clone(),
-        root: spec.root,
-        workspace: spec.workspace,
+        root_literal: spec.root_literal,
+        workspace_literal: spec.workspace_literal,
         timeout,
         capabilities,
         redactor: SecretRedactor::from_process(),
@@ -106,8 +112,11 @@ fn resolve_command(root: &Path, command: &str) -> OsString {
 
 struct ProcessPluginHost {
     package: String,
-    root: std::path::PathBuf,
-    workspace: std::path::PathBuf,
+    // The package directory and workspace exactly as the JSON protocol carries them,
+    // validated when the runtime surface was built so `initialize` has no path left to
+    // reject, mangle, or silently substitute.
+    root_literal: String,
+    workspace_literal: String,
     timeout: Duration,
     capabilities: Vec<String>,
     redactor: SecretRedactor,
@@ -130,8 +139,8 @@ impl ProcessPluginHost {
                 json!({
                     "protocolVersion": PLUGIN_PROTOCOL_VERSION,
                     "packageId": self.package,
-                    "packageRoot": self.root,
-                    "workspace": self.workspace,
+                    "packageRoot": self.root_literal,
+                    "workspace": self.workspace_literal,
                     "capabilities": self.capabilities,
                 }),
                 None,
@@ -197,7 +206,8 @@ impl ProcessPluginHost {
             "method": method,
             "params": params,
         });
-        let operation = exchange(state, id, request);
+        let dispatched = AtomicBool::new(false);
+        let operation = exchange(state, id, request, &dispatched);
         let outcome = if let Some(interrupt) = interrupt {
             tokio::select! {
                 result = tokio::time::timeout(self.timeout, operation) => {
@@ -220,25 +230,16 @@ impl ProcessPluginHost {
             Ok(Err(failure)) | Err(failure) => {
                 let mut failed = slot.take().expect("state existed during exchange");
                 drop(slot);
-                let cleanup = terminate(&mut failed).await;
+                let cleanup = terminate(&mut failed.child).await;
                 let stderr = finish_stderr(&mut failed).await;
                 match failure {
+                    // The dispatch fact is reported as observed, not filtered through
+                    // `uncertain_after_send`: only a call whose dispatch matters is given
+                    // an interrupt to be cancelled by, and folding a policy flag into an
+                    // observation is how the report came to describe a dispatch that did
+                    // not happen. Dropping it here can only widen uncertainty.
                     RpcFailure::Cancelled => {
-                        if let Err(cleanup) = cleanup {
-                            return Err(PluginHostError::Uncertain {
-                                package: self.package.clone(),
-                                operation: method.to_owned(),
-                                message: diagnostic(
-                                    &self.redactor,
-                                    format!("cancellation cleanup failed: {cleanup}"),
-                                    &stderr,
-                                ),
-                            });
-                        }
-                        Err(PluginHostError::Cancelled {
-                            package: self.package.clone(),
-                            tool: method.to_owned(),
-                        })
+                        Err(self.cancelled(dispatched.load(Ordering::Acquire), cleanup, &stderr))
                     }
                     RpcFailure::TimedOut if !uncertain_after_send && cleanup.is_ok() => {
                         Err(PluginHostError::Timeout {
@@ -268,6 +269,38 @@ impl ProcessPluginHost {
         }
     }
 
+    /// The cancellation outcome of a call whose host has just been retired.
+    ///
+    /// Two independent facts decide it. `dispatched` says whether the plugin owned the
+    /// call: killing the process group settles this host, never a side effect the plugin
+    /// had already begun, because no reply survives to say how far it got. `cleanup` says
+    /// whether the plugin is actually stopped — a failed stop (`taskkill /f /t` exiting
+    /// non-zero against a live tree, a process that outlived `STOP_WAIT`) leaves a process
+    /// that may still be acting on the call, so the outcome is undecided even when the
+    /// request never reached its stdin. Neither fact may be merged into the other: a
+    /// cancellation reported as decided is published to the model and the durable record as
+    /// cleanup that completed, and one reported as dispatched when it was not is published
+    /// as a side effect that may be half applied. Both travel to the report separately.
+    fn cancelled(
+        &self,
+        dispatched: bool,
+        cleanup: Result<(), String>,
+        stderr: &str,
+    ) -> PluginHostError {
+        let cleanup = cleanup.err().map(|error| {
+            diagnostic(
+                &self.redactor,
+                format!("stopping the plugin failed: {error}"),
+                stderr,
+            )
+        });
+        PluginHostError::Cancelled {
+            package: self.package.clone(),
+            dispatched,
+            cleanup,
+        }
+    }
+
     async fn retire_uncertain(&self, operation: String, message: String) -> PluginHostError {
         let state = {
             let mut slot = self.state.lock().await;
@@ -280,7 +313,7 @@ impl ProcessPluginHost {
                 message: self.redactor.safe(message),
             };
         };
-        let cleanup = terminate(&mut state).await;
+        let cleanup = terminate(&mut state.child).await;
         let stderr = finish_stderr(&mut state).await;
         let message = match cleanup {
             Ok(()) => message,
@@ -335,11 +368,13 @@ impl PluginHost for ProcessPluginHost {
                 "method": "shutdown",
                 "params": {},
             });
+            let dispatched = AtomicBool::new(false);
             let _ignored =
-                tokio::time::timeout(self.timeout, exchange(&mut state, id, request)).await;
+                tokio::time::timeout(self.timeout, exchange(&mut state, id, request, &dispatched))
+                    .await;
             state
         };
-        let cleanup = terminate(&mut state).await;
+        let cleanup = terminate(&mut state.child).await;
         let stderr = finish_stderr(&mut state).await;
         cleanup.map_err(|error| PluginHostError::Stop {
             package: self.package.clone(),
@@ -374,7 +409,16 @@ fn decode_result(value: Value) -> Result<PluginResult, String> {
     })
 }
 
-async fn exchange(state: &mut ProcessState, id: u64, request: Value) -> Result<Value, RpcFailure> {
+/// Write one request and read its response, recording when the plugin owns the call.
+///
+/// `dispatched` is set exactly when the frame has reached the plugin's stdin, which is
+/// the point after which a cancellation can no longer claim that nothing ran.
+async fn exchange(
+    state: &mut ProcessState,
+    id: u64,
+    request: Value,
+    dispatched: &AtomicBool,
+) -> Result<Value, RpcFailure> {
     let mut encoded = serde_json::to_vec(&request).map_err(|error| RpcFailure::Protocol {
         message: error.to_string(),
     })?;
@@ -385,6 +429,7 @@ async fn exchange(state: &mut ProcessState, id: u64, request: Value) -> Result<V
         .await
         .map_err(RpcFailure::Io)?;
     state.writer.flush().await.map_err(RpcFailure::Io)?;
+    dispatched.store(true, Ordering::Release);
     let frame = read_frame(&mut state.reader).await?;
     let response: Value = serde_json::from_slice(&frame).map_err(|error| RpcFailure::Protocol {
         message: format!("malformed JSON-RPC response: {error}"),
@@ -470,23 +515,73 @@ impl RpcFailure {
     }
 }
 
-async fn terminate(state: &mut ProcessState) -> Result<(), String> {
-    if state
-        .child
+async fn terminate(child: &mut Child) -> Result<(), String> {
+    terminate_with(child, zuno_process::request_contained_process_shutdown).await
+}
+
+/// Stop one plugin process tree through an injected process-control call.
+///
+/// `shutdown` is a parameter only so a test can drive this exact function with a call that
+/// really does block: on a Unix host the production call is a bare `kill(2)` that returns
+/// immediately, so nothing here could otherwise show that the dispatch leaves the runtime
+/// worker, and a test that called the dispatch helper directly would keep passing after
+/// this function was changed back to an inline call.
+async fn terminate_with<F>(child: &mut Child, shutdown: F) -> Result<(), String>
+where
+    F: FnOnce(u32) -> std::io::Result<()> + Send + 'static,
+{
+    if child
         .try_wait()
         .map_err(|error| error.to_string())?
         .is_some()
     {
         return Ok(());
     }
-    if let Some(pid) = state.child.id() {
-        zuno_process::request_contained_process_shutdown(pid).map_err(|error| error.to_string())?;
+    if let Some(pid) = child.id() {
+        // `zuno_process::request_contained_process_shutdown` keeps a blocking signature
+        // because synchronous callers need it, and on Unix it is a bare `kill(2)`. On
+        // Windows the same call spawns `taskkill /pid n /f /t` and waits for the whole
+        // tree walk, and every session runtime Zuno builds is current-thread: an inline
+        // call would freeze the provider stream and the client event pump until the walk
+        // finished, which is precisely when a cancelling user needs them draining.
+        match off_runtime_worker(move || shutdown(pid)).await {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Err(error.to_string()),
+            None => {
+                return Err(format!(
+                    "stop request did not return within {PROCESS_CONTROL_LIMIT:?}"
+                ));
+            }
+        }
     }
-    tokio::time::timeout(STOP_WAIT, state.child.wait())
+    tokio::time::timeout(STOP_WAIT, child.wait())
         .await
         .map_err(|_| format!("process did not exit within {STOP_WAIT:?}"))?
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// Run one blocking process-control call without stalling the runtime worker.
+///
+/// The join is bounded because moving the call off the worker does not make it finish: a
+/// wedged `taskkill` is the Windows case this dispatch exists for, and an unbounded join
+/// would hold the caller past `STOP_WAIT`. `None` therefore means the stop was not
+/// confirmed, which is the honest outcome — it can only add uncertainty to what the caller
+/// reports, never claim more than the inline call could. Aborting is not attempted: a
+/// blocking task that has started cannot be cancelled, so the ceiling releases this await,
+/// not the operating-system call, and the child is spawned with `kill_on_drop` so dropping
+/// it still terminates the direct child.
+async fn off_runtime_worker<T>(operation: impl FnOnce() -> T + Send + 'static) -> Option<T>
+where
+    T: Send + 'static,
+{
+    tokio::time::timeout(
+        PROCESS_CONTROL_LIMIT,
+        tokio::task::spawn_blocking(operation),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
 }
 
 async fn read_bounded(mut reader: impl AsyncRead + Unpin, limit: usize) -> String {
@@ -522,5 +617,136 @@ fn diagnostic(redactor: &SecretRedactor, message: impl AsRef<str>, stderr: &str)
         message
     } else {
         format!("{message}; stderr: {stderr}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Used only by the Unix-gated tick-counting test; on Windows the import would be
+    // reported as unused under `-D warnings`.
+    #[cfg(unix)]
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    fn retired_host() -> ProcessPluginHost {
+        ProcessPluginHost {
+            package: "review-kit".to_owned(),
+            root_literal: "/tmp/review-kit".to_owned(),
+            workspace_literal: "/tmp/workspace".to_owned(),
+            timeout: Duration::from_secs(5),
+            capabilities: Vec::new(),
+            redactor: SecretRedactor::from_process(),
+            state: Mutex::new(None),
+        }
+    }
+
+    /// A stop that was not confirmed leaves the cancellation undecided, and keeps the
+    /// dispatch observation the report needs to describe it truthfully.
+    ///
+    /// The Windows case is `taskkill /pid n /f /t` exiting non-zero against a tree that is
+    /// still alive: `terminate` returns immediately, well inside the dispatcher's grace
+    /// window, so nothing else would ever contradict a decided verdict. Reporting one would
+    /// publish "acknowledged cancellation and completed its cleanup" for a plugin that is
+    /// still running and may still be writing. Merging the two facts into one bit instead
+    /// fixes that verdict and then publishes the opposite lie — a dispatch this host
+    /// observed did not happen — so this drives the exact input through both production
+    /// functions: the host's own constructor, then the report the tool returns.
+    #[test]
+    fn a_failed_stop_makes_a_cancellation_undecided() {
+        let host = retired_host();
+        let error = host.cancelled(
+            false,
+            Err("taskkill failed for process tree 4242 with status exit code: 128".to_owned()),
+            "",
+        );
+        let PluginHostError::Cancelled {
+            dispatched,
+            cleanup,
+            ..
+        } = &error
+        else {
+            panic!("a cancellation stays a cancellation: {error}");
+        };
+        assert!(!*dispatched, "the request never reached stdin: {error}");
+        let cleanup = cleanup.as_deref().expect("the failed stop is reported");
+        assert!(cleanup.contains("taskkill failed"), "{cleanup}");
+        assert!(error.is_uncertain(), "{error}");
+
+        let settled = error
+            .cancellation_report("review_outline")
+            .expect("a cancellation settles as a report");
+        let claim = &settled.metadata[crate::host::METADATA_CANCELLATION_KEY];
+        assert_eq!(claim["uncertain"], json!(true), "{claim}");
+        assert_eq!(claim["dispatched"], json!(false), "{claim}");
+        assert!(
+            !settled.output.contains("had already been sent"),
+            "{}",
+            settled.output
+        );
+        assert!(
+            settled.output.contains("may still be running"),
+            "{}",
+            settled.output
+        );
+    }
+
+    #[test]
+    fn a_confirmed_stop_reports_the_dispatch_state_it_observed() {
+        let host = retired_host();
+        for observed in [false, true] {
+            let error = host.cancelled(observed, Ok(()), "");
+            let PluginHostError::Cancelled {
+                dispatched,
+                cleanup,
+                ..
+            } = &error
+            else {
+                panic!("a cancellation stays a cancellation: {error}");
+            };
+            assert_eq!(*dispatched, observed, "{error}");
+            assert_eq!(error.is_uncertain(), observed, "{error}");
+            assert!(cleanup.is_none(), "{error}");
+        }
+    }
+
+    /// Stopping a plugin must not freeze the session runtime it was cancelled from.
+    ///
+    /// Every session runtime Zuno builds is current-thread, so an inline blocking stop
+    /// starves every other task on it — the provider stream and the client event pump
+    /// included — for as long as the call takes. On Unix the production call is a bare
+    /// `kill(2)`, so the injected stop is what a Windows `taskkill /f /t` tree walk does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_plugin_leaves_the_session_worker_free() {
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("a live child to stop");
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let pump = tokio::spawn({
+            let ticks = Arc::clone(&ticks);
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ticks.fetch_add(1, Ordering::Release);
+                }
+            }
+        });
+
+        let cleanup = terminate_with(&mut child, |pid| {
+            std::thread::sleep(Duration::from_millis(300));
+            zuno_process::request_contained_process_shutdown(pid)
+        })
+        .await;
+
+        pump.abort();
+        assert_eq!(cleanup, Ok(()), "the child was reaped");
+        let ticks = ticks.load(Ordering::Acquire);
+        assert!(
+            ticks >= 5,
+            "the runtime worker was blocked for the whole stop: {ticks} ticks"
+        );
     }
 }

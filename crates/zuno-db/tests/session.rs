@@ -159,6 +159,48 @@ fn insert_context_epoch(connection: &Connection, session_id: &str) {
         .expect("insert session_context_epoch");
 }
 
+fn insert_verification_receipt(connection: &Connection, session_id: &str) {
+    connection
+        .execute(
+            "INSERT INTO verification_receipt \
+               (id, session_id, tool_call_id, tool_id, summary, exit_authority, outcome, \
+                time_created) \
+             VALUES (?1, ?2, 'call_1', 'shell', 'cargo test passed', 'authoritative', \
+                     'passed', 1)",
+            [&format!("vrc_{session_id}"), &session_id.to_owned()],
+        )
+        .expect("insert verification_receipt");
+}
+
+/// A durable question and its answer. The table declares no foreign key, so nothing in
+/// the schema removes the user's own text when the session that asked it goes.
+fn insert_human_request(connection: &Connection, session_id: &str) {
+    connection
+        .execute(
+            "INSERT INTO human_request \
+               (id, session_id, kind, state, payload, response, revision, time_created, \
+                time_updated) \
+             VALUES (?1, ?2, 'input', 'answered', \
+                     '{\"question\":\"which database should I point at?\"}', \
+                     '{\"answer\":\"the release channel one\"}', 1, 1, 1)",
+            [&format!("hrq_{session_id}"), &session_id.to_owned()],
+        )
+        .expect("insert human_request");
+}
+
+/// A persisted retry deadline. Also foreign-key free, and keyed only by session.
+fn insert_retry_backoff(connection: &Connection, session_id: &str) {
+    connection
+        .execute(
+            "INSERT INTO provider_retry_backoff \
+               (session_id, request_id, turn_id, failed_attempt, next_attempt, max_attempts, \
+                reason, delay_ms, retry_at_ms, scheduled_at_ms) \
+             VALUES (?1, 'req_1', 'trn_1', 1, 2, 5, 'provider_unavailable', 1000, 2000, 1000)",
+            [session_id],
+        )
+        .expect("insert provider_retry_backoff");
+}
+
 fn insert_share(connection: &Connection, session_id: &str) {
     connection
         .execute(
@@ -267,6 +309,9 @@ impl Tree {
                 insert_session_input(&connection, &format!("sinp_{id}"), id, seq);
                 insert_context_epoch(&connection, id);
                 insert_events(&connection, id);
+                insert_verification_receipt(&connection, id);
+                insert_human_request(&connection, id);
+                insert_retry_backoff(&connection, id);
             }
             insert_share(&connection, "ses_root");
 
@@ -1723,6 +1768,29 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
         assert_eq!(remaining, 0, "{table} still holds rows for ses_child");
     }
 
+    // `verification_receipt` declares no foreign key either, and `prune` already
+    // sweeps it: a receipt keeps the tool call's summary, workdir, and git head
+    // durable, so which command a user reached for must not decide whether the
+    // transcript's evidence outlives the transcript.
+    assert_eq!(
+        count(
+            &connection,
+            "SELECT count(*) FROM verification_receipt WHERE session_id IN \
+             ('ses_root', 'ses_child', 'ses_grandchild')"
+        ),
+        0,
+        "zero verification_receipt rows left behind"
+    );
+    assert_eq!(
+        count_for(
+            &connection,
+            "SELECT count(*) FROM verification_receipt WHERE session_id = ?1",
+            "ses_bystander"
+        ),
+        1,
+        "the bystander keeps its receipt"
+    );
+
     // The event log, which no cascade reaches from `session`.
     assert_eq!(
         count(
@@ -1797,6 +1865,130 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
         (1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 2),
         "row counts after the delete: only the bystander's rows remain"
     );
+}
+
+/// Every table whose session key no foreign key covers, read out of the live schema.
+///
+/// A table is listed here when it has a `session_id` or `aggregate_id` column and
+/// `PRAGMA foreign_key_list` declares no foreign key *on that column*: a
+/// `DELETE FROM session` cascade can never reach such a row, so [`session::remove`] has
+/// to name it explicitly. A table whose session key does carry a foreign key is left out
+/// because its chain ends either at `session` or at one of these roots.
+fn tables_no_session_cascade_reaches(connection: &Connection) -> Vec<(String, String)> {
+    let mut tables = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .expect("prepare table list")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query table list")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read table list");
+    tables.retain(|table| table != "session");
+
+    let mut uncovered = Vec::new();
+    for table in tables {
+        let keys = connection
+            .prepare("SELECT name FROM pragma_table_info(?1) WHERE name IN ('session_id', 'aggregate_id')")
+            .expect("prepare column list")
+            .query_map([&table], |row| row.get::<_, String>(0))
+            .expect("query column list")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read column list");
+        let Some(key) = keys.into_iter().next() else {
+            continue;
+        };
+        let covered: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_foreign_key_list(?1) WHERE \"from\" = ?2",
+                rusqlite::params![&table, &key],
+                |row| row.get(0),
+            )
+            .expect("count foreign keys on the session key");
+        if covered == 0 {
+            uncovered.push((table, key));
+        }
+    }
+    uncovered
+}
+
+/// The FK-less set is derived from the schema, not listed by hand.
+///
+/// `verification_receipt` was swept only after a leak was found in review; `human_request`
+/// and `provider_retry_backoff` were still leaking behind it, which is what a hand-written
+/// table list cost. So this test asks SQLite which tables carry a session key that no
+/// cascade covers, fails when one of them has no seeded fixture here, and then asserts
+/// [`session::remove`] emptied every one of them for the removed subtree while leaving the
+/// bystander's rows alone. A table added later with a session key and no foreign key
+/// cannot slip through: it fails this test until it is both seeded and swept.
+///
+/// The scope is this crate's own schema. Tables another crate creates in the same pool —
+/// `zuno_goal`'s `goal*` set — carry a `session_id` with no foreign key and are not swept by
+/// either path; see the boundary note in `zuno_db::session_keys`.
+#[test]
+fn removing_a_session_sweeps_every_table_no_cascade_reaches() {
+    let tree = Tree::build();
+    let connection = tree.connection();
+    let uncovered = tables_no_session_cascade_reaches(&connection);
+
+    // Seeded for all four sessions by `Tree::build`, keyed by the column the schema scan
+    // reports. `event` is reached by the cascade from `event_sequence`, so it is not in
+    // this set; `remove` sweeps it anyway and the subtree test above pins that.
+    let seeded = [
+        ("event_sequence", "aggregate_id"),
+        ("human_request", "session_id"),
+        ("part", "session_id"),
+        ("provider_retry_backoff", "session_id"),
+        ("verification_receipt", "session_id"),
+    ];
+    assert_eq!(
+        uncovered
+            .iter()
+            .map(|(table, key)| (table.as_str(), key.as_str()))
+            .collect::<Vec<_>>(),
+        seeded,
+        "a session-keyed table with no foreign key on that key needs a fixture here and \
+         an explicit statement in session::remove"
+    );
+    for (table, key) in &seeded {
+        assert!(
+            count_for(
+                &connection,
+                &format!("SELECT count(*) FROM {table} WHERE {key} = ?1"),
+                "ses_child"
+            ) > 0,
+            "{table} must be seeded before the delete or the sweep proves nothing"
+        );
+    }
+    drop(connection);
+
+    let removed = tree.store().remove("ses_root").expect("remove the subtree");
+    assert_eq!(removed, ["ses_grandchild", "ses_child", "ses_root"]);
+
+    let connection = tree.connection();
+    for (table, key) in &seeded {
+        assert_eq!(
+            count(
+                &connection,
+                &format!(
+                    "SELECT count(*) FROM {table} WHERE {key} IN \
+                     ('ses_root', 'ses_child', 'ses_grandchild')"
+                )
+            ),
+            0,
+            "{table} still holds rows for the removed subtree"
+        );
+        assert_eq!(
+            count_for(
+                &connection,
+                &format!("SELECT count(*) FROM {table} WHERE {key} = ?1"),
+                "ses_bystander"
+            ),
+            1,
+            "{table} lost the bystander's row: the sweep is too broad"
+        );
+    }
 }
 
 #[test]

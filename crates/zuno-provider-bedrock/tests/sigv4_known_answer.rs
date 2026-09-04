@@ -46,16 +46,19 @@ fn aws_s3_get_object_known_answer_matches_byte_for_byte() {
     let expected_signature = "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41";
 
     assert_eq!(
-        signed.canonical_request.as_bytes(),
+        signed.canonical_request.expose_bytes(),
         expected_canonical_request.as_bytes()
     );
     assert_eq!(
         signed.string_to_sign.as_bytes(),
         expected_string_to_sign.as_bytes()
     );
-    assert_eq!(signed.signature.as_bytes(), expected_signature.as_bytes());
     assert_eq!(
-        signed.authorization,
+        signed.signature.expose_bytes(),
+        expected_signature.as_bytes()
+    );
+    assert_eq!(
+        signed.authorization.expose(),
         concat!(
             "AWS4-HMAC-SHA256 ",
             "Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, ",
@@ -85,10 +88,7 @@ fn temporary_credentials_sign_the_security_token() {
 
     assert!(signed.signed_headers.contains("x-amz-security-token"));
     assert_eq!(
-        signed
-            .headers
-            .get("x-amz-security-token")
-            .map(String::as_str),
+        signed.headers.get("x-amz-security-token"),
         Some("session-token")
     );
 }

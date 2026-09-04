@@ -90,7 +90,16 @@ impl SigV4Signer {
         canonical.insert("host".to_owned(), host);
         canonical.insert("x-amz-date".to_owned(), amz_date.to_owned());
         if let Some(token) = &credentials.session_token {
-            canonical.insert("x-amz-security-token".to_owned(), token.clone());
+            // Normalized like every other header value, not merely because SigV4 folds
+            // header whitespace, but because the redaction below is line-oriented: a value
+            // that still carried a newline would put its own tail on the next canonical
+            // line, where nothing named `x-amz-security-token` prefixes it and the
+            // redactor cannot see it. One call makes the single-line shape a property of
+            // the value rather than an assumption about the issuer's format.
+            canonical.insert(
+                "x-amz-security-token".to_owned(),
+                normalize_header_value(token),
+            );
         }
         for (name, value) in headers {
             let name = name.to_ascii_lowercase();
@@ -144,26 +153,210 @@ impl SigV4Signer {
         let mut output_headers = canonical;
         output_headers.insert("authorization".to_owned(), authorization.clone());
         Ok(SigningOutput {
-            canonical_request,
+            canonical_request: CanonicalRequest(canonical_request),
             string_to_sign,
-            signature,
-            authorization,
+            signature: Redacted(signature),
+            authorization: Redacted(authorization),
             signed_headers,
             payload_hash,
-            headers: output_headers,
+            headers: SigningHeaders(output_headers),
         })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SigningOutput {
-    pub canonical_request: String,
+    /// The canonical request, whose own rendering hides the session-token line.
+    pub canonical_request: CanonicalRequest,
+    /// `AWS4-HMAC-SHA256`, the timestamp, the credential scope, and a digest of the
+    /// canonical request. Carries no credential material, so it renders in full: the
+    /// scope is a date, a region and a service name, and the digest is one-way.
     pub string_to_sign: String,
-    pub signature: String,
-    pub authorization: String,
+    pub signature: Redacted,
+    pub authorization: Redacted,
     pub signed_headers: String,
     pub payload_hash: String,
-    pub headers: BTreeMap<String, String>,
+    /// The headers to send, whose own rendering hides both credential-bearing values.
+    pub headers: SigningHeaders,
+}
+
+/// Redacted like [`AwsCredentials`], for the same reason: `headers` carries the
+/// temporary `x-amz-security-token` and the `authorization` line carries the request
+/// signature, so a derived `Debug` would put a live AWS credential into any log line or
+/// error chain that formats a value embedding this one.
+///
+/// A redaction that lives only here covers `{signing:?}` and nothing else. The three
+/// credential-bearing fields are typed so that formatting *one field* —
+/// `tracing::debug!(canonical = %signing.canonical_request)`, the exact line this struct
+/// invites — is redacted by the field's own `Display` and `Debug`.
+impl fmt::Debug for SigningOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SigningOutput")
+            .field("canonical_request", &self.canonical_request)
+            .field("string_to_sign", &self.string_to_sign)
+            .field("signature", &self.signature)
+            .field("authorization", &self.authorization)
+            .field("signed_headers", &self.signed_headers)
+            .field("payload_hash", &self.payload_hash)
+            .field("headers", &self.headers)
+            .finish()
+    }
+}
+
+/// The headers a signed request carries, with a rendering that hides the credentials.
+///
+/// A plain `BTreeMap` field was redacted by [`SigningOutput`]'s own `Debug` and by nothing
+/// else, so `tracing::debug!(headers = ?signing.headers)` — the natural line to add while
+/// debugging a 403 — wrote the live `x-amz-security-token` and the whole
+/// `AWS4-HMAC-SHA256 Credential=…, Signature=…` line to the log. The values are still
+/// reachable, but only by iterating them into a request, which is what the sink they are
+/// for looks like.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SigningHeaders(BTreeMap<String, String>);
+
+impl SigningHeaders {
+    /// The value of one header, for a byte-exact assertion against a known answer.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).map(String::as_str)
+    }
+
+    /// Every header name and value, in canonical order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+}
+
+impl IntoIterator for SigningHeaders {
+    type Item = (String, String);
+    type IntoIter = std::collections::btree_map::IntoIter<String, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl fmt::Debug for SigningHeaders {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&RedactedHeaders(&self.0), formatter)
+    }
+}
+
+/// The canonical header line that carries a temporary credential.
+const SESSION_TOKEN_HEADER: &str = "x-amz-security-token:";
+
+/// A signing artifact that renders as `<redacted>` however it is formatted.
+///
+/// The signature is a MAC over the request derived from the secret key, and the
+/// `Authorization` line carries both it and the access key id. Neither belongs in a log,
+/// and both are `String`-shaped, which is exactly the shape that gets interpolated into
+/// one. The plaintext is still reachable, but only through a call that says so.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Redacted(String);
+
+impl Redacted {
+    /// The plaintext value. Never hand this to a logging or error-rendering sink.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// The plaintext bytes, for a byte-exact comparison against a known answer.
+    #[must_use]
+    pub fn expose_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl fmt::Display for Redacted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+/// The canonical request, minus the one line that carries a credential.
+///
+/// Redacting the whole value would be self-defeating: reading this string is how a
+/// signature mismatch gets diagnosed, so a blanket `<redacted>` would push the next
+/// debugger straight to [`expose`](Self::expose) and put the session token in the log
+/// anyway. Only the `x-amz-security-token` header line is replaced; the method, path,
+/// query, header set, signed-header list and payload hash — everything that explains a
+/// mismatch — render verbatim.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CanonicalRequest(String);
+
+impl CanonicalRequest {
+    /// The exact bytes that were signed, session token included.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// The signed bytes, for a byte-exact comparison against a known answer.
+    #[must_use]
+    pub fn expose_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    /// The canonical request with the session token replaced.
+    ///
+    /// Splits on `\n` rather than iterating [`str::lines`] so the result is the input
+    /// byte for byte wherever no token line is present, including a trailing newline.
+    #[must_use]
+    pub fn redacted(&self) -> String {
+        self.0
+            .split('\n')
+            .map(|line| {
+                if line.starts_with(SESSION_TOKEN_HEADER) {
+                    format!("{SESSION_TOKEN_HEADER}<redacted>")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+impl fmt::Debug for CanonicalRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.redacted(), formatter)
+    }
+}
+
+impl fmt::Display for CanonicalRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.redacted())
+    }
+}
+
+/// The canonical header map with every credential-bearing value replaced.
+struct RedactedHeaders<'headers>(&'headers BTreeMap<String, String>);
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_map()
+            .entries(self.0.iter().map(|(name, value)| {
+                let rendered: &dyn fmt::Debug =
+                    if matches!(name.as_str(), "authorization" | "x-amz-security-token") {
+                        &"<redacted>"
+                    } else {
+                        value
+                    };
+                (name, rendered)
+            }))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -334,6 +527,124 @@ mod tests {
     fn uri_encoding_preserves_path_boundaries_and_encoded_slashes() {
         assert_eq!(canonical_uri("/model/a%2Fb:c"), "/model/a%2Fb%3Ac");
         assert_eq!(canonical_uri("/test$file.text"), "/test%24file.text");
+    }
+
+    /// `SigningOutput` is `pub` and re-exported, so one added `tracing::debug!(?signing)`
+    /// would otherwise put a live AWS session token and the request signature verbatim
+    /// into a log line or a persisted error chain.
+    #[test]
+    fn signing_output_never_renders_the_session_token_or_signature() {
+        let credentials = AwsCredentials::new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG")
+            .with_session_token("FwoGZXIvYXdzEExampleSessionToken");
+        let signing = SigV4Signer::new("us-east-1", "bedrock")
+            .sign(
+                "POST",
+                &Url::parse(
+                    "https://bedrock-runtime.us-east-1.amazonaws.com/model/m/converse-stream",
+                )
+                .expect("static URL"),
+                &BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
+                b"{}",
+                &credentials,
+                "20260904T000000Z",
+            )
+            .expect("signing succeeds");
+
+        // Every way a caller can format one of these values, not just `{signing:?}`:
+        // a redacting `Debug` on the struct does nothing for
+        // `tracing::debug!(canonical = %signing.canonical_request)`, which formats the
+        // field itself.
+        for rendered in [
+            format!("{signing:?}"),
+            format!("{signing:#?}"),
+            format!("{signing}", signing = signing.canonical_request),
+            format!("{:?}", signing.canonical_request),
+            format!("{}", signing.signature),
+            format!("{:?}", signing.signature),
+            format!("{}", signing.authorization),
+            format!("{:?}", signing.authorization),
+            // The header map is a public field and the natural thing to log while
+            // debugging a 403, so its own rendering has to be redacted too — the enclosing
+            // struct's `Debug` never runs for `?signing.headers`.
+            format!("{:?}", signing.headers),
+            format!("{:#?}", signing.headers),
+            signing.string_to_sign.clone(),
+        ] {
+            assert!(
+                !rendered.contains("FwoGZXIvYXdzEExampleSessionToken"),
+                "the temporary session token must never be rendered: {rendered}"
+            );
+            assert!(
+                !rendered.contains(signing.signature.expose()),
+                "the request signature must never be rendered: {rendered}"
+            );
+            assert!(
+                !rendered.contains("AWS4-HMAC-SHA256 Credential="),
+                "the authorization line must never be rendered: {rendered}"
+            );
+        }
+
+        // The token is redacted in the rendering, not dropped from the signature: the
+        // signed bytes still carry it, and the rendered form still carries everything a
+        // signature mismatch is diagnosed with.
+        let signed_bytes = signing.canonical_request.expose();
+        assert!(
+            signed_bytes.contains("x-amz-security-token:FwoGZXIvYXdzEExampleSessionToken"),
+            "the canonical request must still sign the token: {signed_bytes}"
+        );
+        let diagnostic = signing.canonical_request.to_string();
+        assert!(
+            diagnostic.contains("x-amz-security-token:<redacted>")
+                && diagnostic.contains("content-type:application/json")
+                && diagnostic.contains("x-amz-date:20260904T000000Z")
+                && diagnostic.ends_with(&signing.payload_hash),
+            "only the credential line is replaced: {diagnostic}"
+        );
+    }
+
+    /// A session token that is not one line.
+    ///
+    /// The canonical-request redactor is line-oriented, so a value carrying a newline used
+    /// to leave its tail on a line no prefix matched — redaction that depended on the
+    /// issuer's format. The value is folded at the insert site instead, so the single-line
+    /// shape is a property of what was signed.
+    #[test]
+    fn a_session_token_containing_a_newline_is_folded_before_it_is_signed() {
+        let credentials = AwsCredentials::new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG")
+            .with_session_token("FwoGZXIvYXdzEExample\nTAIL_SECRET");
+        let signing = SigV4Signer::new("us-east-1", "bedrock")
+            .sign(
+                "POST",
+                &Url::parse(
+                    "https://bedrock-runtime.us-east-1.amazonaws.com/model/m/converse-stream",
+                )
+                .expect("static URL"),
+                &BTreeMap::new(),
+                b"{}",
+                &credentials,
+                "20260904T000000Z",
+            )
+            .expect("signing succeeds");
+
+        assert!(
+            signing
+                .canonical_request
+                .expose()
+                .contains("x-amz-security-token:FwoGZXIvYXdzEExample TAIL_SECRET"),
+            "the value is folded onto one canonical line: {}",
+            signing.canonical_request.expose()
+        );
+        for rendered in [
+            signing.canonical_request.to_string(),
+            format!("{:?}", signing.canonical_request),
+            format!("{signing:?}"),
+            format!("{:?}", signing.headers),
+        ] {
+            assert!(
+                !rendered.contains("TAIL_SECRET"),
+                "no rendering may carry any part of the token: {rendered}"
+            );
+        }
     }
 
     #[test]

@@ -38,7 +38,14 @@ uuid = { workspace = true }
 # `User::from_uid` wraps the thread-safe `getpwuid_r` account lookup without
 # introducing first-party `unsafe` code. This sees NSS-backed users that are not
 # necessarily materialized in `/etc/passwd`.
-nix = { workspace = true }
+#
+# `signal` adds `kill(pid, 0)`, which is how `recorded_process` asks whether a process
+# another Zuno recorded still exists: a background row written before the ownership-claim
+# protocol has no lock file to ask about, and its pid is the only thing left that can
+# contradict "the owner is gone". The feature is additive on top of the workspace pin and
+# pulls in no further crates (`signal = ["process"]`, both empty), and the call itself is
+# `unsafe`-free here, which this crate's `unsafe_code = "forbid"` requires.
+nix = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

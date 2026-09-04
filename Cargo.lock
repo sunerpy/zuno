@@ -6675,9 +6675,11 @@ dependencies = [
  "image",
  "kamadak-exif",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.19",
+ "zuno-paths",
 ]
 
 [[package]]
@@ -6697,6 +6699,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zuno-atomic-file",
  "zuno-error",
  "zuno-network",
  "zuno-paths",
@@ -6979,6 +6982,7 @@ dependencies = [
  "zuno-catalog",
  "zuno-config",
  "zuno-error",
+ "zuno-paths",
  "zuno-process",
  "zuno-tool",
 ]
@@ -7120,6 +7124,7 @@ dependencies = [
  "rustix 1.1.4",
  "signal-hook 0.4.1",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

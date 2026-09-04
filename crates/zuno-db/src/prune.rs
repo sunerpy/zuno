@@ -47,6 +47,15 @@ pub const PRUNE_TABLES: [&str; 20] = [
 /// which foreign-key cascades happen to exist in one schema revision. Dependants
 /// precede their owners (`memory_reflection_job` before its delivery row and
 /// `agent_job` before its optional report input).
+///
+/// This is the *ordered* set, not the whole set. After it, [`delete_in_transaction`] sweeps
+/// every session-keyed table the schema leaves without a foreign key —
+/// [`crate::session_keys::uncascaded`], the same enumeration [`crate::session::remove`]
+/// uses — because a table reachable by neither a cascade nor this list is reachable by
+/// nothing, which is how `human_request` and `provider_retry_backoff` kept a pruned
+/// session's rows. Order does not matter for those: having no foreign key on the session key
+/// is exactly what puts them in that set. [`preview`] accounts for them too, so the
+/// projection and the delete describe the same operation.
 pub const DELETE_ORDER: [&str; 20] = PRUNE_TABLES;
 
 /// A reversible change to `session.time_archived`.
@@ -197,7 +206,8 @@ pub struct TableImpact {
 pub struct PrunePreview {
     /// The exact ids supplied by retention, deduplicated without another tree walk.
     pub session_ids: Vec<String>,
-    /// One entry for each table in [`PRUNE_TABLES`], including zeroes.
+    /// One entry for each table in [`PRUNE_TABLES`], including zeroes, then one for every
+    /// other session-keyed table the delete sweeps because no cascade reaches it.
     pub tables: Vec<TableImpact>,
     /// Sum of all table row counts.
     pub total_rows: u64,
@@ -372,6 +382,31 @@ pub fn preview(
         let (predicate, binding) = relation_filter(spec.relation, &selected_json, &aggregate_json);
         tables.push(table_impact(connection, spec, predicate, binding)?);
     }
+    // The delete sweeps every session-keyed table with no cascade, including the ones
+    // `PRUNE_TABLES` does not name, so the preview has to measure them too: a preview that
+    // promised fewer rows than the delete removes is a preview of a different operation, and
+    // the rows involved are `human_request`'s question-and-answer text.
+    for key in uncascaded_beyond_delete_order(connection)? {
+        let (predicate, binding) = if key.column == "aggregate_id" {
+            (
+                "aggregate_id IN (SELECT value FROM json_each(?1))",
+                aggregate_json.as_str(),
+            )
+        } else {
+            (
+                "session_id IN (SELECT value FROM json_each(?1))",
+                selected_json.as_str(),
+            )
+        };
+        let columns = crate::session_keys::columns(connection, key.table)?;
+        tables.push(measure_table(
+            connection,
+            key.table,
+            columns.iter().map(String::as_str),
+            predicate,
+            binding,
+        )?);
+    }
 
     let (cost, input, output, reasoning, cache_read, cache_write) = connection
         .query_row(
@@ -477,6 +512,20 @@ pub fn delete_in_transaction(
             changed_sessions = count_from_usize(changed)?;
         }
     }
+
+    // Every session-keyed table the schema leaves without a foreign key, read out of the live
+    // schema rather than restated here. `DELETE_ORDER` is the explicitly ordered set this
+    // module accounts for; this sweep is what makes the *set* complete, and it is the same
+    // enumeration `crate::session::remove` uses, so a table added later with a session key
+    // and no cascade cannot be reached by only one of the two delete paths. It leaked before:
+    // `human_request` holds a question a user was asked and the answer they gave, and a
+    // pruned session kept both.
+    crate::session_keys::sweep_many(
+        transaction,
+        &crate::session_keys::uncascaded(transaction)?,
+        &selected_json,
+        &aggregate_json,
+    )?;
 
     transaction
         .execute(
@@ -626,21 +675,58 @@ fn table_impact(
     predicate: &str,
     binding: &str,
 ) -> Result<TableImpact, PruneError> {
-    let bytes = spec
-        .columns
-        .iter()
+    measure_table(
+        connection,
+        spec.name,
+        spec.columns.iter().copied(),
+        predicate,
+        binding,
+    )
+}
+
+/// Session-keyed tables the delete sweeps that [`PRUNE_TABLES`] does not name.
+///
+/// The published delete order is a documented contract with a fixed length; this is the
+/// remainder, so the preview can account for what the sweep removes without the two ever
+/// disagreeing about which tables exist.
+///
+/// # Errors
+///
+/// [`PruneError::Database`] if the schema cannot be read.
+fn uncascaded_beyond_delete_order(
+    connection: &Connection,
+) -> Result<Vec<crate::session_keys::SessionKey>, PruneError> {
+    let mut keys = crate::session_keys::uncascaded(connection)?;
+    keys.retain(|key| !PRUNE_TABLES.contains(&key.table));
+    Ok(keys)
+}
+
+/// Rows and logical payload bytes one table holds for a selection.
+///
+/// `columns` is only ever a name this crate authored, or one `crate::session_keys` validated
+/// as a plain identifier, because it is interpolated into the byte sum.
+fn measure_table<'columns>(
+    connection: &Connection,
+    table: &'static str,
+    columns: impl Iterator<Item = &'columns str>,
+    predicate: &str,
+    binding: &str,
+) -> Result<TableImpact, PruneError> {
+    let bytes = columns
         .map(|column| format!("COALESCE(length(CAST({column} AS BLOB)), 0)"))
         .collect::<Vec<_>>()
         .join(" + ");
-    let sql = format!(
-        "SELECT COUNT(*), COALESCE(SUM({bytes}), 0) FROM {} WHERE {predicate}",
-        spec.name
-    );
+    let bytes = if bytes.is_empty() {
+        "0".to_owned()
+    } else {
+        bytes
+    };
+    let sql = format!("SELECT COUNT(*), COALESCE(SUM({bytes}), 0) FROM {table} WHERE {predicate}");
     let (rows, bytes): (i64, i64) = connection
         .query_row(&sql, [binding], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(open::map_error)?;
     Ok(TableImpact {
-        table: spec.name,
+        table,
         rows: count_from_i64(rows)?,
         bytes: count_from_i64(bytes)?,
     })

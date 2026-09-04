@@ -606,6 +606,28 @@ impl fmt::Debug for TerminalLeaseGuard {
     }
 }
 
+/// Reclaim is synchronous, including a cleanup hook that blocks.
+///
+/// `before_reclaim` reaps the holder's child, and the TUI's implementation waits for a
+/// terminating editor for up to its reap timeout. On a current-thread runtime that
+/// blocks the reactor for the same duration, and the offload that would avoid it is
+/// available here — `Handle::try_current()` plus `spawn_blocking`, exactly as the
+/// deadline sweep uses 90 lines above. It is deliberately not used, for three reasons
+/// that all outrank the stall:
+///
+/// * The terminal would be returned to its owner *later* than `release` returns, and
+///   [`TerminalLeaseGuard::release`] promises the opposite. A TUI that redraws on the
+///   next line would then paint over a child that still holds the TTY.
+/// * The next `acquire` would see the slot still occupied and fail with
+///   [`TerminalLeaseError::Busy`] for a lease its predecessor had already given up.
+/// * `_released` is dropped with the guard, so the watchdog that would otherwise
+///   force-reclaim stops at exactly the moment the offloaded work begins. If the runtime
+///   shuts down before that task is polled, nothing reclaims the terminal at all and the
+///   user is left in raw mode. Failing closed here means blocking, not deferring.
+///
+/// `lease_release_reclaims_the_terminal_before_it_returns` pins this; the stall is only
+/// reachable when a child is still alive, which for the TUI means the editor was
+/// cancelled rather than closed.
 impl Drop for TerminalLeaseGuard {
     fn drop(&mut self) {
         if self.settled.load(Ordering::SeqCst) {
@@ -851,6 +873,73 @@ mod tests {
             "the terminal was reclaimed before cleanup: {lines:?}"
         );
         drop(guard);
+    }
+
+    /// A cleanup that blocks the way reaping a terminating child blocks, and records
+    /// the thread it ran on.
+    struct BlockingCleanup {
+        log: Arc<Mutex<Vec<String>>>,
+        thread: Arc<Mutex<Option<std::thread::ThreadId>>>,
+    }
+
+    impl TerminalLeaseCleanup for BlockingCleanup {
+        fn before_reclaim(&self) -> Result<(), String> {
+            *self.thread.lock().unwrap() = Some(std::thread::current().id());
+            std::thread::sleep(Duration::from_millis(20));
+            self.log.lock().unwrap().push(String::from("cleanup"));
+            Ok(())
+        }
+    }
+
+    /// Releasing a lease has already reclaimed the terminal by the time it returns.
+    ///
+    /// The reactor stall inside `before_reclaim` is the price of this, and this test is
+    /// what makes that a decision instead of an oversight: moving the cleanup onto
+    /// `spawn_blocking` would still satisfy "the cleanup eventually runs", and it cannot
+    /// satisfy this. The assertions run with no intervening await, so they observe only
+    /// what `release` finished doing, and the recorded thread is the releasing one — a
+    /// cleanup that ran anywhere else means the child was still holding the TTY when the
+    /// owner was told it had it back.
+    #[tokio::test]
+    async fn lease_release_reclaims_the_terminal_before_it_returns() {
+        let (owner, log) = RecordingOwner::new();
+        let broker = TerminalBroker::with_timeout(owner, NEVER);
+        let thread = Arc::new(Mutex::new(None));
+        let cleanup: Arc<dyn TerminalLeaseCleanup> = Arc::new(BlockingCleanup {
+            log: Arc::clone(&log),
+            thread: Arc::clone(&thread),
+        });
+        let guard = broker
+            .acquire_with_cleanup(LeaseReason::new("tui", "external editor"), cleanup)
+            .await
+            .expect("acquire");
+        assert!(
+            tokio::runtime::Handle::try_current().is_ok(),
+            "the offload this test rules out is available on this runtime"
+        );
+
+        let releasing = std::thread::current().id();
+        guard.release();
+
+        assert_eq!(
+            entries(&log),
+            vec![
+                "yield tui".to_owned(),
+                "cleanup".to_owned(),
+                "reclaim-released tui".to_owned()
+            ],
+            "release returned before the terminal was back with its owner"
+        );
+        assert_eq!(
+            *thread.lock().unwrap(),
+            Some(releasing),
+            "the child was reaped on another thread, so release could only promise the \
+             terminal was returned"
+        );
+        assert!(
+            broker.reclaim_if_expired().is_none(),
+            "the released lease is settled, so nothing is left for the watchdog"
+        );
     }
 
     #[tokio::test]

@@ -129,6 +129,15 @@ Set `"oauth": false` to suppress auto-detection for a server that advertises OAu
 you do not want used. For a static token, a header is simpler than an OAuth flow, but keep
 the value in the environment rather than in the JSON file.
 
+OAuth metadata documents are read with a 1 MiB bound, and what an oversized document
+means depends on who chose its address. A URL the server named in its own
+`WWW-Authenticate` challenge fails the login with an OAuth error, because the server chose
+both the address and the size. The `.well-known` paths Zuno derives from the configured
+URL are guesses, so an oversized answer there is logged with a warning and the next
+candidate is tried — a catch-all page on `/.well-known/oauth-protected-resource` cannot
+stop you logging in. An oversized document is never parsed on either path, and discovery
+that ends with no authorization server metadata at all still fails rather than guessing.
+
 ## ACP session servers
 
 An ACP client may supply a complete session-local `mcpServers` list on
@@ -222,11 +231,28 @@ may have happened and must not be replayed until authoritative external state pr
 it did not complete. The two resource-listing tools declare themselves replay-safe,
 since `resources/list` mutates nothing.
 
+An unreadable reply is the same third case. If a call that can change server state answers
+with a body Zuno cannot parse — cut short by a proxy, invalid JSON in an SSE event, or a
+stream that ends before the reply arrives — the write already reached the server, so the
+call reports the uncertain outcome rather than a definite failure, and the non-replayable
+policy still applies. Read-only methods such as `tools/list` and `resources/read` report
+the protocol error directly, because nothing on the server can have changed.
+
 Stdio framing is bounded. One JSON-RPC frame may be up to 64 MiB, over four times
 the largest base64 resource blob a server can legitimately send. A longer frame fails
 every pending call with a protocol error and closes the stream, because a stream cut
 mid-frame cannot be resynchronised. Server stderr is bounded at 8 KiB per line and
 truncated rather than treated as fatal, since it has no pending caller.
+
+Stdout that is not JSON-RPC is diagnosed rather than waited out. Lines that do not parse
+as a JSON-RPC message, blank lines included, are counted per connection; a server that
+produces 32 of them without ever framing one decodable message fails its pending calls
+with a protocol error naming the count, instead of sitting until the timeout with nothing
+to report, and the log records one warning per 1024 such lines rather than one per line.
+Once a server has framed a single message, later noise never disconnects it. A base64
+resource blob or image block is measured after line breaks are removed, and the
+attachment Zuno stores holds exactly the bytes that were measured, so padding a payload
+cannot widen the 10 MiB decoded ceiling.
 
 ## When tools do not appear
 

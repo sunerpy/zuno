@@ -718,6 +718,19 @@ first and the narrow patterns that carve exceptions out of it belong last. The
 `edit` key covers the `write`, `edit`, and `apply_patch` tools; there is no
 separate `write` rule key.
 
+That order is the order you wrote, and it survives the two places it used to be
+lost. A Markdown agent's `permission.rules` reaches the evaluator in frontmatter
+order, and merging two configuration layers keeps the base layer's rule order
+rather than re-sorting it. Both used to alphabetize the keys, which is a different
+policy and not a cosmetic difference: `$HOME/.ssh/*` sorts before `*`, so sorting
+`{"*": "allow", "$HOME/.ssh/*": "deny"}` moves the deny above the catch-all and
+last-match-wins then deletes the protection.
+
+On a merge, a key both layers set is replaced where the base layer put it, and a
+key only the overlay sets is appended after the base layer's keys. An overlay
+pattern therefore outranks a base catch-all, which is the useful direction: a
+project or agent layer narrows a broad rule without having to restate it.
+
 A rule key that only aliases another key is a validation error that names the key
 to use instead: `write` and `apply_patch` both fold into `edit`, and
 `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource` all
@@ -729,6 +742,28 @@ The top-level `tools` switch stays keyed by tool name, and the same folding appl
 to it: `{"tools": {"apply_patch": false}}` becomes a lowest-precedence `edit` deny,
 so it turns off `edit` and `write` as well. Name the governing tool when that is not
 what you meant.
+
+Because of that folding, two `tools` entries in one configuration layer can land on
+one synthesized rule, and they must then agree. `{"tools": {"edit": false, "write":
+true}}` fails validation with a message naming both spellings and the key that governs
+them, alongside the file it was read from:
+
+```text
+tools "edit" is false and tools "write" is true, but both are governed by permission "edit"; one rule cannot be both, so set them alike or write the rule under permission.rules.edit
+```
+
+Setting both entries to the same value still loads. **This is a breaking change**: a
+`tools` block that contradicted itself this way used to load, with whichever entry
+came last silently winning, so a block that read as a denial could have been granting
+the tool instead. State the intent once under `permission.rules.<key>`, using the key
+the message names.
+
+Two layers that disagree are a different case. A `tools` entry in one layer and an entry
+in another that fold onto the same key are an override rather than a contradiction, and
+they resolve the way every other config key does: the layer with the highest precedence
+that names the permission key wins. A global `write: true` and a project `edit: false`
+both load, and the project layer decides. Only a disagreement inside one layer has no
+ordering to appeal to, which is why that is the only one refused.
 
 To run tool calls without Zuno HITL prompts, use `allow_all`:
 
@@ -1042,6 +1077,73 @@ the OS temporary directory is treated as no-op cleanup. There is no tool
 argument that lets a model approve its own risky call, and an explicit
 permission deny always wins.
 
+### Wrapper programs
+
+The Shell gate reads a command line through the wrapper programs in front of
+it — `sudo`, `doas`, `env`, `nice`, `ionice`, `time`, `timeout`, `nohup`,
+`xargs`, `command`, `builtin`, `exec`, `setsid`, `stdbuf`, `chroot`, `watch`,
+`chrt`, `taskset`, `flock` — so the program they run is judged, not the
+wrapper. Every way the line can be read is judged and the findings are the
+union: a reading can add a confirmation or a refusal, never remove one.
+An option the gate does not recognise is read both ways, as a flag and as an
+option whose value is the next word, so an unknown option can cost a
+confirmation on a harmless line but never hides the program behind it.
+
+One rule governs every word of a wrapper: **a word the shell computes may
+vanish, so wherever it appears the gate judges every later word as the
+possible program, and an attached or `=`-joined computed value is treated the
+same way.** `$VAR`, `${VAR}`, `$(…)`, a backtick and a glob are all computed
+words. An unquoted empty expansion disappears from the line, and an empty
+attached value turns `-u$EMPTY` into `-u`, which then takes the *next* word as
+its value; either way the program moves to the right.
+`sudo -u$EMPTY root rm -rf /` really runs `rm -rf /` as root and
+`chroot $ROOT /mnt rm -rf /` really runs it under `/mnt`, so both are refused.
+
+The rule holds in every slot, with no exceptions: option flags, an option's
+value written separately (`-u $EMPTY`), attached (`-u$EMPTY`, `-Eu$EMPTY`,
+`-n$N`) or with `=` (`--user=$VAL`), options the gate does not recognise, the
+operands a wrapper takes before its program (`chroot NEWROOT`, `taskset MASK`,
+`flock FILE`, `env VAR=value`, `chrt PRIORITY`), a `timeout` duration or
+signal, and the word that carries an inline script.
+
+Judging every later word over-approximates on purpose. `sudo $X echo rm -rf /`
+only prints, and it is refused anyway: guessing where an expansion ends would
+have to be right about a value the gate cannot see, and a wrong guess hides
+the program. A refusal for a line that prints costs a rewording; a missed
+`rm -rf /` costs the filesystem. The rule can add a prompt or a refusal to a
+line a computed word makes ambiguous, and never removes one. A line with two
+computed words among a wrapper's options may now ask for confirmation, because
+the second one is read as a possible program.
+
+The gate follows an inline script wherever a program it knows hands one over:
+the `-c` (or `-Command`) script of `sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`,
+`pwsh` and `powershell`, the words after `eval`, `su -c`, `env -S` and
+`flock -c`. An inline script counts as the program in every spelling its
+program accepts, including behind another wrapper: `env -S 'rm -rf /'`,
+`env -S'rm -rf /'`, `env -iS 'rm -rf /'`, `env --split-string='rm -rf /'`,
+`su -c'rm -rf /'`, `su -lc 'rm -rf /'`, `su --command='rm -rf /'`,
+`flock FILE -c 'rm -rf /'`, `sudo env --split-string='rm -rf /'`,
+`timeout 5 env -S'rm -rf /'`. ANSI-C quoting is materialised before the script
+is read, so `sh -c $'echo hi\nrm -rf /'` is refused exactly like
+`sh -c 'echo hi; rm -rf /'`. A program word that still holds whitespace or a
+list operator once its quoting is materialised, and an argument after a
+shell's `-c` script that still reads like a command list (`;`, `|`, `&` or a
+newline), are held for confirmation because the line could not be split
+reliably.
+
+`timeout` needs a duration it accepts: a word that starts with a digit, after
+an optional `+` or `.`, or is `inf` or `infinity` in any letter case — `5`,
+`1.5m`, `10s`, `.5`, `+5`, `1e3`. A word that is not one is a usage error, so
+nothing runs and the line is not refused — `timeout '' rm -rf /` exits with
+`invalid time interval`. Where the duration is valid, the next word is the
+program and the rest are its arguments, so `timeout 5 sh rm -rf /` runs `sh`
+on a script file named `rm`, not the `rm` program.
+
+Ordinary wrapper use is unaffected: `sudo -u root ls`, `sudo -u $USER ls -la`,
+`sudo -u$USER ls -la`, `sudo --user=$USER ls`, `chroot $ROOT /mnt ls -la`,
+`taskset $MASK 0x3 ls`, `nice -n$N make -j4`, `env FOO=bar make`,
+`timeout 5 cargo test` and `timeout inf cargo test` all run without a prompt.
+
 ## Skill discovery
 
 Zuno discovers skills in this scope order:
@@ -1248,6 +1350,15 @@ store:
   records.
 - global aggregation defaults to one seven-day bucket and requires two projects.
 - automatic prompt retrieval is capped at five items and 1,200 context tokens.
+- `retrieval.max_context_tokens` is measured on the rendered
+  `learning.experiences` section, escaping and `[U+XXXX]` markers included. A
+  budget too small for the framed section plus its cheapest matching record
+  retrieves nothing and reports the token figure that record needs; it does not
+  silently disable learning.
+- A reflection that writes an unresolvable encoding (the Unicode Tags block, the
+  Variation Selectors Supplement, or a C0/C1 control) loses that one entry, not
+  the extraction. The remaining entries are stored and the discard is recorded
+  in the learning job's `result` as `refusedItems`.
 - automatic Skill proposals require three independent sessions and at most 15
   learned rules.
 - `skill.require_review` must remain `true`; configuration that disables review

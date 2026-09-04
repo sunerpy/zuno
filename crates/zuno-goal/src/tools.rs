@@ -1,6 +1,8 @@
 //! Model-facing tools for reading, creating, and finishing persisted goals, and for
 //! recording what a session relies on while it works towards one.
 
+use crate::projection::clip_to;
+use crate::store::{MAX_CRITERION_STATEMENT_CHARS, MAX_WAIVER_REASON_CHARS};
 use crate::{
     CapabilityClaim, CapabilityClaimOutcome, CapabilityClaimState, Goal, GoalCriterion,
     GoalCriterionStatus, GoalError, GoalStore, ModelStatus, NewCapabilityClaim,
@@ -51,7 +53,14 @@ pub struct CreateGoalParams {
     /// Concrete objective the goal should pursue.
     pub objective: String,
     /// Concrete checks that define completion. The model cannot later rewrite them.
-    #[serde(default)]
+    ///
+    /// Required, and required to hold at least one non-blank entry. It carries no
+    /// `serde(default)` on purpose: the field is the whole evidence gate's input, and a
+    /// default would let the model opt out of being gated by leaving it out — which is
+    /// not a decision a proposal gets to make. Omitting it fails to deserialize;
+    /// supplying `[]` or only blank strings earns
+    /// [`GoalError::MissingSuccessCriteria`] from
+    /// [`GoalStore::create_goal_as_model`], which says what to do instead.
     pub success_criteria: Vec<String>,
     /// Positive token ceiling, only when explicitly requested.
     #[serde(default)]
@@ -248,20 +257,13 @@ impl TypedTool for CreateGoalTool {
         let store = Arc::clone(&self.store);
         let session_id = ctx.session_id;
         let objective = params.objective;
-        let success_criteria = params
-            .success_criteria
-            .into_iter()
-            .map(|criterion| criterion.trim().to_owned())
-            .filter(|criterion| !criterion.is_empty())
-            .collect::<Vec<_>>();
+        // Trimming and the refusal for an all-blank list both live in the store, so a
+        // second caller of the model path cannot reintroduce the criteria-less goal by
+        // filtering here and passing the empty result on.
+        let success_criteria = params.success_criteria;
         let token_budget = params.token_budget;
         let created = tokio::task::spawn_blocking(move || {
-            store.create_goal_with_criteria(
-                &session_id,
-                &objective,
-                &success_criteria,
-                token_budget,
-            )
+            store.create_goal_as_model(&session_id, &objective, &success_criteria, token_budget)
         })
         .await
         .map_err(|error| failed(CREATE_GOAL_TOOL_ID, error))?
@@ -370,7 +372,11 @@ impl TypedTool for UpdateGoalTool {
         let status_session_id = session_id.clone();
         let goal = tokio::task::spawn_blocking(move || {
             if matches!(status, ModelStatus::Complete) {
-                status_store.complete_checked(&status_session_id, revision)
+                // The model's own audit, not the human's: `complete_checked` exempts a
+                // criteria-free goal from the capability ledger because no CLI verb clears
+                // a claim, and a tool must not claim that exemption for the run that wrote
+                // the claim.
+                status_store.complete_as_model_checked(&status_session_id, revision)
             } else {
                 status_store.update_status_as_model_checked(&status_session_id, status, revision)
             }
@@ -703,6 +709,14 @@ fn criteria_output(
 }
 
 /// One checklist line: the id to cite, the statement, and where it stands.
+///
+/// The statement and the waiver reason are clipped to the caps the store enforces on
+/// them, the way [`crate::projection`] already clipped them in the human-readable
+/// document. This result is a tool result, so whatever it renders is pasted into the next
+/// model request and re-pasted on every later read: a 2 000 000-character waiver reason
+/// rendered a 2 000 434-byte tool result here while the same reason rendered clipped in
+/// the document. Rows an earlier release stored above either cap are clipped for the same
+/// reason — the bound belongs to the render, not only to the write.
 fn render_criterion(criterion: &GoalCriterion) -> String {
     let standing = match criterion.status {
         GoalCriterionStatus::Open => "open; cite the receipt id that proves it".to_owned(),
@@ -710,14 +724,15 @@ fn render_criterion(criterion: &GoalCriterion) -> String {
             || "satisfied".to_owned(),
             |receipt_id| format!("satisfied by receipt {receipt_id}"),
         ),
-        GoalCriterionStatus::Waived => criterion
-            .waiver_reason
-            .as_deref()
-            .map_or_else(|| "waived".to_owned(), |reason| format!("waived: {reason}")),
+        GoalCriterionStatus::Waived => criterion.waiver_reason.as_deref().map_or_else(
+            || "waived".to_owned(),
+            |reason| format!("waived: {}", clip_to(reason, MAX_WAIVER_REASON_CHARS)),
+        ),
     };
     format!(
         "{}  {} [{standing}]",
-        criterion.criterion_id, criterion.statement
+        criterion.criterion_id,
+        clip_to(&criterion.statement, MAX_CRITERION_STATEMENT_CHARS)
     )
 }
 

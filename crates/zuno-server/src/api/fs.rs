@@ -44,6 +44,8 @@
 //! `filesystem/search.ts`, where the index is built with the location as its
 //! base.
 
+use std::collections::{BinaryHeap, VecDeque};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use axum::extract::{Path as PathParam, Query, State};
@@ -51,7 +53,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
-use super::catalog::LocationEnvelope;
+use super::catalog::{LocationBody, LocationEnvelope};
 use super::error::ApiError;
 use super::state::ApiState;
 
@@ -66,6 +68,23 @@ const DEFAULT_FIND_LIMIT: usize = 50;
 /// and skips `.git`. This port does not shell out, so the exclusions are named
 /// here; see the module note in [`find`] on where that leaves ranking parity.
 const FIND_EXCLUDED: &[&str] = &[".git", "node_modules", "target", ".jj", ".hg", ".svn"];
+
+/// How many levels below the session directory `fs/find` descends.
+///
+/// The walk is bounded rather than exhaustive because the response is bounded: no
+/// caller can see past `limit` entries, and an unbounded descent on a deep tree
+/// costs the whole process (see [`blocking`]) for results nobody receives.
+const FIND_MAX_DEPTH: usize = 16;
+
+/// How many directory entries one `fs/find` examines before it answers with the
+/// best matches it has, for the same reason [`FIND_MAX_DEPTH`] exists.
+const FIND_MAX_ENTRIES: usize = 20_000;
+
+/// The largest file `fs/read` returns.
+///
+/// The body is buffered whole, so without a ceiling one request grows the process
+/// by the size of whatever file it names.
+const READ_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// One directory entry, upstream's `FileSystem.Entry`
 /// (`packages/schema/src/filesystem.ts:14-18`).
@@ -88,6 +107,29 @@ pub enum EntryKind {
     Directory,
     /// A regular file.
     File,
+}
+
+/// `fs/find`'s answer: the location envelope plus whether a ceiling stopped the walk.
+///
+/// [`FIND_MAX_DEPTH`] and [`FIND_MAX_ENTRIES`] make an empty `data` ambiguous — no such
+/// file, or a walk that gave up before reaching it — and a search endpoint that cannot
+/// tell a caller which one it means is reporting an absence it did not establish. The
+/// flag is the difference, so a client can say "no matches here" or "narrow the search".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FindEnvelope {
+    /// Which directory, workspace and project the answer was computed for.
+    pub location: LocationBody,
+    /// The ranked matches, bounded by the request's `limit`.
+    pub data: Vec<Entry>,
+    /// `true` when the walk hit [`FIND_MAX_DEPTH`] or [`FIND_MAX_ENTRIES`], so a path
+    /// missing from `data` may still exist.
+    pub truncated: bool,
+}
+
+impl IntoResponse for FindEnvelope {
+    fn into_response(self) -> Response {
+        axum::Json(self).into_response()
+    }
 }
 
 /// `GET /api/fs/list` query.
@@ -246,15 +288,8 @@ pub async fn read(
     State(state): State<ApiState>,
     PathParam(path): PathParam<String>,
 ) -> Result<Response, ApiError> {
-    let sandbox = Sandbox::open(state.directory())?;
-    let target = sandbox.resolve(Some(&path))?;
-    let metadata = std::fs::symlink_metadata(&target.real)
-        .map_err(|_| ApiError::PathNotFound(path.clone()))?;
-    if !metadata.is_file() {
-        return Err(ApiError::PathNotFound(path));
-    }
-    let bytes = std::fs::read(&target.real).map_err(|_| ApiError::PathNotFound(path.clone()))?;
-    let mime = mime_type(&target.real);
+    let directory = state.directory().to_owned();
+    let (bytes, mime) = blocking(move || read_contained_file(&directory, &path)).await?;
     Ok((
         StatusCode::OK,
         [(
@@ -265,6 +300,40 @@ pub async fn read(
         bytes,
     )
         .into_response())
+}
+
+/// Resolves `path` inside the sandbox and reads it, refusing anything above
+/// [`READ_MAX_BYTES`].
+fn read_contained_file(directory: &str, path: &str) -> Result<(Vec<u8>, &'static str), ApiError> {
+    let sandbox = Sandbox::open(directory)?;
+    let target = sandbox.resolve(Some(path))?;
+    let metadata = std::fs::symlink_metadata(&target.real)
+        .map_err(|_| ApiError::PathNotFound(path.to_owned()))?;
+    if !metadata.is_file() {
+        return Err(ApiError::PathNotFound(path.to_owned()));
+    }
+    if metadata.len() > READ_MAX_BYTES {
+        return Err(ApiError::FileTooLarge {
+            path: path.to_owned(),
+            limit: READ_MAX_BYTES,
+        });
+    }
+    let file =
+        std::fs::File::open(&target.real).map_err(|_| ApiError::PathNotFound(path.to_owned()))?;
+    let mut bytes = Vec::new();
+    // The ceiling is enforced again on the read itself: the size above came from a
+    // separate `stat`, and a file that grew in between would otherwise still be
+    // buffered whole.
+    file.take(READ_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ApiError::PathNotFound(path.to_owned()))?;
+    if bytes.len() as u64 > READ_MAX_BYTES {
+        return Err(ApiError::FileTooLarge {
+            path: path.to_owned(),
+            limit: READ_MAX_BYTES,
+        });
+    }
+    Ok((bytes, mime_type(&target.real)))
 }
 
 /// `GET /api/fs/list` — the direct children of one directory.
@@ -279,15 +348,21 @@ pub async fn list(
     State(state): State<ApiState>,
     Query(input): Query<ListQuery>,
 ) -> Result<LocationEnvelope<Vec<Entry>>, ApiError> {
-    let sandbox = Sandbox::open(state.directory())?;
-    let target = sandbox.resolve(input.path.as_deref())?;
-    let metadata = std::fs::metadata(&target.real).map_err(|_| {
-        ApiError::PathNotFound(input.path.clone().unwrap_or_else(|| ".".to_owned()))
-    })?;
+    let directory = state.directory().to_owned();
+    let entries =
+        blocking(move || list_contained_directory(&directory, input.path.as_deref())).await?;
+    Ok(state.envelope(entries))
+}
+
+/// Lists the direct children of one contained directory.
+fn list_contained_directory(directory: &str, path: Option<&str>) -> Result<Vec<Entry>, ApiError> {
+    let sandbox = Sandbox::open(directory)?;
+    let target = sandbox.resolve(path)?;
+    let requested = || path.unwrap_or(".").to_owned();
+    let metadata =
+        std::fs::metadata(&target.real).map_err(|_| ApiError::PathNotFound(requested()))?;
     if !metadata.is_dir() {
-        return Err(ApiError::PathNotFound(
-            input.path.unwrap_or_else(|| ".".to_owned()),
-        ));
+        return Err(ApiError::PathNotFound(requested()));
     }
     let mut entries = Vec::new();
     let reader = std::fs::read_dir(&target.real).map_err(|_| ApiError::FilesystemUnavailable)?;
@@ -314,10 +389,17 @@ pub async fn list(
             .cmp(&right.kind)
             .then_with(|| locale_compare(&left.path, &right.path))
     });
-    Ok(state.envelope(entries))
+    Ok(entries)
 }
 
 /// `GET /api/fs/find` — a bounded fuzzy search rooted at the session directory.
+///
+/// # Bounded means the walk, not only the answer
+///
+/// The walk descends at most [`FIND_MAX_DEPTH`] levels, examines at most
+/// [`FIND_MAX_ENTRIES`] entries, and never holds more than `limit` candidates, so a
+/// large or deep working tree costs a bounded amount of time and memory instead of
+/// one allocation per file. Only the ranking of what it did examine is exact.
 ///
 /// # Ranking is shape parity, not byte parity
 ///
@@ -337,7 +419,7 @@ pub async fn list(
 pub async fn find(
     State(state): State<ApiState>,
     Query(input): Query<FindQuery>,
-) -> Result<LocationEnvelope<Vec<Entry>>, ApiError> {
+) -> Result<FindEnvelope, ApiError> {
     let Some(needle) = input.query else {
         return Err(ApiError::MissingQueryKey("query"));
     };
@@ -349,78 +431,210 @@ pub async fn find(
             .filter(|value| *value > 0)
             .ok_or(ApiError::InvalidQueryValue("limit"))?,
     };
-    let sandbox = Sandbox::open(state.directory())?;
+    let directory = state.directory().to_owned();
     let needle = needle.trim().to_owned();
-    let mut scored = Vec::new();
-    collect(&sandbox.root, &sandbox.root, &mut scored);
-    let mut matched = scored
-        .into_iter()
-        .filter(|entry| match input.kind {
-            Some(EntryFilter::File) => entry.kind == EntryKind::File,
-            Some(EntryFilter::Directory) => entry.kind == EntryKind::Directory,
-            None => true,
-        })
-        .filter_map(|entry| score(&entry.path, &needle).map(|score| (score, entry)))
-        .collect::<Vec<_>>();
-    matched.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.path.len().cmp(&right.1.path.len()))
-            .then_with(|| locale_compare(&left.1.path, &right.1.path))
-    });
-    let data = matched
-        .into_iter()
-        .take(limit)
-        .map(|(_, entry)| Entry {
-            path: with_directory_suffix(entry.path, entry.kind),
-            kind: entry.kind,
-        })
-        .collect();
-    Ok(state.envelope(data))
+    let kind = input.kind;
+    let found = blocking(move || search(&directory, &needle, kind, limit)).await?;
+    let envelope = state.envelope(found.entries);
+    Ok(FindEnvelope {
+        location: envelope.location,
+        data: envelope.data,
+        truncated: found.truncated,
+    })
 }
 
-/// One candidate before it is scored, holding the separator-free relative path.
-struct Candidate {
+/// Runs one filesystem operation off the reactor, inside the filesystem budget.
+///
+/// `zuno serve` polls this router on a single-threaded runtime
+/// (`zuno serve`'s `Builder::new_current_thread`), so a synchronous walk or read
+/// here freezes every SSE stream and every live turn in the process until the disk
+/// answers. A slow network mount makes that freeze unbounded.
+///
+/// Moving the work off the reactor also removes the serialization the reactor was
+/// providing, which is why every off-reactor handler shares one budget module: see
+/// [`super::blocking`] for why the permit is held by the work rather than by the
+/// caller, and what that makes the process-wide ceiling for [`READ_MAX_BYTES`]
+/// buffers on an endpoint that is unauthenticated unless the operator sets
+/// `ZUNO_SERVER_PASSWORD`.
+async fn blocking<T, F>(work: F) -> Result<T, ApiError>
+where
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+    T: Send + 'static,
+{
+    super::blocking::run(super::blocking::Budget::Filesystem, work).await
+}
+
+/// Walks the sandbox breadth-first and returns the best `limit` matches.
+///
+/// Breadth-first is what makes [`FIND_MAX_ENTRIES`] useful: when the budget runs
+/// out the entries already examined are the shallow ones, which is where the paths
+/// a caller is searching for usually live.
+fn search(
+    directory: &str,
+    needle: &str,
+    filter: Option<EntryFilter>,
+    limit: usize,
+) -> Result<Found, ApiError> {
+    let sandbox = Sandbox::open(directory)?;
+    let mut best = BestMatches::new(limit);
+    let mut examined = 0_usize;
+    let mut truncated = false;
+    let mut queue = VecDeque::from([(sandbox.root.clone(), 0_usize)]);
+    while let Some((directory, depth)) = queue.pop_front() {
+        // A subtree this walk cannot open — permission denied, a directory that went
+        // away mid-walk — is unexamined, not empty. Reporting the search as complete
+        // would let a caller read "not present" out of "not searchable", which is the
+        // silent absence `truncated` exists to remove.
+        let Ok(reader) = std::fs::read_dir(&directory) else {
+            truncated = true;
+            continue;
+        };
+        for item in reader {
+            let Ok(item) = item else {
+                truncated = true;
+                continue;
+            };
+            if examined >= FIND_MAX_ENTRIES {
+                return Ok(Found {
+                    entries: best.into_ranked_entries(),
+                    truncated: true,
+                });
+            }
+            examined += 1;
+            // `file_type` on a `DirEntry` does not follow the link, so a symlink is
+            // neither descended into nor reported. That is the search-side half of
+            // the sandbox: the walk cannot leave the root at all.
+            let Ok(kind) = item.file_type() else {
+                truncated = true;
+                continue;
+            };
+            let name = item.file_name();
+            if kind.is_dir() && FIND_EXCLUDED.contains(&name.to_string_lossy().as_ref()) {
+                continue;
+            }
+            let absolute = directory.join(&name);
+            let Some(relative) = relative_to(&sandbox.root, &absolute) else {
+                truncated = true;
+                continue;
+            };
+            let kind = if kind.is_dir() {
+                if depth + 1 < FIND_MAX_DEPTH {
+                    queue.push_back((absolute, depth + 1));
+                } else {
+                    // A directory the walk refuses to enter is an answer this search
+                    // cannot give; whatever is inside it is unexamined, not absent.
+                    truncated = true;
+                }
+                EntryKind::Directory
+            } else if kind.is_file() {
+                EntryKind::File
+            } else {
+                continue;
+            };
+            let wanted = match filter {
+                Some(EntryFilter::File) => kind == EntryKind::File,
+                Some(EntryFilter::Directory) => kind == EntryKind::Directory,
+                None => true,
+            };
+            if !wanted {
+                continue;
+            }
+            if let Some(score) = score(&relative, needle) {
+                best.consider(Ranked {
+                    score,
+                    path: relative,
+                    kind,
+                });
+            }
+        }
+    }
+    Ok(Found {
+        entries: best.into_ranked_entries(),
+        truncated,
+    })
+}
+
+/// What one [`search`] examined: its best matches, and whether a ceiling cut it short.
+struct Found {
+    entries: Vec<Entry>,
+    truncated: bool,
+}
+
+/// One scored candidate, ordered best-first.
+struct Ranked {
+    /// The match span, lower being tighter; see [`score`].
+    score: usize,
     /// The path relative to the session directory, without a directory suffix.
     path: String,
     /// Whether it is a file or a directory.
     kind: EntryKind,
 }
 
-/// Walks `directory` depth-first, appending every file and directory beneath the
-/// sandbox root and never following a symlink out of it.
-fn collect(root: &Path, directory: &Path, out: &mut Vec<Candidate>) {
-    let Ok(reader) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for item in reader.flatten() {
-        // `file_type` on a `DirEntry` does not follow the link, so a symlink is
-        // neither descended into nor reported. That is the search-side half of
-        // the sandbox: the walk cannot leave the root at all.
-        let Ok(kind) = item.file_type() else {
-            continue;
-        };
-        let name = item.file_name();
-        let name = name.to_string_lossy();
-        if kind.is_dir() && FIND_EXCLUDED.contains(&name.as_ref()) {
-            continue;
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .cmp(&other.score)
+            .then_with(|| self.path.len().cmp(&other.path.len()))
+            .then_with(|| locale_compare(&self.path, &other.path))
+    }
+}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Ranked {}
+
+/// The best `limit` candidates seen so far.
+///
+/// The walk keeps only what the response can carry, so the corpus never lands in
+/// memory: a max-heap of `limit` entries gives the same answer the old
+/// collect-everything-then-sort did, without holding one entry per file in the tree.
+struct BestMatches {
+    limit: usize,
+    heap: BinaryHeap<Ranked>,
+}
+
+impl BestMatches {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            heap: BinaryHeap::new(),
         }
-        let absolute = directory.join(item.file_name());
-        let Some(relative) = relative_to(root, &absolute) else {
-            continue;
-        };
-        if kind.is_dir() {
-            out.push(Candidate {
-                path: relative,
-                kind: EntryKind::Directory,
-            });
-            collect(root, &absolute, out);
-        } else if kind.is_file() {
-            out.push(Candidate {
-                path: relative,
-                kind: EntryKind::File,
-            });
+    }
+
+    fn consider(&mut self, candidate: Ranked) {
+        if self.heap.len() < self.limit {
+            self.heap.push(candidate);
+            return;
         }
+        if self
+            .heap
+            .peek()
+            .is_some_and(|worst| candidate.cmp(worst).is_lt())
+        {
+            let _worst = self.heap.pop();
+            self.heap.push(candidate);
+        }
+    }
+
+    fn into_ranked_entries(self) -> Vec<Entry> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|ranked| Entry {
+                path: with_directory_suffix(ranked.path, ranked.kind),
+                kind: ranked.kind,
+            })
+            .collect()
     }
 }
 
@@ -531,6 +745,98 @@ fn mime_type(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    /// The reviewed input: whole-file reads whose callers hang up mid-read.
+    ///
+    /// `zuno serve` sets no `max_blocking_threads`, so tokio's default of 512 is how
+    /// many reads could run at once the moment the work moved off the reactor, and
+    /// `ZUNO_SERVER_PASSWORD` is optional, so an unauthenticated caller reaches it.
+    ///
+    /// A permit held in the *handler's* future does not bound that: a `spawn_blocking`
+    /// closure whose `JoinHandle` is dropped runs to completion, so four callers that
+    /// disconnect while their reads are in flight measured four free slots with four
+    /// 32 MiB buffers still resident, and eight concurrent reads under a four-slot cap.
+    /// The permit now lives inside the work, so a disconnect frees nothing until the
+    /// read it queued has ended, and the process-wide ceiling really is
+    /// `Budget::Filesystem` slots times [`READ_MAX_BYTES`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disconnected_caller_holds_its_filesystem_slot_until_its_read_ends() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        use super::super::blocking::Budget;
+
+        const TOKIO_DEFAULT_BLOCKING_THREADS: usize = 512;
+        let slots = Budget::Filesystem.size();
+        assert!(
+            slots < TOKIO_DEFAULT_BLOCKING_THREADS,
+            "the bound has to be below the blocking pool to be a bound at all"
+        );
+        let running = Arc::new(AtomicUsize::new(0));
+        let finish = Arc::new(AtomicBool::new(false));
+        // Every slot taken by a caller that hangs up the moment its read is queued.
+        for _ in 0..slots {
+            let running = Arc::clone(&running);
+            let finish = Arc::clone(&finish);
+            let mut call = std::pin::pin!(blocking(move || {
+                running.fetch_add(1, Ordering::SeqCst);
+                // The read is held open by the test, with a real-clock ceiling so a
+                // regression fails the suite instead of hanging it.
+                let ceiling = Instant::now() + Duration::from_secs(30);
+                while !finish.load(Ordering::SeqCst) && Instant::now() < ceiling {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(())
+            }));
+            assert!(
+                futures::poll!(&mut call).is_pending(),
+                "the read is queued and its caller is waiting"
+            );
+            // The client hangs up here: the handler future goes out of scope at the end
+            // of this iteration, while the `spawn_blocking` closure it queued keeps
+            // running. (`drop` on the `Pin<&mut _>` would not do this — it drops the
+            // pointer, not the future.)
+        }
+        let ceiling = Instant::now() + Duration::from_secs(30);
+        while running.load(Ordering::SeqCst) < slots {
+            assert!(
+                Instant::now() < ceiling,
+                "the disconnected reads never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(
+            Budget::Filesystem.available(),
+            0,
+            "{slots} disconnected callers handed their slots back while their reads \
+             still hold their buffers, so {TOKIO_DEFAULT_BLOCKING_THREADS} reads can \
+             be resident under a {slots}-slot cap"
+        );
+        let mut queued = std::pin::pin!(blocking(|| Ok(READ_MAX_BYTES)));
+        // A real-clock window, not a poll count: this closure returns immediately once it
+        // runs, so a poll count could pass merely because the blocking pool had not been
+        // scheduled yet.
+        let window = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < window {
+            assert!(
+                futures::poll!(&mut queued).is_pending(),
+                "a {READ_MAX_BYTES}-byte read started while every slot was still held \
+                 by a disconnected caller's read"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        finish.store(true, Ordering::SeqCst);
+        assert_eq!(
+            queued
+                .await
+                .expect("the queued read runs once a slot frees"),
+            READ_MAX_BYTES,
+            "the bound must queue the work, not drop it"
+        );
+    }
+
     #[test]
     fn lexical_resolution_folds_parent_components_before_containment_runs() {
         let root = Path::new("/work/repo");
@@ -579,6 +885,68 @@ mod tests {
         assert_eq!(score("a-l-p-h-a.txt", "alpha"), Some(9));
         assert_eq!(score("beta.txt", "alpha"), None);
         assert_eq!(score("anything", ""), Some(0));
+    }
+
+    /// A subtree the walk cannot open must not be reported as a complete search.
+    ///
+    /// `GET /api/fs/find?query=secret` over a tree containing one directory this
+    /// process may not read used to answer `truncated: false`, so a caller could not
+    /// tell "no such path" from "one whole subtree was never examined". The same
+    /// silent absence covers a directory removed mid-walk and a `file_type` that
+    /// fails.
+    ///
+    /// The input is only constructible when the mode bits actually deny this process;
+    /// a root test runner reads the directory anyway, and the test says so and stops
+    /// rather than passing on an input it never built.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_subtree_marks_the_search_truncated() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("a temporary sandbox root");
+        std::fs::write(root.path().join("secret.txt"), b"visible")
+            .expect("a matching file in the readable part of the tree");
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).expect("a subdirectory to lock");
+        std::fs::write(locked.join("secret-inner.txt"), b"hidden")
+            .expect("a matching file inside the locked subtree");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("clearing the subdirectory's mode bits");
+
+        let denied = std::fs::read_dir(&locked).is_err();
+        // Restore before any assertion so the temporary directory can be removed.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("restoring the subdirectory's mode bits");
+        if !denied {
+            // Running with a uid that ignores mode bits: the reviewed input does not
+            // exist here, and asserting on it would report coverage that was not run.
+            return;
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("clearing the subdirectory's mode bits again");
+
+        let found = search(
+            &root.path().to_string_lossy(),
+            "secret",
+            None,
+            DEFAULT_FIND_LIMIT,
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("restoring the subdirectory's mode bits");
+        let found = found.expect("an unreadable subtree does not fail the whole search");
+        assert!(
+            found
+                .entries
+                .iter()
+                .any(|entry| entry.path.ends_with("secret.txt")),
+            "the readable part of the tree is still searched"
+        );
+        assert!(
+            found.truncated,
+            "a subtree the walk could not open leaves the search incomplete, so a \
+             caller must not read `truncated: false` as `not present`"
+        );
     }
 
     #[test]

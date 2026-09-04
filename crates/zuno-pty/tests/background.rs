@@ -5,9 +5,9 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 use zuno_pty::{
-    BUFFER_LIMIT, BackgroundExecutionId, BackgroundExecutionInput, BackgroundExecutionPurpose,
-    BackgroundExecutionRetention, BackgroundExecutionService, BackgroundExecutionStatus,
-    MAX_RETAINED_TERMINAL_EXECUTIONS, ReplayCursor,
+    BUFFER_LIMIT, BackgroundExecutionError, BackgroundExecutionId, BackgroundExecutionInput,
+    BackgroundExecutionPurpose, BackgroundExecutionRetention, BackgroundExecutionService,
+    BackgroundExecutionStatus, MAX_RETAINED_TERMINAL_EXECUTIONS, ReplayCursor,
 };
 use zuno_sandbox::{
     NetworkAccess, PrepareRequest, PreparedCommand, SandboxCapabilities, SandboxMode, SandboxPolicy,
@@ -59,6 +59,45 @@ fn input(
         hard_ceiling,
         retention: BackgroundExecutionRetention::Durable,
     }
+}
+
+/// An ephemeral command's capture file is created after its `<id>.lock` and has to be
+/// removed before it, because a capture with no claim beside it is what a build from
+/// before the claim protocol leaves and `reclaim_orphan` deliberately never sweeps one.
+/// This pins the resting state a peer can observe once the caller has the bytes: neither
+/// file left behind, the claim included.
+#[tokio::test]
+async fn consuming_a_foreground_result_leaves_neither_its_capture_nor_its_claim() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let service = BackgroundExecutionService::open(directory.path()).expect("background service");
+    let mut launch = input(directory.path(), "printf done", Duration::from_secs(30));
+    launch.retention = BackgroundExecutionRetention::Ephemeral;
+    let started = service.start(launch).expect("command starts");
+    let capture = started.output_file.clone();
+    let claim = directory
+        .path()
+        .join(format!("{}.lock", started.id.as_str()));
+    assert!(claim.exists(), "the claim precedes the capture it covers");
+    service
+        .wait(&started.id, None)
+        .await
+        .expect("the command settles");
+
+    let output = service
+        .finish_foreground(&started.id)
+        .expect("the caller consumes the terminal result");
+
+    assert_eq!(output, b"done");
+    assert!(
+        !capture.exists(),
+        "the capture file is consumed and removed"
+    );
+    assert!(
+        !claim.exists(),
+        "and its claim goes with it: a leaked claim file would make every later id \
+         collision look owned, and a claim released before the capture would leave the \
+         capture in the one state nothing sweeps"
+    );
 }
 
 #[tokio::test]
@@ -400,6 +439,10 @@ async fn remote_observer_purpose_survives_terminal_persistence_and_reopen() {
     assert!(restored.purpose.requires_authoritative_refresh());
 }
 
+/// A row in the shape Zuno 0.6.6 wrote it - format 3, no `claimed` marker, no `<id>.lock` -
+/// whose command is over. It is reconciled exactly as the released build reconciled it,
+/// because the pid it recorded is one this process spawned and reaped, so its absence is
+/// provable rather than assumed from the missing lock file.
 #[test]
 fn persisted_running_state_reconciles_to_uncertain_without_replay() {
     let directory = tempfile::tempdir().expect("workspace");
@@ -407,6 +450,7 @@ fn persisted_running_state_reconciles_to_uncertain_without_replay() {
         BackgroundExecutionId::parse("bg_0123456789abcdef0123456789abcdef").expect("fixture id");
     let output_file = directory.path().join(format!("{id}.output"));
     let status_file = directory.path().join(format!("{id}.status.json"));
+    let reaped = reaped_pid();
     std::fs::write(&output_file, b"partial").expect("fixture output");
     std::fs::write(
         &status_file,
@@ -419,7 +463,7 @@ fn persisted_running_state_reconciles_to_uncertain_without_replay() {
                 "command": "fixture",
                 "cwd": directory.path(),
                 "status": "running",
-                "pid": 999999,
+                "pid": reaped,
                 "exitCode": null,
                 "timedOut": false,
                 "timeCreated": 1,
@@ -525,6 +569,122 @@ fn persisted_v2_authority_recovers_with_requested_equal_to_effective() {
     assert_eq!(info.purpose, BackgroundExecutionPurpose::Command);
 }
 
+#[tokio::test]
+async fn a_second_service_leaves_a_live_process_execution_to_its_owner() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let pid_file = directory.path().join("live.pid");
+    let command = format!("printf '%s' \"$$\" > '{}'; sleep 30", pid_file.display());
+    let owner = BackgroundExecutionService::open(directory.path()).expect("owning service");
+    let started = owner
+        .start(input(directory.path(), command, Duration::from_secs(30)))
+        .expect("command starts");
+    wait_for_file(&pid_file).await;
+
+    // What a concurrent `zuno run` or `zuno serve` in the same worktree does.
+    let peer = BackgroundExecutionService::open(directory.path()).expect("peer service");
+    let observed = peer
+        .get(&started.id)
+        .expect("the running row stays visible");
+
+    assert_eq!(observed.status, BackgroundExecutionStatus::Running);
+    assert_eq!(observed.pid, started.pid);
+    assert!(started.output_file.exists(), "live output must survive");
+    assert!(started.status_file.exists(), "live state must survive");
+    assert!(matches!(
+        peer.cancel(&started.id),
+        Err(BackgroundExecutionError::Foreign(_))
+    ));
+    assert!(matches!(
+        peer.wait(&started.id, None).await,
+        Err(BackgroundExecutionError::Foreign(_))
+    ));
+
+    assert!(owner.cancel(&started.id).expect("the owner still cancels"));
+    let settled = owner
+        .wait(&started.id, None)
+        .await
+        .expect("owner cancellation settles")
+        .info;
+    assert_eq!(settled.status, BackgroundExecutionStatus::Cancelled);
+    wait_for_process_exit(read_pid(&pid_file)).await;
+
+    // The peer's row is a snapshot of someone else's execution, and nothing in this
+    // process will ever move it. Without a refresh it reports `running` with a dead pid
+    // and refuses every wait for as long as this process lives.
+    let converged = peer.get(&started.id).expect("the peer's row converges");
+    assert_eq!(converged.status, BackgroundExecutionStatus::Cancelled);
+    assert_eq!(converged.pid, None);
+    let waited = peer
+        .wait(&started.id, None)
+        .await
+        .expect("a settled row is no longer refused");
+    assert_eq!(waited.info.status, BackgroundExecutionStatus::Cancelled);
+    assert!(
+        !peer
+            .cancel(&started.id)
+            .expect("terminal cancel is a no-op")
+    );
+}
+
+#[tokio::test]
+async fn a_peer_sweep_reclaims_a_dead_capture_and_keeps_a_live_one() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let owner = BackgroundExecutionService::open(directory.path()).expect("owning service");
+    let mut foreground = input(directory.path(), "sleep 30", Duration::from_secs(30));
+    foreground.retention = BackgroundExecutionRetention::Ephemeral;
+    let live = owner.start(foreground).expect("foreground command starts");
+    // What this build leaves behind when it is killed before it can clean up: the claim
+    // file it created before the capture (`claim_capture`) survives the process, and the
+    // OS releases the lock on it. That pair - a capture beside a claim nobody holds - is
+    // what proves the writer is gone. A capture with no claim file beside it proves
+    // nothing and is left alone; `an_orphaned_capture_with_no_claim_file_beside_it_is_not_swept`
+    // pins that half.
+    let dead = directory
+        .path()
+        .join("bg_8123456789abcdef0123456789abcdef.output");
+    std::fs::write(&dead, b"lost").expect("dead capture");
+    let dead_claim = directory
+        .path()
+        .join("bg_8123456789abcdef0123456789abcdef.lock");
+    std::fs::write(&dead_claim, b"").expect("its released claim");
+
+    let _peer = BackgroundExecutionService::open(directory.path()).expect("peer service");
+
+    assert!(
+        live.output_file.exists(),
+        "a live foreground capture has no state row and must survive a peer's sweep"
+    );
+    assert!(!dead.exists(), "a capture no process owns is reclaimed");
+    assert!(!dead_claim.exists(), "and so is the claim that proved it");
+    let _cancelled = owner.cancel(&live.id);
+}
+
+#[tokio::test]
+async fn a_state_path_that_is_not_utf8_reports_an_error_instead_of_aborting_the_turn() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let directory = tempfile::tempdir().expect("workspace");
+    let root = directory
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"background-\xff"));
+    std::fs::create_dir(&root).expect("non-utf8 root");
+    let service = BackgroundExecutionService::open(&root).expect("background service");
+
+    let error = service
+        .start(input(directory.path(), "printf hi", Duration::from_secs(2)))
+        .expect_err("a state file that cannot be encoded is an error, not an abort");
+
+    assert!(
+        matches!(error, BackgroundExecutionError::State { .. }),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&root).expect("state root").count(),
+        0,
+        "a failed start leaves no state, capture, or claim behind"
+    );
+}
+
 async fn wait_for_file(path: &Path) {
     tokio::time::timeout(Duration::from_secs(1), async {
         while !path.exists() || std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0) {
@@ -540,6 +700,157 @@ fn read_pid(path: &Path) -> u32 {
         .expect("pid file")
         .parse()
         .expect("numeric pid")
+}
+
+/// The reviewer's input for the released-format gate: a real `sleep 30` recorded in a row
+/// that is byte-for-byte what Zuno 0.6.6 writes. The marker `claimed` is optional, so the
+/// released build - which has no claim protocol and creates no `<id>.lock` at all - writes
+/// exactly the row a reader could mistake for "the owner is gone".
+///
+/// Settling it reports a command that is running as `uncertain` / "was not replayed", and
+/// under retention pressure takes its `.status.json` and `.output` with it while the owner
+/// is still appending to an unlinked inode. Every background command a released Zuno
+/// started and is still running across an upgrade is this row.
+#[tokio::test]
+async fn a_released_format_row_is_left_alone_while_the_command_it_names_still_runs() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let pid_file = directory.path().join("released.pid");
+    let command = format!(
+        "printf '%s' \"$$\" > '{}'; printf ready; sleep 30",
+        pid_file.display()
+    );
+    let owner = BackgroundExecutionService::open(directory.path()).expect("owning service");
+    let started = owner
+        .start(input(directory.path(), command, Duration::from_secs(30)))
+        .expect("command starts");
+    wait_for_file(&pid_file).await;
+    // The capture is written by the owner's pump task, so wait for the bytes rather than
+    // for the process: a peer must be able to read a released row's output, and an empty
+    // file would pass that assertion for the wrong reason.
+    wait_for_file(&started.output_file).await;
+    let live_pid = started.pid.expect("a spawned command records its pid");
+
+    // Downgrade the row this build just wrote to the released format. `git show
+    // df4d7490:crates/zuno-pty/src/background.rs` serializes `PersistedExecution { format,
+    // info }` with an identical `BackgroundExecutionInfo`, so the released row is this row
+    // without the marker - and the released build never creates the lock file.
+    let mut row = read_row(&started.status_file);
+    assert_eq!(
+        row["claimed"],
+        serde_json::json!(true),
+        "this build records the claim it holds"
+    );
+    assert_eq!(row["info"]["pid"], serde_json::json!(live_pid));
+    let object = row.as_object_mut().expect("row object");
+    assert!(object.remove("claimed").is_some());
+    assert_eq!(
+        object.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["format", "info"],
+        "the released row is this row minus the marker: another top-level key means the \
+         released shape has to be re-derived before this fixture means anything"
+    );
+    std::fs::write(
+        &started.status_file,
+        serde_json::to_vec_pretty(&row).expect("released row"),
+    )
+    .expect("released row is written");
+    let lock_file = directory.path().join(format!("{}.lock", started.id));
+    assert!(lock_file.exists(), "this build took a claim");
+    std::fs::remove_file(&lock_file).expect("the released build creates no claim file");
+    // Enough terminal history that a settled row would be pruned on sight.
+    for index in 0..=MAX_RETAINED_TERMINAL_EXECUTIONS {
+        seed_completed_row(directory.path(), &row, index);
+    }
+
+    // What an upgraded `zuno run` or `zuno serve` opening the same worktree does.
+    let peer = BackgroundExecutionService::open(directory.path()).expect("peer service");
+    let observed = peer
+        .get(&started.id)
+        .expect("the released row stays visible");
+
+    assert_eq!(observed.status, BackgroundExecutionStatus::Running);
+    assert_eq!(observed.pid, Some(live_pid));
+    assert!(observed.error.is_none(), "{:?}", observed.error);
+    assert!(
+        started.output_file.exists(),
+        "a live command's capture must survive a peer that cannot prove its owner is gone"
+    );
+    assert!(started.status_file.exists(), "and so must its row");
+    let on_disk = read_row(&started.status_file);
+    assert_eq!(
+        on_disk["info"]["status"], "running",
+        "nothing proves this command is over, so its row must not be rewritten"
+    );
+    assert!(
+        on_disk.get("claimed").is_none(),
+        "a peer that owns nothing here may not stamp a claim marker either"
+    );
+    assert_eq!(
+        peer.output(&started.id, ReplayCursor::Full, None)
+            .expect("the released row's capture is readable")
+            .bytes,
+        b"ready",
+        "a released row still reads through the new build"
+    );
+    assert!(matches!(
+        peer.cancel(&started.id),
+        Err(BackgroundExecutionError::Foreign(_))
+    ));
+    assert_eq!(
+        owner
+            .get(&started.id)
+            .expect("the owner still owns it")
+            .status,
+        BackgroundExecutionStatus::Running,
+        "the command really was running for the whole check"
+    );
+
+    // And it still converges: once the owner publishes an outcome, the peer adopts it.
+    assert!(owner.cancel(&started.id).expect("the owner cancels"));
+    let settled = owner
+        .wait(&started.id, None)
+        .await
+        .expect("owner cancellation settles")
+        .info;
+    assert_eq!(settled.status, BackgroundExecutionStatus::Cancelled);
+    wait_for_process_exit(read_pid(&pid_file)).await;
+    let converged = peer.get(&started.id).expect("the peer's row converges");
+    assert_eq!(converged.status, BackgroundExecutionStatus::Cancelled);
+}
+
+fn read_row(status_file: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(status_file).expect("row bytes")).expect("row JSON")
+}
+
+/// One retained terminal row, derived from a real one so its `authority` and paths are real.
+fn seed_completed_row(directory: &Path, template: &serde_json::Value, index: usize) {
+    let id = BackgroundExecutionId::parse(format!("bg_{index:032x}")).expect("fixture id");
+    let mut row = template.clone();
+    row["claimed"] = serde_json::json!(true);
+    row["info"]["id"] = serde_json::json!(id.as_str());
+    row["info"]["status"] = serde_json::json!("completed");
+    row["info"]["pid"] = serde_json::Value::Null;
+    row["info"]["exitCode"] = serde_json::json!(0);
+    row["info"]["timeCreated"] = serde_json::json!(index);
+    row["info"]["timeUpdated"] = serde_json::json!(index);
+    row["info"]["timeCompleted"] = serde_json::json!(index);
+    std::fs::write(directory.join(format!("{id}.output")), b"old").expect("fixture output");
+    std::fs::write(
+        directory.join(format!("{id}.status.json")),
+        serde_json::to_vec_pretty(&row).expect("fixture row"),
+    )
+    .expect("fixture status");
+}
+
+/// A pid no process can be using: spawned, waited for, and therefore reaped.
+fn reaped_pid() -> u32 {
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("a shell runs");
+    let pid = child.id();
+    assert!(child.wait().expect("the child is reaped").success());
+    pid
 }
 
 async fn wait_for_process_exit(pid: u32) {

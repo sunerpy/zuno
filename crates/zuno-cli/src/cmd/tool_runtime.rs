@@ -181,6 +181,16 @@ pub(crate) struct Delegation {
 
 /// Assemble the registry for `agent` and project it onto `provider_id`/`model_id`.
 ///
+/// `generated_root` is the already-resolved anchor for Zuno's generated directories, and
+/// exists because this function is synchronous while its sole production caller is not.
+/// Resolving the root spawns `git rev-parse`, which blocks the calling thread — the whole
+/// reactor on the `new_current_thread` runtimes every CLI entry point builds — so the
+/// caller resolves it off-reactor and hands the answer in. `None` keeps the lazy
+/// resolution inside the registry builder and the shell tool, which is right for a
+/// synchronous host and for tests. Both consumers get the same value, so a session cannot
+/// end up with its tool output under one spelling of a directory and its background
+/// executions under another.
+///
 /// # Errors
 ///
 /// Returns a message when the file tools, the shell tool, or the todo store cannot
@@ -188,6 +198,7 @@ pub(crate) struct Delegation {
 pub(crate) fn assemble(
     directory: &Path,
     worktree: Option<&Path>,
+    generated_root: Option<&Path>,
     env: &Env,
     config: &Config,
     selected_profile: &AgentProfile,
@@ -244,7 +255,12 @@ pub(crate) fn assemble(
     let rules = selected_profile.rules_with_extension_tools(&dynamic_tool_ids);
 
     let file_tools = FileTools::new(directory).map_err(to_string)?;
-    let mut builder = ToolRegistryBuilder::new(directory, file_tools, flags)
+    let registry = ToolRegistryBuilder::new(directory, file_tools, flags);
+    let registry = match generated_root {
+        Some(root) => registry.with_generated_root(root),
+        None => registry,
+    };
+    let mut builder = registry
         .with_builtin_slots(selection.manifest.slots().iter().copied())
         .with_harness_tools(selection.contributions.tools().iter().cloned());
     let scope = SearchScope {
@@ -265,11 +281,12 @@ pub(crate) fn assemble(
             .map_err(|error| render_sandbox_error(error, requested_mode))?;
         sandbox_notice = native_notice(&resolution);
         let (backend, execution_policy) = resolution.into_execution();
-        zuno_tools::shell::ShellTool::with_sandbox_backend(
+        zuno_tools::shell::ShellTool::with_sandbox_backend_and_generated_root(
             directory,
             config.shell.as_deref(),
             backend,
             execution_policy,
+            generated_root.map(Path::to_path_buf),
         )
         .map_err(to_string)
         .map(|tool| {

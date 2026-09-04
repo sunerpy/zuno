@@ -1,5 +1,12 @@
 //! Process-tree containment shared by every resident external host.
 
+mod shutdown;
+
+pub use shutdown::{
+    ChildReap, ContainedShutdown, ReaderDrain, ShutdownCeilings, ShutdownRequest, drain_readers,
+    off_runtime_worker, shutdown_contained_child, shutdown_contained_child_with,
+};
+
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;

@@ -2,7 +2,7 @@ use std::sync::{Arc, OnceLock};
 
 use rusqlite::OptionalExtension;
 use serde_json::{Map, Value};
-use zuno_db::{Pool, TransactionBehavior, migration, open};
+use zuno_db::{Pool, TransactionBehavior, event_log, migration, open};
 use zuno_error::DbError;
 
 use super::{EventCursor, EventStreamError, NewEvent, StreamEvent};
@@ -43,53 +43,82 @@ impl Store {
         self.subscriber_capacity
     }
 
+    /// The application database this log writes through.
+    ///
+    /// Exposed for the one caller that has to commit two durable rows of its own in
+    /// a single transaction and has no event to attach them to; see
+    /// [`super::EventService::application_pool`].
+    pub(super) fn pool(&self) -> Arc<Pool> {
+        Arc::clone(&self.pool)
+    }
+
+    /// Commit one event in its own transaction.
+    ///
+    /// The row layout, the identifier scheme, the version suffix, and the
+    /// sequence upsert all belong to [`zuno_db::event_log`]; this is only the
+    /// transaction boundary. A caller that has to commit an event together with
+    /// the state that event asserts uses [`Store::append_in`] instead, because a
+    /// published event whose state never committed is a durable lie about the
+    /// session.
     pub(super) fn append(
         &self,
         session_id: &str,
         event: NewEvent,
     ) -> Result<StreamEvent, EventStreamError> {
         self.ensure_initialized()?;
-        let aggregate_id = session_id.to_owned();
-        let id = format!("evt_{}", uuid::Uuid::now_v7().simple());
-        let data = serde_json::to_string(&event.properties)?;
-        let stored_type = format!("{}.1", event.event_type);
-        let sequence = self.pool.transaction(|transaction| {
-            let latest = latest_sequence(transaction, &aggregate_id)?;
-            let sequence = latest.checked_add(1).ok_or_else(|| DbError::Query {
-                source: Box::new(std::io::Error::other("event sequence exhausted")),
-            })?;
-            transaction
-                .execute(
-                    "INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?1, ?2, NULL) \
-                     ON CONFLICT(aggregate_id) DO UPDATE SET seq = excluded.seq",
-                    rusqlite::params![aggregate_id, sequence],
-                )
-                .map_err(open::map_error)?;
-            transaction
-                .execute(
-                    "INSERT INTO event (id, aggregate_id, seq, type, data) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![
-                        id,
-                        aggregate_id,
-                        sequence,
-                        stored_type,
-                        data
-                    ],
-                )
-                .map_err(open::map_error)?;
-            Ok(sequence)
-        })?;
+        let session_id = session_id.to_owned();
+        let appended = self
+            .pool
+            .transaction(|transaction| Self::append_in(transaction, &session_id, event))?;
+        Ok(appended)
+    }
+
+    /// Insert one event inside a transaction the caller owns.
+    ///
+    /// The returned event is only publishable after that transaction commits.
+    pub(super) fn append_in(
+        transaction: &rusqlite::Transaction<'_>,
+        session_id: &str,
+        event: NewEvent,
+    ) -> Result<StreamEvent, DbError> {
+        let appended = event_log::append_in(
+            transaction,
+            session_id,
+            event_log::NewSessionEvent::new(event.event_type, event.properties)?,
+        )?;
         Ok(StreamEvent {
             cursor: EventCursor {
-                session_id: session_id.to_owned(),
-                sequence,
+                session_id: appended.session_id,
+                sequence: appended.sequence,
             },
-            id,
-            event_type: event.event_type,
-            version: 1,
-            properties: event.properties,
+            id: appended.id,
+            event_type: appended.event_type,
+            version: appended.version,
+            properties: appended.properties,
         })
+    }
+
+    /// Commit `mutate` and one event in the same transaction.
+    ///
+    /// `mutate` runs first, so a failure there rolls the event back with it. The
+    /// returned event is committed but not yet published; fan-out is the caller's
+    /// step, after this returns.
+    pub(super) fn append_with<F>(
+        &self,
+        session_id: &str,
+        event: NewEvent,
+        mutate: F,
+    ) -> Result<StreamEvent, EventStreamError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<(), DbError>,
+    {
+        self.ensure_initialized()?;
+        let session_id = session_id.to_owned();
+        let appended = self.pool.transaction(|transaction| {
+            mutate(transaction)?;
+            Self::append_in(transaction, &session_id, event)
+        })?;
+        Ok(appended)
     }
 
     /// Whether the session table has a row for `session_id`.

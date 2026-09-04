@@ -31,18 +31,36 @@ impl Default for SseDecoder {
 impl SseDecoder {
     pub(super) fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.bytes.extend_from_slice(bytes);
-        while let Some((end, delimiter)) = frame_end(&self.bytes) {
+        // One chunk can carry hundreds of events: `reqwest` grows its read buffer
+        // towards 512 KiB on a fast peer, and a legacy MCP server's pre-`endpoint`
+        // backlog arrives as a few such reads. The frames are therefore cut against a
+        // moving offset and the consumed prefix is drained once, after the last complete
+        // frame. Draining per frame moved the whole remainder of the chunk for every
+        // event in it, which with the rescan `frame_end` used to do made a chunk cost
+        // quadratic in its size — on a debug build, over a second per 350 KiB chunk, so
+        // a 1 MiB backlog outlived a 5 s request deadline on a slower host and the peer
+        // was reported as a timeout instead of the protocol fault it was.
+        let mut consumed = 0;
+        let outcome = loop {
+            let Some((end, delimiter)) = frame_end(&self.bytes[consumed..]) else {
+                break Ok(());
+            };
             if end > self.max_event_bytes {
                 return Err(self.reject(end));
             }
-            let frame = self.bytes.drain(..end).collect::<Vec<_>>();
-            self.bytes.drain(..delimiter);
-            let frame = std::str::from_utf8(&frame)
-                .map_err(|error| format!("SSE event was not UTF-8: {error}"))?;
-            if let Some(event) = parse_event(frame) {
-                self.events.push_back(event);
+            let frame = &self.bytes[consumed..consumed + end];
+            consumed += end + delimiter;
+            match std::str::from_utf8(frame) {
+                Ok(frame) => {
+                    if let Some(event) = parse_event(frame) {
+                        self.events.push_back(event);
+                    }
+                }
+                Err(error) => break Err(format!("SSE event was not UTF-8: {error}")),
             }
-        }
+        };
+        self.bytes.drain(..consumed);
+        outcome?;
         // A server that never sends a blank line would otherwise grow `bytes` without
         // limit, which is the defect the perf plan §2 names.
         if self.bytes.len() > self.max_event_bytes {
@@ -76,7 +94,7 @@ impl SseDecoder {
     }
 }
 
-/// Where the first event separator ends, and how many bytes it spans.
+/// Where the first event separator starts, and how many bytes it spans.
 ///
 /// The **earlier** of the two spellings wins, which is the whole reason this is not two
 /// chained `or_else` lookups: both are legal in one stream, and searching for `\r\n\r\n`
@@ -84,20 +102,32 @@ impl SseDecoder {
 /// one frame. It then joins their `data:` payloads and the caller decodes the pair as a
 /// single malformed JSON-RPC message. Matches `zuno_llm::sse`'s `next_separator`, which
 /// compares the two positions for the same reason.
+///
+/// One forward pass over the line feeds decides both spellings at once and stops at the
+/// first hit. Both separators contain a `\n`, and a `\r\n\r\n` starting at `i` is anchored
+/// at `i + 1` while a `\n\n` starting at `i` is anchored at `i`; a `\n\n` cannot start
+/// where a `\r\n\r\n` does, so the first anchor in byte order is also the earliest
+/// separator. Searching each spelling to the end of the buffer separately cost a full
+/// scan per frame — for the `\r\n\r\n` a stream never uses, every time — which is the
+/// quadratic term [`SseDecoder::push`] describes.
 fn frame_end(bytes: &[u8]) -> Option<(usize, usize)> {
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| (index, 4));
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|index| (index, 2));
-    match (lf, crlf) {
-        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
-        (Some(separator), None) | (None, Some(separator)) => Some(separator),
-        (None, None) => None,
+    let mut from = 0;
+    while let Some(offset) = bytes[from..].iter().position(|&byte| byte == b'\n') {
+        let anchor = from + offset;
+        match bytes.get(anchor + 1) {
+            Some(b'\n') => return Some((anchor, 2)),
+            Some(b'\r')
+                if anchor >= 1
+                    && bytes[anchor - 1] == b'\r'
+                    && bytes.get(anchor + 2) == Some(&b'\n') =>
+            {
+                return Some((anchor - 1, 4));
+            }
+            _ => {}
+        }
+        from = anchor + 1;
     }
+    None
 }
 
 fn parse_event(frame: &str) -> Option<SseEvent> {
@@ -231,6 +261,49 @@ mod tests {
             drain(&mut decoder),
             vec![String::from("{\"id\":1}"), String::from("{\"id\":2}")],
             "the CRLF separator came first, so it ends the first frame"
+        );
+    }
+
+    /// A legacy MCP server's pre-`endpoint` backlog reaches the decoder as a few reads
+    /// of up to 512 KiB, each carrying hundreds of small events. Framing one such chunk
+    /// must cost time linear in its size: the previous decoder rescanned and moved the
+    /// whole remainder once per event, and on a debug build a 1 MiB backlog then took
+    /// longer than the 5 s request deadline on a Windows host, so the peer surfaced as
+    /// a body timeout rather than the protocol fault its size was.
+    ///
+    /// Sized so the two shapes are not close: the quadratic decoder needs minutes for
+    /// this chunk on a debug build, the linear one well under a second, and the bound
+    /// sits between them with room for a loaded CI host.
+    #[test]
+    fn a_chunk_carrying_thousands_of_events_is_framed_in_linear_time() {
+        const EVENTS: usize = 7_000;
+        let event = format!("event: message\ndata: {}\n\n", "x".repeat(580));
+        let chunk = event.repeat(EVENTS).into_bytes();
+        assert!(
+            chunk.len() > 4 * 1024 * 1024,
+            "the chunk must dwarf a socket read"
+        );
+        let mut decoder = decoder(64 * 1024);
+
+        let started = std::time::Instant::now();
+        decoder
+            .push(&chunk)
+            .expect("every event is far under the cap");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            drain(&mut decoder).len(),
+            EVENTS,
+            "every event in the chunk must be framed"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "framing {} bytes took {elapsed:?}, which is the quadratic decoder",
+            chunk.len()
+        );
+        assert!(
+            decoder.bytes.is_empty(),
+            "a chunk that ends on a separator leaves nothing pending"
         );
     }
 

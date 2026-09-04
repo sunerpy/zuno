@@ -74,6 +74,15 @@ impl Output {
     }
 
     /// Standard output decoded as UTF-8.
+    ///
+    /// This fails the whole call rather than substituting `U+FFFD`, which is the
+    /// deliberate choice and worth stating: in a worktree holding one latin-1 name
+    /// such as `caf\xe9.txt`, `Store::patch` and every capture report
+    /// `SnapshotError::Encoding` and list nothing at all instead of naming a path
+    /// that does not exist. Reporting nothing is recoverable; a wrong path is not.
+    /// Carrying git's `-z` output as bytes and going lossy only at the display
+    /// boundary would serve those worktrees, and is a change to every `-z` reader
+    /// rather than to this decoder.
     pub(crate) fn text(&self, args: &[String]) -> Result<String> {
         String::from_utf8(self.stdout.clone()).map_err(|source| SnapshotError::Encoding {
             args: args.to_vec(),
@@ -141,6 +150,23 @@ impl Argv {
 /// `env` entries are added to the inherited environment, matching the oracle's
 /// `extendEnv: true`. `stdin` is written to the child and the pipe is then closed,
 /// which is what `--pathspec-from-file=-` waits for.
+///
+/// # Why the payload is written from another thread
+///
+/// stdout and stderr are pipes with a fixed kernel buffer, and not every caller
+/// waits for EOF before it answers: `check-ignore --stdin -z` in [`crate::Store`]'s
+/// `ignore` echoes a record for every matched path while it is still reading. Sending
+/// the whole payload before touching stdout therefore stops dead once both buffers
+/// fill — `git` blocked writing its answer, Zuno blocked writing the question — and
+/// the per-git-directory lock is held across the call, so every later capture, undo
+/// and patch for that worktree queues behind a call that can never return. The
+/// payload goes to a scoped thread and this thread stays in `wait_with_output`, which
+/// drains both output pipes at once, so neither side has to finish first.
+///
+/// The wait itself is deliberately not bounded. `checkout-index`, `write-tree` and
+/// `apply` take as long as the worktree is large, and killing one part-way through
+/// leaves a half-written index or working tree, which is a worse outcome than a slow
+/// answer; what is removed here is the stall Zuno creates for itself.
 pub(crate) fn run(
     argv: &Argv,
     cwd: &Path,
@@ -169,17 +195,36 @@ pub(crate) fn run(
     };
 
     let mut child = command.spawn().map_err(spawn_error)?;
-    if let Some(bytes) = stdin {
-        let mut pipe = child
-            .stdin
-            .take()
-            .ok_or_else(|| spawn_error(std::io::Error::other("git stdin pipe was not created")))?;
-        pipe.write_all(bytes).map_err(spawn_error)?;
-        // Dropping the handle closes the pipe; `--pathspec-from-file=-` blocks
-        // until it sees EOF.
-        drop(pipe);
+    let payload = match stdin {
+        Some(bytes) => {
+            let pipe = child.stdin.take().ok_or_else(|| {
+                spawn_error(std::io::Error::other("git stdin pipe was not created"))
+            })?;
+            Some((pipe, bytes))
+        }
+        None => None,
+    };
+
+    let (output, written) = std::thread::scope(|scope| {
+        let writer = payload.map(|(mut pipe, bytes)| {
+            // Dropping the handle as the thread ends closes the pipe;
+            // `--pathspec-from-file=-` blocks until it sees EOF.
+            scope.spawn(move || pipe.write_all(bytes))
+        });
+        let output = child.wait_with_output();
+        let written = writer.map(std::thread::ScopedJoinHandle::join);
+        (output, written)
+    });
+
+    // A short write is still the failure it was before the write moved off this
+    // thread — a child that died early leaves a broken pipe here, and reporting the
+    // exit status instead would let a truncated question look like a real answer.
+    if let Some(written) = written {
+        written
+            .unwrap_or_else(|_| Err(std::io::Error::other("the git stdin writer panicked")))
+            .map_err(spawn_error)?;
     }
-    let output = child.wait_with_output().map_err(spawn_error)?;
+    let output = output.map_err(spawn_error)?;
 
     Ok(Output {
         status: output.status,
@@ -222,6 +267,8 @@ pub(crate) fn split_nul(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -274,6 +321,75 @@ mod tests {
         let output = run(&argv, dir.path(), &[], None).expect("spawn git");
         assert!(!output.ok(), "a temp dir is not a repository");
         assert!(output.stderr.contains("not a git repository"));
+    }
+
+    /// Four times the usual 64 KiB pipe capacity, so a payload of this size cannot
+    /// cross the pipe unless somebody drains the answer at the same time.
+    const OVERSIZED_PAYLOAD: usize = 256 * 1024;
+
+    /// Probes long enough to reach [`OVERSIZED_PAYLOAD`] without an absurd count, all
+    /// matching the fixture's `*.log` rule so every one of them is echoed back.
+    fn oversized_probes() -> Vec<String> {
+        let mut probes = Vec::new();
+        let mut bytes = 0;
+        while bytes < OVERSIZED_PAYLOAD {
+            let probe = format!(
+                "ignored/{:08}/some/rebuilt/artifact/chunk.log",
+                probes.len()
+            );
+            bytes += probe.len() + 1;
+            probes.push(probe);
+        }
+        probes
+    }
+
+    /// The `check-ignore` invocation from `Store::ignore`, which answers while it is
+    /// still reading and so is the caller that a write-then-read `run` deadlocks.
+    #[test]
+    fn a_stdin_payload_larger_than_the_pipe_buffer_does_not_deadlock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut init = Argv::new();
+        init.extend(["init", "-q", "."]);
+        assert!(
+            run(&init, dir.path(), &[], None).expect("spawn git").ok(),
+            "the fixture repository is created"
+        );
+        std::fs::write(dir.path().join(".gitignore"), "*.log\n").expect("write .gitignore");
+
+        let probes = oversized_probes();
+        let payload = nul_terminated(&probes);
+        assert!(payload.len() > OVERSIZED_PAYLOAD, "{}", payload.len());
+
+        // The call runs on a worker thread so the deadlock this test pins fails it
+        // instead of wedging the whole test binary. On failure that thread and its
+        // `git` child are deliberately left behind — the payload writer is inside
+        // `run`, so the test cannot reach the child to kill it, and the harness reaps
+        // both when it exits. A failing run can therefore leave one stuck
+        // `check-ignore` per attempt.
+        let worktree = dir.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut argv = Argv::flags(QUOTE);
+            argv.push("--git-dir")
+                .push(worktree.join(".git"))
+                .push("--work-tree")
+                .push(&worktree)
+                .extend(["check-ignore", "--no-index", "--stdin", "-z"]);
+            let outcome = run(&argv, &worktree, &[], Some(&payload))
+                .map(|output| (output.ok(), output.stderr, output.stdout));
+            let _ = sender.send(outcome);
+        });
+
+        let Ok(outcome) = receiver.recv_timeout(Duration::from_secs(60)) else {
+            panic!("check-ignore never answered a payload larger than the pipe buffer");
+        };
+        let (ok, stderr, stdout) = outcome.expect("spawn git");
+        assert!(ok, "every probe is ignored, so the exit is zero: {stderr}");
+        assert_eq!(
+            split_nul(&String::from_utf8(stdout).expect("utf-8")).len(),
+            probes.len(),
+            "every probe is echoed back"
+        );
     }
 
     #[test]

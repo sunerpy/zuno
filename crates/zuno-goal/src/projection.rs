@@ -1100,18 +1100,30 @@ fn criterion_line_id(line: &str) -> Option<String> {
     Some(key.to_owned())
 }
 
-/// Collapse model-written prose to one clipped line.
+/// Collapse model-written prose to one clipped line for this document.
+fn clip(text: &str) -> String {
+    clip_to(text, MAX_CRITERION_CHARS)
+}
+
+/// Collapse model-written prose to one line of at most `max_chars` characters.
 ///
 /// One line because the document is parsed by lines, so a statement containing a
 /// newline would otherwise render as something no reader could match back to its
-/// criterion; clipped because [`MAX_CRITERION_CHARS`] is the size budget the
-/// projection renders within.
-fn clip(text: &str) -> String {
+/// criterion — and a tool result and a refusal are read the same way.
+///
+/// Shared with [`crate::tools`] and [`crate::error`] rather than reimplemented there:
+/// every place a model-written criterion statement, waiver reason or capability name is
+/// rendered back into a model request needs the same bound, and the reason this document
+/// clipped while the `goal_update` tool result did not was that the clip lived here
+/// alone. The budget stays a parameter because the surfaces differ: this document
+/// renders within [`MAX_CRITERION_CHARS`], while a tool result may render a statement up
+/// to the length the store accepts.
+pub(crate) fn clip_to(text: &str, max_chars: usize) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= MAX_CRITERION_CHARS {
+    if collapsed.chars().count() <= max_chars {
         return collapsed;
     }
-    let kept: String = collapsed.chars().take(MAX_CRITERION_CHARS).collect();
+    let kept: String = collapsed.chars().take(max_chars).collect();
     format!("{kept}…")
 }
 

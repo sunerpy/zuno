@@ -50,9 +50,16 @@
 //! the mark is refused up front, for the reason [`GoalStore::satisfy_criterion`]
 //! refuses a stale citation — accepting it would record a claim that could never be
 //! relied on.
+//!
+//! A probe receipt recorded before the current *goal* is refused up front for the same
+//! reason, and that rule is what stops goal replacement from laundering a retired probe:
+//! the replacement clears the mutation mark and keeps the receipts, so re-recording the
+//! old probe under the new goal would otherwise read as current. A claim recorded while
+//! no goal exists is untouched — there is nothing for it to predate, and the completion
+//! audit already ignores claims older than the goal.
 
 use crate::error::GoalError;
-use crate::store::{GoalStore, mutation_mark, receipt_for, unproven_reason};
+use crate::store::{GoalStore, has_visible_character, mutation_mark, receipt_for, unproven_reason};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -74,7 +81,7 @@ const CLAIM_COLUMNS: &str = "id, session_id, capability, subject, state, sources
 /// therefore whether anything may be built on it. The two states that rest on
 /// something observable — a named document, an observed request — may be relied on;
 /// the other two are recorded so that the reliance is visible, and they block a
-/// change goal until replaced.
+/// gated goal until replaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityClaimState {
@@ -274,15 +281,26 @@ impl GoalStore {
     /// hot path as a write, and completion re-reads the ledger in its own
     /// transaction.
     ///
+    /// Blank is measured with [`has_visible_character`], not with `trim`, on the
+    /// capability, the subject and every source. `str::trim` strips White_Space only, so
+    /// a capability of `"\u{200b}"` used to be stored and then named nothing in the
+    /// [`GoalError::CapabilityUnverified`] refusal that blocks completion — a blocker a
+    /// human cannot read is not a blocker they can clear. Same predicate as the criterion
+    /// statements, the waiver reasons and the objective, because all four are the one
+    /// model-written audit surface.
+    ///
     /// # Errors
     ///
-    /// [`GoalError::EmptyCapabilityClaimField`] when the capability or subject is
-    /// blank, [`GoalError::CapabilityUndocumented`] when `documented` cites nothing,
+    /// [`GoalError::EmptyCapabilityClaimField`] when the capability or subject holds no
+    /// visible character, [`GoalError::CapabilityUndocumented`] when `documented` cites
+    /// nothing that renders,
     /// [`GoalError::CapabilityProbeUncited`] when `probed` names no receipt,
     /// [`GoalError::CapabilityProbeUnproven`] when the receipt is missing from this
     /// session, failed, undecidable, or carries a derived or absent exit status,
     /// [`GoalError::CapabilityProbeStale`] when the receipt predates the last recorded
-    /// change to the workspace, and [`GoalError::Db`] on a statement failure.
+    /// change to the workspace, [`GoalError::CapabilityProbePredatesGoal`] when the
+    /// receipt was recorded before the goal instance in force, and [`GoalError::Db`] on a
+    /// statement failure.
     pub fn record_capability_claim(
         &self,
         session_id: &str,
@@ -290,20 +308,20 @@ impl GoalStore {
         at_ms: i64,
     ) -> Result<CapabilityClaimOutcome, GoalError> {
         let capability = claim.capability.trim();
-        if capability.is_empty() {
+        if !has_visible_character(capability) {
             return Err(GoalError::EmptyCapabilityClaimField {
                 field: "capability",
             });
         }
         let subject = claim.subject.trim();
-        if subject.is_empty() {
+        if !has_visible_character(subject) {
             return Err(GoalError::EmptyCapabilityClaimField { field: "subject" });
         }
         let sources: Vec<String> = claim
             .sources
             .iter()
             .map(|source| source.trim())
-            .filter(|source| !source.is_empty())
+            .filter(|source| has_visible_character(source))
             .map(str::to_owned)
             .collect();
         if claim.state == CapabilityClaimState::Documented && sources.is_empty() {
@@ -411,14 +429,22 @@ impl GoalStore {
 
 /// Refuse completion while the goal relies on a claim nobody verified.
 ///
-/// Called from the store's evidence audit, for change goals only — a question goal
-/// wrote no configuration that could rest on a claim. Only claims recorded or updated
-/// since the current goal instance was created are read; the module docs say why
-/// earlier claims are kept but do not gate this goal.
+/// Called from the store's evidence audit on a change goal and on a goal that recorded
+/// success criteria whoever asked to complete it, and on a goal that recorded neither only
+/// when the *run* asked. The last case is deliberate, and so is its one exemption: the
+/// human's `/goal complete` has no verb that settles a claim, so refusing it over a
+/// model-written row would leave a goal that can only be cancelled. See
+/// `store::CompletionAuthority`. A claim is written by the session itself, so auditing one needs no
+/// tool to report what it wrote — which is exactly the reporting the goal's kind
+/// depends on — and a run that guessed at a capability, wrote the configuration through
+/// `shell` and therefore never escalated would otherwise carry the guess out with the
+/// goal. A goal with no claims settles this in one query. Only claims recorded or
+/// updated since the current goal instance was created are read; the module docs say
+/// why earlier claims are kept but do not gate this goal.
 ///
 /// `inferred` and `unknown` claims are refused for what they are. A `probed` claim is
-/// refused when its receipt is gone from this session, no longer proves success, or
-/// predates the last recorded workspace change — the re-check that lets
+/// refused when its receipt is gone from this session, no longer proves success, predates
+/// the goal instance, or predates the last recorded workspace change — the re-check that lets
 /// [`GoalStore::mark_mutation`] retire probes without rewriting the ledger. Every
 /// refused claim is named, so the model can see which reliance to settle rather than
 /// being told only that completion was refused.
@@ -426,15 +452,7 @@ pub(crate) fn audit_capability_claims(
     tx: &Transaction<'_>,
     session_id: &str,
 ) -> Result<(), GoalError> {
-    let created_at_ms = tx
-        .query_row(
-            "SELECT created_at_ms FROM goal WHERE session_id = ?1",
-            params![session_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(zuno_db::map_error)?;
-    let Some(created_at_ms) = created_at_ms else {
+    let Some(created_at_ms) = goal_created_at_ms(tx, session_id)? else {
         return Ok(());
     };
     let marked_at_ms = mutation_mark(tx, session_id)?;
@@ -443,7 +461,9 @@ pub(crate) fn audit_capability_claims(
         if claim.time_updated < created_at_ms {
             continue;
         }
-        if let Some(reason) = unverified_reason(tx, session_id, &claim, marked_at_ms)? {
+        if let Some(reason) =
+            unverified_reason(tx, session_id, &claim, marked_at_ms, created_at_ms)?
+        {
             unverified.push(UnverifiedCapability {
                 capability: claim.capability,
                 subject: claim.subject,
@@ -468,6 +488,7 @@ fn unverified_reason(
     session_id: &str,
     claim: &CapabilityClaim,
     marked_at_ms: Option<i64>,
+    goal_created_at_ms: i64,
 ) -> Result<Option<String>, GoalError> {
     let reason = match claim.state {
         CapabilityClaimState::Documented => None,
@@ -496,6 +517,16 @@ fn unverified_reason(
                     "is recorded as `probed`, but receipt `{receipt_id}` no longer proves it: {}",
                     unproven_reason(&receipt)
                 )),
+                // The lower bound is re-read here for the reason the receipt itself is:
+                // a row is data. `record_capability_claim` refuses a probe older than the
+                // goal, so post-fix no writer produces this shape, but a row a previous
+                // release stored is refused at the gate rather than believed.
+                Some(receipt) if receipt.time_created < goal_created_at_ms => Some(format!(
+                    "is recorded as `probed`, but receipt `{receipt_id}` recorded at {} was \
+                     recorded before this goal was created at {goal_created_at_ms}; probe again \
+                     under the current goal and record the claim again",
+                    receipt.time_created
+                )),
                 Some(receipt) => match marked_at_ms {
                     Some(marked_at_ms) if marked_at_ms > receipt.time_created => Some(format!(
                         "is recorded as `probed`, but receipt `{receipt_id}` recorded at {} \
@@ -513,9 +544,18 @@ fn unverified_reason(
 
 /// Check the receipt a `probed` claim cites, in the words of the refusal it earns.
 ///
-/// Three rules, mirroring [`GoalStore::satisfy_criterion`]: the receipt has to exist
-/// in this session, it has to prove success with an authoritative exit status, and it
-/// has to be newer than the last recorded change to the workspace.
+/// Four rules, mirroring [`GoalStore::satisfy_criterion`]: the receipt has to exist in
+/// this session, it has to prove success with an authoritative exit status, it has to be
+/// newer than the last recorded change to the workspace, and — when a goal is in force —
+/// it may not predate that goal instance.
+///
+/// The last rule is the sibling of [`GoalError::EvidencePredatesGoal`] and closes the
+/// same laundering step at the same seam. Goal replacement clears the mutation mark and
+/// keeps the receipts, so a probe the previous goal was refused for would be accepted
+/// again under the next one, and the completion audit would then read the re-recorded
+/// claim as current. A claim recorded while no goal exists is untouched: there is nothing
+/// to predate, and [`audit_capability_claims`] already ignores claims older than the
+/// goal.
 fn audit_probe_receipt(
     tx: &Transaction<'_>,
     session_id: &str,
@@ -542,6 +582,17 @@ fn audit_probe_receipt(
             reason: unproven_reason(&receipt),
         });
     }
+    if let Some(goal_created_at_ms) = goal_created_at_ms(tx, session_id)?
+        && receipt.time_created < goal_created_at_ms
+    {
+        return Err(GoalError::CapabilityProbePredatesGoal {
+            capability: capability.to_owned(),
+            subject: subject.to_owned(),
+            receipt_id: receipt_id.to_owned(),
+            goal_created_at_ms,
+            receipt_at_ms: receipt.time_created,
+        });
+    }
     if let Some(marked_at_ms) = mutation_mark(tx, session_id)?
         && marked_at_ms > receipt.time_created
     {
@@ -554,6 +605,18 @@ fn audit_probe_receipt(
         });
     }
     Ok(())
+}
+
+/// When the goal instance in force was created, or `None` when the session has none.
+fn goal_created_at_ms(tx: &Transaction<'_>, session_id: &str) -> Result<Option<i64>, GoalError> {
+    tx.query_row(
+        "SELECT created_at_ms FROM goal WHERE session_id = ?1",
+        params![session_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(zuno_db::map_error)
+    .map_err(GoalError::from)
 }
 
 /// Every claim for a session, oldest first, from any connection or transaction.

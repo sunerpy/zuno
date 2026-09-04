@@ -7,12 +7,22 @@
 //! variants live here and follow the same doctrine, verbatim from
 //! `zuno-error/src/lib.rs`:
 //!
-//! - **No catch-all.** No `Other(String)`, no `Unknown { message }`. Five
+//! - **No catch-all.** No `Other(String)`, no `Unknown { message }`. Seven
 //!   variants, each a distinct thing that happened.
 //! - **Anything a decision needs is a field.** Every variant carries the
-//!   [`PathBuf`] it failed on, and the concrete `std::io::Error` or
-//!   `serde_json::Error` in `#[source]` position, so `ErrorKind` and the JSON
-//!   line/column survive to whoever reports it.
+//!   [`PathBuf`] it failed on, and every variant with a lower-level failure
+//!   underneath it carries that in `#[source]` position, so `ErrorKind` and the
+//!   JSON line/column survive to whoever reports it.
+//!   [`AuthError::Unresolved`] has no source: several reads failed, and the finding
+//!   is that they disagreed with the filesystem rather than any one of their errors.
+//!
+//! There is deliberately **no** variant for a credential file that holds no bytes.
+//! An empty file holds no entry a write could destroy, and every read of it is
+//! either a display (`zuno auth list`, `zuno models`) or the read half of the write
+//! that repairs it (`zuno auth login`, a token refresh). Reporting it as a failure
+//! denied all of them to exactly the users whose file the shipped 0.6.6 truncate
+//! window emptied. It is [`crate::StoreDamage`] instead: data that travels with a
+//! successful read.
 //! - **Not `#[non_exhaustive]`.** Every consumer is in this workspace; an added
 //!   variant should break each match until its author decides what it means.
 //! - **No `String` message field**, so nothing downstream can be tempted to
@@ -30,6 +40,12 @@
 //! *provider* rejects a credential (`ProviderError::Auth`), whereas these are
 //! failures to reach the store at all, and a fresh login would write to the same
 //! unwritable path.
+//!
+//! [`AuthError::Unresolved`] is the one that describes a transient condition, and it
+//! is still [`Recovery::Fail`]. The retry that helps is the user running the command
+//! again, not a mechanical repeat inside a credential write: that write is an
+//! at-most-once side effect, and a loop that re-reads and re-publishes on its own is
+//! how a lost update becomes automatic. The message says so.
 
 use std::path::PathBuf;
 
@@ -63,6 +79,51 @@ pub enum AuthError {
         /// The parse failure, carrying line and column.
         #[source]
         source: serde_json::Error,
+    },
+
+    /// The file is there and could not be opened, so what it holds is unknown.
+    ///
+    /// Only a read whose result would be written back raises this. Concluding
+    /// "absent, therefore no credentials" from an open that failed inside another
+    /// process's publication is how a write comes to publish a store holding only
+    /// its own entry, so an unconfirmable file is reported as unresolved instead. On
+    /// Windows a `ReplaceFileW` in flight produces exactly that answer for a file
+    /// that is present and complete.
+    #[error(
+        "credential file {path} exists but could not be read while it was being replaced, so \
+             what it holds is unknown; nothing was written — run the command again"
+    )]
+    Unresolved {
+        /// The file whose contents could not be resolved.
+        path: PathBuf,
+    },
+
+    /// The containing directory would not accept the file publication needs to create.
+    ///
+    /// Publishing writes a sibling and renames it, so it needs permission to create a
+    /// file in the directory — where an in-place truncate needed only permission on the
+    /// file. A hardened layout (data directory `0555`, `auth.json` `0600`) that could
+    /// refresh a token before therefore fails here, and it is the directory that
+    /// refused, not the credential file. Naming the file instead would send the
+    /// operator to `chmod` the wrong thing.
+    ///
+    /// Raised on Unix only. Off Unix the publication is
+    /// `zuno_atomic_file::replace`'s, which reports one `io::Error` for the whole
+    /// operation and gives this module nothing to attribute, so the same condition
+    /// arrives as [`AuthError::Write`] there.
+    #[error(
+        "credential file {path} could not be published because directory {directory} would \
+             not accept a new file; publication writes a sibling and renames it, so the \
+             directory needs write permission"
+    )]
+    Directory {
+        /// The credential file that was being published.
+        path: PathBuf,
+        /// The directory that refused.
+        directory: PathBuf,
+        /// The underlying failure.
+        #[source]
+        source: std::io::Error,
     },
 
     /// The file could not be written.
@@ -108,6 +169,8 @@ impl AuthError {
         match self {
             Self::Read { path, .. }
             | Self::Malformed { path, .. }
+            | Self::Unresolved { path }
+            | Self::Directory { path, .. }
             | Self::Write { path, .. }
             | Self::Serialize { path, .. }
             | Self::Permissions { path, .. } => path,
@@ -132,6 +195,8 @@ impl Recoverable for AuthError {
         match self {
             Self::Read { .. }
             | Self::Malformed { .. }
+            | Self::Unresolved { .. }
+            | Self::Directory { .. }
             | Self::Write { .. }
             | Self::Serialize { .. }
             | Self::Permissions { .. } => Recovery::Fail,
@@ -155,6 +220,12 @@ mod tests {
             AuthError::Malformed {
                 path: path.clone(),
                 source: json,
+            },
+            AuthError::Unresolved { path: path.clone() },
+            AuthError::Directory {
+                path: path.clone(),
+                directory: PathBuf::from("/tmp"),
+                source: std::io::Error::from(ErrorKind::PermissionDenied),
             },
             AuthError::Write {
                 path: path.clone(),
@@ -181,6 +252,25 @@ mod tests {
             assert!(
                 error.to_string().contains("/tmp/auth.json"),
                 "{error} should name the file"
+            );
+        }
+    }
+
+    /// The message is the only place a user is told what to do about a store this
+    /// build refused to write over, so the text has to carry the remedy and state
+    /// that nothing was destroyed by reporting it.
+    #[test]
+    fn the_unresolved_message_carries_a_remedy() {
+        let path = PathBuf::from("/tmp/auth.json");
+        let unresolved = AuthError::Unresolved { path }.to_string();
+        for expected in [
+            "while it was being replaced",
+            "nothing was written",
+            "run the command again",
+        ] {
+            assert!(
+                unresolved.contains(expected),
+                "{unresolved} is missing {expected:?}"
             );
         }
     }

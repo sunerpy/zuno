@@ -8,10 +8,41 @@ Zuno separates two kinds of durable data:
   session/turn correlation, provider attempts, tool lifecycle, timing, typed
   outcomes, and resource incidents.
 
-Operational logs must not become a second transcript. Prompt, command, request
-body, raw tool input, output, credential, token, cookie, and similarly named
-fields are redacted before persistence. A component that needs model-visible
-payloads must use the session event log.
+Operational logs must not become a second transcript. Every text sink and the
+SQLite sink pass field values through the same name-based redaction predicate
+before the record is written, so a field whose name spells `authorization`,
+`api_key`, `access_token`, `refresh_token`, `private_key`, `password`,
+`passphrase`, `secret`, `credential`, `cookie`, `token`, `bearer`, `signature`,
+`prompt`, `content`, `body`, `command`, `input`, `output`, `report`, `stdin`,
+`stdout`, or `stderr` is written as `[redacted]`. Separators and case are
+ignored, so `api_key`, `apiKey`, `api-key`, and `API.KEY` are one name; regular
+plurals are matched too (`commands`, `cookies`, `access_tokens`). A field name
+Zuno cannot classify, one containing a non-ASCII byte or with no recognizable
+component, fails closed and is redacted. Redaction replaces one field's value:
+the record, its event text, and its other fields are still written, so a
+redacted payload never costs you the diagnostic.
+
+Two exceptions are deliberate, and both are limits to design around:
+
+- **A name that spells only a bound stays readable**, so there is a safe way to
+  report size: `command_bytes`, `prompt_tokens`, `output_tokens`,
+  `input_tokens`, `content_tokens`, `command_tokens`, `secret_bytes`,
+  `cookie_count`. Only those five token-accounting classes license the plural
+  `tokens` reading; `secret_tokens`, `cookie_tokens`, `auth_tokens`,
+  `total_tokens`, and `max_tokens` are redacted. Never put a value in a field
+  named for its bound: `secret_bytes` must hold a byte count.
+- **The field named `message` is never redacted.** `message` is the name
+  `tracing` gives an event's own text, and the formatter prints it with no
+  `name=` prefix, so whatever a callsite puts there is written verbatim to the
+  plaintext log, to `--print-logs` stderr, and to the `message` column of
+  `logs.sqlite`, where it reads as the event message. Zuno's own emitters keep
+  external text out of `message`: an MCP server's stderr line is logged under
+  `stderr`, which is redacted, and a test-suite tripwire
+  (`no_crate_emits_an_unexpected_message_field`) fails when a new callsite
+  routes a value there. Give a payload its own field name, which the predicate
+  can classify, or log only a bound (`bytes`, `limit`, `truncated`).
+
+A component that needs model-visible payloads must use the session event log.
 
 ## Default store
 

@@ -1,5 +1,6 @@
 //! Model Context Protocol client: stdio and remote transports, tools, resources, prompts.
 
+mod body;
 pub mod catalog;
 mod lifecycle;
 mod oauth;
@@ -8,6 +9,9 @@ pub mod remote;
 pub mod stdio;
 
 pub(crate) const CLIENT_NAME: &str = "zuno";
+
+pub use body::MAX_OAUTH_BODY_BYTES;
+pub use protocol::MAX_CONSECUTIVE_UNDECODABLE_FRAMES;
 
 pub use catalog::{
     ATTACHABLE_MIMES, Catalog, CatalogEvent, CatalogLoader, ConnectedServer, Diagnostic,
@@ -24,6 +28,6 @@ pub use lifecycle::{
 pub use remote::{AuthorizationRequest, RemoteClient, RemoteConnect, RemoteError, RemoteTransport};
 
 pub use stdio::{
-    DEFAULT_REQUEST_TIMEOUT, InitializeResult, Notification, PROTOCOL_VERSION, StdioClient,
-    ToolCallResult, ToolDefinition, ToolsChanged, tool_name,
+    DEFAULT_REQUEST_TIMEOUT, InitializeResult, MAX_FRAME_BYTES, Notification, PROTOCOL_VERSION,
+    StdioClient, ToolCallResult, ToolDefinition, ToolsChanged, tool_name,
 };

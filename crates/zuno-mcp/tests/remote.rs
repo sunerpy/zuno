@@ -1,5 +1,9 @@
 mod remote_support;
 
+#[path = "remote/legacy_stream.rs"]
+mod legacy_stream;
+#[path = "remote/oauth_body.rs"]
+mod oauth_body;
 #[path = "remote/oauth_finish.rs"]
 mod oauth_finish;
 #[path = "remote/oauth_refresh.rs"]

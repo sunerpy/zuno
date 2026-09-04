@@ -196,8 +196,9 @@ pub const TOOL_OUTPUT: GeneratedPath = GeneratedPath {
     per_session: true,
 };
 
-/// `.zuno/background/<id>.status.json` and `<id>.output`, the shell tool's background
-/// commands.
+/// `.zuno/background/<id>.status.json`, the `<id>.status.json.tmp` it is staged through,
+/// `<id>.output`, and `<id>.lock`: the four names one of the shell tool's background
+/// commands owns.
 ///
 /// Written by `BackgroundExecutionService` in `crates/zuno-pty/src/background.rs`;
 /// rooted under the worktree by `ShellTool::with_sandbox_backend` in

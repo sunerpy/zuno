@@ -163,6 +163,21 @@ fn request(action: SessionPruneAction) -> SessionPruneRequest {
     }
 }
 
+/// The one sentence that says the snapshot class was not evaluated.
+///
+/// Written out here rather than rendered through the crate's own `Display`: this string is
+/// a published report value that `docs/session-retention.md` quotes verbatim, so a test
+/// that asked the implementation to spell it could not notice the wording drifting away
+/// from the documentation.
+fn snapshot_skip_warning(database: &std::path::Path) -> String {
+    format!(
+        "`{}` retains 0 sessions after this operation; snapshot store reclamation is skipped \
+         because a shared artifact cannot be attributed to a surviving session and may belong \
+         to another channel's database.",
+        database.display()
+    )
+}
+
 fn session_count(connection: &Connection) -> i64 {
     connection
         .query_row("SELECT count(*) FROM session", [], |row| row.get(0))
@@ -231,10 +246,7 @@ fn session_prune_empty_database_warns_for_preview_and_delete() {
     let mut connection = pool.get().expect("check out connection");
     migration::apply(&mut connection).expect("apply schema");
     let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
-    let warning = format!(
-        "`{}` contains 0 sessions; artifact reclamation is skipped because shared snapshot stores cannot be attributed and may belong to another channel's database.",
-        database_path.display()
-    );
+    let warning = snapshot_skip_warning(&database_path);
 
     for action in [SessionPruneAction::Preview, SessionPruneAction::Delete] {
         let mut empty_request = request(action);
@@ -400,6 +412,235 @@ fn session_prune_reclaims_in_checkout_tool_output_and_keeps_a_survivors_artifact
         "{:?}",
         report.artifacts.items
     );
+}
+
+/// The database row deletion is already committed when the artifact stage runs, so an
+/// artifact gate re-derived from the surviving rows failed the whole operation for the
+/// user who pruned everything: no report said which sessions went, the caller could not
+/// forget their grants, and the selected ids — the only thing that could still attribute
+/// those files — were discarded with the error. The shared snapshot root is the one class
+/// that needs a survivor to attribute it, and it stays untouched.
+#[test]
+fn session_prune_deleting_every_session_still_reports_and_reclaims_its_tool_output() {
+    let temp = tempfile::tempdir().expect("temporary fixture root");
+    let database_path = temp.path().join("opencode-local.db");
+    let pool = Pool::open(&DbLocation::File(database_path.clone())).expect("open file database");
+    let mut connection = pool.get().expect("check out connection");
+    migration::apply(&mut connection).expect("apply schema");
+    let worktree = temp.path().join("checkout");
+    fs::create_dir_all(&worktree).expect("create checkout");
+    connection
+        .execute(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+             VALUES ('prj_only', ?1, 1, 1, '[]')",
+            rusqlite::params![worktree.to_string_lossy()],
+        )
+        .expect("insert project");
+    insert_session(&connection, "ses_only", "prj_only", None, OLD, false);
+    let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
+    let output = ToolOutputStore::in_worktree(&worktree)
+        .persist("shell", "ses_only", "authoritative test summary")
+        .expect("persist the pruned session's output");
+    let foreign = StoreKey::new("prj_other_channel", std::path::Path::new("/srv/other"));
+    write(
+        &foreign.path_in(&paths.snapshots).join("objects/history"),
+        b"another channel's history",
+    );
+    let mut delete = request(SessionPruneAction::Delete);
+    delete.scope = SessionPruneScope::AllProjects;
+    delete.confirm_delete = true;
+
+    let report = execute(
+        &mut connection,
+        &paths,
+        &delete,
+        &Reachable,
+        &Remote,
+        &mut Progress::default(),
+    )
+    .expect("a delete that empties the database still produces a report");
+
+    assert_eq!(report.selected_session_ids, ["ses_only"]);
+    assert_eq!(report.changed_sessions, 1);
+    assert_eq!(session_count(&connection), 0);
+    assert!(!output.path.exists());
+    assert!(
+        report.artifacts.items.iter().any(|item| {
+            item.path == zuno_paths::wire_path(&output.path)
+                && item.kind == "tool_output"
+                && item.reason == "deleted_session:ses_only"
+                && item.removed
+        }),
+        "{:?}",
+        report.artifacts.items
+    );
+    assert!(
+        foreign.path_in(&paths.snapshots).is_dir(),
+        "a database with no survivors cannot attribute a channel-shared snapshot store"
+    );
+    // Skipping the class silently was the cost of letting the operation finish: the
+    // pre-mutation visibility check runs while the row being deleted is still there, so it
+    // cannot fire for this case, and after the commit no row is left to attribute those
+    // stores on any later pass. The report is the only place the bytes can still be named.
+    assert_eq!(
+        report.warnings,
+        [snapshot_skip_warning(&database_path)],
+        "a skipped artifact class is reported, not silent"
+    );
+}
+
+/// The held-back attachment bytes reach the report an operator actually reads.
+///
+/// `artifact_gc` can only record the suppression; `session_prune` is the surface that
+/// publishes it, and `warnings` is the one field the CLI's text and JSON output and the
+/// server's maintenance handler both render. Without this edge the interface and its
+/// producer existed with no consumer, and the operator still saw a clean zero.
+///
+/// The sentence is written out here instead of rendered through the crate's own `Display`,
+/// for the same reason `snapshot_skip_warning` is: a test that asks the implementation to
+/// spell a published value cannot notice that value changing.
+#[test]
+fn session_prune_reports_attachment_bytes_a_surviving_prose_row_holds_back() {
+    let temp = tempfile::tempdir().expect("temporary fixture root");
+    let database_path = temp.path().join("zuno.db");
+    let pool = Pool::open(&DbLocation::File(database_path.clone())).expect("open file database");
+    let mut connection = pool.get().expect("check out connection");
+    migration::apply(&mut connection).expect("apply schema");
+    connection
+        .execute(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+             VALUES ('prj_a', ?1, 1, 1, '[]')",
+            rusqlite::params![temp.path().join("checkout").to_string_lossy()],
+        )
+        .expect("insert project");
+    insert_session(&connection, "ses_old", "prj_a", None, OLD, false);
+    insert_session(&connection, "ses_keep", "prj_a", None, NEW, false);
+    connection
+        .execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES ('msg_keep', 'ses_keep', 1, 1, '{}')",
+            [],
+        )
+        .expect("insert surviving message");
+
+    // The pruned session's object, named only as prose by a row that survives. A tool
+    // result or a model turn can author exactly this.
+    let digest = "5e".repeat(32);
+    connection
+        .execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+             VALUES ('prt_prose', 'msg_keep', 'ses_keep', 1, 1, ?1)",
+            rusqlite::params![format!("the deleted session's file was sha256:{digest}")],
+        )
+        .expect("insert prose payload");
+
+    let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
+    let object = paths
+        .attachments
+        .join("v1")
+        .join(zuno_attachment::AttachmentStore::database_identity(
+            database_path.to_string_lossy().as_bytes(),
+        ))
+        .join("objects")
+        .join(&digest[..2])
+        .join(&digest);
+    write(&object, b"object");
+
+    let mut delete = request(SessionPruneAction::Delete);
+    delete.confirm_delete = true;
+    let report = execute(
+        &mut connection,
+        &paths,
+        &delete,
+        &Reachable,
+        &Remote,
+        &mut Progress::default(),
+    )
+    .expect("delete with a held-back attachment class");
+
+    assert_eq!(report.selected_session_ids, ["ses_old"]);
+    assert!(
+        object.is_file(),
+        "a digest a surviving row names is never reclaimed"
+    );
+    assert_eq!(
+        report.warnings,
+        [format!(
+            "`{}` kept 1 attachment object whose 1 digest surviving rows name only as free \
+             text; model- or tool-authored content can produce that spelling, so those bytes \
+             are not reclaimable while such a row survives.",
+            database_path.display()
+        )],
+        "the suppression must be visible where an operator reads the report"
+    );
+    let serialized = String::from_utf8(to_json_bytes(&report).expect("serialize report"))
+        .expect("report JSON is UTF-8");
+    assert!(
+        serialized.contains("only as free text"),
+        "the JSON surface carries the same sentence: {serialized}"
+    );
+}
+
+/// Preview must promise exactly what delete can deliver.
+///
+/// A preview builds its survivor set by removing the selection from the live rows, so a
+/// preview that selects every session reaches the snapshot decision with the same empty set
+/// the delete will see. Without that symmetry the preview enumerated every store under the
+/// shared `$DATA/snapshot` — including another channel database's — as reclaimable bytes,
+/// and the `--delete` that followed reclaimed none of them and said nothing.
+#[test]
+fn session_prune_preview_that_selects_every_session_promises_no_snapshot_reclamation() {
+    let temp = tempfile::tempdir().expect("temporary fixture root");
+    let database_path = temp.path().join("opencode-local.db");
+    let pool = Pool::open(&DbLocation::File(database_path.clone())).expect("open file database");
+    let mut connection = pool.get().expect("check out connection");
+    migration::apply(&mut connection).expect("apply schema");
+    connection
+        .execute_batch(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+             VALUES ('prj_only', '/srv/only', 1, 1, '[]');",
+        )
+        .expect("insert project");
+    insert_session(&connection, "ses_only", "prj_only", None, OLD, false);
+    let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
+    let foreign = StoreKey::new("prj_other_channel", std::path::Path::new("/srv/other"));
+    write(
+        &foreign.path_in(&paths.snapshots).join("objects/history"),
+        b"another channel's history",
+    );
+    let mut preview = request(SessionPruneAction::Preview);
+    preview.scope = SessionPruneScope::AllProjects;
+
+    let report = execute(
+        &mut connection,
+        &paths,
+        &preview,
+        &Reachable,
+        &Remote,
+        &mut Progress::default(),
+    )
+    .expect("preview succeeds");
+
+    assert_eq!(report.selected_session_ids, ["ses_only"]);
+    assert!(
+        !report
+            .artifacts
+            .items
+            .iter()
+            .any(|item| item.kind == "snapshot_store"),
+        "a preview must not offer bytes the delete cannot reclaim: {:?}",
+        report.artifacts.items
+    );
+    assert_eq!(
+        report.warnings,
+        [snapshot_skip_warning(&database_path)],
+        "the preview names the class it did not evaluate"
+    );
+    assert!(
+        foreign.path_in(&paths.snapshots).is_dir(),
+        "a preview never touches the filesystem"
+    );
+    assert_eq!(session_count(&connection), 1, "a preview is inert");
 }
 
 #[test]

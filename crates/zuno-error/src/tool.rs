@@ -238,6 +238,60 @@ impl Recoverable for ToolError {
     }
 }
 
+/// Why a call that changed authoritative state cannot say what it changed.
+///
+/// A call reaches this state two ways, and both leave the same question behind:
+/// the effect may or may not have completed, and only the state the call was
+/// changing can answer. The cause is retained because it is the evidence a human
+/// reads when deciding where to look — not because the two recover differently.
+/// Neither is ever replayed mechanically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UncertainCause {
+    /// The call applied changes and then lost its authoritative final result.
+    ///
+    /// This is [`ToolError::Uncertain`]: the tool observed which paths it had
+    /// touched and reported them, and then the response that would have settled
+    /// the outcome never arrived.
+    LostOutcome,
+    /// A hard interruption stopped the call before its work reached a verdict.
+    ///
+    /// The tool may have settled a decided outcome of its own, in which case the
+    /// call is not uncertain at all. This cause is recorded only for the calls
+    /// whose own report says the outcome is undecided, and for a forced abort,
+    /// where nothing was observed because the grace period elapsed first.
+    Interrupted,
+}
+
+impl UncertainCause {
+    /// Every cause, for exhaustive round-trip and projection tests.
+    pub const ALL: [Self; 2] = [Self::LostOutcome, Self::Interrupted];
+
+    /// Stable durable and wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LostOutcome => "lost_outcome",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    /// Parse a durable or wire spelling back to the typed cause.
+    ///
+    /// Returns `None` for anything else. A caller reading durable state decides
+    /// what an unreadable cause means for it; this refuses to guess, because a
+    /// guess here would report an inspected outcome for a call nobody inspected.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|cause| cause.as_str() == value)
+    }
+}
+
+impl std::fmt::Display for UncertainCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +445,14 @@ mod tests {
             e.source().map(ToString::to_string).as_deref(),
             Some("exit status 1")
         );
+    }
+    #[test]
+    fn every_uncertain_cause_round_trips_through_its_durable_spelling() {
+        for cause in UncertainCause::ALL {
+            assert_eq!(UncertainCause::parse(cause.as_str()), Some(cause));
+            assert_eq!(cause.to_string(), cause.as_str());
+        }
+        assert_eq!(UncertainCause::parse("uncertain"), None);
+        assert_eq!(UncertainCause::parse(""), None);
     }
 }

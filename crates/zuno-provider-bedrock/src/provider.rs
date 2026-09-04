@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 use time::macros::format_description;
 use url::Url;
 use zuno_error::ProviderError;
-use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent};
+use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent, tool_arguments_text};
 use zuno_llm::http::{HttpTimeouts, RequestDeadlines, read_error_body};
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Provider, ProviderStream, Spec, generation,
@@ -50,6 +50,135 @@ pub struct BedrockConfig {
     pub operation: BedrockOperation,
     pub credentials: CredentialChainConfig,
     pub generation: BedrockGeneration,
+    /// Which models may be sent tool definitions.
+    pub tools: BedrockToolPolicy,
+}
+
+/// Whether a model this provider serves accepts tool definitions on the wire.
+///
+/// Bedrock is one endpoint in front of every vendor's models, and tool use is a
+/// *per-model* fact there: Converse answers `toolConfig` for a family that does not
+/// implement it with a `ValidationException`, and Bedrock's own model table is what says
+/// which families those are. [`Provider::capabilities`] has no model to branch on, and the
+/// catalog's per-model `tool_call` flag reaches only the compatible transport
+/// (`with_compatible_model_capabilities` in the CLI), so this crate resolves the question
+/// itself and gives an operator two levers over the answer.
+///
+/// Order of authority, most specific first:
+///
+/// 1. `modelCapabilities.<model id>.tool_calls` — one answer for one model, in the same
+///    spelling the compatible provider already reads, so a composition root that forwards
+///    the catalog flag needs no second shape.
+/// 2. `toolCalls` — one answer for every model this provider entry serves. `false` also
+///    withdraws the `tool_calls` capability, so the turn loop stops assembling a snapshot
+///    the wire will not carry.
+/// 3. The families Bedrock documents Converse tool use for. Anything unrecognised —
+///    a provisioned-throughput ARN, a model newer than this build — resolves to *no tool
+///    definitions*, which is byte for byte what 0.6.6 sent for every Bedrock model, and is
+///    raised by either lever above rather than by guessing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BedrockToolPolicy {
+    provider_wide: Option<bool>,
+    per_model: BTreeMap<String, bool>,
+}
+
+/// The model families Bedrock's Converse API documents as accepting `toolConfig`.
+///
+/// Matched as a substring of the lowercased model id so that a cross-region routing
+/// prefix (`us.anthropic.claude-…`) and an inference-profile ARN whose resource name
+/// carries the model id both resolve like the bare id.
+const CONVERSE_TOOL_USE_FAMILIES: &[&str] = &[
+    "anthropic.claude",
+    "amazon.nova-micro",
+    "amazon.nova-lite",
+    "amazon.nova-pro",
+    "amazon.nova-premier",
+    "cohere.command-r",
+    "meta.llama3-1",
+    "meta.llama3-2",
+    "meta.llama3-3",
+    "meta.llama4",
+    "mistral.mistral-large",
+    "mistral.mistral-small",
+    "mistral.pixtral-large",
+    "ai21.jamba-1-5",
+];
+
+/// Members of a listed family that predate its tool support.
+///
+/// Claude 2 and Claude Instant are `anthropic.claude*` ids that Converse serves without
+/// tool use, so the family prefix alone would send them a `toolConfig` they reject.
+const CONVERSE_TOOL_USE_EXCEPTIONS: &[&str] = &["anthropic.claude-v2", "anthropic.claude-instant"];
+
+impl BedrockToolPolicy {
+    /// The policy `spec.options` describes.
+    fn from_spec(spec: &Spec) -> Self {
+        let provider_wide = ["toolCalls", "tool_calls"]
+            .iter()
+            .find_map(|key| spec.options.get(*key))
+            .and_then(Value::as_bool);
+        let per_model = spec
+            .options
+            .get("modelCapabilities")
+            .and_then(Value::as_object)
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(|(model, capabilities)| {
+                        capabilities
+                            .get("tool_calls")
+                            .or_else(|| capabilities.get("toolcall"))
+                            .and_then(Value::as_bool)
+                            .map(|allowed| (model.clone(), allowed))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            provider_wide,
+            per_model,
+        }
+    }
+
+    /// Whether `model_id` may be sent tool definitions on this operation and surface.
+    #[must_use]
+    pub fn allows(&self, model_id: &str, operation: BedrockOperation, surface: ApiSurface) -> bool {
+        if let Some(explicit) = self.per_model.get(model_id) {
+            return *explicit;
+        }
+        if let Some(explicit) = self.provider_wide {
+            return explicit;
+        }
+        // The Mantle surfaces post a real OpenAI Chat or Responses body to
+        // `invoke-with-response-stream`. Converse's model table describes what *Converse*
+        // accepts and says nothing about those, so the family fallback is not applied to
+        // them; `toolCalls` is how an operator decides for a Mantle deployment.
+        if operation == BedrockOperation::InvokeModelWithResponseStream
+            && matches!(surface, ApiSurface::Chat | ApiSurface::Responses)
+        {
+            return true;
+        }
+        converse_documents_tool_use(model_id)
+    }
+
+    /// Whether any model of this provider may carry tools, for [`Provider::capabilities`].
+    const fn enabled_provider_wide(&self) -> bool {
+        !matches!(self.provider_wide, Some(false))
+    }
+}
+
+/// Whether Bedrock documents Converse tool use for this model id.
+fn converse_documents_tool_use(model_id: &str) -> bool {
+    let model_id = model_id.to_ascii_lowercase();
+    if CONVERSE_TOOL_USE_EXCEPTIONS
+        .iter()
+        .any(|excluded| model_id.contains(excluded))
+    {
+        return false;
+    }
+    CONVERSE_TOOL_USE_FAMILIES
+        .iter()
+        .any(|family| model_id.contains(family))
 }
 
 /// The generation controls Bedrock accepts, in Bedrock's own spelling.
@@ -119,6 +248,7 @@ impl BedrockConfig {
             operation: BedrockOperation::ConverseStream,
             credentials: CredentialChainConfig::default(),
             generation: BedrockGeneration::default(),
+            tools: BedrockToolPolicy::default(),
         }
     }
 
@@ -170,6 +300,7 @@ impl BedrockConfig {
                 ..CredentialChainConfig::default()
             },
             generation: BedrockGeneration::from_spec(spec),
+            tools: BedrockToolPolicy::from_spec(spec),
         })
     }
 }
@@ -228,7 +359,12 @@ impl BedrockProvider {
     /// Whatever the body builder rejects — a non-text system block, or content no
     /// Bedrock operation can express.
     pub fn body_for(&self, request: &CompletionRequest) -> Result<Value, ProviderError> {
-        request_body(request, self.config.operation, &self.config.generation)
+        request_body(
+            request,
+            self.config.operation,
+            &self.config.generation,
+            &self.config.tools,
+        )
     }
 
     async fn open_stream(
@@ -237,6 +373,30 @@ impl BedrockProvider {
     ) -> Result<ProviderStream<'static>, ProviderError> {
         if request.surface == ApiSurface::Default && self.config.provider_id.ends_with("/mantle") {
             request.surface = mantle_surface(&request.model_id);
+        }
+        // `invoke-with-response-stream` frames Anthropic Messages events, and this crate
+        // decodes only those. An OpenAI Chat chunk or Responses event arrives inside the
+        // same `chunk.bytes` envelope and falls through the decoder's ignore arm, which
+        // `eventstream::tests::openai_shaped_invoke_chunks_yield_no_events_at_all` pins as
+        // *zero* events for both shapes. Signed and sent anyway, the turn bills a whole
+        // invocation, decodes nothing, and ends as `upstream_stream_incomplete` — a
+        // transient class the engine retries, billing it again on every attempt. The
+        // request half of this pairing is real (see `native_body`), so the answer is not
+        // to unbuild the body but to refuse the call that cannot be read back, naming the
+        // operation that can. `body_for` deliberately stays reachable: the bytes remain
+        // inspectable for the day a shared OpenAI stream decoder makes this path work.
+        let undecodable_response = match self.config.operation {
+            BedrockOperation::ConverseStream => None,
+            BedrockOperation::InvokeModelWithResponseStream => match request.surface {
+                ApiSurface::Chat => Some("Chat"),
+                ApiSurface::Responses => Some("Responses"),
+                ApiSurface::Default | ApiSurface::Messages => None,
+            },
+        };
+        if let Some(surface) = undecodable_response {
+            return Err(ProviderError::fatal(
+                BedrockProtocolError::UndecodableInvokeResponse { surface },
+            ));
         }
         let body = serde_json::to_vec(&self.body_for(&request)?).map_err(ProviderError::fatal)?;
         let url = self.request_url(&request.model_id)?;
@@ -396,7 +556,12 @@ impl Provider for BedrockProvider {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             reasoning: true,
-            tool_calls: true,
+            // Per-model narrowing happens at the body, because one provider instance
+            // serves every model in the account and this answer cannot see which one is
+            // about to be called. A configured `toolCalls: false` is the one answer that
+            // holds for all of them, and withdrawing the capability here stops the turn
+            // loop from assembling a snapshot no body will carry.
+            tool_calls: self.config.tools.enabled_provider_wide(),
             prompt_cache: true,
             attachments: true,
             sampling_params: true,
@@ -433,14 +598,38 @@ fn request_body(
     request: &CompletionRequest,
     operation: BedrockOperation,
     generation: &BedrockGeneration,
+    tools: &BedrockToolPolicy,
 ) -> Result<Value, ProviderError> {
+    // A family Bedrock does not implement tool use for answers a body carrying tool
+    // definitions with a `ValidationException`: permanent, so every turn of that
+    // configuration fails, where before tools were simply never sent. The snapshot is
+    // cleared once, here, ahead of the surface dispatch below, so every body shape this
+    // operation can produce inherits one decision instead of each re-deriving it.
+    let without_tools;
+    let request = if request.tools.is_empty()
+        || tools.allows(&request.model_id, operation, request.surface)
+    {
+        request
+    } else {
+        without_tools = request.clone().with_tools(Vec::new());
+        &without_tools
+    };
     let mut value = match operation {
         BedrockOperation::ConverseStream => converse_body(request, generation)?,
         BedrockOperation::InvokeModelWithResponseStream => native_body(request, generation)?,
     };
-    // Bedrock speaks neither OpenAI surface; both operations are Anthropic-shaped
-    // bodies posted to a Bedrock Runtime action.
-    request.apply_parameters(&mut value, ApiSurface::Messages);
+    // `apply_parameters` takes the surface the bytes were built for, not the one the
+    // provider family prefers. Converse is Anthropic-shaped, but Mantle posts a real
+    // OpenAI Chat or Responses body, and a per-request parameter such as
+    // `reasoningEffort` lowers to a different field name on each of the three.
+    let sending_to = match operation {
+        BedrockOperation::ConverseStream => ApiSurface::Messages,
+        BedrockOperation::InvokeModelWithResponseStream => match request.surface {
+            ApiSurface::Default => ApiSurface::Messages,
+            surface => surface,
+        },
+    };
+    request.apply_parameters(&mut value, sending_to);
     Ok(value)
 }
 
@@ -486,6 +675,24 @@ fn converse_body(
     }
     if let Some(config) = generation.inference_config() {
         body.insert("inferenceConfig".to_owned(), config);
+    }
+    if !request.tools.is_empty() {
+        body.insert(
+            "toolConfig".to_owned(),
+            json!({
+                "tools": request
+                    .tools
+                    .iter()
+                    .map(|tool| json!({
+                        "toolSpec": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "inputSchema": {"json": tool.parameters},
+                        }
+                    }))
+                    .collect::<Vec<_>>()
+            }),
+        );
     }
     Ok(Value::Object(body))
 }
@@ -571,6 +778,7 @@ fn native_body(
                 "stream": true,
                 "messages": messages,
             });
+            insert_openai_tools(&mut body, request, OpenAiToolEnvelope::Nested);
             insert_openai_generation(&mut body, "max_tokens", generation);
             Ok(body)
         }
@@ -584,6 +792,7 @@ fn native_body(
             if let Some(instructions) = instructions {
                 body["instructions"] = Value::String(instructions);
             }
+            insert_openai_tools(&mut body, request, OpenAiToolEnvelope::Flat);
             insert_openai_generation(&mut body, "max_output_tokens", generation);
             Ok(body)
         }
@@ -659,6 +868,24 @@ fn anthropic_native_body(
     if !system.is_empty() {
         body.insert("system".to_owned(), Value::Array(system));
     }
+    if !request.tools.is_empty() {
+        body.insert(
+            "tools".to_owned(),
+            Value::Array(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "input_schema": tool.parameters,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
     Ok(Value::Object(body))
 }
 
@@ -712,29 +939,172 @@ fn anthropic_content(blocks: &[RequestContentBlock]) -> Result<Vec<Value>, Provi
         .collect()
 }
 
-fn openai_messages(messages: &[Message]) -> Result<Vec<Value>, ProviderError> {
-    messages.iter().map(openai_message).collect()
+/// How the surface nests a tool definition: Chat under `function`, Responses flat.
+#[derive(Clone, Copy)]
+enum OpenAiToolEnvelope {
+    Nested,
+    Flat,
 }
 
-fn openai_message(message: &Message) -> Result<Value, ProviderError> {
-    let mut text = String::new();
-    for block in &message.content {
-        let Some(value) = block.provider_text() else {
-            return Err(ProviderError::fatal(
-                RequestShapeError::OpenAiBlockUnsupported,
-            ));
-        };
-        text.push_str(value.as_ref());
+/// Write the locked tool snapshot onto a Mantle body in that surface's envelope.
+///
+/// The snapshot is a property of the request, not of the provider instance: it is what
+/// the turn loop locked and what tool dispatch is checked against, so a body built
+/// without it advertises `tool_calls` while making a tool call impossible.
+fn insert_openai_tools(
+    body: &mut Value,
+    request: &CompletionRequest,
+    envelope: OpenAiToolEnvelope,
+) {
+    if request.tools.is_empty() {
+        return;
     }
-    Ok(json!({
-        "role": match message.role {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::Tool => "tool",
-        },
-        "content": text,
-    }))
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let tools = request
+        .tools
+        .iter()
+        .map(|tool| match envelope {
+            OpenAiToolEnvelope::Nested => json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                }
+            }),
+            OpenAiToolEnvelope::Flat => json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            }),
+        })
+        .collect::<Vec<_>>();
+    object.insert("tools".to_owned(), Value::Array(tools));
+}
+
+/// Lower a history into OpenAI Chat messages.
+///
+/// One provider-neutral message can become several wire messages: Chat carries tool
+/// results as their own `role: "tool"` entries rather than as blocks inside the message
+/// that produced them.
+fn openai_messages(messages: &[Message]) -> Result<Vec<Value>, ProviderError> {
+    let mut wire = Vec::new();
+    for message in messages {
+        openai_chat_message(message, &mut wire)?;
+    }
+    Ok(wire)
+}
+
+fn openai_role(role: Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+}
+
+/// Chat's `image_url` part, which takes an inline data URL rather than raw bytes.
+fn openai_image_part(media_type: &str, data: &str) -> Value {
+    json!({
+        "type": "image_url",
+        "image_url": {"url": format!("data:{media_type};base64,{data}")}
+    })
+}
+
+fn openai_chat_message(message: &Message, wire: &mut Vec<Value>) -> Result<(), ProviderError> {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    let mut tool_calls = Vec::new();
+    let mut tool_results = Vec::new();
+    for block in &message.content {
+        match block {
+            RequestContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                raw_arguments,
+                ..
+            } => tool_calls.push(json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": tool_arguments_text(input, raw_arguments.as_deref()),
+                },
+            })),
+            RequestContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => tool_results.push(json!({
+                "role": "tool",
+                "tool_call_id": tool_use_id,
+                "content": content,
+            })),
+            RequestContentBlock::Image {
+                media_type, data, ..
+            } => images.push(openai_image_part(media_type, data)),
+            // Neither OpenAI surface has a field for an Anthropic-signed thinking
+            // block, and Mantle does not ask for reasoning to be replayed, so this is
+            // dropped rather than refused — the turn continues without it.
+            RequestContentBlock::SignedThinking { .. } => {}
+            RequestContentBlock::ProviderEncryptedReasoning { .. } => {
+                return Err(ProviderError::fatal(
+                    RequestShapeError::EncryptedReasoningUnsupported,
+                ));
+            }
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
+            RequestContentBlock::Text { .. } | RequestContentBlock::ResourceLink { .. } => {
+                let Some(value) = block.provider_text() else {
+                    return Err(ProviderError::fatal(
+                        RequestShapeError::OpenAiBlockUnsupported,
+                    ));
+                };
+                text.push_str(value.as_ref());
+            }
+        }
+    }
+
+    // A message that produced no wire item of its own still becomes an empty-content
+    // message, which is what the text-only path has always sent.
+    let produced_items = !tool_calls.is_empty() || !tool_results.is_empty();
+    if !text.is_empty() || !images.is_empty() || !produced_items {
+        let mut value = Map::from_iter([(
+            "role".to_owned(),
+            Value::String(openai_role(message.role).to_owned()),
+        )]);
+        if images.is_empty() {
+            value.insert("content".to_owned(), Value::String(text));
+        } else {
+            let mut parts = Vec::new();
+            if !text.is_empty() {
+                parts.push(json!({"type": "text", "text": text}));
+            }
+            parts.extend(images);
+            value.insert("content".to_owned(), Value::Array(parts));
+        }
+        if !tool_calls.is_empty() {
+            value.insert("tool_calls".to_owned(), Value::Array(tool_calls));
+            tool_calls = Vec::new();
+        }
+        wire.push(Value::Object(value));
+    }
+    if !tool_calls.is_empty() {
+        wire.push(json!({
+            "role": openai_role(message.role),
+            "tool_calls": tool_calls,
+        }));
+    }
+    wire.extend(tool_results);
+    Ok(())
 }
 
 fn append_openai_developer_context(
@@ -750,24 +1120,97 @@ fn append_openai_developer_context(
     );
 }
 
+/// Lower a history into OpenAI Responses `input` items.
+///
+/// Responses is an item list, not a message list: a tool call and its result are
+/// sibling `function_call` / `function_call_output` items rather than blocks inside a
+/// message, so one provider-neutral message can produce several items.
 fn openai_responses_input(
     request: &CompletionRequest,
 ) -> Result<(Option<String>, Vec<Value>), ProviderError> {
     let mut instructions = None;
     let mut input = Vec::new();
     for message in &request.messages {
-        let mut value = openai_message(message)?;
-        if message.role == Role::System && instructions.is_none() {
-            instructions = value
-                .get("content")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+        let mut text = String::new();
+        let mut images = Vec::new();
+        let mut items = Vec::new();
+        for block in &message.content {
+            match block {
+                RequestContentBlock::ToolUse {
+                    id,
+                    name,
+                    input: arguments,
+                    raw_arguments,
+                    ..
+                } => items.push(json!({
+                    "type": "function_call",
+                    "call_id": id,
+                    "name": name,
+                    "arguments": tool_arguments_text(arguments, raw_arguments.as_deref()),
+                })),
+                RequestContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => items.push(json!({
+                    "type": "function_call_output",
+                    "call_id": tool_use_id,
+                    "output": content,
+                })),
+                RequestContentBlock::Image {
+                    media_type, data, ..
+                } => images.push(json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{media_type};base64,{data}"),
+                })),
+                // See `openai_chat_message`: no field exists for it and Mantle does
+                // not ask for reasoning replay.
+                RequestContentBlock::SignedThinking { .. } => {}
+                RequestContentBlock::ProviderEncryptedReasoning { .. } => {
+                    return Err(ProviderError::fatal(
+                        RequestShapeError::EncryptedReasoningUnsupported,
+                    ));
+                }
+                RequestContentBlock::ImageAttachment { .. } => {
+                    unreachable!(
+                        "attachment references must be resolved before provider request shaping"
+                    )
+                }
+                RequestContentBlock::Text { .. } | RequestContentBlock::ResourceLink { .. } => {
+                    let Some(value) = block.provider_text() else {
+                        return Err(ProviderError::fatal(
+                            RequestShapeError::OpenAiBlockUnsupported,
+                        ));
+                    };
+                    text.push_str(value.as_ref());
+                }
+            }
+        }
+
+        if message.role == Role::System && instructions.is_none() && images.is_empty() {
+            instructions = Some(text);
+            input.extend(items);
             continue;
         }
-        if message.role == Role::System {
-            value["role"] = Value::String("developer".to_owned());
+        if !text.is_empty() || !images.is_empty() || items.is_empty() {
+            let role = if message.role == Role::System {
+                "developer"
+            } else {
+                openai_role(message.role)
+            };
+            let content = if images.is_empty() {
+                Value::String(text)
+            } else {
+                let mut parts = Vec::new();
+                if !text.is_empty() {
+                    parts.push(json!({"type": "input_text", "text": text}));
+                }
+                parts.extend(images);
+                Value::Array(parts)
+            };
+            input.push(json!({"role": role, "content": content}));
         }
-        input.push(value);
+        input.extend(items);
     }
     append_openai_developer_context(&mut input, &request.developer_context, "developer");
     Ok((instructions.filter(|value| !value.is_empty()), input))
@@ -819,6 +1262,17 @@ enum RequestShapeError {
 enum BedrockProtocolError {
     #[error("Bedrock streaming response did not use application/vnd.amazon.eventstream")]
     UnexpectedContentType,
+    /// An OpenAI-shaped body was about to be posted to `invoke-with-response-stream`,
+    /// whose reply this crate cannot decode.
+    ///
+    /// Fatal rather than transient on purpose: the combination is a property of the
+    /// configuration, so every retry would reproduce it exactly, at the price of
+    /// another billed invocation.
+    #[error(
+        "Bedrock `invoke-with-response-stream` cannot decode an OpenAI {surface} response; \
+         set `options.operation` to `converse-stream` for this model"
+    )]
+    UndecodableInvokeResponse { surface: &'static str },
 }
 
 pub fn factory(spec: Spec) -> Result<Arc<dyn Provider>, BedrockBuildError> {
@@ -899,6 +1353,571 @@ mod tests {
         assert_eq!(
             responses["input"][2],
             json!({"role": "developer", "content": "memory"})
+        );
+    }
+
+    fn read_tool() -> zuno_llm::registry::ToolSchema {
+        zuno_llm::registry::ToolSchema {
+            name: "read".to_owned(),
+            description: "Read a file".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            }),
+        }
+    }
+
+    fn tool_request(surface: ApiSurface) -> CompletionRequest {
+        CompletionRequest::new(
+            "anthropic.claude-sonnet-4-5",
+            vec![Message::new(Role::User, "Read the file.")],
+        )
+        .on_surface(surface)
+        .with_tools(vec![read_tool()])
+    }
+
+    /// The turn loop locks its tool snapshot into `CompletionRequest::tools`, so every
+    /// Bedrock body must show the model those tools in that operation's own envelope;
+    /// anything else advertises `tool_calls` while making a tool call impossible.
+    #[test]
+    fn the_locked_tool_snapshot_reaches_every_bedrock_body_shape() {
+        let converse = converse_body(
+            &tool_request(ApiSurface::Default),
+            &BedrockGeneration::default(),
+        )
+        .expect("Converse body");
+        assert_eq!(
+            converse["toolConfig"],
+            json!({"tools": [{"toolSpec": {
+                "name": "read",
+                "description": "Read a file",
+                "inputSchema": {"json": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                }},
+            }}]})
+        );
+
+        let messages = native_body(
+            &tool_request(ApiSurface::Messages),
+            &BedrockGeneration::default(),
+        )
+        .expect("Anthropic body");
+        assert_eq!(
+            messages["tools"],
+            json!([{
+                "name": "read",
+                "description": "Read a file",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }])
+        );
+
+        let chat = native_body(
+            &tool_request(ApiSurface::Chat),
+            &BedrockGeneration::default(),
+        )
+        .expect("Mantle Chat body");
+        assert_eq!(chat["tools"][0]["type"], "function");
+        assert_eq!(chat["tools"][0]["function"]["name"], "read");
+
+        let responses = native_body(
+            &tool_request(ApiSurface::Responses),
+            &BedrockGeneration::default(),
+        )
+        .expect("Mantle Responses body");
+        assert_eq!(
+            responses["tools"],
+            json!([{
+                "type": "function",
+                "name": "read",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }])
+        );
+    }
+
+    /// One model id, one policy, through the production entry point for that operation.
+    fn body_for_model(
+        model_id: &str,
+        operation: BedrockOperation,
+        surface: ApiSurface,
+        policy: &BedrockToolPolicy,
+    ) -> Value {
+        let request =
+            CompletionRequest::new(model_id, vec![Message::new(Role::User, "Read the file.")])
+                .on_surface(surface)
+                .with_tools(vec![read_tool()]);
+        request_body(&request, operation, &BedrockGeneration::default(), policy)
+            .expect("request body")
+    }
+
+    fn spec_with(options: Value) -> Spec {
+        let mut spec = Spec::new("amazon-bedrock");
+        for (name, value) in options.as_object().expect("options are an object") {
+            spec = spec.with_option(name.clone(), value.clone());
+        }
+        spec
+    }
+
+    /// A model family Converse does not implement tool use for.
+    ///
+    /// Converse answers `toolConfig` for these with a `ValidationException`, which is
+    /// permanent: every turn of the configuration fails. 0.6.6 sent no tool definitions at
+    /// all on this transport, so the model simply answered in prose, and that is what an
+    /// unrecognised or documented-tool-less family must keep doing.
+    #[test]
+    fn a_tool_less_bedrock_family_carries_no_tool_definitions() {
+        let policy = BedrockToolPolicy::default();
+        for model_id in [
+            "amazon.titan-text-express-v1",
+            "amazon.titan-text-lite-v1",
+            "amazon.titan-text-premier-v1:0",
+            "meta.llama2-13b-chat-v1",
+            "meta.llama3-8b-instruct-v1:0",
+            "anthropic.claude-v2:1",
+            "anthropic.claude-instant-v1",
+            "mistral.mistral-7b-instruct-v0:2",
+            "cohere.command-text-v14",
+            "arn:aws:bedrock:us-east-1:123456789012:provisioned-model/abcdefghijkl",
+        ] {
+            let converse = body_for_model(
+                model_id,
+                BedrockOperation::ConverseStream,
+                ApiSurface::Default,
+                &policy,
+            );
+            assert!(
+                converse.get("toolConfig").is_none(),
+                "`{model_id}` answers a toolConfig with a ValidationException, and this \
+                 body carried one: {converse}"
+            );
+            let native = body_for_model(
+                model_id,
+                BedrockOperation::InvokeModelWithResponseStream,
+                ApiSurface::Messages,
+                &policy,
+            );
+            assert!(
+                native.get("tools").is_none(),
+                "the Anthropic-native invoke body reads the same snapshot: {native}"
+            );
+        }
+    }
+
+    /// The families Bedrock documents tool use for still carry the snapshot, including
+    /// through a cross-region routing prefix and an inference-profile ARN.
+    #[test]
+    fn a_tool_capable_bedrock_family_still_carries_the_locked_snapshot() {
+        let policy = BedrockToolPolicy::default();
+        for model_id in [
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "us.amazon.nova-pro-v1:0",
+            "amazon.nova-micro-v1:0",
+            "meta.llama3-1-70b-instruct-v1:0",
+            "us.meta.llama3-2-11b-instruct-v1:0",
+            "meta.llama4-maverick-17b-instruct-v1:0",
+            "mistral.mistral-large-2407-v1:0",
+            "cohere.command-r-plus-v1:0",
+            "ai21.jamba-1-5-large-v1:0",
+        ] {
+            let converse = body_for_model(
+                model_id,
+                BedrockOperation::ConverseStream,
+                ApiSurface::Default,
+                &policy,
+            );
+            assert_eq!(
+                converse["toolConfig"]["tools"][0]["toolSpec"]["name"],
+                json!("read"),
+                "`{model_id}` accepts tool use, and a body without it advertises \
+                 `tool_calls` while making a tool call impossible"
+            );
+        }
+    }
+
+    /// `toolCalls` is the provider-wide lever over the family table, in both directions.
+    #[test]
+    fn the_tool_calls_option_overrides_the_family_table_in_both_directions() {
+        let forced = BedrockToolPolicy::from_spec(&spec_with(json!({"toolCalls": true})));
+        let converse = body_for_model(
+            "amazon.titan-text-express-v1",
+            BedrockOperation::ConverseStream,
+            ApiSurface::Default,
+            &forced,
+        );
+        assert_eq!(
+            converse["toolConfig"]["tools"][0]["toolSpec"]["name"],
+            json!("read"),
+            "an operator who knows a model accepts tool use can say so"
+        );
+
+        let withheld = BedrockToolPolicy::from_spec(&spec_with(json!({"toolCalls": false})));
+        let converse = body_for_model(
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            BedrockOperation::ConverseStream,
+            ApiSurface::Default,
+            &withheld,
+        );
+        assert!(
+            converse.get("toolConfig").is_none(),
+            "an operator who wants no tool traffic at all can say that too"
+        );
+        assert!(
+            !withheld.enabled_provider_wide(),
+            "`toolCalls: false` also withdraws the capability, so no snapshot is assembled"
+        );
+        assert!(BedrockToolPolicy::default().enabled_provider_wide());
+    }
+
+    /// `modelCapabilities.<model>.tool_calls` decides one model and leaves the rest alone,
+    /// in the spelling the compatible transport already reads.
+    #[test]
+    fn a_per_model_capability_decides_exactly_that_model() {
+        let policy = BedrockToolPolicy::from_spec(&spec_with(json!({
+            "modelCapabilities": {
+                "amazon.titan-text-express-v1": {"tool_calls": true},
+                "anthropic.claude-sonnet-4-5-20250929-v1:0": {"tool_calls": false},
+            }
+        })));
+
+        assert_eq!(
+            body_for_model(
+                "amazon.titan-text-express-v1",
+                BedrockOperation::ConverseStream,
+                ApiSurface::Default,
+                &policy,
+            )["toolConfig"]["tools"][0]["toolSpec"]["name"],
+            json!("read")
+        );
+        assert!(
+            body_for_model(
+                "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                BedrockOperation::ConverseStream,
+                ApiSurface::Default,
+                &policy,
+            )
+            .get("toolConfig")
+            .is_none(),
+            "a catalog entry that declares no tool support overrides the family table"
+        );
+        assert_eq!(
+            body_for_model(
+                "us.amazon.nova-pro-v1:0",
+                BedrockOperation::ConverseStream,
+                ApiSurface::Default,
+                &policy,
+            )["toolConfig"]["tools"][0]["toolSpec"]["name"],
+            json!("read"),
+            "a per-model answer is not a provider-wide one"
+        );
+    }
+
+    /// The Mantle surfaces are not Converse, so Converse's model table does not decide for
+    /// them: an `openai.*` id keeps the OpenAI-shaped `tools` array it was given.
+    #[test]
+    fn the_mantle_surfaces_keep_their_tools_for_an_openai_model_id() {
+        let policy = BedrockToolPolicy::default();
+        let chat = body_for_model(
+            "openai.gpt-oss-120b",
+            BedrockOperation::InvokeModelWithResponseStream,
+            ApiSurface::Chat,
+            &policy,
+        );
+        assert_eq!(chat["tools"][0]["function"]["name"], json!("read"));
+
+        let responses = body_for_model(
+            "openai.gpt-oss-120b",
+            BedrockOperation::InvokeModelWithResponseStream,
+            ApiSurface::Responses,
+            &policy,
+        );
+        assert_eq!(responses["tools"][0]["name"], json!("read"));
+
+        let withheld = BedrockToolPolicy::from_spec(&spec_with(json!({"toolCalls": false})));
+        assert!(
+            body_for_model(
+                "openai.gpt-oss-120b",
+                BedrockOperation::InvokeModelWithResponseStream,
+                ApiSurface::Chat,
+                &withheld,
+            )
+            .get("tools")
+            .is_none(),
+            "`toolCalls: false` is the lever that covers a Mantle deployment"
+        );
+    }
+
+    /// `capabilities()` claims `attachments` and `tool_calls` for both operations, so the
+    /// Mantle surfaces have to be able to express the content that claim invites. They
+    /// previously rejected every non-text block as a fatal request-shape error, which
+    /// turned the first image attachment — and, once tools are sent, the first tool
+    /// result — into an aborted turn.
+    #[test]
+    fn mantle_surfaces_express_the_content_their_capabilities_claim() {
+        let history = vec![
+            Message::from_content(
+                Role::User,
+                vec![
+                    RequestContentBlock::Text {
+                        text: "What is this?".to_owned(),
+                    },
+                    RequestContentBlock::Image {
+                        media_type: "image/png".to_owned(),
+                        data: "aGk=".to_owned(),
+                        filename: None,
+                    },
+                ],
+            ),
+            Message::from_content(
+                Role::Assistant,
+                vec![RequestContentBlock::ToolUse {
+                    id: "call_1".to_owned(),
+                    name: "read".to_owned(),
+                    input: json!({"path": "a.txt"}),
+                    raw_arguments: None,
+                    thought_signature: None,
+                }],
+            ),
+            Message::from_content(
+                Role::Tool,
+                vec![RequestContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_owned(),
+                    content: "file body".to_owned(),
+                    is_error: None,
+                }],
+            ),
+        ];
+        let request = CompletionRequest::new("openai.gpt-oss-120b", history);
+
+        let chat = native_body(
+            &request.clone().on_surface(ApiSurface::Chat),
+            &BedrockGeneration::default(),
+        )
+        .expect("a Chat body must accept image, tool-call and tool-result content");
+        assert_eq!(
+            chat["messages"][0]["content"][1],
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}})
+        );
+        assert_eq!(chat["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            chat["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            r#"{"path":"a.txt"}"#
+        );
+        assert_eq!(
+            chat["messages"][2],
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "file body"})
+        );
+
+        let responses = native_body(
+            &request.on_surface(ApiSurface::Responses),
+            &BedrockGeneration::default(),
+        )
+        .expect("a Responses body must accept the same content");
+        assert_eq!(
+            responses["input"][0]["content"][1],
+            json!({"type": "input_image", "image_url": "data:image/png;base64,aGk="})
+        );
+        assert_eq!(
+            responses["input"][1],
+            json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": r#"{"path":"a.txt"}"#,
+            })
+        );
+        assert_eq!(
+            responses["input"][2],
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "file body",
+            })
+        );
+    }
+
+    /// `apply_parameters` takes the surface the bytes were built for. Mantle posts a real
+    /// OpenAI Responses body, so a per-request `reasoningEffort` has to lower to
+    /// `reasoning.effort` there, not to Chat's `reasoning_effort`.
+    #[test]
+    fn mantle_parameters_lower_against_the_surface_the_body_was_built_for() {
+        let mut parameters = Map::new();
+        parameters.insert("reasoningEffort".to_owned(), json!("high"));
+        let request = CompletionRequest::new(
+            "openai.gpt-oss-120b",
+            vec![Message::new(Role::User, "Say hello.")],
+        )
+        .on_surface(ApiSurface::Responses)
+        .with_parameters(parameters.clone());
+
+        let responses = request_body(
+            &request,
+            BedrockOperation::InvokeModelWithResponseStream,
+            &BedrockGeneration::default(),
+            &BedrockToolPolicy::default(),
+        )
+        .expect("Mantle Responses body");
+        assert_eq!(responses["reasoning"], json!({"effort": "high"}));
+        assert!(responses.get("reasoning_effort").is_none());
+
+        let chat = request_body(
+            &request.on_surface(ApiSurface::Chat),
+            BedrockOperation::InvokeModelWithResponseStream,
+            &BedrockGeneration::default(),
+            &BedrockToolPolicy::default(),
+        )
+        .expect("Mantle Chat body");
+        assert_eq!(chat["reasoning_effort"], json!("high"));
+
+        let converse = request_body(
+            &CompletionRequest::new(
+                "anthropic.claude-sonnet-4-5",
+                vec![Message::new(Role::User, "Say hello.")],
+            )
+            .with_parameters(parameters),
+            BedrockOperation::ConverseStream,
+            &BedrockGeneration::default(),
+            &BedrockToolPolicy::default(),
+        )
+        .expect("Converse body");
+        assert_eq!(
+            converse["reasoning_effort"],
+            json!("high"),
+            "Converse is Anthropic-shaped and keeps the non-Responses lowering"
+        );
+    }
+
+    /// A Mantle provider exactly as the CLI registers it, plus the operation under test.
+    ///
+    /// Explicit credentials keep the resolver off the ambient environment, so an
+    /// assertion about the refusal cannot be satisfied by a missing-credential failure
+    /// instead.
+    fn mantle_provider(operation: BedrockOperation, endpoint: Option<Url>) -> BedrockProvider {
+        let mut config = BedrockConfig::new("us-east-1");
+        config.provider_id = "amazon-bedrock/mantle".to_owned();
+        config.operation = operation;
+        config.endpoint = endpoint;
+        config.credentials = CredentialChainConfig {
+            explicit: Some(crate::AwsCredentials::new("AKIAREPLAY", "replay-secret")),
+            ..CredentialChainConfig::default()
+        };
+        BedrockProvider::new(config).expect("a Mantle provider with explicit credentials")
+    }
+
+    /// The surface an [`BedrockProtocolError::UndecodableInvokeResponse`] named, when that
+    /// is what the failure is.
+    ///
+    /// Reads the typed source rather than the rendered message, so the test still fails if
+    /// the refusal is downgraded to a transient class that keeps its wording.
+    fn refusal_surface(error: &ProviderError) -> Option<&'static str> {
+        let ProviderError::Fatal {
+            source: Some(source),
+            ..
+        } = error
+        else {
+            return None;
+        };
+        if let Some(BedrockProtocolError::UndecodableInvokeResponse { surface }) =
+            source.downcast_ref::<BedrockProtocolError>()
+        {
+            Some(surface)
+        } else {
+            None
+        }
+    }
+
+    /// `bedrock-mantle` with `options.operation: "invoke-with-response-stream"`.
+    ///
+    /// That pairing posts a real OpenAI Responses body and then reads the reply with an
+    /// Anthropic Messages decoder;
+    /// `eventstream::tests::openai_shaped_invoke_chunks_yield_no_events_at_all` pins that
+    /// decode at zero events for both OpenAI shapes. Sent anyway, the turn spends a full
+    /// billed invocation, produces nothing, and ends as `upstream_stream_incomplete` — a
+    /// transient class the engine retries, so the charge repeats per attempt. The refusal
+    /// therefore has to land before signing and has to be fatal.
+    #[tokio::test]
+    async fn a_mantle_invoke_stream_is_refused_before_it_is_signed_and_billed() {
+        use futures::StreamExt as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let request = CompletionRequest::new(
+            "openai.gpt-oss-120b",
+            vec![Message::new(Role::User, "Say hello.")],
+        );
+        let mantle_invoke = mantle_provider(BedrockOperation::InvokeModelWithResponseStream, None);
+
+        assert!(
+            mantle_invoke
+                .body_for(&request.clone().on_surface(ApiSurface::Responses))
+                .expect("Mantle Responses body")
+                .get("input")
+                .is_some(),
+            "the request half stays inspectable through `body_for`; only the reply this \
+             crate cannot read back is refused"
+        );
+
+        let refused = mantle_invoke
+            .stream(request.clone())
+            .next()
+            .await
+            .expect("the refusal is the first item of the stream")
+            .expect_err("an undecodable response must not be requested");
+        assert_eq!(
+            refusal_surface(&refused),
+            Some("Responses"),
+            "the surface `mantle_surface` resolved for this model must be named: {refused:?}"
+        );
+        assert!(
+            !refused.is_retryable(),
+            "a mismatch the peer cannot fix must not bill a second invocation: {refused:?}"
+        );
+
+        // The control isolates the operation: same provider id, same model, same promoted
+        // surface. `converse-stream` sends an Anthropic-shaped body this crate can decode,
+        // so it must still reach the socket — the mock's `expect(1)` is the proof.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/model/openai.gpt-oss-120b/converse-stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let converse = mantle_provider(
+            BedrockOperation::ConverseStream,
+            Some(Url::parse(&server.uri()).expect("a mock endpoint")),
+        );
+        let answered = converse
+            .stream(request)
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("the mock answers application/json, not an eventstream");
+        assert_eq!(
+            refusal_surface(&answered),
+            None,
+            "converse-stream must not be refused: {answered:?}"
+        );
+        assert!(
+            matches!(&answered, ProviderError::Fatal { source: Some(source), .. }
+            if matches!(
+                source.downcast_ref::<BedrockProtocolError>(),
+                Some(BedrockProtocolError::UnexpectedContentType)
+            )),
+            "the signed request reached the mock and its content type was rejected: \
+             {answered:?}"
         );
     }
 

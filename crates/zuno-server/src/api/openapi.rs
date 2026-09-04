@@ -137,7 +137,7 @@ const BODY_SCHEMA_GAPS: &[BodySchemaGap] = &[
     (
         "/api/fs/find",
         "get",
-        "LocationEnvelope<Vec<Entry>> does not derive JsonSchema",
+        "FindEnvelope does not derive JsonSchema",
     ),
     (
         "/api/pty",

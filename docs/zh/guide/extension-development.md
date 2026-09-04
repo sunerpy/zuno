@@ -220,7 +220,13 @@ shutdown() -> result<_, error>
 
 `initialize` 必须精确返回 `zuno.plugin/1`。`metadata-json` 必须能解析为对象或
 `null`。`output` 对模型可见，因此不得放入凭据、Authorization header、私有上游
-响应正文或无界二进制数据。
+响应正文或无界二进制数据。不要在 `metadata-json` 中返回 `cancellation`：该键为
+Zuno 自身的取消声明保留，会被丢弃并记录告警。
+
+`workspace` 逐字节携带原生工作区路径，在任何平台上都不做分隔符规范化。如果工作区
+路径不是合法的 UTF-8，它在这条边界上没有表示形式，因此 Zuno 会按名字拒绝启动该
+组件，而不是传入一个被替换过的路径。继承的环境变量遵循同一规则：值不是合法 UTF-8
+的变量会被从 guest 环境中省略，并记录一条指名该变量的告警，而绝不做字符替换。
 
 ### Manifest 与权限
 

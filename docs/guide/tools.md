@@ -121,11 +121,37 @@ logs. Diagnostics identify only provider, scheme, host, path, status, and error
 category; they do not contain an API key, authorization header, or full query.
 
 `glob` and `grep` drive the official `rg` executable, with Zuno contributing only typed
-arguments, cancellation, bounded decoding, and stable ordering. Ripgrep 14 or newer must
-be available for those two tools. Discovery is lazy and scoped to them: a missing `rg`
-makes `glob` and `grep` report a typed tool error, and never a silent fallback to a
-slower walker, but it does not block Zuno from starting, reading configuration, reaching
-a provider, or opening its database.
+arguments, cancellation, bounded decoding, stable ordering, and path validation. Ripgrep
+14 or newer must be available for those two tools. Discovery is lazy and scoped to them:
+a missing `rg` makes `glob` and `grep` report a typed tool error, and never a silent
+fallback to a slower walker, but it does not block Zuno from starting, reading
+configuration, reaching a provider, or opening its database.
+
+Both tools report a refused call instead of an empty result. An unparseable pattern or
+`include` glob is invalid arguments naming the pattern `rg` itself quoted, so a refusal
+caused by the `include` is never blamed on the regex; a regex over ripgrep's own
+compiled-size limit is reported the same way. A run whose output exceeds 64 MiB is
+refused with advice to narrow the pattern, path, or `include`, because a stable order
+cannot be decided from part of a parallel walk. A `grep` restricted to one path that `rg`
+never managed to read is a refused call, not "no matches".
+
+A path is an identifier, not display text, so both tools return only paths they can name:
+every result comes back under the name the file actually has. A file whose name is not
+valid UTF-8 — a legacy encoding from an old archive, or a lone surrogate in an NTFS name
+— is left out of the results rather than reported with a replacement character that would
+name no file, and the same holds for the file a `grep` match lives in. On Linux and macOS
+a filename containing a backslash comes back verbatim, because a backslash is an ordinary
+filename byte there; on Windows, ripgrep's backslash separators are reported as `/`,
+which that platform accepts. A file name containing a newline is returned as the single
+path it is. Matching lines are capped at 2000 UTF-16 code units and a single `rg` record
+over 1 MiB is skipped. The rendered `glob`/`grep` output marks the result as truncated
+whenever a match was dropped, whether by the limit or because its path could not be named,
+and a path is returned exactly once, as the identifier of one real file. A directory the
+walk cannot enter contributes no results and is reported as "No files found", not as a
+permission failure: ripgrep's per-path diagnostics are suppressed so that one unreadable
+directory elsewhere under the root cannot turn the common "my pattern matched nothing"
+outcome into a tool failure. Zuno does not distinguish "not there" from "could not be
+read" for a subtree.
 
 For a Shell command that only observes remote work, set
 `backgroundPurpose: "remoteObserver"`. This value is persisted with the background
@@ -287,31 +313,108 @@ than coming back blank.
 ## What a shell command inherits
 
 A `shell` call runs with the host environment the Zuno process itself has, minus
-Zuno's own secrets. Three variables are removed before the command is assembled:
+Zuno's own. `ZUNO_*` is Zuno's private configuration namespace, and the whole namespace
+is withheld from a model-composed command:
 
-| Variable | What it holds |
+| Variable | Treatment |
 | --- | --- |
-| `ZUNO_AUTH_CONTENT` | Injected provider credentials, replacing the credential store |
-| `ZUNO_SERVER_PASSWORD` | The HTTP server's Basic authentication password |
-| `ZUNO_SERVER_USERNAME` | The account name that password belongs to |
+| `ZUNO_*` | Withheld in full. Not one name in the namespace is inherited, including the ones that look like bare identity |
+| `ZUNO`, `AGENT` | Inherited. The bare markers saying a process was launched by Zuno are outside the namespace |
+| Everything else | Inherited |
 
-Names are compared case-insensitively, because Windows environment variable names
-are. Removal happens before any host-supplied environment hook, so the host stays
-the single place that decides what a model-composed command may read, and nothing
-in the shipped configuration puts these three back.
+This is a namespace rule rather than a list of the variables known to hold a secret,
+because a list has to stay right for every variable Zuno ever reads and was wrong once
+already. `ZUNO_AUTH_CONTENT` was withheld while `ZUNO_CONFIG_CONTENT` was not — the same
+injected-document shape, carrying the same provider keys under
+`provider.<id>.options.apiKey`, but it arrived as configuration rather than as
+credentials. Withholding the namespace has to be right once, and the next variable Zuno
+reads is withheld before anyone has to notice what it holds.
 
-Everything else is inherited on purpose. A wildcard filter over `*_API_KEY` and
-`*_TOKEN` was considered and rejected: it silently breaks `gh`, `aws`, `az`, and
-`gcloud`, along with every user who exports a token because a command needs it. A
-tool that quietly removes the credential a command requires fails worse than one
-that keeps it, because the removal surfaces later as an unexplained authentication
-error somewhere else.
+There is no allowlist. An earlier release inherited three names — `ZUNO_PID`,
+`ZUNO_CLIENT`, and `ZUNO_WORKSPACE_ID` — on the reasoning that a pid, a client surface,
+and a workspace identifier are none of them a document or a credential. That is true of
+each value and beside the point: the pid is the *address* of every document withheld
+above. On an unconfined path `tr '\0' '\n' < /proc/$ZUNO_PID/environ` on Linux, or
+`ps eww $ZUNO_PID` on macOS, reads the Zuno process environment straight back, so handing
+the pid to a model-composed command turned a discovery step into a one-liner. The other
+two went with it because nothing outside Zuno reads them: `ZUNO_CLIENT` is read by Zuno
+itself in process, and `ZUNO_WORKSPACE_ID` by nothing beyond the CLI's own flag snapshot.
+A script that only needs to know it is running under Zuno reads `ZUNO` or `AGENT`, which
+are outside the namespace and untouched.
 
-One consequence is worth stating plainly. A nested `zuno` launched from inside a
-`shell` call no longer inherits `ZUNO_AUTH_CONTENT`, so it resolves credentials the
-ordinary way and needs its own configuration or credential store. The interactive
-terminal is unaffected, because its shell is driven by you rather than composed by
-a model.
+Names are compared case-insensitively, because Windows environment variable names are, so
+`%zuno_server_password%` names the same secret there. The fold is only ever allowed to
+grow the withheld set: it decides what is *removed*, and there is no allowlist for it to
+collapse a name onto. That direction matters — with an allowlist, a Linux `ZUNO_Pid` is a
+different variable from `ZUNO_PID` and could hold anything, and a case-insensitive
+comparison would have inherited it for looking like an allowlisted name.
+
+Removal happens before any host-supplied environment hook, so the host stays the single
+place that decides what a model-composed command may read. A deployment that genuinely
+needs a value in the tool environment puts it back through that hook, deliberately;
+nothing in the shipped configuration puts one back.
+
+Everything outside the namespace is inherited on purpose. A wildcard filter over
+`*_API_KEY` and `*_TOKEN` was considered and rejected: it silently breaks `gh`, `aws`,
+`az`, and `gcloud`, along with every user who exports a token because a command needs it.
+A tool that quietly removes the credential a command requires fails worse than one that
+keeps it, because the removal surfaces later as an unexplained authentication error
+somewhere else.
+
+One consequence is worth stating plainly. A nested `zuno` launched from inside a `shell`
+call inherits none of that namespace — not `ZUNO_CONFIG_CONTENT`, `ZUNO_CONFIG`,
+`ZUNO_CONFIG_DIR`, `ZUNO_DB`, the `ZUNO_MODELS_*` variables, or the `ZUNO_SANDBOX_*`
+variables — so it resolves configuration, credentials, and its database the ordinary way,
+and needs its own. The interactive terminal is unaffected, because its shell is driven by
+you rather than composed by a model.
+
+Withholding is defence in depth, not a containment boundary. On an unconfined path the
+Zuno process environment is still readable from the host, so a variable being absent from
+the command's own environment raises the cost of reading it rather than guaranteeing it
+cannot be read. Sandboxing is what narrows that; this removal is what stops one `env` or
+one `printenv` from being enough.
+
+## The pre-flight repository read budget
+
+A `git commit` or `git add` is inspected before it runs, so the call can refuse to deliver
+generated state. That inspection makes up to four `git` reads, and all of them share one
+thirty-second budget for the whole phase — not thirty seconds each. The number is a total:
+the reads race a deadline that is the budget minus a small reserve, and the reserve is what
+stops a read that never answered, so a configured thirty seconds cannot admit a
+sixty-second phase.
+
+A read that does not answer in time is a refusal, not a pass:
+
+```
+`git status --porcelain` did not answer within the 30s this command's pre-flight repository reads share, so the repository state it depends on is unknown; it was not run
+```
+
+The command is not run. An unknown repository is not an empty one, and reading a hung read
+as "nothing to report" would turn a stalled `.git` into permission to commit. Cancelling the
+call refuses it the same way. In both cases the abandoned `git` and anything it started are
+stopped as a group before the refusal returns.
+
+## What a shell call reports it wrote
+
+`write`, `edit`, and `apply_patch` each name the files they changed. `shell` now does too,
+on the same `writtenPaths` metadata, so a command that edits the workspace is visible to
+everything built on that key — the goal store's escalation from a question to a change, the
+freshness mark that retires a stale verification receipt, the changed-file list an
+interrupted call settles with, and every client's tool-call view. Before this,
+`shell {"command": "sed -i 's/foo/bar/' src/lib.rs"}` could complete a goal with no
+evidence at all, because nothing had told the store that anything changed.
+
+The report is observed, never inferred. Each statically resolvable path the command names
+is examined before and after the run, and a path is reported only when the two observations
+disagree — because the filesystem says the file changed, not because a command name looked
+like a writer. That makes it a deliberate lower bound. Not reported: a target the shell
+expands (`$OUT`, `*.rs`, `$(ls)`, a here-document, a redirection), which is skipped rather
+than guessed; a path outside the workspace and outside the directories the call was
+granted; a deletion, because the key means "this file is now here to be re-read"; a rewrite
+that leaves both size and modification time unchanged; and a command promoted to the
+background, which is still writing when the call returns. A missing path costs evidence. A
+fabricated one would retire a receipt over a file nothing touched, so the bound errs toward
+silence.
 
 ## Effect classification
 

@@ -13,7 +13,7 @@
 //! (`disabled` and `visibleTools`).
 
 use crate::types::Rule;
-use crate::wildcard::wildcard_match;
+use crate::wildcard::key_governs;
 use std::collections::BTreeSet;
 use zuno_config::schema::permission::PermissionAction;
 
@@ -57,8 +57,10 @@ pub fn merge_agent_session(agent: &[Rule], session: &[Rule]) -> Vec<Rule> {
 /// Return whether a tool is advertised to the model.
 ///
 /// The tool is hidden when the last rule whose permission key matches denies
-/// every pattern. The key match reuses [`wildcard_match`], the same primitive
-/// the evaluator uses, so a `{"*": "deny"}` outer key hides every tool.
+/// every pattern. The key match reuses [`crate::wildcard_match`] through the same
+/// `key_governs` the evaluator uses, so a `{"*": "deny"}` outer key hides every
+/// tool and a deny written `Shell` hides `shell` while an allow written that way
+/// governs nothing.
 #[must_use]
 pub fn is_tool_visible(tool: &str, rules: &[Rule]) -> bool {
     !is_tool_hidden(tool, rules)
@@ -73,7 +75,7 @@ pub fn is_tool_hidden(tool: &str, rules: &[Rule]) -> bool {
     rules
         .iter()
         .rev()
-        .find(|rule| wildcard_match(key, &rule.permission))
+        .find(|rule| key_governs(key, rule))
         .is_some_and(|rule| rule.pattern == "*" && rule.action == PermissionAction::Deny)
 }
 

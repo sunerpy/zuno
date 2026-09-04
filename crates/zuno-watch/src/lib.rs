@@ -32,6 +32,69 @@
 //! difference is exactly why one is silent and the other is an event. A consumer
 //! that receives [`WatchEvent::Overflow`] must rescan.
 //!
+//! Loss the platform inflicts is reported through the same event, because a hole is
+//! a hole whoever made it: a backend rescan notice (inotify's `IN_Q_OVERFLOW`,
+//! FSEvents' `MustScanSubDirs`) and a watch limit that left a subtree unwatched
+//! (inotify's `MaxFilesWatch`) both become a [`WatchEvent::Overflow`]. Neither
+//! states how much was lost, so its count is a floor.
+//!
+//! A loss that does not heal is re-reported on a floor of
+//! [`LOST_COVERAGE_REPORT_INTERVAL`] rather than on every occurrence, because
+//! `notify` re-delivers such a failure without bound and the consumer's response to
+//! it is a full rescan. That floor is keyed **per loss class**, not per watch: an
+//! exhausted watch limit and a failing read on the notification fd hold separate
+//! budgets, so a frequent cause can never spend the report belonging to a rare one.
+//! Each admitted report keeps its own `WARN`, so a watch that never recovers stays
+//! visible to an operator whether or not anything reads
+//! [`Watcher::lost_coverage`] — which is additionally sticky for the life of the
+//! watch, but nothing here depends on that being read.
+//!
+//! A read error the backend simply repeats loses nothing and is therefore not a
+//! loss at all: `notify` forwards every non-`WouldBlock` read error to the callback
+//! and then loops round to read again, so an `EINTR` arrives here with the events
+//! still queued. Reporting it would be a false hole — and a false hole that spends
+//! an operator's attention on the one condition they cannot do anything about. It
+//! fails closed if it stops being transient, though: a read still being repeated
+//! after `RETRIED_READS_BEFORE_LOSS` consecutive attempts with not one notification
+//! delivered in between means nothing is draining the bounded kernel queue, and that
+//! is reported as lost coverage like any other.
+//!
+//! # What this crate still cannot see
+//!
+//! Two losses reach no consumer at all, because `notify` 8.2 does not hand them to
+//! the callback in any form. Both leave a subtree dark while every counter here
+//! reads healthy, so [`Watcher::lost_coverage`] returning `false` and a stream with
+//! no [`WatchEvent::Overflow`] on it are **not** a completeness guarantee; a
+//! consumer that must not miss a change needs a periodic rescan of its own.
+//!
+//! - **Windows, for every kernel-side loss.** `ReadDirectoryChangesW` never sets a
+//!   rescan flag and never delivers an `Err` — `notify-8.2.0/src/windows.rs`
+//!   contains no `Flag::Rescan` at all. A buffer overrun arrives as
+//!   `ERROR_NOTIFY_ENUM_DIR` (1022) in the unidentified-error arm at
+//!   `windows.rs:355-368`, which logs and then calls `request.unwatch()`. So the
+//!   loss is not merely unreported: **the directory watch itself is removed for the
+//!   life of the process**, the handler is never told, and [`Watcher::active_root`]
+//!   keeps naming a scope that will never deliver anything again. There is no probe
+//!   this crate could use to notice — that backend's `unwatch` returns `Ok(())`
+//!   whether or not the watch still exists (`windows.rs:546-559`, and
+//!   `remove_watch` at `windows.rs:243` is a silent no-op for an absent key) — and
+//!   blind periodic re-registration would have to assume loss every time, which
+//!   would cost every Windows consumer a permanent rescan duty cycle. So this is
+//!   recorded rather than papered over.
+//! - **Linux, an auto-add that fails for anything but the watch limit.** When a
+//!   directory appears under a recursive watch, `notify` adds a watch for it and
+//!   forwards only [`NotifyErrorKind::MaxFilesWatch`] to the handler
+//!   (`inotify.rs:383-395`). `EACCES` from `inotify_add_watch` becomes `Io`
+//!   (`inotify.rs:455`) and is dropped on the floor — and because the recursive add
+//!   propagates it with `?` out of the `WalkDir` loop (`inotify.rs:406-412`), the
+//!   sibling directories after it are abandoned too. A directory `WalkDir` cannot
+//!   even read is dropped one step earlier, by `filter_dir` (`inotify.rs:523-532`),
+//!   which discards its error along with it. So a directory created unreadable under
+//!   the watched root is dark with no signal, and it can take its later siblings
+//!   with it. The same failure at [`Watcher::start`] is *not* silent: there the
+//!   error is returned as [`WatchError::Notify`] rather than delivered to the
+//!   callback, and the watch does not start.
+//!
 //! # Why the watcher thread cannot be blocked
 //!
 //! [`notify`] runs its callback on a thread it owns. Blocking there stops the
@@ -40,7 +103,9 @@
 //! the kernel sets `IN_Q_OVERFLOW` and *silently discards* events. So the
 //! callback only ever takes a mutex around the coalescing buffer, and the only
 //! send it performs is [`tokio::sync::mpsc::Sender::try_send`], from a different
-//! thread. No path in this crate calls a blocking or awaiting send.
+//! thread. No path in this crate calls a blocking or awaiting send. When the queue
+//! overflows anyway, the loss is silent only to the kernel: the flag the backend
+//! sets on it becomes [`WatchEvent::Overflow`].
 //!
 //! # Threads, not tasks
 //!
@@ -113,6 +178,67 @@ pub const DEFAULT_MAX_PENDING: usize = 4_096;
 /// only bounds how long shutdown can take if a wake is missed.
 const IDLE_POLL: Duration = Duration::from_millis(50);
 
+/// What one platform-reported loss of unstated size adds to the drop count.
+///
+/// Neither inotify's `IN_Q_OVERFLOW` nor FSEvents' `MustScanSubDirs` says how many
+/// notifications were discarded, and the only correct consumer response is the same
+/// whatever the number is: rescan. So one is recorded rather than a guess or a
+/// sentinel, which keeps [`WatchEvent::Overflow`]'s count a floor on the loss
+/// instead of an invention.
+const UNKNOWN_LOSS: u64 = 1;
+
+/// How often a platform loss that does not heal may reach the consumer again.
+///
+/// `notify` re-delivers a persistent failure without bound. Its inotify drain loop
+/// hands the callback `Err` and loops again on any read error that is not
+/// `WouldBlock` — there is no `break` on that arm
+/// (`notify-8.2.0/src/inotify.rs:367-374`) — and it re-attempts a failed recursive
+/// add for every batch of newly created directories (`inotify.rs:383-395`), a
+/// condition that only an operator can clear. Reporting every occurrence would make
+/// [`WatchEvent::Overflow`], whose consumer response is a full rescan, a duty cycle
+/// driven by a broken watch, and would write a log line per iteration on the one
+/// thread that must never stall. Reporting only the first would instead leave a
+/// consumer stale for as long as the process runs, because the hole does not close
+/// on its own.
+///
+/// A floor is therefore the answer rather than a latch: at one minute a consumer is
+/// at most a minute behind a watch it cannot fix, and the report costs roughly four
+/// orders of magnitude less than the loop producing the notifications. It
+/// deliberately does not back off — a hole that persists has to stay visible rather
+/// than fade out — and it deliberately does not apply to a backend rescan notice,
+/// which is a distinct loss each time it is emitted (see `ingest_at`).
+///
+/// Every loss class holds its own floor, because a floor keyed per watch lets a
+/// frequent benign cause spend the budget of the rare consequential one: one
+/// interrupted read would otherwise consume the report and leave the next fifty
+/// watch-limit failures with nothing to say. The interval is a crate constant and
+/// not a [`WatchOptions`] field on purpose. It bounds a cost — one log line and one
+/// consumer rescan per class — that a caller has no input on, nothing derives it
+/// from an event, and the only thing lowering it could buy is the flood it exists to
+/// prevent. What a host can still bound is the *response*: the consumer decides what
+/// [`WatchEvent::Overflow`] costs it.
+pub const LOST_COVERAGE_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How many consecutive repeated reads mean the queue is not being drained at all.
+///
+/// A read the backend repeats loses nothing, so one of them is not a hole (see
+/// [`read_will_be_retried`]). A read *still* being repeated after this many
+/// consecutive attempts, with not one notification delivered in between, is a
+/// different condition: nothing is draining the kernel queue, that queue is bounded,
+/// and what it discards once it fills is gone. So the retryable class fails closed
+/// into a reported loss rather than staying quiet for the life of the process.
+///
+/// Audited in both directions. Downward, if the threshold is reached when nothing
+/// was actually lost, the cost is one admitted report — one consumer rescan and one
+/// log line — floored per class like every other report, and a single delivered
+/// notification resets the count, so no isolated interrupted read can walk up to it.
+/// Upward, a genuinely stuck drain loop is reported after 1024 iterations of a loop
+/// that spins as fast as `read` can return, which is immediate in wall-clock terms
+/// rather than a delay an operator would notice. Nothing derives this number from an
+/// event, a peer, or any other input: it counts this crate's own observations, and
+/// no caller can raise it.
+const RETRIED_READS_BEFORE_LOSS: u64 = 1_024;
+
 /// Something the consumer needs to know about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatchEvent {
@@ -123,7 +249,10 @@ pub enum WatchEvent {
     ///
     /// Delivered before the batch it precedes. `dropped` counts paths lost since
     /// the previous `Overflow`, not since the start, so a consumer can act on the
-    /// number without keeping a running total.
+    /// number without keeping a running total. It is a *floor*: a loss the platform
+    /// reports without a magnitude — a kernel queue overflow, or a watch limit that
+    /// left a subtree unwatched — counts as one, because the required response is a
+    /// rescan either way.
     Overflow {
         /// How many paths were discarded unreported.
         dropped: u64,
@@ -314,6 +443,133 @@ struct Counters {
     dropped: AtomicU64,
 }
 
+/// Whether one occurrence of a repeating platform loss may be reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LossReport {
+    /// The first for this watch. Worth an operator's attention.
+    First,
+    /// A later one, admitted because the report floor has elapsed.
+    Again,
+}
+
+/// What kind of coverage a `notify` failure took away.
+///
+/// The classes exist to be *budgeted separately*. They differ in how often they can
+/// arrive, in how consequential they are, and in what an operator can do about them,
+/// so a report floor shared between them would let the cheap frequent one silence
+/// the expensive rare one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LossClass {
+    /// `fs.inotify.max_user_watches` is exhausted, so a subtree is unwatched for the
+    /// life of the watch. Rare, and the only one an operator can fix.
+    WatchLimit,
+    /// The backend could not read the notification queue, so whatever that read
+    /// would have returned is gone. Repeats as fast as the drain loop can spin.
+    Notifications,
+}
+
+/// How a `notify::Error` handed to the callback must be treated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchFailure {
+    /// Coverage is gone until something outside this process changes.
+    Lost(LossClass),
+    /// The read did not happen, so the queue still holds its events and the backend
+    /// will deliver them on the next iteration. Nothing was lost.
+    Retryable,
+    /// An answer to a call this crate made about one path, which
+    /// [`Watcher::reconcile`] already handles.
+    Incidental,
+}
+
+/// The floor for one repeating condition.
+///
+/// Takes the current instant as an argument rather than reading the clock, for the
+/// reason [`crate::debounce`] does: both directions of the window — suppressed
+/// inside it, admitted once past it — are then assertable on an explicit timeline
+/// instead of by sleeping and hoping.
+#[derive(Debug, Default)]
+struct ReportFloor {
+    /// When a report was last admitted. `None` until the first one, which is also
+    /// what makes the answer to [`ReportFloor::reported`] sticky.
+    admitted: Mutex<Option<Instant>>,
+}
+
+impl ReportFloor {
+    /// Whether this occurrence may be reported, and whether it is the first ever.
+    ///
+    /// A poisoned mutex is recovered from rather than propagated, for the same
+    /// reason [`Shared::lock`] recovers: a panic elsewhere must not silence the one
+    /// signal that says the watch has a hole.
+    fn admit(&self, now: Instant) -> Option<LossReport> {
+        let mut admitted = self
+            .admitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *admitted {
+            Some(at) if now.saturating_duration_since(at) < LOST_COVERAGE_REPORT_INTERVAL => None,
+            ever => {
+                *admitted = Some(now);
+                Some(if ever.is_some() {
+                    LossReport::Again
+                } else {
+                    LossReport::First
+                })
+            }
+        }
+    }
+
+    /// Whether this condition has ever been reported for this watch.
+    fn reported(&self) -> bool {
+        self.admitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+}
+
+/// One [`ReportFloor`] per condition, so no two conditions share a budget.
+#[derive(Debug, Default)]
+struct LossReports {
+    /// [`LossClass::WatchLimit`].
+    watch_limit: ReportFloor,
+    /// [`LossClass::Notifications`].
+    notifications: ReportFloor,
+    /// Not a loss and never reported to the consumer: this only bounds how often a
+    /// retried read error is written to the log from the thread that must keep
+    /// draining the kernel queue. Kept separate from both loss classes precisely so
+    /// that a signal arriving at an unlucky moment cannot spend either one.
+    retried: ReportFloor,
+    /// Repeated reads since the last notification actually delivered. Zeroed by any
+    /// delivery, which is what makes [`RETRIED_READS_BEFORE_LOSS`] a statement about
+    /// a drain loop that is stuck rather than one that was merely interrupted.
+    retried_reads: AtomicU64,
+}
+
+impl LossReports {
+    /// The floor that budgets `class`.
+    fn floor(&self, class: LossClass) -> &ReportFloor {
+        match class {
+            LossClass::WatchLimit => &self.watch_limit,
+            LossClass::Notifications => &self.notifications,
+        }
+    }
+
+    /// Whether this occurrence of `class` may be reported, and whether it is the
+    /// first of its class ever.
+    fn admit(&self, class: LossClass, now: Instant) -> Option<LossReport> {
+        self.floor(class).admit(now)
+    }
+
+    /// Whether a *coverage loss* has ever been reported for this watch.
+    ///
+    /// Deliberately excludes [`LossReports::retried`]: a read the backend repeats
+    /// lost nothing, so letting it latch this would turn one interrupted syscall
+    /// into a watch permanently described as degraded.
+    fn reported(&self) -> bool {
+        self.watch_limit.reported() || self.notifications.reported()
+    }
+}
+
 /// What the callback thread and the flush thread share.
 struct Shared {
     debouncer: Mutex<Debouncer>,
@@ -321,6 +577,9 @@ struct Shared {
     shutdown: AtomicBool,
     sender: Sender<WatchEvent>,
     counters: Counters,
+    /// One report floor per loss class. Written by the callback thread and read by
+    /// [`Watcher::lost_coverage`] on the consumer's thread.
+    losses: LossReports,
 }
 
 impl Shared {
@@ -443,6 +702,7 @@ impl Watcher {
             shutdown: AtomicBool::new(false),
             sender,
             counters: Counters::default(),
+            losses: LossReports::default(),
         });
 
         if decision.is_disabled() {
@@ -632,13 +892,42 @@ impl Watcher {
         self.shared.counters.published.load(Ordering::Relaxed)
     }
 
-    /// Paths discarded without being reported so far.
+    /// Changes discarded without being reported so far.
     ///
     /// Mirrors the totals delivered as [`WatchEvent::Overflow`]; non-zero means a
-    /// consumer's view of the tree has a hole.
+    /// consumer's view of the tree has a hole. Deliberately not a path count: the
+    /// pending ceiling and a refused send count paths, while a platform loss of
+    /// unstated size contributes one whatever it swallowed, so this is a floor on
+    /// what was missed.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.shared.counters.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Whether the platform has told this watch that coverage was lost.
+    ///
+    /// Sticky: it never returns to `false`, because nothing this crate can observe
+    /// says an exhausted watch limit or a failing read on the notification fd was
+    /// fixed. That is how a degraded watch stays *reported* instead of being
+    /// announced once and forgotten — a consumer or a diagnostic can read it long
+    /// after the [`WatchEvent::Overflow`] that carried the news was consumed.
+    ///
+    /// `false` is not a promise of completeness. It is `false` on Windows even when
+    /// the watch has been silently removed, and `false` on Linux when a directory
+    /// appeared that `notify` could not add a watch for; see the module docs for both.
+    /// It is also `false` after a read the backend retried, because that read lost
+    /// nothing.
+    ///
+    /// Nothing in the workspace reads this yet. The operator-visible signal for a
+    /// degraded watch is deliberately not conditional on anyone doing so: it is the
+    /// `WARN` that `report_lost_coverage` repeats on its floor for as long as the
+    /// condition lasts. This exists so that a consumer which wants the state in its
+    /// own diagnostics — `SkillCatalogService`'s watcher warnings being the intended
+    /// one — can read it instead of having to remember a
+    /// [`WatchEvent::Overflow`] it may have consumed before it started caring.
+    #[must_use]
+    pub fn lost_coverage(&self) -> bool {
+        self.shared.losses.reported()
     }
 
     /// Distinct paths held in the coalescing buffer right now.
@@ -797,45 +1086,241 @@ pub fn is_vcs_reportable(vcs_dir: &Path, path: &Path) -> bool {
 /// Map one `notify` event into the coalescing buffer.
 ///
 /// Runs on `notify`'s own thread, so it does the least possible work: classify,
-/// filter, take a mutex, merge, wake. No I/O, no send, no allocation beyond the
-/// paths `notify` already allocated.
+/// filter, take a mutex, merge, wake. Two deliberate choices about that thread:
+///
+/// - The ignore decision is made *before* the lock, because it can read a
+///   `.gitignore` ([`crate::ignore`]) and holding the coalescing buffer across that
+///   would put the flush thread behind filesystem I/O for the length of a flood.
+/// - `is_dir` is passed as a closure ([`Filter::is_ignored_with`]), so the `stat`
+///   that answers it happens only when a gitignore rule actually reads it. With no
+///   `.gitignore` chain configured — the only shape any first-party caller starts —
+///   this function performs no filesystem call at all.
+///
+/// Not yet off this thread, and stated rather than implied: with
+/// [`WatchOptions::gitignore`] enabled, the first path judged under a directory
+/// still loads that directory's `.gitignore` here, so a burst that first touches
+/// many directories pays one open-and-parse each on the thread that must drain the
+/// kernel queue.
 fn ingest(
     shared: &Arc<Shared>,
     filter: &Filter,
     vcs_dir: Option<&Path>,
     event: notify::Result<notify::Event>,
 ) {
+    ingest_at(shared, filter, vcs_dir, event, Instant::now());
+}
+
+/// [`ingest`] on an explicit instant.
+///
+/// The clock is read exactly once per notification, at the edge, and everything
+/// below here takes the instant as an argument — the way [`crate::debounce`] already
+/// does. That is what lets a test drive the report floor's window through the real
+/// production path, in both directions, without sleeping for a minute and hoping.
+fn ingest_at(
+    shared: &Arc<Shared>,
+    filter: &Filter,
+    vcs_dir: Option<&Path>,
+    event: notify::Result<notify::Event>,
+    now: Instant,
+) {
     let event = match event {
         Ok(event) => event,
         Err(error) => {
-            // A watch error is not a change, and the oracle's callback likewise
-            // ignores its `_error` parameter (`watcher.ts:83`).
-            tracing::debug!(%error, "watch error");
+            match classify_failure(&error) {
+                WatchFailure::Lost(class) => report_lost_coverage(shared, &error, class, now),
+                WatchFailure::Retryable => report_retried_read(shared, &error, now),
+                // A watch error is not a change, and the oracle's callback likewise
+                // ignores its `_error` parameter (`watcher.ts:83`).
+                WatchFailure::Incidental => tracing::debug!(%error, "watch error"),
+            }
             return;
         }
     };
-    let now = Instant::now();
-    let mut woke = false;
+    // Any delivered notification proves the drain loop is getting through, which is
+    // what distinguishes a read that was interrupted from a queue nothing is
+    // draining. Relaxed and unconditional: it is one store on a thread that is about
+    // to take a mutex anyway, and it must count the events this crate then filters
+    // out as much as the ones it keeps — the backend read them either way.
+    shared.losses.retried_reads.store(0, Ordering::Relaxed);
+    // The backend saying "notifications were lost" outranks whatever path it names
+    // — inotify names none (`IN_Q_OVERFLOW`), FSEvents names the subtree root
+    // (`MustScanSubDirs`), and in both cases the loss is wider than that path, so
+    // reading it as a change to one path is how the hole went unreported.
+    if event.need_rescan() {
+        // Not put through the report floor that [`report_lost_coverage`] applies,
+        // and that asymmetry is the point: a backend emits this notice only when a
+        // loss actually happened, so each one is news, and suppressing one would
+        // hide a hole the consumer has not rescanned for yet. What the asymmetry
+        // costs, stated rather than implied: every notice inside one flush window
+        // still leaves as a single `Overflow`, but a writer that keeps overrunning
+        // the kernel queue under a watched root gets one `Overflow` per window — up
+        // to ten a second at [`DEFAULT_DEBOUNCE`] — and each one is a full rescan at
+        // the consumer. Coalescing that belongs where the cost of a rescan is known,
+        // which is the consumer; the only alternative here is discarding a genuine
+        // distinct loss.
+        tracing::debug!(?event, "watch backend dropped notifications");
+        record_hole(shared, now);
+        return;
+    }
+    let mut accepted = classify(&event);
+    accepted.retain(|(path, kind)| match vcs_dir {
+        Some(dir) if path.starts_with(dir) => is_vcs_reportable(dir, path),
+        _ => !filter.is_ignored_with(path, || *kind != ChangeKind::Unlink && path.is_dir()),
+    });
+    if accepted.is_empty() {
+        return;
+    }
     let mut guard = shared.lock();
-    for (path, kind) in classify(&event) {
-        let reportable = match vcs_dir {
-            Some(dir) if path.starts_with(dir) => is_vcs_reportable(dir, &path),
-            _ => !filter.is_ignored(&path, kind != ChangeKind::Unlink && path.is_dir()),
-        };
-        if !reportable {
-            continue;
-        }
+    for (path, kind) in accepted {
         guard.accept(path, kind, now);
-        woke = true;
     }
     shared
         .counters
         .accepted
         .store(guard.accepted(), Ordering::Relaxed);
     drop(guard);
-    if woke {
-        shared.wake.notify_one();
+    shared.wake.notify_one();
+}
+
+/// How a watcher error handed to the callback must be treated.
+///
+/// [`NotifyErrorKind::MaxFilesWatch`] is the consequential one: inotify returns it
+/// part-way through a recursive add when `fs.inotify.max_user_watches` is
+/// exhausted and then stops adding, so every subtree after it is dark for the life
+/// of the watch. An I/O failure while the backend drains the kernel queue is the
+/// same shape — whatever that read would have returned is unrecoverable — *unless*
+/// the read never happened. `notify`'s drain loop hands the callback every
+/// non-`WouldBlock` read error and then loops round to read again with no `break`
+/// (`notify-8.2.0/src/inotify.rs:367-374`), and `inotify-0.11.5` returns
+/// `io::Error::last_os_error()` without retrying `EINTR`
+/// (`inotify-0.11.5/src/inotify.rs:206-219`), so an interrupted read reaches this
+/// function with its events still in the kernel queue and the next iteration about
+/// to deliver them. Calling that lost coverage is a false hole, and — because a
+/// report is a budgeted resource — a false hole that silences the one condition an
+/// operator could have fixed.
+///
+/// The remaining kinds answer a call this crate made about one path, and
+/// [`Watcher::reconcile`] already handles those; treating them as holes would make
+/// every short-lived directory cost the consumer a full rescan. `notify` never hands
+/// them to a callback in the first place: `grep 'handle_event(Err'` across
+/// `notify-8.2.0/src` matches exactly `inotify.rs:373` and `inotify.rs:389`, so that
+/// arm is defensive rather than reachable.
+fn classify_failure(error: &notify::Error) -> WatchFailure {
+    match &error.kind {
+        NotifyErrorKind::MaxFilesWatch => WatchFailure::Lost(LossClass::WatchLimit),
+        NotifyErrorKind::Io(io) if read_will_be_retried(io.kind()) => WatchFailure::Retryable,
+        NotifyErrorKind::Io(_) => WatchFailure::Lost(LossClass::Notifications),
+        _ => WatchFailure::Incidental,
     }
+}
+
+/// Whether an I/O error means the read transferred nothing and will be repeated.
+///
+/// Both kinds leave the notification queue exactly as it was: `Interrupted`
+/// (`EINTR`) because a signal arrived before the read completed, and `WouldBlock`
+/// (`EAGAIN`) because there was nothing to read — `notify` handles the latter itself
+/// and never forwards it, so listing it here is defensive. Every other kind either
+/// consumed events or means the descriptor will not produce them again: `EIO`,
+/// `EINVAL` (the buffer could not hold the next event, so that event cannot be
+/// read at all), `ENOMEM`, and the `UnexpectedEof` that `inotify-rs` synthesises
+/// when `read` returns `0` (`inotify-0.11.5/src/inotify.rs:210-215`). Those are lost
+/// coverage, and the classification fails **closed** for anything it does not
+/// recognise: an unknown io kind is treated as a loss, not as retryable.
+fn read_will_be_retried(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Report a loss of coverage, at most once per class per
+/// [`LOST_COVERAGE_REPORT_INTERVAL`].
+///
+/// The floor is the whole reason this exists: every caller arrives from a `notify`
+/// failure that repeats for as long as the condition lasts, so reporting each
+/// occurrence turns one broken watch into an unbounded log flood on the drain thread
+/// and a rescan duty cycle at the consumer. A suppressed occurrence is not the same
+/// as nothing having happened — the admitted one already told the consumer to
+/// rescan — and the floor is short enough that a consumer of a watch that never
+/// recovers is re-told rather than left stale forever.
+///
+/// Two things make the floor safe in the *other* direction, where a bound reduces
+/// what an operator is told. It is per class, so the classes cannot silence each
+/// other; and every admitted report warns, rather than the first warning and the
+/// rest being downgraded, because no client surface reads
+/// [`Watcher::lost_coverage`] today and a condition that lasts for hours must not be
+/// evidenced by a single line at minute zero.
+fn report_lost_coverage(
+    shared: &Arc<Shared>,
+    error: &notify::Error,
+    class: LossClass,
+    now: Instant,
+) {
+    match shared.losses.admit(class, now) {
+        // Worth an operator's attention rather than a debug line: unlike a queue
+        // overflow this hole does not close on its own, so a rescan reports the same
+        // missing subtree next time. The message is per class because the remedy is:
+        // the watch limit is a number an operator can raise, and a failing read on
+        // the notification descriptor is not.
+        Some(report) => {
+            let first = report == LossReport::First;
+            match class {
+                LossClass::WatchLimit => {
+                    tracing::warn!(%error, first, "filesystem watch lost coverage");
+                }
+                LossClass::Notifications => {
+                    tracing::warn!(%error, first, "filesystem watch stopped reading notifications");
+                }
+            }
+            record_hole(shared, now);
+        }
+        None => tracing::trace!(%error, ?class, "coverage loss already reported this window"),
+    }
+}
+
+/// Note a read the backend will repeat, and decide whether it is still one.
+///
+/// The count is the whole point. A single repeated read is not a loss and must not
+/// spend a loss class's report budget, but "the backend will read again" is only true
+/// while it eventually does, so the condition fails closed at
+/// [`RETRIED_READS_BEFORE_LOSS`] into a reported loss instead of staying a `debug!`
+/// forever.
+fn report_retried_read(shared: &Arc<Shared>, error: &notify::Error, now: Instant) {
+    let consecutive = shared
+        .losses
+        .retried_reads
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    if consecutive >= RETRIED_READS_BEFORE_LOSS {
+        // Not reset afterwards: the drain loop is stuck until something is delivered,
+        // and the per-class floor is what keeps that from becoming a stream of
+        // reports.
+        report_lost_coverage(shared, error, LossClass::Notifications, now);
+        return;
+    }
+    // Bounded like a report although it is not one: the drain loop repeats this as
+    // fast as it can call `read`, on the thread that must never stall, so a line per
+    // occurrence is the same flood the report floor exists to prevent. Its budget is
+    // its own, never a loss class's.
+    match shared.losses.retried.admit(now) {
+        Some(_) => {
+            tracing::debug!(%error, consecutive, "watch read did not complete; the backend retries");
+        }
+        None => tracing::trace!(%error, consecutive, "watch read did not complete, again"),
+    }
+}
+
+/// Record a loss this crate did not cause, so the consumer is told to rescan.
+///
+/// Goes through the debouncer rather than the channel on purpose: the flush loop
+/// owns every send, so a hole is delivered by exactly the path that already
+/// delivers [`WatchEvent::Overflow`] ahead of a batch, and every hole recorded
+/// inside one flush window leaves as a single overflow event rather than one per
+/// notification. Across windows it is [`report_lost_coverage`]'s per-class floor,
+/// not this, that keeps a repeating failure from becoming a stream of them.
+fn record_hole(shared: &Arc<Shared>, now: Instant) {
+    shared.lock().record_dropped(UNKNOWN_LOSS, now);
+    shared.wake.notify_one();
 }
 
 /// Split one `notify` event into the (path, kind) pairs it means.
@@ -982,7 +1467,7 @@ fn publish(shared: &Arc<Shared>, flush: Flush) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{CreateKind, DataChange, ModifyKind};
+    use notify::event::{CreateKind, DataChange, Flag, ModifyKind};
 
     fn event(kind: EventKind, paths: &[&str]) -> notify::Event {
         notify::Event {
@@ -990,6 +1475,430 @@ mod tests {
             paths: paths.iter().map(PathBuf::from).collect(),
             attrs: notify::event::EventAttributes::new(),
         }
+    }
+
+    /// The callback thread's collaborators, with the flush loop left to the test.
+    ///
+    /// [`ingest`] is what `notify` calls and [`publish`] is what the flush thread
+    /// calls, so driving both by hand exercises the real hole-reporting path
+    /// end to end without waiting on a real kernel queue to overflow.
+    fn harness() -> (Arc<Shared>, Filter, Receiver<WatchEvent>) {
+        let (sender, receiver) = mpsc::channel(8);
+        let shared = Arc::new(Shared {
+            debouncer: Mutex::new(Debouncer::new(
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+                8,
+            )),
+            wake: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+            sender,
+            counters: Counters::default(),
+            losses: LossReports::default(),
+        });
+        let filter = FilterBuilder::new("/r").build().expect("built-in patterns");
+        (shared, filter, receiver)
+    }
+
+    /// Everything the flush loop would deliver for what has been ingested so far.
+    fn delivered(shared: &Arc<Shared>, receiver: &mut Receiver<WatchEvent>) -> Vec<WatchEvent> {
+        let flush = shared.lock().flush();
+        assert!(publish(shared, flush), "the consumer is still connected");
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    #[test]
+    fn a_backend_rescan_notice_is_reported_as_a_hole() {
+        let (shared, filter, mut receiver) = harness();
+        // The inotify shape: `IN_Q_OVERFLOW` arrives as a flagged event with no
+        // paths at all, so anything keyed off `event.paths` sees nothing to do.
+        ingest(
+            &shared,
+            &filter,
+            None,
+            Ok(notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)),
+        );
+        assert_eq!(
+            delivered(&shared, &mut receiver),
+            vec![WatchEvent::Overflow { dropped: 1 }],
+            "a kernel-side loss must reach the consumer as an overflow"
+        );
+    }
+
+    #[test]
+    fn a_rescan_notice_carrying_a_path_is_still_a_hole() {
+        let (shared, filter, mut receiver) = harness();
+        // The FSEvents shape: `MustScanSubDirs` names the subtree root, and reading
+        // it as a change to that one directory understates a loss that is wider.
+        ingest(
+            &shared,
+            &filter,
+            None,
+            Ok(event(EventKind::Other, &["/r/sub"]).set_flag(Flag::Rescan)),
+        );
+        assert_eq!(
+            delivered(&shared, &mut receiver),
+            vec![WatchEvent::Overflow { dropped: 1 }]
+        );
+    }
+
+    #[test]
+    fn exhausting_the_watch_limit_is_reported_as_a_hole() {
+        let (shared, filter, mut receiver) = harness();
+        ingest(
+            &shared,
+            &filter,
+            None,
+            Err(notify::Error::new(NotifyErrorKind::MaxFilesWatch)
+                .add_path(PathBuf::from("/r/deep"))),
+        );
+        assert_eq!(
+            delivered(&shared, &mut receiver),
+            vec![WatchEvent::Overflow { dropped: 1 }],
+            "an unwatched subtree is a hole, not a debug line"
+        );
+    }
+
+    /// The exact shape `notify`'s inotify drain loop repeats without bound: a read
+    /// error that is not `WouldBlock` is handed to the callback and the loop goes
+    /// round again with no `break` (`notify-8.2.0/src/inotify.rs:367-374`).
+    fn drain_read_failure() -> notify::Error {
+        notify::Error::io(std::io::Error::other("input/output error"))
+    }
+
+    #[test]
+    fn a_persistent_read_failure_is_reported_once_and_not_per_occurrence() {
+        let (shared, filter, mut receiver) = harness();
+        // Two flush windows, because per-window coalescing alone would still deliver
+        // one `Overflow` per window — that is the rescan duty cycle this pins shut.
+        for _ in 0..500 {
+            ingest(&shared, &filter, None, Err(drain_read_failure()));
+        }
+        assert_eq!(
+            delivered(&shared, &mut receiver),
+            vec![WatchEvent::Overflow { dropped: 1 }],
+            "500 iterations of one unrecoverable read must be one hole, not 500"
+        );
+        for _ in 0..500 {
+            ingest(&shared, &filter, None, Err(drain_read_failure()));
+        }
+        assert!(
+            delivered(&shared, &mut receiver).is_empty(),
+            "the same unchanged failure must not re-report every flush window"
+        );
+        assert!(
+            shared.losses.reported(),
+            "the loss must stay readable after the event carrying it was consumed; \
+             this is what `Watcher::lost_coverage` returns"
+        );
+    }
+
+    #[test]
+    fn the_report_floor_admits_a_repeat_only_once_it_has_elapsed() {
+        let reports = ReportFloor::default();
+        assert!(!reports.reported(), "nothing has gone wrong yet");
+        let first = Instant::now();
+        assert_eq!(reports.admit(first), Some(LossReport::First));
+        assert_eq!(
+            reports.admit(first + LOST_COVERAGE_REPORT_INTERVAL - Duration::from_millis(1)),
+            None,
+            "inside the floor the loss is already reported"
+        );
+        assert_eq!(
+            reports.admit(first + LOST_COVERAGE_REPORT_INTERVAL),
+            Some(LossReport::Again),
+            "a watch that never recovers must be re-reported, not forgotten"
+        );
+        assert_eq!(
+            reports.admit(first + LOST_COVERAGE_REPORT_INTERVAL),
+            None,
+            "the floor runs from the last admitted report, not from the first"
+        );
+        assert!(reports.reported());
+    }
+
+    /// A non-regression guard, not evidence for the report floor: it passes with the
+    /// floor removed as well, because the error and the notice each contribute one
+    /// hole either way. It exists to fail if the floor is ever widened to cover the
+    /// rescan notice too. The floor's own behaviour is pinned by
+    /// `the_floor_reopens_through_the_production_path_after_the_interval`.
+    #[test]
+    fn a_kernel_rescan_notice_is_not_suppressed_by_a_reported_error() {
+        let (shared, filter, mut receiver) = harness();
+        ingest(&shared, &filter, None, Err(drain_read_failure()));
+        // A genuine, distinct loss arriving while the error's floor is still closed.
+        // Rate-limiting this too would hide a hole the consumer has not rescanned
+        // for, so the floor deliberately covers only the repeating error class.
+        ingest(
+            &shared,
+            &filter,
+            None,
+            Ok(notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)),
+        );
+        assert_eq!(
+            delivered(&shared, &mut receiver),
+            vec![WatchEvent::Overflow { dropped: 2 }],
+            "a rescan notice must still count while a persistent error is suppressed"
+        );
+    }
+
+    /// The exact input the reviewer measured: a read on the notification fd
+    /// interrupted by a signal. `inotify-0.11.5` returns `io::Error::last_os_error()`
+    /// without retrying `EINTR` (`src/inotify.rs:206-219`) and `notify` forwards
+    /// every non-`WouldBlock` read error to the callback before looping round to read
+    /// again, so this arrives here having lost nothing at all.
+    fn interrupted_read() -> notify::Error {
+        notify::Error::io(std::io::Error::from(std::io::ErrorKind::Interrupted))
+    }
+
+    /// The one loss an operator can actually fix.
+    fn watch_limit_exhausted() -> notify::Error {
+        notify::Error::new(NotifyErrorKind::MaxFilesWatch).add_path(PathBuf::from("/r/deep"))
+    }
+
+    #[test]
+    fn an_interrupted_read_is_not_a_hole_and_does_not_latch() {
+        let (shared, filter, mut receiver) = harness();
+        ingest(&shared, &filter, None, Err(interrupted_read()));
+        assert!(
+            delivered(&shared, &mut receiver).is_empty(),
+            "the events were still queued for the next read; nothing was lost"
+        );
+        assert!(
+            !shared.losses.reported(),
+            "a retried read must not leave the watch permanently marked degraded"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_read_does_not_spend_the_watch_limit_report() {
+        let (shared, filter, mut receiver) = harness();
+        // Every value is measured before anything is asserted, so one run records
+        // both halves of the defect: what the benign read did, and what the fifty
+        // consequential failures behind it were then allowed to deliver.
+        ingest(&shared, &filter, None, Err(interrupted_read()));
+        let transient = delivered(&shared, &mut receiver);
+        let latched = shared.losses.reported();
+        for _ in 0..50 {
+            ingest(&shared, &filter, None, Err(watch_limit_exhausted()));
+        }
+        let limit = delivered(&shared, &mut receiver);
+        assert!(
+            transient.is_empty() && !latched,
+            "a benign interrupted read is not a coverage loss \
+             (measured: it delivered {transient:?}, lost_coverage={latched}, and the \
+             50 watch-limit failures behind it then delivered {limit:?})"
+        );
+        assert_eq!(
+            limit,
+            vec![WatchEvent::Overflow { dropped: 1 }],
+            "the watch limit must still reach the consumer after a transient read error"
+        );
+        assert!(shared.losses.reported(), "this one really is lost coverage");
+    }
+
+    #[test]
+    fn a_failing_drain_read_does_not_spend_the_watch_limit_report() {
+        let (shared, filter, mut receiver) = harness();
+        ingest(&shared, &filter, None, Err(drain_read_failure()));
+        ingest(&shared, &filter, None, Err(watch_limit_exhausted()));
+        assert_eq!(
+            delivered(&shared, &mut receiver),
+            vec![WatchEvent::Overflow { dropped: 2 }],
+            "two different losses hold two different report budgets"
+        );
+    }
+
+    #[test]
+    fn only_a_read_the_backend_repeats_is_treated_as_no_loss() {
+        use std::io::ErrorKind;
+
+        assert_eq!(
+            classify_failure(&notify::Error::io(std::io::Error::from(
+                ErrorKind::Interrupted
+            ))),
+            WatchFailure::Retryable,
+            "EINTR left every event in the kernel queue for the next read"
+        );
+        // The other kinds the same `read` can return. Each one either consumed events
+        // or means the descriptor is finished, so the classification fails closed.
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::InvalidInput,
+            ErrorKind::OutOfMemory,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                classify_failure(&notify::Error::io(std::io::Error::from(kind))),
+                WatchFailure::Lost(LossClass::Notifications),
+                "{kind:?} is not a read the backend simply repeats"
+            );
+        }
+        assert_eq!(
+            classify_failure(&notify::Error::new(NotifyErrorKind::MaxFilesWatch)),
+            WatchFailure::Lost(LossClass::WatchLimit),
+            "the watch limit is budgeted on its own, away from every read error"
+        );
+        assert_eq!(
+            classify_failure(&notify::Error::path_not_found()),
+            WatchFailure::Incidental
+        );
+    }
+
+    /// The public accessor, over the same state the callback thread writes.
+    ///
+    /// Checked through a real [`Watcher`] rather than through `Shared` because the
+    /// accessor is the provider half of a capability whose consumer lives in another
+    /// crate: if it stopped reflecting what the callback recorded, or started
+    /// reflecting a read that lost nothing, this is the only place in this crate that
+    /// would notice.
+    #[test]
+    fn the_public_accessor_reports_what_the_callback_recorded() {
+        let (shared, filter, _receiver) = harness();
+        let watcher = Watcher {
+            decision: Decision::Full,
+            shared: Arc::clone(&shared),
+            filter: Arc::new(FilterBuilder::new("/r").build().expect("built-in patterns")),
+            requested_root: PathBuf::from("/r"),
+            active_scope: None,
+            watch_missing_ancestors: false,
+            inner: None,
+            flush: None,
+        };
+        assert!(!watcher.lost_coverage(), "nothing has gone wrong yet");
+        ingest(&shared, &filter, None, Err(interrupted_read()));
+        assert!(
+            !watcher.lost_coverage(),
+            "a read the backend repeats took no coverage away"
+        );
+        ingest(&shared, &filter, None, Err(watch_limit_exhausted()));
+        assert!(watcher.lost_coverage(), "an unwatched subtree did");
+        assert_eq!(
+            watcher.dropped(),
+            0,
+            "and it says so before the flush loop has published anything, which is \
+             why a consumer can read it instead of remembering an `Overflow`"
+        );
+    }
+
+    #[test]
+    fn a_read_that_is_never_completed_fails_closed_into_a_loss() {
+        let (quiet, filter, mut receiver) = harness();
+        for _ in 0..RETRIED_READS_BEFORE_LOSS - 1 {
+            ingest(&quiet, &filter, None, Err(interrupted_read()));
+        }
+        assert!(
+            delivered(&quiet, &mut receiver).is_empty() && !quiet.losses.reported(),
+            "below the threshold this is still a read the backend repeats"
+        );
+
+        let (stuck, filter, mut receiver) = harness();
+        for _ in 0..RETRIED_READS_BEFORE_LOSS {
+            ingest(&stuck, &filter, None, Err(interrupted_read()));
+        }
+        assert_eq!(
+            delivered(&stuck, &mut receiver),
+            vec![WatchEvent::Overflow { dropped: 1 }],
+            "a read that is still being repeated with nothing delivered is a hole"
+        );
+        assert!(
+            stuck.losses.reported(),
+            "nothing is draining the kernel queue, and that queue is bounded"
+        );
+    }
+
+    #[test]
+    fn a_delivered_notification_resets_the_repeated_read_count() {
+        let (shared, filter, mut receiver) = harness();
+        for round in 0..3 {
+            for _ in 0..RETRIED_READS_BEFORE_LOSS - 1 {
+                ingest(&shared, &filter, None, Err(interrupted_read()));
+            }
+            ingest(
+                &shared,
+                &filter,
+                None,
+                Ok(event(
+                    EventKind::Create(CreateKind::File),
+                    &[&format!("/r/a{round}")],
+                )),
+            );
+        }
+        assert_eq!(
+            delivered(&shared, &mut receiver),
+            vec![
+                WatchEvent::Changed(FileEvent::new("/r/a0", ChangeKind::Add)),
+                WatchEvent::Changed(FileEvent::new("/r/a1", ChangeKind::Add)),
+                WatchEvent::Changed(FileEvent::new("/r/a2", ChangeKind::Add)),
+            ],
+            "3071 interrupted reads that each ended in a delivery are not a hole"
+        );
+        assert!(
+            !shared.losses.reported(),
+            "the backend got through every time, so no coverage was lost"
+        );
+    }
+
+    #[test]
+    fn the_floor_reopens_through_the_production_path_after_the_interval() {
+        let (shared, filter, mut receiver) = harness();
+        let start = Instant::now();
+        let feed = |at: Instant| {
+            ingest_at(&shared, &filter, None, Err(watch_limit_exhausted()), at);
+        };
+        feed(start);
+        feed(start + LOST_COVERAGE_REPORT_INTERVAL - Duration::from_millis(1));
+        assert_eq!(
+            delivered(&shared, &mut receiver),
+            vec![WatchEvent::Overflow { dropped: 1 }],
+            "inside the floor a repeat of the same condition adds nothing"
+        );
+        feed(start + LOST_COVERAGE_REPORT_INTERVAL);
+        assert_eq!(
+            delivered(&shared, &mut receiver),
+            vec![WatchEvent::Overflow { dropped: 1 }],
+            "a watch that never recovers must be re-reported once the floor elapses"
+        );
+        feed(start + LOST_COVERAGE_REPORT_INTERVAL + Duration::from_millis(1));
+        assert!(
+            delivered(&shared, &mut receiver).is_empty(),
+            "the floor runs from the last admitted report, not from the first"
+        );
+    }
+
+    #[test]
+    fn an_error_about_one_missing_path_is_not_a_hole() {
+        let (shared, filter, mut receiver) = harness();
+        for error in [
+            notify::Error::path_not_found(),
+            notify::Error::watch_not_found(),
+        ] {
+            ingest(&shared, &filter, None, Err(error));
+        }
+        assert!(
+            delivered(&shared, &mut receiver).is_empty(),
+            "a short-lived directory must not cost the consumer a rescan"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_change_still_publishes_without_an_overflow() {
+        let (shared, filter, mut receiver) = harness();
+        ingest(
+            &shared,
+            &filter,
+            None,
+            Ok(event(EventKind::Create(CreateKind::File), &["/r/a"])),
+        );
+        assert_eq!(
+            delivered(&shared, &mut receiver),
+            vec![WatchEvent::Changed(FileEvent::new("/r/a", ChangeKind::Add))]
+        );
     }
 
     #[test]

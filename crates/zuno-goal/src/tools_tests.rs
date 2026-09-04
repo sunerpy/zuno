@@ -94,9 +94,19 @@ async fn all_three_tools_share_one_authoritative_goal() {
         Some(created_goal)
     );
 
+    // The criteria this goal recorded gate its completion, so the same call closes
+    // them: the point here is that the three tools agree on one goal, not that a
+    // checklist can be skipped.
     let completed = tools[2]
         .execute(
-            json!({"expected_revision": 1, "status": "complete"}),
+            json!({
+                "expected_revision": 1,
+                "status": "complete",
+                "waive_criteria": [
+                    {"criterionId": "c1", "reason": "the artifact is built by release tooling"},
+                    {"criterionId": "c2", "reason": "the gates run in CI for this fixture"}
+                ]
+            }),
             fixture.context("call_update"),
         )
         .await
@@ -148,13 +158,16 @@ async fn model_refusals_are_correctable_and_internal_failures_are_not_forged() {
     let fixture = Fixture::new();
     let create = erase(CreateGoalTool::new(Arc::clone(&fixture.store)));
     create
-        .execute(json!({"objective": "first"}), fixture.context("call_first"))
+        .execute(
+            json!({"objective": "first", "success_criteria": ["the first check passes"]}),
+            fixture.context("call_first"),
+        )
         .await
         .expect("first goal");
 
     let conflict = create
         .execute(
-            json!({"objective": "second"}),
+            json!({"objective": "second", "success_criteria": ["the second check passes"]}),
             fixture.context("call_second"),
         )
         .await
@@ -164,7 +177,11 @@ async fn model_refusals_are_correctable_and_internal_failures_are_not_forged() {
 
     let invalid_budget = create
         .execute(
-            json!({"objective": "second", "token_budget": 0}),
+            json!({
+                "objective": "second",
+                "success_criteria": ["the second check passes"],
+                "token_budget": 0
+            }),
             fixture.context("call_budget"),
         )
         .await
@@ -328,8 +345,19 @@ fn refusal_detail(error: &ToolError) -> String {
 }
 
 /// Store an authoritative passing receipt for the tool session to cite.
+///
+/// A goal in the session is also moved behind `time_created`. These tests cite
+/// receipts at small synthetic times while a goal stamps its creation from the wall
+/// clock, and the evidence gate refuses a check that ran before its goal existed,
+/// so without this the fixture would be citing a receipt from before the goal.
 fn record_passing_receipt(fixture: &Fixture, id: &str, time_created: i64) {
     let connection = fixture.store.pool().get().expect("check out connection");
+    connection
+        .execute(
+            "UPDATE goal SET created_at_ms = MIN(created_at_ms, ?2) WHERE session_id = ?1",
+            rusqlite::params!["ses_tools", time_created],
+        )
+        .expect("move the goal behind the receipt");
     zuno_db::verification::record(
         &connection,
         &zuno_db::verification::NewVerificationReceipt {
@@ -355,12 +383,20 @@ fn record_passing_receipt(fixture: &Fixture, id: &str, time_created: i64) {
 #[test]
 fn goal_descriptions_teach_the_evidence_contract() {
     assert!(
-        CREATE_DESCRIPTION.contains("success criteria"),
-        "{CREATE_DESCRIPTION}"
+        CREATE_DESCRIPTION.contains("success_criteria is required"),
+        "the model must be told the checklist is not optional, because omitting it is what \
+         used to skip the whole audit: {CREATE_DESCRIPTION}"
     );
     assert!(
-        CREATE_DESCRIPTION.contains("treated as a question"),
-        "the empty-criteria case is a documented decision, not an accident: {CREATE_DESCRIPTION}"
+        !CREATE_DESCRIPTION.contains("record them only for checks you intend to close"),
+        "nothing may present a recorded criterion as a liability, which reads as advice to \
+         record none: {CREATE_DESCRIPTION}"
+    );
+    assert!(
+        !UPDATE_DESCRIPTION.contains("editing files after a criterion was satisfied reopens it"),
+        "an unconditional promise that edits reopen criteria is false for an edit no tool \
+         reported, and teaches the model to trust a criterion that stayed closed: \
+         {UPDATE_DESCRIPTION}"
     );
     assert!(
         UPDATE_DESCRIPTION.contains("receipt id"),
@@ -372,27 +408,131 @@ fn goal_descriptions_teach_the_evidence_contract() {
     );
 }
 
+/// The reported bypass, run as the reporter ran it: propose a goal with no
+/// `success_criteria`, edit the workspace through `shell` — which reports no written
+/// path, so nothing escalates the goal and nothing stamps a mutation mark — then
+/// report `complete`. Every step after the first is unreachable now, because no goal
+/// exists to complete: the checklist is the evidence audit's only input, and a
+/// proposal that supplies none is refused at the moment it could still be corrected.
+///
+/// The oracle here is deliberately *not* "the refusal happened". It is that the
+/// session holds no goal afterwards, which is what makes the remaining two steps of
+/// the exploit impossible; a test that only matched the error text could not tell a
+/// refusal from a refusal that still wrote the row.
 #[tokio::test]
-async fn a_goal_proposed_without_criteria_is_a_question_until_the_first_write_then_names_the_remedy()
- {
+async fn a_goal_proposed_with_no_criteria_is_refused_and_no_ungated_goal_is_left_behind() {
     let fixture = Fixture::new();
-    let created = erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+    let create = erase(CreateGoalTool::new(Arc::clone(&fixture.store)));
+
+    // The model reads the schema, not the deserializer, so the schema is where "not
+    // optional" has to be visible. Pinned because a re-added `serde(default)` would
+    // reopen the whole ungated path silently, and this is the one line that would
+    // notice.
+    let required = create.definition().parameters["required"].to_string();
+    assert!(
+        required.contains("success_criteria"),
+        "the published schema must declare the checklist required: {required}"
+    );
+
+    let refusal = create
         .execute(
-            json!({"objective": "enable structured output for the bedrock model"}),
+            json!({"objective": "make the parser accept trailing commas"}),
             fixture.context("call_create"),
         )
         .await
-        .expect("a goal without criteria is a question, and a question needs none");
+        .expect_err("a proposal with nothing to check cannot be gated, so it is not accepted");
+
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
     assert!(
-        !created.output.contains("Success criteria"),
-        "no checklist is invented from the objective: {}",
-        created.output
+        refusal.is_model_correctable(),
+        "the remedy is one corrected call: {refusal}"
     );
-    assert!(!created.metadata.contains_key("criteria"));
+    assert_eq!(
+        fixture.store.goal("ses_tools").expect("read goal"),
+        None,
+        "no goal row means step 2 and step 3 of the reported sequence have nothing to complete"
+    );
+
+    // Sub-variant: a checklist that is blank after trimming is not a checklist. It
+    // must not become an empty one, which is the same ungated goal by another route.
+    let blank = create
+        .execute(
+            json!({"objective": "make the parser accept trailing commas", "success_criteria": ["   "]}),
+            fixture.context("call_blank"),
+        )
+        .await
+        .expect_err("a blank criterion is not a criterion");
+    assert!(matches!(blank, ToolError::InvalidArgs { .. }));
+    let message = refusal_detail(&blank);
+    assert!(
+        message.contains("at least one non-blank success criterion"),
+        "the model is told its checklist was rejected rather than silently emptied: {message}"
+    );
+    assert_eq!(
+        fixture.store.goal("ses_tools").expect("read goal"),
+        None,
+        "and the blank list leaves no goal behind either"
+    );
+}
+
+/// The same sequence once the proposal is corrected: with a checklist recorded, the
+/// unreported `shell` edit no longer matters, because the audit reads the checklist
+/// instead of the goal kind. Nothing escalates the goal here — that is the point.
+#[tokio::test]
+async fn a_criteria_bearing_goal_cannot_be_completed_after_an_unreported_shell_edit() {
+    let fixture = Fixture::new();
+    erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "objective": "make the parser accept trailing commas",
+                "success_criteria": ["the parser test suite passes"]
+            }),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("a proposal that says what would prove it done is accepted");
+
+    // `shell {"command": "sed -i 's/foo/bar/' crates/zuno-parser/src/lib.rs"}` runs
+    // here. It reports no written path, so the host's ledger neither escalates the
+    // goal nor stamps a mutation mark: the store is called for neither, which is
+    // exactly why this fixture calls nothing.
+    let refusal = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({"expected_revision": 1, "status": "complete"}),
+            fixture.context("call_complete"),
+        )
+        .await
+        .expect_err("the checklist is still open, whatever the goal kind says");
+
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    let message = refusal_detail(&refusal);
+    assert!(message.contains("c1"), "the refusal names it: {message}");
     assert_eq!(
         fixture.store.kind("ses_tools").expect("read kind"),
-        crate::GoalKind::Question
+        crate::GoalKind::Question,
+        "no write was reported, which is the reporting gap the checklist covers"
     );
+    assert_eq!(
+        fixture
+            .store
+            .goal("ses_tools")
+            .expect("read goal")
+            .expect("goal exists")
+            .status,
+        GoalStatus::Active
+    );
+}
+
+/// A change goal with no criteria is still refused, and still told where criteria come
+/// from. Only [`GoalStore::create_goal`] — the user's own `/goal create` — can produce
+/// such a goal now, so the remedy sentence is aimed at the run that inherited one.
+#[tokio::test]
+async fn a_user_created_goal_that_reported_a_write_cannot_complete_by_assertion() {
+    let fixture = Fixture::new();
+    fixture
+        .store
+        .create_goal("ses_tools", "enable structured output", None)
+        .expect("the user states an objective without measuring it");
 
     // The host's verification ledger reports the first write; the store sees it as
     // this call.
@@ -962,4 +1102,230 @@ async fn goal_update_refuses_to_waive_a_criterion_that_is_already_satisfied() {
         crate::GoalCriterionStatus::Open,
         "the refusal stops the call before the later waiver is applied"
     );
+}
+
+/// The whole sequence through the wire boundary the model actually reaches, because the
+/// reviewer's reproduction was at this level: a passing receipt already on the record,
+/// then `goal_propose` with a checklist, then `goal_update` citing that receipt. It used
+/// to print `Ok("accepted")` with the goal at `Complete`, so the mandatory checklist
+/// proved that a receipt id existed, not that anything was verified for this goal.
+#[tokio::test]
+async fn a_receipt_from_before_the_goal_cannot_complete_it_through_the_tools() {
+    let fixture = Fixture::new();
+    // No goal row yet, so this is genuinely a check that ran before the goal existed.
+    record_passing_receipt(&fixture, "rec_before", 2_000);
+    erase(CreateGoalTool::new(Arc::clone(&fixture.store)))
+        .execute(
+            json!({
+                "objective": "ship the evidence gate",
+                "success_criteria": ["workspace gates pass"]
+            }),
+            fixture.context("call_create"),
+        )
+        .await
+        .expect("create goal");
+    let update = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
+
+    let refusal = update
+        .execute(
+            json!({
+                "expected_revision": 1,
+                "status": "complete",
+                "satisfy_criteria": [{"criterionId": "c1", "receiptId": "rec_before"}]
+            }),
+            fixture.context("call_launder"),
+        )
+        .await
+        .expect_err("a check that ran before the goal existed proves nothing about it");
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    let message = refusal_detail(&refusal);
+    assert!(
+        message.contains("rec_before") && message.contains("run the check again"),
+        "the refusal names the receipt and the remedy: {message}"
+    );
+    let goal = fixture
+        .store
+        .goal("ses_tools")
+        .expect("read goal")
+        .expect("goal exists");
+    assert_eq!(
+        goal.status,
+        GoalStatus::Active,
+        "and the run is still going, with the checklist still open"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .criteria("ses_tools")
+            .expect("read criteria")
+            .into_iter()
+            .filter(|criterion| criterion.status == crate::GoalCriterionStatus::Open)
+            .count(),
+        1,
+        "the refused update settled nothing"
+    );
+
+    // Run the check again under this goal and the same call completes.
+    record_passing_receipt(&fixture, "rec_after", goal.created_at_ms + 1);
+    let completed = update
+        .execute(
+            json!({
+                "expected_revision": 1,
+                "status": "complete",
+                "satisfy_criteria": [{"criterionId": "c1", "receiptId": "rec_after"}]
+            }),
+            fixture.context("call_complete"),
+        )
+        .await
+        .expect("a check that ran under this goal completes it");
+    assert_eq!(
+        goal_from_metadata(&completed)
+            .expect("decode update metadata")
+            .expect("goal exists")
+            .status,
+        GoalStatus::Complete
+    );
+}
+
+/// The tool result is a model request in waiting, so the checklist it renders is bounded
+/// whatever the rows hold. A 2 000 000-character waiver reason rendered a 2 000 434-byte
+/// `goal_update` result, and the same reason rendered clipped in the goal document the
+/// human reads — the clip existed, in one renderer only.
+///
+/// The assertion is on the checklist section, because it is the section
+/// [`render_criterion`] owns. The JSON echo above it is the stored goal row, whose
+/// `success_criteria` projection is bounded for anything this release writes
+/// (`MAX_SUCCESS_CRITERIA` statements of `MAX_CRITERION_STATEMENT_CHARS`) but not for a
+/// row an earlier release wrote longer.
+#[tokio::test]
+async fn a_checklist_result_is_bounded_however_long_a_stored_row_is() {
+    let fixture = Fixture::new();
+    let update = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
+    // The system path stores what an earlier release stored: no length bound at all.
+    fixture
+        .store
+        .create_goal_with_criteria(
+            "ses_tools",
+            "ship it",
+            &["s".repeat(2_000_000), "the gates pass".to_owned()],
+            None,
+        )
+        .expect("the system path still accepts what an earlier release stored");
+    {
+        let connection = fixture.store.pool().get().expect("check out connection");
+        connection
+            .execute(
+                "UPDATE goal_criterion SET status = 'waived', waiver_reason = ?2 \
+                 WHERE session_id = ?1 AND criterion_id = 'c2'",
+                rusqlite::params!["ses_tools", "w".repeat(2_000_000)],
+            )
+            .expect("write the waiver row a previous release accepted");
+        connection
+            .execute(
+                "UPDATE goal_criterion SET status = 'waived', waiver_reason = 'out of scope' \
+                 WHERE session_id = ?1 AND criterion_id = 'c1'",
+                rusqlite::params!["ses_tools"],
+            )
+            .expect("settle the oversized statement too");
+    }
+    let revision = fixture
+        .store
+        .goal("ses_tools")
+        .expect("read goal")
+        .expect("the session has a goal")
+        .revision;
+
+    let completed = update
+        .execute(
+            json!({"expected_revision": revision, "status": "complete"}),
+            fixture.context("call_render"),
+        )
+        .await
+        .expect("a fully waived checklist completes");
+    let checklist = completed
+        .output
+        .split_once("Success criteria:")
+        .expect("the result renders the checklist")
+        .1;
+    assert!(
+        checklist.len() < 2_000,
+        "the checklist the model reads is bounded, not 4 MB: {} bytes",
+        checklist.len()
+    );
+    assert!(
+        checklist.contains("c1  ssss") && checklist.contains('\u{2026}'),
+        "the statement identifies itself and says it was clipped: {checklist}"
+    );
+    assert!(
+        checklist.contains("waived: www"),
+        "the waiver reason renders too, clipped: {checklist}"
+    );
+    assert!(
+        !checklist.contains(&"w".repeat(1_000)),
+        "and neither one arrives whole: {} bytes",
+        checklist.len()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .criteria("ses_tools")
+            .expect("read criteria")
+            .iter()
+            .filter(|criterion| criterion.statement.chars().count() == 2_000_000
+                || criterion
+                    .waiver_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.chars().count() == 2_000_000))
+            .count(),
+        2,
+        "clipping is a render bound: both stored rows are untouched"
+    );
+}
+
+/// The bounds on the mandatory checklist reach the model as a corrected call, not as a
+/// harness failure, and nothing is written on the way. 5000 criteria used to be accepted
+/// through this exact call, and a 2 000 000-character statement with them.
+#[tokio::test]
+async fn goal_propose_bounds_the_checklist_it_now_requires() {
+    let fixture = Fixture::new();
+    let create = erase(CreateGoalTool::new(Arc::clone(&fixture.store)));
+
+    let flood = (1..=5_000)
+        .map(|index| format!("check number {index}"))
+        .collect::<Vec<_>>();
+    let refusal = create
+        .execute(
+            json!({"objective": "ship it", "success_criteria": flood}),
+            fixture.context("call_flood"),
+        )
+        .await
+        .expect_err("a checklist nobody could review is not a checklist");
+    assert!(matches!(refusal, ToolError::InvalidArgs { .. }));
+    let message = refusal_detail(&refusal);
+    assert!(
+        message.contains("5000") && message.contains("32"),
+        "the refusal names what was sent and the bound in force: {message}"
+    );
+    assert_eq!(
+        fixture.store.goal("ses_tools").expect("read goal"),
+        None,
+        "the bound is checked before the write"
+    );
+
+    let refusal = create
+        .execute(
+            json!({
+                "objective": "ship it",
+                "success_criteria": ["workspace gates pass", "a".repeat(2_000_000)]
+            }),
+            fixture.context("call_long"),
+        )
+        .await
+        .expect_err("a statement no document could render is not a statement");
+    let message = refusal_detail(&refusal);
+    assert!(
+        message.contains("2000000") && message.contains("500"),
+        "{message}"
+    );
+    assert_eq!(fixture.store.goal("ses_tools").expect("read goal"), None);
 }

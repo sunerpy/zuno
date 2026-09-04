@@ -84,19 +84,33 @@ zuno providers login [OPTIONS] [TARGET]
 
 | Argument | Description |
 | --- | --- |
-| `[TARGET]` | Provider id/name, or an HTTPS URL implementing `/.well-known/zuno`. Omit in a terminal to choose interactively |
+| `[TARGET]` | Provider id/name, or an HTTPS URL implementing `/.well-known/zuno`. Omit in a terminal to choose interactively. A URL login runs a program that the remote host names, shown for confirmation before it starts |
 
 | Option | Description | Default |
 | --- | --- | --- |
 | `-p`, `--provider <PROVIDER>` | Provider id or display name, as an alternative to the positional target | |
 | `-v`, `--version` | Show the Zuno package version | |
 | `-m`, `--method <METHOD>` | Method id shown by `zuno auth methods <provider>`. Omit in a terminal to choose when several methods are available | |
+| `--trust-remote-command` | Run the program named by the URL's `/.well-known/zuno` document without an interactive confirmation. The remote host chooses that program and its arguments, and it runs with your privileges: pass this only for a host you already trust. Without it, a URL login refuses when stdin or stderr is not a terminal | |
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
+
+A URL target executes a command chosen by the remote host. `zuno auth login <url>` accepts
+`https://` to any host, or plain `http://` to a loopback IP address such as
+`http://127.0.0.1:8080` or `http://[::1]:3000`; the URL must carry no userinfo. A hostname
+that merely begins with `127.0.0.1` (for example `http://127.0.0.1.attacker.example`), a
+`user@host` form, and `http://localhost` are refused before anything is fetched. Zuno
+downloads `<url>/.well-known/zuno`, prints the program and every argument that document
+names — one argument per line, quoted — and asks `Run this command` with `No` preselected;
+Enter, Esc, or Ctrl-C declines and nothing is run or stored. The credential is stored only
+after the confirmed command exits successfully. When stdin or stderr is not a terminal the
+login refuses instead of prompting; pass `--trust-remote-command` to run the remote-chosen
+command without confirmation, for a host you already trust. The flag is refused for
+provider logins.
 
 ### zuno providers logout
 

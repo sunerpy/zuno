@@ -66,7 +66,7 @@ the lower value. The top level rejects unknown keys.
 | --- | --- |
 | `ZUNO_CONFIG` | Adds one explicit configuration file as a high-precedence layer |
 | `ZUNO_CONFIG_DIR` | Adds one directory containing `zuno.json[c]` as a switchable overlay |
-| `ZUNO_CONFIG_CONTENT` | Supplies the final layer inline, for managed or ephemeral environments |
+| `ZUNO_CONFIG_CONTENT` | Supplies the final layer inline, for managed or ephemeral environments. Withheld from the `shell` tool, along with the rest of the `ZUNO_*` namespace, because the layer can carry an inline `provider.<id>.options.apiKey` — see [Authentication](/config/authentication) |
 
 ```sh
 ZUNO_CONFIG="$HOME/audit/zuno.json" zuno debug config

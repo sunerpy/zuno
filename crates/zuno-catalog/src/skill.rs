@@ -389,6 +389,13 @@ pub enum SkillWarningKind {
         /// The entry's name.
         skill: String,
     },
+    /// An index entry whose `name` is not a single directory segment, so the
+    /// cache directory it names is not inside the skill cache at all. This port's
+    /// hardening, not the oracle's behaviour.
+    UnsafeIndexName {
+        /// The offending entry name.
+        skill: String,
+    },
     /// An index entry file that would be written outside its cache directory.
     /// This port's hardening, not the oracle's behaviour.
     UnsafeIndexPath {
@@ -489,6 +496,11 @@ impl fmt::Display for SkillWarning {
             SkillWarningKind::EntryMissingSkillMd { skill } => write!(
                 f,
                 "skill entry missing SKILL.md: `{skill}` in {}",
+                self.source
+            ),
+            SkillWarningKind::UnsafeIndexName { skill } => write!(
+                f,
+                "skill entry name `{skill}` is not a single directory segment: {}",
                 self.source
             ),
             SkillWarningKind::UnsafeIndexPath { skill, file } => write!(

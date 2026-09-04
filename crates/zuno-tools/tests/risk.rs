@@ -631,3 +631,338 @@ fn risk_reads_a_backslash_as_a_separator_under_powershell_and_an_escape_under_ba
         "a backtick target must still reach the user: {outcome:?}"
     );
 }
+
+/// Bash's `$'…'` (ANSI-C) and `$"…"` (locale) quoting denote their body literally when
+/// no escape is inside, so every one of these runs `rm -rf /`. Read as ordinary
+/// characters the program was `rm$`, which is in no table, and the call was `Allow`.
+#[test]
+fn risk_dollar_quoting_cannot_hide_a_catastrophic_program_or_target() {
+    for command in [
+        "rm$'' -rf /",
+        "r$'m' -rf /",
+        "$'rm' -rf /",
+        "rm$\"\" -rf /",
+        "r$\"m\" -rf /",
+        "env rm$'' -rf /",
+        "sudo -u root rm$'' -rf /",
+        "nice -n 5 r$'m' -rf /",
+        "rm -rf $'/'",
+        "sh -c $'rm -rf /'",
+        "bash -c $\"rm -rf /\"",
+    ] {
+        assert_risk_denied(command);
+    }
+}
+
+/// A `$`, a backtick or a glob character anywhere in the program word — not only at
+/// its first character — means the shell computes the program, and the gate can only
+/// ask a human. `rm${IFS}-rf${IFS}/` and `git${IFS}push --force` were `Allow`.
+#[test]
+fn risk_a_program_computed_at_runtime_is_held_wherever_the_expansion_sits() {
+    for command in [
+        "rm${IFS}-rf${IFS}/",
+        "rm$IFS-rf$IFS/",
+        "env rm${IFS}-rf${IFS}/",
+        "sudo rm${IFS}-rf${IFS}/",
+        "git${IFS}push --force",
+        "git $SUB --force",
+        "$(echo rm) -rf /",
+        "`echo rm` -rf /",
+        "/usr/bin/r? -rf /",
+        "/usr/bin/r* -rf /",
+        "r[m] -rf /",
+    ] {
+        let outcome = risk_gate(command);
+        assert!(
+            matches!(outcome, GateOutcome::Confirm { ref reason, .. }
+                if reason.contains("cannot be checked")),
+            "a computed program must be held for a human, not allowed: {command:?} -> {outcome:?}"
+        );
+    }
+}
+
+/// A `$'…'` body is materialised, escapes and all, so the word names what the shell will
+/// name. Left as written its `$` made the word merely computed: `r$'\x6d' -rf /` was a
+/// prompt for an unknown program and `sh -c $'echo hi\nrm -rf /'` a prompt for an unknown
+/// script, while both are exactly `rm -rf /`.
+#[test]
+fn risk_ansi_c_quoting_is_materialised_before_the_program_is_judged() {
+    for command in [
+        "r$'\\x6d' -rf /",
+        "sh -c $'echo hi\\nrm -rf /'",
+        "sh -c $'rm\\x20-rf\\x20/'",
+        "eval $'echo hi\\nrm -rf /'",
+        "sudo sh -c $'echo hi\\nrm -rf /'",
+    ] {
+        assert_risk_denied(command);
+    }
+    // One word, spaces and all: `$'rm\x20-rf'` materialises to a program name with a
+    // space in it. Bash reports `command not found` for that exact word, but the same
+    // shape also comes out of the tokenizer for a line that really runs `rm -rf /`
+    // (`$'echo hi'\;$'rm -rf /'` is one shell word split into two tokens), so a
+    // materialised program that is not one name is held for a human, never waved through.
+    assert!(matches!(
+        risk_gate("$'rm\\x20-rf' /"),
+        GateOutcome::Confirm { .. }
+    ));
+    for command in [r"sh -c $'echo hi'\;$'rm -rf /'", "$'rm -rf' /"] {
+        assert!(
+            !matches!(risk_gate(command), GateOutcome::Allow),
+            "{command} must not run without a prompt"
+        );
+    }
+}
+
+/// The subcommand and the options of a git call get the shell's own per-character
+/// reading, so `p''ush` is `push` and `--for''ce` is `--force`. Both were `Allow`.
+#[test]
+fn risk_git_spelling_tricks_still_reach_the_force_push_gate() {
+    for command in [
+        "git p''ush --force",
+        "git push --for''ce",
+        "git 'push' -f",
+        "git p\"ush\" --force",
+        "git push --f'o'rce",
+        "git p$'ush' --force",
+        "git --no-pager p''ush -f origin main",
+    ] {
+        let outcome = risk_gate(command);
+        assert!(
+            matches!(outcome, GateOutcome::Deny { ref reason }
+                if reason.contains("published Git history")),
+            "expected the force-push denial for {command:?}, got {outcome:?}"
+        );
+    }
+    assert!(
+        matches!(
+            risk_gate(
+                "git push --force-with-lease=refs/heads/main:0123456789abcdef0123456789abcdef01234567"
+            ),
+            GateOutcome::Confirm { .. }
+        ),
+        "an explicit atomic lease is still confirmable, not denied"
+    );
+    assert_eq!(risk_gate("git p''ush origin main"), GateOutcome::Allow);
+}
+
+/// A PowerShell `?` is the `Where-Object` alias, a fixed cmdlet, so the wider dynamic
+/// reading must not start prompting on an ordinary pipeline.
+#[test]
+fn risk_powershell_where_object_alias_is_not_a_glob() {
+    let assessment = assess_command(
+        "Get-Process | ? { $_.CPU -gt 10 }",
+        ShellSyntax::PowerShell,
+        &risk_context(),
+    )
+    .expect("the command must parse");
+    assert_eq!(gate(&assessment), GateOutcome::Allow);
+}
+
+/// A word the shell computes, sitting between a wrapper and its program, can only add
+/// uncertainty. It must never remove a denial the static words already justify: with
+/// `EMPTY` unset every one of these runs `rm -rf /` (or force-pushes), and each was a
+/// human-approvable Confirm because the computed word ended the assessment.
+#[test]
+fn risk_a_computed_word_before_the_program_cannot_downgrade_a_denial() {
+    for command in [
+        "env $FOO rm -rf /",
+        "env ${FOO} rm -rf /",
+        "sudo $U rm -rf /",
+        "nice $X rm -rf /",
+        "timeout $T rm -rf /",
+        "sudo -u root $EMPTY rm -rf /",
+        "sudo -E$FLAGS rm -rf /",
+        "sh -c $EMPTY 'rm -rf /'",
+        "bash -c $EMPTY $ALSO_EMPTY 'rm -rf /'",
+        "git $EMPTY push --force",
+        "$FOO rm -rf /",
+        "chroot /mnt $X rm -rf /",
+    ] {
+        assert_risk_denied(command);
+    }
+    // The uncertainty itself is still reported next to the denial.
+    let outcome = risk_gate("sudo -u root $EMPTY rm -rf /");
+    assert!(
+        matches!(outcome, GateOutcome::Deny { ref reason }
+            if reason.contains("computed at runtime") && reason.contains("protected system")),
+        "both the computed word and the catastrophic target must be explained: {outcome:?}"
+    );
+}
+
+/// A wrapper option the gate does not know must not decide which word is the program.
+/// `exec -a foo rm -rf /` was the program `foo` — `-a` was read as a flag, `foo` was
+/// judged and found harmless, and `rm` was never examined — so the call was Allow with
+/// no prompt at all. The same happened for every real value-taking option missing from
+/// the table, for a short-option cluster, and for a truly unknown option.
+#[test]
+fn risk_a_wrapper_option_the_gate_does_not_know_cannot_hide_the_program_behind_it() {
+    for command in [
+        "exec -a foo rm -rf /",
+        "watch -n 1 rm -rf /",
+        "watch --interval 1 rm -rf /",
+        r"xargs -d '\n' rm -rf /",
+        "xargs --replace rm -rf /",
+        "sudo -R / rm -rf /",
+        "sudo -D /tmp rm -rf /",
+        "sudo -T 5 rm -rf /",
+        "sudo -r role rm -rf /",
+        "sudo -t type rm -rf /",
+        "sudo -U alice rm -rf /",
+        "sudo -Eu root rm -rf /",
+        "sudo --zuno-unknown-option value rm -rf /",
+        "sudo --zuno-unknown-option rm -rf /",
+        "sudo -Z value rm -rf /",
+        "ionice -t rm -rf /",
+        "flock /tmp/lock rm -rf /",
+        "flock -w 5 /tmp/lock rm -rf /",
+        "flock /tmp/lock -c 'rm -rf /'",
+        "taskset 0x3 rm -rf /",
+        "taskset -c 0-3 rm -rf /",
+        "chrt -f 99 rm -rf /",
+        "sh -c -x 'rm -rf /'",
+        "exec -a foo watch -n 1 sudo -R / rm -rf /",
+    ] {
+        assert_risk_denied(command);
+    }
+}
+
+/// The fail-closed reading must not start prompting on the wrapper options people
+/// actually write, and the verdicts the gate already gave must stand.
+#[test]
+fn risk_known_wrapper_options_keep_their_verdicts() {
+    for command in [
+        "sudo -u root ls",
+        "sudo -E -H -u root ls -la",
+        "sudo --user=root ls",
+        "sudo -uroot ls",
+        "sudo -Eu root ls",
+        "sudo -R / ls",
+        "sudo -n true",
+        "env FOO=bar make",
+        "env -i FOO=bar make",
+        "timeout 5 cargo test",
+        "timeout -k 5 10s cargo test",
+        "exec -a foo ls",
+        "watch -n 1 date",
+        "watch -d -n 1 date",
+        "xargs -0 -n 1 echo",
+        "xargs -I {} echo {}",
+        "nice -n 5 make",
+        "nice -5 make",
+        "stdbuf -oL cat",
+        "ionice -c 3 -n 7 cat",
+        "ionice -t cat",
+        "chroot /mnt ls",
+        "taskset 0x3 ls",
+        "chrt -f 99 ls",
+        "flock /tmp/lock ls",
+        "flock -n 9",
+        "sudo --zuno-unknown-option value ls",
+    ] {
+        assert_eq!(risk_gate(command), GateOutcome::Allow, "{command:?}");
+    }
+    for command in ["sudo -u $USER rm -rf /", "nice -n $N rm -rf /"] {
+        assert_risk_denied(command);
+    }
+    for command in [
+        // An option the gate does not know may have taken the program as its value.
+        "sudo --zuno-unknown-option ls",
+        // A destructive program behind an unknown option is still bounded.
+        "exec -Z rm -rf ./build",
+        "sudo -s",
+        "env rm${IFS}-rf${IFS}/",
+        "$DELETE_COMMAND -rf /",
+    ] {
+        let outcome = risk_gate(command);
+        assert!(
+            matches!(outcome, GateOutcome::Confirm { .. }),
+            "expected a confirmation for {command:?}, got {outcome:?}"
+        );
+    }
+}
+
+/// A program path with a space in its directory is one name, not a command line, and a
+/// quoted script that materialises to `rm -rf` is a command line, not a name.
+#[test]
+fn risk_a_quoted_program_path_with_a_space_is_one_name() {
+    for command in [
+        r#""C:\Program Files\Git\cmd\git.exe" --version"#,
+        "'/opt/my app/bin/tool' --version",
+        "'/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code' .",
+        "/opt/my\\ app/bin/tool --version",
+    ] {
+        assert_eq!(risk_gate(command), GateOutcome::Allow, "{command}");
+    }
+    // A directory whose name starts with a program name does not turn the path into a
+    // command line: the whole word is the program `rm`, judged as `rm`.
+    for command in [
+        r#""/opt/sh dir/rm" -rf /"#,
+        r#""/usr/local/sudo bin/rm" -rf /"#,
+        r#""/home/alice/git repos/rm" -rf /"#,
+        r#""/opt/find tools/sh" -c 'rm -rf /'"#,
+        r#""/opt/rm bin/dd" of=/dev/sda"#,
+    ] {
+        assert_risk_denied(command);
+    }
+    for command in ["$'rm -rf' /", "$'sudo rm' -rf /", "$'sh -c' 'rm -rf /'"] {
+        assert!(
+            !matches!(risk_gate(command), GateOutcome::Allow),
+            "{command} must not run without a prompt"
+        );
+    }
+    // The same split shape behind `su -c`: the argument is held too.
+    assert!(!matches!(
+        risk_gate(r"su -c 'echo hi'\;'rm -rf /'"),
+        GateOutcome::Allow
+    ));
+}
+
+/// Every computed word after a wrapper forks a reading at every later word, so a line of
+/// hundreds of computed words was cubic work: four hundred took seconds and three
+/// thousand did not finish. Past a few thousand walk states the walk stops and the line
+/// is held for a human; a line within the cap is still refused outright.
+#[test]
+fn risk_many_computed_words_after_a_wrapper_are_held_rather_than_read_forever() {
+    assert_risk_denied(&format!(
+        "env {} rm -rf /",
+        (0..8)
+            .map(|i| format!("$A{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+    // A full queue stops forking, never the reading being followed: the chain of
+    // computed assignments still reaches `rm -rf /` and is refused.
+    assert_risk_denied(&format!(
+        "env {} rm -rf /",
+        (0..100)
+            .map(|i| format!("V{i}=$X{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+    // A script option that is really on the line is never starved by speculative
+    // readings from a long tail: with `A` unset this runs `rm -rf / f0 …`.
+    assert_risk_denied(&format!(
+        "env $A -S 'rm -rf /' {}",
+        (0..300)
+            .map(|i| format!("f{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+    for n in [2000usize, 3000] {
+        let words = (0..n)
+            .map(|i| format!("$A{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let started = std::time::Instant::now();
+        let outcome = risk_gate(&format!("env {words} rm -rf /"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the wrapper walk must stop forking at n={n}: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !matches!(outcome, GateOutcome::Allow),
+            "a line the walk could not finish reading is held, never waved through: {outcome:?}"
+        );
+    }
+}

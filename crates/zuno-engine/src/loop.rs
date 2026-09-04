@@ -14,14 +14,14 @@
 
 use std::collections::BTreeMap;
 use std::num::{NonZeroU8, NonZeroU32};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::{StreamExt, stream};
 use serde_json::{Map, Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::Instrument as _;
 use uuid::Uuid;
 use zuno_db::event_log::{NewSessionEvent, append_with_connection};
@@ -31,7 +31,7 @@ use zuno_db::message::{
     TASK_REPORT_METADATA_KEY, created_after, now_millis,
 };
 use zuno_db::{Connection, open, session};
-use zuno_error::{DbError, ProviderError};
+use zuno_error::{DbError, ProviderError, UncertainCause};
 use zuno_llm::cache::{CacheViolation, DynamicContext, McpToolStatus, PreparedTurn, PromptCache};
 use zuno_llm::event::{
     FinishReason, Message, PromptAccounting, RequestContentBlock, Role, StreamEvent,
@@ -75,6 +75,74 @@ pub const TURN_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// Text used to close an unanswered tool call before its transcript is replayed.
 pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution was interrupted]";
+
+/// Text closing a call whose side effects may have landed unobserved.
+///
+/// Deliberately not [`INTERRUPTED_TOOL_RESULT`], which closes only calls that provably
+/// ran nothing: a row this build checkpointed ([`DISPATCH_TRACKED_FIELD`]) and never
+/// handed over. This text is written whenever the hand-off cannot be ruled out — the row
+/// carries [`DISPATCH_STARTED_FIELD`], or it predates hand-off tracking entirely — so
+/// what the model reads says the outcome is undecided rather than reporting a decided
+/// failure it is free to reissue.
+pub const UNOBSERVED_TOOL_RESULT: &str = "[Tool execution was interrupted] Its final \
+side-effect state is uncertain; inspect authoritative state before retrying.";
+
+/// Durable stamp saying one call was handed to a tool before it could take effect.
+///
+/// Written into the checkpointed tool part immediately before execution, and committed
+/// on its own, so it is a fact about the process that handed the call over rather than
+/// about the process that reads it back. [`repair_missing_tool_outputs`] reads it
+/// together with [`DISPATCH_TRACKED_FIELD`]: an unanswered call carrying this stamp may
+/// have changed authoritative state nobody observed. Without the distinction the repair
+/// has to pick one wrong answer for every unanswered row — either every budget stop and
+/// step-limit stop manufactures an inspection obligation no side effect earned, or a
+/// call killed mid-`git push` is reported to the model as a decided failure it may
+/// reissue.
+///
+/// A sibling field rather than a fifth `state.status`: `status` is projected by the TUI,
+/// by ACP replay, and by the export redactor, and a call that is durably pending should
+/// keep reading as pending on every one of them. Nothing but the repair reads this.
+const DISPATCH_STARTED_FIELD: &str = "dispatchedAtMs";
+
+/// Durable marker saying the writing build records tool-call hand-off at all.
+///
+/// [`DISPATCH_STARTED_FIELD`] alone cannot answer the repair's question, because a row
+/// written before that stamp existed carries no stamp for two different reasons. Every
+/// released build through 0.9.0 persisted exactly `{"status","input","raw"}` for a call
+/// it then handed to the executor — measured, not assumed: see
+/// `RELEASED_PENDING_TOOL_ROW` in `tests/loop.rs`, captured from the last such build.
+/// Reading that absence as "never dispatched" would issue the false "provably changed
+/// nothing" verdict on the first recovery after an upgrade, for exactly the population
+/// that needs the opposite, so this marker makes the absence self-describing instead:
+///
+/// * marker and no stamp — this build checkpointed the call and never handed it over;
+/// * marker and stamp — this build handed it over and lost the answer;
+/// * neither — written before hand-off was recorded, so the hand-off is unprovable and
+///   [`repair_missing_tool_outputs`] fails closed and demands an inspection.
+///
+/// Additive rather than a migration on purpose. A backfill would have to guess the same
+/// unknowable fact for every existing row while rewriting durable user state; the
+/// tri-state reads every already-stored row without touching it, and the unknown class
+/// is closed to new rows the moment this build writes one. Deliberately *not* written by
+/// `StreamProjector::persist_pending_tool`, the other pending-tool writer in this crate:
+/// that projection never records a hand-off, so claiming tracking there would turn its
+/// rows into false "provably changed nothing" verdicts.
+const DISPATCH_TRACKED_FIELD: &str = "dispatchTracked";
+
+/// Identity recorded for an inspection obligation whose own row cannot name the call.
+///
+/// `MessageStore::pending_uncertain_tool_calls` requires both `callID` and `tool`, and
+/// reports a row missing either as a decode failure for the whole session's queue. A
+/// provider-supplied id is not guaranteed to be usable: a gateway translator that does
+/// `call.id.clone().unwrap_or_default()` yields an empty string, and nothing between the
+/// stream and the durable row rejects it. Recording the obligation under a placeholder
+/// beats the alternatives — dropping it leaves every client surface claiming the outcome
+/// is uncertain while nothing is ever obliged to inspect anything, and refusing the turn
+/// turns a provider's sloppy id into a hard failure. The part id in the same row is the
+/// handle `reconcile_uncertain_tool_calls` takes, so the obligation stays actionable
+/// without it. Angle brackets keep this outside the identifier syntax providers require
+/// of a real tool name, so it cannot collide with one.
+const UNNAMED_TOOL_CALL_IDENTITY: &str = "<unnamed>";
 
 /// Stable user-facing marker for a turn the user explicitly stopped.
 ///
@@ -524,6 +592,28 @@ pub struct ToolFailureRecovery {
     pub replay_policy: ToolReplayPolicy,
     /// Delay requested by the failed peer, when one was supplied.
     pub retry_after: Option<Duration>,
+}
+
+/// What a call left behind when it could not settle what it had changed.
+///
+/// Carried separately from [`ToolDispatchResult::recovery`] on purpose, and the
+/// separation is the whole point. `recovery` says an identical call may be issued
+/// again once a backoff has passed; an uncertain outcome never permits that, so
+/// putting the two in one field would make every consumer re-derive which kind it
+/// was holding. The dispatcher decides this once, from the typed error or the
+/// tool's own cancellation verdict, and everything downstream reads the decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncertainOutcome {
+    /// Tool whose call lost its authoritative final state.
+    pub tool: String,
+    /// Paths the call was observed to have changed, when it observed any.
+    ///
+    /// Evidence for inspection, never permission to replay. An empty list is a
+    /// real answer: a supervisor that died around a command lost the outcome
+    /// without ever learning which paths the command had reached.
+    pub applied_paths: Vec<String>,
+    /// How the call arrived at an undecided outcome.
+    pub cause: UncertainCause,
 }
 
 /// A classified failure of the turn spine.
@@ -976,6 +1066,8 @@ pub struct ToolDispatchResult {
     pub blocked: Option<ToolBlockKind>,
     /// Present only when an already-running call settled after a hard interruption.
     pub interruption: Option<ToolInterruption>,
+    /// Present only when the call changed state it could not then account for.
+    pub uncertain: Option<UncertainOutcome>,
 }
 
 impl ToolDispatchResult {
@@ -987,6 +1079,7 @@ impl ToolDispatchResult {
             recovery: None,
             blocked: None,
             interruption: None,
+            uncertain: None,
         }
     }
 
@@ -998,6 +1091,7 @@ impl ToolDispatchResult {
             recovery: None,
             blocked: None,
             interruption: None,
+            uncertain: None,
         }
     }
 
@@ -1009,6 +1103,7 @@ impl ToolDispatchResult {
             recovery: None,
             blocked: Some(kind),
             interruption: None,
+            uncertain: None,
         }
     }
 
@@ -1020,7 +1115,19 @@ impl ToolDispatchResult {
             recovery: None,
             blocked: None,
             interruption: Some(interruption),
+            uncertain: None,
         }
+    }
+
+    /// Record that this call changed authoritative state it could not account for.
+    ///
+    /// A builder rather than a constructor because the outcome is orthogonal to how
+    /// the call ended: a lost response produces an error result, and a hard
+    /// interruption produces an interrupted one, and both may be uncertain.
+    #[must_use]
+    pub fn with_uncertain_outcome(mut self, uncertain: UncertainOutcome) -> Self {
+        self.uncertain = Some(uncertain);
+        self
     }
 
     #[must_use]
@@ -1031,6 +1138,7 @@ impl ToolDispatchResult {
             recovery: Some(recovery),
             blocked: None,
             interruption: None,
+            uncertain: None,
         }
     }
 }
@@ -1768,6 +1876,7 @@ async fn run_turn_in_span(
     let mut prompt_cache: Option<PromptCache<ToolDefinition>> = None;
     let mut prompt_traces = PromptTraceSet::default();
     let mut unresolved_tool_failures = BTreeMap::<String, ToolFailureRecovery>::new();
+    let mut resolved_attachments = ResolvedAttachments::new();
     let mut consecutive_invalid_tool_calls = 0_u8;
     let mut step_limit_finalization_attempted = false;
     let mut turn_usage = empty_turn_usage();
@@ -1803,7 +1912,12 @@ async fn run_turn_in_span(
         if inject_live_inputs(&mut context, &request, &requested)?.count > 0 {
             continue;
         }
-        resolve_history_attachments(&mut history, context.attachments.as_deref())?;
+        resolve_history_attachments(
+            &mut history,
+            context.attachments.as_ref(),
+            &mut resolved_attachments,
+        )
+        .await?;
         let agent = context
             .resolver
             .resolve_agent(&requested.agent)
@@ -2794,6 +2908,31 @@ async fn run_turn_in_span(
                     prepared.push((call_index, call, display_name, ui_intent, dispatch));
                 }
 
+                // The hand-off becomes durable before any of this group can take
+                // effect. A process that dies inside `execute` leaves a row the next
+                // turn has to classify, and the only evidence that survives the death
+                // is what was committed before it: `repair_missing_tool_outputs` reads
+                // this stamp to separate a call that may have changed authoritative
+                // state from one that was never handed over. Written for the whole
+                // group in one transaction because the group runs concurrently, so any
+                // member of it may be the call that is in flight.
+                mark_group_dispatched(
+                    context.connection,
+                    &request,
+                    step,
+                    DispatchedGroup {
+                        assistant_id: &assistant_id,
+                        assistant_time_created,
+                        call_positions: &call_positions,
+                        calls: prepared
+                            .iter()
+                            .map(|(call_index, call, display_name, ui_intent, _)| {
+                                (*call_index, call, display_name.as_str(), *ui_intent)
+                            })
+                            .collect(),
+                    },
+                )?;
+
                 let completed = if first_policy == ToolConcurrencyPolicy::Exclusive {
                     let (call_index, call, display_name, ui_intent, dispatch) =
                         prepared.pop().expect("exclusive group contains one call");
@@ -3323,6 +3462,36 @@ fn required_string(record: &MessageRecord, field: &'static str) -> Result<String
         })
 }
 
+/// Close every tool call the session left unanswered, splitting on hand-off evidence.
+///
+/// The repair runs at the head of a turn, which is where the least is known about a
+/// session the previous process abandoned. Two durable fields are the only evidence that
+/// survives that process, and together they separate classes that must not be closed the
+/// same way:
+///
+/// * [`DISPATCH_TRACKED_FIELD`] and no [`DISPATCH_STARTED_FIELD`]: this build
+///   checkpointed the call in model order and never handed it to a tool — a budget stop,
+///   a step-limit stop, an urgent input that skipped the rest of the group, or a death
+///   before the hand-off was committed. It provably changed nothing, so it is closed as
+///   the interruption it was, with the same `metadata.synthetic` shape the checkpoint
+///   uses for calls it closes itself. This is the only class that gets a decided answer.
+/// * [`DISPATCH_STARTED_FIELD`] present: the previous process handed the call over and
+///   never recorded what came back.
+/// * Neither field: the row predates hand-off tracking, so *nothing* about it
+///   distinguishes a lost `git push` from a call that never started. The released build
+///   wrote exactly this shape for calls it dispatched, so the absence is read as unknown
+///   and closed as unknown.
+///
+/// The last two are one undecided outcome in the [`UncertainCause::Interrupted`] sense,
+/// closed with the dispatcher's own verdict shape *and* with the durable `state.outcome`
+/// / `state.uncertain` obligation the dispatcher writes, which is what
+/// `MessageStore::pending_uncertain_tool_calls` reads and what pauses the goal before
+/// automatic execution may continue. Claiming the verdict on the wire without creating
+/// the obligation would tell every client surface that authoritative state must be
+/// inspected while leaving the reconciliation queue empty, which is the one combination
+/// that is worse than either honest answer — so a row whose own `callID` or `tool` is
+/// unusable still carries its obligation, under [`UNNAMED_TOOL_CALL_IDENTITY`], and is
+/// reported through `tracing::error!` as well.
 fn repair_missing_tool_outputs(
     connection: &Connection,
     session_id: &str,
@@ -3330,21 +3499,105 @@ fn repair_missing_tool_outputs(
     let store = MessageStore::new(connection);
     let mut repaired = 0;
     for mut part in store.unfinished_tool_parts_for_session(session_id)? {
+        let part_id = part.id.clone();
+        let call_id = non_empty_field(&part, "callID");
+        let tool = non_empty_field(&part, "tool");
         let Some(state) = part.data.get_mut("state").and_then(Value::as_object_mut) else {
             continue;
         };
+        // Presence alone, not the stamped instant: the value is evidence for a human
+        // reading the row, and a clock that went backwards must not turn an observed
+        // hand-off into an unobserved one.
+        let stamped = state.contains_key(DISPATCH_STARTED_FIELD);
+        // Only a row this build checkpointed can prove a *negative*. Without the tracking
+        // marker the row was written before hand-off was recorded at all, and the
+        // released build wrote that same shape for calls it went on to dispatch, so the
+        // missing stamp is unknown rather than "never started". Unknown fails closed.
+        // The value, not the key: a writer that spells "I do not track hand-off" as
+        // `dispatchTracked: false` (or `null`) must read as unprovable, never as proof.
+        let hand_off_provable =
+            state.get(DISPATCH_TRACKED_FIELD).and_then(Value::as_bool) == Some(true);
+        let may_have_run = stamped || !hand_off_provable;
         state.insert("status".to_owned(), Value::String("error".to_owned()));
-        state.insert(
-            "error".to_owned(),
-            Value::String(INTERRUPTED_TOOL_RESULT.to_owned()),
-        );
-        let mut metadata = Map::new();
-        metadata.insert("interrupted".to_owned(), Value::Bool(true));
-        state.insert("metadata".to_owned(), Value::Object(metadata));
+        let observed_at = now_millis();
+        if may_have_run {
+            state.insert(
+                "error".to_owned(),
+                Value::String(UNOBSERVED_TOOL_RESULT.to_owned()),
+            );
+            // `Forced` is the mode a repair can honestly claim: nothing was observed,
+            // and no tool acknowledged anything. `graceMs` is zero because a repair
+            // allowed no settling window at all, which is the fact the dispatcher's
+            // own record of that field reports. The certainty is recorded beside the
+            // mode rather than left to be re-derived from it.
+            let interruption = json!({
+                "mode": ToolInterruption::Forced.as_str(),
+                "forced": ToolInterruption::Forced.is_forced(),
+                "uncertain": true,
+                "graceMs": 0,
+            });
+            let mut metadata = state
+                .get_mut("metadata")
+                .and_then(Value::as_object_mut)
+                .map(std::mem::take)
+                .unwrap_or_default();
+            metadata.insert(
+                crate::dispatch::INTERRUPTION_METADATA_KEY.to_owned(),
+                interruption,
+            );
+            state.insert("metadata".to_owned(), Value::Object(metadata));
+            if tool.is_none() || call_id.is_none() {
+                // The obligation is still recorded below. This says the evidence in it is
+                // degraded, which is a defect in whatever wrote the row — not a reason to
+                // let a possibly-landed side effect go uninspected.
+                tracing::error!(
+                    part = %part_id,
+                    named_tool = tool.is_some(),
+                    named_call = call_id.is_some(),
+                    "an unanswered dispatched tool call cannot name itself, so its \
+                     inspection obligation is recorded under a placeholder identity"
+                );
+            }
+            state.insert("outcome".to_owned(), Value::String("uncertain".to_owned()));
+            state.insert(
+                "uncertain".to_owned(),
+                json!({
+                    "tool": tool.unwrap_or_else(|| UNNAMED_TOOL_CALL_IDENTITY.to_owned()),
+                    "callID": call_id
+                        .unwrap_or_else(|| UNNAMED_TOOL_CALL_IDENTITY.to_owned()),
+                    // Nothing observed which paths moved: the process that could
+                    // have said so is gone. An empty list is the real answer.
+                    "appliedPaths": [],
+                    "cause": UncertainCause::Interrupted.as_str(),
+                    "observedAtMs": observed_at,
+                }),
+            );
+        } else {
+            state.insert(
+                "error".to_owned(),
+                Value::String(INTERRUPTED_TOOL_RESULT.to_owned()),
+            );
+            let mut metadata = state
+                .get_mut("metadata")
+                .and_then(Value::as_object_mut)
+                .map(std::mem::take)
+                .unwrap_or_default();
+            metadata.insert("synthetic".to_owned(), Value::Bool(true));
+            state.insert("metadata".to_owned(), Value::Object(metadata));
+        }
         store.put_part(&part)?;
         repaired += 1;
     }
     Ok(repaired)
+}
+
+/// One top-level part field, as an owned string, only when it can identify anything.
+fn non_empty_field(part: &PartRecord, field: &str) -> Option<String> {
+    part.data
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 /// Hydrate exactly the suffix that [`retained_history`] permits a request to carry.
@@ -3771,9 +4024,88 @@ fn append_user_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRecord>
     }
 }
 
-fn resolve_history_attachments(
+/// Provider-bound image bytes already resolved during this turn.
+///
+/// Keyed by content identity alone because this path always resolves under
+/// [`zuno_attachment::ImageRequestPolicy::default()`]: a second policy would need a
+/// second key, not a shared entry.
+#[derive(Debug, Default)]
+struct ResolvedAttachments {
+    entries: BTreeMap<zuno_attachment::AttachmentId, zuno_attachment::ResolvedImage>,
+    retained_bytes: usize,
+}
+
+/// How much base64 the turn memo may hold before it stops growing.
+///
+/// The memo exists to stop one object being re-read on every step, not to hold a
+/// session's whole image history: an admitted object may be up to
+/// `ImageAdmissionPolicy::max_encoded_bytes`, which is ~6.7 MiB once base64-encoded, and
+/// the retained history may carry many of them beside the per-step history copy and the
+/// assembled request.
+///
+/// Exceeding it is not an error and never rejects an image. Resolution continues; only
+/// the memoization stops, so a history above the ceiling degrades to the per-step
+/// resolution it had before the memo existed. That direction matters: a ceiling that
+/// turned an image-heavy session into a failed turn would be a worse defect than the
+/// memory it saves.
+const RESOLVED_ATTACHMENT_MEMO_BYTES: usize = 32 * 1024 * 1024;
+
+impl ResolvedAttachments {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, id: &zuno_attachment::AttachmentId) -> Option<&zuno_attachment::ResolvedImage> {
+        self.entries.get(id)
+    }
+
+    /// Memoize one resolution while the turn's retained payload stays under the cap.
+    ///
+    /// Admission is all-or-nothing per entry and never evicts: an entry already handed
+    /// out has been cloned into a request, so dropping it would cost a re-read without
+    /// releasing anything the request still holds.
+    fn remember(
+        &mut self,
+        id: zuno_attachment::AttachmentId,
+        image: &zuno_attachment::ResolvedImage,
+    ) {
+        let size = image.data.len().saturating_add(image.media_type.len());
+        let Some(retained) = self
+            .retained_bytes
+            .checked_add(size)
+            .filter(|retained| *retained <= RESOLVED_ATTACHMENT_MEMO_BYTES)
+        else {
+            return;
+        };
+        if self.entries.insert(id, image.clone()).is_none() {
+            self.retained_bytes = retained;
+        }
+    }
+}
+
+/// Fill every retained image part with the bytes the provider request carries.
+///
+/// Resolution is filesystem work — a whole-object read, a SHA-256 verification, a
+/// base64 encode, and on a derived-cache miss a resize plus an fsynced write — so it
+/// runs on the blocking pool rather than inline, inside the process-wide
+/// [`ATTACHMENT_RESOLVE_SLOTS`] budget. `zuno serve` and `zuno acp` drive their turns on
+/// a current-thread runtime, where doing it inline freezes every in-flight stream,
+/// permission answer, and interrupt for the whole span. `resolved` is the turn's memo:
+/// history is re-hydrated on every step, and one object is worth reading once per turn,
+/// not once per step. The memo stops growing at [`RESOLVED_ATTACHMENT_MEMO_BYTES`] and
+/// then simply resolves again, so an image-heavy history costs time rather than
+/// unbounded memory.
+///
+/// # Errors
+///
+/// [`TurnError::Attachment`] when no store is configured for a history that carries a
+/// durable reference, when the reference itself is unreadable, when the store refuses
+/// the object, or when the blocking pool drops the call during shutdown. A panic inside
+/// the offloaded closure is re-raised rather than turned into an error.
+async fn resolve_history_attachments(
     history: &mut [MessageWithParts],
-    store: Option<&zuno_attachment::AttachmentStore>,
+    store: Option<&Arc<zuno_attachment::AttachmentStore>>,
+    resolved: &mut ResolvedAttachments,
 ) -> Result<(), TurnError> {
     for message in history {
         for part in &mut message.parts {
@@ -3792,18 +4124,28 @@ fn resolve_history_attachments(
             .map_err(|_| {
                 TurnError::Attachment(zuno_attachment::AttachmentError::InvalidReference)
             })?;
-            let resolved = store
-                .resolve(&reference, zuno_attachment::ImageRequestPolicy::default())
-                .map_err(TurnError::Attachment)?;
-            part.data.insert(
-                "mime".to_owned(),
-                Value::String(resolved.media_type.clone()),
-            );
+            let image = match resolved.get(&reference.id) {
+                Some(image) => image.clone(),
+                None => {
+                    let image =
+                        resolve_attachment_offloaded(Arc::clone(store), reference.clone()).await?;
+                    resolved.remember(reference.id.clone(), &image);
+                    image
+                }
+            };
             part.data
-                .insert("data".to_owned(), Value::String(resolved.data));
-            if !part.data.contains_key("filename")
-                && let Some(filename) = reference.filename
-            {
+                .insert("mime".to_owned(), Value::String(image.media_type));
+            part.data
+                .insert("data".to_owned(), Value::String(image.data));
+            // The typed reference was sanitized while it deserialized above. The
+            // top-level duplicate that client surfaces label a part with was stored raw
+            // by older builds, so the hydrated copy carries the sanitized spelling of
+            // whatever the row holds; a name this build wrote is already a fixed point.
+            let display_name = match part.data.get("filename").and_then(Value::as_str) {
+                Some(stored) => Some(zuno_attachment::sanitize_display_filename(stored)),
+                None => reference.filename,
+            };
+            if let Some(filename) = display_name {
                 part.data
                     .insert("filename".to_owned(), Value::String(filename));
             }
@@ -3812,68 +4154,341 @@ fn resolve_history_attachments(
     Ok(())
 }
 
-fn request_file_block(data: &Map<String, Value>) -> Option<RequestContentBlock> {
-    let filename = data
-        .get("filename")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let media_type = data.get("mime").and_then(Value::as_str).map(str::to_owned);
-    let payload = data.get("data").and_then(Value::as_str).map(str::to_owned);
-    if let (Some(media_type), Some(payload)) = (media_type.clone(), payload) {
-        return Some(RequestContentBlock::Image {
-            filename,
-            media_type,
-            data: payload,
-        });
+/// How many durable-attachment resolutions run on the blocking pool at once, process-wide.
+///
+/// One resolution is bounded by the attachment crate at its `MAX_STORED_DECODE_WORKING_BYTES`
+/// (900,000,000 bytes, pinned by that crate's own tests) of live working memory: a stored
+/// object is already on the user's disk, so its decode gate is the stored byte backstop plus
+/// the intermediate and output a refit at the 2,000-pixel request route costs, measured at
+/// 875,712 kB peak RSS for an 11313x11313 object. The offload alone removed the
+/// serialization the reactor used to provide, so without this bound N concurrent turns whose
+/// histories carry such objects are N blocking threads each holding that working set,
+/// limited only by the pool's 512 threads. Two keeps the process-wide resident ceiling for
+/// history resolution at 1.8 GB, the same order as the server's admission budget (two
+/// decodes at 512,000,000 bytes) that shares the pool; the fast path — a whole-object read
+/// and a base64 encode of an already-fit object — is short enough that two slots rarely
+/// queue. `zuno serve` and `zuno acp` ran this inline on a single-threaded reactor before
+/// the offload existed, an effective concurrency of one, so two is looser than that shipped
+/// behaviour and cannot starve a history that release served.
+const ATTACHMENT_RESOLVE_SLOTS: usize = 2;
+
+static ATTACHMENT_RESOLVE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(ATTACHMENT_RESOLVE_SLOTS)));
+
+/// Resolve one durable object on the blocking pool, inside the process-wide budget.
+///
+/// The permit moves **into** the closure rather than staying in this future. A
+/// `spawn_blocking` closure whose `JoinHandle` is dropped still runs to completion, so a
+/// permit held here would be handed back the moment an interrupted turn dropped this future
+/// while the read it queued keeps its whole-object buffer resident: the bound would limit
+/// waiting turns rather than work in flight. Released when the work ends, it bounds the
+/// resident working set, which is the only thing worth bounding.
+///
+/// # Errors
+///
+/// [`TurnError::Attachment`] with [`zuno_attachment::AttachmentError::StoreUnavailable`]
+/// when a permit cannot be had — nothing closes the budget, so this is the fail-closed
+/// answer if something ever does — or when the blocking pool drops the call; the store's
+/// own error otherwise. A panic inside the closure is re-raised, see
+/// [`attachment_offload_failure`].
+async fn resolve_attachment_offloaded(
+    store: Arc<zuno_attachment::AttachmentStore>,
+    reference: zuno_attachment::ImageAttachmentRef,
+) -> Result<zuno_attachment::ResolvedImage, TurnError> {
+    let attachment = reference.id.clone();
+    let permit = Arc::clone(&ATTACHMENT_RESOLVE)
+        .acquire_owned()
+        .await
+        .map_err(|_closed| {
+            tracing::error!(%attachment, "the attachment resolution budget is closed");
+            TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable)
+        })?;
+    let joined = tokio::task::spawn_blocking(move || {
+        let outcome = store.resolve(&reference, zuno_attachment::ImageRequestPolicy::default());
+        drop(permit);
+        outcome
+    })
+    .await;
+    match joined {
+        Ok(resolved) => resolved.map_err(TurnError::Attachment),
+        Err(error) => Err(attachment_offload_failure(error, &attachment)),
     }
-    let uri = data.get("url").and_then(Value::as_str)?.to_owned();
+}
+
+/// The one typed reading of a lost attachment offload, with panics kept as panics.
+///
+/// A [`tokio::task::JoinError`] has two causes and they are not the same kind of event,
+/// so collapsing both into an error would launder one of them:
+///
+/// * A panic inside the closure is a decoder or store bug, not a verdict about this
+///   turn. Image decoding and Lanczos3 resizing are the panic surfaces here, and they
+///   are reachable from an object a peer supplied. It is re-raised on the thread that
+///   was going to observe it before the offload existed, because reporting it as a
+///   permanent attachment failure would hide a Zuno bug behind "the store is
+///   unavailable" and latch the goal as failed for it.
+/// * Otherwise the blocking pool dropped the call, which happens while the runtime
+///   shuts down. That has one honest reading — this process can no longer reach the
+///   store — and it is a decision made from [`tokio::task::JoinError::is_panic`], never
+///   from a rendered message. The `JoinError` is logged rather than discarded because
+///   it is the only remaining evidence of which cause was taken.
+///
+/// # Panics
+///
+/// Re-raises the offloaded closure's panic payload unchanged.
+fn attachment_offload_failure(
+    error: tokio::task::JoinError,
+    attachment: &impl std::fmt::Display,
+) -> TurnError {
+    if error.is_panic() {
+        std::panic::resume_unwind(error.into_panic());
+    }
+    tracing::error!(
+        %error,
+        %attachment,
+        "resolving a durable attachment lost its blocking task"
+    );
+    TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable)
+}
+
+/// The model-visible block for one durable file part.
+///
+/// Every field is read through a predicate on the way out rather than trusted from the
+/// row, because a row an older build wrote holds whatever the client sent — path
+/// separators, control characters and bidi overrides included — and the typed
+/// `attachment.filename`, which is sanitized while it deserializes, is not the value the
+/// TUI replay and ACP replay label a part with: the top-level duplicate is, so the
+/// duplicate stays in the row and is cleaned here. The durable row is never rewritten;
+/// every transformation only removes, is idempotent, and leaves a value this build wrote
+/// byte for byte. Each field gets the predicate its role calls for:
+///
+/// * `filename` is a display name: [`zuno_attachment::sanitize_display_filename`].
+/// * `title`, `description` and a resource link's `mime` are free text: the same forbidden
+///   character set without the basename reduction — a title may legitimately be a path —
+///   and a cap, [`MAX_RESOURCE_LABEL_CHARS`] or [`MAX_RESOURCE_DESCRIPTION_CHARS`].
+/// * `url` becomes the `uri` after the same characters are stripped, uncapped, because it
+///   may be a `data:` URL whose payload truncation would corrupt.
+/// * `mime` on an image is not text but a wire token every provider splices into a `data:`
+///   URL or a `media_type` field, so it is parsed the way the attachment crate parses a
+///   declared type ([`canonical_image_media_type`]). A declaration that is not one of the
+///   four image types the store can hold makes the row a resource link when it has a
+///   `url` that is not a `data:` URL, and nothing otherwise — strictly better than the
+///   released behaviour, where the provider rejected the request and the whole turn
+///   failed with it. A `data:` URL on such a row is the refused payload itself, and a
+///   link's `uri` reaches the model in full as prose.
+fn request_file_block(data: &Map<String, Value>) -> Option<RequestContentBlock> {
+    file_part_block(FilePartFields::cloned_from(data))
+}
+
+/// Owned twin of [`request_file_block`]: the payload moves out of the row instead of being
+/// cloned, and every field passes the same predicates.
+fn take_request_file_block(data: &mut Map<String, Value>) -> Option<RequestContentBlock> {
+    file_part_block(FilePartFields::taken_from(data))
+}
+
+/// The fields of a durable file part that can reach the model, as the row holds them.
+struct FilePartFields {
+    filename: Option<String>,
+    mime: Option<String>,
+    data: Option<String>,
+    url: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    size: Option<u64>,
+}
+
+impl FilePartFields {
+    fn cloned_from(data: &Map<String, Value>) -> Self {
+        let text = |key: &str| data.get(key).and_then(Value::as_str).map(str::to_owned);
+        Self {
+            filename: text("filename"),
+            mime: text("mime"),
+            data: text("data"),
+            url: text("url"),
+            title: text("title"),
+            description: text("description"),
+            size: data.get("size").and_then(Value::as_u64),
+        }
+    }
+
+    fn taken_from(data: &mut Map<String, Value>) -> Self {
+        Self {
+            filename: take_string(data, "filename"),
+            mime: take_string(data, "mime"),
+            data: take_string(data, "data"),
+            url: take_string(data, "url"),
+            title: take_string(data, "title"),
+            description: take_string(data, "description"),
+            size: data.remove("size").and_then(|value| value.as_u64()),
+        }
+    }
+}
+
+/// Longest model-visible resource-link title or media-type label, in characters: the
+/// ceiling a display name already has.
+const MAX_RESOURCE_LABEL_CHARS: usize = 255;
+
+/// Longest model-visible resource-link description, in characters. A description is a
+/// sentence or a paragraph about the resource, not the resource; a client that has more to
+/// say than this sends the resource.
+const MAX_RESOURCE_DESCRIPTION_CHARS: usize = 1024;
+
+fn file_part_block(fields: FilePartFields) -> Option<RequestContentBlock> {
+    let filename = fields
+        .filename
+        .as_deref()
+        .map(zuno_attachment::sanitize_display_filename);
+    let refused_image = match (fields.data, fields.mime.as_deref()) {
+        (Some(payload), Some(declared)) => match canonical_image_media_type(declared) {
+            Some(media_type) => {
+                return Some(RequestContentBlock::Image {
+                    filename,
+                    media_type: media_type.to_owned(),
+                    data: payload,
+                });
+            }
+            None => {
+                tracing::debug!(
+                    media_type = ?declared,
+                    "a durable image part declares a media type no request may carry; the \
+                     model does not see the image"
+                );
+                true
+            }
+        },
+        _ => false,
+    };
+    let uri = sanitize_model_text(fields.url.as_deref()?, usize::MAX)?;
+    if refused_image && is_data_url(&uri) {
+        // The link would be the refused image by another route: `provider_text` renders a
+        // resource link's `uri` in full, so a `data:` URL puts the whole base64 payload the
+        // image block was just refused with into the prompt as prose. Tested on the
+        // sanitized `uri`, not the raw `url`, so an invisible character in front of the
+        // scheme cannot get it through.
+        return None;
+    }
     let name = filename.unwrap_or_else(|| {
-        uri.rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or("attachment")
-            .to_owned()
+        zuno_attachment::sanitize_display_filename(
+            uri.rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("attachment"),
+        )
     });
     Some(RequestContentBlock::ResourceLink {
         name,
         uri,
-        title: data.get("title").and_then(Value::as_str).map(str::to_owned),
-        description: data
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        media_type,
-        size: data.get("size").and_then(Value::as_u64),
+        title: fields
+            .title
+            .as_deref()
+            .and_then(|title| sanitize_model_text(title, MAX_RESOURCE_LABEL_CHARS)),
+        description: fields.description.as_deref().and_then(|description| {
+            sanitize_model_text(description, MAX_RESOURCE_DESCRIPTION_CHARS)
+        }),
+        media_type: fields
+            .mime
+            .as_deref()
+            .and_then(|mime| sanitize_model_text(mime, MAX_RESOURCE_LABEL_CHARS)),
+        size: fields.size,
     })
 }
 
-fn take_request_file_block(data: &mut Map<String, Value>) -> Option<RequestContentBlock> {
-    let filename = take_string(data, "filename");
-    let media_type = take_string(data, "mime");
-    let payload = take_string(data, "data");
-    if let (Some(media_type), Some(payload)) = (media_type.clone(), payload) {
-        return Some(RequestContentBlock::Image {
-            filename,
-            media_type,
-            data: payload,
-        });
-    }
-    let uri = take_string(data, "url")?;
-    let name = filename.unwrap_or_else(|| {
-        uri.rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or("attachment")
-            .to_owned()
-    });
-    Some(RequestContentBlock::ResourceLink {
-        name,
-        uri,
-        title: take_string(data, "title"),
-        description: take_string(data, "description"),
-        media_type,
-        size: data.remove("size").and_then(|value| value.as_u64()),
-    })
+/// The wire media type an image block may carry for a row's declared `mime`, or `None`.
+///
+/// This is the attachment crate's own parse of a declared type — parameters dropped, type
+/// and subtype case-folded as RFC 2045 allows, the aliases browsers and toolkits emit
+/// mapped — required to be one of the four formats the store can hold, which are also the
+/// four every provider's image block accepts. Anything else, from `image/svg+xml` to a type
+/// with a control character spliced into it, is not a media type a request may carry. The
+/// set lives in one place: what admission accepts is exactly what a request may carry.
+fn canonical_image_media_type(declared: &str) -> Option<&'static str> {
+    zuno_attachment::DeclaredImageMediaType::parse(declared)
+        .map(zuno_attachment::DeclaredImageMediaType::as_str)
+}
+
+/// Whether a sanitized `uri` is a `data:` URL: the scheme is case-insensitive (RFC 3986),
+/// so `DATA:` is one too.
+fn is_data_url(uri: &str) -> bool {
+    uri.as_bytes()
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"data:"))
+}
+
+/// Reduce free text from a durable row to what may reach the model: the forbidden
+/// characters removed, the first `max_chars` kept, surrounding spaces trimmed, and `None`
+/// when nothing is left rather than an empty field.
+fn sanitize_model_text(text: &str, max_chars: usize) -> Option<String> {
+    let kept: String = text
+        .chars()
+        .filter(|character| !is_forbidden_in_model_text(*character))
+        .take(max_chars)
+        .collect();
+    let kept = kept.trim();
+    (!kept.is_empty()).then(|| kept.to_owned())
+}
+
+/// Characters no model-visible text field of a durable file part may contain.
+///
+/// This is `zuno_attachment`'s display-name predicate — Cc, every Z* other than U+0020,
+/// Cf, `Default_Ignorable_Code_Point`, U+2800 BRAILLE PATTERN BLANK, private use and
+/// noncharacters — restated here because that crate exposes only
+/// [`zuno_attachment::sanitize_display_filename`], which also reduces to a basename, and a
+/// title or a URL is text that may legitimately contain a path. The two sets are pinned to
+/// each other code point by code point in `model_text_tests`, with the public sanitizer as
+/// the oracle, so neither can drift from the other unnoticed.
+fn is_forbidden_in_model_text(character: char) -> bool {
+    character.is_control()
+        || (character.is_whitespace() && character != ' ')
+        || is_invisible_format_or_ignorable(character)
+        || character == '\u{2800}'
+        || is_private_use(character)
+        || is_noncharacter(character)
+}
+
+/// Cf and `Default_Ignorable_Code_Point`, as one table: soft hyphens, zero-width joiners,
+/// bidi controls and isolates, byte-order marks, fillers, variation selectors, tag
+/// characters, and the reserved code points inside those ranges that a conforming renderer
+/// draws as nothing.
+fn is_invisible_format_or_ignorable(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
+    )
+}
+
+fn is_private_use(character: char) -> bool {
+    matches!(
+        character,
+        '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}'
+    )
+}
+
+fn is_noncharacter(character: char) -> bool {
+    let code = u32::from(character);
+    (0xfdd0..=0xfdef).contains(&code) || code & 0xfffe == 0xfffe
 }
 
 fn append_assistant_message(messages: &mut Vec<Message>, message: &MessageWithParts) {
@@ -5066,7 +5681,7 @@ fn checkpoint_assistant(
                         display_name: &display_name,
                         ui_intent: tool_ui_intent(locked_tools, &call.name),
                     },
-                    tool_failure,
+                    tool_failure.map_or(ToolPartStage::Pending, ToolPartStage::Closed),
                 )?;
                 store.put_part_at(&tool, completed)?;
             }
@@ -5155,10 +5770,41 @@ fn provider_reasoning_part(
     .map_err(TurnError::from)
 }
 
+/// How far one checkpointed call had got when its row was written.
+///
+/// The three states are durably distinguishable on purpose, because the repair at the
+/// head of the next turn has to tell them apart without asking a live signal that a
+/// dead process cannot answer.
+#[derive(Debug, Clone, Copy)]
+enum ToolPartStage<'a> {
+    /// Recorded in model order, not yet handed to a tool.
+    Pending,
+    /// Handed to a tool. The row is otherwise identical to [`Self::Pending`]; the
+    /// stamp is the whole difference, so nothing but the repair changes behaviour.
+    Dispatched,
+    /// Closed at checkpoint without ever being dispatched, carrying this text.
+    Closed(&'a str),
+}
+
+/// The durably pending shape both un-dispatched and dispatched rows start from.
+///
+/// Shared so the two stages cannot drift: the hand-off stamp must be the *only*
+/// difference between them, and [`DISPATCH_TRACKED_FIELD`] must be on both or the repair
+/// would read a genuinely un-dispatched row from this build as an unprovable one.
+fn pending_tool_state(call: &ToolCall) -> Value {
+    let mut state = json!({
+        "status": "pending",
+        "input": call.input,
+        "raw": call.raw_input
+    });
+    state[DISPATCH_TRACKED_FIELD] = Value::Bool(true);
+    state
+}
+
 fn checkpoint_tool_part(
     request: &RunTurnRequest,
     identity: ToolPartIdentity<'_>,
-    failure: Option<&str>,
+    stage: ToolPartStage<'_>,
 ) -> Result<PartRecord, TurnError> {
     let ToolPartIdentity {
         step,
@@ -5169,21 +5815,21 @@ fn checkpoint_tool_part(
         display_name,
         ui_intent,
     } = identity;
-    let mut state = if let Some(error) = failure {
-        json!({
+    let mut state = match stage {
+        ToolPartStage::Closed(error) => json!({
             "status": "error",
             "input": call.input,
             "raw": call.raw_input,
             "error": error,
             "metadata": { "synthetic": true },
             "time": { "end": now_millis() }
-        })
-    } else {
-        json!({
-            "status": "pending",
-            "input": call.input,
-            "raw": call.raw_input
-        })
+        }),
+        ToolPartStage::Pending => pending_tool_state(call),
+        ToolPartStage::Dispatched => {
+            let mut dispatched = pending_tool_state(call);
+            dispatched[DISPATCH_STARTED_FIELD] = Value::from(now_millis());
+            dispatched
+        }
     };
     if let Some(error) = &call.input_error {
         state["inputError"] = Value::String(error.clone());
@@ -5221,6 +5867,65 @@ struct ToolPartIdentity<'a> {
     ui_intent: ToolUiIntent,
 }
 
+/// One prepared concurrency group, addressed the way its rows are addressed.
+///
+/// `call_positions` is indexed by dispatch index and yields the call's place in the
+/// step's stream, which is what [`positional_part_id`] hashes; using the dispatch index
+/// instead would stamp a different row than the one the result will close.
+struct DispatchedGroup<'a> {
+    assistant_id: &'a str,
+    assistant_time_created: i64,
+    call_positions: &'a [usize],
+    calls: Vec<(usize, &'a ToolCall, &'a str, ToolUiIntent)>,
+}
+
+/// Record that every call in a prepared group was handed to a tool.
+///
+/// Committed before the first execution starts, which is the entire point: the stamp is
+/// only evidence if it outlives the process that wrote it. The row is otherwise
+/// byte-identical to the one the checkpoint wrote — same id, same creation time, same
+/// input — so no projection sees a new state and no reader outside
+/// [`repair_missing_tool_outputs`] changes behaviour.
+///
+/// Also stamps calls whose dispatcher decided the result during preparation (an unknown
+/// tool, a denied permission, malformed arguments). Those never reached a tool, so the
+/// stamp overstates what happened in the window between this commit and the result
+/// write; that direction is deliberate, because the alternative reading of an
+/// unanswered row is that a side effect went unobserved.
+///
+/// # Errors
+///
+/// [`TurnError::Database`] when the transaction, either write, or the commit fails. The
+/// turn stops rather than dispatching work it could not admit to having dispatched.
+fn mark_group_dispatched(
+    connection: &Connection,
+    request: &RunTurnRequest,
+    step: u32,
+    group: DispatchedGroup<'_>,
+) -> Result<(), TurnError> {
+    let transaction = open::immediate_transaction(connection)?;
+    let store = MessageStore::new(&transaction);
+    let dispatched_at = now_millis();
+    for (call_index, call, display_name, ui_intent) in group.calls {
+        let part = checkpoint_tool_part(
+            request,
+            ToolPartIdentity {
+                step,
+                position: group.call_positions[call_index],
+                message_time_created: group.assistant_time_created,
+                message_id: group.assistant_id,
+                call,
+                display_name,
+                ui_intent,
+            },
+            ToolPartStage::Dispatched,
+        )?;
+        store.put_part_at(&part, dispatched_at)?;
+    }
+    transaction.commit().map_err(open::map_error)?;
+    Ok(())
+}
+
 fn persist_tool_result(
     connection: &Connection,
     request: &RunTurnRequest,
@@ -5244,6 +5949,26 @@ fn persist_tool_result(
     if let Some(kind) = dispatch.blocked {
         state["outcome"] = Value::String("blocked".to_owned());
         state["blockKind"] = Value::String(kind.as_str().to_owned());
+    }
+    // The dispatcher's own verdict, recorded where a reader looks for the call's
+    // disposition rather than only inside the tool-authored metadata blob. It cannot
+    // collide with `blocked`: a blocked call was refused before its effect ran, so it
+    // has nothing to be uncertain about.
+    //
+    // This field is what closes the crash window. The turn may end, or the process may
+    // die, between this write and the Goal accounting for it, so the obligation to
+    // inspect authoritative state has to survive in the tool record itself — the same
+    // single write that makes the result model-visible. `reconciledAtMs` is absent
+    // until a human acts on it, and its absence is the pending state.
+    if let Some(uncertain) = &dispatch.uncertain {
+        state["outcome"] = Value::String("uncertain".to_owned());
+        state["uncertain"] = json!({
+            "tool": uncertain.tool,
+            "callID": identity.call.id,
+            "appliedPaths": uncertain.applied_paths,
+            "cause": uncertain.cause.as_str(),
+            "observedAtMs": now_millis(),
+        });
     }
     if dispatch.is_error {
         state["error"] = Value::String(dispatch.output.output.clone());
@@ -5316,4 +6041,316 @@ const PART_KIND_TOOL: &str = "tool";
 /// be right only for a step that reasons once.
 fn positional_part_id(turn_id: &str, step: u32, position: usize, kind: &str) -> String {
     format!("prt_{turn_id}_{step:04}_{position:04}_{kind}")
+}
+
+#[cfg(test)]
+mod attachment_offload_tests {
+    use super::{TurnError, TurnRecovery, attachment_offload_failure};
+
+    /// The reviewer's input: a `JoinError` whose task panicked.
+    ///
+    /// The oracle is deliberately not the function's own classification. It is the
+    /// original panic payload arriving at the caller, which can only happen if the
+    /// panic was re-raised rather than turned into a value. Before the split, the same
+    /// input returned `TurnError::Attachment(StoreUnavailable)` and this test could not
+    /// have observed the payload at all.
+    #[tokio::test]
+    async fn a_panicking_attachment_resolution_is_re_raised_not_classified() {
+        let panicked = tokio::task::spawn_blocking(|| panic!("image decoder overflowed"))
+            .await
+            .expect_err("the offloaded closure panicked");
+        assert!(panicked.is_panic(), "the fixture must be the panic cause");
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            attachment_offload_failure(panicked, &"sha256:probe")
+        }))
+        .expect_err("a store bug must reach the caller instead of becoming a TurnError");
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .expect("the original panic payload survives the offload");
+        assert_eq!(
+            message, "image decoder overflowed",
+            "the payload must be the closure's, not a re-panic of our own"
+        );
+    }
+
+    /// The other reviewer input: a `JoinError` from a task the pool dropped.
+    ///
+    /// This is the only cause that may become a typed error, and it must not be
+    /// retryable: retrying a shutting-down runtime cannot succeed.
+    #[tokio::test]
+    async fn a_cancelled_attachment_resolution_fails_the_turn_without_retrying() {
+        let handle = tokio::task::spawn(std::future::pending::<()>());
+        handle.abort();
+        let cancelled = handle.await.expect_err("the aborted task cannot complete");
+        assert!(
+            cancelled.is_cancelled(),
+            "the fixture must be the cancellation cause"
+        );
+
+        let error = attachment_offload_failure(cancelled, &"sha256:probe");
+        assert!(
+            matches!(
+                error,
+                TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable)
+            ),
+            "a dropped offload means this process cannot reach the store: {error:?}"
+        );
+        assert!(
+            matches!(error.recovery(), TurnRecovery::Fail),
+            "{error:?} must not be retried against a runtime that is going away"
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_text_tests {
+    use super::{
+        FilePartFields, RequestContentBlock, file_part_block, is_forbidden_in_model_text,
+        sanitize_model_text,
+    };
+
+    /// The engine's forbidden set is the attachment crate's, code point for code point.
+    ///
+    /// The oracle is the one public sanitizer: a lone character it strips comes back as
+    /// its `image` fallback, a lone character it keeps comes back as itself. Four
+    /// characters it treats specially for reasons unrelated to their class — the space it
+    /// trims, the `.` it reads as a directory, and the two separators it splits on — are
+    /// not part of the class comparison.
+    #[test]
+    fn the_forbidden_set_is_the_attachment_crate_s_code_point_for_code_point() {
+        let mut buffer = [0_u8; 4];
+        for code in 0..=u32::from(char::MAX) {
+            let Some(character) = char::from_u32(code) else {
+                continue;
+            };
+            if matches!(character, ' ' | '.' | '/' | '\\') {
+                continue;
+            }
+            let probe = character.encode_utf8(&mut buffer);
+            let stripped = zuno_attachment::sanitize_display_filename(probe) == "image";
+            assert_eq!(
+                is_forbidden_in_model_text(character),
+                stripped,
+                "U+{code:04X} is classified differently from the attachment crate"
+            );
+        }
+    }
+
+    #[test]
+    fn free_text_is_stripped_capped_trimmed_and_never_empty() {
+        assert_eq!(
+            sanitize_model_text("../\\evil\u{202e}gnp.exe\u{7}\n", 255).as_deref(),
+            Some("../\\evilgnp.exe"),
+            "the forbidden characters go; the path stays"
+        );
+        assert_eq!(
+            sanitize_model_text("  padded\u{3000}  ", 255).as_deref(),
+            Some("padded")
+        );
+        assert_eq!(sanitize_model_text("\u{202e}\u{7}\n", 255), None);
+        assert_eq!(sanitize_model_text("   ", 255), None);
+        assert_eq!(
+            sanitize_model_text(&"é".repeat(300), 255).as_deref(),
+            Some("é".repeat(255).as_str()),
+            "the cap is in characters, not bytes"
+        );
+    }
+
+    /// A refused image must not leak its payload as a link. A row holding inline `data`
+    /// under a media type no request may carry has already lost its image block; when its
+    /// `url` is a `data:` URL of that same payload, the resource-link fallback would hand
+    /// the whole base64 body to the model as prose, because
+    /// `RequestContentBlock::provider_text` renders a link's `uri` in full. Such a row
+    /// yields nothing. The scheme test is case-insensitive and runs on the sanitized
+    /// `uri`, so neither `DATA:` nor an invisible character in front of the scheme gets
+    /// the payload through. A refused image whose `url` points elsewhere is still a link,
+    /// as before, and that link never carries the payload.
+    #[test]
+    fn a_refused_image_with_a_data_url_is_dropped_rather_than_leaked_as_a_link() {
+        const PAYLOAD: &str =
+            "Qk06AAAAAAAAADYAAAAoAAAAAQAAAAEAAAABABgAAAAAAAQAAAATCwAAEwsAAAAAAAAAAAAAAAAA";
+        let refused = |url: &str| FilePartFields {
+            filename: Some("scan.bmp".to_owned()),
+            mime: Some("image/bmp".to_owned()),
+            data: Some(PAYLOAD.to_owned()),
+            url: Some(url.to_owned()),
+            title: None,
+            description: None,
+            size: Some(58),
+        };
+        for url in [
+            format!("data:image/bmp;base64,{PAYLOAD}"),
+            format!("DATA:image/bmp;base64,{PAYLOAD}"),
+            format!("\u{200b}data:image/bmp;base64,{PAYLOAD}"),
+        ] {
+            assert_eq!(
+                file_part_block(refused(&url)),
+                None,
+                "a refused image's own payload must not come back as a link: {url:?}"
+            );
+        }
+
+        let link = file_part_block(refused("https://example.test/scan.bmp"))
+            .expect("a refused image with an external url is still a link");
+        assert_eq!(
+            link,
+            RequestContentBlock::ResourceLink {
+                name: "scan.bmp".to_owned(),
+                uri: "https://example.test/scan.bmp".to_owned(),
+                title: None,
+                description: None,
+                media_type: Some("image/bmp".to_owned()),
+                size: Some(58),
+            }
+        );
+        let text = link
+            .provider_text()
+            .expect("a resource link has provider text");
+        assert!(
+            !text.contains(PAYLOAD),
+            "the link's prose must not carry the refused payload: {text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod attachment_resolve_budget_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{ATTACHMENT_RESOLVE, ATTACHMENT_RESOLVE_SLOTS, resolve_attachment_offloaded};
+
+    /// A 1x1 RGB PNG, small enough that the request policy resolves the admitted object
+    /// itself: one whole-object read, no refit.
+    const TINY_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mMQUDAAAACkAGEKm67eAAAAAElFTkSuQmCC";
+
+    /// A private data root that is removed even when an assertion panics first.
+    struct TempDataRoot(std::path::PathBuf);
+
+    impl TempDataRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("zuno-engine-resolve-budget-{}", std::process::id()));
+            let _ignored = std::fs::remove_dir_all(&root);
+            Self(root)
+        }
+    }
+
+    impl Drop for TempDataRoot {
+        fn drop(&mut self) {
+            let _ignored = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The bound is on work in flight, not on callers. With every slot held a resolution
+    /// must not run at all; once a slot is free it runs, and the slot comes back when the
+    /// work ends. Before, the offload took no permit: the same resolution completed with
+    /// every slot held, which is what "N concurrent turns are N unbounded blocking threads
+    /// at up to 900 MB each" looks like from inside one process.
+    ///
+    /// This is the only test in the unit binary that touches the process-wide budget; the
+    /// integration binaries are separate processes with their own statics.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resolution_waits_for_a_free_slot_and_returns_it_when_the_work_ends() {
+        let all = u32::try_from(ATTACHMENT_RESOLVE_SLOTS).expect("the budget fits a permit count");
+        let held = Arc::clone(&ATTACHMENT_RESOLVE)
+            .acquire_many_owned(all)
+            .await
+            .expect("the budget is open");
+        let root = TempDataRoot::new();
+        let store = Arc::new(
+            zuno_attachment::AttachmentStore::new(
+                &root.0,
+                "resolve-budget-test",
+                zuno_attachment::ImageAdmissionPolicy::default(),
+            )
+            .expect("create attachment store"),
+        );
+        let reference = store
+            .admit_base64_typed(TINY_PNG_BASE64, Some("image/png"), None)
+            .expect("admit tiny png");
+
+        let mut resolving = tokio::spawn(resolve_attachment_offloaded(
+            Arc::clone(&store),
+            reference.clone(),
+        ));
+        let early = tokio::time::timeout(Duration::from_millis(500), &mut resolving).await;
+        assert!(
+            early.is_err(),
+            "the resolution ran while every slot was held: {early:?}"
+        );
+        assert_eq!(ATTACHMENT_RESOLVE.available_permits(), 0);
+
+        drop(held);
+        let image = resolving
+            .await
+            .expect("the resolving task joins")
+            .expect("the object resolves once a slot is free");
+        assert_eq!(
+            image.media_type, reference.media_type,
+            "the object resolved is the one admitted"
+        );
+        assert_eq!(
+            ATTACHMENT_RESOLVE.available_permits(),
+            ATTACHMENT_RESOLVE_SLOTS,
+            "the slot is returned when the work ends"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolved_attachment_memo_tests {
+    use super::{RESOLVED_ATTACHMENT_MEMO_BYTES, ResolvedAttachments};
+
+    fn image(bytes: usize) -> zuno_attachment::ResolvedImage {
+        zuno_attachment::ResolvedImage {
+            media_type: String::new(),
+            data: "x".repeat(bytes),
+        }
+    }
+
+    fn id(digit: char) -> zuno_attachment::AttachmentId {
+        zuno_attachment::AttachmentId::parse(format!("sha256:{}", digit.to_string().repeat(64)))
+            .expect("a well-formed attachment id")
+    }
+
+    /// The ceiling is inclusive at exactly `RESOLVED_ATTACHMENT_MEMO_BYTES`, one byte
+    /// past it is resolved again rather than memoized, a refusal evicts nothing, and a
+    /// total that would overflow refuses instead of wrapping.
+    #[test]
+    fn the_memo_admits_exactly_its_byte_ceiling_and_nothing_past_it() {
+        let mut memo = ResolvedAttachments::new();
+        memo.remember(id('a'), &image(RESOLVED_ATTACHMENT_MEMO_BYTES));
+        assert!(
+            memo.get(&id('a')).is_some(),
+            "exactly the ceiling is retained"
+        );
+        memo.remember(id('b'), &image(1));
+        assert!(
+            memo.get(&id('b')).is_none(),
+            "one byte past the ceiling is not"
+        );
+        assert!(
+            memo.get(&id('a')).is_some(),
+            "a refused entry evicts nothing"
+        );
+
+        let mut memo = ResolvedAttachments::new();
+        memo.remember(id('c'), &image(RESOLVED_ATTACHMENT_MEMO_BYTES + 1));
+        assert!(
+            memo.get(&id('c')).is_none(),
+            "a lone payload over the ceiling is not"
+        );
+
+        let mut memo = ResolvedAttachments::new();
+        memo.retained_bytes = usize::MAX;
+        memo.remember(id('d'), &image(1));
+        assert!(
+            memo.get(&id('d')).is_none(),
+            "an overflowing total refuses, not wraps"
+        );
+    }
 }

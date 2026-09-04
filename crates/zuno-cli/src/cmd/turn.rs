@@ -85,10 +85,10 @@ use zuno_goal::{
     GoalStatus, GoalStore, GoalTerminalFailure, GoalTurnMode, GoalTurnOutcome, QueuedUserInput,
 };
 use zuno_learning::{
-    CompletedTaskSignals, ExperienceRetriever, ExperienceService, ExtractionRequest,
-    FeedbackService, LearningExtraction, LearningExtractor, LearningScheduleOutcome,
-    LearningScheduler, ManualExperienceRequest, PatternMiner, SkillCandidateService,
-    SkillSourceResolver,
+    CompletedTaskSignals, ExperienceRetriever, ExperienceService, ExtractionPersistence,
+    ExtractionRequest, FeedbackService, LearningExtraction, LearningExtractor,
+    LearningScheduleOutcome, LearningScheduler, ManualExperienceRequest, PatternMiner,
+    SkillCandidateService, SkillSourceResolver,
 };
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
 use zuno_llm::catalog::resolved::ModelEndpoint;
@@ -2264,6 +2264,13 @@ pub(crate) struct TurnHost {
     learning: Option<LearningRuntime>,
     learning_maintenance_cancel: Option<tokio_util::sync::CancellationToken>,
     learning_maintenance_task: Option<tokio::task::JoinHandle<()>>,
+    /// Whether this session has already been told that experience retrieval found
+    /// records it could not fit under `retrieval_max_context_tokens`.
+    ///
+    /// The retriever reports the same reason on every turn while the budget stays
+    /// below the framed floor; one notice per session says it without repeating it
+    /// on every prompt.
+    learning_retrieval_skip_noticed: bool,
 }
 
 struct LearningRuntime {
@@ -2972,6 +2979,40 @@ fn learning_transcript_json(transcript: &TurnTranscript) -> Vec<Value> {
         .collect()
 }
 
+/// One user-visible line per entry an extraction refused instead of stored.
+///
+/// The `warning: ` prefix is what the TUI keys on to put a status detail into the
+/// transcript as a notice rather than into the transient footer.
+fn extraction_refusal_lines(persisted: &ExtractionPersistence) -> Vec<String> {
+    persisted
+        .refusals
+        .iter()
+        .map(|refusal| {
+            format!(
+                "warning: learning extraction refused experience {} ({}): {}",
+                refusal.experience_ordinal, refusal.field, refusal.detail
+            )
+        })
+        .collect()
+}
+
+/// The refused entries in the shape the durable job `result` uses for `refusedItems`.
+fn extraction_refusals_value(persisted: &ExtractionPersistence) -> Value {
+    Value::Array(
+        persisted
+            .refusals
+            .iter()
+            .map(|refusal| {
+                json!({
+                    "experienceOrdinal": refusal.experience_ordinal,
+                    "field": refusal.field,
+                    "detail": refusal.detail,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn experience_value(record: &zuno_db::experience::ExperienceRecord) -> Value {
     let experience = &record.projection;
     json!({
@@ -3311,7 +3352,17 @@ async fn run_recovered_learning_job(
                             zuno_db::message::now_millis(),
                         )
                         .map_err(to_string)
-                        .and_then(|_| {
+                        .and_then(|persisted| {
+                            // A recovered job has no turn to report into; the refusal
+                            // lines go to the log here and stay durable in the job
+                            // row's `refusedItems`.
+                            for refusal in extraction_refusal_lines(&persisted) {
+                                tracing::warn!(
+                                    job_id = job.id,
+                                    refusal = %refusal,
+                                    "recovered learning extraction refused one entry"
+                                );
+                            }
                             run_due_learning_maintenance(
                                 &scheduler,
                                 &patterns,
@@ -3891,6 +3942,60 @@ impl TurnHost {
             }
         }
         let project_id = plan.project.id.clone();
+        // Both of these spawn git and block the calling thread, and every entry point
+        // that reaches this function drives a `new_current_thread` runtime, so on that
+        // runtime a blocked thread is the whole reactor: a `.git` on a stalled mount
+        // would freeze the session's timers, its cancellation, and its stream reads for
+        // the full ceiling. `assembled` below is a synchronous closure and cannot await,
+        // so they are resolved here, in the async frame, in the same order the closure
+        // used to reach them.
+        //
+        // `generated_root` is not resolved again at all. `worktree` above is
+        // `plan.project.directory` whenever git recognised a repository, and
+        // `plan.project` came from `resolve_project(&plan.directory)` — the same
+        // `discover_repository` call `zuno_paths::generated_root` would make from the same
+        // start path — so the answer is already in hand and asking for it costs three more
+        // `git rev-parse` calls for a value we hold. Outside a repository `generated_root`
+        // returns the directory itself, and `ShellTool` canonicalizes its workspace before
+        // resolving, so that branch canonicalizes too: both consumers then anchor their
+        // generated state at one spelling instead of the two they used to pick
+        // independently. Inside a repository the two spellings already agree, because
+        // `git rev-parse --show-toplevel` reports the physical top level whether it is
+        // asked through a symlinked path or through the real one.
+        let generated_root = match worktree.clone() {
+            Some(root) => root,
+            None => tokio::fs::canonicalize(&plan.directory)
+                .await
+                .unwrap_or_else(|_| plan.directory.clone()),
+        };
+        let exclude_note = match worktree.clone() {
+            None => None,
+            Some(root) => {
+                let outcome = tokio::task::spawn_blocking({
+                    let root = root.clone();
+                    move || zuno_paths::ensure_managed_block(&root, zuno_paths::IGNORE_PATTERNS)
+                })
+                .await
+                .map_err(to_string)?;
+                match outcome {
+                    // Silent when nothing changed: re-asserting the same block on every
+                    // session is the normal case and does not need reporting.
+                    Ok(outcome) if outcome.changed() => Some(format!(
+                        "excluded Zuno's generated state under {} from git in {}",
+                        zuno_paths::PROJECT_DIRECTORY,
+                        root.display()
+                    )),
+                    Ok(_) => None,
+                    // A note, never a failure. Running outside a repository is ordinary,
+                    // and a machine without git still deserves a working session; the
+                    // cost of not writing the block is a generated file the user sees in
+                    // `git status`, which is a nuisance and not a correctness problem.
+                    Err(error) => Some(format!(
+                        "warning: could not exclude generated paths from git: {error}"
+                    )),
+                }
+            }
+        };
         let assembled = (|| -> Result<Self, String> {
             let _profile_id = profile_runtime
                 .active_profile_id()
@@ -4013,26 +4118,10 @@ impl TurnHost {
             // `.gitignore`, because Zuno editing a file the repository's history owns
             // would land as an unexplained diff in somebody else's next commit. Once
             // per host: the call spawns git, and the block is idempotent, so a turn
-            // loop would pay for it repeatedly to learn nothing.
-            if let Some(worktree) = worktree.as_deref() {
-                match zuno_paths::ensure_managed_block(worktree, zuno_paths::IGNORE_PATTERNS) {
-                    // Silent when nothing changed: re-asserting the same block on every
-                    // session is the normal case and does not need reporting.
-                    Ok(outcome) if outcome.changed() => notes.push(format!(
-                        "excluded Zuno's generated state under {} from git in {}",
-                        zuno_paths::PROJECT_DIRECTORY,
-                        worktree.display()
-                    )),
-                    Ok(_) => {}
-                    // A note, never a failure. Running outside a repository is ordinary,
-                    // and a machine without git still deserves a working session; the
-                    // cost of not writing the block is a generated file the user sees in
-                    // `git status`, which is a nuisance and not a correctness problem.
-                    Err(error) => notes.push(format!(
-                        "warning: could not exclude generated paths from git: {error}"
-                    )),
-                }
-            }
+            // loop would pay for it repeatedly to learn nothing. It ran off-reactor
+            // above, in the async frame this closure cannot await from; all that is left
+            // here is to report it in the position the note has always occupied.
+            notes.extend(exclude_note);
             let learning = match plan.learning_model.take() {
                 Some(learning_model) if learning_settings.enabled => {
                     let model = learning_model.model;
@@ -4194,6 +4283,7 @@ impl TurnHost {
             let runtime_tools = super::tool_runtime::assemble(
                 &plan.directory,
                 worktree.as_deref(),
+                Some(generated_root.as_path()),
                 env,
                 &plan.config,
                 &plan.agent,
@@ -4419,6 +4509,7 @@ impl TurnHost {
                 learning,
                 learning_maintenance_cancel: None,
                 learning_maintenance_task: None,
+                learning_retrieval_skip_noticed: false,
             };
             let goal = if host.agent == "plan" {
                 host.goal_store
@@ -4775,6 +4866,28 @@ impl TurnHost {
                     "cancel" => zuno_goal::SystemStatus::Cancelled,
                     _ => unreachable!("closed goal system action"),
                 };
+                // Resuming is the explicit recovery action an uncertain side effect
+                // waits for, so it retires exactly the calls it can name. Without this
+                // the resume would not resume: the pending obligation is durable, and
+                // the next continuation tick would read it and pause again.
+                //
+                // Pausing and cancelling retire nothing. Neither claims anything was
+                // inspected, and a cancelled goal's evidence is still the evidence.
+                let reconciled = if action == "resume" {
+                    let pending = self
+                        .pending_uncertain_side_effects()
+                        .map_err(SessionCommandError::internal)?;
+                    let part_ids = pending
+                        .iter()
+                        .map(|call| call.part_id.clone())
+                        .collect::<Vec<_>>();
+                    zuno_db::message::MessageStore::new(&self.connection)
+                        .reconcile_uncertain_tool_calls(&part_ids, zuno_db::message::now_millis())
+                        .map_err(SessionCommandError::internal)?;
+                    pending
+                } else {
+                    Vec::new()
+                };
                 let expected_revision = self
                     .goal_store
                     .goal(&self.session_id)
@@ -4795,7 +4908,17 @@ impl TurnHost {
                         )
                     })?;
                 changed = true;
-                serde_json::to_value(goal).map_err(SessionCommandError::internal)?
+                let mut output =
+                    serde_json::to_value(goal).map_err(SessionCommandError::internal)?;
+                if !reconciled.is_empty()
+                    && let Some(object) = output.as_object_mut()
+                {
+                    object.insert(
+                        "reconciledUncertainCalls".to_owned(),
+                        serde_json::to_value(&reconciled).map_err(SessionCommandError::internal)?,
+                    );
+                }
+                output
             }
             "block" => {
                 if value.is_empty() {
@@ -4966,13 +5089,21 @@ impl TurnHost {
             .into_iter()
             .filter(|request| human_request_belongs_to_goal(request.goal_id.as_deref(), goal_id))
             .collect::<Vec<_>>();
+        // A goal paused for `uncertain_side_effect` will not resume until someone
+        // inspects the state its call may have changed. Naming those calls, and the
+        // paths they reported, is what makes the pause actionable instead of a dead
+        // end — the reason is the diagnosis and this is the evidence.
+        let pending_uncertain_calls = self
+            .pending_uncertain_side_effects()
+            .map_err(SessionCommandError::internal)?;
         Ok(json!({
             "revision": goal.as_ref().map(|goal| goal.revision),
             "goal": goal,
             "pause": pause,
             "retry": retry,
             "providerBackoff": provider_backoff,
-            "pendingHumanRequests": pending_human_requests
+            "pendingHumanRequests": pending_human_requests,
+            "pendingUncertainCalls": pending_uncertain_calls
         }))
     }
 
@@ -5812,6 +5943,7 @@ impl TurnHost {
                     "rejectedReason": promotion.rejected_reason,
                 }))
                 .collect::<Vec<_>>(),
+            "refusedItems": extraction_refusals_value(&persisted),
         }))
     }
 
@@ -7374,6 +7506,18 @@ impl TurnHost {
         } else {
             QueuedUserInput::Absent
         };
+        // Ahead of every start guard, because this one survives a process that died
+        // before it could record the pause: the guards read goal status and retry
+        // state, and neither was written by the turn that lost its outcome.
+        match self.pause_for_uncertain_side_effects()? {
+            UncertainSideEffects::None => {}
+            UncertainSideEffects::JustPaused => {
+                self.write_goal_projection()?;
+                self.work_changes.changed();
+                return Ok(false);
+            }
+            UncertainSideEffects::AlreadyPaused => return Ok(false),
+        }
         let prepared = match self
             .goal_continuation
             .prepare_if_idle(&self.session_id, mode, queued_input)
@@ -7641,6 +7785,22 @@ impl TurnHost {
                 .retriever
                 .retrieve(&self.project_id, &query)
                 .map_err(TurnFailure::host)?;
+            if let Some(reason) = &retrieved.skipped_reason
+                && !self.learning_retrieval_skip_noticed
+            {
+                // Matching records exist but none fits the configured budget. Without
+                // this the section is empty and the turn looks like one in a project
+                // that has learned nothing.
+                self.learning_retrieval_skip_noticed = true;
+                events
+                    .publish(TurnEvent::Notice {
+                        severity: NoticeSeverity::Warning,
+                        code: "learning.retrieval_skipped".to_owned(),
+                        detail: reason.clone(),
+                    })
+                    .await
+                    .map_err(TurnFailure::host)?;
+            }
             resolver
                 .append_prompt_section(
                     "learning.experiences",
@@ -7824,7 +7984,14 @@ impl TurnHost {
                 unresolved_tool_failures,
                 ..
             }) => {
-                if let Some(failure) = goal_tool_failure(unresolved_tool_failures) {
+                // Ordered ahead of the retry decision on purpose. A turn can end
+                // holding both a retryable failure and a call that changed state it
+                // could not account for, and scheduling the retry would be the one
+                // thing an uncertain outcome forbids.
+                if self.pause_for_uncertain_side_effects()?.blocks_execution() {
+                    // Nothing else to record: the pause is terminal for this turn, and
+                    // a retry scheduled underneath it would outlive the pause.
+                } else if let Some(failure) = goal_tool_failure(unresolved_tool_failures) {
                     self.goal_continuation
                         .record_terminal_failure(&self.session_id, failure)
                         .map_err(to_string)?;
@@ -8020,21 +8187,41 @@ impl TurnHost {
         let project_id = self.project_id.clone();
         let project_root = self.project_root.clone();
         let changes = self.work_changes.clone();
+        let events = events.clone();
+        let step = *steps;
         let supervised = tokio::spawn(async move {
             match extractor.extract(request).await {
-                Ok(extraction) => {
-                    if let Err(error) = experiences.persist_extraction(
-                        &job_id,
-                        &owner_id,
-                        extraction,
-                        zuno_db::message::now_millis(),
-                    ) {
+                Ok(extraction) => match experiences.persist_extraction(
+                    &job_id,
+                    &owner_id,
+                    extraction,
+                    zuno_db::message::now_millis(),
+                ) {
+                    Err(error) => {
                         tracing::warn!(
                             job_id,
                             error = %error,
                             "learning extraction outcome could not be persisted"
                         );
-                    } else {
+                    }
+                    Ok(persisted) => {
+                        // An extraction that stored two of three entries is a different
+                        // outcome from one that stored three. The reason is durable in
+                        // the job row; this is the line the user sees, on the same path
+                        // the other learning warnings above take.
+                        for detail in extraction_refusal_lines(&persisted) {
+                            tracing::warn!(
+                                job_id,
+                                refusal = %detail,
+                                "learning extraction refused one entry"
+                            );
+                            let _ = events
+                                .publish(TurnEvent::Provider {
+                                    step,
+                                    event: StreamEvent::StatusDetail { detail },
+                                })
+                                .await;
+                        }
                         if let Err(error) = run_due_learning_maintenance(
                             &scheduler,
                             &patterns,
@@ -8052,7 +8239,7 @@ impl TurnHost {
                         }
                         changes.changed();
                     }
-                }
+                },
                 Err(error) => {
                     if let Err(settle_error) = scheduler.fail(
                         &job_id,
@@ -8157,6 +8344,65 @@ impl TurnHost {
     /// Writes the criteria with the goal rather than the goal alone: the document is
     /// what a human reads to see where the run stands, and a checklist that never
     /// appears there makes an evidence-gated goal look like it is waiting on nothing.
+    /// Tool calls of the active goal instance that owe an inspection.
+    ///
+    /// Read from the durable tool records rather than from the turn that produced
+    /// them, and that is the point. A call's disposition is written in the same
+    /// statement that makes its result model-visible, so this answer is the same
+    /// whether the turn just ended, the process died between persisting the result
+    /// and accounting for it, or a different client opened the database afterwards.
+    /// Recomputing it from a live signal would give the pause a second source of
+    /// truth that can disagree with the record — the failure this whole path exists
+    /// to prevent.
+    ///
+    /// Empty when no goal is active: an uncertain call still demands inspection, but
+    /// it demands it of the human reading the transcript, and there is no automatic
+    /// execution to suspend. Scoped to the goal instance so a fresh objective does
+    /// not inherit an obligation the previous one incurred.
+    fn pending_uncertain_side_effects(
+        &self,
+    ) -> Result<Vec<zuno_db::message::UncertainToolCall>, String> {
+        let Some(goal) = self.goal_store.goal(&self.session_id).map_err(to_string)? else {
+            return Ok(Vec::new());
+        };
+        zuno_db::message::MessageStore::new(&self.connection)
+            .pending_uncertain_tool_calls(&self.session_id, goal.created_at_ms)
+            .map_err(to_string)
+    }
+
+    /// Suspend automatic execution while any call of this goal owes an inspection.
+    ///
+    /// Called from both ends of the window: at the end of the turn that produced the
+    /// call, so the status surface is right immediately, and before any later turn may
+    /// start, which is what closes the crash window between those two points. Both read
+    /// the same durable set, so the second is a backstop rather than a second opinion.
+    fn pause_for_uncertain_side_effects(&mut self) -> Result<UncertainSideEffects, String> {
+        let pending = self.pending_uncertain_side_effects()?;
+        if pending.is_empty() {
+            return Ok(UncertainSideEffects::None);
+        }
+        // Whether the pause is already recorded has to be answered before recording it,
+        // and not as an optimization. A continuation driver asks this question on every
+        // idle tick, so a guard that rewrote the row and republished the projection each
+        // time would turn one stopped goal into an unbounded stream of identical client
+        // notifications — the goal would look busy precisely because it is not.
+        let recorded = self
+            .goal_store
+            .pause_state(&self.session_id)
+            .map_err(to_string)?
+            .is_some_and(|pause| pause.reason == zuno_goal::GoalPauseReason::UncertainSideEffect);
+        if recorded {
+            return Ok(UncertainSideEffects::AlreadyPaused);
+        }
+        self.goal_continuation
+            .record_terminal_failure(
+                &self.session_id,
+                GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::UncertainSideEffect),
+            )
+            .map_err(to_string)?;
+        Ok(UncertainSideEffects::JustPaused)
+    }
+
     fn write_goal_projection(&self) -> Result<(), String> {
         if let Some(goal) = self.goal_store.goal(&self.session_id).map_err(to_string)? {
             let criteria = self
@@ -8326,6 +8572,28 @@ fn human_request_summary(payload: &Value) -> Option<String> {
         })
         .or_else(|| payload.get("action").and_then(Value::as_str))
         .map(str::to_owned)
+}
+
+/// What the durable pending set decided about letting the goal run.
+///
+/// Three states rather than a boolean because the callers need different halves of the
+/// answer: every caller has to know whether execution may proceed, and only the caller
+/// that publishes to clients has to know whether anything actually changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UncertainSideEffects {
+    /// No call of this goal owes an inspection.
+    None,
+    /// A call owes an inspection and the durable pause already says so.
+    AlreadyPaused,
+    /// A call owes an inspection and this consultation is what recorded the pause.
+    JustPaused,
+}
+
+impl UncertainSideEffects {
+    /// Whether automatic execution must stay suspended.
+    const fn blocks_execution(self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 fn goal_tool_failure(recoveries: &[ToolFailureRecovery]) -> Option<GoalTerminalFailure> {

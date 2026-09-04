@@ -97,10 +97,13 @@ that variable, Zuno does not persist rotated OAuth tokens back to disk, because
 there is no file it owns.
 
 The variable is withheld from the `shell` tool, so a command the model composes
-cannot read the injected credentials. A nested `zuno` started from inside such a
-command therefore does not inherit them and resolves credentials the ordinary way,
-which means it needs its own credential store or configuration. Plan for that in a
-container that supplies credentials only through the environment. See
+cannot read the injected credentials. The whole `ZUNO_*` namespace is withheld, not
+just this variable, which closes the same leak by the other route: an inline
+`provider.<id>.options.apiKey` supplied through `ZUNO_CONFIG_CONTENT` is a provider
+credential too, and it is withheld as well. A nested `zuno` started from inside such
+a command therefore inherits neither, and resolves configuration and credentials the
+ordinary way, which means it needs its own credential store or configuration. Plan
+for that in a container that supplies credentials only through the environment. See
 [Tools](/guide/tools#what-a-shell-command-inherits).
 
 Putting `apiKey` directly in `zuno.json` is supported but exposes a secret to
@@ -108,6 +111,41 @@ configuration backups and source control. Prefer the credential store or an inje
 `ZUNO_AUTH_CONTENT`. If you do use `options.apiKey`, keep it out of any layer that
 gets committed; see [Variables and substitution](/config/variables) for reading a
 value from a file or environment instead.
+
+## When the credential file is damaged or newer than this build
+
+A credential file that exists but holds no store — zero bytes, or nothing but
+whitespace, which is what an interrupted write or a truncation from outside leaves
+behind — no longer fails every command that touches it. A read reports an empty store
+together with the damage it found, so `zuno auth list`, `zuno auth login` and the model
+catalogue keep working, and the next write publishes a whole store over it. The finding
+is logged at error level once per file per process: the credentials that were in it are
+gone, and logging in again is not the same as getting them back, so restore a backup if
+those credentials mattered.
+
+An entry Zuno cannot decode is kept, not dropped. A credential written by a newer Zuno,
+a hand edit, or an authentication shape this build does not model would otherwise be
+deleted by the first `zuno auth login` for any *other* provider, with the loss visible
+only in a log line. The same holds one level down: a field a newer Zuno added to an
+entry this build does understand is written back as it was found — on the entry being
+changed as well as on every entry the write never touched.
+
+Two omissions there are deliberate. `zuno auth login <provider>` replaces that
+provider's credential outright, so unrecognized fields carried on the credential it
+replaced are dropped rather than re-attached: a device binding or a rotation stamp
+issued for the old token is not a claim about the new one, and a newer Zuno writing the
+entry again restores them. And a field this build *does* model is always written from
+the value Zuno holds, so clearing a credential really clears it.
+
+Preservation is not a promise about bytes. A preserved entry is republished as the same
+JSON value, re-encoded by Zuno, so indentation and the key order inside the object are
+the encoder's.
+
+An entry this build cannot decode is not yet reachable from the command line:
+`zuno auth list` does not list it, `zuno auth logout` answers
+`Unknown configured provider`, and `zuno mcp logout` refuses while any entry in
+`mcp-auth.json` is undecodable. Removing such an entry means editing the file. No Zuno
+write ever deletes it.
 
 ## Inspecting without leaking
 

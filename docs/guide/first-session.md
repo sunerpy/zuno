@@ -141,6 +141,14 @@ Those four answer most questions: what the effective policy is, what the model a
 received, what the agent's resolved capability surface is, and whether delegation created
 child sessions you have not looked at.
 
+If a session looks like it lost its history, check whether the checkout is on an
+unresponsive mount: Zuno waits about ten seconds per git query and then continues as if
+the directory were in no repository, which puts the project id back to `global` and writes
+`.zuno` state under the current directory instead of the worktree root. The same ten-second
+ceiling applies to the git exclude query, which has a different consequence — the session
+starts, but without the exclude block; see
+[Durable state](/guide/durable-state) for what that leaves visible.
+
 ## See also
 
 - [Sessions and turns](/guide/sessions)

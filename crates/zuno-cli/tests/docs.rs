@@ -1093,6 +1093,9 @@ fn architecture_documents_pin_the_native_harness_decisions() {
             "ZUNO_AUTH_CONTENT",
             "transport",
             "myopenai",
+            "StoreDamage",
+            "preserved",
+            "ABSENCE_CONFIRMATION",
         ],
     );
     contains_all(
@@ -1103,6 +1106,8 @@ fn architecture_documents_pin_the_native_harness_decisions() {
             "subagent_claude_code",
             "app-server",
             "stream-json",
+            "permission_denials",
+            "codexErrorInfo",
             "ToolReplayPolicy::Never",
             "JobSubject",
             "uncertain",
@@ -1756,7 +1761,7 @@ fn durable_state_guides_document_evidence_gated_completion() {
             "[verification rcp_",
             "Cite this id as evidence",
             "inferred rather than observed",
-            "Evidence expires",
+            "Evidence is bounded at both ends",
             "[goal evidence]",
             "turns a question goal into a change goal",
             "`.git/info/exclude`",
@@ -1799,7 +1804,7 @@ fn durable_state_guides_document_evidence_gated_completion() {
             "`waive_criteria`",
             "[verification rcp_",
             "推断得来、而非直接观测到的",
-            "证据会过期",
+            "证据在两端都有边界",
             "[goal evidence]",
             "转成 change Goal",
             "`.git/info/exclude`",
@@ -2348,4 +2353,426 @@ fn resume_docs_pin_the_saved_agent_model_and_level_precedence() {
     );
     refuses_all("docs/guide/agents.md", &["so a resume restores the mode."]);
     refuses_all("docs/zh/guide/agents.md", &["因此续跑会恢复该模式。"]);
+}
+
+/// Plan mode is a no-mutation boundary, not a shell-free one. Two guides said the opposite
+/// of the overlay two tests already pin, and a reader who believed them would treat Plan as
+/// a confidentiality boundary it never was.
+#[test]
+fn plan_mode_docs_do_not_claim_a_shell_free_boundary() {
+    for page in ["docs/guide/durable-state.md", "docs/guide/agents.md"] {
+        let text = read(page);
+        assert!(
+            !text.contains("denying shell"),
+            "{page} must not claim Plan mode denies shell"
+        );
+    }
+    contains_all(
+        "docs/guide/durable-state.md",
+        &["Plan mode is a no-mutation boundary, not a shell-free one"],
+    );
+    for page in ["docs/zh/guide/durable-state.md", "docs/zh/guide/agents.md"] {
+        let text = read(page);
+        assert!(
+            !text.contains("拒绝 shell"),
+            "{page} must not claim Plan mode denies shell"
+        );
+    }
+    contains_all(
+        "docs/zh/guide/durable-state.md",
+        &["是一条“不得修改”的边界，而不是一条“没有 shell”的边界"],
+    );
+}
+
+/// The claim a reader depends on is that the obligation outlives the pause row, and that
+/// one named action is what retires it. Both languages have to make it.
+#[test]
+fn uncertain_side_effect_docs_pin_the_durable_obligation_and_its_recovery_action() {
+    contains_all(
+        "docs/harness-runtime.md",
+        &[
+            "The obligation is durable on the tool record",
+            "`state.uncertain` with the tool id, the call id",
+            "`lost_outcome` or `interrupted`",
+            "A process that dies after that write",
+            "does not\n  inherit the previous objective's obligations",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/harness-runtime.md",
+        &[
+            "这份义务落在工具记录上，而不是 pause 上",
+            "`lost_outcome` 或 `interrupted`",
+            "进程若死在这次写入之后、pause 行落盘之前",
+            "所以新目标不会继承上一个目标的义务",
+        ],
+    );
+    contains_all(
+        "docs/guide/durable-state.md",
+        &[
+            "`pendingUncertainCalls`, one entry per uncertain call",
+            "`/goal resume`\nis the explicit statement that those states were inspected",
+            "retire nothing, because neither claims an inspection\nhappened",
+            "`interrupted` for a claim the interruption left unsettled",
+            "leaves the pause missing and the obligation intact",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/durable-state.md",
+        &[
+            "`/goal show` 给出 `pendingUncertainCalls`",
+            "就是“这些状态已经检查过了”这句话本身",
+            "不结清任何一条，因为它们都没有声称检查已经发生",
+            "中断留下未结算声明是 `interrupted`",
+            "pause 缺失而\n义务仍在",
+        ],
+    );
+}
+
+/// The clipboard ladder is a platform behavior, so a reader on any host has to be able to
+/// find out which helper their host reaches for and what happens when none is installed.
+///
+/// The `stdin` sentence is the one that matters most and the one most likely to be dropped
+/// as an implementation detail: it is the user-facing statement of why copying a transcript
+/// message cannot execute what that message contained.
+#[test]
+fn clipboard_docs_name_the_ladder_and_the_stdin_contract() {
+    contains_all(
+        "docs/guide/tui.md",
+        &[
+            "Copy prefers OSC 52",
+            "`pbcopy` on macOS",
+            "`wl-copy`, `xclip`, or `xsel` on Linux",
+            "`Set-Clipboard` through PowerShell on Windows",
+            "reports that no clipboard is\navailable instead of appearing to copy",
+            "never as a script to run",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/tui.md",
+        &[
+            "复制优先使用 OSC 52",
+            "macOS 上是 `pbcopy`",
+            "Linux 上是 `wl-copy`、`xclip` 或 `xsel`",
+            "Windows 上是通过 PowerShell 的 `Set-Clipboard`",
+            "报告没有可用剪贴板",
+            "绝不当作要执行的脚本",
+        ],
+    );
+}
+
+/// A remote `index.json` is untrusted input, and its entry `name` decides a directory that
+/// a versioned refresh renames aside and then deletes. The single-segment rule is what keeps
+/// that directory inside the download cache instead of anywhere the index chooses, so both
+/// languages have to state the rule, that a rejected entry downloads nothing, and the
+/// stage-and-swap reason the rule exists — a reader who only learns "names are validated"
+/// cannot tell that a lax name once reached their own `skill/` directory.
+///
+/// `:` is pinned alongside the two separators because it is the character whose meaning
+/// differs by platform: `C:evil` is drive-relative on Windows and an ordinary name on
+/// Linux, and `SKILL.md:$DATA` names a Windows alternate data stream with no drive letter
+/// in it. A page that lists only `/` and `\\` tells a reader the rule is about path
+/// separators, so an index author would reasonably expect a `:` name to work.
+#[test]
+fn remote_skill_index_docs_pin_the_single_segment_entry_name_rule() {
+    contains_all(
+        "docs/config/authoring-skills.md",
+        &[
+            "`name` must be a single directory segment",
+            "is not a single directory segment",
+            "nothing is downloaded for it",
+            "stages the download beside it",
+            "Both separators and `:` are refused on every platform",
+            "`SKILL.md:$DATA`",
+        ],
+    );
+    contains_all(
+        "docs/guide/skills.md",
+        &[
+            "`name` must be a single directory segment",
+            "nothing is downloaded for",
+            "/config/authoring-skills#remote-skill-indexes",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/authoring-skills.md",
+        &[
+            "`name` 必须是单个目录段",
+            "is not a single directory segment",
+            "不会为它下载任何东西",
+            "把下载内容暂存在旁边",
+            "两种分隔符与 `:` 在所有平台上都被拒绝",
+            "`SKILL.md:$DATA`",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/skills.md",
+        &[
+            "`name` 必须是单个目录段",
+            "不会为它们下载任何东西",
+            "/zh/config/authoring-skills#远端-skill-索引",
+        ],
+    );
+}
+
+/// Two `tools` entries that fold onto one permission key used to load, with whichever entry
+/// came last silently winning, so a block a reader took for a denial could have been granting
+/// the tool. It is now a validation error, which means a configuration that loaded before
+/// stops loading — the kind of change a reader has to find in the reference rather than in a
+/// failed startup. The refusal is scoped to one layer, and a reader who takes it for the
+/// merged view would conclude that a global `write` and a project `edit` cannot coexist, so
+/// pin the scope alongside the refusal text and the breaking-change notice in both languages.
+#[test]
+fn colliding_tools_keys_docs_pin_the_refusal_and_name_it_breaking() {
+    const MESSAGE: &str = "tools \"edit\" is false and tools \"write\" is true, but both are \
+                           governed by permission \"edit\"";
+    const REMEDY: &str =
+        "one rule cannot be both, so set them alike or write the rule under permission.rules.edit";
+    for page in [
+        "docs/reference/configuration.md",
+        "docs/guide/permissions.md",
+    ] {
+        contains_all(
+            page,
+            &[
+                MESSAGE,
+                REMEDY,
+                "**This is a breaking change**",
+                "State the intent once under",
+                "in one configuration layer",
+                "an override rather than a contradiction",
+            ],
+        );
+    }
+    for page in [
+        "docs/zh/config/reference.md",
+        "docs/zh/guide/permissions.md",
+    ] {
+        contains_all(
+            page,
+            &[
+                MESSAGE,
+                REMEDY,
+                "**这是一处不兼容变更**",
+                "把两个条目设成相同的值仍然可以加载",
+                "同一个配置层内",
+                "这属于覆盖，而不是矛盾",
+            ],
+        );
+    }
+}
+
+/// Batch 3 measured four statements in the guides against the code and found each one
+/// stale: the off-reactor budget count omitted the prompt-admission budget
+/// (`ADMISSION_SLOTS` in `crates/zuno-server/src/api/blocking.rs`), the HTTP
+/// `prompt.files[].mimeType` rule and the legacy `filename` projection were undocumented,
+/// the dispatch-tracking upgrade boundary named 0.6.6 where every release through 0.9.0
+/// wrote untracked rows, the `message`-field caveat described a leak the MCP drain no
+/// longer has, and the standing-grant sentence claimed the grant was an audit row when the
+/// broker keeps it in memory and writes one settled row per pre-approved call.
+#[test]
+fn batch3_docs_pin_the_admission_budget_standing_rows_and_upgrade_boundary() {
+    contains_all(
+        "docs/guide/headless.md",
+        &[
+            "two inline image decodes for\n`POST /api/session/{sessionID}/prompt`",
+            "a\nprompt without files never waits for a slot",
+            "already-settled request row (`source: \"standing\"`)",
+            "the grant itself is never written",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/headless.md",
+        &[
+            "这四组端点",
+            "在整个进程内同时最多 2 个",
+            "不带文件的 prompt 从不为名额等待",
+            "已结算的请求行（`source: \"standing\"`）",
+            "授权本身从不落盘",
+        ],
+    );
+    contains_all(
+        "docs/guide/permissions.md",
+        &[
+            "already-settled request row",
+            "{\"reply\":\"once\",\"source\":\"standing\"}",
+            "the grant itself is never written",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/permissions.md",
+        &[
+            "已结算的请求行",
+            "{\"reply\":\"once\",\"source\":\"standing\"}",
+            "授权本身从不落盘",
+        ],
+    );
+    contains_all(
+        "docs/reference/attachments.md",
+        &[
+            "`prompt.files[].mimeType`",
+            "RFC 2045",
+            "five aliases browsers emit: `image/apng`,\n`image/x-png`, and `image/vnd.mozilla.apng` for PNG",
+            "only PNG, JPEG, GIF and\nWebP images are accepted",
+            "Every other `image/` subtype",
+            "sanitizes each field on its way into a\nmodel request instead",
+            "leaves the stored row as written",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/attachments.md",
+        &[
+            "`prompt.files[].mimeType`",
+            "RFC 2045",
+            "PNG 的 `image/apng`、`image/x-png`、`image/vnd.mozilla.apng`，以及 JPEG 的 `image/jpg`、`image/pjpeg`",
+            "only PNG, JPEG, GIF and WebP images are accepted",
+            "其他任何 `image/` 子类型",
+            "不改写已存储的行",
+            "投影进模型请求时逐一净化",
+        ],
+    );
+    contains_all(
+        "docs/guide/durable-state.md",
+        &[
+            "any release up\nto and including 0.9.0",
+            "`zuno-unnamed-call-<position>`",
+            "`call_…`, `fc_…`, `toolu_…`",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/durable-state.md",
+        &[
+            "0.9.0 及更早的任何版本",
+            "`zuno-unnamed-call-<position>`",
+            "`call_…`、`fc_…`、`toolu_…`",
+        ],
+    );
+    contains_all(
+        "docs/logging.md",
+        &[
+            "Zuno's own emitters keep\n  external text out of `message`",
+            "is logged under\n  `stderr`, which is redacted",
+            "`no_crate_emits_an_unexpected_message_field`",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/logging.md",
+        &[
+            "不会把外部文本放进 `message`",
+            "记录在 `stderr`",
+            "`no_crate_emits_an_unexpected_message_field`",
+        ],
+    );
+    for (relative, retired) in [
+        (
+            "docs/guide/headless.md",
+            "standing grant an `always` reply installs is written",
+        ),
+        ("docs/zh/guide/headless.md", "写入独立的审计行"),
+        ("docs/zh/guide/headless.md", "这三组端点"),
+        (
+            "docs/guide/permissions.md",
+            "standing grant an `always` reply installs is written",
+        ),
+        ("docs/zh/guide/permissions.md", "写入独立的审计行"),
+        ("docs/guide/durable-state.md", "from 0.6.6"),
+        ("docs/zh/guide/durable-state.md", "从 0.6.6 升级"),
+        ("docs/logging.md", "Some Zuno callsites still"),
+        ("docs/zh/operate/logging.md", "仍有若干调用点"),
+    ] {
+        assert!(
+            !read(relative).contains(retired),
+            "{relative} still carries retired wording {retired:?}"
+        );
+    }
+}
+
+/// `PermissionResolution::settle` and `QuestionResolution::settle` detach the commit and
+/// everything after it from the HTTP handler's future, and `establish_in_turn` reports a
+/// walk its own ceilings cut short as `TransportFailure::Abandoned`. The guides pin what a
+/// client observes: a committed reply is final even when the connection drops before the
+/// `204`, its retry answers `404`, and a truncated address walk is a permanent failure for
+/// that resolution rather than a retryable timeout.
+#[test]
+fn batch3_docs_pin_committed_replies_and_abandoned_address_walks() {
+    contains_all(
+        "docs/guide/headless.md",
+        &["because the request is no longer pending, not because the reply was lost"],
+    );
+    contains_all("docs/zh/guide/headless.md", &["而不是回复丢失了"]);
+    contains_all(
+        "docs/guide/permissions.md",
+        &["A reply that has committed is final"],
+    );
+    contains_all("docs/zh/guide/permissions.md", &["已提交的回复是终态的"]);
+    contains_all(
+        "docs/reference/providers.md",
+        &["`gave up after N of M validated addresses`"],
+    );
+    contains_all(
+        "docs/zh/config/providers.md",
+        &["不会按退避重试；新的请求会重新解析域名并重新遍历"],
+    );
+}
+
+/// `zuno providers login <url>` runs a program the remote host names. The CLI reference
+/// pages mirror clap's help by hand, so the `--trust-remote-command` row, the tightened
+/// loopback guard, and the `Run this command` confirmation are pinned here rather than
+/// generated, and the two providers reference pages must point at that section.
+#[test]
+fn providers_login_docs_pin_the_remote_command_confirmation_and_trust_flag() {
+    contains_all(
+        "docs/cli/providers.md",
+        &[
+            "| `--trust-remote-command` |",
+            "shown for confirmation before it starts",
+            "`http://127.0.0.1.attacker.example`",
+            "asks `Run this command` with `No` preselected",
+            "refused before anything is fetched",
+        ],
+    );
+    contains_all(
+        "docs/zh/cli/providers.md",
+        &[
+            "| `--trust-remote-command` |",
+            "运行前会先显示并请求确认",
+            "`http://127.0.0.1.attacker.example`",
+            "以 `Run this command` 询问，默认选中 `No`",
+            "该选项对 provider 登录会被拒绝",
+        ],
+    );
+    for relative in ["docs/reference/providers.md", "docs/zh/config/providers.md"] {
+        contains_all(relative, &["`--trust-remote-command`", "`providers login`"]);
+    }
+}
+
+/// The Shell gate's wrapper walk (`wrapper_readings` in `crates/zuno-tools/src/risk.rs`)
+/// reads a command line through `sudo`, `env`, `timeout` and the other wrappers in
+/// `WRAPPER_COMMANDS`. The configuration reference pins the rules a user can observe: an
+/// option the gate does not know is read both ways, `timeout` needs a duration it accepts
+/// before the next word is the program, a second computed word among a wrapper's options
+/// is read as a possible program and may cost a confirmation, and a line that could not
+/// be split reliably is held for a human.
+#[test]
+fn wrapper_program_docs_pin_the_fork_rule_and_the_timeout_duration() {
+    contains_all(
+        "docs/reference/configuration.md",
+        &[
+            "### Wrapper programs",
+            "An option the gate does not recognise is read both ways",
+            "`timeout` needs a duration it accepts",
+            "computed words among a wrapper's options may now ask for confirmation",
+            "the line could not be split",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/reference.md",
+        &[
+            "### 包装程序",
+            "门禁不认识的选项会按两种方式读取",
+            "`timeout` 需要一个它能接受的时长",
+            "因为第二个计算词被当作可能的程序来读取",
+            "无法被可靠地切分",
+        ],
+    );
 }

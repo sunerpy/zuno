@@ -27,6 +27,18 @@
 //! the moment it writes a file git never reads, at which point the generated files
 //! are still dirty and nothing says why.
 //!
+//! # And why the question has a deadline
+//!
+//! Asking git is a subprocess, and a subprocess reading a `.git` on an unresponsive
+//! network mount does not fail — it waits, in a kernel call with nothing to time it
+//! out — and neither does a git that started a credential helper which is itself
+//! waiting. [`resolve_exclude_path`] is synchronous and is reached during host
+//! assembly, so an unbounded wait there is not one slow answer but a session that
+//! never starts. The call is bounded by [`crate::bounded::GIT_TIMEOUT`] and a git that
+//! outstays it is killed. That outcome is [`ExcludeError::GitTimedOut`] and not one of
+//! the failures beside it, because nothing else here is true of it: git started, git
+//! did not object, and whether this directory is a repository is still unknown.
+//!
 //! # What a managed block is for
 //!
 //! [`ensure_managed_block`] maintains exactly one marker-delimited block. Content
@@ -41,10 +53,11 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::bounded::{self, GIT_TIMEOUT};
 use crate::generated::{ANY_DEPTH, GENERATED_PATHS, IGNORE_PATTERNS};
 use crate::project::resolve_git_path;
 
@@ -141,6 +154,31 @@ pub enum ExcludeError {
         message: String,
     },
 
+    /// `git` was still running when its ceiling ran out, and was killed.
+    ///
+    /// A `.git` on an unresponsive network mount, or a credential helper waiting on
+    /// input that will never come: git does not fail in either case, it waits, and
+    /// this call is synchronous. Distinct from the three failures above because none
+    /// of them is true here — git was started, it did not object, and whether this
+    /// directory is a repository is still unknown — and because a caller deciding
+    /// between reporting a broken mount and retrying later must not have to read that
+    /// out of a rendered message.
+    ///
+    /// Nothing was written, and nothing about the repository was learned. Whether the
+    /// managed block is already in place is exactly as unknown as it was before the
+    /// call.
+    #[error(
+        "git rev-parse --git-path {EXCLUDE_GIT_PATH} did not answer within {ceiling:?} in {}",
+        worktree.display()
+    )]
+    GitTimedOut {
+        /// The directory git ran in.
+        worktree: PathBuf,
+        /// The ceiling git outstayed, so a report can name it without the reader
+        /// having to know this crate's constants.
+        ceiling: Duration,
+    },
+
     /// The filesystem refused to read or replace the exclude file.
     ///
     /// When the exclude file is a symbolic link, `path` is the file the link resolves
@@ -186,23 +224,44 @@ pub enum ExcludeError {
 ///
 /// [`ExcludeError::GitUnavailable`] when git cannot be started.
 /// [`ExcludeError::NotARepository`] when git reports no repository at or above
-/// `worktree`. [`ExcludeError::GitFailed`] for any other non-zero exit, carrying
-/// git's own message, or when git reports a path this crate cannot represent as
-/// text. Nothing is written in any case.
+/// `worktree`. [`ExcludeError::GitTimedOut`] when git is still running after
+/// [`crate::bounded::GIT_TIMEOUT`] and has to be killed.
+/// [`ExcludeError::GitFailed`] for any other non-zero exit, carrying git's own
+/// message, when git reports a path this crate cannot represent as text, or when its
+/// output could not be collected. Nothing is written in any case.
 pub fn resolve_exclude_path(worktree: &Path) -> Result<PathBuf, ExcludeError> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["rev-parse", "--git-path", EXCLUDE_GIT_PATH])
         .current_dir(worktree)
-        .stdin(Stdio::null())
         // Pin the message locale so the classification below reads git's own words
         // rather than a translation of them.
         .env("LC_ALL", "C")
-        .env("LANGUAGE", "C")
-        .output()
-        .map_err(|source| ExcludeError::GitUnavailable {
+        .env("LANGUAGE", "C");
+    // Both pipes are drained, not just stdout: the classification below is made from
+    // git's stderr, so discarding it would turn a fixable ownership refusal into an
+    // unexplained failure — and draining only one of two pipes deadlocks on a child
+    // that fills the other. `bounded::output` also closes stdin, which this call has
+    // always done, so a git that decides to prompt gets end of file rather than the
+    // caller's terminal.
+    let output = bounded::output(&mut command, GIT_TIMEOUT).map_err(|failure| match failure {
+        bounded::Failure::Spawn(source) => ExcludeError::GitUnavailable {
             worktree: worktree.to_path_buf(),
             source,
-        })?;
+        },
+        bounded::Failure::TimedOut => ExcludeError::GitTimedOut {
+            worktree: worktree.to_path_buf(),
+            ceiling: GIT_TIMEOUT,
+        },
+        // git ran and this process could not collect what it said. There is no exit
+        // code to report and no message of git's to quote, and reporting the answer
+        // that did arrive would be reporting a partial one.
+        bounded::Failure::Lost => ExcludeError::GitFailed {
+            worktree: worktree.to_path_buf(),
+            status: None,
+            message: "git ran but its output could not be collected".to_owned(),
+        },
+    })?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         if message.to_ascii_lowercase().contains(NOT_A_REPOSITORY) {
@@ -305,7 +364,8 @@ pub fn resolve_exclude_path(worktree: &Path) -> Result<PathBuf, ExcludeError> {
 ///
 /// [`ExcludeError::InvalidEntry`] when an entry contains a newline, which no git
 /// exclude pattern can. Everything [`resolve_exclude_path`] can return, since the
-/// path is resolved first. [`ExcludeError::Filesystem`] when the file cannot be
+/// path is resolved first — including [`ExcludeError::GitTimedOut`], which arrives
+/// after a bounded wait rather than never. [`ExcludeError::Filesystem`] when the file cannot be
 /// read, when its directory cannot be created, when a symbolic link cannot be
 /// preserved, or when the replacement fails; in every case the previous contents are
 /// still on disk.
@@ -660,6 +720,10 @@ fn temporary_name(path: &Path) -> OsString {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    #[cfg(unix)]
+    use std::process::Stdio;
+    #[cfg(unix)]
+    use std::time::Instant;
 
     use super::*;
 
@@ -1404,5 +1468,386 @@ mod tests {
             assert_is_link_to(&path, Path::new("exclude"));
             assert_no_temporary_left_in(path.parent().expect("info directory"));
         }
+    }
+
+    // ------------------------------------------------------------------
+    // A `git` that misbehaves on purpose.
+    //
+    // `PATH` decides which `git` runs, `std::env::set_var` is unsafe and this
+    // workspace forbids unsafe code, so a test can never doctor its own
+    // environment — only a child's. Each case below therefore re-execs this test
+    // binary with a fake `git` first on its `PATH`.
+    // ------------------------------------------------------------------
+
+    /// Names the case a re-exec of this test binary is playing, and is what turns
+    /// that re-exec into the child half of a fake-git case at all.
+    #[cfg(unix)]
+    const FAKE_GIT_CASE: &str = "ZUNO_PATHS_EXCLUDE_FAKE_GIT_CASE";
+
+    /// The worktree the child half asks git about.
+    #[cfg(unix)]
+    const FAKE_GIT_WORKTREE: &str = "ZUNO_PATHS_EXCLUDE_FAKE_GIT_WORKTREE";
+
+    /// The leaf name of the child half, spelled once so the filter handed to the
+    /// child is derived from it rather than typed again.
+    ///
+    /// A test binary given a filter that matches nothing exits *successfully* and
+    /// reports `0 passed`, so a drifted name would turn every case here into a
+    /// silent pass. Three things stop that: this constant, the child's own
+    /// [`OBSERVED`] line, and the parent's insistence on `ok. 1 passed` — a rename
+    /// has to defeat all three.
+    #[cfg(unix)]
+    const CHILD_TEST_LEAF: &str = "fake_git_child";
+
+    /// What the child half prints once it has made every assertion its case calls
+    /// for.
+    #[cfg(unix)]
+    const OBSERVED: &str = "fake git case observed: ";
+
+    /// How long the fake `git` sleeps in the `timeout` case.
+    ///
+    /// An order of magnitude past [`GIT_TIMEOUT`], so a call that returns at all can
+    /// only have returned because the ceiling ended it, and so the assertion on
+    /// elapsed time is not a race against a slow machine.
+    #[cfg(unix)]
+    const FAKE_GIT_SLEEP: Duration = Duration::from_secs(120);
+
+    /// The size of each stream the fake `git` floods in the large cases.
+    ///
+    /// Four times the usual 64 KiB pipe capacity, so a stream this size cannot be
+    /// written unless somebody is draining that pipe while this process waits.
+    #[cfg(unix)]
+    const LARGE_OUTPUT: usize = 256 * 1024;
+
+    /// The libtest name of the child half: its module path without the crate, which
+    /// is how libtest spells it, plus [`CHILD_TEST_LEAF`].
+    #[cfg(unix)]
+    fn child_test_name() -> String {
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_crate_name, rest)| rest);
+        format!("{module}::{CHILD_TEST_LEAF}")
+    }
+
+    /// A `git` that misbehaves on purpose, one branch per case.
+    ///
+    /// `timeout` is the defect itself: a `.git` on a dead network mount, where git
+    /// blocks in the kernel and never answers. The rest pin the behaviours the
+    /// ceiling was not allowed to change — above all the classification, which is
+    /// made from git's *stderr* and so cannot survive a bound that only drains
+    /// stdout.
+    ///
+    /// The stall `exec`s rather than calling `sleep`, so the process the ceiling
+    /// kills is the one that is stalling. A shell that merely waited for `sleep`
+    /// would be killed while `sleep` kept the pipe open behind it, which is a
+    /// property of this fixture and not of `git`.
+    ///
+    /// `deadlock-bait` writes past the pipe capacity on stderr *first* and only then
+    /// on stdout. Draining stdout to end of file before touching stderr blocks the
+    /// child on stderr; draining stderr first blocks it on stdout. One reader thread
+    /// deadlocks whichever order it picks, and reports this healthy call as a
+    /// timeout.
+    #[cfg(unix)]
+    fn fake_git_script() -> String {
+        format!(
+            "#!/bin/sh\n\
+             case \"${FAKE_GIT_CASE}\" in\n\
+             timeout) exec sleep {sleep} ;;\n\
+             not-a-repository)\n\
+               echo 'fatal: not a git repository (or any parent up to mount point /)' >&2\n\
+               exit 128 ;;\n\
+             dubious-ownership)\n\
+               echo \"fatal: detected dubious ownership in repository at '/mnt/repo'\" >&2\n\
+               exit 128 ;;\n\
+             deadlock-bait)\n\
+               yes | head -c {large} >&2\n\
+               tr '\\000' 'a' < /dev/zero | head -c {large} ;;\n\
+             loud-failure)\n\
+               printf 'ignored\\n'\n\
+               yes | head -c {large} >&2\n\
+               exit 3 ;;\n\
+             invalid-utf8) printf '\\377\\376' ;;\n\
+             stdin) printf 'from-stdin:'; cat ;;\n\
+             locale) printf 'locale-%s-%s' \"$LC_ALL\" \"$LANGUAGE\" ;;\n\
+             *) echo 'unknown case' >&2; exit 127 ;;\n\
+             esac\n",
+            sleep = FAKE_GIT_SLEEP.as_secs(),
+            large = LARGE_OUTPUT,
+        )
+    }
+
+    /// Run this binary again as the child half of `case`, with a fake `git` as the
+    /// first `git` on its `PATH`, and report how long the child took.
+    ///
+    /// The child's own output goes to files rather than pipes. This half has to be
+    /// able to give up on a child that never exits, and polling for an exit while
+    /// nobody drains a pipe is precisely the deadlock [`crate::bounded::output`] is
+    /// written to avoid; reproducing it in the test that proves the fix would prove
+    /// nothing.
+    #[cfg(unix)]
+    fn run_fake_git_case(case: &str) -> (Duration, String) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let bin = home.path().join("bin");
+        fs::create_dir(&bin).expect("create the fake bin directory");
+        // The `absent` case is the machine without git, so it gets no fake either.
+        let absent = case == "absent";
+        if !absent {
+            let program = bin.join("git");
+            fs::write(&program, fake_git_script()).expect("write the fake git");
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
+                .expect("make the fake git executable");
+        }
+
+        let worktree = home.path().join("work");
+        fs::create_dir(&worktree).expect("create the worktree");
+
+        // Bait for the `stdin` case: with stdin closed the fake git reads nothing,
+        // and with stdin inherited it reads this, so the two are told apart by the
+        // answer rather than by how long the read took.
+        let bait = home.path().join("stdin");
+        fs::write(&bait, "leaked").expect("write the stdin bait");
+        let out = home.path().join("stdout");
+        let err = home.path().join("stderr");
+
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .args(["--exact", &child_test_name(), "--nocapture"])
+            .env(FAKE_GIT_CASE, case)
+            .env(FAKE_GIT_WORKTREE, &worktree)
+            // The fake git shadows the real one because it comes first, and the usual
+            // directories stay on the path because the script needs a shell's own
+            // utilities. The `absent` case keeps them off, since a real git found in
+            // `/usr/bin` is not an absent one.
+            .env(
+                "PATH",
+                if absent {
+                    bin.display().to_string()
+                } else {
+                    format!("{}:/bin:/usr/bin", bin.display())
+                },
+            )
+            .stdin(Stdio::from(
+                fs::File::open(&bait).expect("open the stdin bait"),
+            ))
+            .stdout(Stdio::from(
+                fs::File::create(&out).expect("create the child stdout"),
+            ))
+            .stderr(Stdio::from(
+                fs::File::create(&err).expect("create the child stderr"),
+            ));
+
+        let started = Instant::now();
+        let mut child = command.spawn().expect("spawn the child half");
+        // Four ceilings: room for a loaded machine, and short enough that a lost
+        // bound fails this test instead of hanging the suite.
+        let deadline = started + GIT_TIMEOUT * 4;
+        let status = loop {
+            match child.try_wait().expect("poll the child half") {
+                Some(status) => break status,
+                None if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "the {case} child never returned within {:?}",
+                        started.elapsed()
+                    );
+                }
+            }
+        };
+        let elapsed = started.elapsed();
+        let log = format!(
+            "{}{}",
+            fs::read_to_string(&out).expect("read the child stdout"),
+            fs::read_to_string(&err).expect("read the child stderr")
+        );
+        assert!(status.success(), "the {case} child failed:\n{log}");
+        assert!(
+            log.contains("ok. 1 passed"),
+            "the {case} child ran no test: the filter {} matched nothing, so this \
+             case proves nothing:\n{log}",
+            child_test_name()
+        );
+        assert!(
+            log.contains(&format!("{OBSERVED}{case}")),
+            "the {case} child never reached its assertions:\n{log}"
+        );
+        (elapsed, log)
+    }
+
+    /// The defect this closes: `git` reading a `.git` on an unresponsive network
+    /// mount blocks in the kernel and never answers, and `resolve_exclude_path` is
+    /// synchronous, so an unbounded wait wedges whoever asked — on a current-thread
+    /// runtime, the whole reactor with it.
+    #[test]
+    #[cfg(unix)]
+    fn a_git_that_never_answers_is_given_up_on_at_the_ceiling() {
+        let (elapsed, log) = run_fake_git_case("timeout");
+
+        assert!(
+            elapsed < FAKE_GIT_SLEEP,
+            "waited {elapsed:?} on a git sleeping {FAKE_GIT_SLEEP:?}:\n{log}"
+        );
+    }
+
+    /// Everything the ceiling had to leave alone, each against a `git` built to
+    /// produce exactly that answer. `deadlock-bait` is the one that fails if the
+    /// bound drains a single pipe.
+    #[test]
+    #[cfg(unix)]
+    fn bounding_the_wait_changed_no_other_answer() {
+        for case in [
+            "not-a-repository",
+            "dubious-ownership",
+            "deadlock-bait",
+            "loud-failure",
+            "invalid-utf8",
+            "stdin",
+            "locale",
+            "absent",
+        ] {
+            let (elapsed, log) = run_fake_git_case(case);
+            assert!(
+                elapsed < GIT_TIMEOUT,
+                "the {case} case took {elapsed:?}, so it was decided by the ceiling \
+                 rather than by the answer:\n{log}"
+            );
+        }
+    }
+
+    /// The child half of every fake-git case, and a no-op in an ordinary run: one
+    /// test binary is also its own fixture, since only a child process can be given
+    /// a different `PATH`.
+    #[test]
+    #[cfg(unix)]
+    fn fake_git_child() {
+        let Ok(case) = std::env::var(FAKE_GIT_CASE) else {
+            return;
+        };
+        let worktree = PathBuf::from(std::env::var(FAKE_GIT_WORKTREE).expect("the worktree"));
+        let name = |path: &Path| {
+            path.file_name()
+                .expect("the resolved path names a file")
+                .to_string_lossy()
+                .into_owned()
+        };
+        let started = Instant::now();
+        match case.as_str() {
+            "timeout" => {
+                let observed = resolve_exclude_path(&worktree);
+                let elapsed = started.elapsed();
+                let Err(ExcludeError::GitTimedOut {
+                    worktree: asked,
+                    ceiling,
+                }) = &observed
+                else {
+                    panic!("a git that never answered is a timeout, not {observed:?}");
+                };
+                assert_eq!(asked, &worktree, "the error names the directory git ran in");
+                assert_eq!(*ceiling, GIT_TIMEOUT, "the error names the ceiling it hit");
+                assert!(
+                    observed
+                        .as_ref()
+                        .expect_err("a timeout")
+                        .to_string()
+                        .contains("did not answer"),
+                    "a timeout must not render as a repository that is not there"
+                );
+                assert!(
+                    elapsed >= GIT_TIMEOUT,
+                    "returned in {elapsed:?}, inside the ceiling: the fake git cannot \
+                     have run, so this proves nothing"
+                );
+                assert!(
+                    elapsed < FAKE_GIT_SLEEP,
+                    "waited {elapsed:?} on a git sleeping {FAKE_GIT_SLEEP:?}"
+                );
+            }
+            // The classification is made from git's stderr, so a bound that dropped
+            // stderr would report this — the ordinary case of running outside a
+            // repository — as an unexplained failure.
+            "not-a-repository" => {
+                let observed = resolve_exclude_path(&worktree);
+                assert!(
+                    matches!(observed, Err(ExcludeError::NotARepository { .. })),
+                    "{observed:?}"
+                );
+            }
+            // The other side of that classification: git exits 128 here too, so only
+            // its message separates a fixable ownership refusal from no repository.
+            "dubious-ownership" => {
+                let observed = resolve_exclude_path(&worktree);
+                let Err(ExcludeError::GitFailed {
+                    status, message, ..
+                }) = &observed
+                else {
+                    panic!("a refusal that is not about a missing repository: {observed:?}");
+                };
+                assert_eq!(*status, Some(128), "the exit code reaches the caller");
+                assert!(message.contains("dubious ownership"), "{message}");
+            }
+            // A healthy answer that floods stderr before stdout: proof that both
+            // pipes are drained, and that neither is drained to end of file before
+            // the other is touched.
+            "deadlock-bait" => {
+                let path = resolve_exclude_path(&worktree).expect("a healthy answer");
+                assert_eq!(
+                    name(&path).len(),
+                    LARGE_OUTPUT,
+                    "stdout was truncated or the streams deadlocked"
+                );
+            }
+            // The same flood on the failure path, where the message is what a caller
+            // reports: it has to arrive whole rather than as much as fitted.
+            "loud-failure" => {
+                let observed = resolve_exclude_path(&worktree);
+                let Err(ExcludeError::GitFailed {
+                    status, message, ..
+                }) = &observed
+                else {
+                    panic!("a non-zero exit is a failure: {observed:?}");
+                };
+                assert_eq!(*status, Some(3));
+                assert!(
+                    message.len() >= LARGE_OUTPUT - 2,
+                    "git's message arrived truncated at {} bytes",
+                    message.len()
+                );
+            }
+            "invalid-utf8" => {
+                let observed = resolve_exclude_path(&worktree);
+                let Err(ExcludeError::GitFailed { message, .. }) = &observed else {
+                    panic!("a path that is not text is no answer: {observed:?}");
+                };
+                assert!(message.contains("not valid UTF-8"), "{message}");
+            }
+            // Stdin stays closed rather than inherited: git must never consume the
+            // bytes a caller of Zuno is holding for something else.
+            "stdin" => {
+                let path = resolve_exclude_path(&worktree).expect("a healthy answer");
+                assert_eq!(name(&path), "from-stdin:");
+            }
+            // The C locale is still pinned, so the classification above keeps reading
+            // git's own words rather than a translation of them.
+            "locale" => {
+                let path = resolve_exclude_path(&worktree).expect("a healthy answer");
+                assert_eq!(name(&path), "locale-C-C");
+            }
+            // A machine without git is a spawn failure and not a timeout, so the two
+            // stay distinguishable to whoever reports them.
+            "absent" => {
+                let observed = resolve_exclude_path(&worktree);
+                assert!(
+                    matches!(observed, Err(ExcludeError::GitUnavailable { .. })),
+                    "{observed:?}"
+                );
+            }
+            other => panic!("unknown fake git case {other}"),
+        }
+        println!("{OBSERVED}{case}");
     }
 }

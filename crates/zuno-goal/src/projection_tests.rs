@@ -1092,8 +1092,18 @@ impl Fixture {
             .expect("render projection");
     }
 
+    /// Record a passing receipt, and move any goal in the session behind it. These
+    /// tests cite receipts at small synthetic times while a goal stamps its creation
+    /// from the wall clock, and the evidence gate refuses a check that ran before its
+    /// goal was proposed.
     fn record_receipt(&self, id: &str, time_created: i64) {
         let connection = self.store.pool().get().expect("check out connection");
+        connection
+            .execute(
+                "UPDATE goal SET created_at_ms = MIN(created_at_ms, ?2) WHERE session_id = ?1",
+                rusqlite::params![SESSION, time_created],
+            )
+            .expect("move the goal behind the receipt");
         zuno_db::verification::record(
             &connection,
             &zuno_db::verification::NewVerificationReceipt {

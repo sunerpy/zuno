@@ -35,6 +35,24 @@ Report findings as a list. Do not edit files.
 
 当提示词长到 JSON 字符串转义变得难受时，优先用 Markdown；当定义主要由能力字段构成时，优先用 JSON。
 
+frontmatter 会保留你写下的键顺序，而这一点对其中一个字段很关键。`permission.rules` 块按作者写下的键顺序、以「最后一条匹配的规则胜出」来评估，而 frontmatter 此前会在 Agent 定义构建之前被按字母排序，于是一条本应压住 catch-all 的 deny，反过来被 catch-all 压住了。现在不会了：规则会按文件写出的顺序到达评估器。
+
+```markdown
+---
+description: Reviews a diff and reports findings without editing
+mode: subagent
+permission:
+  rules:
+    read:
+      "*": allow
+      "$HOME/.ssh/*": deny
+---
+
+Report findings as a list. Do not edit files.
+```
+
+这个顺序是承重的。`$HOME/.ssh/*` 排在 `*` 之前，所以把这个块按字母排序会把 deny 放到 catch-all 之上，随后胜出的就是 catch-all，这与文件所写的意思正好相反。
+
 ## 全部字段
 
 | 键 | 类型 | 默认值 | 说明 |
@@ -93,6 +111,8 @@ Report findings as a list. Do not edit files.
 | `rules` | object | `{}` | 有序的逐工具规则。显式拒绝在任何模式下都是终态 |
 
 显式拒绝在任何模式下都是终态，包括 `allow_all`。这种不对称正是关键所在：`allow_all` 移除的是询问，不是限制。
+
+`rules` 是有序的，最后一条匹配的规则胜出；而一份 Agent 定义往往是叠在另一层之上的覆盖层，所以合并顺序值得了解。基础层的规则顺序会被保留：两层都设置的键在基础层给它的位置上被替换，只有覆盖层设置的键则追加在基础层各键之后 —— 因此覆盖层的模式会压过基础层的 catch-all。这正是有用的方向：Agent 只要点名例外，就能收窄一条宽规则，而不必把那条宽规则重写一遍。此前只要存在第二层，合并就会把这些键重新按字母排序；现在不会了。结果请用 `zuno debug agent <name>` 读回来，而不是靠推测。
 
 ## Agent 的模型路由
 

@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use zuno_auth::{ClientInfo, McpAuthStore, Secret};
 use zuno_config::schema::mcp::McpRemote;
 
+use crate::body::{MAX_OAUTH_BODY_BYTES, read_bounded_json};
 use crate::remote::{AuthorizationRequest, RemoteConnect, RemoteError};
 
 use super::discovery::discover;
@@ -165,10 +166,9 @@ async fn client_information(
             ),
         });
     }
-    let registered = response
-        .json::<RegistrationResponse>()
+    let registered = read_bounded_json::<RegistrationResponse>(response, MAX_OAUTH_BODY_BYTES)
         .await
-        .map_err(|error| oauth_error(server, error))?;
+        .map_err(|error| oauth_error(server, error.describe("dynamic client registration")))?;
     let client = ClientInfo {
         client_id: registered.client_id,
         client_secret: registered.client_secret.map(Secret::new),

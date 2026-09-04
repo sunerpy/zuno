@@ -37,6 +37,8 @@ zuno plugin remove review-kit --project
 
 模型也可以使用 `extension_define`、`extension_run`、`extension_stop`、`extension_undefine` 和 `extension_inspect` 来处理进程本地的声明式包。这条路径绝不写磁盘，并且刻意拒绝可执行运行时声明。
 
+`extension_inspect` 把静态安装的包报告为 `"source": {"lifetime": "static", "manifest": "<path>"}`，其中 `<path>` 就是磁盘上的原生 manifest 路径本身。分隔符绝不会被规范化：在 Linux 和 macOS 上 `\` 是普通的文件名字节，因此一个位于名为 `zuno\ws` 的目录下的包会带着反斜杠原样报告，可以直接交给 `read` 或 `grep`。如果该路径不是合法的 UTF-8，它在 JSON 里根本没有拼写方式，因此该字段会报告为 `"manifest": null`，并在旁边给出 `"manifestUnrepresentable": true`，而不是替换出一个别的路径；该包的其余字段仍会照常列出。
+
 ## 自定义 Agent 与 workflow
 
 扩展提供的 Agent 就是一个普通的 Zuno Agent。决定它能使用哪些对模型可见的工具的，是它的 `permission` 对象，而不是插件的运行时能力列表：
@@ -180,7 +182,11 @@ sh scripts/check-plugin-examples.sh
 - `tools/call` 收到工具名、JSON 参数、session/message/call 坐标和当前 Agent，并返回 `title`、`output` 以及对象形式的 `metadata`；
 - `shutdown` 在 Zuno 终止并回收进程树之前请求优雅清理。
 
-协议帧与捕获的 stderr 都是有界的，诊断信息会针对已知的密钥环境值做脱敏，超时与取消会停止整棵进程树，而请求发出之后的协议丢失会被报告为 `Uncertain`。
+`packageRoot` 与 `workspace` 逐字节携带原生路径。Zuno 绝不在这里规范化分隔符：在 Linux 和 macOS 上 `\` 是普通的文件名字节，因此名为 `zuno\ws` 的工作区目录会作为 `zuno\ws` 发送，绝不会变成 `zuno/ws`。如果一个包的根目录或工作区路径不是合法的 UTF-8，它在这条边界上没有任何表示形式，因此 Zuno 会按名字拒绝启动该运行时，而不是发送一个被替换过的路径。
+
+插件不得在 `metadata` 中返回 `cancellation`。该键为 Zuno 自身的取消声明保留，并被当作宿主发出的确定性陈述来读取，因此插件提供的 `cancellation` 对象会被丢弃并记录一条告警。
+
+协议帧与捕获的 stderr 都是有界的，诊断信息会针对已知的密钥环境值做脱敏，超时与取消会停止整棵进程树。请求发出之后的协议丢失会被报告为不确定的结果，Zuno 绝不机械重放它。被用户取消的调用会被报告为一条已结算的结果，标题为 `<tool> cancelled`，其 `cancellation` 元数据记录插件是否已经收到该调用（`dispatched`）、停止插件是否已被确认（`stopped`、`cleanup`），以及 Zuno 由这两项事实推导出的 `uncertain`/`authoritative` 判定。
 
 最小可执行示例见 [`examples/plugins/process-review`](https://github.com/sunerpy/zuno/blob/main/examples/plugins/process-review)。完整实现指南是[受信进程插件开发](https://github.com/sunerpy/zuno/blob/main/docs/process-plugin-development.md)，其中包含协议帧、安全评审、取消与不确定结果、测试，以及运维方本地的 OpenCode Antigravity 搜索桥接。
 

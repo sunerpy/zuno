@@ -606,6 +606,101 @@ async fn batch_oversized_subcall_output_is_withheld_whole_and_still_counts_as_su
     assert!(output.output.contains("Completed: 1 succeeded, 0 failed"));
 }
 
+/// A generated root the caller already resolved is the one `build` uses.
+///
+/// [`ToolRegistryBuilder::build`] resolved it itself with `zuno_paths::generated_root`,
+/// which spawns up to three synchronous `git rev-parse` calls — each bounded at ten seconds
+/// inside `zuno_paths`, none of them off-thread — so building a registry from an async fn on
+/// a current-thread runtime stalled the whole process for up to thirty seconds against a
+/// `.git` on a stalled mount. `build` cannot be async (it hands out `Arc<dyn Tool>` through
+/// `Arc::new_cyclic`), so the caller resolves the root in one `spawn_blocking` and supplies
+/// it. Pinned here as the observable consequence rather than as the absence of a call: the
+/// artefact of an oversized sub-call lands under the supplied root, and without the setter
+/// it does not.
+#[tokio::test]
+async fn an_explicitly_resolved_generated_root_is_where_the_registry_saves_output() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let elsewhere = tempfile::tempdir().expect("generated root");
+    let files = FileTools::new(root.path()).expect("create file tools");
+    let injected = ToolRegistryBuilder::new(
+        root.path(),
+        files,
+        RegistryFlags {
+            experimental_code_mode: true,
+            ..RegistryFlags::default()
+        },
+    )
+    .with_harness_tools(vec![Arc::new(LargeTool) as CustomTool])
+    .with_generated_root(elsewhere.path())
+    .build();
+
+    let output = injected
+        .execute(
+            "execute",
+            json!({
+                "tool_calls": [{ "tool": "large", "intent": "exercise budget" }]
+            }),
+            context(Arc::new(zuno_tool::AllowAll)),
+        )
+        .await
+        .expect("the batch reports a per-call withheld notice");
+
+    // Compared path-typed against the durable `outputPaths` reference, not as a string
+    // prefix of `Path::display`. The notice and the metadata both spell the artefact in
+    // wire form — forward slashes, no verbatim prefix — on every platform, which is the
+    // spelling `bg artifact` takes back; a native Windows root spelt with backslashes only
+    // agrees with it component by component, which is how `Path::starts_with` compares.
+    let expected = elsewhere.path().join(".zuno").join("tool-output");
+    let recorded = output.output_paths();
+    assert!(
+        !recorded.is_empty(),
+        "the withheld sub-call recorded no artefact:\n{}",
+        output.output
+    );
+    for artefact in recorded {
+        assert!(
+            Path::new(artefact).starts_with(&expected),
+            "the artefact landed outside the generated root that was supplied ({}): \
+             {artefact}\n{}",
+            expected.display(),
+            output.output
+        );
+        assert!(
+            output.output.contains(artefact),
+            "the withheld notice does not name the artefact the durable part records \
+             ({artefact}):\n{}",
+            output.output
+        );
+    }
+
+    // Unset, `build` resolves the root itself, which for a workspace that is not a
+    // repository is the workspace: the setter changed where output went.
+    let default = registry(root.path(), vec![Arc::new(LargeTool)]);
+    let output = default
+        .execute(
+            "execute",
+            json!({
+                "tool_calls": [{ "tool": "large", "intent": "exercise budget" }]
+            }),
+            context(Arc::new(zuno_tool::AllowAll)),
+        )
+        .await
+        .expect("the batch reports a per-call withheld notice");
+    let recorded = output.output_paths();
+    assert!(
+        !recorded.is_empty(),
+        "the withheld sub-call recorded no artefact:\n{}",
+        output.output
+    );
+    for artefact in recorded {
+        assert!(
+            !Path::new(artefact).starts_with(elsewhere.path()),
+            "output landed under the injected root without anyone asking ({artefact}):\n{}",
+            output.output
+        );
+    }
+}
+
 /// A sub-tool that fails with a cause two links deep, like an MCP proxy relaying a
 /// server's rejection of a call the transport had already refused.
 struct NestedFailureTool;

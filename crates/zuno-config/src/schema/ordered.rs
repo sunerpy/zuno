@@ -7,12 +7,16 @@
 //! keys and `serde_json::Map` sorts them too unless its `preserve_order` feature
 //! is on, which it is not in this workspace.
 //!
+//! [`OrderedJson`] is the same guarantee for a whole document rather than one
+//! map: a parser that builds config-shaped JSON for a typed `Deserialize` builds
+//! this instead of a `serde_json::Value`, whose objects would sort.
+//!
 //! [`False`] exists because the oracle has two `Schema.Literal(false)` arms
 //! (provider timeouts and MCP OAuth) where `bool` would wrongly accept `true`.
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
-use serde::de::{self, MapAccess, Visitor};
-use serde::ser::SerializeMap;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::marker::PhantomData;
@@ -161,6 +165,143 @@ impl<'de, V: Deserialize<'de>> Deserialize<'de> for OrderedMap<V> {
     }
 }
 
+/// A JSON document whose objects keep the key order they were written in.
+///
+/// `serde_json::Map` is a `BTreeMap` in this workspace, so anything that hops
+/// through [`serde_json::Value`] comes out alphabetized. `permission.rules` is
+/// evaluated last-match-wins over the author's key order
+/// ([`PermissionObject`](crate::schema::permission::PermissionObject)), which
+/// makes an alphabetized rule set a *different* rule set: sorting
+/// `{"*": "allow", "$HOME/.ssh/*": "deny"}` moves the deny before the catch-all
+/// and deletes the protection. A parser that produces config-shaped JSON for a
+/// typed `Deserialize` builds this instead of a `Value`, and hands it over as
+/// JSON **text** (`serde_json::to_string`), which every `Deserialize` impl in the
+/// schema reads in order.
+///
+/// Objects are [`OrderedMap`]s, so one object cannot hold one key twice: a repeat
+/// resolves last-wins in the first key's position, as `serde_json` and
+/// `JSON.parse` do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderedJson {
+    /// `null`.
+    Null,
+    /// `true` or `false`.
+    Bool(bool),
+    /// Any JSON number.
+    Number(serde_json::Number),
+    /// A string.
+    String(String),
+    /// An array, in order.
+    Array(Vec<Self>),
+    /// An object, in the author's key order.
+    Object(OrderedMap<Self>),
+}
+
+impl OrderedJson {
+    /// The value under `key`, or `None` for a missing key or a non-object.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&Self> {
+        match self {
+            Self::Object(entries) => entries.get(key),
+            _ => None,
+        }
+    }
+
+    /// This value as a string, or `None` when it is any other shape.
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for OrderedJson {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Null => serializer.serialize_unit(),
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::Number(value) => value.serialize(serializer),
+            Self::String(value) => serializer.serialize_str(value),
+            Self::Array(values) => {
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(value)?;
+                }
+                sequence.end()
+            }
+            Self::Object(entries) => entries.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderedJson {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct OrderedJsonVisitor;
+
+        impl<'de> Visitor<'de> for OrderedJsonVisitor {
+            type Value = OrderedJson;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON value")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(OrderedJson::Bool(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(OrderedJson::Number(value.into()))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(OrderedJson::Number(value.into()))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(OrderedJson::Number)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(OrderedJson::String(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(OrderedJson::String(value))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(OrderedJson::Null)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(OrderedJson::Null)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = access.next_element()? {
+                    values.push(value);
+                }
+                Ok(OrderedJson::Array(values))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+                let mut entries = OrderedMap::new();
+                while let Some((key, value)) = access.next_entry::<String, OrderedJson>()? {
+                    entries.insert(key, value);
+                }
+                Ok(OrderedJson::Object(entries))
+            }
+        }
+
+        deserializer.deserialize_any(OrderedJsonVisitor)
+    }
+}
+
 /// The literal `false`, for union arms where `true` must be rejected.
 ///
 /// Mirrors `Schema.Literal(false)` in `config/provider.ts:102,109` and
@@ -195,5 +336,66 @@ impl<'de> Deserialize<'de> for False {
                 &"the literal false",
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `$HOME/.ssh/*` sorts before `*`, so a carrier that sorted would reverse the
+    /// precedence of exactly the rule pair the permissions guide tells users to write.
+    const GUIDE_SHAPE: &str =
+        r#"{"permission":{"rules":{"read":{"*":"allow","$HOME/.ssh/*":"deny"}}}}"#;
+
+    fn keys(value: &OrderedJson) -> Vec<&str> {
+        match value {
+            OrderedJson::Object(entries) => entries.keys().collect(),
+            other => panic!("expected an object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_document_round_trips_through_text_in_the_authors_key_order() {
+        let parsed: OrderedJson = serde_json::from_str(GUIDE_SHAPE).expect("parses");
+        let read = parsed
+            .get("permission")
+            .and_then(|permission| permission.get("rules"))
+            .and_then(|rules| rules.get("read"))
+            .expect("nested object");
+        assert_eq!(keys(read), ["*", "$HOME/.ssh/*"]);
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("serializes"),
+            GUIDE_SHAPE,
+            "the text a typed Deserialize reads is the text the author wrote"
+        );
+        let sorted: serde_json::Value = serde_json::from_str(GUIDE_SHAPE).expect("parses");
+        assert_ne!(
+            serde_json::to_string(&sorted).expect("serializes"),
+            GUIDE_SHAPE,
+            "the control: serde_json::Value really does reorder this document"
+        );
+    }
+
+    #[test]
+    fn a_repeated_key_resolves_last_wins_in_the_first_keys_position() {
+        let parsed: OrderedJson =
+            serde_json::from_str(r#"{"a":1,"b":2,"a":3}"#).expect("serde_json accepts repeats");
+        assert_eq!(keys(&parsed), ["a", "b"]);
+        assert_eq!(
+            parsed.get("a"),
+            Some(&OrderedJson::Number(3.into())),
+            "the later value wins, as serde_json::Map and JSON.parse resolve it"
+        );
+    }
+
+    #[test]
+    fn every_scalar_shape_survives_a_round_trip() {
+        let text = r#"[null,true,false,1,-2,3.5,"s",[],{}]"#;
+        let parsed: OrderedJson = serde_json::from_str(text).expect("parses");
+        assert_eq!(serde_json::to_string(&parsed).expect("serializes"), text);
+        assert_eq!(parsed.get("anything"), None, "an array has no keys");
+        assert_eq!(OrderedJson::String("s".to_owned()).as_str(), Some("s"));
+        assert_eq!(OrderedJson::Bool(true).as_str(), None);
     }
 }

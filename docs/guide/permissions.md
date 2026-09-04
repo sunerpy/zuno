@@ -323,6 +323,20 @@ stream keeps them, because a stream is not the session. A decision meant to
 outlive one session belongs in `permission.rules`. See
 [Session retention](/session-retention#archiving-ends-a-sessions-standing-http-authorizations).
 
+Over HTTP, every call a standing `always` pre-approves is recorded as its own
+already-settled request row, with the response `{"reply":"once","source":"standing"}`;
+the grant itself is never written. A reply that arrives after its asker is gone — the
+turn was interrupted, or the process that made the call restarted — is still recorded,
+and the answer reaches the session through the durable inbox, but it installs no
+standing grant: an authorization is only saved when the call it authorizes actually
+received the reply.
+
+A reply that has committed is final: if the HTTP connection drops before the `204`
+arrives, the tool call still receives the decision, a standing `always` is still
+installed, and the paused goal still resumes. A client that retries such a reply
+gets `404` because the request is no longer pending, not because the reply was
+lost.
+
 ## Per-tool rules
 
 `permission.rules` is ordered, and **the last matching rule wins**. A rule is either
@@ -353,6 +367,20 @@ out of it go **last**: `git *` overrides the catch-all, and `git push*` then ove
 removes the protection, because `*` written last would override every rule above it
 and turn `rm -rf /` back into a prompt.
 
+Because order is policy, Zuno preserves the order you wrote through the two stages that
+used to lose it. A Markdown agent's `permission.rules` reaches the evaluator in
+frontmatter order, and merging one configuration layer over another keeps the base
+layer's rule order instead of re-sorting it. Both stages used to alphabetize the keys,
+and alphabetizing the example above is enough to break it: `$HOME/.ssh/*` sorts before
+`*`, so a sorted `{"*": "allow", "$HOME/.ssh/*": "deny"}` puts the deny above the
+catch-all and the catch-all then wins.
+
+The merge rule is worth knowing because you can see it in `zuno debug permissions`. A key
+both layers set is replaced where the base layer put it, and a key only the overlay sets
+is appended after the base layer's keys. So an overlay pattern outranks a base catch-all:
+a project or agent layer can carve an exception out of a broad rule without restating the
+broad rule.
+
 The `edit` key covers the `write`, `edit`, and `apply_patch` tools; all three request
 authorization under it. There is no separate `write` or `apply_patch` rule key, and
 `permission.rules` refuses one: a rule under `write`, `apply_patch`,
@@ -362,6 +390,26 @@ first two, `read` for the three MCP resource tools. Those five keys used to be a
 and evaluated nothing. Any other key is still legitimate, because MCP, plugin, and Skill
 tools are named at runtime and a key may be a wildcard pattern.
 
+The top-level `tools` switch is keyed by tool name, and the same folding applies to it,
+so two `tools` entries in one configuration layer can land on one synthesized rule and
+must then agree. `{"tools": {"edit": false, "write": true}}` fails validation with a
+message naming both spellings and the key that governs them:
+
+```text
+tools "edit" is false and tools "write" is true, but both are governed by permission "edit"; one rule cannot be both, so set them alike or write the rule under permission.rules.edit
+```
+
+Setting both entries to the same value still loads. **This is a breaking change**: a
+`tools` block that contradicted itself this way used to load, with whichever entry came
+last silently winning, so a block that read as a denial could have been granting the tool
+instead. State the intent once under `permission.rules.<key>`, using the key the message
+names.
+
+Two layers that disagree are an override rather than a contradiction, and resolve the way
+every other config key does: the layer with the highest precedence that names the
+permission key wins, so a project `edit: false` beats a global `write: true`. Only a
+disagreement inside one layer has no ordering to appeal to, so only that one is refused.
+
 A path rule is matched against the path the call names and against its normalized
 spelling, so separators are unified and `.` segments and repeated separators are
 dropped: `./src/main.rs`, `src//main.rs`, and the backslash spelling `src\main.rs` all
@@ -370,6 +418,12 @@ covers the `..`-resolved path, and a deny written with an absolute path covers t
 relative tail of that path as well, so a deny cannot be sidestepped by respelling the
 file. An `allow` never widens in either of those directions, because a widened allow
 would authorize a file the rule did not name.
+
+The keys treated this way are `read`, `edit`, `write`, `list`, and `lsp`. `lsp` is one
+of them because its resource is a file as well: the language-server tool names the file
+relative to the worktree containing the session, and falls back to the resolved absolute
+path where the session directory and the worktree do not nest. A deny written
+`{"lsp": {"secrets.rs": "deny"}}` therefore covers the file under either layout.
 
 Plan an `allow` around that asymmetry. `read`, `edit`, `write`, and `apply_patch` are
 documented to take absolute paths, so `"read": {"src/main.rs": "allow"}` does not cover

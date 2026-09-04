@@ -21,10 +21,28 @@
 //!
 //! # The clipboard's fallback ladder is data, not control flow
 //!
-//! `copy_command` (`packages/tui/src/clipboard.ts:75-91`) picks a program by platform
-//! and by what is installed. It is ported as a pure function over
-//! `(platform, wayland, has)` so the whole ladder is testable without any of those
-//! programs being present — which is the only way to test it at all.
+//! `copy_command` picks a program by platform and by what is installed. It is a pure
+//! function over `(platform, wayland, resolve)` so the whole ladder is testable without
+//! any of those programs being present — which is the only way to test it at all. What
+//! an arm may name is constrained by how the payload is delivered, and which file that
+//! name may mean is constrained by who else could answer to it; see `copy_command`.
+//!
+//! # The file the probe approved is the file that runs
+//!
+//! `SystemClipboard::for_environment` proves that one concrete candidate `is_file()`
+//! before the ladder may claim a helper exists, so an arm carries that resolved absolute
+//! path as `argv[0]` rather than the program's name. Handing the name back would let the
+//! decision be taken a second time — by `execvp`, or by Windows' own resolution — from a
+//! list that is not the one the probe walked. POSIX reads an empty `PATH` component as
+//! the current directory, and `path_candidates` deliberately ignores those components,
+//! so a bare name approved as `/usr/bin/wl-copy` could spawn instead a `wl-copy` that a
+//! cloned repository, a dependency's build output or an earlier tool call left in the
+//! workspace. What that child then receives on its stdin is the transcript text the user
+//! asked to copy.
+//!
+//! Making the two halves agree the other way round — dropping the empty-component filter
+//! so the probe honours the current directory as well — was rejected: agreement is only
+//! worth having on the safe answer.
 //!
 //! # OSC 52 wins; the native tool is the fallback
 //!
@@ -797,10 +815,15 @@ impl Osc52Sink for RecordingSink {
 pub trait CommandRunner: Send + Sync {
     /// Run `argv`, feeding `input` to the child's stdin.
     ///
+    /// `argv[0]` is an already-resolved absolute path rather than a program name — see
+    /// [`copy_command`] — and an implementation spawns it as given. Resolving it again is
+    /// exactly what carrying the path here exists to prevent.
+    ///
     /// # Errors
     ///
-    /// [`ExternalError::Failed`] when the program is missing, the write to its stdin
-    /// fails, it exits non-zero, or it exceeds the runner's deadline.
+    /// [`ExternalError::Failed`] when `argv[0]` is not such a path, the program is
+    /// missing, the write to its stdin fails, it exits non-zero, or it exceeds the
+    /// runner's deadline.
     fn run(&self, argv: &[String], input: &str) -> Result<(), ExternalError>;
 }
 
@@ -857,6 +880,18 @@ impl CommandRunner for ChildProcessRunner {
                 "the clipboard command is empty",
             )));
         };
+        // Refused here as well as decided in `copy_command`, because this is the line
+        // that would do the searching: `Command::new` resolves a bare name through
+        // `execvp` on Unix and through its own list on Windows, and neither walks the
+        // list the availability probe walked. Reporting the caller's bug beats spawning
+        // whichever file happens to answer to the name, since the payload this runner
+        // writes to stdin is a transcript message a model composed.
+        if !Path::new(program).is_absolute() {
+            return Err(ExternalError::Failed(format!(
+                "refusing to run {program}: a clipboard command must be an absolute path \
+                 already resolved against PATH, not a name to search for"
+            )));
+        }
         let mut child = Command::new(program)
             .args(arguments)
             .stdin(Stdio::piped())
@@ -1280,29 +1315,74 @@ impl Platform {
 
 /// The copy command for a host, or `None` when nothing is available.
 ///
-/// Verbatim from `clipboard.ts:75-91`, including the order: Wayland before X11 on
-/// Linux, and `xclip` before `xsel`.
+/// # Every arm receives the copied text on stdin
+///
+/// [`ChildProcessRunner::run`] spawns `argv` and writes the payload to the child's
+/// stdin, so an arm may only name a program that reads stdin as *clipboard data*. A
+/// program that reads stdin as its own source — `osascript` invoked without a script
+/// file is exactly that — would execute whatever a model wrote into the transcript
+/// message the user copied. macOS therefore uses `pbcopy`, and a macOS host without it
+/// has no native fallback at all rather than one that runs the payload.
+///
+/// The order within a platform is a preference, not a fallback for a broken arm:
+/// Wayland before X11 on Linux, and `xclip` before `xsel`.
+///
+/// # `argv[0]` is the path `resolve` proved, not the name it was asked about
+///
+/// `resolve` answers *where* a program is rather than whether one exists, and the arm
+/// puts that path in `argv[0]`, because [`ChildProcessRunner::run`] hands `argv[0]` to
+/// [`Command::new`], which resolves a bare name all over again — through a search list
+/// that is not the one the availability probe walked. The module header names what that
+/// second search can reach that the first refused. A path also strengthens the
+/// [`path_candidates`] note about `PATHEXT` instead of weakening it: the spawn now names
+/// the exact file the probe proved, so no platform appends an extension to it or consults
+/// a directory for it. An arm whose resolved path is not UTF-8 yields `None`; see
+/// [`resolved_argv`].
 #[must_use]
 pub fn copy_command(
     platform: Platform,
     wayland: bool,
-    has: impl Fn(&str) -> bool,
+    resolve: impl Fn(&str) -> Option<PathBuf>,
 ) -> Option<Vec<String>> {
-    let owned = |parts: &[&str]| Some(parts.iter().map(|part| (*part).to_owned()).collect());
     match platform {
-        Platform::Macos if has("osascript") => owned(&["osascript"]),
-        Platform::Linux if wayland && has("wl-copy") => owned(&["wl-copy"]),
-        Platform::Linux if has("xclip") => owned(&["xclip", "-selection", "clipboard"]),
-        Platform::Linux if has("xsel") => owned(&["xsel", "--clipboard", "--input"]),
-        Platform::Windows if has("powershell.exe") => owned(&[
-            "powershell.exe",
-            "-NonInteractive",
-            "-NoProfile",
-            "-Command",
-            "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
-        ]),
+        Platform::Macos if let Some(program) = resolve("pbcopy") => resolved_argv(&program, &[]),
+        Platform::Linux if wayland && let Some(program) = resolve("wl-copy") => {
+            resolved_argv(&program, &[])
+        }
+        Platform::Linux if let Some(program) = resolve("xclip") => {
+            resolved_argv(&program, &["-selection", "clipboard"])
+        }
+        Platform::Linux if let Some(program) = resolve("xsel") => {
+            resolved_argv(&program, &["--clipboard", "--input"])
+        }
+        Platform::Windows if let Some(program) = resolve("powershell.exe") => resolved_argv(
+            &program,
+            &[
+                "-NonInteractive",
+                "-NoProfile",
+                "-Command",
+                "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+            ],
+        ),
         _ => None,
     }
+}
+
+/// The argv that runs `program` with `arguments`, or `None` when the path is not UTF-8.
+///
+/// Its own function so both ladders build an argv the same way, and so the one judgement
+/// call in it has somewhere to be explained. A non-UTF-8 path is refused rather than
+/// converted: this argv is `Vec<String>` because everything downstream — the worker
+/// mailbox, the failure messages, the recording double — reads it as text, and
+/// `to_string_lossy` would substitute replacement characters and hand the spawn a path
+/// naming some other file, or none. A host whose helper lives under such a path
+/// therefore has no native fallback, which is the answer [`copy_command`] already gives
+/// a macOS host with no `pbcopy`: one mechanism fewer, never a wrong one.
+fn resolved_argv(program: &Path, arguments: &[&str]) -> Option<Vec<String>> {
+    let mut argv = Vec::with_capacity(arguments.len() + 1);
+    argv.push(program.to_str()?.to_owned());
+    argv.extend(arguments.iter().map(|part| (*part).to_owned()));
+    Some(argv)
 }
 
 /// The read command for a host, when an image-capable one exists.
@@ -1311,18 +1391,25 @@ pub fn copy_command(
 /// to text. Only the Linux arms are expressible as a plain command; macOS needs an
 /// AppleScript that writes a file and Windows a PowerShell script, so those return
 /// `None` here and the real implementation handles them.
+///
+/// `resolve` hands back a path for the reason [`copy_command`] gives. Nothing spawns this
+/// ladder yet — [`Clipboard::read`] is refused — and that is precisely why the signature
+/// matters now: whoever wires reading later inherits a resolved `argv[0]` instead of
+/// rediscovering that a bare name is resolved a second time by the spawn.
 #[must_use]
 pub fn image_read_command(
     platform: Platform,
     wayland: bool,
-    has: impl Fn(&str) -> bool,
+    resolve: impl Fn(&str) -> Option<PathBuf>,
 ) -> Option<Vec<String>> {
-    let owned = |parts: &[&str]| Some(parts.iter().map(|part| (*part).to_owned()).collect());
     match platform {
-        Platform::Linux if wayland && has("wl-paste") => owned(&["wl-paste", "-t", "image/png"]),
-        Platform::Linux if has("xclip") => {
-            owned(&["xclip", "-selection", "clipboard", "-t", "image/png", "-o"])
+        Platform::Linux if wayland && let Some(program) = resolve("wl-paste") => {
+            resolved_argv(&program, &["-t", "image/png"])
         }
+        Platform::Linux if let Some(program) = resolve("xclip") => resolved_argv(
+            &program,
+            &["-selection", "clipboard", "-t", "image/png", "-o"],
+        ),
         _ => None,
     }
 }
@@ -1347,8 +1434,16 @@ pub fn osc52(text: &str, multiplexed: bool) -> String {
 /// Split from the filesystem check so the joining and the platform's separator are
 /// testable without planting executables, the same trade [`copy_command`] makes.
 ///
+/// An empty component is dropped rather than joined. POSIX reads one as the current
+/// directory, and a clipboard helper taken from whatever directory the user happened to
+/// start Zuno in is the one file an attacker gets to choose. [`is_resolved_program`]
+/// would refuse the joined result anyway, since it is relative; the filter stays because
+/// it keeps the intent where the list is built, and keeps this function's answer honest
+/// about which places were searched.
+///
 /// No `PATHEXT` handling, and that is not an omission: the only Windows arm of the
-/// ladder names `powershell.exe` with its extension already.
+/// ladder names `powershell.exe` with its extension already, and since [`copy_command`]
+/// now spawns the exact candidate proved here, nothing downstream appends one either.
 #[must_use]
 pub fn path_candidates(program: &str, path: &str, platform: Platform) -> Vec<PathBuf> {
     let separator = if matches!(platform, Platform::Windows) {
@@ -1360,6 +1455,25 @@ pub fn path_candidates(program: &str, path: &str, platform: Platform) -> Vec<Pat
         .filter(|entry| !entry.is_empty())
         .map(|entry| Path::new(entry).join(program))
         .collect()
+}
+
+/// Whether `candidate` is a file this host can spawn without searching for it.
+///
+/// Both halves are load-bearing. `is_file` is the availability probe itself: it is what
+/// entitles the ladder to claim a helper exists. `is_absolute` is what makes that answer
+/// keep its meaning. A relative candidate — what a relative `PATH` entry produces — would
+/// be resolved once more against whatever the current directory is when the child starts,
+/// and that happens later, on [`NativeClipboardWorker`]'s detached thread, not here.
+/// Refusing it costs a `PATH` entry shape no clipboard helper is installed under in
+/// practice and buys an argument that holds without knowing the process's cwd.
+///
+/// Deliberately host semantics: [`Path::is_absolute`] answers for the platform this
+/// binary runs on, which is the platform whose filesystem [`Path::is_file`] just
+/// consulted. [`Platform`] chooses the *ladder*; it does not get to reinterpret a real
+/// path.
+#[must_use]
+pub fn is_resolved_program(candidate: &Path) -> bool {
+    candidate.is_absolute() && candidate.is_file()
 }
 
 /// The clipboard a real host has: OSC 52 first, then the native fallback.
@@ -1425,6 +1539,11 @@ impl SystemClipboard {
     /// `sink` is a parameter rather than built in here so that a test can observe the
     /// sequence instead of painting it into the terminal running the suite — the same
     /// reason `runner` is one.
+    ///
+    /// The probe hands the ladder the path it proved rather than the name it was asked
+    /// about, so the file this constructor decided on is the file that later runs. See
+    /// [`is_resolved_program`] for what a candidate has to be, and the module header for
+    /// what a re-resolved name could have become.
     #[must_use]
     pub fn for_environment(
         platform: Platform,
@@ -1436,8 +1555,8 @@ impl SystemClipboard {
         let wayland = environment("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty());
         let command = copy_command(platform, wayland, |program| {
             path_candidates(program, &path, platform)
-                .iter()
-                .any(|candidate| candidate.is_file())
+                .into_iter()
+                .find(|candidate| is_resolved_program(candidate))
         });
         Self::new(sink, is_multiplexed(&environment), command, runner)
     }

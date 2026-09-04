@@ -77,19 +77,57 @@ pub enum SearchError {
         /// `rg`'s own diagnostics, trimmed.
         message: String,
     },
+
+    /// `rg` refused the invocation and therefore searched nothing.
+    ///
+    /// Model-correctable, and deliberately distinct from [`SearchError::Ripgrep`] so
+    /// it is not laundered into the not-correctable bucket: every part of the
+    /// invocation Zuno does not fix itself came from the call, so a refusal names the
+    /// call's own pattern, include glob, or path, and `message` is the backend's
+    /// advice about which. Distinct from the two pattern failures because Zuno cannot
+    /// always say *which* input `rg` objected to.
+    #[error("ripgrep rejected the search: {message}")]
+    Rejected {
+        /// `rg`'s own diagnostic, or Zuno's description of what was never searched.
+        message: String,
+    },
+
+    /// The search produced more output than Zuno will buffer, and was abandoned.
+    ///
+    /// Model-correctable: a narrower pattern, path, or include filter is the only
+    /// thing that changes the outcome, which is what `message` tells the model. Typed
+    /// apart from [`SearchError::Ripgrep`] because the backend did not fail — Zuno
+    /// stopped it — and because a caller that reported this as unfixable would turn a
+    /// one-token correction into a permanent tool failure.
+    #[error("{message}")]
+    TooBroad {
+        /// What the limit was and how to get under it.
+        message: String,
+    },
 }
 
 impl SearchError {
     /// Whether the model can fix this by issuing a different call.
     ///
-    /// The two pattern failures are the model's to correct. A missing root, a
-    /// cancellation, or a backend failure are not: nothing the model can write in
-    /// the next call changes them.
+    /// The two pattern failures are the model's to correct, as are an invocation the
+    /// backend refused and a search too broad to buffer: in all four the next call can
+    /// carry a different pattern, filter, or path. A missing root, a cancellation, or
+    /// a backend failure are not: nothing the model can write in the next call changes
+    /// them.
+    ///
+    /// This predicate is the only thing `zuno-tools` consults when it decides between
+    /// `ToolError::InvalidArgs` and the deliberately-non-retryable `ToolError::Failed`,
+    /// so a failure whose own message tells the model what to change must be listed
+    /// here or that advice is addressed to an actor the taxonomy declares powerless.
     #[must_use]
     pub fn is_model_correctable(&self) -> bool {
         matches!(
             self,
-            Self::InvalidGlob { .. } | Self::InvalidPattern { .. } | Self::RootNotDirectory { .. }
+            Self::InvalidGlob { .. }
+                | Self::InvalidPattern { .. }
+                | Self::RootNotDirectory { .. }
+                | Self::Rejected { .. }
+                | Self::TooBroad { .. }
         )
     }
 }

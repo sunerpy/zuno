@@ -254,6 +254,10 @@ backend, so the Shell tool cannot be registered under the requested
 
 一条已保存的 `always` 活在运行中的进程里，而不在数据库里，并且随 session 结束而结束。通过 HTTP 时，用 `POST /api/session/prune` 归档或删除一个 session 会撤销该 session 授予的每一条授权，重启 `zuno serve` 会清空全部；断开再重连事件流不会丢失它们，因为一条流不等于那个 session。想让一个决定活得比一个 session 更久，应该写进 `permission.rules`。参见[会话保留](/zh/operate/session-retention#归档会终止该-session-的常驻-http-授权)。
 
+通过 HTTP 时，常驻 `always` 预先批准的每一次调用都会被记录为一条独立的、已结算的请求行，响应为 `{"reply":"once","source":"standing"}`；授权本身从不落盘。如果一条回复到达时它的提问方已经消失 —— 回合被中断，或发起调用的进程已重启 —— 这条回复依然会被记录，答案会通过持久 inbox 进入会话，但不会安装任何常驻授权：只有真正收到该回复的调用才会让授权被保存。
+
+已提交的回复是终态的：即使 HTTP 连接在 `204` 送达之前断开，工具调用仍会收到这个决定，常驻的 `always` 仍会被安装，被暂停的 goal 仍会恢复。客户端若重试这样一条回复，会得到 `404`，原因是该请求已不再处于待处理状态，而不是回复丢失了。
+
 ## 逐工具规则
 
 `permission.rules` 是有序的，**最后一条匹配的规则胜出**。一条规则要么是对整个工具的单一动作，要么是按模式匹配的多个动作。
@@ -278,9 +282,25 @@ backend, so the Shell tool cannot be registered under the requested
 
 顺序很关键，上面的例子依赖它。因为后面的规则会覆盖前面的规则，catch-all `*` 要写在**最前面**，而从它当中划出例外的窄模式要写在**最后面**：`git *` 覆盖 catch-all，`git push*` 再覆盖 `git *`，于是 push 被拒绝。把顺序倒过来不只是风格差异，它会让保护失效：写在最后的 `*` 会覆盖它上面的每一条规则，`rm -rf /` 会重新变成一次询问。
 
+既然顺序本身就是策略，Zuno 在此前会丢掉顺序的两个环节上都保住了你写下的顺序。Markdown Agent 的 `permission.rules` 会按 frontmatter 中的顺序到达评估器；把一个配置层合并到另一层之上时，基础层的规则顺序会被保留，而不是重新排序。这两个环节此前都会把键按字母排序，而把上面那个例子排一遍序就足以让它失效：`$HOME/.ssh/*` 排在 `*` 之前，所以排序后的 `{"*": "allow", "$HOME/.ssh/*": "deny"}` 会把 deny 放到 catch-all 之上，于是 catch-all 反而胜出。
+
+合并规则值得了解，因为你可以在 `zuno debug permissions` 的输出里看到它：两层都设置的键在基础层给它的位置上被替换，只有覆盖层设置的键则追加在基础层各键之后。因此覆盖层的模式会压过基础层的 catch-all：项目层或 Agent 层可以从一条宽规则里划出例外，而不必把那条宽规则重写一遍。
+
 `edit` 这个键同时管 `write`、`edit` 和 `apply_patch` 三个工具，它们都在这个键下申请授权。不存在单独的 `write` 或 `apply_patch` 规则键，而且 `permission.rules` 会直接拒绝它们：写在 `write`、`apply_patch`、`list_mcp_resources`、`list_mcp_resource_templates` 或 `read_mcp_resource` 下的规则会导致配置校验失败，并指出应当改用哪个键——前两个用 `edit`，三个 MCP 资源工具用 `read`。这五个键此前会被接受，却什么都不评估。其他键仍然合法，因为 MCP、插件与 Skill 工具的名字在运行时才确定，键本身也可以是通配模式。
 
+顶层 `tools` 开关按工具名索引，同一套折叠也适用于它，因此同一个配置层内的两个 `tools` 条目可能落到同一条合成规则上，此时它们必须一致。`{"tools": {"edit": false, "write": true}}` 会校验失败，错误信息会同时点名两种拼法和起管辖作用的那个键：
+
+```text
+tools "edit" is false and tools "write" is true, but both are governed by permission "edit"; one rule cannot be both, so set them alike or write the rule under permission.rules.edit
+```
+
+把两个条目设成相同的值仍然可以加载。**这是一处不兼容变更**：这样自相矛盾的 `tools` 块此前是可以加载的，写在后面的那个条目会静默胜出，于是一个读起来像是禁用的块，实际上可能正在放开那个工具。请在 `permission.rules.<key>` 下把意图写一次，用错误信息点名的那个键。
+
+分处两层的分歧则是另一回事：这属于覆盖，而不是矛盾，解析方式和其他任何配置键一样——在点名了该 permission 键的各层中，优先级最高的那一层胜出，所以项目层的 `edit: false` 会压过全局的 `write: true`。只有同一层内部的分歧没有顺序可以援引，因此只有它会被拒绝。
+
 路径规则会同时按调用给出的原样路径和它的规范化拼写来匹配：分隔符被统一，`.` 段与重复分隔符被去掉，因此 `./src/main.rs`、`src//main.rs` 以及反斜杠写法 `src\main.rs` 都能匹配一条写作 `src/main.rs` 的规则。`deny` 刻意伸得更远：它还覆盖 `..` 解析后的路径，而写成绝对路径的 deny 也覆盖该路径的相对尾段，所以 deny 无法靠改写路径拼法绕过。`allow` 在这两个方向上都不会被放宽，因为放宽一条 allow 就等于授权了规则没有点名的文件。
+
+按这种方式处理的键是 `read`、`edit`、`write`、`list` 与 `lsp`。`lsp` 也在其中，是因为它的资源同样是一个文件：语言服务器工具会把该文件命名为相对于包含本次会话的工作区的路径，而当会话目录与工作区不构成嵌套关系时，则回退为解析后的绝对路径。因此写作 `{"lsp": {"secrets.rs": "deny"}}` 的 deny 在两种布局下都能覆盖这个文件。
 
 写 `allow` 时要照这个不对称来规划。`read`、`edit`、`write`、`apply_patch` 的文档约定接收绝对路径，所以 `"read": {"src/main.rs": "allow"}` 覆盖不到调用实际传入的绝对路径，而同样的模式写成 `deny` 却能覆盖。请用 `~`、`$HOME` 或绝对前缀来写 allow，或者用 `*`（它可以跨分隔符匹配），例如 `{"*/src/*": "allow"}`。
 

@@ -851,6 +851,143 @@ mod tests {
         frame
     }
 
+    /// One `:event-type`-tagged frame, as Bedrock actually sends them.
+    fn event_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
+        let mut headers = Vec::new();
+        for (name, value) in [
+            (":message-type", "event"),
+            (":event-type", event_type),
+            (":content-type", "application/json"),
+        ] {
+            headers.push(u8::try_from(name.len()).expect("header name length"));
+            headers.extend_from_slice(name.as_bytes());
+            headers.push(7);
+            headers.extend_from_slice(
+                &u16::try_from(value.len())
+                    .expect("header value length")
+                    .to_be_bytes(),
+            );
+            headers.extend_from_slice(value.as_bytes());
+        }
+        let total_length =
+            u32::try_from(OVERHEAD_LEN + headers.len() + payload.len()).expect("frame fits in u32");
+        let mut frame = Vec::with_capacity(total_length as usize);
+        frame.extend_from_slice(&total_length.to_be_bytes());
+        frame.extend_from_slice(
+            &u32::try_from(headers.len())
+                .expect("headers fit in u32")
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(&crc32(&frame[..8]).to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(payload);
+        let message_crc = crc32(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        frame
+    }
+
+    /// `InvokeModelWithResponseStream` wraps the model's own payload, base64-encoded,
+    /// in a `chunk` event.
+    fn invoke_chunk(inner: &Value) -> Vec<u8> {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(inner).expect("serialize inner payload"));
+        event_frame(
+            "chunk",
+            &serde_json::to_vec(&serde_json::json!({"bytes": encoded}))
+                .expect("serialize chunk envelope"),
+        )
+    }
+
+    fn decode_all(frames: &[Vec<u8>]) -> Vec<StreamEvent> {
+        let mut decoder = BedrockEventDecoder::new();
+        let mut events = Vec::new();
+        for frame in frames {
+            events.extend(decoder.push(frame).expect("the frame decodes"));
+        }
+        events
+    }
+
+    /// The Anthropic-shaped invoke payload this decoder was written for.
+    #[test]
+    fn an_anthropic_shaped_invoke_chunk_decodes_its_tool_call() {
+        let events = decode_all(&[
+            invoke_chunk(&serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read"}
+            })),
+            invoke_chunk(&serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\"a\"}"}
+            })),
+        ]);
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolUseStart {
+                    id: "toolu_1".to_owned(),
+                    name: "read".to_owned(),
+                },
+                StreamEvent::ToolInputDelta {
+                    id: "toolu_1".to_owned(),
+                    delta: "{\"path\":\"a\"}".to_owned(),
+                },
+            ]
+        );
+    }
+
+    /// The evidence behind the Mantle refusal in `provider::open_stream`.
+    ///
+    /// `InvokeModelWithResponseStream` on a Mantle (OpenAI-shaped) model answers with
+    /// Chat Completions chunks or Responses events. This decoder understands only
+    /// Anthropic Messages event types, so both shapes fall through its catch-all arm and
+    /// the whole reply — text and tool calls alike — is discarded. Nothing downstream can
+    /// recover from that, which is why the request is refused before it is signed and
+    /// billed instead of streaming into silence. When a shared OpenAI decoder becomes
+    /// available to this crate, this test is the one that must flip.
+    #[test]
+    fn openai_shaped_invoke_chunks_yield_no_events_at_all() {
+        let chat = decode_all(&[invoke_chunk(&serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "hello",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": {"name": "read", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+        }))]);
+        assert_eq!(chat, Vec::new(), "an OpenAI Chat chunk is discarded whole");
+
+        let responses = decode_all(&[
+            invoke_chunk(&serde_json::json!({
+                "type": "response.output_item.added",
+                "item": {"type": "function_call", "call_id": "call_1", "name": "read"}
+            })),
+            invoke_chunk(&serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "delta": "{}"
+            })),
+            invoke_chunk(&serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": "hello"
+            })),
+            invoke_chunk(&serde_json::json!({"type": "response.completed"})),
+        ]);
+        assert_eq!(
+            responses,
+            Vec::new(),
+            "an OpenAI Responses event stream is discarded whole"
+        );
+    }
+
     #[test]
     fn a_large_frame_does_not_strand_its_capacity_for_the_rest_of_the_stream() {
         let mut decoder = EventStreamDecoder::new();

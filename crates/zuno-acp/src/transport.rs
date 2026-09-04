@@ -500,6 +500,11 @@ where
 
     let loop_result = async {
         loop {
+            // A JoinSet holds each finished task's entry until it is joined, so a
+            // session that stays connected for days would grow one entry per frame it
+            // handled, and the EOF drain would spend its grace on tasks that already
+            // responded instead of on the ones still running.
+            while requests.try_join_next().is_some() {}
             let frame = match read_frame(&mut reader, MAX_INBOUND_FRAME_BYTES).await? {
                 FrameRead::Eof => {
                     clean_eof = true;
@@ -860,6 +865,80 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Client-side test doubles for agent code that talks back over the connection.
+#[cfg(test)]
+pub(crate) mod test_client {
+    use super::*;
+
+    /// A [`ClientConnection`] whose outbound requests are answered by a closure.
+    ///
+    /// The agent side under test uses the real connection API, so a test never
+    /// re-implements request framing or waiter bookkeeping.
+    pub(crate) struct ScriptedClient {
+        connection: ClientConnection,
+        methods: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedClient {
+        pub(crate) fn new<F>(respond: F) -> Self
+        where
+            F: Fn(&str, &Value) -> Result<Value, RpcError> + Send + 'static,
+        {
+            let (output, mut frames) = mpsc::channel(OUTBOUND_FRAME_CHANNEL_CAPACITY);
+            let connection = ClientConnection {
+                output,
+                pending: Arc::new(Mutex::new(PendingState::default())),
+                next_id: Arc::new(AtomicU64::new(1)),
+                deferred: None,
+                scoped_requests: None,
+            };
+            let methods = Arc::new(Mutex::new(Vec::new()));
+            let pending = Arc::clone(&connection.pending);
+            let recorded = Arc::clone(&methods);
+            tokio::spawn(async move {
+                while let Some(outbound) = frames.recv().await {
+                    let Outbound::Frame { value, sent } = outbound else {
+                        continue;
+                    };
+                    let _ignored = sent.send(Ok(()));
+                    let method = value
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    lock(&recorded).push(method.clone());
+                    let waiter = value
+                        .get("id")
+                        .and_then(id_key)
+                        .and_then(|id| lock(&pending).waiters.remove(&id));
+                    if let Some(waiter) = waiter {
+                        let params = value.get("params").cloned().unwrap_or(Value::Null);
+                        let _ignored = waiter.send(respond(&method, &params));
+                    }
+                }
+            });
+            Self {
+                connection,
+                methods,
+            }
+        }
+
+        /// A connection whose every request fails, for code that must not reach the wire.
+        pub(crate) fn unreachable() -> Self {
+            Self::new(|method, _| Err(RpcError::method_not_found(method)))
+        }
+
+        pub(crate) fn connection(&self) -> ClientConnection {
+            self.connection.clone()
+        }
+
+        /// Methods the agent sent, in order.
+        pub(crate) fn methods(&self) -> Vec<String> {
+            lock(&self.methods).clone()
+        }
+    }
 }
 
 #[cfg(test)]

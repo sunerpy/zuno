@@ -1,4 +1,4 @@
-use crate::rule::{evaluate, evaluate_ordered};
+use crate::rule::{Denial, decide, decide_ordered, evaluate};
 use crate::types::{
     Authorization, PermissionReply, PermissionRequest, ReplyKind, ReplyOutcome, ResolvedRequest,
     Rule,
@@ -46,34 +46,55 @@ impl PermissionEngine {
     ///
     /// # Errors
     /// Returns [`ToolError::Denied`] as soon as any requested pattern evaluates
-    /// to deny. A denied request is never inserted into pending state.
+    /// to deny. A denied request is never inserted into pending state. The error
+    /// names only the tool; [`Self::authorize_explained`] keeps the rule and the
+    /// reason for a caller that has to say why.
     pub fn authorize(
+        &mut self,
+        request: PermissionRequest,
+        ruleset: &[Rule],
+    ) -> Result<Authorization, ToolError> {
+        self.authorize_explained(request, ruleset)
+            .map_err(ToolError::from)
+    }
+
+    /// [`Self::authorize`], with a refusal that says which rule and why.
+    ///
+    /// A configured `deny` is terminal — no prompt follows and no runtime grant can
+    /// cross it — so the person who hits one needs the rule that fired and the
+    /// reading it fired under, most of all when that reading is one a deny alone
+    /// may use: a bare `$EDITOR` refused by `rm -rf*` because the program can only
+    /// be resolved by the shell. [`Denial`] renders that account.
+    ///
+    /// # Errors
+    /// Returns the [`Denial`] for the first requested pattern that evaluates to
+    /// deny, boxed because it carries the rule and the resource. A denied request is
+    /// never inserted into pending state.
+    pub fn authorize_explained(
         &mut self,
         mut request: PermissionRequest,
         ruleset: &[Rule],
-    ) -> Result<Authorization, ToolError> {
+    ) -> Result<Authorization, Box<Denial>> {
         if request.patterns.is_empty() {
             request.patterns.push("*".to_owned());
         }
         let mut needs_ask = false;
         for pattern in &request.patterns {
-            if evaluate(&request.permission, pattern, ruleset) == PermissionAction::Deny {
-                return Err(ToolError::Denied {
-                    tool: request.permission.clone(),
-                });
+            if let Some(denial) =
+                decide(&request.permission, pattern, ruleset).denial(&request.permission, pattern)
+            {
+                return Err(Box::new(denial));
             }
-            match evaluate_ordered(
+            let layered = decide_ordered(
                 &request.permission,
                 pattern,
                 ruleset.iter().chain(self.approved.iter()),
-            ) {
-                PermissionAction::Ask => needs_ask = true,
-                PermissionAction::Allow => {}
-                PermissionAction::Deny => {
-                    return Err(ToolError::Denied {
-                        tool: request.permission.clone(),
-                    });
-                }
+            );
+            if let Some(denial) = layered.denial(&request.permission, pattern) {
+                return Err(Box::new(denial));
+            }
+            if layered.action == PermissionAction::Ask {
+                needs_ask = true;
             }
         }
 

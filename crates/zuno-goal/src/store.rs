@@ -54,14 +54,17 @@
 //! failed run and an inferred exit status count for nothing. A receipt older than
 //! the last [`GoalStore::mark_mutation`] is refused, and a criterion already
 //! satisfied by one is reopened, so editing files after a green test run undoes the
-//! evidence rather than the other way round. And a goal that
-//! [`GoalStore::escalate_to_change`] marked as changing the workspace cannot
-//! complete while any criterion is still open — including the case of having no
-//! criteria at all, which is assertion with extra steps.
+//! evidence rather than the other way round. And a goal that recorded success
+//! criteria, or that [`GoalStore::escalate_to_change`] marked as changing the
+//! workspace, cannot complete while any criterion is still open — including the case
+//! of a change goal having no criteria at all, which is assertion with extra steps.
 //!
-//! A [`GoalKind::Question`] goal is untouched by all three. Answering a question
-//! leaves nothing behind to verify, and demanding a receipt for it would only teach
-//! the model to manufacture one.
+//! A [`GoalKind::Question`] goal that recorded no criteria is untouched by all
+//! three. Answering a question leaves nothing behind to verify, and demanding a
+//! receipt for it would only teach the model to manufacture one. A criteria-bearing
+//! goal is held to its checklist whatever its kind, because the kind is derived from
+//! tool-reported write paths and a run that edits through a tool reporting none
+//! never escalates.
 //!
 //! Two consequences of that split are decisions, not gaps. A goal proposed with no
 //! criteria at all is accepted, because a question needs none, and it stays a
@@ -121,6 +124,100 @@ pub struct GoalHumanRequestOrigin {
     pub call_id: Option<String>,
 }
 
+/// The most success criteria one model-proposed goal may record.
+///
+/// A checklist is a list of the checks that decide the objective, not a work plan;
+/// `plan_update` owns finer decomposition. The bound exists because the field is now
+/// mandatory and model-supplied, and every entry lands in a durable column, in the
+/// `goal.success_criteria` JSON projection, and in the id list
+/// [`GoalError::EvidenceMissing`] renders back into the model's context on every
+/// completion attempt. Unmeasured before this, 5 000 criteria were accepted and made
+/// that refusal 34 KB.
+///
+/// A crate constant rather than a profile field on purpose, and it removes no operator
+/// lever: there was no bound at all, so nothing an operator could set was tighter, and
+/// no client can raise this one. If a deployment ever needs a *lower* ceiling it belongs
+/// in a validated profile field, and the refusal already names the number in force.
+///
+/// Enforced by [`GoalStore::create_goal_as_model`] at creation only. A goal an earlier
+/// release stored with more criteria still reads, projects and completes.
+pub const MAX_SUCCESS_CRITERIA: usize = 32;
+
+/// The longest one success-criterion statement may be, in characters.
+///
+/// The objective next door is capped at [`crate::spill::MAX_OBJECTIVE_CHARS`] and spills
+/// past it; a criterion statement had no bound at all, and a 2 000 000-character
+/// statement was accepted into the column and into the JSON projection. Sized well above
+/// [`crate::projection::MAX_CRITERION_CHARS`], the 200 characters the human-readable goal
+/// document renders before clipping, so the document shows a visibly clipped line rather
+/// than a column nothing bounds.
+///
+/// Enforced by [`GoalStore::create_goal_as_model`] at creation only, for the reason
+/// [`MAX_SUCCESS_CRITERIA`] gives.
+pub const MAX_CRITERION_STATEMENT_CHARS: usize = 500;
+
+/// The longest reason a waiver may give, in characters.
+///
+/// The same number as [`MAX_CRITERION_STATEMENT_CHARS`] because it is the same surface
+/// seen from the other side: a waiver excuses one criterion statement, is written by the
+/// model, lands in a durable column with no spill path, and is rendered back into the
+/// `goal_update` tool result and into the goal document. Bounding the statement and not
+/// the excuse for it left a 2 000 000-character reason accepted, stored, and rendered as
+/// a 2 000 434-byte tool result on every later read — the defect
+/// [`MAX_CRITERION_STATEMENT_CHARS`] closed, one function away.
+///
+/// Enforced by [`GoalStore::waive_criterion`] at the write only: a reason an earlier
+/// release stored still reads, still projects and still completes, and the renderers clip
+/// it.
+pub const MAX_WAIVER_REASON_CHARS: usize = 500;
+
+/// Whether `text` holds at least one character a human reading the goal could see.
+///
+/// `str::trim` and `char::is_whitespace` cover White_Space, which is why `"\u{00a0}"`
+/// and `"\u{3000}"` were already refused as blank. They do not cover the format and
+/// default-ignorable code points, so `"\u{200b}"`, `"\u{feff}"`, `"\u{2060}"`,
+/// `"\u{00ad}"`, `"\u{180e}"` and `"\u{200e}"` used to pass as a whole success
+/// criterion or as a whole waiver reason: populated in the database, empty on screen.
+/// That divergence is the one thing this audit surface exists to remove, so both fields
+/// share this predicate.
+///
+/// A deny-list of the formatting ranges that render as nothing, not a Unicode
+/// Default_Ignorable table — this crate cannot take a new dependency for one predicate,
+/// and the failure mode of an incomplete deny-list is that one more invisible spelling
+/// stays accepted, where an over-broad range would refuse a legitimate statement in a
+/// script the author never tested. Visible-but-meaningless text such as `"."` is
+/// deliberately still accepted: it renders as itself, so a human reviewing the checklist
+/// sees exactly what the database holds, which is the property being defended.
+#[must_use]
+pub fn has_visible_character(text: &str) -> bool {
+    text.chars()
+        .any(|character| !(character.is_whitespace() || is_invisible(character)))
+}
+
+/// Whether `character` is a formatting or ignorable code point that renders as nothing.
+const fn is_invisible(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00ad}'                  // SOFT HYPHEN
+            | '\u{034f}'                // COMBINING GRAPHEME JOINER
+            | '\u{061c}'                // ARABIC LETTER MARK
+            | '\u{115f}'..='\u{1160}'  // HANGUL CHOSEONG/JUNGSEONG FILLER
+            | '\u{17b4}'..='\u{17b5}'  // KHMER INHERENT VOWELS
+            | '\u{180b}'..='\u{180f}'  // MONGOLIAN SELECTORS AND VOWEL SEPARATOR
+            | '\u{200b}'..='\u{200f}'  // ZWSP, ZWNJ, ZWJ, LRM, RLM
+            | '\u{202a}'..='\u{202e}'  // BIDI EMBEDDING CONTROLS
+            | '\u{2060}'..='\u{2064}'  // WORD JOINER, INVISIBLE OPERATORS
+            | '\u{2066}'..='\u{206f}'  // BIDI ISOLATES, DEPRECATED FORMAT
+            | '\u{3164}'                // HANGUL FILLER
+            | '\u{fe00}'..='\u{fe0f}'  // VARIATION SELECTORS
+            | '\u{feff}'                // ZERO WIDTH NO-BREAK SPACE
+            | '\u{ffa0}'                // HALFWIDTH HANGUL FILLER
+            | '\u{1d173}'..='\u{1d17a}' // MUSICAL FORMAT CONTROLS
+            | '\u{e0000}'..='\u{e0fff}' // TAGS AND VARIATION SELECTORS SUPPLEMENT
+        )
+}
+
 /// The table, verbatim.
 ///
 /// A port of `codex-rs/state/goals_migrations/0001_thread_goals.sql` with
@@ -167,9 +264,11 @@ CREATE TABLE IF NOT EXISTS goal (
 /// this batch, outside the database format marker `zuno_db::migration` maintains.
 /// That is deliberate: they carry *goal* policy rather than application data, they
 /// are created by whichever process attaches a [`GoalStore`], and a database that
-/// predates them is not stale — it simply has no criteria, and no claims, yet.
-/// Putting them behind the format marker would make a goal-policy change a
-/// whole-database migration.
+/// predates them is not stale — it has no claims yet, and the checklist it does hold
+/// is in the `goal.success_criteria` column, from which `backfill_criteria` mints
+/// the `goal_criterion` rows in the same transaction that creates the table. Putting
+/// them behind the format marker would make a goal-policy change a whole-database
+/// migration.
 ///
 /// `goal_capability_claim` is session-scoped rather than goal-scoped: it is
 /// provenance for what a session relied on, and [`crate::capability`] explains why
@@ -489,7 +588,10 @@ impl GoalKind {
         }
     }
 
-    /// Whether completion of this kind of goal requires recorded evidence.
+    /// Whether this kind alone requires recorded evidence to complete.
+    ///
+    /// Not the whole gate: a recorded checklist is audited whatever the kind, so this
+    /// answers only whether a goal with *no* criteria is held to evidence.
     #[must_use]
     pub const fn requires_evidence(self) -> bool {
         matches!(self, Self::Change)
@@ -618,16 +720,23 @@ impl GoalStore {
 
     /// Attach goal state to an existing application database pool.
     ///
+    /// Creates the goal tables and then brings a database an earlier release wrote
+    /// forward — the history trigger, the pause table's `CHECK` members and the
+    /// criterion rows a `0.6.x` goal kept only in its `success_criteria` column — in one
+    /// `IMMEDIATE` transaction, so a crash leaves either the old state or the new one and
+    /// never a table without its rows.
+    ///
     /// # Errors
     ///
-    /// [`GoalError::Db`] when the goal tables cannot be initialized.
+    /// [`GoalError::Db`] when the goal tables cannot be initialized or repaired.
     pub fn from_pool(pool: Arc<Pool>, spill_dir: PathBuf) -> Result<Self, GoalError> {
         pool.transaction(|tx| {
             tx.execute_batch(SCHEMA).map_err(zuno_db::map_error)?;
             tx.execute_batch(AUXILIARY_SCHEMA)
                 .map_err(zuno_db::map_error)?;
             guard_history_trigger(tx)?;
-            widen_pause_reasons(tx)
+            widen_pause_reasons(tx)?;
+            backfill_criteria(tx, None)
         })?;
         Ok(Self { pool, spill_dir })
     }
@@ -975,7 +1084,10 @@ impl GoalStore {
 
     /// Create the goal for `session_id`, replacing a finished or cancelled one.
     ///
-    /// The model-facing entry point. It succeeds when the session has no goal,
+    /// The guarded entry point for a goal the *user* stated, such as `/goal create`.
+    /// It records no success criteria, so the resulting goal is not gated on evidence;
+    /// [`Self::create_goal_as_model`] is the model's own entry point and requires a
+    /// checklist. It succeeds when the session has no goal,
     /// or when the goal it has is `complete` or `cancelled`; anything else is
     /// [`GoalError::GoalNotReplaceable`], naming the status that blocked it. A
     /// replacement mints a fresh `goal_id` and resets both counters, matching
@@ -1002,7 +1114,101 @@ impl GoalStore {
             .map(|created| created.goal)
     }
 
-    /// Create a guarded model goal with explicit immutable success criteria.
+    /// Create the goal the model proposed for itself, which must say what will prove
+    /// it done.
+    ///
+    /// The model-authority creator, and the only one that requires a checklist.
+    /// [`Self::create_goal`] and [`Self::replace_goal_as_system`] stay criteria-less
+    /// on purpose: the human who typed `/goal create` is the authority for their own
+    /// objective and may leave it unmeasured. A goal the model proposes for itself is
+    /// not that, and [`audit_evidence`] can only read a checklist — a proposed goal
+    /// with none is one the audit has nothing to read, so `complete` would be an
+    /// assertion, and no citation offered later can help because criteria are
+    /// immutable after creation.
+    ///
+    /// The requirement therefore lands at creation rather than at completion. Creation
+    /// is the only moment it can still be met, and refusing here costs one corrected
+    /// tool call, where refusing at completion would strand a run that had already
+    /// done the work with no way to record what it should have promised.
+    ///
+    /// Blank entries are not criteria. Trimming happens here, in the store, so
+    /// `["   "]` cannot arrive as a checklist and leave as an empty one: it earns
+    /// [`GoalError::MissingSuccessCriteria`] instead of silently landing on the
+    /// criteria-less path a caller believed it had avoided.
+    ///
+    /// An entry with no visible character is blank for the same reason. `str::trim`
+    /// strips White_Space, so `"\u{200b}"`, `"\u{feff}"` and `"\u{00ad}"` survive it
+    /// and would become a criterion that is populated in the database and empty on
+    /// screen — a checklist a human cannot audit is not an audit surface. See
+    /// [`has_visible_character`].
+    ///
+    /// The list is also bounded, because it is mandatory, model-supplied, stored twice
+    /// and re-rendered into every later refusal: see [`MAX_SUCCESS_CRITERIA`] and
+    /// [`MAX_CRITERION_STATEMENT_CHARS`]. The bounds are checked before the write, so a refused
+    /// proposal leaves no goal row and no partial checklist. They apply to *creation
+    /// only*: a goal an earlier release stored with more or longer criteria still reads,
+    /// still projects and still completes.
+    ///
+    /// # Errors
+    ///
+    /// [`GoalError::MissingSuccessCriteria`] when no visible criterion was supplied,
+    /// [`GoalError::TooManySuccessCriteria`] past [`MAX_SUCCESS_CRITERIA`],
+    /// [`GoalError::SuccessCriterionTooLong`] past [`MAX_CRITERION_STATEMENT_CHARS`], and
+    /// otherwise every failure [`Self::create_goal_with_criteria`] reports.
+    pub fn create_goal_as_model(
+        &self,
+        session_id: &str,
+        objective: &str,
+        success_criteria: &[String],
+        token_budget: Option<i64>,
+    ) -> Result<GoalCreation, GoalError> {
+        // The refused positions are the caller's, not the filtered list's. Dropping
+        // blank entries first and then counting made every reported ordinal a position
+        // in a list the model never sent, which sent it to edit the wrong criterion.
+        let submitted = success_criteria.len();
+        let mut recorded: Vec<String> = Vec::with_capacity(submitted);
+        // Characters, not bytes: the cap is about what a human reads and what the
+        // column contracts for, and `MAX_OBJECTIVE_CHARS` next door counts the same way.
+        let mut too_long: Option<(usize, usize)> = None;
+        for (index, criterion) in success_criteria.iter().enumerate() {
+            let criterion = criterion.trim();
+            if !has_visible_character(criterion) {
+                continue;
+            }
+            let actual = criterion.chars().count();
+            if too_long.is_none() && actual > MAX_CRITERION_STATEMENT_CHARS {
+                too_long = Some((index.saturating_add(1), actual));
+            }
+            recorded.push(criterion.to_owned());
+        }
+        if recorded.is_empty() {
+            return Err(GoalError::MissingSuccessCriteria);
+        }
+        // Count first, then length, so a flood of entries is refused for being a flood
+        // rather than for whichever one of them happened also to be too long.
+        if recorded.len() > MAX_SUCCESS_CRITERIA {
+            return Err(GoalError::TooManySuccessCriteria {
+                submitted,
+                recorded: recorded.len(),
+                max: MAX_SUCCESS_CRITERIA,
+            });
+        }
+        if let Some((ordinal, actual)) = too_long {
+            return Err(GoalError::SuccessCriterionTooLong {
+                ordinal,
+                submitted,
+                actual,
+                max: MAX_CRITERION_STATEMENT_CHARS,
+            });
+        }
+        self.create_goal_with_criteria(session_id, objective, &recorded, token_budget)
+    }
+
+    /// Create a guarded goal with explicit immutable success criteria.
+    ///
+    /// System authority: it accepts an empty list, so it is not the model's entry
+    /// point. [`Self::create_goal_as_model`] is, and it says why the model's own goal
+    /// must name a check.
     ///
     /// Each criterion is stored twice: verbatim in the `goal.success_criteria`
     /// JSON column, which is unchanged and remains the compatibility projection,
@@ -1127,9 +1333,10 @@ impl GoalStore {
     /// regardless of what it cost. Ports `goals.rs:328`.
     ///
     /// `complete` is not a plain write. Whichever entry point asks for it, the request
-    /// runs the audit [`Self::complete_checked`] runs — plan ownership, unfinished
-    /// durable work, criterion evidence, capability claims — because a gate with an
-    /// unguarded side door is not a gate. Before this, an embedder calling here with
+    /// runs the audit [`Self::complete_as_model_checked`] runs — plan ownership,
+    /// unfinished durable work, criterion evidence, capability claims — because a gate
+    /// with an unguarded side door is not a gate. This is a model-authority writer, so it
+    /// takes the run's audit and not the human's. Before this, an embedder calling here with
     /// `Complete` could finish a change goal whose criteria were still open.
     ///
     /// Returns `None` when the session has no goal.
@@ -1144,7 +1351,7 @@ impl GoalStore {
         status: ModelStatus,
     ) -> Result<Option<Goal>, GoalError> {
         if matches!(status, ModelStatus::Complete) {
-            return self.complete_with_revision(session_id, None);
+            return self.complete_with_revision(session_id, None, CompletionAuthority::Model);
         }
         self.write_status(
             SET_STATUS_AS_MODEL,
@@ -1166,7 +1373,11 @@ impl GoalStore {
         expected_revision: i64,
     ) -> Result<Option<Goal>, GoalError> {
         if matches!(status, ModelStatus::Complete) {
-            return self.complete_with_revision(session_id, Some(expected_revision));
+            return self.complete_with_revision(
+                session_id,
+                Some(expected_revision),
+                CompletionAuthority::Model,
+            );
         }
         self.write_status(
             SET_STATUS_AS_MODEL,
@@ -1211,6 +1422,11 @@ impl GoalStore {
 
     /// Complete a goal only when all durable work and recorded evidence agree.
     ///
+    /// The *human's* entry point — `/goal complete` — and the only one that is. The
+    /// run's is [`Self::complete_as_model_checked`], which differs in exactly one check;
+    /// see [`CompletionAuthority`] for why that difference is the capability ledger on a
+    /// criteria-free goal and nothing else.
+    ///
     /// The completion audit and status update share one `IMMEDIATE` transaction, so a
     /// concurrent writer cannot add unfinished work, record a receipt, or change the
     /// workspace between the check and the update. The same audit runs when
@@ -1223,30 +1439,68 @@ impl GoalStore {
     /// `work_plan` row whose `goal_id` names another goal is refused as stale
     /// whatever its steps say — see [`audit_plan_ownership`] for why a plan with no
     /// `goal_id`, and an archived plan, are deliberately let through. On top of all
-    /// that, a goal that [`Self::escalate_to_change`] marked as changing the
-    /// workspace must have every criterion settled and must cite evidence no older
-    /// than the last [`Self::mark_mutation`]. A [`GoalKind::Question`] goal is
-    /// unaffected by the evidence rules and completes as it always did.
+    /// that, a goal with recorded success criteria — or one that
+    /// [`Self::escalate_to_change`] marked as changing the workspace — must have
+    /// every criterion settled and must cite evidence no older than the last
+    /// [`Self::mark_mutation`]. Only a [`GoalKind::Question`] goal that recorded no
+    /// criteria is unaffected by the evidence rules.
     ///
     /// # Errors
     ///
     /// [`GoalError::RevisionConflict`] when the goal moved on since the caller read
     /// it, [`GoalError::PlanBelongsToAnotherGoal`] when the visible plan is bound to
     /// a different goal, [`GoalError::CompletionBlocked`] when durable work is
-    /// unfinished, [`GoalError::EvidenceMissing`] when a change goal has criteria
-    /// that are neither satisfied nor waived — or no criteria at all, which is
-    /// completion by assertion — [`GoalError::EvidenceUnproven`] when a cited receipt
-    /// has since been rewritten or pruned so that it no longer proves success,
-    /// [`GoalError::EvidenceStale`] when a cited receipt predates the last recorded
-    /// change to the workspace, [`GoalError::CapabilityUnverified`] when a capability
-    /// claim recorded under this goal cannot be relied on, and [`GoalError::Db`] on a
-    /// statement failure.
+    /// unfinished, [`GoalError::EvidenceMissing`] when the goal has criteria that are
+    /// neither satisfied nor waived — or is a change goal with no criteria at all,
+    /// which is completion by assertion — [`GoalError::EvidenceUnproven`] when a
+    /// cited receipt has since been rewritten or pruned so that it no longer proves
+    /// success, [`GoalError::EvidencePredatesGoal`] when a cited receipt was recorded
+    /// before this goal instance existed, [`GoalError::EvidenceStale`] when a cited
+    /// receipt predates the last
+    /// recorded change to the workspace, [`GoalError::CapabilityUnverified`] when a
+    /// capability claim recorded under this goal cannot be relied on, and
+    /// [`GoalError::Db`] on a statement failure.
     pub fn complete_checked(
         &self,
         session_id: &str,
         expected_revision: i64,
     ) -> Result<Option<Goal>, GoalError> {
-        self.complete_with_revision(session_id, Some(expected_revision))
+        self.complete_with_revision(
+            session_id,
+            Some(expected_revision),
+            CompletionAuthority::User,
+        )
+    }
+
+    /// Complete a goal on the *run's* authority, with the audit the run answers for.
+    ///
+    /// The same call as [`Self::complete_checked`] in every respect but one: a goal that
+    /// recorded no success criteria and was never escalated is still audited against the
+    /// capability ledger, so a run that guessed at a capability, wrote the configuration
+    /// through `shell` and therefore never escalated cannot carry the guess out with the
+    /// goal. [`Self::complete_checked`] is the human's `/goal complete` and skips exactly
+    /// that one check, because the only way to settle a claim is a `capability_claim` call
+    /// the model makes and no CLI verb clears the row — see [`CompletionAuthority`].
+    ///
+    /// Every model-facing entry point must come through here or through
+    /// [`Self::update_status_as_model`]; a tool that reaches for
+    /// [`Self::complete_checked`] would be claiming the human's authority for the run.
+    ///
+    /// # Errors
+    ///
+    /// Every refusal [`Self::complete_checked`] reports, plus
+    /// [`GoalError::CapabilityUnverified`] for a criteria-free goal that relies on a claim
+    /// nobody verified.
+    pub fn complete_as_model_checked(
+        &self,
+        session_id: &str,
+        expected_revision: i64,
+    ) -> Result<Option<Goal>, GoalError> {
+        self.complete_with_revision(
+            session_id,
+            Some(expected_revision),
+            CompletionAuthority::Model,
+        )
     }
 
     /// The one statement path that sets `complete`, guarded on a revision or not.
@@ -1260,18 +1514,29 @@ impl GoalStore {
         &self,
         session_id: &str,
         expected_revision: Option<i64>,
+        authority: CompletionAuthority,
     ) -> Result<Option<Goal>, GoalError> {
         let now_ms = now_ms()?;
         self.pool.try_transaction(|tx| {
+            // `created_at_ms` is read from the same row, in the same transaction, as the
+            // revision the caller is guarded on: the audit's lower bound on evidence has
+            // to be this goal instance's creation and not a value a concurrent
+            // replacement could have moved underneath it.
             let current = tx
                 .query_row(
-                    "SELECT goal_id, revision FROM goal WHERE session_id = ?1",
+                    "SELECT goal_id, revision, created_at_ms FROM goal WHERE session_id = ?1",
                     params![session_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(zuno_db::map_error)?;
-            let Some((goal_id, actual)) = current else {
+            let Some((goal_id, actual, created_at_ms)) = current else {
                 return Ok(None);
             };
             if let Some(expected) = expected_revision
@@ -1298,7 +1563,7 @@ impl GoalStore {
                     human_requests,
                 });
             }
-            audit_evidence(tx, session_id)?;
+            audit_evidence(tx, session_id, created_at_ms, authority)?;
 
             let goal = {
                 let mut statement = tx
@@ -1376,13 +1641,23 @@ impl GoalStore {
     /// beside the write that flips the row, so no receipt can be recorded and no
     /// file changed between the check and the citation being accepted.
     ///
-    /// Four rules, and each one exists because a model can assert its way past the
+    /// Five rules, and each one exists because a model can assert its way past the
     /// absence of it. The receipt has to exist *in this session*, so a receipt id
     /// from another run proves nothing here. Its outcome has to be `passed`. Its
     /// exit status has to be authoritative, because a status inferred from the last
-    /// stage of a pipeline is a claim about `tee`, not about the tests. And it has
-    /// to be newer than the last recorded change to the workspace, because evidence
-    /// gathered before an edit says nothing about the code that exists after it.
+    /// stage of a pipeline is a claim about `tee`, not about the tests. It has to be
+    /// newer than the last recorded change to the workspace, because evidence
+    /// gathered before an edit says nothing about the code that exists after it. And
+    /// it has to be no older than the goal it is offered to close.
+    ///
+    /// That last rule is what makes the checklist prove verification rather than
+    /// citation. Receipts are session-scoped and deliberately survive goal
+    /// replacement — [`clear_auxiliary_state`] wipes criteria, the goal kind and the
+    /// mutation mark, and leaves `verification_receipt` alone — so without it a run
+    /// could close a brand-new criterion with a check that ran before the goal was
+    /// proposed, and a receipt the *previous* goal was refused as stale would become
+    /// usable again the moment the replacement cleared the mark. `>=` rather than `>`
+    /// so a receipt recorded in the same millisecond as the goal still counts.
     ///
     /// # Errors
     ///
@@ -1391,9 +1666,10 @@ impl GoalStore {
     /// it, [`GoalError::UnknownCriterion`] when the id was never assigned,
     /// [`GoalError::EvidenceUnproven`] when the receipt is missing, failed,
     /// undecidable, carries a derived or absent exit status, or the criterion is
-    /// already waived, [`GoalError::EvidenceStale`] when the receipt predates the
-    /// last recorded change to the workspace, and [`GoalError::Db`] on a statement
-    /// failure.
+    /// already waived, [`GoalError::EvidencePredatesGoal`] when the receipt was
+    /// recorded before this goal instance existed, [`GoalError::EvidenceStale`] when
+    /// the receipt predates the last recorded change to the workspace, and
+    /// [`GoalError::Db`] on a statement failure.
     pub fn satisfy_criterion(
         &self,
         session_id: &str,
@@ -1403,7 +1679,7 @@ impl GoalStore {
         at_ms: i64,
     ) -> Result<CriterionOutcome, GoalError> {
         self.pool.try_transaction(|tx| {
-            let criterion =
+            let (goal, criterion) =
                 read_criterion_for_write(tx, session_id, expected_revision, criterion_id)?;
             if criterion.status == GoalCriterionStatus::Waived {
                 return Err(GoalError::EvidenceUnproven {
@@ -1428,6 +1704,17 @@ impl GoalStore {
                     criterion_id: criterion_id.to_owned(),
                     receipt_id: receipt_id.to_owned(),
                     reason: unproven_reason(&receipt),
+                });
+            }
+            // Before the mutation mark, because "this receipt belongs to a goal that no
+            // longer exists" is a different mistake from "you edited after checking", and
+            // the mark is cleared by the very replacement that makes the first one true.
+            if receipt.time_created < goal.created_at_ms {
+                return Err(GoalError::EvidencePredatesGoal {
+                    criterion_id: criterion_id.to_owned(),
+                    receipt_id: receipt_id.to_owned(),
+                    goal_created_at_ms: goal.created_at_ms,
+                    receipt_at_ms: receipt.time_created,
                 });
             }
             if let Some(marked_at_ms) = mutation_mark(tx, session_id)?
@@ -1476,6 +1763,7 @@ impl GoalStore {
     /// [`GoalError::RevisionConflict`] when the goal moved on since the caller read
     /// it, [`GoalError::UnknownCriterion`] when the id was never assigned,
     /// [`GoalError::EmptyWaiverReason`] when the reason is blank,
+    /// [`GoalError::WaiverReasonTooLong`] past [`MAX_WAIVER_REASON_CHARS`],
     /// [`GoalError::CriterionAlreadySatisfied`] when the criterion already has
     /// evidence, and [`GoalError::Db`] on a statement failure.
     pub fn waive_criterion(
@@ -1487,13 +1775,28 @@ impl GoalStore {
         at_ms: i64,
     ) -> Result<CriterionOutcome, GoalError> {
         let reason = reason.trim();
-        if reason.is_empty() {
+        // `is_empty` after trimming is not enough: `str::trim` strips White_Space only,
+        // so a reason of `"\u{200b}"` survives it and lands in the ledger as a waiver
+        // that renders as nothing. Same predicate as the criterion statements, so the
+        // two sides of the audit surface cannot drift.
+        if !has_visible_character(reason) {
             return Err(GoalError::EmptyWaiverReason {
                 criterion_id: criterion_id.to_owned(),
             });
         }
+        // And the same bound, for the same reason: matching the emptiness predicate while
+        // leaving the length unbounded is exactly the drift the comment above denies.
+        // Characters, not bytes, like every other cap in this module.
+        let actual = reason.chars().count();
+        if actual > MAX_WAIVER_REASON_CHARS {
+            return Err(GoalError::WaiverReasonTooLong {
+                criterion_id: criterion_id.to_owned(),
+                actual,
+                max: MAX_WAIVER_REASON_CHARS,
+            });
+        }
         self.pool.try_transaction(|tx| {
-            let criterion =
+            let (_goal, criterion) =
                 read_criterion_for_write(tx, session_id, expected_revision, criterion_id)?;
             if criterion.status == GoalCriterionStatus::Satisfied {
                 return Err(GoalError::CriterionAlreadySatisfied {
@@ -2203,6 +2506,17 @@ impl GoalStore {
                     .map_err(zuno_db::map_error)?;
                 }
             }
+            // The only statements that take a goal out of `complete` — the system's
+            // `active`, the model's `blocked` — are the two this function runs, so this
+            // is where a goal a `0.6.x` release finished, whose checklist
+            // `backfill_criteria` deliberately left dormant at open, gets its rows the
+            // moment it is live again and can be completed a second time. A no-op for
+            // every goal this release wrote, because those rows already exist.
+            if let Some(current) = goal.as_ref()
+                && !checklist_dormant(current.status)
+            {
+                backfill_criteria(tx, Some(session_id))?;
+            }
             Ok(Ok(goal))
         })?
     }
@@ -2616,6 +2930,22 @@ fn insert_criteria(
         params![session_id],
     )
     .map_err(zuno_db::map_error)?;
+    insert_criterion_rows(tx, session_id, statements, now_ms)
+}
+
+/// Write `statements` as open criterion rows `c1..cN`, all stamped `stamp_ms`.
+///
+/// The one place a criterion row is minted, shared by [`insert_criteria`] at goal
+/// creation and by [`backfill_criteria`] when a checklist an earlier release kept only in
+/// the `success_criteria` column is brought forward: the ids, the ordinals, the `open`
+/// status and the stamps a backfilled goal ends up with are exactly the ones creation
+/// would have written, because they come from the same statement.
+fn insert_criterion_rows(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    statements: &[String],
+    stamp_ms: i64,
+) -> Result<Vec<GoalCriterion>, DbError> {
     let mut criteria = Vec::with_capacity(statements.len());
     for (index, statement) in statements.iter().enumerate() {
         let ordinal = i64::try_from(index).unwrap_or(i64::MAX);
@@ -2625,7 +2955,7 @@ fn insert_criteria(
              (session_id, criterion_id, ordinal, statement, status, waiver_reason, \
               receipt_id, satisfied_at_ms, created_at_ms, updated_at_ms) \
              VALUES (?1, ?2, ?3, ?4, 'open', NULL, NULL, NULL, ?5, ?5)",
-            params![session_id, criterion_id, ordinal, statement, now_ms],
+            params![session_id, criterion_id, ordinal, statement, stamp_ms],
         )
         .map_err(zuno_db::map_error)?;
         criteria.push(GoalCriterion {
@@ -2641,8 +2971,24 @@ fn insert_criteria(
     Ok(criteria)
 }
 
-/// Refuse completion when a change goal's criteria are not settled by evidence
-/// that still describes the current workspace.
+/// Who asked for `complete`, for the one gate whose remedy only one of them has.
+///
+/// Not a permission level: every completion runs plan ownership, the durable-work
+/// blockers and the whole criterion-evidence audit whoever asks. It exists for the
+/// capability ledger on the criteria-free branch, where the only way to settle a claim is
+/// a `capability_claim` call the model makes, so refusing there would strand the human
+/// rather than correct the run. [`audit_evidence`] is the only reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionAuthority {
+    /// The human's own `/goal complete`, through [`GoalStore::complete_checked`].
+    User,
+    /// The run reporting on itself, through [`GoalStore::complete_as_model_checked`] or
+    /// [`GoalStore::update_status_as_model`] with `Complete`.
+    Model,
+}
+
+/// Refuse completion when a goal's criteria are not settled by evidence that still
+/// describes the current workspace.
 ///
 /// Two distinct failures, both invisible in prose. A criterion still `open` means
 /// nothing ever verified it, and a change goal with no criteria at all means
@@ -2661,19 +3007,77 @@ fn insert_criteria(
 /// [`VerificationReceipt::proves_success`] is asked again.
 ///
 /// A third failure is a reliance rather than a check: a capability the session
-/// enabled on a guess. Once the criteria are settled, the claims recorded under this
-/// goal are audited too — see [`crate::capability::audit_capability_claims`] — so a
-/// goal cannot complete while it rests on an `inferred` or `unknown` claim, or on a
-/// probe that a later write retired.
+/// enabled on a guess. The claims recorded under this goal are audited too — see
+/// [`crate::capability::audit_capability_claims`] — so a goal cannot complete while it
+/// rests on an `inferred` or `unknown` claim, or on a probe that a later write
+/// retired. That audit runs on *every* path through this function, including the
+/// checklist-free one, because a claim is recorded by the session itself and so needs
+/// no tool to report what it wrote: a run that guessed at a capability and then wrote
+/// the configuration through `shell` never escalates, and gating the claim audit on
+/// the kind would let the guess out with the goal.
 ///
-/// A [`GoalKind::Question`] goal passes straight through. Nothing changed, so
-/// there is nothing to verify, and requiring a receipt would leave a run that was
-/// only ever asked a question with no way to finish.
-fn audit_evidence(tx: &Transaction<'_>, session_id: &str) -> Result<(), GoalError> {
-    if !kind_from(tx, session_id)?.requires_evidence() {
-        return Ok(());
-    }
+/// A goal with neither a checklist nor a reported change is not held to *evidence*:
+/// nothing was verifiable and nothing was verified, and requiring a receipt there
+/// would leave a run that was only ever asked a question with no way to finish. Only
+/// [`GoalStore::create_goal`] — the user's own `/goal create` — can produce such a
+/// goal, because [`GoalStore::create_goal_as_model`] refuses a proposal with no
+/// criterion.
+///
+/// A recorded criterion is gated whatever the goal's kind says, because
+/// [`GoalKind`] is only as good as the mutation reports it is built from. Escalation
+/// happens when a tool names the paths it wrote, and a shell command is watched only
+/// as far as its target can be resolved without running it: `sed -i 's/a/b/' src/lib.rs`
+/// escalates, while a target the shell expands — `$OUT`, `*.rs`, `$(ls)`, a here-doc, a
+/// redirection, or the files `git apply` rewrites — is skipped rather than guessed, so
+/// that run stays a [`GoalKind::Question`] and would otherwise skip this audit entirely
+/// with every criterion still open. The checklist is the one signal that does not depend
+/// on that reporting: the run wrote down what would prove it done, so it settles
+/// each one with a receipt or a recorded waiver before claiming completion.
+///
+/// What is *not* covered, and needs the missing report rather than another rule here:
+/// freshness. [`mutation_mark`] advances from the same written-path signal, so an edit
+/// whose target that signal cannot name leaves the mark where it was and a receipt
+/// recorded before that edit is still accepted. The mark cannot be reconstructed from receipts,
+/// because the editing call earns a passing receipt of its own and is indistinguishable
+/// here from the check it invalidated.
+///
+/// One deliberate consequence of reading the criteria before the kind: a criterion row
+/// whose `status` is not one this crate writes now fails a question goal's completion
+/// with [`GoalError::UnknownCriterionStatus`] instead of being skipped unread. Only an
+/// external writer can get past the column's `CHECK` constraint, the error is not a
+/// model refusal, and it fails closed — the intended outcome for a corrupt row, not a
+/// retryability regression.
+fn audit_evidence(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    goal_created_at_ms: i64,
+    authority: CompletionAuthority,
+) -> Result<(), GoalError> {
     let criteria = criteria_from(tx, session_id)?;
+    if criteria.is_empty() && !kind_from(tx, session_id)?.requires_evidence() {
+        // Nothing was verifiable, but something may still have been *relied on*. The
+        // claims are recorded by the session itself, so auditing them needs no tool to
+        // report what it wrote — which is the whole reason this branch exists — and a
+        // run that guessed at a capability, wrote the configuration through `shell` and
+        // therefore never escalated is exactly the case the kind cannot see. A goal
+        // that recorded no claims passes this in one query, so the branch stays free
+        // for the run that really only answered a question.
+        //
+        // Only against the model, though. This branch is reachable only for a goal the
+        // *user* or the system created — `create_goal_as_model` refuses a proposal with
+        // no checklist — and the only way to settle a claim is a `capability_claim` tool
+        // call the model makes. Refusing the human's own `/goal complete` over a row the
+        // model wrote would leave them a goal they can cancel and cannot finish, which is
+        // a hard failure keyed on input the untrusted actor supplies. The model reporting
+        // `complete` on that same goal is still audited, so the reliance cannot be
+        // carried out with the goal by the actor that recorded it.
+        return match authority {
+            CompletionAuthority::Model => {
+                crate::capability::audit_capability_claims(tx, session_id)
+            }
+            CompletionAuthority::User => Ok(()),
+        };
+    }
     // A `satisfied` row with no citation is unproven by construction — the store
     // never writes one — but a row is data, and the audit trusts it no further than
     // the receipt it can fetch.
@@ -2716,6 +3120,19 @@ fn audit_evidence(tx: &Transaction<'_>, session_id: &str) -> Result<(), GoalErro
                      cite the new receipt",
                     unproven_reason(&receipt)
                 ),
+            });
+        }
+        // Re-checked here and not only in `satisfy_criterion` for the reason the whole
+        // loop exists: a `satisfied` row is data, and the audit trusts it no further than
+        // the receipt it can fetch. A row written by a release that had no lower bound —
+        // or by any future writer that skips the citation path — is refused at the gate
+        // rather than believed.
+        if receipt.time_created < goal_created_at_ms {
+            return Err(GoalError::EvidencePredatesGoal {
+                criterion_id: criterion.criterion_id.clone(),
+                receipt_id: receipt_id.to_owned(),
+                goal_created_at_ms,
+                receipt_at_ms: receipt.time_created,
             });
         }
         if let Some(marked_at_ms) = marked_at_ms
@@ -2806,6 +3223,15 @@ fn require_criterion(
     }
 }
 
+/// The ids the caller should have cited, bounded like every other id list in a
+/// model-visible refusal.
+///
+/// [`MAX_SUCCESS_CRITERIA`] bounds what this release stores, so the list is short for
+/// any goal created now. It is not the goal this has to survive: the cap applies at
+/// creation only, and a goal an earlier release stored with 5 000 criteria still reads
+/// and still refuses an unknown id — with the whole checklist interpolated, which is the
+/// 34 KB refusal [`crate::error::listed_ids`] was introduced to stop. Same helper as
+/// [`GoalError::EvidenceMissing`], so the two id lists cannot drift.
 fn known_criteria(connection: &Connection, session_id: &str) -> Result<String, GoalError> {
     let ids: Vec<String> = criteria_from(connection, session_id)?
         .into_iter()
@@ -2814,7 +3240,7 @@ fn known_criteria(connection: &Connection, session_id: &str) -> Result<String, G
     Ok(if ids.is_empty() {
         "this goal has no success criteria".to_owned()
     } else {
-        format!("known criteria: {}", ids.join(", "))
+        format!("known criteria: {}", crate::error::listed_ids(&ids))
     })
 }
 
@@ -2827,7 +3253,7 @@ fn read_criterion_for_write(
     session_id: &str,
     expected_revision: i64,
     criterion_id: &str,
-) -> Result<GoalCriterion, GoalError> {
+) -> Result<(Goal, GoalCriterion), GoalError> {
     let goal = goal_from_transaction(tx, session_id)?.ok_or_else(|| GoalError::NoGoal {
         session_id: session_id.to_owned(),
     })?;
@@ -2838,7 +3264,8 @@ fn read_criterion_for_write(
             actual: goal.revision,
         });
     }
-    require_criterion(tx, session_id, criterion_id)
+    let criterion = require_criterion(tx, session_id, criterion_id)?;
+    Ok((goal, criterion))
 }
 
 /// Bump the goal's revision so a criterion change is visible to optimistic
@@ -3411,6 +3838,95 @@ fn widen_pause_reasons(tx: &Transaction<'_>) -> Result<(), DbError> {
          DROP TABLE goal_pause_superseded",
     )
     .map_err(zuno_db::map_error)
+}
+
+/// Whether a goal in `status` keeps a checklist it has only in its column dormant.
+///
+/// `complete` and `cancelled` are the two statuses a goal finishes in — the only two
+/// [`GoalStore::create_goal`] replaces, and the only two nothing resumes. A `0.6.x`
+/// release finished such a goal without ever tracking a criterion, and reconstructing
+/// `open` rows for it would change how a finished goal reads: the goal document would
+/// show an unverified checklist under a status that says done, and a repeated `complete`
+/// — accepted today as the idempotent no-op it is — would be refused for evidence the
+/// release that finished the goal never asked for. Measured on the exact `0.6.6` shape
+/// before deciding: [`crate::projection::render`] emits `_This goal has no success
+/// criteria._` and `complete_as_model_checked` returns `Ok(Some(Complete))`, and both
+/// stay that way. `budget_limited` is terminal for the continuation board but a raised
+/// budget revives it, and `blocked` is the status the model writes when it is stuck and
+/// the system resumes from, so both get their rows at open like every live goal.
+///
+/// Dormant, not forgotten: the only two writes that leave `complete` — the system's
+/// `active` and the model's `blocked` — both run through [`GoalStore::write_status`],
+/// which backfills the goal the moment it is live again, so a revived goal is held to the
+/// checklist it recorded exactly as one that never finished is. The `status NOT IN`
+/// clause in [`backfill_criteria`] names the same two statuses; the tests over the
+/// `0.6.6` fixture pin both.
+const fn checklist_dormant(status: GoalStatus) -> bool {
+    matches!(status, GoalStatus::Complete | GoalStatus::Cancelled)
+}
+
+/// Mint `goal_criterion` rows for goals whose checklist exists only in the column.
+///
+/// The `0.6.x` releases had no `goal_criterion` table: `goal_propose` stored the model's
+/// `success_criteria` into the `goal.success_criteria` JSON column and nowhere else. The
+/// table this release creates with `CREATE TABLE IF NOT EXISTS` therefore starts empty
+/// on an upgraded database while the column still names every check, and
+/// [`audit_evidence`] — which reads only the rows — refused such a goal's completion with
+/// a message saying it had no criteria at all. The row the database holds says otherwise,
+/// and AGENTS.md is explicit that a shipped format advances through a forward migration
+/// rather than asking the user to cancel and rebuild.
+///
+/// For every live goal — see [`checklist_dormant`] for the two statuses left alone —
+/// whose column is a non-empty JSON array of strings and which has no criterion row, the
+/// entries become `c1..cN` in array order, `open`, stamped with the goal's own
+/// `created_at_ms`: the same ids, ordinals and status [`insert_criteria`] would have
+/// written at creation, through the same statement, so a projection rendered from either
+/// storage agrees. Nothing is inferred beyond that — not a satisfied status, not a waiver.
+///
+/// Guarded and idempotent by construction. `NOT EXISTS` skips any goal that already has a
+/// row, so a second open, or a goal this release created, inserts nothing and never
+/// touches a row a citation may already reference. `success_criteria <> '[]'` is exact
+/// for anything this crate or its predecessors wrote, because both serialise an empty list
+/// as those two bytes, so a user's criteria-less `/goal create` is not re-parsed on every
+/// start. A column that does not parse as a JSON array of strings is left exactly as it
+/// is: it is corruption, not input, and guessing at its shape here would turn one bad row
+/// into invented durable state. It keeps failing closed where it fails today — the
+/// [`GoalStore::goal`] read of that session reports [`GoalError::Db`] — rather than
+/// taking every other session's goal down with it by failing the whole open.
+///
+/// `session_id` narrows the scan to one goal for [`GoalStore::write_status`], which
+/// revives a finished goal; `None` is the open-time pass over the whole table. Runs
+/// inside the caller's transaction, so on the open-time pass the table creation, the
+/// trigger and pause repairs and these rows commit together or not at all.
+fn backfill_criteria(tx: &Transaction<'_>, session_id: Option<&str>) -> Result<(), DbError> {
+    let candidates: Vec<(String, String, i64)> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT session_id, success_criteria, created_at_ms FROM goal \
+                 WHERE (?1 IS NULL OR session_id = ?1) \
+                   AND status NOT IN ('complete', 'cancelled') \
+                   AND success_criteria <> '[]' \
+                   AND NOT EXISTS (\
+                       SELECT 1 FROM goal_criterion \
+                       WHERE goal_criterion.session_id = goal.session_id) \
+                 ORDER BY session_id",
+            )
+            .map_err(zuno_db::map_error)?;
+        let rows = statement
+            .query_map(params![session_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(zuno_db::map_error)?;
+        rows.collect::<Result<_, _>>().map_err(zuno_db::map_error)?
+    };
+    for (session_id, column, created_at_ms) in &candidates {
+        // A column that is not a JSON array of strings is left alone; see above.
+        let Ok(statements) = serde_json::from_str::<Vec<String>>(column) else {
+            continue;
+        };
+        insert_criterion_rows(tx, session_id, &statements, *created_at_ms)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

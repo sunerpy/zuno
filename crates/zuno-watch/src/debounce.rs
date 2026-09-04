@@ -109,11 +109,15 @@ pub struct Flush {
     /// transcript diffable and makes "the first N" a meaningful phrase, at no
     /// cost over a hash map at these sizes. `zuno-search` sorts for the same reason.
     pub events: Vec<FileEvent>,
-    /// How many paths were discarded, unreported, since the last flush.
+    /// How many changes were discarded, unreported, since the last flush.
     ///
-    /// Non-zero only when the pending map hit its ceiling. A consumer that sees
-    /// this knows its view of the tree has a hole in it and must rescan; that is
-    /// the whole reason the number is surfaced rather than logged.
+    /// Non-zero when the pending map hit its ceiling, when the publish channel
+    /// refused a batch that had already been taken out of the map, or when the
+    /// platform reported a loss of its own through [`Debouncer::record_dropped`]. It
+    /// is therefore a floor on what was missed rather than a count of paths: the
+    /// first two causes count paths, and a platform loss states no magnitude at all.
+    /// A consumer that sees this knows its view of the tree has a hole in it and must
+    /// rescan; that is the whole reason the number is surfaced rather than logged.
     pub dropped: u64,
 }
 

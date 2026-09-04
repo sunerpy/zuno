@@ -212,7 +212,8 @@ fn editing_one_file_produces_exactly_one_coalesced_change_event() {
     assert_eq!(
         overflow_total(&events),
         0,
-        "one file cannot overflow anything"
+        "one file cannot overflow the coalescing buffer, and one file cannot overflow \
+         the kernel queue (`fs.inotify.max_queued_events`) either"
     );
     // The coalescing claim, stated as a measurement: inotify produced more
     // notifications for this one write than the consumer received events.
@@ -305,7 +306,9 @@ fn a_burst_of_one_thousand_files_is_coalesced_to_one_event_per_path() {
     assert_eq!(
         overflow_total(&events),
         0,
-        "the default 4096-path buffer must absorb a 1000-file burst without dropping"
+        "the default 4096-path buffer must absorb a 1000-file burst without dropping, \
+         and the kernel queue (`fs.inotify.max_queued_events`, 16384 by default) must \
+         not have overflowed either — both losses arrive as this same event"
     );
     let missing: Vec<_> = expected
         .iter()

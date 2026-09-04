@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, TransactionBehavior};
 use zuno_error::DbError;
 use zuno_snapshot::{SessionRef, SnapshotError};
@@ -20,6 +21,10 @@ use crate::open;
 /// Default retention window for unattributable tool output.
 pub const DEFAULT_TOOL_OUTPUT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// The serialized prefix of every `zuno_attachment::AttachmentId`.
+const ATTACHMENT_ID_PREFIX: &[u8] = b"sha256:";
+/// Hex digits in one attachment digest, which is also the object file-name stem.
+const DIGEST_HEX_LEN: usize = 64;
 /// The caller identity `zuno_tool`'s store reports in an error it raises for this pass.
 const TOOL_OUTPUT_READER: &str = "session_prune";
 
@@ -173,14 +178,158 @@ pub struct SkippedRoot {
 
 impl fmt::Display for SkippedRoot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // This rendering is the serialized value: `session_prune` collects it straight
+        // into the report's `warnings` array, beside `artifacts[].path` entries that are
+        // deliberately in wire form. Rendering natively made the one line that names the
+        // files left behind disagree with the list they belong to on Windows.
         write!(
             formatter,
             "tool output under {} was not swept: could not {} {} ({})",
-            self.root.display(),
+            zuno_paths::wire_path(&self.root),
             self.operation,
-            self.path.display(),
+            zuno_paths::wire_path(&self.path),
             self.reason
         )
+    }
+}
+
+/// A whole artifact class this pass did not evaluate, and the evidence for why.
+///
+/// Distinct from an empty result on purpose. A caller that previewed reclaimable bytes and
+/// then saw a smaller total after deleting has to be able to tell "nothing was
+/// reclaimable" from "this class was never looked at", and after a delete the rows that
+/// could have attributed the class are already gone, so this value is the only record that
+/// those bytes are still on disk.
+///
+/// It is evidence, not a work item, and it deliberately names no directory to remove. The
+/// class is skipped precisely because this database cannot prove which store belongs to it,
+/// so an operator deleting one under `$DATA/snapshot` by hand would be making the
+/// cross-database attribution judgement the pass refuses — on a directory that may belong to
+/// another channel's database. Nothing has to be done: the next pass that runs against this
+/// database while at least one session survives evaluates the class and reclaims it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedClass {
+    /// The class left unevaluated.
+    pub kind: ArtifactKind,
+    /// SQLite's path for the database whose rows would have attributed it.
+    pub database: String,
+    /// Session rows that remain once the operation being accounted for is applied.
+    pub retained_sessions: u64,
+}
+
+impl SkippedClass {
+    /// A class no surviving row in this database can be attributed to.
+    #[must_use]
+    pub const fn unattributable(
+        kind: ArtifactKind,
+        database: String,
+        retained_sessions: u64,
+    ) -> Self {
+        Self {
+            kind,
+            database,
+            retained_sessions,
+        }
+    }
+}
+
+impl fmt::Display for SkippedClass {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Like `SkippedRoot`, this rendering is the serialized value: `session_prune`
+        // forwards it into the report's `warnings` array, and it is the same sentence the
+        // pre-mutation visibility check emits, so an operator sees one wording for one
+        // fact whether the survivor set was already empty or this operation emptied it.
+        write!(
+            formatter,
+            "`{}` retains {} sessions after this operation; {} reclamation is skipped \
+             because a shared artifact cannot be attributed to a surviving session and may \
+             belong to another channel's database.",
+            self.database,
+            self.retained_sessions,
+            class_noun(self.kind)
+        )
+    }
+}
+
+/// The operator-facing name of one artifact class.
+const fn class_noun(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::SnapshotStore => "snapshot store",
+        ArtifactKind::ToolOutput => "tool output",
+        ArtifactKind::AttachmentObject => "attachment object",
+    }
+}
+
+/// The `s` an English count needs, so a published sentence never says "1 objects".
+const fn plural(count: u64) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+/// Attachment bytes this pass kept because it could not prove nothing names them.
+///
+/// The liveness scan reads a stored payload as bytes and treats every well-formed attachment
+/// id it finds as a reference (see [`collect_attachment_digests`]). That direction is the
+/// safe one — keeping an object nothing needs costs bytes a later pass reclaims, while
+/// deleting the only copy of one a queued prompt still names is unrecoverable — and it is
+/// also suppressible: a digest quoted in prose, or echoed by a tool result, pins the object
+/// it names, and both of those are content a model or a tool can author.
+///
+/// This record is what makes that suppression visible. Without it a pass whose whole
+/// attachment class was pinned by one untrusted payload reported a clean zero, so the
+/// operator-facing reclamation ceiling was decided by model output with nothing in the report
+/// to say so. It is produced only when bytes were actually held back for a reason outside
+/// the operator's control, so the ordinary case — surviving sessions naming their own
+/// attachments through a stored reference — stays silent and cannot spend the signal that
+/// exists for the suppressed one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedAttachments {
+    /// SQLite's path for the database whose surviving rows were scanned.
+    pub database: String,
+    /// Objects and derived entries kept because only free text named their digest.
+    pub objects: u64,
+    /// Distinct digests surviving rows name only as free text, never as a stored reference.
+    pub digests: u64,
+    /// Surviving payload rows whose stored value is neither text nor a blob, so no digest
+    /// could be read out of them. Such a value cannot spell the `sha256:` prefix at all, so
+    /// this count is evidence about the rows, not a set of objects at risk.
+    pub unscanned_rows: u64,
+}
+
+impl fmt::Display for PinnedAttachments {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Like `SkippedRoot` and `SkippedClass`, this rendering is the serialized value:
+        // `session_prune` forwards it into the report's `warnings` array, which is the only
+        // place a CLI or HTTP caller can see that a class was held back rather than empty.
+        // Each clause appears only when its own count is non-zero, so the sentence never
+        // reports a zero as if it were a finding.
+        write!(formatter, "`{}`", self.database)?;
+        if self.objects > 0 {
+            write!(
+                formatter,
+                " kept {} attachment object{} whose {} digest{} surviving rows name only as \
+                 free text; model- or tool-authored content can produce that spelling, so \
+                 those bytes are not reclaimable while such a row survives",
+                self.objects,
+                plural(self.objects),
+                self.digests,
+                plural(self.digests)
+            )?;
+        }
+        if self.unscanned_rows > 0 {
+            let joiner = if self.objects > 0 {
+                ", and has"
+            } else {
+                " has"
+            };
+            write!(
+                formatter,
+                "{joiner} {} surviving payload row{} stored as neither text nor a blob, so \
+                 no attachment id could be read out of them",
+                self.unscanned_rows,
+                plural(self.unscanned_rows)
+            )?;
+        }
+        write!(formatter, ".")
     }
 }
 
@@ -193,6 +342,10 @@ pub struct ArtifactGcReport {
     pub total_bytes: u64,
     /// Tool-output roots that could not be read, in the order they were tried.
     pub skipped_roots: Vec<SkippedRoot>,
+    /// Artifact classes this pass declined to evaluate at all.
+    pub skipped_classes: Vec<SkippedClass>,
+    /// Attachment bytes held back because untrusted text still names them, when any were.
+    pub pinned_attachments: Option<PinnedAttachments>,
 }
 
 /// A classified database, snapshot scan, or filesystem failure.
@@ -280,7 +433,6 @@ pub fn execute(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(open::map_error)?;
-    ensure_visible_session_owners(&transaction)?;
     let mut survivors = read_survivors(&transaction)?;
     let requested_session_ids = request
         .deleted_session_ids
@@ -304,7 +456,32 @@ pub fn execute(
 
     let mut candidates = Vec::new();
     let mut skipped_roots = Vec::new();
-    discover_snapshot_candidates(paths, &survivors, &mut candidates)?;
+    let mut skipped_classes = Vec::new();
+    // The survivor set gates the shared snapshot root and nothing else, and it is the set
+    // that remains *after* the operation being accounted for: the rows are already gone in
+    // `Delete`, and `retain` above removes the selection in `Preview`, so both modes reach
+    // this decision with the same list. That symmetry is the point — a preview that
+    // enumerated every store under the shared root and a delete that then reclaimed none
+    // of them promised bytes the delete could not deliver.
+    //
+    // Applying the same gate to the whole pass instead turned a delete that emptied
+    // `session` into a hard failure: the caller lost the report for rows `crate::prune`
+    // had already committed, and the tool output of those sessions could never be named
+    // again because no row was left to attribute it to. Tool output is attributed from
+    // this request's own deleted-session ids plus the age backstop, and attachment objects
+    // live under a root keyed by this database's identity, so both stay attributable with
+    // no survivors at all. Only `$DATA/snapshot` is shared with other channel databases,
+    // where an empty survivor set would make every store on disk look unreferenced.
+    let retained_sessions = u64::try_from(survivors.len()).unwrap_or(u64::MAX);
+    if retained_sessions == 0 {
+        skipped_classes.push(SkippedClass::unattributable(
+            ArtifactKind::SnapshotStore,
+            database_path(&transaction),
+            retained_sessions,
+        ));
+    } else {
+        discover_snapshot_candidates(paths, &survivors, &mut candidates)?;
+    }
     discover_tool_output_candidates(
         &transaction,
         paths,
@@ -313,11 +490,20 @@ pub fn execute(
         &mut candidates,
         &mut skipped_roots,
     )?;
-    discover_attachment_candidates(&transaction, paths, &deleted_session_ids, &mut candidates)?;
+    let mut pinned_attachments = None;
+    discover_attachment_candidates(
+        &transaction,
+        paths,
+        &deleted_session_ids,
+        &mut candidates,
+        &mut pinned_attachments,
+    )?;
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
 
     let mut report = ArtifactGcReport {
         skipped_roots,
+        skipped_classes,
+        pinned_attachments,
         ..ArtifactGcReport::default()
     };
     for candidate in candidates {
@@ -343,22 +529,33 @@ pub fn execute(
 pub(crate) fn ensure_visible_session_owners(
     connection: &Connection,
 ) -> Result<(), ArtifactGcError> {
-    let session_count = connection
-        .query_row("SELECT count(*) FROM session", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map_err(open::map_error)?
-        .unsigned_abs();
+    let session_count = visible_session_owners(connection)?;
     if session_count > 0 {
         return Ok(());
     }
     Err(ArtifactGcError::NoVisibleSessions {
-        database: connection
-            .path()
-            .unwrap_or(zuno_paths::MEMORY_SENTINEL)
-            .to_owned(),
+        database: database_path(connection),
         session_count,
     })
+}
+
+/// SQLite's own path for the main database, or the in-memory sentinel.
+fn database_path(connection: &Connection) -> String {
+    connection
+        .path()
+        .unwrap_or(zuno_paths::MEMORY_SENTINEL)
+        .to_owned()
+}
+
+/// Session rows the open database can attribute a channel-shared artifact to.
+fn visible_session_owners(connection: &Connection) -> Result<u64, ArtifactGcError> {
+    connection
+        .query_row("SELECT count(*) FROM session", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(i64::unsigned_abs)
+        .map_err(open::map_error)
+        .map_err(ArtifactGcError::from)
 }
 
 #[derive(Debug)]
@@ -595,6 +792,7 @@ fn discover_attachment_candidates(
     paths: &ArtifactGcPaths,
     deleted_session_ids: &BTreeSet<String>,
     candidates: &mut Vec<Candidate>,
+    pinned: &mut Option<PinnedAttachments>,
 ) -> Result<(), ArtifactGcError> {
     if !table_exists(connection, "part")? {
         return Ok(());
@@ -611,8 +809,24 @@ fn discover_attachment_candidates(
         return Ok(());
     }
     let live = live_attachment_digests(connection, deleted_session_ids)?;
+    let mut held_back = 0_u64;
     for directory in [root.join("objects"), root.join("derived")] {
-        discover_unreferenced_attachment_files(&directory, &live, candidates)?;
+        held_back = held_back.saturating_add(discover_unreferenced_attachment_files(
+            &directory, &live, candidates,
+        )?);
+    }
+    // Reported only when bytes were actually held back by something outside the operator's
+    // control: an object pinned by free text, or a row nothing could be read out of. A
+    // surviving session naming its own attachment through a stored reference is the ordinary
+    // case and stays silent, so this line cannot be spent by the frequent benign event and
+    // then be missing for the rare suppressed one.
+    if held_back > 0 || live.unscanned_rows > 0 {
+        *pinned = Some(PinnedAttachments {
+            database: database.to_owned(),
+            objects: held_back,
+            digests: live.text_only_count(),
+            unscanned_rows: live.unscanned_rows,
+        });
     }
     Ok(())
 }
@@ -628,55 +842,242 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool, ArtifactGc
         .map_err(ArtifactGcError::from)
 }
 
+/// Every object digest a surviving durable row of this database still names.
+///
+/// A message `part` is the reference the transcript carries, but it is not the first
+/// one written. The durable inbox admits a prompt — and the object it uploaded —
+/// before the turn that converts it into parts ever runs, and that row can stay
+/// pending for as long as the session is busy. Collecting from `part` alone deleted
+/// the store's only copy of an image the user had already handed over, and the queued
+/// turn could then never be executed as sent.
 fn live_attachment_digests(
     connection: &Connection,
     deleted_session_ids: &BTreeSet<String>,
-) -> Result<BTreeSet<String>, ArtifactGcError> {
-    let mut statement = connection
-        .prepare("SELECT session_id, data FROM part ORDER BY id")
-        .map_err(open::map_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(open::map_error)?;
-    let mut live = BTreeSet::new();
-    for row in rows {
-        let (session_id, data) = row.map_err(open::map_error)?;
-        if deleted_session_ids.contains(&session_id) {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
-            continue;
-        };
-        if value.get("type").and_then(serde_json::Value::as_str) != Some("file") {
-            continue;
-        }
-        if let Some(digest) = value
-            .pointer("/attachment/id")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|id| id.strip_prefix("sha256:"))
-            .filter(|digest| {
-                digest.len() == 64
-                    && digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
-        {
-            live.insert(digest.to_owned());
-        }
+) -> Result<LiveDigests, ArtifactGcError> {
+    let mut live = LiveDigests::default();
+    collect_referenced_digests(
+        connection,
+        "SELECT session_id, data FROM part ORDER BY id",
+        deleted_session_ids,
+        &mut live,
+    )?;
+    if table_exists(connection, "session_input")? {
+        collect_referenced_digests(
+            connection,
+            "SELECT session_id, prompt FROM session_input ORDER BY id",
+            deleted_session_ids,
+            &mut live,
+        )?;
     }
     Ok(live)
 }
 
+/// The digests surviving rows name, and how each one was named.
+///
+/// `mentioned` is the liveness set: an object whose digest is in it is never a candidate.
+/// `referenced` is the subset that appeared as a complete stored string value, and exists
+/// only so the report can say how much of the liveness set came from free text instead. The
+/// two are deliberately not the same decision: classification is reporting, liveness is
+/// deletion, and narrowing liveness to a recognized spelling is what deleted live objects.
+#[derive(Debug, Default)]
+struct LiveDigests {
+    /// Every digest a surviving row names, whatever carried it and however it was spelled.
+    mentioned: BTreeSet<String>,
+    /// Digests that appeared at least once as a complete stored string value.
+    referenced: BTreeSet<String>,
+    /// Surviving rows whose payload was neither text nor a blob, so nothing was scanned.
+    unscanned_rows: u64,
+}
+
+impl LiveDigests {
+    /// Whether a surviving row still names this object, by any spelling.
+    fn pins(&self, digest: &str) -> bool {
+        self.mentioned.contains(digest)
+    }
+
+    /// Whether the only thing naming this object is free text in a surviving row.
+    fn text_only(&self, digest: &str) -> bool {
+        self.mentioned.contains(digest) && !self.referenced.contains(digest)
+    }
+
+    /// How many distinct digests are named only as free text.
+    fn text_only_count(&self) -> u64 {
+        let count = self.mentioned.difference(&self.referenced).count();
+        u64::try_from(count).unwrap_or(u64::MAX)
+    }
+}
+
+/// Scan one `(session_id, payload)` projection and record every digest it names.
+///
+/// A row of a session this pass is accounting for as deleted is skipped by id, which is the
+/// only thing that makes an object of a pruned session reclaimable at all.
+///
+/// Both columns are read as raw bytes through [`rusqlite::types::ValueRef`] rather than as
+/// `String`, and that is a correctness requirement, not a style choice. Neither `part.data`
+/// nor `session_input.prompt` carries a type or `json_valid` constraint, and the database is
+/// not a file Zuno exclusively writes, so one value stored as a blob or as text that is not
+/// valid UTF-8 used to fail `row.get::<_, String>` and abort the whole artifact pass — after
+/// `crate::prune` had already committed its row deletions. The caller then saw a failed
+/// prune whose database work had happened, which is the uncertain-outcome shape a mechanical
+/// retry cannot resolve, and the artifacts leaked for good because the rows that could
+/// attribute them were gone. Reading bytes cannot fail on any value SQLite can hold, so the
+/// payload is scanned whatever its declared type: a blob that spells a digest still pins its
+/// object. A value that is null, an integer, or a real cannot contain the `sha256:` prefix,
+/// so those rows are counted as unscanned evidence rather than treated as a risk.
+///
+/// A session id this crate cannot read as UTF-8 is treated as unknown, never as a match, so
+/// such a row is scanned as a survivor: it keeps objects rather than releasing them. It is
+/// deliberately not normalized. `String::from_utf8_lossy` would fold every unreadable byte
+/// onto `U+FFFD`, and a requested id that itself contains `U+FFFD` would then compare equal
+/// to a row it has nothing to do with, releasing the objects that row still names.
+fn collect_referenced_digests(
+    connection: &Connection,
+    query: &str,
+    deleted_session_ids: &BTreeSet<String>,
+    live: &mut LiveDigests,
+) -> Result<(), ArtifactGcError> {
+    let mut statement = connection.prepare(query).map_err(open::map_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            let session_id = match row.get_ref(0)? {
+                ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                    str::from_utf8(bytes).ok().map(ToOwned::to_owned)
+                }
+                ValueRef::Null | ValueRef::Integer(_) | ValueRef::Real(_) => None,
+            };
+            let payload = match row.get_ref(1)? {
+                ValueRef::Text(bytes) | ValueRef::Blob(bytes) => Some(bytes.to_vec()),
+                ValueRef::Null | ValueRef::Integer(_) | ValueRef::Real(_) => None,
+            };
+            Ok((session_id, payload))
+        })
+        .map_err(open::map_error)?;
+    for row in rows {
+        let (session_id, payload) = row.map_err(open::map_error)?;
+        if session_id.is_some_and(|id| deleted_session_ids.contains(&id)) {
+            continue;
+        }
+        match payload {
+            Some(payload) => collect_attachment_digests(&payload, live),
+            None => live.unscanned_rows = live.unscanned_rows.saturating_add(1),
+        }
+    }
+    Ok(())
+}
+
+/// Record every attachment id one durable payload names, whatever carries it.
+///
+/// The id is the invariant; nothing else about the payload is. An HTTP prompt nests a
+/// reference under `attachment` (`/prompt/files/N/attachment`), while the terminal
+/// composer and ACP persist `zuno_llm::event::RequestContentBlock::ImageAttachment`,
+/// whose durable key is `reference` because that enum's `rename_all` renames its variants
+/// and not its fields. Keying on one writer's spelling swept the objects of the two
+/// default surfaces while a test written against the third stayed green. Keying on the
+/// `id` field of an object would leave the same trap one level down, and parsing the row
+/// at all makes a payload this build cannot parse — a truncated write, a shape an older
+/// format wrote, a `ToolUse` input deeper than `serde_json`'s 128-level limit — look like
+/// a row that references nothing, which is a licence to delete.
+///
+/// So the scan reads the stored bytes and asks only what `zuno_attachment::AttachmentId`
+/// itself guarantees: the id serializes as `sha256:` followed by 64 lowercase hex digits
+/// (`#[serde(into = "String")]`). It does not require the payload to be JSON, to parse, or
+/// to be text at all.
+///
+/// The asymmetry is deliberate. Retaining an object nothing needs costs bytes a later pass
+/// reclaims once no row names the digest; deleting one a queued prompt still names is
+/// permanent durable-state loss with no recovery. Consequences of reading the row as bytes
+/// are recorded rather than narrowed: a digest quoted in prose or in a tool result pins that
+/// object, and a payload that fabricates many well-formed ids makes this set as large as the
+/// bytes it fabricated them in. Both directions only ever keep bytes, and a cap would hand
+/// any writer of one large payload a switch that skips the whole class. What the pass owes
+/// the operator instead is the count: [`is_stored_reference`] separates an id that was
+/// serialized as its own value from one that is merely mentioned, and
+/// [`PinnedAttachments`] reports the objects the second kind held back.
+///
+/// One spelling this cannot see is an id whose prefix a writer escaped, such as
+/// `\u0073ha256:`. `serde_json` and `JSON.stringify` escape neither the prefix nor a hex
+/// digit — `an_ascii_escaped_prefix_is_not_what_this_crate_writes` pins that — so no writer
+/// in this repository produces it; an importer that did would have its objects reclaimed.
+fn collect_attachment_digests(payload: &[u8], live: &mut LiveDigests) {
+    let mut cursor = 0_usize;
+    while let Some(offset) = find_bytes(&payload[cursor..], ATTACHMENT_ID_PREFIX) {
+        let start = cursor + offset;
+        let body = start + ATTACHMENT_ID_PREFIX.len();
+        // A new occurrence cannot begin inside the prefix just matched: no proper suffix of
+        // `sha256:` is a prefix of it. Advancing past the prefix therefore skips nothing.
+        cursor = body;
+        let Some(digest) = payload.get(body..body + DIGEST_HEX_LEN) else {
+            continue;
+        };
+        if !is_object_digest(digest) {
+            continue;
+        }
+        let Ok(digest) = std::str::from_utf8(digest) else {
+            continue;
+        };
+        live.mentioned.insert(digest.to_owned());
+        if is_stored_reference(payload, start, body + DIGEST_HEX_LEN) {
+            live.referenced.insert(digest.to_owned());
+        }
+    }
+}
+
+/// The first index in `haystack` where `needle` starts.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Whether this occurrence is a complete stored string value rather than free text.
+///
+/// Every writer in this repository persists a reference as its own JSON string, so the id is
+/// quote-delimited: `"sha256:<64hex>"`, or `\"sha256:<64hex>\"` when one document was
+/// serialized inside another's string. Prose that merely mentions a digest, and a tool result
+/// that echoes one inside a longer message, are not.
+///
+/// This classifies; it never decides liveness. Both forms keep the object, because a writer
+/// this build has not seen — or a future format — may spell a reference some third way, and
+/// the cost of guessing wrong in the other direction is deleting the only copy of an object a
+/// durable row still names. Misclassifying here costs report precision only.
+fn is_stored_reference(payload: &[u8], start: usize, end: usize) -> bool {
+    let before = start
+        .checked_sub(1)
+        .and_then(|index| payload.get(index))
+        .copied();
+    if before != Some(b'"') {
+        return false;
+    }
+    match payload.get(end).copied() {
+        Some(b'"') => true,
+        Some(b'\\') => payload.get(end + 1).copied() == Some(b'"'),
+        _ => false,
+    }
+}
+
+/// Whether these bytes are the hex body of an attachment id, and therefore an object name.
+fn is_object_digest(digest: &[u8]) -> bool {
+    digest.len() == DIGEST_HEX_LEN
+        && digest
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+/// Collect every object file no surviving row names, and count those held back by text.
+///
+/// The return value is the number of files that were *not* collected because the only thing
+/// naming their digest was free text in a surviving row. That count is the size of the
+/// suppression [`PinnedAttachments`] reports; a file kept by a stored reference is ordinary
+/// liveness and is not counted.
 fn discover_unreferenced_attachment_files(
     root: &Path,
-    live: &BTreeSet<String>,
+    live: &LiveDigests,
     candidates: &mut Vec<Candidate>,
-) -> Result<(), ArtifactGcError> {
+) -> Result<u64, ArtifactGcError> {
     if !is_real_directory(root)? {
-        return Ok(());
+        return Ok(0);
     }
+    let mut held_back = 0_u64;
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
         for entry in read_directory(&directory)? {
@@ -696,7 +1097,13 @@ fn discover_unreferenced_attachment_files(
                 continue;
             };
             let digest = name.split('-').next().unwrap_or_default();
-            if digest.len() != 64 || live.contains(digest) {
+            if digest.len() != DIGEST_HEX_LEN {
+                continue;
+            }
+            if live.pins(digest) {
+                if live.text_only(digest) {
+                    held_back = held_back.saturating_add(1);
+                }
                 continue;
             }
             candidates.push(Candidate {
@@ -707,7 +1114,7 @@ fn discover_unreferenced_attachment_files(
             });
         }
     }
-    Ok(())
+    Ok(held_back)
 }
 
 fn read_directory(path: &Path) -> Result<Vec<fs::DirEntry>, ArtifactGcError> {
@@ -872,6 +1279,12 @@ mod tests {
                    id TEXT PRIMARY KEY,\
                    session_id TEXT NOT NULL,\
                    data TEXT NOT NULL\
+                 );\
+                 CREATE TABLE session_input (\
+                   id TEXT PRIMARY KEY,\
+                   session_id TEXT NOT NULL,\
+                   prompt TEXT NOT NULL,\
+                   state TEXT NOT NULL\
                  );",
             )
             .expect("create attachment GC schema");
@@ -909,6 +1322,119 @@ mod tests {
         connection
     }
 
+    /// The exact shape `zuno-server` admits: the reference nests two levels below the
+    /// row's `prompt`, which is why liveness cannot be one hard-coded pointer per table.
+    fn insert_pending_input(connection: &Connection, id: &str, session_id: &str, digest: &str) {
+        insert_pending_prompt(
+            connection,
+            id,
+            session_id,
+            &serde_json::json!({
+                "kind": "user",
+                "prompt": {
+                    "text": "what does this screenshot show?",
+                    "files": [{
+                        "type": "image",
+                        "attachment": {
+                            "id": format!("sha256:{digest}"),
+                            "mediaType": "image/png",
+                            "width": 1,
+                            "height": 1,
+                            "encodedBytes": 1
+                        }
+                    }],
+                    "agents": []
+                },
+                "agent": null,
+                "model": null
+            }),
+        );
+    }
+
+    /// The exact row `zuno-cli`'s terminal composer admits, copied field for field from
+    /// `PersistedTuiInput::TuiPrompt` wrapping `PromptSubmission::Content`.
+    ///
+    /// The reference is under `reference`, not `attachment`: the block is
+    /// `RequestContentBlock::ImageAttachment`, and that enum's `rename_all` renames its
+    /// variants, not its fields. This is the default surface — a paste while a turn runs
+    /// is admitted with `TurnLease::Deferred`, so the row is pending and no `part` row
+    /// exists yet.
+    fn insert_pending_tui_input(connection: &Connection, id: &str, session_id: &str, digest: &str) {
+        insert_pending_prompt(
+            connection,
+            id,
+            session_id,
+            &serde_json::json!({
+                "kind": "tuiPrompt",
+                "submission": {
+                    "kind": "content",
+                    "data": {
+                        "text": "what does this screenshot show?",
+                        "content": [{
+                            "type": "image_attachment",
+                            "reference": {
+                                "id": format!("sha256:{digest}"),
+                                "mediaType": "image/png",
+                                "width": 1,
+                                "height": 1,
+                                "encodedBytes": 1
+                            }
+                        }]
+                    }
+                },
+                "origin": "tui_keybinding"
+            }),
+        );
+    }
+
+    /// The exact row `acp_prompt_payload` admits for an ACP image block.
+    fn insert_pending_acp_input(connection: &Connection, id: &str, session_id: &str, digest: &str) {
+        insert_pending_prompt(
+            connection,
+            id,
+            session_id,
+            &serde_json::json!({
+                "kind": "acpPrompt",
+                "text": "what does this screenshot show?",
+                "content": [{
+                    "type": "image_attachment",
+                    "reference": {
+                        "id": format!("sha256:{digest}"),
+                        "mediaType": "image/png",
+                        "width": 1,
+                        "height": 1,
+                        "encodedBytes": 1
+                    }
+                }]
+            }),
+        );
+    }
+
+    fn insert_pending_prompt(
+        connection: &Connection,
+        id: &str,
+        session_id: &str,
+        prompt: &serde_json::Value,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO session_input (id, session_id, prompt, state)
+                 VALUES (?1, ?2, ?3, 'queued')",
+                params![id, session_id, prompt.to_string()],
+            )
+            .expect("insert pending inbox prompt");
+    }
+
+    /// One `part` row with exactly the bytes given, valid JSON or not.
+    fn insert_part_payload(connection: &Connection, id: &str, session_id: &str, data: &str) {
+        connection
+            .execute(
+                "INSERT INTO part (id, session_id, data) VALUES (?1, ?2, ?3)",
+                params![id, session_id, data],
+            )
+            .expect("insert part payload");
+    }
+
     fn attachment_file(
         paths: &ArtifactGcPaths,
         database: &Path,
@@ -927,8 +1453,31 @@ mod tests {
             .join(name)
     }
 
+    /// `session_prune` collects this rendering straight into the serialized report's
+    /// `warnings` array, next to `artifacts[].path` values that are already in wire form.
+    /// A consumer that joins the two lists needs one spelling of the same directory.
     #[test]
-    fn zero_total_sessions_refuses_gc_and_names_the_database() {
+    fn a_skipped_root_warning_renders_both_paths_in_wire_form() {
+        let skipped = SkippedRoot {
+            root: PathBuf::from(r"C:\repo\.zuno\tool-output"),
+            path: PathBuf::from(r"C:\repo\.zuno\tool-output\tool_ses_old_call.jsonl"),
+            operation: "scan",
+            reason: "access is denied".to_owned(),
+        };
+
+        assert_eq!(
+            skipped.to_string(),
+            "tool output under C:/repo/.zuno/tool-output was not swept: could not scan \
+             C:/repo/.zuno/tool-output/tool_ses_old_call.jsonl (access is denied)"
+        );
+    }
+
+    /// The gate protects the shared snapshot root, and only it. A pass whose caller has
+    /// already committed a delete that emptied `session` must still complete and report,
+    /// because the ids it was handed are the last record of which files belonged to those
+    /// sessions; every later pass would see an unattributable name instead.
+    #[test]
+    fn zero_total_sessions_leaves_shared_snapshots_alone_and_still_completes() {
         let temp = tempfile::tempdir().expect("temp dir");
         let database_path = temp.path().join("wrong-channel.db");
         let mut connection = Connection::open(&database_path).expect("open file database");
@@ -948,17 +1497,137 @@ mod tests {
             &unowned.path_in(&paths.snapshots).join("objects/history"),
             b"must survive",
         );
+        let attributable = paths
+            .tool_output
+            .join("tool_ses_selected_00000000000000000000000000000001");
+        write(&attributable, b"the deleted session's output");
 
-        let error = execute(
+        let report = execute(
             &mut connection,
             &paths,
-            &ArtifactGcRequest::new(["ses_selected"], SystemTime::now()),
+            &ArtifactGcRequest::new(["ses_selected"], SystemTime::now()).deleting(),
         )
-        .expect_err("an empty database cannot prove shared artifacts are unreferenced");
+        .expect("a committed delete that emptied the table still reports its artifacts");
+
+        assert!(
+            unowned.path_in(&paths.snapshots).is_dir(),
+            "an empty database cannot prove a shared snapshot store is unreferenced"
+        );
+        assert!(
+            !attributable.exists(),
+            "tool output named by the request's own ids is still attributable"
+        );
+        assert!(report.artifacts.iter().any(|artifact| {
+            artifact.path == attributable
+                && artifact.kind == ArtifactKind::ToolOutput
+                && artifact.removed
+        }));
+        // Completing is not licence to be silent. The rows that could have attributed those
+        // stores are already gone, so the report is the only place the bytes still get named.
+        assert_eq!(
+            report.skipped_classes,
+            [SkippedClass::unattributable(
+                ArtifactKind::SnapshotStore,
+                database_path.to_string_lossy().into_owned(),
+                0,
+            )]
+        );
+        let error = ensure_visible_session_owners(&connection)
+            .expect_err("the pre-mutation gate still names the database and the count");
         let message = error.to_string();
         assert!(message.contains(&database_path.to_string_lossy().into_owned()));
-        assert!(message.contains("0"), "{message}");
-        assert!(unowned.path_in(&paths.snapshots).is_dir());
+        assert!(message.contains('0'), "{message}");
+    }
+
+    /// The skipped snapshot class needs no operator action, and the doc comment says so.
+    ///
+    /// The previous wording told an operator the bytes now needed a human, and the pending
+    /// documentation asked them to `rm` the store directory by hand. That is the one thing
+    /// they must not do: `$ZUNO_DATA/snapshot` is shared, a store there can belong to another
+    /// channel's database, and deciding which is exactly the cross-database attribution this
+    /// pass refuses to make. This test is the evidence for the replacement claim -- the bytes
+    /// survive the survivorless pass and the next pass over the same database reclaims them
+    /// once one session exists to attribute against.
+    #[test]
+    fn a_class_skipped_without_survivors_is_reclaimed_by_the_next_pass_with_one() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let database_path = temp.path().join("later.db");
+        let mut connection = Connection::open(&database_path).expect("open file database");
+        connection
+            .execute_batch(
+                "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL);\
+                 CREATE TABLE session (\
+                   id TEXT PRIMARY KEY,\
+                   project_id TEXT NOT NULL,\
+                   directory TEXT NOT NULL\
+                 );",
+            )
+            .expect("create schema");
+        let paths = ArtifactGcPaths::from_data_root(temp.path());
+        let worktree = temp.path().join("worktree");
+        let stale = StoreKey::new("project", &temp.path().join("gone"));
+        write(
+            &stale.path_in(&paths.snapshots).join("objects/history"),
+            b"nothing references this",
+        );
+
+        let first = execute(
+            &mut connection,
+            &paths,
+            &ArtifactGcRequest::new(["ses_selected"], SystemTime::now()).deleting(),
+        )
+        .expect("a pass with no surviving session still completes");
+        assert!(
+            stale.path_in(&paths.snapshots).is_dir(),
+            "an empty database cannot attribute a shared store, so the bytes stay"
+        );
+        assert_eq!(
+            first.skipped_classes,
+            [SkippedClass::unattributable(
+                ArtifactKind::SnapshotStore,
+                database_path.to_string_lossy().into_owned(),
+                0,
+            )],
+            "the skip is recorded, and it is a record, not a work item"
+        );
+
+        // The ordinary course of operation: the database gains a session again.
+        insert_project(&connection, "project", &worktree);
+        insert_session(&connection, "ses_live", "project", &worktree);
+        let second = execute(
+            &mut connection,
+            &paths,
+            &ArtifactGcRequest::new(Vec::<String>::new(), SystemTime::now()).deleting(),
+        )
+        .expect("the later pass evaluates the class it previously skipped");
+
+        assert!(
+            !stale.path_in(&paths.snapshots).exists(),
+            "the next pass with a survivor reclaims the store, with no manual step"
+        );
+        assert!(second.skipped_classes.is_empty());
+    }
+
+    /// No operator-facing text in this module may hand out a removal recipe for shared bytes.
+    ///
+    /// The claim above is only worth anything if the file cannot drift back to advising a
+    /// manual delete under `$ZUNO_DATA/snapshot`, where a store may belong to another
+    /// channel's database. Only the production half of the file is inspected, so this
+    /// assertion cannot match its own text.
+    #[test]
+    fn no_doc_comment_here_tells_an_operator_to_remove_shared_bytes_by_hand() {
+        let source = include_str!("artifact_gc.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the source before the test module");
+        for recipe in ["rm $ZUNO_DATA", "rm -rf", "rmdir", "delete the directory"] {
+            assert!(
+                !production.contains(recipe),
+                "a skipped class is evidence, not an invitation to delete shared bytes: \
+                 {recipe:?}"
+            );
+        }
     }
 
     #[test]
@@ -1175,12 +1844,194 @@ mod tests {
             "database A GC must not inspect database B's object scope"
         );
         assert_eq!(
+            report.pinned_attachments, None,
+            "a surviving session naming its own attachment through a stored reference is \
+             ordinary liveness, and must not spend the suppression signal"
+        );
+        assert_eq!(
             report
                 .artifacts
                 .iter()
                 .filter(|artifact| artifact.kind == ArtifactKind::AttachmentObject)
                 .count(),
             2
+        );
+    }
+
+    /// A queued prompt is durable, accepted user input: the row names the object long
+    /// before the turn that would write a `part` row is admitted, and it stays pending
+    /// for as long as the session is busy. Sweeping on `part` alone deleted the store's
+    /// only copy of an image the user had already sent, and the pass that did it was a
+    /// prune of an unrelated old session.
+    #[test]
+    fn a_pending_inbox_prompt_keeps_its_attachment_object_live() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
+        let database = temp.path().join("inbox.db");
+        let transcript = "11".repeat(32);
+        let queued = "55".repeat(32);
+        let pruned = "66".repeat(32);
+        let orphan = "22".repeat(32);
+        let mut connection = attachment_database(&database, "ses_live", &transcript);
+        insert_session(
+            &connection,
+            "ses_busy",
+            "project",
+            database.parent().expect("database parent"),
+        );
+        insert_pending_input(&connection, "inp_busy", "ses_busy", &queued);
+        insert_pending_input(&connection, "inp_pruned", "ses_pruned", &pruned);
+
+        let transcript_object = attachment_file(&paths, &database, "objects", &transcript);
+        let queued_object = attachment_file(&paths, &database, "objects", &queued);
+        let pruned_object = attachment_file(&paths, &database, "objects", &pruned);
+        let orphan_object = attachment_file(&paths, &database, "objects", &orphan);
+        for path in [
+            &transcript_object,
+            &queued_object,
+            &pruned_object,
+            &orphan_object,
+        ] {
+            write(path, b"object");
+        }
+
+        execute(
+            &mut connection,
+            &paths,
+            &ArtifactGcRequest::new(["ses_pruned"], SystemTime::now()).deleting(),
+        )
+        .expect("collect attachments");
+
+        assert!(
+            queued_object.is_file(),
+            "a durable inbox row is a live reference"
+        );
+        assert!(transcript_object.is_file());
+        assert!(
+            !pruned_object.exists(),
+            "the pruned session's own queued object is still reclaimable"
+        );
+        assert!(!orphan_object.exists());
+    }
+
+    /// The two default surfaces do not spell the reference `attachment`.
+    ///
+    /// A terminal paste and an ACP image block both persist
+    /// `RequestContentBlock::ImageAttachment`, whose durable key is `reference`, so a scan
+    /// keyed on the HTTP writer's spelling swept the objects of the surfaces almost every
+    /// user is on while a test written against the HTTP shape stayed green. The rows here
+    /// are copied field for field from `PersistedTuiInput::TuiPrompt` and
+    /// `acp_prompt_payload`, and the digests they name must survive a prune of an
+    /// unrelated session.
+    #[test]
+    fn a_pending_tui_or_acp_prompt_keeps_its_attachment_object_live() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
+        let database = temp.path().join("inbox.db");
+        let transcript = "11".repeat(32);
+        let tui = "77".repeat(32);
+        let acp = "88".repeat(32);
+        let orphan = "22".repeat(32);
+        let mut connection = attachment_database(&database, "ses_live", &transcript);
+        let parent = database.parent().expect("database parent");
+        insert_session(&connection, "ses_tui_busy", "project", parent);
+        insert_session(&connection, "ses_acp_busy", "project", parent);
+        insert_pending_tui_input(&connection, "inp_tui", "ses_tui_busy", &tui);
+        insert_pending_acp_input(&connection, "inp_acp", "ses_acp_busy", &acp);
+
+        let tui_object = attachment_file(&paths, &database, "objects", &tui);
+        let acp_object = attachment_file(&paths, &database, "objects", &acp);
+        let orphan_object = attachment_file(&paths, &database, "objects", &orphan);
+        for path in [&tui_object, &acp_object, &orphan_object] {
+            write(path, b"object");
+        }
+
+        execute(
+            &mut connection,
+            &paths,
+            &ArtifactGcRequest::new(["ses_pruned"], SystemTime::now()).deleting(),
+        )
+        .expect("collect attachments");
+
+        assert!(
+            tui_object.is_file(),
+            "a pending terminal prompt names its object under `reference`, not `attachment`"
+        );
+        assert!(
+            acp_object.is_file(),
+            "a pending ACP prompt names its object under `reference`, not `attachment`"
+        );
+        assert!(
+            !orphan_object.exists(),
+            "a key-agnostic scan must still reclaim an object no durable row names"
+        );
+    }
+
+    /// A payload this build cannot turn into a value is not a payload that names nothing.
+    ///
+    /// Neither `part.data` nor `session_input.prompt` carries a `json_valid` constraint, so
+    /// a half-written row, a shape an older format persisted, and a `ToolUse` input nested
+    /// past `serde_json`'s 128-level parse limit all arrive as text no parse will accept.
+    /// A liveness scan that parses first has to skip such a row, and skipping it deleted
+    /// the object the row still names: corrupt durable state became a licence to destroy
+    /// the bytes that could have recovered it. The two payloads here are asserted
+    /// unparsable by this build first, so the fixture cannot quietly become a parsable one.
+    #[test]
+    fn an_unparsable_payload_still_keeps_the_object_it_names_live() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
+        let database = temp.path().join("corrupt.db");
+        let transcript = "11".repeat(32);
+        let truncated_digest = "33".repeat(32);
+        let deep_digest = "44".repeat(32);
+        let orphan = "22".repeat(32);
+        let mut connection = attachment_database(&database, "ses_live", &transcript);
+
+        // A write cut off mid-object: the id is durable, the closing braces are not.
+        let truncated = format!(
+            "{{\"type\":\"file\",\"attachment\":{{\"id\":\"sha256:{truncated_digest}\",\"mediaTy"
+        );
+        // 200 levels of array around the same reference a `ToolUse` input could nest.
+        let deep = format!(
+            "{}{}{}",
+            "[".repeat(200),
+            serde_json::json!({"id": format!("sha256:{deep_digest}")}),
+            "]".repeat(200)
+        );
+        for payload in [&truncated, &deep] {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(payload).is_err(),
+                "the fixture must be a payload this build cannot parse: {payload}"
+            );
+        }
+        insert_part_payload(&connection, "part_truncated", "ses_live", &truncated);
+        insert_part_payload(&connection, "part_deep", "ses_live", &deep);
+
+        let truncated_object = attachment_file(&paths, &database, "objects", &truncated_digest);
+        let deep_object = attachment_file(&paths, &database, "objects", &deep_digest);
+        let orphan_object = attachment_file(&paths, &database, "objects", &orphan);
+        for path in [&truncated_object, &deep_object, &orphan_object] {
+            write(path, b"object");
+        }
+
+        execute(
+            &mut connection,
+            &paths,
+            &ArtifactGcRequest::new(["ses_pruned"], SystemTime::now()).deleting(),
+        )
+        .expect("collect attachments");
+
+        assert!(
+            truncated_object.is_file(),
+            "a truncated payload still names its object, and the object is the only copy"
+        );
+        assert!(
+            deep_object.is_file(),
+            "a payload deeper than the parse limit still names its object"
+        );
+        assert!(
+            !orphan_object.exists(),
+            "failing closed on unreadable rows must not stop reclaiming a real orphan"
         );
     }
 
@@ -1323,5 +2174,321 @@ mod tests {
 
         assert!(report.artifacts.is_empty());
         assert!(tool_file.is_file());
+    }
+
+    /// A payload the released build could have stored must not fail the whole pass.
+    ///
+    /// `part.data` and `session_input.prompt` are declared `text` with no `json_valid`
+    /// constraint, and a TEXT-affinity column stores a blob as a blob and keeps text SQLite
+    /// never validated as UTF-8, so both values below are ordinary content of a 0.6.6
+    /// database. Reading either through `row.get::<_, String>` returns `Err`, and this pass
+    /// runs *after* `crate::prune` has already committed its row deletions: the caller saw a
+    /// failed prune whose database work had happened, and the artifacts of the sessions it
+    /// deleted could never be attributed again, because the rows that named them were gone.
+    ///
+    /// So the scan reads bytes. A digest inside a blob still pins its object, a digest inside
+    /// text that is not valid UTF-8 still pins its object, and a real orphan in the same
+    /// database is still reclaimed in the same pass.
+    #[test]
+    fn a_blob_or_invalid_utf8_payload_is_scanned_instead_of_failing_the_pass() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
+        let database = temp.path().join("bytes.db");
+        let transcript = "11".repeat(32);
+        let blob_digest = "33".repeat(32);
+        let latin1_digest = "44".repeat(32);
+        let orphan = "22".repeat(32);
+        let mut connection = attachment_database(&database, "ses_live", &transcript);
+
+        // The exact bytes of a stored reference, stored in the TEXT column as a blob.
+        let mut blob = br#"{"type":"file","attachment":{"id":"sha256:"#.to_vec();
+        blob.extend_from_slice(blob_digest.as_bytes());
+        blob.extend_from_slice(br#""}}"#);
+        connection
+            .execute(
+                "INSERT INTO part (id, session_id, data) VALUES ('part_blob', 'ses_live', ?1)",
+                params![blob],
+            )
+            .expect("insert blob payload");
+
+        // Text SQLite stored without validating it: a legacy paste, byte 0xff first.
+        let mut latin1 = b"\xff\xfe pasted transcript, attachment sha256:".to_vec();
+        latin1.extend_from_slice(latin1_digest.as_bytes());
+        latin1.extend_from_slice(b" was reviewed");
+        connection
+            .execute(
+                "INSERT INTO session_input (id, session_id, prompt, state) \
+                 VALUES ('inp_latin1', 'ses_live', CAST(?1 AS TEXT), 'queued')",
+                params![latin1],
+            )
+            .expect("insert invalid utf-8 prompt");
+
+        // The fixture is only the reviewer's input if these are really the two storage
+        // classes that used to abort the pass.
+        let stored: String = connection
+            .query_row(
+                "SELECT typeof(data) FROM part WHERE id = 'part_blob'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read stored type");
+        assert_eq!(stored, "blob", "the payload must be stored as a blob");
+        let stored: String = connection
+            .query_row(
+                "SELECT typeof(prompt) FROM session_input WHERE id = 'inp_latin1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read stored type");
+        assert_eq!(stored, "text", "the prompt must be stored as text");
+        for query in [
+            "SELECT data FROM part WHERE id = 'part_blob'",
+            "SELECT prompt FROM session_input WHERE id = 'inp_latin1'",
+        ] {
+            assert!(
+                connection
+                    .query_row(query, [], |row| row.get::<_, String>(0))
+                    .is_err(),
+                "the fixture must be a value a `String` read cannot decode: {query}"
+            );
+        }
+
+        let blob_object = attachment_file(&paths, &database, "objects", &blob_digest);
+        let latin1_object = attachment_file(&paths, &database, "objects", &latin1_digest);
+        let orphan_object = attachment_file(&paths, &database, "objects", &orphan);
+        for path in [&blob_object, &latin1_object, &orphan_object] {
+            write(path, b"object");
+        }
+
+        let report = execute(
+            &mut connection,
+            &paths,
+            &ArtifactGcRequest::new(["ses_pruned"], SystemTime::now()).deleting(),
+        )
+        .expect("a blob or non-UTF-8 payload must not fail the pass");
+
+        assert!(
+            blob_object.is_file(),
+            "a digest stored as a blob still names the only copy of its object"
+        );
+        assert!(
+            latin1_object.is_file(),
+            "a digest inside text that is not valid UTF-8 still names its object"
+        );
+        assert!(
+            !orphan_object.exists(),
+            "a real orphan is still reclaimed in the same pass"
+        );
+        // The blob spelled a complete stored reference, so it is ordinary liveness; the
+        // legacy paste named its digest as free text, so it is the reported suppression.
+        assert_eq!(
+            report.pinned_attachments,
+            Some(PinnedAttachments {
+                database: database.to_string_lossy().into_owned(),
+                objects: 1,
+                digests: 1,
+                unscanned_rows: 0,
+            }),
+            "only the free-text digest is counted as held back"
+        );
+    }
+
+    /// A row whose session id is not UTF-8 is never folded onto the id being deleted.
+    ///
+    /// The scan compares a row's `session_id` against the ids this pass is deleting. Reading
+    /// that column with `String::from_utf8_lossy` replaces every unreadable byte with
+    /// `U+FFFD`, so a row keyed by the single byte `0xff` reads back as `"\u{FFFD}"` — and a
+    /// requested id spelled `"\u{FFFD}"` then matches it. The row is skipped as belonging to
+    /// a deleted session, its stored reference is never collected, and the only copy of the
+    /// object it names is deleted while the row survives. That is data loss produced by a
+    /// normalization step, not by any decision an operator made.
+    #[test]
+    fn a_row_whose_session_id_is_not_utf8_is_never_folded_onto_a_deleted_id() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
+        let database = temp.path().join("folded.db");
+        let transcript = "11".repeat(32);
+        let held = "55".repeat(32);
+        let mut connection = attachment_database(&database, "ses_live", &transcript);
+
+        let reference = serde_json::json!({
+            "type": "file",
+            "attachment": { "id": format!("sha256:{held}") }
+        })
+        .to_string();
+        connection
+            .execute(
+                "INSERT INTO part (id, session_id, data) \
+                 VALUES ('part_unreadable', CAST(?1 AS TEXT), ?2)",
+                params![b"\xff".to_vec(), reference],
+            )
+            .expect("insert row keyed by a byte that is not UTF-8");
+
+        // The fixture is only the dangerous input if the stored key really is unreadable and
+        // really does fold onto the id this pass deletes.
+        let stored: Vec<u8> = connection
+            .query_row(
+                "SELECT CAST(session_id AS BLOB) FROM part WHERE id = 'part_unreadable'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read stored key");
+        assert_eq!(stored, b"\xff", "the key must be the single byte 0xff");
+        assert_eq!(
+            String::from_utf8_lossy(&stored),
+            "\u{FFFD}",
+            "the fixture must fold onto the requested id"
+        );
+
+        let held_object = attachment_file(&paths, &database, "objects", &held);
+        write(&held_object, b"object");
+
+        let report = execute(
+            &mut connection,
+            &paths,
+            &ArtifactGcRequest::new(["\u{FFFD}"], SystemTime::now()).deleting(),
+        )
+        .expect("an unreadable session key must not fail the pass");
+
+        assert!(
+            held_object.is_file(),
+            "a row this crate cannot attribute keeps the object it names"
+        );
+        assert!(
+            !report
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.path.to_string_lossy().contains(&held)),
+            "the object must not even be projected as reclaimable: {:?}",
+            report.artifacts
+        );
+    }
+
+    /// An attachment class held back by untrusted text is reported, not a clean zero.
+    ///
+    /// One surviving `part` row lists 200 digests as prose — the shape a tool result or a
+    /// model turn can author — and every one of those objects belongs to a session this pass
+    /// is deleting. The scan keeps all 200, which is the safe direction and stays, but the
+    /// report used to say `total_bytes = 0` with no warning at all: model output had decided
+    /// the operator's reclamation ceiling and nothing in the report said so.
+    ///
+    /// The transcript object of the same surviving session is kept too, by a stored
+    /// reference. It must not be counted here: the benign case is what would spend the
+    /// signal that exists for the suppressed one.
+    #[test]
+    fn attachment_objects_kept_only_by_free_text_are_reported_not_a_silent_zero() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
+        let database = temp.path().join("prose.db");
+        let transcript = "11".repeat(32);
+        let mut connection = attachment_database(&database, "ses_live", &transcript);
+
+        let digests: Vec<String> = (0..200_u32).map(|index| format!("{index:064x}")).collect();
+        let prose = format!(
+            "I reviewed the pruned session's attachments: {}. None of them mattered.",
+            digests
+                .iter()
+                .map(|digest| format!("sha256:{digest}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(
+            !prose.contains(&format!("\"sha256:{}\"", digests[0])),
+            "no digest here is a stored reference; every one is prose"
+        );
+        insert_part_payload(&connection, "part_prose", "ses_live", &prose);
+
+        let transcript_object = attachment_file(&paths, &database, "objects", &transcript);
+        write(&transcript_object, b"object");
+        let objects: Vec<PathBuf> = digests
+            .iter()
+            .map(|digest| attachment_file(&paths, &database, "objects", digest))
+            .collect();
+        for path in &objects {
+            write(path, b"object");
+        }
+
+        let report = execute(
+            &mut connection,
+            &paths,
+            &ArtifactGcRequest::new(["ses_pruned"], SystemTime::now()).deleting(),
+        )
+        .expect("collect attachments");
+
+        for path in &objects {
+            assert!(
+                path.is_file(),
+                "a digest a surviving row names is never a candidate: {}",
+                path.display()
+            );
+        }
+        assert!(transcript_object.is_file());
+        assert!(
+            report.artifacts.is_empty() && report.total_bytes == 0,
+            "the pass reclaimed nothing, which is exactly why it has to say why"
+        );
+        assert_eq!(
+            report.pinned_attachments,
+            Some(PinnedAttachments {
+                database: database.to_string_lossy().into_owned(),
+                objects: 200,
+                digests: 200,
+                unscanned_rows: 0,
+            }),
+            "the report must name the suppressed class, and must not count the transcript \
+             object that a stored reference keeps"
+        );
+        let rendered = report
+            .pinned_attachments
+            .as_ref()
+            .expect("pinned record")
+            .to_string();
+        assert_eq!(
+            rendered,
+            format!(
+                "`{}` kept 200 attachment objects whose 200 digests surviving rows name \
+                 only as free text; model- or tool-authored content can produce that \
+                 spelling, so those bytes are not reclaimable while such a row survives.",
+                database.display()
+            ),
+            "this sentence is the operator-visible value `session_prune` forwards"
+        );
+    }
+
+    /// The one spelling the byte scan cannot see is not a spelling this repository writes.
+    ///
+    /// `collect_attachment_digests` matches the literal bytes `sha256:`, so an id whose
+    /// prefix a writer escaped as `\u0073ha256:` is invisible to it and its object would be
+    /// reclaimed. That residual is bounded by what the serializers actually emit: neither
+    /// `serde_json` nor `JSON.stringify` escapes an ASCII letter or a hex digit.
+    #[test]
+    fn an_ascii_escaped_prefix_is_not_what_this_crate_writes() {
+        let digest = "ab".repeat(32);
+        let id = format!("sha256:{digest}");
+        let document = serde_json::json!({"attachment": {"id": id.clone()}}).to_string();
+        assert!(
+            document.contains(&format!("\"{id}\"")),
+            "the id is persisted verbatim: {document}"
+        );
+        assert!(
+            !document.contains("\\u"),
+            "no ASCII escape appears in a serialized attachment id: {document}"
+        );
+
+        let mut live = LiveDigests::default();
+        collect_attachment_digests(document.as_bytes(), &mut live);
+        assert!(live.pins(&digest), "the real spelling pins the object");
+        assert!(
+            !live.text_only(&digest),
+            "and is classified as a stored reference, not as free text"
+        );
+
+        let escaped = document.replace("sha256:", "\\u0073ha256:");
+        let mut live = LiveDigests::default();
+        collect_attachment_digests(escaped.as_bytes(), &mut live);
+        assert!(
+            !live.pins(&digest),
+            "an escaped prefix is the known residual: no writer here produces it"
+        );
     }
 }

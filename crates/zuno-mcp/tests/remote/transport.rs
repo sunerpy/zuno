@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use zuno_mcp::{RemoteClient, RemoteConnect, RemoteError, RemoteTransport};
 
@@ -39,6 +39,124 @@ async fn remote_streamable_http_accepts_plain_json_and_negotiates_the_server_ver
     let initialize: serde_json::Value =
         serde_json::from_slice(&requests[0].body).expect("initialize request JSON");
     assert_eq!(initialize["params"]["clientInfo"]["name"], "zuno");
+}
+
+/// The non-SSE branch is selected by a `Content-Type` header alone, so an unbounded
+/// read there is one header away from bypassing the SSE event cap — and an OOM kill
+/// takes the whole agent down, not just the MCP call.
+#[tokio::test]
+async fn remote_streamable_http_refuses_a_body_past_the_message_bound() {
+    // The production constant, not a copy of its value: a test that restates the
+    // bound keeps passing after the bound moves, and then proves nothing about the
+    // build it ran against.
+    const BOUND: usize = zuno_mcp::MAX_FRAME_BYTES;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_bytes(vec![b'x'; BOUND + 1]),
+        )
+        .mount(&server)
+        .await;
+    let mut config = remote_config(format!("{}/mcp", server.uri()));
+    // No fallback: the streamable branch is what is under test, and a second
+    // multi-megabyte attempt proves nothing further.
+    config.streamable_http_only = true;
+
+    let error = RemoteClient::connect("oversized", &config)
+        .await
+        .expect_err("a body past the message bound must be refused");
+    let RemoteError::Protocol { message, .. } = &error else {
+        panic!("an over-long body is a framing violation, not a transport hiccup: {error:?}")
+    };
+    assert!(
+        message.contains(&BOUND.to_string()) && message.contains("past the"),
+        "the refusal must name the bound it enforced, not a JSON parse position: {message}"
+    );
+}
+
+/// The reviewer's input: a `tools/call` answered with a reply that stops mid-JSON.
+///
+/// `{"jsonrpc":"2.0","id":2,"result":{"content":[{"typ` arrives whole, with a 200 and a
+/// JSON content type, and does not parse. The request had already reached the server,
+/// so the tool may well have run — reporting that as a definite permanent failure is
+/// the direction that invites a duplicate side effect, so it reports the uncertain
+/// class instead. A read-only method mutated nothing, so it keeps the permanent framing
+/// error that names the fault.
+#[tokio::test]
+async fn remote_an_unreadable_reply_to_a_side_effecting_call_is_uncertain_not_a_definite_failure() {
+    const TRUNCATED: &str = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"typ"#;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_string_contains(r#""method":"initialize""#))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": initialize_result("2025-03-26", "truncating-server"),
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_string_contains("notifications/initialized"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    for outstanding in [r#""method":"tools/call""#, r#""method":"resources/read""#] {
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_string_contains(outstanding))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(TRUNCATED),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let outcome = RemoteClient::connect(
+        "truncating",
+        &remote_config(format!("{}/mcp", server.uri())),
+    )
+    .await
+    .expect("the handshake itself is well-formed");
+    let RemoteConnect::Connected(client) = outcome else {
+        panic!("an unauthenticated server must connect")
+    };
+
+    let error = client
+        .call_tool("shoot", serde_json::Map::new())
+        .await
+        .expect_err("an unparseable reply cannot be reported as a successful call");
+    assert!(
+        matches!(&error, RemoteError::Timeout { .. }) && error.is_timeout(),
+        "a call that may have taken effect and was answered unreadably has an unknown \
+         outcome, not a definite permanent failure: {error:?}"
+    );
+
+    let error = client
+        .read_resource("mcp://doc")
+        .await
+        .expect_err("an unparseable reply cannot be reported as resource contents");
+    let RemoteError::Protocol { message, .. } = &error else {
+        panic!(
+            "a read-only method mutated nothing, so the framing fault is the whole diagnosis: {error:?}"
+        )
+    };
+    assert!(
+        message.contains("response body was not JSON"),
+        "the read-only refusal must still name the fault: {message}"
+    );
 }
 
 #[tokio::test]

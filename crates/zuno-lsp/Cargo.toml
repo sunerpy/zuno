@@ -14,6 +14,11 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 zuno-catalog = { workspace = true }
 zuno-error = { workspace = true }
+# `wire_path` is the one spelling of a path in durable metadata and in an
+# `external_directory` grant pattern. Naming it here rather than re-deriving it keeps
+# the `lsp` escalation byte-identical to the one `read`, `glob` and `grep` raise, so a
+# single standing decision covers all four for the same directory.
+zuno-paths = { workspace = true }
 zuno-process = { workspace = true }
 zuno-tool = { workspace = true }
 schemars = { workspace = true }

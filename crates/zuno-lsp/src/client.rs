@@ -178,6 +178,10 @@ struct Inner {
     diagnostic_changed: Notify,
     documents: Mutex<BTreeMap<PathBuf, DocumentState>>,
     closed: watch::Sender<bool>,
+    /// The task that owns the server's stdout, until its owner takes it to settle it.
+    ///
+    /// A `std` mutex: it is only ever locked to move the handle out, never across an await.
+    reader: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// A connected, initialized language-server client.
@@ -223,17 +227,34 @@ impl Client {
             diagnostic_changed: Notify::new(),
             documents: Mutex::new(BTreeMap::new()),
             closed,
+            reader: std::sync::Mutex::new(None),
         });
         let client = Self {
             inner: Arc::clone(&inner),
         };
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             if let Err(error) = read_loop(reader, Arc::clone(&inner)).await {
                 tracing::warn!(server = %inner.server_id, %error, "language server reader stopped");
             }
             close_pending(&inner).await;
         });
+        *lock_reader(&client.inner) = Some(reader);
 
+        if let Err(error) = client.handshake(process_id).await {
+            // No caller ever sees this client, so nobody could take the reader and settle it.
+            // Left alone it would run until the server's stdout reaches EOF, which a server
+            // that leaked a helper holding that pipe never delivers.
+            if let Some(reader) = client.take_reader() {
+                reader.abort();
+            }
+            return Err(error);
+        }
+        Ok(client)
+    }
+
+    /// The `initialize` round trip and the notifications that follow it.
+    async fn handshake(&self, process_id: Option<u32>) -> Result<(), ClientError> {
+        let client = self;
         let root_uri = file_uri(&client.inner.root)?;
         let initialized = client
             .request_with_timeout(
@@ -271,7 +292,18 @@ impl Client {
                 )
                 .await?;
         }
-        Ok(client)
+        Ok(())
+    }
+
+    /// Hands the reader task to whoever owns the server's lifecycle, exactly once.
+    ///
+    /// The reader returns only when the server's stdout reaches EOF, and EOF needs every process
+    /// holding that pipe to have closed it. The owner that reaps the server settles the reader
+    /// under its own ceiling and aborts it if the pipe is still held; a second call, or a call
+    /// after a failed handshake, gets `None`.
+    #[must_use]
+    pub fn take_reader(&self) -> Option<tokio::task::JoinHandle<()>> {
+        lock_reader(&self.inner).take()
     }
 
     /// Registry id of the connected server.
@@ -613,6 +645,13 @@ async fn publish_diagnostics(inner: &Inner, params: Option<&Value>) -> Result<()
     drop(epochs);
     inner.diagnostic_changed.notify_waiters();
     Ok(())
+}
+
+fn lock_reader(inner: &Inner) -> std::sync::MutexGuard<'_, Option<tokio::task::JoinHandle<()>>> {
+    inner
+        .reader
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 async fn close_pending(inner: &Inner) {

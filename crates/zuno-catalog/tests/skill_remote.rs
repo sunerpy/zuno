@@ -549,3 +549,76 @@ async fn one_dead_url_does_not_stop_the_next_one() {
 
     assert_eq!(names(&skills), expected_names(&["second"]));
 }
+
+/// A cache root is joined with a remote `name`, and a versioned refresh *replaces*
+/// the directory it lands in: `swap` renames whatever is already there out of the way
+/// and then deletes it. Three `..` segments walk out of `$XDG_CACHE_HOME/zuno/skills`
+/// onto `$XDG_CONFIG_HOME/zuno/skill`, so this index does not merely write outside the
+/// cache: without the `name` gate it deletes the user's own local skills, and the load
+/// then warns that a file it had just enumerated is missing.
+#[tokio::test]
+async fn an_index_entry_whose_name_escapes_the_cache_never_reaches_the_disk() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"skills":[{"name":"../../../.config/zuno/skill","files":["SKILL.md"],"version":"1"},{"name":"fine","files":["SKILL.md"]}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    // `Url::join` collapses the `..` segments, so this is the path the escaping
+    // entry would actually have fetched from.
+    Mock::given(method("GET"))
+        .and(path("/.config/zuno/skill/SKILL.md"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(skill_body("hijack", "remote")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/fine/SKILL.md"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(skill_body("fine", "remote")))
+        .mount(&server)
+        .await;
+
+    let tree = Tree::new();
+    tree.local_skill("keeper");
+    let local = tree
+        .home()
+        .join(".config")
+        .join("zuno")
+        .join("skill")
+        .join("keeper")
+        .join("SKILL.md");
+
+    let skills = load(&tree.options(vec![server.uri()])).await;
+
+    assert_eq!(
+        fs::read_to_string(&local).ok().as_deref(),
+        Some("---\nname: keeper\ndescription: local\n---\nB\n"),
+        "the local skill directory the name pointed at must survive untouched"
+    );
+    assert!(
+        !tree
+            .home()
+            .join(".config")
+            .join("zuno")
+            .join("skill")
+            .join(VERSION_FILE)
+            .exists(),
+        "nothing may be staged into the escaped directory"
+    );
+    assert!(skills.get("keeper").is_some(), "{:?}", skills.warnings());
+    assert!(
+        skills.get("fine").is_some(),
+        "the well-formed entry beside it still loads"
+    );
+    assert_eq!(
+        skills
+            .warnings()
+            .iter()
+            .map(|warning| warning.kind())
+            .collect::<Vec<_>>(),
+        vec![&SkillWarningKind::UnsafeIndexName {
+            skill: "../../../.config/zuno/skill".to_string()
+        }]
+    );
+}

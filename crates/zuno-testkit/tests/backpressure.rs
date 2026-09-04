@@ -175,6 +175,22 @@ const CHANNELS: &[ChannelGate] = &[
         "guard.requeue(std::iter::once(event).chain(iterator), now)",
     ),
     gate(
+        // A `std::sync::mpsc` channel with no capacity argument, declared as the
+        // exception it is rather than left for the scanner to report: exactly two
+        // producers exist, one reader thread per child pipe, each sends once and
+        // hangs up, and the receiver takes exactly two under the caller's ceiling.
+        // The bound is the producer count, not a queue depth. When the ceiling wins
+        // the race the receiver is already gone, so a late reader's send is dropped
+        // rather than kept for nobody; nothing here can block a producer.
+        "paths-child-pipe-drains",
+        "zuno-paths/src/bounded.rs",
+        "let (sender, receiver) = mpsc::channel();",
+        "2 (one send per drain thread)",
+        Policy::ClosedDrop,
+        "zuno-paths/src/bounded.rs",
+        "let _ = sender.send((stream, outcome));",
+    ),
+    gate(
         "skill-catalog-snapshots",
         "zuno-catalog/src/skill/catalog.rs",
         "let (sender, _) = watch::channel(Arc::clone(&snapshot));",
@@ -240,7 +256,7 @@ const CHANNELS: &[ChannelGate] = &[
     gate(
         "background-restored-info",
         "zuno-pty/src/background.rs",
-        "let (info, _) = watch::channel(persisted.info);",
+        "let (info, _) = watch::channel(info);",
         "latest value",
         Policy::LatestValue,
         "zuno-pty/src/background.rs",
@@ -443,7 +459,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
         actual, expected,
         "channel registry differs from production source"
     );
-    assert_eq!(CHANNELS.len(), 40);
+    assert_eq!(CHANNELS.len(), 41);
 
     let crates = crates_root();
     for entry in CHANNELS {
@@ -511,6 +527,10 @@ channel_gate!(
 );
 channel_gate!(lsp_client_closed_keeps_latest_value, "lsp-client-closed");
 channel_gate!(watch_events_coalesce_when_full, "watch-events");
+channel_gate!(
+    paths_child_pipe_drains_drop_after_receiver_close,
+    "paths-child-pipe-drains"
+);
 channel_gate!(
     skill_catalog_snapshots_keep_latest_value,
     "skill-catalog-snapshots"
@@ -994,7 +1014,7 @@ fn production_lines(source: &str) -> Vec<&str> {
             while next < lines.len() && lines[next].trim().starts_with("#[") {
                 next += 1;
             }
-            if next < lines.len() && lines[next].trim_start().starts_with("mod tests") {
+            if next < lines.len() && is_module_declaration(lines[next]) {
                 let mut depth = brace_delta(lines[next]);
                 index = next + 1;
                 while index < lines.len() && depth > 0 {
@@ -1008,6 +1028,38 @@ fn production_lines(source: &str) -> Vec<&str> {
         index += 1;
     }
     result
+}
+
+/// Whether `line` declares a module, with any visibility and any name.
+///
+/// `#[cfg(test)]` modules in production files are not all called `tests`:
+/// `pub(crate) mod test_client`, `mod recovery_tests` and `pub(crate) mod testkit`
+/// all exist, and a channel built inside one is a test double, not a production
+/// boundary this registry accounts for. A `mod name;` declaration is accepted too;
+/// its body is a separate file that the walk judges on its own.
+fn is_module_declaration(line: &str) -> bool {
+    let line = line.trim();
+    let rest = match line.strip_prefix("pub") {
+        None => line,
+        Some(rest) if rest.starts_with('(') => match rest.find(')') {
+            Some(close) => rest[close + 1..].trim_start(),
+            None => return false,
+        },
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start(),
+        Some(_) => return false,
+    };
+    let Some(rest) = rest.strip_prefix("mod") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(char::is_whitespace) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let name_end = rest
+        .find(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .unwrap_or(rest.len());
+    let tail = rest[name_end..].trim_start();
+    name_end > 0 && (tail.starts_with('{') || tail.starts_with(';'))
 }
 
 fn brace_delta(line: &str) -> i32 {

@@ -21,6 +21,14 @@ pub const CREDENTIAL_CHAIN_ORDER: [CredentialSource; 6] = [
 
 const CREDENTIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CREDENTIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Byte ceiling for a credential response body.
+///
+/// Every document read here — an STS/SSO credential set, an IMDS token, an IMDS role
+/// name — is well under a kilobyte. The cap exists because
+/// `AWS_CONTAINER_CREDENTIALS_FULL_URI` is documented as accepting a remote HTTPS
+/// endpoint, so this read runs against a peer the user does not necessarily control,
+/// before every Bedrock request, with only a five-second timeout for a bound.
+const MAX_CREDENTIAL_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialSource {
@@ -197,7 +205,7 @@ impl CredentialResolver {
             .await
             .map_err(CredentialError::Http)?;
         let status = response.status();
-        let bytes = response.bytes().await.map_err(CredentialError::Http)?;
+        let bytes = bounded_body(response, "SSO").await?;
         if !status.is_success() {
             return Err(CredentialError::CredentialService {
                 source_name: "SSO",
@@ -246,7 +254,7 @@ impl CredentialResolver {
         }
         let response = request.send().await.map_err(CredentialError::Http)?;
         let status = response.status();
-        let bytes = response.bytes().await.map_err(CredentialError::Http)?;
+        let bytes = bounded_body(response, "container metadata").await?;
         if !status.is_success() {
             return Err(CredentialError::CredentialService {
                 source_name: "container metadata",
@@ -281,10 +289,7 @@ impl CredentialResolver {
             Ok(response) if response.status().is_success() => response,
             Ok(_) | Err(_) => return Ok(None),
         };
-        let token_bytes = token_response
-            .bytes()
-            .await
-            .map_err(CredentialError::Http)?;
+        let token_bytes = bounded_body(token_response, "IMDS token").await?;
         let token = strict_utf8(&token_bytes, "IMDS token")?;
         let role_url = endpoint
             .join("/latest/meta-data/iam/security-credentials/")
@@ -302,7 +307,7 @@ impl CredentialResolver {
         if !role_response.status().is_success() {
             return Ok(None);
         }
-        let role_bytes = role_response.bytes().await.map_err(CredentialError::Http)?;
+        let role_bytes = bounded_body(role_response, "IMDS role name").await?;
         let role = strict_utf8(&role_bytes, "IMDS role name")?.trim();
         if role.is_empty() || role.contains(['/', '\\']) {
             return Err(CredentialError::InvalidMetadata {
@@ -326,9 +331,28 @@ impl CredentialResolver {
         if !response.status().is_success() {
             return Ok(None);
         }
-        let bytes = response.bytes().await.map_err(CredentialError::Http)?;
+        let bytes = bounded_body(response, "IMDS").await?;
         parse_metadata_credentials(&bytes, "IMDS").map(Some)
     }
+}
+
+/// Read a credential response, refusing anything past [`MAX_CREDENTIAL_BODY_BYTES`].
+///
+/// Streamed rather than `bytes()` so an oversized body is refused as it arrives instead
+/// of after it has already been buffered into one allocation. The cap is reported as
+/// [`CredentialError::InvalidMetadata`], which names the source and carries no secret.
+async fn bounded_body(
+    mut response: reqwest::Response,
+    source_name: &'static str,
+) -> Result<Vec<u8>, CredentialError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(CredentialError::Http)? {
+        if body.len().saturating_add(chunk.len()) > MAX_CREDENTIAL_BODY_BYTES {
+            return Err(CredentialError::InvalidMetadata { source_name });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn metadata_client() -> reqwest::Result<reqwest::Client> {
@@ -837,6 +861,101 @@ mod tests {
         assert!(!is_local_metadata_endpoint(
             &Url::parse("https://credentials.example.com/path").expect("valid remote endpoint")
         ));
+    }
+
+    /// `AWS_CONTAINER_CREDENTIALS_FULL_URI` is documented as accepting a remote HTTPS
+    /// endpoint, so this read runs against a peer the user does not necessarily control,
+    /// before every Bedrock request. An unbounded `bytes()` buffers whatever it streams.
+    #[tokio::test]
+    async fn an_oversized_credential_body_is_refused_rather_than_buffered() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/credentials"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("x".repeat(MAX_CREDENTIAL_BODY_BYTES + 1)),
+            )
+            .mount(&server)
+            .await;
+        let response =
+            zuno_network::direct_client_builder(zuno_network::DirectPurpose::CloudMetadata)
+                .build()
+                .expect("direct metadata client")
+                .get(format!("{}/credentials", server.uri()))
+                .send()
+                .await
+                .expect("the mock answers");
+
+        let error = bounded_body(response, "container metadata")
+            .await
+            .expect_err("a body past the cap must be refused");
+
+        assert!(
+            matches!(
+                error,
+                CredentialError::InvalidMetadata {
+                    source_name: "container metadata"
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// Which reads route through the cap, not just that the cap works.
+    ///
+    /// `an_oversized_credential_body_is_refused_rather_than_buffered` calls the helper
+    /// directly, so reverting one call site to `response.bytes()` leaves it green — and
+    /// the finding was about five specific reads, one of them
+    /// (`AWS_CONTAINER_CREDENTIALS_FULL_URI`) against a host the operator does not
+    /// necessarily control. A per-call-site behavioural test would have to point that
+    /// variable at a mock, and `unsafe_code = "forbid"` denies this process the ability to
+    /// set its own environment; re-execing a child for a nit buys one call site where this
+    /// covers all five. The oracle is the source text, so it cannot be satisfied by the
+    /// cap merely existing.
+    #[test]
+    fn every_credential_body_read_routes_through_the_cap() {
+        const SOURCE: &str = include_str!("credentials.rs");
+        // Written as an escape, so these bytes are `\` and `n` and this literal is not
+        // itself a second match. A leading newline anchors the declaration to column zero
+        // while still matching a CRLF checkout, where the preceding bytes are `\r\n`.
+        const MARKER: &str = "\nmod tests {";
+
+        assert_eq!(
+            SOURCE.matches(MARKER).count(),
+            1,
+            "a second test module would silently narrow this scan to the first one"
+        );
+        let production = SOURCE
+            .split_once(MARKER)
+            .map_or(SOURCE, |(production, _)| production);
+        assert!(
+            !production.is_empty() && production.len() < SOURCE.len(),
+            "the production/test split marker moved, so this scan is reading the tests too"
+        );
+
+        for unbounded in [".bytes()", ".text()", ".json::<"] {
+            assert!(
+                !production.contains(unbounded),
+                "`{unbounded}` buffers a peer-controlled body without a cap; \
+                 route the read through `bounded_body` instead"
+            );
+        }
+        assert_eq!(
+            production.matches(".chunk()").count(),
+            1,
+            "`bounded_body` is the only place that may stream a credential body by hand; \
+             a second `chunk()` loop is a second, uncapped reader"
+        );
+        assert_eq!(
+            production.matches("bounded_body(").count(),
+            6,
+            "one definition plus the five credential reads (SSO, container metadata, \
+             IMDS token, IMDS role name, IMDS credentials); a different count means a \
+             read was added without the cap or one was rewired around it"
+        );
     }
 
     #[tokio::test]

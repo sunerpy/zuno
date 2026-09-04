@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,6 +16,50 @@ use crate::{PluginCapability, PluginRuntime};
 
 const MAX_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
 const INTERRUPT_GRACE: Duration = Duration::from_secs(1);
+
+/// Whether guest code ever ran, decided exactly once between the worker and its interrupt.
+///
+/// A queued call and the arm that cancels it race for the same answer: the worker blocks on
+/// the instance lock, so an interrupt serviced while it waits can truthfully report that
+/// nothing ran — but only if the worker can no longer enter the guest afterwards. A plain
+/// flag cannot express that: the arm reads it, reports "nothing ran", and the worker then
+/// acquires the lock, re-arms its own epoch deadline past the increment, and runs. The
+/// claim is therefore a single compare-and-exchange that one side wins.
+struct GuestEntry(AtomicU8);
+
+impl GuestEntry {
+    const QUEUED: u8 = 0;
+    const ENTERED: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    fn new() -> Self {
+        Self(AtomicU8::new(Self::QUEUED))
+    }
+
+    /// Claim the right to enter the guest; `false` once the call has been abandoned.
+    fn claim(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::QUEUED,
+                Self::ENTERED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Withdraw a call that has not entered the guest; `false` once it has.
+    fn abandon(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::QUEUED,
+                Self::ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
 
 type InitializeFn = TypedFunc<(String, String, Vec<String>), (Result<String, String>,)>;
 type InvokeFn = TypedFunc<
@@ -84,7 +128,7 @@ pub(super) async fn start(spec: RuntimeSpec) -> Result<Arc<dyn PluginHost>, Plug
     let capability_names = spec.capability_names();
     let host = Arc::new(WasiPluginHost {
         package: spec.package.clone(),
-        workspace: spec.workspace,
+        workspace_literal: spec.workspace_literal,
         capabilities: capability_names,
         timeout,
         fuel: *fuel,
@@ -139,9 +183,24 @@ fn build_instance(
             .allow_udp(true);
     }
     for name in environment {
-        if let Some(value) = std::env::var_os(name) {
-            builder.env(name, value.to_string_lossy());
-        }
+        let Some(value) = std::env::var_os(name) else {
+            continue;
+        };
+        // A WASI environment is UTF-8 by construction, so a value that is not valid UTF-8
+        // has no faithful representation here. The guest is left seeing the variable unset
+        // — a state it must already handle, and one it can detect — rather than a
+        // substituted value it cannot tell apart from the real one; an allowlist commonly
+        // names path-bearing variables, and on a POSIX host those can hold any bytes.
+        // Refusing the start instead would let one odd byte in an allowlisted `PATH` take
+        // the whole extension down, which is a worse answer than an absent variable.
+        let Some(value) = value.to_str() else {
+            tracing::warn!(
+                variable = %name,
+                "allowlisted environment value is not valid UTF-8; the WASI guest is not given it"
+            );
+            continue;
+        };
+        builder.env(name, value);
     }
     let mut store = Store::new(
         engine,
@@ -212,7 +271,11 @@ struct WasiInstance {
 
 struct WasiPluginHost {
     package: String,
-    workspace: std::path::PathBuf,
+    /// The workspace exactly as the guest's WIT `string` argument carries it.
+    ///
+    /// Validated when the runtime surface was built, so the guest never receives a
+    /// substituted or separator-folded root it cannot tell apart from the real one.
+    workspace_literal: String,
     capabilities: Vec<String>,
     timeout: Duration,
     fuel: u64,
@@ -225,7 +288,7 @@ struct WasiPluginHost {
 impl WasiPluginHost {
     async fn initialize(&self) -> Result<(), PluginHostError> {
         let package = self.package.clone();
-        let workspace = self.workspace.to_string_lossy().into_owned();
+        let workspace = self.workspace_literal.clone();
         let capabilities = self.capabilities.clone();
         let negotiated = self
             .call("initialize", None, false, move |instance| {
@@ -273,12 +336,23 @@ impl WasiPluginHost {
         let state = Arc::clone(&self.state);
         let poisoned = Arc::clone(&self.poisoned);
         let fuel = self.fuel;
+        let entry = Arc::new(GuestEntry::new());
+        let claim = Arc::clone(&entry);
         let mut task = tokio::task::spawn_blocking(move || {
             let mut guard = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if poisoned.load(Ordering::Acquire) {
                 return Err("the WASI instance was withdrawn before this call started".to_owned());
+            }
+            // Guest code runs from here, and `set_epoch_deadline` below re-arms past any
+            // increment an interrupt has already made, so this is the last point at which
+            // the call can be withdrawn. Claiming first means an interrupt that has
+            // already reported "nothing ran" cannot be contradicted by this call.
+            if !claim.claim() {
+                return Err(
+                    "the call was withdrawn before it reached the guest and did not run".to_owned(),
+                );
             }
             let instance = guard
                 .as_mut()
@@ -326,6 +400,10 @@ impl WasiPluginHost {
                 })
             }
             Exit::TimedOut | Exit::Cancelled => {
+                // Withdraw the call before anything else: while this arm waits, a call
+                // still queued behind the instance lock could otherwise enter the guest
+                // after the outcome below has already said it never did.
+                let entered = !entry.abandon();
                 self.engine.increment_epoch();
                 let settled = tokio::time::timeout(INTERRUPT_GRACE, task).await;
                 if !matches!(settled, Ok(Ok(Ok(_)))) {
@@ -334,7 +412,22 @@ impl WasiPluginHost {
                 match exit {
                     Exit::Cancelled => Err(PluginHostError::Cancelled {
                         package: self.package.clone(),
-                        tool: operation.to_owned(),
+                        // Epoch interruption stops the guest at an arbitrary instruction,
+                        // so anything a call that entered the guest already wrote through
+                        // its preopen survives the instance that is being withdrawn. This
+                        // reports whether it entered, as observed; the report derives the
+                        // verdict from that and from `cleanup`, and only a call whose
+                        // dispatch matters is given an interrupt to be cancelled by.
+                        dispatched: entered,
+                        // An interrupted guest that did not return within the grace window
+                        // is still running — epoch interruption cannot preempt a blocked
+                        // host call — so withdrawing the instance is not a confirmed stop.
+                        cleanup: (entered && settled.is_err()).then(|| {
+                            format!(
+                                "the interrupted instance did not stop within \
+                                 {INTERRUPT_GRACE:?} and was withdrawn while still running"
+                            )
+                        }),
                     }),
                     Exit::TimedOut if !uncertain_after_start => Err(PluginHostError::Timeout {
                         package: self.package.clone(),
@@ -469,5 +562,34 @@ impl PluginHost for WasiPluginHost {
             }),
             Err(error) => Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One side wins: a withdrawn call can never enter the guest afterwards.
+    ///
+    /// This is the whole certainty claim for a cancellation serviced while the call was
+    /// still queued behind the instance lock. With a plain flag the interrupt arm could
+    /// report "nothing ran" and the worker could then acquire the lock, re-arm its epoch
+    /// deadline past the increment, and run the guest anyway.
+    #[test]
+    fn a_withdrawn_wasi_call_cannot_still_enter_the_guest() {
+        let withdrawn = GuestEntry::new();
+        assert!(withdrawn.abandon(), "an unclaimed call can be withdrawn");
+        assert!(
+            !withdrawn.claim(),
+            "a withdrawn call must not reach the guest after the outcome was reported"
+        );
+
+        let running = GuestEntry::new();
+        assert!(running.claim(), "an unclaimed call may enter the guest");
+        assert!(
+            !running.abandon(),
+            "a call already in the guest cannot be reported as never dispatched"
+        );
+        assert!(!running.claim(), "the guest is entered exactly once");
     }
 }

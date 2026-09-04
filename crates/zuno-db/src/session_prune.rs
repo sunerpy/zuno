@@ -276,7 +276,7 @@ pub fn execute(
         ProgressPhase::Artifacts,
         Some(selected_count),
     ));
-    let (artifacts, skipped_roots) = match request.action {
+    let (artifacts, artifact_warnings) = match request.action {
         SessionPruneAction::Archive { .. } => (SessionPruneArtifactImpact::default(), Vec::new()),
         SessionPruneAction::Preview | SessionPruneAction::Delete
             if outcome.preview.session_ids.is_empty() =>
@@ -293,23 +293,38 @@ pub fn execute(
             }
             let report = artifact_gc::execute(connection, paths, &artifact_request)
                 .map_err(SessionPruneError::Artifacts)?;
-            // A root the pass could not read is reported, not swallowed: those files were
-            // left in place, and after a delete the sessions that own them are already
-            // gone from the database, so this line is the only record that names them.
+            // A root the pass could not read, a class it declined to evaluate at all, and
+            // attachment bytes it held back are reported rather than swallowed: those files
+            // were left in place, and after a delete the sessions that own them are already
+            // gone from the database, so these lines are the only record that names them. The
+            // class warning is the one signal that a whole class was skipped instead of found
+            // empty — the pre-mutation visibility check cannot cover it, because it runs
+            // while the rows this operation is about to remove are still there. The
+            // attachment line is the one signal that model- or tool-authored text, not the
+            // operator, decided how much of that class could be reclaimed.
             let skipped = report
-                .skipped_roots
+                .skipped_classes
                 .iter()
                 .map(ToString::to_string)
+                .chain(report.skipped_roots.iter().map(ToString::to_string))
+                .chain(report.pinned_attachments.iter().map(ToString::to_string))
                 .collect();
             (artifact_impact(report), skipped)
         }
     };
 
+    // The pre-mutation visibility check and the pass's own skipped-class record produce the
+    // same sentence for the same fact, so an already-empty database reports it once instead
+    // of twice. The two producers are in practice mutually exclusive — a database with no
+    // session row selects nothing, so the artifact phase is skipped entirely — and the guard
+    // is kept because every artifact line is a rendered sentence, so a second producer of an
+    // existing wording must not be able to duplicate it either.
     let mut warnings = outcome.warnings;
-    if let Some(warning) = visibility_warning {
-        warnings.push(warning);
+    for warning in visibility_warning.into_iter().chain(artifact_warnings) {
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
     }
-    warnings.extend(skipped_roots);
     let report = SessionPruneReport {
         action: request.action,
         selected_session_ids: outcome.preview.session_ids.clone(),
@@ -342,12 +357,20 @@ fn artifact_visibility_warning(
     }
     match artifact_gc::ensure_visible_session_owners(connection) {
         Ok(()) => Ok(None),
+        // One wording, produced by one `Display`: this is the same fact the pass itself
+        // records when the operation empties the survivor set, and an operator reading the
+        // warnings array must not have to recognise two sentences as one condition.
         Err(ArtifactGcError::NoVisibleSessions {
             database,
             session_count,
-        }) => Ok(Some(format!(
-            "`{database}` contains {session_count} sessions; artifact reclamation is skipped because shared snapshot stores cannot be attributed and may belong to another channel's database."
-        ))),
+        }) => Ok(Some(
+            artifact_gc::SkippedClass::unattributable(
+                ArtifactKind::SnapshotStore,
+                database,
+                session_count,
+            )
+            .to_string(),
+        )),
         Err(error) => Err(SessionPruneError::Artifacts(error)),
     }
 }
@@ -530,6 +553,8 @@ mod tests {
             }],
             total_bytes: 12,
             skipped_roots: Vec::new(),
+            skipped_classes: Vec::new(),
+            pinned_attachments: None,
         });
 
         assert_eq!(

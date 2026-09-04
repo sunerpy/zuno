@@ -163,7 +163,9 @@ fn gemini_request_and_stream_replay_the_real_tool_call_cassette() {
             StreamEvent::TokenUsage { .. },
             StreamEvent::MessageEnd { .. }
         ] if name == "get_weather"
-            && input_id == "tool_0"
+            // Prefix-agnostic: the synthesized id carries a per-stream prefix so it
+            // cannot collide with a later request's first call in the same session.
+            && input_id.starts_with("tool_")
             && signature_id == input_id
             && end_id == input_id
             && input == r#"{"city":"Paris"}"#

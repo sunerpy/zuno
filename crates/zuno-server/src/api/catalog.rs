@@ -31,6 +31,7 @@ use zuno_config::schema::Config;
 use zuno_config::schema::permission::PermissionAction;
 use zuno_permission::rules_from_config;
 
+use super::blocking::Budget;
 use super::error::ApiError;
 use super::state::ApiState;
 
@@ -646,18 +647,24 @@ pub async fn commands(
     Ok(state.envelope(data))
 }
 
-/// Runs skill discovery off the request thread.
+/// Runs skill discovery off the request thread, inside the catalogue budget.
 ///
 /// `zuno_catalog::skill::load` walks the disk and may fetch remote skill indexes, so
 /// its future is not `Send` and axum cannot hold it across an await. Moving it onto
 /// a blocking thread with its own current-thread runtime is what the CLI already
 /// does with `block_on`, and it keeps a slow disk walk off the reactor besides.
 ///
+/// It is charged to [`Budget::Catalog`] for the reason
+/// [`crate::api::blocking`] gives: this is a sibling of the filesystem and maintenance
+/// handlers on the same unbounded blocking pool, its duration is bounded by a remote
+/// index rather than by local disk, and bounding those two while leaving this one
+/// unbounded would only move the starvation to `GET /api/skill`.
+///
 /// # Errors
 /// Returns [`ApiError::CatalogUnavailable`] when the discovery thread cannot be
 /// started or panics.
 async fn load_skills(options: SkillOptions) -> Result<zuno_catalog::skill::Skills, ApiError> {
-    tokio::task::spawn_blocking(move || {
+    super::blocking::run(Budget::Catalog, move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -665,7 +672,6 @@ async fn load_skills(options: SkillOptions) -> Result<zuno_catalog::skill::Skill
         Ok(runtime.block_on(zuno_catalog::skill::load(&options)))
     })
     .await
-    .map_err(|error| ApiError::CatalogUnavailable(error.to_string()))?
 }
 
 /// `GET /api/skill` — discovered skill metadata.

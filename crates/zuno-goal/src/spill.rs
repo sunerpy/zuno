@@ -30,6 +30,7 @@
 //! project's own words.
 
 use crate::error::GoalError;
+use crate::store::has_visible_character;
 use std::path::{Path, PathBuf};
 
 /// The longest objective the `goal.objective` column will hold.
@@ -55,14 +56,26 @@ pub const OBJECTIVE_FILE_NAME: &str = "goal-objective.md";
 /// for the pointer to fit fails without leaving an orphan file behind — the same
 /// ordering as `goal_files.rs:125-135`.
 ///
+/// # Why the emptiness check is not `is_empty`
+///
+/// This is the only path an objective reaches the column by, from
+/// [`crate::GoalStore::create_goal`], [`crate::GoalStore::create_goal_as_model`] and
+/// [`crate::GoalStore::set_objective`] alike, so it is also the only place the blankness
+/// rule can be stated once. `str::trim` strips White_Space only, so an objective of
+/// `"\u{200b}\u{feff}"` used to be stored and then rendered as a blank objective line in
+/// the goal document on every later turn — a live goal whose stated purpose reads as
+/// nothing. The criterion statements and the waiver reasons already shared
+/// [`has_visible_character`]; the objective is the headline of the same audit surface and
+/// now shares it too.
+///
 /// # Errors
 ///
-/// [`GoalError::EmptyObjective`] for an empty or whitespace-only objective,
+/// [`GoalError::EmptyObjective`] for an objective with no visible character,
 /// [`GoalError::PointerTooLong`] when the pointer would exceed the cap, and
 /// [`GoalError::Spill`] when the directory or file cannot be written.
 pub fn store_objective(spill_dir: &Path, objective: &str) -> Result<String, GoalError> {
     let objective = objective.trim();
-    if objective.is_empty() {
+    if !has_visible_character(objective) {
         return Err(GoalError::EmptyObjective);
     }
     if objective.chars().count() <= MAX_OBJECTIVE_CHARS {

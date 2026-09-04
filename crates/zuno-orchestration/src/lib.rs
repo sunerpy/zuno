@@ -121,7 +121,16 @@ const USER_FACING_PROFILES: &[&str] = &[
     "looker",
 ];
 
-const DEEPWORK_PROFILES: &[&str] = &["orchestrator", "build", "plan", "deep", "general"];
+/// Profiles whose shipped permission overlay lets them read durable Goal state.
+///
+/// `deepwork` requires `goal_get` (its body opens with "Read the current Goal, Plan,
+/// and Todo state"), and among the deny-by-default overlays only `plan` names
+/// `goal_get`; `orchestrator` and `build` see it through the allow-all base. `deep`
+/// and `general` grant the other four required tools but not this one, so declaring
+/// them here advertised a Skill that the visibility gate then dropped on every turn
+/// (audit OH-01). The contract test in `zuno-cli` (`agent::tests`) now runs that gate
+/// against the real overlays for every declared pair.
+const DEEPWORK_PROFILES: &[&str] = &["orchestrator", "build", "plan"];
 
 const CODEMAP_PROFILES: &[&str] = &[
     "orchestrator",
@@ -149,6 +158,16 @@ const REFLECT_PROFILES: &[&str] = &["orchestrator", "build", "deep", "general", 
 
 const MUTATING_WORK_PROFILES: &[&str] = &["orchestrator", "build", "deep", "fixer", "general"];
 
+/// Profiles whose shipped permission overlay lets them call `capability_claim`.
+///
+/// No deny-by-default overlay names `capability_claim`, so only the two profiles
+/// that inherit the allow-all base can record a claim. `deep`, `fixer`, and `general`
+/// hold `edit` and could make the write this Skill governs, but they cannot record
+/// the evidence it demands, and advertising the Skill to them was a promise the
+/// visibility gate silently withdrew (audit OH-02). Kept separate from
+/// [`MUTATING_WORK_PROFILES`], whose other two Skills need only `read` and `shell`.
+const CAPABILITY_CLAIM_PROFILES: &[&str] = &["orchestrator", "build"];
+
 const UI_DESIGN_PROFILES: &[&str] = &[
     "orchestrator",
     "build",
@@ -158,7 +177,6 @@ const UI_DESIGN_PROFILES: &[&str] = &[
     "general",
     "oracle",
     "looker",
-    "designer",
 ];
 
 const NATIVE_PROVENANCE: SkillProvenance = SkillProvenance {
@@ -319,7 +337,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 11] = [
         content: include_str!("skills/bedrock-model-capability-review.md"),
         source_id: pack_source_id!("skill/bedrock-model-capability-review"),
         location: pack_location!("bedrock-model-capability-review"),
-        allowed_profiles: MUTATING_WORK_PROFILES,
+        allowed_profiles: CAPABILITY_CLAIM_PROFILES,
         required_tools: &["read", "capability_claim"],
         content_sha256: "f56621fa11ffeadd9b3d09131ad3efc6e979101a6e4d2a2ba7b66dcc61b81285",
         provenance: NATIVE_PROVENANCE,

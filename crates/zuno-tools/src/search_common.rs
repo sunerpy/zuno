@@ -272,9 +272,62 @@ pub fn display_relative(base: &Path, path: &Path) -> String {
     }
 }
 
+/// `path` as one line of model-visible text.
+///
+/// A path is an identifier the model feeds straight back into `read`, `edit` and the
+/// next search, and both search tools render one identifier per line — so a file name
+/// that carries a line break read as two files, neither of which existed. Control
+/// characters, and the Unicode line and paragraph separators some readers also break
+/// on, are spelled the way Rust's `Debug` spells them (`\n`, `\t`, `\u{7f}`). Nothing
+/// else is touched: no quoting and no escaping of `\`, `'` or `"`, so an ordinary path,
+/// a Windows path included, renders byte-for-byte as before and only a name that could
+/// not otherwise be shown on one line changes. `Debug` spelling rather than quoting
+/// because quoting would change every line the model has been trained on, and because
+/// the escape is reversible for a reader who needs the original. The structured
+/// metadata beside the text keeps the exact bytes; this spelling is for reading.
+#[must_use]
+pub fn one_line(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if !text.chars().any(breaks_a_line) {
+        return text.into_owned();
+    }
+    let mut rendered = String::with_capacity(text.len() + 8);
+    for character in text.chars() {
+        if breaks_a_line(character) {
+            rendered.extend(character.escape_debug());
+        } else {
+            rendered.push(character);
+        }
+    }
+    rendered
+}
+
+fn breaks_a_line(character: char) -> bool {
+    character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_without_control_characters_renders_byte_for_byte() {
+        for path in [
+            "/work/project/src/main.rs",
+            r"C:\Users\alice\src\main.rs",
+            "/work/it's \"quoted\"/back\\slash.rs",
+            "/work/caf\u{e9}/\u{200b}zero-width.rs",
+        ] {
+            assert_eq!(one_line(Path::new(path)), path);
+        }
+    }
+
+    #[test]
+    fn a_line_break_in_a_file_name_is_spelled_so_one_file_is_one_line() {
+        let rendered = one_line(Path::new("/work/two\nlines\r\ttab\u{7f}\u{2028}.ts"));
+        assert_eq!(rendered, r"/work/two\nlines\r\ttab\u{7f}\u{2028}.ts");
+        assert_eq!(rendered.lines().count(), 1);
+    }
 
     #[test]
     fn an_absent_path_argument_resolves_to_the_session_directory() {

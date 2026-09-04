@@ -60,6 +60,24 @@ pub fn shell_tool(workspace: &Path) -> ShellTool {
     configured_shell_tool(workspace, None)
 }
 
+/// A shell tool told where generated state lives instead of resolving it.
+pub fn shell_tool_with_generated_root(workspace: &Path, generated_root: &Path) -> ShellTool {
+    let policy = SandboxPolicy::new(
+        workspace,
+        SandboxMode::WorkspaceWrite,
+        NetworkAccess::Allowed,
+    )
+    .expect("test sandbox policy");
+    ShellTool::with_sandbox_backend_and_generated_root(
+        workspace,
+        None,
+        Arc::new(DirectTestSandbox::new()),
+        policy,
+        Some(generated_root.to_path_buf()),
+    )
+    .expect("shell tool")
+}
+
 pub fn configured_shell_tool(workspace: &Path, shell: Option<&str>) -> ShellTool {
     let policy = SandboxPolicy::new(
         workspace,

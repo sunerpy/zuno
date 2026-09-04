@@ -84,6 +84,82 @@ fn main() -> ExitCode {
         "probe emitted a sensitive field"
     );
 
+    // The exact shape of a live emitter outside this crate: zuno-snapshot's
+    // `store.rs` logs raw git subprocess stderr at WARN, which the default INFO
+    // filter admits, so an operator running with `ZUNO_PLAINTEXT_LOGS=1` used to get
+    // the whole subprocess payload in a file on disk.
+    tracing::warn!(
+        marker = "probe-subprocess",
+        hash = "0f1e2d3c",
+        code = ?Some(128),
+        stderr = %"never-print-this-git-stderr",
+        "failed to get diff"
+    );
+
+    // Names `docs/logging.md` promises are redacted, plus the prefix-compound and
+    // camelCase spellings of the same payloads. `stdout_bytes` is the bounded
+    // measurement that exists so the payload never has to be logged; it has to stay
+    // readable or the safe alternative is worthless.
+    tracing::warn!(
+        marker = "probe-credential",
+        token = "never-print-this-bearer-token",
+        credential = "never-print-this-credential",
+        prompt_text = "never-print-this-prefix-prompt",
+        command_line = "never-print-this-command-line",
+        accessToken = "never-print-this-camel-token",
+        stdout_bytes = 12,
+        "probe emitted credential-named fields"
+    );
+
+    // A plural is the natural Rust spelling for a collection of the same payload, and a
+    // singular-only rule left every one of these in the clear. `prompt_tokens` is the
+    // documented carve-out that has to survive the plural rule.
+    let cookie_jar = "session=never-print-this-cookie-jar";
+    let argv = ["git", "never-print-this-argv"];
+    tracing::warn!(
+        marker = "probe-plural",
+        cookies = %cookie_jar,
+        commands = ?argv,
+        outputs = "never-print-this-outputs",
+        prompt_tokens = 1024,
+        "probe emitted plural payload fields"
+    );
+
+    // The field shape of zuno-mcp's stderr drain (`crates/zuno-mcp/src/stdio.rs`,
+    // `spawn_stderr_reader`) -- field names, level, and event text -- at the DEBUG level
+    // it really uses: one ordinary line and one line truncated at the drain's byte
+    // bound. The `bytes` and `limit` values below are the probe's own, not the drain's:
+    // production truncates at `MAX_STDERR_LINE_BYTES` (8 KiB), and
+    // `tests/stdout_purity.rs` pins these two numbers as the readable diagnostics that
+    // must survive next to the redacted payload. The value is a peer-controlled
+    // process's stderr, so it arrives under `stderr`, a field name the redaction
+    // predicate classifies as a payload. Recorded as `message` — the field name
+    // `tracing` gives an event's own text and the one name the predicate deliberately
+    // leaves readable — the same line was measured rendering as
+    // `DEBUG …: MCP server stderr server=probe-mcp Traceback: API_KEY=sk-live-abc123`
+    // in every sink, with no `name=` prefix; `tests/stdout_purity.rs` pins that this
+    // shape comes out as `stderr="[redacted]"` instead.
+    {
+        let server = "probe-mcp";
+        let line = "Traceback: API_KEY=sk-live-abc123\n";
+        tracing::debug!(
+            marker = "probe-mcp-stderr",
+            %server,
+            stderr = line.trim_end_matches(['\r', '\n']),
+            "MCP server stderr"
+        );
+        let truncated_line = "Traceback: API_KEY=sk-live-truncated-def456";
+        tracing::debug!(
+            marker = "probe-mcp-stderr",
+            %server,
+            bytes = 65_536_usize,
+            limit = 65_536_usize,
+            truncated = true,
+            stderr = %truncated_line,
+            "MCP server stderr line exceeded its bound and was truncated"
+        );
+    }
+
     {
         let request_span = span::provider_request("anthropic", "claude-sonnet-4-5", 1, true);
         let _request_entered = request_span.enter();
@@ -115,6 +191,23 @@ fn main() -> ExitCode {
         blocked.blocked("denied");
 
         let _abandoned = ToolLifecycle::pending("shell", "toolu_probe_abandoned");
+    }
+
+    {
+        // A sensitive value can arrive as a span field rather than an event field,
+        // which reaches a text sink through the span list on every enclosed record.
+        let sensitive_span = tracing::info_span!(
+            "probe_sensitive_span",
+            marker = "probe-span-sensitive",
+            prompt = "never-print-this-prompt",
+            report = tracing::field::Empty,
+        );
+        sensitive_span.record("report", "never-print-this-report");
+        let _sensitive_entered = sensitive_span.enter();
+        tracing::info!(
+            marker = "probe-span-sensitive-event",
+            "probe emitted inside a span carrying sensitive fields"
+        );
     }
 
     frame(r#"{"jsonrpc":"2.0","method":"probe/emitted","params":{"levels":5}}"#);

@@ -44,6 +44,14 @@ pub enum ApiError {
     /// The session directory itself could not be read.
     #[error("the session directory could not be read")]
     FilesystemUnavailable,
+    /// A file is larger than the read endpoint will buffer.
+    #[error("`{path}` is larger than the {limit}-byte read ceiling")]
+    FileTooLarge {
+        /// The path as the caller spelled it.
+        path: String,
+        /// The ceiling the file exceeded.
+        limit: u64,
+    },
     /// A required query key was absent.
     #[error("missing query key `{0}`")]
     MissingQueryKey(&'static str),
@@ -215,6 +223,11 @@ impl IntoResponse for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "filesystem_error",
                 "the session directory could not be read".to_owned(),
+            ),
+            Self::FileTooLarge { path, limit } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "file_too_large",
+                format!("`{path}` is larger than the {limit}-byte read ceiling"),
             ),
             Self::InvalidQueryValue(key) => (
                 StatusCode::BAD_REQUEST,

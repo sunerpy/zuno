@@ -23,7 +23,9 @@ Zuno 通过 magic bytes 而不是文件扩展名来探测内容。支持的格�
 - GIF（`image/gif`）；
 - WebP（`image/webp`）。
 
-源文件默认上限为 20 MiB。Zuno 会在无界解码之前检查源尺寸与像素数，应用 EXIF 方向，动画只保留第一帧，把像素转换为 8-bit，并移除全部元数据。透明输出使用 PNG，不透明输出使用 JPEG。直接粘贴的图像不会写入提示词召回历史，因为仅凭显示句柄无法重建图像；提交之后，持久引用会在重放与子会话续跑中存活。
+通过 HTTP 时，`POST /api/session/{sessionID}/prompt` 会在解码 base64 载荷之前先检查 `prompt.files[].mimeType`（也接受 `mime` 键）。声明值按 RFC 2045 媒体类型读取：去掉首尾空白与 `;参数` 后缀，并折叠 ASCII 大小写，因此 `IMAGE/PNG` 与 `image/png; charset=binary` 都会被接受。被接纳的恰好是上述四种类型，再加上浏览器会发出的五个别名——PNG 的 `image/apng`、`image/x-png`、`image/vnd.mozilla.apng`，以及 JPEG 的 `image/jpg`、`image/pjpeg`。其他任何 `image/` 子类型（例如 `image/svg+xml`、`image/bmp`、`image/x-icon`）都会以 `400` 拒绝，消息为 `prompt.files[N] uses unsupported MIME type <value>; only PNG, JPEG, GIF and WebP images are accepted`。通过这项检查的声明仍会与探测到的字节比较，参见[声明的 MIME 与展示文件名](#声明的-mime-与展示文件名)。
+
+源文件默认上限为 20 MiB。在任何解码器分配内存之前，Zuno 会先读取源文件头，检查尺寸、像素数与解码后的字节数，参见[解码上限](#解码上限)。随后应用 EXIF 方向，动画只保留第一帧，把像素转换为 8-bit，并移除全部元数据。透明输出使用 PNG，不透明输出使用 JPEG。当调用方声明了源 MIME 类型时，该声明会先被规范化，再与探测到的字节比较，参见[声明的 MIME 与展示文件名](#声明的-mime-与展示文件名)。直接粘贴的图像不会写入提示词召回历史，因为仅凭显示句柄无法重建图像；提交之后，持久引用会在重放与子会话续跑中存活。
 
 ## 引用项目文件
 
@@ -76,6 +78,23 @@ zuno run "Explain the evidence" \
 
 `max_base64_bytes` 不是配置字段。限制针对源字节、解码尺寸/像素与规范化后的编码对象，而不是某一种传输专用的 base64 表示。
 
+### 解码上限
+
+在任何解码器分配内存之前，Zuno 会读取源文件头并施加两条任何配置都无法放宽的绝对上限：
+
+- 64,000,000 像素，超过则以 `PixelLimit` 失败；
+- 167,772,160 解码字节，超过则以 `DecodedTooLarge` 失败。
+
+`max_pixels` 只能降低字节上限，永远无法提高它：该上限为 `max_pixels × 40 + 16 MiB`，再夹到不低于 33,554,432 字节、不高于 167,772,160 字节。因此调低 `attachment.image.max_pixels` 就是运维方约束单次接纳的解码内存与 CPU 的手段：在默认的 `max_pixels` 4,000,000 下，一张 8000x8000 的 8-bit 灰度 PNG 会被接纳并缩放；把 `max_pixels` 调到 1,000,000 之后，同一张图会在解码器分配内存之前被拒绝，错误为 `image decodes to 64000000 bytes, exceeding the 56777216-byte decode limit`。每个输出像素 40 字节的换算比例覆盖了缩放中间缓冲，而它才是峰值内存的主要来源：其大小为源宽度 × 目标高度 × 16 字节。
+
+读回规范对象永远不受解码上限限制：`read` 只校验 digest 并返回已存储的字节。从已存储对象生成请求衍生图受另一套约束，因为该对象本来就是这台主机自己的配置接纳的：当前接纳策略自身能写出它，或者它落在所有已发布版本都能解析的下限之内，就会被解码；其上还有任何配置都无法提高的绝对上限 —— 128,000,000 像素与 512,000,000 解码字节。该下限，以及调低某个上限对高于下限的对象意味着什么，见[持久化与 provider 行为](#持久化与-provider-行为)。超出绝对上限的对象仍然可读、可导出，但无法再为模型请求重新编码，且失败是带类型的，而不是被报成损坏文件。
+
+### 声明的 MIME 与展示文件名
+
+当调用方声明源 MIME 类型时（ACP 与 HTTP 入口都会声明），该声明会先被规范化再与探测结果比较：去掉首尾空白与 `;参数` 后缀、转为小写，并把 `image/jpg`、`image/x-png`、`image/apng`、`image/vnd.mozilla.apng`、`image/pjpeg` 归一到它们所指的规范类型。规范化之后仍与实际字节不一致的声明，会以带类型的 mismatch 错误被拒绝。存储的 MIME 始终是探测出来的那个。
+
+展示文件名只是展示值，绝不作为路径使用。Zuno 只保留最后一个路径分段，然后移除所有无法安全显示的字符：C0/C1 控制字符、除普通空格以外的全部空白字符、`U+00AD` 与 `U+FEFF` 等格式字符、bidi 控制与隔离符、`U+3164` HANGUL FILLER 和变体选择符等 `Default_Ignorable_Code_Point` 字符、`U+2800` BRAILLE PATTERN BLANK、私用区码位以及非字符码位。结果按字符边界截断到最多 255 个字符且不超过 255 字节。如果没有任何可显示字符剩下（例如去掉禁止字符并修剪首尾后只剩 `.` 或 `..` 的名字、只含控制字符的名字或空字符串），展示名回退为 `image`。仅仅形似盘符相对路径的名字（例如 `x:y.png`）会保留首字符；只有带分隔符的前缀才会被移除。反序列化存储的或客户端提交的 `ImageAttachmentRef` 时会再执行一次同样的处理，因此被手工改写过的引用、或旧版本写入的引用，都无法重新引入未净化的名字。
+
 ## 持久化与 provider 行为
 
 新写入的持久文件 part 只保存 `ImageAttachmentRef`：`sha256:<hex>` 内容 id、展示文件名、规范化 MIME、尺寸与编码大小，不保存 base64。规范对象位于：
@@ -84,11 +103,15 @@ zuno run "Explain the evidence" \
 $DATA/attachments/v1/<database-identity>/objects/<prefix>/<digest>
 ```
 
-目录与文件使用私有权限。发布过程使用临时文件、文件同步与原子 rename；并发接纳相同的规范化字节会收敛到同一个 digest。请求衍生图按 attachment id、策略版本与 `ImageRequestPolicy` 缓存。
+目录与文件使用私有权限。文件系统失败只报告存储内的相对路径，例如 `objects/<prefix>/<digest>`，而不是绝对路径，因此渲染给模型或写进日志的错误不会泄露数据根目录。发布过程使用临时文件、文件同步与原子 rename；并发接纳相同的规范化字节会收敛到同一个 digest。请求衍生图按 attachment id、策略版本与 `ImageRequestPolicy` 缓存；只有提高内部策略版本才会让已缓存的衍生图失效。
 
-Provider 请求组装只在真正发请求之前解析对象，并继续向现有 provider 适配器提供 inline 的 provider-neutral 图像块。因此 provider 不拥有存储或重放生命周期。TUI、`zuno run --file`、ACP 与 Server 的图像入口都会先接纳，再写入持久 inbox。
+`image.max_width`、`image.max_height` 与 `image.max_pixels` 同样约束 Zuno 在 provider 路由需要更小的衍生图时会重新解码哪些已存储对象，但有一条下限：对象按其自身每像素字节数计算的解码大小若不超过“路由 `max_pixels` × 4 + 16 MiB”（默认路由为 32,777,216 字节，例如一张 2828×2828 的 RGBA8 PNG 或一张 3300×3300 的 RGB8 JPEG），无论当前接纳配置为何都一定能解析，因为已发布版本都能解析它。超过这条下限的已存储对象，只有在当前接纳策略自身也能写出它时才会被解码：把 `image.max_pixels`、`image.max_width` 或 `image.max_height` 调低到接纳该对象时的值以下，会让历史中带有该对象的会话之后的每个 turn 都以类型化的 `PixelLimit`、`DecodedTooLarge` 或 `DecodeWorkTooLarge` 附件错误失败，直到把值调回。读取对象与提供已缓存的衍生图不受此限制，只有冷的衍生解码才会。
+
+Provider 请求组装只在真正发请求之前解析对象，并继续向现有 provider 适配器提供 inline 的 provider-neutral 图像块。因此 provider 不拥有存储或重放生命周期。TUI、`zuno run --file`、ACP 与 Server 的图像入口都会先接纳，再写入持久 inbox。对象解析在请求 reactor 之外执行，并受进程级预算约束：整个进程同时最多 2 次解析，按一个已存储对象重新编码可能占用的 900,000,000 字节工作内存定尺；历史需要第三次解析的回合会等待名额，而不是启动第三次解码；名额在工作完成时释放，而不是在等待中的回合被中断时释放。
 
 历史上包含 `media_type`/`data` 的文件 part 仍可读取和重放，但不会被静默重写。对象缺失、digest 不符或引用元数据不符属于永久持久状态失败；Zuno 不会回退到原始路径，也不会机械重试 provider 调用。
+
+持久文件 part 在类型化引用旁边还带有一个顶层 `filename`，TUI 与 ACP 的重放用它为 part 打标签，而旧版本写入的 part 会按客户端发来的原样保存每一个字段。Zuno 不改写已存储的行，而是在把各字段投影进模型请求时逐一净化。`filename` 采用展示名处理：只保留最后一个路径分段，去掉控制字符与格式字符，并截断到最多 255 个字符且不超过 255 字节，与[声明的 MIME 与展示文件名](#声明的-mime-与展示文件名)中的处理相同。资源链接的 `title`、`description` 与 `mime` 是自由文本，会去掉同一组禁止字符但不做基名归约（标题本身可以合法地是一条路径）；`title` 与 `mime` 截断到 255 个字符，`description` 截断到 1,024 个字符，净化后为空的字段会被省略。`url` 在成为链接 URI 之前去掉同一组字符，但不截断，因为它可能是 `data:` URL。历史内联图像的 `mime` 是线上令牌而不是文本：它按上文读取声明类型的方式解析——去掉参数、折叠大小写、映射同一组别名——并且必须是 PNG、JPEG、GIF 或 WebP 之一。声明类型不满足这一要求的行，在带有 `url` 时投影为资源链接，否则不向请求贡献任何内容；旧版本会把这样的值原样发给 provider，而 provider 会拒绝整个请求。当已存储的文件 part 携带内联图像数据、其媒体类型是 Zuno 无法发送的类型（PNG、JPEG、GIF、WebP 之外的任何类型），且其 `url` 是 `data:` URL 时，该 part 会被整个从模型请求中省略，而不是作为资源链接发送，因此被拒绝图像的 base64 载荷绝不会以文本形式到达模型；被拒绝的图像若其 `url` 指向外部位置，仍会作为资源链接发送。本版本写入的值已经是所有这些处理的不动点，会原样通过。
 
 压缩绝不会把历史图像字节发给压缩模型。它会把摘要输入中的每张图像替换为一个标签，例如 `[Attached diagram.png (image/png)]`；原始的持久会话记录保持不变。
 

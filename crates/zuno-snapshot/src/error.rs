@@ -157,6 +157,28 @@ pub enum SnapshotError {
         source: std::string::FromUtf8Error,
     },
 
+    /// The worktree root's bytes are not valid UTF-8, so no absolute path can be
+    /// reported for it.
+    ///
+    /// [`Store::patch`](crate::Store::patch) is the one report built by joining this
+    /// root onto Git's worktree-relative paths, and a lossy conversion there names
+    /// files that do not exist — a `U+FFFD` path whose `Path::exists()` is false,
+    /// which is worse than reporting nothing. Capture, restore and undo build no
+    /// absolute paths and keep working; the refusal is scoped to the report, and
+    /// renaming the directory clears it.
+    ///
+    /// The root itself is deliberately absent from the message: rendering it needs
+    /// the very lossy conversion this variant exists to refuse.
+    #[error(
+        "refusing to report snapshot paths: the worktree root is not valid utf-8 \
+         (valid up to byte {valid_up_to})"
+    )]
+    UndecodableWorktree {
+        /// How many leading bytes of the root did decode, so the offending path
+        /// component can be located without printing the root.
+        valid_up_to: usize,
+    },
+
     /// A filesystem operation on the store itself failed — creating the object
     /// directory, writing `info/exclude`, seeding `objects/info/alternates`, or
     /// reading back a persisted uncertain-restore record.
