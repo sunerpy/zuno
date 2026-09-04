@@ -245,6 +245,7 @@ mod tests {
 
     /// Four times the usual 64 KiB pipe capacity, so a child cannot finish writing
     /// one pipe unless somebody is draining it while this process waits.
+    #[cfg(unix)]
     const LARGE: usize = 256 * 1024;
 
     /// Enough of a ceiling that a healthy `sh` on a loaded machine is never the thing

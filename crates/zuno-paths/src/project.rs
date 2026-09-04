@@ -350,7 +350,10 @@ fn bounded_stdout(command: &mut Command, ceiling: Duration) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
+    #[cfg(unix)]
+    use std::process::Stdio;
+    #[cfg(unix)]
     use std::time::Instant;
 
     fn run(cwd: &Path, args: &[&str]) {
@@ -726,9 +729,11 @@ mod tests {
 
     /// Names the case a re-exec of this test binary is playing, and is what turns
     /// that re-exec into the child half of a fake-git case at all.
+    #[cfg(unix)]
     const FAKE_GIT_CASE: &str = "ZUNO_PATHS_FAKE_GIT_CASE";
 
     /// The directory the child half asks git about.
+    #[cfg(unix)]
     const FAKE_GIT_CWD: &str = "ZUNO_PATHS_FAKE_GIT_CWD";
 
     /// What the child half prints once it has made every assertion its case calls for.
@@ -736,6 +741,7 @@ mod tests {
     /// A test binary given a filter that matches nothing exits successfully, so a
     /// misspelled child name would turn every case below into a silent pass. The
     /// child says which case it actually ran, and this half insists on hearing it.
+    #[cfg(unix)]
     const OBSERVED: &str = "fake git case observed: ";
 
     /// How long the fake `git` sleeps in the stalled cases.
@@ -743,6 +749,7 @@ mod tests {
     /// An order of magnitude past [`GIT_TIMEOUT`], so a call that returns at all can
     /// only have returned because the ceiling ended it, and so the assertion on
     /// elapsed time is not a race against a slow machine.
+    #[cfg(unix)]
     const FAKE_GIT_SLEEP: Duration = Duration::from_secs(120);
 
     /// The size of the fake `git`'s answer in the `large` case.
@@ -751,6 +758,7 @@ mod tests {
     /// unless somebody is draining the pipe while this process waits for the exit.
     /// An implementation that waited first and read afterwards would deadlock here
     /// and then report this healthy call as a timeout.
+    #[cfg(unix)]
     const LARGE_OUTPUT: usize = 256 * 1024;
 
     /// A `git` that misbehaves on purpose, one branch per case.

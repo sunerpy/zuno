@@ -720,7 +720,9 @@ fn temporary_name(path: &Path) -> OsString {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    #[cfg(unix)]
     use std::process::Stdio;
+    #[cfg(unix)]
     use std::time::Instant;
 
     use super::*;
@@ -1479,9 +1481,11 @@ mod tests {
 
     /// Names the case a re-exec of this test binary is playing, and is what turns
     /// that re-exec into the child half of a fake-git case at all.
+    #[cfg(unix)]
     const FAKE_GIT_CASE: &str = "ZUNO_PATHS_EXCLUDE_FAKE_GIT_CASE";
 
     /// The worktree the child half asks git about.
+    #[cfg(unix)]
     const FAKE_GIT_WORKTREE: &str = "ZUNO_PATHS_EXCLUDE_FAKE_GIT_WORKTREE";
 
     /// The leaf name of the child half, spelled once so the filter handed to the
@@ -1492,10 +1496,12 @@ mod tests {
     /// silent pass. Three things stop that: this constant, the child's own
     /// [`OBSERVED`] line, and the parent's insistence on `ok. 1 passed` — a rename
     /// has to defeat all three.
+    #[cfg(unix)]
     const CHILD_TEST_LEAF: &str = "fake_git_child";
 
     /// What the child half prints once it has made every assertion its case calls
     /// for.
+    #[cfg(unix)]
     const OBSERVED: &str = "fake git case observed: ";
 
     /// How long the fake `git` sleeps in the `timeout` case.
@@ -1503,16 +1509,19 @@ mod tests {
     /// An order of magnitude past [`GIT_TIMEOUT`], so a call that returns at all can
     /// only have returned because the ceiling ended it, and so the assertion on
     /// elapsed time is not a race against a slow machine.
+    #[cfg(unix)]
     const FAKE_GIT_SLEEP: Duration = Duration::from_secs(120);
 
     /// The size of each stream the fake `git` floods in the large cases.
     ///
     /// Four times the usual 64 KiB pipe capacity, so a stream this size cannot be
     /// written unless somebody is draining that pipe while this process waits.
+    #[cfg(unix)]
     const LARGE_OUTPUT: usize = 256 * 1024;
 
     /// The libtest name of the child half: its module path without the crate, which
     /// is how libtest spells it, plus [`CHILD_TEST_LEAF`].
+    #[cfg(unix)]
     fn child_test_name() -> String {
         let module = module_path!()
             .split_once("::")
