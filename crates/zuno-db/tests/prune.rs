@@ -401,7 +401,22 @@ fn prune_default_preview_is_inert_across_every_real_table() {
     assert_eq!(outcome.mode, PruneMode::Preview);
     assert_eq!(all_table_counts(&connection), before);
     assert!(remote.calls.borrow().is_empty(), "preview never unshares");
-    assert_eq!(outcome.preview.tables.len(), PRUNE_TABLES.len());
+    // The projection is `PRUNE_TABLES` plus every session-keyed table the live schema
+    // declares that no foreign key covers and `DELETE_ORDER` does not name, so the preview
+    // describes exactly the rows the delete removes.
+    let projected: BTreeSet<&str> = outcome
+        .preview
+        .tables
+        .iter()
+        .map(|table| table.table)
+        .collect();
+    for derived in ["human_request", "provider_retry_backoff"] {
+        assert!(
+            projected.contains(derived),
+            "{derived} is swept by the delete, so preview must count it"
+        );
+    }
+    assert_eq!(outcome.preview.tables.len(), PRUNE_TABLES.len() + 2);
     assert_eq!(outcome.preview.total_rows, 57);
     assert!(outcome.preview.total_bytes > 0);
     assert_eq!(outcome.preview.cost, 7.5);
@@ -694,6 +709,174 @@ fn prune_rolled_back_delete_preserves_the_original_preview() {
         after, before,
         "an aborted transaction must expose no partial delete"
     );
+}
+
+/// Rows one table holds for a set of session ids, for the FK-less sweep tests.
+fn count_keyed(connection: &Connection, table: &str, key: &str, ids: &str) -> u64 {
+    let rows: i64 = connection
+        .query_row(
+            &format!("SELECT count(*) FROM {table} WHERE {key} IN ({ids})"),
+            [],
+            |row| row.get(0),
+        )
+        .expect("count keyed rows");
+    u64::try_from(rows).expect("row count is non-negative")
+}
+
+/// Which tables carry a session key that no foreign key covers, asked of SQLite.
+///
+/// The same derivation `tests/session.rs` uses, repeated here because the oracle has to be
+/// independent of the crate's own enumeration: if it read `session_keys::uncascaded`, a
+/// mistake in that function would be asserted against itself.
+fn tables_no_session_cascade_reaches(connection: &Connection) -> Vec<(String, String)> {
+    let mut tables = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .expect("prepare table list")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query table list")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read table list");
+    tables.retain(|table| table != "session");
+
+    let mut uncovered = Vec::new();
+    for table in tables {
+        let keys = connection
+            .prepare(
+                "SELECT name FROM pragma_table_info(?1) \
+                 WHERE name IN ('session_id', 'aggregate_id')",
+            )
+            .expect("prepare column list")
+            .query_map([&table], |row| row.get::<_, String>(0))
+            .expect("query column list")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read column list");
+        let Some(key) = keys.into_iter().next() else {
+            continue;
+        };
+        let covered: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_foreign_key_list(?1) WHERE \"from\" = ?2",
+                rusqlite::params![&table, &key],
+                |row| row.get(0),
+            )
+            .expect("count foreign keys on the session key");
+        if covered == 0 {
+            uncovered.push((table, key));
+        }
+    }
+    uncovered
+}
+
+/// Retention's delete reaches every FK-less session-keyed table, not just the listed ones.
+///
+/// `human_request.payload` and `response` hold the question a user was asked and the answer
+/// they typed, and `provider_retry_backoff` holds a pending retry deadline. Neither table
+/// carries a foreign key on `session_id`, and neither was named by `DELETE_ORDER`, so a
+/// confirmed retention delete left both rows behind for every pruned session: the user's own
+/// text surviving the delete that was supposed to remove it, and a retry that would fire for
+/// a session that no longer exists.
+///
+/// The set is derived from the live schema rather than restated, so a table added later with
+/// a session key and no foreign key fails this test until it is both seeded and swept -- the
+/// mirror of `tests/session.rs::removing_a_session_sweeps_every_table_no_cascade_reaches`,
+/// which pins the other deletion path.
+///
+/// The scope is this crate's own schema. Tables another crate creates in the same pool —
+/// `zuno_goal`'s `goal*` set — carry a `session_id` with no foreign key and are not swept by
+/// either path; see the boundary note in `zuno_db::session_keys`.
+#[test]
+fn prune_delete_sweeps_every_session_keyed_table_no_cascade_reaches() {
+    let fixture = Fixture::build();
+    let mut connection = fixture.connection();
+    let uncovered = tables_no_session_cascade_reaches(&connection);
+    let seeded = [
+        ("event_sequence", "aggregate_id"),
+        ("human_request", "session_id"),
+        ("part", "session_id"),
+        ("provider_retry_backoff", "session_id"),
+        ("verification_receipt", "session_id"),
+    ];
+    assert_eq!(
+        uncovered
+            .iter()
+            .map(|(table, key)| (table.as_str(), key.as_str()))
+            .collect::<Vec<_>>(),
+        seeded,
+        "a session-keyed table with no foreign key on that key needs a fixture here and \
+         must be swept by the delete path"
+    );
+
+    // `part` and `event_sequence` come from `seed`; the three tables the delete used to miss
+    // are seeded here, for the selected subtree and for the bystander.
+    for session_id in ["ses_root", "ses_child", "ses_grandchild", "ses_bystander"] {
+        connection
+            .execute(
+                "INSERT INTO human_request
+                   (id, session_id, kind, state, payload, revision, time_created, time_updated)
+                 VALUES (?1, ?2, 'input', 'answered', ?3, 1, 1, 1)",
+                rusqlite::params![
+                    format!("hrq_{session_id}"),
+                    session_id,
+                    format!(r#"{{"question":"api key for {session_id}?"}}"#),
+                ],
+            )
+            .expect("insert human request");
+        connection
+            .execute(
+                "INSERT INTO provider_retry_backoff
+                   (session_id, request_id, turn_id, failed_attempt, next_attempt,
+                    max_attempts, reason, delay_ms, retry_at_ms, scheduled_at_ms)
+                 VALUES (?1, 'req', 'trn', 1, 2, 3, 'stream reset', 500, 900, 400)",
+                [session_id],
+            )
+            .expect("insert retry backoff");
+        connection
+            .execute(
+                "INSERT INTO verification_receipt
+                   (id, session_id, tool_call_id, tool_id, summary, exit_authority, outcome,
+                    time_created)
+                 VALUES (?1, ?2, 'call', 'bash', 'cargo test', 'authoritative', 'passed', 1)",
+                rusqlite::params![format!("vrc_{session_id}"), session_id],
+            )
+            .expect("insert verification receipt");
+    }
+    for (table, key) in &seeded {
+        assert!(
+            count_keyed(&connection, table, key, "'ses_child'") > 0,
+            "{table} must hold a row before the delete or the sweep proves nothing"
+        );
+    }
+
+    let remote = FakeRemote::default();
+    let outcome = execute(
+        &mut connection,
+        &fixture.selection,
+        &PruneRequest::delete().confirmed(),
+        &remote,
+    )
+    .expect("confirmed delete");
+    assert_eq!(outcome.mode, PruneMode::Delete);
+
+    for (table, key) in &seeded {
+        assert_eq!(
+            count_keyed(
+                &connection,
+                table,
+                key,
+                "'ses_root', 'ses_child', 'ses_grandchild'"
+            ),
+            0,
+            "{table} still holds rows for the pruned sessions"
+        );
+        assert_eq!(
+            count_keyed(&connection, table, key, "'ses_bystander'"),
+            1,
+            "{table} lost the bystander's row: the sweep is too broad"
+        );
+    }
 }
 
 #[test]

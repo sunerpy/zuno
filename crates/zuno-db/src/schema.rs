@@ -693,6 +693,37 @@ CREATE INDEX `verification_receipt_session_time_idx`
   ON `verification_receipt` (`session_id`,`time_created`,`id`);
 "#;
 
+/// Every table name the current schema's DDL declares, in declaration order.
+///
+/// Read out of the DDL instead of restated as a list, so a table is enrolled everywhere that
+/// needs to know about it by having a `CREATE TABLE` statement here. [`crate::session_keys`]
+/// intersects the live schema with this set before it will build a `DELETE` naming a table:
+/// a supported database is Zuno's own, but a leftover table from an earlier product or an
+/// operator's own copy of the data must not become deletable just because it carries a
+/// `session_id` column.
+///
+/// Virtual tables are absent on purpose — `CREATE VIRTUAL TABLE` is not this literal — and so
+/// are the shadow tables an FTS index creates underneath itself.
+pub(crate) fn declared_tables() -> Vec<&'static str> {
+    [
+        CORE_SCHEMA_SQL,
+        LEARNING_SCHEMA_SQL,
+        VERIFICATION_SCHEMA_SQL,
+    ]
+    .into_iter()
+    .flat_map(declared_tables_in)
+    .collect()
+}
+
+/// The table names one DDL batch declares.
+fn declared_tables_in(sql: &'static str) -> impl Iterator<Item = &'static str> {
+    sql.split("CREATE TABLE ")
+        .skip(1)
+        .filter_map(|statement| statement.split_once('(').map(|(name, _)| name))
+        .map(|name| name.trim().trim_matches('`').trim())
+        .filter(|name| !name.is_empty())
+}
+
 /// Create every application table and explicit index in the current schema.
 ///
 /// The caller owns the transaction so schema creation and format marking can
@@ -755,4 +786,42 @@ pub(crate) fn up_plan_stack(transaction: &Transaction<'_>) -> Result<(), DbError
                ON work_plan_archive(session_id,state,time_archived);",
         )
         .map_err(migration::map_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// The DDL scan is the authority two delete paths build SQL from, so it must agree with
+    /// what SQLite actually created — not with a count someone maintained by hand.
+    #[test]
+    fn every_declared_table_is_a_table_the_schema_creates() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        let transaction = connection.transaction().expect("begin");
+        up(&transaction).expect("create the current schema");
+        let mut created = transaction
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .expect("prepare inventory")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query inventory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read inventory");
+        created.sort();
+
+        let mut declared = declared_tables();
+        declared.sort_unstable();
+        assert_eq!(
+            declared, created,
+            "declared_tables must equal the tables `up` creates"
+        );
+        assert_eq!(
+            declared.len(),
+            TABLE_COUNT,
+            "TABLE_COUNT is the same schema counted a second way"
+        );
+    }
 }
