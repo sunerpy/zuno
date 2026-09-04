@@ -62,7 +62,18 @@ server 或 headless 界面上弹出准入卡片。显式的权限拒绝以及 Sh
 
 macOS 与 Windows 的受约束模式目前返回一个带类型的不支持平台错误。在默认 `deny` 下不会
 注册 Shell；受信的 `run-unconfined` 可以让具备写能力的 Agent 原生继续，而显式的
-`danger-full-access` 始终可以独立使用原生进程后端。参见
+`danger-full-access` 始终可以独立使用原生进程后端。拒绝信息会点明平台、说明降级是否适用于
+本次请求，并列出全部补救方式：`zuno --sandbox-on-unavailable run-unconfined`、
+`zuno --sandbox danger-full-access`、`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`，或在
+受信层（全局、受管、环境、CLI）设置 `sandbox.onUnavailable`；项目层无法启用它。在这类主机上
+交互式启动 `zuno` 时，会在进入 raw mode 之前询问一次是否以原生方式运行本次会话——仅限具备
+写能力的请求、仅当没有任何层设置过 `sandbox.onUnavailable`、且标准输入与标准错误都是终端；
+回答 yes 时本进程的解析结果与命令行标志完全一致，回答 no 则以该拒绝信息退出。这个回答只对当前
+进程生效：在 macOS 上，命令行标志会通过启动时的 re-exec 写入真实环境变量，从而被嵌套的 Zuno
+进程继承，而提示里的回答不会；如果嵌套的 `zuno` 也需要同样的答案，请设置
+`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined` 或在受信层设置 `sandbox.onUnavailable`。
+`run`、`acp` 与 `serve` 永远不会询问，仍然需要标志或环境变量。以上任何一种都不是沙箱隔离。
+切换到一个无法注册 Shell 的 Agent 时，会保留当前 Agent 并给出同样的提示，而不是结束会话。参见
 [Shell sandbox roadmap](https://github.com/sunerpy/zuno/blob/main/docs/design/shell-sandbox-roadmap.md)。
 
 ## 为什么 `bwrap` 会以 `loopback: Failed RTM_NEWADDR: Operation not permitted` 失败？

@@ -197,7 +197,8 @@ zuno
 | --- | --- | --- |
 | `rg` is missing or too old | `glob` / `grep` backend is unavailable | Install ripgrep 14 or newer; Zuno startup and unrelated core features remain usable, and the running session picks the new install up within five seconds without a restart |
 | `no trusted system bubblewrap executable was found` | No confinement backend | Install bubblewrap 0.8.0 or newer, use explicit `danger-full-access`, or enable trusted unavailable fallback for a write-capable Agent |
-| `OS sandbox is not implemented for platform` | Confined mode on macOS or Windows | Use explicit `danger-full-access`, trusted `run-unconfined` fallback for a write-capable Agent, or run on Linux |
+| `OS sandbox is not implemented for platform` | Confined mode on macOS or Windows | The refusal names the platform and lists the remedies that apply to that request: explicit `danger-full-access`, trusted `run-unconfined` fallback for a write-capable Agent, or run on Linux |
+| `Run this session natively without OS confinement?` on a bare `zuno` start | macOS or Windows, a write-capable Agent, and no layer set `sandbox.onUnavailable` | Answer `y` to run this session natively with your permission mode kept, or `n` to exit with the refusal. Decide it up front with `--sandbox-on-unavailable run-unconfined`, `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`, or `sandbox.onUnavailable` in a trusted layer |
 | A validation error naming a rejected top-level key | TUI-only key such as `theme` in `zuno.json` | Move it to `tui.json`. See [Files and precedence](/config/files) |
 | Empty session list after switching builds | Source and release builds open different database files | See [Database lifecycle](/migration) |
 | A model id is not found | Catalog cached before the provider was added | `zuno models --refresh` |

@@ -346,6 +346,94 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
     }
 }
 
+/// What a macOS or Windows user reads about a host with no confined backend.
+///
+/// Three separate claims were wrong in the released text, and each is pinned here: the
+/// permission guides and quick-start rows presented the bare one-line
+/// `OS sandbox is not implemented for platform` as the whole report; the prompt's
+/// condition was documented as standard input alone when `is_interactive` requires
+/// standard error too; and the interactive answer was documented as identical to
+/// `--sandbox-on-unavailable run-unconfined`, which it is only for this process — on
+/// Unix the flag reaches child processes through the startup re-exec and the answer,
+/// resolved after it, does not.
+#[test]
+fn unsupported_platform_docs_pin_the_refusal_the_prompt_and_its_process_scope() {
+    // The opening clause is quoted on both pages so the string a user greps for still
+    // lands where the remedies are, without the page claiming it is the whole report.
+    let opening =
+        "OS sandbox is not implemented for platform `macos`: macos has no confined sandbox";
+    contains_all(
+        "docs/guide/permissions.md",
+        &[
+            "confined backend at all",
+            opening,
+            "standard error are both terminals",
+            "resolves this process",
+            "The answer belongs to this process",
+            "keeps the current Agent",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/permissions.md",
+        &[
+            "根本没有受约束后端",
+            opening,
+            "标准错误都是终端",
+            "这个回答只属于当前这个进程",
+            "保留当前 Agent",
+        ],
+    );
+    contains_all(
+        "docs/reference/configuration.md",
+        &[
+            "standard input **and** standard error are both",
+            "resolves this process exactly as",
+            "The answer is not inherited by child processes",
+            "no such re-exec",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/reference.md",
+        &[
+            "标准错误都是终端",
+            "这个回答不会被子进程继承",
+            "没有这一次 re-exec",
+        ],
+    );
+    contains_all(
+        "docs/faq.md",
+        &[
+            "standard input and standard error are both terminals",
+            "process exactly as the flag does",
+            "startup re-exec that exports it",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/faq.md",
+        &[
+            "标准错误都是终端",
+            "这个回答只对当前",
+            "通过启动时的 re-exec 写入真实环境变量",
+        ],
+    );
+    for relative in ["docs/guide/quick-start.md", "docs/zh/guide/quick-start.md"] {
+        contains_all(
+            relative,
+            &["Run this session natively without OS confinement?"],
+        );
+    }
+
+    // The framing that presented a bare one-line error as the whole report.
+    assert!(
+        !read("docs/guide/permissions.md").contains("restricted mode reports:"),
+        "docs/guide/permissions.md still presents the bare unsupported-platform line"
+    );
+    assert!(
+        !read("docs/zh/guide/permissions.md").contains("受限模式报告："),
+        "docs/zh/guide/permissions.md still presents the bare unsupported-platform line"
+    );
+}
+
 #[test]
 fn continuity_docs_explain_switching_scope_and_final_tool_filters() {
     contains_all(

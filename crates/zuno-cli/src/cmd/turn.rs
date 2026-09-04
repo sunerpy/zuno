@@ -990,6 +990,11 @@ impl TurnPlan {
         self.agent.name()
     }
 
+    /// The resolved profile of the agent that will answer, as assembly will see it.
+    pub(crate) const fn agent_profile(&self) -> &AgentProfile {
+        &self.agent
+    }
+
     /// Every resolved agent, including active static and process extensions.
     pub(crate) fn agents(&self) -> &[zuno_catalog::agent::Agent] {
         &self.agents

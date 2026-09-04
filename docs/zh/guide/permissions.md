@@ -178,15 +178,42 @@ zuno debug sandbox
 
 ### 其他平台
 
-OS 约束后端已在 Linux 上实现。在 macOS 与 Windows 上，受限模式报告：
+OS 约束后端已在 Linux 上实现。macOS 与 Windows 根本没有受约束后端，所以受限模式在这两个
+平台上是失败即拒绝，而不是悄悄降级。这条拒绝信息是写给人照着做的：它会点明平台、说明受信的
+`run-unconfined` 降级是否适用于**当前这次**请求、逐条列出补救方式以及可以设置它的配置层，
+并且明确说明这些补救方式都不是沙箱隔离。它的开头仍是早先版本单独打印的那条类型化原因：
 
 ```
-OS sandbox is not implemented for platform `macos`
+OS sandbox is not implemented for platform `macos`: macos has no confined sandbox
+backend, so the Shell tool cannot be registered under the requested
+`workspace-write` authority. …
 ```
 
-默认仍然失败即拒绝。受信的 `run-unconfined` 可以让具备写能力的
-`workspace-write` Agent 原生继续；只读 Agent 仍会拒绝。`danger-full-access`
-始终直接选择原生执行。
+- 具备写能力的 `workspace-write` 请求符合降级条件，因此拒绝信息会给出
+  `--sandbox-on-unavailable run-unconfined`、`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`，
+  以及在受信层（全局、受管、环境、CLI）里设置
+  `"sandbox": {"onUnavailable": "run-unconfined"}` —— 项目层无法启用它。
+- 只读请求永远不会降级，拒绝信息会直接这么说，而不是列出一条其实不适用的补救方式：在这类
+  平台上，只有显式的 `danger-full-access` 请求才会原生执行，而且只有契约本身具备写能力的
+  Agent 才能发出这个请求，所以像 `plan` 这样的只读 Agent 在这些平台上没有原生执行的路径。
+
+在这类主机上交互式启动 `zuno` 时，会在终端进入 raw mode 之前询问一次，是否以原生方式运行
+本次会话。只有三个条件同时成立才会询问：请求具备写能力、没有任何配置层设置过
+`sandbox.onUnavailable`、标准输入与标准错误都是终端。回答 yes 时，本进程的解析结果与传入
+`--sandbox-on-unavailable run-unconfined` 完全一致，并对该进程之后的每一次组合都生效；
+回答 no 则以上面那条拒绝信息退出。`run`、`acp`、`serve` 以及任何没有终端的启动都不会询问，
+仍然需要命令行标志、环境变量或受信配置层。
+
+这个回答只属于当前这个进程。在 macOS 上，命令行标志会由启动时那一次 re-exec 写入真实环境
+变量，因此工具启动的嵌套 `zuno` 会继承它；而在提示里输入的回答发生在那次 re-exec 之后，
+不会被继承。如果嵌套的 Zuno 进程也需要同样的答案，请设置环境变量或受信配置层。参见
+[沙箱模式与后端不可用策略](/zh/config/reference#沙箱模式与后端不可用策略)。
+
+切换到一个无法注册 Shell 的 Agent 时，Zuno 会保留当前 Agent 并在 transcript 上给出同样的
+拒绝信息，而不是因为一次可以撤销的切换就结束会话。
+
+`danger-full-access` 始终直接选择原生执行。它和降级都不是沙箱隔离：命令以 Zuno 进程用户的
+宿主权限运行，但已配置的权限模式、显式拒绝与灾难性命令拒绝依然生效。
 
 ## 权限模式
 

@@ -80,8 +80,24 @@ default exists.
 Confined macOS and Windows modes currently return a typed unsupported-platform
 error. They do not register Shell under the default `deny`; trusted
 `run-unconfined` may allow a write-capable Agent to proceed natively, while
-explicit `danger-full-access` remains available independently. See the
-[Shell sandbox roadmap](design/shell-sandbox-roadmap.md).
+explicit `danger-full-access` remains available independently. The refusal you
+read names the platform, says whether the fallback would apply to your request,
+and lists the remedies: `zuno --sandbox-on-unavailable run-unconfined`,
+`zuno --sandbox danger-full-access`, `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`,
+or `sandbox.onUnavailable` in a trusted (global, managed, environment, or CLI)
+layer; a project layer cannot enable it. An interactive `zuno` start on such a
+host asks once, before raw mode, whether to run this session natively — only for
+a write-capable request, only when no layer set `sandbox.onUnavailable`, and only
+when standard input and standard error are both terminals; yes resolves this
+process exactly as the flag does, no exits with the refusal. The answer covers
+this process only: on macOS the flag reaches nested Zuno processes through the
+startup re-exec that exports it, and an answer given at the prompt does not, so
+set `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined` or a trusted
+`sandbox.onUnavailable` when a nested `zuno` needs the same answer.
+`run`, `acp`, and `serve` never ask and still need the flag or the variable. None
+of this is confinement. Switching to an Agent whose Shell cannot be registered
+keeps the current Agent and reports the same text instead of ending the session.
+See the [Shell sandbox roadmap](design/shell-sandbox-roadmap.md).
 
 ## Why does `bwrap` fail with `loopback: Failed RTM_NEWADDR: Operation not permitted`?
 

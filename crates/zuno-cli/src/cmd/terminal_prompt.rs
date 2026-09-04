@@ -45,6 +45,39 @@ pub(crate) fn is_interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
+/// Ask one yes/no question on standard error and read the answer from standard input.
+///
+/// Fails closed: without an interactive terminal there is nobody to answer, so the
+/// caller gets an error rather than a default. Only `y`/`yes` (any case) is a yes.
+pub(crate) fn confirm(message: &str) -> Result<bool, String> {
+    confirm_with(message, is_interactive(), || {
+        eprint!("{message} [y/N] ");
+        std::io::stderr()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .map_err(|error| error.to_string())?;
+        Ok(answer)
+    })
+}
+
+fn confirm_with(
+    message: &str,
+    interactive: bool,
+    read_answer: impl FnOnce() -> Result<String, String>,
+) -> Result<bool, String> {
+    if !interactive {
+        return Err(format!("{message} requires an interactive terminal"));
+    }
+    let answer = read_answer()?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 /// Select one value with arrows, paging, and type-to-filter.
 pub(crate) fn select(message: &str, choices: Vec<Choice>) -> Result<Option<String>, String> {
     if choices.is_empty() {
@@ -375,6 +408,32 @@ mod tests {
         state.push('o');
         assert_eq!(state.cursor, 0);
         assert!(!state.visible.is_empty());
+    }
+
+    #[test]
+    fn confirm_fails_closed_without_a_terminal_and_accepts_only_yes() {
+        let error = confirm_with("Continue?", false, || {
+            panic!("a non-interactive confirm must not read standard input")
+        })
+        .expect_err("no terminal, no answer");
+        assert_eq!(error, "Continue? requires an interactive terminal");
+
+        for (answer, expected) in [
+            ("y\n", true),
+            ("Yes\n", true),
+            ("  YES  \n", true),
+            ("n\n", false),
+            ("\n", false),
+            ("maybe\n", false),
+        ] {
+            let accepted = confirm_with("Continue?", true, || Ok(answer.to_owned()))
+                .expect("an interactive answer is read");
+            assert_eq!(accepted, expected, "answer {answer:?}");
+        }
+
+        let error = confirm_with("Continue?", true, || Err("closed".to_owned()))
+            .expect_err("a failed read is an error, not a no");
+        assert_eq!(error, "closed");
     }
 
     #[test]

@@ -10676,3 +10676,582 @@ mod learning_runtime {
         );
     }
 }
+
+/// Acts as a host with no confined backend: the typed cause macOS and Windows raise.
+///
+/// Mirrors `resolve_policy_with` exactly: a trusted `run-unconfined` resolves a
+/// write-capable request through the native fallback, everything else is the typed
+/// refusal, so the tests below exercise the real resolver contract on a Linux runner.
+#[derive(Debug)]
+struct UnsupportedPlatformTestSandbox;
+
+impl zuno_sandbox::SandboxResolver for UnsupportedPlatformTestSandbox {
+    fn resolve(
+        self: Arc<Self>,
+        policy: zuno_sandbox::SandboxPolicy,
+        on_unavailable: zuno_sandbox::SandboxUnavailableAction,
+    ) -> Result<zuno_sandbox::SandboxResolution, zuno_sandbox::SandboxError> {
+        let _ = self;
+        if on_unavailable == zuno_sandbox::SandboxUnavailableAction::RunUnconfined
+            && policy.mode() == zuno_sandbox::SandboxMode::WorkspaceWrite
+        {
+            return zuno_sandbox::SandboxResolution::unavailable_fallback(
+                policy,
+                zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                    platform: "windows".to_owned(),
+                },
+            );
+        }
+        Err(zuno_sandbox::SandboxError::UnsupportedPlatform(
+            "windows".to_owned(),
+        ))
+    }
+}
+
+fn read_only_shell_profile() -> zuno_agent::profile::AgentProfile {
+    use zuno_config::schema::permission::PermissionAction;
+
+    let rules = std::iter::once(zuno_permission::Rule {
+        permission: "*".to_owned(),
+        pattern: "*".to_owned(),
+        action: PermissionAction::Allow,
+    })
+    .chain(
+        ["apply_patch", "write", "edit"]
+            .into_iter()
+            .map(|permission| zuno_permission::Rule {
+                permission: permission.to_owned(),
+                pattern: "*".to_owned(),
+                action: PermissionAction::Deny,
+            }),
+    )
+    .collect::<Vec<_>>();
+    zuno_agent::profile::AgentProfile::resolve(agent("read-only-shell"), rules, false)
+}
+
+fn assemble_on_unsupported_platform(
+    directory: &Path,
+    goal_spill: &Path,
+    config: &zuno_config::schema::Config,
+    selected_agent: &zuno_agent::profile::AgentProfile,
+) -> Result<tool_runtime::ToolRuntime, String> {
+    tool_runtime::assemble(
+        directory,
+        None,
+        &Env::empty(),
+        config,
+        selected_agent,
+        tool_runtime::ToolSelection {
+            provider_id: "provider",
+            model_id: "model",
+            manifest: Arc::new(zuno_harness::ToolManifest::standard()),
+            contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
+            question: None,
+            interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
+            background_executions: test_background_executions(directory),
+            sandbox: Some(Arc::new(UnsupportedPlatformTestSandbox)),
+            todo_store: Arc::new(
+                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
+            ),
+            work_observer: test_work_observer(),
+            goal_store: Arc::new(
+                GoalStore::open_memory(goal_spill.to_owned()).expect("in-memory goal store"),
+            ),
+            mcp_loader: None,
+            skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            skill_catalog: None,
+            capability: test_capability(),
+            delegation: test_delegation(),
+            product_agents: test_product_agents(),
+            workflows: test_workflows(),
+            councils: test_councils(),
+            job_controller: test_job_controller(),
+            memory: None,
+            experience_search: None,
+            tool_authority: None,
+        },
+    )
+}
+
+fn config_json(json: &str) -> zuno_config::schema::Config {
+    zuno_config::schema::Config::from_json_str(Path::new("trusted.json"), json)
+        .expect("test configuration parses")
+}
+
+const WRITE_CAPABLE_REMEDIES: [&str; 11] = [
+    "OS sandbox is not implemented for platform `windows`",
+    "windows has no confined sandbox backend",
+    "`workspace-write` authority",
+    "write-capable, so the trusted `run-unconfined` fallback applies",
+    "`zuno --sandbox-on-unavailable run-unconfined`",
+    "`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`",
+    "`zuno --sandbox danger-full-access`",
+    "\"onUnavailable\": \"run-unconfined\"",
+    "trusted global, managed, environment, or CLI configuration layer",
+    "a project layer cannot enable it",
+    "None of these is confinement",
+];
+
+const READ_ONLY_REMEDIES: [&str; 9] = [
+    "OS sandbox is not implemented for platform `windows`",
+    "windows has no confined sandbox backend",
+    "`read-only` authority",
+    "A read-only request never falls back",
+    "`zuno --sandbox-on-unavailable run-unconfined`, `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`, and a trusted `\"sandbox\": {\"onUnavailable\": \"run-unconfined\"}` do not apply",
+    "Only an explicit `danger-full-access` request runs natively",
+    "`zuno --sandbox danger-full-access`",
+    "a project layer cannot select it",
+    "That is not confinement",
+];
+
+/// The refusal a headless `run`, `acp`, or `serve` prints for a write-capable Agent on a
+/// host with no confined backend: the same assembly they all reach, with nothing to ask
+/// and every remedy in the text.
+#[test]
+fn unsupported_platform_refusal_for_a_write_capable_request_names_every_remedy() {
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    for json in [r#"{}"#, r#"{"sandbox":{"onUnavailable":"deny"}}"#] {
+        let config = config_json(json);
+        let selected_agent = agent_profile(agent("build"), directory.path(), &config);
+        let message = assemble_on_unsupported_platform(
+            directory.path(),
+            goal_spill.path(),
+            &config,
+            &selected_agent,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{json}: an unsupported platform under deny refuses Shell"));
+
+        assert_eq!(
+            message,
+            tool_runtime::unsupported_platform_refusal(
+                "windows",
+                zuno_sandbox::SandboxMode::WorkspaceWrite
+            ),
+            "{json}: assembly renders the shared refusal, not a bare cause"
+        );
+        for needle in WRITE_CAPABLE_REMEDIES {
+            assert!(
+                message.contains(needle),
+                "{json}: missing {needle:?} in {message}"
+            );
+        }
+        assert!(!message.contains("quiescent"), "{message}");
+    }
+}
+
+/// A read-only request is told the truth: the fallback remedies do not apply to it.
+#[test]
+fn unsupported_platform_refusal_for_a_read_only_request_says_only_danger_full_access_runs_natively()
+{
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let selected_agent = read_only_shell_profile();
+    for json in [r#"{}"#, r#"{"sandbox":{"onUnavailable":"run-unconfined"}}"#] {
+        let config = config_json(json);
+        let message = assemble_on_unsupported_platform(
+            directory.path(),
+            goal_spill.path(),
+            &config,
+            &selected_agent,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{json}: read-only authority never runs unconfined"));
+
+        assert_eq!(
+            message,
+            tool_runtime::unsupported_platform_refusal(
+                "windows",
+                zuno_sandbox::SandboxMode::ReadOnly
+            ),
+            "{json}"
+        );
+        for needle in READ_ONLY_REMEDIES {
+            assert!(
+                message.contains(needle),
+                "{json}: missing {needle:?} in {message}"
+            );
+        }
+        assert!(
+            !message.contains("fallback applies"),
+            "{json}: a read-only request must not be offered the fallback: {message}"
+        );
+    }
+}
+
+/// The trusted choice still resolves exactly as before: fallback, typed reason, notice.
+#[test]
+fn trusted_run_unconfined_still_resolves_a_write_capable_request_on_an_unsupported_platform() {
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let config = config_json(r#"{"sandbox":{"onUnavailable":"run-unconfined"}}"#);
+    let selected_agent = agent_profile(agent("build"), directory.path(), &config);
+
+    let runtime = assemble_on_unsupported_platform(
+        directory.path(),
+        goal_spill.path(),
+        &config,
+        &selected_agent,
+    )
+    .expect("trusted fallback assembles on an unsupported platform");
+
+    let notice = runtime
+        .sandbox_notice
+        .as_deref()
+        .expect("native fallback carries its notice");
+    assert!(notice.contains("unsupported_platform"), "{notice}");
+    assert!(notice.contains("without OS isolation"), "{notice}");
+    assert!(
+        runtime.tools.iter().any(|tool| tool.id() == "shell"),
+        "the write-capable Agent keeps Shell"
+    );
+}
+
+/// Every branch of the one decision the TUI start and an agent switch share.
+#[test]
+fn unsupported_platform_decision_covers_every_branch() {
+    use tool_runtime::{UnsupportedPlatformDecision, UnsupportedPlatformRefusal};
+    use zuno_config::schema::sandbox::SandboxUnavailableAction as Configured;
+    use zuno_sandbox::SandboxMode;
+
+    let write = UnsupportedPlatformRefusal {
+        platform: "windows".to_owned(),
+        requested_mode: SandboxMode::WorkspaceWrite,
+    };
+    let read_only = UnsupportedPlatformRefusal {
+        platform: "macos".to_owned(),
+        requested_mode: SandboxMode::ReadOnly,
+    };
+    let write_text =
+        tool_runtime::unsupported_platform_refusal("windows", SandboxMode::WorkspaceWrite);
+    let read_only_text = tool_runtime::unsupported_platform_refusal("macos", SandboxMode::ReadOnly);
+
+    // Nothing pending: Linux with bubblewrap, no Shell, an explicit `danger-full-access`,
+    // or a trusted fallback that resolved all arrive here.
+    for configured in [
+        None,
+        Some(Configured::Deny),
+        Some(Configured::RunUnconfined),
+    ] {
+        for interactive in [true, false] {
+            assert_eq!(
+                tool_runtime::decide_unsupported_platform(None, configured, interactive),
+                UnsupportedPlatformDecision::Proceed,
+                "{configured:?} interactive={interactive}"
+            );
+        }
+    }
+
+    // The one case that asks: write-capable, nobody configured onUnavailable, a TTY.
+    assert_eq!(
+        tool_runtime::decide_unsupported_platform(Some(&write), None, true),
+        UnsupportedPlatformDecision::OfferNativeExecution {
+            platform: "windows".to_owned()
+        }
+    );
+
+    // Off a TTY nothing may prompt; the headless text is the answer.
+    assert_eq!(
+        tool_runtime::decide_unsupported_platform(Some(&write), None, false),
+        UnsupportedPlatformDecision::Refuse {
+            message: write_text.clone()
+        }
+    );
+
+    // A layer that chose is honoured: an explicit deny never prompts, and an explicit
+    // run-unconfined that still refused (it never covers read-only) is not re-asked.
+    for configured in [Configured::Deny, Configured::RunUnconfined] {
+        for interactive in [true, false] {
+            assert_eq!(
+                tool_runtime::decide_unsupported_platform(
+                    Some(&write),
+                    Some(configured),
+                    interactive
+                ),
+                UnsupportedPlatformDecision::Refuse {
+                    message: write_text.clone()
+                },
+                "{configured:?} interactive={interactive}"
+            );
+        }
+    }
+
+    // Read-only never falls back, so there is nothing to offer, TTY or not.
+    for configured in [
+        None,
+        Some(Configured::Deny),
+        Some(Configured::RunUnconfined),
+    ] {
+        for interactive in [true, false] {
+            assert_eq!(
+                tool_runtime::decide_unsupported_platform(
+                    Some(&read_only),
+                    configured,
+                    interactive
+                ),
+                UnsupportedPlatformDecision::Refuse {
+                    message: read_only_text.clone()
+                },
+                "{configured:?} interactive={interactive}"
+            );
+        }
+    }
+    for needle in READ_ONLY_REMEDIES {
+        assert!(
+            read_only_text.replace("macos", "windows").contains(needle),
+            "missing {needle:?}"
+        );
+    }
+}
+
+/// The preflight reports exactly the refusal assembly would produce, and nothing else.
+#[test]
+fn sandbox_preflight_reports_only_an_unsupported_platform_that_assembly_would_refuse() {
+    use tool_runtime::UnsupportedPlatformRefusal;
+    use zuno_sandbox::{SandboxError, SandboxMode, SandboxPolicy};
+    use zuno_tools::registry::BuiltinSlot;
+
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let standard = zuno_harness::ToolManifest::standard();
+    let windows = |_: &SandboxPolicy| -> Result<(), SandboxError> {
+        Err(SandboxError::UnsupportedPlatform("windows".to_owned()))
+    };
+    let no_bubblewrap =
+        |_: &SandboxPolicy| -> Result<(), SandboxError> { Err(SandboxError::BubblewrapNotFound) };
+    let confined = |_: &SandboxPolicy| -> Result<(), SandboxError> { Ok(()) };
+
+    let unset = config_json(r#"{}"#);
+    let build = agent_profile(agent("build"), directory.path(), &unset);
+    assert_eq!(
+        tool_runtime::sandbox_preflight(directory.path(), &unset, &build, &standard, &windows),
+        Some(UnsupportedPlatformRefusal {
+            platform: "windows".to_owned(),
+            requested_mode: SandboxMode::WorkspaceWrite,
+        }),
+        "a write-capable request under the default deny would be refused"
+    );
+
+    let denied = config_json(r#"{"sandbox":{"onUnavailable":"deny"}}"#);
+    let build_denied = agent_profile(agent("build"), directory.path(), &denied);
+    assert_eq!(
+        tool_runtime::sandbox_preflight(
+            directory.path(),
+            &denied,
+            &build_denied,
+            &standard,
+            &windows
+        )
+        .map(|refusal| refusal.requested_mode),
+        Some(SandboxMode::WorkspaceWrite),
+        "an explicit deny is a refusal too; the decision, not the preflight, declines to ask"
+    );
+
+    let trusted = config_json(r#"{"sandbox":{"onUnavailable":"run-unconfined"}}"#);
+    let build_trusted = agent_profile(agent("build"), directory.path(), &trusted);
+    assert_eq!(
+        tool_runtime::sandbox_preflight(
+            directory.path(),
+            &trusted,
+            &build_trusted,
+            &standard,
+            &windows
+        ),
+        None,
+        "a trusted run-unconfined resolves a write-capable request through the fallback"
+    );
+
+    let read_only = read_only_shell_profile();
+    assert_eq!(
+        tool_runtime::sandbox_preflight(
+            directory.path(),
+            &trusted,
+            &read_only,
+            &standard,
+            &windows
+        ),
+        Some(UnsupportedPlatformRefusal {
+            platform: "windows".to_owned(),
+            requested_mode: SandboxMode::ReadOnly,
+        }),
+        "read-only never falls back, trusted or not"
+    );
+
+    let native = config_json(r#"{"sandbox":{"mode":"danger-full-access"}}"#);
+    let build_native = agent_profile(agent("build"), directory.path(), &native);
+    assert_eq!(
+        tool_runtime::sandbox_preflight(
+            directory.path(),
+            &native,
+            &build_native,
+            &standard,
+            &windows
+        ),
+        None,
+        "an explicit danger-full-access request never discovers a confined backend"
+    );
+
+    assert_eq!(
+        tool_runtime::sandbox_preflight(
+            directory.path(),
+            &unset,
+            &build,
+            &standard,
+            &no_bubblewrap
+        ),
+        None,
+        "a Linux host without bubblewrap keeps its own refusal from assembly"
+    );
+    assert_eq!(
+        tool_runtime::sandbox_preflight(directory.path(), &unset, &build, &standard, &confined),
+        None,
+        "a host with a confined backend has nothing to report"
+    );
+
+    let mut reader = agent("reader");
+    reader.tools = Some(vec!["read".to_owned()]);
+    let reader = agent_profile(reader, directory.path(), &unset);
+    assert_eq!(
+        tool_runtime::sandbox_preflight(directory.path(), &unset, &reader, &standard, &windows),
+        None,
+        "an Agent without Shell never resolves a sandbox, so it is never refused one"
+    );
+
+    let without_shell =
+        zuno_harness::ToolManifest::new([BuiltinSlot::Read]).expect("a manifest without Shell");
+    assert_eq!(
+        tool_runtime::sandbox_preflight(directory.path(), &unset, &build, &without_shell, &windows),
+        None,
+        "a profile whose manifest omits Shell never resolves a sandbox either"
+    );
+}
+
+/// The headless surfaces reach the refusal through assembly and have no question to
+/// ask; only the TUI asks, and only before raw mode. A scan is crude, and it is also
+/// the check that fails the moment a prompt is added to a surface that has no terminal.
+#[test]
+fn only_the_interactive_tui_offers_native_execution_and_only_before_raw_mode() {
+    let cmd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("cmd");
+    let read = |name: &str| {
+        std::fs::read_to_string(cmd.join(name)).unwrap_or_else(|_| panic!("{name} is readable"))
+    };
+
+    for surface in ["run.rs", "acp.rs", "serve.rs", "turn.rs", "tool_runtime.rs"] {
+        let source = read(surface);
+        assert!(
+            !source.contains("terminal_prompt::confirm"),
+            "`{surface}` must never ask; it refuses with the remedies in the text"
+        );
+        assert!(
+            !source.contains("with_sandbox_on_unavailable("),
+            "`{surface}` must not widen its own sandbox authority"
+        );
+    }
+
+    let tui = read("tui.rs");
+    let question = tui
+        .find("terminal_prompt::confirm(")
+        .expect("the TUI asks its one question through terminal_prompt::confirm");
+    let raw_mode = tui
+        .find("TerminalSession::start(lifecycle.clone())")
+        .expect("the TUI enters raw mode through TerminalSession::start");
+    assert!(
+        question < raw_mode,
+        "the question is asked before raw mode, while the terminal is still the shell's"
+    );
+    assert!(
+        tui.contains("sandbox_decision(&plan, super::terminal_prompt::is_interactive())"),
+        "the start decides from the terminal it actually has"
+    );
+    assert!(
+        tui.contains("&super::tool_runtime::system_sandbox_probe"),
+        "the production decision probes the real backend, not a stand-in"
+    );
+    assert!(
+        tui.contains("sandbox_decision(&plan, false)"),
+        "an agent switch never asks: it keeps the current host and says why"
+    );
+    // The ordering itself is proved by `tui::tests::
+    // a_candidate_refused_for_its_platform_never_stops_the_current_host`, which drives
+    // the wrapper with a fake host. What remains here is that the switch reaches its
+    // replacement through that wrapper and never through the unguarded `replace_host`.
+    assert!(
+        !tui.contains("replace_host(host,"),
+        "an agent switch must not reach `replace_host` without the platform guard"
+    );
+    let switch_guard = tui
+        .find("sandbox_decision(&plan, false)")
+        .expect("switch guard present");
+    let replace = tui
+        .find("replace_host_unless_refused(host,")
+        .expect("apply_selection replaces the host through the guarded wrapper");
+    assert!(
+        switch_guard < replace,
+        "the switch decides before it asks for a replacement"
+    );
+}
+
+/// The decision both TUI consumers make, driven through the probe seam on a plan the
+/// production fixture builds, rather than asserted about the shape of the source.
+///
+/// A Linux test host always discovers its own platform, so an injected probe is the
+/// only way to stand where a Windows or macOS user stands.
+#[test]
+fn a_write_capable_plan_without_a_platform_backend_asks_only_on_a_terminal() {
+    use tool_runtime::UnsupportedPlatformDecision;
+    use zuno_sandbox::{SandboxError, SandboxMode, SandboxPolicy};
+
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let plan = plan(
+        directory
+            .path()
+            .to_str()
+            .expect("a UTF-8 temporary workspace"),
+        SessionChoice::New,
+    );
+    let windows = |_: &SandboxPolicy| -> Result<(), SandboxError> {
+        Err(SandboxError::UnsupportedPlatform("windows".to_owned()))
+    };
+    let confined = |_: &SandboxPolicy| -> Result<(), SandboxError> { Ok(()) };
+
+    // On a terminal the one question is offered, because the fixture's Agent is
+    // write-capable and its configuration sets no `sandbox.onUnavailable`.
+    assert_eq!(
+        crate::cmd::tui::decide_for_plan(&plan, &windows, true),
+        UnsupportedPlatformDecision::OfferNativeExecution {
+            platform: "windows".to_owned()
+        },
+        "an interactive start offers native execution"
+    );
+
+    // Off a terminal — every headless start, and every agent switch, which decides
+    // while the terminal is in raw mode — the same plan refuses.
+    let refused = crate::cmd::tui::decide_for_plan(&plan, &windows, false);
+    let UnsupportedPlatformDecision::Refuse { message } = refused else {
+        panic!("without a terminal there is nobody to ask: {refused:?}");
+    };
+    assert_eq!(
+        message,
+        tool_runtime::unsupported_platform_refusal("windows", SandboxMode::WorkspaceWrite),
+        "the refusal is the write-capable text, which offers the fallback"
+    );
+    for needle in WRITE_CAPABLE_REMEDIES {
+        assert!(message.contains(needle), "missing {needle:?} in {message}");
+    }
+    assert!(
+        !message.contains("A read-only request never falls back"),
+        "a write-capable request must not read the read-only refusal: {message}"
+    );
+
+    // A host that does have a confined backend has nothing to decide, terminal or not.
+    for interactive in [true, false] {
+        assert_eq!(
+            crate::cmd::tui::decide_for_plan(&plan, &confined, interactive),
+            UnsupportedPlatformDecision::Proceed,
+            "interactive={interactive}"
+        );
+    }
+}

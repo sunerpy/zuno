@@ -190,6 +190,36 @@ impl StartupEnvironment {
         }
     }
 
+    /// The same environment after this process chose an unavailable-sandbox action.
+    ///
+    /// Takes the exact path `--sandbox-on-unavailable` takes: the value becomes the
+    /// `ZUNO_SANDBOX_ON_UNAVAILABLE` override that configuration discovery reads as a
+    /// trusted layer, and the flag snapshot is re-read so nothing downstream can see the
+    /// old answer. Shared registries are the same `Arc`s, so an environment derived this
+    /// way still owns the background work the original started.
+    #[must_use]
+    pub(crate) fn with_sandbox_on_unavailable(
+        &self,
+        action: crate::command::CliSandboxUnavailableAction,
+    ) -> Self {
+        let mut overrides = self.overrides.clone();
+        overrides.insert(ZUNO_SANDBOX_ON_UNAVAILABLE, action.as_str().to_owned());
+        let resolved = self
+            .resolved
+            .clone()
+            .with(ZUNO_SANDBOX_ON_UNAVAILABLE, action.as_str());
+        let flags = ZunoFlags::read(&resolved);
+        Self {
+            resolved,
+            overrides,
+            extensions: Arc::clone(&self.extensions),
+            background_executions: Arc::clone(&self.background_executions),
+            background_jobs: Arc::clone(&self.background_jobs),
+            background_notifications: self.background_notifications.clone(),
+            flags,
+        }
+    }
+
     /// The complete environment value command implementations should consult.
     #[must_use]
     pub fn resolved(&self) -> &Env {
@@ -319,6 +349,58 @@ mod tests {
         assert_eq!(snapshot.iter().count(), ZUNO_FLAG_NAMES.len());
         assert!(!snapshot.is_empty());
         assert!(snapshot.iter().all(|(_, value)| value.is_none()));
+    }
+
+    #[test]
+    fn choosing_run_unconfined_later_takes_the_same_override_path_as_the_flag() {
+        let globals = GlobalOptions {
+            print_logs: false,
+            log_level: None,
+            sandbox: None,
+            sandbox_on_unavailable: None,
+        };
+        let startup = StartupEnvironment::resolve(&Env::empty(), &globals);
+        assert_eq!(startup.flags.value(ZUNO_SANDBOX_ON_UNAVAILABLE), None);
+
+        let chosen = startup.with_sandbox_on_unavailable(
+            crate::command::CliSandboxUnavailableAction::RunUnconfined,
+        );
+        let flagged = StartupEnvironment::resolve(
+            &Env::empty(),
+            &GlobalOptions {
+                sandbox_on_unavailable: Some(
+                    crate::command::CliSandboxUnavailableAction::RunUnconfined,
+                ),
+                ..globals
+            },
+        );
+
+        assert_eq!(
+            chosen.resolved().value(ZUNO_SANDBOX_ON_UNAVAILABLE),
+            Some("run-unconfined")
+        );
+        assert_eq!(
+            chosen.flags.value(ZUNO_SANDBOX_ON_UNAVAILABLE),
+            Some("run-unconfined")
+        );
+        assert_eq!(
+            chosen.overrides().collect::<Vec<_>>(),
+            flagged.overrides().collect::<Vec<_>>()
+        );
+        assert!(Arc::ptr_eq(chosen.extensions(), startup.extensions()));
+        assert!(Arc::ptr_eq(
+            &chosen.background_executions,
+            &startup.background_executions
+        ));
+        assert!(Arc::ptr_eq(
+            &chosen.background_jobs,
+            &startup.background_jobs
+        ));
+        assert!(
+            chosen
+                .background_notifications
+                .ptr_eq(&startup.background_notifications)
+        );
     }
 
     #[test]

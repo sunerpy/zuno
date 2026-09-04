@@ -57,8 +57,8 @@ use zuno_paths::Env;
 use zuno_permission::Rule;
 use zuno_permission::visibility::permission_key;
 use zuno_sandbox::{
-    NetworkAccess, SandboxMode, SandboxPolicy, SandboxResolution, SandboxResolutionKind,
-    SandboxResolver, SandboxUnavailableAction, SystemSandboxResolver,
+    NetworkAccess, SandboxError, SandboxMode, SandboxPolicy, SandboxResolution,
+    SandboxResolutionKind, SandboxResolver, SandboxUnavailableAction, SystemSandboxResolver,
 };
 use zuno_tool::{
     OutputLimits, PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolUiIntent, erase,
@@ -250,15 +250,16 @@ pub(crate) fn assemble(
     };
     let tooling = SearchTooling::deferred(scope);
     let mut sandbox_notice = None;
-    let shell = shell_visible(selected_profile, selected_agent, &selection).then(|| {
+    let shell = shell_visible(selected_profile, selected_agent, &selection.manifest).then(|| {
         let policy = sandbox_policy(directory, config, selected_profile, &rules)?;
+        let requested_mode = policy.mode();
         let resolver = selection
             .sandbox
             .clone()
             .unwrap_or_else(|| Arc::new(SystemSandboxResolver));
         let resolution = resolver
             .resolve(policy, sandbox_unavailable_action(config))
-            .map_err(to_string)?;
+            .map_err(|error| render_sandbox_error(error, requested_mode))?;
         sandbox_notice = fallback_notice(&resolution);
         let (backend, execution_policy) = resolution.into_execution();
         zuno_tools::shell::ShellTool::with_sandbox_backend(
@@ -593,12 +594,177 @@ fn fallback_notice(resolution: &SandboxResolution) -> Option<String> {
     ))
 }
 
+/// Render a refused sandbox resolution for the surface that opened this composition.
+///
+/// Every cause keeps its `zuno-sandbox` rendering except an unsupported platform: that
+/// one used to be a bare `OS sandbox is not implemented for platform` with nothing to
+/// do about it, and it is the whole story on macOS and Windows. The typed code, the
+/// deployment report and `zuno debug sandbox` are untouched; only this text is.
+fn render_sandbox_error(error: SandboxError, requested_mode: SandboxMode) -> String {
+    match error {
+        SandboxError::UnsupportedPlatform(platform) => {
+            unsupported_platform_refusal(&platform, requested_mode)
+        }
+        other => other.to_string(),
+    }
+}
+
+/// The refusal a user reads when this platform has no confined sandbox backend.
+///
+/// Names the platform, says whether the trusted fallback would apply to this request,
+/// and lists every remedy with the layer that may set it. A write-capable request may
+/// take the `run-unconfined` fallback; a read-only request never falls back, so for it
+/// only an explicit `danger-full-access` request runs natively. Neither is confinement,
+/// and the text says so rather than letting a remedy read like a fix.
+#[must_use]
+pub(crate) fn unsupported_platform_refusal(platform: &str, requested_mode: SandboxMode) -> String {
+    let opening = format!(
+        "OS sandbox is not implemented for platform `{platform}`: {platform} has no confined \
+         sandbox backend, so the Shell tool cannot be registered under the requested \
+         `{requested}` authority.",
+        requested = requested_mode.as_str(),
+    );
+    if requested_mode == SandboxMode::ReadOnly {
+        return format!(
+            "{opening} A read-only request never falls back: `zuno --sandbox-on-unavailable \
+             run-unconfined`, `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`, and a trusted \
+             `\"sandbox\": {{\"onUnavailable\": \"run-unconfined\"}}` do not apply to it. Only an \
+             explicit `danger-full-access` request runs natively (`zuno --sandbox \
+             danger-full-access`, or `sandbox.mode` in a trusted global, managed, environment, \
+             or CLI layer; a project layer cannot select it), and only an Agent whose contract \
+             is write-capable can make that request. That is not confinement: commands run \
+             with the Zuno process user's host authority."
+        );
+    }
+    format!(
+        "{opening} The request is write-capable, so the trusted `run-unconfined` fallback \
+         applies: Shell would run natively with the Zuno process user's host authority while \
+         your permission mode is kept. To continue that way, pass `zuno \
+         --sandbox-on-unavailable run-unconfined`, set \
+         `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`, or set `\"sandbox\": \
+         {{\"onUnavailable\": \"run-unconfined\"}}` in a trusted global, managed, environment, or \
+         CLI configuration layer (a project layer cannot enable it); `zuno --sandbox \
+         danger-full-access` runs natively as well. None of these is confinement."
+    )
+}
+
+/// The situation an interactive TUI start prints before asking its one question.
+#[must_use]
+pub(crate) fn native_execution_offer(platform: &str, permission_mode: &str) -> String {
+    format!(
+        "OS sandbox is not implemented for platform `{platform}`: {platform} has no confined \
+         sandbox backend. The requested `workspace-write` authority is write-capable, so this \
+         session can instead run Shell natively with the Zuno process user's host authority \
+         under permission mode `{permission_mode}`; that is not confinement. Headless runs \
+         choose this with `zuno --sandbox-on-unavailable run-unconfined` or \
+         `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`, and `zuno --sandbox \
+         danger-full-access` runs natively as well."
+    )
+}
+
+/// Typed reason a composition would refuse to register Shell on this host.
+///
+/// Produced by [`sandbox_preflight`] before a host is opened, so a surface can decide
+/// what to do about an unsupported platform from data rather than from the rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnsupportedPlatformRefusal {
+    pub(crate) platform: String,
+    pub(crate) requested_mode: SandboxMode,
+}
+
+/// What a surface does about an [`UnsupportedPlatformRefusal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnsupportedPlatformDecision {
+    /// Nothing is pending; compose as usual.
+    Proceed,
+    /// Ask the user, once, whether this process may run natively.
+    OfferNativeExecution { platform: String },
+    /// Refuse with the actionable text; nothing may prompt.
+    Refuse { message: String },
+}
+
+/// Decide what an unsupported platform means for the surface about to compose.
+///
+/// The offer is made only when every guard holds: the request is write-capable (the
+/// fallback never covers read-only), nobody configured `sandbox.onUnavailable` (an
+/// explicit `deny` from any layer is honoured, and an explicit `run-unconfined` would
+/// already have resolved), and the surface can actually ask. Everything else refuses
+/// with the same text the headless surfaces print.
+#[must_use]
+pub(crate) fn decide_unsupported_platform(
+    refusal: Option<&UnsupportedPlatformRefusal>,
+    configured: Option<ConfigSandboxUnavailableAction>,
+    interactive: bool,
+) -> UnsupportedPlatformDecision {
+    let Some(refusal) = refusal else {
+        return UnsupportedPlatformDecision::Proceed;
+    };
+    let message = unsupported_platform_refusal(&refusal.platform, refusal.requested_mode);
+    if refusal.requested_mode != SandboxMode::WorkspaceWrite || configured.is_some() || !interactive
+    {
+        return UnsupportedPlatformDecision::Refuse { message };
+    }
+    UnsupportedPlatformDecision::OfferNativeExecution {
+        platform: refusal.platform.clone(),
+    }
+}
+
+/// The discovery a production composition performs, without keeping the backend.
+///
+/// On Linux this is the same cached bubblewrap discovery the resolver uses, so a
+/// composition that follows a preflight does not probe the host twice.
+pub(crate) fn system_sandbox_probe(policy: &SandboxPolicy) -> Result<(), SandboxError> {
+    zuno_sandbox::system_backend(policy.workspace(), policy.mode()).map(drop)
+}
+
+/// Whether assembling `selected_profile` would refuse Shell for want of a platform backend.
+///
+/// Runs ahead of [`assemble`] with the same policy, unavailable action and Shell
+/// visibility, so the TUI can ask before raw mode and an agent switch can keep its
+/// host. `probe` stands in for backend discovery so a Linux test can act as a Windows
+/// host. Every other outcome is `None` and reaches assembly unchanged: Shell not
+/// visible, an unbuildable policy, a different failure, an explicit `danger-full-access`
+/// request, or a trusted fallback that would resolve.
+pub(crate) fn sandbox_preflight(
+    directory: &Path,
+    config: &Config,
+    selected_profile: &AgentProfile,
+    manifest: &zuno_harness::ToolManifest,
+    probe: &dyn Fn(&SandboxPolicy) -> Result<(), SandboxError>,
+) -> Option<UnsupportedPlatformRefusal> {
+    if !shell_visible(selected_profile, selected_profile.definition(), manifest) {
+        return None;
+    }
+    let policy = sandbox_policy(
+        directory,
+        config,
+        selected_profile,
+        selected_profile.capabilities().rules(),
+    )
+    .ok()?;
+    let requested_mode = policy.mode();
+    if requested_mode == SandboxMode::DangerFullAccess {
+        return None;
+    }
+    let fallback_would_resolve = requested_mode == SandboxMode::WorkspaceWrite
+        && sandbox_unavailable_action(config) == SandboxUnavailableAction::RunUnconfined;
+    match probe(&policy) {
+        Err(SandboxError::UnsupportedPlatform(platform)) if !fallback_would_resolve => {
+            Some(UnsupportedPlatformRefusal {
+                platform,
+                requested_mode,
+            })
+        }
+        Ok(()) | Err(_) => None,
+    }
+}
+
 fn shell_visible(
     selected_profile: &AgentProfile,
     selected_agent: &zuno_catalog::agent::Agent,
-    selection: &ToolSelection<'_>,
+    manifest: &zuno_harness::ToolManifest,
 ) -> bool {
-    selection.manifest.contains(BuiltinSlot::Shell)
+    manifest.contains(BuiltinSlot::Shell)
         && selected_profile.capabilities().tool_available("shell")
         && selected_agent
             .tools

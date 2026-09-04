@@ -429,6 +429,10 @@ fn provider_config(base_url: &str) -> String {
         // `OS sandbox is not implemented for platform 'macos'` and refuses to start.
         // That refusal is the intended fail-closed behaviour, which is why the smoke
         // has to make the trusted choice explicitly rather than expect it to pass.
+        // The refusal now names the platform and lists the remedies, and an
+        // interactive `zuno` start offers the trusted choice once before raw mode
+        // for a write-capable request — but the smoke is headless (`run`, no TTY),
+        // and headless surfaces never ask, so the choice still has to be made here.
         //
         // This belongs here and NOT in a workflow environment variable: `invoke`
         // calls `env_clear()` and forwards only the map built by `turn_variables`, so
