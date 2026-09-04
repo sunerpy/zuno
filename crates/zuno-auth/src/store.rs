@@ -154,7 +154,11 @@
 //! that names the path.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read as _, Write as _};
+use std::io::{ErrorKind, Read as _};
+// `Write` is used only by the Unix atomic-rename path; the Windows path goes through
+// `zuno_atomic_file::replace` and would report the import as unused under `-D warnings`.
+#[cfg(unix)]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
