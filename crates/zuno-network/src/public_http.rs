@@ -14,9 +14,10 @@ use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use url::{Host, Url};
 
-use crate::proxy_transport::{RouteKind, SessionTransport};
+use crate::proxy_transport::{RouteKind, SessionTransport, TransportFailure};
 
 const IPV4ONLY_ARPA: &str = "ipv4only.arpa";
 const RFC_6052_PREFIX_LENGTHS: [usize; 6] = [32, 40, 48, 56, 64, 96];
@@ -167,6 +168,10 @@ impl fmt::Debug for PublicHttpClient {
         formatter
             .debug_struct("PublicHttpClient")
             .field("policy", &self.policy)
+            // The transport's own `Debug` redacts proxy credentials and reports the
+            // establishment budget, which is the field an operator needs when a fetch
+            // gives up on one address sooner than expected.
+            .field("transport", &self.transport)
             .finish_non_exhaustive()
     }
 }
@@ -194,6 +199,31 @@ impl PublicHttpClient {
             #[cfg(test)]
             connector_addresses: None,
         }
+    }
+
+    /// Bound the connection-establishment phase for one validated address.
+    ///
+    /// The transport tries every validated address in turn. This is how long a single
+    /// address may spend on TCP, proxy negotiation, and the TLS handshake before the next
+    /// address gets its turn; waiting for response headers is deliberately excluded,
+    /// because that is response latency and the caller's own request deadline owns it.
+    ///
+    /// A caller whose total request budget is smaller than the shipped 10s default should
+    /// set this, otherwise one silent address can consume that whole budget and the
+    /// remaining validated addresses are never attempted. The value is clamped into
+    /// `[100ms, 10s]`: a caller can only tighten the window one stalled address holds,
+    /// never widen it, and a degenerate zero cannot produce a transport that never
+    /// connects.
+    ///
+    /// It also tightens the whole sequence. The establishment budget for one request is
+    /// three times this value, capped at 30s regardless, so setting 1s here bounds the
+    /// entire address walk at 3s. That ceiling exists because the number of addresses is the
+    /// size of a DNS answer the destination's own zone chooses; no caller and no answer can
+    /// raise it.
+    #[must_use]
+    pub fn with_establish_timeout(mut self, per_address: Duration) -> Self {
+        self.transport.set_establish_timeout(per_address);
+        self
     }
 
     /// The credential-free route currently selected for `target`.
@@ -314,11 +344,7 @@ impl PublicHttpClient {
             .transport
             .get(target, headers, &addresses, connector_addresses)
             .await
-            .map_err(|source| PublicHttpError::Transport {
-                endpoint: target.diagnostic(),
-                route: route.as_str(),
-                source,
-            })?;
+            .map_err(|failure| transport_error(failure, target.diagnostic(), route.as_str()))?;
         Ok(PublicHttpResponse {
             response,
             endpoint: target.diagnostic(),
@@ -466,7 +492,7 @@ pub enum PublicHttpError {
         #[source]
         source: io::Error,
     },
-    /// Sending the request failed.
+    /// Sending the request failed for a reason a later attempt may survive.
     #[error("request to {endpoint} failed through {route}")]
     Transport {
         /// Redacted endpoint.
@@ -474,6 +500,17 @@ pub enum PublicHttpError {
         /// Credential-free route label.
         route: &'static str,
         /// Socket, proxy, TLS, or HTTP failure.
+        #[source]
+        source: io::Error,
+    },
+    /// Sending the request failed for a reason repeating it cannot fix.
+    #[error("request to {endpoint} failed permanently through {route}")]
+    PermanentTransport {
+        /// Redacted endpoint.
+        endpoint: DiagnosticEndpoint,
+        /// Credential-free route label.
+        route: &'static str,
+        /// Certificate, proxy-credential, or protocol rejection.
         #[source]
         source: io::Error,
     },
@@ -499,9 +536,33 @@ pub enum PublicHttpError {
 
 impl PublicHttpError {
     /// Whether repeating the same target may succeed later.
+    ///
+    /// A rejected certificate, a refused proxy credential, and a protocol violation are
+    /// answers rather than outages, so the transport reports them as
+    /// [`Self::PermanentTransport`] and they are never retried.
     #[must_use]
     pub const fn is_transient(&self) -> bool {
         matches!(self, Self::Resolve { .. } | Self::Transport { .. })
+    }
+}
+
+fn transport_error(
+    failure: TransportFailure,
+    endpoint: DiagnosticEndpoint,
+    route: &'static str,
+) -> PublicHttpError {
+    if failure.is_permanent() {
+        PublicHttpError::PermanentTransport {
+            endpoint,
+            route,
+            source: failure.into_io(),
+        }
+    } else {
+        PublicHttpError::Transport {
+            endpoint,
+            route,
+            source: failure.into_io(),
+        }
     }
 }
 
@@ -787,10 +848,153 @@ mod tests {
         resolver: Arc<dyn HostResolver>,
         connector_address: SocketAddr,
     ) -> PublicHttpClient {
+        test_client_over(resolver, vec![connector_address])
+    }
+
+    fn test_client_over(
+        resolver: Arc<dyn HostResolver>,
+        connector_addresses: Vec<SocketAddr>,
+    ) -> PublicHttpClient {
         let mut client = PublicHttpClient::with_resolver(resolver, PublicHttpPolicy::default());
         client.transport = SessionTransport::direct_for_tests();
-        client.connector_addresses = Some(vec![connector_address]);
+        client.connector_addresses = Some(connector_addresses);
         client
+    }
+
+    /// A listener that accepts, reads, and then answers a TLS ClientHello with a page.
+    ///
+    /// This is the shape of a captive portal or a transparent interception box on 443.
+    async fn plaintext_on_a_tls_port() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an interception fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let served = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut discard = [0_u8; 4096];
+                    let _ = stream.read(&mut discard).await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://portal.test/\r\n\r\n")
+                        .await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        });
+        (address, served)
+    }
+
+    /// The whole retry decision for an intercepted TLS port, end to end.
+    ///
+    /// The oracle is a real rustls handshake rather than a hand-built `io::Error`, so it
+    /// also pins the typed downcast in `classify_tls_error` against a tokio-rustls change
+    /// that stopped carrying `rustls::Error` as the source.
+    #[tokio::test]
+    async fn an_intercepted_tls_port_is_not_retried() {
+        let (portal, served) = plaintext_on_a_tls_port().await;
+        let client = test_client(
+            Arc::new(FixedResolver(vec![public_address(portal.port())])),
+            portal,
+        );
+        let error = client
+            .get(
+                PublicTarget::parse("https://origin.test/path").expect("public target"),
+                HeaderMap::new(),
+            )
+            .await
+            .expect_err("a plaintext page cannot complete a TLS handshake");
+        assert!(
+            matches!(error, PublicHttpError::PermanentTransport { .. }),
+            "{error:?}"
+        );
+        assert!(
+            !error.is_transient(),
+            "retrying an interception on backoff only hides it behind a delay: {error:?}"
+        );
+        served.abort();
+    }
+
+    /// An address that accepts the TCP connection and then stalls must yield its turn.
+    ///
+    /// The stall is inside the TLS handshake, which is the case the round-1 bound missed:
+    /// only `TcpStream::connect` was bounded, so this fixture held the entire request.
+    #[tokio::test]
+    async fn a_stalled_handshake_yields_to_the_next_validated_address() {
+        let stalling = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a stalling fixture");
+        let stalled = stalling.local_addr().expect("fixture address");
+        let accepted = tokio::spawn(async move {
+            // Accept and never answer: a load balancer that lost its upstream.
+            let _held = stalling.accept().await.expect("accept the ClientHello");
+            std::future::pending::<()>().await;
+        });
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port to learn a free one");
+        let refused = closed.local_addr().expect("listener address");
+        drop(closed);
+
+        let client = test_client_over(
+            Arc::new(FixedResolver(vec![public_address(stalled.port())])),
+            vec![stalled, refused],
+        );
+        let mut client = client;
+        client
+            .transport
+            .set_establish_timeout_for_tests(Duration::from_millis(250));
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.get(
+                PublicTarget::parse("https://origin.test/path").expect("public target"),
+                HeaderMap::new(),
+            ),
+        )
+        .await
+        .expect("a stalled handshake must not hold the whole request")
+        .expect_err("neither address can serve the request");
+        let PublicHttpError::Transport { source, .. } = &error else {
+            panic!("a stalled address and a refused port are both weather: {error:?}");
+        };
+        assert_eq!(
+            source.kind(),
+            io::ErrorKind::ConnectionRefused,
+            "the second validated address must get its turn: {source:?}"
+        );
+        assert!(error.is_transient(), "{error:?}");
+        accepted.abort();
+    }
+
+    #[tokio::test]
+    async fn a_caller_can_only_tighten_the_establishment_budget() {
+        let client = PublicHttpClient::new();
+        let tightened = format!(
+            "{:?}",
+            client
+                .clone()
+                .with_establish_timeout(Duration::from_secs(2))
+        );
+        assert!(
+            tightened.contains("2s"),
+            "a caller-supplied budget must reach the transport: {tightened}"
+        );
+        let widened = format!(
+            "{:?}",
+            client
+                .clone()
+                .with_establish_timeout(Duration::from_secs(600))
+        );
+        assert!(
+            widened.contains("10s"),
+            "no caller may widen how long one stalled address holds the request: {widened}"
+        );
+        let degenerate = format!("{:?}", client.with_establish_timeout(Duration::ZERO));
+        assert!(
+            degenerate.contains("100ms"),
+            "a zero budget must not produce a transport that never connects: {degenerate}"
+        );
     }
 
     #[tokio::test]
@@ -1016,6 +1220,37 @@ mod tests {
                 }
             ));
         });
+    }
+
+    #[test]
+    fn permanent_transport_failures_leave_the_retryable_surface() {
+        let transient = transport_error(
+            TransportFailure::Transient(io::Error::from(io::ErrorKind::ConnectionReset)),
+            DiagnosticEndpoint("https://origin.example/probe".to_owned()),
+            "direct",
+        );
+        assert!(
+            matches!(transient, PublicHttpError::Transport { .. }),
+            "{transient:?}"
+        );
+        assert!(transient.is_transient());
+
+        let permanent = transport_error(
+            TransportFailure::Permanent(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "proxy rejected the supplied credentials",
+            )),
+            DiagnosticEndpoint("https://origin.example/probe".to_owned()),
+            "http_proxy",
+        );
+        assert!(
+            matches!(permanent, PublicHttpError::PermanentTransport { .. }),
+            "{permanent:?}"
+        );
+        assert!(
+            !permanent.is_transient(),
+            "a rejected credential must not be retried on backoff"
+        );
     }
 
     struct Nat64Resolver;
