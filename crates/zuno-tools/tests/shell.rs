@@ -9,13 +9,19 @@ use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
 use std::collections::BTreeMap;
 #[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt as _;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+#[cfg(unix)]
 use std::path::Path;
 #[cfg(unix)]
 use std::process::Command;
 #[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 #[cfg(unix)]
@@ -670,6 +676,427 @@ async fn shell_history_rewrite_refuses_a_repository_redirect_from_the_effective_
     assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), original_head);
 }
 
+/// Puts a fake `git` where the tool will find it first.
+///
+/// The pre-flight reads and the command itself both resolve `git` through the environment
+/// the tool hands the child, so replacing `PATH` is what lets a test decide how long one
+/// of those reads takes.
+#[cfg(unix)]
+struct OnlyFakeGitOnPath {
+    bin: String,
+}
+
+#[cfg(unix)]
+#[async_trait]
+impl ShellEnvHook for OnlyFakeGitOnPath {
+    async fn env(&self, _input: ShellEnvInput) -> Result<BTreeMap<String, String>, ToolError> {
+        Ok(BTreeMap::from([("PATH".to_owned(), self.bin.clone())]))
+    }
+}
+
+#[cfg(unix)]
+fn write_fake_git(bin: &Path, body: &str) {
+    let path = bin.join("git");
+    // The child's `PATH` holds this directory alone, so the script names its own search
+    // path instead of inheriting one it cannot rely on.
+    std::fs::write(&path, format!("#!/bin/sh\nPATH=/usr/bin:/bin\n{body}"))
+        .expect("write the fake git");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fake git executable");
+}
+
+/// A pre-flight `git` read leaves the runtime free to poll everything else.
+///
+/// `zuno serve`, `zuno acp`, and `zuno run` all drive a current-thread runtime — the
+/// flavour this test runs on — so waiting on git synchronously parked every session in
+/// the process: no provider stream advanced, no SSE frame was written and no interrupt
+/// was observed for as long as the untracked-file walk took.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pre_flight_git_read_leaves_the_runtime_polling() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let bin = tempfile::tempdir().expect("fake git directory");
+    write_fake_git(
+        bin.path(),
+        "if [ \"$1\" = rev-parse ]; then sleep 2; exit 1; fi\nexit 0\n",
+    );
+    let tool =
+        support::sandbox::shell_tool(workspace.path()).with_env_hook(Arc::new(OnlyFakeGitOnPath {
+            bin: bin.path().display().to_string(),
+        }));
+
+    let started = Instant::now();
+    let woke_after = Arc::new(AtomicU64::new(0));
+    let elapsed = Arc::clone(&woke_after);
+    let timer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        elapsed.store(
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+    });
+
+    tool.run(
+        params("git commit --quiet -m wip"),
+        context(Arc::new(NeverInterrupted)),
+    )
+    .await
+    .expect("the fake git reports no repository, so the commit is not the tool's to refuse");
+    timer.await.expect("the timer task joins");
+
+    let woke_after = woke_after.load(Ordering::SeqCst);
+    assert!(
+        woke_after < 1_000,
+        "a 100ms timer resolved after {woke_after}ms: the two seconds git spent answering \
+         `rev-parse` were two seconds this runtime polled nothing else"
+    );
+}
+
+/// A pre-flight `git` read that never answers refuses the call instead of allowing it.
+///
+/// These reads decide whether a commit delivers Zuno's own generated state, so a read
+/// that outlives its ceiling leaves the repository state unknown, not empty. Reading it
+/// as "nothing staged" would turn a `.git` on a stalled mount into permission to commit
+/// whatever is there, which is the one outcome a timeout must not buy.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pre_flight_git_read_that_never_answers_refuses_the_commit() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let bin = tempfile::tempdir().expect("fake git directory");
+    let pid_file = workspace.path().join("git.pid");
+    // `exec` so the recorded pid is the process that outlives the ceiling, and the
+    // teardown assertion below is about that process rather than a shell that wrapped it.
+    write_fake_git(
+        bin.path(),
+        &format!(
+            "printf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    );
+    let tool = support::sandbox::shell_tool(workspace.path())
+        .with_env_hook(Arc::new(OnlyFakeGitOnPath {
+            bin: bin.path().display().to_string(),
+        }))
+        .with_git_ceiling(Duration::from_millis(200));
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        tool.run(
+            params("git commit --quiet -m wip"),
+            context(Arc::new(NeverInterrupted)),
+        ),
+    )
+    .await
+    .expect("an unanswered pre-flight read must settle at its ceiling, not hang the call")
+    .expect_err("an unknown repository state must not admit the commit");
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains("did not answer within the 200ms"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("it was not run"), "{rendered}");
+
+    wait_for_process_exit(read_pid(&pid_file)).await;
+}
+
+/// A user's interrupt ends a hung pre-flight `git` read instead of waiting out the ceiling.
+///
+/// The ceiling made the reads survivable for the rest of the process; it did nothing for
+/// the user in front of this call, who had no way to stop it — and putting the read in its
+/// own process group took away the terminal `SIGINT` that used to reach a hung pre-flight
+/// git under `zuno run`. `ctx.interrupt` is the cancellation every client surface has, so
+/// it is the one the reads have to answer.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_interrupt_ends_a_hung_pre_flight_git_read() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let bin = tempfile::tempdir().expect("fake git directory");
+    let pid_file = workspace.path().join("git.pid");
+    write_fake_git(
+        bin.path(),
+        &format!(
+            "printf '%s' \"$$\" > '{}'\nexec sleep 60\n",
+            pid_file.display()
+        ),
+    );
+    let tool = support::sandbox::shell_tool(workspace.path())
+        .with_env_hook(Arc::new(OnlyFakeGitOnPath {
+            bin: bin.path().display().to_string(),
+        }))
+        // Far beyond the assertion window, so only the interrupt can end this call.
+        .with_git_ceiling(Duration::from_secs(600));
+    let interrupt = Arc::new(FirableInterrupt::default());
+    let fires = Arc::clone(&interrupt);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        fires.fire();
+    });
+
+    let started = Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        tool.run(params("git commit --quiet -m wip"), context(interrupt)),
+    )
+    .await
+    .expect(
+        "an interrupted pre-flight read must settle when the user asks, not when its \
+         ten-minute ceiling expires",
+    )
+    .expect_err("an interrupted call has no repository answer to report");
+
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains("shell command was interrupted"),
+        "{rendered}"
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_secs(5),
+        "the call took {waited:?} to answer an interrupt fired after 300ms"
+    );
+    // Abandoning the read is not enough: the group it leads has to go with it, or a
+    // credential helper git spawned outlives the cancellation with nothing left to reap it.
+    wait_for_process_exit(read_pid(&pid_file)).await;
+}
+
+/// The pre-flight ceiling covers the whole phase, not each read on its own.
+///
+/// `refuse_generated_delivery` makes up to four reads and `validate_expected_git_head` one
+/// more. Given a ceiling each, a `.git` that answers slowly but does answer left the call
+/// unresponsive for five times the number the ceiling advertises — with the 30s default,
+/// about two and a half minutes.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_pre_flight_ceiling_covers_the_phase_rather_than_each_read() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let bin = tempfile::tempdir().expect("fake git directory");
+    // Every read answers, and answers well inside a 500ms per-read ceiling. Only a shared
+    // deadline can notice that four of them do not fit inside one.
+    write_fake_git(
+        bin.path(),
+        &format!(
+            "sleep 0.2\nif [ \"$1\" = rev-parse ]; then printf '%s' '{}'; fi\nexit 0\n",
+            workspace.path().display()
+        ),
+    );
+    let tool = support::sandbox::shell_tool(workspace.path())
+        .with_env_hook(Arc::new(OnlyFakeGitOnPath {
+            bin: bin.path().display().to_string(),
+        }))
+        .with_git_ceiling(Duration::from_millis(500));
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        tool.run(
+            params("git add -A && git commit --quiet -m wip"),
+            context(Arc::new(NeverInterrupted)),
+        ),
+    )
+    .await
+    .expect("the phase must settle")
+    .expect_err("four 200ms reads do not fit in a 500ms phase, so the state is unknown");
+
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains("did not answer within the 500ms"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("it was not run"), "{rendered}");
+}
+
+/// A byte no UTF-8 sequence can start with, which is what makes an entry unspellable.
+///
+/// `0xE9` is `é` in Latin-1, so this is not a synthetic hostile input: it is what a
+/// `LANG=en_US.ISO-8859-1` login, a Windows console codepage, or a filename from a
+/// pre-Unicode archive puts in the environment of the process that launches Zuno.
+#[cfg(unix)]
+const LATIN1_E_ACUTE: u8 = 0xE9;
+
+/// An environment variable value that is not Unicode.
+#[cfg(unix)]
+fn non_unicode_value() -> OsString {
+    let mut bytes = b"caf".to_vec();
+    bytes.push(LATIN1_E_ACUTE);
+    OsString::from_vec(bytes)
+}
+
+/// An environment variable *name* that is not Unicode.
+///
+/// Set in the child so `std::env::vars` has something to panic on, and deliberately not
+/// followed into the command: `/bin/sh` drops an environment name that is not a valid shell
+/// identifier before `env` can print it (measured: absent through `sh -c env`, present
+/// through a direct `exec` of `env`), so no command run through a shell can witness it.
+/// What Zuno does with it is pinned on [`zuno_tools::shell`]'s own withholding decision at
+/// unit level.
+#[cfg(unix)]
+fn non_unicode_name() -> OsString {
+    let mut bytes = b"LOCALE_NAME_PROBE_".to_vec();
+    bytes.push(LATIN1_E_ACUTE);
+    OsString::from_vec(bytes)
+}
+
+/// This process's environment entries that cannot be spelled as UTF-8.
+///
+/// Asserted before anything else in the child: on a platform or a libc that refused to pass
+/// the bytes through, every assertion about them would hold vacuously.
+#[cfg(unix)]
+fn unspellable_environment_entries() -> Vec<(OsString, OsString)> {
+    std::env::vars_os()
+        .filter(|(name, value)| name.to_str().is_none() || value.to_str().is_none())
+        .collect()
+}
+
+/// The `#[test]` this test re-execs itself as.
+///
+/// A `--exact` filter that matches nothing is not an error to libtest: it prints
+/// `ok. 0 passed; 0 failed; 35 filtered out` and exits 0, so a parent that asserts only
+/// `status.success()` passes without a single assertion having run. Renaming the test
+/// below is therefore enough to disarm it silently. Two things stop that here: the parent
+/// asserts this name appears in the binary's own `--list`, and it insists on seeing
+/// [`WITHHOLDING_OBSERVED`], which only the child's last line can print.
+#[cfg(unix)]
+const WITHHOLDING_TEST: &str =
+    "zunos_own_environment_is_absent_from_a_composed_commands_environment";
+
+/// The child's proof that it ran to the end of its assertions.
+#[cfg(unix)]
+const WITHHOLDING_OBSERVED: &str = "zuno-tools: the composed command's environment was observed";
+
+/// Zuno's own environment is not part of the environment a model-composed command reads.
+///
+/// The assertions run in a child of this test binary because the variables have to be
+/// real: only a process that actually carries `ZUNO_CONFIG_CONTENT` shows what a `shell`
+/// call can read, and setting one in this process is `unsafe`, which this workspace
+/// forbids.
+#[cfg(unix)]
+#[tokio::test]
+async fn zunos_own_environment_is_absent_from_a_composed_commands_environment() {
+    const CHILD: &str = "ZUNO_TOOLS_WITHHOLDING_CHILD";
+    const LEAKED: &str = "sk-live-must-not-leak";
+
+    if std::env::var_os(CHILD).is_none() {
+        let binary = std::env::current_exe().expect("this test binary");
+        // Before the run that matters: a filter naming no test is a silent pass, so the
+        // name is checked against the binary's own catalogue first.
+        let listed = Command::new(&binary)
+            .args(["--list", "--format", "terse"])
+            .output()
+            .expect("list this binary's tests");
+        let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+        assert!(
+            listed.contains(&format!("{WITHHOLDING_TEST}: test")),
+            "`{WITHHOLDING_TEST}` is not a test in this binary, so the re-exec below would \
+             filter to nothing and pass without asserting anything:\n{listed}"
+        );
+
+        let child = Command::new(&binary)
+            .args(["--exact", WITHHOLDING_TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(
+                "ZUNO_CONFIG_CONTENT",
+                format!(r#"{{"provider":{{"anthropic":{{"options":{{"apiKey":"{LEAKED}"}}}}}}}}"#),
+            )
+            .env(
+                "ZUNO_AUTH_CONTENT",
+                format!(r#"{{"anthropic":{{"key":"{LEAKED}"}}}}"#),
+            )
+            // Named nowhere in the tool: whatever Zuno reads next is withheld without
+            // anyone having had to anticipate that it holds a secret.
+            .env("ZUNO_PROVIDER_TOKEN", LEAKED)
+            .env("ZUNO_WORKSPACE_ID", "wsp_1")
+            .env("ZUNO_PID", std::process::id().to_string())
+            // The bare marker, so the child can pin that it survived the namespace rule.
+            .env("ZUNO", "1")
+            // An entry Zuno cannot spell, in both polarities. `std::env::vars` *panics* on
+            // a name or value that is not Unicode, and the panic unwound the turn rather
+            // than the call: in a process launched with one Latin-1 byte anywhere in its
+            // environment, every `shell` call failed and no message named why.
+            .env("LOCALE_PROBE", non_unicode_value())
+            .env("ZUNO_PROBE", non_unicode_value())
+            .env(non_unicode_name(), non_unicode_value())
+            .output()
+            .expect("re-run this test with Zuno's own environment set");
+        let stdout = String::from_utf8_lossy(&child.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&child.stderr).into_owned();
+        assert!(
+            child.status.success(),
+            "the child's assertions must hold:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains(WITHHOLDING_OBSERVED),
+            "the child never reported observing a composed command's environment, so \
+             nothing was asserted:\n{stdout}\n{stderr}"
+        );
+        return;
+    }
+
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let tool = support::sandbox::shell_tool(workspace.path());
+
+    // The exfiltration this closes is one `env` away from being a network request.
+    let output = tool
+        .run(params("env"), context(Arc::new(NeverInterrupted)))
+        .await
+        .expect("reading the environment succeeds");
+
+    assert!(!output.output.contains(LEAKED), "{}", output.output);
+    // Identity is withheld too. `ZUNO_PID` is the address of every value above: on this
+    // unconfined path `tr '\0' '\n' < /proc/$ZUNO_PID/environ` reads them back out of the
+    // Zuno process, so handing the pid to the command is handing over the documents.
+    for withheld in ["ZUNO_PID=", "ZUNO_WORKSPACE_ID=", "ZUNO_CONFIG_CONTENT="] {
+        assert!(
+            !output.output.contains(withheld),
+            "{withheld} reached the command:\n{}",
+            output.output
+        );
+    }
+    // The bare markers are outside the namespace, so "am I under Zuno?" still answers.
+    assert!(
+        output.output.lines().any(|line| line == "ZUNO=1"),
+        "{}",
+        output.output
+    );
+
+    // The entries that cannot be spelled. Read back as bytes rather than out of
+    // `output.output`, which is a `String` and would have replaced them with U+FFFD before
+    // the assertion could see them.
+    let unspellable = unspellable_environment_entries();
+    assert!(
+        unspellable.len() >= 3,
+        "this process carries {} environment entries that are not Unicode, not the three the \
+         parent set, so every assertion below would hold without the hostile case existing",
+        unspellable.len()
+    );
+    assert!(
+        unspellable
+            .iter()
+            .any(|(name, _)| name.as_encoded_bytes().starts_with(b"LOCALE_NAME_PROBE_")),
+        "the entry whose *name* is not Unicode did not survive the spawn, so the panic this \
+         covers would not be reachable from here"
+    );
+    tool.run(params("env > raw.env"), context(Arc::new(NeverInterrupted)))
+        .await
+        .expect("writing the environment out succeeds");
+    let raw = std::fs::read(workspace.path().join("raw.env")).expect("read the environment back");
+    let mut preserved = b"LOCALE_PROBE=".to_vec();
+    preserved.extend_from_slice(&non_unicode_value().into_vec());
+    assert!(
+        raw.windows(preserved.len())
+            .any(|window| window == preserved),
+        "the entry Zuno cannot spell did not reach the command unchanged. Dropping it would \
+         silently change the environment the command runs in; preserving it is the decision \
+         this pins:\n{}",
+        String::from_utf8_lossy(&raw)
+    );
+    assert!(
+        !raw.windows(b"ZUNO_PROBE".len())
+            .any(|window| window == b"ZUNO_PROBE"),
+        "a withheld name reached the command because its value was not Unicode:\n{}",
+        String::from_utf8_lossy(&raw)
+    );
+    println!("{WITHHOLDING_OBSERVED}");
+}
+
 #[test]
 fn shell_description_bounds_git_apply_and_defines_non_destructive_recovery() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
@@ -1057,6 +1484,72 @@ async fn shell_oversized_output_is_detected_and_persisted_in_the_shared_store() 
         output.output
     );
     assert_eq!(window.cursor, window.total);
+}
+
+/// A generated root the caller already resolved is the one the tool writes under.
+///
+/// This entry point exists so an async caller can resolve the root off-reactor:
+/// `zuno_paths::generated_root` spawns up to three synchronous `git rev-parse` calls, each
+/// bounded at ten seconds inside `zuno_paths`, and a current-thread runtime — `zuno run`,
+/// `zuno acp`, `zuno serve` — has no other thread to run them on, so constructing the tool
+/// stalled every session in the process for up to thirty seconds against a `.git` on a
+/// stalled mount. Handing the answer in is only worth anything if the answer is used, so
+/// what is pinned here is the observable consequence: the artefact of an oversized command
+/// lands under the supplied root, and under the default it lands under the workspace, which
+/// is what would happen if the parameter were quietly ignored.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_explicitly_resolved_generated_root_is_where_the_shell_tool_saves_output() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let elsewhere = tempfile::tempdir().expect("generated root");
+    let limits = OutputLimits {
+        max_lines: 1,
+        max_bytes: 4,
+    };
+
+    let injected =
+        support::sandbox::shell_tool_with_generated_root(workspace.path(), elsewhere.path())
+            .with_output_limits(limits);
+    let output = injected
+        .execute(
+            json!({
+                "command": "printf 'one\\ntwo\\n'",
+                ACCEPT_LARGE_OUTPUT_KEY: true,
+            }),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect("explicitly accepted command output succeeds");
+    let paths = output.output_paths();
+    let saved = std::path::Path::new(paths.first().expect("stored output path"));
+    let expected = elsewhere.path().join(".zuno").join("tool-output");
+    assert!(
+        saved.starts_with(&expected),
+        "{} is not under the generated root that was supplied ({})",
+        saved.display(),
+        expected.display()
+    );
+
+    // Unset, the tool resolves the root itself, which for a workspace that is not a
+    // repository is the workspace: the parameter changed where output went.
+    let default = support::sandbox::shell_tool(workspace.path()).with_output_limits(limits);
+    let output = default
+        .execute(
+            json!({
+                "command": "printf 'one\\ntwo\\n'",
+                ACCEPT_LARGE_OUTPUT_KEY: true,
+            }),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect("explicitly accepted command output succeeds");
+    let paths = output.output_paths();
+    let saved = std::path::Path::new(paths.first().expect("stored output path"));
+    assert!(
+        !saved.starts_with(elsewhere.path()),
+        "{} landed under the injected root without anyone asking",
+        saved.display()
+    );
 }
 
 /// A command that succeeded and produced too much output is still a successful result.
@@ -1448,14 +1941,229 @@ fn read_pid(path: &Path) -> u32 {
         .expect("numeric pid")
 }
 
+/// Whether `pid` still names a process, reaped or not.
+///
+/// `ps -p` rather than `/proc/{pid}`: `/proc` is Linux, so a `cfg(unix)` helper that probes
+/// it makes every macOS run of the assertions below vacuously true — the path never exists,
+/// so the first check passes without having observed anything.
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// The probe itself has to be able to see a live process.
+///
+/// `ps` missing, or refusing, would make [`process_exists`] answer `false` for every pid,
+/// and every "it is gone" assertion below would pass without having observed anything —
+/// the same vacuous shape as probing `/proc` on macOS. This process's own pid is the one
+/// case whose answer is known.
+#[cfg(unix)]
+fn assert_process_probe_works() {
+    assert!(
+        process_exists(std::process::id()),
+        "`ps -p` cannot see this test process, so it cannot witness any other process \
+         either: the exit assertions would be vacuous"
+    );
+}
+
 #[cfg(unix)]
 async fn wait_for_process_exit(pid: u32) {
-    let proc_path = std::path::PathBuf::from(format!("/proc/{pid}"));
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while proc_path.exists() {
+    assert_process_probe_works();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while process_exists(pid) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap_or_else(|_| panic!("process {pid} survived group termination"));
+}
+
+/// The exact input the goal store recorded as unreachable: a workspace edit made by
+/// running a command.
+///
+/// `crates/zuno-goal/src/store_tests.rs` names it verbatim —
+/// `shell {"command": "sed -i 's/foo/bar/' crates/zuno-parser/src/lib.rs"}` — and its
+/// premise is that the call reports no written path, so the store is told nothing happened
+/// and a user-created goal completes with zero evidence. This is the report that premise
+/// waited for.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_that_edits_a_file_reports_the_path_it_wrote() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let source = workspace.path().join("crates/zuno-parser/src");
+    std::fs::create_dir_all(&source).expect("create the source tree");
+    let subject = source.join("lib.rs");
+    std::fs::write(&subject, "fn foo() {}\n").expect("write the file the command edits");
+    let tool = support::sandbox::shell_tool(workspace.path());
+
+    let output = tool
+        .run(
+            params("sed -i 's/foo/bar/' crates/zuno-parser/src/lib.rs"),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect("the edit succeeds");
+
+    let reported = output.written_paths();
+    let canonical = subject.canonicalize().expect("canonical subject");
+    assert_eq!(
+        reported,
+        vec![zuno_paths::wire_path(&canonical)],
+        "the command edited {} and reported {reported:?}",
+        canonical.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&subject).expect("read back"),
+        "fn bar() {}\n",
+        "the command really did rewrite the file"
+    );
+}
+
+/// A command that only reads reports nothing, so the report cannot escalate a goal that
+/// changed nothing.
+///
+/// The report is two `stat`s that disagree, not a guess from the command line: `cat` and
+/// `grep` name the same file the `sed` above named, and neither is reported.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_that_only_reads_reports_no_written_path() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let subject = workspace.path().join("lib.rs");
+    std::fs::write(&subject, "fn foo() {}\n").expect("write the file the command reads");
+    let tool = support::sandbox::shell_tool(workspace.path());
+
+    for command in ["cat lib.rs", "grep foo lib.rs", "wc -l lib.rs"] {
+        let output = tool
+            .run(params(command), context(Arc::new(NeverInterrupted)))
+            .await
+            .expect("the read succeeds");
+        assert!(
+            output.written_paths().is_empty(),
+            "`{command}` reported a write: {:?}",
+            output.written_paths()
+        );
+    }
+}
+
+/// A created file is reported and a deleted one is not.
+///
+/// [`zuno_tool::METADATA_WRITTEN_PATHS_KEY`] means "this file is now here to be re-read",
+/// so a path the command removed is deliberately absent: a consumer that re-read it would
+/// find nothing, and the tools that already report writes report deletions nowhere either.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_created_file_is_reported_and_a_removed_one_is_not() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let doomed = workspace.path().join("doomed.txt");
+    std::fs::write(&doomed, "gone soon\n").expect("write the file the command removes");
+    let tool = support::sandbox::shell_tool(workspace.path());
+
+    let created = tool
+        .run(
+            params("touch fresh.txt"),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect("the create succeeds");
+    let fresh = workspace
+        .path()
+        .join("fresh.txt")
+        .canonicalize()
+        .expect("canonical fresh path");
+    assert_eq!(created.written_paths(), vec![zuno_paths::wire_path(&fresh)]);
+
+    let removed = tool
+        .run(params("rm doomed.txt"), context(Arc::new(NeverInterrupted)))
+        .await
+        .expect("the removal succeeds");
+    assert!(
+        removed.written_paths().is_empty(),
+        "a removed path was reported as written: {:?}",
+        removed.written_paths()
+    );
+    assert!(!doomed.exists(), "the command really did remove the file");
+}
+
+/// A target the shell would expand is not reported, and the boundary is stated rather than
+/// guessed at.
+///
+/// Resolving `*.rs` or `$OUT` here would mean re-implementing the shell's own expansion,
+/// and a report that names a path the command never touched is worse than a short one: a
+/// consumer re-reads it and retires evidence over it. So the report is a lower bound, and
+/// this pins where the bound is — the same command with the name written out is reported.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_target_the_shell_expands_is_left_out_of_the_report() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let subject = workspace.path().join("lib.rs");
+    std::fs::write(&subject, "fn foo() {}\n").expect("write the file the command edits");
+    let tool = support::sandbox::shell_tool(workspace.path());
+
+    let expanded = tool
+        .run(
+            params("sed -i 's/foo/bar/' *.rs"),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect("the edit succeeds");
+
+    assert_eq!(
+        std::fs::read_to_string(&subject).expect("read back"),
+        "fn bar() {}\n",
+        "the glob really did reach the file"
+    );
+    assert!(
+        expanded.written_paths().is_empty(),
+        "a glob was resolved into a reported path: {:?}",
+        expanded.written_paths()
+    );
+
+    // The same write, named statically, is reported: the gap is expansion, not the tool.
+    let named = tool
+        .run(
+            params("sed -i 's/bar/baz/' lib.rs"),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect("the edit succeeds");
+    assert_eq!(
+        named.written_paths(),
+        vec![zuno_paths::wire_path(
+            &subject.canonicalize().expect("canonical subject")
+        )]
+    );
+}
+
+/// A command that wrote and then failed still reports what it wrote.
+///
+/// The exit status decides whether the *command* succeeded; it says nothing about whether
+/// the workspace changed. A consumer told nothing here would go on citing a verification
+/// receipt that no longer describes the file.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_that_wrote_before_failing_still_reports_the_write() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let subject = workspace.path().join("half-done.txt");
+    let tool = support::sandbox::shell_tool(workspace.path());
+
+    let output = tool
+        .run(
+            params("touch half-done.txt && cat missing.txt"),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect("a non-zero exit is a result, not an error");
+
+    assert_eq!(
+        output.written_paths(),
+        vec![zuno_paths::wire_path(
+            &subject.canonicalize().expect("canonical subject")
+        )],
+        "the file the command created before failing was not reported"
+    );
 }

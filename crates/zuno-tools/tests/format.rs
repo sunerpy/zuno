@@ -1360,3 +1360,284 @@ async fn the_failure_report_names_the_formatter_the_command_and_the_reason() {
         "no failures means no metadata key"
     );
 }
+
+// ---------------------------------------------------------------------------
+// What a ceiling reaches, and what the environment can do to a formatter
+// ---------------------------------------------------------------------------
+
+/// Whether `pid` still names a process, reaped or not.
+///
+/// `ps -p` rather than `/proc/{pid}`, which exists only on Linux and would make the
+/// assertions below vacuously true on macOS.
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// The probe itself has to be able to see a live process.
+///
+/// `ps` missing, or refusing, would make [`process_exists`] answer `false` for every pid
+/// and every "it is gone" assertion would pass without having observed anything. This
+/// process's own pid is the one case whose answer is known.
+#[cfg(unix)]
+fn assert_process_probe_works() {
+    assert!(
+        process_exists(std::process::id()),
+        "`ps -p` cannot see this test process, so it cannot witness any other process \
+         either: the exit assertions would be vacuous"
+    );
+}
+
+#[cfg(unix)]
+async fn read_pid_when_written(path: &Path) -> u32 {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && let Ok(pid) = raw.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} was never written", path.display()))
+}
+
+#[cfg(unix)]
+async fn assert_process_stopped(label: &str, pid: u32) {
+    assert_process_probe_works();
+    let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+        while process_exists(pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        stopped.is_ok(),
+        "{label} (pid {pid}) outlived the ceiling: the abandoned formatter's process group \
+         was never torn down"
+    );
+}
+
+/// A formatter abandoned at the ceiling takes everything it started with it.
+///
+/// `kill_on_drop(true)` reaches the **direct child only**: dropping the wait future
+/// `SIGKILL`s the formatter and leaves every process it started running. `process_group(0)`
+/// makes that worse rather than better — the group is no longer Zuno's, so neither the
+/// terminal's `SIGINT` nor Zuno's own group teardown reaches it — so a `prettier` wrapper's
+/// `node` daemon, a `rustfmt` shim's `sleep`, or a formatter's language server survived
+/// every edit for the rest of the login session with nothing left to reap it. Two comments
+/// beside the spawn asserted the opposite.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_formatter_abandoned_at_the_ceiling_takes_its_helpers_with_it() {
+    let (root, bin, subject) = workspace();
+    let leader_pid = root.path().join("formatter.pid");
+    let helper_pid = root.path().join("helper.pid");
+    // The helper is a child of the formatter, so it joins the group `process_group(0)` gave
+    // the formatter. `exec` so the leader pid is the process that outlives the ceiling.
+    let stub = script(
+        &bin,
+        "stub-hang-group",
+        &format!(
+            "sleep 60 &\nprintf '%s' \"$!\" > '{helper}'\nprintf '%s' \"$$\" > '{leader}'\nexec sleep 60\n",
+            helper = helper_pid.display(),
+            leader = leader_pid.display()
+        ),
+    );
+    let runtime = formatters(
+        root.path(),
+        &serde_json::to_string(&json!({
+            "stub": entry(Some(command(&stub, &["$FILE"])), Some(&[".txt"]), None, None),
+        }))
+        .expect("config json"),
+        Arc::new(StubPrograms::default().with("stub-hang-group", &stub)),
+    )
+    .with_ceiling(Duration::from_millis(300));
+
+    let leader = read_pid_when_written(&leader_pid);
+    let helper = read_pid_when_written(&helper_pid);
+    let outcome = runtime.format_all(&subject);
+    let (leader, helper, outcome) = tokio::join!(leader, helper, outcome);
+
+    assert_eq!(outcome.failures.len(), 1);
+    assert_eq!(
+        outcome.failures[0].kind,
+        FailureKind::TimedOut { after_seconds: 0 }
+    );
+    assert_process_stopped("the abandoned formatter", leader).await;
+    assert_process_stopped("the helper the formatter spawned", helper).await;
+}
+
+/// The `#[test]` the environment test re-execs itself as.
+///
+/// A `--exact` filter that matches nothing is not an error to libtest: it prints
+/// `ok. 0 passed; 0 failed; N filtered out` and exits 0, so a parent that asserts only
+/// `status.success()` passes without a single assertion having run. Renaming the test would
+/// be enough to disarm it silently, so the parent asserts this name appears in the binary's
+/// own `--list` and insists on seeing [`ENVIRONMENT_OBSERVED`].
+#[cfg(unix)]
+const ENVIRONMENT_TEST: &str = "an_environment_entry_zuno_cannot_spell_still_formats_the_file";
+
+/// The child's proof that it ran to the end of its assertions.
+#[cfg(unix)]
+const ENVIRONMENT_OBSERVED: &str = "zuno-tools: the formatter's environment was observed";
+
+/// A byte no UTF-8 sequence can start with, which is what makes an entry unspellable.
+///
+/// `0xE9` is `é` in Latin-1, so this is not a synthetic hostile input: it is what a
+/// `LANG=en_US.ISO-8859-1` login, a Windows console codepage, or a filename from a
+/// pre-Unicode archive puts into the environment of the process that launches Zuno.
+#[cfg(unix)]
+const LATIN1_E_ACUTE: u8 = 0xE9;
+
+#[cfg(unix)]
+fn non_unicode(prefix: &[u8]) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt as _;
+    let mut bytes = prefix.to_vec();
+    bytes.push(LATIN1_E_ACUTE);
+    std::ffi::OsString::from_vec(bytes)
+}
+
+/// An entry Zuno cannot spell costs neither the formatting run nor the turn.
+///
+/// `std::env::vars` **panics** on any entry whose name or value is not Unicode, and this
+/// panic was not confined to the formatter: it unwound the turn. So in a process launched
+/// with one Latin-1 byte anywhere in its environment — a `LANG` a distribution still ships,
+/// a `PWD` under a pre-Unicode directory name — *every* post-edit format failed, and no
+/// message named the reason. The decision this pins is that such an entry is **passed
+/// through unchanged** rather than dropped: dropping it silently changes the environment
+/// the operator's formatter runs in, and a formatter that reads it would then behave one
+/// way under Zuno and another way in a terminal.
+///
+/// The assertions run in a child of this test binary because the entry has to be real, and
+/// setting one in this process is `unsafe`, which this workspace forbids.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_environment_entry_zuno_cannot_spell_still_formats_the_file() {
+    const CHILD: &str = "ZUNO_TOOLS_FORMATTER_ENVIRONMENT_CHILD";
+
+    if std::env::var_os(CHILD).is_none() {
+        let binary = std::env::current_exe().expect("this test binary");
+        let listed = std::process::Command::new(&binary)
+            .args(["--list", "--format", "terse"])
+            .output()
+            .expect("list this binary's tests");
+        let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+        assert!(
+            listed.contains(&format!("{ENVIRONMENT_TEST}: test")),
+            "`{ENVIRONMENT_TEST}` is not a test in this binary, so the re-exec below would \
+             filter to nothing and pass without asserting anything:\n{listed}"
+        );
+
+        let child = std::process::Command::new(&binary)
+            .args(["--exact", ENVIRONMENT_TEST, "--nocapture"])
+            .env(CHILD, "1")
+            // A value Zuno cannot spell, under a name a POSIX shell still exports. This is
+            // the entry the child follows all the way into the formatter.
+            .env("LOCALE_PROBE", non_unicode(b"caf"))
+            // The same shape inside Zuno's namespace: the withholding rule has to hold for
+            // a value Zuno cannot spell, or an unspellable value would be the way around it.
+            .env("ZUNO_PROBE", non_unicode(b"caf"))
+            // A *name* Zuno cannot spell. `std::env::vars` panics on this one exactly as it
+            // does on the values above, which is what the child's first assertion checks it
+            // is carrying. It is deliberately not followed into the formatter: `/bin/sh`
+            // drops an environment name that is not a valid shell identifier before `env`
+            // can print it (measured: absent through `sh -c env`, present through a direct
+            // `exec` of `env`), so a formatter stub written as a shell script cannot witness
+            // it. What happens to it inside Zuno is pinned at unit level instead, on
+            // `withhold_zuno_environment`.
+            .env(non_unicode(b"LOCALE_NAME_PROBE_"), non_unicode(b"caf"))
+            .output()
+            .expect("re-run this test with an environment entry that is not Unicode");
+        let stdout = String::from_utf8_lossy(&child.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&child.stderr).into_owned();
+        assert!(
+            child.status.success(),
+            "the child's assertions must hold:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains(ENVIRONMENT_OBSERVED),
+            "the child never reported observing the formatter's environment, so nothing was \
+             asserted:\n{stdout}\n{stderr}"
+        );
+        return;
+    }
+
+    // Vacuity check first: on a platform or libc that refused to pass the bytes through,
+    // every assertion below would hold without the hostile case ever existing.
+    let unspellable: Vec<_> = std::env::vars_os()
+        .filter(|(name, value)| name.to_str().is_none() || value.to_str().is_none())
+        .collect();
+    assert!(
+        unspellable.len() >= 3,
+        "this process carries {} environment entries that are not Unicode, not the three the \
+         parent set, so nothing below would be tested",
+        unspellable.len()
+    );
+    assert!(
+        unspellable
+            .iter()
+            .any(|(name, _)| name.as_encoded_bytes().starts_with(b"LOCALE_NAME_PROBE_")),
+        "the entry whose *name* is not Unicode did not survive the spawn, so the panic this \
+         test exists for would not be reachable from here"
+    );
+
+    let (root, bin, subject) = workspace();
+    let dump = root.path().join("formatter.env");
+    let stub = script(
+        &bin,
+        "stub-env",
+        &format!(
+            "{LAST_ARGUMENT}env > '{dump}'\nprintf '%s' '{AFTER}' > \"$target\"\n",
+            dump = dump.display()
+        ),
+    );
+    let runtime = formatters(
+        root.path(),
+        &serde_json::to_string(&json!({
+            "stub": entry(Some(command(&stub, &["$FILE"])), Some(&[".txt"]), None, None),
+        }))
+        .expect("config json"),
+        Arc::new(StubPrograms::default().with("stub-env", &stub)),
+    );
+
+    let outcome = runtime.format_all(&subject).await;
+    assert!(
+        outcome.failures.is_empty(),
+        "an unspellable environment entry cost the formatting run: {:?}",
+        outcome.failures
+    );
+    assert!(outcome.changed);
+    assert_eq!(
+        std::fs::read_to_string(&subject).expect("read back"),
+        AFTER,
+        "the formatter did not actually run"
+    );
+
+    // Read the dump as bytes: a `String` would have replaced the entry with U+FFFD before
+    // the assertion could see it.
+    let raw = std::fs::read(&dump).expect("the formatter recorded its environment");
+    let mut preserved = Vec::new();
+    preserved.extend_from_slice(b"LOCALE_PROBE=caf");
+    preserved.push(LATIN1_E_ACUTE);
+    assert!(
+        raw.windows(preserved.len())
+            .any(|window| window == preserved),
+        "the entry Zuno cannot spell did not reach the formatter unchanged:\n{}",
+        String::from_utf8_lossy(&raw)
+    );
+    assert!(
+        !raw.windows(b"ZUNO_PROBE".len())
+            .any(|window| window == b"ZUNO_PROBE"),
+        "a withheld name reached the formatter because its value was not Unicode:\n{}",
+        String::from_utf8_lossy(&raw)
+    );
+    println!("{ENVIRONMENT_OBSERVED}");
+}

@@ -606,6 +606,76 @@ async fn batch_oversized_subcall_output_is_withheld_whole_and_still_counts_as_su
     assert!(output.output.contains("Completed: 1 succeeded, 0 failed"));
 }
 
+/// A generated root the caller already resolved is the one `build` uses.
+///
+/// [`ToolRegistryBuilder::build`] resolved it itself with `zuno_paths::generated_root`,
+/// which spawns up to three synchronous `git rev-parse` calls — each bounded at ten seconds
+/// inside `zuno_paths`, none of them off-thread — so building a registry from an async fn on
+/// a current-thread runtime stalled the whole process for up to thirty seconds against a
+/// `.git` on a stalled mount. `build` cannot be async (it hands out `Arc<dyn Tool>` through
+/// `Arc::new_cyclic`), so the caller resolves the root in one `spawn_blocking` and supplies
+/// it. Pinned here as the observable consequence rather than as the absence of a call: the
+/// artefact of an oversized sub-call lands under the supplied root, and without the setter
+/// it does not.
+#[tokio::test]
+async fn an_explicitly_resolved_generated_root_is_where_the_registry_saves_output() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let elsewhere = tempfile::tempdir().expect("generated root");
+    let files = FileTools::new(root.path()).expect("create file tools");
+    let injected = ToolRegistryBuilder::new(
+        root.path(),
+        files,
+        RegistryFlags {
+            experimental_code_mode: true,
+            ..RegistryFlags::default()
+        },
+    )
+    .with_harness_tools(vec![Arc::new(LargeTool) as CustomTool])
+    .with_generated_root(elsewhere.path())
+    .build();
+
+    let output = injected
+        .execute(
+            "execute",
+            json!({
+                "tool_calls": [{ "tool": "large", "intent": "exercise budget" }]
+            }),
+            context(Arc::new(zuno_tool::AllowAll)),
+        )
+        .await
+        .expect("the batch reports a per-call withheld notice");
+
+    let expected = elsewhere.path().join(".zuno").join("tool-output");
+    let expected = expected.display().to_string();
+    assert!(
+        output.output.contains(&expected),
+        "the withheld notice names a path outside the generated root that was supplied \
+         ({expected}):\n{}",
+        output.output
+    );
+
+    // Unset, `build` resolves the root itself, which for a workspace that is not a
+    // repository is the workspace: the setter changed where output went.
+    let default = registry(root.path(), vec![Arc::new(LargeTool)]);
+    let output = default
+        .execute(
+            "execute",
+            json!({
+                "tool_calls": [{ "tool": "large", "intent": "exercise budget" }]
+            }),
+            context(Arc::new(zuno_tool::AllowAll)),
+        )
+        .await
+        .expect("the batch reports a per-call withheld notice");
+    assert!(
+        !output
+            .output
+            .contains(elsewhere.path().to_str().expect("utf-8 path")),
+        "output landed under the injected root without anyone asking:\n{}",
+        output.output
+    );
+}
+
 /// A sub-tool that fails with a cause two links deep, like an MCP proxy relaying a
 /// server's rejection of a call the transport had already refused.
 struct NestedFailureTool;

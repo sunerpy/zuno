@@ -14,12 +14,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::process::Command;
 use tree_sitter::{Node, Parser};
 use zuno_error::ToolError;
 use zuno_paths::GeneratedDirectory;
@@ -34,8 +35,8 @@ use zuno_sandbox::{
     SandboxResolutionKind,
 };
 use zuno_tool::{
-    ExitAuthority, OutputLimits, PermissionAsk, ReceiptOutcome, Tool, ToolContext, ToolOutput,
-    ToolOutputStore, VerificationReceipt,
+    ExitAuthority, InterruptHandle, OutputLimits, PermissionAsk, ReceiptOutcome, Tool, ToolContext,
+    ToolOutput, ToolOutputStore, VerificationReceipt,
 };
 
 const TOOL_ID: &str = "shell";
@@ -407,6 +408,28 @@ impl ShellEnvHook for NoopShellEnv {
     }
 }
 
+/// How long a call's pre-flight `git` reads may take *in total* before it is refused.
+///
+/// The reads decide whether a commit is allowed, so this ceiling is not a licence to
+/// proceed without an answer: one that expires fails the call rather than reporting an
+/// empty repository. Thirty seconds is far longer than an untracked-file walk needs on a
+/// large worktree and far shorter than a session will spend on a `.git` that lives on a
+/// stalled network mount, which is where the untimed reads hung forever.
+///
+/// Per phase rather than per read. `refuse_generated_delivery` makes up to four reads and
+/// `validate_expected_git_head` one more, and five independent thirty-second ceilings is
+/// two and a half minutes — long enough that a waiting user cannot tell a bounded
+/// pre-flight from the hang it replaced. [`GitReadBudget`] takes the deadline once, when
+/// the phase starts, and every read inside the phase races that one instant.
+///
+/// A total, not a bound on the reads alone. Stopping a read that did not answer takes time
+/// of its own, and giving that the full ceiling a second time meant a configured thirty
+/// seconds admitted a sixty-second phase — twice what this constant, the refusal message
+/// and the documentation all say. The reads race `ceiling` minus
+/// [`crate::child_process::teardown_ceiling`], the teardown gets that reserve, and the two
+/// together are what this number bounds.
+const GIT_READ_CEILING: Duration = Duration::from_secs(30);
+
 pub struct ShellTool {
     workspace: PathBuf,
     shell: CommandShell,
@@ -414,6 +437,7 @@ pub struct ShellTool {
     output_store: ToolOutputStore,
     output_limits: OutputLimits,
     hard_ceiling: Duration,
+    git_ceiling: Duration,
     background_executions: Arc<BackgroundExecutionService>,
     /// The generated directory the background service writes into, when its root is
     /// one. `None` for a service a caller rooted somewhere of its own choosing, which
@@ -448,15 +472,48 @@ impl ShellTool {
         sandbox: Arc<dyn SandboxBackend>,
         sandbox_policy: SandboxPolicy,
     ) -> io::Result<Self> {
+        Self::with_sandbox_backend_and_generated_root(
+            workspace,
+            configured,
+            sandbox,
+            sandbox_policy,
+            None,
+        )
+    }
+
+    /// The same construction, with the generated root already resolved.
+    ///
+    /// `generated_root` is for a caller that is on a reactor. Resolving it costs up to
+    /// three `git rev-parse` calls that are synchronous — bounded at ten seconds each in
+    /// `zuno_paths`, so up to thirty seconds of a blocked *thread* — and this constructor
+    /// is not async and cannot be, so an async caller resolves
+    /// `zuno_paths::generated_root` off-reactor (one `tokio::task::spawn_blocking`) and
+    /// hands the answer in here. It must be resolved from the same directory this
+    /// constructor canonicalizes `workspace` to, because that is the worktree the exclude
+    /// patterns are anchored in.
+    ///
+    /// `None` keeps the lazy resolution, which is right for every caller that was never on
+    /// a reactor: a CLI one-shot, a test, or any synchronous host.
+    pub fn with_sandbox_backend_and_generated_root(
+        workspace: &Path,
+        configured: Option<&str>,
+        sandbox: Arc<dyn SandboxBackend>,
+        sandbox_policy: SandboxPolicy,
+        generated_root: Option<PathBuf>,
+    ) -> io::Result<Self> {
         let workspace = workspace.canonicalize()?;
         let shell = zuno_pty::shells::command(configured)?;
         // Generated state is rooted at the worktree, because that is where the exclude
         // patterns are anchored and where `classify` looks; joining the project
         // directory onto a session's own directory put it somewhere nothing covered.
-        // Resolved once because it spawns git, and only these two roots move: the
-        // workspace itself still decides the sandbox boundary, the default working
-        // directory, and what a relative `workdir` resolves against.
-        let generated_root = zuno_paths::generated_root(&workspace);
+        // Resolved once because it spawns git — bounded now, but still synchronously, so
+        // this line blocks its thread for up to thirty seconds on a `.git` that lives on a
+        // stalled mount and must not run on a current-thread reactor; an async caller
+        // supplies `generated_root` instead. Only these two roots move: the workspace
+        // itself still decides the sandbox boundary, the default working directory, and
+        // what a relative `workdir` resolves against.
+        let generated_root =
+            generated_root.unwrap_or_else(|| zuno_paths::generated_root(&workspace));
         let output_store = ToolOutputStore::in_worktree(&generated_root);
         let background_directory = GeneratedDirectory::in_worktree(
             &generated_root,
@@ -473,6 +530,7 @@ impl ShellTool {
             output_store,
             output_limits: OutputLimits::default(),
             hard_ceiling: crate::timeout::DEFAULT_HARD_CEILING,
+            git_ceiling: GIT_READ_CEILING,
             background_executions,
             background_directory: Some(background_directory),
             sandbox,
@@ -501,6 +559,13 @@ impl ShellTool {
     #[must_use]
     pub fn with_hard_ceiling(mut self, ceiling: Duration) -> Self {
         self.hard_ceiling = ceiling;
+        self
+    }
+
+    /// Shorten the pre-flight `git` phase ceiling, for a test that must watch one expire.
+    #[must_use]
+    pub const fn with_git_ceiling(mut self, ceiling: Duration) -> Self {
+        self.git_ceiling = ceiling;
         self
     }
 
@@ -571,13 +636,23 @@ impl ShellTool {
             return Err(interrupted());
         }
         let env = self.environment(&cwd, &ctx).await?;
+        // Every read in the pre-flight phase races the interrupt and shares one deadline.
+        // Bounding the reads restored progress for every *other* session; it did nothing
+        // for this call, which sat through up to five reads — five independent ceilings —
+        // with no way for its own user to stop it, and `process_group(0)` took the
+        // terminal's `SIGINT` away from them, so `ctx.interrupt` is the only cancellation
+        // left that reaches them. The race lives inside `bounded_git_read` rather than
+        // around this phase because that is where the child is: see [`GitReadBudget`].
+        let budget = GitReadBudget::starting_now(self.git_ceiling, ctx.interrupt.as_ref());
         let git_head = validate_expected_git_head(
             &risk_assessment,
             params.expected_git_head.as_deref(),
             &cwd,
             &env,
-        )?;
-        refuse_generated_delivery(&analysis, self.syntax(), &cwd, &env)?;
+            budget,
+        )
+        .await?;
+        refuse_generated_delivery(&analysis, self.syntax(), &cwd, &env, budget).await?;
         if ctx.is_interrupted() {
             return Err(interrupted());
         }
@@ -620,6 +695,14 @@ impl ShellTool {
             // mid-session has to come back excluded rather than come back bare.
             directory.ensure().map_err(failed)?;
         }
+        // Taken before the command starts, because the report is the difference between
+        // two observations rather than a guess from the command line: see [`WriteWatch`].
+        let writes = WriteWatch::before(
+            &analysis,
+            &cwd,
+            &self.workspace,
+            &authorization.writable_roots,
+        );
         let (execution, mut lease) = self
             .background_executions
             .start_leased(input)
@@ -686,14 +769,18 @@ impl ShellTool {
                     }
                 };
                 lease.disarm();
-                return self.cancelled_output(
-                    &verification,
-                    foreground_timeout_ms,
-                    &settled,
-                    captured,
-                    &ctx.session_id,
-                    accept_large_output,
-                );
+                // A cancelled command has usually already written something, which is the
+                // whole reason its captured output is kept above.
+                return self
+                    .cancelled_output(
+                        &verification,
+                        foreground_timeout_ms,
+                        &settled,
+                        captured,
+                        &ctx.session_id,
+                        accept_large_output,
+                    )
+                    .map(|output| writes.report(output));
             }
         };
         if waited.timed_out {
@@ -722,6 +809,9 @@ impl ShellTool {
             .finish_foreground(&execution.id)
             .map_err(failed)?;
         lease.disarm();
+        // Reported for a failing exit status too: a command that wrote three files and then
+        // failed on the fourth changed the workspace, and a consumer told nothing would go
+        // on citing a check that no longer describes those files.
         self.completed_output(
             &verification,
             foreground_timeout_ms,
@@ -730,6 +820,7 @@ impl ShellTool {
             &ctx.session_id,
             accept_large_output,
         )
+        .map(|output| writes.report(output))
     }
 
     fn syntax(&self) -> ShellSyntax {
@@ -875,10 +966,16 @@ impl ShellTool {
         &self,
         cwd: &Path,
         ctx: &ToolContext,
-    ) -> Result<BTreeMap<String, String>, ToolError> {
-        // Zuno's own secrets are removed before the hook runs, so a host that wants a
+    ) -> Result<BTreeMap<OsString, OsString>, ToolError> {
+        // Zuno's own environment is removed before the hook runs, so a host that wants a
         // credential in the tool environment can still put one back deliberately.
-        let mut env = withhold_zuno_secrets(std::env::vars());
+        //
+        // `vars_os`, not `vars`: `std::env::vars` panics on any entry whose name or value
+        // is not Unicode, and one such entry is ordinary on Linux and normal on Windows.
+        // The panic was not confined to the call — it unwound the turn — so every `shell`
+        // call in a process launched with, say, a Latin-1 filename in an environment
+        // variable failed the same way, for a reason no message named.
+        let mut env = withhold_zuno_environment(std::env::vars_os());
         let extra = self
             .env_hook
             .env(ShellEnvInput {
@@ -887,14 +984,20 @@ impl ShellTool {
                 call_id: ctx.call_id.clone(),
             })
             .await?;
-        env.extend(extra);
+        // A hook value is host-supplied configuration, which is `String` by construction;
+        // it joins the inherited map as `OsString` so the whole environment has one type.
+        env.extend(
+            extra
+                .into_iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+        );
         Ok(env)
     }
 
     fn execution_input(
         &self,
         request: ShellRequest<'_>,
-        env: BTreeMap<String, String>,
+        env: BTreeMap<OsString, OsString>,
         ctx: &ToolContext,
         lifecycle: ShellExecutionLifecycle,
         authorization: &ShellAuthorization,
@@ -905,10 +1008,7 @@ impl ShellTool {
             request.exit_policy,
             request.command,
         );
-        let environment = env
-            .into_iter()
-            .map(|(key, value)| (key.into(), value.into()))
-            .collect();
+        let environment = env;
         let mut policy = self.sandbox_policy.clone();
         if policy.mode() == SandboxMode::WorkspaceWrite {
             policy = policy
@@ -1743,24 +1843,158 @@ fn leading_assignments(source: &str) -> impl Iterator<Item = &str> {
         .map(|(name, _)| name)
 }
 
-/// The paths one git list command reports, read from its `-z` output.
+/// What every pre-flight `git` read of a single call is allowed to spend, and what may
+/// stop it early.
 ///
-/// `-z` because a path is bytes: git quotes anything unusual in its default output,
-/// and a quoted path is not a path. `None` when git could not answer at all, which is
-/// how "there is no repository here" arrives.
-fn git_reported_paths(
+/// Carries the deadline rather than a per-read duration so the phase, not each read, is
+/// what is bounded; `ceiling` travels with it only so the refusal can name the number a
+/// reader would have to look up otherwise.
+///
+/// The interrupt travels with it because the cancellation and the teardown have to be
+/// decided in the same place. Racing `ctx.interrupt` a level up, around the phase, reads
+/// better but drops the read's future the moment the interrupt wins — and dropping it
+/// reaps the leader, so whether the group is torn down or orphaned would come down to
+/// which arm `tokio::select!` happened to poll first. The reads are the only awaits in the
+/// phase, so racing here loses nothing and keeps the teardown deterministic.
+///
+/// `ceiling` is the whole phase, teardown included, which is why the deadline the reads
+/// race is earlier than it. Stopping a read that did not answer costs time too — one
+/// `kill(2)` on Unix, a `taskkill /t` on Windows — and giving that the full ceiling again
+/// made a configured 30s bound admit a 60s phase. The reserve is carved out of the phase
+/// instead: see [`crate::child_process::teardown_ceiling`].
+#[derive(Clone, Copy)]
+struct GitReadBudget<'a> {
+    /// The whole phase, reads and teardown together. Named in the refusal, because it is
+    /// the number an operator configured.
+    ceiling: Duration,
+    /// The tail of `ceiling` reserved for stopping a read that did not answer.
+    teardown: Duration,
+    /// When the reads themselves must be done: `ceiling` minus `teardown`.
+    deadline: tokio::time::Instant,
+    interrupt: &'a dyn InterruptHandle,
+}
+
+impl<'a> GitReadBudget<'a> {
+    /// Starts the phase now.
+    fn starting_now(ceiling: Duration, interrupt: &'a dyn InterruptHandle) -> Self {
+        Self {
+            ceiling,
+            teardown: crate::child_process::teardown_ceiling(ceiling),
+            deadline: tokio::time::Instant::now() + crate::child_process::work_window(ceiling),
+            interrupt,
+        }
+    }
+}
+
+/// Why one bounded read stopped.
+enum GitReadOutcome {
+    /// git answered, well or badly.
+    Answered(io::Result<std::process::Output>),
+    /// The phase deadline passed first.
+    Expired,
+    /// The user cancelled the call first.
+    Interrupted,
+}
+
+/// One pre-flight `git` read, bounded so a repository that never answers cannot park
+/// the reactor.
+///
+/// Awaited rather than waited on: `zuno serve`, `zuno acp`, and `zuno run` all drive a
+/// current-thread runtime, so a synchronous spawn-and-wait here stopped every other
+/// session's provider stream, SSE frame, and interrupt for as long as git took — and
+/// with `.git` on a stalled mount, permanently.
+///
+/// `Err` when git could not be started or did not answer before `budget`'s deadline.
+/// Neither is an answer about the repository, and a caller that reads either as "nothing
+/// to report" turns a hung read into permission to commit.
+async fn bounded_git_read(
     cwd: &Path,
-    env: &BTreeMap<String, String>,
+    env: &BTreeMap<OsString, OsString>,
     arguments: &[&str],
-) -> Result<Option<Vec<PathBuf>>, ToolError> {
-    let output = Command::new("git")
+    budget: GitReadBudget<'_>,
+) -> Result<std::process::Output, ToolError> {
+    let mut process = Command::new("git");
+    process
         .args(arguments)
         .current_dir(cwd)
         .env_clear()
         .envs(env)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(failed)?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // A dedicated group so the read leads one, which is what lets the teardown below stop
+    // a git that spawned helpers of its own together with them. It also takes the read out
+    // of Zuno's process group, so a terminal `SIGINT` no longer reaches it; the phase
+    // races `ctx.interrupt` instead, which is a cancellation every client surface has and
+    // a foreground process group was not.
+    #[cfg(unix)]
+    process.process_group(0);
+    let child = process.spawn().map_err(failed)?;
+    // Registered while the child is certainly alive: on Unix this validates that the pid
+    // leads its own group, and after the read is reaped the pid names nothing.
+    let group = crate::child_process::group_of(&child);
+    // Pinned rather than moved into `tokio::time::timeout`, because the order of the
+    // teardown is the whole point. `timeout` drops the future it wraps before it returns,
+    // and dropping this one runs `kill_on_drop`, which `SIGKILL`s *and reaps* the leader —
+    // and a group whose leader has been reaped can no longer be named, so the helpers
+    // would be signalled at nothing. Pinning keeps the child alive across the group kill;
+    // the drop at the end of this function is what then reaps it.
+    let read = child.wait_with_output();
+    tokio::pin!(read);
+    let outcome = tokio::select! {
+        output = &mut read => GitReadOutcome::Answered(output),
+        () = tokio::time::sleep_until(budget.deadline) => GitReadOutcome::Expired,
+        () = budget.interrupt.notified() => GitReadOutcome::Interrupted,
+    };
+    match outcome {
+        GitReadOutcome::Answered(output) => output.map_err(failed),
+        // Both non-answers tear the group down first, for the same reason: the read is
+        // about to be abandoned, and whatever git started beside it has nothing else that
+        // will ever stop it.
+        GitReadOutcome::Expired => {
+            crate::child_process::stop_process_group(
+                group,
+                budget.teardown,
+                "an expired pre-flight git read",
+            )
+            .await;
+            Err(failed(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "`git {}` did not answer within the {:?} this command's pre-flight \
+                     repository reads share, so the repository state it depends on is \
+                     unknown; it was not run",
+                    arguments.join(" "),
+                    budget.ceiling
+                ),
+            )))
+        }
+        GitReadOutcome::Interrupted => {
+            crate::child_process::stop_process_group(
+                group,
+                budget.teardown,
+                "a cancelled pre-flight git read",
+            )
+            .await;
+            Err(interrupted())
+        }
+    }
+}
+
+/// The paths one git list command reports, read from its `-z` output.
+///
+/// `-z` because a path is bytes: git quotes anything unusual in its default output,
+/// and a quoted path is not a path. `None` when git answered that it cannot do this
+/// here, which is how "there is no repository" arrives; a read that never answered is
+/// an error instead, because an unknown repository is not an empty one.
+async fn git_reported_paths(
+    cwd: &Path,
+    env: &BTreeMap<OsString, OsString>,
+    arguments: &[&str],
+    budget: GitReadBudget<'_>,
+) -> Result<Option<Vec<PathBuf>>, ToolError> {
+    let output = bounded_git_read(cwd, env, arguments, budget).await?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -1821,11 +2055,12 @@ fn git_reported_paths(
 /// [`ToolError::InvalidArgs`] when a commit retargets its repository, and
 /// [`ToolError::Failed`] carrying every generated path with the reason it exists and the
 /// remedy, when a commit would deliver one.
-fn refuse_generated_delivery(
+async fn refuse_generated_delivery(
     analysis: &ShellAnalysis,
     syntax: ShellSyntax,
     cwd: &Path,
-    env: &BTreeMap<String, String>,
+    env: &BTreeMap<OsString, OsString>,
+    budget: GitReadBudget<'_>,
 ) -> Result<(), ToolError> {
     let Some(delivery) = chain_delivery(analysis, syntax) else {
         return Ok(());
@@ -1844,7 +2079,8 @@ fn refuse_generated_delivery(
              workdir instead"
         )));
     }
-    let Some(worktree) = git_reported_paths(cwd, env, &["rev-parse", "--show-toplevel"])?
+    let Some(worktree) = git_reported_paths(cwd, env, &["rev-parse", "--show-toplevel"], budget)
+        .await?
         .and_then(|paths| paths.into_iter().next())
     else {
         return Ok(());
@@ -1864,7 +2100,9 @@ fn refuse_generated_delivery(
             "--name-only",
             "-z",
         ],
-    )?
+        budget,
+    )
+    .await?
     .unwrap_or_default();
     if let Some(scope) = &delivery.staged.scope {
         let pathspecs = scope.pathspecs();
@@ -1878,7 +2116,11 @@ fn refuse_generated_delivery(
                 "--",
             ];
             arguments.extend(pathspecs.iter().copied());
-            delivered.extend(git_reported_paths(cwd, env, &arguments)?.unwrap_or_default());
+            delivered.extend(
+                git_reported_paths(cwd, env, &arguments, budget)
+                    .await?
+                    .unwrap_or_default(),
+            );
         }
         if delivery.staged.untracked {
             // `--full-name` for the same reason `diff.relative=false` is set above: without
@@ -1893,7 +2135,11 @@ fn refuse_generated_delivery(
                 "--",
             ];
             arguments.extend(pathspecs.iter().copied());
-            delivered.extend(git_reported_paths(cwd, env, &arguments)?.unwrap_or_default());
+            delivered.extend(
+                git_reported_paths(cwd, env, &arguments, budget)
+                    .await?
+                    .unwrap_or_default(),
+            );
         }
     }
     zuno_paths::refuse_generated_state(&worktree, &delivered).map_err(|refusal| {
@@ -1904,11 +2150,12 @@ fn refuse_generated_delivery(
     })
 }
 
-fn validate_expected_git_head(
+async fn validate_expected_git_head(
     assessment: &RiskAssessment,
     expected: Option<&str>,
     cwd: &Path,
-    env: &BTreeMap<String, String>,
+    env: &BTreeMap<OsString, OsString>,
+    budget: GitReadBudget<'_>,
 ) -> Result<Option<String>, ToolError> {
     if !assessment.requires_expected_git_head() {
         return Ok(None);
@@ -1918,6 +2165,10 @@ fn validate_expected_git_head(
             .iter()
             .any(|variable| key.eq_ignore_ascii_case(variable))
     }) {
+        // Lossy only to *name* the variable in the refusal. The decision above compares the
+        // real `OsStr`, so a name Zuno cannot spell is still refused, and a lossy spelling
+        // is never what the comparison sees.
+        let variable = variable.to_string_lossy();
         return Err(invalid(format!(
             "{variable} may not be set for a local Git history rewrite; select the repository \
              with the Shell workdir"
@@ -1935,14 +2186,7 @@ fn validate_expected_git_head(
             "expectedGitHead must be a full 40- or 64-character hexadecimal object id",
         ));
     }
-    let output = Command::new("git")
-        .args(["rev-parse", "--verify", "HEAD"])
-        .current_dir(cwd)
-        .env_clear()
-        .envs(env)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(failed)?;
+    let output = bounded_git_read(cwd, env, &["rev-parse", "--verify", "HEAD"], budget).await?;
     if !output.status.success() {
         return Err(failed(io::Error::other(format!(
             "could not verify Git HEAD before history rewrite: {}",
@@ -2264,48 +2508,264 @@ const TWO_TOKEN_COMMANDS: &[&str] = &[
 ];
 const THREE_TOKEN_COMMANDS: &[&str] = &["aws", "az", "doctl", "gcloud", "gh", "sfdx"];
 
-/// Zuno's own secrets, withheld from every model-composed command.
+/// Zuno's own environment, withheld from every model-composed command.
 ///
-/// These three are set for the Zuno process itself — the HTTP server's credentials and
-/// the provider auth store's contents — and no shell command a model writes has any
-/// use for them. Inheriting them meant one `env`, one `printenv`, or one curl of an
-/// attacker-chosen URL exfiltrated the operator's server password and every provider
-/// key in the auth store.
+/// `ZUNO_*` is Zuno's private configuration namespace: the HTTP server's credentials,
+/// the provider auth store's contents, and the inline configuration layer that carries a
+/// provider `apiKey`. No shell command a model writes has any use for them, and
+/// inheriting them meant one `env`, one `printenv`, or one curl of an attacker-chosen
+/// URL exfiltrated the lot.
 ///
-/// Everything else is still inherited on purpose. A wildcard `*_API_KEY` / `*_TOKEN`
-/// filter was rejected: it silently breaks `gh`, `aws`, `az`, and `gcloud` (see
-/// [`THREE_TOKEN_COMMANDS`]) along with every user who exports a token deliberately,
-/// and a tool that quietly removes the credentials a command needs is a worse failure
-/// than one that keeps them. A deployment that wants a credential in the tool
-/// environment supplies it through [`ShellEnvHook`], which runs after this removal, so
-/// the host — not this crate — stays the single place that decides.
-const WITHHELD_ENVIRONMENT: &[&str] = &[
-    "ZUNO_AUTH_CONTENT",
-    "ZUNO_SERVER_PASSWORD",
-    "ZUNO_SERVER_USERNAME",
-];
+/// The whole namespace goes, rather than the names known to hold a secret today. That
+/// list was wrong once already: `ZUNO_AUTH_CONTENT` was withheld while
+/// `ZUNO_CONFIG_CONTENT` — the same injected-document shape, carrying the same provider
+/// keys — was not, because it arrived as configuration rather than as credentials. A
+/// list of secrets has to stay right for every variable Zuno ever reads; withholding the
+/// namespace has to be right once, and the next variable Zuno invents is withheld before
+/// anybody has had to notice it holds anything.
+///
+/// Everything outside the namespace is still inherited on purpose. A wildcard
+/// `*_API_KEY` / `*_TOKEN` filter was rejected: it silently breaks `gh`, `aws`, `az`,
+/// and `gcloud` (see [`THREE_TOKEN_COMMANDS`]) along with every user who exports a token
+/// deliberately, and a tool that quietly removes the credentials a command needs is a
+/// worse failure than one that keeps them. A deployment that wants a credential in the
+/// tool environment supplies it through [`ShellEnvHook`], which runs after this removal,
+/// so the host — not this crate — stays the single place that decides.
+///
+/// Not one name in the namespace is inherited, including the ones that look like bare
+/// identity. `ZUNO_PID` was allowlisted once on the reasoning that a pid is neither a
+/// document nor a credential: true of the value and beside the point, because the pid is
+/// the *address* of every document withheld above. On an unconfined path `tr '\0' '\n' <
+/// /proc/$ZUNO_PID/environ` on Linux and `ps eww $ZUNO_PID` on macOS read the Zuno
+/// process environment straight back — verified from a descendant on Linux with
+/// `kernel.yama.ptrace_scope=1` — so handing the pid over turns a discovery step into a
+/// one-liner. `ZUNO_CLIENT` and `ZUNO_WORKSPACE_ID` went with it because no consumer
+/// needs them in a model-composed command: `ZUNO_CLIENT` is read by Zuno itself in
+/// process (see [`crate::exposure::ENV_CLIENT`]) and `ZUNO_WORKSPACE_ID` is read by
+/// nothing outside the CLI's own flag snapshot. `ZUNO` and `AGENT`, the bare markers that
+/// say a process was launched by Zuno, are outside the namespace and untouched, so a
+/// script that only asks "am I under Zuno?" is unaffected.
+///
+/// Withholding is defence in depth, not a containment boundary. It removes the easiest
+/// read — one `env` — and it does not make Zuno's environment unreadable: under
+/// `danger-full-access`, under the trusted `run-unconfined` fallback, and on macOS and
+/// Windows where there is no confined backend at all, a command that knows or finds the
+/// Zuno pid can still read that process's environment. The boundary is the sandbox; the
+/// Linux `workspace-write` and `read-only` backends are what actually deny it, with
+/// `--unshare-pid` and a private `/proc`.
+const ZUNO_ENVIRONMENT_PREFIX: &str = "ZUNO_";
 
-/// Whether a variable name is one of Zuno's own secrets.
+/// Whether a variable belongs to Zuno's own environment rather than the command's.
 ///
-/// Compared case-insensitively because Windows environment variable names are
-/// case-insensitive, so `%zuno_server_password%` names the same secret there.
-fn is_withheld_variable(name: &str) -> bool {
-    WITHHELD_ENVIRONMENT
-        .iter()
-        .any(|withheld| name.eq_ignore_ascii_case(withheld))
+/// Case-folded because Windows environment variable names are case-insensitive, so
+/// `%zuno_server_password%` names the same secret there. The fold is only ever allowed to
+/// grow this set: it decides what is *withheld*, so a spelling it collapses is withheld
+/// on every platform, and there is no allowlist for it to collapse a name onto. An
+/// exception list compared this way would be the other direction — a Linux `ZUNO_Pid`,
+/// which is a different variable from `ZUNO_PID` and could hold anything, would have been
+/// inherited for looking like an allowlisted name.
+///
+/// The name arrives as an [`OsStr`] because that is what the process really holds — bytes
+/// on Unix, UTF-16 code units on Windows — and `to_string_lossy` is the only portable way
+/// to compare it. That is a reduction, so it is audited in both directions rather than
+/// assumed safe: it feeds the *withheld* side, and it can neither lose a match nor invent
+/// one. It cannot lose one because a name whose first five bytes are `ZUNO_` still spells
+/// `ZUNO_` after the conversion — ASCII is never part of an ill-formed sequence in either
+/// encoding, so the replacement character can only appear elsewhere in the name. It cannot
+/// invent one because `U+FFFD` is not ASCII, so no unrepresentable byte can become one of
+/// the five. There is no allowlist left for it to collapse a name onto.
+fn is_withheld_variable(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    let Some(prefix) = name.as_bytes().get(..ZUNO_ENVIRONMENT_PREFIX.len()) else {
+        return false;
+    };
+    prefix.eq_ignore_ascii_case(ZUNO_ENVIRONMENT_PREFIX.as_bytes())
 }
 
-/// The inherited environment with Zuno's own secrets removed.
+/// The inherited environment with Zuno's own environment removed.
 ///
 /// Takes the variables as an argument so the decision is testable: setting a process
 /// environment variable is `unsafe`, which this workspace forbids.
-fn withhold_zuno_secrets(
-    variables: impl IntoIterator<Item = (String, String)>,
-) -> BTreeMap<String, String> {
+///
+/// `OsString` rather than `String` all the way through, because the alternative is to
+/// decide what happens to a variable Zuno cannot spell, and every answer to that is worse
+/// than not having to answer. `std::env::vars` *panics* on an entry that is not Unicode,
+/// which took the whole turn down and not just the call; collecting into `String` instead
+/// would have had to drop such an entry, silently changing the environment a command runs
+/// in. A child receives its `OsString` name and value unchanged, whatever it holds, and
+/// the withholding decision above still applies to it.
+pub(crate) fn withhold_zuno_environment(
+    variables: impl IntoIterator<Item = (OsString, OsString)>,
+) -> BTreeMap<OsString, OsString> {
     variables
         .into_iter()
         .filter(|(name, _)| !is_withheld_variable(name))
         .collect()
+}
+
+/// The most path tokens one call watches for a write.
+///
+/// A `stat` per candidate before the command and one after is cheap, but a generated
+/// command line can hold thousands of arguments, and a write report is not worth an
+/// unbounded amount of work on the turn's critical path. Sixty-four is far more than any
+/// hand-written or model-written command names and small enough that the pair of passes
+/// stays inside a millisecond. Past the cap the report is a shorter lower bound, which is
+/// what it already is for every command whose targets are not statically resolvable.
+const MAX_WRITE_CANDIDATES: usize = 64;
+
+/// What a `stat` says about a regular file, to the precision two `stat`s can compare.
+///
+/// Modification time and length, and nothing platform-specific: an inode number would be
+/// sharper on Unix and does not exist on Windows, and `created()` is unsupported on some
+/// Linux filesystems. A rewrite that preserves *both* fields is not observed — which is a
+/// residual of the mechanism, not of the command: see [`WriteWatch`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileFacts {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl FileFacts {
+    /// `None` when `path` is not a regular file right now — absent, a directory, or a
+    /// device.
+    ///
+    /// Following symlinks deliberately: a command that writes through a link changes the
+    /// target, and the target is the file whose content a later reader will see. A
+    /// directory is never reported, because "the directory changed" says a file inside it
+    /// was created or removed without saying which, and a path that names no file is not
+    /// something a consumer can re-read.
+    fn of(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Some(Self {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })
+    }
+}
+
+/// The paths a shell call is watching, and what each held before the command ran.
+///
+/// `shell` is the one mutating tool that reported nothing. `write`, `edit` and
+/// `apply_patch` each record what they wrote through
+/// [`zuno_tool::ToolOutput::with_written_path`], and every consumer of that key — the goal
+/// store's escalation from a question to a change and the freshness mark that retires a
+/// stale verification receipt (`crates/zuno-cli/src/cmd/verification_ledger.rs`), the
+/// changed-file list an interrupted call settles with
+/// (`crates/zuno-engine/src/dispatch.rs`), the `ToolDispatchCompleted` event every client
+/// renders from, and the ACP tool-call locations — was therefore blind to a command that
+/// edited the workspace. `sed -i 's/foo/bar/' src/lib.rs` completed a user-created goal
+/// with zero evidence, because nothing had told the store that anything changed.
+///
+/// Observed, never inferred. The report is what two `stat`s of the same path disagree
+/// about, so a path is reported because the filesystem says it changed and not because a
+/// command name looked like a writer. That makes the report a **lower bound**, and
+/// deliberately so — a fabricated path is worse than a missing one, because a consumer
+/// re-reads it and retires evidence over it. What is outside the bound:
+///
+/// * A target that is not statically resolvable — `$OUT`, `*.rs`, `$(ls)`, a here-doc, a
+///   redirection — is skipped rather than guessed. Resolving it would mean re-implementing
+///   the shell's own expansion, and getting that wrong invents paths.
+/// * A path outside the workspace and outside the directories this call was granted is not
+///   watched, so the report stays about state a later session can read.
+/// * A deletion is not reported, matching
+///   [`zuno_tool::METADATA_WRITTEN_PATHS_KEY`]: the key means "this file is now here to be
+///   re-read".
+/// * A rewrite that leaves both modification time and length unchanged is invisible to
+///   `stat`, and a command promoted to the background is still writing when this call ends.
+struct WriteWatch {
+    before: Vec<(PathBuf, Option<FileFacts>)>,
+}
+
+impl WriteWatch {
+    /// Snapshot every statically resolvable path token this call could write.
+    fn before(analysis: &ShellAnalysis, cwd: &Path, workspace: &Path, granted: &[PathBuf]) -> Self {
+        let mut candidates = BTreeSet::new();
+        for resource in &analysis.commands {
+            // `cd` names a directory and writes nothing, and its argument would otherwise
+            // be stat'ed on every compound command.
+            if resource.changes_directory {
+                continue;
+            }
+            let Some(program) = resource.tokens.first() else {
+                continue;
+            };
+            let program = unquote(program).to_ascii_lowercase();
+            for argument in path_arguments(&resource.tokens, &program) {
+                if candidates.len() >= MAX_WRITE_CANDIDATES {
+                    break;
+                }
+                let argument = unquote(argument);
+                // A token the shell would expand is not a path this process can resolve;
+                // see the lower-bound note on [`WriteWatch`].
+                if argument.is_empty() || is_dynamic_path(&argument) {
+                    continue;
+                }
+                let candidate = if Path::new(&argument).is_absolute() {
+                    PathBuf::from(&argument)
+                } else {
+                    cwd.join(&argument)
+                };
+                if !watchable(&candidate, cwd, workspace, granted) {
+                    continue;
+                }
+                candidates.insert(candidate);
+            }
+        }
+        Self {
+            before: candidates
+                .into_iter()
+                .map(|path| {
+                    let facts = FileFacts::of(&path);
+                    (path, facts)
+                })
+                .collect(),
+        }
+    }
+
+    /// The watched paths whose file changed or came into existence since [`Self::before`].
+    ///
+    /// Reported canonical, the way `write` and `edit` report theirs, so two tools naming
+    /// the same file produce the same string. A canonicalization that fails — the file was
+    /// removed between the comparison and this call — falls back to the resolved path
+    /// rather than dropping the report.
+    fn written(&self) -> Vec<PathBuf> {
+        self.before
+            .iter()
+            .filter_map(|(path, before)| {
+                let after = FileFacts::of(path)?;
+                // Absent before and a file now: created. A file both times with different
+                // facts: rewritten. Same facts, or gone now: nothing to report.
+                if before.is_some_and(|before| before == after) {
+                    return None;
+                }
+                Some(path.canonicalize().unwrap_or_else(|_| path.clone()))
+            })
+            .collect()
+    }
+
+    /// Record what this call was observed to write on `output`.
+    fn report(&self, mut output: ToolOutput) -> ToolOutput {
+        for path in self.written() {
+            output = output.with_written_path(&path);
+        }
+        output
+    }
+}
+
+/// Whether a write to `path` is inside what this call was allowed to change.
+///
+/// The workspace, the working directory, and any external directory the user granted this
+/// call. Prefix comparison on already-resolved paths, with no case folding and no
+/// separator rewriting: a reduction here would let a path match a root that does not
+/// contain it, and this predicate decides what gets *reported*, so widening it invents
+/// reports. A path outside every root is simply not watched.
+fn watchable(path: &Path, cwd: &Path, workspace: &Path, granted: &[PathBuf]) -> bool {
+    path.starts_with(workspace)
+        || path.starts_with(cwd)
+        || granted.iter().any(|root| path.starts_with(root))
 }
 
 fn external_directories(
@@ -2489,37 +2949,146 @@ fn interrupted() -> ToolError {
 mod tests {
     use super::*;
 
+    /// The pre-flight phase spends its ceiling once, not twice.
+    ///
+    /// The teardown of a read that never answered used to be given the full `ceiling`
+    /// *after* the reads had already spent it, so the phase a `shell` call could sit in was
+    /// twice the number [`GIT_READ_CEILING`], the refusal message, and the documentation all
+    /// state: a configured thirty seconds admitted sixty. The reserve is carved out of the
+    /// phase instead, so the advertised number is the total.
+    #[tokio::test]
+    async fn a_pre_flight_read_phase_spends_its_ceiling_once() {
+        let interrupt = zuno_tool::NeverInterrupted;
+        let budget = GitReadBudget::starting_now(GIT_READ_CEILING, &interrupt);
+        // Read after construction, so `reads` is the window still ahead of a caller that is
+        // about to spawn: measuring from before would add the clock's own delta to it and
+        // make the sum look like an overrun that is not there.
+        let now = tokio::time::Instant::now();
+        let reads = budget.deadline.saturating_duration_since(now);
+
+        assert_eq!(
+            budget.ceiling, GIT_READ_CEILING,
+            "the refusal names the ceiling, so it has to be the configured one"
+        );
+        assert_eq!(
+            budget.teardown,
+            Duration::from_secs(3),
+            "the shipped thirty-second ceiling reserves three seconds for the teardown"
+        );
+        assert!(
+            reads + budget.teardown <= GIT_READ_CEILING,
+            "the phase can spend {reads:?} of reads plus a {:?} teardown, which is more than \
+             the {GIT_READ_CEILING:?} it advertises",
+            budget.teardown
+        );
+        assert!(
+            reads >= Duration::from_secs(26),
+            "the reads were left only {reads:?} of the {GIT_READ_CEILING:?} phase"
+        );
+    }
+
     #[test]
-    fn zunos_own_secrets_never_reach_a_model_composed_command() {
+    fn zunos_own_environment_never_reaches_a_model_composed_command() {
         let inherited = [
             ("ZUNO_SERVER_PASSWORD", "hunter2"),
             ("ZUNO_SERVER_USERNAME", "operator"),
             ("ZUNO_AUTH_CONTENT", r#"{"anthropic":{"key":"sk-live"}}"#),
+            // The inline configuration layer carries a provider `apiKey` exactly the way
+            // the auth store does, and a list of named secrets missed it.
+            (
+                "ZUNO_CONFIG_CONTENT",
+                r#"{"provider":{"anthropic":{"options":{"apiKey":"sk-live"}}}}"#,
+            ),
             // Windows environment names are case-insensitive, so the same secret can
             // arrive under any spelling.
             ("zuno_auth_content", "{}"),
+            // Withheld without being named anywhere: whatever Zuno reads next is not a
+            // secret this list has to have anticipated.
+            ("ZUNO_PROVIDER_TOKEN", "sk-live"),
+            ("ZUNO_DB", "/srv/zuno/zuno.db"),
             // Deliberately kept: a wildcard `*_TOKEN` / `*_API_KEY` filter would take
             // these away and silently break `gh`, `aws`, `az`, and `gcloud`.
             ("GITHUB_TOKEN", "gho_kept"),
             ("AWS_ACCESS_KEY_ID", "AKIA_kept"),
             ("OPENAI_API_KEY", "sk-kept"),
             ("PATH", "/usr/bin"),
-            // Non-secret Zuno variables a command may legitimately need to see.
+            // The bare markers are outside the namespace, so a command still learns it
+            // runs under Zuno.
+            ("AGENT", "1"),
+            ("ZUNO", "1"),
+            // Withheld even though the values are identity rather than content:
+            // `ZUNO_PID` is the address of every document above — `/proc/$ZUNO_PID/environ`
+            // reads them back on an unconfined path — and neither of the other two has a
+            // consumer in a model-composed command.
+            ("ZUNO_CLIENT", "cli"),
+            ("ZUNO_PID", "4242"),
             ("ZUNO_WORKSPACE_ID", "wsp_1"),
+            // A Linux-only spelling of an identity name. It is a different variable from
+            // `ZUNO_PID` and could hold anything, which is why the case fold decides only
+            // what is withheld and never what is kept.
+            ("ZUNO_Pid", "4242"),
         ]
-        .map(|(name, value)| (name.to_owned(), value.to_owned()));
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)));
 
-        let env = withhold_zuno_secrets(inherited);
+        let env = withhold_zuno_environment(inherited);
 
         assert_eq!(
-            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            env.keys()
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
             vec![
+                "AGENT",
                 "AWS_ACCESS_KEY_ID",
                 "GITHUB_TOKEN",
                 "OPENAI_API_KEY",
                 "PATH",
-                "ZUNO_WORKSPACE_ID",
+                "ZUNO",
             ]
+        );
+    }
+
+    /// An entry Zuno cannot spell is decided by the same rule as one it can.
+    ///
+    /// The name arrives as an [`OsStr`], so the comparison has to reduce it to compare it,
+    /// and a reduction on the withholding path is only safe in one direction. Both
+    /// polarities are pinned here: a `ZUNO_`-prefixed name whose tail is not Unicode is
+    /// still withheld — an unspellable tail is not a way around the namespace — and a name
+    /// outside the namespace is kept with its bytes unchanged, rather than being dropped for
+    /// being unrepresentable or handed on in a lossy spelling.
+    ///
+    /// Unix-gated because building the input needs a platform encoding: the Windows
+    /// equivalent is an unpaired surrogate through `OsStringExt::from_wide`, and the rule
+    /// under test is the same one.
+    #[cfg(unix)]
+    #[test]
+    fn an_environment_entry_zuno_cannot_spell_is_withheld_by_the_same_rule() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        fn unspellable(prefix: &[u8]) -> OsString {
+            let mut bytes = prefix.to_vec();
+            // `0xE9` is `é` in Latin-1 and can start no UTF-8 sequence.
+            bytes.push(0xE9);
+            OsString::from_vec(bytes)
+        }
+
+        let kept_name = unspellable(b"LOCALE_PROBE_");
+        let value = unspellable(b"caf");
+        let env = withhold_zuno_environment([
+            (kept_name.clone(), value.clone()),
+            (unspellable(b"ZUNO_PROBE_"), value.clone()),
+            (unspellable(b"zuno_probe_"), value.clone()),
+            (OsString::from("ZUNO_PROBE"), value.clone()),
+        ]);
+
+        assert_eq!(
+            env.keys().cloned().collect::<Vec<_>>(),
+            vec![kept_name.clone()],
+            "the only entry outside Zuno's namespace is the one that should have been kept"
+        );
+        assert_eq!(
+            env.get(&kept_name),
+            Some(&value),
+            "the value reached the map in a spelling other than its own bytes"
         );
     }
 

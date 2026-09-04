@@ -258,6 +258,11 @@ pub struct ToolRegistryBuilder {
     configured_builtins: Vec<Arc<dyn Tool>>,
     harness_tools: Vec<CustomTool>,
     mcp_loader: Arc<dyn McpToolLoader>,
+    /// The worktree root the tool-output store is anchored in, when a caller resolved it.
+    ///
+    /// `None` means [`Self::build`] resolves it, which spawns git. See
+    /// [`Self::with_generated_root`].
+    generated_root: Option<PathBuf>,
 }
 
 impl ToolRegistryBuilder {
@@ -282,6 +287,7 @@ impl ToolRegistryBuilder {
             configured_builtins: Vec::new(),
             harness_tools: Vec::new(),
             mcp_loader: Arc::new(NoopMcpToolLoader),
+            generated_root: None,
         }
     }
 
@@ -341,14 +347,37 @@ impl ToolRegistryBuilder {
         self
     }
 
+    /// Use a worktree root the caller already resolved.
+    ///
+    /// [`zuno_paths::generated_root`] runs up to three `git rev-parse` calls, each bounded
+    /// at ten seconds inside `zuno_paths` but all of them synchronous, so [`Self::build`]
+    /// blocks its thread for up to thirty seconds against a `.git` on a stalled mount.
+    /// `build` is not async and cannot be — it hands out `Arc<dyn Tool>` through
+    /// `Arc::new_cyclic` — so a caller that builds a registry from inside an async fn on a
+    /// current-thread runtime resolves the root off-reactor (one
+    /// `tokio::task::spawn_blocking`) and hands the answer in here.
+    ///
+    /// Unset keeps the lazy resolution, which is right for every caller that was never on
+    /// a reactor.
+    #[must_use]
+    pub fn with_generated_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.generated_root = Some(root.into());
+        self
+    }
+
     /// Load every source once and freeze the native source order.
     #[must_use]
     pub fn build(self) -> ToolRegistry {
         // At the worktree root, not at this registry's own directory: the exclude
         // patterns and `classify` are both anchored there, so a store under a
-        // subdirectory would be generated state nothing recognises.
-        let output_store =
-            ToolOutputStore::in_worktree(&zuno_paths::generated_root(&self.directory));
+        // subdirectory would be generated state nothing recognises. Resolving it spawns
+        // git synchronously, so an async caller supplies the answer through
+        // `with_generated_root` rather than letting this line block a reactor.
+        let generated_root = self
+            .generated_root
+            .clone()
+            .unwrap_or_else(|| zuno_paths::generated_root(&self.directory));
+        let output_store = ToolOutputStore::in_worktree(&generated_root);
         let mut diagnostics = Vec::new();
         let core = Arc::new_cyclic(|weak| {
             let mut sourced_tools = Vec::new();

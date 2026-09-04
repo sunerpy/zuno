@@ -106,6 +106,12 @@
 pub mod apply_patch;
 pub mod batch;
 pub mod bg;
+/// Bounded, off-reactor teardown for a process group this crate spawned directly.
+///
+/// Internal because it is a rule two tool surfaces share, not a capability a host
+/// configures: `shell`'s pre-flight `git` reads and `format`'s formatter children both
+/// spawn a group of their own, and both abandoned it at their ceiling.
+mod child_process;
 pub mod diff;
 pub mod edit;
 pub mod format;
