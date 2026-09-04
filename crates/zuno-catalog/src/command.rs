@@ -75,7 +75,7 @@ use std::path::{Path, PathBuf};
 use zuno_config::Config;
 use zuno_config::discovery::{DiscoveryOptions, discover_with, merge_layers};
 use zuno_config::schema::CommandConfig;
-use zuno_config::schema::ordered::OrderedMap;
+use zuno_config::schema::ordered::{OrderedJson, OrderedMap};
 use zuno_error::ConfigError;
 use zuno_paths::{Env, Layout};
 
@@ -383,17 +383,15 @@ fn read_markdown_command(
     let mut object = document.data;
     let name = object
         .get("name")
-        .and_then(serde_json::Value::as_str)
+        .and_then(OrderedJson::as_str)
         .map_or(derived, str::to_owned);
     object.insert(
-        "template".to_owned(),
-        serde_json::Value::String(document.content.trim().to_owned()),
+        "template",
+        OrderedJson::String(document.content.trim().to_owned()),
     );
-    let command = serde_json::from_value(serde_json::Value::Object(object)).map_err(|source| {
-        ConfigError::Json {
-            path: file.to_path_buf(),
-            source,
-        }
+    let command = crate::agent::from_ordered_json(&object).map_err(|source| ConfigError::Json {
+        path: file.to_path_buf(),
+        source,
     })?;
     Ok(Some((name, command)))
 }

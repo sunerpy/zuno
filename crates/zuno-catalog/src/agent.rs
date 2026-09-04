@@ -18,6 +18,12 @@
 //! are merged before Markdown agents. `ZUNO_CONFIG_CONTENT` is re-applied after
 //! Markdown so the explicit environment layer remains authoritative.
 //!
+//! Every step keeps the author's key order. Frontmatter is parsed into
+//! [`zuno_config::schema::ordered::OrderedJson`] and reaches [`AgentConfig`] as
+//! JSON text, and layers merge through [`zuno_config::discovery::merge_layers`],
+//! so a `permission.rules` block is evaluated in the order it was written rather
+//! than in the alphabetical order a `serde_json::Map` would impose on it.
+//!
 //! # What is deliberately not here
 //!
 //! * `{mode,modes}/*.md` is not scanned. Zuno reads only `agent/` and `agents/`.
@@ -37,9 +43,9 @@ use serde::Serialize;
 use serde_json::Value;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use zuno_config::discovery::{DiscoveryOptions, discover_with};
+use zuno_config::discovery::{DiscoveryOptions, discover_with, merge_layers};
 use zuno_config::schema::agent::{AgentColor, AgentConfig, AgentReasoning};
-use zuno_config::schema::ordered::OrderedMap;
+use zuno_config::schema::ordered::{OrderedJson, OrderedMap};
 use zuno_config::schema::permission::PermissionConfig;
 use zuno_config::schema::{Config, JsonMap};
 use zuno_error::ConfigError;
@@ -325,23 +331,21 @@ pub fn read_markdown_agent(dir: &Path, file: &Path) -> Result<Option<MarkdownAge
     // body always wins over a frontmatter `prompt:`.
     let name = object
         .get("name")
-        .and_then(Value::as_str)
+        .and_then(OrderedJson::as_str)
         .map_or(derived, str::to_owned);
-    object.insert("name".to_owned(), Value::String(name.clone()));
-    object
-        .entry("options".to_owned())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    object
-        .entry("permission".to_owned())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    object.insert("name", OrderedJson::String(name.clone()));
+    for key in ["options", "permission"] {
+        if !object.contains_key(key) {
+            object.insert(key, OrderedJson::Object(OrderedMap::new()));
+        }
+    }
     object.insert(
-        "prompt".to_owned(),
-        Value::String(document.content.trim().to_owned()),
+        "prompt",
+        OrderedJson::String(document.content.trim().to_owned()),
     );
 
-    let value = Value::Object(object);
     let config: AgentConfig =
-        serde_json::from_value(value).map_err(|source| ConfigError::Invalid {
+        from_ordered_json(&object).map_err(|source| ConfigError::Invalid {
             path: file.to_path_buf(),
             issues: vec![zuno_error::ConfigIssue::new(
                 ["agent", name.as_str()],
@@ -354,6 +358,18 @@ pub fn read_markdown_agent(dir: &Path, file: &Path) -> Result<Option<MarkdownAge
         path: file.to_path_buf(),
         config,
     }))
+}
+
+/// Deserialize a frontmatter object through JSON **text**.
+///
+/// `serde_json::from_value` would rebuild the object as a `serde_json::Map` — a
+/// `BTreeMap` in this workspace — and sort its keys on the way in, and
+/// `permission.rules` precedence is the author's key order. JSON text is the one
+/// carrier every `Deserialize` impl in the schema reads in order.
+pub(crate) fn from_ordered_json<T: serde::de::DeserializeOwned>(
+    object: &OrderedMap<OrderedJson>,
+) -> Result<T, serde_json::Error> {
+    serde_json::from_str(&serde_json::to_string(object)?)
 }
 
 /// `path.relative(dir, item)` with `/` separators, for the name rule.
@@ -382,58 +398,41 @@ pub fn discover_markdown(dirs: &[PathBuf]) -> Result<Vec<MarkdownAgent>, ConfigE
 
 /// Deep-merge one agent map over another.
 ///
-/// Merging happens on the JSON representation so an `options` map or nested
-/// `permission` object merges key-by-key rather than being replaced wholesale.
+/// The merge is [`zuno_config::discovery::merge_layers`] — the same
+/// order-preserving deep merge config discovery applies between two `zuno.json`
+/// layers, and the one [`crate::command::merge_command_maps`] already uses. Objects
+/// merge key-by-key and anything else is replaced; a key both layers set keeps the
+/// base layer's position and takes the overlay's value; a key only the overlay
+/// sets is appended after the base block. Nothing sorts, so a `permission.rules`
+/// block reaches the merged [`AgentConfig`] in the order its authors wrote it.
+/// Merging through `serde_json::Value` alphabetized it, and rule precedence is
+/// last-match-wins over that order.
 ///
 /// # Errors
 ///
-/// [`ConfigError::Invalid`] when a merged entry no longer satisfies the agent
-/// schema, naming the agent.
+/// [`ConfigError`] when the merged map no longer satisfies the agent schema.
 pub fn merge_agent_maps(
     base: &OrderedMap<AgentConfig>,
     overlay: &OrderedMap<AgentConfig>,
 ) -> Result<OrderedMap<AgentConfig>, ConfigError> {
-    let mut merged = OrderedMap::new();
-    for (name, config) in base.iter() {
-        merged.insert(name, config.clone());
-    }
-    for (name, config) in overlay.iter() {
-        let next = match merged.get(name) {
-            Some(existing) => merge_one(name, existing, config)?,
-            None => config.clone(),
-        };
-        merged.insert(name, next);
-    }
-    Ok(merged)
+    let merged = merge_layers([
+        Config {
+            agent: Some(base.clone()),
+            ..Config::default()
+        },
+        Config {
+            agent: Some(overlay.clone()),
+            ..Config::default()
+        },
+    ])?;
+    Ok(merged.agent.unwrap_or_default())
 }
 
-fn merge_one(
-    name: &str,
-    base: &AgentConfig,
-    overlay: &AgentConfig,
-) -> Result<AgentConfig, ConfigError> {
-    let mut merged = to_value(name, base)?;
-    merge_deep(&mut merged, to_value(name, overlay)?);
-    serde_json::from_value(merged).map_err(|source| ConfigError::Invalid {
-        path: PathBuf::from(format!("agent.{name}")),
-        issues: vec![zuno_error::ConfigIssue::new(
-            ["agent", name],
-            source.to_string(),
-        )],
-    })
-}
-
-fn to_value(name: &str, config: &AgentConfig) -> Result<Value, ConfigError> {
-    serde_json::to_value(config).map_err(|source| ConfigError::Invalid {
-        path: PathBuf::from(format!("agent.{name}")),
-        issues: vec![zuno_error::ConfigIssue::new(
-            ["agent", name],
-            source.to_string(),
-        )],
-    })
-}
-
-/// remeda's `mergeDeep`: objects merge key-by-key, everything else is replaced.
+/// remeda's `mergeDeep`, for provider options only.
+///
+/// Options live in a [`JsonMap`], which is sorted by type, so no author key order
+/// exists here to protect — unlike `permission.rules`, nothing downstream reads
+/// provider options positionally.
 fn merge_deep(target: &mut Value, source: Value) {
     match (target, source) {
         (Value::Object(target), Value::Object(source)) => {
@@ -694,9 +693,30 @@ pub fn load_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zuno_config::schema::permission::{PermissionAction, PermissionRule};
 
     fn map(json: serde_json::Value) -> OrderedMap<AgentConfig> {
         serde_json::from_value(json).expect("agent map fixture should deserialize")
+    }
+
+    /// Deserialize a fixture from JSON **text**.
+    ///
+    /// `serde_json::from_value` sorts an object's keys before the schema sees them,
+    /// so it cannot express a `permission.rules` fixture at all: the order under
+    /// test would already be gone in the input.
+    fn map_text(json: &str) -> OrderedMap<AgentConfig> {
+        serde_json::from_str(json).expect("agent map fixture should deserialize")
+    }
+
+    fn rule_keys(agents: &OrderedMap<AgentConfig>, name: &str) -> Vec<String> {
+        agents
+            .get(name)
+            .and_then(|config| config.permission.as_ref())
+            .expect("the merged agent keeps its policy")
+            .rules
+            .iter()
+            .map(|(key, _)| key.to_owned())
+            .collect()
     }
 
     fn names(agents: &[Agent]) -> Vec<&str> {
@@ -909,6 +929,61 @@ mod tests {
             custom.options.get("nested"),
             Some(&serde_json::json!({ "a": 1, "b": 2 }))
         );
+    }
+
+    #[test]
+    fn merging_agent_layers_keeps_the_base_permission_rule_order() {
+        // `$HOME/.ssh/*` sorts before `*`, so a merge through `serde_json::Value`
+        // moves the deny above the catch-all allow and, with last-match-wins
+        // precedence, hands the agent read access to the key it denied.
+        let base = map_text(
+            r#"{"custom":{"permission":{"rules":{"read":{"*":"allow","$HOME/.ssh/*":"deny"}}}}}"#,
+        );
+        let overlay = map_text(r#"{"custom":{"permission":{"rules":{"read":{"tmp/*":"allow"}}}}}"#);
+
+        let merged = merge_agent_maps(&base, &overlay).expect("merge succeeds");
+        let rule = merged
+            .get("custom")
+            .and_then(|config| config.permission.as_ref())
+            .expect("the merged agent keeps its policy")
+            .rules
+            .get("read")
+            .expect("the read rule survives the merge")
+            .clone();
+
+        let PermissionRule::Patterns(patterns) = rule else {
+            panic!("expected per-pattern rules, got {rule:?}");
+        };
+        assert_eq!(
+            patterns.keys().collect::<Vec<_>>(),
+            ["*", "$HOME/.ssh/*", "tmp/*"],
+            "the base layer sets the order, and an overlay-only pattern is appended"
+        );
+    }
+
+    #[test]
+    fn a_key_both_layers_set_keeps_the_base_position_and_takes_the_overlay_value() {
+        // The rule config discovery applies between two `zuno.json` layers, pinned
+        // on the agent path so the two cannot drift apart: the base wrote its
+        // catch-all last, and an overlay restating `edit` does not move it.
+        let base = map_text(r#"{"build":{"permission":{"rules":{"edit":"deny","*":"deny"}}}}"#);
+        let overlay = map_text(r#"{"build":{"permission":{"rules":{"edit":"allow"}}}}"#);
+        let merged = merge_agent_maps(&base, &overlay).expect("merge succeeds");
+        assert_eq!(rule_keys(&merged, "build"), ["edit", "*"]);
+        assert_eq!(
+            merged
+                .get("build")
+                .and_then(|config| config.permission.as_ref())
+                .and_then(|permission| permission.rules.get("edit")),
+            Some(&PermissionRule::Action(PermissionAction::Allow)),
+            "the overlay's value replaces the base's value in place"
+        );
+
+        // A key only the overlay names is appended, so it becomes the last match.
+        let base = map_text(r#"{"build":{"permission":{"rules":{"shell":"deny"}}}}"#);
+        let overlay = map_text(r#"{"build":{"permission":{"rules":{"*":"allow"}}}}"#);
+        let merged = merge_agent_maps(&base, &overlay).expect("merge succeeds");
+        assert_eq!(rule_keys(&merged, "build"), ["shell", "*"]);
     }
 
     #[test]

@@ -9,11 +9,15 @@ use std::error::Error;
 use std::fs;
 use std::path::Path;
 use zuno_catalog::agent::{
-    self, AgentMode, AgentSource, discover_in_directory, read_markdown_agent,
+    self, AgentMode, AgentSource, discover_in_directory, load_map, read_markdown_agent,
 };
+use zuno_config::discovery::{DiscoveryOptions, discover_with};
 use zuno_config::schema::agent::AgentConfig;
 use zuno_config::schema::ordered::OrderedMap;
+use zuno_config::schema::permission::{PermissionAction, PermissionConfig, permission_key};
 use zuno_error::ConfigError;
+use zuno_paths::Env;
+use zuno_permission::{evaluate, rules_from_config};
 
 fn write(root: &Path, relative: &str, contents: &str) -> Result<(), Box<dyn Error>> {
     let path = root.join(relative);
@@ -391,4 +395,285 @@ fn read_markdown_agent_names_the_file_it_could_not_read() {
         panic!("expected an io failure, got {error:?}");
     };
     assert_eq!(path, missing);
+}
+
+// ---------------------------------------------------------------------------
+// Permission rule order, asserted through the real evaluator.
+//
+// Rule precedence is last-match-wins over the author's key order, so the frontmatter
+// parser and the agent merge are part of the permission boundary: a representation
+// that sorted keys on the way in would hand the evaluator a policy the file does not
+// state. These run the production path — `load_map` over real files, then
+// `rules_from_config` and `evaluate` — because key order in a config struct is only
+// evidence, and an allow/deny verdict is the behavior.
+// ---------------------------------------------------------------------------
+
+/// A project directory with the layered environment `load_map` and `discover_with`
+/// read: an isolated home and XDG config root, a `.git` marker so the project is a
+/// worktree, and a managed config dir that does not exist so the host's own
+/// `/etc/zuno` cannot leak into the fixture.
+struct Layered {
+    root: tempfile::TempDir,
+}
+
+impl Layered {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        let root = tempfile::tempdir()?;
+        for relative in ["home", "xdg-config", "project/.git"] {
+            fs::create_dir_all(root.path().join(relative))?;
+        }
+        Ok(Self { root })
+    }
+
+    fn project(&self) -> std::path::PathBuf {
+        self.root.path().join("project")
+    }
+
+    fn env(&self) -> Env {
+        let path = |relative: &str| self.root.path().join(relative).display().to_string();
+        Env::from_pairs([
+            ("HOME", path("home")),
+            ("ZUNO_TEST_HOME", path("home")),
+            ("XDG_CONFIG_HOME", path("xdg-config")),
+            ("ZUNO_TEST_MANAGED_CONFIG_DIR", path("managed-absent")),
+        ])
+    }
+
+    fn write(&self, relative: &str, contents: &str) -> Result<(), Box<dyn Error>> {
+        write(self.root.path(), relative, contents)
+    }
+
+    fn load_agent_policy(&self, name: &str) -> Result<PermissionConfig, Box<dyn Error>> {
+        let loaded = load_map(&self.project(), Some(&self.project()), &self.env())?;
+        Ok(loaded
+            .agents
+            .get(name)
+            .and_then(|config| config.permission.clone())
+            .ok_or_else(|| format!("agent {name} has no permission policy"))?)
+    }
+
+    fn discover_agent_policy(&self, name: &str) -> Result<PermissionConfig, Box<dyn Error>> {
+        let options = DiscoveryOptions::new(self.project(), Some(self.project()), self.env())
+            .with_default_username("unknown");
+        let config = discover_with(&options)?;
+        Ok(config
+            .agent
+            .as_ref()
+            .and_then(|agents| agents.get(name))
+            .and_then(|config| config.permission.clone())
+            .ok_or_else(|| format!("agent {name} has no permission policy"))?)
+    }
+}
+
+/// `(permission, pattern, action)` for every flattened rule, in evaluation order.
+fn shape(policy: &PermissionConfig) -> Vec<(String, String, PermissionAction)> {
+    rules_from_config(policy)
+        .into_iter()
+        .map(|rule| (rule.permission, rule.pattern, rule.action))
+        .collect()
+}
+
+/// The verdict for `tool` on `resource` under `policy`, through the real evaluator.
+fn verdict(policy: &PermissionConfig, tool: &str, resource: &str) -> PermissionAction {
+    evaluate(permission_key(tool), resource, &rules_from_config(policy))
+}
+
+/// The directory `$HOME` expanded to in `policy`'s `.ssh` rule.
+///
+/// `rules_from_config` expands `$HOME` with the process's own home directory, not
+/// the fixture's, so the resource under test is derived from the expanded rule
+/// rather than from an assumption about the host.
+fn expanded_home(policy: &PermissionConfig) -> String {
+    rules_from_config(policy)
+        .iter()
+        .find_map(|rule| rule.pattern.strip_suffix("/.ssh/*").map(str::to_owned))
+        .expect("the policy carries the .ssh rule")
+}
+
+/// The audit's failure scenario, end to end: the exact shape
+/// `docs/guide/permissions.md` tells users to write. `$HOME/.ssh/*` (0x24) sorts
+/// before `*` (0x2A), so an alphabetized copy of this block evaluates deny first and
+/// allow last, and the private key is readable without a prompt.
+#[test]
+fn frontmatter_permission_rules_reach_the_evaluator_in_the_authors_order()
+-> Result<(), Box<dyn Error>> {
+    let layered = Layered::new()?;
+    layered.write(
+        "project/.zuno/agents/reviewer.md",
+        r#"---
+description: Reviews a diff and reports findings without editing
+mode: subagent
+permission:
+  rules:
+    read:
+      "*": allow
+      "$HOME/.ssh/*": deny
+---
+Review with care.
+"#,
+    )?;
+
+    let policy = layered.load_agent_policy("reviewer")?;
+    let home = expanded_home(&policy);
+    assert_eq!(
+        shape(&policy),
+        [
+            ("read".to_owned(), "*".to_owned(), PermissionAction::Allow),
+            (
+                "read".to_owned(),
+                format!("{home}/.ssh/*"),
+                PermissionAction::Deny
+            ),
+        ],
+        "the flattened rules keep the order the file wrote them in"
+    );
+    assert_eq!(
+        verdict(&policy, "read", &format!("{home}/.ssh/id_rsa")),
+        PermissionAction::Deny,
+        "the deny is written last, so it is the last match"
+    );
+    assert_eq!(
+        verdict(&policy, "read", "src/main.rs"),
+        PermissionAction::Allow,
+        "an ordinary file is still governed by the catch-all"
+    );
+
+    // The parse step alone reaches the same order, so the merge is not what saved it.
+    let parsed = read_markdown_agent(
+        &layered.project().join(".zuno"),
+        &layered.project().join(".zuno/agents/reviewer.md"),
+    )?
+    .expect("the agent parses");
+    assert_eq!(
+        shape(parsed.config.permission.as_ref().expect("policy")),
+        shape(&policy)
+    );
+    Ok(())
+}
+
+/// The honest half: honoring the author's order also means honoring it where the
+/// alphabetical accident happened to be stricter. `*` sorts before `r` and before
+/// `s`, so the sorted copies of both blocks below would evaluate the deny last.
+#[test]
+fn the_authors_order_wins_where_alphabetical_order_would_have_been_stricter()
+-> Result<(), Box<dyn Error>> {
+    let layered = Layered::new()?;
+    layered.write(
+        "project/.zuno/agents/runner.md",
+        r#"---
+permission:
+  rules:
+    shell:
+      "rm -rf*": deny
+      "*": allow
+---
+Run the build.
+"#,
+    )?;
+    let policy = layered.load_agent_policy("runner")?;
+    assert_eq!(
+        shape(&policy)
+            .iter()
+            .map(|(_, pattern, _)| pattern.as_str())
+            .collect::<Vec<_>>(),
+        ["rm -rf*", "*"]
+    );
+    assert_eq!(
+        verdict(&policy, "shell", "rm -rf /"),
+        PermissionAction::Allow,
+        "the author wrote the catch-all allow last; sorting would have denied this"
+    );
+
+    let layered = Layered::new()?;
+    layered.write(
+        "project/.zuno/agents/loose.md",
+        "---\npermission:\n  rules:\n    shell: deny\n    \"*\": allow\n---\nBody.\n",
+    )?;
+    let policy = layered.load_agent_policy("loose")?;
+    assert_eq!(
+        shape(&policy)
+            .iter()
+            .map(|(permission, _, _)| permission.as_str())
+            .collect::<Vec<_>>(),
+        ["shell", "*"]
+    );
+    assert_eq!(
+        verdict(&policy, "shell", "ls"),
+        PermissionAction::Allow,
+        "top-level keys follow the same rule: the catch-all written last wins"
+    );
+    Ok(())
+}
+
+/// A Markdown agent merges over the config-file agent of the same name by exactly
+/// the rule two `zuno.json` layers merge by: a key both set keeps the base position
+/// and takes the overlay value, a key only the overlay sets is appended. Both
+/// pairs below are therefore asserted equal to the same content spelled as a
+/// global file plus a project file, verdicts included — the second pair shows an
+/// appended overlay catch-all becoming the last match, as it does for file layers.
+#[test]
+fn a_markdown_overlay_merges_by_the_file_layer_rule() -> Result<(), Box<dyn Error>> {
+    let cases: [(&str, &str, &str, &str, PermissionAction); 2] = [
+        (
+            r#"{"edit":"deny","*":"deny"}"#,
+            "edit: allow",
+            "edit",
+            "notes.txt",
+            PermissionAction::Deny,
+        ),
+        (
+            r#"{"shell":"deny"}"#,
+            "\"*\": allow",
+            "shell",
+            "rm -rf /",
+            PermissionAction::Allow,
+        ),
+    ];
+    for (base_rules, overlay_rule, tool, resource, expected) in cases {
+        let markdown = Layered::new()?;
+        markdown.write(
+            "project/.zuno/zuno.json",
+            &format!(r#"{{"agents":{{"build":{{"permission":{{"rules":{base_rules}}}}}}}}}"#),
+        )?;
+        markdown.write(
+            "project/.zuno/agent/build.md",
+            &format!("---\npermission:\n  rules:\n    {overlay_rule}\n---\nBuild.\n"),
+        )?;
+        let from_markdown = markdown.load_agent_policy("build")?;
+
+        let files = Layered::new()?;
+        files.write(
+            "xdg-config/zuno/zuno.json",
+            &format!(r#"{{"agents":{{"build":{{"permission":{{"rules":{base_rules}}}}}}}}}"#),
+        )?;
+        let (key, action) = overlay_rule
+            .split_once(": ")
+            .expect("fixture rule is `key: action`");
+        files.write(
+            "project/.zuno/zuno.json",
+            &format!(
+                r#"{{"agents":{{"build":{{"permission":{{"rules":{{{}:"{action}"}}}}}}}}}}"#,
+                if key.starts_with('"') {
+                    key.to_owned()
+                } else {
+                    format!("\"{key}\"")
+                }
+            ),
+        )?;
+        let from_files = files.discover_agent_policy("build")?;
+
+        assert_eq!(
+            shape(&from_markdown),
+            shape(&from_files),
+            "{base_rules} + {overlay_rule}: the Markdown overlay and a project file merge identically"
+        );
+        assert_eq!(
+            verdict(&from_markdown, tool, resource),
+            expected,
+            "{base_rules} + {overlay_rule}: rules were {:?}",
+            shape(&from_markdown)
+        );
+        assert_eq!(verdict(&from_files, tool, resource), expected);
+    }
+    Ok(())
 }

@@ -35,14 +35,20 @@
 //! in any agent definition the oracle ships or documents, and supporting them
 //! half-way is worse than refusing them.
 
-use serde_json::{Map, Number, Value};
+use serde_json::Number;
 use std::fmt;
+use zuno_config::schema::ordered::{OrderedJson, OrderedMap};
 
 /// A parsed Markdown file: its frontmatter data, and everything after the head.
+///
+/// `data` is order-preserving all the way down. A `permission.rules` block is
+/// evaluated last-match-wins in the author's key order, so a representation that
+/// sorted keys — every `serde_json::Value` in this workspace — would turn a deny
+/// that shadows a catch-all into a deny the catch-all shadows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
     /// The frontmatter object, empty when the file has no `---` head.
-    pub data: Map<String, Value>,
+    pub data: OrderedMap<OrderedJson>,
     /// The body, verbatim and untrimmed. Callers that need the oracle's
     /// `md.content.trim()` do the trimming themselves.
     pub content: String,
@@ -165,7 +171,7 @@ pub fn parse(text: &str) -> Result<Document, FrontmatterError> {
 
     let Some(split) = split_head(text) else {
         return Ok(Document {
-            data: Map::new(),
+            data: OrderedMap::new(),
             content: text.to_owned(),
         });
     };
@@ -330,7 +336,7 @@ struct Line<'a> {
     blanks_before: usize,
 }
 
-fn parse_head(head: &str, line_offset: usize) -> Result<Map<String, Value>, FrontmatterError> {
+fn parse_head(head: &str, line_offset: usize) -> Result<OrderedMap<OrderedJson>, FrontmatterError> {
     let mut lines: Vec<Line<'_>> = Vec::new();
     let mut pending_blanks = 0usize;
     for (index, raw) in head.lines().enumerate() {
@@ -349,14 +355,14 @@ fn parse_head(head: &str, line_offset: usize) -> Result<Map<String, Value>, Fron
     }
 
     if lines.is_empty() {
-        return Ok(Map::new());
+        return Ok(OrderedMap::new());
     }
 
     let mut cursor = 0usize;
     let base = lines[0].indent;
     let value = parse_block(&lines, &mut cursor, base)?;
     match value {
-        Value::Object(map) => Ok(map),
+        OrderedJson::Object(map) => Ok(map),
         _ => Err(FrontmatterError::NotAMapping),
     }
 }
@@ -392,7 +398,7 @@ fn parse_block(
     lines: &[Line<'_>],
     cursor: &mut usize,
     indent: usize,
-) -> Result<Value, FrontmatterError> {
+) -> Result<OrderedJson, FrontmatterError> {
     let first = &lines[*cursor];
     if first.text.starts_with("- ") || first.text == "-" {
         parse_sequence(lines, cursor, indent)
@@ -405,8 +411,8 @@ fn parse_mapping(
     lines: &[Line<'_>],
     cursor: &mut usize,
     indent: usize,
-) -> Result<Value, FrontmatterError> {
-    let mut map = Map::new();
+) -> Result<OrderedJson, FrontmatterError> {
+    let mut map = OrderedMap::new();
     while *cursor < lines.len() {
         let line = &lines[*cursor];
         if line.indent < indent {
@@ -429,7 +435,7 @@ fn parse_mapping(
         let value = if rest.is_empty() {
             parse_child_block(lines, cursor, indent, line, &key)?
         } else if let Some(header) = BlockScalarHeader::parse(rest) {
-            Value::String(parse_block_scalar(lines, cursor, indent, &header))
+            OrderedJson::String(parse_block_scalar(lines, cursor, indent, &header))
         } else {
             parse_inline_scalar(rest, line.number)?
         };
@@ -441,7 +447,7 @@ fn parse_mapping(
             });
         }
     }
-    Ok(Value::Object(map))
+    Ok(OrderedJson::Object(map))
 }
 
 /// A `key:` with nothing after it: the value is the more-indented block that
@@ -452,7 +458,7 @@ fn parse_child_block(
     indent: usize,
     key_line: &Line<'_>,
     key: &str,
-) -> Result<Value, FrontmatterError> {
+) -> Result<OrderedJson, FrontmatterError> {
     let Some(next) = lines.get(*cursor) else {
         return Err(FrontmatterError::MissingValue {
             line: key_line.number,
@@ -475,7 +481,7 @@ fn parse_sequence(
     lines: &[Line<'_>],
     cursor: &mut usize,
     indent: usize,
-) -> Result<Value, FrontmatterError> {
+) -> Result<OrderedJson, FrontmatterError> {
     let mut items = Vec::new();
     while *cursor < lines.len() {
         let line = &lines[*cursor];
@@ -496,14 +502,14 @@ fn parse_sequence(
 
         if rest.is_empty() {
             let Some(next) = lines.get(*cursor) else {
-                items.push(Value::Null);
+                items.push(OrderedJson::Null);
                 continue;
             };
             if next.indent > indent {
                 let child_indent = next.indent;
                 items.push(parse_block(lines, cursor, child_indent)?);
             } else {
-                items.push(Value::Null);
+                items.push(OrderedJson::Null);
             }
             continue;
         }
@@ -516,14 +522,14 @@ fn parse_sequence(
         }
 
         if let Some(header) = BlockScalarHeader::parse(rest) {
-            items.push(Value::String(parse_block_scalar(
+            items.push(OrderedJson::String(parse_block_scalar(
                 lines, cursor, indent, &header,
             )));
         } else {
             items.push(parse_inline_scalar(rest, line.number)?);
         }
     }
-    Ok(Value::Array(items))
+    Ok(OrderedJson::Array(items))
 }
 
 fn strip_dash(text: &str) -> Option<&str> {
@@ -539,7 +545,7 @@ fn nested_mapping_after_dash(
     cursor: &mut usize,
     dash_line: &Line<'_>,
     rest: &str,
-) -> Result<Option<Value>, FrontmatterError> {
+) -> Result<Option<OrderedJson>, FrontmatterError> {
     if rest.starts_with(['{', '[', '"', '\'', '|', '>']) {
         return Ok(None);
     }
@@ -547,7 +553,7 @@ fn nested_mapping_after_dash(
         return Ok(None);
     };
     let inner_indent = dash_line.indent + (dash_line.text.len() - rest.len());
-    let mut map = Map::new();
+    let mut map = OrderedMap::new();
     let first = if value.is_empty() {
         let synthetic = Line {
             number: dash_line.number,
@@ -557,7 +563,7 @@ fn nested_mapping_after_dash(
         };
         parse_child_block(lines, cursor, inner_indent, &synthetic, key)?
     } else if let Some(header) = BlockScalarHeader::parse(value) {
-        Value::String(parse_block_scalar(lines, cursor, inner_indent, &header))
+        OrderedJson::String(parse_block_scalar(lines, cursor, inner_indent, &header))
     } else {
         parse_inline_scalar(value, dash_line.number)?
     };
@@ -575,7 +581,7 @@ fn nested_mapping_after_dash(
         let value = if value_rest.is_empty() {
             parse_child_block(lines, cursor, inner_indent, line, &key)?
         } else if let Some(header) = BlockScalarHeader::parse(value_rest) {
-            Value::String(parse_block_scalar(lines, cursor, inner_indent, &header))
+            OrderedJson::String(parse_block_scalar(lines, cursor, inner_indent, &header))
         } else {
             parse_inline_scalar(value_rest, line.number)?
         };
@@ -586,7 +592,7 @@ fn nested_mapping_after_dash(
             });
         }
     }
-    Ok(Some(Value::Object(map)))
+    Ok(Some(OrderedJson::Object(map)))
 }
 
 fn reject_unsupported(line: &Line<'_>) -> Result<(), FrontmatterError> {
@@ -781,7 +787,7 @@ fn fold(body: &[String]) -> String {
 // Scalars and flow collections.
 // ---------------------------------------------------------------------------
 
-fn parse_inline_scalar(text: &str, line: usize) -> Result<Value, FrontmatterError> {
+fn parse_inline_scalar(text: &str, line: usize) -> Result<OrderedJson, FrontmatterError> {
     let text = text.trim();
     if text.starts_with('{') {
         return parse_flow_map(text, line);
@@ -806,21 +812,23 @@ fn parse_inline_scalar(text: &str, line: usize) -> Result<Value, FrontmatterErro
 
 /// A plain, single-quoted, or double-quoted scalar, resolved to the YAML 1.1 core
 /// types gray-matter's `js-yaml` produces.
-fn scalar(text: &str) -> Value {
+fn scalar(text: &str) -> OrderedJson {
     if let Some(inner) = strip_quotes(text, '"') {
-        return Value::String(unescape(inner, '"'));
+        return OrderedJson::String(unescape(inner, '"'));
     }
     if let Some(inner) = strip_quotes(text, '\'') {
         // A single-quoted scalar escapes only `''`.
-        return Value::String(inner.replace("''", "'"));
+        return OrderedJson::String(inner.replace("''", "'"));
     }
     match text {
-        "" | "~" | "null" | "Null" | "NULL" => Value::Null,
-        "true" | "True" | "TRUE" | "yes" | "Yes" | "YES" | "on" | "On" | "ON" => Value::Bool(true),
-        "false" | "False" | "FALSE" | "no" | "No" | "NO" | "off" | "Off" | "OFF" => {
-            Value::Bool(false)
+        "" | "~" | "null" | "Null" | "NULL" => OrderedJson::Null,
+        "true" | "True" | "TRUE" | "yes" | "Yes" | "YES" | "on" | "On" | "ON" => {
+            OrderedJson::Bool(true)
         }
-        _ => number(text).unwrap_or_else(|| Value::String(text.to_owned())),
+        "false" | "False" | "FALSE" | "no" | "No" | "NO" | "off" | "Off" | "OFF" => {
+            OrderedJson::Bool(false)
+        }
+        _ => number(text).unwrap_or_else(|| OrderedJson::String(text.to_owned())),
     }
 }
 
@@ -831,20 +839,20 @@ fn strip_quotes(text: &str, quote: char) -> Option<&str> {
     None
 }
 
-fn number(text: &str) -> Option<Value> {
+fn number(text: &str) -> Option<OrderedJson> {
     // A leading `+`, a leading zero, or an underscore separator are all YAML but
     // are not JSON numbers; parsing them through Rust's own parsers keeps the two
     // sets aligned and rejects the rest as strings.
     if let Ok(integer) = text.parse::<i64>() {
-        return Some(Value::Number(Number::from(integer)));
+        return Some(OrderedJson::Number(Number::from(integer)));
     }
     if let Ok(unsigned) = text.parse::<u64>() {
-        return Some(Value::Number(Number::from(unsigned)));
+        return Some(OrderedJson::Number(Number::from(unsigned)));
     }
     let float = text.parse::<f64>().ok()?;
     // `Number::from_f64` refuses NaN and infinity, which JSON cannot hold; a
     // frontmatter `.inf` therefore stays a string rather than becoming null.
-    Number::from_f64(float).map(Value::Number)
+    Number::from_f64(float).map(OrderedJson::Number)
 }
 
 fn unescape(text: &str, quote: char) -> String {
@@ -876,7 +884,7 @@ fn unescape(text: &str, quote: char) -> String {
     out
 }
 
-fn parse_flow_map(text: &str, line: usize) -> Result<Value, FrontmatterError> {
+fn parse_flow_map(text: &str, line: usize) -> Result<OrderedJson, FrontmatterError> {
     let inner = text
         .strip_prefix('{')
         .and_then(|rest| rest.strip_suffix('}'))
@@ -884,7 +892,7 @@ fn parse_flow_map(text: &str, line: usize) -> Result<Value, FrontmatterError> {
             line,
             detail: "unbalanced `{}`".to_owned(),
         })?;
-    let mut map = Map::new();
+    let mut map = OrderedMap::new();
     for entry in split_flow(inner, line)? {
         let entry = entry.trim();
         if entry.is_empty() {
@@ -902,10 +910,10 @@ fn parse_flow_map(text: &str, line: usize) -> Result<Value, FrontmatterError> {
             });
         }
     }
-    Ok(Value::Object(map))
+    Ok(OrderedJson::Object(map))
 }
 
-fn parse_flow_sequence(text: &str, line: usize) -> Result<Value, FrontmatterError> {
+fn parse_flow_sequence(text: &str, line: usize) -> Result<OrderedJson, FrontmatterError> {
     let inner = text
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
@@ -921,7 +929,7 @@ fn parse_flow_sequence(text: &str, line: usize) -> Result<Value, FrontmatterErro
         }
         items.push(parse_inline_scalar(entry, line)?);
     }
-    Ok(Value::Array(items))
+    Ok(OrderedJson::Array(items))
 }
 
 /// Split a flow collection's interior on top-level commas, respecting nesting and
@@ -971,10 +979,67 @@ fn split_flow(inner: &str, line: usize) -> Result<Vec<&str>, FrontmatterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
+    /// The parsed head as a `Value`, so the shape assertions below stay readable.
+    ///
+    /// Key *order* is what `Value` cannot carry, so the tests that care about it
+    /// assert on the parser's own representation instead of going through here.
     fn data(text: &str) -> Value {
-        Value::Object(parse(text).expect("frontmatter should parse").data)
+        let document = parse(text).expect("frontmatter should parse");
+        serde_json::from_str(&serde_json::to_string(&document.data).expect("data serializes"))
+            .expect("data round-trips")
+    }
+
+    /// `data()` compares through `serde_json::Value`, which sorts keys, so the one
+    /// property a `permission.rules` block depends on has to be asserted on the
+    /// parser's own representation: `$HOME/.ssh/*` sorts before `*`, and rules are
+    /// evaluated last-match-wins.
+    #[test]
+    fn a_nested_mapping_keeps_the_key_order_it_was_written_in() {
+        let document = parse(
+            "---\npermission:\n  rules:\n    read:\n      \"*\": allow\n      \"$HOME/.ssh/*\": deny\n    shell:\n      \"pytest*\": allow\n      \"*\": deny\n---\nbody\n",
+        )
+        .expect("frontmatter should parse");
+        let rules = document
+            .data
+            .get("permission")
+            .and_then(|permission| permission.get("rules"))
+            .expect("the nested rules object is present");
+        let OrderedJson::Object(rules) = rules else {
+            panic!("expected an object, got {rules:?}");
+        };
+        assert_eq!(rules.keys().collect::<Vec<_>>(), ["read", "shell"]);
+        let OrderedJson::Object(read) = rules.get("read").expect("read") else {
+            panic!("expected an object");
+        };
+        assert_eq!(read.keys().collect::<Vec<_>>(), ["*", "$HOME/.ssh/*"]);
+        let OrderedJson::Object(shell) = rules.get("shell").expect("shell") else {
+            panic!("expected an object");
+        };
+        assert_eq!(shell.keys().collect::<Vec<_>>(), ["pytest*", "*"]);
+    }
+
+    /// The flow spelling and a mapping that starts on a `- ` line go through their
+    /// own builders, so each is pinned separately with keys whose written order is
+    /// the reverse of their sorted order.
+    #[test]
+    fn flow_maps_and_dash_mappings_keep_the_key_order_too() {
+        let document = parse(
+            "---\nread: { \"*\": allow, \"$HOME/.ssh/*\": deny }\nitems:\n  - zeta: allow\n    alpha: deny\n---\nbody\n",
+        )
+        .expect("frontmatter should parse");
+        let OrderedJson::Object(read) = document.data.get("read").expect("read") else {
+            panic!("expected a flow map object");
+        };
+        assert_eq!(read.keys().collect::<Vec<_>>(), ["*", "$HOME/.ssh/*"]);
+        let Some(OrderedJson::Array(items)) = document.data.get("items") else {
+            panic!("expected a sequence");
+        };
+        let OrderedJson::Object(item) = &items[0] else {
+            panic!("expected a mapping item");
+        };
+        assert_eq!(item.keys().collect::<Vec<_>>(), ["zeta", "alpha"]);
     }
 
     #[test]
@@ -1215,9 +1280,15 @@ mod tests {
         // `Expected PermissionActionConfig, got "{ edit: deny" permission`,
         // which only makes sense if the YAML layer let the string through.
         let doc = parse("---\npermission: { edit: deny\n---\nb\n").expect("sanitize rescues it");
+        // Whole-object equality, not a single lookup: the claim is that `sanitize`
+        // produced exactly one key holding the literal text, not that this key is
+        // among whatever else it produced.
         assert_eq!(
-            Value::Object(doc.data),
-            json!({ "permission": "{ edit: deny" })
+            doc.data.into_iter().collect::<Vec<_>>(),
+            vec![(
+                "permission".to_owned(),
+                OrderedJson::String("{ edit: deny".to_owned())
+            )]
         );
     }
 
