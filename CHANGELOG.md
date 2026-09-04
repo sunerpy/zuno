@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/sunerpy/zuno/compare/v0.9.0...v0.9.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* **cli:** make the unsupported-platform sandbox refusal actionable and offer the trusted choice at TUI start ([#103](https://github.com/sunerpy/zuno/issues/103)) ([af604fa](https://github.com/sunerpy/zuno/commit/af604fa3ed69b1ac4cf9c94b6ed61180858a371d))
+
 ## [0.9.0](https://github.com/sunerpy/zuno/compare/v0.8.0...v0.9.0) (2026-09-03)
 
 
