@@ -981,6 +981,73 @@ the OS temporary directory is treated as no-op cleanup. There is no tool
 argument that lets a model approve its own risky call, and an explicit
 permission deny always wins.
 
+### Wrapper programs
+
+The Shell gate reads a command line through the wrapper programs in front of
+it — `sudo`, `doas`, `env`, `nice`, `ionice`, `time`, `timeout`, `nohup`,
+`xargs`, `command`, `builtin`, `exec`, `setsid`, `stdbuf`, `chroot`, `watch`,
+`chrt`, `taskset`, `flock` — so the program they run is judged, not the
+wrapper. Every way the line can be read is judged and the findings are the
+union: a reading can add a confirmation or a refusal, never remove one.
+An option the gate does not recognise is read both ways, as a flag and as an
+option whose value is the next word, so an unknown option can cost a
+confirmation on a harmless line but never hides the program behind it.
+
+One rule governs every word of a wrapper: **a word the shell computes may
+vanish, so wherever it appears the gate judges every later word as the
+possible program, and an attached or `=`-joined computed value is treated the
+same way.** `$VAR`, `${VAR}`, `$(…)`, a backtick and a glob are all computed
+words. An unquoted empty expansion disappears from the line, and an empty
+attached value turns `-u$EMPTY` into `-u`, which then takes the *next* word as
+its value; either way the program moves to the right.
+`sudo -u$EMPTY root rm -rf /` really runs `rm -rf /` as root and
+`chroot $ROOT /mnt rm -rf /` really runs it under `/mnt`, so both are refused.
+
+The rule holds in every slot, with no exceptions: option flags, an option's
+value written separately (`-u $EMPTY`), attached (`-u$EMPTY`, `-Eu$EMPTY`,
+`-n$N`) or with `=` (`--user=$VAL`), options the gate does not recognise, the
+operands a wrapper takes before its program (`chroot NEWROOT`, `taskset MASK`,
+`flock FILE`, `env VAR=value`, `chrt PRIORITY`), a `timeout` duration or
+signal, and the word that carries an inline script.
+
+Judging every later word over-approximates on purpose. `sudo $X echo rm -rf /`
+only prints, and it is refused anyway: guessing where an expansion ends would
+have to be right about a value the gate cannot see, and a wrong guess hides
+the program. A refusal for a line that prints costs a rewording; a missed
+`rm -rf /` costs the filesystem. The rule can add a prompt or a refusal to a
+line a computed word makes ambiguous, and never removes one. A line with two
+computed words among a wrapper's options may now ask for confirmation, because
+the second one is read as a possible program.
+
+The gate follows an inline script wherever a program it knows hands one over:
+the `-c` (or `-Command`) script of `sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`,
+`pwsh` and `powershell`, the words after `eval`, `su -c`, `env -S` and
+`flock -c`. An inline script counts as the program in every spelling its
+program accepts, including behind another wrapper: `env -S 'rm -rf /'`,
+`env -S'rm -rf /'`, `env -iS 'rm -rf /'`, `env --split-string='rm -rf /'`,
+`su -c'rm -rf /'`, `su -lc 'rm -rf /'`, `su --command='rm -rf /'`,
+`flock FILE -c 'rm -rf /'`, `sudo env --split-string='rm -rf /'`,
+`timeout 5 env -S'rm -rf /'`. ANSI-C quoting is materialised before the script
+is read, so `sh -c $'echo hi\nrm -rf /'` is refused exactly like
+`sh -c 'echo hi; rm -rf /'`. A program word that still holds whitespace or a
+list operator once its quoting is materialised, and an argument after a
+shell's `-c` script that still reads like a command list (`;`, `|`, `&` or a
+newline), are held for confirmation because the line could not be split
+reliably.
+
+`timeout` needs a duration it accepts: a word that starts with a digit, after
+an optional `+` or `.`, or is `inf` or `infinity` in any letter case — `5`,
+`1.5m`, `10s`, `.5`, `+5`, `1e3`. A word that is not one is a usage error, so
+nothing runs and the line is not refused — `timeout '' rm -rf /` exits with
+`invalid time interval`. Where the duration is valid, the next word is the
+program and the rest are its arguments, so `timeout 5 sh rm -rf /` runs `sh`
+on a script file named `rm`, not the `rm` program.
+
+Ordinary wrapper use is unaffected: `sudo -u root ls`, `sudo -u $USER ls -la`,
+`sudo -u$USER ls -la`, `sudo --user=$USER ls`, `chroot $ROOT /mnt ls -la`,
+`taskset $MASK 0x3 ls`, `nice -n$N make -j4`, `env FOO=bar make`,
+`timeout 5 cargo test` and `timeout inf cargo test` all run without a prompt.
+
 ## Skill discovery
 
 Zuno discovers skills in this scope order:

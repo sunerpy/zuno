@@ -29,6 +29,55 @@ An explicitly empty `options.apiKey` is intentional and prevents fallback. This 
 
 Environment credentials remain process inputs. They are not copied into the credential file. Stored credentials live at `$XDG_DATA_HOME/zuno/auth.json`, normally `~/.local/share/zuno/auth.json`. `ZUNO_AUTH_CONTENT` supplies an in-memory read override for managed environments.
 
+## Credential file integrity
+
+The credential file is durable user state, so `zuno-auth` owns three properties above a
+plain serialize-and-write path.
+
+**Publication is visibility-atomic, and crash-bounded on Unix only.** A write goes to a
+temporary sibling created with `O_EXCL` at `0600`, is `fsync`ed, and is renamed over the
+target; the containing directory is then `fsync`ed so the name transition itself
+survives a power loss. Off Unix the publication is `zuno_atomic_file::replace`
+(`ReplaceFileW`, chosen because `MoveFileEx` replacement is not gap-free), which
+deliberately does not promise crash durability, and its temporary file is private to
+that crate. `zuno-auth` adds the only narrowing reachable from outside the primitive: it
+`sync_all`s the *published* file afterwards, best effort, logged rather than returned
+because the document is already published. That moves the exposure from "the whole
+document may never have reached the device" to "the interval between the name transition
+and that flush may not have". Windows therefore has a weaker crash boundary than Unix
+here; closing it needs a durable publication in `zuno-atomic-file`.
+
+**Damage is data, not an error.** A file that exists and holds no store decodes to the
+default store carrying a `StoreDamage`, and every read surface keeps working. There is
+no `AuthError` variant for it: a store that returns `Err` for a zero-byte file denies
+the login that would repair it, while leaving the file as broken as it found it, and a
+file holding no bytes holds no credential a write could destroy. A file with *content*
+this build cannot parse is still refused (`AuthError::Malformed`), because those bytes
+may be a recoverable store. The damage report is latched once per `(kind, path)` per
+process, so a per-request read path cannot bury it, and the same finding is returned as
+data for surfaces whose log sink is off.
+
+**Forward compatibility is preserved at two granularities.** An entry that does not
+decode is kept verbatim and republished by every write, and is resolvable and removable
+through `names`, `contains`, `is_preserved` and `remove`. A field that no modelled shape
+names is carried per entry and merged back on write. The key list is declared on each
+credential type rather than derived from serialization: a derived list cannot tell a
+field this build never knew about from a field the user just cleared, and would
+resurrect the cleared value. `store::settle_unmodelled` reconciles the carry against
+what a mutation actually did — a carried key whose entry is gone goes with it, and a
+carried key that lived inside a modelled object the write replaced is not re-attached to
+the value that replaced it, because an unknown key inside `tokens` is a claim about the
+tokens that were there.
+
+**Absence is confirmed, not assumed.** A read whose result will be written back treats a
+failed open that Windows cannot distinguish from a replacement in flight as no answer at
+all, and re-probes for `ABSENCE_CONFIRMATION` (6 ms) before concluding the file is
+absent; a file that is present but still unopenable is `AuthError::Unresolved` rather
+than an empty store. The bound is owned here rather than inherited from
+`zuno_atomic_file::metadata`, whose one-second expected-presence budget would be spent
+in full on the ordinary first login, in `thread::sleep`, inside a synchronous function
+that async callers reach.
+
 ## Method registration and catalog availability
 
 Every login method is an explicit registration. The shipped registry gives the

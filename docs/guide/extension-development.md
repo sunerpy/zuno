@@ -237,6 +237,15 @@ shutdown() -> result<_, error>
 `initialize` must return exactly `zuno.plugin/1`. `metadata-json` must decode to
 an object or `null`. `output` is model-visible, so do not place credentials,
 authorization headers, private upstream bodies, or unbounded binary data in it.
+Do not return `cancellation` in `metadata-json`: it is reserved for Zuno's own
+cancellation claim and is dropped with a warning.
+
+`workspace` is the native workspace path byte for byte, with no separator
+normalization on any platform. A workspace whose path is not valid UTF-8 has no
+representation on this boundary, so Zuno refuses to start the component by name
+rather than passing a substituted path. Inherited environment values follow the
+same rule: a variable whose value is not valid UTF-8 is omitted from the guest
+environment with a warning naming the variable, never substituted.
 
 ### Manifest and authority
 

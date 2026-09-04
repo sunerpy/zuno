@@ -95,6 +95,10 @@ has several authentication methods, Zuno opens a second picker for the method.
 Escape or Ctrl+C cancels either picker. Non-interactive invocations still require
 an explicit provider so scripts cannot hang on a prompt.
 
+A URL login (`zuno auth login https://gateway.example.com`) runs a command
+chosen by that host and asks for confirmation first; see the `providers login`
+reference for the prompt and `--trust-remote-command`.
+
 The built-in `openai` provider supports three methods:
 
 ```sh
@@ -126,7 +130,7 @@ Using `transport: "openai"` does not grant a custom provider OpenAI's ChatGPT OA
 
 ## Credential storage
 
-Credentials created by `zuno auth login` are stored by provider id in `$XDG_DATA_HOME/zuno/auth.json` (normally `~/.local/share/zuno/auth.json`) with mode `0600` on Unix. `ZUNO_AUTH_CONTENT` can replace credential reads with a JSON object for ephemeral or managed environments.
+Credentials created by `zuno auth login` are stored by provider id in `$XDG_DATA_HOME/zuno/auth.json` (normally `~/.local/share/zuno/auth.json`) with mode `0600` on Unix. `ZUNO_AUTH_CONTENT` can replace credential reads with a JSON object for ephemeral or managed environments. A credential file that was emptied by an interrupted write still reads, reporting the damage, and the next write replaces it; an entry Zuno cannot decode is preserved rather than deleted by an unrelated login.
 
 Credential precedence is:
 
@@ -188,6 +192,8 @@ Important options include:
 | `headerTimeout` | response-header timeout in milliseconds, or `false` |
 | `chunkTimeout` | maximum gap between streamed chunks in milliseconds |
 | `maxTokens`, `temperature`, `topP`, `toolChoice` | generation controls forwarded by the native provider |
+| `toolCalls` | Bedrock only: `true` or `false` for every model this provider entry serves, overriding the built-in Converse tool-use table |
+| `modelCapabilities` | Bedrock only: `<model id>.tool_calls` decides exactly that model id and nothing else |
 | `responsesTextBlocks` | Responses text projection: `multiple` by default, or `single` for gateways that expose only one upstream text field |
 | `reasoningReplay` | `off` by default, or `encrypted` for a Responses endpoint that seals reasoning |
 | `reasoningReplayMaxAge` | oldest sealed reasoning envelope Zuno still replays, in milliseconds |
@@ -212,6 +218,62 @@ the default `multiple` behavior. Do not use it with the 2026-08-28
 `kiro-provider` build: that provider now concatenates consecutive all-text
 blocks byte-for-byte with no separator, while this option intentionally inserts
 a blank line.
+
+### Tool definitions and `toolChoice`
+
+The tools a turn may call are locked by the turn loop, not by provider options,
+and every native provider sends that per-turn set. `options.tools` is for tools
+the *endpoint* runs on your behalf — Anthropic's `web_search_20250305`, the
+Vertex Anthropic equivalents — which the turn loop cannot express.
+
+When a turn carries a locked set, a configured entry is kept only if it is such
+a server-run tool (recognised by carrying no `input_schema`) and its name is not
+already taken by a locked tool, because two entries sharing one name is itself a
+permanent 400. A configured *custom* declaration is superseded: tool dispatch is
+checked against the locked set, so a second, differing declaration of the same
+tool surface could only invite a call Zuno would refuse. When a turn carries no
+locked set — a title, summary, or compaction request — `options.tools` is sent
+unchanged.
+
+`toolChoice` is sent only when the body actually carries the tool it names.
+`{"type": "tool", "name": "…"}` on the Anthropic and Vertex Anthropic surfaces,
+and a single-function restriction on Gemini, are permanent 400s when the named
+tool is absent from the request, so an unsatisfiable choice is dropped rather
+than turned into a failed turn. The model then chooses freely — on Gemini that
+is the `AUTO` mode applied when no `toolConfig` is sent — and can never be
+pushed at a different tool than the one you asked for.
+
+### Bedrock tool definitions per model
+
+Bedrock is one endpoint in front of every vendor's models, and Converse answers
+a `toolConfig` for a family that does not implement tool use with a
+`ValidationException` — a permanent failure, not a retryable one. Zuno therefore
+sends tool definitions only for the families Bedrock documents Converse tool use
+for: `anthropic.claude` (except `anthropic.claude-v2` and
+`anthropic.claude-instant`), `amazon.nova-micro`, `amazon.nova-lite`,
+`amazon.nova-pro`, `amazon.nova-premier`, `cohere.command-r`, `meta.llama3-1`,
+`meta.llama3-2`, `meta.llama3-3`, `meta.llama4`, `mistral.mistral-large`,
+`mistral.mistral-small`, `mistral.pixtral-large`, and `ai21.jamba-1-5`. The
+match is a substring of the lowercased model id, so a cross-region prefix
+(`us.anthropic.claude-…`) and an inference-profile ARN carrying the model id
+resolve like the bare id.
+
+Anything else — a provisioned-throughput ARN, a model newer than this build — is
+sent with no tool definitions, which is what earlier releases sent for every
+Bedrock model. Two options override that:
+
+- `toolCalls: true` sends tool definitions for every model this provider entry
+  serves. `toolCalls: false` sends them for none and also withdraws the
+  provider's tool-call capability, so the turn loop stops assembling a tool set
+  the wire will not carry.
+- `modelCapabilities: {"<model id>": {"tool_calls": true}}` decides exactly that
+  model id and leaves every other model to `toolCalls` or the table above. The
+  key is the full model id as configured, in the same spelling the
+  OpenAI-compatible provider already reads.
+
+`bedrock-mantle` posts an OpenAI Chat or Responses body instead of a Converse
+body, so the Converse table does not describe it: those two surfaces carry tool
+definitions unless `toolCalls: false` or a per-model entry says otherwise.
 
 ### Encrypted reasoning replay
 
@@ -329,8 +391,35 @@ proxy. For every original URL and redirect, Zuno resolves and validates all
 target addresses locally, then sends an already-validated IP through the
 selected HTTP, HTTPS, SOCKS4, or SOCKS5 route while retaining the original Host
 header and TLS SNI. If the configured proxy is unavailable, the request fails;
-it never silently retries direct. `NO_PROXY` is the only environment-level way
-to select direct routing for a matching public target.
+it never silently retries direct.
+
+Two environment variables select direct routing for a matching public target:
+
+- `NO_PROXY` (or `no_proxy`) bypasses the configured proxy for the destinations
+  it matches.
+- `REQUEST_METHOD` disables the proxy environment entirely. A CGI-style host
+  maps an inbound `Proxy:` request header onto `HTTP_PROXY` (httpoxy), so when
+  `REQUEST_METHOD` is present Zuno ignores `HTTP_PROXY`, `HTTPS_PROXY`,
+  `ALL_PROXY`, and `NO_PROXY` for the whole process and routes every public
+  request directly. Unset `REQUEST_METHOD` if you export it for unrelated
+  reasons and still want proxy routing.
+
+Some establishment failures are answers rather than weather, and `webfetch`
+fails them once instead of retrying on backoff: proxy CONNECT status 401, 403,
+404, 407, 501, and any status outside 408, 429, and the remaining 5xx; SOCKS5
+replies other than 0x01, 0x03, 0x04, 0x05, and 0x06; SOCKS4 replies other than
+0x5b; and every certificate or protocol-level TLS rejection, including a
+plaintext captive-portal answer on port 443. A 403 or 404, and SOCKS5 0x02 or
+0x08, name one destination, so the remaining validated addresses are still
+attempted -- but the denial still decides the request if none of them connects.
+
+Establishment is bounded twice. One validated address may spend 10 seconds on
+TCP, proxy negotiation, and the TLS handshake; one hop's whole address walk --
+the original URL, and again each redirect it follows -- may spend 30 seconds and
+at most 8 validated addresses, so a large DNS answer cannot extend it. Waiting
+for response headers is not part of that budget: the caller's own request
+timeout owns it. Every other Zuno HTTP client carries a 30-second connect
+default that an individual provider may tighten.
 
 Commands started by shell tools, formatters, language servers, and local MCP
 servers inherit the Zuno process environment. Their explicit environment

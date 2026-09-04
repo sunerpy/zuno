@@ -35,11 +35,12 @@ Two exceptions are deliberate, and both are limits to design around:
   `tracing` gives an event's own text, and the formatter prints it with no
   `name=` prefix, so whatever a callsite puts there is written verbatim to the
   plaintext log, to `--print-logs` stderr, and to the `message` column of
-  `logs.sqlite`, where it reads as the event message. Some Zuno callsites still
-  route external text through `message` (an MCP server's stderr line is the one
-  to know about), so the plaintext log can contain raw child-process output.
-  Give a payload its own field name, which the predicate can classify, or log
-  only a bound (`bytes`, `limit`, `truncated`).
+  `logs.sqlite`, where it reads as the event message. Zuno's own emitters keep
+  external text out of `message`: an MCP server's stderr line is logged under
+  `stderr`, which is redacted, and a test-suite tripwire
+  (`no_crate_emits_an_unexpected_message_field`) fails when a new callsite
+  routes a value there. Give a payload its own field name, which the predicate
+  can classify, or log only a bound (`bytes`, `limit`, `truncated`).
 
 A component that needs model-visible payloads must use the session event log.
 

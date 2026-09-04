@@ -52,6 +52,15 @@ A model may also use `extension_define`, `extension_run`, `extension_stop`,
 packages. That path never writes disk and deliberately rejects executable
 runtime declarations.
 
+`extension_inspect` reports a statically installed package as
+`"source": {"lifetime": "static", "manifest": "<path>"}`, where `<path>` is the
+native manifest path exactly as it is on disk. Separators are never normalized,
+so a package under a directory named `zuno\ws` is reported with the backslash
+intact and can be handed straight to `read` or `grep`. A path that is not valid
+UTF-8 has no JSON spelling at all, so the field is reported as
+`"manifest": null` with `"manifestUnrepresentable": true` beside it rather than a
+substituted path; the package's other fields are still listed.
+
 ## Custom agent and workflow
 
 An extension agent is a normal Zuno agent. Its `permission` object, not the
@@ -245,9 +254,25 @@ The protocol is JSON-RPC 2.0, one JSON object per line:
 - `shutdown` requests graceful cleanup before Zuno terminates and reaps the
   process tree.
 
+`packageRoot` and `workspace` carry the native path byte for byte. Zuno never
+normalizes separators there: on Linux and macOS `\` is an ordinary filename
+byte, so a workspace directory named `zuno\ws` is sent as `zuno\ws` and never as
+`zuno/ws`. A package whose root or workspace path is not valid UTF-8 has no
+representation on this boundary, so Zuno refuses to start that runtime by name
+instead of sending a substituted path.
+
+A plugin must not return `cancellation` in `metadata`. That key is reserved for
+Zuno's own cancellation claim and is read as a host-issued certainty statement,
+so a plugin-supplied `cancellation` object is dropped with a warning.
+
 Frames and captured stderr are bounded, diagnostics are scrubbed against known
-secret environment values, timeouts and cancellation stop the process tree, and
-protocol loss after a request is sent is reported as `Uncertain`.
+secret environment values, and timeouts and cancellation stop the process tree.
+Protocol loss after a request is sent is reported as an uncertain outcome that
+Zuno never mechanically replays. A call the user cancels is reported as a settled
+result titled `<tool> cancelled`, whose `cancellation` metadata records whether
+the plugin had been handed the call (`dispatched`), whether stopping the plugin
+was confirmed (`stopped`, `cleanup`), and the `uncertain`/`authoritative` verdict
+Zuno derived from both.
 
 See [`examples/plugins/process-review`](https://github.com/sunerpy/zuno/blob/main/examples/plugins/process-review) for
 the minimal executable example. The complete implementation guide is

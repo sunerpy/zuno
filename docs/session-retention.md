@@ -170,6 +170,13 @@ because the order is what keeps foreign keys satisfied mid-transaction.
 | 20 | `verification_receipt` |
 <!-- generated:END prune-tables -->
 
+That table is the ordered part of the delete. After it, the same transaction sweeps every
+session-keyed table the live schema declares with no foreign key on that key — today
+`human_request` and `provider_retry_backoff` — derived from the schema at run time and
+shared with `zuno session delete`, so a table added later cannot be reached by only one of
+the two paths. Preview counts those rows too, which is why `database.tables` in the JSON
+report can list more tables than the block above.
+
 Regenerate with:
 
 ```sh
@@ -213,13 +220,35 @@ reachable again.
 A report may carry:
 
 ```text
-`<database>` contains <n> sessions; artifact reclamation is skipped because shared snapshot stores cannot be attributed and may belong to another channel's database.
+`<database>` retains <n> sessions after this operation; snapshot store reclamation is skipped because a shared artifact cannot be attributed to a surviving session and may belong to another channel's database.
 ```
 
-This is not a failure. It says the run could not prove a snapshot store belongs to
-the sessions being pruned, so it left the bytes alone. The most common cause is
-running a source build against a release install's data directory — the two select
-different database files. See [migration.md](migration.md#the-channel-database).
+This is not a failure, and it is not a work item. It says the run could not prove a
+snapshot store belongs to the sessions being pruned, so it left those bytes alone; the
+same pass still reclaims tool output and attachment objects and reports their bytes.
+Preview and `--delete` report this identically, so the projection you approve is the
+operation you get. Nothing has to be done by hand: the next prune that runs against this
+database while at least one session survives evaluates the snapshot class and reclaims
+the store. Do not delete anything under `$ZUNO_DATA/snapshot` yourself — that directory
+is shared, a store there can belong to another channel's database, and choosing which is
+exactly the judgement the run declined to make. The most common cause is running a
+source build against a release install's data directory — the two select different
+database files. See [migration.md](migration.md#the-channel-database).
+
+A report may also carry:
+
+```text
+`<database>` kept 12 attachment objects whose 12 digests surviving rows name only as free text; model- or tool-authored content can produce that spelling, so those bytes are not reclaimable while such a row survives.
+```
+
+An attachment object is kept whenever any surviving row still names its digest, including
+a digest that appears only as text inside a message or a tool result. That direction is
+deliberate — deleting the only copy of an object a queued prompt still names is
+unrecoverable — but it means model- or tool-authored content can hold attachment bytes on
+disk. This warning is how you see it: it appears only when bytes were actually held back
+that way, or when a payload row was stored as neither text nor a blob and could not be
+scanned at all. Deleting the session that holds the row releases those objects on the
+next pass.
 
 An `n` of `0` here alongside a database you know has sessions is the signal that
 you are looking at the wrong database, not that your sessions are gone.

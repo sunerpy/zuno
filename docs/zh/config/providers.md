@@ -80,6 +80,8 @@ zuno auth login
 
 用方向键或输入文字过滤，然后按 Enter。如果所选 provider 有多种认证方法，Zuno 会为方法再打开一个选择器。Escape 或 Ctrl+C 可以取消任一选择器。非交互式调用仍然要求显式指定 provider，这样脚本就不会卡在一个询问上。
 
+URL 登录（`zuno auth login https://gateway.example.com`）会运行由该主机选择的命令并先请求确认；提示与 `--trust-remote-command` 见 `providers login` 参考。
+
 内置的 `openai` provider 支持三种方法：
 
 ```sh
@@ -108,7 +110,7 @@ printf '%s' "$MYOPENAI_API_KEY" | zuno auth login myopenai
 
 ## 凭据存储
 
-由 `zuno auth login` 创建的凭据按 provider id 存放在 `$XDG_DATA_HOME/zuno/auth.json`（通常是 `~/.local/share/zuno/auth.json`），Unix 上权限为 `0600`。对临时或受管环境，`ZUNO_AUTH_CONTENT` 可以用一个 JSON 对象取代凭据读取。
+由 `zuno auth login` 创建的凭据按 provider id 存放在 `$XDG_DATA_HOME/zuno/auth.json`（通常是 `~/.local/share/zuno/auth.json`），Unix 上权限为 `0600`。对临时或受管环境，`ZUNO_AUTH_CONTENT` 可以用一个 JSON 对象取代凭据读取。被中断的写入清空后的凭据文件仍然可读，并会报告损坏，下一次写入会替换它；Zuno 无法解码的条目会被保留，而不会被一次无关的登录删除。
 
 凭据优先级是：
 
@@ -163,12 +165,60 @@ Codex 与 Claude Code 产品子 Agent 是一项独立能力。它们继承对应
 | `headerTimeout` | 响应头超时（毫秒），或 `false` |
 | `chunkTimeout` | 流式数据块之间的最大间隔（毫秒） |
 | `maxTokens`、`temperature`、`topP`、`toolChoice` | 由原生 provider 转发的生成控制项 |
+| `toolCalls` | 仅 Bedrock：对该 provider 条目服务的所有模型给出 `true` 或 `false`，覆盖内置的 Converse 工具调用表 |
+| `modelCapabilities` | 仅 Bedrock：`<model id>.tool_calls` 只决定这一个模型 id，不影响其他模型 |
 | `responsesTextBlocks` | Responses 文本投影：默认 `multiple`，对只暴露一个上游文本字段的网关使用 `single` |
 | `reasoningReplay` | 默认 `off`；对会封装推理的 Responses 端点使用 `encrypted` |
 | `reasoningReplayMaxAge` | Zuno 仍会重放的最旧封装推理信封年龄（毫秒） |
 | `extraBody` | 在受保护字段组装完成之后追加的请求字段 |
 
 `responsesTextBlocks: "single"` 是一项兼容性声明，不是从 provider id 推断出的模型能力。它让 Zuno 的持久提示词 part 保持类型化，但会在构建 compatible Responses 请求之前，用一个空行把它们的文本投影连接起来。内联图像仍然是独立的内容块。只有当目标端点拒绝一条消息中出现多个 `input_text` 块时才使用它；符合标准的端点应当保持默认的 `multiple` 行为。不要把它用于 2026-08-28 的 `kiro-provider` 构建：那个 provider 现在会把连续的全文本块逐字节拼接、不加分隔符，而这个选项会有意插入一个空行。
+
+### 工具声明与 `toolChoice`
+
+一轮可以调用哪些工具，由 turn loop 锁定，而不是由 provider 选项决定；每个原生
+provider 都会发送这份逐轮工具集。`options.tools` 是给那些由 *端点* 代你执行的工具用的
+——例如 Anthropic 的 `web_search_20250305` 以及 Vertex Anthropic 上的对应项——这些是
+turn loop 无法表达的。
+
+当一轮带有锁定的工具集时，配置里的条目只有同时满足两点才会保留：它是这类由端点执行的
+工具（判据是它不带 `input_schema`），并且它的名字没有被锁定的工具占用——因为两个同名条目
+本身就是一个永久 400。配置里的 *自定义* 声明会被取代：工具派发是按锁定集校验的，因此第二份
+不一致的同名声明只会招来 Zuno 一定会拒绝的调用。当一轮不带锁定集时——标题、摘要、压缩请求
+——`options.tools` 会原样发送。
+
+`toolChoice` 只在请求体确实带着它所指名的那个工具时才发送。Anthropic 与 Vertex Anthropic
+surface 上的 `{"type": "tool", "name": "…"}`，以及 Gemini 上限定单个函数的写法，在被指名的
+工具不在请求里时都是永久 400，因此不可满足的选择会被丢弃，而不是变成一轮失败。此时模型自行
+决定——在 Gemini 上就是不发送 `toolConfig` 时的 `AUTO` 模式——并且永远不会被推向一个与你要求
+的不同的工具。
+
+### Bedrock 的逐模型工具声明
+
+Bedrock 是一个端点后面接着所有厂商的模型，而 Converse 对不支持工具调用的家族返回
+`toolConfig` 时会给出 `ValidationException`——这是永久失败，不可重试。因此 Zuno 只对
+Bedrock 明确记载 Converse 支持工具调用的家族发送工具声明：`anthropic.claude`（除
+`anthropic.claude-v2` 与 `anthropic.claude-instant`）、`amazon.nova-micro`、
+`amazon.nova-lite`、`amazon.nova-pro`、`amazon.nova-premier`、`cohere.command-r`、
+`meta.llama3-1`、`meta.llama3-2`、`meta.llama3-3`、`meta.llama4`、
+`mistral.mistral-large`、`mistral.mistral-small`、`mistral.pixtral-large` 与
+`ai21.jamba-1-5`。匹配方式是对小写模型 id 做子串匹配，因此跨区域前缀
+（`us.anthropic.claude-…`）以及资源名里带有模型 id 的 inference profile ARN，都会与裸 id
+解析成同一结果。
+
+其他情况——预置吞吐量 ARN、比本次构建更新的模型——会在不带任何工具声明的情况下发送，这与
+既有版本对所有 Bedrock 模型的行为一致。有两个选项可以覆盖它：
+
+- `toolCalls: true` 让该 provider 条目服务的所有模型都带上工具声明。`toolCalls: false`
+  则一个都不带，并且同时撤回该 provider 的工具调用能力，于是 turn loop 不再去组装一份
+  链路无法承载的工具集。
+- `modelCapabilities: {"<model id>": {"tool_calls": true}}` 只决定这一个模型 id，其余模型
+  仍由 `toolCalls` 或上面的表决定。键是配置里写的完整模型 id，拼写与 OpenAI-compatible
+  provider 已经读取的那一份完全相同。
+
+`bedrock-mantle` 发送的是 OpenAI Chat 或 Responses 请求体而不是 Converse 请求体，因此
+Converse 的那张表并不描述它：除非 `toolCalls: false` 或逐模型条目另有说明，这两个 surface
+会照常携带工具声明。
 
 ### 加密推理重放
 
@@ -213,8 +263,29 @@ zuno
 `webfetch` 使用同一条路由，但不会把目标 DNS 的权威交给代理。对原始 URL 与每一跳
 重定向，Zuno 都会在本地解析并校验全部目标地址，再通过选中的 HTTP、HTTPS、
 SOCKS4 或 SOCKS5 路由连接一个已校验 IP，同时保留原始 Host header 与 TLS SNI。
-配置的代理不可用时请求直接失败，不会静默重试直连；`NO_PROXY` 是环境层面对匹配
-公开目标选择直连的唯一方式。
+配置的代理不可用时请求直接失败，不会静默重试直连。
+
+有两个环境变量会让匹配的公开目标走直连：
+
+- `NO_PROXY`（或 `no_proxy`）让它匹配到的目标绕过已配置的代理。
+- `REQUEST_METHOD` 会整体停用代理环境。CGI 风格的宿主会把请求中传入的 `Proxy:`
+  header 映射成 `HTTP_PROXY`（httpoxy），因此只要存在 `REQUEST_METHOD`，Zuno 就会
+  在整个进程内忽略 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`，所有
+  公开请求一律直连。如果你因为其他原因导出了 `REQUEST_METHOD` 但仍希望走代理，
+  请取消该变量。
+
+有些建连失败是对方给出的答复而不是网络波动，`webfetch` 只失败一次、不再按退避重试：
+代理 CONNECT 返回 401、403、404、407、501，以及除 408、429 和其余 5xx 之外的任何
+状态；SOCKS5 除 0x01、0x03、0x04、0x05、0x06 之外的回复；SOCKS4 除 0x5b 之外的
+回复；以及任何证书或协议层面的 TLS 拒绝，包括 443 端口上以明文应答的强制门户。
+其中 403、404 与 SOCKS5 的 0x02、0x08 只针对一个目标地址，因此剩余的已校验地址
+仍会被尝试；但如果它们都没能连上，这条拒绝仍然决定整个请求的结果。
+
+建连有两重上限：单个已校验地址在 TCP、代理协商与 TLS 握手上最多用 10 秒；每一跳
+（原始 URL，以及随后的每一次重定向）的整轮地址遍历最多 30 秒、最多 8 个已校验地址，
+因此再大的 DNS 应答也无法延长它。等待响应 header 不计入该预算，由调用方自己的请求
+超时负责。Zuno 其他 HTTP 客户端都带有 30 秒的默认 connect 超时，个别 provider 可以
+把它调得更短。
 
 由 shell 工具、格式化器、语言服务器和本地 MCP server 启动的命令会继承 Zuno 的进程环境。它们各自显式的环境配置可以覆盖个别代理变量。
 

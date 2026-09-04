@@ -293,10 +293,41 @@ should handle normal termination signals promptly and must not detach
 unmanaged children.
 
 If Zuno sent `tools/call` and then lost the response, the external side effect
-may already have happened. Zuno reports that outcome as `Uncertain`, retires
-the process, and never mechanically replays the call. This is why every process
-tool is side-effecting and replay-never even when its ordinary operation looks
-like a read.
+may already have happened. Zuno reports that outcome as an uncertain failure,
+retires the process, and never mechanically replays the call. This is why every
+process tool is side-effecting and replay-never even when its ordinary operation
+looks like a read.
+
+User cancellation is different: it is a settled result, not a failure. Zuno
+publishes a result titled `<tool> cancelled` whose text states what the model may
+assume, plus a `cancellation` metadata object that records the same facts
+durably:
+
+| Field | Meaning |
+| --- | --- |
+| `cancelled` | Always `true` on this result. |
+| `dispatched` | Whether the plugin had been handed the call. `false` means the request never left Zuno. |
+| `stopped` | Present, and `false`, only when stopping the plugin was not confirmed. |
+| `cleanup` | Why the stop was not confirmed, when it was not. |
+| `uncertain` | `dispatched`, or an unconfirmed stop: authoritative state must be inspected before any retry. |
+| `authoritative` | The negation of `uncertain`. |
+| `detail` | One sentence stating both facts as the host observed them. |
+
+The two facts stay separate. A cancellation that is undecided only because
+`taskkill /pid n /f /t` could not confirm the process tree died still reports
+`dispatched: false`, and its text says the call was stopped before the plugin
+received it but the plugin may still be running and may still read it. A
+cancellation Zuno can decide reports `uncertain: false` and says nothing ran.
+
+`cancellation` is therefore a reserved metadata key: a plugin that returns it
+from `tools/call` has it dropped with a warning, because only the host can
+observe dispatch and cleanup.
+
+`packageRoot` and `workspace` in `initialize` carry the native path byte for
+byte, with no separator normalization on any platform, so a directory named
+`zuno\ws` arrives as `zuno\ws`. A package whose root or workspace path is not
+valid UTF-8 cannot be represented on this boundary at all and Zuno refuses to
+start that runtime by name.
 
 Design the upstream operation around this boundary:
 

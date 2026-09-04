@@ -206,6 +206,8 @@ OS sandbox is not implemented for platform `macos`
 
 一条已保存的 `always` 活在运行中的进程里，而不在数据库里，并且随 session 结束而结束。通过 HTTP 时，用 `POST /api/session/prune` 归档或删除一个 session 会撤销该 session 授予的每一条授权，重启 `zuno serve` 会清空全部；断开再重连事件流不会丢失它们，因为一条流不等于那个 session。想让一个决定活得比一个 session 更久，应该写进 `permission.rules`。参见[会话保留](/zh/operate/session-retention#归档会终止该-session-的常驻-http-授权)。
 
+通过 HTTP 时，常驻 `always` 预先批准的每一次调用都会被记录为一条独立的、已结算的请求行，响应为 `{"reply":"once","source":"standing"}`；授权本身从不落盘。如果一条回复到达时它的提问方已经消失 —— 回合被中断，或发起调用的进程已重启 —— 这条回复依然会被记录，答案会通过持久 inbox 进入会话，但不会安装任何常驻授权：只有真正收到该回复的调用才会让授权被保存。
+
 ## 逐工具规则
 
 `permission.rules` 是有序的，**最后一条匹配的规则胜出**。一条规则要么是对整个工具的单一动作，要么是按模式匹配的多个动作。

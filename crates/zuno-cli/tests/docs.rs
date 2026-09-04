@@ -630,6 +630,9 @@ fn architecture_documents_pin_the_native_harness_decisions() {
             "ZUNO_AUTH_CONTENT",
             "transport",
             "myopenai",
+            "StoreDamage",
+            "preserved",
+            "ABSENCE_CONFIRMATION",
         ],
     );
     contains_all(
@@ -1295,7 +1298,7 @@ fn durable_state_guides_document_evidence_gated_completion() {
             "[verification rcp_",
             "Cite this id as evidence",
             "inferred rather than observed",
-            "Evidence expires",
+            "Evidence is bounded at both ends",
             "[goal evidence]",
             "turns a question goal into a change goal",
             "`.git/info/exclude`",
@@ -1338,7 +1341,7 @@ fn durable_state_guides_document_evidence_gated_completion() {
             "`waive_criteria`",
             "[verification rcp_",
             "推断得来、而非直接观测到的",
-            "证据会过期",
+            "证据在两端都有边界",
             "[goal evidence]",
             "转成 change Goal",
             "`.git/info/exclude`",
@@ -1982,4 +1985,191 @@ fn colliding_tools_keys_docs_pin_the_refusal_and_name_it_breaking() {
             ],
         );
     }
+}
+
+/// Batch 3 measured four statements in the guides against the code and found each one
+/// stale: the off-reactor budget count omitted the prompt-admission budget
+/// (`ADMISSION_SLOTS` in `crates/zuno-server/src/api/blocking.rs`), the HTTP
+/// `prompt.files[].mimeType` rule and the legacy `filename` projection were undocumented,
+/// the dispatch-tracking upgrade boundary named 0.6.6 where every release through 0.9.0
+/// wrote untracked rows, the `message`-field caveat described a leak the MCP drain no
+/// longer has, and the standing-grant sentence claimed the grant was an audit row when the
+/// broker keeps it in memory and writes one settled row per pre-approved call.
+#[test]
+fn batch3_docs_pin_the_admission_budget_standing_rows_and_upgrade_boundary() {
+    contains_all(
+        "docs/guide/headless.md",
+        &[
+            "two inline image decodes for\n`POST /api/session/{sessionID}/prompt`",
+            "a\nprompt without files never waits for a slot",
+            "already-settled request row (`source: \"standing\"`)",
+            "the grant itself is never written",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/headless.md",
+        &[
+            "这四组端点",
+            "在整个进程内同时最多 2 个",
+            "不带文件的 prompt 从不为名额等待",
+            "已结算的请求行（`source: \"standing\"`）",
+            "授权本身从不落盘",
+        ],
+    );
+    contains_all(
+        "docs/guide/permissions.md",
+        &[
+            "already-settled request row",
+            "{\"reply\":\"once\",\"source\":\"standing\"}",
+            "the grant itself is never written",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/permissions.md",
+        &[
+            "已结算的请求行",
+            "{\"reply\":\"once\",\"source\":\"standing\"}",
+            "授权本身从不落盘",
+        ],
+    );
+    contains_all(
+        "docs/reference/attachments.md",
+        &[
+            "`prompt.files[].mimeType`",
+            "RFC 2045",
+            "five aliases browsers emit: `image/apng`,\n`image/x-png`, and `image/vnd.mozilla.apng` for PNG",
+            "only PNG, JPEG, GIF and\nWebP images are accepted",
+            "Every other `image/` subtype",
+            "sanitizes each field on its way into a\nmodel request instead",
+            "leaves the stored row as written",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/attachments.md",
+        &[
+            "`prompt.files[].mimeType`",
+            "RFC 2045",
+            "PNG 的 `image/apng`、`image/x-png`、`image/vnd.mozilla.apng`，以及 JPEG 的 `image/jpg`、`image/pjpeg`",
+            "only PNG, JPEG, GIF and WebP images are accepted",
+            "其他任何 `image/` 子类型",
+            "不改写已存储的行",
+            "投影进模型请求时逐一净化",
+        ],
+    );
+    contains_all(
+        "docs/guide/durable-state.md",
+        &[
+            "any release up\nto and including 0.9.0",
+            "`zuno-unnamed-call-<position>`",
+            "`call_…`, `fc_…`, `toolu_…`",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/durable-state.md",
+        &[
+            "0.9.0 及更早的任何版本",
+            "`zuno-unnamed-call-<position>`",
+            "`call_…`、`fc_…`、`toolu_…`",
+        ],
+    );
+    contains_all(
+        "docs/logging.md",
+        &[
+            "Zuno's own emitters keep\n  external text out of `message`",
+            "is logged under\n  `stderr`, which is redacted",
+            "`no_crate_emits_an_unexpected_message_field`",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/logging.md",
+        &[
+            "不会把外部文本放进 `message`",
+            "记录在 `stderr`",
+            "`no_crate_emits_an_unexpected_message_field`",
+        ],
+    );
+    for (relative, retired) in [
+        (
+            "docs/guide/headless.md",
+            "standing grant an `always` reply installs is written",
+        ),
+        ("docs/zh/guide/headless.md", "写入独立的审计行"),
+        ("docs/zh/guide/headless.md", "这三组端点"),
+        (
+            "docs/guide/permissions.md",
+            "standing grant an `always` reply installs is written",
+        ),
+        ("docs/zh/guide/permissions.md", "写入独立的审计行"),
+        ("docs/guide/durable-state.md", "from 0.6.6"),
+        ("docs/zh/guide/durable-state.md", "从 0.6.6 升级"),
+        ("docs/logging.md", "Some Zuno callsites still"),
+        ("docs/zh/operate/logging.md", "仍有若干调用点"),
+    ] {
+        assert!(
+            !read(relative).contains(retired),
+            "{relative} still carries retired wording {retired:?}"
+        );
+    }
+}
+
+/// `zuno providers login <url>` runs a program the remote host names. The CLI reference
+/// pages mirror clap's help by hand, so the `--trust-remote-command` row, the tightened
+/// loopback guard, and the `Run this command` confirmation are pinned here rather than
+/// generated, and the two providers reference pages must point at that section.
+#[test]
+fn providers_login_docs_pin_the_remote_command_confirmation_and_trust_flag() {
+    contains_all(
+        "docs/cli/providers.md",
+        &[
+            "| `--trust-remote-command` |",
+            "shown for confirmation before it starts",
+            "`http://127.0.0.1.attacker.example`",
+            "asks `Run this command` with `No` preselected",
+            "refused before anything is fetched",
+        ],
+    );
+    contains_all(
+        "docs/zh/cli/providers.md",
+        &[
+            "| `--trust-remote-command` |",
+            "运行前会先显示并请求确认",
+            "`http://127.0.0.1.attacker.example`",
+            "以 `Run this command` 询问，默认选中 `No`",
+            "该选项对 provider 登录会被拒绝",
+        ],
+    );
+    for relative in ["docs/reference/providers.md", "docs/zh/config/providers.md"] {
+        contains_all(relative, &["`--trust-remote-command`", "`providers login`"]);
+    }
+}
+
+/// The Shell gate's wrapper walk (`wrapper_readings` in `crates/zuno-tools/src/risk.rs`)
+/// reads a command line through `sudo`, `env`, `timeout` and the other wrappers in
+/// `WRAPPER_COMMANDS`. The configuration reference pins the rules a user can observe: an
+/// option the gate does not know is read both ways, `timeout` needs a duration it accepts
+/// before the next word is the program, a second computed word among a wrapper's options
+/// is read as a possible program and may cost a confirmation, and a line that could not
+/// be split reliably is held for a human.
+#[test]
+fn wrapper_program_docs_pin_the_fork_rule_and_the_timeout_duration() {
+    contains_all(
+        "docs/reference/configuration.md",
+        &[
+            "### Wrapper programs",
+            "An option the gate does not recognise is read both ways",
+            "`timeout` needs a duration it accepts",
+            "computed words among a wrapper's options may now ask for confirmation",
+            "the line could not be split",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/reference.md",
+        &[
+            "### 包装程序",
+            "门禁不认识的选项会按两种方式读取",
+            "`timeout` 需要一个它能接受的时长",
+            "因为第二个计算词被当作可能的程序来读取",
+            "无法被可靠地切分",
+        ],
+    );
 }

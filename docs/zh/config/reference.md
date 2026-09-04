@@ -385,6 +385,65 @@ ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined zuno
 命令放在全局 `zuno.json` 或其他受信层，或者用 `trust.project_host_commands`
 接纳特定检出，详见本页「用信任接纳检出声明的本机命令」一节。
 
+Shell 风险门禁区分可确认的风险与灾难性拒绝。有边界的破坏性操作、动态目标，以及覆盖已存在的
+重定向目标都会请求新的批准，除非生效权限模式是 `allow_all`；在 `allow_all` 下它们不经提示直接
+执行。灾难性目标在所有模式下都被直接拒绝。工作目录或 OS 临时目录下的新静态文件被视为创建。对
+OS 临时目录下当前不存在的、静态命名路径的精确、非递归 `rm -f` 被视为无操作清理。没有任何工具
+参数能让模型批准自己的风险调用，显式的权限拒绝始终优先。
+
+### 包装程序
+
+Shell 门禁会穿过命令行前面的包装程序来阅读它——`sudo`、`doas`、`env`、`nice`、
+`ionice`、`time`、`timeout`、`nohup`、`xargs`、`command`、`builtin`、`exec`、
+`setsid`、`stdbuf`、`chroot`、`watch`、`chrt`、`taskset`、`flock`——因此被判定的是
+它们运行的程序，而不是包装程序本身。命令行的每一种读法都会被判定，结论取并集：一种读法
+只能增加确认或拒绝，绝不会移除。门禁不认识的选项会按两种方式读取：既当作开关，也当作
+以下一个词为值的选项；因此不认识的选项可能让一条无害的命令多出一次确认，但绝不会把它
+后面的程序藏起来。
+
+包装程序的每一个词都遵循同一条规则：**由 shell 计算出来的词可能在运行时消失，因此只要
+出现这样的词，门禁就把它之后的每一个词都当作可能的程序来判定；紧贴在选项后面或用 `=`
+连接的计算值，同样如此处理。** `$VAR`、`${VAR}`、`$(…)`、反引号和通配符都属于计算出来
+的词。未加引号的空展开会整词消失，而紧贴的空值会把 `-u$EMPTY` 变成 `-u`，于是它转而把
+**下一个**词当作自己的值；两种情况都会让程序向右移动。`sudo -u$EMPTY root rm -rf /`
+确实会以 root 身份运行 `rm -rf /`，`chroot $ROOT /mnt rm -rf /` 确实会在 `/mnt` 下
+运行它，所以两者都被拒绝。
+
+这条规则在所有位置上一律适用，没有例外：选项开关、单独写出的选项值（`-u $EMPTY`）、
+紧贴写出的选项值（`-u$EMPTY`、`-Eu$EMPTY`、`-n$N`）、用 `=` 连接的值（`--user=$VAL`）、
+门禁不认识的选项、包装程序在其程序之前接受的操作数（`chroot NEWROOT`、`taskset MASK`、
+`flock FILE`、`env VAR=value`、`chrt PRIORITY`）、`timeout` 的时长与信号，以及携带内联
+脚本的那个词。
+
+把之后的每个词都判定一遍是有意的过度近似。`sudo $X echo rm -rf /` 只会打印，但仍然会被
+拒绝：猜测展开在哪里结束，就必须猜对门禁看不到的值，而猜错就会把程序藏起来。为一条只是
+打印的命令付出重写措辞的代价，远小于漏掉一次 `rm -rf /` 而失去文件系统。这条规则只会为
+含计算词的命令**增加**确认或拒绝，绝不会减少。包装程序的选项中出现两个计算词的命令，现在
+可能会请求确认，因为第二个计算词被当作可能的程序来读取。
+
+只要门禁认识的程序交出了内联脚本，门禁就会跟进去读：`sh`、`bash`、`zsh`、`dash`、
+`ksh`、`fish`、`pwsh` 和 `powershell` 的 `-c`（或 `-Command`）脚本、`eval` 之后的词、
+`su -c`、`env -S` 和 `flock -c`。内联脚本在其程序接受的每一种写法下都算作程序，包括
+位于另一个包装程序之后：`env -S 'rm -rf /'`、`env -S'rm -rf /'`、`env -iS 'rm -rf /'`、
+`env --split-string='rm -rf /'`、`su -c'rm -rf /'`、`su -lc 'rm -rf /'`、
+`su --command='rm -rf /'`、`flock FILE -c 'rm -rf /'`、
+`sudo env --split-string='rm -rf /'`、`timeout 5 env -S'rm -rf /'`。ANSI-C 引用会在
+读取脚本之前先展开，因此 `sh -c $'echo hi\nrm -rf /'` 与 `sh -c 'echo hi; rm -rf /'`
+一样被拒绝。程序名那个词在引用展开之后仍含有空白或列表运算符，或者 shell `-c` 脚本之后
+的参数仍读起来像一串命令（含 `;`、`|`、`&` 或换行），都会被留给人确认，因为这条命令行
+无法被可靠地切分。
+
+`timeout` 需要一个它能接受的时长：以数字开头（前面可以带 `+` 或 `.`）的词，或不分大小写
+的 `inf`、`infinity`——如 `5`、`1.5m`、`10s`、`.5`、`+5`、`1e3`。不是时长的词属于用法
+错误，什么都不会运行，因此这样的命令不会被拒绝——`timeout '' rm -rf /` 会以
+`invalid time interval` 退出。时长有效时，紧随其后的词才是程序，其余都是它的参数，所以
+`timeout 5 sh rm -rf /` 运行的是 `sh` 加一个名为 `rm` 的脚本文件，而不是 `rm` 程序。
+
+日常的包装程序用法不受影响：`sudo -u root ls`、`sudo -u $USER ls -la`、
+`sudo -u$USER ls -la`、`sudo --user=$USER ls`、`chroot $ROOT /mnt ls -la`、
+`taskset $MASK 0x3 ls`、`nice -n$N make -j4`、`env FOO=bar make`、
+`timeout 5 cargo test` 和 `timeout inf cargo test` 都会直接运行，不会弹出确认。
+
 ## 严格 HITL 授权
 
 `strict` 模式要求每个有副作用的调用都获得一次新的人工决策。这适用于不希望任何写操作在无人确认下发生的场景。

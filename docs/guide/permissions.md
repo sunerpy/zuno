@@ -259,6 +259,14 @@ stream keeps them, because a stream is not the session. A decision meant to
 outlive one session belongs in `permission.rules`. See
 [Session retention](/session-retention#archiving-ends-a-sessions-standing-http-authorizations).
 
+Over HTTP, every call a standing `always` pre-approves is recorded as its own
+already-settled request row, with the response `{"reply":"once","source":"standing"}`;
+the grant itself is never written. A reply that arrives after its asker is gone — the
+turn was interrupted, or the process that made the call restarted — is still recorded,
+and the answer reaches the session through the durable inbox, but it installs no
+standing grant: an authorization is only saved when the call it authorizes actually
+received the reply.
+
 ## Per-tool rules
 
 `permission.rules` is ordered, and **the last matching rule wins**. A rule is either

@@ -145,7 +145,9 @@ ordinal, the responsible field (`experiences.summary`, `memories.content`,
 unusable (no durable project, session, or source message, a `memories[]` entry
 pointing outside the extractor's own list, or a confidence that is not a
 probability) settles the job `failed`. A learning job is attempted at most
-three times.
+three times. The `/reflect` result carries the same `refusedItems`, and the
+post-turn extraction worker surfaces each refused entry to the client as a
+`warning: learning extraction refused experience …` status line.
 
 Resident Memory keeps its own fence. A candidate extracted from an experience is
 proposed through the normal review path, so the injection and exfiltration
@@ -167,7 +169,8 @@ marker expansion, so it is never lower than what the prompt actually spends. If
 cheapest matching record, retrieval returns nothing and says so, naming the
 configured budget and the token figure that smallest record needs, so a budget
 below the floor is a visible diagnostic rather than a project that appears to
-have learned nothing.
+have learned nothing. The turn reports that condition once per session as a
+warning notice with code `learning.retrieval_skipped`.
 
 ## Feedback
 

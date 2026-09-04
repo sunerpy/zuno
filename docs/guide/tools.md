@@ -141,13 +141,14 @@ a filename containing a backslash comes back verbatim, because a backslash is an
 filename byte there; on Windows, ripgrep's backslash separators are reported as `/`,
 which that platform accepts. A file name containing a newline is returned as the single
 path it is. Matching lines are capped at 2000 UTF-16 code units and a single `rg` record
-over 1 MiB is skipped; a skipped record or an unnameable path is not currently
-distinguished from the result limit in the rendered output. A directory the walk cannot
-enter contributes no results and is reported as "No files found", not as a permission
-failure: ripgrep's per-path diagnostics are suppressed so that one unreadable directory
-elsewhere under the root cannot turn the common "my pattern matched nothing" outcome into
-a tool failure. Zuno does not distinguish "not there" from "could not be read" for a
-subtree.
+over 1 MiB is skipped. The rendered `glob`/`grep` output marks the result as truncated
+whenever a match was dropped, whether by the limit or because its path could not be named,
+and a path is returned exactly once, as the identifier of one real file. A directory the
+walk cannot enter contributes no results and is reported as "No files found", not as a
+permission failure: ripgrep's per-path diagnostics are suppressed so that one unreadable
+directory elsewhere under the root cannot turn the common "my pattern matched nothing"
+outcome into a tool failure. Zuno does not distinguish "not there" from "could not be
+read" for a subtree.
 
 For a Shell command that only observes remote work, set
 `backgroundPurpose: "remoteObserver"`. This value is persisted with the background
@@ -369,6 +370,48 @@ Zuno process environment is still readable from the host, so a variable being ab
 the command's own environment raises the cost of reading it rather than guaranteeing it
 cannot be read. Sandboxing is what narrows that; this removal is what stops one `env` or
 one `printenv` from being enough.
+
+## The pre-flight repository read budget
+
+A `git commit` or `git add` is inspected before it runs, so the call can refuse to deliver
+generated state. That inspection makes up to four `git` reads, and all of them share one
+thirty-second budget for the whole phase — not thirty seconds each. The number is a total:
+the reads race a deadline that is the budget minus a small reserve, and the reserve is what
+stops a read that never answered, so a configured thirty seconds cannot admit a
+sixty-second phase.
+
+A read that does not answer in time is a refusal, not a pass:
+
+```
+`git status --porcelain` did not answer within the 30s this command's pre-flight repository reads share, so the repository state it depends on is unknown; it was not run
+```
+
+The command is not run. An unknown repository is not an empty one, and reading a hung read
+as "nothing to report" would turn a stalled `.git` into permission to commit. Cancelling the
+call refuses it the same way. In both cases the abandoned `git` and anything it started are
+stopped as a group before the refusal returns.
+
+## What a shell call reports it wrote
+
+`write`, `edit`, and `apply_patch` each name the files they changed. `shell` now does too,
+on the same `writtenPaths` metadata, so a command that edits the workspace is visible to
+everything built on that key — the goal store's escalation from a question to a change, the
+freshness mark that retires a stale verification receipt, the changed-file list an
+interrupted call settles with, and every client's tool-call view. Before this,
+`shell {"command": "sed -i 's/foo/bar/' src/lib.rs"}` could complete a goal with no
+evidence at all, because nothing had told the store that anything changed.
+
+The report is observed, never inferred. Each statically resolvable path the command names
+is examined before and after the run, and a path is reported only when the two observations
+disagree — because the filesystem says the file changed, not because a command name looked
+like a writer. That makes it a deliberate lower bound. Not reported: a target the shell
+expands (`$OUT`, `*.rs`, `$(ls)`, a here-document, a redirection), which is skipped rather
+than guessed; a path outside the workspace and outside the directories the call was
+granted; a deletion, because the key means "this file is now here to be re-read"; a rewrite
+that leaves both size and modification time unchanged; and a command promoted to the
+background, which is still writing when the call returns. A missing path costs evidence. A
+fabricated one would retire a receipt over a file nothing touched, so the bound errs toward
+silence.
 
 ## Effect classification
 

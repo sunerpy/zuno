@@ -27,9 +27,10 @@ Zuno 把两类持久数据分开：
 - **名为 `message` 的字段永不脱敏。** `message` 是 `tracing` 给事件自身文本的字段名，
   formatter 打印它时不带 `name=` 前缀，因此调用点放在这里的任何内容都会原样写入纯文本日志、
   `--print-logs` 的 stderr，以及 `logs.sqlite` 的 `message` 列，并且读起来就是事件消息本身。
-  Zuno 目前仍有若干调用点把外部文本经由 `message` 输出（最需要知道的是 MCP server 的
-  stderr 行），所以纯文本日志中可能出现子进程的原始输出。请给载荷单独的字段名，让判定能够
-  归类它，或只记录一个「量」（`bytes`、`limit`、`truncated`）。
+  Zuno 自己的发射点不会把外部文本放进 `message`：MCP server 的 stderr 行记录在 `stderr`
+  字段下，该字段会被脱敏；并且测试套件里有一道 tripwire
+  （`no_crate_emits_an_unexpected_message_field`），一旦新的调用点把值送进 `message` 就会失败。
+  请给载荷单独的字段名，让判定能够归类它，或只记录一个「量」（`bytes`、`limit`、`truncated`）。
 
 需要模型可见载荷的组件必须使用 session 事件日志。
 

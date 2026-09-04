@@ -216,6 +216,56 @@ compaction holds the session lease waits in the durable inbox and is driven as s
 as the compaction releases the lease, instead of sitting there until some unrelated
 event happens to wake the session.
 
+### Reading files over the API
+
+`GET /api/fs/read` buffers the whole file, so it refuses anything larger than 32 MiB
+with `413` and the error code `file_too_large` instead of growing the server by the
+size of whatever path a caller names. `GET /api/fs/find` answers with a `truncated`
+field: `true` means the walk stopped early — the 20,000-entry budget, the 16-level
+depth limit, or a subtree this process could not open — so `truncated: true` with no
+match means *not searched*, never *not present*. The published `/openapi.json`
+document still declares the find response body as a schema gap, so a generated client
+has to read this field from this page.
+
+The filesystem, session-maintenance, catalogue, and prompt-admission endpoints run
+their synchronous work off the request reactor inside a fixed process-wide budget:
+four concurrent `/api/fs` operations, two `/api/session/prune` previews or mutations,
+eight catalogue discovery walks, and two inline image decodes for
+`POST /api/session/{sessionID}/prompt`. The fourth budget is charged once for every
+prompt whose `prompt.files[]` is non-empty — inline images and references to
+already-admitted attachments alike — and covers each decode in that
+prompt, so at most two decodes run at once across the whole process; a
+prompt without files never waits for a slot. A request over any budget waits for a
+slot rather than being refused, and a caller that disconnects while waiting never
+starts the work at all. The budgets are cost bounds rather than tuning knobs — no
+request field, header, or configuration key raises one. Resolving a durable image
+object for a provider request is bounded the same way in every host, not only the
+server: at most two resolutions run at once across the whole process, sized against
+the 900,000,000-byte working set a stored object may cost to re-encode, and a turn
+whose history needs a third waits for a slot.
+
+### Replying to a permission request or a question
+
+A reply is one durable transition. `204` means the request row, the reply event, and —
+for a request recovered after a restart — the durable inbox entry all committed. `404`
+with `not_found` means nothing was written, because the request was already settled,
+belongs to another session, or has been claimed by another reply that is still
+committing. Exactly one reply to a request can receive `204`.
+
+A `204` reply whose original asker is gone — the turn was interrupted, or the process
+that made the call restarted — is still recorded, and the answer reaches the session
+through the durable inbox. Because nothing consumed it, `reply: "always"` in that case
+saves no standing grant: an authorization is only installed when the call it authorizes
+actually received the reply.
+
+A request that no reply settles ends in a terminal state of its own rather than a
+synthesized denial. `expired` means the observer grace window closed with no client
+watching (30 seconds after the last observer disconnects), `cancelled` means the
+session or turn withdrew the request, and `failed` means the server could not record a
+decision. Every call a standing `always` pre-approves is recorded as its own
+already-settled request row (`source: "standing"`); the grant itself is never written,
+and archiving or deleting a session withdraws the grants that session made.
+
 ## See also
 
 - [zuno run](/cli/run)
