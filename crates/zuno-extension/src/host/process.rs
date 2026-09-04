@@ -622,6 +622,9 @@ fn diagnostic(redactor: &SecretRedactor, message: impl AsRef<str>, stderr: &str)
 
 #[cfg(test)]
 mod tests {
+    // Used only by the Unix-gated tick-counting test; on Windows the import would be
+    // reported as unused under `-D warnings`.
+    #[cfg(unix)]
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
