@@ -6979,6 +6979,7 @@ dependencies = [
  "zuno-catalog",
  "zuno-config",
  "zuno-error",
+ "zuno-paths",
  "zuno-process",
  "zuno-tool",
 ]
