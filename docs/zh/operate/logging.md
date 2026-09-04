@@ -7,9 +7,31 @@ Zuno 把两类持久数据分开：
 - 运维日志包含有界的诊断元数据：进程生命周期、session/turn 关联、Provider 尝试、工具
   生命周期、耗时、带类型的结果，以及资源事件。
 
-运维日志不能变成第二份 transcript。prompt、command、request body、raw tool input、output、
-credential、token、cookie 以及类似命名的字段会在持久化之前被脱敏。需要模型可见载荷的组件
-必须使用 session 事件日志。
+运维日志不能变成第二份 transcript。在记录写出之前，所有文本 sink 与 SQLite sink 都会让
+字段值经过同一个基于字段名的脱敏判定：字段名拼出 `authorization`、`api_key`、
+`access_token`、`refresh_token`、`private_key`、`password`、`passphrase`、`secret`、
+`credential`、`cookie`、`token`、`bearer`、`signature`、`prompt`、`content`、`body`、
+`command`、`input`、`output`、`report`、`stdin`、`stdout`、`stderr` 的字段会写成
+`[redacted]`。分隔符与大小写会被忽略，因此 `api_key`、`apiKey`、`api-key`、`API.KEY`
+是同一个名字；规则复数同样匹配（`commands`、`cookies`、`access_tokens`）。Zuno 无法归类的
+字段名（含非 ASCII 字节的，或没有任何可识别成分的）按失败即拒绝处理，一律脱敏。脱敏只替换
+单个字段的值：记录本身、它的事件文本以及其余字段仍会写出，所以脱敏不会让你失去这条诊断。
+
+有两个例外是有意保留的，都属于需要提前规划的边界：
+
+- **只拼出「量」的字段名保持可读**，这样调用方有安全的方式报告规模：`command_bytes`、
+  `prompt_tokens`、`output_tokens`、`input_tokens`、`content_tokens`、`command_tokens`、
+  `secret_bytes`、`cookie_count`。只有上述五个 token 计量类别才允许 `tokens` 的复数读法；
+  `secret_tokens`、`cookie_tokens`、`auth_tokens`、`total_tokens`、`max_tokens` 都会被脱敏。
+  绝不要把值放进以「量」命名的字段：`secret_bytes` 必须存放字节数。
+- **名为 `message` 的字段永不脱敏。** `message` 是 `tracing` 给事件自身文本的字段名，
+  formatter 打印它时不带 `name=` 前缀，因此调用点放在这里的任何内容都会原样写入纯文本日志、
+  `--print-logs` 的 stderr，以及 `logs.sqlite` 的 `message` 列，并且读起来就是事件消息本身。
+  Zuno 目前仍有若干调用点把外部文本经由 `message` 输出（最需要知道的是 MCP server 的
+  stderr 行），所以纯文本日志中可能出现子进程的原始输出。请给载荷单独的字段名，让判定能够
+  归类它，或只记录一个「量」（`bytes`、`limit`、`truncated`）。
+
+需要模型可见载荷的组件必须使用 session 事件日志。
 
 ## 默认存储
 

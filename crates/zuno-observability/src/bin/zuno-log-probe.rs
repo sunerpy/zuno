@@ -84,6 +84,47 @@ fn main() -> ExitCode {
         "probe emitted a sensitive field"
     );
 
+    // The exact shape of a live emitter outside this crate: zuno-snapshot's
+    // `store.rs` logs raw git subprocess stderr at WARN, which the default INFO
+    // filter admits, so an operator running with `ZUNO_PLAINTEXT_LOGS=1` used to get
+    // the whole subprocess payload in a file on disk.
+    tracing::warn!(
+        marker = "probe-subprocess",
+        hash = "0f1e2d3c",
+        code = ?Some(128),
+        stderr = %"never-print-this-git-stderr",
+        "failed to get diff"
+    );
+
+    // Names `docs/logging.md` promises are redacted, plus the prefix-compound and
+    // camelCase spellings of the same payloads. `stdout_bytes` is the bounded
+    // measurement that exists so the payload never has to be logged; it has to stay
+    // readable or the safe alternative is worthless.
+    tracing::warn!(
+        marker = "probe-credential",
+        token = "never-print-this-bearer-token",
+        credential = "never-print-this-credential",
+        prompt_text = "never-print-this-prefix-prompt",
+        command_line = "never-print-this-command-line",
+        accessToken = "never-print-this-camel-token",
+        stdout_bytes = 12,
+        "probe emitted credential-named fields"
+    );
+
+    // A plural is the natural Rust spelling for a collection of the same payload, and a
+    // singular-only rule left every one of these in the clear. `prompt_tokens` is the
+    // documented carve-out that has to survive the plural rule.
+    let cookie_jar = "session=never-print-this-cookie-jar";
+    let argv = ["git", "never-print-this-argv"];
+    tracing::warn!(
+        marker = "probe-plural",
+        cookies = %cookie_jar,
+        commands = ?argv,
+        outputs = "never-print-this-outputs",
+        prompt_tokens = 1024,
+        "probe emitted plural payload fields"
+    );
+
     {
         let request_span = span::provider_request("anthropic", "claude-sonnet-4-5", 1, true);
         let _request_entered = request_span.enter();
@@ -115,6 +156,23 @@ fn main() -> ExitCode {
         blocked.blocked("denied");
 
         let _abandoned = ToolLifecycle::pending("shell", "toolu_probe_abandoned");
+    }
+
+    {
+        // A sensitive value can arrive as a span field rather than an event field,
+        // which reaches a text sink through the span list on every enclosed record.
+        let sensitive_span = tracing::info_span!(
+            "probe_sensitive_span",
+            marker = "probe-span-sensitive",
+            prompt = "never-print-this-prompt",
+            report = tracing::field::Empty,
+        );
+        sensitive_span.record("report", "never-print-this-report");
+        let _sensitive_entered = sensitive_span.enter();
+        tracing::info!(
+            marker = "probe-span-sensitive-event",
+            "probe emitted inside a span carrying sensitive fields"
+        );
     }
 
     frame(r#"{"jsonrpc":"2.0","method":"probe/emitted","params":{"levels":5}}"#);

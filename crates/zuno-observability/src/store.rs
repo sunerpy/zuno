@@ -22,9 +22,12 @@ use serde_json::{Map, Number, Value, json};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Id, Subscriber};
 use tracing_subscriber::Layer;
+use tracing_subscriber::field::RecordFields;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use uuid::Uuid;
+
+use crate::redact::Redacting;
 
 pub const STRUCTURED_LOG_FILE: &str = "logs.sqlite";
 pub const DEFAULT_MAX_RECORDS: usize = 50_000;
@@ -286,8 +289,7 @@ where
         let Some(span) = context.span(id) else {
             return;
         };
-        let mut visitor = FieldVisitor::default();
-        attributes.record(&mut visitor);
+        let visitor = FieldVisitor::record(attributes);
         span.extensions_mut().insert(SpanFields {
             name: attributes.metadata().name(),
             fields: visitor.fields,
@@ -302,15 +304,12 @@ where
         let Some(fields) = extensions.get_mut::<SpanFields>() else {
             return;
         };
-        let mut visitor = FieldVisitor::default();
-        values.record(&mut visitor);
-        fields.fields.extend(visitor.fields);
+        fields.fields.extend(FieldVisitor::record(values).fields);
     }
 
     fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
         let metadata = event.metadata();
-        let mut visitor = FieldVisitor::default();
-        event.record(&mut visitor);
+        let visitor = FieldVisitor::record(event);
 
         let mut span_values = Vec::new();
         let mut inherited = BTreeMap::<String, String>::new();
@@ -392,13 +391,23 @@ struct SpanFields {
     fields: Map<String, Value>,
 }
 
-#[derive(Default)]
 struct FieldVisitor {
     fields: Map<String, Value>,
     message: Option<String>,
 }
 
 impl FieldVisitor {
+    /// The only way to build a visitor, so every field pass into this store runs
+    /// through the shared redaction proxy whether or not its author remembered.
+    fn record(fields: impl RecordFields) -> Self {
+        let mut visitor = Self {
+            fields: Map::new(),
+            message: None,
+        };
+        fields.record(&mut Redacting::new(&mut visitor));
+        visitor
+    }
+
     fn insert(&mut self, field: &Field, value: Value) {
         if field.name() == "message" {
             self.message = value
@@ -407,13 +416,9 @@ impl FieldVisitor {
                 .or_else(|| Some(value.to_string().trim_matches('"').to_owned()));
             return;
         }
-        let value = if sensitive_field(field.name()) {
-            Value::String("[redacted]".to_owned())
-        } else {
-            match value {
-                Value::String(value) => Value::String(truncate(value, MAX_FIELD_BYTES)),
-                value => value,
-            }
+        let value = match value {
+            Value::String(value) => Value::String(truncate(value, MAX_FIELD_BYTES)),
+            value => value,
         };
         self.fields.insert(field.name().to_owned(), value);
     }
@@ -450,29 +455,6 @@ impl Visit for FieldVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         self.insert(field, Value::String(format!("{value:?}")));
     }
-}
-
-fn sensitive_field(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase().replace(['-', '.'], "_");
-    [
-        "authorization",
-        "api_key",
-        "apikey",
-        "access_token",
-        "refresh_token",
-        "password",
-        "secret",
-        "cookie",
-        "prompt",
-        "content",
-        "body",
-        "command",
-        "raw_input",
-        "output",
-        "report",
-    ]
-    .iter()
-    .any(|needle| normalized == *needle || normalized.ends_with(&format!("_{needle}")))
 }
 
 fn context_value(
@@ -671,20 +653,57 @@ fn unix_millis() -> i64 {
 mod tests {
     use super::*;
 
+    /// The needle list itself is covered in `crate::redact`. What has to be pinned
+    /// here is that this layer's own field pass still goes through it, on the real
+    /// `on_event` path rather than a reimplementation of it.
     #[test]
-    fn sensitive_fields_are_redacted_by_name() {
-        for field in [
-            "authorization",
-            "api_key",
-            "request.access_token",
-            "tool_command",
-            "raw_input",
-        ] {
-            assert!(sensitive_field(field), "{field} should be sensitive");
-        }
-        for field in ["session_id", "turn_id", "provider", "command_bytes"] {
-            assert!(!sensitive_field(field), "{field} should remain diagnostic");
-        }
+    fn the_store_layer_redacts_on_the_real_event_path() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let (sender, receiver) = sync_channel(BATCH_CAPACITY);
+        let subscriber = tracing_subscriber::registry().with(StructuredLogLayer {
+            sender,
+            dropped: Arc::new(AtomicUsize::new(0)),
+            failures: Arc::new(AtomicUsize::new(0)),
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("probe", prompt = "never-store-this-prompt");
+            let _entered = span.enter();
+            tracing::info!(
+                command = "never-store-this-command",
+                command_bytes = 24,
+                "sensitive event"
+            );
+        });
+
+        let records = std::iter::from_fn(|| receiver.try_recv().ok())
+            .map(|command| match command {
+                Command::Record(record) => *record,
+                Command::Shutdown => panic!("the layer never sends Shutdown"),
+            })
+            .collect::<Vec<_>>();
+        let record = records
+            .iter()
+            .find(|record| record.message.as_deref() == Some("sensitive event"))
+            .expect("the sensitive event reached the store queue");
+        assert!(
+            record
+                .fields_json
+                .contains(&format!(r#""command":"{}""#, crate::redact::REDACTED)),
+            "{}",
+            record.fields_json
+        );
+        assert!(record.fields_json.contains(r#""command_bytes":24"#));
+        assert!(
+            !record.fields_json.contains("never-store-this-command"),
+            "{}",
+            record.fields_json
+        );
+        assert!(
+            !record.spans_json.contains("never-store-this-prompt"),
+            "{}",
+            record.spans_json
+        );
     }
 
     #[test]

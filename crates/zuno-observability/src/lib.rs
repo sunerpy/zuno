@@ -4,12 +4,15 @@
 //! events. This crate records operational metadata instead: process lifecycle,
 //! turn/provider/tool correlation, failures, timing, and resource diagnostics.
 //! The default sink is a bounded SQLite database shared safely by concurrent
-//! processes. Logs never write to stdout.
+//! processes. Logs never write to stdout, and a field whose name looks sensitive
+//! is replaced with a placeholder before any sink — SQLite, plaintext file, or
+//! stderr — writes it.
 
 mod config;
 mod error;
 pub mod frame;
 pub mod memory;
+mod redact;
 pub mod span;
 mod store;
 pub mod tool;
@@ -20,6 +23,7 @@ pub use crate::config::{
     LOG_FILE_SUFFIX, LogConfig, LogLevel,
 };
 pub use crate::error::LogInitError;
+pub use crate::redact::REDACTED;
 pub use crate::store::{
     DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_BYTES, DEFAULT_MAX_RECORDS, STRUCTURED_LOG_FILE,
 };
@@ -87,24 +91,18 @@ pub fn init(config: LogConfig) -> Result<LogHandle, LogInitError> {
             .thread_name("zuno-plaintext-log")
             .finish(file);
         let dropped = writer.error_counter();
-        let layer = tracing_subscriber::fmt::layer()
-            .with_writer(writer)
-            .with_ansi(false)
-            .with_target(true)
-            .with_level(true)
-            .with_span_events(span_events.clone());
+        let layer = redact::text_layer(writer, false, span_events.clone());
         (Some(layer), Some(guard), Some(dropped), Some(path))
     } else {
         (None, None, None, None)
     };
 
     let stderr_layer = print_logs.then(|| {
-        tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
-            .with_ansi(std::io::stderr().is_terminal())
-            .with_target(true)
-            .with_level(true)
-            .with_span_events(span_events)
+        redact::text_layer(
+            std::io::stderr,
+            std::io::stderr().is_terminal(),
+            span_events,
+        )
     });
 
     let store::StoreRuntime {

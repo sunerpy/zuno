@@ -6,6 +6,35 @@ use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::TempDir;
 
+/// Raw values the probe emits under a sensitive field name. No sink may contain
+/// them: not the SQLite store, not the plaintext file, not stderr.
+const SENSITIVE_LITERALS: &[&str] = &[
+    "never-store-this-command",
+    "never-print-this-prompt",
+    "never-print-this-report",
+    // Raw subprocess output, under the field name a live emitter outside this crate
+    // already uses at WARN.
+    "never-print-this-git-stderr",
+    // Names `docs/logging.md` promises are redacted.
+    "never-print-this-bearer-token",
+    "never-print-this-credential",
+    // The payload word is not the last component of the field name.
+    "never-print-this-prefix-prompt",
+    "never-print-this-command-line",
+    // The payload word is only visible after a camelCase split.
+    "never-print-this-camel-token",
+    // Plural spellings of a documented class: the natural Rust name for a collection.
+    "never-print-this-cookie-jar",
+    "never-print-this-argv",
+    "never-print-this-outputs",
+];
+
+/// The placeholder is operator-visible output, so its spelling is pinned here once.
+#[test]
+fn the_redaction_placeholder_spelling_is_pinned() {
+    assert_eq!(zuno_observability::REDACTED, "[redacted]");
+}
+
 const LOG_ONLY_MARKERS: &[&str] = &[
     "probe-trace",
     "probe-debug",
@@ -13,6 +42,9 @@ const LOG_ONLY_MARKERS: &[&str] = &[
     "probe-warn",
     "probe-error",
     "probe-provider",
+    "probe-subprocess",
+    "probe-credential",
+    "probe-plural",
     "TOOL_LIFECYCLE",
     "toolu_probe",
 ];
@@ -71,6 +103,34 @@ impl ProbeRun {
 
     fn has(&self, marker: &str) -> bool {
         self.records.iter().any(|record| record.contains(marker))
+    }
+
+    fn records_text(&self) -> String {
+        self.records
+            .iter()
+            .map(|record| format!("{record:?}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// The rendering a text sink produces for a scrubbed field. Built from the crate's
+/// own constant, so changing the placeholder does not turn every assertion below into
+/// an unexplained string mismatch.
+fn redacted(field: &str) -> String {
+    format!("{field}=\"{}\"", zuno_observability::REDACTED)
+}
+
+/// Fails if any raw sensitive value survived into `text`.
+///
+/// A substring scan rather than a field lookup, because the sinks under test render
+/// fields as free text and the question is only whether the bytes are there.
+fn assert_no_sensitive_literal(sink: &str, text: &str) {
+    for literal in SENSITIVE_LITERALS {
+        assert!(
+            !text.contains(literal),
+            "{literal:?} reached {sink} unredacted:\n{text}"
+        );
     }
 }
 
@@ -259,6 +319,12 @@ fn stderr_is_additive_and_stdout_remains_protocol_only() {
     assert_stdout_is_pure(&run);
     assert!(run.stderr().contains("probe emitted at info"));
     assert!(run.has("probe-info"));
+    assert_no_sensitive_literal("stderr", &run.stderr());
+    assert!(
+        run.stderr().contains(&redacted("command")),
+        "stderr never rendered the redacted field:\n{}",
+        run.stderr()
+    );
 
     let rejected = run_probe(&[("ZUNO_PRINT_LOGS", "true")]);
     assert!(rejected.output.status.success(), "{}", rejected.stderr());
@@ -342,14 +408,164 @@ fn sensitive_fields_are_redacted_before_persistence() {
         .iter()
         .find(|record| record.contains("probe-sensitive"))
         .expect("sensitive-field record");
-    assert_eq!(record.fields["command"].as_str(), Some("[redacted]"));
-    let database_bytes = std::fs::read(&run.database_path).expect("read database");
-    assert!(
-        !database_bytes
-            .windows(b"never-store-this-command".len())
-            .any(|window| window == b"never-store-this-command"),
-        "the raw command reached the SQLite file"
+    assert_eq!(
+        record.fields["command"].as_str(),
+        Some(zuno_observability::REDACTED)
     );
+    assert_database_has_no_sensitive_literal(&run.database_path);
+}
+
+/// One run with all three sinks live. Redaction is a property of the record, not of
+/// the sink that happens to be enabled, so the same emission has to come out
+/// scrubbed in SQLite, in the plaintext file, and on stderr.
+#[test]
+fn every_enabled_sink_redacts_the_same_record() {
+    let run = run_probe(&[("ZUNO_PROBE_PLAINTEXT", "1"), ("ZUNO_PRINT_LOGS", "1")]);
+    assert!(run.output.status.success(), "{}", run.stderr());
+    assert_stdout_is_pure(&run);
+
+    // Each sink has to have received the emission, or absence proves nothing.
+    assert!(run.has("probe-sensitive"), "the store missed the emission");
+    assert!(
+        run.has("probe-span-sensitive-event"),
+        "the store missed the span emission"
+    );
+    assert!(
+        run.plaintext.contains("probe-span-sensitive-event"),
+        "the plaintext file missed the emission:\n{}",
+        run.plaintext
+    );
+    assert!(
+        run.stderr().contains("probe-span-sensitive-event"),
+        "stderr missed the emission:\n{}",
+        run.stderr()
+    );
+
+    assert_no_sensitive_literal("the plaintext file", &run.plaintext);
+    assert_no_sensitive_literal("stderr", &run.stderr());
+    assert_no_sensitive_literal("the decoded SQLite records", &run.records_text());
+    assert_database_has_no_sensitive_literal(&run.database_path);
+
+    for sink in [&run.plaintext, &run.stderr()] {
+        assert!(
+            sink.contains(&redacted("prompt")) && sink.contains(&redacted("report")),
+            "a text sink dropped the sensitive span fields instead of redacting them:\n{sink}"
+        );
+    }
+}
+
+/// The classification, not just the plumbing. A payload can arrive under a name that
+/// spells the sensitive word anywhere — a raw subprocess stream, a credential name
+/// `docs/logging.md` promises is scrubbed, a prefix compound, or a camelCase word —
+/// and the bounded measurement that exists so the payload never has to be logged has
+/// to survive in the clear.
+#[test]
+fn a_subprocess_stream_and_a_credential_named_field_are_redacted_in_every_sink() {
+    let run = run_probe(&[("ZUNO_PROBE_PLAINTEXT", "1"), ("ZUNO_PRINT_LOGS", "1")]);
+    assert!(run.output.status.success(), "{}", run.stderr());
+    assert_stdout_is_pure(&run);
+
+    // Absence has to mean redaction rather than a missing emission.
+    for marker in ["probe-subprocess", "probe-credential", "probe-plural"] {
+        assert!(run.has(marker), "the store missed {marker}");
+        assert!(
+            run.plaintext.contains(marker),
+            "the plaintext file missed {marker}:\n{}",
+            run.plaintext
+        );
+        assert!(
+            run.stderr().contains(marker),
+            "stderr missed {marker}:\n{}",
+            run.stderr()
+        );
+    }
+
+    assert_no_sensitive_literal("the plaintext file", &run.plaintext);
+    assert_no_sensitive_literal("stderr", &run.stderr());
+    assert_no_sensitive_literal("the decoded SQLite records", &run.records_text());
+    assert_database_has_no_sensitive_literal(&run.database_path);
+
+    for sink in [&run.plaintext, &run.stderr()] {
+        for field in [
+            "stderr",
+            "token",
+            "credential",
+            "prompt_text",
+            "command_line",
+            "accessToken",
+            "cookies",
+            "commands",
+            "outputs",
+        ] {
+            let expected = redacted(field);
+            assert!(
+                sink.contains(&expected),
+                "a text sink dropped the field instead of rendering {expected}:\n{sink}"
+            );
+        }
+        assert!(
+            sink.contains("stdout_bytes=12"),
+            "a bounded measurement of a sensitive value was redacted too:\n{sink}"
+        );
+        assert!(
+            sink.contains("prompt_tokens=1024"),
+            "the documented token-count carve-out was redacted too:\n{sink}"
+        );
+        assert!(
+            sink.contains("hash=\"0f1e2d3c\""),
+            "an unrelated diagnostic field was redacted:\n{sink}"
+        );
+    }
+
+    let record = run
+        .records
+        .iter()
+        .find(|record| record.contains("probe-credential"))
+        .expect("credential-named record");
+    assert_eq!(
+        record.fields["token"].as_str(),
+        Some(zuno_observability::REDACTED)
+    );
+    assert_eq!(
+        record.fields["credential"].as_str(),
+        Some(zuno_observability::REDACTED)
+    );
+    assert_eq!(
+        record.fields["accessToken"].as_str(),
+        Some(zuno_observability::REDACTED)
+    );
+    assert_eq!(record.fields["stdout_bytes"].as_u64(), Some(12));
+
+    // The SQLite sink is the third sink, and the plural spellings have to reach it
+    // redacted too. `logs.sqlite` is where an operator looks after `--print-logs`.
+    let record = run
+        .records
+        .iter()
+        .find(|record| record.contains("probe-plural"))
+        .expect("plural-named record");
+    for field in ["cookies", "commands", "outputs"] {
+        assert_eq!(
+            record.fields[field].as_str(),
+            Some(zuno_observability::REDACTED),
+            "{field} was stored unredacted: {}",
+            record.fields
+        );
+    }
+    assert_eq!(record.fields["prompt_tokens"].as_u64(), Some(1024));
+}
+
+/// The file bytes, not the decoded rows: a value could survive in a WAL page or in a
+/// column the row decoder does not read back.
+fn assert_database_has_no_sensitive_literal(path: &Path) {
+    let bytes = std::fs::read(path).expect("read database");
+    for literal in SENSITIVE_LITERALS {
+        assert!(
+            !bytes
+                .windows(literal.len())
+                .any(|window| window == literal.as_bytes()),
+            "{literal:?} reached the SQLite file"
+        );
+    }
 }
 
 #[test]
@@ -362,6 +578,7 @@ fn plaintext_is_opt_in_process_specific_and_private() {
     assert!(enabled.output.status.success(), "{}", enabled.stderr());
     let path = enabled.plaintext_path.as_ref().expect("plaintext path");
     assert!(enabled.plaintext.contains("probe emitted at info"));
+    assert_no_sensitive_literal("the plaintext file", &enabled.plaintext);
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
