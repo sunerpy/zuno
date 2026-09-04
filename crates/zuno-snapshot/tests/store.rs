@@ -402,6 +402,54 @@ fn diff_is_empty_when_the_worktree_is_unchanged() {
     );
 }
 
+/// A newline in a tracked name is legal on Unix, and `--name-only` C-quotes it, so
+/// the report has to read git's field separator rather than its rendering.
+#[cfg(unix)]
+#[test]
+fn patch_names_a_file_whose_path_contains_a_newline() {
+    let fixture = Fixture::new("wt");
+    let odd = "we\nird.txt";
+    fixture.write(odd, "before\n");
+    git(&fixture.worktree, &["add", "-A"]);
+    git(&fixture.worktree, &["commit", "-qm", "odd"]);
+
+    let store = fixture.store();
+    let hash = store.track().expect("track").expect("enabled");
+    fixture.write(odd, "after\n");
+
+    let patch = store.patch(&hash).expect("patch");
+    let expected = fixture.path(odd).to_string_lossy().into_owned();
+    assert_eq!(patch.files, vec![expected], "{:?}", patch.files);
+}
+
+/// A literal backslash is an ordinary filename character on Unix, so nothing may
+/// rewrite it into a separator. `-z` delivers `we\ird.txt` raw (git 2.43.0 does not
+/// quote it), and a separator conversion applied on every platform then reported
+/// `<worktree>/we/ird.txt` — a path that does not exist — while the file that
+/// actually changed was missing from the list.
+#[cfg(unix)]
+#[test]
+fn patch_names_a_file_whose_path_contains_a_backslash() {
+    let fixture = Fixture::new("wt");
+    let odd = "we\\ird.txt";
+    fixture.write(odd, "before\n");
+    git(&fixture.worktree, &["add", "-A"]);
+    git(&fixture.worktree, &["commit", "-qm", "odd"]);
+
+    let store = fixture.store();
+    let hash = store.track().expect("track").expect("enabled");
+    fixture.write(odd, "after\n");
+
+    let patch = store.patch(&hash).expect("patch");
+    let expected = fixture.path(odd).to_string_lossy().into_owned();
+    assert_eq!(patch.files, vec![expected], "{:?}", patch.files);
+    assert!(
+        Path::new(&patch.files[0]).is_file(),
+        "a reported path has to exist: {:?}",
+        patch.files
+    );
+}
+
 #[test]
 fn gitignored_files_stay_out_of_the_snapshot() {
     let fixture = Fixture::new("wt");
@@ -438,6 +486,11 @@ fn gitignored_files_stay_out_of_the_snapshot() {
     assert!(!listed.contains("secret.txt"), "{listed}");
 }
 
+/// The outcome is what is pinned here, not the mechanism: what must hold is that the
+/// oversized file is absent from the tree the store wrote and is named in the
+/// exclusions, whichever way `plan` achieves that. An earlier version of this test also
+/// asserted the presence of a `/huge.bin` line in the store's `info/exclude`, which
+/// pinned a derived pattern that could exclude a *different* file — see `Store::sync`.
 #[test]
 fn large_untracked_files_are_excluded_instead_of_stored() {
     let fixture = Fixture::new("wt");
@@ -447,7 +500,7 @@ fn large_untracked_files_are_excluded_instead_of_stored() {
     let big = "x".repeat(usize::try_from(zuno_snapshot::LARGE_FILE_LIMIT).expect("usize") + 1);
     fixture.write("huge.bin", &big);
     fixture.write("small.txt", "tiny\n");
-    store.track().expect("track").expect("enabled");
+    let capture = store.capture().expect("capture").expect("enabled");
 
     let listed = git(
         &fixture.worktree,
@@ -465,9 +518,391 @@ fn large_untracked_files_are_excluded_instead_of_stored() {
         zuno_snapshot::LARGE_FILE_LIMIT + 1
     );
 
+    let captured = tree_paths(&fixture, store.git_dir(), capture.tree());
+    assert!(
+        captured.contains(&"small.txt".to_owned()) && !captured.contains(&"huge.bin".to_owned()),
+        "{captured:?}"
+    );
+    assert_eq!(capture.exclusions().oversized(), ["huge.bin"]);
+}
+
+/// Every path in `tree`, read with `-z` so a name holding a newline arrives raw.
+fn tree_paths(fixture: &Fixture, git_dir: &Path, tree: &str) -> Vec<String> {
+    let raw = git(
+        &fixture.worktree,
+        &[
+            "--git-dir",
+            &git_dir.to_string_lossy(),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            tree,
+        ],
+    );
+    let mut paths: Vec<String> = raw
+        .split('\0')
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// An oversized untracked file literally named `big\nfile.bin`, next to an unrelated
+/// small `file.bin`.
+///
+/// `info/exclude` is newline-separated, so writing that name in raw produced two
+/// patterns, `/big` and `file.bin`. `git add` then refused the explicitly named,
+/// now-ignored `file.bin` and wrote no index at all (git 2.43.0, exit 1), and the
+/// read-back that decides what to report could not see the file either because the
+/// same pattern hid it from `--exclude-standard` — a capture missing a changed user
+/// file with nothing recorded about the loss.
+///
+/// No entry is derived from a filename any more (see `Store::sync`), so this pins the
+/// outcome for the whole class rather than one encoder's escaping.
+#[cfg(unix)]
+#[test]
+fn an_oversized_file_named_with_a_newline_does_not_drop_another_file_from_the_capture() {
+    let fixture = Fixture::new("wt");
+    fixture.write("seed.txt", "seed\n");
+    git(&fixture.worktree, &["add", "-A"]);
+    git(&fixture.worktree, &["commit", "-qm", "seed"]);
+
+    let oversized = "big\nfile.bin";
+    fs::write(
+        fixture.path(oversized),
+        vec![b'z'; usize::try_from(zuno_snapshot::LARGE_FILE_LIMIT).expect("usize") + 1],
+    )
+    .expect("write oversized");
+    fixture.write("file.bin", "an unrelated file the user changed\n");
+
+    let store = fixture.store();
+    let capture = store.capture().expect("capture").expect("enabled");
+    let captured = tree_paths(&fixture, store.git_dir(), capture.tree());
+
+    assert!(
+        captured.contains(&"file.bin".to_owned()),
+        "an unrelated file must not leave the capture because of another file's name: {captured:?}"
+    );
+    assert!(
+        captured.contains(&"seed.txt".to_owned()) && captured.contains(&"a.txt".to_owned()),
+        "{captured:?}"
+    );
+    assert!(
+        !captured.contains(&oversized.to_owned()),
+        "the oversized file itself still stays out of the tree: {captured:?}"
+    );
+    assert_eq!(capture.exclusions().oversized(), [oversized]);
+
     let excludes = fs::read_to_string(store.git_dir().join("info").join("exclude"))
         .expect("read store excludes");
-    assert!(excludes.contains("/huge.bin"), "{excludes}");
+    assert!(
+        !excludes.lines().any(|line| line == "file.bin"),
+        "one name may never become a second pattern: {excludes:?}"
+    );
+}
+
+/// `info/exclude` is wildmatch, not a list of literal paths, and a backslash is a
+/// legal Unix filename character rather than a separator.
+///
+/// Raw entries turned an oversized `a*.txt` into `/a*.txt`, which also excludes
+/// `abc.txt`, and an oversized `we\ird.txt` into `/we/ird.txt`, which excludes the
+/// real `we/ird.txt` while matching nothing that is actually oversized. Escaping those
+/// operators narrowed the bug without closing it; the entries are now gone entirely,
+/// and what this pins is the outcome either way.
+#[cfg(unix)]
+#[test]
+fn an_oversized_filename_is_not_read_as_a_glob_or_as_a_separator() {
+    let fixture = Fixture::new("wt");
+    let big = vec![b'z'; usize::try_from(zuno_snapshot::LARGE_FILE_LIMIT).expect("usize") + 1];
+    fs::write(fixture.path("a*.txt"), &big).expect("write glob-named oversized");
+    fs::write(fixture.path("we\\ird.txt"), &big).expect("write backslash-named oversized");
+    fixture.write("abc.txt", "not oversized\n");
+    fixture.write("we/ird.txt", "not oversized either\n");
+
+    let store = fixture.store();
+    let capture = store.capture().expect("capture").expect("enabled");
+    let captured = tree_paths(&fixture, store.git_dir(), capture.tree());
+
+    assert!(
+        captured.contains(&"abc.txt".to_owned()),
+        "`a*.txt` must be one name, not a glob: {captured:?}"
+    );
+    assert!(
+        captured.contains(&"we/ird.txt".to_owned()),
+        "a backslash in a name is not a separator: {captured:?}"
+    );
+    assert!(
+        !captured.contains(&"a*.txt".to_owned()) && !captured.contains(&"we\\ird.txt".to_owned()),
+        "both oversized files still stay out of the tree: {captured:?}"
+    );
+    assert_eq!(capture.exclusions().oversized(), ["a*.txt", "we\\ird.txt"]);
+}
+
+/// The same class with names every platform allows, so this half is reachable on
+/// Windows and macOS too and is deliberately not `cfg(unix)`.
+///
+/// Measured on git 2.43.0: the raw entry `/big [1].bin` reads `[1]` as a bracket
+/// expression, excludes the *different* file `big 1.bin`, and matches nothing that is
+/// actually oversized. The oversized file is now kept out of the tree by name alone —
+/// this asserts that outcome, not the absence of one particular pattern.
+#[test]
+fn an_oversized_name_holding_a_bracket_expression_excludes_only_itself() {
+    let fixture = Fixture::new("wt");
+    let big = vec![b'z'; usize::try_from(zuno_snapshot::LARGE_FILE_LIMIT).expect("usize") + 1];
+    fs::write(fixture.path("big [1].bin"), &big).expect("write oversized");
+    fixture.write("big 1.bin", "not oversized\n");
+
+    let store = fixture.store();
+    let capture = store.capture().expect("capture").expect("enabled");
+    let captured = tree_paths(&fixture, store.git_dir(), capture.tree());
+
+    assert!(
+        captured.contains(&"big 1.bin".to_owned()),
+        "a bracket expression in one name must not exclude another file: {captured:?}"
+    );
+    assert!(
+        !captured.contains(&"big [1].bin".to_owned()),
+        "the oversized file itself still stays out of the tree: {captured:?}"
+    );
+    assert_eq!(capture.exclusions().oversized(), ["big [1].bin"]);
+}
+
+/// The mirrored source `info/exclude`, and nothing derived from any filename.
+///
+/// A pattern built from an oversized file's own name can never be made to match only
+/// that name, however carefully its wildmatch operators are escaped: `git` folds case
+/// while matching `info/exclude` whenever `core.ignorecase` is on, which `git init`
+/// sets by itself on APFS and NTFS and which a user may set globally on any platform.
+/// So no entry is derived at all — `plan` keeps an oversized path out of the staged
+/// pathspec set by exact name, which needs no pattern.
+#[test]
+fn the_store_exclude_file_is_the_users_own_with_nothing_derived_from_a_filename() {
+    let fixture = Fixture::new("wt");
+    fixture.write(".git/info/exclude", "generated.txt\n");
+    let store = fixture.store();
+
+    let big = vec![b'z'; usize::try_from(zuno_snapshot::LARGE_FILE_LIMIT).expect("usize") + 1];
+    fs::write(fixture.path("huge.bin"), &big).expect("write oversized");
+    fixture.write("small.txt", "tiny\n");
+
+    let capture = store.capture().expect("capture").expect("enabled");
+    assert_eq!(capture.exclusions().oversized(), ["huge.bin"]);
+    let captured = tree_paths(&fixture, store.git_dir(), capture.tree());
+    assert!(
+        captured.contains(&"small.txt".to_owned()) && !captured.contains(&"huge.bin".to_owned()),
+        "{captured:?}"
+    );
+
+    let excludes = fs::read_to_string(store.git_dir().join("info").join("exclude"))
+        .expect("read store excludes");
+    assert_eq!(
+        excludes, "generated.txt\n",
+        "the store's exclude file is the user's own, verbatim: {excludes:?}"
+    );
+}
+
+/// A store the released build left behind holds derived entries in its own
+/// `info/exclude` — `/huge.bin`, or `/HUGE.BIN` from a macOS or Windows checkout where
+/// `git init` set `core.ignorecase=true`.
+///
+/// Reading that store must neither refuse it nor inherit the loss those entries caused.
+/// [`Store::sync`] rewrites the file from the user's own exclude before `plan` lists
+/// anything, so the first capture after an upgrade contains the file the stale entry was
+/// hiding. This passes on both sides of the change — the point is that a store written
+/// by a shipped release still reads, which is why it is asserted rather than assumed.
+/// The cross-build half was run for real: the `HEAD` crate wrote
+/// `info/exclude` ending `/HUGE.BIN` with a tree of `["a.txt"]`, and this crate then
+/// read that same store directory.
+#[test]
+fn a_store_left_holding_a_derived_exclude_entry_still_reads_and_captures_the_named_file() {
+    let fixture = Fixture::new("wt");
+    let store = fixture.store();
+    let released = store.track().expect("track").expect("enabled");
+    let git_dir = store.git_dir().to_string_lossy().into_owned();
+    git(
+        &fixture.worktree,
+        &["--git-dir", &git_dir, "config", "core.ignorecase", "true"],
+    );
+    let exclude = store.git_dir().join("info").join("exclude");
+    let released_exclude = fs::read_to_string(&exclude).expect("read store excludes");
+    write(
+        &exclude,
+        &format!("{released_exclude}/HUGE.BIN\n/huge.bin\n"),
+    );
+
+    fixture.write("huge.bin", "changed after the upgrade\n");
+    let capture = store
+        .capture()
+        .expect("capture a released store")
+        .expect("enabled");
+    let captured = tree_paths(&fixture, store.git_dir(), capture.tree());
+
+    assert!(
+        captured.contains(&"huge.bin".to_owned()),
+        "a stale derived entry must not hide a changed file from the first capture \
+         after the upgrade: {captured:?}"
+    );
+    assert!(
+        capture.exclusions().is_empty(),
+        "{:?}",
+        capture.exclusions()
+    );
+    let after = fs::read_to_string(&exclude).expect("read store excludes");
+    assert!(
+        !after.contains("HUGE.BIN") && !after.contains("/huge.bin"),
+        "the stale entries are rewritten away: {after:?}"
+    );
+    // A tree the released build wrote is still readable afterwards.
+    assert!(
+        store
+            .diff(&released)
+            .expect("diff a released tree")
+            .contains("huge.bin")
+    );
+}
+
+/// A worktree root whose bytes are not valid UTF-8 refuses the `patch` report rather
+/// than naming files that do not exist.
+///
+/// `Store::patch` is the one report that joins this root onto Git's worktree-relative
+/// paths, so it decodes the root itself and refuses before it stages anything. The
+/// refusal is *not* a side effect of the `sync` pre-flight: that only decodes a path
+/// containing the root in a plain repository, where `.git` sits under the worktree.
+/// See [`a_non_utf8_linked_worktree_root_denies_the_report_too`] for the shape where it
+/// does not, which reported two `U+FFFD` absolute paths whose `Path::exists()` was false
+/// until the root was decoded here. Refusing is recoverable by renaming the directory;
+/// a wrong path is not.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_worktree_root_refuses_the_report_instead_of_a_lossy_path() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let worktree = temp.path().join(OsStr::from_bytes(b"wt\xff"));
+    let root = temp.path().join("data").join("snapshot");
+    fs::create_dir_all(&worktree).expect("create worktree");
+    fs::create_dir_all(&root).expect("create snapshot root");
+    git(&worktree, &["init", "-q", "."]);
+    git(&worktree, &["config", "user.email", "test@example.com"]);
+    git(&worktree, &["config", "user.name", "Test"]);
+    write(&worktree.join("a.txt"), "hello\n");
+    git(&worktree, &["add", "-A"]);
+    git(&worktree, &["commit", "-qm", "init"]);
+    write(&worktree.join("a.txt"), "changed\n");
+
+    let store = Store::open(Location::new(&root, "proj", &worktree));
+    let error = store
+        .patch("0000000000000000000000000000000000000000")
+        .expect_err("a root that does not decode refuses the report");
+    let SnapshotError::UndecodableWorktree { valid_up_to } = &error else {
+        panic!("the root is refused, not substituted: {error:?}");
+    };
+    assert_eq!(
+        *valid_up_to,
+        worktree.as_os_str().len() - 1,
+        "the refusal locates the one byte that did not decode: {error}"
+    );
+    assert!(
+        !error.to_string().contains('\u{fffd}'),
+        "no replacement character reaches a caller, not even inside the refusal: {error}"
+    );
+}
+
+/// The same undecodable root in a **linked** worktree, where the pre-flight decodes
+/// nothing that holds the bad bytes.
+///
+/// `git rev-parse --git-path info/exclude` resolves against `$GIT_COMMON_DIR`, which for
+/// a linked worktree (and for a submodule) lives under the *main* repository, and
+/// `--git-common-dir` does the same, so `seed` and `sync` both decode a path that holds
+/// none of this root's bytes. Measured on git 2.43.0 before the root was decoded
+/// explicitly: that pre-flight returned `<main>/.git/info/exclude`, `track` returned
+/// tree `2e81171448eb…`, and `patch` returned
+/// `["<temp>/wt\u{fffd}/a.txt", "<temp>/wt\u{fffd}/new.txt"]` — both paths holding
+/// `U+FFFD`, both `Path::exists() == false`. `Store::ignore` could not intercept them
+/// either: `--git-dir <worktree>/.git` is a *file* here, so the probe returns nothing.
+/// Zuno itself develops in linked worktrees and `zuno debug snapshot patch` reaches
+/// this path.
+///
+/// Capture is deliberately still allowed: it emits no absolute path, so `/undo` keeps
+/// working in such a worktree while only the report refuses.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_linked_worktree_root_denies_the_report_too() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let main = temp.path().join("main");
+    let root = temp.path().join("data").join("snapshot");
+    fs::create_dir_all(&main).expect("create main");
+    fs::create_dir_all(&root).expect("create snapshot root");
+    git(&main, &["init", "-q", "."]);
+    git(&main, &["config", "user.email", "test@example.com"]);
+    git(&main, &["config", "user.name", "Test"]);
+    write(&main.join("a.txt"), "hello\n");
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-qm", "init"]);
+
+    let linked = temp.path().join(OsStr::from_bytes(b"wt\xff"));
+    let added = Command::new("git")
+        .arg("-C")
+        .arg(&main)
+        .args(["worktree", "add", "-q"])
+        .arg(&linked)
+        .args(["-b", "side"])
+        .output()
+        .expect("spawn git worktree add");
+    assert!(
+        added.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    // The pre-flight the old comment relied on: it decodes, which is why nothing
+    // upstream of the report refuses this worktree.
+    let common = git(
+        &linked,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+        ],
+    );
+    assert!(
+        common.starts_with(&main.to_string_lossy().into_owned()),
+        "`--git-path info/exclude` resolves under the main repository: {common:?}"
+    );
+
+    let store = Store::open(Location::new(&root, "proj", &linked));
+    let tracked = store
+        .track()
+        .expect("a capture emits no absolute path, so it is still allowed")
+        .expect("enabled");
+    write(&linked.join("new.txt"), "untracked\n");
+    write(&linked.join("a.txt"), "changed\n");
+
+    let error = store
+        .patch(&tracked)
+        .expect_err("a root that does not decode refuses the report");
+    assert!(
+        matches!(error, SnapshotError::UndecodableWorktree { .. }),
+        "the root is refused, not substituted: {error:?}"
+    );
+    assert!(
+        !error.to_string().contains('\u{fffd}'),
+        "no replacement character reaches a caller: {error}"
+    );
+    // Everything that reports worktree-*relative* paths still works: those come from
+    // Git already decoded, and none of them is joined onto the root.
+    assert!(
+        store
+            .diff(&tracked)
+            .expect("a relative-path report is unaffected")
+            .contains("new.txt")
+    );
 }
 
 #[test]
