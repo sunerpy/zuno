@@ -15,10 +15,29 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use url::Url;
+use zuno_process::ShutdownCeilings;
 
 const CLIENT_READY_TIMEOUT: Duration = Duration::from_secs(50);
+/// Ceiling on one blocking process-control call, which on Windows is a `taskkill /f /t` tree walk.
+const PROCESS_CONTROL_LIMIT: Duration = Duration::from_secs(2);
+/// Ceiling on collecting a language server after its tree was asked to stop.
+const CHILD_REAP_LIMIT: Duration = Duration::from_secs(2);
+/// Ceiling on the two reader tasks that hold a language server's stdout and stderr.
+const PIPE_DRAIN_LIMIT: Duration = Duration::from_secs(1);
+/// The ceilings every language-server settlement runs under.
+///
+/// Constants, and only constants: nothing a language server sends, nothing the model asks for,
+/// and nothing in configuration reaches them, so a server cannot widen the bound on its own
+/// shutdown. Every exit of the supervisor — the server exiting on its own, a requested restart,
+/// manager shutdown, and a failed handshake — goes through [`settle`] with these.
+const SHUTDOWN_CEILINGS: ShutdownCeilings = ShutdownCeilings {
+    process_control: PROCESS_CONTROL_LIMIT,
+    reap: CHILD_REAP_LIMIT,
+    drain: PIPE_DRAIN_LIMIT,
+};
 
 /// Bounded restart behavior for a crashed language server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -664,7 +683,12 @@ async fn supervise(
     let mut started_once = false;
     loop {
         let launched = launch(&manager, &server).await;
-        let (mut child, client, process_id) = match launched {
+        let LaunchedServer {
+            mut child,
+            client,
+            process_id,
+            stderr_reader,
+        } = match launched {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!(server = %server.spec.id, %error, "language server launch failed");
@@ -693,22 +717,31 @@ async fn supervise(
         .await;
         started_once = true;
 
+        let readers = |client: &Client| {
+            stderr_reader
+                .into_iter()
+                .chain(client.take_reader())
+                .collect::<Vec<_>>()
+        };
         let should_restart = tokio::select! {
             status = child.wait() => {
                 if let Err(error) = status {
                     tracing::warn!(server = %server.spec.id, %error, "language server wait failed");
                 }
+                // The child is already reaped; this settles the two readers, which a helper
+                // the server leaked can otherwise hold open for the rest of the session.
+                settle(&server.spec.id, &mut child, readers(&client)).await;
                 true
             }
             command = commands.recv() => {
                 match command {
                     Some(SupervisorCommand::Terminate) => {
-                        kill_and_reap(&mut child).await;
+                        settle(&server.spec.id, &mut child, readers(&client)).await;
                         true
                     }
                     Some(SupervisorCommand::Shutdown) | None => {
                         client.shutdown().await;
-                        kill_and_reap(&mut child).await;
+                        settle(&server.spec.id, &mut child, readers(&client)).await;
                         publish_stopped(&manager, &server).await;
                         return;
                     }
@@ -735,10 +768,19 @@ async fn supervise(
     }
 }
 
+/// One language server that completed its handshake, with every handle its owner must settle.
+struct LaunchedServer {
+    child: Child,
+    client: Client,
+    process_id: u32,
+    /// The task draining the server's stderr, if the server provided that pipe.
+    stderr_reader: Option<JoinHandle<()>>,
+}
+
 async fn launch(
     manager: &ManagerInner,
     server: &ManagedServer,
-) -> Result<(Child, Client, u32), ManagerError> {
+) -> Result<LaunchedServer, ManagerError> {
     let argv = manager.registry.launch_command(&server.spec).await?;
     let executable = argv.first().ok_or_else(|| RegistryError::EmptyCommand {
         server_id: server.spec.id.clone(),
@@ -775,7 +817,7 @@ async fn launch(
             server_id: server.spec.id.clone(),
             stream: "stdin",
         })?;
-    if let Some(stderr) = child.stderr.take() {
+    let stderr_reader = child.stderr.take().map(|stderr| {
         let server_id = server.spec.id.clone();
         tokio::spawn(async move {
             let mut buffer = Vec::new();
@@ -788,8 +830,8 @@ async fn launch(
             {
                 tracing::debug!(server = %server_id, bytes = buffer.len(), "language server stderr");
             }
-        });
-    }
+        })
+    });
     match Client::connect(
         server.spec.id.clone(),
         server.root.clone(),
@@ -800,9 +842,21 @@ async fn launch(
     )
     .await
     {
-        Ok(client) => Ok((child, client, process_id)),
+        Ok(client) => Ok(LaunchedServer {
+            child,
+            client,
+            process_id,
+            stderr_reader,
+        }),
         Err(source) => {
-            kill_and_reap(&mut child).await;
+            // A failed handshake already aborted the client's own reader; the stderr reader is
+            // this function's to settle.
+            settle(
+                &server.spec.id,
+                &mut child,
+                stderr_reader.into_iter().collect(),
+            )
+            .await;
             Err(ManagerError::Initialize {
                 server_id: server.spec.id.clone(),
                 source,
@@ -926,11 +980,22 @@ async fn wait_backoff_or_shutdown(
     }
 }
 
-async fn kill_and_reap(child: &mut Child) {
-    if let Some(pid) = child.id() {
-        let _result = zuno_process::request_contained_process_shutdown(pid);
+/// Stops one language server's tree, collects it, and settles its readers, each under its
+/// ceiling.
+///
+/// This is the only way a supervised child leaves. `zuno_process::shutdown_contained_child`
+/// runs the process-control call off the runtime worker — on Windows it is a `taskkill /f /t`
+/// tree walk that would otherwise freeze the current-thread session runtime — bounds the reap,
+/// and aborts a reader that is still holding a pipe at the drain ceiling rather than dropping
+/// it, which would leave the task alive for as long as whatever the server leaked keeps the
+/// pipe open. An unsettled outcome is logged, never promoted to a clean stop.
+async fn settle(server_id: &str, child: &mut Child, readers: Vec<JoinHandle<()>>) {
+    let outcome = zuno_process::shutdown_contained_child(child, readers, SHUTDOWN_CEILINGS).await;
+    if outcome.is_settled() {
+        tracing::debug!(server = %server_id, %outcome, "language server settled");
+    } else {
+        tracing::warn!(server = %server_id, %outcome, "language server did not settle cleanly");
     }
-    let _result = child.wait().await;
 }
 
 fn server_key(id: &str, root: &Path) -> String {
@@ -1321,5 +1386,166 @@ while True:
         assert_eq!(manager.status().await[0].state, ServerState::Connected);
         manager.shutdown().await;
         assert_eq!(manager.status().await[0].state, ServerState::Stopped);
+    }
+
+    /// Tasks alive on this test's runtime, where the supervisor spawns both pipe readers.
+    ///
+    /// A reader returns only at EOF, and EOF needs every writer to have closed the pipe. One
+    /// whose handle was dropped instead of aborted is still alive after the supervisor has
+    /// published `Stopped`, still holding the pipe read end. The runtime already counts it, so
+    /// no production hook is needed to see it.
+    fn alive_tasks() -> usize {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// A language server that answers `initialize`, detaches a helper into its own session
+    /// that inherits the server's stdout and stderr, then stops reading and never exits.
+    ///
+    /// The helper is what keeps both pipes open after the server's own group is reaped: it
+    /// is outside that group, so the group kill never reaches it, and a reader that is only
+    /// dropped keeps waiting for an EOF that arrives when the helper dies and not before.
+    #[cfg(unix)]
+    fn write_wedged_server(path: &Path) {
+        fs::write(
+            path,
+            r#"import json, os, signal, subprocess, sys, time
+pid_file = sys.argv[1]
+def read():
+    size = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b'\r\n', b'\n'):
+            break
+        if line.lower().startswith(b'content-length:'):
+            size = int(line.split(b':', 1)[1].strip())
+    return json.loads(sys.stdin.buffer.read(size))
+def send(value):
+    body = json.dumps(value, separators=(',', ':')).encode()
+    sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n' % len(body)).encode() + body)
+    sys.stdout.buffer.flush()
+while True:
+    message = read()
+    if message is None:
+        break
+    if message.get('method') == 'initialize':
+        send({'jsonrpc':'2.0','id':message['id'],'result':{'capabilities':{}}})
+        helper = subprocess.Popen(['sleep', '600'], stdin=subprocess.DEVNULL, start_new_session=True)
+        with open(pid_file + '.tmp', 'w') as handle:
+            handle.write(str(helper.pid))
+        os.replace(pid_file + '.tmp', pid_file)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        while True:
+            time.sleep(3600)
+"#,
+        )
+        .expect("write wedged language server");
+    }
+
+    /// Cancelling a server that stopped reading and never exits must settle the whole
+    /// launch: the child reaped and both pipe readers gone, within fixed ceilings.
+    ///
+    /// The fixture's escaped helper holds stdout and stderr open past the group kill, so a
+    /// reader that was dropped rather than aborted stays alive for the helper's whole life
+    /// and the runtime's task count never returns to where it started. An unbounded
+    /// `child.wait()` would show up here as the shutdown never returning at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_wedged_server_leaves_no_reader_holding_its_pipes() {
+        let Some(python) = test_python() else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let script = temp.path().join("wedged_server.py");
+        let source = temp.path().join("file.mine");
+        let pid_path = temp.path().join("helper.pid");
+        write_wedged_server(&script);
+        fs::write(&source, "content\n").expect("write source file");
+        let config: LspConfig = serde_json::from_value(json!({
+            "wedged": {
+                "command": [
+                    python.to_string_lossy(),
+                    script.to_string_lossy(),
+                    pid_path.to_string_lossy()
+                ],
+                "extensions": [".mine"]
+            }
+        }))
+        .expect("custom LSP config");
+        let registry = Arc::new(ServerRegistry::offline(&ResolvedLsp::resolve(Some(
+            &config,
+        ))));
+        let manager = Manager::new(
+            temp.path(),
+            registry,
+            RestartPolicy::default(),
+            NonZeroUsize::new(4).expect("non-zero"),
+        );
+
+        let baseline = alive_tasks();
+        manager
+            .touch_file(&source)
+            .await
+            .expect("the wedged server still completes initialization");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !pid_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fixture records its helper's pid");
+        let helper = fs::read_to_string(&pid_path)
+            .expect("helper pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric helper pid");
+        assert!(
+            alive_tasks() > baseline,
+            "the supervisor and its readers must be running before the cancellation"
+        );
+
+        let started = std::time::Instant::now();
+        manager.shutdown().await;
+        let settled = tokio::time::timeout(
+            SHUTDOWN_CEILINGS.reap + SHUTDOWN_CEILINGS.drain + Duration::from_secs(5),
+            async {
+                while alive_tasks() != baseline {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let helper_alive = process_exists(helper);
+        let _killed = std::process::Command::new("kill")
+            .args(["-9", &helper.to_string()])
+            .status();
+
+        assert!(
+            helper_alive,
+            "the escaped helper must outlive the cancellation, otherwise both pipes would \
+             reach EOF on their own and a leaked reader would exit without being observed"
+        );
+        assert_eq!(manager.status().await[0].state, ServerState::Stopped);
+        assert!(
+            settled.is_ok(),
+            "{} task(s) above the baseline were still alive {elapsed:?} after shutdown: a \
+             pipe reader was dropped instead of aborted, or the reap had no ceiling",
+            alive_tasks().saturating_sub(baseline)
+        );
     }
 }

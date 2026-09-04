@@ -9,6 +9,13 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[dependencies]
+# `shutdown_contained_child` is the one contained-shutdown dispatch every tokio-owned
+# resident host (LSP, process extension, product agent, background shell) settles through,
+# and `off_runtime_worker` is the one home for moving the blocking process-control call
+# off a current-thread runtime. Both need the runtime's process, task and time drivers.
+tokio = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["event", "termios"] }
 signal-hook = { workspace = true }
