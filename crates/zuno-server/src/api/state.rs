@@ -261,8 +261,12 @@ impl ApiState {
         Arc::clone(&self.pool)
     }
 
-    pub(super) fn attachments(&self) -> &zuno_attachment::AttachmentStore {
-        &self.attachments
+    /// The attachment store as an owned handle, for work that leaves the reactor.
+    ///
+    /// Prompt admission decodes caller-supplied images inside
+    /// [`super::blocking::run`], whose closure must own everything it touches.
+    pub(super) fn attachments(&self) -> Arc<zuno_attachment::AttachmentStore> {
+        Arc::clone(&self.attachments)
     }
 
     pub(super) fn artifact_paths(&self) -> &ArtifactGcPaths {

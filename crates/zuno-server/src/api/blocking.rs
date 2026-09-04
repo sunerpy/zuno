@@ -4,8 +4,8 @@
 //!
 //! `zuno serve` polls this router on a single-threaded runtime
 //! (`Builder::new_current_thread`), so a synchronous handler — a whole-file read, a
-//! retention scan, a skill-tree walk — has to leave the reactor or it freezes every SSE
-//! stream and every live turn until the disk answers.
+//! retention scan, a skill-tree walk, an image decode — has to leave the reactor or it
+//! freezes every SSE stream and every live turn until the disk or the decoder answers.
 //!
 //! Moving that work to `tokio::task::spawn_blocking` removes the serialization the
 //! reactor was providing. Without a bound, concurrency is limited only by the blocking
@@ -61,6 +61,18 @@ const MAINTENANCE_SLOTS: usize = 2;
 /// duration is bounded by a network peer rather than by local disk.
 const CATALOG_SLOTS: usize = 8;
 
+/// How many prompt attachment admissions decode at once.
+///
+/// `POST /api/session/{sessionID}/prompt` decodes every inline `prompt.files[]` image
+/// before the prompt is persisted. The attachment crate bounds one decode's live
+/// working set at 512,000,000 bytes (`MAX_DECODE_WORKING_BYTES`), and the worst legal
+/// default admission -- an 8-bit gray 30,117,000 x 1 PNG of 146,036 source bytes --
+/// measures about 522 MB peak RSS and 3.4 s on Linux x86_64. Two keeps the process-wide
+/// resident ceiling near 1 GiB. The released build ran this loop inline on the
+/// single-threaded serve reactor, an effective concurrency of one, so two is looser than
+/// the shipped behaviour and cannot refuse a prompt the previous release admitted.
+const ADMISSION_SLOTS: usize = 2;
+
 static FILESYSTEM: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(FILESYSTEM_SLOTS)));
 
@@ -69,6 +81,9 @@ static MAINTENANCE: LazyLock<Arc<Semaphore>> =
 
 static CATALOG: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(CATALOG_SLOTS)));
+
+static ADMISSION: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(ADMISSION_SLOTS)));
 
 /// Which budget one piece of off-reactor work is charged to.
 ///
@@ -83,6 +98,9 @@ pub(super) enum Budget {
     Maintenance,
     /// `GET /api/skill` discovery.
     Catalog,
+    /// `POST /api/session/{sessionID}/prompt` attachment admission: image header
+    /// parse, decode gate, decode, fit, re-encode and object write.
+    Admission,
 }
 
 impl Budget {
@@ -91,6 +109,7 @@ impl Budget {
             Self::Filesystem => &FILESYSTEM,
             Self::Maintenance => &MAINTENANCE,
             Self::Catalog => &CATALOG,
+            Self::Admission => &ADMISSION,
         }
     }
 
@@ -108,6 +127,9 @@ impl Budget {
             Self::Catalog => {
                 ApiError::CatalogUnavailable("catalogue discovery did not finish".to_owned())
             }
+            Self::Admission => {
+                ApiError::MutationFailed("prompt attachment admission did not finish".to_owned())
+            }
         }
     }
 
@@ -118,6 +140,7 @@ impl Budget {
             Self::Filesystem => FILESYSTEM_SLOTS,
             Self::Maintenance => MAINTENANCE_SLOTS,
             Self::Catalog => CATALOG_SLOTS,
+            Self::Admission => ADMISSION_SLOTS,
         }
     }
 

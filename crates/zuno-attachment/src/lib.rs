@@ -241,6 +241,57 @@ pub struct ImageAttachmentRef {
     pub encoded_bytes: u64,
 }
 
+/// A caller-declared source media type, typed to the four formats admission can accept.
+///
+/// The bytes stay authoritative: this value selects no decoder and grants no capability,
+/// and [`AttachmentStore::admit_base64_typed`] still refuses a declaration that disagrees
+/// with the sniffed format. It exists so every ingress path -- HTTP `prompt.files`, ACP
+/// image blocks and embedded binary resources -- refuses a type this crate can never admit
+/// before decoding its payload, through the crate's own reduction rather than a copied
+/// table or a prefix test. A prefix test is wrong in both directions: `image/svg+xml`
+/// carries the `image/` prefix and is never admitted, while `IMAGE/PNG` lacks the lowercase
+/// prefix and is admitted under RFC 2045.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeclaredImageMediaType {
+    Png,
+    Jpeg,
+    Gif,
+    WebP,
+}
+
+impl DeclaredImageMediaType {
+    /// Parse a declared media type, or `None` for anything admission cannot accept --
+    /// including every other `image/` subtype.
+    ///
+    /// The reduction is the crate's own: the `;parameter` suffix dropped, surrounding
+    /// whitespace trimmed, ASCII case folded, and the aliases browsers emit (`image/jpg`,
+    /// `image/pjpeg`, `image/apng`, `image/x-png`, `image/vnd.mozilla.apng`) folded onto
+    /// the name they mean. Admission compares through this same parse, so a spelling this
+    /// returns `Some` for is one `admit_base64_typed` accepts for matching bytes, and a
+    /// `None` is one it refuses regardless of the bytes.
+    #[must_use]
+    pub fn parse(declared: &str) -> Option<Self> {
+        match canonical_declared_media_type(declared).as_str() {
+            "image/png" => Some(Self::Png),
+            "image/jpeg" => Some(Self::Jpeg),
+            "image/gif" => Some(Self::Gif),
+            "image/webp" => Some(Self::WebP),
+            _ => None,
+        }
+    }
+
+    /// The canonical media type name this value stands for.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Gif => "image/gif",
+            Self::WebP => "image/webp",
+        }
+    }
+}
+
 /// Host policy applied while admitting untrusted source bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageAdmissionPolicy {
@@ -396,7 +447,11 @@ impl AttachmentStore {
             .map_err(AttachmentError::Base64)?;
         if let Some(expected) = expected_media_type {
             let detected = source_media_type(&bytes)?;
-            if canonical_declared_media_type(expected) != detected {
+            // The same parse every ingress pre-filter uses, so the set of spellings refused
+            // here and the set refused before decoding cannot drift apart.
+            let declared =
+                DeclaredImageMediaType::parse(expected).map(DeclaredImageMediaType::as_str);
+            if declared != Some(detected) {
                 return Err(AttachmentError::MediaTypeMismatch {
                     expected: expected.to_owned(),
                     detected: detected.to_owned(),
@@ -1156,8 +1211,9 @@ fn canonical_declared_media_type(declared: &str) -> String {
     // `image/apng` is what Chrome and Firefox send for an animated PNG, whose first frame
     // is what normalization keeps, exactly as for an animated GIF. Widening this table
     // cannot widen what is admitted: the declaration selects no decoder and grants no
-    // capability, `image::guess_format` decides the real format, and every alias here is
-    // still an `image/` type for any caller that pre-filters on the prefix.
+    // capability, and `image::guess_format` decides the real format. Callers pre-filter
+    // through `DeclaredImageMediaType::parse`, which is built on this reduction, so no
+    // ingress path keys on the `image/` prefix.
     match essence.as_str() {
         "image/jpg" | "image/pjpeg" => "image/jpeg".to_owned(),
         "image/apng" | "image/x-png" | "image/vnd.mozilla.apng" => "image/png".to_owned(),
@@ -1259,17 +1315,17 @@ fn verify_digest(id: &AttachmentId, bytes: &[u8]) -> Result<(), AttachmentError>
 /// The transformation only ever removes: it drops forbidden characters, keeps the last path
 /// segment, truncates, and falls back to `image` when nothing is left. It never fails, so a
 /// hostile name degrades a display string instead of rejecting a valid image.
+///
+/// It is a fixed point: sanitizing its own output returns that output unchanged. The JSON
+/// boundary and the durable round-trip depend on this, so every check below runs on the
+/// reduced string rather than on the posted one -- a test applied before a reduction step
+/// is a test the reduction can invalidate.
 #[must_use]
 pub fn sanitize_display_filename(filename: &str) -> String {
     // Split on both separators rather than through `Path::file_name`, whose parsing is
     // target-specific: `C:\\Users\\victim\\evil.png` must reduce to the same display name on
     // Linux and macOS as it does on Windows.
-    let mut base = filename.rsplit(['/', '\\']).next().unwrap_or_default();
-    // `.` and `..` name a directory rather than a file, which is why `Path::file_name`
-    // reports neither. A dotfile keeps its leading dot.
-    if base == "." || base == ".." {
-        base = "";
-    }
+    let base = filename.rsplit(['/', '\\']).next().unwrap_or_default();
     // No drive-letter strip. `rsplit` above already removes every Windows prefix that
     // carries a separator, including `C:\\Users\\victim\\evil.png`, and the only shape left is a
     // drive-relative `C:evil.png`, which is indistinguishable from the legal POSIX filename
@@ -1291,7 +1347,12 @@ pub fn sanitize_display_filename(filename: &str) -> String {
         count += 1;
     }
     let kept = kept.trim();
-    if kept.is_empty() {
+    // `.` and `..` name a directory rather than a file, which is why `Path::file_name`
+    // reports neither. The test runs here, on the stripped and trimmed text, because
+    // `" . "`, `".\u{7}"`, and `"a/ .. "` all reduce to one of the two names, and a check on
+    // the raw segment would have published `.` and then turned it into `image` on the next
+    // pass. A dotfile keeps its leading dot.
+    if kept.is_empty() || kept == "." || kept == ".." {
         "image".to_owned()
     } else {
         kept.to_owned()
@@ -3003,6 +3064,117 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_media_type_is_typed_to_exactly_what_admission_accepts() {
+        // Left: every spelling admission accepts, as the HTTP and ACP ingress paths receive
+        // it. Right: the only value the parse may produce. This table is the contract those
+        // paths share, so each of them consumes the parse instead of copying the table.
+        const ADMITTED: [(&str, DeclaredImageMediaType); 15] = [
+            ("image/png", DeclaredImageMediaType::Png),
+            ("IMAGE/PNG", DeclaredImageMediaType::Png),
+            ("Image/Png", DeclaredImageMediaType::Png),
+            ("image/png; charset=binary", DeclaredImageMediaType::Png),
+            (" image/png ", DeclaredImageMediaType::Png),
+            ("image/apng", DeclaredImageMediaType::Png),
+            ("IMAGE/APNG", DeclaredImageMediaType::Png),
+            ("image/x-png", DeclaredImageMediaType::Png),
+            ("image/vnd.mozilla.apng", DeclaredImageMediaType::Png),
+            ("image/jpeg", DeclaredImageMediaType::Jpeg),
+            ("image/jpg", DeclaredImageMediaType::Jpeg),
+            ("IMAGE/JPG", DeclaredImageMediaType::Jpeg),
+            ("image/pjpeg", DeclaredImageMediaType::Jpeg),
+            ("image/gif", DeclaredImageMediaType::Gif),
+            ("image/webp", DeclaredImageMediaType::WebP),
+        ];
+        // Declarations that carry the `image/` prefix a string test keys on but name nothing
+        // admission accepts -- `image/svg+xml` is the one measured reaching the ACP
+        // decoder -- plus near-misses of the admitted names and non-image types.
+        const REFUSED: [&str; 21] = [
+            "image/svg+xml",
+            "IMAGE/SVG+XML",
+            "image/svg+xml; charset=utf-8",
+            "image/bmp",
+            "image/tiff",
+            "image/avif",
+            "image/heic",
+            "image/x-icon",
+            "image/x-evil",
+            "image/png-lookalike",
+            "image/pngx",
+            "image/jpeg2000",
+            "image/png/evil",
+            "image/png\u{0}",
+            "image/",
+            "image/ png",
+            "",
+            "image",
+            "imagex/png",
+            "text/html",
+            "application/octet-stream",
+        ];
+        for (declared, expected) in ADMITTED {
+            assert_eq!(
+                DeclaredImageMediaType::parse(declared),
+                Some(expected),
+                "{declared:?} is a spelling admission accepts"
+            );
+            assert_eq!(
+                canonical_declared_media_type(declared),
+                expected.as_str(),
+                "{declared:?} reduces to the name its typed value stands for"
+            );
+        }
+        for declared in REFUSED {
+            assert_eq!(
+                DeclaredImageMediaType::parse(declared),
+                None,
+                "{declared:?} names nothing admission accepts"
+            );
+        }
+        for value in [
+            DeclaredImageMediaType::Png,
+            DeclaredImageMediaType::Jpeg,
+            DeclaredImageMediaType::Gif,
+            DeclaredImageMediaType::WebP,
+        ] {
+            assert_eq!(DeclaredImageMediaType::parse(value.as_str()), Some(value));
+        }
+        // Parameters and case can make a spelling match an admitted name, never a different
+        // admitted name.
+        assert_eq!(
+            DeclaredImageMediaType::parse("IMAGE/JPG; q=0.9"),
+            Some(DeclaredImageMediaType::Jpeg)
+        );
+        assert_eq!(
+            DeclaredImageMediaType::parse("image/jpeg; type=image/png"),
+            Some(DeclaredImageMediaType::Jpeg)
+        );
+
+        // Admission compares through the same parse. A refused spelling is a typed mismatch
+        // for bytes the crate would otherwise admit, and the error echoes the caller's own
+        // spelling; an admitted spelling for the wrong bytes is refused the same way.
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            AttachmentStore::new(root.path(), "database", ImageAdmissionPolicy::default()).unwrap();
+        let png_data = base64::engine::general_purpose::STANDARD.encode(png(2, 2, false));
+        for declared in REFUSED {
+            match store.admit_base64_typed(&png_data, Some(declared), None) {
+                Err(AttachmentError::MediaTypeMismatch { expected, detected }) => {
+                    assert_eq!(expected, declared);
+                    assert_eq!(detected, "image/png");
+                }
+                other => panic!("{declared:?} must be a typed mismatch, got {other:?}"),
+            }
+        }
+        match store.admit_base64_typed(&png_data, Some("IMAGE/GIF"), None) {
+            Err(AttachmentError::MediaTypeMismatch { expected, detected }) => {
+                assert_eq!(expected, "IMAGE/GIF");
+                assert_eq!(detected, "image/png");
+            }
+            other => panic!("an admitted name for the wrong bytes must mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_valid_declared_mime_spelling_is_accepted_for_matching_bytes() {
         let root = tempfile::tempdir().unwrap();
         let store =
@@ -3070,6 +3242,15 @@ mod tests {
             ("x:y.png", "x:y.png"),
             ("..", "image"),
             (".hidden.png", ".hidden.png"),
+            // A name that becomes `.` or `..` only after the forbidden characters are
+            // stripped and the ends trimmed still names a directory, not a file. Testing
+            // for the two names before that reduction let `.` through, and a second pass
+            // then turned it into `image`, so the function was not the fixed point the
+            // JSON boundary and the durable round-trip rely on.
+            (" . ", "image"),
+            (".\u{7}", "image"),
+            (" .. ", "image"),
+            ("a/ . ", "image"),
         ];
         for (posted, expected) in cases {
             let admitted = store
@@ -3118,6 +3299,34 @@ mod tests {
             let once = sanitize_display_filename(posted);
             assert_eq!(sanitize_display_filename(&once), once, "{posted:?}");
             assert_eq!(once, expected);
+        }
+    }
+
+    #[test]
+    fn sanitizing_a_display_filename_is_a_fixed_point_over_every_short_dot_space_control_mix() {
+        // The measured escapes -- `" . "`, `".\u{7}"`, `" .. "`, `"a/ . "` -- were all short
+        // mixes of a dot, a space, a stripped character, a separator, and a letter. Every
+        // string of at most four such atoms is enumerated here so the property is pinned
+        // over the whole class rather than over the four members that were noticed.
+        const ATOMS: [&str; 6] = [".", " ", "\u{7}", "/", "\\", "a"];
+        let mut names = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::with_capacity(names.len() * ATOMS.len());
+            for name in &names {
+                for atom in ATOMS {
+                    next.push(format!("{name}{atom}"));
+                }
+            }
+            names.extend(next);
+        }
+        assert!(names.len() > 1_500, "{} names", names.len());
+        for name in names {
+            let once = sanitize_display_filename(&name);
+            assert_eq!(sanitize_display_filename(&once), once, "{name:?}");
+            assert_ne!(once, ".", "{name:?}");
+            assert_ne!(once, "..", "{name:?}");
+            assert!(!once.is_empty(), "{name:?}");
+            assert_eq!(once.trim(), once, "{name:?}");
         }
     }
 

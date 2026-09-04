@@ -868,7 +868,25 @@ pub async fn prompt(
         agent,
         model,
     } = input;
-    let admitted_attachments = admit_prompt_files(&state, &mut prompt)?;
+    // Admission decodes caller-supplied images: the worst legal default input is a
+    // 146,036-byte 30,117,000 x 1 PNG that holds about 500 MB live for seconds, and
+    // `zuno serve` polls this handler on a single-threaded runtime, so the loop runs off
+    // the reactor inside the admission budget. The permit travels with the work, so a
+    // caller that disconnects mid-decode frees no slot until the decode ends. A prompt
+    // with no files admits nothing and never contends for a slot.
+    let admitted_attachments = if prompt.files.is_empty() {
+        Vec::new()
+    } else {
+        let attachments = state.attachments();
+        let (returned, admitted) =
+            super::blocking::run(super::blocking::Budget::Admission, move || {
+                let admitted = admit_prompt_files(&attachments, &mut prompt)?;
+                Ok((prompt, admitted))
+            })
+            .await?;
+        prompt = returned;
+        admitted
+    };
     let message_id = id.unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().simple()));
     let delivery = delivery.unwrap_or(PromptDelivery::Queue);
     let created = zuno_db::message::now_millis();
@@ -1165,8 +1183,21 @@ fn report_execution(
     })
 }
 
+// The pre-filter for `prompt.files[].mimeType` is the attachment crate's own typed parse,
+// so a prompt naming a type the crate can never admit is refused before its base64 payload
+// is decoded, and a spelling the crate admits (RFC 2045 case, parameters, and the aliases
+// browsers emit) is never refused here. The declaration is a cross-check, not a capability:
+// the crate still sniffs the bytes and refuses a declaration that disagrees with them,
+// echoing the caller's own spelling. Consuming the crate's parse instead of a copied table is
+// what keeps this route from drifting from the crate.
+use zuno_attachment::DeclaredImageMediaType;
+
+/// Admit every inline image in `prompt.files`, replacing each with its durable reference.
+///
+/// Synchronous by design: it decodes and re-encodes caller-supplied images and writes
+/// objects, so [`prompt`] runs it through [`super::blocking::run`] rather than inline.
 fn admit_prompt_files(
-    state: &ApiState,
+    store: &zuno_attachment::AttachmentStore,
     prompt: &mut PromptInputBody,
 ) -> Result<Vec<zuno_attachment::ImageAttachmentRef>, ApiError> {
     let mut admitted = Vec::with_capacity(prompt.files.len());
@@ -1183,7 +1214,7 @@ fn admit_prompt_files(
                             "prompt.files[{index}].attachment is invalid"
                         ))
                     })?;
-            state.attachments().read(&reference).map_err(|error| {
+            store.read(&reference).map_err(|error| {
                 ApiError::InvalidPrompt(format!(
                     "prompt.files[{index}] references an invalid image object: {error}"
                 ))
@@ -1200,9 +1231,9 @@ fn admit_prompt_files(
                         "prompt.files[{index}] must contain a non-empty image MIME type"
                     ))
                 })?;
-            if !media_type.starts_with("image/") {
+            if DeclaredImageMediaType::parse(media_type).is_none() {
                 return Err(ApiError::InvalidPrompt(format!(
-                    "prompt.files[{index}] uses unsupported MIME type {media_type}; only images are accepted"
+                    "prompt.files[{index}] uses unsupported MIME type {media_type}; only PNG, JPEG, GIF and WebP images are accepted"
                 )));
             }
             let data = object
@@ -1218,8 +1249,9 @@ fn admit_prompt_files(
                 .get("filename")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            state
-                .attachments()
+            // The caller's own spelling goes through: the crate canonicalizes it again and
+            // echoes it verbatim in `MediaTypeMismatch`.
+            store
                 .admit_base64_typed(data, Some(media_type), filename)
                 .map_err(|error| {
                     ApiError::InvalidPrompt(format!(
@@ -1653,4 +1685,513 @@ fn encode_message_cursor(id: &str, order: MessageOrder, direction: CursorDirecti
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&value).expect("message cursor has an infallible JSON representation"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+    use zuno_attachment::{AttachmentStore, ImageAdmissionPolicy, ImageAttachmentRef};
+    use zuno_engine::r#loop::TurnEventSender;
+
+    use super::super::blocking::Budget;
+    use super::*;
+
+    /// The four names the attachment crate can admit, spelled every way its own suite
+    /// accepts (`a_valid_declared_mime_spelling_is_accepted_for_matching_bytes`) plus
+    /// the two sniffed formats it re-encodes.
+    const ADMITTED_SPELLINGS: [(&str, DeclaredImageMediaType); 15] = [
+        ("image/png", DeclaredImageMediaType::Png),
+        ("IMAGE/PNG", DeclaredImageMediaType::Png),
+        ("Image/Png", DeclaredImageMediaType::Png),
+        ("image/png; charset=binary", DeclaredImageMediaType::Png),
+        (" image/png ", DeclaredImageMediaType::Png),
+        ("image/apng", DeclaredImageMediaType::Png),
+        ("IMAGE/APNG", DeclaredImageMediaType::Png),
+        ("image/x-png", DeclaredImageMediaType::Png),
+        ("image/vnd.mozilla.apng", DeclaredImageMediaType::Png),
+        ("image/jpeg", DeclaredImageMediaType::Jpeg),
+        ("image/jpg", DeclaredImageMediaType::Jpeg),
+        ("IMAGE/JPG", DeclaredImageMediaType::Jpeg),
+        ("image/pjpeg", DeclaredImageMediaType::Jpeg),
+        ("image/gif", DeclaredImageMediaType::Gif),
+        ("image/webp", DeclaredImageMediaType::WebP),
+    ];
+
+    /// Declarations that carry the `image/` prefix the released pre-filter keyed on but
+    /// name nothing the crate admits, plus near-misses of the admitted names.
+    const SPOOFED_IMAGE_PREFIXES: [&str; 14] = [
+        "image/svg+xml",
+        "image/bmp",
+        "image/tiff",
+        "image/avif",
+        "image/heic",
+        "image/x-icon",
+        "image/x-evil",
+        "image/png-lookalike",
+        "image/pngx",
+        "image/jpeg2000",
+        "image/png/evil",
+        "image/png\u{0}",
+        "image/",
+        "image/ png",
+    ];
+
+    /// The smallest GIF: `GIF89a`, 1x1, a two-entry palette, one transparent pixel.
+    const GIF_1X1: [u8; 43] = [
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
+    ];
+
+    /// An 8-bit grayscale PNG of `width` x 1 black pixels, built without an encoder.
+    ///
+    /// The same class as the worst legal default admission the reviewer measured -- a
+    /// 146,036-byte 30,117,000 x 1 gray PNG at about 500 MB peak RSS and 2-3.4 s -- and
+    /// slow for the same reason: one source row, so the fit clamps the target height to
+    /// a single row and the Lanczos3 intermediate costs 16 bytes per source pixel. The
+    /// image data is one fixed-Huffman DEFLATE block: a literal zero, then a
+    /// `length 258 / distance 1` match per 258 bytes of the zero run.
+    fn wide_gray_png(width: u32) -> Vec<u8> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = 0xffff_ffff_u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xedb8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            let length = u32::try_from(data.len()).expect("a PNG chunk fits its length field");
+            out.extend_from_slice(&length.to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            let mut checked = kind.to_vec();
+            checked.extend_from_slice(data);
+            out.extend_from_slice(&crc32(&checked).to_be_bytes());
+        }
+
+        /// DEFLATE bit packing: data fields LSB-first, Huffman codes MSB-first.
+        #[derive(Default)]
+        struct Bits {
+            out: Vec<u8>,
+            acc: u64,
+            filled: u32,
+        }
+
+        impl Bits {
+            fn push(&mut self, value: u32, count: u32) {
+                self.acc |= u64::from(value) << self.filled;
+                self.filled += count;
+                while self.filled >= 8 {
+                    self.out
+                        .push(u8::try_from(self.acc & 0xff).expect("masked to one byte"));
+                    self.acc >>= 8;
+                    self.filled -= 8;
+                }
+            }
+
+            fn huffman(&mut self, code: u32, length: u32) {
+                let mut reversed = 0_u32;
+                for bit in 0..length {
+                    if code & (1 << bit) != 0 {
+                        reversed |= 1 << (length - 1 - bit);
+                    }
+                }
+                self.push(reversed, length);
+            }
+
+            fn finish(mut self) -> Vec<u8> {
+                if self.filled > 0 {
+                    self.out
+                        .push(u8::try_from(self.acc & 0xff).expect("masked to one byte"));
+                }
+                self.out
+            }
+        }
+
+        // One scanline: the filter byte, then `width` zero samples.
+        let raw_len = u64::from(width) + 1;
+        let mut bits = Bits::default();
+        bits.push(1, 1); // BFINAL
+        bits.push(1, 2); // BTYPE 01: fixed Huffman codes
+        bits.huffman(0x30, 8); // literal 0x00 is fixed code 0b0011_0000
+        let mut remaining = raw_len - 1;
+        while remaining >= 258 {
+            bits.huffman(0xc5, 8); // length 258 is symbol 285, fixed code 0b1100_0101
+            bits.huffman(0, 5); // distance 1 is symbol 0
+            remaining -= 258;
+        }
+        for _ in 0..remaining {
+            bits.huffman(0x30, 8);
+        }
+        bits.huffman(0, 7); // end of block is symbol 256, fixed code 0b000_0000
+        let deflate = bits.finish();
+        // Adler-32 of `raw_len` zero bytes: `a` stays 1 and `b` gains `a` once per byte.
+        let adler_b = u32::try_from(raw_len % 65_521).expect("a residue below 65,521");
+        let mut zlib = vec![0x78, 0x01];
+        zlib.extend_from_slice(&deflate);
+        zlib.extend_from_slice(&((adler_b << 16) | 1).to_be_bytes());
+
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&1_u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 0, 0, 0, 0]); // 8-bit grayscale, no interlace
+        chunk(&mut png, b"IHDR", &ihdr);
+        chunk(&mut png, b"IDAT", &zlib);
+        chunk(&mut png, b"IEND", &[]);
+        png
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn inline_file(media_type: &str, data: &str) -> PromptInputBody {
+        PromptInputBody {
+            text: "inspect the image".to_owned(),
+            files: vec![json!({
+                "filename": "shot.png",
+                "mimeType": media_type,
+                "data": data,
+            })],
+            agents: Vec::new(),
+        }
+    }
+
+    fn admitted_reference(prompt: &PromptInputBody) -> ImageAttachmentRef {
+        assert_eq!(prompt.files.len(), 1, "one file was posted");
+        assert_eq!(prompt.files[0]["type"], "image");
+        assert!(
+            prompt.files[0].get("data").is_none(),
+            "the durable form carries no base64"
+        );
+        serde_json::from_value(prompt.files[0]["attachment"].clone())
+            .expect("the durable file carries a typed attachment reference")
+    }
+
+    fn fresh_store() -> (tempfile::TempDir, AttachmentStore) {
+        let root = tempfile::tempdir().expect("temporary attachment root");
+        let store = AttachmentStore::new(root.path(), "database", ImageAdmissionPolicy::default())
+            .expect("attachment store opens");
+        (root, store)
+    }
+
+    #[test]
+    fn a_declared_media_type_is_typed_to_exactly_what_the_attachment_crate_admits() {
+        for (declared, expected) in ADMITTED_SPELLINGS {
+            assert_eq!(
+                DeclaredImageMediaType::parse(declared),
+                Some(expected),
+                "{declared:?} is a spelling the attachment crate admits"
+            );
+        }
+        for declared in SPOOFED_IMAGE_PREFIXES {
+            assert_eq!(
+                DeclaredImageMediaType::parse(declared),
+                None,
+                "{declared:?} carries the image/ prefix but names nothing the crate admits"
+            );
+        }
+        for declared in [
+            "",
+            "image",
+            "imagex/png",
+            "text/html",
+            "application/octet-stream",
+        ] {
+            assert_eq!(
+                DeclaredImageMediaType::parse(declared),
+                None,
+                "{declared:?}"
+            );
+        }
+        // The reduction is deny-side only: parameters and case can make a spelling match
+        // an admitted name, never a different admitted name.
+        assert_eq!(
+            DeclaredImageMediaType::parse("IMAGE/JPG; q=0.9"),
+            Some(DeclaredImageMediaType::Jpeg)
+        );
+        assert_eq!(
+            DeclaredImageMediaType::parse("image/jpeg; type=image/png"),
+            Some(DeclaredImageMediaType::Jpeg)
+        );
+    }
+
+    /// The ledger item: the pre-filter compared the declaration against a string prefix.
+    ///
+    /// Both directions were wrong. A spoofed `image/` subtype (`image/svg+xml`,
+    /// `image/x-evil`) passed the pre-filter and reached base64 decoding, while the
+    /// spellings the attachment crate itself admits under RFC 2045 -- `IMAGE/PNG`,
+    /// `" image/png "`, `image/png; charset=binary`, the `apng`/`x-png`/`jpg`/`pjpeg`
+    /// aliases -- were refused with the "only images" message before the crate saw them.
+    #[test]
+    fn a_spoofed_image_prefix_is_refused_and_every_admitted_spelling_is_accepted() {
+        let (_root, store) = fresh_store();
+
+        // The payload is not base64, so the refusal can only be the pre-filter's: the
+        // spoofed prefix is turned away before the data is looked at.
+        for declared in SPOOFED_IMAGE_PREFIXES {
+            let mut prompt = inline_file(declared, "!!not base64!!");
+            let error = admit_prompt_files(&store, &mut prompt)
+                .expect_err("a media type the crate cannot admit is refused");
+            let expected = format!(
+                "prompt.files[0] uses unsupported MIME type {declared}; only PNG, JPEG, GIF \
+                 and WebP images are accepted"
+            );
+            assert!(
+                matches!(&error, ApiError::InvalidPrompt(message) if *message == expected),
+                "{declared:?}: {error}"
+            );
+            assert_eq!(
+                prompt.files[0]["mimeType"], declared,
+                "a refused prompt is left as posted"
+            );
+        }
+
+        // A 2 x 1 gray PNG: opaque, so the store re-encodes it as JPEG and its object
+        // bytes are the real JPEG the JPEG spellings are checked against below.
+        let png = base64(&wide_gray_png(2));
+        let mut jpeg_bytes = None;
+        for (declared, expected) in ADMITTED_SPELLINGS {
+            if expected != DeclaredImageMediaType::Png {
+                continue;
+            }
+            let mut prompt = inline_file(declared, &png);
+            let admitted = admit_prompt_files(&store, &mut prompt)
+                .unwrap_or_else(|error| panic!("{declared:?} must be admitted: {error}"));
+            let reference = admitted_reference(&prompt);
+            assert_eq!(admitted, vec![reference.clone()]);
+            assert_eq!((reference.width, reference.height), (2, 1));
+            assert_eq!(reference.media_type, "image/jpeg");
+            jpeg_bytes = Some(store.read(&reference).expect("the admitted object reads"));
+        }
+        let jpeg = base64(&jpeg_bytes.expect("at least one PNG spelling was admitted"));
+        for (declared, expected) in ADMITTED_SPELLINGS {
+            if expected != DeclaredImageMediaType::Jpeg {
+                continue;
+            }
+            let mut prompt = inline_file(declared, &jpeg);
+            admit_prompt_files(&store, &mut prompt)
+                .unwrap_or_else(|error| panic!("{declared:?} must be admitted: {error}"));
+            assert_eq!(admitted_reference(&prompt).media_type, "image/jpeg");
+        }
+        let mut prompt = inline_file("image/gif", &base64(&GIF_1X1));
+        admit_prompt_files(&store, &mut prompt)
+            .unwrap_or_else(|error| panic!("a GIF declared image/gif must be admitted: {error}"));
+        assert_eq!(
+            (
+                admitted_reference(&prompt).width,
+                admitted_reference(&prompt).height
+            ),
+            (1, 1)
+        );
+
+        // The pre-filter types the declaration; the bytes stay the crate's call. An
+        // admitted name that disagrees with the payload is refused by the crate, which
+        // echoes the caller's own spelling.
+        let mut prompt = inline_file("IMAGE/GIF", &png);
+        let error = admit_prompt_files(&store, &mut prompt)
+            .expect_err("a declaration that disagrees with the bytes is refused");
+        assert!(
+            matches!(
+                &error,
+                ApiError::InvalidPrompt(message)
+                    if message.starts_with("prompt.files[0] image admission failed: ")
+                        && message.contains("IMAGE/GIF")
+            ),
+            "{error}"
+        );
+    }
+
+    /// A turn executor that finishes at once, so the prompt handler's admission path can
+    /// run without a provider.
+    #[derive(Debug)]
+    struct IdleExecutor;
+
+    impl crate::SessionMutationExecutor for IdleExecutor {
+        fn prompt(
+            &self,
+            _request: SessionPromptExecution,
+            _guard: SessionRunGuard,
+            _events: TurnEventSender,
+        ) -> crate::SessionMutationFuture {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn reports(
+            &self,
+            _request: SessionReportExecution,
+            _guard: SessionRunGuard,
+            _events: TurnEventSender,
+        ) -> crate::SessionMutationFuture {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn compact(
+            &self,
+            _request: SessionCompactExecution,
+            _guard: SessionRunGuard,
+            _events: TurnEventSender,
+        ) -> crate::SessionMutationFuture {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Seam 25: attachment admission ran inline in `pub async fn prompt`.
+    ///
+    /// `zuno serve` polls the router on a `new_current_thread` runtime, which is also
+    /// what `#[tokio::test]` builds here. Inline, the first poll of the handler returned
+    /// only after the whole decode had run on the reactor, so every other request --
+    /// this test's `GET /api/health` -- waited behind it; for the worst legal default
+    /// input that is about 3.4 s and 500 MB. The input is that shape scaled to what a
+    /// unit test can afford: a 25,484-byte 4,000,000 x 1 gray PNG that the real store
+    /// admits as a 2000 x 1 object.
+    ///
+    /// Two oracles. With the admission budget fully held, the handler stays pending for
+    /// a real-clock window and a health request still completes, so the work is charged
+    /// to [`Budget::Admission`] and queued rather than started. With the budget free, the
+    /// handler's first poll is pending while the decode holds one permit on the blocking
+    /// pool, the health request completes, and the admission then finishes.
+    #[tokio::test]
+    async fn a_slow_attachment_admission_does_not_block_a_concurrent_health_request() {
+        const SESSION: &str = "ses_admission";
+        let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+        state
+            .sessions()
+            .create(&SessionCreate::new(
+                SESSION,
+                SESSION,
+                GLOBAL_PROJECT_ID,
+                "/repo",
+                "/repo",
+                "admission",
+                "test",
+            ))
+            .expect("fixture session inserts");
+        let services = ServerServices::new(64).with_mutations(Arc::new(IdleExecutor));
+        let source = base64(&wide_gray_png(4_000_000));
+        assert_eq!(
+            source.len(),
+            33_980,
+            "the fixture is the reviewed shape, base64"
+        );
+        let body = |id: &str| PromptBody {
+            id: Some(id.to_owned()),
+            prompt: inline_file("image/png", &source),
+            delivery: None,
+            resume: None,
+            agent: None,
+            model: None,
+        };
+        let health = || {
+            super::super::router(state.clone()).oneshot(
+                Request::get("/api/health")
+                    .body(Body::empty())
+                    .expect("the health request builds"),
+            )
+        };
+
+        // Budget held: the admission waits for a permit and the reactor stays free.
+        let held = Budget::Admission.hold_all().await;
+        let mut queued = std::pin::pin!(prompt(
+            State(state.clone()),
+            Extension(services.clone()),
+            Path(SESSION.to_owned()),
+            Json(body("msg_queued")),
+        ));
+        let window = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < window {
+            assert!(
+                futures::poll!(&mut queued).is_pending(),
+                "an attachment admission started outside the admission budget"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let response = tokio::time::timeout(Duration::from_secs(10), health())
+            .await
+            .expect("the reactor answered a health request while an admission was queued")
+            .expect("the router serves health");
+        assert_eq!(response.status(), StatusCode::OK);
+        // A prompt without files admits nothing and does not queue behind image decodes.
+        let text_only = prompt(
+            State(state.clone()),
+            Extension(services.clone()),
+            Path(SESSION.to_owned()),
+            Json(PromptBody {
+                id: Some("msg_text".to_owned()),
+                prompt: PromptInputBody {
+                    text: "hello".to_owned(),
+                    files: Vec::new(),
+                    agents: Vec::new(),
+                },
+                delivery: None,
+                resume: None,
+                agent: None,
+                model: None,
+            }),
+        )
+        .await
+        .expect("a text prompt is admitted while every admission slot is held");
+        assert!(text_only.0.data.prompt.files.is_empty());
+        drop(held);
+        let admitted = queued
+            .await
+            .expect("the queued admission runs once the budget frees");
+        let reference = admitted_reference(&admitted.0.data.prompt);
+        assert_eq!((reference.width, reference.height), (2_000, 1));
+        assert_eq!(reference.media_type, "image/jpeg");
+
+        // Budget free: the decode runs on the blocking pool, holding its permit there,
+        // and the reactor answers health before the admission completes.
+        let started = Instant::now();
+        let mut decoding = std::pin::pin!(prompt(
+            State(state.clone()),
+            Extension(services.clone()),
+            Path(SESSION.to_owned()),
+            Json(body("msg_decoding")),
+        ));
+        assert!(
+            futures::poll!(&mut decoding).is_pending(),
+            "the first poll of the prompt handler ran the whole image decode on the reactor"
+        );
+        assert_eq!(
+            Budget::Admission.available(),
+            Budget::Admission.size() - 1,
+            "the running decode holds exactly one admission permit"
+        );
+        let response = tokio::time::timeout(Duration::from_secs(10), health())
+            .await
+            .expect("the reactor answered a health request during an image decode")
+            .expect("the router serves health");
+        assert_eq!(response.status(), StatusCode::OK);
+        let health_answered = started.elapsed();
+        let admitted = decoding
+            .await
+            .expect("the admission completes off the reactor");
+        let admission_finished = started.elapsed();
+        assert!(
+            health_answered < admission_finished,
+            "health answered at {health_answered:?}, admission finished at \
+             {admission_finished:?}"
+        );
+        let reference = admitted_reference(&admitted.0.data.prompt);
+        assert_eq!((reference.width, reference.height), (2_000, 1));
+        assert_eq!(
+            Budget::Admission.available(),
+            Budget::Admission.size(),
+            "the permit is handed back when the decode ends"
+        );
+    }
 }
