@@ -1196,7 +1196,23 @@ impl PermissionResolution {
     /// Every durable write here leaves the reactor: `HumanRequestStore` is synchronous
     /// rusqlite, and on the single-threaded `zuno serve` runtime a contended write on
     /// the reply path would freeze every SSE stream and every live turn.
-    pub async fn settle(mut self, reply: ReplyKind) -> Result<Settled, SettleError> {
+    ///
+    /// The whole sequence runs on its own task, and this future only awaits its outcome.
+    /// The reply route that calls `settle` is dropped the moment its client hangs up or
+    /// a proxy times the request out, and dropping that future does not take back the
+    /// blocking write it queued: the row and the event still land, but nothing past the
+    /// commit runs, and `Drop` — holding an answer nobody delivered — refuses the call
+    /// and leaves the goal paused. The audit row, the event log and the session history
+    /// then all record an approval the execution contradicted. Detaching the work keeps
+    /// the commit the one authoritative transition and makes what follows it as
+    /// uncancellable as the write itself.
+    pub async fn settle(self, reply: ReplyKind) -> Result<Settled, SettleError> {
+        tokio::spawn(self.settle_to_completion(reply))
+            .await
+            .map_err(|error| worker_error(&error))?
+    }
+
+    async fn settle_to_completion(mut self, reply: ReplyKind) -> Result<Settled, SettleError> {
         let live = self.answer.is_some();
         // An asker that is already gone cannot be authorized, so nothing is committed
         // for it: the alternative is an `answered` audit row and a published reply for
@@ -1379,8 +1395,18 @@ pub struct QuestionResolution {
 
 impl QuestionResolution {
     /// Commits the decision, the event announcing it, and the row state it asserts,
-    /// then delivers the decision. See [`PermissionResolution::settle`].
-    pub async fn settle(mut self, decision: QuestionDecision) -> Result<Settled, SettleError> {
+    /// then delivers the decision. See [`PermissionResolution::settle`], including why
+    /// the work is detached from the future that awaits it.
+    pub async fn settle(self, decision: QuestionDecision) -> Result<Settled, SettleError> {
+        tokio::spawn(self.settle_to_completion(decision))
+            .await
+            .map_err(|error| worker_error(&error))?
+    }
+
+    async fn settle_to_completion(
+        mut self,
+        decision: QuestionDecision,
+    ) -> Result<Settled, SettleError> {
         let live = self.answer.is_some();
         if self.answer.as_ref().is_some_and(oneshot::Sender::is_closed) {
             return Err(SettleError::Gone);
@@ -2217,6 +2243,179 @@ mod tests {
             "an `always` no call ever received must not auto-approve the next `git push`"
         );
         next.abort();
+    }
+
+    /// Lets a settle's commit land while the future that started it is never polled again.
+    ///
+    /// The database's write lock makes the moment deterministic: the settle parks inside
+    /// its transaction, the lock is released, and the audit row is watched until it reads
+    /// `Answered`. The blocking write has now landed for a future nobody polled past its
+    /// commit — the state a reply route is in when its client hung up mid-request. The
+    /// caller drops `settling` next.
+    async fn let_the_commit_land_unobserved<F: std::future::Future>(
+        pool: &Arc<zuno_db::Pool>,
+        request_id: &str,
+        mut settling: std::pin::Pin<&mut F>,
+    ) {
+        let blocker = pool.get().expect("blocking connection");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("the test holds the write lock");
+        for _ in 0..16 {
+            assert!(
+                futures::poll!(&mut settling).is_pending(),
+                "the reply must park on the held write lock"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        blocker
+            .execute_batch("ROLLBACK")
+            .expect("the test releases the write lock");
+        drop(blocker);
+        let store = HumanRequestStore::new(Arc::clone(pool));
+        let ceiling = std::time::Instant::now() + Duration::from_secs(60);
+        while store
+            .get(request_id)
+            .expect("the audit row reads")
+            .is_none_or(|row| row.state != HumanRequestState::Answered)
+        {
+            assert!(
+                std::time::Instant::now() < ceiling,
+                "the reply to `{request_id}` never committed"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// The reviewed input: the reply route's client hangs up once the reply has committed.
+    ///
+    /// `settle` used to run its commit, the goal resume and the hand-off to the asker as
+    /// one cancellable future. A handler is dropped the moment its client disconnects or
+    /// a proxy times the request out, and dropping the future does not take back the
+    /// blocking write it queued: the row read `Answered {"reply":"always"}` and
+    /// `permission.v2.replied` was in the log, but nothing past the commit ran, and
+    /// `Drop` — holding an answer nobody had delivered — told the tool call `Failed`. The
+    /// audit row, the event log and the session history all said the user approved a
+    /// call that was refused, and the goal the ask had paused was never resumed.
+    #[tokio::test]
+    async fn a_reply_whose_connection_drops_after_the_commit_still_authorizes_the_call() {
+        let (_spill, pool, goals, broker) = durable_broker_on_disk();
+        goals
+            .create_goal("ses_http", "finish after the approval", None)
+            .expect("create goal");
+        let asker = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .ask_permission(ask("per_hangup", vec!["shell".to_owned()]))
+                    .await
+            }
+        });
+        wait_for_ask(&broker, "per_hangup").await;
+        assert_eq!(
+            goals
+                .goal("ses_http")
+                .expect("read goal")
+                .expect("goal")
+                .status,
+            zuno_goal::GoalStatus::Paused,
+            "a goal-owned ask pauses the goal until it is answered"
+        );
+        let claim = broker
+            .claim_permission("ses_http", "per_hangup")
+            .expect("the live ask is claimable");
+
+        // `Box::pin`, not `pin!`: dropping the box is what drops the future.
+        let mut settling = Box::pin(claim.settle(ReplyKind::Always));
+        let_the_commit_land_unobserved(&pool, "per_hangup", settling.as_mut()).await;
+        // The client is gone: the handler, and the settle inside it, are dropped with
+        // the reply already on disk.
+        drop(settling);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), asker)
+                .await
+                .expect("the committed reply reaches the asker")
+                .expect("permission asker task does not panic"),
+            ReplyKind::Always,
+            "the reply the audit row and the event log carry must be the one the call sees"
+        );
+        assert_eq!(
+            goals
+                .goal("ses_http")
+                .expect("read goal")
+                .expect("goal")
+                .status,
+            zuno_goal::GoalStatus::Active,
+            "the committed reply resumes the goal the ask paused"
+        );
+        assert_eq!(
+            published_replies(&pool).await.len(),
+            1,
+            "one reply committed, so one reply is announced"
+        );
+        // The standing `always` follows delivery, so it lands last; wait for it rather
+        // than for a task handle the dropped route no longer holds.
+        let ceiling = std::time::Instant::now() + Duration::from_secs(5);
+        while broker.lock().standing.is_empty() {
+            assert!(
+                std::time::Instant::now() < ceiling,
+                "a delivered `always` installs its standing grant"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            broker
+                .lock()
+                .standing
+                .iter()
+                .any(|grant| grant.session_id == "ses_http" && grant.action == "shell"),
+            "the standing grant is the one the delivered reply saved"
+        );
+    }
+
+    /// The same hang-up for a question: the answer committed, then the route was dropped.
+    #[tokio::test]
+    async fn an_answer_whose_connection_drops_after_the_commit_still_reaches_the_tool() {
+        let (_spill, pool, _goals, broker) = durable_broker_on_disk();
+        let asker = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .ask_question(QuestionRequest {
+                        id: "que_hangup".to_owned(),
+                        session_id: "ses_http".to_owned(),
+                        questions: vec![json!({"question": "Which channel?"})],
+                        tool: None,
+                    })
+                    .await
+            }
+        });
+        let ceiling = std::time::Instant::now() + Duration::from_secs(60);
+        while broker.questions(Some("ses_http")).is_empty() {
+            assert!(
+                std::time::Instant::now() < ceiling,
+                "`que_hangup` never reached the human"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let claim = broker
+            .claim_question("ses_http", "que_hangup")
+            .expect("the live question is claimable");
+
+        let answers = vec![vec!["canary".to_owned()]];
+        let mut settling = Box::pin(claim.settle(QuestionDecision::Answered(answers.clone())));
+        let_the_commit_land_unobserved(&pool, "que_hangup", settling.as_mut()).await;
+        drop(settling);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), asker)
+                .await
+                .expect("the committed answer reaches the asker")
+                .expect("question asker task does not panic"),
+            QuestionDecision::Answered(answers),
+            "the answer the audit row carries must be the one the tool sees"
+        );
     }
 
     #[tokio::test(start_paused = true)]

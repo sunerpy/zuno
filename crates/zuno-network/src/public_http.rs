@@ -1268,6 +1268,24 @@ mod tests {
             !permanent.is_transient(),
             "a rejected credential must not be retried on backoff"
         );
+
+        let abandoned = transport_error(
+            TransportFailure::Abandoned(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "gave up after 8 of 9 validated addresses: connection refused",
+            )),
+            DiagnosticEndpoint("https://origin.example/probe".to_owned()),
+            "direct",
+        );
+        assert!(
+            matches!(abandoned, PublicHttpError::PermanentTransport { .. }),
+            "{abandoned:?}"
+        );
+        assert!(
+            !abandoned.is_transient(),
+            "a walk our own ceilings cut short must not be retried on backoff into the same \
+             answer set"
+        );
     }
 
     struct Nat64Resolver;

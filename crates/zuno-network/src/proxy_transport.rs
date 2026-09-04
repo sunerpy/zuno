@@ -144,24 +144,45 @@ pub(crate) enum TransportFailure {
     PermanentForAddress(io::Error),
     /// Certificate, credential, and protocol rejections that cannot succeed later.
     Permanent(io::Error),
+    /// An address walk our own ceilings cut short before any address decided the request.
+    ///
+    /// The attempt cap and the sequence budget bound what one DNS answer can cost, so a
+    /// walk they stop has untried addresses behind it. Nothing in that walk is a peer
+    /// decision, but a mechanical retry against the same answer set performs the same
+    /// truncated walk and stops at the same place: it cannot reach the addresses this one
+    /// did not, and it repeats whatever the reached addresses did. Reporting that as
+    /// weather would let the author of the answer set choose how long the retry loop runs:
+    /// eight cheap refusals or three silent records in front of a denied one would turn a
+    /// permanent refusal into a loop that never sees it. The request is therefore decided
+    /// for this answer set; a caller that wants another attempt makes it deliberately, with
+    /// a fresh resolution, rather than on backoff.
+    Abandoned(io::Error),
 }
 
 impl TransportFailure {
-    /// Whether repeating the request can change this answer.
+    /// Whether repeating the request on backoff can change this answer.
     pub(crate) const fn is_permanent(&self) -> bool {
-        matches!(self, Self::Permanent(_) | Self::PermanentForAddress(_))
+        matches!(
+            self,
+            Self::Permanent(_) | Self::PermanentForAddress(_) | Self::Abandoned(_)
+        )
     }
 
     /// Whether the remaining validated addresses cannot change this answer either.
+    ///
+    /// An abandoned walk arrives here from a nested sequence - the proxy host's own answer,
+    /// walked once per destination address - and that inner answer set is the same for
+    /// every remaining destination, so the next destination would abandon it identically.
     const fn short_circuits(&self) -> bool {
-        matches!(self, Self::Permanent(_))
+        matches!(self, Self::Permanent(_) | Self::Abandoned(_))
     }
 
     pub(crate) fn into_io(self) -> io::Error {
         match self {
-            Self::Transient(error) | Self::PermanentForAddress(error) | Self::Permanent(error) => {
-                error
-            }
+            Self::Transient(error)
+            | Self::PermanentForAddress(error)
+            | Self::Permanent(error)
+            | Self::Abandoned(error) => error,
         }
     }
 
@@ -626,6 +647,15 @@ async fn connect_any(
 /// had weather. Letting the aggregate widen instead would put the retry decision in the
 /// hands of whoever controls the DNS answer: adding one unroutable A record would make any
 /// proxy-side denial retryable on every backoff step.
+///
+/// The same reasoning bounds a walk the ceilings cut short. A denial *behind* the cap or
+/// the budget is never reached, so it cannot be reported as a denial without the round
+/// trips the ceilings exist to refuse - but the truncation itself must not be reported as
+/// weather either: a retry on the same answer set repeats the same prefix and stops at the
+/// same address, so a transient answer would let the answer's author pick how many times
+/// that happens. An abandoned walk is therefore [`TransportFailure::Abandoned`], decided
+/// for this answer set, and it names how much of the answer was walked. A walk that
+/// reaches the end of the answer set with only weather stays transient.
 async fn establish_in_turn<F, Fut>(
     addresses: &[SocketAddr],
     attempt_timeout: Duration,
@@ -692,13 +722,15 @@ where
         return Err(denied);
     }
     Err(match (abandoned, last) {
-        // Our own ceiling stopped the walk. That is not a peer decision, so the request
-        // stays retryable - but say so, rather than reporting one address's timeout as if
-        // the whole answer set had been tried.
-        (Some(reason), Some(last)) => TransportFailure::transient(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("{reason}: {}", last.into_io()),
-        )),
+        // Our own ceiling stopped the walk with addresses untried. That is not a peer
+        // decision, but a backoff retry on the same answer set would walk the same prefix
+        // to the same stop, so the request is decided for this answer set - and says so,
+        // rather than reporting one address's failure as if the whole answer had been
+        // tried. The last failure keeps its kind: it is the one answer this walk received.
+        (Some(reason), Some(last)) => {
+            let last = last.into_io();
+            TransportFailure::Abandoned(io::Error::new(last.kind(), format!("{reason}: {last}")))
+        }
         (None, Some(last)) => last,
         // An empty address set is not a peer decision: `PublicHttpClient` rejects an empty
         // answer set before the transport sees it, and a resolver that answers with no
@@ -1722,12 +1754,16 @@ mod tests {
             elapsed < Duration::from_millis(1_500),
             "30 stalled addresses must not hold the caller for 30 attempts: {elapsed:?}"
         );
-        let permanent = failure.is_permanent();
-        let rendered = failure.into_io().to_string();
         assert!(
-            !permanent,
-            "our own budget expiring is not a peer decision: {rendered}"
+            matches!(failure, TransportFailure::Abandoned(_)),
+            "our own budget expiring is not a peer decision, and it is not weather either: a \
+             retry on this answer set stalls at the same three addresses: {failure:?}"
         );
+        assert!(
+            failure.is_permanent(),
+            "an abandoned walk is not retried on backoff"
+        );
+        let rendered = failure.into_io().to_string();
         assert!(
             rendered.contains("gave up"),
             "an abandoned walk must say so rather than looking like a single timeout: \
@@ -1797,6 +1833,195 @@ mod tests {
             !failure.is_permanent(),
             "a socket failure is not a decision about the destination: {:?}",
             failure.into_io()
+        );
+    }
+
+    /// Eight refusals, then the one address the proxy's ruleset denies.
+    ///
+    /// The attempt cap stops the walk before the denied address, so the walk cannot *see*
+    /// the denial: the cap exists so that one answer set cannot buy a ninth proxy round
+    /// trip. What the walk can do is refuse to call its own truncation weather. A retry
+    /// against the same answer set repeats the same eight refusals and stops at the same
+    /// place, so a transient answer here would let whoever orders the DNS answer decide how
+    /// long the retry loop runs - the shape `connect_any` walking every address never had.
+    #[tokio::test]
+    async fn a_denial_behind_the_attempt_cap_is_not_retried_as_weather() {
+        let denied: SocketAddr = "93.184.216.99:443".parse().expect("IPv4 address");
+        let mut addresses = (1..=8)
+            .map(|host| {
+                format!("93.184.216.{host}:443")
+                    .parse::<SocketAddr>()
+                    .expect("IPv4 address")
+            })
+            .collect::<Vec<_>>();
+        addresses.push(denied);
+        let attempted = std::sync::Mutex::new(Vec::new());
+        let failure = expect_failure(
+            establish_in_turn(&addresses, Duration::from_secs(5), |address| {
+                attempted.lock().expect("attempt log").push(address);
+                async move {
+                    if address == denied {
+                        Err(connect_failure(StatusCode::FORBIDDEN))
+                    } else {
+                        Err(TransportFailure::transient(io::Error::from(
+                            io::ErrorKind::ConnectionRefused,
+                        )))
+                    }
+                }
+            })
+            .await,
+            "no address produced a connection",
+        );
+        let attempted = attempted.lock().expect("attempt log").clone();
+        assert_eq!(attempted.len(), 8, "the attempt cap still bounds the walk");
+        assert!(
+            !attempted.contains(&denied),
+            "the denied address sits behind the cap and is never reached: {attempted:?}"
+        );
+        assert!(
+            matches!(failure, TransportFailure::Abandoned(_)),
+            "the truncation is a typed result of its own, not a peer decision: {failure:?}"
+        );
+        let permanent = failure.is_permanent();
+        let rendered = failure.into_io().to_string();
+        assert!(
+            permanent,
+            "a walk the cap cut short is decided for this answer set, not retried into the \
+             same eight refusals: {rendered}"
+        );
+        assert!(
+            rendered.contains("gave up after 8 of 9 validated addresses"),
+            "the truncation must name how much of the answer was walked: {rendered}"
+        );
+    }
+
+    /// Three silent addresses, then the denied one: the time budget rather than the cap.
+    ///
+    /// Silence at the first three addresses spends the whole sequence budget, so the
+    /// denied address is never reached. The retry would spend the same three budgets on
+    /// the same three addresses and stop at the same place, so this truncation is decided
+    /// for this answer set too - and costs 3 x the per-address budget per repetition.
+    #[tokio::test]
+    async fn a_denial_behind_the_stalled_address_allowance_is_not_retried_as_weather() {
+        let denied: SocketAddr = "93.184.216.99:443".parse().expect("IPv4 address");
+        let mut addresses = (1..=3)
+            .map(|host| {
+                format!("93.184.216.{host}:443")
+                    .parse::<SocketAddr>()
+                    .expect("IPv4 address")
+            })
+            .collect::<Vec<_>>();
+        addresses.push(denied);
+        let attempted = std::sync::Mutex::new(Vec::new());
+        let started = Instant::now();
+        let failure = expect_failure(
+            establish_in_turn(&addresses, Duration::from_millis(200), |address| {
+                attempted.lock().expect("attempt log").push(address);
+                async move {
+                    if address == denied {
+                        Err(connect_failure(StatusCode::FORBIDDEN))
+                    } else {
+                        std::future::pending::<Result<BoxIo, TransportFailure>>().await
+                    }
+                }
+            })
+            .await,
+            "no address produced a connection",
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "the sequence budget still holds: {elapsed:?}"
+        );
+        let attempted = attempted.lock().expect("attempt log").clone();
+        assert_eq!(
+            attempted.len(),
+            3,
+            "the stalled-address allowance still bounds the walk"
+        );
+        assert!(
+            !attempted.contains(&denied),
+            "the denied address sits behind the spent budget and is never reached: \
+             {attempted:?}"
+        );
+        assert!(
+            matches!(failure, TransportFailure::Abandoned(_)),
+            "the truncation is a typed result of its own, not a peer decision: {failure:?}"
+        );
+        let permanent = failure.is_permanent();
+        let rendered = failure.into_io().to_string();
+        assert!(
+            permanent,
+            "a walk the budget cut short is decided for this answer set, not retried into \
+             the same three stalls: {rendered}"
+        );
+        assert!(
+            rendered.contains("gave up after 3 of 4 validated addresses"),
+            "the truncation must name how much of the answer was walked: {rendered}"
+        );
+    }
+
+    /// A listener that would accept, behind eight refusals.
+    ///
+    /// The cap means this address is never tried; the honest report is that this request
+    /// is decided for this answer set, not a transient failure that a backoff retry walks
+    /// into the same eight refusals again. A caller that wants another attempt makes it
+    /// deliberately, with a fresh resolution.
+    #[tokio::test]
+    async fn a_reachable_address_behind_the_attempt_cap_is_decided_for_this_answer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let reachable = listener.local_addr().expect("listener address");
+        let mut addresses = (1..=8)
+            .map(|host| {
+                format!("93.184.216.{host}:443")
+                    .parse::<SocketAddr>()
+                    .expect("IPv4 address")
+            })
+            .collect::<Vec<_>>();
+        addresses.push(reachable);
+        let attempted = std::sync::Mutex::new(Vec::new());
+        let failure = expect_failure(
+            establish_in_turn(&addresses, Duration::from_secs(5), |address| {
+                attempted.lock().expect("attempt log").push(address);
+                async move {
+                    if address == reachable {
+                        Ok(Box::new(
+                            TcpStream::connect(address)
+                                .await
+                                .map_err(TransportFailure::transient)?,
+                        ) as BoxIo)
+                    } else {
+                        Err(TransportFailure::transient(io::Error::from(
+                            io::ErrorKind::ConnectionRefused,
+                        )))
+                    }
+                }
+            })
+            .await,
+            "the reachable address sits behind the cap",
+        );
+        let attempted = attempted.lock().expect("attempt log").clone();
+        assert_eq!(attempted.len(), 8, "the attempt cap still bounds the walk");
+        assert!(
+            !attempted.contains(&reachable),
+            "the cap is what keeps this address from being tried: {attempted:?}"
+        );
+        assert!(
+            matches!(failure, TransportFailure::Abandoned(_)),
+            "the truncation is a typed result of its own, not a peer decision: {failure:?}"
+        );
+        let permanent = failure.is_permanent();
+        let rendered = failure.into_io().to_string();
+        assert!(
+            permanent,
+            "an address the walk never reached is not evidence for a backoff retry: \
+             {rendered}"
+        );
+        assert!(
+            rendered.contains("gave up after 8 of 9 validated addresses"),
+            "the truncation must name how much of the answer was walked: {rendered}"
         );
     }
 
