@@ -270,6 +270,13 @@ with `not_found` means nothing was written, because the request was already sett
 belongs to another session, or has been claimed by another reply that is still
 committing. Exactly one reply to a request can receive `204`.
 
+A reply that has committed is final: if the HTTP connection drops before the `204`
+arrives, the tool call still receives the decision, a standing `always` is still
+installed, and the paused goal still resumes, because nothing after the commit runs on
+the connection that carried the reply. A client that retries such a reply gets `404`
+because the request is no longer pending, not because the reply was lost. Only a `500`
+with `mutation_failed` leaves the request pending and the reply worth sending again.
+
 A `204` reply whose original asker is gone — the turn was interrupted, or the process
 that made the call restarted — is still recorded, and the answer reaches the session
 through the durable inbox. Because nothing consumed it, `reply: "always"` in that case

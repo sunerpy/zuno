@@ -2687,6 +2687,34 @@ fn batch3_docs_pin_the_admission_budget_standing_rows_and_upgrade_boundary() {
     }
 }
 
+/// `PermissionResolution::settle` and `QuestionResolution::settle` detach the commit and
+/// everything after it from the HTTP handler's future, and `establish_in_turn` reports a
+/// walk its own ceilings cut short as `TransportFailure::Abandoned`. The guides pin what a
+/// client observes: a committed reply is final even when the connection drops before the
+/// `204`, its retry answers `404`, and a truncated address walk is a permanent failure for
+/// that resolution rather than a retryable timeout.
+#[test]
+fn batch3_docs_pin_committed_replies_and_abandoned_address_walks() {
+    contains_all(
+        "docs/guide/headless.md",
+        &["because the request is no longer pending, not because the reply was lost"],
+    );
+    contains_all("docs/zh/guide/headless.md", &["而不是回复丢失了"]);
+    contains_all(
+        "docs/guide/permissions.md",
+        &["A reply that has committed is final"],
+    );
+    contains_all("docs/zh/guide/permissions.md", &["已提交的回复是终态的"]);
+    contains_all(
+        "docs/reference/providers.md",
+        &["`gave up after N of M validated addresses`"],
+    );
+    contains_all(
+        "docs/zh/config/providers.md",
+        &["不会按退避重试；新的请求会重新解析域名并重新遍历"],
+    );
+}
+
 /// `zuno providers login <url>` runs a program the remote host names. The CLI reference
 /// pages mirror clap's help by hand, so the `--trust-remote-command` row, the tightened
 /// loopback guard, and the `Run this command` confirmation are pinned here rather than

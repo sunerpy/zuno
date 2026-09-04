@@ -421,6 +421,16 @@ for response headers is not part of that budget: the caller's own request
 timeout owns it. Every other Zuno HTTP client carries a 30-second connect
 default that an individual provider may tighten.
 
+A walk those ceilings cut short is decided, not deferred. When the eight-address
+cap or the sequence budget stops the walk before any address accepted or denied
+the request, the request fails as a permanent transport error for that
+resolution -- `gave up after N of M validated addresses`, naming how much of the
+answer was walked -- and is not retried on backoff; a fresh request re-resolves
+the name and walks again. Earlier releases reported that truncation as a
+retryable timeout. The same DNS answer reproduces the same truncated walk, so
+retrying it would hand the length of the retry loop to whoever authors the
+answer.
+
 Commands started by shell tools, formatters, language servers, and local MCP
 servers inherit the Zuno process environment. Their explicit environment
 configuration may override individual proxy variables.

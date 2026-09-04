@@ -331,6 +331,12 @@ and the answer reaches the session through the durable inbox, but it installs no
 standing grant: an authorization is only saved when the call it authorizes actually
 received the reply.
 
+A reply that has committed is final: if the HTTP connection drops before the `204`
+arrives, the tool call still receives the decision, a standing `always` is still
+installed, and the paused goal still resumes. A client that retries such a reply
+gets `404` because the request is no longer pending, not because the reply was
+lost.
+
 ## Per-tool rules
 
 `permission.rules` is ordered, and **the last matching rule wins**. A rule is either
