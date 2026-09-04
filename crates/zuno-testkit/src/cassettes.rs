@@ -381,13 +381,77 @@ fn decode_bedrock(interaction: &HttpInteraction) -> Vec<StreamEvent> {
 }
 
 fn decode_gemini(interaction: &HttpInteraction) -> Vec<StreamEvent> {
+    normalize_synthesized_tool_ids(decode_gemini_raw(interaction.response.body.as_bytes()))
+}
+
+fn decode_gemini_raw(body: &[u8]) -> Vec<StreamEvent> {
     let mut decoder = GeminiStreamDecoder::new("google", "model");
     let mut events = Vec::new();
-    for chunk in interaction.response.body.as_bytes().chunks(11) {
+    for chunk in body.chunks(11) {
         events.extend(decoder.push(chunk).expect("Gemini fixture decodes"));
     }
     events.extend(decoder.finish().expect("Gemini fixture finishes"));
     events
+}
+
+/// Rewrite Gemini's invented tool-call ids to their first-appearance ordinal.
+///
+/// Gemini sends no id, so the decoder mints one, and it carries a per-stream random
+/// prefix precisely so two streams in one session cannot collide — which means the
+/// literal id is not a stable property of the wire and cannot be pinned here. Every
+/// property that *is* stable survives this rewrite: the number of calls, their order,
+/// which events belong to which call, and the fact that two calls never share an id
+/// (two calls sharing one would both normalize to `tool_0` and fail the comparison).
+/// The uniqueness of the raw ids is pinned separately by
+/// `cassettes_gemini_synthesized_tool_ids_never_repeat_within_or_across_streams`.
+fn normalize_synthesized_tool_ids(events: Vec<StreamEvent>) -> Vec<StreamEvent> {
+    let mut ordinals: Vec<String> = Vec::new();
+    let mut normalized = |id: String| -> String {
+        assert!(!id.is_empty(), "a synthesized tool-call id is never empty");
+        let position = ordinals.iter().position(|known| *known == id);
+        let position = position.unwrap_or_else(|| {
+            ordinals.push(id);
+            ordinals.len() - 1
+        });
+        format!("tool_{position}")
+    };
+    events
+        .into_iter()
+        .map(|event| match event {
+            StreamEvent::ToolUseStart { id, name } => StreamEvent::ToolUseStart {
+                id: normalized(id),
+                name,
+            },
+            StreamEvent::ToolInputDelta { id, delta } => StreamEvent::ToolInputDelta {
+                id: normalized(id),
+                delta,
+            },
+            StreamEvent::ToolUseSignature { id, signature } => StreamEvent::ToolUseSignature {
+                id: normalized(id),
+                signature,
+            },
+            StreamEvent::ToolUseEnd { id } => StreamEvent::ToolUseEnd { id: normalized(id) },
+            other => other,
+        })
+        .collect()
+}
+
+/// The ids in one decoded stream, in first-appearance order.
+fn synthesized_tool_ids(events: &[StreamEvent]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for event in events {
+        let id = match event {
+            StreamEvent::ToolUseStart { id, .. }
+            | StreamEvent::ToolInputDelta { id, .. }
+            | StreamEvent::ToolUseSignature { id, .. }
+            | StreamEvent::ToolUseEnd { id } => id,
+            _ => continue,
+        };
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
+    ids
 }
 
 fn named_sse(frames: Vec<(&str, Value)>) -> Vec<u8> {
@@ -1441,6 +1505,55 @@ fn cassettes_gap_cells_name_protocol_absence_instead_of_claiming_authored_bytes_
         Evidence::Gap { reason } => !reason.trim().is_empty(),
         Evidence::Recorded { .. } | Evidence::Authored { .. } => false,
     }));
+}
+
+/// Gemini sends no tool-call id, so the decoder invents one, and two session-wide
+/// consumers key on it: the history pairing that names a replayed `functionResponse`,
+/// and the verification ledger's `(session_id, tool_call_id)` upsert. An id must
+/// therefore be unique among one stream's calls *and* unrepeated by the next stream in
+/// the same session — a per-decoder ordinal alone restarts at zero every request, which
+/// is why the exact-sequence expectations above are normalized rather than literal.
+#[test]
+fn cassettes_gemini_synthesized_tool_ids_never_repeat_within_or_across_streams() {
+    let body = gemini_parallel_tools();
+    let first = decode_gemini_raw(&body);
+    let second = decode_gemini_raw(&body);
+
+    let first_ids = synthesized_tool_ids(&first);
+    let second_ids = synthesized_tool_ids(&second);
+
+    assert_eq!(
+        first_ids.len(),
+        2,
+        "two parallel calls need two distinct ids: {first:?}"
+    );
+    // Pinned at the decoder boundary as well as through the disjointness comparison:
+    // `normalize_synthesized_tool_ids` maps a bare `tool_0` to `tool_0`, so a revert to
+    // per-decoder ordinals would leave every *normalized* expectation in this file green.
+    assert!(
+        first_ids.iter().all(|id| id != "tool_0"),
+        "a raw id is per-stream, not a per-decoder ordinal: {first_ids:?}"
+    );
+    assert!(
+        first_ids.iter().all(|id| !second_ids.contains(id)),
+        "the next stream in this session reused an id: {first_ids:?} then {second_ids:?}"
+    );
+    for id in &first_ids {
+        let named = first
+            .iter()
+            .filter(|event| match event {
+                StreamEvent::ToolUseStart { id: found, .. }
+                | StreamEvent::ToolInputDelta { id: found, .. }
+                | StreamEvent::ToolUseSignature { id: found, .. }
+                | StreamEvent::ToolUseEnd { id: found } => found == id,
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            named, 3,
+            "one call brackets start, input and end under one id: {first:?}"
+        );
+    }
 }
 
 #[test]

@@ -18,4 +18,6 @@ pub use eventstream::{
 pub use provider::{
     BedrockBuildError, BedrockConfig, BedrockOperation, BedrockProvider, factory, mantle_surface,
 };
-pub use sigv4::{AwsCredentials, SigV4Error, SigV4Signer, SigningOutput};
+pub use sigv4::{
+    AwsCredentials, CanonicalRequest, Redacted, SigV4Error, SigV4Signer, SigningOutput,
+};

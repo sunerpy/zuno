@@ -25,8 +25,7 @@ use zuno_llm::effort::{
     DeclaredVariants, EffortCapabilities, ProviderFamily, ReasoningEffort, resolve_effort,
 };
 use zuno_llm::event::{
-    FinishReason, Message, PromptAccounting, RequestContentBlock, Role, StreamEvent,
-    ThoughtSignature,
+    FinishReason, PromptAccounting, RequestContentBlock, Role, StreamEvent, ThoughtSignature,
 };
 use zuno_llm::http::{
     HttpTimeouts, MAX_ERROR_BODY_BYTES, RequestDeadlines, map_messages_http_error,
@@ -329,8 +328,7 @@ impl GoogleGenerativeAi {
     ) -> Result<PreparedRequest, GoogleProviderError> {
         let base = self.options.base_url.as_deref().unwrap_or(GOOGLE_BASE_URL);
         let url = gemini_api_endpoint(base, &request.model_id)?;
-        let mut body =
-            build_gemini_body(&request.messages, &request.developer_context, &self.options)?;
+        let mut body = build_gemini_body(request, &self.options)?;
         // Gemini's `generateContent` is neither OpenAI surface; `Messages` selects
         // no OpenAI-specific rename, and the Google rule nests `thinkingConfig`
         // under `generationConfig` on every surface.
@@ -430,8 +428,7 @@ impl VertexGemini {
         } else {
             vertex_gemini_endpoint(&self.project, &self.location, &request.model_id)?
         };
-        let mut body =
-            build_gemini_body(&request.messages, &request.developer_context, &self.options)?;
+        let mut body = build_gemini_body(request, &self.options)?;
         // Gemini's `generateContent` is neither OpenAI surface; `Messages` selects
         // no OpenAI-specific rename, and the Google rule nests `thinkingConfig`
         // under `generationConfig` on every surface.
@@ -489,11 +486,21 @@ fn gemini_capabilities() -> Capabilities {
 }
 
 fn build_gemini_body(
-    messages: &[Message],
-    developer_context: &[String],
+    request: &CompletionRequest,
     options: &GeminiOptions,
 ) -> Result<Value, GoogleProviderError> {
-    let tool_names = collect_tool_names(messages);
+    let messages = request.messages.as_slice();
+    let developer_context = request.developer_context.as_slice();
+    // Gemini's `functionResponse` carries the *name* of the call it answers, never its
+    // id, so every replayed tool result has to recover a name from the history. A
+    // synthesized id is unique only inside the stream that minted it: sessions written
+    // before ids carried a per-stream prefix hold `tool_0` once per turn, usually
+    // naming a different tool each time. The name is therefore resolved against the
+    // nearest *preceding* call with that id, which this forward pass gets for free by
+    // letting a later call overwrite an earlier one as it is lowered. A map collected
+    // over the whole history first would answer turn 1's result with turn 2's name, and
+    // refusing a repeated id would make those persisted sessions unresumable.
+    let mut tool_names: HashMap<&str, &str> = HashMap::new();
     let mut system = Vec::new();
     let mut contents = Vec::new();
 
@@ -519,7 +526,7 @@ fn build_gemini_body(
         };
         let mut parts = Vec::new();
         for block in &message.content {
-            let part = lower_gemini_block(message.role, block, &tool_names)?;
+            let part = lower_gemini_block(message.role, block, &mut tool_names)?;
             parts.push(part);
         }
         contents.push(json!({"role": role, "parts": parts}));
@@ -537,31 +544,38 @@ fn build_gemini_body(
     if !system.is_empty() {
         body.insert("systemInstruction".to_owned(), json!({"parts": system}));
     }
-    if !options.tools.is_empty() && !matches!(options.tool_choice, Some(GeminiToolChoice::None)) {
-        let declarations: Vec<Value> = options
-            .tools
-            .iter()
-            .map(|tool| {
-                json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
-                })
-            })
-            .collect();
+    let declarations = function_declarations(request, options);
+    // A configured `toolChoice: "none"` used to delete the whole declaration block. That
+    // is not how Gemini spells "do not call functions": the vocabulary for it is
+    // `functionCallingConfig.mode = "NONE"`, which the match below already wrote and which
+    // the deleted block made unreachable. Suppressing the declarations instead reproduces
+    // the defect this lane is closing — the model is shown an empty tool list — and it also
+    // strands history, because the `functionCall` and `functionResponse` parts already in
+    // the transcript are replayed with nothing declaring the functions they name. The
+    // declarations now travel with the mode that forbids calling them.
+    if !declarations.is_empty() {
+        // `allowedFunctionNames` may only name a function this body declares, and the
+        // snapshot supersedes a configured declaration, so a `Tool(name)` policy naming a
+        // superseded function would force the model towards a function it cannot see —
+        // an INVALID_ARGUMENT the turn cannot recover from. An unsatisfiable restriction
+        // is dropped instead: `AUTO` is the mode Gemini applies with no `toolConfig` at
+        // all, so the model may still answer in prose and can never be pushed at a
+        // *different* function than the one that was asked for.
+        let function_config = options
+            .tool_choice
+            .as_ref()
+            .and_then(|choice| match choice {
+                GeminiToolChoice::Auto => Some(json!({"mode": "AUTO"})),
+                GeminiToolChoice::None => Some(json!({"mode": "NONE"})),
+                GeminiToolChoice::Required => Some(json!({"mode": "ANY"})),
+                GeminiToolChoice::Tool(name) => declares_tool_named(&declarations, name)
+                    .then(|| json!({"mode": "ANY", "allowedFunctionNames": [name]})),
+            });
         body.insert(
             "tools".to_owned(),
             json!([{"functionDeclarations": declarations}]),
         );
-        if let Some(choice) = &options.tool_choice {
-            let function_config = match choice {
-                GeminiToolChoice::Auto => json!({"mode": "AUTO"}),
-                GeminiToolChoice::None => json!({"mode": "NONE"}),
-                GeminiToolChoice::Required => json!({"mode": "ANY"}),
-                GeminiToolChoice::Tool(name) => {
-                    json!({"mode": "ANY", "allowedFunctionNames": [name]})
-                }
-            };
+        if let Some(function_config) = function_config {
             body.insert(
                 "toolConfig".to_owned(),
                 json!({"functionCallingConfig": function_config}),
@@ -600,22 +614,60 @@ fn build_gemini_body(
     Ok(Value::Object(body))
 }
 
-fn collect_tool_names(messages: &[Message]) -> HashMap<&str, &str> {
-    let mut names = HashMap::new();
-    for message in messages {
-        for block in &message.content {
-            if let RequestContentBlock::ToolUse { id, name, .. } = block {
-                names.insert(id.as_str(), name.as_str());
-            }
-        }
+/// Gemini `functionDeclarations` for this request.
+///
+/// The per-turn snapshot in [`CompletionRequest::tools`] is authoritative: it is what
+/// the turn loop locked and what tool dispatch is checked against. The instance-frozen
+/// `tools` option stays reachable only as an explicit override for a request that
+/// offers no snapshot at all.
+fn function_declarations(request: &CompletionRequest, options: &GeminiOptions) -> Vec<Value> {
+    // Two source types, one wire shape: `GeminiToolDefinition` (option bag) and
+    // `ToolSchema` (locked snapshot) carry the same three fields under different
+    // Rust types, so the declaration is written in exactly one place.
+    if request.tools.is_empty() {
+        return options
+            .tools
+            .iter()
+            .map(|tool| function_declaration(&tool.name, &tool.description, &tool.parameters))
+            .collect();
     }
-    names
+    request
+        .tools
+        .iter()
+        .map(|tool| function_declaration(&tool.name, &tool.description, &tool.parameters))
+        .collect()
 }
 
-fn lower_gemini_block(
+/// Whether an assembled tool array declares a tool under `name`.
+///
+/// Shared by both surfaces because both spell the same permanent failure: Gemini rejects
+/// an `allowedFunctionNames` entry it has no declaration for, and Anthropic Messages
+/// rejects a `{"type":"tool","name":N}` choice whose `N` is not in `tools`. A name that
+/// cannot be resolved against what is actually being sent is not forwarded.
+fn declares_tool_named(entries: &[Value], name: &str) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
+}
+
+/// One Gemini `functionDeclarations` entry.
+fn function_declaration(name: &str, description: &str, parameters: &Value) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "parameters": parameters,
+    })
+}
+
+/// Lower one history block into a Gemini `part`.
+///
+/// `tool_names` accumulates id-to-name pairs as the history is walked, so a
+/// `functionResponse` is named after the most recent call carrying its id rather than
+/// after whichever call a whole-history map happened to keep last.
+fn lower_gemini_block<'a>(
     role: Role,
-    block: &RequestContentBlock,
-    tool_names: &HashMap<&str, &str>,
+    block: &'a RequestContentBlock,
+    tool_names: &mut HashMap<&'a str, &'a str>,
 ) -> Result<Value, GoogleProviderError> {
     match (role, block) {
         (Role::User, RequestContentBlock::Text { text })
@@ -646,12 +698,14 @@ fn lower_gemini_block(
         (
             Role::Assistant,
             RequestContentBlock::ToolUse {
+                id,
                 name,
                 input,
                 thought_signature,
                 ..
             },
         ) => {
+            tool_names.insert(id.as_str(), name.as_str());
             let mut part = Map::from_iter([(
                 "functionCall".to_owned(),
                 json!({"name": name, "args": input}),
@@ -835,12 +889,35 @@ fn validate_endpoint_component(
     }
 }
 
+/// A per-stream prefix that makes a synthesized Gemini tool-call id session-unique.
+///
+/// Gemini's `functionCall` parts carry no id, so one has to be invented. The ordinal
+/// alone restarts at zero on every request, and two consumers key on the id across a
+/// whole session: the history's id-to-name map that names a replayed `functionResponse`,
+/// and the verification ledger's `(session_id, tool_call_id)` upsert. Random rather
+/// than a process counter because a resumed session's earlier ids outlive the process
+/// that minted them.
+fn tool_call_id_prefix() -> String {
+    let mut bytes = [0_u8; 8];
+    if aws_lc_rs::rand::fill(&mut bytes).is_err() {
+        // A failed system RNG must not fail the turn. Nanosecond wall time still
+        // separates streams within a process, and the ordinal separates calls.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        return format!("{nanos:x}");
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Incremental Gemini SSE decoder backed by the workspace's shared UTF-8 parser.
 #[derive(Debug)]
 pub struct GeminiStreamDecoder {
     provider: String,
     model: String,
     parser: SseParser,
+    tool_call_id_prefix: String,
     next_tool_call_id: u64,
     has_tool_calls: bool,
     reasoning_open: bool,
@@ -856,6 +933,7 @@ impl GeminiStreamDecoder {
             parser: SseParser::for_stream(provider.clone(), model.clone()),
             provider,
             model,
+            tool_call_id_prefix: tool_call_id_prefix(),
             next_tool_call_id: 0,
             has_tool_calls: false,
             reasoning_open: false,
@@ -967,7 +1045,10 @@ impl GeminiStreamDecoder {
         }
         if let Some(call) = part.function_call {
             self.close_reasoning(output);
-            let id = format!("tool_{}", self.next_tool_call_id);
+            let id = format!(
+                "tool_{}_{}",
+                self.tool_call_id_prefix, self.next_tool_call_id
+            );
             self.next_tool_call_id += 1;
             output.push(StreamEvent::ToolUseStart {
                 id: id.clone(),
@@ -1226,11 +1307,7 @@ impl VertexAnthropic {
             Some(base) => vertex_anthropic_custom_endpoint(base, &request.model_id)?,
             None => vertex_anthropic_endpoint(&self.project, &self.location, &request.model_id)?,
         };
-        let mut body = build_vertex_anthropic_body(
-            &request.messages,
-            &request.developer_context,
-            &self.options,
-        )?;
+        let mut body = build_vertex_anthropic_body(request, &self.options)?;
         request.apply_parameters(&mut body, ApiSurface::Messages);
         let mut prepared = PreparedRequest::new(url, body);
         prepared.headers.extend(request.headers.clone());
@@ -1310,14 +1387,54 @@ fn vertex_anthropic_custom_endpoint(
     Ok(url.into())
 }
 
+/// Anthropic `tools` entries for this request, as the Vertex publisher expects them.
+///
+/// The locked per-turn snapshot is authoritative for the tools it can express, exactly as
+/// in [`function_declarations`]. A configured entry carrying no `input_schema` is a
+/// provider-run tool the snapshot can never contain, so it travels *with* the snapshot
+/// rather than being replaced by it — dropping it disabled a configuration 0.6.6 sent and
+/// left a `toolChoice` naming it pointing at nothing. A name a locked tool already
+/// occupies is skipped, because two entries sharing one name is itself a 400.
+fn anthropic_tool_definitions(
+    request: &CompletionRequest,
+    options: &VertexAnthropicOptions,
+) -> Vec<Value> {
+    if request.tools.is_empty() {
+        return options.tools.clone();
+    }
+    let mut tools = request
+        .tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.parameters,
+            })
+        })
+        .collect::<Vec<_>>();
+    tools.extend(
+        options
+            .tools
+            .iter()
+            .filter(|tool| tool.get("input_schema").is_none())
+            .filter(|tool| match tool.get("name").and_then(Value::as_str) {
+                Some(name) => !request.tools.iter().any(|locked| locked.name == name),
+                None => true,
+            })
+            .cloned(),
+    );
+    tools
+}
+
 fn build_vertex_anthropic_body(
-    messages: &[Message],
-    developer_context: &[String],
+    request: &CompletionRequest,
     options: &VertexAnthropicOptions,
 ) -> Result<Value, GoogleProviderError> {
+    let developer_context = request.developer_context.as_slice();
     let mut system = options.system.clone();
     let mut wire_messages = Vec::new();
-    for message in messages {
+    for message in &request.messages {
         if message.role == Role::System {
             for block in &message.content {
                 let Some(text) = block.provider_text() else {
@@ -1369,11 +1486,27 @@ fn build_vertex_anthropic_body(
             ),
         );
     }
-    if !options.tools.is_empty() {
-        body.insert("tools".to_owned(), Value::Array(options.tools.clone()));
-    }
-    if let Some(tool_choice) = &options.tool_choice {
-        body.insert("tool_choice".to_owned(), tool_choice.clone());
+    let tools = anthropic_tool_definitions(request, options);
+    if !tools.is_empty() {
+        // `tool_choice` is only legal alongside `tools`, and a `{"type":"tool"}` choice
+        // only when that tool is one of the entries being sent: the Messages API answers
+        // either mismatch with a permanent 400, so the documented option has to stay
+        // unsent rather than end the turn as a provider failure. `toolChoice` is
+        // config-reachable here (`VertexAnthropicOptions::from_spec`) while `tools` is
+        // not, so a configured choice naming anything outside the snapshot is exactly the
+        // shape a user can reach.
+        let tool_choice = options
+            .tool_choice
+            .as_ref()
+            .filter(|choice| match choice.get("name").and_then(Value::as_str) {
+                Some(name) => declares_tool_named(&tools, name),
+                None => true,
+            })
+            .cloned();
+        body.insert("tools".to_owned(), Value::Array(tools));
+        if let Some(tool_choice) = tool_choice {
+            body.insert("tool_choice".to_owned(), tool_choice);
+        }
     }
     insert_optional_f64(&mut body, "temperature", options.temperature);
     insert_optional_f64(&mut body, "top_p", options.top_p);
@@ -2448,6 +2581,7 @@ fn block_kind(block: &RequestContentBlock) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zuno_llm::event::Message;
 
     /// A throwaway 2048-bit RSA key, generated once for this test and committed. It
     /// protects nothing: the assertions it signs are never sent to Google.
@@ -3001,6 +3135,14 @@ mod tests {
 
     /// The Vertex-Anthropic body a provider configured from an option bag sends.
     fn vertex_anthropic_body_from_options(options: serde_json::Value) -> Value {
+        vertex_anthropic_body(options, Vec::new())
+    }
+
+    /// The same, for a request that also carries a locked tool snapshot.
+    fn vertex_anthropic_body(
+        options: serde_json::Value,
+        tools: Vec<zuno_llm::registry::ToolSchema>,
+    ) -> Value {
         let mut spec = Spec::new("google-vertex-anthropic");
         for (name, value) in options.as_object().expect("options are an object") {
             spec = spec.with_option(name.clone(), value.clone());
@@ -3015,8 +3157,21 @@ mod tests {
         let request = CompletionRequest::new(
             "claude-model-under-test",
             vec![Message::new(Role::User, "Say hello.")],
-        );
+        )
+        .with_tools(tools);
         provider.prepare(&request).expect("Anthropic request").body
+    }
+
+    fn read_tool() -> zuno_llm::registry::ToolSchema {
+        zuno_llm::registry::ToolSchema {
+            name: "read".to_owned(),
+            description: "Read a file".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            }),
+        }
     }
 
     #[test]
@@ -3025,7 +3180,6 @@ mod tests {
             "maxTokens": 8_192,
             "temperature": 0.3,
             "topP": 0.9,
-            "toolChoice": {"type": "any"}
         }));
 
         assert_eq!(body["max_tokens"], json!(8_192));
@@ -3036,11 +3190,359 @@ mod tests {
             "this path had no `top_p` field at all, so a configured cutoff was accepted \
              and dropped"
         );
+    }
+
+    /// The Messages surface rejects `tool_choice` with no `tools` as a permanent 400,
+    /// so the documented option travels only when the request actually offers tools.
+    #[test]
+    fn vertex_anthropic_tool_choice_travels_only_with_a_tool_snapshot() {
+        let options = json!({"toolChoice": {"type": "any"}});
+
+        assert!(
+            vertex_anthropic_body_from_options(options.clone())
+                .get("tool_choice")
+                .is_none(),
+            "`tool_choice` without `tools` ends the turn as an unrecoverable 400"
+        );
+
+        let body = vertex_anthropic_body(options, vec![read_tool()]);
+        assert_eq!(body["tool_choice"], json!({"type": "any"}));
+    }
+
+    /// A configured `toolChoice` naming a tool no assembled `tools` entry carries.
+    ///
+    /// Config-reachable on this surface: `from_spec` parses `toolChoice` and never parses
+    /// `tools`, so a user who names any tool outside the locked snapshot used to get a body
+    /// whose `tool_choice` pointed at nothing — a permanent 400 on every turn. The oracle
+    /// is set membership between the two fields.
+    #[test]
+    fn vertex_anthropic_tool_choice_naming_an_absent_tool_stays_off_the_wire() {
+        let body = vertex_anthropic_body(
+            json!({"toolChoice": {"type": "tool", "name": "web_search"}}),
+            vec![read_tool()],
+        );
+
+        assert_eq!(body["tools"][0]["name"], json!("read"));
+        assert!(
+            body.get("tool_choice").is_none(),
+            "`tool_choice` naming a tool `tools` does not carry is a permanent 400"
+        );
+    }
+
+    /// A provider-run tool the snapshot cannot express keeps travelling beside it, so a
+    /// `tool_choice` naming it stays satisfiable.
+    #[test]
+    fn a_configured_vertex_server_tool_travels_with_the_locked_snapshot() {
+        let options = VertexAnthropicOptions {
+            tools: vec![json!({"type": "web_search_20250305", "name": "web_search"})],
+            tool_choice: Some(json!({"type": "tool", "name": "web_search"})),
+            ..VertexAnthropicOptions::default()
+        };
+        let provider = VertexAnthropic::new(
+            "project-a",
+            "us",
+            VertexCredentials::access_token("test-token"),
+            options,
+        )
+        .expect("Vertex Anthropic");
+        let request = CompletionRequest::new(
+            "claude-model-under-test",
+            vec![Message::new(Role::User, "Search the web.")],
+        )
+        .with_tools(vec![read_tool()]);
+
+        let body = provider.prepare(&request).expect("Anthropic request").body;
+
+        assert_eq!(body["tools"][0]["name"], json!("read"));
+        assert_eq!(
+            body["tools"][1],
+            json!({"type": "web_search_20250305", "name": "web_search"})
+        );
         assert_eq!(
             body["tool_choice"],
-            json!({"type": "any"}),
-            "the field existed and only the `with_*` builders could set it, so a \
-             configured `toolChoice` never reached the wire"
+            json!({"type": "tool", "name": "web_search"})
         );
+    }
+
+    /// `GeminiToolChoice::Tool` for a function the snapshot superseded.
+    ///
+    /// `allowedFunctionNames` may only name a declared function, and the configured
+    /// declaration is not sent once a snapshot exists, so the restriction is unsatisfiable
+    /// and is dropped rather than sent as an INVALID_ARGUMENT. Reachability, stated rather
+    /// than assumed: `GeminiOptions::tool_choice` has no `spec.options` reader, so this is
+    /// an in-process caller's shape, not a user configuration's.
+    #[test]
+    fn a_gemini_tool_choice_for_a_superseded_function_sends_no_tool_config() {
+        let options = GeminiOptions {
+            tools: vec![GeminiToolDefinition {
+                name: "web_search".to_owned(),
+                description: "Search".to_owned(),
+                parameters: json!({"type": "object"}),
+            }],
+            tool_choice: Some(GeminiToolChoice::Tool("web_search".to_owned())),
+            ..GeminiOptions::default()
+        };
+        let provider =
+            GoogleGenerativeAi::new("test-api-key", options).expect("provider configuration");
+        let request = CompletionRequest::new(
+            "gemini-2.5-flash",
+            vec![Message::new(Role::User, "Read the file.")],
+        )
+        .with_tools(vec![read_tool()]);
+
+        let body = provider.prepare(&request).expect("Gemini request").body;
+
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["name"],
+            json!("read")
+        );
+        assert!(
+            body.get("toolConfig").is_none(),
+            "a restriction to an undeclared function is rejected, so it is not sent"
+        );
+    }
+
+    /// The same policy for a function the snapshot *does* declare still restricts to it.
+    #[test]
+    fn a_gemini_tool_choice_for_a_locked_function_restricts_to_that_function() {
+        let options = GeminiOptions {
+            tool_choice: Some(GeminiToolChoice::Tool("read".to_owned())),
+            ..GeminiOptions::default()
+        };
+        let provider =
+            GoogleGenerativeAi::new("test-api-key", options).expect("provider configuration");
+        let request = CompletionRequest::new(
+            "gemini-2.5-flash",
+            vec![Message::new(Role::User, "Read the file.")],
+        )
+        .with_tools(vec![read_tool()]);
+
+        let body = provider.prepare(&request).expect("Gemini request").body;
+
+        assert_eq!(
+            body["toolConfig"],
+            json!({"functionCallingConfig": {
+                "mode": "ANY",
+                "allowedFunctionNames": ["read"],
+            }})
+        );
+    }
+
+    /// The turn loop locks its tool snapshot into `CompletionRequest::tools`, so a body
+    /// built from a request that carries one must show the model those tools; anything
+    /// else advertises `tool_calls` while making a tool call impossible.
+    #[test]
+    fn the_locked_tool_snapshot_reaches_the_vertex_anthropic_body() {
+        let body = vertex_anthropic_body(json!({}), vec![read_tool()]);
+
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "name": "read",
+                "description": "Read a file",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }])
+        );
+    }
+
+    #[test]
+    fn the_locked_tool_snapshot_reaches_the_gemini_body() {
+        let provider = GoogleGenerativeAi::new("test-api-key", GeminiOptions::default())
+            .expect("provider configuration");
+        let request = CompletionRequest::new(
+            "gemini-2.5-flash",
+            vec![Message::new(Role::User, "Read the file.")],
+        )
+        .with_tools(vec![read_tool()]);
+
+        let body = provider.prepare(&request).expect("Gemini request").body;
+
+        assert_eq!(
+            body["tools"],
+            json!([{"functionDeclarations": [{
+                "name": "read",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }]}])
+        );
+    }
+
+    /// `GeminiToolChoice::None` with a locked snapshot.
+    ///
+    /// Deleting the declaration block was the same defect this lane is closing by another
+    /// route: the model is shown an empty tool list, and the `functionCall` /
+    /// `functionResponse` parts already in the transcript are replayed with nothing
+    /// declaring the functions they name. Gemini's own vocabulary for "do not call
+    /// functions" is `functionCallingConfig.mode = "NONE"`, and the arm that writes it was
+    /// unreachable while the suppression stood.
+    ///
+    /// Reachability, checked rather than assumed: no `spec.options` read populates
+    /// `GeminiOptions::tool_choice` (only `VertexAnthropicOptions::from_spec` parses
+    /// `toolChoice`), so this state is reachable from an in-process Rust caller and not
+    /// from user configuration.
+    #[test]
+    fn a_gemini_tool_choice_of_none_still_declares_the_locked_snapshot() {
+        let options = GeminiOptions {
+            tool_choice: Some(GeminiToolChoice::None),
+            ..GeminiOptions::default()
+        };
+        let provider =
+            GoogleGenerativeAi::new("test-api-key", options).expect("provider configuration");
+        let request = CompletionRequest::new(
+            "gemini-2.5-flash",
+            vec![Message::new(Role::User, "Read the file.")],
+        )
+        .with_tools(vec![read_tool()]);
+
+        let body = provider.prepare(&request).expect("Gemini request").body;
+
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["name"],
+            json!("read"),
+            "a refusal to call tools is a mode, not a reason to hide the tool list"
+        );
+        assert_eq!(
+            body["toolConfig"],
+            json!({"functionCallingConfig": {"mode": "NONE"}}),
+            "the mode that forbids the call is what carries the refusal to the model"
+        );
+    }
+
+    /// An assistant turn that calls one tool, exactly as a session persisted before
+    /// synthesized ids carried a per-stream prefix records it.
+    fn legacy_call(name: &str) -> Message {
+        Message::from_content(
+            Role::Assistant,
+            vec![RequestContentBlock::ToolUse {
+                id: "tool_0".to_owned(),
+                name: name.to_owned(),
+                input: json!({}),
+                raw_arguments: None,
+                thought_signature: None,
+            }],
+        )
+    }
+
+    fn legacy_result(content: &str) -> Message {
+        Message::from_content(
+            Role::Tool,
+            vec![RequestContentBlock::ToolResult {
+                tool_use_id: "tool_0".to_owned(),
+                content: content.to_owned(),
+                is_error: None,
+            }],
+        )
+    }
+
+    /// The durable shape every multi-turn Gemini session written before the per-stream
+    /// prefix holds: `tool_0` twice, naming a different tool each time. Such a session
+    /// must keep replaying, and each `functionResponse` must be named after the call it
+    /// answers — Gemini pairs a result to its call by name and by nothing else.
+    #[test]
+    fn a_repeated_legacy_tool_call_id_pairs_each_result_with_its_own_call() {
+        let provider = GoogleGenerativeAi::new("test-api-key", GeminiOptions::default())
+            .expect("provider configuration");
+        let request = CompletionRequest::new(
+            "gemini-2.5-flash",
+            vec![
+                Message::new(Role::User, "Fix the file."),
+                legacy_call("read"),
+                legacy_result("file body"),
+                legacy_call("edit"),
+                legacy_result("edited"),
+            ],
+        );
+
+        let body = provider
+            .prepare(&request)
+            .expect("a session persisted with repeated ids still replays")
+            .body;
+
+        let contents = body["contents"].as_array().expect("contents array");
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["name"],
+            json!("read"),
+            "turn 1's result answers turn 1's call; a whole-history map named it `edit`"
+        );
+        assert_eq!(
+            contents[4]["parts"][0]["functionResponse"]["name"],
+            json!("edit")
+        );
+    }
+
+    /// Removing the ambiguity refusal must not weaken the one case that really is
+    /// unresolvable: a result whose call is nowhere in the history has no name to send,
+    /// so it still fails closed instead of inventing one.
+    #[test]
+    fn a_tool_result_with_no_call_in_the_history_is_still_refused() {
+        let provider = GoogleGenerativeAi::new("test-api-key", GeminiOptions::default())
+            .expect("provider configuration");
+        let request = CompletionRequest::new(
+            "gemini-2.5-flash",
+            vec![Message::new(Role::User, "Continue."), legacy_result("body")],
+        );
+
+        let error = provider
+            .prepare(&request)
+            .expect_err("a result with no call cannot be named");
+
+        assert!(
+            matches!(
+                error,
+                GoogleProviderError::UnknownToolResult { ref tool_use_id }
+                    if tool_use_id == "tool_0"
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// Two requests in one session decode through two decoders. A per-decoder ordinal
+    /// alone restarts at zero, so turn 2's first call would reuse turn 1's id — which the
+    /// verification ledger's `(session_id, tool_call_id)` upsert would silently rewrite.
+    #[test]
+    fn separate_streams_in_one_session_mint_distinct_tool_call_ids() {
+        let frame = sse_frame(json!({
+            "candidates": [{
+                "content": {"parts": [{"functionCall": {"name": "read", "args": {}}}]},
+                "finishReason": "STOP"
+            }]
+        }));
+        let first_call_id = |()| {
+            let mut decoder = GeminiStreamDecoder::new(GOOGLE_PROVIDER_ID, "gemini-2.5-flash");
+            let events = decoder.push(&frame).expect("the frame decodes");
+            decoder.finish().expect("the stream is terminated");
+            events
+                .into_iter()
+                .find_map(|event| match event {
+                    StreamEvent::ToolUseStart { id, .. } => Some(id),
+                    _ => None,
+                })
+                .expect("a tool call started")
+        };
+
+        let turn_one = first_call_id(());
+        let turn_two = first_call_id(());
+
+        assert_ne!(
+            turn_one, turn_two,
+            "a session-unique id is what keeps turn 1's receipt and history entry intact"
+        );
+        // The cassette fixtures compare *normalized* ids (first-appearance ordinals), so
+        // `tool_0` maps to `tool_0` and they keep passing if the prefix is reverted. This
+        // is the same oracle stated on the raw decode, in the crate that mints the id.
+        for id in [&turn_one, &turn_two] {
+            assert_ne!(
+                id, "tool_0",
+                "a raw id carries the per-stream prefix, not a bare per-decoder ordinal"
+            );
+        }
     }
 }
