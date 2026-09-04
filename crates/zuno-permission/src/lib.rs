@@ -19,8 +19,8 @@ pub mod visibility;
 mod wildcard;
 
 pub use crate::engine::PermissionEngine;
-pub use crate::resource::{canonical_path_resource, canonical_shell_resource};
-pub use crate::rule::{evaluate, rules_from_config};
+pub use crate::resource::{MatchReason, canonical_path_resource, canonical_shell_resource};
+pub use crate::rule::{Decision, Denial, Matched, decide, evaluate, rules_from_config};
 pub use crate::types::{
     Authorization, PermissionReply, PermissionRequest, ReplyKind, ReplyOutcome, ResolvedRequest,
     Rule, ToolCall,

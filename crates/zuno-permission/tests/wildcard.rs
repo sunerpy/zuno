@@ -28,22 +28,27 @@ fn star_spans_slashes_and_newlines() {
 }
 
 #[test]
-fn backslashes_are_normalized_in_input_and_pattern() {
-    assert!(wildcard_match(
+fn the_primitive_is_literal_on_every_platform() {
+    // `wildcard_match` is the identity comparison. Reading `\` as `/` and folding
+    // case both relate spellings that can name different things — a POSIX file
+    // named `a\b`, a file in a case-sensitive directory — so neither happens here on
+    // any platform. Where one of them is identity on the host (path separators on
+    // Windows) `zuno_permission::resource` supplies the spelling, and a `deny` alone
+    // is offered the folded reading there.
+    assert!(!wildcard_match(
         "C:\\Windows\\System32\\drivers",
         "C:/Windows/System32/*"
     ));
-    assert!(wildcard_match(
+    assert!(!wildcard_match(
         "C:/Windows/System32/drivers",
         "C:\\Windows\\System32\\*"
     ));
-}
-
-#[test]
-fn case_sensitivity_matches_the_host_platform() {
-    let matches = wildcard_match("/users/test/file", "/Users/test/*");
-
-    assert_eq!(matches, cfg!(windows));
+    assert!(wildcard_match(
+        "C:\\Windows\\System32\\drivers",
+        "C:\\Windows\\System32\\*"
+    ));
+    assert!(!wildcard_match("/users/test/file", "/Users/test/*"));
+    assert!(wildcard_match("/Users/test/file", "/Users/test/*"));
 }
 
 #[test]

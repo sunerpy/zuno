@@ -23,8 +23,17 @@ fn the_canonical_path_spelling_drops_noise_but_keeps_parent_segments() {
         canonical_path_resource("/ws//src/./main.rs"),
         "/ws/src/main.rs"
     );
-    assert_eq!(canonical_path_resource("src\\main.rs"), "src/main.rs");
-    assert_eq!(canonical_path_resource("C:\\ws\\src"), "C:/ws/src");
+    // `\` is a separator under Windows and part of a file name under Linux and
+    // macOS, so the public spelling follows the host it was compiled for; both
+    // readings are pinned per host in `src/resource.rs`
+    // (`the_host_decides_whether_a_backslash_separates_a_path`).
+    let (slashed, drive) = if cfg!(windows) {
+        ("src/main.rs", "C:/ws/src")
+    } else {
+        ("src\\main.rs", "C:\\ws\\src")
+    };
+    assert_eq!(canonical_path_resource("src\\main.rs"), slashed);
+    assert_eq!(canonical_path_resource("C:\\ws\\src"), drive);
     assert_eq!(
         canonical_path_resource("/ws/../etc/passwd"),
         "/ws/../etc/passwd",

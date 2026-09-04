@@ -8,26 +8,32 @@
 //! `command rm -rf x`. Quoting is not only something that surrounds a word either:
 //! a shell removes it per character and before it looks up the program, so
 //! `'r'm`, `r"m"`, `rm""` and — wherever `\` is an escape rather than a path
-//! separator — `r\m` all invoke `rm` too.
+//! separator — `r\m` all invoke `rm` too. Nor is it only the program: the shell
+//! removes quoting from every word, so `git p''ush --force`, `git p"ush" --force`
+//! and `git pu\sh --force` all run `git push --force` (measured under bash, dash
+//! and zsh), and a `git push*` deny sitting under a `git *` allow has to see that.
 //!
 //! # Canonical spellings
 //!
 //! * A **shell** resource is one command line with a single space between tokens,
 //!   the program token reduced to the word the host's own shell builds from it, and
 //!   a leading `command` builtin removed. See [`canonical_shell_resource`].
-//! * A **path** resource is forward-slashed, with no `.` segments, no `./` prefix,
-//!   no repeated separators and no trailing separator. Inside the workspace it is
-//!   **workspace-relative**, which is the spelling the file tools already derive
-//!   (`crates/zuno-tools/src/read/support.rs`); outside the workspace it is
-//!   absolute. See [`canonical_path_resource`].
+//! * A **path** resource has no `.` segments, no `./` prefix, no repeated separators
+//!   and no trailing separator, and on a Windows host it is forward-slashed — there
+//!   `\` and `/` are the same separator, while under Linux and macOS `\` is an
+//!   ordinary character in a file name and `src/a\b` is a different file from
+//!   `src/a/b`. Inside the workspace it is **workspace-relative**, which is the
+//!   spelling the file tools already derive (`crates/zuno-tools/src/read/support.rs`);
+//!   outside the workspace it is absolute. See [`canonical_path_resource`].
 //!
 //! # Why a deny widens further than an allow
 //!
 //! Normalizations that preserve *which* program or file is named — whitespace
-//! between tokens, quote removal, a `\` the host's own shell removes, a `./`
-//! prefix, separators, the `command` builtin where the host's shell has that
-//! builtin — apply to every rule whatever its action, because the two spellings
-//! denote the same thing.
+//! between tokens, quote removal in the program token, a `\` the host's own shell
+//! removes, a `./` prefix, repeated separators, the `command` builtin where the
+//! host's shell has that builtin, `\` read as `/` in a path on a host whose file
+//! system separates on both — apply to every rule whatever its action, because the
+//! two spellings denote the same thing.
 //!
 //! Normalizations that *discard* identity apply to `deny` only:
 //!
@@ -35,13 +41,39 @@
 //! * reading the program token under a dialect the host's shell may not be —
 //!   cmd's `^`, PowerShell's backtick, bash/zsh `$'...'` and bash `$"..."`, or the
 //!   POSIX `\` escape on a Windows host — which guesses the interpreter,
+//! * removing quoting and escapes from the **argument** tokens. A rule that mentions
+//!   an argument means that argument as the caller wrote it, so `rm -rf 'a b'` is
+//!   granted by allow `rm -rf 'a b'` and not by allow `rm -rf a b`; a deny sees the
+//!   words the shell will pass as well, under every dialect, so `git p''ush --force`
+//!   also spells `git push --force` and an empty word (`rm '' -rf x`, where `rm`
+//!   reports the empty operand and removes `x` anyway) is dropped,
+//! * reading an unquoted expansion as whitespace and as nothing, anywhere in the
+//!   line. `git ${IFS}push --force`, `git${IFS}push --force` and
+//!   `$EMPTY rm -rf /tmp/build` run the denied command under bash and dash; a deny
+//!   sees the line with the expansion gone, and `git checkout $branch` reads as
+//!   `git checkout`, which a `git push*` deny does not match,
 //! * reading a program word that contains whitespace, which can re-partition the
 //!   rule: the matcher compares one flattened command line, so admitting the word
 //!   `/bin/rm -rf` would let allow `/bin/rm -rf *` govern `"/bin/rm -rf" /` — a
 //!   file literally named `/bin/rm -rf`, which the agent can plant itself. Being
 //!   path-shaped does not make it safe, so no shape of it reaches an `allow`,
 //! * dropping the `command` word on a host whose shell has no such builtin, where
-//!   `command rm -rf x` runs a program named `command` instead, and
+//!   `command rm -rf x` runs a program named `command` instead,
+//! * folding case, on **every** platform. The default volume on macOS and almost
+//!   every volume on Windows is case-insensitive, so `RM -rf /` runs `/bin/rm` and
+//!   `Secrets/x` is `secrets/x` there; a deny has to hold on those hosts. A grant
+//!   never folds, on any host: NTFS directories can be case-sensitive and Linux
+//!   always is, so allow `src/a/b` covering `SRC/A/B` would name a different file.
+//!   This means an allow on Windows that used to match by case now needs the exact
+//!   case, which is the deliberate cost,
+//! * reading `\` as `/` where the host does not — in a shell line on every host,
+//!   because bash removes the backslash (`rm -rf \tmp\x` removes `tmpx`) and cmd
+//!   reads `/s` as a switch and `\s` as a path, and in a path on Linux and macOS,
+//!   where `\` is part of the name,
+//! * resolving a `..` segment. A lexical `..` can leave the directory a symlink
+//!   pointed at, so `docs/../src/secret` under allow `docs/*` is not a file in
+//!   `docs/`; a resource that contains a `..` segment never satisfies a grant at all,
+//!   while a deny is matched against the resolved path as well, and
 //! * relating an absolute path to a relative one, which this crate cannot do
 //!   exactly because it is not told the workspace root and a host may run
 //!   sessions in several directories at once.
@@ -67,8 +99,8 @@
 //! shell can work out. Reporting "no match" for those would turn an explicit
 //! prohibition into the catch-all, so they are reported as *unresolvable* instead
 //! and a `deny` is retried with the program the rule itself names, in
-//! `Spellings::matches`. That over-refuses, which is the direction that fails safe;
-//! an `allow` never sees them.
+//! `Spellings::match_reason`. That over-refuses, which is the direction that fails
+//! safe; an `allow` never sees them.
 //!
 //! An **unquoted** run goes further than that, because the shell word-splits its
 //! result: `rm${IFS}-rf${IFS}/tmp/build`, `$(echo rm -rf /tmp/build)` and the
@@ -82,9 +114,16 @@
 //! quote, a trailing escape, an empty word — is unresolvable for the same reason and
 //! fails closed the same way; no shell runs those lines, so the cost is a command
 //! that could not have executed.
+//!
+//! The cost of that rule is that a bare `$EDITOR`, `*.sh` or `$(date +%s)` is
+//! refused by *any* shell deny, and a configured deny is terminal. So the refusal is
+//! explainable: every match carries a [`MatchReason`], and [`crate::decide`] and
+//! [`crate::Denial`] hand the rule and the reason to whoever reports it. Writing the
+//! expansion quoted — `"$EDITOR"` — makes it one word, which is asked about instead.
 
 use crate::types::Rule;
-use crate::wildcard::wildcard_match;
+use crate::wildcard::{fold, key_governs, wildcard_match, wildcard_match_folded};
+use std::fmt;
 use zuno_config::schema::permission::PermissionAction;
 
 /// Permission keys whose resource is a shell command line.
@@ -124,14 +163,94 @@ impl ResourceKind {
     }
 }
 
+/// Why a rule governed a resource.
+///
+/// A configured `deny` is terminal, so the person who hits one needs to see which
+/// rule fired and under which reading — most of all when the reading is one this
+/// crate applies to a deny alone. Carried by [`crate::Decision`] and [`crate::Denial`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchReason {
+    /// The resource, as written or in its canonical spelling, is what the pattern
+    /// names. The only reading an `allow` or an `ask` ever matches under.
+    Identity,
+    /// A `deny` matched a spelling only a deny may read — the program's file name
+    /// alone, a dialect the host may not be, an argument with its quoting removed,
+    /// or a `..` resolved — and this is that spelling.
+    DenySpelling(String),
+    /// A `deny` matched a spelling once its case was folded and `\` read as `/`,
+    /// which is how a case-insensitive volume or a Windows path reads it, and this
+    /// is the folded spelling.
+    Folded(String),
+    /// A `deny` matched because the program token names a program only the shell
+    /// can resolve (an unquoted expansion, substitution or glob) or is a token no
+    /// shell accepts (an unterminated quote), and no argument token follows it, so
+    /// which command runs is not knowable and any deny refuses the line.
+    UnresolvableProgram {
+        /// The program token as written.
+        program: String,
+    },
+    /// A `deny` matched because the program token names a program only the shell
+    /// can resolve and the visible arguments fit the rule once the line is read with
+    /// the program the rule itself names.
+    UnresolvableProgramArguments {
+        /// The program token as written.
+        program: String,
+        /// The command line the deny was retried with.
+        retried_as: String,
+    },
+    /// A `deny` written with an absolute path also covers the relative spelling of
+    /// the same file, and this is the tail of the pattern that matched.
+    RelativeTail(String),
+}
+
+impl fmt::Display for MatchReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identity => f.write_str("the resource is what the pattern names"),
+            Self::DenySpelling(spelling) => {
+                write!(f, "a deny also reads the resource as {spelling:?}")
+            }
+            Self::Folded(spelling) => write!(
+                f,
+                "a deny also reads the resource with case folded and `\\` as `/`, as \
+                 {spelling:?}"
+            ),
+            Self::UnresolvableProgram { program } => write!(
+                f,
+                "the program token {program:?} names a program only the shell can resolve, \
+                 or is a token no shell accepts, and no argument token follows it, so which \
+                 command runs is not knowable and any deny refuses the line; a quoted \
+                 expansion such as \"$PROG\" is one word and is asked about instead"
+            ),
+            Self::UnresolvableProgramArguments {
+                program,
+                retried_as,
+            } => write!(
+                f,
+                "the program token {program:?} names a program only the shell can resolve, \
+                 and the arguments fit the rule when the line is read as {retried_as:?}"
+            ),
+            Self::RelativeTail(tail) => write!(
+                f,
+                "the deny's absolute pattern also covers the relative tail {tail:?}"
+            ),
+        }
+    }
+}
+
 /// Every spelling of one requested resource, prepared once per evaluation.
 pub(crate) struct Spellings {
     kind: ResourceKind,
     permission: String,
+    host: HostShell,
     /// Spellings that denote exactly the same resource, in match order.
     identity: Vec<String>,
     /// Extra spellings only a `deny` rule is allowed to match.
     deny_only: Vec<String>,
+    /// Whether a path resource contains a `..` segment, which no grant may match:
+    /// resolving it is a guess about symlinks, and not resolving it lets `docs/*`
+    /// cover `docs/../src/secret`.
+    parent_segment: bool,
     /// What a shell command whose program token names a program only the shell can
     /// resolve still tells us. `None` in the ordinary case.
     unresolved: Option<UnresolvedProgram>,
@@ -145,11 +264,16 @@ impl Spellings {
     fn for_host(permission: &str, resource: &str, host: HostShell) -> Self {
         let kind = ResourceKind::of(permission);
         let mut identity = vec![resource.to_owned()];
+        let mut parent_segment = false;
         match kind {
             ResourceKind::Shell => {
                 push_new(&mut identity, canonical_shell_resource_for(resource, host));
             }
-            ResourceKind::Path => push_new(&mut identity, canonical_path_resource(resource)),
+            ResourceKind::Path => {
+                let canonical = canonical_path_resource_for(resource, host);
+                parent_segment = has_parent_segment(&canonical);
+                push_new(&mut identity, canonical);
+            }
             ResourceKind::Opaque => {}
         }
         let mut deny_only = Vec::new();
@@ -164,29 +288,45 @@ impl Spellings {
         Self {
             kind,
             permission: permission.to_owned(),
+            host,
             identity,
             deny_only,
+            parent_segment,
             unresolved,
         }
     }
 
     /// Whether `rule` governs this request.
+    #[cfg(test)]
     pub(crate) fn matches(&self, rule: &Rule) -> bool {
-        if !wildcard_match(&self.permission, &rule.permission) {
-            return false;
+        self.match_reason(rule).is_some()
+    }
+
+    /// Why `rule` governs this request, or `None` when it does not.
+    pub(crate) fn match_reason(&self, rule: &Rule) -> Option<MatchReason> {
+        if !key_governs(&self.permission, rule) {
+            return None;
         }
-        if self.matches_pattern(&rule.pattern) {
-            return true;
+        if self.matches_identity(&rule.pattern) {
+            return Some(MatchReason::Identity);
         }
         if rule.action != PermissionAction::Deny {
-            return false;
+            return None;
         }
-        if self
-            .deny_only
-            .iter()
-            .any(|spelling| wildcard_match(spelling, &rule.pattern))
+        // A deny reads every spelling — the identity ones included, because a `..`
+        // segment keeps them from a grant — as written first, then with case folded
+        // and `\` read as `/`.
+        if let Some(spelling) = self
+            .spellings()
+            .find(|spelling| wildcard_match(spelling, &rule.pattern))
         {
-            return true;
+            return Some(MatchReason::DenySpelling(spelling.clone()));
+        }
+        if let Some(spelling) = self
+            .spellings()
+            .find(|spelling| wildcard_match_folded(spelling, &rule.pattern))
+        {
+            return Some(MatchReason::Folded(fold(spelling)));
         }
         // A program token this crate cannot resolve without running the shell — an
         // expansion, a glob, an encoded `$'\x72'` escape — must not degrade into a
@@ -198,35 +338,75 @@ impl Spellings {
             // knowable at all and the denied one is among the possibilities. Refusing
             // every pattern over-refuses, which is the direction that fails safe;
             // assuming the arguments were still visible is what let the deny miss.
-            Some(UnresolvedProgram::WholeLine) => return true,
+            Some(UnresolvedProgram::WholeLine { program }) => {
+                return Some(MatchReason::UnresolvableProgram {
+                    program: program.clone(),
+                });
+            }
             // The argument tokens are still the words the shell will pass, so the
             // deny is retried with the program the rule itself names and the
-            // arguments still have to fit the rule.
-            Some(UnresolvedProgram::Arguments(arguments)) => {
+            // arguments — as written and as each dialect reads them — still have to
+            // fit the rule.
+            Some(UnresolvedProgram::Arguments { program, spellings }) => {
                 let pattern_tokens = shell_tokens(&rule.pattern);
-                if let Some(program) = pattern_tokens.first()
-                    && wildcard_match(&command_line(program, arguments), &rule.pattern)
-                {
-                    return true;
+                if let Some(rule_program) = pattern_tokens.first() {
+                    for arguments in spellings {
+                        let retried_as = command_line(rule_program, arguments);
+                        if wildcard_match_folded(&retried_as, &rule.pattern) {
+                            return Some(MatchReason::UnresolvableProgramArguments {
+                                program: program.clone(),
+                                retried_as,
+                            });
+                        }
+                    }
                 }
             }
             None => {}
+        }
+        if self.kind != ResourceKind::Path {
+            return None;
         }
         // A deny written with an absolute path also covers the relative spelling of
         // the same file. The workspace root is unknown here, so the pattern is
         // shortened at segment boundaries and the all-wildcard tail is dropped: an
         // absolute deny must not degrade into "deny every relative path".
-        self.kind == ResourceKind::Path
-            && segment_suffixes(&canonical_path_resource(&rule.pattern))
-                .into_iter()
-                .filter(|suffix| has_literal_segment(suffix))
-                .any(|suffix| self.matches_pattern(&suffix))
+        segment_suffixes(&normalized_path(&rule.pattern, PathReading::Deny))
+            .into_iter()
+            .filter(|suffix| has_literal_segment(suffix))
+            .find(|suffix| {
+                self.spellings()
+                    .any(|spelling| wildcard_match_folded(spelling, suffix))
+            })
+            .map(MatchReason::RelativeTail)
     }
 
-    fn matches_pattern(&self, pattern: &str) -> bool {
-        self.identity
+    fn spellings(&self) -> impl Iterator<Item = &String> {
+        self.identity.iter().chain(self.deny_only.iter())
+    }
+
+    /// Whether the pattern names exactly this resource — the only match a grant has.
+    fn matches_identity(&self, pattern: &str) -> bool {
+        if self.parent_segment {
+            return false;
+        }
+        if self
+            .identity
             .iter()
             .any(|spelling| wildcard_match(spelling, pattern))
+        {
+            return true;
+        }
+        // Where the file system separates on `\` and `/` alike, a path rule may be
+        // written with either; the canonical resource spelling is forward-slashed.
+        if self.kind != ResourceKind::Path || !self.host.unifies_path_separators() {
+            return false;
+        }
+        let unified = pattern.replace('\\', "/");
+        unified != pattern
+            && self
+                .identity
+                .iter()
+                .any(|spelling| wildcard_match(spelling, &unified))
     }
 }
 
@@ -239,7 +419,7 @@ fn deny_only_spellings(kind: ResourceKind, resource: &str) -> Vec<String> {
             }
         }
         ResourceKind::Path => {
-            let resolved = normalized_path(resource, true);
+            let resolved = normalized_path(resource, PathReading::Deny);
             push_new(&mut spellings, resolved.clone());
             if is_absolute(&resolved) {
                 for suffix in segment_suffixes(&resolved) {
@@ -263,7 +443,8 @@ fn push_new(spellings: &mut Vec<String>, spelling: String) {
 /// One space between tokens, the program token reduced to the word the host's own
 /// shell builds from it, and a leading `command` builtin dropped. Argument tokens
 /// keep their own quoting, because a rule that mentions an argument means that
-/// argument as the caller wrote it.
+/// argument as the caller wrote it; a `deny` additionally reads them with the
+/// quoting removed, in `shell_deny_spellings`.
 #[must_use]
 pub fn canonical_shell_resource(command: &str) -> String {
     canonical_shell_resource_for(command, HostShell::current())
@@ -291,22 +472,56 @@ fn canonical_shell_resource_for(command: &str, host: HostShell) -> String {
 
 /// The canonical spelling of a path resource.
 ///
-/// Forward slashes, no `.` segments, no `./` prefix, no repeated separators and no
-/// trailing separator. `..` is **not** resolved here: a lexical `..` can leave the
-/// directory a symlink pointed at, so resolving it is only used to widen a deny.
+/// No `.` segments, no `./` prefix, no repeated separators and no trailing
+/// separator; forward-slashed on a Windows host, where `\` and `/` are the same
+/// separator, and left as written on Linux and macOS, where `\` is part of a file
+/// name. `..` is **not** resolved here: a lexical `..` can leave the directory a
+/// symlink pointed at, so resolving it is only used to widen a deny, and a resource
+/// that keeps a `..` segment never satisfies a grant.
 #[must_use]
 pub fn canonical_path_resource(resource: &str) -> String {
-    normalized_path(resource, false)
+    canonical_path_resource_for(resource, HostShell::current())
 }
 
-fn normalized_path(resource: &str, resolve_parents: bool) -> String {
-    let slashed = resource.replace('\\', "/");
+fn canonical_path_resource_for(resource: &str, host: HostShell) -> String {
+    normalized_path(resource, PathReading::Identity(host))
+}
+
+/// Which reductions a path spelling is built with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathReading {
+    /// The spelling every rule may match: separators unified only where the host's
+    /// file system does, and `..` kept.
+    Identity(HostShell),
+    /// The spelling a `deny` may also match: separators unified and `..` resolved.
+    Deny,
+}
+
+impl PathReading {
+    const fn unifies_separators(self) -> bool {
+        match self {
+            Self::Identity(host) => host.unifies_path_separators(),
+            Self::Deny => true,
+        }
+    }
+
+    const fn resolves_parents(self) -> bool {
+        matches!(self, Self::Deny)
+    }
+}
+
+fn normalized_path(resource: &str, reading: PathReading) -> String {
+    let slashed = if reading.unifies_separators() {
+        resource.replace('\\', "/")
+    } else {
+        resource.to_owned()
+    };
     let (root, rest) = split_root(&slashed);
     let mut segments: Vec<&str> = Vec::new();
     for segment in rest.split('/') {
         match segment {
             "" | "." => {}
-            ".." if resolve_parents => {
+            ".." if reading.resolves_parents() => {
                 if segments.last().is_some_and(|last| *last != "..") {
                     segments.pop();
                 } else if root.is_empty() {
@@ -329,6 +544,11 @@ fn normalized_path(resource: &str, resolve_parents: bool) -> String {
         return root.to_owned();
     }
     format!("{root}{joined}")
+}
+
+/// Whether a canonical path spelling still contains a `..` segment.
+fn has_parent_segment(canonical: &str) -> bool {
+    canonical.split('/').any(|segment| segment == "..")
 }
 
 /// Split a leading `/` or `C:/` off a forward-slashed path.
@@ -376,12 +596,134 @@ fn has_literal_segment(pattern: &str) -> bool {
 ///
 /// A deny has to hold for whichever interpreter runs the line and for whatever the
 /// program token turns out to name, so this widens past the canonical spelling in
-/// two ways a grant must not follow: it reads the program under **every** dialect
-/// in [`DENY_SYNTAXES`], including the ones the host's shell may not be, and it
-/// reduces a program path to its file name (`/bin/rm -rf x` becomes `rm -rf x`).
-/// Both drop information, and both can only refuse more than was asked, which
-/// fails safe.
+/// four ways a grant must not follow: it reads the program under **every** dialect
+/// in [`DENY_SYNTAXES`], including the ones the host's shell may not be; it reduces
+/// a program path to its file name (`/bin/rm -rf x` becomes `rm -rf x`); it reads
+/// the argument tokens with their quoting removed under each dialect too, so
+/// `git p''ush --force` also spells `git push --force` and a `git push*` deny is not
+/// decoration under a `git *` allow; and it reads every unquoted expansion as
+/// whitespace and as nothing ([`expansions_replaced`]), so `git ${IFS}push --force`
+/// and `$EMPTY rm -rf /tmp/build` spell the command bash runs them as. All four drop
+/// information, and all four can only refuse more than was asked, which fails safe.
 fn shell_deny_spellings(command: &str) -> Vec<String> {
+    let mut spellings = Vec::new();
+    for line in deny_readings_of_line(command) {
+        for spelling in shell_deny_spellings_of(&line) {
+            push_new(&mut spellings, spelling);
+        }
+    }
+    spellings
+}
+
+/// The line as written, then with every unquoted expansion read as whitespace and
+/// as nothing.
+fn deny_readings_of_line(command: &str) -> Vec<String> {
+    let mut lines = vec![command.to_owned()];
+    for filler in [" ", ""] {
+        if let Some(line) = expansions_replaced(command, filler) {
+            push_new(&mut lines, line);
+        }
+    }
+    lines
+}
+
+/// The line with every unquoted parameter expansion and command substitution
+/// replaced by `filler`, for a `deny`.
+///
+/// `$IFS` is the classic bypass: bash and dash run `git${IFS}push --force`,
+/// `git ${IFS}push --force`, `rm -rf$IFS/` and `$EMPTY rm -rf /tmp/build` as the
+/// denied command (measured with fake programs on `PATH`), because an unquoted
+/// expansion is word-split on whitespace and an unset one vanishes. This crate cannot
+/// know a variable's value or a substitution's output; it can assume the two values
+/// that make the line say what its literal text says — whitespace, and nothing — and
+/// offer both readings to a deny, which may over-refuse (`git checkout $branch` reads
+/// as `git checkout`, which no `git push*` deny matches). A quoted expansion is one
+/// word whatever it holds and stays as written; `$'...'` is quoting, not expansion.
+/// `None` when the line has no unquoted expansion, or one is never closed.
+fn expansions_replaced(command: &str, filler: &str) -> Option<String> {
+    let mut line = String::with_capacity(command.len());
+    let mut replaced = false;
+    let mut characters = command.chars().peekable();
+    let mut quote = None;
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' if quote != Some('\'') => {
+                line.push(character);
+                line.extend(characters.next());
+            }
+            '\'' | '"' => {
+                if quote == Some(character) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(character);
+                }
+                line.push(character);
+            }
+            '`' if quote.is_none() => {
+                skip_through(&mut characters, |next| next == '`', |_| false)?;
+                line.push_str(filler);
+                replaced = true;
+            }
+            '$' if quote.is_none() => match characters.peek().copied() {
+                Some(open @ ('{' | '(')) => {
+                    characters.next();
+                    let close = if open == '{' { '}' } else { ')' };
+                    skip_through(&mut characters, |next| next == close, |next| next == open)?;
+                    line.push_str(filler);
+                    replaced = true;
+                }
+                Some(next) if next.is_ascii_alphabetic() || next == '_' => {
+                    while characters
+                        .peek()
+                        .is_some_and(|next| next.is_ascii_alphanumeric() || *next == '_')
+                    {
+                        characters.next();
+                    }
+                    line.push_str(filler);
+                    replaced = true;
+                }
+                Some(next)
+                    if next.is_ascii_digit()
+                        || matches!(next, '@' | '*' | '#' | '?' | '-' | '$' | '!') =>
+                {
+                    characters.next();
+                    line.push_str(filler);
+                    replaced = true;
+                }
+                _ => line.push(character),
+            },
+            _ => line.push(character),
+        }
+    }
+    replaced.then_some(line)
+}
+
+/// Consume through the delimiter that closes a run, honouring `\` and nesting.
+///
+/// `None` when the run is never closed.
+fn skip_through(
+    characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    closes: impl Fn(char) -> bool,
+    opens: impl Fn(char) -> bool,
+) -> Option<()> {
+    let mut depth = 1usize;
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            characters.next();
+        } else if opens(character) {
+            depth += 1;
+        } else if closes(character) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(());
+            }
+        }
+    }
+    None
+}
+
+/// The deny spellings of one reading of the line.
+fn shell_deny_spellings_of(command: &str) -> Vec<String> {
     let tokens = shell_tokens(command);
     let tokens = without_command_builtin(&tokens, |token| {
         DENY_SYNTAXES
@@ -401,10 +743,76 @@ fn shell_deny_spellings(command: &str) -> Vec<String> {
     // what `.\rm.exe` or `C:\bin\rm.exe` has to be reduced from.
     push_new(&mut programs, program.clone());
     let mut spellings = Vec::new();
-    for program in &programs {
+    let mut push_line = |program: &str, arguments: &[String]| {
         push_new(&mut spellings, command_line(program, arguments));
         if let Some(base) = program_basename(program) {
             push_new(&mut spellings, command_line(base, arguments));
+        }
+    };
+    // Every reading of the program with the arguments as written, so a deny that
+    // quotes an argument the way the caller did keeps matching ...
+    for reading in &programs {
+        push_line(reading, arguments);
+    }
+    // ... and, per dialect, the program and the arguments read together the way that
+    // shell would pass them. A real shell reads the whole line under one dialect, so
+    // the readings are paired rather than crossed.
+    for syntax in DENY_SYNTAXES {
+        let reading = match program_word(program, syntax) {
+            Some(ProgramWord::Literal(word)) => word,
+            Some(ProgramWord::Unresolved) | None => program.clone(),
+        };
+        push_line(&reading, &deny_arguments(arguments, syntax));
+    }
+    spellings
+}
+
+/// The argument tokens as one dialect passes them, for a `deny`.
+///
+/// A shell removes quotes and escapes from every word, not only from the program:
+/// `git p''ush --force`, `git p"ush" --force`, `git 'push' --force`,
+/// `git "push --force"` and — where `\` escapes — `git pu\sh --force` all run
+/// `git push --force` (measured under bash, dash and zsh with a fake `git` on
+/// `PATH`). A grant is still matched against the argument as written, because a rule
+/// that mentions an argument means what the caller wrote; a deny additionally sees
+/// the words the shell will pass, which can only refuse more. A word that reduces to
+/// nothing is dropped — `rm '' -rf x` passes an empty operand that `rm` reports and
+/// ignores before it removes `x` — and a token this dialect cannot read, or one that
+/// spells a character only the shell decodes, is kept as written.
+fn deny_arguments(arguments: &[String], syntax: WordSyntax) -> Vec<String> {
+    arguments
+        .iter()
+        .filter_map(|token| match unquoted_word(token, syntax) {
+            Some(Word::Literal(word)) if word.is_empty() => None,
+            Some(Word::Literal(word)) => Some(word),
+            Some(Word::Encoded) | None => Some(token.clone()),
+        })
+        .collect()
+}
+
+/// The argument list as written, with each unquoted expansion read as whitespace
+/// and as nothing, and as each dialect passes every one of those, deduplicated.
+fn argument_spellings(arguments: &[String]) -> Vec<Vec<String>> {
+    let mut lists = vec![arguments.to_vec()];
+    for line in deny_readings_of_line(&arguments.join(" "))
+        .into_iter()
+        .skip(1)
+    {
+        let tokens = shell_tokens(&line);
+        if !lists.contains(&tokens) {
+            lists.push(tokens);
+        }
+    }
+    let mut spellings = Vec::new();
+    for list in lists {
+        for syntax in DENY_SYNTAXES {
+            let reduced = deny_arguments(&list, syntax);
+            if !spellings.contains(&reduced) {
+                spellings.push(reduced);
+            }
+        }
+        if !spellings.contains(&list) {
+            spellings.push(list);
         }
     }
     spellings
@@ -419,13 +827,17 @@ fn shell_deny_spellings(command: &str) -> Vec<String> {
 /// named has to assume the worst.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UnresolvedProgram {
-    /// The program token names no knowable program, and these are the argument tokens
-    /// the shell will pass after it.
-    Arguments(Vec<String>),
+    /// The program token names no knowable program, and these are the argument
+    /// tokens the shell will pass after it — as written and as each dialect reads
+    /// them.
+    Arguments {
+        program: String,
+        spellings: Vec<Vec<String>>,
+    },
     /// Nothing about the line is knowable: either it is one token whose *unquoted*
     /// run the shell resolves, so the result is word-split into the program *and* its
     /// arguments, or no dialect can read the program token at all.
-    WholeLine,
+    WholeLine { program: String },
 }
 
 fn unresolved_program(command: &str) -> Option<UnresolvedProgram> {
@@ -444,7 +856,7 @@ fn unresolved_program(command: &str) -> Option<UnresolvedProgram> {
     // is measured as a syntax error under bash, dash, zsh and PowerShell, so refusing
     // it costs a command that could not have run.
     if readings.iter().all(Option::is_none) {
-        return Some(UnresolvedProgram::WholeLine);
+        return Some(UnresolvedProgram::WholeLine { program });
     }
     if !readings
         .iter()
@@ -460,9 +872,12 @@ fn unresolved_program(command: &str) -> Option<UnresolvedProgram> {
     // here. Reporting only the program as unresolvable let the retry below compare
     // the bare rule program (`rm`) against `rm -rf*` and match nothing.
     if arguments.is_empty() && splits_into_words(&program) {
-        return Some(UnresolvedProgram::WholeLine);
+        return Some(UnresolvedProgram::WholeLine { program });
     }
-    Some(UnresolvedProgram::Arguments(arguments))
+    Some(UnresolvedProgram::Arguments {
+        program,
+        spellings: argument_spellings(&arguments),
+    })
 }
 
 /// Whether `token` resolves a run *outside* quotes, so the shell word-splits it.
@@ -665,7 +1080,7 @@ fn names_command_builtin(token: &str, syntax: WordSyntax) -> bool {
     matches!(program_word(token, syntax), Some(ProgramWord::Literal(word)) if word == "command")
 }
 
-/// Which shell's escaping the identity reading of a program token follows.
+/// The host this build runs on, which decides which readings are identity.
 ///
 /// This crate is not told which interpreter will run the line, and the answer
 /// changes what a token *names*: `\` escapes under every POSIX shell and separates
@@ -674,8 +1089,9 @@ fn names_command_builtin(token: &str, syntax: WordSyntax) -> bool {
 /// Reading it the POSIX way everywhere would let an allow rule for `rm.exe *` grant
 /// a planted `.\r\m.exe` on Windows, so the identity reading follows the host and
 /// the portable half of the guarantee is carried by [`shell_deny_spellings`], which
-/// reads every dialect for a `deny`. `crate::wildcard` forks on the same host for
-/// the same reason.
+/// reads every dialect for a `deny`. The same host decides whether `\` and `/` are
+/// one separator in a **path**: they are under Windows, and under Linux and macOS
+/// `\` is an ordinary character in a file name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostShell {
     Posix,
@@ -697,6 +1113,11 @@ impl HostShell {
     /// Whether this host's default shell has the POSIX `command` builtin.
     const fn has_command_builtin(self) -> bool {
         matches!(self, Self::Posix)
+    }
+
+    /// Whether this host's file system reads `\` and `/` as the same separator.
+    const fn unifies_path_separators(self) -> bool {
+        matches!(self, Self::Windows)
     }
 
     /// The one reading that keeps naming the same file on this host.
@@ -770,6 +1191,17 @@ impl WordSyntax {
     }
 }
 
+/// What one reading makes of any token once its quoting is removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Word {
+    /// The literal word, possibly empty. It may still contain `$`, a backtick or a
+    /// glob character; whether that matters depends on the position of the token.
+    Literal(String),
+    /// A `$'...'` run spells a character this crate does not decode (`\xHH`,
+    /// `\uHHHH`, an octal `\NNN`, `\cX`).
+    Encoded,
+}
+
 /// What one reading makes of a program token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProgramWord {
@@ -810,12 +1242,25 @@ fn identity_program(token: &str, host: HostShell) -> Option<String> {
     Some(word)
 }
 
-/// The word one dialect builds from `token` once its quoting is removed.
+/// What one dialect makes of `token` in program position.
 ///
 /// `None` for a token that reduces to nothing or that no shell would accept: an
 /// unterminated quote or a trailing escape means the word was cut off, and reducing
 /// it would invent a program nobody named.
 fn program_word(token: &str, syntax: WordSyntax) -> Option<ProgramWord> {
+    match unquoted_word(token, syntax)? {
+        Word::Encoded => Some(ProgramWord::Unresolved),
+        Word::Literal(word) if word.is_empty() => None,
+        Word::Literal(word) if needs_the_shell(&word) => Some(ProgramWord::Unresolved),
+        Word::Literal(word) => Some(ProgramWord::Literal(word)),
+    }
+}
+
+/// The word one dialect builds from `token` once its quoting is removed.
+///
+/// `None` when no shell would accept the token: an unterminated quote or a trailing
+/// escape means the word was cut off.
+fn unquoted_word(token: &str, syntax: WordSyntax) -> Option<Word> {
     let mut word = String::new();
     let mut characters = token.chars().peekable();
     while let Some(character) = characters.next() {
@@ -826,14 +1271,13 @@ fn program_word(token: &str, syntax: WordSyntax) -> Option<ProgramWord> {
             && let Some(&quote @ ('\'' | '"')) = characters.peek()
         {
             characters.next();
-            let run = if quote == '\'' {
-                ansi_c_run(&mut characters)?
+            if quote == '\'' {
+                match ansi_c_run(&mut characters)? {
+                    Word::Literal(text) => word.push_str(&text),
+                    Word::Encoded => return Some(Word::Encoded),
+                }
             } else {
-                ProgramWord::Literal(quoted_run(&mut characters, '"', syntax)?)
-            };
-            match run {
-                ProgramWord::Literal(text) => word.push_str(&text),
-                ProgramWord::Unresolved => return Some(ProgramWord::Unresolved),
+                word.push_str(&quoted_run(&mut characters, '"', syntax)?);
             }
             continue;
         }
@@ -847,14 +1291,7 @@ fn program_word(token: &str, syntax: WordSyntax) -> Option<ProgramWord> {
         }
         word.push(character);
     }
-    if word.is_empty() {
-        return None;
-    }
-    Some(if needs_the_shell(&word) {
-        ProgramWord::Unresolved
-    } else {
-        ProgramWord::Literal(word)
-    })
+    Some(Word::Literal(word))
 }
 
 /// The literal one quoted run contributes, consuming its closing delimiter.
@@ -885,17 +1322,18 @@ fn quoted_run(
 ///
 /// The unambiguous single-character escapes are reversed exactly. `\xHH`, `\uHHHH`,
 /// `\UHHHHHHHH`, an octal `\NNN` and `\cX` spell a character this crate would have
-/// to decode; rather than guess, the run is reported [`ProgramWord::Unresolved`] so
-/// the deny side fails closed. `None` when the run is never closed.
-fn ansi_c_run(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<ProgramWord> {
+/// to decode; rather than guess, the run is reported [`Word::Encoded`] so the deny
+/// side fails closed on a program and keeps an argument as written. `None` when the
+/// run is never closed.
+fn ansi_c_run(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<Word> {
     let mut text = String::new();
-    let mut unresolved = false;
+    let mut encoded = false;
     while let Some(character) = characters.next() {
         if character == '\'' {
-            return Some(if unresolved {
-                ProgramWord::Unresolved
+            return Some(if encoded {
+                Word::Encoded
             } else {
-                ProgramWord::Literal(text)
+                Word::Literal(text)
             });
         }
         if character != '\\' {
@@ -912,7 +1350,7 @@ fn ansi_c_run(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Opti
             'r' => text.push('\r'),
             't' => text.push('\t'),
             'v' => text.push('\u{b}'),
-            _ => unresolved = true,
+            _ => encoded = true,
         }
     }
     None
@@ -955,8 +1393,16 @@ mod tests {
         }
     }
 
+    fn path_rule(pattern: &str, action: PermissionAction) -> Rule {
+        Rule {
+            permission: "read".to_owned(),
+            pattern: pattern.to_owned(),
+            action,
+        }
+    }
+
     fn governs(resource: &str, host: HostShell, rule: &Rule) -> bool {
-        Spellings::for_host("shell", resource, host).matches(rule)
+        Spellings::for_host(&rule.permission, resource, host).matches(rule)
     }
 
     #[test]
@@ -1131,5 +1577,125 @@ mod tests {
             ),
             "a deny still drops the word under every dialect"
         );
+    }
+
+    #[test]
+    fn the_host_decides_whether_a_backslash_separates_a_path() {
+        // Under Windows `\` and `/` are one separator, so both spellings name one
+        // file and a rule may be written with either. Under Linux and macOS `\` is an
+        // ordinary character in a file name: `src/a\b` is a file the agent can plant
+        // next to `src/a/b`, and it must not inherit that file's grant.
+        for (resource, windows, posix) in [
+            ("src\\main.rs", "src/main.rs", "src\\main.rs"),
+            ("C:\\ws\\src", "C:/ws/src", "C:\\ws\\src"),
+            ("src/a\\b", "src/a/b", "src/a\\b"),
+            ("src\\.\\a", "src/a", "src\\.\\a"),
+        ] {
+            assert_eq!(
+                canonical_path_resource_for(resource, HostShell::Windows),
+                windows,
+                "Windows reading of `{resource}`"
+            );
+            assert_eq!(
+                canonical_path_resource_for(resource, HostShell::Posix),
+                posix,
+                "POSIX reading of `{resource}`"
+            );
+        }
+        for (resource, pattern) in [
+            ("src/a\\b", "src/a/b"),
+            ("src\\a\\b", "src/a/b"),
+            ("src/a/b", "src\\a\\b"),
+            ("C:\\ws\\x", "C:/ws/*"),
+            ("C:/ws/x", "C:\\ws\\*"),
+        ] {
+            let allow = path_rule(pattern, PermissionAction::Allow);
+            assert!(
+                governs(resource, HostShell::Windows, &allow),
+                "on Windows `{pattern}` names `{resource}`"
+            );
+            assert!(
+                !governs(resource, HostShell::Posix, &allow),
+                "on a POSIX host `{pattern}` must not grant the distinct file `{resource}`"
+            );
+            let deny = path_rule(pattern, PermissionAction::Deny);
+            for host in [HostShell::Windows, HostShell::Posix] {
+                assert!(
+                    governs(resource, host, &deny),
+                    "a deny reads `\\` as `/` on {host:?}, which can only refuse more"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_shell_line_never_unifies_separators_on_the_identity_side() {
+        // bash removes the backslash, so `rm -rf \tmp\x` removes `tmpx` in the
+        // current directory (measured) — a different file from `/tmp/x`. cmd reads
+        // `/s` as a switch and `\s` as a path. Neither host has the two spellings
+        // name one thing, so the reading is deny-only everywhere.
+        for host in [HostShell::Posix, HostShell::Windows] {
+            assert!(
+                !governs(
+                    r"rm -rf \tmp\x",
+                    host,
+                    &rule("rm -rf /tmp/x", PermissionAction::Allow)
+                ),
+                "allow `rm -rf /tmp/x` must not cover `rm -rf \\tmp\\x` on {host:?}"
+            );
+            assert!(
+                governs(
+                    r"rm -rf \tmp\y",
+                    host,
+                    &rule("rm -rf /tmp/y", PermissionAction::Deny)
+                ),
+                "the deny still reads `\\` as `/` on {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn case_is_folded_for_a_deny_on_every_host_and_never_for_a_grant() {
+        // The default macOS volume and almost every Windows volume are
+        // case-insensitive, so `RM -rf /` runs `/bin/rm` there and a deny has to
+        // hold. A Linux file system and a case-sensitive NTFS directory are not, so a
+        // grant that folded case would name a different file; an allow on Windows
+        // that used to match by case now needs the exact case, deliberately.
+        for host in [HostShell::Posix, HostShell::Windows] {
+            for resource in ["RM -rf /", "Rm -Rf /", "rM -RF /"] {
+                assert!(
+                    governs(resource, host, &rule("rm -rf*", PermissionAction::Deny)),
+                    "`rm -rf*` must refuse `{resource}` on {host:?}"
+                );
+                assert!(
+                    !governs(resource, host, &rule("rm -rf *", PermissionAction::Allow)),
+                    "allow `rm -rf *` must not cover `{resource}` on {host:?}"
+                );
+            }
+            assert!(
+                governs(
+                    "SECRETS/x",
+                    host,
+                    &path_rule("secrets/*", PermissionAction::Deny)
+                ),
+                "a path deny folds case on {host:?}"
+            );
+            assert!(
+                !governs(
+                    "SRC/A/B",
+                    host,
+                    &path_rule("src/a/b", PermissionAction::Allow)
+                ),
+                "a path allow never folds case on {host:?}"
+            );
+            assert!(
+                governs(
+                    "src/a/b",
+                    host,
+                    &path_rule("src/a/b", PermissionAction::Allow)
+                ),
+                "the exact case still grants on {host:?}"
+            );
+        }
     }
 }
