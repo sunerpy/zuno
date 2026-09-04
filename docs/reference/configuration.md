@@ -912,6 +912,34 @@ The environment equivalent is `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`.
 Managed policy has later precedence and may still replace either override with
 `deny`.
 
+On a platform with no confined backend (macOS and Windows today), an interactive
+`zuno` start asks once before the terminal enters raw mode, and only when every
+guard holds: the request is write-capable (`workspace-write`), no layer set
+`sandbox.onUnavailable` at all, and standard input **and** standard error are both
+terminals. Answering yes resolves this process exactly as
+`--sandbox-on-unavailable run-unconfined` would — same override path,
+`resolutionKind` `unavailable_fallback`, the same durable record and the same
+native-execution warning — and the answer holds for every later composition of
+that process. Answering no exits with the refusal. The prompt never appears for a
+read-only request, which never falls back; when any layer chose `deny` or
+`run-unconfined`, which is honoured as written; or off a terminal. `run`, `acp`,
+and `serve` never ask: they print the same refusal with the remedies, and a
+headless invocation still needs the flag, the environment variable, or a trusted
+configuration layer. Accepting the prompt is not confinement; it is native
+execution with the Zuno process user's authority.
+
+The answer is not inherited by child processes, and there the flag and the prompt
+differ. On Unix the resolved overrides are exported into the real environment by
+the one startup re-exec that hands the command process its bootstrap environment,
+so `--sandbox-on-unavailable run-unconfined` is visible to a nested `zuno` that a
+tool launches; the prompt is answered after that re-exec, so its answer is not.
+On macOS, where the prompt is reachable, a nested `zuno run` therefore meets the
+refusal again even though this process fell back. Windows performs no such re-exec,
+so neither route is inherited there. Set
+`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined` in the environment, or
+`sandbox.onUnavailable` in a trusted layer, when nested Zuno processes need the
+same answer.
+
 Provenance also governs host commands, and a project layer that declares one is
 refused rather than warned about. A project `zuno.json[c]` or `.zuno` layer that
 sets `shell`, a local `mcp.*.command`, an `lsp.*.command`, a
@@ -929,11 +957,15 @@ successful user, mount, PID, UTS, IPC, seccomp, and—when `network` is
 `deny`—network namespace probes. A failed probe stops tool assembly unless it is
 an eligible typed availability failure and trusted policy selected
 `run-unconfined`. Confined macOS and Windows backends are not yet implemented
-and fail closed by default; trusted fallback may run a write-capable Agent
-natively, while an explicit `danger-full-access` invocation always uses the
-native process backend on all supported platforms. See the
-[sandbox FAQ](../faq.md) for the security boundary, Ubuntu AppArmor setup, and
-nested-sandbox diagnosis.
+and fail closed by default; the refusal names the platform, says whether the
+trusted fallback would apply to the request, and lists every remedy. Trusted
+fallback may run a write-capable Agent natively — an interactive TUI start
+offers that choice once, before raw mode, when nobody configured
+`sandbox.onUnavailable` (see [unavailable confinement](#unavailable-confinement))
+— while an explicit `danger-full-access` invocation always uses the native
+process backend on all supported platforms. A read-only request is never run
+natively by either route. See the [sandbox FAQ](../faq.md) for the security
+boundary, Ubuntu AppArmor setup, and nested-sandbox diagnosis.
 
 The Shell risk gate distinguishes confirmable risk from catastrophic denial.
 Bounded destructive operations, dynamic targets, and replacing an existing

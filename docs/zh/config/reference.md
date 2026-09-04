@@ -349,6 +349,26 @@ ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined zuno
 用 `zuno debug sandbox` 查看请求/实际权限、降级资格、`resolutionKind` 和
 `fallbackReason`。`--check` 仍严格检查请求的约束是否可部署，不会因为允许降级而成功。
 
+macOS 与 Windows 目前没有受约束的沙箱后端，默认失败关闭；拒绝信息会点明平台、说明受信降级
+是否适用于本次请求，并列出上述全部补救方式。在这类平台上交互式启动 `zuno` 时，会在终端进入
+raw mode 之前询问一次，且只在以下条件同时成立时才询问：请求具备写能力（`workspace-write`）、
+没有任何层设置过 `sandbox.onUnavailable`、标准输入**与**标准错误都是终端。回答 yes 时，
+本进程的解析结果与传入 `--sandbox-on-unavailable run-unconfined` 完全一致——同一条覆盖
+路径、`resolutionKind` 为 `unavailable_fallback`、同样的持久化记录与原生执行警告——并对
+该进程之后的每一次组合都生效；回答 no 则以该拒绝信息退出。只读请求永远不会降级，因此不会
+询问；任何层显式选择了 `deny` 或 `run-unconfined` 时按原样生效，也不会询问；非终端下同样
+不会询问。`run`、`acp` 与 `serve` 永远不会询问，只打印同样带补救方式的拒绝信息，headless
+调用仍然需要标志、环境变量或受信配置层。接受询问不是沙箱隔离，而是以 Zuno 进程用户的权限
+原生执行。
+
+这个回答不会被子进程继承，命令行标志与交互式提示在这一点上并不相同。在 Unix 上，解析出的
+覆盖项会由启动时那一次 re-exec 写入真实环境变量，所以工具启动的嵌套 `zuno` 能看到
+`--sandbox-on-unavailable run-unconfined`；而提示是在那次 re-exec 之后回答的，它的答案
+不会被写入环境。因此在可以触发提示的 macOS 上，即使本进程已经降级，嵌套的 `zuno run` 仍会
+再次遇到该拒绝。Windows 没有这一次 re-exec，所以两条路径在那里都不会被继承。如果嵌套的
+Zuno 进程也需要同样的答案，请在环境里设置 `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`，
+或在受信层设置 `sandbox.onUnavailable`。
+
 来源同样约束本机命令，而且项目层的声明是被拒绝，而不是仅仅告警。项目 `zuno.json[c]` 或
 `.zuno` 层声明了 `shell`、本地 `mcp.*.command`、`lsp.*.command`、`formatter.*.command`，
 或 `productAgent.*.command` 时，配置发现会以校验错误失败，并指明该文件与其中每一个命令键；

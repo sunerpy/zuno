@@ -218,16 +218,55 @@ zuno debug sandbox
 
 ### Other platforms
 
-The OS confinement backend is implemented for Linux. On macOS and Windows a
-restricted mode reports:
+The OS confinement backend is implemented for Linux. macOS and Windows have no
+confined backend at all, so a restricted mode there fails closed rather than
+degrading quietly. The refusal is written to be acted on: it names the platform,
+says whether the trusted `run-unconfined` fallback applies to **this** request,
+lists every remedy together with the layer that may set it, and states that none
+of those remedies is confinement. It opens on the same typed cause earlier releases
+printed alone:
 
 ```
-OS sandbox is not implemented for platform `macos`
+OS sandbox is not implemented for platform `macos`: macos has no confined sandbox
+backend, so the Shell tool cannot be registered under the requested
+`workspace-write` authority. …
 ```
 
-The default remains fail-closed. A trusted `run-unconfined` policy may let a
-write-capable `workspace-write` Agent proceed natively; a read-only Agent still
-refuses. `danger-full-access` always selects native execution directly.
+- A write-capable `workspace-write` request is eligible for the fallback, so the
+  refusal offers `--sandbox-on-unavailable run-unconfined`,
+  `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`, and
+  `"sandbox": {"onUnavailable": "run-unconfined"}` in a trusted global, managed,
+  environment, or CLI layer — a project layer cannot enable it.
+- A read-only request never falls back, and the refusal says so instead of listing
+  a remedy that would not apply: only an explicit `danger-full-access` request runs
+  natively there, and only an Agent whose contract is write-capable can make that
+  request, so a read-only Agent such as `plan` has no native route on these
+  platforms.
+
+An interactive `zuno` start on such a host asks once, before the terminal enters
+raw mode, whether to run that session natively. It asks only for a write-capable
+request, only when no layer set `sandbox.onUnavailable`, and only when standard
+input and standard error are both terminals. Answering yes resolves this process
+exactly as `--sandbox-on-unavailable run-unconfined` does, for every later
+composition of it; answering no exits with the refusal above. `run`, `acp`,
+`serve`, and any start without a terminal never ask, and still need the flag, the
+variable, or a trusted layer.
+
+The answer belongs to this process. On macOS the flag is exported into the real
+environment by the one startup re-exec, so a nested `zuno` that a tool launches
+inherits it, while an answer typed at the prompt arrives after that re-exec and is
+not inherited. Set the environment variable or a trusted layer when nested Zuno
+processes need the same answer. See
+[Unavailable confinement](/reference/configuration#unavailable-confinement).
+
+Switching to an Agent whose Shell cannot be registered keeps the current Agent and
+reports the same refusal on the transcript, instead of ending the session over a
+switch you can undo.
+
+`danger-full-access` always selects native execution directly. Neither it nor the
+fallback is confinement: commands run with the Zuno process user's host authority,
+while the configured permission mode, explicit denies, and catastrophic-command
+refusals still apply.
 
 ## Permission modes
 
