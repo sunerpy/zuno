@@ -120,6 +120,55 @@ post-hook section in the normal prompt receipt before the provider request.
 Replaying the receipt therefore reconstructs every model-visible learned item
 without consulting the current FTS index.
 
+## Untrusted learned text
+
+Everything a reflection writes is untrusted model output, and the boundary has
+two halves that are deliberately not the same set.
+
+At write time an extracted experience or Memory field is refused only when its
+*encoding* cannot be resolved to what a model will read: the Unicode Tags block
+(`U+E0000..=U+E007F`), the Variation Selectors Supplement
+(`U+E0100..=U+E01EF`), and the C0/C1 controls other than tab, newline, and
+carriage return. A payload re-spelled in the Tags block contains no ASCII `<`,
+so no text scan can see it. Nothing else is refused: variation selectors, soft
+hyphens, directional marks, and prose that merely mentions `~/.ssh/config`,
+`AGENTS.md`, or a quoted injection attempt are all stored, because a record of
+an attack is exactly what this subsystem exists to keep.
+
+A refusal is per item, never per batch. The offending entry is skipped, its
+clean siblings in the same extraction are stored under their original extractor
+ordinals, the job settles `completed`, and the reason is durable in the job's
+`result` JSON as `refusedItems`: one object per discard, with the experience
+ordinal, the responsible field (`experiences.summary`, `memories.content`,
+`memories.old_text`, `memories.reason`, `memories.experience_ordinal`, or
+`memories.proposal`), and the detail. Only a failure that makes the whole job
+unusable (no durable project, session, or source message, a `memories[]` entry
+pointing outside the extractor's own list, or a confidence that is not a
+probability) settles the job `failed`. A learning job is attempted at most
+three times.
+
+Resident Memory keeps its own fence. A candidate extracted from an experience is
+proposed through the normal review path, so the injection and exfiltration
+pattern scan still runs on the exact text that would be written to the resident
+file; a hit rejects that one candidate, is reported as `memories.proposal`, and
+the experience it came from is still stored.
+
+At read time retrieval carries the rest of the boundary. The
+`learning.experiences` section escapes `&`, `<`, `>`, and `"`, announces itself
+as data rather than instruction, and replaces every invisible or reordering
+codepoint with a visible `[U+XXXX]` marker. A marker is evidence only if a
+record cannot forge one, so a literal `[` that begins `[U+` in stored text is
+emitted as `&#91;`: every `[U+` in a rendered section was inserted by the
+renderer.
+
+The reported token cost is measured on the rendered section, after escaping and
+marker expansion, so it is never lower than what the prompt actually spends. If
+`retrieval_max_context_tokens` is too small to hold the framed section plus its
+cheapest matching record, retrieval returns nothing and says so, naming the
+configured budget and the token figure that smallest record needs, so a budget
+below the floor is a visible diagnostic rather than a project that appears to
+have learned nothing.
+
 ## Feedback
 
 Feedback targets only an already persisted assistant message. A write supplies

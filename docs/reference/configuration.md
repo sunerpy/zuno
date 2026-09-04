@@ -1187,6 +1187,15 @@ store:
   records.
 - global aggregation defaults to one seven-day bucket and requires two projects.
 - automatic prompt retrieval is capped at five items and 1,200 context tokens.
+- `retrieval.max_context_tokens` is measured on the rendered
+  `learning.experiences` section, escaping and `[U+XXXX]` markers included. A
+  budget too small for the framed section plus its cheapest matching record
+  retrieves nothing and reports the token figure that record needs; it does not
+  silently disable learning.
+- A reflection that writes an unresolvable encoding (the Unicode Tags block, the
+  Variation Selectors Supplement, or a C0/C1 control) loses that one entry, not
+  the extraction. The remaining entries are stored and the discard is recorded
+  in the learning job's `result` as `refusedItems`.
 - automatic Skill proposals require three independent sessions and at most 15
   learned rules.
 - `skill.require_review` must remain `true`; configuration that disables review
