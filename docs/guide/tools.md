@@ -118,11 +118,36 @@ logs. Diagnostics identify only provider, scheme, host, path, status, and error
 category; they do not contain an API key, authorization header, or full query.
 
 `glob` and `grep` drive the official `rg` executable, with Zuno contributing only typed
-arguments, cancellation, bounded decoding, and stable ordering. Ripgrep 14 or newer must
-be available for those two tools. Discovery is lazy and scoped to them: a missing `rg`
-makes `glob` and `grep` report a typed tool error, and never a silent fallback to a
-slower walker, but it does not block Zuno from starting, reading configuration, reaching
-a provider, or opening its database.
+arguments, cancellation, bounded decoding, stable ordering, and path validation. Ripgrep
+14 or newer must be available for those two tools. Discovery is lazy and scoped to them:
+a missing `rg` makes `glob` and `grep` report a typed tool error, and never a silent
+fallback to a slower walker, but it does not block Zuno from starting, reading
+configuration, reaching a provider, or opening its database.
+
+Both tools report a refused call instead of an empty result. An unparseable pattern or
+`include` glob is invalid arguments naming the pattern `rg` itself quoted, so a refusal
+caused by the `include` is never blamed on the regex; a regex over ripgrep's own
+compiled-size limit is reported the same way. A run whose output exceeds 64 MiB is
+refused with advice to narrow the pattern, path, or `include`, because a stable order
+cannot be decided from part of a parallel walk. A `grep` restricted to one path that `rg`
+never managed to read is a refused call, not "no matches".
+
+A path is an identifier, not display text, so both tools return only paths they can name:
+every result comes back under the name the file actually has. A file whose name is not
+valid UTF-8 — a legacy encoding from an old archive, or a lone surrogate in an NTFS name
+— is left out of the results rather than reported with a replacement character that would
+name no file, and the same holds for the file a `grep` match lives in. On Linux and macOS
+a filename containing a backslash comes back verbatim, because a backslash is an ordinary
+filename byte there; on Windows, ripgrep's backslash separators are reported as `/`,
+which that platform accepts. A file name containing a newline is returned as the single
+path it is. Matching lines are capped at 2000 UTF-16 code units and a single `rg` record
+over 1 MiB is skipped; a skipped record or an unnameable path is not currently
+distinguished from the result limit in the rendered output. A directory the walk cannot
+enter contributes no results and is reported as "No files found", not as a permission
+failure: ripgrep's per-path diagnostics are suppressed so that one unreadable directory
+elsewhere under the root cannot turn the common "my pattern matched nothing" outcome into
+a tool failure. Zuno does not distinguish "not there" from "could not be read" for a
+subtree.
 
 For a Shell command that only observes remote work, set
 `backgroundPurpose: "remoteObserver"`. This value is persisted with the background

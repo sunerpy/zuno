@@ -37,9 +37,12 @@ pub enum EntryKind {
 
 /// A path a search produced, relative to the search root.
 ///
-/// The path is always forward-slashed and never carries a `./` prefix, which is the
-/// normalisation the oracle applies to every `rg` line before it becomes a
-/// `RelativePath` (`ripgrep.ts:171-175`).
+/// Never carries a `./` prefix or a leading separator, and is forward-slashed on the
+/// platform where `\` is a separator, which is the normalisation the oracle applies to
+/// every `rg` line before it becomes a `RelativePath` (`ripgrep.ts:171-175`). The path is
+/// an *identifier* the model feeds straight back into `read` or `edit`, so on Unix — where
+/// `\` is an ordinary filename byte — it is the name the file actually has, back-slashes
+/// and all. See [`normalize_relative`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Entry {
     /// The path relative to the search root.
@@ -176,13 +179,18 @@ impl GrepRequest {
 pub struct SearchResults<T> {
     /// The results, at most `limit` of them, in a deterministic order.
     pub items: Vec<T>,
-    /// Whether more results existed beyond the limit.
+    /// Whether the engine knows of a result that `items` does not carry.
     ///
-    /// Distinct from `items.len() == limit`: this is `true` only when the engine
-    /// actually saw a further result. The oracle's tools use the weaker
-    /// `len() == limit` test and so claim truncation when a tree has exactly `limit`
-    /// results; the tools in `zuno-tools` reproduce that weaker test for output
-    /// parity, and keep this field for callers that want the truth.
+    /// Deliberately *not* "the limit cut the list": it is `true` whenever the engine
+    /// saw a further result, whether the limit cut it off or the engine could not
+    /// decode the record that carried it. Both readings answer the only question the
+    /// model actually asks of this field — "is this all there is?" — and the second is
+    /// why `truncated` can be `true` with fewer than `limit` items.
+    ///
+    /// Distinct from `items.len() == limit`, which claims truncation for a tree that
+    /// has exactly `limit` results and misses a dropped record entirely. The oracle's
+    /// tools use that weaker test and the tools in `zuno-tools` reproduce it for output
+    /// parity; this field is for callers that want the truth.
     pub truncated: bool,
 }
 
@@ -209,37 +217,80 @@ impl<T> SearchResults<T> {
     }
 }
 
-/// Strips the `./` prefixes and back-slashes a `rg`-style path into the oracle's
-/// `RelativePath` form.
+/// Strips a `rg`-style path down to the oracle's `RelativePath` form.
 ///
-/// Reproduces `ripgrep.ts:171-175` literally: leading `./` or `.\` repeated any
-/// number of times, then any leading separators, then every back-slash becomes a
-/// forward slash.
+/// Reproduces `ripgrep.ts:171-175`, but only with the reductions that cannot rename a
+/// file on the platform they run on. Leading `./` repeated any number of times, and any
+/// leading `/`, go unconditionally: neither `.` as a whole component nor `/` can occur
+/// inside a filename anywhere Zuno runs, so those bytes are always separators `rg` put
+/// there. The oracle's remaining step — trimming a leading `\` and rewriting every `\`
+/// to `/` — is applied only where `\` *is* a separator, which is Windows.
+///
+/// The split exists because a `RelativePath` is an *identifier* the model feeds straight
+/// back into `read` or `edit`, and on Unix `\` is an ordinary filename byte. Applied
+/// there, the rewrite did not merely render a name oddly, it named a **different real
+/// file**: a tree holding a nested `a/b.ts` and a flat `a\b.ts` reported `a/b.ts` twice,
+/// `back\slash.ts` became a `back/slash.ts` that is not on disk, and `\lead.ts` became
+/// `lead.ts`. That is the same class as a lossy U+FFFD name — see [`relative_to`] — in
+/// its dangerous direction: the U+FFFD name opens nothing, while an alias opens the
+/// *wrong* file, so `grep` reported a hit against a file that does not contain the
+/// pattern and a write-capable `edit` keyed on that path would modify a file that never
+/// matched. A reduction that can make a path name a file it is not belongs on the deny
+/// side only, so this one is kept where `\` cannot be part of a name.
 #[must_use]
 pub fn normalize_relative(raw: &str) -> String {
+    // `cfg!` rather than `#[cfg]` so the Windows arm is compiled, linted and unit-tested
+    // on every host; `normalize_relative_with(raw, true)` is how the tests pin it.
+    normalize_relative_with(raw, cfg!(windows))
+}
+
+/// [`normalize_relative`] with the platform question answered explicitly.
+///
+/// `windows_separators` says whether `\` in `raw` is a path separator rather than a byte
+/// of a filename. It is `cfg!(windows)` in production, because every path either engine
+/// normalises came from `rg` walking the local filesystem, and it is both values in the
+/// tests so the Windows answer is pinned from any host.
+fn normalize_relative_with(raw: &str, windows_separators: bool) -> String {
     let mut rest = raw;
     loop {
         if let Some(stripped) = rest.strip_prefix("./") {
             rest = stripped;
-        } else if let Some(stripped) = rest.strip_prefix(".\\") {
-            rest = stripped;
-        } else {
-            break;
+            continue;
         }
+        // `.\dotdot..ts` is one legal flat filename on Unix, so this is only a prefix
+        // where `\` separates.
+        if windows_separators && let Some(stripped) = rest.strip_prefix(".\\") {
+            rest = stripped;
+            continue;
+        }
+        break;
     }
-    let rest = rest.trim_start_matches(['/', '\\']);
-    rest.replace('\\', "/")
+    if windows_separators {
+        rest.trim_start_matches(['/', '\\']).replace('\\', "/")
+    } else {
+        rest.trim_start_matches('/').to_owned()
+    }
 }
 
-/// Renders `path` relative to `root` in the oracle's `RelativePath` form.
+/// Renders `path` relative to `root` in the oracle's `RelativePath` form, or `None`
+/// when it has no such form.
+///
+/// `None` is the fail-closed answer for a path that is not valid UTF-8, which is
+/// reachable on every supported platform: a latin-1 name from an old archive on
+/// Linux or macOS, a lone surrogate in an NTFS name on Windows. A `RelativePath` is an
+/// *identifier* the model feeds straight back into `read` or `edit`, so rendering such
+/// a path lossily would hand back a name containing U+FFFD that matches no file — the
+/// caller has to be told there is no answer rather than given a wrong one. This is the
+/// same rule [`crate::ripgrep::Ripgrep::glob`] and `grep` apply to the paths `rg`
+/// reports.
 ///
 /// When `path` is not under `root` the whole path is normalised instead, which is
 /// more useful to a caller than an empty string; the engines never produce that case
 /// because every entry they yield came from walking `root`.
 #[must_use]
-pub fn relative_to(root: &Path, path: &Path) -> String {
+pub fn relative_to(root: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root).unwrap_or(path);
-    normalize_relative(&relative.to_string_lossy())
+    Some(normalize_relative(relative.to_str()?))
 }
 
 /// Truncates `text` to `limit` UTF-16 code units, appending `...` when it cut.
@@ -268,12 +319,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn relative_paths_lose_every_dot_slash_prefix_and_gain_forward_slashes() {
+    fn relative_paths_lose_every_dot_slash_prefix_and_leading_separator() {
         assert_eq!(normalize_relative("./src/a.ts"), "src/a.ts");
         assert_eq!(normalize_relative("././src/a.ts"), "src/a.ts");
-        assert_eq!(normalize_relative(".\\src\\a.ts"), "src/a.ts");
         assert_eq!(normalize_relative("/src/a.ts"), "src/a.ts");
         assert_eq!(normalize_relative("src/a.ts"), "src/a.ts");
+    }
+
+    #[test]
+    fn a_windows_path_gains_forward_slashes_and_the_oracles_whole_rewrite() {
+        // The oracle's rewrite in full, pinned from any host. `\` cannot occur in a
+        // Windows filename, so on that platform it can only remove separators `rg` put
+        // there: it can never make a path name a file other than the one it names.
+        assert_eq!(normalize_relative_with(".\\src\\a.ts", true), "src/a.ts");
+        assert_eq!(normalize_relative_with(".\\.\\src\\a.ts", true), "src/a.ts");
+        assert_eq!(normalize_relative_with("\\src\\a.ts", true), "src/a.ts");
+        assert_eq!(normalize_relative_with("src\\a.ts", true), "src/a.ts");
+    }
+
+    #[test]
+    fn a_back_slash_that_is_a_filename_byte_survives_the_normalisation() {
+        // The same three inputs where `\` is part of a name, which is every Unix
+        // filesystem. Rewriting `a\b.ts` to `a/b.ts` aliased one real file onto a
+        // *different* real file, `back\slash.ts` and `\lead.ts` became names that are
+        // not on disk at all, and `.\dotdot..ts` lost a prefix that was its own first
+        // two characters.
+        assert_eq!(normalize_relative_with("a\\b.ts", false), "a\\b.ts");
+        assert_eq!(
+            normalize_relative_with("back\\slash.ts", false),
+            "back\\slash.ts"
+        );
+        assert_eq!(normalize_relative_with("\\lead.ts", false), "\\lead.ts");
+        assert_eq!(
+            normalize_relative_with(".\\dotdot..ts", false),
+            ".\\dotdot..ts"
+        );
+        // And the prefix `rg` really does add is still removed, back-slash or not.
+        assert_eq!(normalize_relative_with("./a\\b.ts", false), "a\\b.ts");
+        assert_eq!(normalize_relative_with("/a\\b.ts", false), "a\\b.ts");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_platform_arm_production_takes_is_the_one_this_platform_needs() {
+        // `normalize_relative` is what both engines call, so the split is only worth
+        // anything if the public entry point picks the arm that matches the filesystem
+        // underneath it.
+        assert_eq!(normalize_relative("a\\b.ts"), "a\\b.ts");
+        assert_eq!(normalize_relative("./a\\b.ts"), "a\\b.ts");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_platform_arm_production_takes_is_the_one_this_platform_needs() {
+        assert_eq!(normalize_relative("a\\b.ts"), "a/b.ts");
+        assert_eq!(normalize_relative(".\\a\\b.ts"), "a/b.ts");
     }
 
     #[test]
@@ -328,12 +428,39 @@ mod tests {
     #[test]
     fn relative_to_falls_back_to_the_whole_path_when_it_escapes_the_root() {
         assert_eq!(
-            relative_to(Path::new("/a/b"), Path::new("/a/b/c/d.ts")),
-            "c/d.ts"
+            relative_to(Path::new("/a/b"), Path::new("/a/b/c/d.ts")).as_deref(),
+            Some("c/d.ts")
         );
         assert_eq!(
-            relative_to(Path::new("/a/b"), Path::new("/x/y.ts")),
-            "x/y.ts"
+            relative_to(Path::new("/a/b"), Path::new("/x/y.ts")).as_deref(),
+            Some("x/y.ts")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_to_names_a_back_slashed_file_as_itself() {
+        // The other public route to a `RelativePath`, on the same reduction: this
+        // answered `a/b.ts` for a flat file called `a\b.ts`, so a caller resolving it
+        // against the root opened a different file, or none.
+        assert_eq!(
+            relative_to(Path::new("/a/b"), Path::new("/a/b/c\\d.ts")).as_deref(),
+            Some("c\\d.ts")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_utf8_has_no_relative_path_form_rather_than_a_lossy_one() {
+        // The same byte sequence the search engines reject, reached through the other
+        // public route to a `RelativePath`. `to_string_lossy` answered `bad\u{fffd}.ts`,
+        // an identifier naming no file; there is no reader of this helper in the
+        // workspace today, so the point is that the next one cannot be handed one.
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = Path::new("/a/b");
+        let odd = Path::new(std::ffi::OsStr::from_bytes(b"/a/b/bad\xff.ts"));
+
+        assert_eq!(relative_to(root, odd), None);
     }
 }
