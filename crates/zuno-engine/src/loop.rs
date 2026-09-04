@@ -14,14 +14,14 @@
 
 use std::collections::BTreeMap;
 use std::num::{NonZeroU8, NonZeroU32};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::{StreamExt, stream};
 use serde_json::{Map, Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::Instrument as _;
 use uuid::Uuid;
 use zuno_db::event_log::{NewSessionEvent, append_with_connection};
@@ -107,10 +107,10 @@ const DISPATCH_STARTED_FIELD: &str = "dispatchedAtMs";
 /// Durable marker saying the writing build records tool-call hand-off at all.
 ///
 /// [`DISPATCH_STARTED_FIELD`] alone cannot answer the repair's question, because a row
-/// written before that stamp existed carries no stamp for two different reasons. The
-/// released 0.6.6 build persisted exactly `{"status","input","raw"}` for a call it then
-/// handed to the executor — measured, not assumed: see
-/// `RELEASED_PENDING_TOOL_ROW` in `tests/loop.rs`, which is that build's own output.
+/// written before that stamp existed carries no stamp for two different reasons. Every
+/// released build through 0.9.0 persisted exactly `{"status","input","raw"}` for a call
+/// it then handed to the executor — measured, not assumed: see
+/// `RELEASED_PENDING_TOOL_ROW` in `tests/loop.rs`, captured from the last such build.
 /// Reading that absence as "never dispatched" would issue the false "provably changed
 /// nothing" verdict on the first recovery after an upgrade, for exactly the population
 /// that needs the opposite, so this marker makes the absence self-describing instead:
@@ -3513,7 +3513,10 @@ fn repair_missing_tool_outputs(
         // marker the row was written before hand-off was recorded at all, and the
         // released build wrote that same shape for calls it went on to dispatch, so the
         // missing stamp is unknown rather than "never started". Unknown fails closed.
-        let hand_off_provable = state.contains_key(DISPATCH_TRACKED_FIELD);
+        // The value, not the key: a writer that spells "I do not track hand-off" as
+        // `dispatchTracked: false` (or `null`) must read as unprovable, never as proof.
+        let hand_off_provable =
+            state.get(DISPATCH_TRACKED_FIELD).and_then(Value::as_bool) == Some(true);
         let may_have_run = stamped || !hand_off_provable;
         state.insert("status".to_owned(), Value::String("error".to_owned()));
         let observed_at = now_millis();
@@ -4084,13 +4087,14 @@ impl ResolvedAttachments {
 ///
 /// Resolution is filesystem work — a whole-object read, a SHA-256 verification, a
 /// base64 encode, and on a derived-cache miss a resize plus an fsynced write — so it
-/// runs on the blocking pool rather than inline. `zuno serve` and `zuno acp` drive
-/// their turns on a current-thread runtime, where doing it inline freezes every
-/// in-flight stream, permission answer, and interrupt for the whole span. `resolved`
-/// is the turn's memo: history is re-hydrated on every step, and one object is worth
-/// reading once per turn, not once per step. The memo stops growing at
-/// [`RESOLVED_ATTACHMENT_MEMO_BYTES`] and then simply resolves again, so an
-/// image-heavy history costs time rather than unbounded memory.
+/// runs on the blocking pool rather than inline, inside the process-wide
+/// [`ATTACHMENT_RESOLVE_SLOTS`] budget. `zuno serve` and `zuno acp` drive their turns on
+/// a current-thread runtime, where doing it inline freezes every in-flight stream,
+/// permission answer, and interrupt for the whole span. `resolved` is the turn's memo:
+/// history is re-hydrated on every step, and one object is worth reading once per turn,
+/// not once per step. The memo stops growing at [`RESOLVED_ATTACHMENT_MEMO_BYTES`] and
+/// then simply resolves again, so an image-heavy history costs time rather than
+/// unbounded memory.
 ///
 /// # Errors
 ///
@@ -4123,18 +4127,8 @@ async fn resolve_history_attachments(
             let image = match resolved.get(&reference.id) {
                 Some(image) => image.clone(),
                 None => {
-                    let store = Arc::clone(store);
-                    let requested = reference.clone();
-                    let joined = tokio::task::spawn_blocking(move || {
-                        store.resolve(&requested, zuno_attachment::ImageRequestPolicy::default())
-                    })
-                    .await;
-                    let image = match joined {
-                        Ok(resolved) => resolved.map_err(TurnError::Attachment)?,
-                        Err(error) => {
-                            return Err(attachment_offload_failure(error, &reference.id));
-                        }
-                    };
+                    let image =
+                        resolve_attachment_offloaded(Arc::clone(store), reference.clone()).await?;
                     resolved.remember(reference.id.clone(), &image);
                     image
                 }
@@ -4143,15 +4137,82 @@ async fn resolve_history_attachments(
                 .insert("mime".to_owned(), Value::String(image.media_type));
             part.data
                 .insert("data".to_owned(), Value::String(image.data));
-            if !part.data.contains_key("filename")
-                && let Some(filename) = reference.filename
-            {
+            // The typed reference was sanitized while it deserialized above. The
+            // top-level duplicate that client surfaces label a part with was stored raw
+            // by older builds, so the hydrated copy carries the sanitized spelling of
+            // whatever the row holds; a name this build wrote is already a fixed point.
+            let display_name = match part.data.get("filename").and_then(Value::as_str) {
+                Some(stored) => Some(zuno_attachment::sanitize_display_filename(stored)),
+                None => reference.filename,
+            };
+            if let Some(filename) = display_name {
                 part.data
                     .insert("filename".to_owned(), Value::String(filename));
             }
         }
     }
     Ok(())
+}
+
+/// How many durable-attachment resolutions run on the blocking pool at once, process-wide.
+///
+/// One resolution is bounded by the attachment crate at its `MAX_STORED_DECODE_WORKING_BYTES`
+/// (900,000,000 bytes, pinned by that crate's own tests) of live working memory: a stored
+/// object is already on the user's disk, so its decode gate is the stored byte backstop plus
+/// the intermediate and output a refit at the 2,000-pixel request route costs, measured at
+/// 875,712 kB peak RSS for an 11313x11313 object. The offload alone removed the
+/// serialization the reactor used to provide, so without this bound N concurrent turns whose
+/// histories carry such objects are N blocking threads each holding that working set,
+/// limited only by the pool's 512 threads. Two keeps the process-wide resident ceiling for
+/// history resolution at 1.8 GB, the same order as the server's admission budget (two
+/// decodes at 512,000,000 bytes) that shares the pool; the fast path — a whole-object read
+/// and a base64 encode of an already-fit object — is short enough that two slots rarely
+/// queue. `zuno serve` and `zuno acp` ran this inline on a single-threaded reactor before
+/// the offload existed, an effective concurrency of one, so two is looser than that shipped
+/// behaviour and cannot starve a history that release served.
+const ATTACHMENT_RESOLVE_SLOTS: usize = 2;
+
+static ATTACHMENT_RESOLVE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(ATTACHMENT_RESOLVE_SLOTS)));
+
+/// Resolve one durable object on the blocking pool, inside the process-wide budget.
+///
+/// The permit moves **into** the closure rather than staying in this future. A
+/// `spawn_blocking` closure whose `JoinHandle` is dropped still runs to completion, so a
+/// permit held here would be handed back the moment an interrupted turn dropped this future
+/// while the read it queued keeps its whole-object buffer resident: the bound would limit
+/// waiting turns rather than work in flight. Released when the work ends, it bounds the
+/// resident working set, which is the only thing worth bounding.
+///
+/// # Errors
+///
+/// [`TurnError::Attachment`] with [`zuno_attachment::AttachmentError::StoreUnavailable`]
+/// when a permit cannot be had — nothing closes the budget, so this is the fail-closed
+/// answer if something ever does — or when the blocking pool drops the call; the store's
+/// own error otherwise. A panic inside the closure is re-raised, see
+/// [`attachment_offload_failure`].
+async fn resolve_attachment_offloaded(
+    store: Arc<zuno_attachment::AttachmentStore>,
+    reference: zuno_attachment::ImageAttachmentRef,
+) -> Result<zuno_attachment::ResolvedImage, TurnError> {
+    let attachment = reference.id.clone();
+    let permit = Arc::clone(&ATTACHMENT_RESOLVE)
+        .acquire_owned()
+        .await
+        .map_err(|_closed| {
+            tracing::error!(%attachment, "the attachment resolution budget is closed");
+            TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable)
+        })?;
+    let joined = tokio::task::spawn_blocking(move || {
+        let outcome = store.resolve(&reference, zuno_attachment::ImageRequestPolicy::default());
+        drop(permit);
+        outcome
+    })
+    .await;
+    match joined {
+        Ok(resolved) => resolved.map_err(TurnError::Attachment),
+        Err(error) => Err(attachment_offload_failure(error, &attachment)),
+    }
 }
 
 /// The one typed reading of a lost attachment offload, with panics kept as panics.
@@ -4189,68 +4250,245 @@ fn attachment_offload_failure(
     TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable)
 }
 
+/// The model-visible block for one durable file part.
+///
+/// Every field is read through a predicate on the way out rather than trusted from the
+/// row, because a row an older build wrote holds whatever the client sent — path
+/// separators, control characters and bidi overrides included — and the typed
+/// `attachment.filename`, which is sanitized while it deserializes, is not the value the
+/// TUI replay and ACP replay label a part with: the top-level duplicate is, so the
+/// duplicate stays in the row and is cleaned here. The durable row is never rewritten;
+/// every transformation only removes, is idempotent, and leaves a value this build wrote
+/// byte for byte. Each field gets the predicate its role calls for:
+///
+/// * `filename` is a display name: [`zuno_attachment::sanitize_display_filename`].
+/// * `title`, `description` and a resource link's `mime` are free text: the same forbidden
+///   character set without the basename reduction — a title may legitimately be a path —
+///   and a cap, [`MAX_RESOURCE_LABEL_CHARS`] or [`MAX_RESOURCE_DESCRIPTION_CHARS`].
+/// * `url` becomes the `uri` after the same characters are stripped, uncapped, because it
+///   may be a `data:` URL whose payload truncation would corrupt.
+/// * `mime` on an image is not text but a wire token every provider splices into a `data:`
+///   URL or a `media_type` field, so it is parsed the way the attachment crate parses a
+///   declared type ([`canonical_image_media_type`]). A declaration that is not one of the
+///   four image types the store can hold makes the row a resource link when it has a
+///   `url` that is not a `data:` URL, and nothing otherwise — strictly better than the
+///   released behaviour, where the provider rejected the request and the whole turn
+///   failed with it. A `data:` URL on such a row is the refused payload itself, and a
+///   link's `uri` reaches the model in full as prose.
 fn request_file_block(data: &Map<String, Value>) -> Option<RequestContentBlock> {
-    let filename = data
-        .get("filename")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let media_type = data.get("mime").and_then(Value::as_str).map(str::to_owned);
-    let payload = data.get("data").and_then(Value::as_str).map(str::to_owned);
-    if let (Some(media_type), Some(payload)) = (media_type.clone(), payload) {
-        return Some(RequestContentBlock::Image {
-            filename,
-            media_type,
-            data: payload,
-        });
+    file_part_block(FilePartFields::cloned_from(data))
+}
+
+/// Owned twin of [`request_file_block`]: the payload moves out of the row instead of being
+/// cloned, and every field passes the same predicates.
+fn take_request_file_block(data: &mut Map<String, Value>) -> Option<RequestContentBlock> {
+    file_part_block(FilePartFields::taken_from(data))
+}
+
+/// The fields of a durable file part that can reach the model, as the row holds them.
+struct FilePartFields {
+    filename: Option<String>,
+    mime: Option<String>,
+    data: Option<String>,
+    url: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    size: Option<u64>,
+}
+
+impl FilePartFields {
+    fn cloned_from(data: &Map<String, Value>) -> Self {
+        let text = |key: &str| data.get(key).and_then(Value::as_str).map(str::to_owned);
+        Self {
+            filename: text("filename"),
+            mime: text("mime"),
+            data: text("data"),
+            url: text("url"),
+            title: text("title"),
+            description: text("description"),
+            size: data.get("size").and_then(Value::as_u64),
+        }
     }
-    let uri = data.get("url").and_then(Value::as_str)?.to_owned();
+
+    fn taken_from(data: &mut Map<String, Value>) -> Self {
+        Self {
+            filename: take_string(data, "filename"),
+            mime: take_string(data, "mime"),
+            data: take_string(data, "data"),
+            url: take_string(data, "url"),
+            title: take_string(data, "title"),
+            description: take_string(data, "description"),
+            size: data.remove("size").and_then(|value| value.as_u64()),
+        }
+    }
+}
+
+/// Longest model-visible resource-link title or media-type label, in characters: the
+/// ceiling a display name already has.
+const MAX_RESOURCE_LABEL_CHARS: usize = 255;
+
+/// Longest model-visible resource-link description, in characters. A description is a
+/// sentence or a paragraph about the resource, not the resource; a client that has more to
+/// say than this sends the resource.
+const MAX_RESOURCE_DESCRIPTION_CHARS: usize = 1024;
+
+fn file_part_block(fields: FilePartFields) -> Option<RequestContentBlock> {
+    let filename = fields
+        .filename
+        .as_deref()
+        .map(zuno_attachment::sanitize_display_filename);
+    let refused_image = match (fields.data, fields.mime.as_deref()) {
+        (Some(payload), Some(declared)) => match canonical_image_media_type(declared) {
+            Some(media_type) => {
+                return Some(RequestContentBlock::Image {
+                    filename,
+                    media_type: media_type.to_owned(),
+                    data: payload,
+                });
+            }
+            None => {
+                tracing::debug!(
+                    media_type = ?declared,
+                    "a durable image part declares a media type no request may carry; the \
+                     model does not see the image"
+                );
+                true
+            }
+        },
+        _ => false,
+    };
+    let uri = sanitize_model_text(fields.url.as_deref()?, usize::MAX)?;
+    if refused_image && is_data_url(&uri) {
+        // The link would be the refused image by another route: `provider_text` renders a
+        // resource link's `uri` in full, so a `data:` URL puts the whole base64 payload the
+        // image block was just refused with into the prompt as prose. Tested on the
+        // sanitized `uri`, not the raw `url`, so an invisible character in front of the
+        // scheme cannot get it through.
+        return None;
+    }
     let name = filename.unwrap_or_else(|| {
-        uri.rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or("attachment")
-            .to_owned()
+        zuno_attachment::sanitize_display_filename(
+            uri.rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("attachment"),
+        )
     });
     Some(RequestContentBlock::ResourceLink {
         name,
         uri,
-        title: data.get("title").and_then(Value::as_str).map(str::to_owned),
-        description: data
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        media_type,
-        size: data.get("size").and_then(Value::as_u64),
+        title: fields
+            .title
+            .as_deref()
+            .and_then(|title| sanitize_model_text(title, MAX_RESOURCE_LABEL_CHARS)),
+        description: fields.description.as_deref().and_then(|description| {
+            sanitize_model_text(description, MAX_RESOURCE_DESCRIPTION_CHARS)
+        }),
+        media_type: fields
+            .mime
+            .as_deref()
+            .and_then(|mime| sanitize_model_text(mime, MAX_RESOURCE_LABEL_CHARS)),
+        size: fields.size,
     })
 }
 
-fn take_request_file_block(data: &mut Map<String, Value>) -> Option<RequestContentBlock> {
-    let filename = take_string(data, "filename");
-    let media_type = take_string(data, "mime");
-    let payload = take_string(data, "data");
-    if let (Some(media_type), Some(payload)) = (media_type.clone(), payload) {
-        return Some(RequestContentBlock::Image {
-            filename,
-            media_type,
-            data: payload,
-        });
-    }
-    let uri = take_string(data, "url")?;
-    let name = filename.unwrap_or_else(|| {
-        uri.rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or("attachment")
-            .to_owned()
-    });
-    Some(RequestContentBlock::ResourceLink {
-        name,
-        uri,
-        title: take_string(data, "title"),
-        description: take_string(data, "description"),
-        media_type,
-        size: data.remove("size").and_then(|value| value.as_u64()),
-    })
+/// The wire media type an image block may carry for a row's declared `mime`, or `None`.
+///
+/// This is the attachment crate's own parse of a declared type — parameters dropped, type
+/// and subtype case-folded as RFC 2045 allows, the aliases browsers and toolkits emit
+/// mapped — required to be one of the four formats the store can hold, which are also the
+/// four every provider's image block accepts. Anything else, from `image/svg+xml` to a type
+/// with a control character spliced into it, is not a media type a request may carry. The
+/// set lives in one place: what admission accepts is exactly what a request may carry.
+fn canonical_image_media_type(declared: &str) -> Option<&'static str> {
+    zuno_attachment::DeclaredImageMediaType::parse(declared)
+        .map(zuno_attachment::DeclaredImageMediaType::as_str)
+}
+
+/// Whether a sanitized `uri` is a `data:` URL: the scheme is case-insensitive (RFC 3986),
+/// so `DATA:` is one too.
+fn is_data_url(uri: &str) -> bool {
+    uri.as_bytes()
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"data:"))
+}
+
+/// Reduce free text from a durable row to what may reach the model: the forbidden
+/// characters removed, the first `max_chars` kept, surrounding spaces trimmed, and `None`
+/// when nothing is left rather than an empty field.
+fn sanitize_model_text(text: &str, max_chars: usize) -> Option<String> {
+    let kept: String = text
+        .chars()
+        .filter(|character| !is_forbidden_in_model_text(*character))
+        .take(max_chars)
+        .collect();
+    let kept = kept.trim();
+    (!kept.is_empty()).then(|| kept.to_owned())
+}
+
+/// Characters no model-visible text field of a durable file part may contain.
+///
+/// This is `zuno_attachment`'s display-name predicate — Cc, every Z* other than U+0020,
+/// Cf, `Default_Ignorable_Code_Point`, U+2800 BRAILLE PATTERN BLANK, private use and
+/// noncharacters — restated here because that crate exposes only
+/// [`zuno_attachment::sanitize_display_filename`], which also reduces to a basename, and a
+/// title or a URL is text that may legitimately contain a path. The two sets are pinned to
+/// each other code point by code point in `model_text_tests`, with the public sanitizer as
+/// the oracle, so neither can drift from the other unnoticed.
+fn is_forbidden_in_model_text(character: char) -> bool {
+    character.is_control()
+        || (character.is_whitespace() && character != ' ')
+        || is_invisible_format_or_ignorable(character)
+        || character == '\u{2800}'
+        || is_private_use(character)
+        || is_noncharacter(character)
+}
+
+/// Cf and `Default_Ignorable_Code_Point`, as one table: soft hyphens, zero-width joiners,
+/// bidi controls and isolates, byte-order marks, fillers, variation selectors, tag
+/// characters, and the reserved code points inside those ranges that a conforming renderer
+/// draws as nothing.
+fn is_invisible_format_or_ignorable(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
+    )
+}
+
+fn is_private_use(character: char) -> bool {
+    matches!(
+        character,
+        '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}'
+    )
+}
+
+fn is_noncharacter(character: char) -> bool {
+    let code = u32::from(character);
+    (0xfdd0..=0xfdef).contains(&code) || code & 0xfffe == 0xfffe
 }
 
 fn append_assistant_message(messages: &mut Vec<Message>, message: &MessageWithParts) {
@@ -5863,6 +6101,256 @@ mod attachment_offload_tests {
         assert!(
             matches!(error.recovery(), TurnRecovery::Fail),
             "{error:?} must not be retried against a runtime that is going away"
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_text_tests {
+    use super::{
+        FilePartFields, RequestContentBlock, file_part_block, is_forbidden_in_model_text,
+        sanitize_model_text,
+    };
+
+    /// The engine's forbidden set is the attachment crate's, code point for code point.
+    ///
+    /// The oracle is the one public sanitizer: a lone character it strips comes back as
+    /// its `image` fallback, a lone character it keeps comes back as itself. Four
+    /// characters it treats specially for reasons unrelated to their class — the space it
+    /// trims, the `.` it reads as a directory, and the two separators it splits on — are
+    /// not part of the class comparison.
+    #[test]
+    fn the_forbidden_set_is_the_attachment_crate_s_code_point_for_code_point() {
+        let mut buffer = [0_u8; 4];
+        for code in 0..=u32::from(char::MAX) {
+            let Some(character) = char::from_u32(code) else {
+                continue;
+            };
+            if matches!(character, ' ' | '.' | '/' | '\\') {
+                continue;
+            }
+            let probe = character.encode_utf8(&mut buffer);
+            let stripped = zuno_attachment::sanitize_display_filename(probe) == "image";
+            assert_eq!(
+                is_forbidden_in_model_text(character),
+                stripped,
+                "U+{code:04X} is classified differently from the attachment crate"
+            );
+        }
+    }
+
+    #[test]
+    fn free_text_is_stripped_capped_trimmed_and_never_empty() {
+        assert_eq!(
+            sanitize_model_text("../\\evil\u{202e}gnp.exe\u{7}\n", 255).as_deref(),
+            Some("../\\evilgnp.exe"),
+            "the forbidden characters go; the path stays"
+        );
+        assert_eq!(
+            sanitize_model_text("  padded\u{3000}  ", 255).as_deref(),
+            Some("padded")
+        );
+        assert_eq!(sanitize_model_text("\u{202e}\u{7}\n", 255), None);
+        assert_eq!(sanitize_model_text("   ", 255), None);
+        assert_eq!(
+            sanitize_model_text(&"é".repeat(300), 255).as_deref(),
+            Some("é".repeat(255).as_str()),
+            "the cap is in characters, not bytes"
+        );
+    }
+
+    /// A refused image must not leak its payload as a link. A row holding inline `data`
+    /// under a media type no request may carry has already lost its image block; when its
+    /// `url` is a `data:` URL of that same payload, the resource-link fallback would hand
+    /// the whole base64 body to the model as prose, because
+    /// `RequestContentBlock::provider_text` renders a link's `uri` in full. Such a row
+    /// yields nothing. The scheme test is case-insensitive and runs on the sanitized
+    /// `uri`, so neither `DATA:` nor an invisible character in front of the scheme gets
+    /// the payload through. A refused image whose `url` points elsewhere is still a link,
+    /// as before, and that link never carries the payload.
+    #[test]
+    fn a_refused_image_with_a_data_url_is_dropped_rather_than_leaked_as_a_link() {
+        const PAYLOAD: &str =
+            "Qk06AAAAAAAAADYAAAAoAAAAAQAAAAEAAAABABgAAAAAAAQAAAATCwAAEwsAAAAAAAAAAAAAAAAA";
+        let refused = |url: &str| FilePartFields {
+            filename: Some("scan.bmp".to_owned()),
+            mime: Some("image/bmp".to_owned()),
+            data: Some(PAYLOAD.to_owned()),
+            url: Some(url.to_owned()),
+            title: None,
+            description: None,
+            size: Some(58),
+        };
+        for url in [
+            format!("data:image/bmp;base64,{PAYLOAD}"),
+            format!("DATA:image/bmp;base64,{PAYLOAD}"),
+            format!("\u{200b}data:image/bmp;base64,{PAYLOAD}"),
+        ] {
+            assert_eq!(
+                file_part_block(refused(&url)),
+                None,
+                "a refused image's own payload must not come back as a link: {url:?}"
+            );
+        }
+
+        let link = file_part_block(refused("https://example.test/scan.bmp"))
+            .expect("a refused image with an external url is still a link");
+        assert_eq!(
+            link,
+            RequestContentBlock::ResourceLink {
+                name: "scan.bmp".to_owned(),
+                uri: "https://example.test/scan.bmp".to_owned(),
+                title: None,
+                description: None,
+                media_type: Some("image/bmp".to_owned()),
+                size: Some(58),
+            }
+        );
+        let text = link
+            .provider_text()
+            .expect("a resource link has provider text");
+        assert!(
+            !text.contains(PAYLOAD),
+            "the link's prose must not carry the refused payload: {text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod attachment_resolve_budget_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{ATTACHMENT_RESOLVE, ATTACHMENT_RESOLVE_SLOTS, resolve_attachment_offloaded};
+
+    /// A 1x1 RGB PNG, small enough that the request policy resolves the admitted object
+    /// itself: one whole-object read, no refit.
+    const TINY_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mMQUDAAAACkAGEKm67eAAAAAElFTkSuQmCC";
+
+    /// A private data root that is removed even when an assertion panics first.
+    struct TempDataRoot(std::path::PathBuf);
+
+    impl TempDataRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("zuno-engine-resolve-budget-{}", std::process::id()));
+            let _ignored = std::fs::remove_dir_all(&root);
+            Self(root)
+        }
+    }
+
+    impl Drop for TempDataRoot {
+        fn drop(&mut self) {
+            let _ignored = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The bound is on work in flight, not on callers. With every slot held a resolution
+    /// must not run at all; once a slot is free it runs, and the slot comes back when the
+    /// work ends. Before, the offload took no permit: the same resolution completed with
+    /// every slot held, which is what "N concurrent turns are N unbounded blocking threads
+    /// at up to 900 MB each" looks like from inside one process.
+    ///
+    /// This is the only test in the unit binary that touches the process-wide budget; the
+    /// integration binaries are separate processes with their own statics.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resolution_waits_for_a_free_slot_and_returns_it_when_the_work_ends() {
+        let all = u32::try_from(ATTACHMENT_RESOLVE_SLOTS).expect("the budget fits a permit count");
+        let held = Arc::clone(&ATTACHMENT_RESOLVE)
+            .acquire_many_owned(all)
+            .await
+            .expect("the budget is open");
+        let root = TempDataRoot::new();
+        let store = Arc::new(
+            zuno_attachment::AttachmentStore::new(
+                &root.0,
+                "resolve-budget-test",
+                zuno_attachment::ImageAdmissionPolicy::default(),
+            )
+            .expect("create attachment store"),
+        );
+        let reference = store
+            .admit_base64_typed(TINY_PNG_BASE64, Some("image/png"), None)
+            .expect("admit tiny png");
+
+        let mut resolving = tokio::spawn(resolve_attachment_offloaded(
+            Arc::clone(&store),
+            reference.clone(),
+        ));
+        let early = tokio::time::timeout(Duration::from_millis(500), &mut resolving).await;
+        assert!(
+            early.is_err(),
+            "the resolution ran while every slot was held: {early:?}"
+        );
+        assert_eq!(ATTACHMENT_RESOLVE.available_permits(), 0);
+
+        drop(held);
+        let image = resolving
+            .await
+            .expect("the resolving task joins")
+            .expect("the object resolves once a slot is free");
+        assert_eq!(
+            image.media_type, reference.media_type,
+            "the object resolved is the one admitted"
+        );
+        assert_eq!(
+            ATTACHMENT_RESOLVE.available_permits(),
+            ATTACHMENT_RESOLVE_SLOTS,
+            "the slot is returned when the work ends"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolved_attachment_memo_tests {
+    use super::{RESOLVED_ATTACHMENT_MEMO_BYTES, ResolvedAttachments};
+
+    fn image(bytes: usize) -> zuno_attachment::ResolvedImage {
+        zuno_attachment::ResolvedImage {
+            media_type: String::new(),
+            data: "x".repeat(bytes),
+        }
+    }
+
+    fn id(digit: char) -> zuno_attachment::AttachmentId {
+        zuno_attachment::AttachmentId::parse(format!("sha256:{}", digit.to_string().repeat(64)))
+            .expect("a well-formed attachment id")
+    }
+
+    /// The ceiling is inclusive at exactly `RESOLVED_ATTACHMENT_MEMO_BYTES`, one byte
+    /// past it is resolved again rather than memoized, a refusal evicts nothing, and a
+    /// total that would overflow refuses instead of wrapping.
+    #[test]
+    fn the_memo_admits_exactly_its_byte_ceiling_and_nothing_past_it() {
+        let mut memo = ResolvedAttachments::new();
+        memo.remember(id('a'), &image(RESOLVED_ATTACHMENT_MEMO_BYTES));
+        assert!(
+            memo.get(&id('a')).is_some(),
+            "exactly the ceiling is retained"
+        );
+        memo.remember(id('b'), &image(1));
+        assert!(
+            memo.get(&id('b')).is_none(),
+            "one byte past the ceiling is not"
+        );
+        assert!(
+            memo.get(&id('a')).is_some(),
+            "a refused entry evicts nothing"
+        );
+
+        let mut memo = ResolvedAttachments::new();
+        memo.remember(id('c'), &image(RESOLVED_ATTACHMENT_MEMO_BYTES + 1));
+        assert!(
+            memo.get(&id('c')).is_none(),
+            "a lone payload over the ceiling is not"
+        );
+
+        let mut memo = ResolvedAttachments::new();
+        memo.retained_bytes = usize::MAX;
+        memo.remember(id('d'), &image(1));
+        assert!(
+            memo.get(&id('d')).is_none(),
+            "an overflowing total refuses, not wraps"
         );
     }
 }

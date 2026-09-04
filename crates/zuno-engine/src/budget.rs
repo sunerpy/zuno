@@ -96,6 +96,17 @@ pub enum BudgetStopKind {
     ToolCallBudget,
     /// Usage cannot be measured, so the allowance cannot be honoured.
     UsageUnknown,
+    /// A tool call in this session changed authoritative state it never accounted for,
+    /// and nobody has inspected that state yet.
+    ///
+    /// Not an allowance, but the same shape of limit: automatic execution may not
+    /// continue past it. The durable obligation lives in the tool row (`state.outcome =
+    /// "uncertain"`, read back by `MessageStore::pending_uncertain_tool_calls`); this
+    /// kind is only how a host-owned policy says so at the one point that is guaranteed
+    /// to see it — [`TurnBudgetPolicy::before_request`] runs after the turn's history
+    /// repair and before its first provider request, so an obligation the repair itself
+    /// records is visible to the very step that would otherwise dispatch on top of it.
+    UncertainSideEffect,
 }
 
 impl BudgetStopKind {
@@ -107,6 +118,7 @@ impl BudgetStopKind {
             Self::TimeBudget => "time_budget",
             Self::ToolCallBudget => "tool_call_budget",
             Self::UsageUnknown => "usage_unknown",
+            Self::UncertainSideEffect => "uncertain_side_effect",
         }
     }
 }
@@ -165,6 +177,15 @@ impl BudgetDecision {
             detail: detail.into(),
         })
     }
+
+    /// Stop the turn because an uncertain side effect is still awaiting inspection.
+    #[must_use]
+    pub fn stop_uncertain_side_effect(detail: impl Into<String>) -> Self {
+        Self::Stop(BudgetStop {
+            kind: BudgetStopKind::UncertainSideEffect,
+            detail: detail.into(),
+        })
+    }
 }
 
 /// Why a [`TurnBudgetPolicy`] could not answer.
@@ -192,6 +213,13 @@ pub enum BudgetPolicyError {
 #[async_trait]
 pub trait TurnBudgetPolicy: Send + Sync {
     /// Called before each provider request, after the prompt is estimated.
+    ///
+    /// Ordering the loop guarantees: on every step this runs after the turn's history
+    /// repair has committed and before the request is sent, so nothing this step goes
+    /// on to dispatch has been issued yet. A policy that reads durable state here sees
+    /// every inspection obligation the repair recorded for this session, which is what
+    /// makes [`BudgetDecision::stop_uncertain_side_effect`] enforceable for the whole
+    /// recovering turn rather than only at its head.
     ///
     /// # Errors
     ///
@@ -389,6 +417,13 @@ mod tests {
                 _ => panic!("expected a stop"),
             },
             "tool_call_budget"
+        );
+        assert_eq!(
+            match BudgetDecision::stop_uncertain_side_effect("1 call awaits inspection") {
+                BudgetDecision::Stop(stop) => stop.kind.code(),
+                _ => panic!("expected a stop"),
+            },
+            "uncertain_side_effect"
         );
     }
 
