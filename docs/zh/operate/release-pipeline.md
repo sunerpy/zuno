@@ -27,6 +27,16 @@ PR base SHA 等于触发本次控制器的 `main` commit，验证由机器人创
 恰好只有这一个 parent，并再次读取 PR，确认 base/head 组合仍然一致。过期的 API 视图只会在
 有界时间内重试，绝不会作为候选的 expected SHA 被调度。
 
+release-please 用 conventional-commits 解析器读取每个已合并 PR 的 squash 提交，任何一条无法解析的
+提交都会被静默跳过：release run 仍显示成功，日志里只有 `commit could not be parsed` 与
+`Considering: 0 commits`，而 Release PR 不会出现。不带显式正文的 squash 合并会让 GitHub 把分支上
+全部 commit 的消息拼进提交正文，其中一行形如 footer、括号不配对，就足以让整条提交解析失败
+（51 个 commit 的批次 3 合并产生了 1891 行正文，0.10.1 的 PR 因此没有被创建）。合并多 commit 的
+PR 时用 `gh pr merge --squash --subject '<conventional 主题>' --body '<简短正文>'`，或在正文里用
+`BEGIN_COMMIT_OVERRIDE` … `END_COMMIT_OVERRIDE` 块写明想让 release-please 看到的消息；每次合并到
+`main` 之后确认 `chore: release X.Y.Z` PR 确实出现。若某次合并已被跳过，再落一个小 PR，其 squash
+正文用 override 块补上被漏掉的变更，release-please 就会记录它。
+
 当文档类或其他不计入版本的提交推进 `main` 时，release-please 可能不会刷新已有 Release PR，
 导致其 head 仍以旧 `main` 为 parent。控制器连续观察到同一个稳定的过期身份后，会拉取同仓库
 release 分支，独立复核单一 parent、机器人作者与 `chore: release` 标题，并确认旧 parent 是
