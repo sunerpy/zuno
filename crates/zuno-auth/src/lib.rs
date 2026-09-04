@@ -99,7 +99,7 @@ pub use crate::openai::{
 };
 pub use crate::provider::{AuthStore, Credential, Credentials, OAUTH_DUMMY_KEY, ZUNO_AUTH_CONTENT};
 pub use crate::secret::{REDACTED, Secret};
-pub use crate::store::{CREDENTIAL_FILE_MODE, PermissionWarning};
+pub use crate::store::{CREDENTIAL_FILE_MODE, PermissionWarning, StoreDamage};
 
 #[cfg(test)]
 mod tests {

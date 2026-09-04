@@ -6697,6 +6697,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zuno-atomic-file",
  "zuno-error",
  "zuno-network",
  "zuno-paths",
