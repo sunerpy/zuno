@@ -908,11 +908,12 @@ pub struct PlanStepPatch {
     pub status: Option<PlanStepStatus>,
 }
 
-/// Model-facing operation interface for durable Plans.
-///
-/// Internal host callers keep using [`PlanUpdateParams`] for atomic objective-boundary
-/// transactions. Model calls never replace an existing snapshot: they name only the
-/// fields or steps that changed, while the host owns newly-created step identifiers.
+/// One tagged operation on the durable Plan: name only the fields or steps that changed;
+/// the host assigns ids to new steps.
+//
+// Internal host callers keep using [`PlanUpdateParams`] for atomic objective-boundary
+// transactions. This doc comment is the parameter schema's root `description` and is sent
+// to the provider on every request, so it stays short and model-facing.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlanMutationParams {
@@ -3118,6 +3119,45 @@ mod tests {
         assert!(
             store.items("ses").expect("list items").is_empty(),
             "a rejected graph must not leave either row behind"
+        );
+    }
+
+    #[test]
+    fn plan_update_wire_schema_exposes_every_action() {
+        // Before the fold in `zuno_tool::schema`, the wire schema was
+        // `{"type":"object","properties":{intent, accept_large_output}}`: the model could not
+        // see `action`, sent `{"intent": …}`, the schema validator waved it through, and only
+        // the typed parse blocked the call with `missing field \`action\``.
+        let schema = zuno_tool::schema::params_schema::<PlanMutationParams>();
+
+        assert_eq!(schema["type"], "object");
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            serde_json::json!(["create", "patch", "append", "push", "pop"])
+        );
+        assert_eq!(schema["required"], serde_json::json!(["action"]));
+        for field in [
+            "expected_revision",
+            "goal_id",
+            "title",
+            "steps",
+            zuno_tool::schema::INTENT_KEY,
+        ] {
+            assert!(
+                schema["properties"][field].is_object(),
+                "{field} must reach the provider"
+            );
+        }
+        let description = schema["properties"]["action"]["description"]
+            .as_str()
+            .expect("action explains each operation");
+        assert!(
+            description.contains("create requires title, steps"),
+            "{description}"
+        );
+        assert!(
+            description.contains("pop requires expected_revision"),
+            "{description}"
         );
     }
 }

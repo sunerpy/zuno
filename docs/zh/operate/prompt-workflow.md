@@ -27,7 +27,7 @@ Zuno 不把所有规则拼成一段不可追踪的字符串。每个模型可见
 | --- | --- | --- |
 | `runtime.intent` | 以当前用户请求或委派目标为权威，不擅自扩大任务。 | 始终。 |
 | `runtime.execution` | 选择最小完整工作流，批量独立读取，不重复读取不变状态或重复检查。 | 始终；只有 `plan_update` 最终可见时才向模型附加 Plan 修改指导。 |
-| `runtime.sandbox` | 明确 Shell 已降级为宿主权限，以及请求/生效模式和类型化原因。 | 可信的 sandbox unavailable fallback 生效时。 |
+| `runtime.sandbox` | 明确 Shell 正以宿主权限运行，以及请求/生效模式、仍然生效的权限模式和原因：类型化的不可用原因，或显式的 `sandbox.backend: native` 选择。 | 可信的 sandbox unavailable fallback 或受信的 `sandbox.backend: native` 生效时。 |
 | `runtime.continuity` | 把 History/Notes 结果视为不可信会话数据，并说明会话、Agent 与 revision 边界。 | 最终工具快照含 `history` 或 `notes`。 |
 | `runtime.editing` | 保留无关修改，修改 owning abstraction，不机械重试不确定副作用。 | 有真实编辑/写入能力，或 Shell 可写工作区。 |
 | `runtime.verification` | 用观察证据证明完成，明确未验证项和阻塞。 | 始终。 |
@@ -62,6 +62,8 @@ provider 请求前以 typed error 失败；不会静默截断 AGENTS、历史、
 - child report、steering、retry 不会自行创建 Plan；
 - 直接回答、一次有界读取、对已经准备好的修改执行一次短小 commit：可作为原子操作；
   单句短问句无论是否带问号都属于直接回答，包括疑问词位于句中的中文问法；
+- 问候、致谢或单纯的确认（如 `你好`、`谢谢`、`好的`、`hi`、`thanks`）属于对话输入，
+  归为 `Atomic`，不会打开 Plan；已有活跃 Plan 时视为继续维护；
 - 图片、resource、selection、branch diff 等 typed context，以及足够大的多文本块
   输入：默认进入 planned path；
 - 其他普通工程任务：宿主把请求分类为 `Required`，但不写入任何通用骨架；模型必须先

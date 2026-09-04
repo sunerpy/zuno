@@ -223,3 +223,51 @@ impl TypedTool for NotesTool {
         Ok(ToolOutput::text(NOTES_TOOL_ID, output).with_metadata("continuityKind", "notes"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notes_wire_schema_exposes_every_action() {
+        // A root `#[serde(tag = "action")]` enum used to reach the provider as an empty
+        // object schema, so the model had to infer the operation names from prose.
+        let schema = zuno_tool::schema::params_schema::<NotesParams>();
+
+        assert_eq!(schema["type"], "object");
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            serde_json::json!([
+                "list_files_by_prefix",
+                "read_file",
+                "search_contents",
+                "append_to_file",
+                "write_file",
+            ])
+        );
+        assert_eq!(schema["required"], serde_json::json!(["action"]));
+        for field in [
+            "prefix",
+            "cursor",
+            "limit",
+            "name",
+            "query",
+            "content",
+            "expected_revision",
+            zuno_tool::schema::INTENT_KEY,
+        ] {
+            assert!(
+                schema["properties"][field].is_object(),
+                "{field} must reach the provider"
+            );
+        }
+        let description = schema["properties"]["action"]["description"]
+            .as_str()
+            .expect("action explains each operation");
+        assert!(
+            description.contains("write_file")
+                && description.contains("name, content, expected_revision"),
+            "{description}"
+        );
+    }
+}

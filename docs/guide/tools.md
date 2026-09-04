@@ -59,7 +59,10 @@ but it does not generate visible generic steps. The model uses
 `patch` changes only named step ids, `append` adds host-identified steps, `push`
 opens a focused child, and `pop` restores the exact parent without retransmitting
 the Plan. Every existing-Plan mutation requires the current
-`expected_revision`. `completed` and `superseded` are terminal.
+`expected_revision`. `completed` and `superseded` are terminal. On `plan_update`,
+`notes`, and `history`, `action` is a required enum: the wire schema lists every
+operation and the fields each one needs, so a call that names no operation is
+rejected before it reaches the tool.
 
 Before successful delivery, a durable reconciliation driver checks Plan, Todo,
 Job, Goal, tool-result, and verification state. Ordinary sessions holding
