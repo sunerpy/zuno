@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/sunerpy/zuno/compare/v0.9.1...v0.10.0) (2026-09-04)
+
+
+### Features
+
+* **sandbox:** explicit trusted native Shell backend, no Plan for greetings, and session resume that keeps Agent/model/level ([#105](https://github.com/sunerpy/zuno/issues/105)) ([bea795a](https://github.com/sunerpy/zuno/commit/bea795abe78977d4058a62102a7bba9bbf042830))
+
 ## [0.9.1](https://github.com/sunerpy/zuno/compare/v0.9.0...v0.9.1) (2026-09-04)
 
 
