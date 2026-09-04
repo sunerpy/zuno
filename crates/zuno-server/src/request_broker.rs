@@ -2232,14 +2232,23 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
-
         // The ceiling is on the *real* clock, not this test's paused one: the asker
         // settles its durable row on the blocking pool, and `tokio::time::timeout` under
         // a paused clock with an idle reactor jumps ahead of that write. The spin keeps
         // the runtime runnable (so the paused clock never auto-advances) while
         // `std::time::Instant` bounds how long a regression can hang the suite, which
         // `cargo test` alone would not.
+        //
+        // The clock jumps by a full deadline on *every* turn of the wait, not once up
+        // front. The ask becomes visible when the blocking pool marks its row persisted,
+        // but the watchdog that owns the deadline is spawned only after the asker resumes
+        // from that write, and it arms its timer on its own first poll. A single jump
+        // taken as soon as the ask shows up can therefore land before the timer exists;
+        // a timer armed after the jump sits a whole deadline ahead of a clock this spin
+        // never lets auto-advance, and nothing releases the asker until the ceiling fires
+        // (about 1 run in 20 on Linux, more often under Windows scheduling). Jumping on
+        // every turn reaches a timer armed at any point, and `advance` yields, so each
+        // turn also lets the watchdog, the asker, and the settle write make progress.
         let ceiling = std::time::Instant::now() + Duration::from_secs(60);
         let mut answer = std::pin::pin!(answer);
         let outcome = loop {
@@ -2250,7 +2259,7 @@ mod tests {
                 std::time::Instant::now() < ceiling,
                 "the elapsed deadline never released the asker"
             );
-            tokio::task::yield_now().await;
+            tokio::time::advance(DEFAULT_REQUEST_TIMEOUT).await;
         };
         assert_eq!(outcome, ReplyKind::Reject);
         let recorded = HumanRequestStore::new(pool)

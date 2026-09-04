@@ -920,6 +920,14 @@ mod tests {
     ///
     /// The stall is inside the TLS handshake, which is the case the round-1 bound missed:
     /// only `TcpStream::connect` was bounded, so this fixture held the entire request.
+    ///
+    /// The witness that the next address got its turn is a second listener that records
+    /// the connection it accepts, not a closed port. A closed loopback port is refused
+    /// instantly on Linux, but Windows retransmits the SYN after the RST and only reports
+    /// `ConnectionRefused` about a second later, so under a sub-second per-address budget
+    /// the second attempt's own timeout arrives first. Observing the accept proves the
+    /// attempt on every platform without depending on the kernel's connect-retry policy,
+    /// and the kind of the failure at the second address is not what this test is about.
     #[tokio::test]
     async fn a_stalled_handshake_yields_to_the_next_validated_address() {
         let stalling = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -931,17 +939,22 @@ mod tests {
             let _held = stalling.accept().await.expect("accept the ClientHello");
             std::future::pending::<()>().await;
         });
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let witness = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind a port to learn a free one");
-        let refused = closed.local_addr().expect("listener address");
-        drop(closed);
+            .expect("bind a witness fixture");
+        let next = witness.local_addr().expect("witness address");
+        let reached = tokio::spawn(async move {
+            // Accept and hang up at once. The accepted connection is the evidence that the
+            // walk moved on, and closing it fails the handshake with a socket error rather
+            // than leaving a second stall to time out.
+            let (stream, _) = witness.accept().await.expect("accept the second attempt");
+            drop(stream);
+        });
 
-        let client = test_client_over(
+        let mut client = test_client_over(
             Arc::new(FixedResolver(vec![public_address(stalled.port())])),
-            vec![stalled, refused],
+            vec![stalled, next],
         );
-        let mut client = client;
         client
             .transport
             .set_establish_timeout_for_tests(Duration::from_millis(250));
@@ -955,15 +968,19 @@ mod tests {
         .await
         .expect("a stalled handshake must not hold the whole request")
         .expect_err("neither address can serve the request");
+        // The request has already failed, so if the witness has not accepted by now it
+        // never will: the timeout only bounds how long a failing test waits to say so.
+        tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .expect("the second validated address must get its turn after the stall")
+            .expect("the witness fixture must not panic");
         let PublicHttpError::Transport { source, .. } = &error else {
-            panic!("a stalled address and a refused port are both weather: {error:?}");
+            panic!("a stalled address and a hung-up address are both weather: {error:?}");
         };
-        assert_eq!(
-            source.kind(),
-            io::ErrorKind::ConnectionRefused,
-            "the second validated address must get its turn: {source:?}"
+        assert!(
+            error.is_transient(),
+            "no peer made a decision about the destination: {source:?}"
         );
-        assert!(error.is_transient(), "{error:?}");
         accepted.abort();
     }
 

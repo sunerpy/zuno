@@ -628,8 +628,18 @@ fn normalize_absolute(path: &Path) -> PathBuf {
 /// so a dangling link is "missing" in both; the kernel resolves a path left to right and
 /// stops at the first component it cannot enter, so once the whole path is `NotFound`
 /// every shorter prefix either exists or is `NotFound` too — the property the search
-/// relies on — and a file in the middle (`NotADirectory`), a permission refusal or a
-/// link loop is reported by the first `canonicalize` before any search runs.
+/// relies on — and a permission refusal or a link loop is reported by the first
+/// `canonicalize` before any search runs.
+///
+/// A regular file in the middle of the path is an error, not a missing tail, on every
+/// platform, but the platforms report it differently. Unix returns `ENOTDIR`
+/// (`NotADirectory`) from the first `canonicalize`, so the search never runs. Windows
+/// returns `ERROR_PATH_NOT_FOUND` for any component it cannot enter, whether that
+/// component is absent or a file, and `std` maps it to `NotFound` — so the search runs,
+/// lands on the file as the deepest existing prefix, and would re-join the tail beneath
+/// it as though it were a directory. The deepest existing prefix is therefore required to
+/// be a directory before the tail is re-joined, using the metadata the search already
+/// fetched, and the failure is reported as `NotADirectory` so both platforms agree.
 fn canonicalize_allow_missing(path: &Path) -> io::Result<PathBuf> {
     let missing = match path.canonicalize() {
         Ok(canonical) => return Ok(canonical),
@@ -639,17 +649,30 @@ fn canonicalize_allow_missing(path: &Path) -> io::Result<PathBuf> {
     let components: Vec<Component<'_>> = path.components().collect();
     let prefix = |count: usize| -> PathBuf { components[..count].iter().collect() };
     // Every prefix of `existing` components exists; the prefix of `absent` does not.
+    // `deepest` is the metadata of the prefix of `existing`, kept from the probe that
+    // found it so the directory check below costs no further filesystem call.
     let (mut existing, mut absent) = (0_usize, components.len());
+    let mut deepest: Option<std::fs::Metadata> = None;
     while absent - existing > 1 {
         let probe = existing + (absent - existing) / 2;
         match std::fs::metadata(prefix(probe)) {
-            Ok(_) => existing = probe,
+            Ok(metadata) => {
+                existing = probe;
+                deepest = Some(metadata);
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => absent = probe,
             Err(error) => return Err(error),
         }
     }
-    if existing == 0 {
+    // No probe succeeded: `existing` is still zero and nothing of the path exists.
+    let Some(deepest) = deepest else {
         return Err(missing);
+    };
+    if !deepest.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", slash(&prefix(existing))),
+        ));
     }
     let mut canonical = prefix(existing).canonicalize()?;
     for component in &components[existing..] {
@@ -711,14 +734,26 @@ mod canonicalize_tests {
         );
     }
 
+    /// Unix reports the file as `ENOTDIR` from the first `canonicalize`. Windows reports
+    /// `ERROR_PATH_NOT_FOUND`, which `std` maps to `NotFound` exactly as it does a missing
+    /// directory, so there the search itself has to notice that the deepest existing
+    /// prefix is not a directory; before it did, this resolved to the phantom path
+    /// `…\file\child` natively on Windows. Both platforms now report `NotADirectory`,
+    /// and a longer missing tail beneath the file changes nothing.
     #[test]
     fn a_file_in_the_middle_is_an_error_not_a_missing_tail() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonical root");
         std::fs::write(root.join("file"), "x").expect("file");
 
-        let error = canonicalize_allow_missing(&root.join("file/child")).expect_err("ENOTDIR");
-        assert_ne!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        for tail in ["file/child", "file/child/grandchild"] {
+            let error = canonicalize_allow_missing(&root.join(tail)).expect_err("not a directory");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::NotADirectory,
+                "{tail}: {error}"
+            );
+        }
     }
 
     /// The S8 reviewer's input: a real 500-deep tree plus a 500-component missing tail,

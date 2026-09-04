@@ -12,7 +12,7 @@
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -98,29 +98,21 @@ impl Drop for WellKnownFixture {
     }
 }
 
-/// A remote-chosen command that leaves a marker file when it runs and prints a token.
-///
-/// `exit_code` other than zero makes it fail after leaving the marker, which is how
-/// "it ran but the credential must not be stored" is told apart from "it never ran".
-fn remote_command(marker: &Path, exit_code: i32) -> serde_json::Value {
-    let marker = marker.display();
-    if cfg!(windows) {
-        serde_json::json!([
-            "cmd",
-            "/C",
-            format!("echo spawned > \"{marker}\" && echo TOKEN && exit {exit_code}")
-        ])
-    } else {
-        serde_json::json!([
-            "sh",
-            "-c",
-            format!("echo spawned > '{marker}' && echo TOKEN && exit {exit_code}")
-        ])
-    }
-}
-
 fn well_known_document(command: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"auth": {"command": command, "env": "ACME_TOKEN"}})
+}
+
+/// Split a well-known `command` array into the program and its arguments, the way the
+/// login does, so a test can check that exactly what was served is what was shown.
+fn argv(command: &serde_json::Value) -> (&str, Vec<&str>) {
+    let elements: Vec<&str> = command
+        .as_array()
+        .expect("the command is an array")
+        .iter()
+        .map(|element| element.as_str().expect("each command element is a string"))
+        .collect();
+    let (program, arguments) = elements.split_first().expect("the command names a program");
+    (program, arguments.to_vec())
 }
 
 struct Sandbox {
@@ -138,6 +130,44 @@ impl Sandbox {
 
     fn marker(&self) -> PathBuf {
         self.root.path().join("remote-command-ran")
+    }
+
+    /// The remote-chosen command: it leaves the marker file when it runs, prints a
+    /// token, and exits with `exit_code`. A code other than zero makes it fail after
+    /// leaving the marker, which is how "it ran but the credential must not be stored"
+    /// is told apart from "it never ran".
+    ///
+    /// On Unix the command is an inline `sh -c` script. On Windows it is a `.cmd` script
+    /// written into the sandbox and named by path, because `cmd /C` takes the rest of its
+    /// command line as text rather than as argv: the `\"` that a CRT-style spawn (Rust's
+    /// `Command`, like Node's or Python's) uses to carry an inner quote is not an escape
+    /// to cmd.exe, so an inline command that quotes the marker path never runs as
+    /// written. A script path is the one argument cmd.exe keeps intact even when it
+    /// contains spaces, and it is what a real document targeting Windows would name.
+    /// `/D` keeps a developer host's AutoRun commands from writing into the token.
+    fn remote_command(&self, exit_code: i32) -> serde_json::Value {
+        let marker = self.marker();
+        let marker = marker.display();
+        #[cfg(windows)]
+        {
+            let script = self.root.path().join("remote-command.cmd");
+            std::fs::write(
+                &script,
+                format!(
+                    "@echo off\r\necho spawned > \"{marker}\"\r\necho TOKEN\r\nexit {exit_code}\r\n"
+                ),
+            )
+            .expect("write the remote command script");
+            serde_json::json!(["cmd", "/D", "/C", script.display().to_string()])
+        }
+        #[cfg(not(windows))]
+        {
+            serde_json::json!([
+                "sh",
+                "-c",
+                format!("echo spawned > '{marker}' && echo TOKEN && exit {exit_code}")
+            ])
+        }
     }
 
     fn auth_json(&self) -> PathBuf {
@@ -187,8 +217,7 @@ fn stderr(output: &Output) -> String {
 #[test]
 fn a_url_login_without_a_terminal_or_the_trust_flag_fetches_spawns_and_stores_nothing() {
     let sandbox = Sandbox::new();
-    let fixture =
-        WellKnownFixture::serve(well_known_document(remote_command(&sandbox.marker(), 0)));
+    let fixture = WellKnownFixture::serve(well_known_document(sandbox.remote_command(0)));
 
     let output = sandbox.login(&[fixture.base_url.as_str()]);
 
@@ -221,8 +250,8 @@ fn a_url_login_without_a_terminal_or_the_trust_flag_fetches_spawns_and_stores_no
 #[test]
 fn the_trust_flag_shows_the_remote_command_runs_it_and_stores_the_credential_after_success() {
     let sandbox = Sandbox::new();
-    let fixture =
-        WellKnownFixture::serve(well_known_document(remote_command(&sandbox.marker(), 0)));
+    let command = sandbox.remote_command(0);
+    let fixture = WellKnownFixture::serve(well_known_document(command.clone()));
 
     let output = sandbox.login(&[fixture.base_url.as_str(), "--trust-remote-command"]);
 
@@ -232,15 +261,21 @@ fn the_trust_flag_shows_the_remote_command_runs_it_and_stores_the_credential_aft
         output.status.success(),
         "stdout: {stdout}\nstderr: {stderr}"
     );
-    let program = if cfg!(windows) { "cmd" } else { "sh" };
+    let (program, arguments) = argv(&command);
     assert!(
         stderr.contains(&format!("program: {program:?}")),
         "the program must be shown before it runs: {stderr}"
     );
     assert!(
-        stderr.contains("arguments (2):") && stderr.contains("echo spawned"),
-        "every argument must be shown: {stderr}"
+        stderr.contains(&format!("arguments ({}):", arguments.len())),
+        "the argument count must be shown: {stderr}"
     );
+    for argument in &arguments {
+        assert!(
+            stderr.contains(&format!("{argument:?}")),
+            "every argument must be shown as served, {argument:?} was not: {stderr}"
+        );
+    }
     assert!(stderr.contains("the remote host did"), "{stderr}");
     assert!(
         stderr.contains("without confirmation because --trust-remote-command"),
@@ -266,8 +301,7 @@ fn the_trust_flag_shows_the_remote_command_runs_it_and_stores_the_credential_aft
 #[test]
 fn a_trusted_remote_command_that_fails_stores_no_credential() {
     let sandbox = Sandbox::new();
-    let fixture =
-        WellKnownFixture::serve(well_known_document(remote_command(&sandbox.marker(), 3)));
+    let fixture = WellKnownFixture::serve(well_known_document(sandbox.remote_command(3)));
 
     let output = sandbox.login(&[fixture.base_url.as_str(), "--trust-remote-command"]);
 

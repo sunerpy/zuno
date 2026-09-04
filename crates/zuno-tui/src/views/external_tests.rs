@@ -722,23 +722,112 @@ impl CommandRunner for CapturingRunner {
     }
 }
 
+/// The arm of the copy ladder this host can prove end to end.
+///
+/// [`SystemClipboard::for_environment`] is bound to the host twice over: [`path_candidates`]
+/// splits `PATH` with the separator of the [`Platform`] it is handed, and
+/// [`is_resolved_program`] asks the host filesystem whether the joined candidate is an
+/// absolute file. A fixture that builds `PATH` from a real temporary directory therefore
+/// has to hand the probe the host's own platform and plant the helper that platform's
+/// ladder asks for. Driving the Linux ladder on a Windows host does not fail for want of
+/// an executable — the probe is `is_file`, which is extension-blind on every platform, and
+/// the runner under these tests captures the argv instead of spawning it — it fails
+/// because `C:\Users\...\real-bin` splits on its drive-letter colon into `C` and
+/// `\Users\...\real-bin`, and `C\xclip` is relative while `\Users\...\real-bin\xclip` has
+/// a root but no prefix, so neither is absolute. Every Unix host reads the Linux ladder's
+/// `PATH` and its paths the way Linux does, so there the Linux arms stand in unchanged.
+struct HostArm {
+    platform: Platform,
+    /// What [`path_candidates`] splits `PATH` on for `platform`.
+    separator: char,
+    /// The program the arm asks `PATH` for, under exactly that name.
+    helper: &'static str,
+    /// The `wayland` flag `for_environment` computes from the environment under test.
+    wayland: bool,
+}
+
+impl HostArm {
+    /// The arm reached with `WAYLAND_DISPLAY` unset.
+    #[cfg(not(windows))]
+    const WITHOUT_WAYLAND: Self = Self {
+        platform: Platform::Linux,
+        separator: ':',
+        helper: "xclip",
+        wayland: false,
+    };
+
+    /// The arm reached with `WAYLAND_DISPLAY` set.
+    #[cfg(not(windows))]
+    const WITH_WAYLAND: Self = Self {
+        platform: Platform::Linux,
+        separator: ':',
+        helper: "wl-copy",
+        wayland: true,
+    };
+
+    /// Windows has one arm whatever the display variables say, so both fixtures reach
+    /// PowerShell; the flag still records what the environment under test implies.
+    #[cfg(windows)]
+    const WITHOUT_WAYLAND: Self = Self {
+        platform: Platform::Windows,
+        separator: ';',
+        helper: "powershell.exe",
+        wayland: false,
+    };
+
+    /// See [`Self::WITHOUT_WAYLAND`].
+    #[cfg(windows)]
+    const WITH_WAYLAND: Self = Self {
+        platform: Platform::Windows,
+        separator: ';',
+        helper: "powershell.exe",
+        wayland: true,
+    };
+
+    /// Plants the helper in `directory` and returns the path the probe has to prove.
+    ///
+    /// The body is never run — the probe is `is_file`, and the runner under these tests
+    /// captures the argv — so it says so instead of pretending to be a program. That also
+    /// keeps the fixture honest on Windows, where the arm asks for `powershell.exe` by
+    /// its full name and the probe appends no `PATHEXT` extension to anything.
+    fn plant(&self, directory: &Path) -> PathBuf {
+        let helper = directory.join(self.helper);
+        std::fs::write(
+            &helper,
+            b"the clipboard probe checks that this file exists; nothing runs it\n",
+        )
+        .expect("plant the helper");
+        helper
+    }
+
+    /// The argv the arm builds once the probe proves `helper`: the ladder's own answer for
+    /// exactly that file, so the fixture does not restate the PowerShell script and the
+    /// property under test stays which *file* reaches the spawn.
+    fn argv_for(&self, helper: &Path) -> Vec<String> {
+        copy_command(self.platform, self.wayland, |program| {
+            (program == self.helper).then(|| helper.to_path_buf())
+        })
+        .expect("the arm resolves its helper")
+    }
+}
+
 #[test]
 fn views_external_the_probe_hands_the_spawn_the_file_it_proved() {
     // The decided path must be the used path. `for_environment` proves one candidate is a
     // file, and that candidate — absolute, inside the directory the probe walked — is what
     // reaches the runner. A bare name would be resolved a second time by the spawn, from a
     // list the probe never consulted.
+    let arm = HostArm::WITHOUT_WAYLAND;
     let directory = tempfile::tempdir().expect("clipboard probe fixture");
     let installed = directory.path().join("real-bin");
     std::fs::create_dir(&installed).expect("create the PATH directory");
-    let helper = installed.join("xclip");
-    std::fs::write(&helper, b"#!/bin/sh\nexec cat >/dev/null\n").expect("plant the helper");
+    let helper = arm.plant(&installed);
 
     let captured = CapturedRun::shared();
     // No sink: a flushed OSC 52 write would end the operation, and the native spawn is
     // what is under test.
     SystemClipboard::for_environment(
-        Platform::Linux,
+        arm.platform,
         |name| (name == "PATH").then(|| installed.display().to_string()),
         None,
         Box::new(CapturingRunner(Arc::clone(&captured))),
@@ -748,18 +837,19 @@ fn views_external_the_probe_hands_the_spawn_the_file_it_proved() {
 
     let argv = captured.argv();
     assert_eq!(
-        argv,
-        vec![
-            helper.display().to_string(),
-            String::from("-selection"),
-            String::from("clipboard"),
-        ],
+        argv.first(),
+        Some(&helper.display().to_string()),
         "the spawn did not name the file the probe approved"
     );
     assert!(
         Path::new(&argv[0]).is_absolute(),
         "argv[0] is still something the spawn would have to search for: {}",
         argv[0]
+    );
+    assert_eq!(
+        argv,
+        arm.argv_for(&helper),
+        "the arm's arguments did not follow the proved file"
     );
     assert_eq!(
         captured.input(),
@@ -776,17 +866,18 @@ fn views_external_an_empty_path_entry_cannot_redirect_the_spawn() {
     // call left in the workspace — while the probe, which ignores that component, had
     // approved the real one. That child's stdin is the transcript the user copied, so the
     // two halves have to agree, and the only answer they may agree on is the real
-    // directory.
+    // directory. The fixture spells the shape with the host's separator — `;<real>` on
+    // Windows — so the probe under test walks one empty component and one real one.
+    let arm = HostArm::WITH_WAYLAND;
     let directory = tempfile::tempdir().expect("clipboard probe fixture");
     let real = directory.path().join("real");
     std::fs::create_dir(&real).expect("create the real PATH directory");
-    std::fs::write(real.join("wl-copy"), b"#!/bin/sh\nexec cat >/dev/null\n")
-        .expect("plant the real helper");
-    let path = format!(":{}", real.display());
+    arm.plant(&real);
+    let path = format!("{}{}", arm.separator, real.display());
 
     let captured = CapturedRun::shared();
     SystemClipboard::for_environment(
-        Platform::Linux,
+        arm.platform,
         |name| match name {
             "PATH" => Some(path.clone()),
             "WAYLAND_DISPLAY" => Some(String::from("wayland-0")),
@@ -800,16 +891,17 @@ fn views_external_an_empty_path_entry_cannot_redirect_the_spawn() {
 
     // One list, walked once: the empty component is not on it, and the argv is the entry
     // that is.
-    let searched = path_candidates("wl-copy", &path, Platform::Linux);
+    let searched = path_candidates(arm.helper, &path, arm.platform);
     assert_eq!(
         searched,
-        vec![real.join("wl-copy")],
+        vec![real.join(arm.helper)],
         "the empty PATH component became a candidate"
     );
     assert_eq!(
         captured.argv(),
-        vec![searched[0].display().to_string()],
-        "the spawn was left free to resolve `wl-copy` against the current directory"
+        arm.argv_for(&searched[0]),
+        "the spawn was left free to resolve `{}` against the current directory",
+        arm.helper
     );
 }
 

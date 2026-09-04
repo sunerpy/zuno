@@ -1394,6 +1394,10 @@ while True:
     /// whose handle was dropped instead of aborted is still alive after the supervisor has
     /// published `Stopped`, still holding the pipe read end. The runtime already counts it, so
     /// no production hook is needed to see it.
+    ///
+    /// Used only by the Unix wedged-server test; on Windows there is no `mkfifo` fixture
+    /// yet, so the helper is gated with its caller instead of tripping `dead_code`.
+    #[cfg(unix)]
     fn alive_tasks() -> usize {
         tokio::runtime::Handle::current()
             .metrics()
