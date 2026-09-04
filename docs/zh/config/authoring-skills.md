@@ -119,7 +119,16 @@ Zuno 按这个作用域顺序发现 Skill：
 路径；它不监听 `~/.zuno` 或私有远端下载缓存。如果规范或显式根目录尚不存在，只会以
 **非递归**方式监听最近的安全已有父目录。缺失目录逐级创建后，订阅会向逻辑根目录
 收窄，只有到达精确根目录才切换为递归监听。相关事件会防抖，watcher overflow 会触发
-完整重扫，新 generation 一次性原子发布。
+完整重扫，新 generation 一次性原子发布。overflow 有三种来源：防抖缓冲区自身的待处理
+路径上限、内核通知队列溢出（仅 Linux 与 macOS 的后端会上报），以及 inotify 监听数量
+耗尽。上报的数量是丢失量的下界，并不是路径条数。出现 `filesystem watch lost coverage`
+警告说明在提高 `fs.inotify.max_user_watches` 之前会有整个子树处于未监听状态；该警告
+首次出现后，在条件持续期间最多每分钟重复一次，每次上报都会触发一次完整 catalog 重扫。
+Windows 完全无法检测内核侧丢失：ReadDirectoryChangesW 缓冲区溢出不会通知 Zuno，并且会
+在进程剩余生命周期内移除该目录的监听，因此只能重启 Zuno 才能恢复 Skill 监听。
+`filesystem watch stopped reading notifications` 警告是同一信号的另一半：watcher 完全
+无法读取通知队列，没有任何上限可供调高；若持续出现请重启 Zuno。仅被信号中断的读取不会
+上报，因为事件仍在队列中等待下一次读取。
 
 Prompt 元数据、`requiredSkills`、斜杠命令、`skill` 工具、TUI 与 ACP 都读取同一份
 快照。因此新增、修改、删除或重命名 Skill 后，现有会话无需重启即可识别。一个损坏或

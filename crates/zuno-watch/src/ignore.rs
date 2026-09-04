@@ -413,8 +413,28 @@ impl Filter {
     /// A path outside [`Filter::root`] is never ignored. The watcher only
     /// subscribes under the root, so this can only be reached by a caller asking
     /// about something unrelated, and silently answering "ignored" would hide it.
+    ///
+    /// A caller that would have to perform I/O to answer `is_dir` wants
+    /// [`Filter::is_ignored_with`] instead.
     #[must_use]
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        self.is_ignored_with(path, || is_dir)
+    }
+
+    /// Whether `path` must not be reported, deciding `is_dir` only if it is read.
+    ///
+    /// Exactly one layer consults `is_dir` — a gitignore pattern ending in `/`
+    /// applies only to directories — so the point of the closure is that a caller on
+    /// a latency-critical thread does not pay for a `stat` no rule will look at. It
+    /// is *not* called when [`FilterBuilder::gitignore`] is off, when the path is
+    /// outside [`Filter::root`], when a whitelist pattern matches, or when a
+    /// folder-name, built-in, or extra pattern has already decided. `notify`'s
+    /// callback thread is the caller this exists for (`ingest`, in the crate root).
+    ///
+    /// Same answer as [`Filter::is_ignored`] for the same inputs; see it for what
+    /// the answer means.
+    #[must_use]
+    pub fn is_ignored_with(&self, path: &Path, is_dir: impl FnOnce() -> bool) -> bool {
         let Some(relative) = self.relative(path) else {
             return false;
         };
@@ -434,7 +454,7 @@ impl Filter {
         }
         self.gitignore
             .as_ref()
-            .is_some_and(|chain| chain.is_ignored(&relative, is_dir))
+            .is_some_and(|chain| chain.is_ignored(&relative, is_dir()))
     }
 
     /// Whether `path` is a `.gitignore`, i.e. whether observing a change to it
@@ -661,5 +681,90 @@ mod tests {
     #[test]
     fn invalidate_is_a_no_op_without_gitignore() {
         filter().invalidate();
+    }
+
+    #[test]
+    fn the_directory_question_is_not_asked_when_no_rule_can_read_it() {
+        // `notify`'s callback thread answers `is_dir` with a `stat`, so every one of
+        // these that still asks is a filesystem call on the thread that must drain
+        // the kernel queue. With no `.gitignore` chain — how every first-party caller
+        // is configured — nothing reads the answer, so nothing may ask for it.
+        let filter = filter();
+        let mut asked = 0_u32;
+        assert!(!filter.is_ignored_with(Path::new("/repo/src/a.rs"), || {
+            asked += 1;
+            false
+        }));
+        assert!(
+            filter.is_ignored_with(Path::new("/repo/target/debug/x"), || {
+                asked += 1;
+                false
+            })
+        );
+        assert!(filter.is_ignored_with(Path::new("/repo/a.log"), || {
+            asked += 1;
+            false
+        }));
+        assert_eq!(
+            asked, 0,
+            "a filter with no gitignore chain must not make its caller stat anything"
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_already_decided_does_not_ask_either() {
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::write(root.path().join(".gitignore"), "*.secret\n").expect("write .gitignore");
+        let filter = FilterBuilder::new(root.path())
+            .gitignore(true)
+            .require_git(false)
+            .build()
+            .expect("patterns compile");
+        let mut asked = 0_u32;
+        // `target` is a folder-name rule, decided before the chain is consulted.
+        assert!(
+            filter.is_ignored_with(&root.path().join("target/debug/x"), || {
+                asked += 1;
+                false
+            })
+        );
+        assert_eq!(asked, 0, "a folder-name rule decides without a stat");
+        // A path no built-in pattern claims does reach the chain, which reads the
+        // answer — `*.log` would not do here, because `IGNORED_FILE_GLOBS` claims it
+        // one layer earlier and the test would pass for the wrong reason.
+        assert!(filter.is_ignored_with(&root.path().join("a.secret"), || {
+            asked += 1;
+            false
+        }));
+        assert_eq!(
+            asked, 1,
+            "the gitignore chain is the one layer that reads `is_dir`"
+        );
+    }
+
+    #[test]
+    fn the_lazy_and_eager_forms_answer_identically() {
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::write(root.path().join(".gitignore"), "build/\n*.secret\n")
+            .expect("write .gitignore");
+        let filter = FilterBuilder::new(root.path())
+            .gitignore(true)
+            .require_git(false)
+            .build()
+            .expect("patterns compile");
+        for (relative, is_dir) in [
+            ("build", true),
+            ("build", false),
+            ("a.secret", false),
+            ("src/main.rs", false),
+            ("src", true),
+        ] {
+            let path = root.path().join(relative);
+            assert_eq!(
+                filter.is_ignored(&path, is_dir),
+                filter.is_ignored_with(&path, || is_dir),
+                "{relative} (is_dir={is_dir}) must not depend on which form asked"
+            );
+        }
     }
 }

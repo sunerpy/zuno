@@ -131,16 +131,29 @@ under the broad external switch.
 
 ## Live catalog generations
 
-Each running session owns one immutable
-`SkillCatalogSnapshot { generation, digest, skills, warnings }`. `zuno-watch`
-observes project scope, the canonical user root, existing shared Agent Skills,
-and explicit configured paths. It does not observe `~/.zuno` or the private
-remote download cache. When a canonical or explicit root does not exist yet,
-the watcher observes the nearest safe existing parent **non-recursively**. The
-subscription moves toward the logical root as missing directories are created
-and becomes recursive only at the exact root. Relevant events are debounced,
-watcher overflow forces a complete rescan, and the next generation is
-published atomically.
+Each running session owns one immutable `SkillCatalogSnapshot { generation,
+digest, skills, warnings }`. `zuno-watch` observes project scope, the canonical
+user root, existing shared Agent Skills, and explicit configured paths. It does
+not observe `~/.zuno` or the private remote download cache. When a canonical or
+explicit root does not exist yet, the watcher observes the nearest safe
+existing parent **non-recursively**. The subscription moves toward the logical
+root as missing directories are created and becomes recursive only at the exact
+root. Relevant events are debounced, watcher overflow forces a complete rescan,
+and the next generation is published atomically. Overflow has three causes: the
+debouncer's own pending-path ceiling, a kernel notification-queue overflow that
+the backend reports on Linux and macOS, and inotify watch-limit exhaustion. The
+reported count is a floor on what was missed, not a count of paths. A
+`filesystem watch lost coverage` warning means whole subtrees stay unwatched
+until you raise `fs.inotify.max_user_watches`; it is logged once and then at
+most once a minute while the condition lasts, and the catalog is rescanned in
+full each time it is reported. Windows cannot detect kernel-side loss at all: a
+ReadDirectoryChangesW buffer overrun is not reported to Zuno and removes that
+directory's watch for the remaining life of the process, so restarting Zuno is
+the only way to restore Skill watching there. A `filesystem watch stopped
+reading notifications` warning is the other half of that signal: the watcher
+could not read the notification queue at all, so there is no limit for you to
+raise — restart Zuno if it repeats. A read the kernel merely interrupted is not
+reported, because its events are still queued for the next one.
 
 Prompt metadata, `requiredSkills`, slash commands, the `skill` tool, TUI, and
 ACP all read that same snapshot. Adding, editing, deleting, or renaming a Skill
