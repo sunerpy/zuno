@@ -1459,3 +1459,49 @@ async fn wait_for_process_exit(pid: u32) {
     .await
     .unwrap_or_else(|_| panic!("process {pid} survived group termination"));
 }
+
+/// Under a trusted native backend the execution policy is `danger-full-access` while the
+/// Agent's contract is still read-only, and the Git-metadata refusal keys on the
+/// contract: a read-only Agent whose Shell runs natively still cannot commit.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_read_only_agent_under_a_trusted_native_backend_still_cannot_modify_git_metadata() {
+    use zuno_sandbox::{NetworkAccess, SandboxMode, SandboxPolicy, SandboxResolution};
+    use zuno_tools::shell::ShellTool;
+
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let head = initialize_git_repository(workspace.path());
+    std::fs::write(workspace.path().join("note.txt"), b"native\n").expect("note");
+    git(workspace.path(), &["add", "note.txt"]);
+
+    let requested = SandboxPolicy::new(
+        workspace.path(),
+        SandboxMode::ReadOnly,
+        NetworkAccess::Denied,
+    )
+    .expect("read-only request");
+    let (backend, execution_policy) = SandboxResolution::trusted_native(requested)
+        .expect("a read-only request resolves natively when the backend is selected")
+        .into_execution();
+    assert_eq!(execution_policy.requested_mode(), SandboxMode::ReadOnly);
+    assert_ne!(execution_policy.mode(), SandboxMode::ReadOnly);
+    let tool = ShellTool::with_sandbox_backend(workspace.path(), None, backend, execution_policy)
+        .expect("shell tool");
+
+    let refusal = tool
+        .run(
+            params(format!(
+                "{} commit --quiet -m native",
+                git_program().display()
+            )),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect_err("a read-only contract refuses Git metadata writes on every backend");
+
+    assert!(
+        format!("{refusal:?}").contains("read-only and cannot modify Git metadata"),
+        "{refusal:?}"
+    );
+    assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), head);
+}

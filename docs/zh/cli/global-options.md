@@ -27,6 +27,7 @@ zuno [OPTIONS] [COMMAND]
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`（最详尽的追踪细节）、`DEBUG`（详细诊断事件）、`INFO`（常规运行事件）、`WARN`（警告与错误）、`ERROR`（仅错误） | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ## 根调用选项
@@ -68,6 +69,14 @@ zuno tui --sandbox read-only
 
 ```sh
 zuno run --sandbox-on-unavailable run-unconfined "run the local build"
+```
+
+在没有 OS 沙箱的主机上让每个 Agent 的 Shell 都原生运行，同时保留已配置的权限模式。这是
+像 `plan` 这样的只读 Agent 在 macOS 与 Windows 上唯一的路径；它是一项受信声明而不是沙箱
+隔离，受管策略也可以把它改回 `auto`。
+
+```sh
+zuno run --agent plan --sandbox-backend native "audit the retry policy"
 ```
 
 在依赖某个约束模式之前，先验证它在本宿主上是否真的可部署。

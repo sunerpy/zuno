@@ -21,6 +21,29 @@ fn contains_all(relative: &str, needles: &[&str]) {
     }
 }
 
+/// Containment that ignores every whitespace character on both sides, so a refused
+/// sentence stays refused however a page wraps it and a Chinese sentence broken across
+/// lines still matches.
+fn contains_ignoring_whitespace(text: &str, needle: &str) -> bool {
+    let squash = |value: &str| {
+        value
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+    };
+    squash(text).contains(&squash(needle))
+}
+
+fn refuses_all(relative: &str, retired: &[&str]) {
+    let text = read(relative);
+    for needle in retired {
+        assert!(
+            !contains_ignoring_whitespace(&text, needle),
+            "{relative} still carries the retired sentence {needle:?}"
+        );
+    }
+}
+
 #[test]
 fn session_retention_table_list_tracks_the_destructive_delete_order() {
     let text = read("docs/session-retention.md");
@@ -206,6 +229,55 @@ fn reconciliation_docs_pin_durable_work_as_the_only_unreconciled_work() {
 }
 
 #[test]
+fn planning_docs_pin_conversational_input_and_operation_enums_on_the_wire() {
+    contains_all(
+        "docs/harness-runtime.md",
+        &[
+            "A greeting, thanks, or bare acknowledgement is",
+            "conversational and stays atomic; it never opens a Plan, and with an active Plan it",
+            "reach the provider as one object schema whose `action` property",
+            "is the only schema-required field",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/harness-runtime.md",
+        &[
+            "问候、致谢或单纯的",
+            "确认属于对话输入，同样归为 `Atomic`，不会打开 Plan；已有活跃 Plan 时视为继续维护",
+            "`action` 属性枚举全部操作，也是 schema 中唯一",
+        ],
+    );
+    contains_all(
+        "docs/guide/durable-state.md",
+        &[
+            "A greeting, thanks, or bare acknowledgement is",
+            "conversational: it never opens a plan, and it keeps an active plan current rather than",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/durable-state.md",
+        &[
+            "问候、致谢或单纯的确认属于对话输入：它不会打开 Plan，已有活跃 Plan 时只是继续维护，而不是替换",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/prompt-workflow.md",
+        &[
+            "问候、致谢或单纯的确认（如 `你好`、`谢谢`、`好的`、`hi`、`thanks`）属于对话输入",
+            "归为 `Atomic`，不会打开 Plan；已有活跃 Plan 时视为继续维护；",
+        ],
+    );
+    contains_all(
+        "docs/guide/tools.md",
+        &["`notes`, and `history`, `action` is a required enum: the wire schema lists every"],
+    );
+    contains_all(
+        "docs/zh/guide/tools.md",
+        &["是必填枚举：线上 schema 列出每个操作以及它需要的字段"],
+    );
+}
+
+#[test]
 fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
     contains_all(
         "docs/design/shell-sandbox-roadmap.md",
@@ -215,6 +287,9 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "read-only Agent contracts",
             "never fall back",
             "command preparation/execution failure",
+            "sandbox.backend: native",
+            "TrustedNative",
+            "not a fallback",
         ],
     );
     contains_all(
@@ -225,14 +300,40 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "requestedMode",
             "fallbackReason",
             "Version-2 background records",
+            "trusted_native",
+            "sandbox.backend",
         ],
+    );
+    refuses_all(
+        "docs/harness-runtime.md",
+        &["Only while a trusted unavailable-sandbox fallback is active."],
+    );
+    contains_all(
+        "docs/zh/operate/harness-runtime.md",
+        &["trusted_native", "sandbox.backend: native"],
+    );
+    contains_all(
+        "docs/zh/operate/prompt-workflow.md",
+        &["sandbox.backend: native"],
+    );
+    refuses_all(
+        "docs/zh/operate/prompt-workflow.md",
+        &["可信的 sandbox unavailable fallback 生效时。 |"],
     );
     contains_all(
         "docs/reference/configuration.md",
         &[
             "\"onUnavailable\": \"deny\"",
+            "\"backend\": \"auto\"",
             "`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`",
-            "A read-only Agent never runs unconfined",
+            "A read-only Agent never runs unconfined through this fallback",
+            "### Native backend",
+            "\"backend\": \"native\"",
+            "`zuno --sandbox-backend native`",
+            "`ZUNO_SANDBOX_BACKEND=native`",
+            "`trusted_native`",
+            "not an OS boundary",
+            "a project layer may say `auto` but fails validation on `native`",
         ],
     );
     contains_all(
@@ -241,6 +342,9 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "`sandbox.onUnavailable`",
             "fallback eligibility",
             "`--check` exits unsuccessfully",
+            "`sandbox.backend`",
+            "`zuno --sandbox-backend native`",
+            "resolutionKind: trusted_native",
         ],
     );
     contains_all(
@@ -250,6 +354,11 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "\"onUnavailable\": \"run-unconfined\"",
             "ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined",
             "read-only Agent never uses",
+            "\"backend\": \"native\"",
+            "--sandbox-backend native",
+            "ZUNO_SANDBOX_BACKEND=native",
+            "not an OS boundary",
+            "`trusted_native`",
             // A saved `always` is session-scoped, in memory, and unaffected by a
             // dropped stream. All three are easy to re-document as global, which is
             // what the batch-2 fix stopped being true.
@@ -265,6 +374,11 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "\"onUnavailable\": \"run-unconfined\"",
             "ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined",
             "只读 Agent 永远不会使用",
+            "\"backend\": \"native\"",
+            "--sandbox-backend native",
+            "ZUNO_SANDBOX_BACKEND=native",
+            "不是 OS 边界",
+            "`trusted_native`",
             "只属于一个 session",
             "而不在数据库里",
         ],
@@ -275,6 +389,8 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "Choosing no-sandbox behavior",
             "\"mode\": \"danger-full-access\"",
             "\"onUnavailable\": \"run-unconfined\"",
+            "\"backend\": \"native\"",
+            "`zuno --sandbox-backend native`",
         ],
     );
     contains_all(
@@ -283,6 +399,8 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "选择无沙箱行为",
             "\"mode\": \"danger-full-access\"",
             "\"onUnavailable\": \"run-unconfined\"",
+            "\"backend\": \"native\"",
+            "`zuno --sandbox-backend native`",
         ],
     );
     for relative in [
@@ -293,8 +411,11 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             relative,
             &[
                 "--sandbox-on-unavailable",
+                "--sandbox-backend <BACKEND>",
                 "requestedMode",
                 "unavailable_fallback",
+                "backendSelection",
+                "trusted_native",
             ],
         );
     }
@@ -304,6 +425,11 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "沙箱模式与后端不可用策略",
             "ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined",
             "fallbackReason",
+            "| `backend` | `auto`、`native` | `auto` |",
+            "\"backend\": \"native\"",
+            "ZUNO_SANDBOX_BACKEND=native",
+            "`trusted_native`",
+            "不是 OS 边界",
         ],
     );
     contains_all(
@@ -312,6 +438,52 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "`sandbox.onUnavailable`",
             "run-unconfined",
             "`debug sandbox --check`",
+            "`sandbox.backend`",
+            "`zuno --sandbox-backend native`",
+            "resolutionKind: trusted_native",
+        ],
+    );
+    // The layer pages list what a project layer may set: `backend` joins `onUnavailable`
+    // there, and the one-invocation overrides include the new flag and variable.
+    contains_all(
+        "docs/config/files.md",
+        &[
+            "or set `backend` to `auto`",
+            "select the native backend",
+            "zuno --sandbox-backend native",
+            "`ZUNO_SANDBOX_BACKEND=native`",
+            "force the backend back to\n`auto`",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/files.md",
+        &[
+            "或把 `backend` 设为 `auto`",
+            "选择原生后端",
+            "zuno --sandbox-backend native",
+            "`ZUNO_SANDBOX_BACKEND=native`",
+            "把后端强制改回 `auto`",
+        ],
+    );
+    // The prompt-section inventory names both causes of a `runtime.sandbox` section.
+    contains_all(
+        "docs/design/prompt-workflow-v2.zh-CN.md",
+        &["可信 fallback 或受信的 `sandbox.backend: native` 生效时"],
+    );
+    // `zuno debug sandbox` under `native` passes the `policy` check and skips exactly the
+    // three probes; the pages say which, instead of "every check".
+    contains_all(
+        "docs/operate/diagnostics.md",
+        &[
+            "the `policy` check passes",
+            "`backend_discovery`, and `execution_self_test` are marked skipped",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/diagnostics.md",
+        &[
+            "`policy` 检查通过",
+            "`backend_discovery` 与 `execution_self_test` 标记为 skipped",
         ],
     );
     for relative in [
@@ -320,7 +492,43 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
         "docs/zh/cli/global-options.md",
         "docs/zh/cli/debug.md",
     ] {
-        contains_all(relative, &["--sandbox-on-unavailable", "run-unconfined"]);
+        contains_all(
+            relative,
+            &[
+                "--sandbox-on-unavailable",
+                "run-unconfined",
+                "--sandbox-backend <BACKEND>",
+                "`auto`",
+                "`native`",
+            ],
+        );
+    }
+    for relative in ["docs/cli/debug.md", "docs/zh/cli/debug.md"] {
+        contains_all(relative, &["trusted_native"]);
+    }
+    for relative in [
+        "docs/guide/agents.md",
+        "docs/guide/installation.md",
+        "docs/guide/quick-start.md",
+        "docs/guide/headless.md",
+        "docs/guide/what-is-zuno.md",
+        "docs/zh/guide/agents.md",
+        "docs/zh/guide/installation.md",
+        "docs/zh/guide/quick-start.md",
+        "docs/zh/guide/headless.md",
+        "docs/zh/guide/what-is-zuno.md",
+        "README.md",
+        "docs/index.md",
+        "docs/zh/index.md",
+        "docs/readme/README.zh-CN.md",
+    ] {
+        contains_all(relative, &["sandbox.backend: native"]);
+    }
+    for relative in ["docs/guide/agents.md", "docs/guide/what-is-zuno.md"] {
+        contains_all(relative, &["role boundary"]);
+    }
+    for relative in ["docs/zh/guide/agents.md", "docs/zh/guide/what-is-zuno.md"] {
+        contains_all(relative, &["角色边界"]);
     }
 
     for directory in ["docs/cli", "docs/zh/cli"] {
@@ -336,10 +544,17 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
                 .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
             let sandbox_options = text.matches("--sandbox <SANDBOX>").count();
             let unavailable_options = text.matches("--sandbox-on-unavailable <ACTION>").count();
+            let backend_options = text.matches("--sandbox-backend <BACKEND>").count();
             assert_eq!(
                 unavailable_options,
                 sandbox_options,
                 "{} must keep the sandbox global options together",
+                path.display()
+            );
+            assert_eq!(
+                backend_options,
+                sandbox_options,
+                "{} must document --sandbox-backend beside every --sandbox",
                 path.display()
             );
         }
@@ -419,7 +634,57 @@ fn unsupported_platform_docs_pin_the_refusal_the_prompt_and_its_process_scope() 
     for relative in ["docs/guide/quick-start.md", "docs/zh/guide/quick-start.md"] {
         contains_all(
             relative,
-            &["Run this session natively without OS confinement?"],
+            &[
+                "Run this session natively without OS confinement?",
+                "--sandbox-backend native",
+                "`sandbox.backend`",
+            ],
+        );
+    }
+
+    // The offer is made for a read-only request too, and acceptance selects the
+    // native backend: each page that describes the prompt says both, and none still
+    // documents the acceptance as the write-capable-only fallback.
+    for (relative, read_only, accepts) in [
+        (
+            "docs/guide/permissions.md",
+            "a read-only Agent's included",
+            "exactly as\n`--sandbox-backend native` does",
+        ),
+        (
+            "docs/reference/configuration.md",
+            "a read-only request included",
+            "exactly as `--sandbox-backend native` would",
+        ),
+        (
+            "docs/faq.md",
+            "read-only\nincluded",
+            "(`--sandbox-backend native`)",
+        ),
+        (
+            "docs/zh/guide/permissions.md",
+            "只读 Agent 的请求也包括在内",
+            "`--sandbox-backend native` 完全一致",
+        ),
+        (
+            "docs/zh/config/reference.md",
+            "只读请求\n也包括在内",
+            "`--sandbox-backend native` 完全一致",
+        ),
+        (
+            "docs/zh/operate/faq.md",
+            "只读请求也包括在内",
+            "`--sandbox-backend native` 完全一致",
+        ),
+    ] {
+        contains_all(relative, &[read_only, accepts]);
+        let text = read(relative);
+        assert!(
+            !text.contains("exactly as\n`--sandbox-on-unavailable run-unconfined` does")
+                && !text.contains("exactly as `--sandbox-on-unavailable run-unconfined` does")
+                && !text.contains("exactly as\n`--sandbox-on-unavailable run-unconfined` would")
+                && !text.contains("`--sandbox-on-unavailable run-unconfined` 完全一致"),
+            "{relative} still documents the interactive answer as the run-unconfined fallback"
         );
     }
 
@@ -431,6 +696,116 @@ fn unsupported_platform_docs_pin_the_refusal_the_prompt_and_its_process_scope() 
     assert!(
         !read("docs/zh/guide/permissions.md").contains("受限模式报告："),
         "docs/zh/guide/permissions.md still presents the bare unsupported-platform line"
+    );
+}
+
+/// The 0.9.1 pages said a read-only Agent had no native route on macOS and Windows,
+/// that only a write-capable request could take one, and that the interactive prompt
+/// was made and answered in terms of the `run-unconfined` fallback. `sandbox.backend:
+/// native` made every one of those sentences false, so each is refused here in the
+/// English and Chinese wording it shipped with; whitespace is ignored so a re-wrapped
+/// page cannot smuggle one back.
+#[test]
+fn native_backend_docs_retire_the_write_capable_only_native_route() {
+    refuses_all(
+        "docs/guide/permissions.md",
+        &[
+            "There are two different ways to run without OS confinement",
+            "only an explicit `danger-full-access` request runs natively there",
+            "has no native route on these platforms",
+            "It asks only for a write-capable request",
+            "exactly as `--sandbox-on-unavailable run-unconfined` does",
+        ],
+    );
+    refuses_all(
+        "docs/reference/configuration.md",
+        &[
+            "A read-only Agent never runs unconfined.",
+            "the request is write-capable (`workspace-write`)",
+            "The prompt never appears for a read-only request",
+            "never run natively by either route",
+            "`resolutionKind` `unavailable_fallback`, the same durable record",
+        ],
+    );
+    refuses_all(
+        "docs/faq.md",
+        &[
+            "only for a write-capable request",
+            "set `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined` or a trusted `sandbox.onUnavailable` when a nested",
+        ],
+    );
+    refuses_all(
+        "docs/guide/what-is-zuno.md",
+        &["Write-capable agents can use an explicit native-execution choice on those platforms"],
+    );
+    refuses_all(
+        "docs/guide/quick-start.md",
+        &[
+            "must use a write-capable Agent and explicitly choose a native path",
+            "macOS or Windows, a write-capable Agent, and no layer set `sandbox.onUnavailable`",
+            "explicit `danger-full-access`, trusted `run-unconfined` fallback for a write-capable Agent, or run on Linux",
+        ],
+    );
+    refuses_all(
+        "docs/guide/installation.md",
+        &["`read-only` never falls back and continues to fail closed. See"],
+    );
+    refuses_all(
+        "docs/design/shell-sandbox-roadmap.md",
+        &["while read-only Agents still refuse."],
+    );
+    refuses_all(
+        "docs/config/files.md",
+        &["It also cannot enable `run-unconfined`. A checked-in"],
+    );
+    refuses_all(
+        "AGENTS.md",
+        &["through the explicit full-access path or the eligible trusted fallback"],
+    );
+
+    refuses_all(
+        "docs/zh/guide/permissions.md",
+        &[
+            "无 OS 约束执行有两种不同含义",
+            "只有显式的 `danger-full-access` 请求才会原生执行",
+            "没有原生执行的路径",
+            "只有三个条件同时成立才会询问：请求具备写能力",
+            "`--sandbox-on-unavailable run-unconfined` 完全一致",
+        ],
+    );
+    refuses_all(
+        "docs/zh/config/reference.md",
+        &[
+            "只读 Agent 永远不会无沙箱降级。",
+            "请求具备写能力（`workspace-write`）",
+            "只读请求永远不会降级，因此不会询问",
+            "`resolutionKind` 为 `unavailable_fallback`",
+        ],
+    );
+    refuses_all("docs/zh/operate/faq.md", &["仅限具备写能力的请求"]);
+    refuses_all(
+        "docs/zh/guide/what-is-zuno.md",
+        &["具备写能力的 Agent 可以在这些平台显式选择原生执行"],
+    );
+    refuses_all(
+        "docs/zh/guide/quick-start.md",
+        &[
+            "必须使用具备写能力的 Agent",
+            "Agent 具备写能力，且没有任何配置层设置过",
+            "显式使用 `danger-full-access`、为具备写能力的 Agent 启用受信的 `run-unconfined` 降级，或在 Linux 上运行",
+        ],
+    );
+    refuses_all(
+        "docs/zh/guide/installation.md",
+        &["永不降级，仍然失败即拒绝。参见"],
+    );
+    refuses_all(
+        "docs/zh/config/files.md",
+        &["也不能启用 `run-unconfined`。因此"],
+    );
+    refuses_all(
+        "docs/design/prompt-workflow-v2.zh-CN.md",
+        &["`runtime.sandbox`（可信 fallback 生效时）"],
     );
 }
 
@@ -1861,4 +2236,116 @@ fn cancellation_docs_pin_certainty_as_a_verdict_and_not_a_mode() {
         &["says nothing about whether the command"],
     );
     contains_all("docs/zh/guide/tools.md", &["对命令是否运行过一概不说"]);
+}
+
+/// A resumed session keeps the Agent, model and reasoning level it last ran with, and the
+/// precedence is one table shared by every surface: flag > session > config default.
+///
+/// The retired sentence promised that "a resume restores the mode" when only `--session`
+/// did, and nothing said which model a resumed turn used; both languages now state the
+/// order, where a pick is written back, and that a vanished Agent or model is reported
+/// rather than fatal.
+#[test]
+fn resume_docs_pin_the_saved_agent_model_and_level_precedence() {
+    contains_all(
+        "docs/guide/sessions.md",
+        &[
+            "keeps the Agent, model, and reasoning level it last ran with",
+            "| Agent | `--agent` or picker > saved on the session > `default_agent` > `orchestrator` |",
+            "| Model | `--model` or picker > a preset chosen in this process > saved on the session > routed through configuration |",
+            "| Reasoning level | `--variant`, `--thinking`, or picker > saved with the session's model > configured defaults |",
+            "In short: flag > session > config default.",
+            "does not rewrite\nthe row",
+            "re-routes the model through\nconfiguration",
+            "says so in a status note",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/sessions.md",
+        &[
+            "沿用它上次运行时的 Agent、模型与推理强度",
+            "| Agent | `--agent` 或选择器 > 会话上保存的值 > `default_agent` > `orchestrator` |",
+            "| 模型 | `--model` 或选择器 > 本进程中选定的 preset > 会话上保存的值 > 按配置路由 |",
+            "| 推理强度 | `--variant`、`--thinking` 或选择器 > 随会话模型一同保存的值 > 配置默认值 |",
+            "参数 > 会话 > 配置默认值",
+            "不会改写会话行",
+            "模型会按配置重新路由",
+            "以一条状态提示说明",
+        ],
+    );
+    contains_all(
+        "docs/guide/headless.md",
+        &[
+            "resumes on the Agent, model, and reasoning\nlevel the session last ran with",
+            "/guide/sessions#continuing-a-session",
+            "outranks the value saved on the session",
+            "(`status_detail` in `--format json`)",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/headless.md",
+        &[
+            "沿用会话上次使用的 Agent、模型与推理强度",
+            "/zh/guide/sessions#续跑会话",
+            "都优先于会话上保存的值",
+            "`--format json` 下为 `status_detail`",
+        ],
+    );
+    contains_all(
+        "docs/guide/tui.md",
+        &[
+            "the identity row shows the Agent, model, and effort the session last ran\nwith",
+            "under *its* saved Agent, model, and effort",
+            "written to the current session so the next resume starts from it",
+            "`warning: keeping the current turn host:`",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/tui.md",
+        &[
+            "身份行显示的是该会话上次使用的 Agent、模型与推理强度",
+            "以目标会话自己保存的 Agent、模型与推理强度重新打开它",
+            "写回当前会话",
+            "`warning: keeping the current turn host:`",
+        ],
+    );
+    contains_all(
+        "docs/cli/run.md",
+        &[
+            "resumes on the Agent, model,\nand reasoning level it last ran with",
+            "Naming another Agent\nre-routes the model through configuration",
+        ],
+    );
+    contains_all(
+        "docs/zh/cli/run.md",
+        &[
+            "沿用它上次使用的 Agent、模型与推理强度",
+            "换用另一个 Agent 会让模型按配置重新路由",
+        ],
+    );
+    contains_all(
+        "docs/cli/tui.md",
+        &["opens on the Agent, model, and reasoning level it last ran\nwith"],
+    );
+    contains_all(
+        "docs/zh/cli/tui.md",
+        &["会以它上次使用的 Agent、模型与推理强度打开"],
+    );
+    contains_all(
+        "docs/guide/agents.md",
+        &["the `/session` picker, and ACP `session/load` all restore the\nmode"],
+    );
+    contains_all(
+        "docs/zh/guide/agents.md",
+        &["ACP 的 `session/load` 都会恢复该模式"],
+    );
+    contains_all(
+        "docs/design/zed-acp-integration.md",
+        &[
+            "Agent, model, and thought level persisted on its row",
+            "falls back to configuration without failing the load",
+        ],
+    );
+    refuses_all("docs/guide/agents.md", &["so a resume restores the mode."]);
+    refuses_all("docs/zh/guide/agents.md", &["因此续跑会恢复该模式。"]);
 }

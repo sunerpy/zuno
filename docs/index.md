@@ -74,9 +74,10 @@ cargo install --git https://github.com/sunerpy/zuno zuno --locked
 Ripgrep 14 or newer is only the backend for the `glob` and `grep` tools; it is not
 required to start Zuno or use the core runtime. Bubblewrap 0.8.0 or newer is only
 the Linux backend for confined `read-only` and `workspace-write` Shell modes.
-Explicit `danger-full-access` and an eligible trusted `workspace-write`
-`run-unconfined` fallback execute natively. macOS and Windows currently have no
-confined backend. The installer verifies the selected release archive against its
+Explicit `danger-full-access`, an eligible trusted `workspace-write`
+`run-unconfined` fallback, and a trusted `sandbox.backend: native` selection for
+every Agent execute natively. macOS and Windows currently have no confined
+backend. The installer verifies the selected release archive against its
 `SHA256SUMS`.
 
 ## Start a run

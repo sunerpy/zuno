@@ -50,10 +50,13 @@ Shell 请求依次经过工具参数校验、权限策略、命令风险检查�
 
 在 Linux 上，`read-only` 和 `workspace-write` 使用 bubblewrap、capability drop 与 seccomp。
 请求的约束无法部署时，Zuno 默认拒绝命令。受信配置可以直接选择
-`danger-full-access`，也可以只在符合条件的沙箱不可用错误下允许
-`workspace-write` 降级。只读 Agent 不使用该降级。
+`danger-full-access`，可以用 `sandbox.backend: native` 为每个 Agent 选择原生后端并保留
+权限模式，也可以只在符合条件的沙箱不可用错误下允许 `workspace-write` 降级。只读 Agent
+不使用该降级。
 
-macOS 与 Windows 尚未实现受限后端；具备写能力的 Agent 可以在这些平台显式选择原生执行。
+macOS 与 Windows 尚未实现受限后端；每个 Agent 都可以在这些平台显式选择受信的原生执行。
+对只读 Agent 来说，这个选择就是 `sandbox.backend: native`，在它之下只读契约是一道
+角色边界，而不是 OS 边界。
 
 参见[权限与沙箱](/zh/guide/permissions)。
 

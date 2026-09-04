@@ -404,3 +404,243 @@ async fn cli_routes_the_default_orchestrator_through_the_active_preset() {
 async fn tui_keeps_deterministic_catalog_fallback_when_model_is_unset() {
     assert_deterministic_fallback(Surface::Tui).await;
 }
+
+/// A route provider with enough responses for a session's title request and every
+/// resumed turn one probe makes, so exhaustion can never masquerade as a routing fact.
+async fn resume_provider(label: &str) -> MockProvider {
+    let mut scenario =
+        Scenario::new(format!("resume-{label}")).respond(route_response(label, "TITLE"));
+    for _ in 0..8 {
+        scenario = scenario.respond(route_response(label, "TURN"));
+    }
+    MockProvider::start(vec![scenario])
+        .await
+        .expect("resume provider binds loopback")
+}
+
+async fn run_cli_with(
+    env: &ScriptedEnv,
+    variables: BTreeMap<String, String>,
+    args: &[&str],
+) -> Vec<serde_json::Value> {
+    let mut command = tokio::process::Command::new(binary());
+    command
+        .args(args)
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(variables);
+    let output = tokio::time::timeout(RUN_TIMEOUT, command.output())
+        .await
+        .expect("the resumed CLI probe must finish inside its budget")
+        .expect("launch the production CLI");
+    assert!(
+        output.status.success(),
+        "production CLI failed for {args:?}:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn resolved_identity(events: &[serde_json::Value]) -> (String, String) {
+    let agent = events
+        .iter()
+        .find(|event| event["type"] == "agent_resolved")
+        .and_then(|event| event["agent"].as_str())
+        .unwrap_or_else(|| panic!("no agent_resolved event in {events:#?}"))
+        .to_owned();
+    let model = events
+        .iter()
+        .find(|event| event["type"] == "model_resolved")
+        .map(|event| {
+            format!(
+                "{}/{}",
+                event["providerID"].as_str().unwrap_or_default(),
+                event["modelID"].as_str().unwrap_or_default()
+            )
+        })
+        .unwrap_or_else(|| panic!("no model_resolved event in {events:#?}"));
+    (agent, model)
+}
+
+fn status_details(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| event["type"] == "status_detail")
+        .filter_map(|event| event["detail"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// A resumed `zuno run` keeps the Agent and model the session last ran with: below an
+/// explicit flag, above `config.model` and the default Agent, through both `--continue`
+/// and `--session`. Proved on the wire — the saved provider receives the resumed turn
+/// while the configured provider stays silent — and on the JSON event stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_resume_keeps_the_saved_agent_and_model_below_flags_and_above_config() {
+    let aaa = resume_provider("CONFIGURED").await;
+    let zzz = resume_provider("SAVED").await;
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    let variables = variables(
+        &env,
+        config(Some("aaa/aaa-model"), aaa.base_url(), zzz.base_url()),
+    );
+    let database = PathBuf::from(
+        variables
+            .get("ZUNO_DB")
+            .expect("the resume probe uses a file database"),
+    );
+
+    // The session is created on the saved provider with the saved Agent.
+    let created = run_cli_with(
+        &env,
+        variables.clone(),
+        &[
+            "run",
+            "--format",
+            "json",
+            "--model",
+            "zzz/zzz-model",
+            "--agent",
+            "build",
+            "--title",
+            "resume probe",
+            "first",
+        ],
+    )
+    .await;
+    assert_eq!(
+        resolved_identity(&created),
+        ("build".to_owned(), "zzz/zzz-model".to_owned())
+    );
+    let pool = zuno_db::Pool::open(&zuno_paths::DbLocation::File(database)).expect("open database");
+    let store = zuno_db::session::Store::new(&pool);
+    let sessions = store
+        .list(
+            &zuno_db::session::ListQuery::directory(
+                env.working_dir().to_string_lossy().into_owned(),
+            )
+            .active_only(),
+        )
+        .expect("list sessions");
+    let [session] = sessions.as_slice() else {
+        panic!("exactly one session was created: {sessions:#?}");
+    };
+    assert_eq!(session.agent.as_deref(), Some("build"));
+    assert_eq!(
+        session.model.as_deref(),
+        Some(zuno_db::session::model_reference("zzz", "zzz-model").as_str()),
+        "the row records the model the session ran with"
+    );
+    let zzz_before = zzz.captured().await.len();
+    assert_eq!(aaa.captured().await.len(), 0);
+
+    // Nothing explicit: the saved Agent and model win over `config.model` and the
+    // default Agent, and the saved provider is the one dialled.
+    let resumed = run_cli_with(
+        &env,
+        variables.clone(),
+        &["run", "--format", "json", "--continue", "second"],
+    )
+    .await;
+    assert_eq!(
+        resolved_identity(&resumed),
+        ("build".to_owned(), "zzz/zzz-model".to_owned()),
+        "--continue must resume on the saved Agent and model"
+    );
+    assert!(
+        zzz.captured().await.len() > zzz_before,
+        "the saved provider was not dialled"
+    );
+    assert_eq!(
+        aaa.captured().await.len(),
+        0,
+        "config.model was dialled on a resume"
+    );
+
+    // A flag wins over the saved model, on `--session` as on `--continue`.
+    let flagged = run_cli_with(
+        &env,
+        variables.clone(),
+        &[
+            "run",
+            "--format",
+            "json",
+            "--session",
+            &session.id,
+            "--model",
+            "aaa/aaa-model",
+            "third",
+        ],
+    )
+    .await;
+    assert_eq!(
+        resolved_identity(&flagged),
+        ("build".to_owned(), "aaa/aaa-model".to_owned()),
+        "-m wins over the saved model while the saved Agent still applies"
+    );
+    let aaa_after_flag = aaa.captured().await.len();
+    assert!(aaa_after_flag > 0, "the flagged provider was not dialled");
+
+    // A different Agent routes its model afresh through configuration.
+    let switched = run_cli_with(
+        &env,
+        variables.clone(),
+        &[
+            "run",
+            "--format",
+            "json",
+            "--continue",
+            "--agent",
+            "orchestrator",
+            "fourth",
+        ],
+    )
+    .await;
+    assert_eq!(
+        resolved_identity(&switched),
+        ("orchestrator".to_owned(), "aaa/aaa-model".to_owned()),
+        "--agent naming another Agent re-routes the model through config.model"
+    );
+    assert!(aaa.captured().await.len() > aaa_after_flag);
+
+    // `run` never rewrote the row: the saved pair is still what the TUI persisted.
+    let unchanged = store.get(&session.id).expect("reread session");
+    assert_eq!(unchanged.agent.as_deref(), Some("build"));
+    assert_eq!(
+        unchanged.model.as_deref(),
+        Some(zuno_db::session::model_reference("zzz", "zzz-model").as_str())
+    );
+
+    // A saved model the catalog no longer offers falls back with a visible note.
+    pool.open_connection()
+        .expect("connection")
+        .execute(
+            "UPDATE session SET model = ?1 WHERE id = ?2",
+            rusqlite::params![zuno_db::session::model_reference("zzz", "gone"), session.id],
+        )
+        .expect("retire the saved model");
+    let fallen_back = run_cli_with(
+        &env,
+        variables.clone(),
+        &["run", "--format", "json", "--continue", "fifth"],
+    )
+    .await;
+    assert_eq!(
+        resolved_identity(&fallen_back),
+        ("build".to_owned(), "aaa/aaa-model".to_owned())
+    );
+    assert!(
+        status_details(&fallen_back).iter().any(|detail| detail
+            == "model zzz/gone saved on this session is not in the catalog; using aaa/aaa-model"),
+        "the fallback must be said, not silent: {:?}",
+        status_details(&fallen_back)
+    );
+
+    aaa.shutdown().await;
+    zzz.shutdown().await;
+}

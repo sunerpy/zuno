@@ -20,6 +20,13 @@ Shell 默认失败即拒绝。受信的全局、显式配置、环境、CLI 或�
 灾难性命令硬拒绝，同时记录请求的文件系统和网络限制没有得到 OS 强制执行。
 显式 `danger-full-access` 会跳过受限后端发现，并把生效权限模式设为 `allow_all`。
 
+受信层也可以用 `sandbox.backend` 直接选定后端：`auto`（默认）按上文发现受约束后端；
+`native` 让每一个 Agent 的 Shell——包括只读 Agent——都在原生进程后端上运行，不做任何
+探测，同时保留已配置的权限模式。这是一项主机声明而不是降级，也不是沙箱隔离：请求的权限
+会被记录（`resolutionKind: trusted_native`）但不由 OS 强制执行，因此只读 Agent 的契约变成
+一道由工具、权限与风险门禁构成的边界。项目层无法选择它；`zuno --sandbox-backend native`
+与 `ZUNO_SANDBOX_BACKEND=native` 只对一次调用选择它。
+
 在受支持的 Linux 宿主上，Zuno 会定位一个固定的、root 所有的系统 `bwrap`，路径为
 `/usr/bin/bwrap` 或 `/bin/bwrap`，探测所需的命名空间，编译生效的 Agent 策略，并且只把
 一个不透明的 `PreparedCommand` 传给进程层。
@@ -61,17 +68,22 @@ server 或 headless 界面上弹出准入卡片。显式的权限拒绝以及 Sh
 仍然是终态；它们直接失败，而不是询问。结构化的用户提问不是准入，仍然可能被展示。
 
 macOS 与 Windows 的受约束模式目前返回一个带类型的不支持平台错误。在默认 `deny` 下不会
-注册 Shell；受信的 `run-unconfined` 可以让具备写能力的 Agent 原生继续，而显式的
+注册 Shell；受信的 `run-unconfined` 可以让具备写能力的 Agent 原生继续，受信的
+`sandbox.backend: native` 让每个 Agent 都原生运行并保留权限模式，而显式的
 `danger-full-access` 始终可以独立使用原生进程后端。拒绝信息会点明平台、说明降级是否适用于
-本次请求，并列出全部补救方式：`zuno --sandbox-on-unavailable run-unconfined`、
-`zuno --sandbox danger-full-access`、`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`，或在
-受信层（全局、受管、环境、CLI）设置 `sandbox.onUnavailable`；项目层无法启用它。在这类主机上
-交互式启动 `zuno` 时，会在进入 raw mode 之前询问一次是否以原生方式运行本次会话——仅限具备
-写能力的请求、仅当没有任何层设置过 `sandbox.onUnavailable`、且标准输入与标准错误都是终端；
-回答 yes 时本进程的解析结果与命令行标志完全一致，回答 no 则以该拒绝信息退出。这个回答只对当前
-进程生效：在 macOS 上，命令行标志会通过启动时的 re-exec 写入真实环境变量，从而被嵌套的 Zuno
-进程继承，而提示里的回答不会；如果嵌套的 `zuno` 也需要同样的答案，请设置
-`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined` 或在受信层设置 `sandbox.onUnavailable`。
+本次请求，并列出全部补救方式：对任何 Agent（包括只读 Agent）适用的
+`zuno --sandbox-backend native`、`ZUNO_SANDBOX_BACKEND=native` 或受信层里的 `sandbox.backend`；
+对具备写能力的 Agent 适用的 `zuno --sandbox-on-unavailable run-unconfined`、
+`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined` 或受信层（全局、受管、环境、CLI）里的
+`sandbox.onUnavailable`；以及 `zuno --sandbox danger-full-access`。项目层无法启用其中任何一项。
+在这类主机上交互式启动 `zuno` 时，会在进入 raw mode 之前询问一次是否以原生方式运行本次会话
+——只要请求无法被约束就会询问，只读请求也包括在内，前提是没有任何层设置过
+`sandbox.onUnavailable` 或 `sandbox.backend`，且标准输入与标准错误都是终端；回答 yes 时选择
+原生后端，本进程的解析结果与命令行标志 `--sandbox-backend native` 完全一致，回答 no 则以该
+拒绝信息退出。这个回答只对当前进程生效：在 macOS 上，命令行标志会
+通过启动时的 re-exec 写入真实环境变量，从而被嵌套的 Zuno 进程继承，而提示里的回答不会；
+如果嵌套的 `zuno` 也需要同样的答案，请设置 `ZUNO_SANDBOX_BACKEND=native` 或在受信层设置
+`sandbox.backend`。
 `run`、`acp` 与 `serve` 永远不会询问，仍然需要标志或环境变量。以上任何一种都不是沙箱隔离。
 切换到一个无法注册 Shell 的 Agent 时，会保留当前 Agent 并给出同样的提示，而不是结束会话。参见
 [Shell sandbox roadmap](https://github.com/sunerpy/zuno/blob/main/docs/design/shell-sandbox-roadmap.md)。
@@ -184,7 +196,9 @@ sudo journalctl -k --since '-10 minutes' \
 ```
 
 这个选择对只读 Agent 无效，也不会掩盖 `debug sandbox --check` 的失败。项目配置不能启用
-它，受管策略仍可强制使用 `deny`。如果容器应当始终原生运行，而不是先尝试沙箱，请直接使用
+它，受管策略仍可强制使用 `deny`。如果容器应当始终原生运行（包括只读 Agent）同时保留权限层，
+请改用 `{"sandbox":{"backend":"native"}}`；在它之下 `--check` 对受约束的请求模式仍会失败，
+因为请求的约束并没有被部署。如果容器应当始终原生运行并且不需要审批提示，请直接使用
 `"mode": "danger-full-access"`。
 
 WSL1 不受支持。WSL2 是一台 Linux 虚拟机，只有在相同的 user、mount、PID、network、

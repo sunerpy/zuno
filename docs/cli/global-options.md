@@ -31,6 +31,7 @@ These options appear in the `--help` output of `zuno` and of every subcommand.
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE` (maximum tracing detail), `DEBUG` (verbose diagnostic events), `INFO` (normal operational events), `WARN` (warnings and errors), `ERROR` (errors only) | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ## Root invocation options
@@ -75,6 +76,15 @@ policy may override this back to `deny`.
 
 ```sh
 zuno run --sandbox-on-unavailable run-unconfined "run the local build"
+```
+
+Run every Agent's Shell natively on a host without an OS sandbox while keeping the
+configured permission mode. This is the one route a read-only Agent such as `plan`
+has on macOS and Windows; it is a trusted declaration, not confinement, and managed
+policy may override it back to `auto`.
+
+```sh
+zuno run --agent plan --sandbox-backend native "audit the retry policy"
 ```
 
 Verify that a confinement mode is actually deployable on this host before relying on it.

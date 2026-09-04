@@ -81,10 +81,15 @@ impl zuno_sandbox::SandboxResolver for UnavailableTestSandbox {
     fn resolve(
         self: Arc<Self>,
         policy: zuno_sandbox::SandboxPolicy,
-        on_unavailable: zuno_sandbox::SandboxUnavailableAction,
+        request: zuno_sandbox::SandboxBackendRequest,
     ) -> Result<zuno_sandbox::SandboxResolution, zuno_sandbox::SandboxError> {
         let _ = self;
-        if on_unavailable == zuno_sandbox::SandboxUnavailableAction::RunUnconfined
+        if request.backend == zuno_sandbox::SandboxBackendSelection::Native
+            && policy.mode() != zuno_sandbox::SandboxMode::DangerFullAccess
+        {
+            return zuno_sandbox::SandboxResolution::trusted_native(policy);
+        }
+        if request.on_unavailable == zuno_sandbox::SandboxUnavailableAction::RunUnconfined
             && policy.mode() == zuno_sandbox::SandboxMode::WorkspaceWrite
         {
             return zuno_sandbox::SandboxResolution::unavailable_fallback(
@@ -264,6 +269,65 @@ fn host_planning_classifier_requires_multi_stage_work_without_seeding_visible_st
             .plan("ses-atomic-policy")
             .expect("read atomic plan")
             .is_none()
+    );
+}
+
+#[test]
+fn a_greeting_is_atomic_and_injects_no_planning_instruction() {
+    // The reported session: `hi` to the `deep` Agent was classified `Required`, the turn
+    // appended "This request requires a durable strategic Plan …" as a runtime
+    // instruction, and the model read and created a Plan titled "Acknowledge greeting"
+    // before saying hello.
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
+    );
+    {
+        let mut connection = pool.get().expect("schema connection");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-greeting', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES \
+                   ('ses-greeting', 'project-greeting', 'greeting', '/workspace', 'greeting', '1', 1, 1);",
+            )
+            .expect("seed greeting session");
+    }
+
+    for prompt in ["hi", "thanks", "你好"] {
+        let outcome = ensure_host_plan(
+            &pool,
+            HostPlanningRequest {
+                session_id: "ses-greeting",
+                agent: "deep",
+                prompt,
+                source: PlanningInputSource::User,
+                content: PlanningContentFacts::empty(),
+                plan_available: true,
+                goal_id: None,
+            },
+        )
+        .expect("classify a greeting");
+        assert!(
+            matches!(outcome.decision, PlanningDecision::Atomic(_)),
+            "{prompt:?} must stay atomic: {:?}",
+            outcome.decision
+        );
+        assert_eq!(outcome.decision.rationale().code(), "conversational");
+        assert!(!outcome.changed, "a greeting changes no durable work state");
+        assert!(
+            planning_runtime_instruction(&outcome.decision).is_none(),
+            "no planning instruction reaches the model for {prompt:?}"
+        );
+    }
+    assert!(
+        zuno_tools::WorkStateStore::new(pool)
+            .plan("ses-greeting")
+            .expect("read plan")
+            .is_none(),
+        "a greeting must not create a Plan row"
     );
 }
 
@@ -1599,6 +1663,22 @@ fn plan_unreconciled_waiting_creates_a_typed_recoverable_human_request() {
 }
 
 fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
+    let agent = agent("build");
+    let config = zuno_config::schema::Config::default();
+    let profile = agent_profile(agent.clone(), Path::new(directory), &config);
+    plan_for(directory, session, agent, profile, config)
+}
+
+/// The same fixture with the Agent, its resolved profile, and the configuration a
+/// test chooses, so a decision can be driven for a read-only Agent or a configuration
+/// that discovery produced from an environment.
+fn plan_for(
+    directory: &str,
+    session: SessionChoice,
+    agent: Agent,
+    profile: zuno_agent::profile::AgentProfile,
+    config: zuno_config::schema::Config,
+) -> TurnPlan {
     let directory = PathBuf::from(directory);
     let auth_store = zuno_auth::AuthStore::new(directory.join(".zuno-test-auth.json"));
     let project = zuno_paths::project::ResolvedProject {
@@ -1607,9 +1687,6 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         directory: directory.clone(),
         vcs: None,
     };
-    let agent = agent("build");
-    let config = zuno_config::schema::Config::default();
-    let profile = agent_profile(agent.clone(), &directory, &config);
     let extension_scope = zuno_extension::Scope::new(&directory);
     let skills = Arc::new(zuno_catalog::skill::Skills::default());
     TurnPlan {
@@ -1661,6 +1738,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         provider_id: "provider".to_owned(),
         model_id: "model".to_owned(),
         model_override: None,
+        preset_override: None,
         auth_store,
         credential: None,
         session,
@@ -10679,9 +10757,11 @@ mod learning_runtime {
 
 /// Acts as a host with no confined backend: the typed cause macOS and Windows raise.
 ///
-/// Mirrors `resolve_policy_with` exactly: a trusted `run-unconfined` resolves a
-/// write-capable request through the native fallback, everything else is the typed
-/// refusal, so the tests below exercise the real resolver contract on a Linux runner.
+/// Mirrors `resolve_policy_with` exactly: a trusted `native` backend selection resolves
+/// every confined request natively before any discovery, a trusted `run-unconfined`
+/// resolves a write-capable request through the native fallback, everything else is
+/// the typed refusal, so the tests below exercise the real resolver contract on a
+/// Linux runner.
 #[derive(Debug)]
 struct UnsupportedPlatformTestSandbox;
 
@@ -10689,10 +10769,15 @@ impl zuno_sandbox::SandboxResolver for UnsupportedPlatformTestSandbox {
     fn resolve(
         self: Arc<Self>,
         policy: zuno_sandbox::SandboxPolicy,
-        on_unavailable: zuno_sandbox::SandboxUnavailableAction,
+        request: zuno_sandbox::SandboxBackendRequest,
     ) -> Result<zuno_sandbox::SandboxResolution, zuno_sandbox::SandboxError> {
         let _ = self;
-        if on_unavailable == zuno_sandbox::SandboxUnavailableAction::RunUnconfined
+        if request.backend == zuno_sandbox::SandboxBackendSelection::Native
+            && policy.mode() != zuno_sandbox::SandboxMode::DangerFullAccess
+        {
+            return zuno_sandbox::SandboxResolution::trusted_native(policy);
+        }
+        if request.on_unavailable == zuno_sandbox::SandboxUnavailableAction::RunUnconfined
             && policy.mode() == zuno_sandbox::SandboxMode::WorkspaceWrite
         {
             return zuno_sandbox::SandboxResolution::unavailable_fallback(
@@ -10779,7 +10864,7 @@ fn config_json(json: &str) -> zuno_config::schema::Config {
         .expect("test configuration parses")
 }
 
-const WRITE_CAPABLE_REMEDIES: [&str; 11] = [
+const WRITE_CAPABLE_REMEDIES: [&str; 16] = [
     "OS sandbox is not implemented for platform `windows`",
     "windows has no confined sandbox backend",
     "`workspace-write` authority",
@@ -10790,18 +10875,27 @@ const WRITE_CAPABLE_REMEDIES: [&str; 11] = [
     "\"onUnavailable\": \"run-unconfined\"",
     "trusted global, managed, environment, or CLI configuration layer",
     "a project layer cannot enable it",
+    "`zuno --sandbox-backend native`",
+    "`ZUNO_SANDBOX_BACKEND=native`",
+    "\"backend\": \"native\"",
+    "every Agent of this process, read-only ones included, with your permission mode kept",
+    "additionally makes the effective permission mode `allow_all`",
     "None of these is confinement",
 ];
 
-const READ_ONLY_REMEDIES: [&str; 9] = [
+const READ_ONLY_REMEDIES: [&str; 13] = [
     "OS sandbox is not implemented for platform `windows`",
     "windows has no confined sandbox backend",
     "`read-only` authority",
     "A read-only request never falls back",
     "`zuno --sandbox-on-unavailable run-unconfined`, `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`, and a trusted `\"sandbox\": {\"onUnavailable\": \"run-unconfined\"}` do not apply",
-    "Only an explicit `danger-full-access` request runs natively",
-    "`zuno --sandbox danger-full-access`",
+    "while keeping your permission mode, select the native backend explicitly",
+    "`zuno --sandbox-backend native`",
+    "`ZUNO_SANDBOX_BACKEND=native`",
+    "\"backend\": \"native\"",
     "a project layer cannot select it",
+    "recorded but not OS-enforced",
+    "the Agent's tool contract, your permission rules, and the Shell risk gate are what remain",
     "That is not confinement",
 ];
 
@@ -10842,14 +10936,19 @@ fn unsupported_platform_refusal_for_a_write_capable_request_names_every_remedy()
     }
 }
 
-/// A read-only request is told the truth: the fallback remedies do not apply to it.
+/// A read-only request is told the truth: the fallback remedies do not apply to it,
+/// and the remedy that does is the trusted `sandbox.backend: native` selection, not a
+/// `danger-full-access` request a read-only contract could never make.
 #[test]
-fn unsupported_platform_refusal_for_a_read_only_request_says_only_danger_full_access_runs_natively()
-{
+fn unsupported_platform_refusal_for_a_read_only_request_names_the_native_backend_setting() {
     let directory = tempfile::TempDir::new().expect("temporary tool workspace");
     let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
     let selected_agent = read_only_shell_profile();
-    for json in [r#"{}"#, r#"{"sandbox":{"onUnavailable":"run-unconfined"}}"#] {
+    for json in [
+        r#"{}"#,
+        r#"{"sandbox":{"onUnavailable":"run-unconfined"}}"#,
+        r#"{"sandbox":{"backend":"auto"}}"#,
+    ] {
         let config = config_json(json);
         let message = assemble_on_unsupported_platform(
             directory.path(),
@@ -10877,6 +10976,125 @@ fn unsupported_platform_refusal_for_a_read_only_request_says_only_danger_full_ac
         assert!(
             !message.contains("fallback applies"),
             "{json}: a read-only request must not be offered the fallback: {message}"
+        );
+        assert!(
+            !message.contains("Only an explicit `danger-full-access` request runs natively"),
+            "{json}: the 0.9.1 remedy a read-only Agent could not take is gone: {message}"
+        );
+        assert!(
+            !message.contains("only an Agent whose contract is write-capable"),
+            "{json}: {message}"
+        );
+    }
+}
+
+/// The route 0.9.1 did not have: a read-only Agent on a host with no confined backend
+/// assembles natively once a trusted layer selects the native backend. Shell is
+/// registered, the durable notice names the selection and the unenforced contract, the
+/// record carries `trusted_native` and the requested `read-only` mode, and the
+/// permission mode is untouched.
+#[cfg(unix)]
+#[tokio::test]
+async fn read_only_agent_assembles_natively_when_a_trusted_layer_selects_the_native_backend() {
+    use zuno_config::schema::permission::PermissionMode;
+    use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
+
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let config = config_json(r#"{"shell":"/bin/sh","sandbox":{"backend":"native"}}"#);
+    assert_eq!(
+        config.effective_permission_mode(),
+        PermissionMode::Standard,
+        "the native backend keeps the permission mode"
+    );
+    let selected_agent = read_only_shell_profile();
+
+    let runtime = assemble_on_unsupported_platform(
+        directory.path(),
+        goal_spill.path(),
+        &config,
+        &selected_agent,
+    )
+    .expect("a trusted native selection assembles a read-only Agent on an unsupported platform");
+
+    let notice = runtime
+        .sandbox_notice
+        .as_deref()
+        .expect("the trusted native selection carries its notice");
+    for needle in [
+        "The native Shell backend was selected explicitly (sandbox.backend: native).",
+        "without OS isolation",
+        "mode=read-only, network=denied",
+        "mode=danger-full-access, network=allowed",
+        "The requested `read-only` authority is recorded but not OS-enforced",
+        "Permission mode `standard`, permission rules, approvals, catastrophic-command refusals, \
+         timeouts, and cancellation still apply",
+        "Do not describe shell execution as sandboxed",
+    ] {
+        assert!(notice.contains(needle), "missing {needle:?} in {notice}");
+    }
+    assert!(
+        !notice.contains("unavailable"),
+        "nothing failed and nothing fell back: {notice}"
+    );
+
+    let shell = runtime
+        .tools
+        .iter()
+        .find(|tool| tool.id() == "shell")
+        .expect("the read-only Agent keeps Shell under the native backend");
+    let output = shell
+        .invoke(
+            serde_json::json!({"command": "printf native"}),
+            ToolContext::new(
+                "ses_native",
+                "msg_native",
+                "call_native",
+                "read-only-shell",
+                Arc::new(AllowAll),
+                Arc::new(NeverInterrupted),
+            ),
+        )
+        .await
+        .expect("the native command executes");
+
+    assert_eq!(output.metadata["sandboxBackend"], "danger_full_access");
+    assert_eq!(output.metadata["sandboxRequestedMode"], "read-only");
+    assert_eq!(output.metadata["sandboxRequestedNetwork"], "denied");
+    assert_eq!(output.metadata["sandboxMode"], "danger-full-access");
+    assert_eq!(output.metadata["sandboxNetwork"], "allowed");
+    assert_eq!(output.metadata["sandboxResolutionKind"], "trusted_native");
+    assert_eq!(output.metadata["sandboxFallback"], false);
+    assert!(output.metadata["sandboxFallbackReason"].is_null());
+}
+
+/// `auto` is exactly what it was: the same read-only Agent under the same host still
+/// refuses when nothing selected the native backend, `run-unconfined` or not.
+#[test]
+fn read_only_agent_still_refuses_under_the_auto_backend_on_an_unsupported_platform() {
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let selected_agent = read_only_shell_profile();
+    for json in [
+        r#"{"sandbox":{"backend":"auto"}}"#,
+        r#"{"sandbox":{"backend":"auto","onUnavailable":"run-unconfined"}}"#,
+    ] {
+        let config = config_json(json);
+        let message = assemble_on_unsupported_platform(
+            directory.path(),
+            goal_spill.path(),
+            &config,
+            &selected_agent,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{json}: auto never runs a read-only request natively"));
+        assert_eq!(
+            message,
+            tool_runtime::unsupported_platform_refusal(
+                "windows",
+                zuno_sandbox::SandboxMode::ReadOnly
+            ),
+            "{json}"
         );
     }
 }
@@ -10912,10 +11130,36 @@ fn trusted_run_unconfined_still_resolves_a_write_capable_request_on_an_unsupport
 /// Every branch of the one decision the TUI start and an agent switch share.
 #[test]
 fn unsupported_platform_decision_covers_every_branch() {
-    use tool_runtime::{UnsupportedPlatformDecision, UnsupportedPlatformRefusal};
+    use tool_runtime::{
+        ConfiguredNativeChoices, UnsupportedPlatformDecision, UnsupportedPlatformRefusal,
+    };
+    use zuno_config::schema::sandbox::SandboxBackendSelection as Backend;
     use zuno_config::schema::sandbox::SandboxUnavailableAction as Configured;
     use zuno_sandbox::SandboxMode;
 
+    let nobody_chose = ConfiguredNativeChoices::default();
+    let choices = [
+        ConfiguredNativeChoices {
+            on_unavailable: Some(Configured::Deny),
+            backend: None,
+        },
+        ConfiguredNativeChoices {
+            on_unavailable: Some(Configured::RunUnconfined),
+            backend: None,
+        },
+        ConfiguredNativeChoices {
+            on_unavailable: None,
+            backend: Some(Backend::Auto),
+        },
+        ConfiguredNativeChoices {
+            on_unavailable: None,
+            backend: Some(Backend::Native),
+        },
+        ConfiguredNativeChoices {
+            on_unavailable: Some(Configured::Deny),
+            backend: Some(Backend::Auto),
+        },
+    ];
     let write = UnsupportedPlatformRefusal {
         platform: "windows".to_owned(),
         requested_mode: SandboxMode::WorkspaceWrite,
@@ -10929,12 +11173,8 @@ fn unsupported_platform_decision_covers_every_branch() {
     let read_only_text = tool_runtime::unsupported_platform_refusal("macos", SandboxMode::ReadOnly);
 
     // Nothing pending: Linux with bubblewrap, no Shell, an explicit `danger-full-access`,
-    // or a trusted fallback that resolved all arrive here.
-    for configured in [
-        None,
-        Some(Configured::Deny),
-        Some(Configured::RunUnconfined),
-    ] {
+    // a trusted native selection, or a trusted fallback that resolved all arrive here.
+    for configured in std::iter::once(nobody_chose).chain(choices) {
         for interactive in [true, false] {
             assert_eq!(
                 tool_runtime::decide_unsupported_platform(None, configured, interactive),
@@ -10944,64 +11184,97 @@ fn unsupported_platform_decision_covers_every_branch() {
         }
     }
 
-    // The one case that asks: write-capable, nobody configured onUnavailable, a TTY.
+    // The cases that ask: nobody configured onUnavailable or backend, and a TTY. Both
+    // requests are offered, because acceptance selects the native backend and that
+    // remedy applies to a read-only contract too.
     assert_eq!(
-        tool_runtime::decide_unsupported_platform(Some(&write), None, true),
+        tool_runtime::decide_unsupported_platform(Some(&write), nobody_chose, true),
         UnsupportedPlatformDecision::OfferNativeExecution {
-            platform: "windows".to_owned()
+            platform: "windows".to_owned(),
+            requested_mode: SandboxMode::WorkspaceWrite,
+        }
+    );
+    assert_eq!(
+        tool_runtime::decide_unsupported_platform(Some(&read_only), nobody_chose, true),
+        UnsupportedPlatformDecision::OfferNativeExecution {
+            platform: "macos".to_owned(),
+            requested_mode: SandboxMode::ReadOnly,
         }
     );
 
     // Off a TTY nothing may prompt; the headless text is the answer.
     assert_eq!(
-        tool_runtime::decide_unsupported_platform(Some(&write), None, false),
+        tool_runtime::decide_unsupported_platform(Some(&write), nobody_chose, false),
         UnsupportedPlatformDecision::Refuse {
             message: write_text.clone()
         }
     );
-
-    // A layer that chose is honoured: an explicit deny never prompts, and an explicit
-    // run-unconfined that still refused (it never covers read-only) is not re-asked.
-    for configured in [Configured::Deny, Configured::RunUnconfined] {
-        for interactive in [true, false] {
-            assert_eq!(
-                tool_runtime::decide_unsupported_platform(
-                    Some(&write),
-                    Some(configured),
-                    interactive
-                ),
-                UnsupportedPlatformDecision::Refuse {
-                    message: write_text.clone()
-                },
-                "{configured:?} interactive={interactive}"
-            );
+    assert_eq!(
+        tool_runtime::decide_unsupported_platform(Some(&read_only), nobody_chose, false),
+        UnsupportedPlatformDecision::Refuse {
+            message: read_only_text.clone()
         }
-    }
+    );
 
-    // Read-only never falls back, so there is nothing to offer, TTY or not.
-    for configured in [
-        None,
-        Some(Configured::Deny),
-        Some(Configured::RunUnconfined),
-    ] {
-        for interactive in [true, false] {
-            assert_eq!(
-                tool_runtime::decide_unsupported_platform(
-                    Some(&read_only),
-                    configured,
-                    interactive
-                ),
-                UnsupportedPlatformDecision::Refuse {
-                    message: read_only_text.clone()
-                },
-                "{configured:?} interactive={interactive}"
-            );
+    // A layer that chose is honoured: an explicit deny or auto never prompts, and an
+    // explicit run-unconfined that still refused (it never covers read-only) is not
+    // re-asked. A configured native that still refused cannot happen (the preflight
+    // returns None for it), and if it did the layer's choice would still stand.
+    for configured in choices {
+        for (refusal, text) in [(&write, &write_text), (&read_only, &read_only_text)] {
+            for interactive in [true, false] {
+                assert_eq!(
+                    tool_runtime::decide_unsupported_platform(
+                        Some(refusal),
+                        configured,
+                        interactive
+                    ),
+                    UnsupportedPlatformDecision::Refuse {
+                        message: text.clone()
+                    },
+                    "{configured:?} {:?} interactive={interactive}",
+                    refusal.requested_mode
+                );
+            }
         }
     }
     for needle in READ_ONLY_REMEDIES {
         assert!(
             read_only_text.replace("macos", "windows").contains(needle),
             "missing {needle:?}"
+        );
+    }
+
+    // The offer text names the requested authority and the one mechanism acceptance
+    // takes, for both requests.
+    for (mode, permission_mode) in [
+        (SandboxMode::ReadOnly, "standard"),
+        (SandboxMode::WorkspaceWrite, "strict"),
+    ] {
+        let offer = tool_runtime::native_execution_offer("macos", mode, permission_mode);
+        for needle in [
+            "OS sandbox is not implemented for platform `macos`: macos has no confined sandbox",
+            &format!(
+                "The requested `{}` authority cannot be confined here",
+                mode.as_str()
+            ),
+            &format!("under permission mode `{permission_mode}`"),
+            "that is not confinement",
+            "a read-only Agent's contract then remains a tool and permission boundary, not an \
+             OS boundary",
+            "Accepting selects the native backend (`sandbox.backend: native`)",
+            "`zuno --sandbox-backend native`",
+            "`ZUNO_SANDBOX_BACKEND=native`",
+            "additionally makes the effective permission mode `allow_all`",
+        ] {
+            assert!(
+                offer.contains(needle),
+                "{mode:?}: missing {needle:?} in {offer}"
+            );
+        }
+        assert!(
+            !offer.contains("run-unconfined"),
+            "{mode:?}: the offer has one mechanism, the native backend: {offer}"
         );
     }
 }
@@ -11092,6 +11365,42 @@ fn sandbox_preflight_reports_only_an_unsupported_platform_that_assembly_would_re
         "an explicit danger-full-access request never discovers a confined backend"
     );
 
+    let native_backend = config_json(r#"{"sandbox":{"backend":"native"}}"#);
+    let build_native_backend = agent_profile(agent("build"), directory.path(), &native_backend);
+    for (profile, label) in [
+        (&build_native_backend, "write-capable"),
+        (&read_only, "read-only"),
+    ] {
+        assert_eq!(
+            tool_runtime::sandbox_preflight(
+                directory.path(),
+                &native_backend,
+                profile,
+                &standard,
+                &|_: &SandboxPolicy| -> Result<(), SandboxError> {
+                    panic!("a trusted native selection never probes the confined backend")
+                }
+            ),
+            None,
+            "{label}: a trusted native backend selection resolves before discovery"
+        );
+    }
+    let auto_backend = config_json(r#"{"sandbox":{"backend":"auto"}}"#);
+    assert_eq!(
+        tool_runtime::sandbox_preflight(
+            directory.path(),
+            &auto_backend,
+            &read_only,
+            &standard,
+            &windows
+        ),
+        Some(UnsupportedPlatformRefusal {
+            platform: "windows".to_owned(),
+            requested_mode: SandboxMode::ReadOnly,
+        }),
+        "an explicit auto is the default behaviour and is refused like it"
+    );
+
     assert_eq!(
         tool_runtime::sandbox_preflight(
             directory.path(),
@@ -11145,10 +11454,20 @@ fn only_the_interactive_tui_offers_native_execution_and_only_before_raw_mode() {
             !source.contains("terminal_prompt::confirm"),
             "`{surface}` must never ask; it refuses with the remedies in the text"
         );
-        assert!(
-            !source.contains("with_sandbox_on_unavailable("),
-            "`{surface}` must not widen its own sandbox authority"
-        );
+        // `ShellTool::with_sandbox_backend(` is the tool constructor every surface reaches
+        // through assembly; the environment override is the call spelled with the CLI
+        // selection, and that is what no headless surface may make.
+        for widening in [
+            "with_sandbox_backend(CliSandboxBackend",
+            "with_sandbox_backend(crate::command::CliSandboxBackend",
+            "accept_native_execution(",
+            "with_sandbox_on_unavailable(",
+        ] {
+            assert!(
+                !source.contains(widening),
+                "`{surface}` must not widen its own sandbox authority ({widening})"
+            );
+        }
     }
 
     let tui = read("tui.rs");
@@ -11169,6 +11488,14 @@ fn only_the_interactive_tui_offers_native_execution_and_only_before_raw_mode() {
     assert!(
         tui.contains("&super::tool_runtime::system_sandbox_probe"),
         "the production decision probes the real backend, not a stand-in"
+    );
+    assert!(
+        tui.contains("*environment = accept_native_execution(environment);"),
+        "acceptance takes the one path the test below drives"
+    );
+    assert!(
+        !tui.contains("with_sandbox_on_unavailable("),
+        "acceptance selects the native backend, not the write-capable-only fallback"
     );
     assert!(
         tui.contains("sandbox_decision(&plan, false)"),
@@ -11222,7 +11549,8 @@ fn a_write_capable_plan_without_a_platform_backend_asks_only_on_a_terminal() {
     assert_eq!(
         crate::cmd::tui::decide_for_plan(&plan, &windows, true),
         UnsupportedPlatformDecision::OfferNativeExecution {
-            platform: "windows".to_owned()
+            platform: "windows".to_owned(),
+            requested_mode: SandboxMode::WorkspaceWrite,
         },
         "an interactive start offers native execution"
     );
@@ -11254,4 +11582,770 @@ fn a_write_capable_plan_without_a_platform_backend_asks_only_on_a_terminal() {
             "interactive={interactive}"
         );
     }
+}
+
+/// The TUI's one question, driven for the request 0.9.1 could not offer it to: a
+/// read-only plan on a host with no confined backend is offered native execution,
+/// accepting selects the native backend for the process through the same override
+/// path the flag takes, discovery reads that override as a trusted layer, and the next
+/// decision on the re-read configuration proceeds, terminal or not, with the
+/// permission mode untouched.
+#[test]
+fn accepting_the_native_offer_for_a_read_only_plan_switches_the_process_to_the_native_backend() {
+    use crate::GlobalOptions;
+    use crate::environment::{StartupEnvironment, ZUNO_SANDBOX_BACKEND};
+    use tool_runtime::UnsupportedPlatformDecision;
+    use zuno_config::schema::permission::PermissionMode;
+    use zuno_config::schema::sandbox::SandboxBackendSelection;
+    use zuno_sandbox::{SandboxError, SandboxMode, SandboxPolicy};
+
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let workspace = directory
+        .path()
+        .to_str()
+        .expect("a UTF-8 temporary workspace");
+    let home = directory.path().join("home");
+    let xdg_config = directory.path().join("xdg-config");
+    for path in [&home, &xdg_config] {
+        std::fs::create_dir_all(path).expect("fixture directory");
+    }
+    let base = Env::from_pairs([
+        ("HOME".to_owned(), home.display().to_string()),
+        ("ZUNO_TEST_HOME".to_owned(), home.display().to_string()),
+        (
+            "XDG_CONFIG_HOME".to_owned(),
+            xdg_config.display().to_string(),
+        ),
+    ]);
+    let discover = |environment: &StartupEnvironment| {
+        zuno_config::discovery::discover_with(
+            &zuno_config::discovery::DiscoveryOptions::new(
+                directory.path(),
+                None::<&Path>,
+                environment.resolved().clone(),
+            )
+            .with_default_username("unknown"),
+        )
+        .expect("configuration discovers from the process environment")
+    };
+    let windows = |_: &SandboxPolicy| -> Result<(), SandboxError> {
+        Err(SandboxError::UnsupportedPlatform("windows".to_owned()))
+    };
+
+    let startup = StartupEnvironment::resolve(&base, &GlobalOptions::default());
+    let before = discover(&startup);
+    assert_eq!(before.sandbox_backend(), SandboxBackendSelection::Auto);
+    let plan_before = plan_for(
+        workspace,
+        SessionChoice::New,
+        agent("read-only-shell"),
+        read_only_shell_profile(),
+        before,
+    );
+    assert_eq!(
+        crate::cmd::tui::decide_for_plan(&plan_before, &windows, true),
+        UnsupportedPlatformDecision::OfferNativeExecution {
+            platform: "windows".to_owned(),
+            requested_mode: SandboxMode::ReadOnly,
+        },
+        "an interactive start offers native execution to a read-only plan too"
+    );
+    assert_eq!(
+        crate::cmd::tui::decide_for_plan(&plan_before, &windows, false),
+        UnsupportedPlatformDecision::Refuse {
+            message: tool_runtime::unsupported_platform_refusal("windows", SandboxMode::ReadOnly),
+        },
+        "off a terminal, and on decline, the read-only refusal names the setting"
+    );
+
+    let accepted = crate::cmd::tui::accept_native_execution(&startup);
+    assert_eq!(
+        accepted.resolved().value(ZUNO_SANDBOX_BACKEND),
+        Some("native")
+    );
+    assert_eq!(accepted.flags.value(ZUNO_SANDBOX_BACKEND), Some("native"));
+    assert_eq!(
+        accepted
+            .resolved()
+            .value(crate::ZUNO_SANDBOX_ON_UNAVAILABLE),
+        None,
+        "acceptance is the backend selection, not the fallback action"
+    );
+    let flagged = StartupEnvironment::resolve(
+        &base,
+        &GlobalOptions {
+            sandbox_backend: Some(crate::CliSandboxBackend::Native),
+            ..GlobalOptions::default()
+        },
+    );
+    assert_eq!(
+        accepted.overrides().collect::<Vec<_>>(),
+        flagged.overrides().collect::<Vec<_>>(),
+        "the answer takes exactly the path `--sandbox-backend native` takes"
+    );
+
+    let after = discover(&accepted);
+    assert_eq!(after.sandbox_backend(), SandboxBackendSelection::Native);
+    assert_eq!(
+        after.effective_permission_mode(),
+        PermissionMode::Standard,
+        "the permission mode is untouched by the answer"
+    );
+    let plan_after = plan_for(
+        workspace,
+        SessionChoice::New,
+        agent("read-only-shell"),
+        read_only_shell_profile(),
+        after,
+    );
+    for interactive in [true, false] {
+        assert_eq!(
+            crate::cmd::tui::decide_for_plan(&plan_after, &windows, interactive),
+            UnsupportedPlatformDecision::Proceed,
+            "interactive={interactive}: the next decision proceeds without asking again"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A resumed session keeps the Agent, model and reasoning level it last ran with.
+//
+// The precedence is `TurnPlan::resolve`'s, so these tests drive the real resolution
+// against an isolated home and a file database rather than a fixture plan: an explicit
+// option wins, then the row the session choice names, then configuration. Two
+// config-provided providers keep the routed model (`aaa`) distinguishable from a saved
+// one (`zzz`), and `zzz` declares exactly `low` and `high` so a saved level can be
+// honoured, outranked, or refused.
+// ---------------------------------------------------------------------------
+
+fn resume_model(id: &str, reasoning: bool) -> serde_json::Value {
+    let mut model = json!({
+        "id": id,
+        "name": id,
+        "attachment": false,
+        "reasoning": reasoning,
+        "temperature": false,
+        "tool_call": true,
+        "release_date": "2025-01-01",
+        "limit": {"context": 100_000, "output": 10_000},
+        "cost": {"input": 0, "output": 0},
+        "options": {}
+    });
+    if reasoning {
+        model["variants"] = json!({
+            "low": {"reasoningEffort": "low"},
+            "high": {"reasoningEffort": "high"}
+        });
+    }
+    model
+}
+
+fn resume_provider(label: &str, reasoning: bool) -> serde_json::Value {
+    json!({
+        "name": label,
+        "id": label,
+        "env": [],
+        "transport": "openai-compatible",
+        "models": {format!("{label}-model"): resume_model(&format!("{label}-model"), reasoning)},
+        // A closed port: resolution never dials, and a test that did would fail fast.
+        "options": {"apiKey": "resume-seed", "baseURL": "http://127.0.0.1:9/v1"}
+    })
+}
+
+fn resume_config(extra: serde_json::Value) -> String {
+    let mut config = json!({
+        "formatter": false,
+        "lsp": false,
+        "model": "aaa/aaa-model",
+        "provider": {
+            "aaa": resume_provider("aaa", false),
+            "zzz": resume_provider("zzz", true)
+        }
+    });
+    if let Some(object) = extra.as_object() {
+        for (key, value) in object {
+            config[key] = value.clone();
+        }
+    }
+    zuno_testkit::trusted_platform_config(config).to_string()
+}
+
+const RESUME_PROJECT: &str = "project-resume-seed";
+
+struct ResumeFixture {
+    env: zuno_testkit::ScriptedEnv,
+    environment: crate::environment::StartupEnvironment,
+    directory: PathBuf,
+    pool: zuno_db::Pool,
+}
+
+impl ResumeFixture {
+    fn new(config: String) -> Self {
+        Self::with_db(config, zuno_testkit::DbChoice::TempFile)
+    }
+
+    fn with_db(config: String, db: zuno_testkit::DbChoice) -> Self {
+        let env = zuno_testkit::ScriptedEnv::new()
+            .expect("isolated environment")
+            .with_db(db);
+        let variables = Env::from_pairs(env.env_vars())
+            .with("ZUNO_CONFIG_CONTENT", config)
+            .with("ZUNO_AUTH_CONTENT", "{}")
+            .with("ZUNO_DISABLE_MODELS_FETCH", "true");
+        let environment = crate::environment::StartupEnvironment::resolve(
+            &variables,
+            &crate::GlobalOptions::default(),
+        );
+        let location = match env.env_vars().get("ZUNO_DB").map(String::as_str) {
+            Some(":memory:") | None => zuno_paths::DbLocation::Memory,
+            Some(path) => zuno_paths::DbLocation::File(PathBuf::from(path)),
+        };
+        let pool = zuno_db::Pool::open(&location).expect("open the fixture database");
+        let directory = env.working_dir().to_path_buf();
+        {
+            let mut connection = pool.get().expect("schema connection");
+            zuno_db::migration::apply(&mut connection).expect("apply schema");
+            connection
+                .execute(
+                    "INSERT INTO project \
+                     (id, worktree, vcs, time_created, time_updated, sandboxes) \
+                     VALUES (?1, ?2, 'git', ?3, ?3, '[]')",
+                    rusqlite::params![
+                        RESUME_PROJECT,
+                        directory.to_string_lossy().into_owned(),
+                        1_787_381_000_000_i64
+                    ],
+                )
+                .expect("fixture project");
+        }
+        Self {
+            env,
+            environment,
+            directory,
+            pool,
+        }
+    }
+
+    fn seed_in(
+        &self,
+        id: &str,
+        directory: &Path,
+        agent: Option<&str>,
+        model: Option<String>,
+        time: i64,
+    ) {
+        let mut connection = self.pool.open_connection().expect("seed connection");
+        let transaction = connection.transaction().expect("seed transaction");
+        let directory = directory.to_string_lossy().into_owned();
+        let mut input = zuno_db::session::SessionCreate::new(
+            id,
+            id,
+            RESUME_PROJECT,
+            &directory,
+            &directory,
+            format!("resume {id}"),
+            crate::RUST_PACKAGE_VERSION,
+        )
+        .at(time);
+        input.agent = agent.map(str::to_owned);
+        input.model = model;
+        zuno_db::session::create(&transaction, &input).expect("seed session");
+        transaction.commit().expect("seed commit");
+    }
+
+    fn seed(&self, id: &str, agent: Option<&str>, model: Option<String>, time: i64) {
+        self.seed_in(id, &self.directory.clone(), agent, model, time);
+    }
+
+    fn archive(&self, id: &str) {
+        self.pool
+            .get()
+            .expect("archive connection")
+            .execute(
+                "UPDATE session SET time_archived = time_updated WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .expect("archive session");
+    }
+
+    fn options(&self, session: SessionChoice) -> TurnOptions {
+        TurnOptions {
+            directory: Some(self.directory.clone()),
+            session,
+            ..TurnOptions::default()
+        }
+    }
+
+    async fn resolve(&self, options: TurnOptions) -> TurnPlan {
+        TurnPlan::resolve(&options, &self.environment)
+            .await
+            .expect("the resumed plan resolves")
+    }
+}
+
+fn saved_session_notes(plan: &TurnPlan) -> Vec<&str> {
+    plan.notes
+        .iter()
+        .map(String::as_str)
+        .filter(|note| note.contains("saved on this session"))
+        .collect()
+}
+
+fn saved_reference(provider: &str, model: &str, variant: Option<&str>) -> Option<String> {
+    Some(zuno_db::session::model_reference_with_variant(
+        provider, model, variant,
+    ))
+}
+
+#[tokio::test]
+async fn resume_seed_flags_win_over_the_saved_session_values() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_flags",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+
+    for session in [
+        SessionChoice::Existing("ses_resume_flags".to_owned()),
+        SessionChoice::Continue,
+    ] {
+        let mut options = fixture.options(session.clone());
+        options.agent = Some("orchestrator".to_owned());
+        options.model = Some("zzz/zzz-model".to_owned());
+        options.variant = Some("low".to_owned());
+        let plan = fixture.resolve(options).await;
+
+        assert_eq!(plan.agent_name(), "orchestrator", "{session:?}");
+        assert_eq!(plan.qualified_model(), "zzz/zzz-model", "{session:?}");
+        assert_eq!(plan.effective_variant(), Some("low"), "{session:?}");
+        assert_eq!(
+            plan.effort(),
+            Some(zuno_llm::effort::ReasoningEffort::Low),
+            "{session:?}"
+        );
+        assert!(
+            saved_session_notes(&plan).is_empty(),
+            "an explicit choice is not a fallback: {:?}",
+            plan.notes
+        );
+    }
+}
+
+#[tokio::test]
+async fn resume_seed_restores_saved_agent_model_and_variant_over_configuration() {
+    let fixture = ResumeFixture::new(resume_config(json!({"default_agent": "orchestrator"})));
+    fixture.seed(
+        "ses_resume_saved",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+
+    for session in [
+        SessionChoice::Existing("ses_resume_saved".to_owned()),
+        SessionChoice::Continue,
+    ] {
+        let plan = fixture.resolve(fixture.options(session.clone())).await;
+
+        assert_eq!(plan.agent_name(), "build", "{session:?}");
+        assert_eq!(plan.qualified_model(), "zzz/zzz-model", "{session:?}");
+        assert_eq!(plan.effective_variant(), Some("high"), "{session:?}");
+        assert_eq!(
+            plan.effort_override(),
+            Some(zuno_llm::effort::ReasoningEffort::High),
+            "a restored level is the surface's choice, so it survives later switches"
+        );
+        assert!(plan.model_override.is_none(), "restored is not an override");
+        assert!(saved_session_notes(&plan).is_empty(), "{:?}", plan.notes);
+        assert_eq!(
+            plan.persisted_model_reference(),
+            zuno_db::session::model_reference_with_variant("zzz", "zzz-model", Some("high")),
+            "what the plan would write back is what it read"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resume_seed_reports_a_saved_agent_that_left_the_roster() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_gone_agent",
+        Some("vanished"),
+        saved_reference("zzz", "zzz-model", None),
+        1_787_381_100_000,
+    );
+
+    let plan = fixture
+        .resolve(fixture.options(SessionChoice::Existing("ses_resume_gone_agent".to_owned())))
+        .await;
+
+    assert_eq!(plan.agent_name(), DEFAULT_AGENT);
+    assert_eq!(
+        saved_session_notes(&plan),
+        [
+            "Agent \"vanished\" saved on this session is no longer available; using \
+             \"orchestrator\""
+        ]
+    );
+    assert_eq!(
+        plan.qualified_model(),
+        "zzz/zzz-model",
+        "the surface named no Agent, so the saved model still applies"
+    );
+}
+
+#[tokio::test]
+async fn resume_seed_reports_a_saved_model_missing_from_the_catalog() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_gone_model",
+        Some("build"),
+        saved_reference("zzz", "gone", Some("high")),
+        1_787_381_100_000,
+    );
+
+    let plan = fixture
+        .resolve(fixture.options(SessionChoice::Continue))
+        .await;
+
+    assert_eq!(plan.agent_name(), "build");
+    assert_eq!(plan.qualified_model(), "aaa/aaa-model");
+    assert_eq!(
+        plan.effective_variant(),
+        None,
+        "a dropped model takes its variant along"
+    );
+    assert_eq!(
+        saved_session_notes(&plan),
+        ["model zzz/gone saved on this session is not in the catalog; using aaa/aaa-model"]
+    );
+}
+
+#[tokio::test]
+async fn resume_seed_drops_a_saved_variant_the_model_no_longer_declares() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_gone_variant",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("max")),
+        1_787_381_100_000,
+    );
+
+    let plan = fixture
+        .resolve(fixture.options(SessionChoice::Existing(
+            "ses_resume_gone_variant".to_owned(),
+        )))
+        .await;
+
+    assert_eq!(plan.qualified_model(), "zzz/zzz-model");
+    assert_eq!(plan.effective_variant(), None);
+    assert_eq!(plan.effort_override(), None);
+    let notes = saved_session_notes(&plan);
+    assert_eq!(notes.len(), 1, "{:?}", plan.notes);
+    assert!(
+        notes[0].starts_with("reasoning variant `max` saved on this session was not restored: "),
+        "{}",
+        notes[0]
+    );
+    assert!(
+        notes[0].contains("does not declare reasoning variant `max`"),
+        "{}",
+        notes[0]
+    );
+}
+
+#[tokio::test]
+async fn resume_seed_never_persists_a_carried_level_the_switched_model_does_not_declare() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_carried_level",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+    let session = SessionChoice::Existing("ses_resume_carried_level".to_owned());
+
+    // Resume, then switch to a model without `high` exactly as a TUI rebuild does: the
+    // surface names the new model and carries the host's own level along as `effort`.
+    let resumed = fixture.resolve(fixture.options(session.clone())).await;
+    assert_eq!(
+        resumed.effort_override(),
+        Some(zuno_llm::effort::ReasoningEffort::High)
+    );
+    let mut switched = fixture.options(session.clone());
+    switched.agent = Some(resumed.agent_name().to_owned());
+    switched.model = Some("aaa/aaa-model".to_owned());
+    switched.effort = resumed.effort_override();
+    let plan = fixture.resolve(switched).await;
+
+    assert_eq!(plan.qualified_model(), "aaa/aaa-model");
+    assert_eq!(
+        plan.effective_variant(),
+        None,
+        "aaa/aaa-model declares no `high`, so the plan runs with no level"
+    );
+    assert_eq!(
+        zuno_db::session::decode_model_reference(&plan.persisted_model_reference())
+            .expect("the reference decodes")
+            .variant,
+        None,
+        "the row must not record a level the model cannot have: {}",
+        plan.persisted_model_reference()
+    );
+    assert_eq!(
+        plan.persisted_model_reference(),
+        zuno_db::session::model_reference("aaa", "aaa-model"),
+        "no variant means no `variant` key at all"
+    );
+    assert_eq!(plan.effort(), None);
+    assert_eq!(
+        plan.effort_override(),
+        None,
+        "a level the model does not declare is not the surface's choice for it"
+    );
+    assert!(saved_session_notes(&plan).is_empty(), "{:?}", plan.notes);
+
+    // What that plan writes back resumes silently: no note about the user's own pick.
+    fixture
+        .pool
+        .get()
+        .expect("rewrite connection")
+        .execute(
+            "UPDATE session SET model = ?1 WHERE id = ?2",
+            rusqlite::params![plan.persisted_model_reference(), "ses_resume_carried_level"],
+        )
+        .expect("rewrite the session model");
+    let reopened = fixture.resolve(fixture.options(session)).await;
+    assert_eq!(reopened.qualified_model(), "aaa/aaa-model");
+    assert_eq!(reopened.effective_variant(), None);
+    assert!(
+        saved_session_notes(&reopened).is_empty(),
+        "{:?}",
+        reopened.notes
+    );
+}
+
+#[tokio::test]
+async fn resume_seed_re_routes_the_model_when_the_surface_names_another_agent() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_switch",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+    let session = SessionChoice::Existing("ses_resume_switch".to_owned());
+
+    let mut switched = fixture.options(session.clone());
+    switched.agent = Some("orchestrator".to_owned());
+    let plan = fixture.resolve(switched).await;
+    assert_eq!(plan.agent_name(), "orchestrator");
+    assert_eq!(
+        plan.qualified_model(),
+        "aaa/aaa-model",
+        "a different Agent routes its model afresh, exactly as an in-session switch does"
+    );
+    assert_eq!(plan.effective_variant(), None);
+    assert!(saved_session_notes(&plan).is_empty(), "{:?}", plan.notes);
+
+    let mut same = fixture.options(session);
+    same.agent = Some("build".to_owned());
+    let plan = fixture.resolve(same).await;
+    assert_eq!(plan.agent_name(), "build");
+    assert_eq!(
+        plan.qualified_model(),
+        "zzz/zzz-model",
+        "naming the saved Agent, as a TUI rebuild does, keeps the saved model"
+    );
+    assert_eq!(plan.effective_variant(), Some("high"));
+}
+
+#[tokio::test]
+async fn resume_seed_yields_to_a_preset_chosen_for_this_process_but_not_a_configured_one() {
+    let presets = json!({
+        "presets": {"team": {"agents": {"build": "aaa/aaa-model"}}}
+    });
+    let fixture = ResumeFixture::new(resume_config(presets.clone()));
+    fixture.seed(
+        "ses_resume_preset",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+    let session = SessionChoice::Existing("ses_resume_preset".to_owned());
+
+    let mut chosen = fixture.options(session.clone());
+    chosen.preset = Some("team".to_owned());
+    let plan = fixture.resolve(chosen).await;
+    assert_eq!(plan.qualified_model(), "aaa/aaa-model");
+    assert_eq!(plan.preset_override, Some("team".to_owned()));
+
+    let plan = fixture.resolve(fixture.options(session.clone())).await;
+    assert_eq!(plan.qualified_model(), "zzz/zzz-model");
+    assert_eq!(plan.preset_override, None);
+
+    let mut configured = presets;
+    configured["preset"] = json!("team");
+    let fixture = ResumeFixture::new(resume_config(configured));
+    fixture.seed(
+        "ses_resume_preset",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+    let plan = fixture.resolve(fixture.options(session)).await;
+    assert_eq!(
+        plan.qualified_model(),
+        "zzz/zzz-model",
+        "a preset from configuration is a configured default, below the saved model"
+    );
+    assert_eq!(plan.preset_name(), Some("team"));
+    assert_eq!(plan.preset_override, None);
+}
+
+#[tokio::test]
+async fn resume_seed_continue_picks_the_most_recent_active_session_in_the_directory() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_older_active",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("low")),
+        1_787_381_100_000,
+    );
+    fixture.seed(
+        "ses_resume_newer_archived",
+        Some("plan"),
+        saved_reference("aaa", "aaa-model", None),
+        1_787_381_200_000,
+    );
+    fixture.archive("ses_resume_newer_archived");
+    let elsewhere = fixture.env.working_dir().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("other directory");
+    fixture.seed_in(
+        "ses_resume_other_directory",
+        &elsewhere,
+        Some("plan"),
+        saved_reference("aaa", "aaa-model", None),
+        1_787_381_300_000,
+    );
+
+    let plan = fixture
+        .resolve(fixture.options(SessionChoice::Continue))
+        .await;
+
+    assert_eq!(plan.agent_name(), "build");
+    assert_eq!(plan.qualified_model(), "zzz/zzz-model");
+    assert_eq!(plan.effective_variant(), Some("low"));
+}
+
+#[tokio::test]
+async fn resume_seed_ignores_new_sessions_and_memory_databases() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_ignored",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+    let plan = fixture.resolve(fixture.options(SessionChoice::New)).await;
+    assert_eq!(plan.agent_name(), DEFAULT_AGENT);
+    assert_eq!(plan.qualified_model(), "aaa/aaa-model");
+    assert_eq!(plan.effective_variant(), None);
+    assert!(saved_session_notes(&plan).is_empty(), "{:?}", plan.notes);
+
+    let memory = ResumeFixture::with_db(resume_config(json!({})), zuno_testkit::DbChoice::Memory);
+    let plan = memory
+        .resolve(memory.options(SessionChoice::Existing("ses_resume_ignored".to_owned())))
+        .await;
+    assert_eq!(plan.agent_name(), DEFAULT_AGENT);
+    assert_eq!(plan.qualified_model(), "aaa/aaa-model");
+    assert!(
+        saved_session_notes(&plan).is_empty(),
+        "an in-memory database is no seed and no failure: {:?}",
+        plan.notes
+    );
+}
+
+#[test]
+fn locate_session_answers_every_session_choice_from_one_lookup() {
+    let pool = zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database");
+    let mut connection = pool.open_connection().expect("connection");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    connection
+        .execute_batch(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+             VALUES ('project-locate', '/workspace', 1, 1, '[]');",
+        )
+        .expect("seed project");
+    let transaction = connection.transaction().expect("transaction");
+    for (id, directory, time) in [
+        ("ses_locate_older", "/workspace", 100_i64),
+        ("ses_locate_newer", "/workspace", 200),
+        ("ses_locate_elsewhere", "/elsewhere", 300),
+    ] {
+        let input = zuno_db::session::SessionCreate::new(
+            id,
+            id,
+            "project-locate",
+            "/workspace",
+            directory,
+            id,
+            "1",
+        )
+        .at(time);
+        zuno_db::session::create(&transaction, &input).expect("seed session");
+    }
+    transaction.commit().expect("commit");
+    let directory = Path::new("/workspace");
+
+    let existing = locate_session(
+        &connection,
+        &SessionChoice::Existing("ses_locate_older".to_owned()),
+        directory,
+    )
+    .expect("existing lookup")
+    .expect("existing row");
+    assert_eq!(existing.id, "ses_locate_older");
+    assert!(
+        locate_session(
+            &connection,
+            &SessionChoice::Existing("ses_locate_missing".to_owned()),
+            directory,
+        )
+        .is_err(),
+        "an explicit id without a row is the host's error, not a silent new session"
+    );
+    let continued = locate_session(&connection, &SessionChoice::Continue, directory)
+        .expect("continue lookup")
+        .expect("continue row");
+    assert_eq!(
+        continued.id, "ses_locate_newer",
+        "the most recent active session in the directory, never one from elsewhere"
+    );
+    assert!(
+        locate_session(&connection, &SessionChoice::New, directory)
+            .expect("new lookup")
+            .is_none()
+    );
+    let pending = PreparedSessionIdentity::pending("ses_locate_pending".to_owned());
+    assert!(
+        locate_session(&connection, &SessionChoice::Prepared(pending), directory)
+            .expect("pending lookup")
+            .is_none(),
+        "a pending identity has no row yet"
+    );
+    let materialized = PreparedSessionIdentity::existing("ses_locate_older".to_owned());
+    assert_eq!(
+        locate_session(
+            &connection,
+            &SessionChoice::Prepared(materialized),
+            directory
+        )
+        .expect("materialized lookup")
+        .expect("materialized row")
+        .id,
+        "ses_locate_older"
+    );
 }

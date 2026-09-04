@@ -158,13 +158,25 @@ pub struct PresetSelection {
 /// Paths remain in their validated configuration spelling here. The shell runtime
 /// resolves them against the active workspace, while this descriptor only ensures a
 /// delegated child cannot silently observe a broader configuration generation.
+///
+/// `backend` is part of the identity because it changes authority without changing
+/// `mode`: a trusted `native` selection runs the same requested mode without OS
+/// enforcement, so an approval issued under confinement must not be reused after a
+/// switch. Records written before the field existed read as `auto`, which is what
+/// they were.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SandboxCapabilityDescriptor {
     pub mode: String,
     pub network: String,
+    #[serde(default = "default_sandbox_backend")]
+    pub backend: String,
     pub writable_roots: Vec<String>,
     pub protected_paths: Vec<String>,
+}
+
+fn default_sandbox_backend() -> String {
+    "auto".to_owned()
 }
 
 impl Default for SandboxCapabilityDescriptor {
@@ -172,6 +184,7 @@ impl Default for SandboxCapabilityDescriptor {
         Self {
             mode: "workspace-write".to_owned(),
             network: "deny".to_owned(),
+            backend: default_sandbox_backend(),
             writable_roots: Vec::new(),
             protected_paths: Vec::new(),
         }
@@ -625,7 +638,7 @@ mod tests {
             network.identity().expect("sandbox network identity")
         );
 
-        let mut writable = original;
+        let mut writable = original.clone();
         writable
             .sandbox
             .writable_roots
@@ -633,6 +646,34 @@ mod tests {
         assert_ne!(
             identity,
             writable.identity().expect("sandbox writable-root identity")
+        );
+
+        let mut backend = original;
+        backend.sandbox.backend = "native".to_owned();
+        assert_ne!(
+            identity,
+            backend.identity().expect("sandbox backend identity"),
+            "a trusted native selection changes authority without changing the mode"
+        );
+    }
+
+    /// A capability record written before `backend` existed still deserializes and
+    /// keeps the identity it would have had with `auto` spelled out.
+    #[test]
+    fn capability_records_without_a_backend_field_read_as_auto() {
+        let snapshot = capability();
+        let mut value = serde_json::to_value(&snapshot).expect("capability snapshot JSON");
+        let sandbox = value["sandbox"]
+            .as_object_mut()
+            .expect("sandbox descriptor object");
+        assert_eq!(sandbox.remove("backend"), Some(serde_json::json!("auto")));
+
+        let decoded: CapabilitySnapshot =
+            serde_json::from_value(value).expect("pre-backend record remains readable");
+        assert_eq!(decoded.sandbox.backend, "auto");
+        assert_eq!(
+            decoded.identity().expect("decoded identity"),
+            snapshot.identity().expect("snapshot identity")
         );
     }
 

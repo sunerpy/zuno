@@ -20,7 +20,6 @@ use zuno_llm::event::{ConnectionPhase, RequestContentBlock, StreamEvent};
 use super::child_turn::DetachedTurnObserver;
 use crate::cmd::turn::{
     SessionChoice, TurnHost, TurnHostRuntimeDependencies, TurnOptions, TurnPlan,
-    persisted_session_agent,
 };
 use crate::command::{RunArgs, RunFormat};
 use crate::environment::StartupEnvironment;
@@ -81,10 +80,9 @@ pub(super) fn execute(
     let options = TurnOptions {
         directory: args.dir.as_deref().map(PathBuf::from),
         model: args.model.clone(),
-        agent: args
-            .agent
-            .clone()
-            .or_else(|| persisted_session_agent(&session)),
+        // No per-surface hint: `TurnPlan::resolve` restores the Agent, model and
+        // reasoning level saved on the resumed session below these explicit flags.
+        agent: args.agent.clone(),
         preset: None,
         session,
         title: args.title.clone(),

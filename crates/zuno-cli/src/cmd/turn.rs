@@ -30,7 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -210,26 +210,69 @@ impl SessionChoice {
     }
 }
 
-/// Stored collaboration agent for an explicitly resumed session.
+/// The durable row a session choice names, or `None` when the choice has no row yet.
 ///
-/// This read-only hint runs before generic turn resolution. Missing, in-memory,
-/// or unreadable databases simply provide no hint; authoritative validation and
-/// schema handling still happen when the turn host opens.
-pub(crate) fn persisted_session_agent(choice: &SessionChoice) -> Option<String> {
-    let SessionChoice::Existing(id) = choice else {
-        return None;
-    };
-    let location = zuno_paths::db_path();
+/// One lookup for every reader — the resolution seed in [`TurnPlan::resolve`] and
+/// [`prepare_turn_host`] — so the row that seeds a plan's Agent, model and reasoning
+/// level is the row the host then opens. `Continue` is the most recent active session
+/// in `directory`; [`SessionChoice::New`] and a pending [`SessionChoice::Prepared`]
+/// have no row.
+///
+/// # Errors
+///
+/// [`zuno_error::DbError::NotFound`] for an `Existing` or materialized `Prepared` id
+/// without a row, and the read errors of the store.
+fn locate_session(
+    connection: &rusqlite::Connection,
+    choice: &SessionChoice,
+    directory: &Path,
+) -> Result<Option<zuno_db::session::Session>, zuno_error::DbError> {
+    match choice {
+        SessionChoice::Existing(session_id) => {
+            zuno_db::session::get(connection, session_id).map(Some)
+        }
+        SessionChoice::Continue => Ok(zuno_db::session::list(
+            connection,
+            &zuno_db::session::ListQuery::directory(directory.to_string_lossy())
+                .active_only()
+                .with_limit(1),
+        )?
+        .into_iter()
+        .next()),
+        SessionChoice::Prepared(identity) if identity.is_materialized() => {
+            zuno_db::session::get(connection, identity.id()).map(Some)
+        }
+        SessionChoice::New | SessionChoice::Prepared(_) => Ok(None),
+    }
+}
+
+/// The durable row a resume will reopen, read ahead of resolution so its saved Agent,
+/// model and reasoning level can take part in it.
+///
+/// A hint, not the authority: a missing, in-memory, locked or otherwise unreadable
+/// database yields `None` and resolution proceeds from configuration alone. The same
+/// [`locate_session`] lookup runs again when the host opens, and that is where a
+/// failure is reported.
+fn persisted_session_seed(
+    layout: &zuno_paths::Layout,
+    choice: &SessionChoice,
+    directory: &Path,
+) -> Option<zuno_db::session::Session> {
+    match choice {
+        SessionChoice::New => return None,
+        SessionChoice::Prepared(identity) if !identity.is_materialized() => return None,
+        SessionChoice::Continue | SessionChoice::Existing(_) | SessionChoice::Prepared(_) => {}
+    }
+    let location = layout.db_path();
     let path = location.as_path()?;
     if !path.exists() {
         return None;
     }
     let pool = zuno_db::pool::Pool::open(&location).ok()?;
     let connection = pool.get().ok()?;
-    zuno_db::session::find(&connection, id)
+    locate_session(&connection, choice, directory)
         .ok()
         .flatten()
-        .and_then(|session| session.agent)
 }
 
 /// Stable process identity for a session whose database row may not exist yet.
@@ -399,6 +442,8 @@ pub(crate) struct TurnPlan {
     model_id: String,
     /// An explicit surface-level model choice, distinct from a model routed by a preset.
     model_override: Option<String>,
+    /// A preset a surface selected for this process, distinct from the configured one.
+    preset_override: Option<String>,
     auth_store: AuthStore,
     credential: Option<Credential>,
     resolver: Resolver,
@@ -609,15 +654,37 @@ impl TurnPlan {
             zuno_catalog::agent::merge_agent_maps(&loaded_agents.agents, extensions.agents())
                 .map_err(to_string)?;
         let agents = zuno_catalog::agent::list(&merged_agents, &loaded_agents.origins);
-        let agent_name =
-            resolve_agent_name(options.agent.as_deref(), config.default_agent.as_deref());
+        let mut notes = Vec::new();
+        // A resumed session keeps the Agent, model and reasoning level it last ran with,
+        // below anything the surface asked for explicitly and above configured defaults.
+        // The precedence lives here so `run`, the TUI, ACP and the server cannot drift.
+        let persisted = persisted_session_seed(&layout, &options.session, &directory);
+        let saved_agent = persisted
+            .as_ref()
+            .and_then(|session| session.agent.as_deref());
+        let configured_agent = config.default_agent.as_deref();
+        let agent_name = match (options.agent.as_deref(), saved_agent) {
+            (Some(requested), _) => requested,
+            (None, Some(saved)) if agents.iter().any(|entry| entry.name == saved) => saved,
+            (None, Some(saved)) => {
+                let fallback = resolve_agent_name(None, configured_agent);
+                extend_unique_notes(
+                    &mut notes,
+                    [format!(
+                        "Agent \"{saved}\" saved on this session is no longer available; \
+                         using \"{fallback}\""
+                    )],
+                );
+                fallback
+            }
+            (None, None) => resolve_agent_name(None, configured_agent),
+        };
         let agent = agents
             .iter()
             .find(|entry| entry.name == agent_name)
             .cloned()
             .ok_or_else(|| format!("Agent not found: {agent_name}"))?;
         let presets = turn_presets(&config, options.preset.as_deref());
-        let mut notes = Vec::new();
         let mut primary_policy = ModelPolicy::new().with_library(&presets);
         if let Some(session_model) = &config.model {
             primary_policy = primary_policy.with_session_model(ModelChoice::new(session_model));
@@ -627,14 +694,53 @@ impl TurnPlan {
         }
         let routed_model = primary_policy.resolve(agent_name, &catalog);
         extend_unique_notes(&mut notes, routed_model.render_diagnostics());
-        let requested_model = options.model.as_deref().or_else(|| {
-            routed_model
-                .model
-                .as_ref()
-                .map(|choice| choice.model.as_str())
-        });
+        // The saved model is the model the saved Agent ran with. A surface that names a
+        // different Agent has changed a routing input, so the model routes afresh
+        // exactly as an Agent switch inside a live session does; a preset chosen for
+        // this process routes too. Everything else keeps the saved model when the
+        // catalog still offers it, and says so when it does not.
+        let agent_switched = match (options.agent.as_deref(), saved_agent) {
+            (Some(requested), Some(saved)) => requested != saved,
+            _ => false,
+        };
+        let saved_model_applies =
+            options.model.is_none() && options.preset.is_none() && !agent_switched;
+        let saved_model = persisted
+            .as_ref()
+            .and_then(|session| session.model.as_deref())
+            .and_then(zuno_db::session::decode_model_reference)
+            .filter(|_| saved_model_applies);
+        let (restored_model, missing_saved_model) = match saved_model {
+            Some(saved) if catalog.model(&saved.provider_id, &saved.model_id).is_some() => {
+                (Some(saved), None)
+            }
+            Some(saved) => (None, Some(saved.qualified())),
+            None => (None, None),
+        };
+        let restored_qualified = restored_model
+            .as_ref()
+            .map(zuno_db::session::PersistedModel::qualified);
+        let requested_model = options
+            .model
+            .as_deref()
+            .or(restored_qualified.as_deref())
+            .or_else(|| {
+                routed_model
+                    .model
+                    .as_ref()
+                    .map(|choice| choice.model.as_str())
+            });
         let (provider_id, model_id, catalog_model) =
             select_model(&catalog, requested_model, loaded.provenance())?;
+        if let Some(missing) = missing_saved_model {
+            extend_unique_notes(
+                &mut notes,
+                [format!(
+                    "model {missing} saved on this session is not in the catalog; \
+                     using {provider_id}/{model_id}"
+                )],
+            );
+        }
         if provider_factory_key(catalog_model.api.transport).is_none() {
             return Err(format!(
                 "model {provider_id}/{model_id} has no native provider transport"
@@ -680,25 +786,94 @@ impl TurnPlan {
             None => agent,
         };
         let definition = agent.definition();
-        let routed_variant = options
-            .model
-            .is_none()
-            .then(|| routed_model.model.as_ref()?.variant.as_deref())
-            .flatten();
-        let reasoning = resolve_turn_reasoning(
-            TurnReasoningSelection {
-                session: options.effort,
-                explicit_variant: options.variant.as_deref(),
-                thinking: options.thinking,
+        // A routed variant names a level of the routed model, so it applies only when
+        // that is the model being sent to — not to a saved model that outranked it.
+        let qualified_model = format!("{provider_id}/{model_id}");
+        let routed_variant = if options.model.is_none() {
+            routed_model
+                .model
+                .as_ref()
+                .filter(|choice| choice.model == qualified_model)
+                .and_then(|choice| choice.variant.as_deref())
+        } else {
+            None
+        };
+        let explicit_reasoning =
+            options.effort.is_some() || options.variant.is_some() || options.thinking;
+        let selection = TurnReasoningSelection {
+            session: options.effort,
+            explicit_variant: options.variant.as_deref(),
+            thinking: options.thinking,
+        };
+        // The saved variant travels with the saved model: it is restored only when that
+        // model was selected above and the surface chose no level itself. A variant the
+        // model no longer declares is reported and dropped rather than failing a resume
+        // that used to work.
+        let saved_variant = restored_model
+            .as_ref()
+            .and_then(|model| model.variant.as_deref())
+            .filter(|_| !explicit_reasoning);
+        let mut restored_variant = false;
+        let reasoning = match saved_variant {
+            Some(variant) => match resolve_turn_reasoning(
+                TurnReasoningSelection {
+                    session: None,
+                    explicit_variant: Some(variant),
+                    thinking: false,
+                },
+                definition,
+                &provider_id,
+                &model_id,
+                routed_variant,
+                catalog_model,
+            ) {
+                Ok(reasoning) => {
+                    restored_variant = true;
+                    reasoning
+                }
+                Err(error) => {
+                    extend_unique_notes(
+                        &mut notes,
+                        [format!(
+                            "reasoning variant `{variant}` saved on this session was not \
+                             restored: {error}"
+                        )],
+                    );
+                    resolve_turn_reasoning(
+                        selection,
+                        definition,
+                        &provider_id,
+                        &model_id,
+                        routed_variant,
+                        catalog_model,
+                    )?
+                }
             },
-            definition,
-            &provider_id,
-            &model_id,
-            routed_variant,
-            catalog_model,
-        )?;
-        let effort = reasoning.effort;
-        let effective_variant = reasoning.variant.clone();
+            None => resolve_turn_reasoning(
+                selection,
+                definition,
+                &provider_id,
+                &model_id,
+                routed_variant,
+                catalog_model,
+            )?,
+        };
+        // A canonical level reaches this point unchecked when it came from a carried
+        // override, a routed variant or an Agent default rather than from `--variant`,
+        // which `resolve_turn_reasoning` validates against the model. The request already
+        // carries no control for a level the model does not declare, so the plan records
+        // none either. Otherwise the row persisted `variant: "high"` for a model without
+        // `high`, every later resume reported the user's own earlier pick as "not
+        // restored", and the level kept travelling as an override onto models it never
+        // applied to.
+        let level_declared = reasoning
+            .effort
+            .is_none_or(|effort| selectable_reasoning_efforts(catalog_model).contains(&effort));
+        let (effort, effective_variant) = if level_declared {
+            (reasoning.effort, reasoning.variant.clone())
+        } else {
+            (None, None)
+        };
         let mut prompt_assembly = PromptAssembly::new();
         prompt_assembly
             .push(
@@ -869,6 +1044,7 @@ impl TurnPlan {
             provider_id,
             model_id,
             model_override: options.model.clone(),
+            preset_override: options.preset.clone(),
             resolver,
             session: options.session.clone(),
             title: options.title.clone(),
@@ -889,10 +1065,10 @@ impl TurnPlan {
             reasoning_supported,
             effort,
             effective_variant,
-            effort_override: if options.effort.is_some()
-                || options.variant.is_some()
-                || options.thinking
-            {
+            // A level restored from the session counts as the surface's own choice: it
+            // then survives an Agent or model switch exactly as a level picked in this
+            // process does, and a client shows it as the level in force.
+            effort_override: if explicit_reasoning || restored_variant {
                 effort
             } else {
                 None
@@ -1140,6 +1316,24 @@ impl TurnPlan {
         self.effort_override
     }
 
+    /// Exact canonical or model-declared variant this plan resolved with.
+    #[cfg(test)]
+    pub(crate) fn effective_variant(&self) -> Option<&str> {
+        self.effective_variant.as_deref()
+    }
+
+    /// The `session.model` value that records this plan's model and reasoning level.
+    ///
+    /// One writer for every persistence point — session creation, a client-surface
+    /// switch, and ACP reconfiguration — so a resume decodes exactly what was written.
+    pub(crate) fn persisted_model_reference(&self) -> String {
+        zuno_db::session::model_reference_with_variant(
+            &self.provider_id,
+            &self.model_id,
+            self.effective_variant.as_deref(),
+        )
+    }
+
     /// The model's context ceiling, or zero when the catalog declares none.
     pub(crate) const fn context_window(&self) -> u64 {
         self.window.context
@@ -1322,15 +1516,16 @@ impl TurnPlan {
             &rules,
         ) {
             Ok(policy) => {
-                let deployment = zuno_sandbox::deployment_report_with_action(
+                let deployment = zuno_sandbox::deployment_report_with_request(
                     policy.workspace(),
                     policy.mode(),
                     policy.network(),
-                    super::tool_runtime::sandbox_unavailable_action(&self.config),
+                    super::tool_runtime::sandbox_backend_request(&self.config),
                 );
                 json!({
                     "configuredMode": self.config.sandbox_mode(),
                     "configuredOnUnavailable": self.config.sandbox_on_unavailable(),
+                    "configuredBackend": self.config.sandbox_backend(),
                     "requestedMode": policy.mode(),
                     "requestedNetwork": policy.network(),
                     "effectiveMode": deployment.effective_mode,
@@ -2022,10 +2217,12 @@ pub(crate) struct TurnHost {
     extension_ownership: Option<ExtensionOwnership>,
     /// The explicit model choice a surface supplied, if any.
     model_override: Option<String>,
-    /// The preset selected for this host.
-    preset: Option<String>,
+    /// The preset a surface selected for this process, if any.
+    preset_override: Option<String>,
     /// The explicit reasoning choice a surface supplied, if any.
     effort_override: Option<zuno_llm::effort::ReasoningEffort>,
+    /// Exact reasoning variant this host runs with, persisted beside the model.
+    effective_variant: Option<String>,
     internals: Internals,
     compaction_config: zuno_config::schema::CompactionConfig,
     compaction_state: CompactionState,
@@ -4187,11 +4384,12 @@ impl TurnHost {
                 provider_id: plan.provider_id,
                 model_id: plan.model_id,
                 model_override: plan.model_override,
-                preset: plan.presets.selected().map(str::to_owned),
+                preset_override: plan.preset_override,
                 extension_scope: plan.extension_scope,
                 extension_revision: plan.extension_revision,
                 extension_ownership: extension_ownership.take(),
                 effort_override: plan.effort_override,
+                effective_variant: plan.effective_variant,
                 internals: plan.internals,
                 compaction_config: plan.config.compaction.clone().unwrap_or_default(),
                 compaction_state: CompactionState::default(),
@@ -4376,12 +4574,13 @@ impl TurnHost {
             .map_err(to_string)
     }
 
-    /// Persist the active model after a successful client-surface host replacement.
+    /// Persist the active model and reasoning variant after a successful client-surface
+    /// host replacement.
     pub(super) fn persist_active_model(&self) -> Result<(), String> {
         if !self.is_session_materialized() {
             return Ok(());
         }
-        let model = zuno_db::session::model_reference(&self.provider_id, &self.model_id);
+        let model = self.persisted_model_reference();
         zuno_db::session::Store::new(&self.database)
             .switch_model_at(
                 &self.session_id,
@@ -6101,9 +6300,24 @@ impl TurnHost {
         self.model_override.as_deref()
     }
 
-    /// Selected model-team preset that must survive unrelated host rebuilds.
-    pub(crate) fn preset_name(&self) -> Option<&str> {
-        self.preset.as_deref()
+    /// Preset a surface selected for this process, excluding the configured default.
+    ///
+    /// This is what a rebuild carries, and it is deliberately not the configured
+    /// preset: that one is re-read from configuration by every resolution, whereas a
+    /// preset the user picked outranks the model saved on the session.
+    pub(crate) fn preset_override(&self) -> Option<&str> {
+        self.preset_override.as_deref()
+    }
+
+    /// The `session.model` value describing this host's model and reasoning level.
+    ///
+    /// Compared before and after a rebuild to decide whether the row needs writing.
+    pub(crate) fn persisted_model_reference(&self) -> String {
+        zuno_db::session::model_reference_with_variant(
+            &self.provider_id,
+            &self.model_id,
+            self.effective_variant.as_deref(),
+        )
     }
 
     /// Extension revision this host was assembled against.
@@ -11046,6 +11260,7 @@ fn sandbox_capability_descriptor(
             zuno_config::schema::sandbox::SandboxNetworkMode::Allow => "allow",
         }
         .to_owned(),
+        backend: config.sandbox_backend().as_str().to_owned(),
         writable_roots,
         protected_paths,
     }
@@ -11256,29 +11471,13 @@ fn prepare_turn_host(
     plan: &TurnPlan,
     now: i64,
 ) -> Result<PreparedTurnHost, String> {
-    match &plan.session {
-        SessionChoice::Existing(session_id) => {
-            let session = zuno_db::session::get(connection, session_id).map_err(to_string)?;
-            return Ok(prepared_existing_session(session));
-        }
-        SessionChoice::Continue => {
-            let session = zuno_db::session::list(
-                connection,
-                &zuno_db::session::ListQuery::directory(plan.directory.to_string_lossy())
-                    .active_only()
-                    .with_limit(1),
-            )
-            .map_err(to_string)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| "no session found to continue in the current directory".to_owned())?;
-            return Ok(prepared_existing_session(session));
-        }
-        SessionChoice::Prepared(identity) if identity.is_materialized() => {
-            let session = zuno_db::session::get(connection, identity.id()).map_err(to_string)?;
-            return Ok(prepared_existing_session(session));
-        }
-        SessionChoice::New | SessionChoice::Prepared(_) => {}
+    if let Some(session) =
+        locate_session(connection, &plan.session, &plan.directory).map_err(to_string)?
+    {
+        return Ok(prepared_existing_session(session));
+    }
+    if matches!(plan.session, SessionChoice::Continue) {
+        return Err("no session found to continue in the current directory".to_owned());
     }
 
     let identity = match &plan.session {
@@ -11303,10 +11502,7 @@ fn prepare_turn_host(
     )
     .at(now);
     input.agent = Some(plan.agent.name().to_owned());
-    input.model = Some(zuno_db::session::model_reference(
-        &plan.provider_id,
-        &plan.model_id,
-    ));
+    input.model = Some(plan.persisted_model_reference());
     Ok(PreparedTurnHost {
         identity,
         title,

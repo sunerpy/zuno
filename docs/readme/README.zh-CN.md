@@ -57,7 +57,8 @@ cargo install --git https://github.com/sunerpy/zuno zuno --locked
 
 `rg`（ripgrep）14 或更新版本只在使用 `glob` 与 `grep` 工具时需要。Linux 上只有
 `read-only` 与 `workspace-write` 受限 Shell 需要 bubblewrap 0.8.0 或更新版本；
-显式 `danger-full-access` 不依赖它。发行目标、手工摘要校验和沙箱选择见
+显式 `danger-full-access` 不依赖它，受信的 `sandbox.backend: native`（让每个 Agent 都
+原生运行并保留权限模式）也不依赖它。发行目标、手工摘要校验和沙箱选择见
 [安装指南](../guide/installation.md)。
 
 已安装的发行版可以原地更新：

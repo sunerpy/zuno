@@ -42,7 +42,8 @@ use crate::schema::product_agent::ProductAgentConfig;
 use crate::schema::provider::ProviderConfig;
 use crate::schema::reference::ReferenceEntry;
 use crate::schema::sandbox::{
-    SandboxConfig, SandboxMode, SandboxNetworkMode, SandboxUnavailableAction,
+    SandboxBackendSelection, SandboxConfig, SandboxMode, SandboxNetworkMode,
+    SandboxUnavailableAction,
 };
 use crate::schema::workflow::AgentWorkflowConfig;
 use schemars::JsonSchema;
@@ -274,6 +275,19 @@ impl Config {
         self.sandbox.as_ref().map_or(
             SandboxUnavailableAction::Deny,
             SandboxConfig::resolved_on_unavailable,
+        )
+    }
+
+    /// Resolve the trusted Shell backend selection.
+    ///
+    /// `native` runs every Agent's Shell natively while
+    /// [`Self::effective_permission_mode`] stays exactly as authored: only
+    /// `danger-full-access` implies `allow_all`.
+    #[must_use]
+    pub fn sandbox_backend(&self) -> SandboxBackendSelection {
+        self.sandbox.as_ref().map_or(
+            SandboxBackendSelection::Auto,
+            SandboxConfig::resolved_backend,
         )
     }
 

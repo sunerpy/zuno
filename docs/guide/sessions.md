@@ -193,6 +193,27 @@ zuno run --session ses_1a2b3c "what changed?"
 zuno run --session ses_1a2b3c --agent plan "what would a safe migration look like?"
 ```
 
+A resumed session keeps the Agent, model, and reasoning level it last ran with. Every
+surface that reopens a session — `--continue`, `--session`, the TUI `/session` picker,
+and ACP `session/load` or `session/resume` — resolves them in the same order, so a flag
+still wins and configuration is only the fallback:
+
+| Setting | Precedence |
+| --- | --- |
+| Agent | `--agent` or picker > saved on the session > `default_agent` > `orchestrator` |
+| Model | `--model` or picker > a preset chosen in this process > saved on the session > routed through configuration |
+| Reasoning level | `--variant`, `--thinking`, or picker > saved with the session's model > configured defaults |
+
+In short: flag > session > config default. The session row records the pair it last ran
+with: a model, level, preset, or Agent pick in the TUI, an ACP configuration change, and
+session creation all write the model reference (with its `variant`) back, so the next
+resume starts from it; a `zuno run` flag applies to that run alone and does not rewrite
+the row. Naming a *different* Agent than the saved one re-routes the model through
+configuration, exactly as switching Agent inside a live session does; pass `--model` to
+pin it. When the saved Agent has left the roster or the saved model is no longer in the
+catalog, the resume falls back to the next rule and says so in a status note rather than
+failing; a saved level the model no longer declares is dropped with the same kind of note.
+
 Forking a session is not part of this binary, so exploring an alternative without
 polluting the session you intend to keep means starting a fresh one: name neither
 `--continue` nor `--session`, and give it a `--title`.

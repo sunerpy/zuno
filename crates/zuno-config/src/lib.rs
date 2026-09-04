@@ -11,7 +11,8 @@ pub use crate::instructions::{
     LoadedInstructions, Origin, UpwardClaims, WarningKind,
 };
 pub use crate::schema::sandbox::{
-    SandboxConfig, SandboxMode, SandboxNetworkMode, SandboxUnavailableAction,
+    SandboxBackendSelection, SandboxConfig, SandboxMode, SandboxNetworkMode,
+    SandboxUnavailableAction,
 };
 pub use crate::schema::{
     Config, KNOWN_TOP_LEVEL_KEYS, LearningConfig, ResolvedLearningConfig, WebSearchBackend,

@@ -2,7 +2,9 @@
 //!
 //! Restricted modes require a proved platform backend and fail closed when one is
 //! unavailable unless a trusted layer explicitly permits unconfined execution.
-//! `danger-full-access` remains a separate, explicit native-execution policy.
+//! `danger-full-access` remains a separate, explicit native-execution policy, and
+//! `backend: native` is a separate, explicit backend selection that keeps the
+//! configured permission mode while running every Agent's Shell natively.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -86,6 +88,45 @@ impl SandboxUnavailableAction {
     }
 }
 
+/// Which execution backend resolves model-initiated Shell calls.
+///
+/// Orthogonal to `mode`: the mode is the authority an Agent is granted, the
+/// backend is what enforces it. `native` enforces nothing at the OS level and
+/// says so in every record and notice.
+#[derive(JsonSchema, Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxBackendSelection {
+    /// Discover the platform's confined backend and apply `onUnavailable` when it
+    /// cannot be deployed.
+    #[default]
+    Auto,
+    /// Run every Agent's Shell, read-only contracts included, on the native process
+    /// backend with the configured permission mode kept. The requested authority is
+    /// recorded but not OS-enforced.
+    Native,
+}
+
+impl SandboxBackendSelection {
+    /// Stable configuration, CLI, and environment spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Native => "native",
+        }
+    }
+
+    /// Parse the exact public spelling.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "native" => Some(Self::Native),
+            _ => None,
+        }
+    }
+}
+
 /// Policy additions shared by every Shell call in one resolved profile.
 #[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,6 +145,13 @@ pub struct SandboxConfig {
     /// `run-unconfined` is accepted only from a trusted configuration layer.
     #[serde(rename = "onUnavailable", skip_serializing_if = "Option::is_none")]
     pub on_unavailable: Option<SandboxUnavailableAction>,
+    /// Backend selection. `auto` (default) discovers the platform's confined
+    /// backend and applies `onUnavailable`. `native` runs every Agent's Shell,
+    /// read-only contracts included, on the native process backend with the
+    /// configured permission mode kept; the requested authority is recorded but
+    /// not OS-enforced. Accepted only from a trusted configuration layer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<SandboxBackendSelection>,
     /// Existing directories writable in addition to the workspace for write-capable Agents.
     ///
     /// Relative paths resolve against the active workspace.
@@ -147,5 +195,11 @@ impl SandboxConfig {
     #[must_use]
     pub fn resolved_on_unavailable(&self) -> SandboxUnavailableAction {
         self.on_unavailable.unwrap_or_default()
+    }
+
+    /// Resolve the backend selection; absence discovers the confined backend.
+    #[must_use]
+    pub fn resolved_backend(&self) -> SandboxBackendSelection {
+        self.backend.unwrap_or_default()
     }
 }

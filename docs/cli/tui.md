@@ -6,7 +6,9 @@ written. It is also what `zuno` does when you give it no subcommand, so the two 
 interchangeable.
 
 Use its options to preselect a model or agent, resume prior work, or submit an opening
-prompt so the session starts working immediately after launch.
+prompt so the session starts working immediately after launch. A resumed session
+(`--continue`, `--session`) opens on the Agent, model, and reasoning level it last ran
+with; `--model` and `--agent` outrank the saved values for this process.
 
 ## Synopsis
 
@@ -28,6 +30,7 @@ zuno tui [OPTIONS]
 | `-s`, `--session <SESSION>` | Talk in this exact session | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
 | `--auto` | Approve every permission that is not explicitly denied, without asking. Upstream's own description ends in "(dangerous!)" and it means it: this replaces the human at the permission prompt, so a tool call the default ruleset would have stopped to ask about proceeds unattended | |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
@@ -39,7 +42,8 @@ Start the terminal application in the current directory.
 zuno tui
 ```
 
-Resume the most recent session in this checkout rather than opening a new one.
+Resume the most recent session in this checkout rather than opening a new one, on the
+Agent and model it last used.
 
 ```sh
 zuno tui --continue

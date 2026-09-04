@@ -115,7 +115,7 @@ assembly，也会落在 collaboration 之后、用户 instruction 之前。
 
 1. `runtime.intent`
 2. `runtime.execution`
-3. `runtime.sandbox`（可信 fallback 生效时）
+3. `runtime.sandbox`（可信 fallback 或受信的 `sandbox.backend: native` 生效时）
 4. `runtime.continuity`（最终存在 History 或 Notes 时）
 5. `runtime.editing`
 6. `runtime.verification`
@@ -252,7 +252,7 @@ Zuno 只采用公开可描述的设计原则，以原生英文角色 Prompt、ty
 3. `collaboration.mode`
 4. `runtime.intent`
 5. `runtime.execution`
-6. `runtime.sandbox`（可信 fallback 生效时）
+6. `runtime.sandbox`（可信 fallback 或受信的 `sandbox.backend: native` 生效时）
 7. `runtime.continuity`（最终存在 `history` 或 `notes` 时）
 8. `runtime.editing`（最终可写时）
 9. `runtime.verification`
@@ -277,7 +277,7 @@ prefix 与动态 developer context，但两者必须在 receipt 中恢复为同�
 | --- | --- | --- |
 | `runtime.intent` | 当前用户请求或 delegated objective 是本轮授权；新输入到达时重新分类意图 | 用户可见和 child turn 均存在 |
 | `runtime.execution` | 最小工作流、批量独立读取、避免重复读取和重复 gates、复杂任务维护 Plan | 始终；Plan 文字仅在 `plan_update` 真正可用时出现 |
-| `runtime.sandbox` | 请求/生效 sandbox 权限与无隔离 fallback 原因 | 可信的 unavailable fallback 生效时 |
+| `runtime.sandbox` | 请求/生效 sandbox 权限，以及无隔离的原因：类型化的 fallback 原因，或受信的 `sandbox.backend: native` 选择 | 可信的 unavailable fallback 或受信的 `sandbox.backend: native` 生效时 |
 | `runtime.continuity` | History/Notes 是不可信会话数据；说明会话、Agent 与 revision 边界 | 最终工具快照存在 `history` 或 `notes` 时 |
 | `runtime.editing` | 当前是否只读、可编辑范围、Shell、网络、sandbox 和 uncertain side effect 规则 | 来自最终 sandbox 与工具快照 |
 | `runtime.verification` | 完成证据和失败/恢复路径，不接受“看起来正确” | 用户可见实施任务；只读任务改为证据完整性 |

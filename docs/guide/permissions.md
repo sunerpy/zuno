@@ -54,14 +54,31 @@ contract still narrows it — see [Agents](/guide/agents).
 
 ### Choosing native execution
 
-There are two different ways to run without OS confinement. Choose the one whose
+There are three different ways to run without OS confinement. Choose the one whose
 meaning matches the deployment:
 
 | Intent | Setting | What happens |
 | --- | --- | --- |
 | Require confinement | `workspace-write` plus `onUnavailable: "deny"` | The default. An unavailable backend stops Shell assembly. |
-| Prefer confinement, but permit an unavailable-only fallback | `workspace-write` plus `onUnavailable: "run-unconfined"` | Zuno probes and verifies the confined backend first, then falls back only for an eligible typed availability failure. |
-| Always use the host process backend | `danger-full-access` | Zuno skips confined-backend discovery and runs natively on every supported platform. |
+| Prefer confinement, but permit an unavailable-only fallback | `workspace-write` plus `onUnavailable: "run-unconfined"` | Zuno probes and verifies the confined backend first, then falls back only for an eligible typed availability failure of a write-capable request. |
+| Run every Agent natively and keep the permission mode | `backend: "native"` | Zuno skips confined-backend discovery and runs every Agent's Shell natively, read-only contracts included; the configured permission mode, rules, approvals and the risk gate stay, and the requested contract is recorded as unenforced. |
+| Always use the host process backend without approval prompts | `danger-full-access` | Zuno skips confined-backend discovery, runs natively on every supported platform, and makes the effective permission mode `allow_all`. |
+
+`backend: "native"` is the choice for a host that has no OS sandbox (macOS and
+Windows today) when the permission layer should stay in force. It is a trusted
+host declaration, not a fallback: nothing is probed and nothing fails first. Under
+it a read-only Agent such as `plan` keeps its tool allowlist, its permission rules,
+and the Shell risk gate, and that is what "read-only" then means — a role boundary,
+not an OS boundary. Set it in a trusted layer, or for one invocation with
+`zuno --sandbox-backend native` or `ZUNO_SANDBOX_BACKEND=native`:
+
+```json
+{
+  "sandbox": {
+    "backend": "native"
+  }
+}
+```
 
 For an explicitly unconfined invocation:
 
@@ -238,26 +255,34 @@ backend, so the Shell tool cannot be registered under the requested
   `"sandbox": {"onUnavailable": "run-unconfined"}` in a trusted global, managed,
   environment, or CLI layer — a project layer cannot enable it.
 - A read-only request never falls back, and the refusal says so instead of listing
-  a remedy that would not apply: only an explicit `danger-full-access` request runs
-  natively there, and only an Agent whose contract is write-capable can make that
-  request, so a read-only Agent such as `plan` has no native route on these
-  platforms.
+  a remedy that would not apply. Its remedy is the explicit native backend:
+  `--sandbox-backend native`, `ZUNO_SANDBOX_BACKEND=native`, or
+  `"sandbox": {"backend": "native"}` in a trusted layer (a project layer cannot
+  select it) runs the Agent's Shell natively while keeping your permission mode.
+  The requested `read-only` authority is then recorded but not OS-enforced: the
+  Agent's tool contract, your permission rules, and the Shell risk gate are what
+  remain, which is a role boundary and not an OS boundary.
+- The write-capable refusal names the native backend beside the fallback, and
+  says that `danger-full-access` additionally makes the effective permission mode
+  `allow_all`.
 
 An interactive `zuno` start on such a host asks once, before the terminal enters
-raw mode, whether to run that session natively. It asks only for a write-capable
-request, only when no layer set `sandbox.onUnavailable`, and only when standard
-input and standard error are both terminals. Answering yes resolves this process
-exactly as `--sandbox-on-unavailable run-unconfined` does, for every later
-composition of it; answering no exits with the refusal above. `run`, `acp`,
-`serve`, and any start without a terminal never ask, and still need the flag, the
-variable, or a trusted layer.
+raw mode, whether to run that session natively. It asks for any request the host
+cannot confine, a read-only Agent's included, only when no layer set
+`sandbox.onUnavailable` or `sandbox.backend`, and only when standard input and
+standard error are both terminals. Answering yes resolves this process exactly as
+`--sandbox-backend native` does — `resolutionKind` `trusted_native` — for every
+later composition of it, a later switch to a read-only Agent included; answering
+no exits with the refusal above. `run`, `acp`, `serve`, and any start without a
+terminal never ask, and still need the flag, the variable, or a trusted layer.
 
 The answer belongs to this process. On macOS the flag is exported into the real
 environment by the one startup re-exec, so a nested `zuno` that a tool launches
 inherits it, while an answer typed at the prompt arrives after that re-exec and is
 not inherited. Set the environment variable or a trusted layer when nested Zuno
 processes need the same answer. See
-[Unavailable confinement](/reference/configuration#unavailable-confinement).
+[Unavailable confinement](/reference/configuration#unavailable-confinement) and
+[Native backend](/reference/configuration#native-backend).
 
 Switching to an Agent whose Shell cannot be registered keeps the current Agent and
 reports the same refusal on the transcript, instead of ending the session over a
@@ -432,6 +457,7 @@ them has real consequences.
 | `workspace-write` + default `deny`, no backend | Shell is not assembled. Nothing runs. |
 | `workspace-write` + trusted `run-unconfined`, eligible unavailable error | The command uses host authority; the configured permission mode and hard denials remain. |
 | `read-only` + `run-unconfined`, no backend | Shell is not assembled. Read-only execution never falls back. |
+| `read-only` + trusted `backend: "native"` | Shell runs natively with the permission mode kept. The read-only contract is a tool, permission and risk-gate boundary, not an OS boundary; the record says `trusted_native` and `requestedMode: read-only`. |
 
 ## Agent contracts narrow, never widen
 
@@ -439,7 +465,10 @@ A read-only agent is pinned to `read-only` regardless of what configuration asks
 for. This direction is one-way by design: an agent contract can only reduce
 authority, so selecting a read-only agent is a guarantee rather than a default that
 configuration can quietly reverse. It also means a read-only Agent never uses
-`run-unconfined`.
+`run-unconfined`. The one way its Shell runs natively is a trusted
+`sandbox.backend: native` selection, which is an explicit host declaration rather
+than a fallback and leaves the contract in force as a tool and permission
+boundary while removing the OS boundary.
 
 An agent contract is deny-by-default, so a tool the contract does not name is *hidden*
 rather than merely unauthorized: the contract's leading `"*": "deny"` is the last rule

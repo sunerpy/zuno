@@ -431,8 +431,11 @@ fn provider_config(base_url: &str) -> String {
         // has to make the trusted choice explicitly rather than expect it to pass.
         // The refusal now names the platform and lists the remedies, and an
         // interactive `zuno` start offers the trusted choice once before raw mode
-        // for a write-capable request — but the smoke is headless (`run`, no TTY),
+        // for any request it cannot confine (read-only included; acceptance selects
+        // `sandbox.backend: native`) — but the smoke is headless (`run`, no TTY),
         // and headless surfaces never ask, so the choice still has to be made here.
+        // The smoke keeps `onUnavailable` rather than `backend: native` so the
+        // release evidence continues to exercise the fallback path as shipped.
         //
         // This belongs here and NOT in a workflow environment variable: `invoke`
         // calls `env_clear()` and forwards only the map built by `turn_variables`, so

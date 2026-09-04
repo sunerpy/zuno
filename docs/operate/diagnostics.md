@@ -121,6 +121,7 @@ zuno debug sandbox --mode workspace-write \
 | `--mode <MODE>` | `read-only`, `workspace-write`, `danger-full-access` | `workspace-write` |
 | `--network <NETWORK>` | `deny`, `allow` | `deny` for confined modes, `allow` for `danger-full-access` |
 | `--sandbox-on-unavailable <ACTION>` | `deny`, `run-unconfined` | `deny` |
+| `--sandbox-backend <BACKEND>` | `auto`, `native` | `auto` |
 | `--check` | Exit unsuccessfully when the requested policy is not deployable | |
 
 A restricted mode verifies bubblewrap deployment, so this is the command that
@@ -130,13 +131,21 @@ than output.
 
 The JSON report separates the requested policy from the execution resolution. Inspect
 `requestedMode`, `requestedNetwork`, `effectiveMode`, `effectiveNetwork`,
-`fallbackEligible`, `resolutionKind`, and `fallbackReason`. An eligible
-`run-unconfined` result can therefore report `ready: false` for requested confinement
-while showing `resolutionKind: "unavailable_fallback"` and effective host authority.
+`fallbackEligible`, `backendSelection`, `resolutionKind`, and `fallbackReason`. An
+eligible `run-unconfined` result can therefore report `ready: false` for requested
+confinement while showing `resolutionKind: "unavailable_fallback"` and effective host
+authority. A trusted `native` backend selection (`--sandbox-backend native`,
+`ZUNO_SANDBOX_BACKEND=native`, or `sandbox.backend` in a trusted layer) probes nothing
+and reports `backendSelection: "native"`, `resolutionKind: "trusted_native"`,
+`nativeExecutionBypass: true`, `fallbackEligible: false`, and `ready: false` for a
+confined requested mode; the `policy` check passes, `launcher_trust`,
+`backend_discovery`, and `execution_self_test` are marked skipped, and `error`
+names the selection.
 
 `--check` stays strict: it exits unsuccessfully whenever the requested confinement is not
-deployable, even when runtime fallback is permitted. This makes it safe as a deployment
-gate instead of accidentally validating an unconfined host.
+deployable, even when runtime fallback is permitted or the native backend is selected.
+This makes it safe as a deployment gate instead of accidentally validating an unconfined
+host.
 
 The confinement semantics themselves are in
 [Permissions and sandboxing](/guide/permissions).
