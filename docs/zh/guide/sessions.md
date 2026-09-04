@@ -123,6 +123,16 @@ zuno run --session ses_1a2b3c "what changed?"
 zuno run --session ses_1a2b3c --agent plan "what would a safe migration look like?"
 ```
 
+续跑的会话会沿用它上次运行时的 Agent、模型与推理强度。所有重新打开会话的界面——`--continue`、`--session`、TUI 的 `/session` 选择器，以及 ACP 的 `session/load` 与 `session/resume`——都按同一顺序解析，因此显式参数仍然优先，配置只是最后的回退：
+
+| 设置 | 优先级 |
+| --- | --- |
+| Agent | `--agent` 或选择器 > 会话上保存的值 > `default_agent` > `orchestrator` |
+| 模型 | `--model` 或选择器 > 本进程中选定的 preset > 会话上保存的值 > 按配置路由 |
+| 推理强度 | `--variant`、`--thinking` 或选择器 > 随会话模型一同保存的值 > 配置默认值 |
+
+一句话概括：参数 > 会话 > 配置默认值。会话行记录的是它上次运行时的那一组值：TUI 中的模型、强度、preset 或 Agent 选择、ACP 的配置变更，以及会话创建，都会把模型引用（连同其 `variant`）写回，下一次续跑就从这里开始；`zuno run` 的参数只作用于那一次运行，不会改写会话行。指定一个与保存值*不同*的 Agent 时，模型会按配置重新路由，与在活动会话里切换 Agent 完全一致；要固定模型就传 `--model`。当保存的 Agent 已不在名册中，或保存的模型已不在目录里，续跑会回退到下一条规则，并以一条状态提示说明，而不是失败；模型不再声明的已保存强度也会以同类提示丢弃。
+
 这个二进制不提供会话分叉，因此想探索一个替代方案又不污染想保留的那个会话时，就新起一个：`--continue` 与 `--session` 都不给，并给它一个 `--title`。
 
 ## 保留

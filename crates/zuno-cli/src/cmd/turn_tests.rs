@@ -1738,6 +1738,7 @@ fn plan_for(
         provider_id: "provider".to_owned(),
         model_id: "model".to_owned(),
         model_override: None,
+        preset_override: None,
         auth_store,
         credential: None,
         session,
@@ -11704,4 +11705,647 @@ fn accepting_the_native_offer_for_a_read_only_plan_switches_the_process_to_the_n
             "interactive={interactive}: the next decision proceeds without asking again"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// A resumed session keeps the Agent, model and reasoning level it last ran with.
+//
+// The precedence is `TurnPlan::resolve`'s, so these tests drive the real resolution
+// against an isolated home and a file database rather than a fixture plan: an explicit
+// option wins, then the row the session choice names, then configuration. Two
+// config-provided providers keep the routed model (`aaa`) distinguishable from a saved
+// one (`zzz`), and `zzz` declares exactly `low` and `high` so a saved level can be
+// honoured, outranked, or refused.
+// ---------------------------------------------------------------------------
+
+fn resume_model(id: &str, reasoning: bool) -> serde_json::Value {
+    let mut model = json!({
+        "id": id,
+        "name": id,
+        "attachment": false,
+        "reasoning": reasoning,
+        "temperature": false,
+        "tool_call": true,
+        "release_date": "2025-01-01",
+        "limit": {"context": 100_000, "output": 10_000},
+        "cost": {"input": 0, "output": 0},
+        "options": {}
+    });
+    if reasoning {
+        model["variants"] = json!({
+            "low": {"reasoningEffort": "low"},
+            "high": {"reasoningEffort": "high"}
+        });
+    }
+    model
+}
+
+fn resume_provider(label: &str, reasoning: bool) -> serde_json::Value {
+    json!({
+        "name": label,
+        "id": label,
+        "env": [],
+        "transport": "openai-compatible",
+        "models": {format!("{label}-model"): resume_model(&format!("{label}-model"), reasoning)},
+        // A closed port: resolution never dials, and a test that did would fail fast.
+        "options": {"apiKey": "resume-seed", "baseURL": "http://127.0.0.1:9/v1"}
+    })
+}
+
+fn resume_config(extra: serde_json::Value) -> String {
+    let mut config = json!({
+        "formatter": false,
+        "lsp": false,
+        "model": "aaa/aaa-model",
+        "provider": {
+            "aaa": resume_provider("aaa", false),
+            "zzz": resume_provider("zzz", true)
+        }
+    });
+    if let Some(object) = extra.as_object() {
+        for (key, value) in object {
+            config[key] = value.clone();
+        }
+    }
+    zuno_testkit::trusted_platform_config(config).to_string()
+}
+
+const RESUME_PROJECT: &str = "project-resume-seed";
+
+struct ResumeFixture {
+    env: zuno_testkit::ScriptedEnv,
+    environment: crate::environment::StartupEnvironment,
+    directory: PathBuf,
+    pool: zuno_db::Pool,
+}
+
+impl ResumeFixture {
+    fn new(config: String) -> Self {
+        Self::with_db(config, zuno_testkit::DbChoice::TempFile)
+    }
+
+    fn with_db(config: String, db: zuno_testkit::DbChoice) -> Self {
+        let env = zuno_testkit::ScriptedEnv::new()
+            .expect("isolated environment")
+            .with_db(db);
+        let variables = Env::from_pairs(env.env_vars())
+            .with("ZUNO_CONFIG_CONTENT", config)
+            .with("ZUNO_AUTH_CONTENT", "{}")
+            .with("ZUNO_DISABLE_MODELS_FETCH", "true");
+        let environment = crate::environment::StartupEnvironment::resolve(
+            &variables,
+            &crate::GlobalOptions::default(),
+        );
+        let location = match env.env_vars().get("ZUNO_DB").map(String::as_str) {
+            Some(":memory:") | None => zuno_paths::DbLocation::Memory,
+            Some(path) => zuno_paths::DbLocation::File(PathBuf::from(path)),
+        };
+        let pool = zuno_db::Pool::open(&location).expect("open the fixture database");
+        let directory = env.working_dir().to_path_buf();
+        {
+            let mut connection = pool.get().expect("schema connection");
+            zuno_db::migration::apply(&mut connection).expect("apply schema");
+            connection
+                .execute(
+                    "INSERT INTO project \
+                     (id, worktree, vcs, time_created, time_updated, sandboxes) \
+                     VALUES (?1, ?2, 'git', ?3, ?3, '[]')",
+                    rusqlite::params![
+                        RESUME_PROJECT,
+                        directory.to_string_lossy().into_owned(),
+                        1_787_381_000_000_i64
+                    ],
+                )
+                .expect("fixture project");
+        }
+        Self {
+            env,
+            environment,
+            directory,
+            pool,
+        }
+    }
+
+    fn seed_in(
+        &self,
+        id: &str,
+        directory: &Path,
+        agent: Option<&str>,
+        model: Option<String>,
+        time: i64,
+    ) {
+        let mut connection = self.pool.open_connection().expect("seed connection");
+        let transaction = connection.transaction().expect("seed transaction");
+        let directory = directory.to_string_lossy().into_owned();
+        let mut input = zuno_db::session::SessionCreate::new(
+            id,
+            id,
+            RESUME_PROJECT,
+            &directory,
+            &directory,
+            format!("resume {id}"),
+            crate::RUST_PACKAGE_VERSION,
+        )
+        .at(time);
+        input.agent = agent.map(str::to_owned);
+        input.model = model;
+        zuno_db::session::create(&transaction, &input).expect("seed session");
+        transaction.commit().expect("seed commit");
+    }
+
+    fn seed(&self, id: &str, agent: Option<&str>, model: Option<String>, time: i64) {
+        self.seed_in(id, &self.directory.clone(), agent, model, time);
+    }
+
+    fn archive(&self, id: &str) {
+        self.pool
+            .get()
+            .expect("archive connection")
+            .execute(
+                "UPDATE session SET time_archived = time_updated WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .expect("archive session");
+    }
+
+    fn options(&self, session: SessionChoice) -> TurnOptions {
+        TurnOptions {
+            directory: Some(self.directory.clone()),
+            session,
+            ..TurnOptions::default()
+        }
+    }
+
+    async fn resolve(&self, options: TurnOptions) -> TurnPlan {
+        TurnPlan::resolve(&options, &self.environment)
+            .await
+            .expect("the resumed plan resolves")
+    }
+}
+
+fn saved_session_notes(plan: &TurnPlan) -> Vec<&str> {
+    plan.notes
+        .iter()
+        .map(String::as_str)
+        .filter(|note| note.contains("saved on this session"))
+        .collect()
+}
+
+fn saved_reference(provider: &str, model: &str, variant: Option<&str>) -> Option<String> {
+    Some(zuno_db::session::model_reference_with_variant(
+        provider, model, variant,
+    ))
+}
+
+#[tokio::test]
+async fn resume_seed_flags_win_over_the_saved_session_values() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_flags",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+
+    for session in [
+        SessionChoice::Existing("ses_resume_flags".to_owned()),
+        SessionChoice::Continue,
+    ] {
+        let mut options = fixture.options(session.clone());
+        options.agent = Some("orchestrator".to_owned());
+        options.model = Some("zzz/zzz-model".to_owned());
+        options.variant = Some("low".to_owned());
+        let plan = fixture.resolve(options).await;
+
+        assert_eq!(plan.agent_name(), "orchestrator", "{session:?}");
+        assert_eq!(plan.qualified_model(), "zzz/zzz-model", "{session:?}");
+        assert_eq!(plan.effective_variant(), Some("low"), "{session:?}");
+        assert_eq!(
+            plan.effort(),
+            Some(zuno_llm::effort::ReasoningEffort::Low),
+            "{session:?}"
+        );
+        assert!(
+            saved_session_notes(&plan).is_empty(),
+            "an explicit choice is not a fallback: {:?}",
+            plan.notes
+        );
+    }
+}
+
+#[tokio::test]
+async fn resume_seed_restores_saved_agent_model_and_variant_over_configuration() {
+    let fixture = ResumeFixture::new(resume_config(json!({"default_agent": "orchestrator"})));
+    fixture.seed(
+        "ses_resume_saved",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+
+    for session in [
+        SessionChoice::Existing("ses_resume_saved".to_owned()),
+        SessionChoice::Continue,
+    ] {
+        let plan = fixture.resolve(fixture.options(session.clone())).await;
+
+        assert_eq!(plan.agent_name(), "build", "{session:?}");
+        assert_eq!(plan.qualified_model(), "zzz/zzz-model", "{session:?}");
+        assert_eq!(plan.effective_variant(), Some("high"), "{session:?}");
+        assert_eq!(
+            plan.effort_override(),
+            Some(zuno_llm::effort::ReasoningEffort::High),
+            "a restored level is the surface's choice, so it survives later switches"
+        );
+        assert!(plan.model_override.is_none(), "restored is not an override");
+        assert!(saved_session_notes(&plan).is_empty(), "{:?}", plan.notes);
+        assert_eq!(
+            plan.persisted_model_reference(),
+            zuno_db::session::model_reference_with_variant("zzz", "zzz-model", Some("high")),
+            "what the plan would write back is what it read"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resume_seed_reports_a_saved_agent_that_left_the_roster() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_gone_agent",
+        Some("vanished"),
+        saved_reference("zzz", "zzz-model", None),
+        1_787_381_100_000,
+    );
+
+    let plan = fixture
+        .resolve(fixture.options(SessionChoice::Existing("ses_resume_gone_agent".to_owned())))
+        .await;
+
+    assert_eq!(plan.agent_name(), DEFAULT_AGENT);
+    assert_eq!(
+        saved_session_notes(&plan),
+        [
+            "Agent \"vanished\" saved on this session is no longer available; using \
+             \"orchestrator\""
+        ]
+    );
+    assert_eq!(
+        plan.qualified_model(),
+        "zzz/zzz-model",
+        "the surface named no Agent, so the saved model still applies"
+    );
+}
+
+#[tokio::test]
+async fn resume_seed_reports_a_saved_model_missing_from_the_catalog() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_gone_model",
+        Some("build"),
+        saved_reference("zzz", "gone", Some("high")),
+        1_787_381_100_000,
+    );
+
+    let plan = fixture
+        .resolve(fixture.options(SessionChoice::Continue))
+        .await;
+
+    assert_eq!(plan.agent_name(), "build");
+    assert_eq!(plan.qualified_model(), "aaa/aaa-model");
+    assert_eq!(
+        plan.effective_variant(),
+        None,
+        "a dropped model takes its variant along"
+    );
+    assert_eq!(
+        saved_session_notes(&plan),
+        ["model zzz/gone saved on this session is not in the catalog; using aaa/aaa-model"]
+    );
+}
+
+#[tokio::test]
+async fn resume_seed_drops_a_saved_variant_the_model_no_longer_declares() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_gone_variant",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("max")),
+        1_787_381_100_000,
+    );
+
+    let plan = fixture
+        .resolve(fixture.options(SessionChoice::Existing(
+            "ses_resume_gone_variant".to_owned(),
+        )))
+        .await;
+
+    assert_eq!(plan.qualified_model(), "zzz/zzz-model");
+    assert_eq!(plan.effective_variant(), None);
+    assert_eq!(plan.effort_override(), None);
+    let notes = saved_session_notes(&plan);
+    assert_eq!(notes.len(), 1, "{:?}", plan.notes);
+    assert!(
+        notes[0].starts_with("reasoning variant `max` saved on this session was not restored: "),
+        "{}",
+        notes[0]
+    );
+    assert!(
+        notes[0].contains("does not declare reasoning variant `max`"),
+        "{}",
+        notes[0]
+    );
+}
+
+#[tokio::test]
+async fn resume_seed_never_persists_a_carried_level_the_switched_model_does_not_declare() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_carried_level",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+    let session = SessionChoice::Existing("ses_resume_carried_level".to_owned());
+
+    // Resume, then switch to a model without `high` exactly as a TUI rebuild does: the
+    // surface names the new model and carries the host's own level along as `effort`.
+    let resumed = fixture.resolve(fixture.options(session.clone())).await;
+    assert_eq!(
+        resumed.effort_override(),
+        Some(zuno_llm::effort::ReasoningEffort::High)
+    );
+    let mut switched = fixture.options(session.clone());
+    switched.agent = Some(resumed.agent_name().to_owned());
+    switched.model = Some("aaa/aaa-model".to_owned());
+    switched.effort = resumed.effort_override();
+    let plan = fixture.resolve(switched).await;
+
+    assert_eq!(plan.qualified_model(), "aaa/aaa-model");
+    assert_eq!(
+        plan.effective_variant(),
+        None,
+        "aaa/aaa-model declares no `high`, so the plan runs with no level"
+    );
+    assert_eq!(
+        zuno_db::session::decode_model_reference(&plan.persisted_model_reference())
+            .expect("the reference decodes")
+            .variant,
+        None,
+        "the row must not record a level the model cannot have: {}",
+        plan.persisted_model_reference()
+    );
+    assert_eq!(
+        plan.persisted_model_reference(),
+        zuno_db::session::model_reference("aaa", "aaa-model"),
+        "no variant means no `variant` key at all"
+    );
+    assert_eq!(plan.effort(), None);
+    assert_eq!(
+        plan.effort_override(),
+        None,
+        "a level the model does not declare is not the surface's choice for it"
+    );
+    assert!(saved_session_notes(&plan).is_empty(), "{:?}", plan.notes);
+
+    // What that plan writes back resumes silently: no note about the user's own pick.
+    fixture
+        .pool
+        .get()
+        .expect("rewrite connection")
+        .execute(
+            "UPDATE session SET model = ?1 WHERE id = ?2",
+            rusqlite::params![plan.persisted_model_reference(), "ses_resume_carried_level"],
+        )
+        .expect("rewrite the session model");
+    let reopened = fixture.resolve(fixture.options(session)).await;
+    assert_eq!(reopened.qualified_model(), "aaa/aaa-model");
+    assert_eq!(reopened.effective_variant(), None);
+    assert!(
+        saved_session_notes(&reopened).is_empty(),
+        "{:?}",
+        reopened.notes
+    );
+}
+
+#[tokio::test]
+async fn resume_seed_re_routes_the_model_when_the_surface_names_another_agent() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_switch",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+    let session = SessionChoice::Existing("ses_resume_switch".to_owned());
+
+    let mut switched = fixture.options(session.clone());
+    switched.agent = Some("orchestrator".to_owned());
+    let plan = fixture.resolve(switched).await;
+    assert_eq!(plan.agent_name(), "orchestrator");
+    assert_eq!(
+        plan.qualified_model(),
+        "aaa/aaa-model",
+        "a different Agent routes its model afresh, exactly as an in-session switch does"
+    );
+    assert_eq!(plan.effective_variant(), None);
+    assert!(saved_session_notes(&plan).is_empty(), "{:?}", plan.notes);
+
+    let mut same = fixture.options(session);
+    same.agent = Some("build".to_owned());
+    let plan = fixture.resolve(same).await;
+    assert_eq!(plan.agent_name(), "build");
+    assert_eq!(
+        plan.qualified_model(),
+        "zzz/zzz-model",
+        "naming the saved Agent, as a TUI rebuild does, keeps the saved model"
+    );
+    assert_eq!(plan.effective_variant(), Some("high"));
+}
+
+#[tokio::test]
+async fn resume_seed_yields_to_a_preset_chosen_for_this_process_but_not_a_configured_one() {
+    let presets = json!({
+        "presets": {"team": {"agents": {"build": "aaa/aaa-model"}}}
+    });
+    let fixture = ResumeFixture::new(resume_config(presets.clone()));
+    fixture.seed(
+        "ses_resume_preset",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+    let session = SessionChoice::Existing("ses_resume_preset".to_owned());
+
+    let mut chosen = fixture.options(session.clone());
+    chosen.preset = Some("team".to_owned());
+    let plan = fixture.resolve(chosen).await;
+    assert_eq!(plan.qualified_model(), "aaa/aaa-model");
+    assert_eq!(plan.preset_override, Some("team".to_owned()));
+
+    let plan = fixture.resolve(fixture.options(session.clone())).await;
+    assert_eq!(plan.qualified_model(), "zzz/zzz-model");
+    assert_eq!(plan.preset_override, None);
+
+    let mut configured = presets;
+    configured["preset"] = json!("team");
+    let fixture = ResumeFixture::new(resume_config(configured));
+    fixture.seed(
+        "ses_resume_preset",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+    let plan = fixture.resolve(fixture.options(session)).await;
+    assert_eq!(
+        plan.qualified_model(),
+        "zzz/zzz-model",
+        "a preset from configuration is a configured default, below the saved model"
+    );
+    assert_eq!(plan.preset_name(), Some("team"));
+    assert_eq!(plan.preset_override, None);
+}
+
+#[tokio::test]
+async fn resume_seed_continue_picks_the_most_recent_active_session_in_the_directory() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_older_active",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("low")),
+        1_787_381_100_000,
+    );
+    fixture.seed(
+        "ses_resume_newer_archived",
+        Some("plan"),
+        saved_reference("aaa", "aaa-model", None),
+        1_787_381_200_000,
+    );
+    fixture.archive("ses_resume_newer_archived");
+    let elsewhere = fixture.env.working_dir().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("other directory");
+    fixture.seed_in(
+        "ses_resume_other_directory",
+        &elsewhere,
+        Some("plan"),
+        saved_reference("aaa", "aaa-model", None),
+        1_787_381_300_000,
+    );
+
+    let plan = fixture
+        .resolve(fixture.options(SessionChoice::Continue))
+        .await;
+
+    assert_eq!(plan.agent_name(), "build");
+    assert_eq!(plan.qualified_model(), "zzz/zzz-model");
+    assert_eq!(plan.effective_variant(), Some("low"));
+}
+
+#[tokio::test]
+async fn resume_seed_ignores_new_sessions_and_memory_databases() {
+    let fixture = ResumeFixture::new(resume_config(json!({})));
+    fixture.seed(
+        "ses_resume_ignored",
+        Some("build"),
+        saved_reference("zzz", "zzz-model", Some("high")),
+        1_787_381_100_000,
+    );
+    let plan = fixture.resolve(fixture.options(SessionChoice::New)).await;
+    assert_eq!(plan.agent_name(), DEFAULT_AGENT);
+    assert_eq!(plan.qualified_model(), "aaa/aaa-model");
+    assert_eq!(plan.effective_variant(), None);
+    assert!(saved_session_notes(&plan).is_empty(), "{:?}", plan.notes);
+
+    let memory = ResumeFixture::with_db(resume_config(json!({})), zuno_testkit::DbChoice::Memory);
+    let plan = memory
+        .resolve(memory.options(SessionChoice::Existing("ses_resume_ignored".to_owned())))
+        .await;
+    assert_eq!(plan.agent_name(), DEFAULT_AGENT);
+    assert_eq!(plan.qualified_model(), "aaa/aaa-model");
+    assert!(
+        saved_session_notes(&plan).is_empty(),
+        "an in-memory database is no seed and no failure: {:?}",
+        plan.notes
+    );
+}
+
+#[test]
+fn locate_session_answers_every_session_choice_from_one_lookup() {
+    let pool = zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database");
+    let mut connection = pool.open_connection().expect("connection");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    connection
+        .execute_batch(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+             VALUES ('project-locate', '/workspace', 1, 1, '[]');",
+        )
+        .expect("seed project");
+    let transaction = connection.transaction().expect("transaction");
+    for (id, directory, time) in [
+        ("ses_locate_older", "/workspace", 100_i64),
+        ("ses_locate_newer", "/workspace", 200),
+        ("ses_locate_elsewhere", "/elsewhere", 300),
+    ] {
+        let input = zuno_db::session::SessionCreate::new(
+            id,
+            id,
+            "project-locate",
+            "/workspace",
+            directory,
+            id,
+            "1",
+        )
+        .at(time);
+        zuno_db::session::create(&transaction, &input).expect("seed session");
+    }
+    transaction.commit().expect("commit");
+    let directory = Path::new("/workspace");
+
+    let existing = locate_session(
+        &connection,
+        &SessionChoice::Existing("ses_locate_older".to_owned()),
+        directory,
+    )
+    .expect("existing lookup")
+    .expect("existing row");
+    assert_eq!(existing.id, "ses_locate_older");
+    assert!(
+        locate_session(
+            &connection,
+            &SessionChoice::Existing("ses_locate_missing".to_owned()),
+            directory,
+        )
+        .is_err(),
+        "an explicit id without a row is the host's error, not a silent new session"
+    );
+    let continued = locate_session(&connection, &SessionChoice::Continue, directory)
+        .expect("continue lookup")
+        .expect("continue row");
+    assert_eq!(
+        continued.id, "ses_locate_newer",
+        "the most recent active session in the directory, never one from elsewhere"
+    );
+    assert!(
+        locate_session(&connection, &SessionChoice::New, directory)
+            .expect("new lookup")
+            .is_none()
+    );
+    let pending = PreparedSessionIdentity::pending("ses_locate_pending".to_owned());
+    assert!(
+        locate_session(&connection, &SessionChoice::Prepared(pending), directory)
+            .expect("pending lookup")
+            .is_none(),
+        "a pending identity has no row yet"
+    );
+    let materialized = PreparedSessionIdentity::existing("ses_locate_older".to_owned());
+    assert_eq!(
+        locate_session(
+            &connection,
+            &SessionChoice::Prepared(materialized),
+            directory
+        )
+        .expect("materialized lookup")
+        .expect("materialized row")
+        .id,
+        "ses_locate_older"
+    );
 }

@@ -109,8 +109,9 @@ receives, so a command can gather evidence but cannot change the tree.
 
 Returning to Work mode requires a durable plan to exist, and the confirmation names its
 title, revision, and completed-step count. The model can recommend starting work but
-cannot select it for you. A confirmed selection is persisted as the session agent, so a
-resume restores the mode.
+cannot select it for you. A confirmed selection is persisted as the session agent, so
+`--continue`, `--session`, the `/session` picker, and ACP `session/load` all restore the
+mode, together with the model and reasoning level the session last ran with.
 
 ## Inspecting what an agent actually resolves to
 

@@ -2086,3 +2086,287 @@ fn session_picker_stays_open_for_consecutive_deletes() {
         transcript.text
     );
 }
+
+/// A second catalog model, so a restored model is visibly not the launch default.
+const RESUME_OTHER_MODEL: &str = "test/other-model";
+/// Wall-clock budget for a launch, a `/session` remount, a `/model` pick and an exit.
+const RESUME_BUDGET: Duration = Duration::from_secs(45);
+
+fn variables_with_other_model(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
+    let mut variables = variables(env, base_url);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&provider_config(base_url)).expect("provider fixture config is JSON");
+    config["provider"]["test"]["models"]["other-model"] = serde_json::json!({
+        "id": "other-model",
+        "name": "Other Model",
+        "attachment": false,
+        "reasoning": false,
+        "temperature": false,
+        "tool_call": true,
+        "release_date": "2025-01-01",
+        "limit": { "context": 100_000, "output": 10_000 },
+        "cost": { "input": 0, "output": 0 },
+        "options": {}
+    });
+    variables.insert("ZUNO_CONFIG_CONTENT".to_owned(), config.to_string());
+    variables
+}
+
+/// The two picker sessions, saved under different Agents and models so that restoring
+/// one is distinguishable from carrying the other's identity across.
+fn seed_resume_sessions(env: &ScriptedEnv) {
+    let pool = session_picker_pool(env);
+    let mut connection = pool.open_connection().expect("resume connection");
+    zuno_db::migration::apply(&mut connection).expect("resume migrations");
+    let directory = env.working_dir().to_string_lossy().into_owned();
+    connection
+        .execute(
+            "INSERT INTO project \
+             (id, worktree, vcs, time_created, time_updated, sandboxes) \
+             VALUES (?1, ?2, 'git', ?3, ?3, '[]')",
+            rusqlite::params!["project-picker", directory, 1_787_381_000_000_i64],
+        )
+        .expect("resume project");
+    let transaction = connection.transaction().expect("resume transaction");
+    for (id, slug, title, time, agent, model) in [
+        (
+            PICKER_FIRST_ID,
+            "picker-first",
+            PICKER_FIRST_TITLE,
+            1_787_381_100_000_i64,
+            "orchestrator",
+            zuno_db::session::model_reference("test", "other-model"),
+        ),
+        (
+            PICKER_SECOND_ID,
+            "picker-second",
+            PICKER_SECOND_TITLE,
+            1_787_381_200_000_i64,
+            "build",
+            zuno_db::session::model_reference("test", "test-model"),
+        ),
+    ] {
+        let mut input = zuno_db::session::SessionCreate::new(
+            id,
+            slug,
+            "project-picker",
+            &directory,
+            &directory,
+            title,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .at(time);
+        input.agent = Some(agent.to_owned());
+        input.model = Some(model);
+        zuno_db::session::create(&transaction, &input).expect("resume session");
+    }
+    transaction.commit().expect("resume sessions commit");
+}
+
+struct ResumeTranscript {
+    text: String,
+    /// `-s` opened the second session under its own saved Agent and model.
+    saw_launch: bool,
+    /// `/session` reopened the first session under *its* saved Agent and model.
+    saw_switch: bool,
+    /// A `/model` pick after the switch was written to the first session's row.
+    saw_persisted: bool,
+    /// The process left the alternate screen once and named the switched-to session.
+    saw_exit: bool,
+}
+
+fn run_session_resume_under_pty(env: &ScriptedEnv) -> Result<ResumeTranscript, std::io::Error> {
+    let script = which::which("script").map_err(|_| {
+        std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
+    })?;
+    // No `--model`: the model must come from the session row, not the command line.
+    let command = format!(
+        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --auto -s {PICKER_SECOND_ID}",
+        shell_quote(&binary().to_string_lossy())
+    );
+    let mut child = Command::new(&script)
+        .args(["-qefc".to_owned(), command, "/dev/null".to_owned()])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(variables_with_other_model(env, "http://127.0.0.1:9"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("resume stdout was not piped"))?;
+    let (chunks, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match output.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => {
+                    if chunks.send(buffer[..read].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let pool = session_picker_pool(env);
+    let store = zuno_db::session::Store::new(&pool);
+    let started = Instant::now();
+    let mut text = String::new();
+    let mut saw_launch = false;
+    let mut saw_switch = false;
+    let mut saw_persisted = false;
+    let mut saw_exit = false;
+    let mut session_command_sent_at = None;
+    let mut session_picker_opened = false;
+    let mut switch_sent_at_offset = None;
+    let mut model_command_sent_at = None;
+    let mut model_picker_opened_at = None;
+    let mut model_filter_sent = false;
+    let mut exit_sent = false;
+    while started.elapsed() < RESUME_BUDGET {
+        let disconnected = match received.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => {
+                text.push_str(&String::from_utf8_lossy(&chunk));
+                false
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => true,
+        };
+        if exit_sent && text.contains("resume this session: zuno -s ") {
+            let entered = text.matches("\u{1b}[?1049h").count();
+            let left = text.matches("\u{1b}[?1049l").count();
+            saw_exit = entered == 1
+                && left == 1
+                && text.contains(&format!("resume this session: zuno -s {PICKER_FIRST_ID}"));
+            break;
+        }
+        if disconnected {
+            break;
+        }
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("resume stdin was not piped"))?;
+        if !saw_launch {
+            if text.contains("ask anything, or / for commands") {
+                // The second session's saved identity, and not the default Agent's.
+                saw_launch = text.contains(MODEL)
+                    && text.contains("build")
+                    && !text.contains("orchestrator");
+                if !saw_launch {
+                    break;
+                }
+                stdin.write_all(b"/session\r")?;
+                stdin.flush()?;
+                session_command_sent_at = Some(Instant::now());
+            }
+        } else if !session_picker_opened {
+            if session_command_sent_at
+                .is_some_and(|sent| sent.elapsed() >= Duration::from_millis(500))
+            {
+                stdin.write_all(b"\r")?;
+                stdin.flush()?;
+                session_picker_opened = true;
+            }
+        } else if switch_sent_at_offset.is_none() {
+            if text.contains(PICKER_FIRST_TITLE) && text.contains(PICKER_SECOND_TITLE) {
+                switch_sent_at_offset = Some(text.len());
+                stdin.write_all(b"\x1b[B\r")?;
+                stdin.flush()?;
+            }
+        } else if !saw_switch {
+            let since_switch = &text[switch_sent_at_offset.unwrap_or_default()..];
+            if since_switch.contains("ask anything, or / for commands")
+                && since_switch.contains(RESUME_OTHER_MODEL)
+                && since_switch.contains("orchestrator")
+            {
+                saw_switch = true;
+                stdin.write_all(b"/model\r")?;
+                stdin.flush()?;
+                model_command_sent_at = Some(Instant::now());
+            }
+        } else if model_picker_opened_at.is_none() {
+            if model_command_sent_at
+                .is_some_and(|sent| sent.elapsed() >= Duration::from_millis(500))
+            {
+                stdin.write_all(b"\r")?;
+                stdin.flush()?;
+                model_picker_opened_at = Some(Instant::now());
+            }
+        } else if !model_filter_sent {
+            if model_picker_opened_at
+                .is_some_and(|opened| opened.elapsed() >= Duration::from_millis(500))
+            {
+                // Typed into the picker's filter: only "Test Model" matches, so Enter
+                // picks it whatever row the cursor started on.
+                stdin.write_all(b"Test Mod\r")?;
+                stdin.flush()?;
+                model_filter_sent = true;
+            }
+        } else if !saw_persisted {
+            let persisted = store
+                .find(PICKER_FIRST_ID)
+                .expect("read the switched-to session")
+                .and_then(|session| session.model)
+                .is_some_and(|model| {
+                    model == zuno_db::session::model_reference("test", "test-model")
+                });
+            if persisted {
+                saw_persisted = true;
+                stdin.write_all(b"\x03")?;
+                stdin.flush()?;
+                exit_sent = true;
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(ResumeTranscript {
+        text,
+        saw_launch,
+        saw_switch,
+        saw_persisted,
+        saw_exit,
+    })
+}
+
+/// The interactive surface resumes a session under the Agent and model it last ran
+/// with, `/session` restores the *target's* saved identity rather than carrying the
+/// current one across, and a model picked afterwards is written to that session's row.
+#[test]
+fn session_switch_restores_the_targets_saved_identity_and_persists_picker_changes() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    seed_resume_sessions(&env);
+
+    let transcript = run_session_resume_under_pty(&env)
+        .expect("the real TUI resumes and switches sessions under a PTY");
+
+    assert!(
+        transcript.saw_launch,
+        "`-s` did not open the session under its saved Agent `build` and model `{MODEL}`\n\
+         transcript:\n{}",
+        transcript.text
+    );
+    assert!(
+        transcript.saw_switch,
+        "`/session` did not restore the target's saved Agent `orchestrator` and model \
+         `{RESUME_OTHER_MODEL}`\ntranscript:\n{}",
+        transcript.text
+    );
+    assert!(
+        transcript.saw_persisted,
+        "the `/model` pick was not persisted on the switched-to session\ntranscript:\n{}",
+        transcript.text
+    );
+    assert!(
+        transcript.saw_exit,
+        "the process did not exit cleanly naming the switched-to session\ntranscript:\n{}",
+        transcript.text
+    );
+}

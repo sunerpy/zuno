@@ -5,7 +5,7 @@
 可以互换。
 
 用它的选项来预先选定模型或 Agent、恢复此前的工作，或者提交一条开场提示，让 session 在
-启动后立即开始工作。
+启动后立即开始工作。被恢复的 session（`--continue`、`--session`）会以它上次使用的 Agent、模型与推理强度打开；`--model` 与 `--agent` 在本进程内优先于保存的值。
 
 ## 用法
 
@@ -39,7 +39,7 @@ zuno tui [OPTIONS]
 zuno tui
 ```
 
-恢复本 checkout 中最近的 session，而不是打开一个新的。
+恢复本 checkout 中最近的 session，而不是打开一个新的，并沿用它上次使用的 Agent 与模型。
 
 ```sh
 zuno tui --continue

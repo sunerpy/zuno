@@ -2237,3 +2237,115 @@ fn cancellation_docs_pin_certainty_as_a_verdict_and_not_a_mode() {
     );
     contains_all("docs/zh/guide/tools.md", &["对命令是否运行过一概不说"]);
 }
+
+/// A resumed session keeps the Agent, model and reasoning level it last ran with, and the
+/// precedence is one table shared by every surface: flag > session > config default.
+///
+/// The retired sentence promised that "a resume restores the mode" when only `--session`
+/// did, and nothing said which model a resumed turn used; both languages now state the
+/// order, where a pick is written back, and that a vanished Agent or model is reported
+/// rather than fatal.
+#[test]
+fn resume_docs_pin_the_saved_agent_model_and_level_precedence() {
+    contains_all(
+        "docs/guide/sessions.md",
+        &[
+            "keeps the Agent, model, and reasoning level it last ran with",
+            "| Agent | `--agent` or picker > saved on the session > `default_agent` > `orchestrator` |",
+            "| Model | `--model` or picker > a preset chosen in this process > saved on the session > routed through configuration |",
+            "| Reasoning level | `--variant`, `--thinking`, or picker > saved with the session's model > configured defaults |",
+            "In short: flag > session > config default.",
+            "does not rewrite\nthe row",
+            "re-routes the model through\nconfiguration",
+            "says so in a status note",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/sessions.md",
+        &[
+            "沿用它上次运行时的 Agent、模型与推理强度",
+            "| Agent | `--agent` 或选择器 > 会话上保存的值 > `default_agent` > `orchestrator` |",
+            "| 模型 | `--model` 或选择器 > 本进程中选定的 preset > 会话上保存的值 > 按配置路由 |",
+            "| 推理强度 | `--variant`、`--thinking` 或选择器 > 随会话模型一同保存的值 > 配置默认值 |",
+            "参数 > 会话 > 配置默认值",
+            "不会改写会话行",
+            "模型会按配置重新路由",
+            "以一条状态提示说明",
+        ],
+    );
+    contains_all(
+        "docs/guide/headless.md",
+        &[
+            "resumes on the Agent, model, and reasoning\nlevel the session last ran with",
+            "/guide/sessions#continuing-a-session",
+            "outranks the value saved on the session",
+            "(`status_detail` in `--format json`)",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/headless.md",
+        &[
+            "沿用会话上次使用的 Agent、模型与推理强度",
+            "/zh/guide/sessions#续跑会话",
+            "都优先于会话上保存的值",
+            "`--format json` 下为 `status_detail`",
+        ],
+    );
+    contains_all(
+        "docs/guide/tui.md",
+        &[
+            "the identity row shows the Agent, model, and effort the session last ran\nwith",
+            "under *its* saved Agent, model, and effort",
+            "written to the current session so the next resume starts from it",
+            "`warning: keeping the current turn host:`",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/tui.md",
+        &[
+            "身份行显示的是该会话上次使用的 Agent、模型与推理强度",
+            "以目标会话自己保存的 Agent、模型与推理强度重新打开它",
+            "写回当前会话",
+            "`warning: keeping the current turn host:`",
+        ],
+    );
+    contains_all(
+        "docs/cli/run.md",
+        &[
+            "resumes on the Agent, model,\nand reasoning level it last ran with",
+            "Naming another Agent\nre-routes the model through configuration",
+        ],
+    );
+    contains_all(
+        "docs/zh/cli/run.md",
+        &[
+            "沿用它上次使用的 Agent、模型与推理强度",
+            "换用另一个 Agent 会让模型按配置重新路由",
+        ],
+    );
+    contains_all(
+        "docs/cli/tui.md",
+        &["opens on the Agent, model, and reasoning level it last ran\nwith"],
+    );
+    contains_all(
+        "docs/zh/cli/tui.md",
+        &["会以它上次使用的 Agent、模型与推理强度打开"],
+    );
+    contains_all(
+        "docs/guide/agents.md",
+        &["the `/session` picker, and ACP `session/load` all restore the\nmode"],
+    );
+    contains_all(
+        "docs/zh/guide/agents.md",
+        &["ACP 的 `session/load` 都会恢复该模式"],
+    );
+    contains_all(
+        "docs/design/zed-acp-integration.md",
+        &[
+            "Agent, model, and thought level persisted on its row",
+            "falls back to configuration without failing the load",
+        ],
+    );
+    refuses_all("docs/guide/agents.md", &["so a resume restores the mode."]);
+    refuses_all("docs/zh/guide/agents.md", &["因此续跑会恢复该模式。"]);
+}

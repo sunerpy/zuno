@@ -26,7 +26,9 @@ The identity row follows the bottom of a short reply and becomes sticky above th
 once content fills the viewport. The final row repeats the current agent, model, and effort
 as a neutral badge, so the selection for the next turn stays visible while a turn runs.
 Pressing Tab updates that badge immediately while the actual host replacement stays
-deferred to the turn boundary.
+deferred to the turn boundary. When the application opens with `--continue` or
+`--session`, the identity row shows the Agent, model, and effort the session last ran
+with; a `--model` or `--agent` flag outranks the saved value for this process.
 
 Transient "working" rows are not inserted into the transcript. Durable activity, errors,
 interruption markers, and assistant content are.
@@ -151,6 +153,12 @@ notice code in brackets. They are not model output.
 
 Resource pickers follow the same naming: `/model`, `/agent`, `/session`, `/skill`,
 `/theme`, `/mcp`, `/diff`, `/commands`, `/help`.
+
+`/session` reopens the chosen session under *its* saved Agent, model, and effort — the
+current session's picks do not follow you — and a `/model`, `/agent`, `/preset`, or
+effort pick is written to the current session so the next resume starts from it. A target
+session whose Shell this platform would refuse keeps the current session and shows
+`warning: keeping the current turn host:` instead of tearing it down.
 
 `/council` appears only when the active agent's final capability snapshot can actually
 reach `council_run`, so the picker cannot advertise a run the dispatcher would reject.

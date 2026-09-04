@@ -6,7 +6,9 @@ form to use in scripts, CI jobs, and git hooks, where there is no interactive se
 attach to and the output needs to be machine-readable.
 
 It can start a fresh session, continue the most recent one in the current directory, or
-target an exact session id.
+target an exact session id. A continued or targeted session resumes on the Agent, model,
+and reasoning level it last ran with; `--agent`, `--model`, `--variant`, and `--thinking`
+outrank those saved values for the run.
 
 ## Synopsis
 
@@ -59,7 +61,8 @@ Run a single message and print the default human-readable result.
 zuno run "explain what changed in the last commit"
 ```
 
-Continue the most recent session in this directory instead of starting a new one.
+Continue the most recent session in this directory instead of starting a new one. The
+turn runs on the Agent and model that session last used.
 
 ```sh
 zuno run --continue "now add tests for the new branch"
@@ -84,7 +87,8 @@ reasoning are never rendered. Each block is delimited by
 ends with an error. `--show-reasoning` cannot be combined with `--format json`;
 JSON mode keeps the existing structured event stream.
 
-Target an exact session and choose a different agent for this turn.
+Target an exact session and choose a different agent for this turn. Naming another Agent
+re-routes the model through configuration; add `--model` to keep the session's model.
 
 ```sh
 zuno run --session ses_1a2b3c --agent plan "what would a safe migration look like?"

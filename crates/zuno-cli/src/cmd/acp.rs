@@ -21,7 +21,7 @@ use super::child_turn::{ChildTurnObserver, DetachedTurnObserver};
 use super::mcp_runtime::{McpRuntime, RequiredMcpServers};
 use super::turn::{
     CatalogModelChoice, ExtensionComposition, SessionChoice, SessionCommandError, TurnHost,
-    TurnHostRuntimeDependencies, TurnOptions, TurnPlan, persisted_session_agent,
+    TurnHostRuntimeDependencies, TurnOptions, TurnPlan,
 };
 
 use crate::command::AcpArgs;
@@ -295,13 +295,14 @@ impl ProductionAcpAgent {
                 .await
                 .map_err(zuno_acp::RpcError::internal)?;
         };
-        let choice = SessionChoice::Existing(session_id.clone());
+        // Nothing explicit: `TurnPlan::resolve` restores the Agent, model and reasoning
+        // level saved on the session, so load and resume reopen it as it last ran.
         let options = TurnOptions {
             directory: Some(cwd),
             model: None,
-            agent: persisted_session_agent(&choice),
+            agent: None,
             preset: None,
-            session: choice,
+            session: SessionChoice::Existing(session_id.clone()),
             title: None,
             effort: None,
             variant: None,
@@ -834,9 +835,12 @@ impl SessionReconfiguration {
     }
 }
 
+/// Which durable session column a reconfiguration writes once its host is running.
+///
+/// Every change persists something: the thought level rides in the model reference,
+/// so there is no reconfiguration the row does not need to record.
 #[derive(Debug, Clone, Copy)]
 enum ConfigurationPersistence {
-    None,
     Agent,
     Model,
 }
@@ -1401,41 +1405,47 @@ async fn shutdown_subagent_bridge(
     }
 }
 
+/// Persist a dormant session's reconfiguration through the same store the live path
+/// uses.
+///
+/// `previous_model` is the `session.model` value the session ran with before the
+/// change. An Agent switch that re-routed the model writes the model too, so the row
+/// keeps recording the pair the session runs with and a later load restores exactly
+/// that pair rather than the old model under the new Agent.
 fn persist_dormant_configuration(
     session_id: &str,
     plan: &TurnPlan,
     persistence: ConfigurationPersistence,
+    previous_model: &str,
 ) -> Result<(), zuno_acp::RpcError> {
-    if matches!(persistence, ConfigurationPersistence::None) {
-        return Ok(());
-    }
     let pool = durable_pool()?;
     let store = zuno_db::session::Store::new(&pool);
-    let message_id = match persistence {
-        ConfigurationPersistence::None => unreachable!("handled above"),
-        ConfigurationPersistence::Agent => format!("msg_agent_{}", uuid::Uuid::new_v4().simple()),
-        ConfigurationPersistence::Model => format!("msg_model_{}", uuid::Uuid::new_v4().simple()),
-    };
     let now = zuno_db::message::now_millis();
+    let model = plan.persisted_model_reference();
+    let persist_model = || {
+        store.switch_model_at(
+            session_id,
+            &format!("msg_model_{}", uuid::Uuid::new_v4().simple()),
+            &model,
+            now,
+        )
+    };
     match persistence {
-        ConfigurationPersistence::None => Ok(()),
-        ConfigurationPersistence::Agent => {
-            store.switch_agent_at(session_id, &message_id, plan.agent_name(), now)
-        }
-        ConfigurationPersistence::Model => {
-            let qualified = plan.qualified_model();
-            let (provider_id, model_id) = qualified.split_once('/').ok_or_else(|| {
-                zuno_acp::RpcError::internal(format!(
-                    "resolved model `{qualified}` is not provider-qualified"
-                ))
-            })?;
-            store.switch_model_at(
+        ConfigurationPersistence::Agent => store
+            .switch_agent_at(
                 session_id,
-                &message_id,
-                &zuno_db::session::model_reference(provider_id, model_id),
+                &format!("msg_agent_{}", uuid::Uuid::new_v4().simple()),
+                plan.agent_name(),
                 now,
             )
-        }
+            .and_then(|()| {
+                if model == previous_model {
+                    Ok(())
+                } else {
+                    persist_model()
+                }
+            }),
+        ConfigurationPersistence::Model => persist_model(),
     }
     .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))
 }
@@ -1782,6 +1792,7 @@ impl AcpSession {
             }
         };
         let rollback_options = rollback_options(&current.host);
+        let previous_model = current.host.persisted_model_reference();
         let build_agent = current.configuration.build_agent.clone();
         let resolve_started = Instant::now();
         let plan = match TurnPlan::resolve(&prepared.options, &state.environment).await {
@@ -1870,9 +1881,18 @@ impl AcpSession {
                 )
                 .await);
         }
+        // An Agent switch that re-routed the model persists the model too: the row
+        // records the pair the session runs with, so a later load restores that pair.
         let persistence = match prepared.persistence {
-            ConfigurationPersistence::None => Ok(()),
-            ConfigurationPersistence::Agent => candidate.host.persist_active_agent(),
+            ConfigurationPersistence::Agent => {
+                candidate.host.persist_active_agent().and_then(|()| {
+                    if candidate.host.persisted_model_reference() == previous_model {
+                        Ok(())
+                    } else {
+                        candidate.host.persist_active_model()
+                    }
+                })
+            }
             ConfigurationPersistence::Model => candidate.host.persist_active_model(),
         };
         if let Err(error) = persistence {
@@ -1929,9 +1949,11 @@ impl AcpSession {
         change: SessionReconfiguration,
         state: &AcpState,
     ) -> Result<SessionConfiguration, zuno_acp::RpcError> {
+        // The configuration, not the dormant options, knows the level in force: a load
+        // restores the session's saved level without any option naming it.
         let Some(prepared) = current.configuration.prepare_reconfiguration(
             current.options.clone(),
-            current.options.effort,
+            current.configuration.effort_override,
             change,
         )?
         else {
@@ -1945,7 +1967,12 @@ impl AcpSession {
             SessionConfiguration::from_plan(&plan, Some(&current.configuration.build_agent));
         let available_commands = available_commands_for_plan(&plan, state.environment.resolved())
             .map_err(zuno_acp::RpcError::internal)?;
-        persist_dormant_configuration(&self.id, &plan, prepared.persistence)?;
+        persist_dormant_configuration(
+            &self.id,
+            &plan,
+            prepared.persistence,
+            &current.configuration.model_reference,
+        )?;
         current.options = prepared.options;
         current.configuration = configuration.clone();
         current.available_commands = available_commands;
@@ -3202,7 +3229,7 @@ fn host_options(host: &TurnHost, model: Option<String>) -> TurnOptions {
         directory: Some(PathBuf::from(host.session_directory())),
         model,
         agent: Some(host.agent_name().to_owned()),
-        preset: host.preset_name().map(str::to_owned),
+        preset: host.preset_override().map(str::to_owned),
         session: host.rebuild_session_choice(),
         title: None,
         effort: host.effort_override(),
@@ -3221,6 +3248,8 @@ struct SessionConfiguration {
     build_agent: String,
     agents: Vec<AgentChoice>,
     model: String,
+    /// The `session.model` value this configuration would persist, for change detection.
+    model_reference: String,
     models: Vec<CatalogModelChoice>,
     effective_effort: Option<zuno_llm::effort::ReasoningEffort>,
     effort_override: Option<zuno_llm::effort::ReasoningEffort>,
@@ -3283,6 +3312,7 @@ impl SessionConfiguration {
             build_agent,
             agents,
             model,
+            model_reference: plan.persisted_model_reference(),
             models: plan.catalog_models(),
             effective_effort: plan.effort(),
             effort_override: plan.effort_override(),
@@ -3387,7 +3417,16 @@ impl SessionConfiguration {
                     return Ok(None);
                 }
                 options.effort = effort;
-                ConfigurationPersistence::None
+                if effort.is_none() {
+                    // "default" means the Agent and model defaults, not the level saved
+                    // on the session: resolution restores that level only for a model it
+                    // selected itself, so naming the current model explicitly is what
+                    // makes it route the level afresh.
+                    options.model = Some(self.model.clone());
+                }
+                // The level is part of the persisted model reference, so a thought-level
+                // change is durable and a later load reopens the session with it.
+                ConfigurationPersistence::Model
             }
         };
         Ok(Some(PreparedReconfiguration {
@@ -4425,6 +4464,11 @@ mod tests {
                 },
             ],
             model: "test/reasoning".to_owned(),
+            model_reference: zuno_db::session::model_reference_with_variant(
+                "test",
+                "reasoning",
+                Some("xhigh"),
+            ),
             models: vec![
                 CatalogModelChoice {
                     id: "test/reasoning".to_owned(),

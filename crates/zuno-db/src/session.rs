@@ -405,17 +405,92 @@ pub struct Summary {
 /// the two spellings diverged in the first place.
 #[must_use]
 pub fn model_reference(provider_id: &str, model_id: &str) -> String {
+    model_reference_with_variant(provider_id, model_id, None)
+}
+
+/// [`model_reference`] carrying the reasoning variant the session last ran with.
+///
+/// `variant` is the optional third key of the same upstream struct, so a resumed
+/// session can restore its reasoning level from the row it already has rather than
+/// from a column that would need a format migration. `None` omits the key and yields
+/// output byte-identical to [`model_reference`]; it never writes `null`.
+#[must_use]
+pub fn model_reference_with_variant(
+    provider_id: &str,
+    model_id: &str,
+    variant: Option<&str>,
+) -> String {
     #[derive(serde::Serialize)]
     struct ModelReference<'a> {
         id: &'a str,
         #[serde(rename = "providerID")]
         provider_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        variant: Option<&'a str>,
     }
     serde_json::to_string(&ModelReference {
         id: model_id,
         provider_id,
+        variant,
     })
-    .expect("two string fields always serialize")
+    .expect("three string fields always serialize")
+}
+
+/// A `session.model` column decoded at the durable-storage boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedModel {
+    /// Catalog provider id.
+    pub provider_id: String,
+    /// Catalog model id within the provider.
+    pub model_id: String,
+    /// Reasoning variant the session last ran with, when one was recorded.
+    pub variant: Option<String>,
+}
+
+impl PersistedModel {
+    /// The `provider/model` spelling turn resolution accepts.
+    #[must_use]
+    pub fn qualified(&self) -> String {
+        format!("{}/{}", self.provider_id, self.model_id)
+    }
+}
+
+/// Decode a `session.model` column tolerantly.
+///
+/// Two shapes have been written to this column by supported formats: the JSON
+/// object [`model_reference_with_variant`] emits (`variant` optional or `null`), and
+/// the plain `provider/model` string an earlier writer stored (see the format-7
+/// fixture's `ses_fixture_0001`). Both decode. Anything else — an empty string, a
+/// JSON object with a missing or non-string key, an unqualified name — yields
+/// `None`, so a resume degrades to configured defaults instead of failing on a row
+/// the user cannot repair.
+#[must_use]
+pub fn decode_model_reference(raw: &str) -> Option<PersistedModel> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<JsonValue>(raw) {
+        let object = value.as_object()?;
+        let provider_id = object.get("providerID")?.as_str()?;
+        let model_id = object.get("id")?.as_str()?;
+        let variant = match object.get("variant") {
+            None | Some(JsonValue::Null) => None,
+            Some(JsonValue::String(variant)) if !variant.is_empty() => Some(variant.clone()),
+            Some(_) => None,
+        };
+        return (!provider_id.is_empty() && !model_id.is_empty()).then(|| PersistedModel {
+            provider_id: provider_id.to_owned(),
+            model_id: model_id.to_owned(),
+            variant,
+        });
+    }
+    let (provider_id, model_id) = raw.split_once('/')?;
+    (!provider_id.is_empty() && !model_id.is_empty()).then(|| PersistedModel {
+        provider_id: provider_id.to_owned(),
+        model_id: model_id.to_owned(),
+        variant: None,
+    })
 }
 
 /// Everything [`create`] needs to write a row.
@@ -2333,5 +2408,71 @@ mod tests {
             serde_json::from_str(&quoted).expect("a quoted id still produces JSON");
         assert_eq!(parsed["id"], "c\\d");
         assert_eq!(parsed["providerID"], "a\"b");
+    }
+
+    #[test]
+    fn a_model_reference_with_a_variant_adds_only_the_optional_key() {
+        assert_eq!(
+            model_reference_with_variant("anthropic", "claude-sonnet-4-5", Some("high")),
+            r#"{"id":"claude-sonnet-4-5","providerID":"anthropic","variant":"high"}"#
+        );
+        assert_eq!(
+            model_reference_with_variant("anthropic", "claude-sonnet-4-5", None),
+            model_reference("anthropic", "claude-sonnet-4-5"),
+            "an absent variant must stay byte-identical to the two-key reference"
+        );
+    }
+
+    #[test]
+    fn decoding_accepts_both_persisted_shapes_and_refuses_garbage() {
+        assert_eq!(
+            decode_model_reference(r#"{"id":"claude-sonnet-4-5","providerID":"anthropic"}"#),
+            Some(PersistedModel {
+                provider_id: "anthropic".to_owned(),
+                model_id: "claude-sonnet-4-5".to_owned(),
+                variant: None,
+            })
+        );
+        assert_eq!(
+            decode_model_reference(
+                r#"{"id":"claude-sonnet-4-5","providerID":"anthropic","variant":"xhigh"}"#
+            ),
+            Some(PersistedModel {
+                provider_id: "anthropic".to_owned(),
+                model_id: "claude-sonnet-4-5".to_owned(),
+                variant: Some("xhigh".to_owned()),
+            })
+        );
+        assert_eq!(
+            decode_model_reference(
+                r#"{"id":"claude-sonnet-4-5","providerID":"anthropic","variant":null}"#
+            )
+            .and_then(|model| model.variant),
+            None,
+            "an explicit null variant is the same as an omitted one"
+        );
+        // The plain string a format-7 writer stored for `ses_fixture_0001`.
+        let legacy = decode_model_reference("anthropic/claude-sonnet-4").expect("legacy string");
+        assert_eq!(legacy.provider_id, "anthropic");
+        assert_eq!(legacy.model_id, "claude-sonnet-4");
+        assert_eq!(legacy.variant, None);
+        assert_eq!(legacy.qualified(), "anthropic/claude-sonnet-4");
+        // A message-table spelling has no `id`, so it is not a session model.
+        assert_eq!(
+            decode_model_reference(r#"{"modelID":"claude-sonnet-4-5","providerID":"anthropic"}"#),
+            None
+        );
+        for garbage in [
+            "",
+            "   ",
+            "not-qualified",
+            "/model",
+            "provider/",
+            "[]",
+            "42",
+            "{}",
+        ] {
+            assert_eq!(decode_model_reference(garbage), None, "{garbage:?}");
+        }
     }
 }

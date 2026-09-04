@@ -6,7 +6,9 @@ written. It is also what `zuno` does when you give it no subcommand, so the two 
 interchangeable.
 
 Use its options to preselect a model or agent, resume prior work, or submit an opening
-prompt so the session starts working immediately after launch.
+prompt so the session starts working immediately after launch. A resumed session
+(`--continue`, `--session`) opens on the Agent, model, and reasoning level it last ran
+with; `--model` and `--agent` outrank the saved values for this process.
 
 ## Synopsis
 
@@ -40,7 +42,8 @@ Start the terminal application in the current directory.
 zuno tui
 ```
 
-Resume the most recent session in this checkout rather than opening a new one.
+Resume the most recent session in this checkout rather than opening a new one, on the
+Agent and model it last used.
 
 ```sh
 zuno tui --continue

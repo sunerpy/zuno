@@ -26,6 +26,10 @@ be resumed in the terminal application and the reverse.
 zuno run --session ses_1a2b3c --agent plan "what would a safe migration look like?"
 ```
 
+With `--continue` or `--session`, the run resumes on the Agent, model, and reasoning
+level the session last ran with unless one of the flags below names another; the
+precedence table is in [Sessions and turns](/guide/sessions#continuing-a-session).
+
 Forking a session is not part of this binary. A script that explores an alternative it
 does not want mixed into the session a human is reading starts a fresh one instead: omit
 both `--continue` and `--session`, and pass `--title` so the run is findable afterwards.
@@ -48,6 +52,13 @@ fail before HTTP I/O and list what is available.
 
 Prefer `--variant max` or `--variant xhigh` when exact effort matters; `--thinking` is
 deliberately an automatic convenience.
+
+On a resumed session each of these flags outranks the value saved on the session, and a
+flag left unset falls back to the saved value before configuration. `--agent` naming a
+different Agent than the saved one re-routes the model through configuration; add
+`--model` to keep the session's model. A saved Agent or model that no longer exists is
+reported as a status note (`status_detail` in `--format json`) and the run continues on
+the next fallback instead of failing.
 
 ## Output format
 

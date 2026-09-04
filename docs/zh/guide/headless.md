@@ -22,6 +22,8 @@ zuno run --continue "now add tests for the new branch"
 zuno run --session ses_1a2b3c --agent plan "what would a safe migration look like?"
 ```
 
+使用 `--continue` 或 `--session` 时，本次运行会沿用会话上次使用的 Agent、模型与推理强度，除非下面某个参数另有指定；优先级表见[会话与回合](/zh/guide/sessions#续跑会话)。
+
 这个二进制不提供会话分叉。脚本要探索一个替代方案，又不想让它混进某个人正在阅读的会话时，改为新起一个会话：同时省掉 `--continue` 与 `--session`，并用 `--title` 让这次运行事后好找。早期版本接受又拒绝的那些选项见 [zuno run](/zh/cli/run)。
 
 ## 选择 Agent、模型与推理强度
@@ -36,6 +38,8 @@ zuno run --session ses_1a2b3c --agent plan "what would a safe migration look lik
 `--thinking` 与 `--variant` 互斥。规范的 variant 名称 `off`、`low`、`medium`、`high`、`xhigh` 和 `max` 只有在所选模型声明了它们、或该模型在没有命名目录的情况下暴露通用推理能力时才被接受。非规范名称会复制该 variant 完整的 provider 选项对象。未知名称会在 HTTP I/O 之前失败，并列出可用项。
 
 当确切的推理强度很重要时，优先使用 `--variant max` 或 `--variant xhigh`；`--thinking` 刻意只是一个自动化的便利选项。
+
+在续跑的会话上，这些参数都优先于会话上保存的值；没有给出的参数则先回退到保存的值，再回退到配置。`--agent` 指定一个与保存值不同的 Agent 时，模型会按配置重新路由；要保留会话的模型就再加上 `--model`。已不存在的已保存 Agent 或模型会以一条状态提示报告（`--format json` 下为 `status_detail`），运行继续使用下一级回退，而不会失败。
 
 ## 输出格式
 
