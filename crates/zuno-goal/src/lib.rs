@@ -43,9 +43,11 @@
 //! and a guess written into configuration and then reported as success is
 //! indistinguishable afterwards from a checked fact. The [`capability`] ledger
 //! records each claim with how it is known — a cited document, an observed probe, an
-//! inference, or nothing — and a goal that changes the workspace cannot complete
-//! while it rests on one of the last two. See
-//! [`store::GoalStore::record_capability_claim`].
+//! inference, or nothing — and a run cannot report a goal complete while it rests on
+//! one of the last two. The human's own completion is not refused over a claim the
+//! model wrote, because no CLI verb clears one. See
+//! [`store::GoalStore::record_capability_claim`] and
+//! [`store::GoalStore::complete_as_model_checked`].
 //!
 //! **The Markdown document is a projection, and the conflict rule is fixed.** The
 //! goal is also rendered to `.zuno/goal/<sessionID>.md` for a human to read

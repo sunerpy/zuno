@@ -50,6 +50,24 @@ impl Fixture {
             .join("goal-test.db")
     }
 
+    /// Rewrite the stored `created_at_ms` of a session's goal.
+    ///
+    /// Goals stamp their creation from the wall clock while these tests record
+    /// receipts at small synthetic times, so a fixture that needs "the check ran
+    /// after this goal was proposed" has to move the goal rather than the clock. A
+    /// real database holds exactly this shape: a goal created long before the
+    /// receipts that close it.
+    fn backdate_goal(&self, session_id: &str, created_at_ms: i64) {
+        let connection = self.store.pool().get().expect("check out connection");
+        let updated = connection
+            .execute(
+                "UPDATE goal SET created_at_ms = ?2 WHERE session_id = ?1",
+                params![session_id, created_at_ms],
+            )
+            .expect("backdate the goal");
+        assert_eq!(updated, 1, "the fixture has a goal to backdate");
+    }
+
     fn materialize_session(&self, session_id: &str) {
         let connection = self.store.pool().get().expect("check out connection");
         connection
@@ -2316,9 +2334,12 @@ fn record_receipt(
 }
 
 /// A change goal with two criteria and one authoritative passing receipt.
+///
+/// The goal is backdated to `1_000` so the receipt at `2_000` is a check that ran
+/// after the goal was proposed, which is what the evidence gate requires.
 fn evidence_fixture() -> (Fixture, Goal) {
     let fixture = Fixture::in_memory();
-    let created = fixture
+    fixture
         .store
         .create_goal_with_criteria(
             SESSION,
@@ -2330,6 +2351,7 @@ fn evidence_fixture() -> (Fixture, Goal) {
             None,
         )
         .expect("create goal with criteria");
+    fixture.backdate_goal(SESSION, 1_000);
     fixture
         .store
         .escalate_to_change(SESSION, "edited crates/zuno-goal/src/store.rs", 1_000)
@@ -2342,7 +2364,12 @@ fn evidence_fixture() -> (Fixture, Goal) {
         zuno_db::verification::ExitAuthority::Authoritative,
         2_000,
     );
-    (fixture, created.goal)
+    let goal = fixture
+        .store
+        .goal(SESSION)
+        .expect("read goal")
+        .expect("the fixture created a goal");
+    (fixture, goal)
 }
 
 #[test]
@@ -2726,23 +2753,154 @@ fn a_waived_criterion_lets_a_change_goal_complete() {
     assert_eq!(completed.status, GoalStatus::Complete);
 }
 
+/// The model's own creator refuses the shape [`audit_evidence`] cannot read, and
+/// refuses it before the row exists, so a run never ends up holding an ungated goal it
+/// could later complete by assertion. Criteria are immutable after creation, so this is
+/// also the only moment the requirement can still be met.
 #[test]
-fn a_question_goal_completes_without_any_evidence() {
+fn the_model_cannot_propose_a_goal_that_names_no_check() {
+    let fixture = Fixture::in_memory();
+
+    let refusal = fixture
+        .store
+        .create_goal_as_model(SESSION, "make the parser accept trailing commas", &[], None)
+        .expect_err("a proposal with no checklist is one the audit cannot read");
+    assert!(matches!(refusal, GoalError::MissingSuccessCriteria));
+    assert_eq!(
+        fixture.store.goal(SESSION).expect("read goal"),
+        None,
+        "the refusal is not a goal with a note attached: nothing was written"
+    );
+
+    let blank = fixture
+        .store
+        .create_goal_as_model(
+            SESSION,
+            "make the parser accept trailing commas",
+            &["   ".to_owned(), "\t\n".to_owned()],
+            None,
+        )
+        .expect_err("entries that are blank after trimming are not criteria");
+    assert!(matches!(blank, GoalError::MissingSuccessCriteria));
+    assert_eq!(fixture.store.goal(SESSION).expect("read goal"), None);
+
+    // A blank entry among real ones is dropped rather than fatal: the checklist still
+    // says something, so there is something to audit.
+    let created = fixture
+        .store
+        .create_goal_as_model(
+            SESSION,
+            "make the parser accept trailing commas",
+            &["  ".to_owned(), " the parser test suite passes ".to_owned()],
+            None,
+        )
+        .expect("a checklist with one real entry is a checklist");
+    assert_eq!(
+        created
+            .criteria
+            .iter()
+            .map(|criterion| (criterion.criterion_id.clone(), criterion.statement.clone()))
+            .collect::<Vec<_>>(),
+        [("c1".to_owned(), "the parser test suite passes".to_owned())],
+        "the blank entry is dropped and the surviving statement is stored trimmed"
+    );
+}
+
+/// The human escape hatch, exactly as `/goal complete` reaches it: read the revision,
+/// then [`GoalStore::complete_checked`]. A goal the model proposed now always carries a
+/// checklist, so the user's own completion runs into the same audit — and until the CLI
+/// grows a criterion verb, that refusal is the only thing standing between the user and
+/// a dead end. The oracle is therefore not "it refuses" but *what the refusal says*: the
+/// criterion id, and the two ways out. A refusal that named neither would be the
+/// regression the reporter found.
+#[test]
+fn the_user_completing_a_model_proposed_goal_is_refused_with_the_id_and_the_way_out() {
     let fixture = Fixture::in_memory();
     let created = fixture
         .store
-        .create_goal_with_criteria(
+        .create_goal_as_model(
             SESSION,
-            "explain how the budget flip works",
-            &["the answer names the statement that flips the status".to_owned()],
+            "make the parser accept trailing commas",
+            &["the parser test suite passes".to_owned()],
             None,
         )
-        .expect("create goal with criteria");
+        .expect("propose a goal with a checklist");
+
+    let refusal = fixture
+        .store
+        .complete_checked(SESSION, created.goal.revision)
+        .expect_err("`/goal complete` runs the same audit as the model's own completion");
+    let message = refusal.to_string();
+    assert!(
+        matches!(&refusal, GoalError::EvidenceMissing { unsatisfied } if unsatisfied == &["c1"]),
+        "{refusal:?}"
+    );
+    assert!(
+        message.contains("c1"),
+        "a user who cannot see the criterion id cannot act on the refusal: {message}"
+    );
+    assert!(
+        message.contains("cite the receipt id"),
+        "the refusal has to name the first way out: {message}"
+    );
+    assert!(
+        message.contains("the reason it will not be verified"),
+        "and the second, or a criterion nothing can verify traps the goal: {message}"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .goal(SESSION)
+            .expect("read goal")
+            .expect("goal exists")
+            .status,
+        GoalStatus::Active,
+        "the refused completion leaves the goal exactly where it was"
+    );
+
+    // And the way out works from the user's side of the store, which is what the CLI
+    // seam needs: waive the criterion, then complete.
+    fixture
+        .store
+        .waive_criterion(
+            SESSION,
+            created.goal.revision,
+            "c1",
+            "the user ended the run before the suite was written",
+            1_000,
+        )
+        .expect("waive the criterion");
+    let revision = fixture
+        .store
+        .goal(SESSION)
+        .expect("read goal")
+        .expect("goal exists")
+        .revision;
+    let completed = fixture
+        .store
+        .complete_checked(SESSION, revision)
+        .expect("a waived criterion is a settled criterion")
+        .expect("goal exists");
+    assert_eq!(completed.status, GoalStatus::Complete);
+}
+
+/// The one goal shape that is still not gated on evidence, and the only creator that
+/// can produce it: [`GoalStore::create_goal`], behind the user's own `/goal create`.
+/// The user is the authority for their own objective and may leave it unmeasured;
+/// [`GoalStore::create_goal_as_model`] refuses the same shape, because a goal the model
+/// proposes for itself does not get to be unmeasurable.
+#[test]
+fn a_user_created_goal_with_no_criteria_completes_without_any_evidence() {
+    let fixture = Fixture::in_memory();
+    let goal = fixture
+        .store
+        .create_goal(SESSION, "explain how the budget flip works", None)
+        .expect("create goal");
 
     let completed = fixture
         .store
-        .complete_checked(SESSION, created.goal.revision)
-        .expect("a goal that changed nothing has nothing to verify")
+        .complete_checked(SESSION, goal.revision)
+        .expect("a goal that changed nothing and promised no check has nothing to verify")
         .expect("goal exists");
 
     assert_eq!(completed.status, GoalStatus::Complete);
@@ -2751,6 +2909,219 @@ fn a_question_goal_completes_without_any_evidence() {
         GoalKind::Question,
         "a goal is presumed harmless until something reports a change"
     );
+}
+
+/// The residual this crate could not close alone, now closed from the other side of the
+/// seam: a goal the *user* created with no criteria, a workspace edit made by running a
+/// command, and a model-reported completion. `shell` reports the paths it observed
+/// changing (`writtenPaths`), and the verification ledger drives the same two calls for
+/// that report as for every other mutating tool — [`GoalStore::escalate_to_change`] with
+/// the reason it renders, then [`GoalStore::mark_mutation`] at the same instant
+/// (`crates/zuno-cli/src/cmd/verification_ledger.rs`). That makes this a change goal with
+/// an empty checklist, and an empty checklist is not a completed one: the model is refused
+/// with [`GoalError::EvidenceMissing`] naming no criterion, because there is none to name.
+///
+/// The report is a lower bound, and only the reported shape is covered here. A target
+/// that is statically resolvable and in scope — `sed -i 's/foo/bar/' src/lib.rs` — is
+/// reported; one the shell expands — `$OUT`, `*.rs`, `$(ls)`, a here-doc, a redirection,
+/// the files `git apply` rewrites — is skipped rather than guessed, and a run that edits
+/// only through those still stays a question goal.
+#[test]
+fn a_shell_reported_write_escalates_a_user_goal_so_the_model_cannot_complete_it_unmeasured() {
+    let fixture = Fixture::in_memory();
+    let goal = fixture
+        .store
+        .create_goal(SESSION, "make the parser accept trailing commas", None)
+        .expect("the user states the objective without measuring it");
+    assert_eq!(
+        fixture.store.kind(SESSION).expect("read kind"),
+        GoalKind::Question,
+        "nothing has been reported yet, so the goal is presumed harmless"
+    );
+
+    // `shell {"command": "sed -i 's/foo/bar/' crates/zuno-parser/src/lib.rs"}` runs
+    // here. The target is a literal in-scope path token, so the call reports it, and
+    // the ledger makes exactly these two calls, in this order, at one timestamp.
+    let at_ms = goal.created_at_ms + 1;
+    assert_eq!(
+        fixture
+            .store
+            .escalate_to_change(
+                SESSION,
+                "`shell` wrote crates/zuno-parser/src/lib.rs",
+                at_ms
+            )
+            .expect("record the reported write"),
+        GoalKind::Change,
+        "the edit is visible to the kind"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .mark_mutation(SESSION, at_ms)
+            .expect("advance the freshness mark"),
+        0,
+        "there was no satisfied criterion to reopen"
+    );
+    let marks: i64 = fixture
+        .store
+        .pool()
+        .get()
+        .expect("check out connection")
+        .query_row(
+            "SELECT count(*) FROM goal_mutation_mark WHERE session_id = ?1",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .expect("count mutation marks");
+    assert_eq!(
+        marks, 1,
+        "and visible to freshness, so a receipt recorded before this edit would be stale"
+    );
+
+    let refusal = fixture
+        .store
+        .update_status_as_model(SESSION, ModelStatus::Complete)
+        .expect_err("a change goal with no checklist has nothing that could prove it done");
+
+    assert!(
+        matches!(&refusal, GoalError::EvidenceMissing { unsatisfied } if unsatisfied.is_empty()),
+        "an empty checklist is refused with no criterion id to name: {refusal}"
+    );
+    assert_eq!(
+        refusal.to_string(),
+        "goal cannot complete without recorded verification evidence: a goal that changes \
+         the workspace cannot complete without success criteria; propose success criteria \
+         with `goal_propose` before completing (an unfinished goal cannot be re-proposed, so \
+         this one has to be cancelled by the user first)",
+        "the refusal says what is missing and what the run can still do about it"
+    );
+    assert!(
+        matches!(
+            fixture.store.complete_as_model_checked(SESSION, goal.revision),
+            Err(GoalError::EvidenceMissing { unsatisfied }) if unsatisfied.is_empty()
+        ),
+        "the revision-guarded model entry point refuses the same way"
+    );
+    assert_eq!(
+        fixture.status(SESSION),
+        GoalStatus::Active,
+        "a refused completion leaves the run going"
+    );
+    assert_eq!(
+        fixture.store.kind(SESSION).expect("read kind"),
+        GoalKind::Change,
+        "and the escalation stands, so the goal stays gated until criteria are proposed"
+    );
+}
+
+/// The checklist gates completion even when nothing escalated the goal, because
+/// escalation needs a tool that reports the paths it wrote and that report is a lower
+/// bound. `shell` reports a statically resolvable in-scope target — `sed -i 's/foo/bar/'
+/// src/lib.rs` — but a shell-expanded one — `$OUT`, `*.rs`, a here-doc, a redirection,
+/// the files `git apply` rewrites — is skipped rather than guessed, so a run that edits
+/// only through those stays a question goal. Without this the whole audit is skipped for
+/// such a run and the goal completes with every criterion still open.
+#[test]
+fn an_unescalated_goal_cannot_complete_while_its_criteria_are_open() {
+    let fixture = Fixture::in_memory();
+    let created = fixture
+        .store
+        .create_goal_with_criteria(
+            SESSION,
+            "fix the failing clippy lint",
+            &[
+                "the workspace clippy gate passes".to_owned(),
+                "the workspace test gate passes".to_owned(),
+            ],
+            None,
+        )
+        .expect("create goal with criteria");
+
+    let refusal = fixture
+        .store
+        .update_status_as_model(SESSION, ModelStatus::Complete)
+        .expect_err("a recorded checklist is audited whatever the kind says");
+
+    assert!(
+        matches!(
+            &refusal,
+            GoalError::EvidenceMissing { unsatisfied } if unsatisfied == &["c1", "c2"]
+        ),
+        "the refusal names both open criteria: {refusal}"
+    );
+    assert_eq!(
+        fixture.store.kind(SESSION).expect("read kind"),
+        GoalKind::Question,
+        "no write was reported, which is the reporting gap the checklist covers"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .goal(SESSION)
+            .expect("read goal")
+            .expect("goal exists")
+            .status,
+        GoalStatus::Active,
+        "a refused completion leaves the run going"
+    );
+    assert!(
+        matches!(
+            fixture
+                .store
+                .complete_checked(SESSION, created.goal.revision),
+            Err(GoalError::EvidenceMissing { .. })
+        ),
+        "the revision-guarded entry point refuses the same way"
+    );
+}
+
+#[test]
+fn an_unescalated_goal_completes_once_its_checklist_is_settled() {
+    let fixture = Fixture::in_memory();
+    let created = fixture
+        .store
+        .create_goal_with_criteria(
+            SESSION,
+            "fix the failing clippy lint",
+            &[
+                "the workspace clippy gate passes".to_owned(),
+                "the release artifact exists".to_owned(),
+            ],
+            None,
+        )
+        .expect("create goal with criteria");
+    fixture.backdate_goal(SESSION, 1_000);
+    record_receipt(
+        &fixture,
+        SESSION,
+        "rec_clippy",
+        ReceiptOutcome::Passed,
+        zuno_db::verification::ExitAuthority::Authoritative,
+        2_000,
+    );
+    let satisfied = fixture
+        .store
+        .satisfy_criterion(SESSION, created.goal.revision, "c1", "rec_clippy", 3_000)
+        .expect("prove the first criterion");
+    let waived = fixture
+        .store
+        .waive_criterion(
+            SESSION,
+            satisfied.goal.revision,
+            "c2",
+            "the release artifact is built by tooling outside this workspace",
+            3_100,
+        )
+        .expect("waive the second criterion");
+
+    let completed = fixture
+        .store
+        .complete_checked(SESSION, waived.goal.revision)
+        .expect("the gate is a checklist to close, not a trap")
+        .expect("goal exists");
+
+    assert_eq!(completed.status, GoalStatus::Complete);
 }
 
 #[test]
@@ -3084,8 +3455,12 @@ fn an_archived_plan_of_an_earlier_goal_does_not_block_completion() {
     assert_eq!(completed.status, GoalStatus::Complete);
 }
 
+/// The *user* path, which is the only path left that reaches a criteria-less goal:
+/// [`GoalStore::create_goal_as_model`] refuses the shape outright, as
+/// `the_model_cannot_propose_a_goal_that_names_no_check` pins. The name says which
+/// actor, because that is the only place this surface records it.
 #[test]
-fn a_goal_proposed_without_criteria_stays_a_question_until_its_first_write_and_then_cannot_complete()
+fn a_user_created_goal_without_criteria_stays_a_question_until_its_first_write_and_then_cannot_complete()
  {
     let fixture = Fixture::in_memory();
     let created = fixture
@@ -3131,8 +3506,9 @@ fn a_goal_proposed_without_criteria_stays_a_question_until_its_first_write_and_t
     );
 }
 
+/// The other half of the user path above: a question nothing wrote for still ends.
 #[test]
-fn a_goal_proposed_without_criteria_completes_as_a_question_while_nothing_was_written() {
+fn a_user_created_goal_without_criteria_completes_as_a_question_while_nothing_was_written() {
     let fixture = Fixture::in_memory();
     let goal = fixture
         .store
@@ -3396,4 +3772,1442 @@ fn a_satisfied_criterion_cannot_be_waived_over_its_evidence() {
         )
         .expect("an open criterion may be waived");
     assert_eq!(waived.criterion.status, GoalCriterionStatus::Waived);
+}
+
+/// Spin until the wall clock has passed `after_ms`, so a goal created next is stamped
+/// strictly later. Goals take their creation stamp from the clock, and these tests need
+/// two goals whose creation stamps are distinguishable.
+fn wait_for_clock_after(after_ms: i64) {
+    while crate::store::now_ms().expect("read the clock") <= after_ms {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// A citation proves that a check ran, not that it ran for *this* goal. The reviewer's
+/// sequence was: record a passing receipt, then propose the goal, then cite it — the
+/// checklist closed and the goal completed, so the mandatory checklist proved citation
+/// rather than verification.
+#[test]
+fn a_receipt_recorded_before_the_goal_existed_cannot_close_its_checklist() {
+    let fixture = Fixture::in_memory();
+    // The receipt exists first, exactly as a check run earlier in the session would.
+    record_receipt(
+        &fixture,
+        SESSION,
+        "rec_before",
+        ReceiptOutcome::Passed,
+        zuno_db::verification::ExitAuthority::Authoritative,
+        2_000,
+    );
+    let created = fixture
+        .store
+        .create_goal_as_model(SESSION, "ship it", &["the gates pass".to_owned()], None)
+        .expect("a proposal that names a check is accepted");
+    let goal = created.goal;
+    assert!(
+        goal.created_at_ms > 2_000,
+        "the goal is stamped from the clock, so the receipt is genuinely older"
+    );
+
+    let refusal = fixture
+        .store
+        .satisfy_criterion(
+            SESSION,
+            goal.revision,
+            "c1",
+            "rec_before",
+            goal.created_at_ms + 1,
+        )
+        .expect_err("a check that ran before the goal existed proves nothing about it");
+    assert!(
+        matches!(
+            &refusal,
+            GoalError::EvidencePredatesGoal { criterion_id, receipt_id, receipt_at_ms, .. }
+                if criterion_id == "c1" && receipt_id == "rec_before" && *receipt_at_ms == 2_000
+        ),
+        "{refusal}"
+    );
+    assert!(
+        refusal.to_string().contains("run the check again"),
+        "the refusal names the remedy: {refusal}"
+    );
+    assert!(refusal.is_model_refusal(), "{refusal}");
+    assert_eq!(
+        fixture.store.criteria(SESSION).expect("read criteria")[0].status,
+        GoalCriterionStatus::Open,
+        "the refused citation left the checklist open"
+    );
+
+    let completion = fixture
+        .store
+        .complete_as_model_checked(SESSION, goal.revision)
+        .expect_err("and the goal cannot complete on a checklist nothing closed");
+    assert!(
+        matches!(
+            &completion,
+            GoalError::EvidenceMissing { unsatisfied } if unsatisfied == &["c1".to_owned()]
+        ),
+        "{completion}"
+    );
+    assert_eq!(fixture.status(SESSION), GoalStatus::Active);
+
+    // The remedy the refusal names works: run the check again, cite the new receipt.
+    record_receipt(
+        &fixture,
+        SESSION,
+        "rec_after",
+        ReceiptOutcome::Passed,
+        zuno_db::verification::ExitAuthority::Authoritative,
+        goal.created_at_ms + 2,
+    );
+    let satisfied = fixture
+        .store
+        .satisfy_criterion(
+            SESSION,
+            goal.revision,
+            "c1",
+            "rec_after",
+            goal.created_at_ms + 3,
+        )
+        .expect("a check that ran under this goal is evidence about it");
+    assert_eq!(satisfied.criterion.status, GoalCriterionStatus::Satisfied);
+    let completed = fixture
+        .store
+        .complete_as_model_checked(SESSION, satisfied.goal.revision)
+        .expect("the gate is a checklist to close, not a trap")
+        .expect("goal exists");
+    assert_eq!(completed.status, GoalStatus::Complete);
+}
+
+/// Replacement clears the mutation mark, so the receipt goal A was refused for came out
+/// of the wash clean and closed goal B's identical criterion. `clear_auxiliary_state`
+/// keeps `verification_receipt` on purpose; the bound against the *new* goal's creation
+/// stamp is what re-establishes the invariant its own comment claims.
+#[test]
+fn a_receipt_the_previous_goal_was_refused_for_cannot_close_the_next_ones() {
+    let fixture = Fixture::in_memory();
+    let first = fixture
+        .store
+        .create_goal_as_model(
+            SESSION,
+            "make the parser accept trailing commas",
+            &["the parser test suite passes".to_owned()],
+            None,
+        )
+        .expect("propose the first goal")
+        .goal;
+    record_receipt(
+        &fixture,
+        SESSION,
+        "rec_first",
+        ReceiptOutcome::Passed,
+        zuno_db::verification::ExitAuthority::Authoritative,
+        first.created_at_ms,
+    );
+    let satisfied = fixture
+        .store
+        .satisfy_criterion(
+            SESSION,
+            first.revision,
+            "c1",
+            "rec_first",
+            first.created_at_ms,
+        )
+        .expect("the receipt is evidence about the goal it ran under");
+    assert_eq!(satisfied.criterion.status, GoalCriterionStatus::Satisfied);
+
+    // A later edit invalidates it, and the first goal is correctly refused.
+    let reopened = fixture
+        .store
+        .mark_mutation(SESSION, first.created_at_ms + 1)
+        .expect("record a workspace change");
+    assert_eq!(reopened, 1, "the satisfied criterion reopened");
+    assert!(matches!(
+        fixture
+            .store
+            .complete_as_model_checked(SESSION, fixture.goal(SESSION).revision),
+        Err(GoalError::EvidenceMissing { .. })
+    ));
+
+    // The run gives up on that objective and proposes the next one, which wipes the
+    // mutation mark along with the checklist.
+    fixture
+        .store
+        .set_status_as_system(SESSION, SystemStatus::Cancelled)
+        .expect("settle the first goal");
+    wait_for_clock_after(first.created_at_ms);
+    let second = fixture
+        .store
+        .create_goal_as_model(
+            SESSION,
+            "make the parser accept trailing commas after all",
+            &["the parser test suite passes".to_owned()],
+            None,
+        )
+        .expect("propose the replacement")
+        .goal;
+    assert!(second.created_at_ms > first.created_at_ms);
+
+    let refusal = fixture
+        .store
+        .satisfy_criterion(
+            SESSION,
+            second.revision,
+            "c1",
+            "rec_first",
+            second.created_at_ms + 1,
+        )
+        .expect_err("the receipt the first goal could not use cannot close the second's");
+    assert!(
+        matches!(
+            &refusal,
+            GoalError::EvidencePredatesGoal { receipt_id, goal_created_at_ms, receipt_at_ms, .. }
+                if receipt_id == "rec_first"
+                    && *goal_created_at_ms == second.created_at_ms
+                    && *receipt_at_ms == first.created_at_ms
+        ),
+        "{refusal}"
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .complete_as_model_checked(SESSION, second.revision),
+        Err(GoalError::EvidenceMissing { .. })
+    ));
+    assert_eq!(fixture.status(SESSION), GoalStatus::Active);
+}
+
+/// A criterion whose every character renders as nothing is populated in the database and
+/// empty on screen, which is the one divergence this audit surface exists to remove.
+/// Each of these was accepted as the whole of criterion `c1`.
+#[test]
+fn a_criterion_that_renders_as_nothing_is_not_a_criterion() {
+    for invisible in [
+        "\u{200b}", // ZERO WIDTH SPACE
+        "\u{feff}", // ZERO WIDTH NO-BREAK SPACE
+        "\u{2060}", // WORD JOINER
+        "\u{00ad}", // SOFT HYPHEN
+        "\u{180e}", // MONGOLIAN VOWEL SEPARATOR
+        "\u{200e}", // LEFT-TO-RIGHT MARK
+        "\u{00a0}", // NO-BREAK SPACE, already refused as White_Space
+        "\u{3000}", // IDEOGRAPHIC SPACE, likewise
+        "\u{200b}\u{feff}\u{2060}",
+    ] {
+        let fixture = Fixture::in_memory();
+        let refusal = fixture
+            .store
+            .create_goal_as_model(SESSION, "ship it", &[invisible.to_owned()], None)
+            .expect_err("a checklist a human cannot read is not a checklist");
+        assert!(
+            matches!(refusal, GoalError::MissingSuccessCriteria),
+            "{:?}: {refusal}",
+            invisible.escape_unicode().to_string()
+        );
+        assert_eq!(
+            fixture.store.goal(SESSION).expect("read goal"),
+            None,
+            "and nothing was written"
+        );
+    }
+
+    // Visible but terse is still a criterion: it renders as itself, so the human sees
+    // exactly what the database holds. Refusing it would be a judgement about wording.
+    let fixture = Fixture::in_memory();
+    let created = fixture
+        .store
+        .create_goal_as_model(SESSION, "ship it", &[".".to_owned()], None)
+        .expect("a visible statement is accepted however terse");
+    assert_eq!(created.criteria[0].statement, ".");
+}
+
+/// The waiver side of the same predicate: a criterion could be closed with a reason
+/// that renders as nothing, so the goal document showed a settled checklist and no
+/// stated reason.
+#[test]
+fn a_waiver_reason_that_renders_as_nothing_is_refused() {
+    let fixture = Fixture::in_memory();
+    let goal = fixture
+        .store
+        .create_goal_as_model(SESSION, "ship it", &["the gates pass".to_owned()], None)
+        .expect("propose a goal")
+        .goal;
+
+    for invisible in [
+        "\u{200b}", "\u{feff}", "\u{2060}", "\u{00ad}", "\u{180e}", "\u{200e}",
+    ] {
+        let refusal = fixture
+            .store
+            .waive_criterion(
+                SESSION,
+                goal.revision,
+                "c1",
+                invisible,
+                goal.created_at_ms + 1,
+            )
+            .expect_err("a reason nobody can read is not a reason");
+        assert!(
+            matches!(&refusal, GoalError::EmptyWaiverReason { criterion_id } if criterion_id == "c1"),
+            "{:?}: {refusal}",
+            invisible.escape_unicode().to_string()
+        );
+        assert_eq!(
+            fixture.store.criteria(SESSION).expect("read criteria")[0].status,
+            GoalCriterionStatus::Open,
+            "and the criterion is still open"
+        );
+    }
+
+    // An invisible character alongside real text is left alone: the reason renders.
+    let waived = fixture
+        .store
+        .waive_criterion(
+            SESSION,
+            goal.revision,
+            "c1",
+            "\u{200b}the gates cannot run in this environment",
+            goal.created_at_ms + 2,
+        )
+        .expect("a reason with visible text is a reason");
+    assert_eq!(waived.criterion.status, GoalCriterionStatus::Waived);
+}
+
+/// The other half of the waiver rule. The emptiness predicate was shared with the
+/// criterion statements and the length bound was not, so `waive_criterion` accepted a
+/// 2 000 000-character reason, stored it, and rendered a 2 000 434-byte `goal_update`
+/// result from it on every later read.
+#[test]
+fn a_waiver_reason_is_bounded_like_the_criterion_statement_it_excuses() {
+    let fixture = Fixture::in_memory();
+    let goal = fixture
+        .store
+        .create_goal_as_model(SESSION, "ship it", &["the gates pass".to_owned()], None)
+        .expect("propose a goal")
+        .goal;
+
+    let refusal = fixture
+        .store
+        .waive_criterion(
+            SESSION,
+            goal.revision,
+            "c1",
+            &"w".repeat(2_000_000),
+            goal.created_at_ms + 1,
+        )
+        .expect_err("a reason no result could render is not a reason");
+    assert!(
+        matches!(
+            &refusal,
+            GoalError::WaiverReasonTooLong { criterion_id, actual: 2_000_000, max }
+                if criterion_id == "c1" && *max == MAX_WAIVER_REASON_CHARS
+        ),
+        "{refusal}"
+    );
+    assert!(
+        refusal.is_model_refusal(),
+        "an oversized reason is a corrected call, not a harness failure: {refusal}"
+    );
+    let criterion = &fixture.store.criteria(SESSION).expect("read criteria")[0];
+    assert_eq!(
+        criterion.status,
+        GoalCriterionStatus::Open,
+        "the bound is checked before the write, so nothing was closed"
+    );
+    assert_eq!(criterion.waiver_reason, None, "and nothing was stored");
+
+    // The boundary is exact, and counted in characters like every other cap here.
+    let refusal = fixture
+        .store
+        .waive_criterion(
+            SESSION,
+            goal.revision,
+            "c1",
+            &"w".repeat(MAX_WAIVER_REASON_CHARS + 1),
+            goal.created_at_ms + 2,
+        )
+        .expect_err("one character past the cap is past the cap");
+    assert!(
+        matches!(&refusal, GoalError::WaiverReasonTooLong { actual, .. } if *actual == 501),
+        "{refusal}"
+    );
+    let waived = fixture
+        .store
+        .waive_criterion(
+            SESSION,
+            goal.revision,
+            "c1",
+            &"漢".repeat(MAX_WAIVER_REASON_CHARS),
+            goal.created_at_ms + 3,
+        )
+        .expect("a reason at the cap is accepted, and multi-byte text is not bytes");
+    assert_eq!(waived.criterion.status, GoalCriterionStatus::Waived);
+    assert_eq!(
+        waived
+            .criterion
+            .waiver_reason
+            .as_deref()
+            .map(str::len)
+            .expect("the reason is stored"),
+        MAX_WAIVER_REASON_CHARS * 3,
+        "500 characters of CJK is 1500 bytes, and the cap counted the characters"
+    );
+}
+
+/// The bound is a write bound, not a read bound: a reason an earlier release stored
+/// above the cap still reads and still lets the goal complete.
+#[test]
+fn a_stored_waiver_reason_longer_than_the_cap_still_reads_and_still_completes() {
+    let fixture = Fixture::in_memory();
+    let goal = fixture
+        .store
+        .create_goal_as_model(SESSION, "ship it", &["the gates pass".to_owned()], None)
+        .expect("propose a goal")
+        .goal;
+    {
+        let connection = fixture.store.pool().get().expect("check out connection");
+        connection
+            .execute(
+                "UPDATE goal_criterion SET status = 'waived', waiver_reason = ?2 \
+                 WHERE session_id = ?1 AND criterion_id = 'c1'",
+                params![SESSION, "w".repeat(2_000_000)],
+            )
+            .expect("write the row a previous release accepted");
+    }
+    let criterion = &fixture.store.criteria(SESSION).expect("read criteria")[0];
+    assert_eq!(criterion.status, GoalCriterionStatus::Waived);
+    assert_eq!(
+        criterion
+            .waiver_reason
+            .as_deref()
+            .expect("the stored reason reads back")
+            .chars()
+            .count(),
+        2_000_000,
+        "the column keeps what it held: a write bound must not rewrite stored history"
+    );
+    let completed = fixture
+        .store
+        .complete_as_model_checked(SESSION, goal.revision)
+        .expect("a waived criterion still settles the checklist")
+        .expect("the session has a goal");
+    assert_eq!(completed.status, GoalStatus::Complete);
+}
+
+/// The third criterion-id list on the same model-visible surface. `EvidenceMissing` and
+/// the capability ledger were bounded and `UnknownCriterion`'s `known` list was not, so a
+/// goal an earlier release stored with an unbounded checklist answered one mistyped id
+/// with the whole 34 KB checklist — the defect the other two lists closed, on the sibling
+/// the cap missed.
+#[test]
+fn an_unknown_criterion_id_is_answered_with_a_bounded_list_of_the_ids_that_exist() {
+    let fixture = Fixture::in_memory();
+    let goal = fixture
+        .store
+        .create_goal_as_model(SESSION, "ship it", &["the gates pass".to_owned()], None)
+        .expect("propose a goal")
+        .goal;
+    // `create_goal_as_model` refuses this many now, so the only database that holds this
+    // shape is one an earlier release wrote; plant it the way an upgrade would find it.
+    {
+        let connection = fixture.store.pool().get().expect("check out connection");
+        for ordinal in 2..=5_000 {
+            connection
+                .execute(
+                    "INSERT INTO goal_criterion \
+                     (session_id, criterion_id, ordinal, statement, status, created_at_ms, \
+                      updated_at_ms) \
+                     VALUES (?1, ?2, ?3, 'a check', 'open', 1, 1)",
+                    params![SESSION, format!("c{ordinal}"), ordinal],
+                )
+                .expect("write the rows a previous release accepted");
+        }
+    }
+
+    let refusal = fixture
+        .store
+        .waive_criterion(
+            SESSION,
+            goal.revision,
+            "c99999",
+            "not an id this goal assigned",
+            goal.created_at_ms + 1,
+        )
+        .expect_err("an id this goal never assigned is refused");
+    let message = refusal.to_string();
+    assert!(
+        matches!(
+            &refusal,
+            GoalError::UnknownCriterion { criterion_id, .. } if criterion_id == "c99999"
+        ),
+        "{refusal}"
+    );
+    assert!(
+        message.len() < 400,
+        "a refusal the model reads on every mistyped id is bounded, not 34 KB: {} bytes",
+        message.len()
+    );
+    assert!(
+        message.contains("known criteria: c1, c2, c3"),
+        "the ids it should have cited are still named: {message}"
+    );
+    assert!(
+        message.contains("and 4990 more"),
+        "and the elision says how many were left out, so nothing reads as the whole list: \
+         {message}"
+    );
+    assert!(
+        !message.contains("c4999"),
+        "the rest is genuinely gone, not merely wrapped: {message}"
+    );
+    assert!(
+        refusal.is_model_refusal(),
+        "a mistyped id is a corrected call, not a harness failure: {refusal}"
+    );
+}
+
+/// The objective is the headline of the same audit surface, and it kept the `trim`
+/// check. An objective of "\u{200b}\u{feff}" was stored on a live goal and printed a
+/// blank objective line into the goal document on every later turn.
+#[test]
+fn an_objective_that_renders_as_nothing_is_refused_on_creation_and_on_rewrite() {
+    for invisible in [
+        "\u{200b}",
+        "\u{feff}",
+        "\u{2060}",
+        "\u{00ad}",
+        "\u{180e}",
+        "\u{3164}",
+        "\u{200b}\u{feff}",
+    ] {
+        let fixture = Fixture::in_memory();
+        let refusal = fixture
+            .store
+            .create_goal_as_model(SESSION, invisible, &["the gates pass".to_owned()], None)
+            .expect_err("a goal whose purpose renders as nothing states no purpose");
+        assert!(
+            matches!(refusal, GoalError::EmptyObjective),
+            "{:?}: {refusal}",
+            invisible.escape_unicode().to_string()
+        );
+        assert_eq!(
+            fixture.store.goal(SESSION).expect("read the goal"),
+            None,
+            "and no goal row was written"
+        );
+
+        // The system path shares the one funnel, so it refuses the same value, and so
+        // does the rewrite.
+        assert!(matches!(
+            fixture.store.create_goal(SESSION, invisible, None),
+            Err(GoalError::EmptyObjective)
+        ));
+        fixture
+            .store
+            .create_goal(SESSION, "a real objective", None)
+            .expect("create the goal");
+        assert!(matches!(
+            fixture.store.update_objective(SESSION, invisible),
+            Err(GoalError::EmptyObjective)
+        ));
+        assert_eq!(fixture.goal(SESSION).objective, "a real objective");
+    }
+
+    // Invisible characters beside real text are left alone: the objective renders.
+    let fixture = Fixture::in_memory();
+    let created = fixture
+        .store
+        .create_goal_as_model(
+            SESSION,
+            "\u{200b}ship it",
+            &["the gates pass".to_owned()],
+            None,
+        )
+        .expect("an objective with visible text is an objective");
+    assert_eq!(created.goal.objective, "\u{200b}ship it");
+}
+
+/// A refused position is a position in the list the model sent. Blank entries were
+/// dropped before the length loop counted, so ["real", "\u{200b}", "", <501 chars>] was
+/// refused as "success criterion 2" and sent the model to edit the wrong element.
+#[test]
+fn a_refused_criterion_is_named_by_its_position_in_the_list_that_was_sent() {
+    let fixture = Fixture::in_memory();
+    let submitted = vec![
+        "the gates pass".to_owned(),
+        "\u{200b}".to_owned(),
+        String::new(),
+        "x".repeat(MAX_CRITERION_STATEMENT_CHARS + 1),
+    ];
+    let refusal = fixture
+        .store
+        .create_goal_as_model(SESSION, "ship it", &submitted, None)
+        .expect_err("the fourth entry is too long");
+    assert!(
+        matches!(
+            refusal,
+            GoalError::SuccessCriterionTooLong {
+                ordinal: 4,
+                submitted: 4,
+                actual: 501,
+                max
+            } if max == MAX_CRITERION_STATEMENT_CHARS
+        ),
+        "the ordinal is the position the model can edit, not a position in the filtered \
+         list: {refusal}"
+    );
+    assert_eq!(fixture.store.goal(SESSION).expect("read goal"), None);
+
+    // The count has the mirror-image rule: the cap is compared against the entries that
+    // would record, and the refusal names both numbers because they differ.
+    let mut submitted = (1..=MAX_SUCCESS_CRITERIA + 3)
+        .map(|index| format!("check number {index}"))
+        .collect::<Vec<_>>();
+    submitted.extend(std::iter::repeat_n("\u{200b}".to_owned(), 5));
+    let refusal = fixture
+        .store
+        .create_goal_as_model(SESSION, "ship it", &submitted, None)
+        .expect_err("35 of the 40 entries record, and 35 is past the cap");
+    assert!(
+        matches!(
+            refusal,
+            GoalError::TooManySuccessCriteria {
+                submitted: 40,
+                recorded: 35,
+                max
+            } if max == MAX_SUCCESS_CRITERIA
+        ),
+        "{refusal}"
+    );
+    let message = refusal.to_string();
+    assert!(
+        message.contains("sent 40 entries") && message.contains("35 of which record"),
+        "a model told only one of the two numbers deletes entries it never had to touch: \
+         {message}"
+    );
+    assert_eq!(fixture.store.goal(SESSION).expect("read goal"), None);
+}
+
+/// The checklist is mandatory, model-supplied, stored twice and re-rendered into every
+/// later refusal, so it is bounded. 5000 criteria were accepted in 108 ms and made the
+/// next refusal 34 213 bytes; a single 2 000 000-character statement was stored whole.
+#[test]
+fn a_proposed_checklist_is_bounded_in_count_and_in_statement_length() {
+    let fixture = Fixture::in_memory();
+    let flood: Vec<String> = (1..=5_000)
+        .map(|index| format!("check number {index}"))
+        .collect();
+    let refusal = fixture
+        .store
+        .create_goal_as_model(SESSION, "ship it", &flood, None)
+        .expect_err("a checklist nobody could review is not a checklist");
+    assert!(
+        matches!(
+            refusal,
+            GoalError::TooManySuccessCriteria { submitted: 5_000, recorded: 5_000, max }
+                if max == MAX_SUCCESS_CRITERIA
+        ),
+        "{refusal}"
+    );
+    assert!(refusal.is_model_refusal(), "{refusal}");
+    assert_eq!(
+        fixture.store.goal(SESSION).expect("read goal"),
+        None,
+        "the bound is checked before the write, so there is no partial checklist"
+    );
+
+    let long = "a".repeat(2_000_000);
+    let refusal = fixture
+        .store
+        .create_goal_as_model(
+            SESSION,
+            "ship it",
+            &["the gates pass".to_owned(), long],
+            None,
+        )
+        .expect_err("a statement no document could render is not a statement");
+    assert!(
+        matches!(
+            refusal,
+            GoalError::SuccessCriterionTooLong {
+                ordinal: 2,
+                submitted: 2,
+                actual: 2_000_000,
+                max
+            } if max == MAX_CRITERION_STATEMENT_CHARS
+        ),
+        "{refusal}"
+    );
+    assert_eq!(fixture.store.goal(SESSION).expect("read goal"), None);
+
+    // The bound is a creation bound, not a read bound: a goal an earlier release stored
+    // with a longer checklist still reads and still completes.
+    let legacy: Vec<String> = (1..=MAX_SUCCESS_CRITERIA + 8)
+        .map(|index| format!("legacy check {index}"))
+        .collect();
+    let created = fixture
+        .store
+        .create_goal_with_criteria(SESSION, "an objective from 0.6.6", &legacy, None)
+        .expect("the system path still accepts what an earlier release stored");
+    assert_eq!(created.criteria.len(), MAX_SUCCESS_CRITERIA + 8);
+    assert_eq!(
+        fixture
+            .store
+            .criteria(SESSION)
+            .expect("read criteria")
+            .len(),
+        MAX_SUCCESS_CRITERIA + 8,
+        "and every row still reads"
+    );
+}
+
+/// What a database written by the released store holds, and what happens to it now. The
+/// shipped `satisfy_criterion` had only the mutation-mark check, so it accepted a receipt
+/// recorded before the goal and wrote exactly this row. The row still reads as satisfied,
+/// with its citation, because a bound at a decision must not change what a stored goal
+/// looks like; completion is the only thing that changes, and it names the way out.
+#[test]
+fn a_stored_criterion_citing_a_pre_goal_receipt_still_reads_and_says_how_to_settle_it() {
+    let fixture = Fixture::in_memory();
+    record_receipt(
+        &fixture,
+        SESSION,
+        "rec_before",
+        ReceiptOutcome::Passed,
+        zuno_db::verification::ExitAuthority::Authoritative,
+        2_000,
+    );
+    let goal = fixture
+        .store
+        .create_goal_as_model(SESSION, "ship it", &["the gates pass".to_owned()], None)
+        .expect("propose a goal")
+        .goal;
+    {
+        // The row the released store wrote for this input, verbatim.
+        let connection = fixture.store.pool().get().expect("check out connection");
+        connection
+            .execute(
+                "UPDATE goal_criterion \
+                 SET status = 'satisfied', waiver_reason = NULL, receipt_id = 'rec_before', \
+                     satisfied_at_ms = 2500, updated_at_ms = 2500 \
+                 WHERE session_id = ?1 AND criterion_id = 'c1'",
+                params![SESSION],
+            )
+            .expect("write the row an earlier release left behind");
+    }
+
+    let stored = fixture.store.criteria(SESSION).expect("read criteria");
+    assert_eq!(stored[0].status, GoalCriterionStatus::Satisfied);
+    assert_eq!(stored[0].receipt_id.as_deref(), Some("rec_before"));
+    assert_eq!(stored[0].satisfied_at_ms, Some(2_500));
+    assert_eq!(
+        fixture
+            .store
+            .goal(SESSION)
+            .expect("read goal")
+            .expect("goal exists")
+            .success_criteria,
+        ["the gates pass"],
+        "and the goal itself is untouched by the new bound"
+    );
+
+    for refusal in [
+        fixture
+            .store
+            .complete_as_model_checked(SESSION, goal.revision)
+            .expect_err("the audit re-reads the citation, because a row is data"),
+        fixture
+            .store
+            .complete_checked(SESSION, goal.revision)
+            .expect_err("and the human is held to the same reading of the same row"),
+    ] {
+        assert!(
+            matches!(
+                &refusal,
+                GoalError::EvidencePredatesGoal { criterion_id, receipt_id, .. }
+                    if criterion_id == "c1" && receipt_id == "rec_before"
+            ),
+            "{refusal}"
+        );
+        assert!(
+            refusal.to_string().contains("run the check again"),
+            "a stored row that can no longer close the goal says what will: {refusal}"
+        );
+    }
+
+    // Both remedies the refusal names work, on the row that was already there.
+    record_receipt(
+        &fixture,
+        SESSION,
+        "rec_now",
+        ReceiptOutcome::Passed,
+        zuno_db::verification::ExitAuthority::Authoritative,
+        goal.created_at_ms + 1,
+    );
+    let resatisfied = fixture
+        .store
+        .satisfy_criterion(
+            SESSION,
+            goal.revision,
+            "c1",
+            "rec_now",
+            goal.created_at_ms + 2,
+        )
+        .expect("re-citing a fresh receipt over a satisfied row is allowed");
+    assert_eq!(resatisfied.criterion.receipt_id.as_deref(), Some("rec_now"));
+    let completed = fixture
+        .store
+        .complete_checked(SESSION, resatisfied.goal.revision)
+        .expect("and then it completes")
+        .expect("goal exists");
+    assert_eq!(completed.status, GoalStatus::Complete);
+}
+
+// ---------------------------------------------------------------------------------
+// Upgrading a `0.6.6` database: the checklist lived only in `goal.success_criteria`.
+// ---------------------------------------------------------------------------------
+
+/// `git show v0.6.6:crates/zuno-goal/src/store.rs`, `SCHEMA` verbatim.
+///
+/// The released `0.6.6` goal table. Identical to today's, which is the point: the row
+/// this test inserts is exactly the row that release wrote, and nothing about the goal
+/// itself needs to move.
+const V0_6_6_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS goal (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    goal_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    objective TEXT NOT NULL,
+    success_criteria TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'active',
+        'paused',
+        'blocked',
+        'usage_limited',
+        'budget_limited',
+        'complete',
+        'cancelled'
+    )),
+    blocked_reason TEXT,
+    token_budget INTEGER,
+    tokens_used INTEGER NOT NULL DEFAULT 0,
+    usage_known INTEGER NOT NULL DEFAULT 1 CHECK(usage_known IN (0, 1)),
+    time_used_seconds INTEGER NOT NULL DEFAULT 0,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+)";
+
+/// `git show v0.6.6:crates/zuno-goal/src/store.rs`, `AUXILIARY_SCHEMA` verbatim.
+///
+/// No `goal_criterion`, no `goal_kind`, no `goal_mutation_mark`, no
+/// `goal_request_usage`, no `goal_capability_claim`; a `goal_pause` `CHECK` without
+/// `turn_budget`; and the unguarded history trigger. Every one of those is what
+/// `from_pool` has to bring forward, in one transaction, without touching the rows.
+const V0_6_6_AUXILIARY_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS goal_continuation_deferral (
+    session_id TEXT PRIMARY KEY NOT NULL
+);
+CREATE TABLE IF NOT EXISTS goal_pending_failure_signal (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    signal TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS goal_failure_streak (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    signal TEXT NOT NULL,
+    consecutive_turns INTEGER NOT NULL CHECK(consecutive_turns BETWEEN 1 AND 3)
+);
+CREATE TABLE IF NOT EXISTS goal_pause (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    goal_id TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason IN (
+        'user_interruption',
+        'plan_mode',
+        'human_input',
+        'permission',
+        'authentication',
+        'uncertain_side_effect'
+    )),
+    human_request_id TEXT,
+    paused_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS goal_retry (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    goal_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK(attempt >= 1),
+    reason TEXT NOT NULL CHECK(reason IN (
+        'rate_limited',
+        'provider_transient',
+        'provider_stream',
+        'provider_retry_deadline',
+        'database_busy',
+        'step_limit',
+        'empty_assistant_message',
+        'context_limit',
+        'context_compacted',
+        'tool_transient'
+    )),
+    delay_ms INTEGER NOT NULL CHECK(delay_ms >= 0),
+    retry_at_ms INTEGER NOT NULL,
+    scheduled_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS goal_history (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    goal_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    objective TEXT NOT NULL,
+    success_criteria TEXT NOT NULL,
+    status TEXT NOT NULL,
+    blocked_reason TEXT,
+    token_budget INTEGER,
+    tokens_used INTEGER NOT NULL,
+    usage_known INTEGER NOT NULL CHECK(usage_known IN (0, 1)),
+    time_used_seconds INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE(goal_id, revision)
+);
+CREATE INDEX IF NOT EXISTS goal_history_session_sequence
+    ON goal_history(session_id, sequence);
+CREATE TRIGGER IF NOT EXISTS goal_history_after_insert
+AFTER INSERT ON goal
+BEGIN
+    INSERT INTO goal_history (
+        session_id, goal_id, revision, objective, success_criteria, status, blocked_reason,
+        token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, updated_at_ms
+    ) VALUES (
+        NEW.session_id, NEW.goal_id, NEW.revision, NEW.objective,
+        NEW.success_criteria, NEW.status, NEW.blocked_reason, NEW.token_budget,
+        NEW.tokens_used, NEW.usage_known, NEW.time_used_seconds, NEW.created_at_ms,
+        NEW.updated_at_ms
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS goal_history_after_update
+AFTER UPDATE ON goal
+BEGIN
+    INSERT INTO goal_history (
+        session_id, goal_id, revision, objective, success_criteria, status, blocked_reason,
+        token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, updated_at_ms
+    ) VALUES (
+        NEW.session_id, NEW.goal_id, NEW.revision, NEW.objective,
+        NEW.success_criteria, NEW.status, NEW.blocked_reason, NEW.token_budget,
+        NEW.tokens_used, NEW.usage_known, NEW.time_used_seconds, NEW.created_at_ms,
+        NEW.updated_at_ms
+    );
+END;";
+
+/// When the `0.6.6` goals below were proposed, in Unix milliseconds.
+const V0_6_6_CREATED_AT_MS: i64 = 1_700_000_000_000;
+
+/// One row of `goal` or `goal_history` as `0.6.6` wrote it, read back raw.
+///
+/// Raw rather than through [`GoalStore`] so the comparison is on the bytes the database
+/// holds and not on what this release's reader makes of them.
+#[derive(Debug, PartialEq, Eq)]
+struct RawGoalRow {
+    session_id: String,
+    goal_id: String,
+    revision: i64,
+    objective: String,
+    success_criteria: String,
+    status: String,
+    blocked_reason: Option<String>,
+    token_budget: Option<i64>,
+    tokens_used: i64,
+    usage_known: i64,
+    time_used_seconds: i64,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+/// A file database holding the goal tables exactly as `0.6.6` created them.
+///
+/// A file and not `:memory:` because the point of the second open below is that it is
+/// a second *process* attaching to the same database. The shared tables beside the goal
+/// ones are current: `zuno-db` owns their forward migration and pins it in its own
+/// tests, and the receipt the closing step cites has to land somewhere.
+fn v0_6_6_database() -> (TempDir, Arc<zuno_db::Pool>) {
+    let directory = tempfile::tempdir().expect("create database directory");
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::File(
+            directory.path().join("zuno-0.6.6.db"),
+        ))
+        .expect("open the file database"),
+    );
+    let mut connection = pool.open_connection().expect("open connection");
+    zuno_db::migration::apply(&mut connection).expect("apply the shared schema");
+    connection
+        .execute_batch(V0_6_6_SCHEMA)
+        .expect("create the 0.6.6 goal table");
+    connection
+        .execute_batch(V0_6_6_AUXILIARY_SCHEMA)
+        .expect("create the 0.6.6 auxiliary tables");
+    assert!(
+        !table_exists_on(&connection, "goal_criterion"),
+        "0.6.6 had no goal_criterion table, or this fixture proves nothing"
+    );
+    drop(connection);
+    (directory, pool)
+}
+
+fn table_exists_on(connection: &Connection, table: &str) -> bool {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .expect("query sqlite_master")
+        .is_some()
+}
+
+/// Insert the row `0.6.6`'s `goal_propose` wrote: the criteria in the JSON column only.
+///
+/// Goes through the `0.6.6` insert trigger, so `goal_history` gains the row that
+/// release recorded for it too.
+fn insert_v0_6_6_goal(
+    connection: &Connection,
+    session_id: &str,
+    goal_id: &str,
+    success_criteria: &str,
+    status: &str,
+) {
+    connection
+        .execute(
+            "INSERT INTO goal (session_id, goal_id, revision, objective, success_criteria, \
+             status, blocked_reason, token_budget, tokens_used, usage_known, \
+             time_used_seconds, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, NULL, 50000, 0, 1, 0, ?6, ?6)",
+            params![
+                session_id,
+                goal_id,
+                format!("objective of {session_id}"),
+                success_criteria,
+                status,
+                V0_6_6_CREATED_AT_MS,
+            ],
+        )
+        .expect("insert the 0.6.6 goal row");
+}
+
+fn raw_goal_rows(connection: &Connection, table: &str, session_id: &str) -> Vec<RawGoalRow> {
+    let order = if table == "goal_history" {
+        "sequence"
+    } else {
+        "session_id"
+    };
+    connection
+        .prepare(&format!(
+            "SELECT session_id, goal_id, revision, objective, success_criteria, status, \
+             blocked_reason, token_budget, tokens_used, usage_known, time_used_seconds, \
+             created_at_ms, updated_at_ms FROM {table} WHERE session_id = ?1 ORDER BY {order}"
+        ))
+        .expect("prepare raw read")
+        .query_map(params![session_id], |row| {
+            Ok(RawGoalRow {
+                session_id: row.get(0)?,
+                goal_id: row.get(1)?,
+                revision: row.get(2)?,
+                objective: row.get(3)?,
+                success_criteria: row.get(4)?,
+                status: row.get(5)?,
+                blocked_reason: row.get(6)?,
+                token_budget: row.get(7)?,
+                tokens_used: row.get(8)?,
+                usage_known: row.get(9)?,
+                time_used_seconds: row.get(10)?,
+                created_at_ms: row.get(11)?,
+                updated_at_ms: row.get(12)?,
+            })
+        })
+        .expect("read raw rows")
+        .collect::<Result<_, _>>()
+        .expect("collect raw rows")
+}
+
+/// `(criterion_id, created_at_ms, updated_at_ms)` for every criterion row of a session.
+fn criterion_stamps(connection: &Connection, session_id: &str) -> Vec<(String, i64, i64)> {
+    connection
+        .prepare(
+            "SELECT criterion_id, created_at_ms, updated_at_ms FROM goal_criterion \
+             WHERE session_id = ?1 ORDER BY ordinal",
+        )
+        .expect("prepare stamp read")
+        .query_map(params![session_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("read stamps")
+        .collect::<Result<_, _>>()
+        .expect("collect stamps")
+}
+
+fn criterion_row_count(connection: &Connection) -> i64 {
+    connection
+        .query_row("SELECT count(*) FROM goal_criterion", [], |row| row.get(0))
+        .expect("count criterion rows")
+}
+
+/// A goal a `0.6.6` database holds only in its column recovers its checklist at open.
+///
+/// `0.6.6` had no `goal_criterion` table, and its `goal_propose` stored the model's
+/// `success_criteria` in the `goal.success_criteria` column. Before this backfill an
+/// upgraded database presented a goal whose column read `["the gates pass", "the docs
+/// build"]` with zero criterion rows, and once the run's first reported write escalated
+/// it, both completion paths refused with "cannot complete without success criteria" —
+/// false about the row the database holds — while `goal_propose` was refused with
+/// `GoalNotReplaceable`, so the only exit was cancelling the goal. Measured on this exact
+/// fixture before the change: 0 rows, that message, on both paths.
+///
+/// Pinned against the column, not table presence: ids, statements, statuses, ordinals,
+/// stamps and count; the goal and history rows byte-for-byte before and after; the
+/// refusal naming the real ids; a second open changing nothing; and the exit the refusal
+/// names actually working.
+#[test]
+fn a_goal_a_0_6_6_database_holds_only_in_its_column_recovers_its_checklist_at_open() {
+    const UPGRADED: &str = "ses_0_6_6_upgraded";
+    let (_directory, pool) = v0_6_6_database();
+    let spill = tempfile::tempdir().expect("create spill directory");
+    let connection = pool.open_connection().expect("open connection");
+    insert_v0_6_6_goal(
+        &connection,
+        UPGRADED,
+        "goal-0-6-6",
+        r#"["the gates pass","the docs build"]"#,
+        "active",
+    );
+    // A second revision through 0.6.6's own trigger, so the goal carries accounting and
+    // the history holds more than the creation row.
+    connection
+        .execute(
+            "UPDATE goal SET revision = 2, tokens_used = 1234, time_used_seconds = 77, \
+             updated_at_ms = ?2 WHERE session_id = ?1",
+            params![UPGRADED, V0_6_6_CREATED_AT_MS + 100_000],
+        )
+        .expect("record a 0.6.6 revision");
+    let goal_before = raw_goal_rows(&connection, "goal", UPGRADED);
+    let history_before = raw_goal_rows(&connection, "goal_history", UPGRADED);
+    assert_eq!(
+        history_before.len(),
+        2,
+        "the fixture must hold real history"
+    );
+    drop(connection);
+
+    let store = GoalStore::from_pool(Arc::clone(&pool), spill.path().to_owned())
+        .expect("attach to the 0.6.6 database");
+    let connection = pool.get().expect("check out a connection");
+
+    // Recovered rows against the column, not against table presence.
+    let goal = store
+        .goal(UPGRADED)
+        .expect("read the goal")
+        .expect("the goal is there");
+    assert_eq!(goal.success_criteria, ["the gates pass", "the docs build"]);
+    let criteria = store.criteria(UPGRADED).expect("read criteria");
+    assert_eq!(criteria.len(), goal.success_criteria.len());
+    for (index, (criterion, statement)) in criteria.iter().zip(&goal.success_criteria).enumerate() {
+        assert_eq!(criterion.criterion_id, format!("c{}", index + 1));
+        assert_eq!(
+            criterion.ordinal,
+            i64::try_from(index).expect("small index")
+        );
+        assert_eq!(&criterion.statement, statement);
+        assert_eq!(criterion.status, GoalCriterionStatus::Open);
+        assert_eq!(criterion.waiver_reason, None);
+        assert_eq!(criterion.receipt_id, None);
+        assert_eq!(criterion.satisfied_at_ms, None);
+    }
+    assert_eq!(
+        criterion_stamps(&connection, UPGRADED),
+        [
+            ("c1".to_owned(), V0_6_6_CREATED_AT_MS, V0_6_6_CREATED_AT_MS),
+            ("c2".to_owned(), V0_6_6_CREATED_AT_MS, V0_6_6_CREATED_AT_MS),
+        ],
+        "stamped from the goal's own creation, not from the clock at open"
+    );
+    // The goal and its history are the rows 0.6.6 wrote, byte for byte.
+    assert_eq!(raw_goal_rows(&connection, "goal", UPGRADED), goal_before);
+    assert_eq!(
+        raw_goal_rows(&connection, "goal_history", UPGRADED),
+        history_before
+    );
+
+    // The path the reviewer measured: the first reported write escalates the goal, the
+    // model then claims completion. The refusal now names the ids the run has to close.
+    assert_eq!(
+        store
+            .escalate_to_change(UPGRADED, "wrote src/main.rs", V0_6_6_CREATED_AT_MS + 5)
+            .expect("escalate"),
+        GoalKind::Change
+    );
+    for refusal in [
+        store
+            .complete_as_model_checked(UPGRADED, goal.revision)
+            .expect_err("the checklist is open"),
+        store
+            .complete_checked(UPGRADED, goal.revision)
+            .expect_err("on the human's path too"),
+    ] {
+        assert!(
+            matches!(
+                &refusal,
+                GoalError::EvidenceMissing { unsatisfied } if unsatisfied == &["c1", "c2"]
+            ),
+            "{refusal}"
+        );
+        let message = refusal.to_string();
+        assert!(message.contains("c1, c2"), "{message}");
+        assert!(
+            !message.contains("without success criteria"),
+            "the refusal must stop saying the goal has no criteria: {message}"
+        );
+    }
+
+    // A second process attaching to the same file changes nothing.
+    let stamps_before = criterion_stamps(&connection, UPGRADED);
+    let history_before = raw_goal_rows(&connection, "goal_history", UPGRADED);
+    drop(connection);
+    drop(store);
+    let store = GoalStore::from_pool(Arc::clone(&pool), spill.path().to_owned())
+        .expect("attach a second time");
+    let connection = pool.get().expect("check out a connection");
+    assert_eq!(store.criteria(UPGRADED).expect("read criteria"), criteria);
+    assert_eq!(criterion_stamps(&connection, UPGRADED), stamps_before);
+    assert_eq!(
+        raw_goal_rows(&connection, "goal_history", UPGRADED),
+        history_before
+    );
+    assert_eq!(criterion_row_count(&connection), 2);
+
+    // And the exit the refusal names exists: settle each id, then complete.
+    zuno_db::verification::record(
+        &connection,
+        &zuno_db::verification::NewVerificationReceipt {
+            id: "rec_gates".to_owned(),
+            session_id: UPGRADED.to_owned(),
+            turn_id: Some("turn-upgrade".to_owned()),
+            tool_call_id: "call-rec_gates".to_owned(),
+            tool_id: "shell".to_owned(),
+            summary: "cargo test -p zuno-goal".to_owned(),
+            workdir: None,
+            exit_code: Some(0),
+            exit_authority: zuno_db::verification::ExitAuthority::Authoritative,
+            outcome: ReceiptOutcome::Passed,
+            git_head: None,
+            output_digest: None,
+            detail: None,
+            time_created: V0_6_6_CREATED_AT_MS + 10,
+        },
+    )
+    .expect("record the receipt");
+    drop(connection);
+    let revision = store
+        .goal(UPGRADED)
+        .expect("read the goal")
+        .expect("goal exists")
+        .revision;
+    let satisfied = store
+        .satisfy_criterion(
+            UPGRADED,
+            revision,
+            "c1",
+            "rec_gates",
+            V0_6_6_CREATED_AT_MS + 11,
+        )
+        .expect("cite the receipt for c1");
+    let waived = store
+        .waive_criterion(
+            UPGRADED,
+            satisfied.goal.revision,
+            "c2",
+            "the docs are built by the release workflow, not this run",
+            V0_6_6_CREATED_AT_MS + 12,
+        )
+        .expect("waive c2");
+    let completed = store
+        .complete_as_model_checked(UPGRADED, waived.goal.revision)
+        .expect("the upgraded goal completes once its checklist is settled")
+        .expect("goal exists");
+    assert_eq!(completed.status, GoalStatus::Complete);
+    assert_eq!(completed.goal_id, "goal-0-6-6", "the same goal instance");
+    assert_eq!(
+        completed.tokens_used, 1234,
+        "with the accounting it carried"
+    );
+}
+
+/// A goal a `0.6.6` database finished keeps reading as it did until it is live again.
+///
+/// The decision `checklist_dormant` documents, measured rather than asserted: for a
+/// `complete` and a `cancelled` `0.6.6` row the rendered document and the result of a
+/// repeated `complete` are byte-for-byte what they were before the backfill existed,
+/// because nothing is minted for them at open. The moment the finished goal is written
+/// back to a live status it gets the rows the column names, and a completion is then held
+/// to them; a `cancelled` goal cannot be written back, so it stays as it is.
+#[test]
+fn a_goal_a_0_6_6_database_finished_reads_as_it_did_until_it_is_made_live_again() {
+    const FINISHED: &str = "ses_0_6_6_complete";
+    const ABANDONED: &str = "ses_0_6_6_cancelled";
+    let (_directory, pool) = v0_6_6_database();
+    let spill = tempfile::tempdir().expect("create spill directory");
+    let connection = pool.open_connection().expect("open connection");
+    insert_v0_6_6_goal(
+        &connection,
+        FINISHED,
+        "goal-0-6-6-done",
+        r#"["shipped"]"#,
+        "complete",
+    );
+    insert_v0_6_6_goal(
+        &connection,
+        ABANDONED,
+        "goal-0-6-6-gone",
+        r#"["never mind"]"#,
+        "cancelled",
+    );
+    drop(connection);
+
+    let store = GoalStore::from_pool(Arc::clone(&pool), spill.path().to_owned())
+        .expect("attach to the 0.6.6 database");
+    let connection = pool.get().expect("check out a connection");
+    assert_eq!(
+        criterion_row_count(&connection),
+        0,
+        "nothing is minted for a finished goal"
+    );
+    let notes = crate::projection::Notes::default();
+    for (session_id, expected) in [
+        (FINISHED, GoalStatus::Complete),
+        (ABANDONED, GoalStatus::Cancelled),
+    ] {
+        let goal = store
+            .goal(session_id)
+            .expect("read the goal")
+            .expect("goal exists");
+        assert_eq!(goal.status, expected);
+        assert_eq!(
+            goal.success_criteria.len(),
+            1,
+            "the column still names the check"
+        );
+        let criteria = store.criteria(session_id).expect("read criteria");
+        assert!(criteria.is_empty());
+        // What the document showed for this row before the backfill existed was the
+        // render of the goal with no criterion rows; it must still be that, byte for byte.
+        let document = crate::projection::render(&goal, &criteria, &notes);
+        assert_eq!(document, crate::projection::render(&goal, &[], &notes));
+        assert!(document.contains("_This goal has no success criteria._"));
+        // And a repeated `complete` is the same idempotent no-op it was.
+        let repeated = store
+            .complete_as_model_checked(session_id, goal.revision)
+            .expect("a finished goal is not refused for evidence it was never asked for")
+            .expect("goal exists");
+        assert_eq!(repeated.status, expected);
+    }
+
+    // Written back to a live status — the system's `active` here; the model's own
+    // `blocked` is the other write that leaves `complete`, through the same statement
+    // path — the checklist the column names comes with it.
+    let revision = store
+        .goal(FINISHED)
+        .expect("read the goal")
+        .expect("goal exists")
+        .revision;
+    let revived = store
+        .set_status_as_system_checked(FINISHED, SystemStatus::Active, revision)
+        .expect("set active")
+        .expect("goal exists");
+    assert_eq!(revived.status, GoalStatus::Active);
+    let criteria = store.criteria(FINISHED).expect("read criteria");
+    assert_eq!(criteria.len(), 1);
+    assert_eq!(criteria[0].criterion_id, "c1");
+    assert_eq!(criteria[0].statement, "shipped");
+    assert_eq!(criteria[0].status, GoalCriterionStatus::Open);
+    assert_eq!(
+        criterion_stamps(&connection, FINISHED),
+        [("c1".to_owned(), V0_6_6_CREATED_AT_MS, V0_6_6_CREATED_AT_MS)]
+    );
+    let refusal = store
+        .complete_as_model_checked(FINISHED, revived.revision)
+        .expect_err("a revived goal is held to the checklist it recorded");
+    assert!(
+        matches!(&refusal, GoalError::EvidenceMissing { unsatisfied } if unsatisfied == &["c1"]),
+        "{refusal}"
+    );
+
+    // A cancelled goal cannot be written back to a live status, so nothing is minted.
+    let revision = store
+        .goal(ABANDONED)
+        .expect("read the goal")
+        .expect("goal exists")
+        .revision;
+    let still_cancelled = store
+        .set_status_as_system_checked(ABANDONED, SystemStatus::Active, revision)
+        .expect("the write is accepted")
+        .expect("goal exists");
+    assert_eq!(still_cancelled.status, GoalStatus::Cancelled);
+    assert!(store.criteria(ABANDONED).expect("read criteria").is_empty());
+}
+
+/// A `success_criteria` column that is not a JSON array of strings is left alone.
+///
+/// Corruption, not input: nothing this crate or `0.6.6` wrote produces it. The backfill
+/// neither guesses at it nor fails the whole open over one session's row — that would
+/// take every other goal in the database down with it — so the row keeps failing closed
+/// exactly where it failed before, on the read of that session, while its neighbours are
+/// brought forward.
+#[test]
+fn a_success_criteria_column_that_is_not_a_json_array_of_strings_is_left_alone_at_open() {
+    const NOT_JSON: &str = "ses_0_6_6_not_json";
+    const NOT_STRINGS: &str = "ses_0_6_6_not_strings";
+    const SOUND: &str = "ses_0_6_6_sound";
+    let (_directory, pool) = v0_6_6_database();
+    let spill = tempfile::tempdir().expect("create spill directory");
+    let connection = pool.open_connection().expect("open connection");
+    insert_v0_6_6_goal(&connection, NOT_JSON, "goal-not-json", "not json", "active");
+    insert_v0_6_6_goal(
+        &connection,
+        NOT_STRINGS,
+        "goal-not-strings",
+        "[1, 2]",
+        "active",
+    );
+    insert_v0_6_6_goal(
+        &connection,
+        SOUND,
+        "goal-sound",
+        r#"["the gates pass"]"#,
+        "active",
+    );
+    let corrupt_before = raw_goal_rows(&connection, "goal", NOT_JSON);
+    drop(connection);
+
+    let store = GoalStore::from_pool(Arc::clone(&pool), spill.path().to_owned())
+        .expect("one corrupt row must not fail the open for every session");
+    let connection = pool.get().expect("check out a connection");
+    assert!(store.criteria(NOT_JSON).expect("read criteria").is_empty());
+    assert!(
+        store
+            .criteria(NOT_STRINGS)
+            .expect("read criteria")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .criteria(SOUND)
+            .expect("read criteria")
+            .iter()
+            .map(|criterion| criterion.statement.as_str())
+            .collect::<Vec<_>>(),
+        ["the gates pass"],
+        "the neighbour is brought forward"
+    );
+    assert_eq!(criterion_row_count(&connection), 1);
+    assert_eq!(
+        raw_goal_rows(&connection, "goal", NOT_JSON),
+        corrupt_before,
+        "left exactly as it was"
+    );
+    // Reported where it was reported before: on the read of that session.
+    assert!(matches!(store.goal(NOT_JSON), Err(GoalError::Db(_))));
+    assert!(matches!(store.goal(NOT_STRINGS), Err(GoalError::Db(_))));
 }
