@@ -10,6 +10,7 @@ use tokio::sync::{broadcast, mpsc};
 use zuno_auth::Secret;
 use zuno_config::schema::mcp::McpRemote;
 
+use crate::protocol::ReaderState;
 use crate::stdio::{DEFAULT_REQUEST_TIMEOUT, PROTOCOL_VERSION};
 
 use super::legacy::open_legacy;
@@ -71,6 +72,7 @@ pub(super) async fn connect_transport(
             legacy,
             operation: tokio::sync::Mutex::new(()),
             closed: AtomicBool::new(false),
+            reader_state: Arc::new(ReaderState::default()),
         }),
     };
     let initialization = client

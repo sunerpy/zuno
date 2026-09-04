@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use zuno_auth::{McpAuthStore, Secret};
 use zuno_config::schema::mcp::McpRemote;
 
-use crate::protocol::{Pending, ReaderFailure, fail_pending, lock};
+use crate::protocol::{Pending, ReaderFailure, ReaderState, fail_pending, lock};
 use crate::stdio::{InitializeResult, Notification};
 use sse::SseDecoder;
 
@@ -349,6 +349,10 @@ struct RemoteInner {
     legacy: Option<LegacyState>,
     operation: tokio::sync::Mutex<()>,
     closed: AtomicBool,
+    /// What the legacy SSE reader has learned about its stream, including why it
+    /// stopped. Empty on a streamable-HTTP connection, which reads every response
+    /// inline and has no reader to outlive a request.
+    reader_state: Arc<ReaderState>,
 }
 
 struct LegacyState {

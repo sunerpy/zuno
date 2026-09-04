@@ -688,20 +688,17 @@ fn a_raw_string_and_a_quote_character_do_not_derail_the_lexer() {
 /// Crates that emit a `message = …` tracing field today, keyed by the path under
 /// `crates/`, with why each is known.
 ///
-/// This is an allowlist, not an approval. Every entry is a place where a payload is
-/// rendered where an event's own text belongs.
+/// This is an allowlist, not an approval. Every entry occupies the bare `message` slot;
+/// the remaining ones carry only Zuno-authored text.
+///
+/// `zuno-mcp` is deliberately absent. It held three entries — `src/stdio.rs` (a raw MCP
+/// server stderr line, the measured leak), `src/oauth/discovery.rs`, and
+/// `src/remote/exchange.rs` — until each emitter renamed its field to one the redaction
+/// predicate classifies (`stderr`, `reason`, `stream_output`). With no entry, the scan
+/// below is live for that crate: a `message` field reintroduced anywhere under
+/// `crates/zuno-mcp/src` fails `no_crate_emits_an_unexpected_message_field`, and
+/// `zuno_mcp_is_not_allowlisted_for_message_fields` keeps the entry from coming back.
 const KNOWN_MESSAGE_FIELD_EMITTERS: &[(&str, &str)] = &[
-    (
-        "zuno-mcp/src/stdio.rs",
-        "a raw MCP server stderr line, verbatim and truncated; recorded as an integrator \
-         ledger seam because the fix is to stop naming the payload `message`, which is a \
-         change in zuno-mcp",
-    ),
-    (
-        "zuno-mcp/src/oauth/discovery.rs",
-        "an OAuth metadata error description, not a stream; still occupies the bare \
-         message slot next to the event's own literal",
-    ),
     (
         "zuno-cli/src/cmd/product_agent.rs",
         "`%message` carries one of two Zuno-authored recovery sentences plus a job id, so \
@@ -711,11 +708,6 @@ const KNOWN_MESSAGE_FIELD_EMITTERS: &[(&str, &str)] = &[
         "zuno-cli/src/cmd/child_turn.rs",
         "`%message` carries one of two Zuno-authored recovery sentences plus a job id, so \
          nothing external reaches the sink; the bare rendering is still misleading",
-    ),
-    (
-        "zuno-mcp/src/remote/exchange.rs",
-        "`%message` carries `ExchangeError`'s own Display, a Zuno-authored failure class, \
-         not peer content",
     ),
 ];
 
@@ -810,9 +802,11 @@ fn message_fields_in(code: &Code) -> Vec<usize> {
 /// That gap cannot be closed here. Redacting `message` would replace every log line in the
 /// plaintext file, on `--print-logs` stderr, and in the `message` column of `logs.sqlite`
 /// with the placeholder — a confidentiality gain paid for with the whole log. So this is a
-/// tripwire instead: the two emitters that exist today are named, with the reason each is
+/// tripwire instead: the emitters that exist today are named, with the reason each is
 /// known, and a *new* one fails here. The fix for a reported emitter is always in the
-/// emitter, not in this crate.
+/// emitter, not in this crate — which is how the `zuno-mcp` entries left this list: the
+/// MCP stderr drain that was measured leaking a peer's `Traceback: API_KEY=sk-live-abc123`
+/// now records the line as `stderr`, a name the predicate redacts.
 ///
 /// The assertion is one-directional on purpose. It fails when an unlisted emitter appears,
 /// and it does *not* fail when a listed one is fixed, because a listed emitter is expected
@@ -906,10 +900,13 @@ fn no_crate_emits_an_unexpected_message_field() {
 /// The `message` detector has to see the spellings that record the field and ignore the
 /// ones that do not, or the tripwire above is decoration.
 ///
-/// The first two cases are the measured emitters, transcribed from
-/// `crates/zuno-mcp/src/stdio.rs`: the first rendered an MCP server's stderr line as
+/// The first two cases are the measured emitters as they stood in
+/// `crates/zuno-mcp/src/stdio.rs` before the field was renamed to `stderr`: the first
+/// rendered an MCP server's stderr line as
 /// `DEBUG …: MCP server stderr server=probe-mcp Traceback: API_KEY=sk-…` through the
-/// shipped `redact::text_layer`.
+/// shipped `redact::text_layer`. They stay here verbatim because they are exactly what a
+/// reintroduction would look like, and `zuno-mcp` is no longer allowlisted, so the
+/// detector seeing them is what makes the live scan fail on it.
 #[test]
 fn the_message_detector_sees_a_field_and_not_a_local() {
     for records in [
@@ -947,4 +944,27 @@ fn the_message_detector_sees_a_field_and_not_a_local() {
             message_fields_in(&normalize(benign))
         );
     }
+}
+
+/// The MCP stderr drain was the live confidentiality leak behind this whole tripwire:
+/// an MCP server writing `Traceback: API_KEY=sk-live-abc123` to stderr reached the
+/// plaintext log, `--print-logs` stderr, and the `message` column of `logs.sqlite`
+/// verbatim, because the drain named the line `message`. The emitter was fixed by
+/// renaming the field, and the fix is only as durable as the scan being live for that
+/// crate. An allowlist entry is how the scan is silenced, so this pins that `zuno-mcp`
+/// has none: reintroducing the field *and* the entry in one change is the only way past
+/// `no_crate_emits_an_unexpected_message_field`, and this test fails on the entry.
+#[test]
+fn zuno_mcp_is_not_allowlisted_for_message_fields() {
+    let listed = KNOWN_MESSAGE_FIELD_EMITTERS
+        .iter()
+        .map(|(file, _)| *file)
+        .filter(|file| file.starts_with("zuno-mcp/"))
+        .collect::<Vec<_>>();
+    assert!(
+        listed.is_empty(),
+        "zuno-mcp is allowlisted for a `message` field again: {listed:?}. Its emitters were \
+         renamed so the redaction predicate can classify them (`stderr`, `reason`, \
+         `stream_output`); a new `message` field there must be renamed, not listed."
+    );
 }

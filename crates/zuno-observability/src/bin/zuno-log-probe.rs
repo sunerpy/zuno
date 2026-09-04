@@ -125,6 +125,41 @@ fn main() -> ExitCode {
         "probe emitted plural payload fields"
     );
 
+    // The field shape of zuno-mcp's stderr drain (`crates/zuno-mcp/src/stdio.rs`,
+    // `spawn_stderr_reader`) -- field names, level, and event text -- at the DEBUG level
+    // it really uses: one ordinary line and one line truncated at the drain's byte
+    // bound. The `bytes` and `limit` values below are the probe's own, not the drain's:
+    // production truncates at `MAX_STDERR_LINE_BYTES` (8 KiB), and
+    // `tests/stdout_purity.rs` pins these two numbers as the readable diagnostics that
+    // must survive next to the redacted payload. The value is a peer-controlled
+    // process's stderr, so it arrives under `stderr`, a field name the redaction
+    // predicate classifies as a payload. Recorded as `message` — the field name
+    // `tracing` gives an event's own text and the one name the predicate deliberately
+    // leaves readable — the same line was measured rendering as
+    // `DEBUG …: MCP server stderr server=probe-mcp Traceback: API_KEY=sk-live-abc123`
+    // in every sink, with no `name=` prefix; `tests/stdout_purity.rs` pins that this
+    // shape comes out as `stderr="[redacted]"` instead.
+    {
+        let server = "probe-mcp";
+        let line = "Traceback: API_KEY=sk-live-abc123\n";
+        tracing::debug!(
+            marker = "probe-mcp-stderr",
+            %server,
+            stderr = line.trim_end_matches(['\r', '\n']),
+            "MCP server stderr"
+        );
+        let truncated_line = "Traceback: API_KEY=sk-live-truncated-def456";
+        tracing::debug!(
+            marker = "probe-mcp-stderr",
+            %server,
+            bytes = 65_536_usize,
+            limit = 65_536_usize,
+            truncated = true,
+            stderr = %truncated_line,
+            "MCP server stderr line exceeded its bound and was truncated"
+        );
+    }
+
     {
         let request_span = span::provider_request("anthropic", "claude-sonnet-4-5", 1, true);
         let _request_entered = request_span.enter();

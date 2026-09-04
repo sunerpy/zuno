@@ -30,6 +30,7 @@ struct FakeServer {
     templates: Vec<ResourceTemplate>,
     prompts: Vec<PromptDefinition>,
     read: Option<ResourceContents>,
+    call_content: Option<Vec<Value>>,
     supports_resources: bool,
     calls: AtomicUsize,
     last_call: std::sync::Mutex<Option<(String, Map<String, Value>)>>,
@@ -44,6 +45,7 @@ impl FakeServer {
             templates: Vec::new(),
             prompts: Vec::new(),
             read: None,
+            call_content: None,
             supports_resources: false,
             calls: AtomicUsize::new(0),
             last_call: std::sync::Mutex::new(None),
@@ -65,6 +67,13 @@ impl FakeServer {
     fn with_read(mut self, contents: ResourceContents) -> Self {
         self.supports_resources = true;
         self.read = Some(contents);
+        self
+    }
+
+    /// Content blocks a `tools/call` answers with, for the rendering rules that only
+    /// a server's own payload can reach.
+    fn with_call_content(mut self, content: Vec<Value>) -> Self {
+        self.call_content = Some(content);
         self
     }
 
@@ -103,8 +112,11 @@ impl ConnectedServer for FakeServer {
     ) -> Result<zuno_mcp::ToolCallResult, McpError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.last_call.lock().expect("record call") = Some((tool.to_owned(), arguments));
+        let content = self.call_content.clone().unwrap_or_else(|| {
+            vec![json!({ "type": "text", "text": format!("{}:{tool}", self.name) })]
+        });
         Ok(zuno_mcp::ToolCallResult {
-            content: vec![json!({ "type": "text", "text": format!("{}:{tool}", self.name) })],
+            content,
             structured_content: None,
             is_error: false,
             extra: Map::new(),
@@ -707,6 +719,126 @@ async fn catalog_read_resource_attaches_a_supported_blob_and_omits_the_rest() {
         output
             .output
             .contains("[MCP resource content without text or blob: mcp://empty]")
+    );
+}
+
+/// An `image` block is untrusted server output on the same footing as a resource
+/// blob, so it obeys the same allow-list and the same ceiling. It used to obey
+/// neither, which let a server hand the provider request an arbitrary MIME string and
+/// an unbounded payload.
+#[tokio::test]
+async fn catalog_tool_call_image_block_obeys_the_attachment_allow_list_and_bound() {
+    let oversized = "A".repeat(4 * (10 * 1024 * 1024 / 3 + 32));
+    let catalog = Catalog::new(["media"]);
+    connect(
+        &catalog,
+        FakeServer::new("media", &["shoot"]).with_call_content(vec![
+            json!({ "type": "image", "mimeType": "image/png", "data": "aGk=" }),
+            json!({ "type": "image", "mimeType": "image/tiff", "data": "aGk=" }),
+            json!({ "type": "image", "mimeType": "image/png", "data": oversized }),
+        ]),
+    );
+
+    let tools = catalog.tools();
+    let shoot = tools
+        .iter()
+        .find(|tool| tool.id() == "media_shoot")
+        .expect("media_shoot is exposed");
+    let output = shoot
+        .execute(json!({ "query": "anything" }), context())
+        .await
+        .expect("call succeeds");
+
+    assert_eq!(
+        output.attachments.len(),
+        1,
+        "only the supported, in-bound PNG attaches: {:?}",
+        output.attachments
+    );
+    assert_eq!(output.attachments[0].mime, "image/png");
+    assert_eq!(output.attachments[0].url, "data:image/png;base64,aGk=");
+    assert!(
+        output.output.contains(
+            "[MCP image content omitted: (image/tiff, 2 B) is not a supported attachment type]"
+        ),
+        "an unrenderable mime is described rather than attached: {}",
+        output.output
+    );
+    assert!(
+        output.output.contains("exceeds 10 MB]"),
+        "an oversized image is described rather than attached: {}",
+        output.output
+    );
+}
+
+/// The reviewer's input: the attachment that is stored is the payload the ceiling
+/// measured, on both content shapes.
+///
+/// `base64_size` skips ASCII whitespace, so `24 MiB of "\n"` + `aGk=` measures 2
+/// decoded bytes and is admitted. Storing the raw payload put a 25,165,850-byte URL
+/// into the provider request against a 10,485,760-byte ceiling, with the peer choosing
+/// the multiplier by how much padding it sent and no refusal text emitted. Both the
+/// `image` block and the resource blob are checked here because they are separate call
+/// sites of the same decision.
+#[tokio::test]
+async fn catalog_admits_only_the_attachment_bytes_the_ceiling_measured() {
+    let mut padded = "\n".repeat(24 * 1024 * 1024);
+    padded.push_str("aGk=");
+    let catalog = Catalog::new(["media"]);
+    connect(
+        &catalog,
+        FakeServer::new("media", &["shoot"])
+            .with_call_content(vec![
+                json!({ "type": "image", "mimeType": "image/png", "data": padded.clone() }),
+            ])
+            .with_read(ResourceContents {
+                contents: vec![
+                    json!({ "uri": "mcp://png", "mimeType": "image/png", "blob": padded }),
+                ],
+            }),
+    );
+
+    let tools = catalog.tools();
+    let shoot = tools
+        .iter()
+        .find(|tool| tool.id() == "media_shoot")
+        .expect("media_shoot is exposed");
+    let output = shoot
+        .execute(json!({ "query": "anything" }), context())
+        .await
+        .expect("call succeeds");
+    assert_eq!(
+        output.attachments.len(),
+        1,
+        "2 decoded bytes are under the ceiling, so the image is admitted: {}",
+        output.output
+    );
+    assert_eq!(
+        output.attachments[0].url,
+        "data:image/png;base64,aGk=",
+        "the admitted image block kept {} bytes the ceiling never measured",
+        output.attachments[0].url.len()
+    );
+
+    let read = tools
+        .iter()
+        .find(|tool| tool.id() == READ_RESOURCE_TOOL)
+        .expect("read_mcp_resource is exposed");
+    let output = read
+        .execute(json!({ "server": "media", "uri": "mcp://png" }), context())
+        .await
+        .expect("read succeeds");
+    assert_eq!(
+        output.attachments.len(),
+        1,
+        "the resource blob is admitted on the same measurement: {}",
+        output.output
+    );
+    assert_eq!(
+        output.attachments[0].url,
+        "data:image/png;base64,aGk=",
+        "the admitted resource blob kept {} bytes the ceiling never measured",
+        output.attachments[0].url.len()
     );
 }
 

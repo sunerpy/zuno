@@ -741,10 +741,12 @@ mod tests {
             // `debug!(message = %raw_stream, "…")` puts a payload exactly where the event
             // text belongs and it reads as prose. Measured through `text_layer`, an MCP
             // server's stderr line rendered as
-            // `DEBUG …: MCP server stderr server=probe-mcp Traceback: API_KEY=sk-…`.
-            // `no_crate_emits_an_unexpected_message_field` in
-            // `tests/every_text_sink_redacts.rs` is the tripwire; closing it belongs in the
-            // emitter, which is outside this crate.
+            // `DEBUG …: MCP server stderr server=probe-mcp Traceback: API_KEY=sk-…` until
+            // that emitter (`zuno-mcp/src/stdio.rs`) renamed the field to `stderr`, which
+            // this predicate redacts; `tests/stdout_purity.rs` drives that exact shape
+            // through every sink. `no_crate_emits_an_unexpected_message_field` in
+            // `tests/every_text_sink_redacts.rs` is the tripwire for the next one, and
+            // closing a reported emitter always belongs in the emitter, not here.
             "message",
         ] {
             assert!(!sensitive_field(benign), "{benign} must not be redacted");

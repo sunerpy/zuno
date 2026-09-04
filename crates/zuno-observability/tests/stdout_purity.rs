@@ -27,6 +27,10 @@ const SENSITIVE_LITERALS: &[&str] = &[
     "never-print-this-cookie-jar",
     "never-print-this-argv",
     "never-print-this-outputs",
+    // An MCP server's stderr line, with the field names zuno-mcp's stderr drain emits:
+    // the ordinary line and the line truncated at the drain's byte bound.
+    "sk-live-abc123",
+    "sk-live-truncated-def456",
 ];
 
 /// The placeholder is operator-visible output, so its spelling is pinned here once.
@@ -45,6 +49,7 @@ const LOG_ONLY_MARKERS: &[&str] = &[
     "probe-subprocess",
     "probe-credential",
     "probe-plural",
+    "probe-mcp-stderr",
     "TOOL_LIFECYCLE",
     "toolu_probe",
 ];
@@ -552,6 +557,116 @@ fn a_subprocess_stream_and_a_credential_named_field_are_redacted_in_every_sink()
         );
     }
     assert_eq!(record.fields["prompt_tokens"].as_u64(), Some(1024));
+}
+
+/// An MCP server's stderr is a peer-controlled stream, and the drain in
+/// `crates/zuno-mcp/src/stdio.rs` logs every line of it at DEBUG. The probe emits the
+/// drain's two events with the drain's field names, level, and event text — the `bytes`
+/// and `limit` values are the probe's own, production truncates at 8 KiB — and a
+/// secret-looking line as the payload. Redaction is by field name, so this is the pin
+/// for the name the drain chose: `stderr`, which every sink renders as `[redacted]`
+/// while `server`, `bytes`, `limit`, and `truncated` stay readable.
+///
+/// Measured before the drain renamed its field: recorded as `message`, the same line
+/// rendered as `DEBUG …: MCP server stderr server=probe-mcp Traceback: API_KEY=sk-live-abc123`
+/// in the plaintext file, on `--print-logs` stderr, and in the `message` column of
+/// `logs.sqlite`, reading as the event's own sentence.
+#[test]
+fn an_mcp_server_stderr_line_is_redacted_in_every_sink() {
+    let run = run_probe(&[
+        ("ZUNO_LOG_LEVEL", "DEBUG"),
+        ("ZUNO_PROBE_PLAINTEXT", "1"),
+        ("ZUNO_PRINT_LOGS", "1"),
+    ]);
+    assert!(run.output.status.success(), "{}", run.stderr());
+    assert_stdout_is_pure(&run);
+
+    // Absence has to mean redaction rather than a missing emission: both drain events
+    // reach all three sinks.
+    let stored = run
+        .records
+        .iter()
+        .filter(|record| record.contains("probe-mcp-stderr"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stored.len(),
+        2,
+        "the store missed an MCP stderr emission:\n{}",
+        run.records_text()
+    );
+    for sink_name in ["MCP server stderr", "exceeded its bound and was truncated"] {
+        assert!(
+            run.plaintext.contains(sink_name),
+            "the plaintext file missed {sink_name:?}:\n{}",
+            run.plaintext
+        );
+        assert!(
+            run.stderr().contains(sink_name),
+            "stderr missed {sink_name:?}:\n{}",
+            run.stderr()
+        );
+    }
+
+    assert_no_sensitive_literal("the plaintext file", &run.plaintext);
+    assert_no_sensitive_literal("stderr", &run.stderr());
+    assert_no_sensitive_literal("the decoded SQLite records", &run.records_text());
+    assert_database_has_no_sensitive_literal(&run.database_path);
+
+    for sink in [&run.plaintext, &run.stderr()] {
+        let lines = sink
+            .lines()
+            .filter(|line| line.contains("probe-mcp-stderr"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines.len(),
+            2,
+            "a text sink missed one of the two drain events:\n{sink}"
+        );
+        for line in &lines {
+            assert!(
+                line.contains(&redacted("stderr")),
+                "a text sink dropped the peer's line instead of rendering {}:\n{line}",
+                redacted("stderr")
+            );
+            assert!(
+                line.contains("server=probe-mcp"),
+                "the server name of the same event was redacted too:\n{line}"
+            );
+        }
+        let truncated = lines
+            .iter()
+            .find(|line| line.contains("was truncated"))
+            .expect("the truncated drain event is one of the two lines");
+        for readable in ["bytes=65536", "limit=65536", "truncated=true"] {
+            assert!(
+                truncated.contains(readable),
+                "a bounded diagnostic of the same event was redacted too ({readable}):\n{truncated}"
+            );
+        }
+    }
+
+    for record in stored {
+        assert_eq!(
+            record.level, "DEBUG",
+            "the drain logs at DEBUG; the probe must too, or the level filter is not the \
+             one an operator runs with: {record:?}"
+        );
+        assert_eq!(
+            record.fields["stderr"].as_str(),
+            Some(zuno_observability::REDACTED),
+            "the peer's line was stored unredacted or under another name: {}",
+            record.fields
+        );
+        assert_eq!(record.fields["server"].as_str(), Some("probe-mcp"));
+        assert!(
+            record
+                .message
+                .as_deref()
+                .is_some_and(|text| text.starts_with("MCP server stderr")),
+            "the event text must be the drain's own literal: {:?}",
+            record.message
+        );
+    }
 }
 
 /// The file bytes, not the decoded rows: a value could survive in a WAL page or in a

@@ -4,6 +4,7 @@ use serde::Deserialize;
 use zuno_auth::{McpAuthStore, Secret, Tokens};
 use zuno_config::schema::mcp::McpRemote;
 
+use crate::body::{MAX_OAUTH_BODY_BYTES, read_bounded_json};
 use crate::remote::{RemoteConnect, RemoteError};
 
 use super::PendingAuthorization;
@@ -148,10 +149,9 @@ async fn decode_token_response(
             &format!("token endpoint returned HTTP {}", response.status()),
         ));
     }
-    response
-        .json()
+    read_bounded_json(response, MAX_OAUTH_BODY_BYTES)
         .await
-        .map_err(|error| oauth_error(server, error))
+        .map_err(|error| oauth_error(server, error.describe("token response")))
 }
 
 fn store_tokens(

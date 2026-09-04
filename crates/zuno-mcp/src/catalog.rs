@@ -1377,7 +1377,12 @@ fn render_content(content: &[Value]) -> Rendered {
                     block.get("mimeType").and_then(Value::as_str),
                     block.get("data").and_then(Value::as_str),
                 ) {
-                    attachments.push(Attachment::new(mime, format!("data:{mime};base64,{data}")));
+                    match attachment_refusal(mime, data) {
+                        // Said out loud rather than dropped, so the model learns the
+                        // image exists and why it is not attached.
+                        Some(reason) => text.push(format!("[MCP image content omitted: {reason}]")),
+                        None => attachments.push(Attachment::new(mime, data_url(mime, data))),
+                    }
                 }
             }
             Some("resource") => {
@@ -1441,43 +1446,117 @@ fn push_resource_item(
         ));
         return;
     };
-    let size = base64_size(blob);
-    if !ATTACHABLE_MIMES.contains(&mime) {
-        text.push(format!(
-            "[Binary MCP resource omitted: {uri} ({mime}, {}) is not a supported attachment type]",
-            format_bytes(size)
-        ));
-        return;
-    }
-    if size > MAX_RESOURCE_BLOB_BYTES {
-        text.push(format!(
-            "[Binary MCP resource omitted: {uri} ({mime}, {}) exceeds {}]",
-            format_bytes(size),
-            format_bytes(MAX_RESOURCE_BLOB_BYTES)
-        ));
+    if let Some(reason) = attachment_refusal(mime, blob) {
+        text.push(format!("[Binary MCP resource omitted: {uri} {reason}]"));
         return;
     }
     text.push(format!("[Binary MCP resource attached: {uri} ({mime})]"));
-    let mut attachment = Attachment::new(mime, format!("data:{mime};base64,{blob}"));
+    let mut attachment = Attachment::new(mime, data_url(mime, blob));
     attachment.filename = Some(uri.to_owned());
     attachments.push(attachment);
 }
 
-/// Decoded byte length of a base64 payload, without decoding it.
+/// Why a base64 payload may not become an attachment, when it may not.
 ///
-/// Oracle: `base64Size` (`session/tools.ts:578-582`). Measuring the encoded
-/// form is the point — a 10 MB limit must be enforced before allocating the
-/// decoded copy.
-fn base64_size(value: &str) -> usize {
-    let trimmed: String = value.chars().filter(|c| !c.is_whitespace()).collect();
-    let padding = if trimmed.ends_with("==") {
-        2
-    } else if trimmed.ends_with('=') {
-        1
+/// Both content shapes a server can send an attachment as — an `image` block and a
+/// resource blob — ask here, so neither arm can accept a type or a size the other
+/// refuses. Untrusted server output is the only source of both.
+///
+/// The size is derived from the encoded form without decoding it and without copying
+/// it: a limit enforced after decoding has already allocated what it meant to refuse,
+/// and a limit enforced on a cleaned-up copy of the payload allocates roughly 1.33x
+/// that instead. Both defeat the point, so [`base64_size`] counts in place.
+///
+/// The number decided here is the number that is admitted: whitespace is invisible to
+/// [`base64_size`], so both callers store the payload through [`data_url`], which
+/// drops exactly the bytes the measurement dropped. Measuring one string and keeping a
+/// different one let the untrusted server choose the difference.
+fn attachment_refusal(mime: &str, data: &str) -> Option<String> {
+    let size = base64_size(data);
+    if !ATTACHABLE_MIMES.contains(&mime) {
+        return Some(format!(
+            "({mime}, {}) is not a supported attachment type",
+            format_bytes(size)
+        ));
+    }
+    if size > MAX_RESOURCE_BLOB_BYTES {
+        return Some(format!(
+            "({mime}, {}) exceeds {}",
+            format_bytes(size),
+            format_bytes(MAX_RESOURCE_BLOB_BYTES)
+        ));
+    }
+    None
+}
+
+/// The `data:` URL an admitted attachment is stored as, over the bytes that were measured.
+///
+/// [`attachment_refusal`] decides on the *decoded* length, which [`base64_size`] derives
+/// while skipping ASCII whitespace. Storing the raw payload therefore admitted a string
+/// the ceiling had never seen: an `image` block declaring `image/png` whose `data` is
+/// 24 MiB of `\n` followed by `aGk=` measures 2 decoded bytes, passes both gates, and
+/// used to produce a 25,165,850-byte attachment URL against a
+/// [`MAX_RESOURCE_BLOB_BYTES`] of 10,485,760 — 2.4x the ceiling, with no refusal text
+/// emitted, and the peer choosing the multiplier.
+///
+/// Dropping the whitespace here rather than refusing on the raw length is what makes
+/// the two numbers the same bytes without narrowing what a lawful server may send:
+/// [`MAX_RESOURCE_BLOB_BYTES`] stays a decoded ceiling (a 10 MiB image arrives as
+/// ~13.4 MiB of base64, so refusing on encoded length would refuse legitimate content),
+/// and RFC 2045 line wrapping is a real thing servers emit, so the whitespace carries
+/// no meaning to strip. It costs nothing either: the URL was already one fresh
+/// allocation, and this one is sized to the payload that survives instead of the
+/// padding in front of it.
+fn data_url(mime: &str, data: &str) -> String {
+    const PREFIX: &str = "data:";
+    const INFIX: &str = ";base64,";
+    let padding = data.bytes().filter(u8::is_ascii_whitespace).count();
+    let mut url = String::with_capacity(
+        PREFIX.len() + mime.len() + INFIX.len() + data.len().saturating_sub(padding),
+    );
+    url.push_str(PREFIX);
+    url.push_str(mime);
+    url.push_str(INFIX);
+    if padding == 0 {
+        url.push_str(data);
     } else {
-        0
-    };
-    (trimmed.len() * 3 / 4).saturating_sub(padding)
+        // `split_ascii_whitespace` splits on the same byte set `base64_size` skips, so
+        // the URL holds exactly the bytes that were counted.
+        url.extend(data.split_ascii_whitespace());
+    }
+    url
+}
+
+/// Decoded byte length of a base64 payload, without decoding it and without copying it.
+///
+/// Oracle: `base64Size` (`session/tools.ts:578-582`). Deriving the length from the
+/// encoded form is the point — a 10 MB limit must be enforced before allocating the
+/// decoded copy — and counting in place rather than collecting a whitespace-stripped
+/// `String` is the other half of it: that copy was ~1.33x the decoded size, so
+/// refusing a payload cost more than decoding it would have.
+///
+/// The count is over bytes, not `char`s, so a payload padded with non-ASCII whitespace
+/// measures *larger* here than the previous `char::is_whitespace` filter made it. That
+/// direction is deliberate: this number only ever decides whether to refuse, so
+/// over-counting can refuse a payload that is not valid base64 anyway and can never
+/// admit one past the ceiling.
+fn base64_size(value: &str) -> usize {
+    let mut len = 0usize;
+    let mut trailing_padding = 0usize;
+    for byte in value.bytes() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        len += 1;
+        // Only padding that survives to the end of the payload counts, which is what
+        // `ends_with` expressed on the stripped copy.
+        trailing_padding = if byte == b'=' {
+            trailing_padding + 1
+        } else {
+            0
+        };
+    }
+    (len * 3 / 4).saturating_sub(trailing_padding.min(2))
 }
 
 /// Oracle: `formatBytes` (`session/tools.ts:584-588`) — rounds **up**, so a
@@ -1550,6 +1629,157 @@ fn required_string(tool: &str, args: &Value, key: &str) -> Result<String, ToolEr
             tool: tool.to_owned(),
             source: Box::new(Message(format!("{key} must be a string"))),
         }),
+    }
+}
+
+#[cfg(test)]
+mod attachment_size_tests {
+    //! What the attachment ceiling is measured on, and that the same bytes are stored.
+    //!
+    //! Unit-level because [`base64_size`] is private and the thing worth pinning is
+    //! its arithmetic against the oracle it was ported from. The end-to-end refusals
+    //! live in `tests/catalog.rs`.
+
+    use super::*;
+
+    /// The oracle (`base64Size`, `session/tools.ts:578-582`) computed on a
+    /// whitespace-stripped copy. Kept here to assert the in-place count agrees with
+    /// it on everything a server can legitimately send.
+    fn oracle(value: &str) -> usize {
+        let stripped: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+        let padding = if stripped.ends_with("==") {
+            2
+        } else if stripped.ends_with('=') {
+            1
+        } else {
+            0
+        };
+        (stripped.len() * 3 / 4).saturating_sub(padding)
+    }
+
+    /// Counting in place instead of on a copy may not change the number for any
+    /// payload that is actually base64.
+    #[test]
+    fn counting_in_place_agrees_with_the_oracle_on_real_base64() {
+        for payload in [
+            "",
+            "   ",
+            "aGk=",
+            "aGVsbG8=",
+            "YQ==",
+            "aG\nk=",
+            "aG k =",
+            "\taGVsbG8sIHdvcmxkIQ==\r\n",
+            "aGk=aGk=",
+            "QUJDRA==",
+        ] {
+            assert_eq!(
+                base64_size(payload),
+                oracle(payload),
+                "in-place count disagrees with the oracle on {payload:?}"
+            );
+        }
+    }
+
+    /// Where the two do differ, the in-place count is the larger one.
+    ///
+    /// The copy filtered `char::is_whitespace`, so a payload padded with non-ASCII
+    /// whitespace measured *smaller* there. Counting bytes keeps those bytes, which
+    /// can only push a payload over the ceiling — never under it. `"aGk=\u{a0}"`
+    /// measured 2 bytes before and measures 4 now; it is not valid base64 either way.
+    #[test]
+    fn non_ascii_whitespace_can_only_raise_the_measurement_never_lower_it() {
+        assert_eq!(base64_size("aGk=\u{a0}"), 4);
+        assert_eq!(oracle("aGk=\u{a0}"), 2);
+        for spacing in ["\u{a0}", "\u{2007}", "\u{3000}", "\u{feff}"] {
+            let payload = format!("aGVsbG8={spacing}");
+            assert!(
+                base64_size(&payload) >= oracle(&payload),
+                "{payload:?} measured smaller in place than on a copy"
+            );
+        }
+    }
+
+    /// The ceiling is on the decoded bytes, which is what the doc now says.
+    ///
+    /// A 9 MiB image arrives as 12 MiB of base64. Measuring the ceiling against the
+    /// encoded payload would refuse it, so this pins which of the two numbers
+    /// [`MAX_RESOURCE_BLOB_BYTES`] governs.
+    #[test]
+    fn the_ceiling_is_the_decoded_size_not_the_encoded_payload_length() {
+        let decoded: usize = 9 * 1024 * 1024;
+        let payload = "A".repeat(decoded.div_ceil(3) * 4);
+        assert!(
+            payload.len() > MAX_RESOURCE_BLOB_BYTES,
+            "the point of the test is an encoded form past the ceiling"
+        );
+        assert_eq!(base64_size(&payload), decoded);
+        assert!(
+            attachment_refusal("image/png", &payload).is_none(),
+            "a 9 MiB image may not be refused for the size of its encoding"
+        );
+    }
+
+    /// And one decoded byte past it is refused, by both content shapes.
+    #[test]
+    fn one_decoded_byte_past_the_ceiling_is_refused() {
+        let payload = "A".repeat((MAX_RESOURCE_BLOB_BYTES + 1).div_ceil(3) * 4);
+        assert!(base64_size(&payload) > MAX_RESOURCE_BLOB_BYTES);
+        let reason = attachment_refusal("image/png", &payload).expect("past the ceiling");
+        assert!(reason.contains("exceeds 10 MB"), "{reason}");
+        let reason = attachment_refusal("application/x-tar", &payload)
+            .expect("an unsupported type is refused whatever its size");
+        assert!(
+            reason.contains("is not a supported attachment type"),
+            "{reason}"
+        );
+    }
+
+    /// The reviewer's input: the admitted attachment may not be a string the ceiling
+    /// never measured.
+    ///
+    /// 24 MiB of `\n` in front of `aGk=` measures 2 decoded bytes. Storing the raw
+    /// payload turned that into a 25,165,850-byte attachment URL against a 10,485,760
+    /// ceiling — the peer choosing the multiplier by how much padding it sent.
+    #[test]
+    fn the_payload_that_was_measured_is_the_payload_that_is_stored() {
+        let mut payload = "\n".repeat(24 * 1024 * 1024);
+        payload.push_str("aGk=");
+        assert_eq!(
+            base64_size(&payload),
+            2,
+            "the measured size is 2 decoded bytes"
+        );
+        assert!(
+            attachment_refusal("image/png", &payload).is_none(),
+            "2 decoded bytes are under the ceiling, so this payload is admitted"
+        );
+        assert_eq!(
+            data_url("image/png", &payload),
+            "data:image/png;base64,aGk="
+        );
+    }
+
+    /// And the bytes that survive are the payload itself, unwrapped.
+    ///
+    /// RFC 2045 line wrapping is what a lawful server sends; dropping it may not change
+    /// what the attachment decodes to, and the URL may never be longer than the one
+    /// `format!("data:{mime};base64,{data}")` built.
+    #[test]
+    fn line_wrapped_base64_survives_as_the_same_attachment() {
+        for (payload, expected) in [
+            ("aGVsbG8=", "aGVsbG8="),
+            ("aGVs\r\nbG8=", "aGVsbG8="),
+            ("  aGVs bG8=\n", "aGVsbG8="),
+            ("aGVsbG8=\n\n\n", "aGVsbG8="),
+        ] {
+            let url = data_url("image/png", payload);
+            assert_eq!(url, format!("data:image/png;base64,{expected}"));
+            assert!(
+                url.len() <= format!("data:image/png;base64,{payload}").len(),
+                "{payload:?} produced a longer URL than the raw form"
+            );
+        }
     }
 }
 
