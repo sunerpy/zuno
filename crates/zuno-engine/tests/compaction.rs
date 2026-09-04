@@ -227,7 +227,7 @@ proptest! {
     fn compaction_boundary_never_splits_a_tool_use_and_result_pair(
         tool_turns in prop::collection::vec(any::<bool>(), 1..48),
         tail_turns in 0_u32..12,
-        preserve_recent_tokens in 1_u32..256,
+        preserve_recent_tokens in 0_u32..256,
     ) {
         let entries = valid_transcript(&tool_turns);
         if let Some(boundary) = select_boundary(&entries, tail_turns, preserve_recent_tokens) {
@@ -235,6 +235,10 @@ proptest! {
             let (uses, results) = pair_ids(retained);
             prop_assert_eq!(uses, results);
             prop_assert!(boundary.retained_from >= boundary.initial_context_end);
+            // The marker names the retained tail by message id, so every accepted
+            // boundary has to address an entry that exists.
+            prop_assert!(boundary.raw_retained_from < entries.len());
+            prop_assert!(boundary.retained_from < entries.len());
         }
     }
 }
@@ -269,6 +273,134 @@ fn compaction_boundary_walks_back_when_the_raw_split_lands_on_a_tool_result() {
         "FAILURE_QA transcript=[system,user-old,tool_use(call-read),tool_result(call-read),user-recent,assistant-recent] raw_boundary={} adjusted_boundary={}",
         boundary.raw_retained_from, boundary.retained_from
     );
+}
+
+#[test]
+fn compaction_boundary_keeps_the_newest_entry_when_no_tail_fits() {
+    let entries = vec![
+        entry("system", Role::System, "Initial context", 1),
+        entry("user-old", Role::User, "Inspect the file", 40),
+        entry("assistant-old", Role::Assistant, "Inspected", 40),
+        entry("user-recent", Role::User, "What next?", 40),
+        entry("assistant-recent", Role::Assistant, "Run tests", 40),
+    ];
+
+    let no_tail_turns = select_boundary(&entries, 0, 4_000).expect("old history to summarize");
+    assert_eq!(no_tail_turns.raw_retained_from, 4);
+    assert_eq!(no_tail_turns.retained_from, 4);
+
+    let oversized_newest = select_boundary(&entries, 2, 10).expect("old history to summarize");
+    assert_eq!(oversized_newest.raw_retained_from, 4);
+    assert_eq!(oversized_newest.retained_from, 4);
+}
+
+#[tokio::test]
+async fn compaction_persists_a_marker_when_only_the_newest_entry_fits_the_tail() {
+    let mut connection = seeded();
+    let entries = vec![
+        entry("system", Role::System, "Initial project context", 20),
+        entry("user-000", Role::User, "first request", 4_000),
+        entry("assistant-000", Role::Assistant, "first answer", 4_000),
+        entry("user-001", Role::User, "second request", 4_000),
+        entry("assistant-001", Role::Assistant, "second answer", 4_000),
+    ];
+
+    // `tailTurns = 0` asks for no verbatim turn at all, and a newest entry larger
+    // than the whole tail budget leaves no room for one either. Both must still
+    // produce a marker that names an entry the transcript actually contains.
+    for (attempt, config) in [
+        (
+            "no-tail-turns",
+            CompactionConfig {
+                tail_turns: Some(0),
+                preserve_recent_tokens: Some(8_000),
+                reserved: Some(20_000),
+                ..CompactionConfig::default()
+            },
+        ),
+        (
+            "oversized-newest",
+            CompactionConfig {
+                tail_turns: Some(2),
+                preserve_recent_tokens: Some(10),
+                reserved: Some(20_000),
+                ..CompactionConfig::default()
+            },
+        ),
+    ] {
+        let provider = CassetteProvider::new(vec![vec![
+            Ok(StreamEvent::TextDelta(SUMMARY.to_owned())),
+            Ok(StreamEvent::MessageEnd { stop_reason: None }),
+        ]]);
+        let hooks = RecordingHooks::new(false);
+        let request = CompactionRequest::new(
+            SESSION_ID,
+            attempt,
+            "build",
+            "cassette",
+            "small-cassette-model",
+            entries.clone(),
+            &config,
+            TokenWindow {
+                context: 120_000,
+                max_output: 4_096,
+            },
+            CompactionTrigger::Manual,
+        );
+        let mut state = CompactionState::default();
+        let mut tracker = CacheTracker::new();
+        let mut locked_tools: LockedTools<String> = LockedTools::new();
+        let outcome = {
+            let mut cache = CompactionCache::new(&mut tracker, &mut locked_tools);
+            run_compaction(
+                &mut connection,
+                &provider,
+                &hooks,
+                &mut state,
+                &mut cache,
+                request,
+            )
+            .await
+            .expect("compaction succeeds")
+        };
+        let CompactionOutcome::Compacted(CompactedTranscript {
+            boundary, messages, ..
+        }) = outcome
+        else {
+            panic!("{attempt} should compact");
+        };
+        assert_eq!(
+            boundary.retained_from,
+            entries.len() - 1,
+            "{attempt} retains exactly the newest entry"
+        );
+        // The model-visible consequence, rather than the index the compactor chose for
+        // itself: an in-bounds boundary that still dropped the newest turn, or one that
+        // resent a summarized turn verbatim, would satisfy the assertion above.
+        let rendered = serde_json::to_string(&messages).expect("serialize the transcript");
+        assert!(
+            rendered.contains("second answer"),
+            "{attempt} compacted away the newest entry: {rendered}"
+        );
+        assert!(
+            !rendered.contains("first request"),
+            "{attempt} resent a summarized entry verbatim: {rendered}"
+        );
+
+        let hydrated = MessageStore::new(&connection)
+            .hydrate_session(SESSION_ID)
+            .expect("hydrate compaction records");
+        assert!(
+            hydrated
+                .iter()
+                .flat_map(|message| &message.parts)
+                .any(|part| {
+                    part.kind == PartKind::Compaction
+                        && part.data["tail_start_id"] == entries[entries.len() - 1].id
+                }),
+            "{attempt} marker names the retained tail"
+        );
+    }
 }
 
 #[test]

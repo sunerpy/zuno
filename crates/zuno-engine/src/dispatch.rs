@@ -52,7 +52,7 @@ const CANCELLATION_METADATA_KEY: &str = "cancellation";
 ///
 /// The durable record of one interrupted call: its mode, whether the grace window
 /// expired, the certainty the dispatcher resolved, and the window it allowed.
-const INTERRUPTION_METADATA_KEY: &str = "interruption";
+pub(crate) const INTERRUPTION_METADATA_KEY: &str = "interruption";
 
 /// Whether a settled result says its cancelled outcome needs authoritative inspection.
 ///

@@ -76,6 +76,74 @@ pub const TURN_EVENT_CHANNEL_CAPACITY: usize = 64;
 /// Text used to close an unanswered tool call before its transcript is replayed.
 pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution was interrupted]";
 
+/// Text closing a call whose side effects may have landed unobserved.
+///
+/// Deliberately not [`INTERRUPTED_TOOL_RESULT`], which closes only calls that provably
+/// ran nothing: a row this build checkpointed ([`DISPATCH_TRACKED_FIELD`]) and never
+/// handed over. This text is written whenever the hand-off cannot be ruled out — the row
+/// carries [`DISPATCH_STARTED_FIELD`], or it predates hand-off tracking entirely — so
+/// what the model reads says the outcome is undecided rather than reporting a decided
+/// failure it is free to reissue.
+pub const UNOBSERVED_TOOL_RESULT: &str = "[Tool execution was interrupted] Its final \
+side-effect state is uncertain; inspect authoritative state before retrying.";
+
+/// Durable stamp saying one call was handed to a tool before it could take effect.
+///
+/// Written into the checkpointed tool part immediately before execution, and committed
+/// on its own, so it is a fact about the process that handed the call over rather than
+/// about the process that reads it back. [`repair_missing_tool_outputs`] reads it
+/// together with [`DISPATCH_TRACKED_FIELD`]: an unanswered call carrying this stamp may
+/// have changed authoritative state nobody observed. Without the distinction the repair
+/// has to pick one wrong answer for every unanswered row — either every budget stop and
+/// step-limit stop manufactures an inspection obligation no side effect earned, or a
+/// call killed mid-`git push` is reported to the model as a decided failure it may
+/// reissue.
+///
+/// A sibling field rather than a fifth `state.status`: `status` is projected by the TUI,
+/// by ACP replay, and by the export redactor, and a call that is durably pending should
+/// keep reading as pending on every one of them. Nothing but the repair reads this.
+const DISPATCH_STARTED_FIELD: &str = "dispatchedAtMs";
+
+/// Durable marker saying the writing build records tool-call hand-off at all.
+///
+/// [`DISPATCH_STARTED_FIELD`] alone cannot answer the repair's question, because a row
+/// written before that stamp existed carries no stamp for two different reasons. The
+/// released 0.6.6 build persisted exactly `{"status","input","raw"}` for a call it then
+/// handed to the executor — measured, not assumed: see
+/// `RELEASED_PENDING_TOOL_ROW` in `tests/loop.rs`, which is that build's own output.
+/// Reading that absence as "never dispatched" would issue the false "provably changed
+/// nothing" verdict on the first recovery after an upgrade, for exactly the population
+/// that needs the opposite, so this marker makes the absence self-describing instead:
+///
+/// * marker and no stamp — this build checkpointed the call and never handed it over;
+/// * marker and stamp — this build handed it over and lost the answer;
+/// * neither — written before hand-off was recorded, so the hand-off is unprovable and
+///   [`repair_missing_tool_outputs`] fails closed and demands an inspection.
+///
+/// Additive rather than a migration on purpose. A backfill would have to guess the same
+/// unknowable fact for every existing row while rewriting durable user state; the
+/// tri-state reads every already-stored row without touching it, and the unknown class
+/// is closed to new rows the moment this build writes one. Deliberately *not* written by
+/// `StreamProjector::persist_pending_tool`, the other pending-tool writer in this crate:
+/// that projection never records a hand-off, so claiming tracking there would turn its
+/// rows into false "provably changed nothing" verdicts.
+const DISPATCH_TRACKED_FIELD: &str = "dispatchTracked";
+
+/// Identity recorded for an inspection obligation whose own row cannot name the call.
+///
+/// `MessageStore::pending_uncertain_tool_calls` requires both `callID` and `tool`, and
+/// reports a row missing either as a decode failure for the whole session's queue. A
+/// provider-supplied id is not guaranteed to be usable: a gateway translator that does
+/// `call.id.clone().unwrap_or_default()` yields an empty string, and nothing between the
+/// stream and the durable row rejects it. Recording the obligation under a placeholder
+/// beats the alternatives — dropping it leaves every client surface claiming the outcome
+/// is uncertain while nothing is ever obliged to inspect anything, and refusing the turn
+/// turns a provider's sloppy id into a hard failure. The part id in the same row is the
+/// handle `reconcile_uncertain_tool_calls` takes, so the obligation stays actionable
+/// without it. Angle brackets keep this outside the identifier syntax providers require
+/// of a real tool name, so it cannot collide with one.
+const UNNAMED_TOOL_CALL_IDENTITY: &str = "<unnamed>";
+
 /// Stable user-facing marker for a turn the user explicitly stopped.
 ///
 /// The engine persists this exact text on the interrupted assistant checkpoint,
@@ -1808,6 +1876,7 @@ async fn run_turn_in_span(
     let mut prompt_cache: Option<PromptCache<ToolDefinition>> = None;
     let mut prompt_traces = PromptTraceSet::default();
     let mut unresolved_tool_failures = BTreeMap::<String, ToolFailureRecovery>::new();
+    let mut resolved_attachments = ResolvedAttachments::new();
     let mut consecutive_invalid_tool_calls = 0_u8;
     let mut step_limit_finalization_attempted = false;
     let mut turn_usage = empty_turn_usage();
@@ -1843,7 +1912,12 @@ async fn run_turn_in_span(
         if inject_live_inputs(&mut context, &request, &requested)?.count > 0 {
             continue;
         }
-        resolve_history_attachments(&mut history, context.attachments.as_deref())?;
+        resolve_history_attachments(
+            &mut history,
+            context.attachments.as_ref(),
+            &mut resolved_attachments,
+        )
+        .await?;
         let agent = context
             .resolver
             .resolve_agent(&requested.agent)
@@ -2834,6 +2908,31 @@ async fn run_turn_in_span(
                     prepared.push((call_index, call, display_name, ui_intent, dispatch));
                 }
 
+                // The hand-off becomes durable before any of this group can take
+                // effect. A process that dies inside `execute` leaves a row the next
+                // turn has to classify, and the only evidence that survives the death
+                // is what was committed before it: `repair_missing_tool_outputs` reads
+                // this stamp to separate a call that may have changed authoritative
+                // state from one that was never handed over. Written for the whole
+                // group in one transaction because the group runs concurrently, so any
+                // member of it may be the call that is in flight.
+                mark_group_dispatched(
+                    context.connection,
+                    &request,
+                    step,
+                    DispatchedGroup {
+                        assistant_id: &assistant_id,
+                        assistant_time_created,
+                        call_positions: &call_positions,
+                        calls: prepared
+                            .iter()
+                            .map(|(call_index, call, display_name, ui_intent, _)| {
+                                (*call_index, call, display_name.as_str(), *ui_intent)
+                            })
+                            .collect(),
+                    },
+                )?;
+
                 let completed = if first_policy == ToolConcurrencyPolicy::Exclusive {
                     let (call_index, call, display_name, ui_intent, dispatch) =
                         prepared.pop().expect("exclusive group contains one call");
@@ -3363,6 +3462,36 @@ fn required_string(record: &MessageRecord, field: &'static str) -> Result<String
         })
 }
 
+/// Close every tool call the session left unanswered, splitting on hand-off evidence.
+///
+/// The repair runs at the head of a turn, which is where the least is known about a
+/// session the previous process abandoned. Two durable fields are the only evidence that
+/// survives that process, and together they separate classes that must not be closed the
+/// same way:
+///
+/// * [`DISPATCH_TRACKED_FIELD`] and no [`DISPATCH_STARTED_FIELD`]: this build
+///   checkpointed the call in model order and never handed it to a tool — a budget stop,
+///   a step-limit stop, an urgent input that skipped the rest of the group, or a death
+///   before the hand-off was committed. It provably changed nothing, so it is closed as
+///   the interruption it was, with the same `metadata.synthetic` shape the checkpoint
+///   uses for calls it closes itself. This is the only class that gets a decided answer.
+/// * [`DISPATCH_STARTED_FIELD`] present: the previous process handed the call over and
+///   never recorded what came back.
+/// * Neither field: the row predates hand-off tracking, so *nothing* about it
+///   distinguishes a lost `git push` from a call that never started. The released build
+///   wrote exactly this shape for calls it dispatched, so the absence is read as unknown
+///   and closed as unknown.
+///
+/// The last two are one undecided outcome in the [`UncertainCause::Interrupted`] sense,
+/// closed with the dispatcher's own verdict shape *and* with the durable `state.outcome`
+/// / `state.uncertain` obligation the dispatcher writes, which is what
+/// `MessageStore::pending_uncertain_tool_calls` reads and what pauses the goal before
+/// automatic execution may continue. Claiming the verdict on the wire without creating
+/// the obligation would tell every client surface that authoritative state must be
+/// inspected while leaving the reconciliation queue empty, which is the one combination
+/// that is worse than either honest answer — so a row whose own `callID` or `tool` is
+/// unusable still carries its obligation, under [`UNNAMED_TOOL_CALL_IDENTITY`], and is
+/// reported through `tracing::error!` as well.
 fn repair_missing_tool_outputs(
     connection: &Connection,
     session_id: &str,
@@ -3370,21 +3499,102 @@ fn repair_missing_tool_outputs(
     let store = MessageStore::new(connection);
     let mut repaired = 0;
     for mut part in store.unfinished_tool_parts_for_session(session_id)? {
+        let part_id = part.id.clone();
+        let call_id = non_empty_field(&part, "callID");
+        let tool = non_empty_field(&part, "tool");
         let Some(state) = part.data.get_mut("state").and_then(Value::as_object_mut) else {
             continue;
         };
+        // Presence alone, not the stamped instant: the value is evidence for a human
+        // reading the row, and a clock that went backwards must not turn an observed
+        // hand-off into an unobserved one.
+        let stamped = state.contains_key(DISPATCH_STARTED_FIELD);
+        // Only a row this build checkpointed can prove a *negative*. Without the tracking
+        // marker the row was written before hand-off was recorded at all, and the
+        // released build wrote that same shape for calls it went on to dispatch, so the
+        // missing stamp is unknown rather than "never started". Unknown fails closed.
+        let hand_off_provable = state.contains_key(DISPATCH_TRACKED_FIELD);
+        let may_have_run = stamped || !hand_off_provable;
         state.insert("status".to_owned(), Value::String("error".to_owned()));
-        state.insert(
-            "error".to_owned(),
-            Value::String(INTERRUPTED_TOOL_RESULT.to_owned()),
-        );
-        let mut metadata = Map::new();
-        metadata.insert("interrupted".to_owned(), Value::Bool(true));
-        state.insert("metadata".to_owned(), Value::Object(metadata));
+        let observed_at = now_millis();
+        if may_have_run {
+            state.insert(
+                "error".to_owned(),
+                Value::String(UNOBSERVED_TOOL_RESULT.to_owned()),
+            );
+            // `Forced` is the mode a repair can honestly claim: nothing was observed,
+            // and no tool acknowledged anything. `graceMs` is zero because a repair
+            // allowed no settling window at all, which is the fact the dispatcher's
+            // own record of that field reports. The certainty is recorded beside the
+            // mode rather than left to be re-derived from it.
+            let interruption = json!({
+                "mode": ToolInterruption::Forced.as_str(),
+                "forced": ToolInterruption::Forced.is_forced(),
+                "uncertain": true,
+                "graceMs": 0,
+            });
+            let mut metadata = state
+                .get_mut("metadata")
+                .and_then(Value::as_object_mut)
+                .map(std::mem::take)
+                .unwrap_or_default();
+            metadata.insert(
+                crate::dispatch::INTERRUPTION_METADATA_KEY.to_owned(),
+                interruption,
+            );
+            state.insert("metadata".to_owned(), Value::Object(metadata));
+            if tool.is_none() || call_id.is_none() {
+                // The obligation is still recorded below. This says the evidence in it is
+                // degraded, which is a defect in whatever wrote the row — not a reason to
+                // let a possibly-landed side effect go uninspected.
+                tracing::error!(
+                    part = %part_id,
+                    named_tool = tool.is_some(),
+                    named_call = call_id.is_some(),
+                    "an unanswered dispatched tool call cannot name itself, so its \
+                     inspection obligation is recorded under a placeholder identity"
+                );
+            }
+            state.insert("outcome".to_owned(), Value::String("uncertain".to_owned()));
+            state.insert(
+                "uncertain".to_owned(),
+                json!({
+                    "tool": tool.unwrap_or_else(|| UNNAMED_TOOL_CALL_IDENTITY.to_owned()),
+                    "callID": call_id
+                        .unwrap_or_else(|| UNNAMED_TOOL_CALL_IDENTITY.to_owned()),
+                    // Nothing observed which paths moved: the process that could
+                    // have said so is gone. An empty list is the real answer.
+                    "appliedPaths": [],
+                    "cause": UncertainCause::Interrupted.as_str(),
+                    "observedAtMs": observed_at,
+                }),
+            );
+        } else {
+            state.insert(
+                "error".to_owned(),
+                Value::String(INTERRUPTED_TOOL_RESULT.to_owned()),
+            );
+            let mut metadata = state
+                .get_mut("metadata")
+                .and_then(Value::as_object_mut)
+                .map(std::mem::take)
+                .unwrap_or_default();
+            metadata.insert("synthetic".to_owned(), Value::Bool(true));
+            state.insert("metadata".to_owned(), Value::Object(metadata));
+        }
         store.put_part(&part)?;
         repaired += 1;
     }
     Ok(repaired)
+}
+
+/// One top-level part field, as an owned string, only when it can identify anything.
+fn non_empty_field(part: &PartRecord, field: &str) -> Option<String> {
+    part.data
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 /// Hydrate exactly the suffix that [`retained_history`] permits a request to carry.
@@ -3811,9 +4021,87 @@ fn append_user_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRecord>
     }
 }
 
-fn resolve_history_attachments(
+/// Provider-bound image bytes already resolved during this turn.
+///
+/// Keyed by content identity alone because this path always resolves under
+/// [`zuno_attachment::ImageRequestPolicy::default()`]: a second policy would need a
+/// second key, not a shared entry.
+#[derive(Debug, Default)]
+struct ResolvedAttachments {
+    entries: BTreeMap<zuno_attachment::AttachmentId, zuno_attachment::ResolvedImage>,
+    retained_bytes: usize,
+}
+
+/// How much base64 the turn memo may hold before it stops growing.
+///
+/// The memo exists to stop one object being re-read on every step, not to hold a
+/// session's whole image history: an admitted object may be up to
+/// `ImageAdmissionPolicy::max_encoded_bytes`, which is ~6.7 MiB once base64-encoded, and
+/// the retained history may carry many of them beside the per-step history copy and the
+/// assembled request.
+///
+/// Exceeding it is not an error and never rejects an image. Resolution continues; only
+/// the memoization stops, so a history above the ceiling degrades to the per-step
+/// resolution it had before the memo existed. That direction matters: a ceiling that
+/// turned an image-heavy session into a failed turn would be a worse defect than the
+/// memory it saves.
+const RESOLVED_ATTACHMENT_MEMO_BYTES: usize = 32 * 1024 * 1024;
+
+impl ResolvedAttachments {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, id: &zuno_attachment::AttachmentId) -> Option<&zuno_attachment::ResolvedImage> {
+        self.entries.get(id)
+    }
+
+    /// Memoize one resolution while the turn's retained payload stays under the cap.
+    ///
+    /// Admission is all-or-nothing per entry and never evicts: an entry already handed
+    /// out has been cloned into a request, so dropping it would cost a re-read without
+    /// releasing anything the request still holds.
+    fn remember(
+        &mut self,
+        id: zuno_attachment::AttachmentId,
+        image: &zuno_attachment::ResolvedImage,
+    ) {
+        let size = image.data.len().saturating_add(image.media_type.len());
+        let Some(retained) = self
+            .retained_bytes
+            .checked_add(size)
+            .filter(|retained| *retained <= RESOLVED_ATTACHMENT_MEMO_BYTES)
+        else {
+            return;
+        };
+        if self.entries.insert(id, image.clone()).is_none() {
+            self.retained_bytes = retained;
+        }
+    }
+}
+
+/// Fill every retained image part with the bytes the provider request carries.
+///
+/// Resolution is filesystem work — a whole-object read, a SHA-256 verification, a
+/// base64 encode, and on a derived-cache miss a resize plus an fsynced write — so it
+/// runs on the blocking pool rather than inline. `zuno serve` and `zuno acp` drive
+/// their turns on a current-thread runtime, where doing it inline freezes every
+/// in-flight stream, permission answer, and interrupt for the whole span. `resolved`
+/// is the turn's memo: history is re-hydrated on every step, and one object is worth
+/// reading once per turn, not once per step. The memo stops growing at
+/// [`RESOLVED_ATTACHMENT_MEMO_BYTES`] and then simply resolves again, so an
+/// image-heavy history costs time rather than unbounded memory.
+///
+/// # Errors
+///
+/// [`TurnError::Attachment`] when no store is configured for a history that carries a
+/// durable reference, when the reference itself is unreadable, when the store refuses
+/// the object, or when the blocking pool drops the call during shutdown. A panic inside
+/// the offloaded closure is re-raised rather than turned into an error.
+async fn resolve_history_attachments(
     history: &mut [MessageWithParts],
-    store: Option<&zuno_attachment::AttachmentStore>,
+    store: Option<&Arc<zuno_attachment::AttachmentStore>>,
+    resolved: &mut ResolvedAttachments,
 ) -> Result<(), TurnError> {
     for message in history {
         for part in &mut message.parts {
@@ -3832,15 +4120,29 @@ fn resolve_history_attachments(
             .map_err(|_| {
                 TurnError::Attachment(zuno_attachment::AttachmentError::InvalidReference)
             })?;
-            let resolved = store
-                .resolve(&reference, zuno_attachment::ImageRequestPolicy::default())
-                .map_err(TurnError::Attachment)?;
-            part.data.insert(
-                "mime".to_owned(),
-                Value::String(resolved.media_type.clone()),
-            );
+            let image = match resolved.get(&reference.id) {
+                Some(image) => image.clone(),
+                None => {
+                    let store = Arc::clone(store);
+                    let requested = reference.clone();
+                    let joined = tokio::task::spawn_blocking(move || {
+                        store.resolve(&requested, zuno_attachment::ImageRequestPolicy::default())
+                    })
+                    .await;
+                    let image = match joined {
+                        Ok(resolved) => resolved.map_err(TurnError::Attachment)?,
+                        Err(error) => {
+                            return Err(attachment_offload_failure(error, &reference.id));
+                        }
+                    };
+                    resolved.remember(reference.id.clone(), &image);
+                    image
+                }
+            };
             part.data
-                .insert("data".to_owned(), Value::String(resolved.data));
+                .insert("mime".to_owned(), Value::String(image.media_type));
+            part.data
+                .insert("data".to_owned(), Value::String(image.data));
             if !part.data.contains_key("filename")
                 && let Some(filename) = reference.filename
             {
@@ -3850,6 +4152,41 @@ fn resolve_history_attachments(
         }
     }
     Ok(())
+}
+
+/// The one typed reading of a lost attachment offload, with panics kept as panics.
+///
+/// A [`tokio::task::JoinError`] has two causes and they are not the same kind of event,
+/// so collapsing both into an error would launder one of them:
+///
+/// * A panic inside the closure is a decoder or store bug, not a verdict about this
+///   turn. Image decoding and Lanczos3 resizing are the panic surfaces here, and they
+///   are reachable from an object a peer supplied. It is re-raised on the thread that
+///   was going to observe it before the offload existed, because reporting it as a
+///   permanent attachment failure would hide a Zuno bug behind "the store is
+///   unavailable" and latch the goal as failed for it.
+/// * Otherwise the blocking pool dropped the call, which happens while the runtime
+///   shuts down. That has one honest reading — this process can no longer reach the
+///   store — and it is a decision made from [`tokio::task::JoinError::is_panic`], never
+///   from a rendered message. The `JoinError` is logged rather than discarded because
+///   it is the only remaining evidence of which cause was taken.
+///
+/// # Panics
+///
+/// Re-raises the offloaded closure's panic payload unchanged.
+fn attachment_offload_failure(
+    error: tokio::task::JoinError,
+    attachment: &impl std::fmt::Display,
+) -> TurnError {
+    if error.is_panic() {
+        std::panic::resume_unwind(error.into_panic());
+    }
+    tracing::error!(
+        %error,
+        %attachment,
+        "resolving a durable attachment lost its blocking task"
+    );
+    TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable)
 }
 
 fn request_file_block(data: &Map<String, Value>) -> Option<RequestContentBlock> {
@@ -5106,7 +5443,7 @@ fn checkpoint_assistant(
                         display_name: &display_name,
                         ui_intent: tool_ui_intent(locked_tools, &call.name),
                     },
-                    tool_failure,
+                    tool_failure.map_or(ToolPartStage::Pending, ToolPartStage::Closed),
                 )?;
                 store.put_part_at(&tool, completed)?;
             }
@@ -5195,10 +5532,41 @@ fn provider_reasoning_part(
     .map_err(TurnError::from)
 }
 
+/// How far one checkpointed call had got when its row was written.
+///
+/// The three states are durably distinguishable on purpose, because the repair at the
+/// head of the next turn has to tell them apart without asking a live signal that a
+/// dead process cannot answer.
+#[derive(Debug, Clone, Copy)]
+enum ToolPartStage<'a> {
+    /// Recorded in model order, not yet handed to a tool.
+    Pending,
+    /// Handed to a tool. The row is otherwise identical to [`Self::Pending`]; the
+    /// stamp is the whole difference, so nothing but the repair changes behaviour.
+    Dispatched,
+    /// Closed at checkpoint without ever being dispatched, carrying this text.
+    Closed(&'a str),
+}
+
+/// The durably pending shape both un-dispatched and dispatched rows start from.
+///
+/// Shared so the two stages cannot drift: the hand-off stamp must be the *only*
+/// difference between them, and [`DISPATCH_TRACKED_FIELD`] must be on both or the repair
+/// would read a genuinely un-dispatched row from this build as an unprovable one.
+fn pending_tool_state(call: &ToolCall) -> Value {
+    let mut state = json!({
+        "status": "pending",
+        "input": call.input,
+        "raw": call.raw_input
+    });
+    state[DISPATCH_TRACKED_FIELD] = Value::Bool(true);
+    state
+}
+
 fn checkpoint_tool_part(
     request: &RunTurnRequest,
     identity: ToolPartIdentity<'_>,
-    failure: Option<&str>,
+    stage: ToolPartStage<'_>,
 ) -> Result<PartRecord, TurnError> {
     let ToolPartIdentity {
         step,
@@ -5209,21 +5577,21 @@ fn checkpoint_tool_part(
         display_name,
         ui_intent,
     } = identity;
-    let mut state = if let Some(error) = failure {
-        json!({
+    let mut state = match stage {
+        ToolPartStage::Closed(error) => json!({
             "status": "error",
             "input": call.input,
             "raw": call.raw_input,
             "error": error,
             "metadata": { "synthetic": true },
             "time": { "end": now_millis() }
-        })
-    } else {
-        json!({
-            "status": "pending",
-            "input": call.input,
-            "raw": call.raw_input
-        })
+        }),
+        ToolPartStage::Pending => pending_tool_state(call),
+        ToolPartStage::Dispatched => {
+            let mut dispatched = pending_tool_state(call);
+            dispatched[DISPATCH_STARTED_FIELD] = Value::from(now_millis());
+            dispatched
+        }
     };
     if let Some(error) = &call.input_error {
         state["inputError"] = Value::String(error.clone());
@@ -5259,6 +5627,65 @@ struct ToolPartIdentity<'a> {
     call: &'a ToolCall,
     display_name: &'a str,
     ui_intent: ToolUiIntent,
+}
+
+/// One prepared concurrency group, addressed the way its rows are addressed.
+///
+/// `call_positions` is indexed by dispatch index and yields the call's place in the
+/// step's stream, which is what [`positional_part_id`] hashes; using the dispatch index
+/// instead would stamp a different row than the one the result will close.
+struct DispatchedGroup<'a> {
+    assistant_id: &'a str,
+    assistant_time_created: i64,
+    call_positions: &'a [usize],
+    calls: Vec<(usize, &'a ToolCall, &'a str, ToolUiIntent)>,
+}
+
+/// Record that every call in a prepared group was handed to a tool.
+///
+/// Committed before the first execution starts, which is the entire point: the stamp is
+/// only evidence if it outlives the process that wrote it. The row is otherwise
+/// byte-identical to the one the checkpoint wrote — same id, same creation time, same
+/// input — so no projection sees a new state and no reader outside
+/// [`repair_missing_tool_outputs`] changes behaviour.
+///
+/// Also stamps calls whose dispatcher decided the result during preparation (an unknown
+/// tool, a denied permission, malformed arguments). Those never reached a tool, so the
+/// stamp overstates what happened in the window between this commit and the result
+/// write; that direction is deliberate, because the alternative reading of an
+/// unanswered row is that a side effect went unobserved.
+///
+/// # Errors
+///
+/// [`TurnError::Database`] when the transaction, either write, or the commit fails. The
+/// turn stops rather than dispatching work it could not admit to having dispatched.
+fn mark_group_dispatched(
+    connection: &Connection,
+    request: &RunTurnRequest,
+    step: u32,
+    group: DispatchedGroup<'_>,
+) -> Result<(), TurnError> {
+    let transaction = open::immediate_transaction(connection)?;
+    let store = MessageStore::new(&transaction);
+    let dispatched_at = now_millis();
+    for (call_index, call, display_name, ui_intent) in group.calls {
+        let part = checkpoint_tool_part(
+            request,
+            ToolPartIdentity {
+                step,
+                position: group.call_positions[call_index],
+                message_time_created: group.assistant_time_created,
+                message_id: group.assistant_id,
+                call,
+                display_name,
+                ui_intent,
+            },
+            ToolPartStage::Dispatched,
+        )?;
+        store.put_part_at(&part, dispatched_at)?;
+    }
+    transaction.commit().map_err(open::map_error)?;
+    Ok(())
 }
 
 fn persist_tool_result(
@@ -5376,4 +5803,66 @@ const PART_KIND_TOOL: &str = "tool";
 /// be right only for a step that reasons once.
 fn positional_part_id(turn_id: &str, step: u32, position: usize, kind: &str) -> String {
     format!("prt_{turn_id}_{step:04}_{position:04}_{kind}")
+}
+
+#[cfg(test)]
+mod attachment_offload_tests {
+    use super::{TurnError, TurnRecovery, attachment_offload_failure};
+
+    /// The reviewer's input: a `JoinError` whose task panicked.
+    ///
+    /// The oracle is deliberately not the function's own classification. It is the
+    /// original panic payload arriving at the caller, which can only happen if the
+    /// panic was re-raised rather than turned into a value. Before the split, the same
+    /// input returned `TurnError::Attachment(StoreUnavailable)` and this test could not
+    /// have observed the payload at all.
+    #[tokio::test]
+    async fn a_panicking_attachment_resolution_is_re_raised_not_classified() {
+        let panicked = tokio::task::spawn_blocking(|| panic!("image decoder overflowed"))
+            .await
+            .expect_err("the offloaded closure panicked");
+        assert!(panicked.is_panic(), "the fixture must be the panic cause");
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            attachment_offload_failure(panicked, &"sha256:probe")
+        }))
+        .expect_err("a store bug must reach the caller instead of becoming a TurnError");
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .expect("the original panic payload survives the offload");
+        assert_eq!(
+            message, "image decoder overflowed",
+            "the payload must be the closure's, not a re-panic of our own"
+        );
+    }
+
+    /// The other reviewer input: a `JoinError` from a task the pool dropped.
+    ///
+    /// This is the only cause that may become a typed error, and it must not be
+    /// retryable: retrying a shutting-down runtime cannot succeed.
+    #[tokio::test]
+    async fn a_cancelled_attachment_resolution_fails_the_turn_without_retrying() {
+        let handle = tokio::task::spawn(std::future::pending::<()>());
+        handle.abort();
+        let cancelled = handle.await.expect_err("the aborted task cannot complete");
+        assert!(
+            cancelled.is_cancelled(),
+            "the fixture must be the cancellation cause"
+        );
+
+        let error = attachment_offload_failure(cancelled, &"sha256:probe");
+        assert!(
+            matches!(
+                error,
+                TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable)
+            ),
+            "a dropped offload means this process cannot reach the store: {error:?}"
+        );
+        assert!(
+            matches!(error.recovery(), TurnRecovery::Fail),
+            "{error:?} must not be retried against a runtime that is going away"
+        );
+    }
 }
