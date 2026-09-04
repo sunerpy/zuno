@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/sunerpy/zuno/compare/v0.10.0...v0.10.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* batch 3 of the repository audit — read shell commands as a shell does, make every reply and obligation durable, bound every peer-controlled read, and pass natively on Windows ([#107](https://github.com/sunerpy/zuno/issues/107)) ([c6f788d](https://github.com/sunerpy/zuno/commit/c6f788d18c8b58b27612db501cf5507ec79641b1))
+
 ## [0.10.0](https://github.com/sunerpy/zuno/compare/v0.9.1...v0.10.0) (2026-09-04)
 
 
