@@ -45,6 +45,24 @@ pub(crate) fn is_interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
+/// Ask a Yes/No question and return `true` only for an explicit Yes.
+///
+/// Built on [`select`], so it inherits its terminal contract: it fails closed with
+/// `"{message} requires an interactive terminal"` when standard input or standard
+/// error is redirected, and it never reads a default from a pipe. "No" is the first
+/// row, so pressing Enter without moving the cursor declines; Esc and Ctrl-C decline
+/// too. A caller that must proceed without a terminal has to say so through its own
+/// explicit flag rather than through this prompt.
+pub(crate) fn confirm(message: &str) -> Result<bool, String> {
+    const YES: &str = "yes";
+    const NO: &str = "no";
+    let choices = vec![
+        Choice::new(NO, "No").hinted("leave everything untouched"),
+        Choice::new(YES, "Yes").hinted("run it"),
+    ];
+    Ok(select(message, choices)?.as_deref() == Some(YES))
+}
+
 /// Select one value with arrows, paging, and type-to-filter.
 pub(crate) fn select(message: &str, choices: Vec<Choice>) -> Result<Option<String>, String> {
     if choices.is_empty() {

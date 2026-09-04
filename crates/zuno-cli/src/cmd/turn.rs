@@ -85,10 +85,10 @@ use zuno_goal::{
     GoalStatus, GoalStore, GoalTerminalFailure, GoalTurnMode, GoalTurnOutcome, QueuedUserInput,
 };
 use zuno_learning::{
-    CompletedTaskSignals, ExperienceRetriever, ExperienceService, ExtractionRequest,
-    FeedbackService, LearningExtraction, LearningExtractor, LearningScheduleOutcome,
-    LearningScheduler, ManualExperienceRequest, PatternMiner, SkillCandidateService,
-    SkillSourceResolver,
+    CompletedTaskSignals, ExperienceRetriever, ExperienceService, ExtractionPersistence,
+    ExtractionRequest, FeedbackService, LearningExtraction, LearningExtractor,
+    LearningScheduleOutcome, LearningScheduler, ManualExperienceRequest, PatternMiner,
+    SkillCandidateService, SkillSourceResolver,
 };
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
 use zuno_llm::catalog::resolved::ModelEndpoint;
@@ -2062,6 +2062,13 @@ pub(crate) struct TurnHost {
     learning: Option<LearningRuntime>,
     learning_maintenance_cancel: Option<tokio_util::sync::CancellationToken>,
     learning_maintenance_task: Option<tokio::task::JoinHandle<()>>,
+    /// Whether this session has already been told that experience retrieval found
+    /// records it could not fit under `retrieval_max_context_tokens`.
+    ///
+    /// The retriever reports the same reason on every turn while the budget stays
+    /// below the framed floor; one notice per session says it without repeating it
+    /// on every prompt.
+    learning_retrieval_skip_noticed: bool,
 }
 
 struct LearningRuntime {
@@ -2770,6 +2777,40 @@ fn learning_transcript_json(transcript: &TurnTranscript) -> Vec<Value> {
         .collect()
 }
 
+/// One user-visible line per entry an extraction refused instead of stored.
+///
+/// The `warning: ` prefix is what the TUI keys on to put a status detail into the
+/// transcript as a notice rather than into the transient footer.
+fn extraction_refusal_lines(persisted: &ExtractionPersistence) -> Vec<String> {
+    persisted
+        .refusals
+        .iter()
+        .map(|refusal| {
+            format!(
+                "warning: learning extraction refused experience {} ({}): {}",
+                refusal.experience_ordinal, refusal.field, refusal.detail
+            )
+        })
+        .collect()
+}
+
+/// The refused entries in the shape the durable job `result` uses for `refusedItems`.
+fn extraction_refusals_value(persisted: &ExtractionPersistence) -> Value {
+    Value::Array(
+        persisted
+            .refusals
+            .iter()
+            .map(|refusal| {
+                json!({
+                    "experienceOrdinal": refusal.experience_ordinal,
+                    "field": refusal.field,
+                    "detail": refusal.detail,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn experience_value(record: &zuno_db::experience::ExperienceRecord) -> Value {
     let experience = &record.projection;
     json!({
@@ -3109,7 +3150,17 @@ async fn run_recovered_learning_job(
                             zuno_db::message::now_millis(),
                         )
                         .map_err(to_string)
-                        .and_then(|_| {
+                        .and_then(|persisted| {
+                            // A recovered job has no turn to report into; the refusal
+                            // lines go to the log here and stay durable in the job
+                            // row's `refusedItems`.
+                            for refusal in extraction_refusal_lines(&persisted) {
+                                tracing::warn!(
+                                    job_id = job.id,
+                                    refusal = %refusal,
+                                    "recovered learning extraction refused one entry"
+                                );
+                            }
                             run_due_learning_maintenance(
                                 &scheduler,
                                 &patterns,
@@ -4255,6 +4306,7 @@ impl TurnHost {
                 learning,
                 learning_maintenance_cancel: None,
                 learning_maintenance_task: None,
+                learning_retrieval_skip_noticed: false,
             };
             let goal = if host.agent == "plan" {
                 host.goal_store
@@ -5687,6 +5739,7 @@ impl TurnHost {
                     "rejectedReason": promotion.rejected_reason,
                 }))
                 .collect::<Vec<_>>(),
+            "refusedItems": extraction_refusals_value(&persisted),
         }))
     }
 
@@ -7513,6 +7566,22 @@ impl TurnHost {
                 .retriever
                 .retrieve(&self.project_id, &query)
                 .map_err(TurnFailure::host)?;
+            if let Some(reason) = &retrieved.skipped_reason
+                && !self.learning_retrieval_skip_noticed
+            {
+                // Matching records exist but none fits the configured budget. Without
+                // this the section is empty and the turn looks like one in a project
+                // that has learned nothing.
+                self.learning_retrieval_skip_noticed = true;
+                events
+                    .publish(TurnEvent::Notice {
+                        severity: NoticeSeverity::Warning,
+                        code: "learning.retrieval_skipped".to_owned(),
+                        detail: reason.clone(),
+                    })
+                    .await
+                    .map_err(TurnFailure::host)?;
+            }
             resolver
                 .append_prompt_section(
                     "learning.experiences",
@@ -7899,21 +7968,41 @@ impl TurnHost {
         let project_id = self.project_id.clone();
         let project_root = self.project_root.clone();
         let changes = self.work_changes.clone();
+        let events = events.clone();
+        let step = *steps;
         let supervised = tokio::spawn(async move {
             match extractor.extract(request).await {
-                Ok(extraction) => {
-                    if let Err(error) = experiences.persist_extraction(
-                        &job_id,
-                        &owner_id,
-                        extraction,
-                        zuno_db::message::now_millis(),
-                    ) {
+                Ok(extraction) => match experiences.persist_extraction(
+                    &job_id,
+                    &owner_id,
+                    extraction,
+                    zuno_db::message::now_millis(),
+                ) {
+                    Err(error) => {
                         tracing::warn!(
                             job_id,
                             error = %error,
                             "learning extraction outcome could not be persisted"
                         );
-                    } else {
+                    }
+                    Ok(persisted) => {
+                        // An extraction that stored two of three entries is a different
+                        // outcome from one that stored three. The reason is durable in
+                        // the job row; this is the line the user sees, on the same path
+                        // the other learning warnings above take.
+                        for detail in extraction_refusal_lines(&persisted) {
+                            tracing::warn!(
+                                job_id,
+                                refusal = %detail,
+                                "learning extraction refused one entry"
+                            );
+                            let _ = events
+                                .publish(TurnEvent::Provider {
+                                    step,
+                                    event: StreamEvent::StatusDetail { detail },
+                                })
+                                .await;
+                        }
                         if let Err(error) = run_due_learning_maintenance(
                             &scheduler,
                             &patterns,
@@ -7931,7 +8020,7 @@ impl TurnHost {
                         }
                         changes.changed();
                     }
-                }
+                },
                 Err(error) => {
                     if let Err(settle_error) = scheduler.fail(
                         &job_id,

@@ -126,7 +126,7 @@ impl NativeProductAgentHost {
                 | JobStatus::Uncertain => continue,
             };
             let settled = self.jobs.settle(&job.id, settlement).map_err(to_string)?;
-            tracing::info!(job_id = %job.id, %status, %message, "reconciled interrupted product-agent job");
+            tracing::info!(job_id = %job.id, %status, reason = %message, "reconciled interrupted product-agent job");
             if let Some(report) = settled.report {
                 self.wake.wake(report).await?;
             }

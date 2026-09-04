@@ -467,7 +467,8 @@ pub enum ProvidersCommand {
     /// Authenticate a provider with one of its implemented login methods.
     Login {
         /// Provider id/name, or an HTTPS URL implementing `/.well-known/zuno`.
-        /// Omit in a terminal to choose interactively.
+        /// Omit in a terminal to choose interactively. A URL login runs a program
+        /// that the remote host names, shown for confirmation before it starts.
         target: Option<String>,
         /// Provider id or display name, as an alternative to the positional target.
         #[arg(short = 'p', long)]
@@ -476,6 +477,12 @@ pub enum ProvidersCommand {
         /// Omit in a terminal to choose when several methods are available.
         #[arg(short = 'm', long)]
         method: Option<String>,
+        /// Run the program named by the URL's `/.well-known/zuno` document without an
+        /// interactive confirmation. The remote host chooses that program and its
+        /// arguments, and it runs with your privileges: pass this only for a host you
+        /// already trust. Without it, a URL login refuses when stdin is not a terminal.
+        #[arg(long, requires = "target")]
+        trust_remote_command: bool,
     },
     Logout {
         provider: Option<String>,

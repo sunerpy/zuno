@@ -245,4 +245,86 @@ mod tests {
         assert_eq!(rules[3].pattern, "/tmp/opencode/*");
         assert_eq!(rules.last().expect("last rule").pattern, "*.env.example");
     }
+
+    /// The first-party pack's `allowed_profiles` and `required_tools` are a hand-kept
+    /// mirror of the native Agent roster and its permission overlays, and nothing else
+    /// binds the two crates. This runs the production rule chain — `default_rules`, the
+    /// native overlay, the read-only profiles' external-directory rules, then the
+    /// factory-default (empty) user and per-Agent layers — and asks the production
+    /// visibility gate the same question the catalog asks at runtime, with `tools`
+    /// `None` because a native Agent declares no explicit tool list.
+    ///
+    /// Two contradictions this catches, both audit findings: a Skill declared for a
+    /// profile whose overlay hides one of its required tools (the Skill can never be
+    /// advertised there, silently), and a Skill declared for a profile that is not a
+    /// native Agent at all. The assertion covers only the factory default: a user rule
+    /// such as `{"goal_get": "allow"}` lands after the overlay and can restore
+    /// visibility, which is why the name says "factory default" rather than "always".
+    #[test]
+    fn every_first_party_skill_is_visible_to_each_declared_profile_under_the_factory_default_config()
+     {
+        use zuno_config::schema::ordered::OrderedMap;
+        use zuno_permission::visibility::is_tool_visible;
+
+        let config = Config::default();
+        let dynamic = DynamicRules {
+            readonly_external: vec![
+                rule("external_directory", "*", PermissionAction::Ask),
+                rule(
+                    "external_directory",
+                    "/tmp/zuno-factory-default/tool-output/*",
+                    PermissionAction::Allow,
+                ),
+            ],
+            truncate_glob: "/tmp/zuno-factory-default/tool-output/*".to_owned(),
+        };
+        // The roster with no user configuration folded over it.
+        let roster = agent::list(&OrderedMap::new(), &[]);
+
+        let mut contradictions = Vec::new();
+        let mut pairs = 0_usize;
+        for skill in zuno_orchestration::SKILLS.iter() {
+            for profile in skill.allowed_profiles {
+                pairs += 1;
+                if agent::builtin::get(profile).is_none() {
+                    contradictions.push(format!(
+                        "`{}` is declared for `{profile}`, which is not a native Agent",
+                        skill.name
+                    ));
+                    continue;
+                }
+                let entry = roster
+                    .iter()
+                    .find(|entry| entry.name == *profile)
+                    .unwrap_or_else(|| panic!("native `{profile}` is missing from the roster"));
+                assert!(
+                    entry.source.is_native(),
+                    "`{profile}` must resolve as native under the factory default"
+                );
+                let rules = resolved_rule_set(entry, &config, &dynamic).rules;
+                if !zuno_catalog::skill::builtin::visible_to(skill.location, profile, None, &rules)
+                {
+                    let hidden = skill
+                        .required_tools
+                        .iter()
+                        .filter(|tool| !is_tool_visible(tool, &rules))
+                        .copied()
+                        .collect::<Vec<_>>();
+                    contradictions.push(format!(
+                        "`{}` is declared for `{profile}`, whose factory-default rules hide its required tool(s) {hidden:?}; the Skill can never be advertised there",
+                        skill.name
+                    ));
+                }
+            }
+        }
+        assert!(
+            pairs >= zuno_orchestration::SKILLS.len(),
+            "every Skill declares at least one profile"
+        );
+        assert!(
+            contradictions.is_empty(),
+            "the first-party pack contradicts the native permission overlays:\n  {}",
+            contradictions.join("\n  ")
+        );
+    }
 }
