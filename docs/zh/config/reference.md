@@ -320,6 +320,7 @@ tools "edit" is false and tools "write" is true, but both are governed by permis
 | `mode` | `read-only`、`workspace-write`、`danger-full-access` | `workspace-write` |
 | `network` | `deny`、`allow` | 受限模式为 `deny`，`danger-full-access` 使用宿主网络 |
 | `onUnavailable` | `deny`、`run-unconfined` | `deny` |
+| `backend` | `auto`、`native` | `auto` |
 | `writableRoots` | 额外的现有可写目录数组 | 空 |
 | `protectedPaths` | 重新施加只读保护的路径数组，每一项在构建沙箱策略时必须已存在且不能是符号链接 | 空 |
 
@@ -363,19 +364,87 @@ bubblewrap 参数的那一刻已存在时才被施加；策略构建之后才消
 
 降级时仍保留 `standard`、`strict` 或 `allow_all` 权限模式、显式拒绝、灾难性命令硬拒绝、
 后台执行、超时与取消链路；但请求的网络拒绝、可写根目录和受保护路径不会由 OS 强制执行。
-只读 Agent 永远不会无沙箱降级。
+只读 Agent 永远不会通过这条降级无沙箱运行；它唯一的原生执行路径是下面显式受信的
+`sandbox.backend: native`。
 
-项目 `zuno.json[c]` 与 `.zuno` 配置只能把 `onUnavailable` 设为 `deny`。只有受信的全局、
-显式配置、环境、CLI 或受管层可以启用 `run-unconfined`，受管策略仍拥有最终否决权：
+`backend` 独立于 `mode` 所授予的权限，单独选择执行后端。`auto`（默认）发现平台的受约束
+后端，无法部署时再应用 `onUnavailable`；`native` 让每一个 Agent 的 Shell——包括契约为
+只读的 Agent——都直接在原生进程后端上运行，完全不探测受约束后端，而已配置的 `standard`、
+`strict` 或 `allow_all` 权限模式原样保留（只有 `danger-full-access` 才隐含 `allow_all`）：
+
+```json
+{
+  "sandbox": {
+    "backend": "native"
+  }
+}
+```
+
+`native` 是对一台没有 OS 沙箱（今天的 macOS 与 Windows）或刻意不用沙箱的主机作出的显式
+声明，既不是降级也不是沙箱隔离：没有任何探测，也没有任何失败在先。请求的权限仍按 Agent
+收窄并被记录——`plan` 记录 `read-only`，`build` 记录已配置的模式——但不会由 OS 强制执行。
+在 `native` 下，只读 Agent 的契约是工具白名单、权限规则与 Shell 风险门禁构成的边界，
+而不是 OS 边界；例如 `plan` 会话可以通过 Shell 新建一个被风险门禁归类为“创建”的文件。`network`、
+`writableRoots` 与 `protectedPaths` 会被接受并记录，但不会被强制执行。每一次这样的解析都会
+在持久化权限记录与 Shell 元数据中写入 `resolutionKind` 为 `trusted_native`，打印一次宿主
+警告，并加入一段持久化的 `runtime.sandbox` 提示词小节（原文如下，按发布内容照录）：
+
+```
+The native Shell backend was selected explicitly (sandbox.backend: native). Shell
+commands are running without OS isolation using the Zuno process user's host
+authority. Requested authority: mode=read-only, network=denied. Effective
+authority: mode=danger-full-access, network=allowed. The requested `read-only`
+authority is recorded but not OS-enforced: its write restrictions, network denial,
+writable-root limits, and protected paths cannot be enforced by an OS sandbox in
+this state. Permission mode `standard`, permission rules, approvals,
+catastrophic-command refusals, timeouts, and cancellation still apply. Do not
+describe shell execution as sandboxed.
+```
+
+`native` 只接受来自受信的全局、显式配置、环境、CLI 或受管层：项目层可以写 `auto`，但写
+`native` 会校验失败；受管策略拥有最终优先级，可以强制改回 `auto`。单次调用的写法是
+`zuno --sandbox-backend native` 与 `ZUNO_SANDBOX_BACKEND=native`。在 Linux 上这个选择同样会
+绕过可用的 bubblewrap，因为它是一项选择而不是平台探测；`zuno debug sandbox` 会报告
+`backendSelection: native`、`resolutionKind: trusted_native`、`nativeExecutionBypass: true`、
+`fallbackEligible: false`，并且对受约束的请求模式保持 `ready: false`，所以 `--check` 依然是
+严格的部署门禁。
+
+项目 `zuno.json[c]` 与 `.zuno` 配置只能把 `onUnavailable` 设为 `deny`、把 `backend` 设为
+`auto`。只有受信的全局、显式配置、环境、CLI 或受管层可以启用 `run-unconfined` 或选择
+`native`，受管策略仍拥有最终否决权：
 
 ```sh
 zuno --sandbox danger-full-access
 zuno --sandbox workspace-write --sandbox-on-unavailable run-unconfined
+zuno --sandbox-backend native
 ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined zuno
+ZUNO_SANDBOX_BACKEND=native zuno
 ```
 
-用 `zuno debug sandbox` 查看请求/实际权限、降级资格、`resolutionKind` 和
-`fallbackReason`。`--check` 仍严格检查请求的约束是否可部署，不会因为允许降级而成功。
+用 `zuno debug sandbox` 查看请求/实际权限、降级资格、`backendSelection`、`resolutionKind`
+和 `fallbackReason`。`--check` 仍严格检查请求的约束是否可部署，不会因为允许降级或选择了
+原生后端而成功。
+
+macOS 与 Windows 目前没有受约束的沙箱后端，默认失败关闭；拒绝信息会点明平台、说明受信降级
+是否适用于本次请求，并列出上述全部补救方式。在这类平台上交互式启动 `zuno` 时，会在终端进入
+raw mode 之前询问一次，且只在以下条件同时成立时才询问：请求在这台主机上无法被约束（只读请求
+也包括在内）、没有任何层设置过 `sandbox.onUnavailable` 或 `sandbox.backend`、标准输入**与**
+标准错误都是终端。回答 yes 时，本进程的解析结果与传入 `--sandbox-backend native` 完全一致
+——同一条覆盖路径、`resolutionKind` 为 `trusted_native`、同样的持久化记录与原生执行警告——
+并对该进程之后的每一次组合都生效，包括之后切换到只读 Agent；回答 no 则以该拒绝信息退出。
+任何层显式选择了 `deny`、`run-unconfined`、`auto` 或 `native` 时按原样生效，不会询问；
+非终端下同样不会询问。`run`、`acp` 与 `serve` 永远不会询问，只打印同样带补救方式的拒绝信息，
+headless 调用仍然需要标志、环境变量或受信配置层。接受询问不是沙箱隔离，而是以 Zuno 进程
+用户的权限原生执行。
+
+这个回答不会被子进程继承，命令行标志与交互式提示在这一点上并不相同。在 Unix 上，解析出的
+覆盖项会由启动时那一次 re-exec 写入真实环境变量，所以工具启动的嵌套 `zuno` 能看到
+`--sandbox-backend native` 与 `--sandbox-on-unavailable run-unconfined`；而提示是在那次
+re-exec 之后回答的，它的答案不会被写入环境。因此在可以触发提示的 macOS 上，即使本进程已经
+原生运行，嵌套的 `zuno run` 仍会再次遇到该拒绝。Windows 没有这一次 re-exec，所以两条路径
+在那里都不会被继承。如果嵌套的 Zuno 进程也需要同样的答案，请在环境里设置
+`ZUNO_SANDBOX_BACKEND=native`（或 `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`），或在受信层
+设置 `sandbox.backend`（或 `sandbox.onUnavailable`）。
 
 来源同样约束本机命令，而且项目层的声明是被拒绝，而不是仅仅告警。项目 `zuno.json[c]` 或
 `.zuno` 层声明了 `shell`、本地 `mcp.*.command`、`lsp.*.command`、`formatter.*.command`，

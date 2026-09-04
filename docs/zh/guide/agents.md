@@ -62,6 +62,8 @@ zuno tui --agent orchestrator
 zuno run --agent plan "audit the retry policy"
 ```
 
+这项保证只有在受约束后端真正运行的地方才由 OS 强制执行。在受信的 `sandbox.backend: native` 选择之下——那是只读 Agent 在 macOS 与 Windows 上唯一的原生路径——同样的 `read-only` 请求会被记录但不由 OS 强制执行，此时“只读”是一道由工具白名单、权限规则与 Shell 风险门禁构成的角色边界，而不是 OS 边界。
+
 ## 只读是角色边界，不只是沙箱模式
 
 `explorer` 的只读来自角色，而不只是沙箱模式。它的默认工具面是 `read`、`glob`、`grep`、只读的 `lsp`、`skill`，以及在只读角色始终获得的只读文件系统策略下的 `shell` 与 `bg`；编辑、委派、`job` 和网络调研都被拒绝。因此 `du`、`stat`、`file` 可以用来取证，而任何会写入的操作都在提示词之下被拒绝，而不是靠提示词劝阻。
@@ -74,7 +76,7 @@ zuno run --agent plan "audit the retry policy"
 
 终端应用中的 `/plan` 会切换协作模式，而这项限制是在提示词之下由一层默认拒绝的能力覆盖层强制执行的：允许仓库检查、只读 LSP 与搜索、外部调研、提问、Skill、后台检查以及带类型的 Goal/Plan/Todo 操作，而文件修改、委派、`job` 与 `execute` 被拒绝。`shell` 在该角色获得的只读沙箱下仍然可用，因此命令可以取证，但不能改动工作树。
 
-回到 Work 模式要求已存在一个持久 plan，确认信息会指出它的标题、revision 和已完成步骤数。模型可以建议开始工作，但不能替你选择。一次确认过的选择会作为会话 Agent 落盘，因此续跑会恢复该模式。
+回到 Work 模式要求已存在一个持久 plan，确认信息会指出它的标题、revision 和已完成步骤数。模型可以建议开始工作，但不能替你选择。一次确认过的选择会作为会话 Agent 落盘，因此 `--continue`、`--session`、`/session` 选择器以及 ACP 的 `session/load` 都会恢复该模式，连同该会话上次使用的模型与推理强度。
 
 ## 检查一个 Agent 实际解析成什么
 

@@ -378,6 +378,48 @@ fn danger_full_access_effectively_disables_hitl_prompts() {
     assert_eq!(confined.effective_permission_mode(), PermissionMode::Strict);
 }
 
+/// `sandbox.backend: native` is a backend choice, not an authority choice: the
+/// authored permission mode survives it exactly, unlike `danger-full-access`.
+#[test]
+fn native_backend_keeps_the_authored_permission_mode() {
+    use crate::schema::sandbox::SandboxBackendSelection;
+
+    let native = parse(
+        r#"{
+            "permission": {"mode": "strict"},
+            "sandbox": {"backend": "native"}
+        }"#,
+    )
+    .expect("trusted native backend configuration parses");
+
+    assert_eq!(native.sandbox_backend(), SandboxBackendSelection::Native);
+    assert_eq!(
+        native.effective_permission_mode(),
+        PermissionMode::Strict,
+        "selecting the native backend never widens the permission mode"
+    );
+    assert!(native.strict_authorization());
+
+    let standard = parse(r#"{"sandbox": {"backend": "native"}}"#)
+        .expect("native backend without a permission section parses");
+    assert_eq!(
+        standard.effective_permission_mode(),
+        PermissionMode::Standard
+    );
+
+    let auto = parse(r#"{"sandbox": {"backend": "auto"}}"#).expect("auto parses");
+    assert_eq!(auto.sandbox_backend(), SandboxBackendSelection::Auto);
+    assert_eq!(
+        Config::default().sandbox_backend(),
+        SandboxBackendSelection::Auto,
+        "absence discovers the confined backend"
+    );
+
+    let error = parse(r#"{"sandbox": {"backend": "none"}}"#)
+        .expect_err("an unknown backend spelling must fail");
+    assert_eq!(issue_path(&error), "sandbox.backend");
+}
+
 #[test]
 fn compaction_threshold_percent_is_typed_and_bounded() {
     let config = parse(r#"{"compaction":{"auto":true,"threshold_percent":80}}"#)

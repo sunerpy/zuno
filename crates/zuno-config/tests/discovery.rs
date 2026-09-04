@@ -10,7 +10,9 @@ use zuno_config::schema::ordered::OrderedMap;
 use zuno_config::schema::permission::{
     PermissionAction, PermissionConfig, PermissionMode, PermissionObject, PermissionRule,
 };
-use zuno_config::schema::sandbox::{SandboxMode, SandboxNetworkMode, SandboxUnavailableAction};
+use zuno_config::schema::sandbox::{
+    SandboxBackendSelection, SandboxMode, SandboxNetworkMode, SandboxUnavailableAction,
+};
 use zuno_error::ConfigError;
 use zuno_paths::Env;
 
@@ -342,6 +344,109 @@ fn invalid_unavailable_override_names_the_exact_configuration_path() {
 
     assert_eq!(path, Path::new("ZUNO_SANDBOX_ON_UNAVAILABLE"));
     assert_eq!(issues[0].key_path, ["sandbox", "onUnavailable"]);
+}
+
+/// The native backend is a trusted host declaration: a checkout cannot select it,
+/// but it may say `auto`, and the refusal names the key and the layers that can.
+#[test]
+fn project_layer_cannot_select_native_backend_but_may_say_auto() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".git")).expect("worktree marker");
+    let path = project.join(".zuno/zuno.json");
+    write(&path, r#"{"sandbox":{"backend":"native"}}"#);
+
+    let error = discover_with(&fixture_options(root, &project, std::iter::empty()))
+        .expect_err("a project file must not select the native backend");
+    let ConfigError::Invalid {
+        path: actual,
+        issues,
+    } = error
+    else {
+        panic!("expected project sandbox validation failure");
+    };
+    assert_eq!(actual, path);
+    assert_eq!(issues[0].key_path, ["sandbox", "backend"]);
+    assert!(issues[0].detail.contains("trusted"), "{}", issues[0].detail);
+    assert!(
+        issues[0].detail.contains("native Shell backend"),
+        "{}",
+        issues[0].detail
+    );
+
+    write(
+        &root.join("xdg-config/zuno/zuno.json"),
+        r#"{"sandbox":{"backend":"native"}}"#,
+    );
+    write(&path, r#"{"sandbox":{"backend":"auto"}}"#);
+    let narrowed = discover_with(&fixture_options(root, &project, std::iter::empty()))
+        .expect("a project may narrow a trusted native selection back to auto");
+    assert_eq!(narrowed.sandbox_backend(), SandboxBackendSelection::Auto);
+
+    fs::remove_file(&path).expect("remove project layer");
+    let trusted = discover_with(&fixture_options(root, &project, std::iter::empty()))
+        .expect("a trusted global layer selects the native backend");
+    assert_eq!(trusted.sandbox_backend(), SandboxBackendSelection::Native);
+}
+
+/// `ZUNO_SANDBOX_BACKEND` is the trusted environment spelling the CLI flag and the
+/// interactive answer both take; managed policy still has the final word.
+#[test]
+fn trusted_backend_env_override_is_typed_and_managed_policy_can_force_auto() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("project");
+    let env_only = discover_with(&fixture_options(
+        temp.path(),
+        &project,
+        [("ZUNO_SANDBOX_BACKEND".to_owned(), "native".to_owned())],
+    ))
+    .expect("trusted environment override resolves");
+    assert_eq!(env_only.sandbox_backend(), SandboxBackendSelection::Native);
+    assert_eq!(
+        env_only.effective_permission_mode(),
+        PermissionMode::Standard,
+        "the native backend keeps the permission mode"
+    );
+
+    let managed = temp.path().join("managed");
+    write(
+        &managed.join("zuno.json"),
+        r#"{"sandbox":{"backend":"auto"}}"#,
+    );
+    let options = fixture_options(
+        temp.path(),
+        &project,
+        [
+            ("ZUNO_SANDBOX_BACKEND".to_owned(), "native".to_owned()),
+            (
+                "ZUNO_TEST_MANAGED_CONFIG_DIR".to_owned(),
+                managed.to_string_lossy().into_owned(),
+            ),
+        ],
+    );
+
+    let config = discover_with(&options).expect("managed sandbox policy resolves");
+    assert_eq!(config.sandbox_backend(), SandboxBackendSelection::Auto);
+}
+
+#[test]
+fn invalid_backend_override_names_the_exact_configuration_path() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("project");
+    let error = discover_with(&fixture_options(
+        temp.path(),
+        &project,
+        [("ZUNO_SANDBOX_BACKEND".to_owned(), "none".to_owned())],
+    ))
+    .expect_err("unknown backend selection must fail");
+    let ConfigError::Invalid { path, issues } = error else {
+        panic!("expected typed backend-selection validation failure");
+    };
+
+    assert_eq!(path, Path::new("ZUNO_SANDBOX_BACKEND"));
+    assert_eq!(issues[0].key_path, ["sandbox", "backend"]);
+    assert_eq!(issues[0].detail, "expected auto or native");
 }
 
 #[test]

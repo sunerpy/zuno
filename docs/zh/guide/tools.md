@@ -47,7 +47,9 @@ Notes 从不暴露宿主路径。每个作用域最多 100 个文档，单文档
 `plan_update action=create` 创建首个 Plan 或替换新目标；`patch` 只修改指定 id，
 `append` 追加由宿主生成 id 的步骤，`push` 打开聚焦子 Plan，`pop` 不重传整份 Plan
 而只恢复精确父 Plan。所有已有 Plan 修改都必须带当前 `expected_revision`；
-`completed` 和 `superseded` 都是终态。
+`completed` 和 `superseded` 都是终态。`plan_update`、`notes`、`history` 的 `action`
+是必填枚举：线上 schema 列出每个操作以及它需要的字段，没有指明操作的调用在到达工具之前
+就会被拒绝。
 
 成功交付前，durable reconciliation driver 会检查 Plan、Todo、Job、Goal、工具结果与
 验证记录。普通会话在持有未对账的持久工作时最多执行两次对账续跑，仍不一致则进入

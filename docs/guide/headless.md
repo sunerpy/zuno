@@ -26,6 +26,10 @@ be resumed in the terminal application and the reverse.
 zuno run --session ses_1a2b3c --agent plan "what would a safe migration look like?"
 ```
 
+With `--continue` or `--session`, the run resumes on the Agent, model, and reasoning
+level the session last ran with unless one of the flags below names another; the
+precedence table is in [Sessions and turns](/guide/sessions#continuing-a-session).
+
 Forking a session is not part of this binary. A script that explores an alternative it
 does not want mixed into the session a human is reading starts a fresh one instead: omit
 both `--continue` and `--session`, and pass `--title` so the run is findable afterwards.
@@ -48,6 +52,13 @@ fail before HTTP I/O and list what is available.
 
 Prefer `--variant max` or `--variant xhigh` when exact effort matters; `--thinking` is
 deliberately an automatic convenience.
+
+On a resumed session each of these flags outranks the value saved on the session, and a
+flag left unset falls back to the saved value before configuration. `--agent` naming a
+different Agent than the saved one re-routes the model through configuration; add
+`--model` to keep the session's model. A saved Agent or model that no longer exists is
+reported as a status note (`status_detail` in `--format json`) and the run continues on
+the next fallback instead of failing.
 
 ## Output format
 
@@ -110,13 +121,20 @@ zuno run --sandbox danger-full-access "run in a deliberately unconfined containe
 zuno run --sandbox workspace-write \
   --sandbox-on-unavailable run-unconfined \
   "prefer confinement, but allow eligible unavailable fallback"
+zuno run --agent plan --sandbox-backend native \
+  "run natively on a host without an OS sandbox, permission mode kept"
 ```
 
 An agent contract may still narrow this. A read-only agent receives `read-only` even when
 the invocation asked for something wider, and read-only Agents never use unavailable
-fallback. `danger-full-access` always selects the native backend. `run-unconfined`
-preserves the configured permission mode and hard denials, but requested filesystem and
-network restrictions are not OS-enforced during fallback.
+fallback. `danger-full-access` always selects the native backend and makes the effective
+permission mode `allow_all`. `run-unconfined` preserves the configured permission mode and
+hard denials, but requested filesystem and network restrictions are not OS-enforced during
+fallback. `--sandbox-backend native` (or `ZUNO_SANDBOX_BACKEND=native`, or
+`sandbox.backend: native` in a trusted layer) selects the native backend for every Agent
+of the invocation, read-only ones included, with the permission mode kept; headless runs
+never prompt, so on macOS and Windows this flag, the variable, or a trusted layer is how a
+read-only Agent gets Shell at all.
 
 Verify deployability before depending on it in CI, and let the exit status gate the job:
 

@@ -26,6 +26,16 @@ refusals, while recording that requested filesystem/network restrictions are not
 OS-enforced. Explicit `danger-full-access` skips confinement discovery and also
 sets effective permission mode to `allow_all`.
 
+A trusted layer may instead select the backend outright with `sandbox.backend`:
+`auto` (the default) discovers the confined backend as above, and `native` runs
+every Agent's Shell, read-only Agents included, on the native process backend
+without probing anything, while the configured permission mode is kept. That is a
+host declaration rather than a fallback, and it is not confinement: the requested
+authority is recorded (`resolutionKind: trusted_native`) but not OS-enforced, so a
+read-only Agent's contract becomes a tool, permission and risk-gate boundary. A
+project layer cannot select it; `zuno --sandbox-backend native` and
+`ZUNO_SANDBOX_BACKEND=native` select it for one invocation.
+
 On supported Linux hosts, Zuno locates a fixed, root-owned system `bwrap` at
 `/usr/bin/bwrap` or `/bin/bwrap`, probes the required namespaces, compiles the
 effective Agent policy, and passes only an opaque `PreparedCommand` to the
@@ -79,9 +89,30 @@ default exists.
 
 Confined macOS and Windows modes currently return a typed unsupported-platform
 error. They do not register Shell under the default `deny`; trusted
-`run-unconfined` may allow a write-capable Agent to proceed natively, while
-explicit `danger-full-access` remains available independently. See the
-[Shell sandbox roadmap](design/shell-sandbox-roadmap.md).
+`run-unconfined` may allow a write-capable Agent to proceed natively, a trusted
+`sandbox.backend: native` runs every Agent natively with the permission mode
+kept, and explicit `danger-full-access` remains available independently. The
+refusal you read names the platform, says whether the fallback would apply to
+your request, and lists the remedies: `zuno --sandbox-backend native`,
+`ZUNO_SANDBOX_BACKEND=native`, or `sandbox.backend` in a trusted layer for any
+Agent including a read-only one; `zuno --sandbox-on-unavailable run-unconfined`,
+`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`, or `sandbox.onUnavailable` in a
+trusted (global, managed, environment, or CLI) layer for a write-capable one; and
+`zuno --sandbox danger-full-access`. A project layer cannot enable any of them.
+An interactive `zuno` start on such a host asks once, before raw mode, whether to
+run this session natively — for any request it cannot confine, read-only
+included, only when no layer set `sandbox.onUnavailable` or `sandbox.backend`,
+and only when standard input and standard error are both terminals; yes selects
+the native backend and resolves this process exactly as the flag does
+(`--sandbox-backend native`), no exits with the refusal. The answer covers this
+process only: on macOS the flag reaches nested Zuno processes through the
+startup re-exec that exports it, and an answer given at the prompt does not, so
+set `ZUNO_SANDBOX_BACKEND=native` or a trusted `sandbox.backend` when a nested
+`zuno` needs the same answer. `run`, `acp`, and `serve` never ask and still need
+the flag or the variable. None of this is confinement. Switching to an Agent
+whose Shell cannot be registered keeps the current Agent and reports the same
+text instead of ending the session.
+See the [Shell sandbox roadmap](design/shell-sandbox-roadmap.md).
 
 ## Why does `bwrap` fail with `loopback: Failed RTM_NEWADDR: Operation not permitted`?
 
@@ -207,7 +238,10 @@ may instead set:
 
 That choice is ignored for read-only Agents and never hides `debug sandbox
 --check` failure. Project configuration cannot enable it, and managed policy may
-still force `deny`.
+still force `deny`. A container that should always run natively, read-only Agents
+included, while keeping the permission layer sets
+`{"sandbox":{"backend":"native"}}` instead; `--check` still fails for a confined
+requested mode under it, because the requested confinement is not deployed.
 
 WSL1 is unsupported. WSL2 is a Linux VM and may use the Linux
 backend only when the same user, mount, PID, network, filesystem, and seccomp

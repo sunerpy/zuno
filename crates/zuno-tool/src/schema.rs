@@ -93,8 +93,12 @@ pub fn accept_large_output_property() -> Value {
 ///   token cost that no provider reads, and `title` is the Rust type name — an
 ///   internal detail that says nothing the tool's own id does not.
 ///
-/// A params type whose schema is not object-shaped is normalized to an empty
-/// object schema. `#[derive(JsonSchema)]` on a unit struct yields `{"type":
+/// A root tagged union — schemars' rendering of `#[serde(tag = "...")]` — is
+/// folded into one object schema by [`fold_tagged_union`], so an operation-based
+/// tool such as `plan_update` reaches the provider with every operation visible.
+///
+/// Any other params type whose schema is not object-shaped is normalized to an
+/// empty object schema. `#[derive(JsonSchema)]` on a unit struct yields `{"type":
 /// "null"}`, but a no-argument tool call arrives on the wire as `{}`, and an
 /// un-augmented non-object schema would silently lose the injected `intent`.
 #[must_use]
@@ -113,9 +117,336 @@ pub fn derive_params_schema<T: JsonSchema>() -> Value {
 
     if is_object_schema(&schema) {
         schema
+    } else if let Some(folded) = fold_tagged_union(&schema) {
+        folded
     } else {
         serde_json::json!({ "type": "object", "properties": {} })
     }
+}
+
+/// Folds a root tagged union into one object schema.
+///
+/// schemars renders an internally tagged enum — `plan_update`'s `PlanMutationParams`,
+/// `notes`' `NotesParams`, `history`'s `HistoryParams` — as a root `oneOf` of object
+/// branches, each carrying the tag as a `const` string property, with neither `type`
+/// nor `properties` at the root. That is not object-shaped, so until this fold
+/// [`derive_params_schema`] normalized all three to `{"type":"object","properties":{}}`:
+/// the model saw only the injected `intent` and `accept_large_output`, called
+/// `plan_update` with `{"intent": …}`, the schema validator accepted it, and only the
+/// typed parse blocked the call with `missing field \`action\``.
+///
+/// The fold emits what most tool schemas already look like: `type: object`, the root
+/// `description`, the union of every branch's properties, the tag as
+/// `{"type":"string","enum":[…]}` whose description names each operation and the
+/// fields it requires, and `required: [tag]`. It emits no `additionalProperties:
+/// false`: the union admits keys no single branch does, and the typed deserializer's
+/// `deny_unknown_fields` still rejects strays per call. Only the tag is
+/// schema-required; each branch's other required fields are enforced by the typed
+/// parse, as before.
+///
+/// A property that several branches declare is merged deterministically, in
+/// declaration order, by [`merge_uses`]:
+///
+/// - subschemas that differ only in `description` collapse to one, and when the
+///   descriptions differ each is attributed to the operations that carry it
+///   (`list_files_by_prefix: Page size, 1 through 50. search_contents: Page size, 1
+///   through 20.`);
+/// - when one is the other widened to admit `null` (`Option<T>` against `T`), the
+///   nullable form wins, because it accepts everything the strict form does;
+/// - otherwise the distinct shapes become an `anyOf`, so a `patch` whose `steps`
+///   carry ids still validates alongside a `create` whose `steps` carry titles.
+///
+/// Returns `None` for a union that is not a tagged enum — branches that are not all
+/// objects, or that do not share exactly one `const` string property with distinct
+/// values — so the caller keeps its empty-object normalization for those.
+fn fold_tagged_union(schema: &Value) -> Option<Value> {
+    let root = schema.as_object()?;
+    let branches = root
+        .get("oneOf")
+        .or_else(|| root.get("anyOf"))?
+        .as_array()?;
+    if branches.is_empty() || !branches.iter().all(is_object_schema) {
+        return None;
+    }
+    let tag = shared_tag(branches)?;
+
+    let mut values: Vec<String> = Vec::with_capacity(branches.len());
+    let mut summaries: Vec<String> = Vec::with_capacity(branches.len());
+    let mut uses: std::collections::BTreeMap<String, Vec<PropertyUse>> =
+        std::collections::BTreeMap::new();
+    for branch in branches {
+        let branch_properties = branch.get("properties")?.as_object()?;
+        let value = const_string(branch_properties.get(&tag)?)?;
+        if values.contains(&value) {
+            return None;
+        }
+        let required: Vec<&str> = branch
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|name| *name != tag)
+                    .collect()
+            })
+            .unwrap_or_default();
+        summaries.push(operation_summary(
+            &value,
+            branch.get("description").and_then(Value::as_str),
+            &required,
+        ));
+        for (name, subschema) in branch_properties {
+            if *name == tag {
+                continue;
+            }
+            uses.entry(name.clone()).or_default().push(PropertyUse {
+                operation: value.clone(),
+                subschema: subschema.clone(),
+            });
+        }
+        values.push(value);
+    }
+    let mut properties: Map<String, Value> = uses
+        .into_iter()
+        .map(|(name, uses)| (name, merge_uses(&uses)))
+        .collect();
+
+    let mut tag_property = Map::new();
+    tag_property.insert("type".to_owned(), Value::String("string".to_owned()));
+    tag_property.insert(
+        "enum".to_owned(),
+        Value::Array(values.into_iter().map(Value::String).collect()),
+    );
+    tag_property.insert(
+        "description".to_owned(),
+        Value::String(format!("Selects the operation. {}", summaries.join(" "))),
+    );
+    properties.insert(tag.clone(), Value::Object(tag_property));
+
+    let mut folded = Map::new();
+    folded.insert("type".to_owned(), Value::String("object".to_owned()));
+    if let Some(description) = root.get("description") {
+        folded.insert("description".to_owned(), description.clone());
+    }
+    // A recursive variant field keeps its `$ref` target: schemars still emits a root
+    // `definitions` (draft-07) or `$defs` map for recursion even with inlining on, and
+    // a fold that dropped it would leave every `$ref` inside the properties dangling.
+    for key in ["definitions", "$defs"] {
+        if let Some(definitions) = root.get(key) {
+            folded.insert(key.to_owned(), definitions.clone());
+        }
+    }
+    folded.insert("properties".to_owned(), Value::Object(properties));
+    folded.insert("required".to_owned(), serde_json::json!([tag]));
+    Some(Value::Object(folded))
+}
+
+/// The one property every branch declares as a `const` string: the serde tag.
+///
+/// Zero candidates means the union is not internally tagged; more than one means the
+/// branches share a literal field this fold cannot tell apart from the tag. Both return
+/// `None` so the caller falls back rather than guessing.
+fn shared_tag(branches: &[Value]) -> Option<String> {
+    let first = branches.first()?.get("properties")?.as_object()?;
+    let mut candidates = first
+        .iter()
+        .filter(|(_, subschema)| const_string(subschema).is_some())
+        .map(|(name, _)| name)
+        .filter(|name| {
+            branches.iter().all(|branch| {
+                branch
+                    .get("properties")
+                    .and_then(|properties| properties.get(name.as_str()))
+                    .and_then(const_string)
+                    .is_some()
+            })
+        });
+    let tag = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(tag.clone())
+}
+
+/// The literal a subschema pins a string to, whether as `const` or a one-value `enum`.
+fn const_string(schema: &Value) -> Option<String> {
+    let object = schema.as_object()?;
+    if let Some(Value::String(value)) = object.get("const") {
+        return Some(value.clone());
+    }
+    match object.get("enum")?.as_array()?.as_slice() {
+        [Value::String(value)] => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// One sentence per operation for the tag's description.
+///
+/// The variant's own doc comment, when it has one, comes first so the model reads what
+/// the operation does before what it needs; the required list is the branch's `required`
+/// minus the tag, in declaration order.
+fn operation_summary(value: &str, description: Option<&str>, required: &[&str]) -> String {
+    let fields = if required.is_empty() {
+        "no other property".to_owned()
+    } else {
+        required.join(", ")
+    };
+    let description = description
+        .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+        .map(|text| text.trim_end_matches('.').to_owned())
+        .filter(|text| !text.is_empty());
+    match description {
+        Some(description) => format!("{value}: {description}; requires {fields}."),
+        None => format!("{value} requires {fields}."),
+    }
+}
+
+/// One branch's declaration of a property: which operation, and what it accepts there.
+struct PropertyUse {
+    operation: String,
+    subschema: Value,
+}
+
+/// One shape a property takes across the operations that declare it.
+struct Shape {
+    /// The subschema with `description` removed and `null` stripped: what makes two
+    /// declarations the same shape.
+    key: Value,
+    /// The subschema to emit for this shape, without its description.
+    schema: Value,
+    /// Whether `schema` already admits `null`.
+    nullable: bool,
+    /// Each distinct description and, in declaration order, the operations that carry it.
+    descriptions: Vec<(Vec<String>, String)>,
+}
+
+impl Shape {
+    fn render(self) -> Value {
+        let Self {
+            mut schema,
+            descriptions,
+            ..
+        } = self;
+        let description = match descriptions.as_slice() {
+            [] => None,
+            [(_, only)] => Some(only.clone()),
+            many => Some(
+                many.iter()
+                    .map(|(operations, text)| format!("{}: {text}", operations.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+        };
+        if let (Some(description), Some(object)) = (description, schema.as_object_mut()) {
+            object.insert("description".to_owned(), Value::String(description));
+        }
+        schema
+    }
+}
+
+/// Merges every branch's declaration of one property into the subschema the wire carries.
+///
+/// See [`fold_tagged_union`] for the policy. Declarations are grouped by shape in
+/// declaration order; a group is emitted in its nullable form as soon as any member is
+/// nullable; one group is emitted as-is and several as an `anyOf`.
+fn merge_uses(uses: &[PropertyUse]) -> Value {
+    let mut shapes: Vec<Shape> = Vec::new();
+    for PropertyUse {
+        operation,
+        subschema,
+    } in uses
+    {
+        let mut schema = subschema.clone();
+        let description = schema
+            .as_object_mut()
+            .and_then(|object| object.remove("description"))
+            .and_then(|description| description.as_str().map(str::to_owned));
+        let (key, nullable) = without_null(&schema);
+        let shape = match shapes.iter().position(|shape| shape.key == key) {
+            Some(index) => {
+                let shape = &mut shapes[index];
+                if nullable && !shape.nullable {
+                    shape.schema = schema;
+                    shape.nullable = true;
+                }
+                shape
+            }
+            None => {
+                shapes.push(Shape {
+                    key,
+                    schema,
+                    nullable,
+                    descriptions: Vec::new(),
+                });
+                shapes.last_mut().expect("a shape was just pushed")
+            }
+        };
+        if let Some(description) = description {
+            match shape
+                .descriptions
+                .iter_mut()
+                .find(|(_, text)| *text == description)
+            {
+                Some((operations, _)) => operations.push(operation.clone()),
+                None => shape
+                    .descriptions
+                    .push((vec![operation.clone()], description)),
+            }
+        }
+    }
+    let mut rendered: Vec<Value> = shapes.into_iter().map(Shape::render).collect();
+    if rendered.len() == 1 {
+        rendered.remove(0)
+    } else {
+        serde_json::json!({ "anyOf": rendered })
+    }
+}
+
+/// The schema with `null` removed from `type` and `enum` and a `null` default dropped,
+/// plus whether anything was removed: the shape `Option<T>` shares with `T`.
+///
+/// schemars renders the option as `"type": [T, "null"]` plus `"default": null`, and a
+/// nullable string enum also lists `null` among its values. Stripping those is what lets
+/// a field that is optional in one operation and required in another be one property.
+fn without_null(schema: &Value) -> (Value, bool) {
+    let Some(object) = schema.as_object() else {
+        return (schema.clone(), false);
+    };
+    let mut stripped = object.clone();
+    let mut changed = false;
+    if let Some(Value::Array(names)) = stripped.get("type").cloned() {
+        let remaining: Vec<Value> = names
+            .iter()
+            .filter(|name| name.as_str() != Some("null"))
+            .cloned()
+            .collect();
+        if remaining.len() != names.len() {
+            changed = true;
+            stripped.insert(
+                "type".to_owned(),
+                match remaining.as_slice() {
+                    [single] => single.clone(),
+                    _ => Value::Array(remaining),
+                },
+            );
+        }
+    }
+    if let Some(Value::Array(values)) = stripped.get("enum").cloned() {
+        let remaining: Vec<Value> = values
+            .iter()
+            .filter(|value| !value.is_null())
+            .cloned()
+            .collect();
+        if remaining.len() != values.len() {
+            changed = true;
+            stripped.insert("enum".to_owned(), Value::Array(remaining));
+        }
+    }
+    if changed && stripped.get("default") == Some(&Value::Null) {
+        stripped.remove("default");
+    }
+    (Value::Object(stripped), changed)
 }
 
 /// Derives and augments in one step: the schema a provider should be sent.
@@ -294,5 +625,314 @@ mod tests {
 
         assert!(is_object_schema(&untyped));
         assert!(augment(untyped)["properties"][INTENT_KEY].is_object());
+    }
+
+    /// The shape `plan_update`, `notes`, and `history` derive from: one operation tag.
+    ///
+    /// The branches disagree on purpose. `expected_revision` and `title` are nullable in
+    /// one branch and required elsewhere; `steps` carries a different item type in
+    /// `create` and `patch`, exactly as `PlanStepInput` and `PlanStepPatch` do.
+    #[derive(JsonSchema, serde::Deserialize)]
+    #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+    #[allow(
+        dead_code,
+        reason = "the variants are consumed only by the JsonSchema derive in this schema fixture"
+    )]
+    enum Tagged {
+        /// Open a plan.
+        Create {
+            #[serde(default)]
+            expected_revision: Option<i64>,
+            title: String,
+            steps: Vec<StepInput>,
+        },
+        Patch {
+            expected_revision: i64,
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            steps: Vec<StepPatch>,
+        },
+        Pop {
+            expected_revision: i64,
+        },
+    }
+
+    #[derive(JsonSchema, serde::Deserialize)]
+    #[allow(
+        dead_code,
+        reason = "the fields are consumed only by the JsonSchema derive in this schema fixture"
+    )]
+    struct StepInput {
+        title: String,
+    }
+
+    #[derive(JsonSchema, serde::Deserialize)]
+    #[allow(
+        dead_code,
+        reason = "the fields are consumed only by the JsonSchema derive in this schema fixture"
+    )]
+    struct StepPatch {
+        id: String,
+        #[serde(default)]
+        title: Option<String>,
+    }
+
+    #[derive(JsonSchema, serde::Deserialize)]
+    #[allow(
+        dead_code,
+        reason = "the variants are consumed only by the JsonSchema derive in this schema fixture"
+    )]
+    enum ExternallyTagged {
+        Read { path: String },
+        Write { path: String, text: String },
+    }
+
+    #[derive(JsonSchema, serde::Deserialize)]
+    #[serde(untagged)]
+    #[allow(
+        dead_code,
+        reason = "the variants are consumed only by the JsonSchema derive in this schema fixture"
+    )]
+    enum Untagged {
+        Name(String),
+        Count(u32),
+    }
+
+    #[test]
+    fn schema_folds_a_root_tagged_enum_into_one_object() {
+        // Guard the premise: schemars renders an internally tagged enum as a root `oneOf`
+        // with neither `type` nor `properties`, so `is_object_schema` rejects it and the
+        // old normalization shipped `{"type":"object","properties":{}}` for `plan_update`.
+        let raw = schemars::generate::SchemaSettings::draft07()
+            .into_generator()
+            .into_root_schema_for::<Tagged>()
+            .to_value();
+        assert!(raw["oneOf"].is_array() && !is_object_schema(&raw));
+
+        let schema = derive_params_schema::<Tagged>();
+
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("oneOf").is_none() && schema.get("anyOf").is_none());
+        assert_eq!(schema["properties"]["action"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            serde_json::json!(["create", "patch", "pop"]),
+            "every operation is listed in declaration order"
+        );
+        assert_eq!(schema["required"], serde_json::json!(["action"]));
+        for field in ["expected_revision", "title", "steps"] {
+            assert!(
+                schema["properties"][field].is_object(),
+                "{field} from at least one branch must reach the wire"
+            );
+        }
+        assert!(
+            schema.get("additionalProperties").is_none(),
+            "the union admits more keys than any one branch; the typed parse rejects strays"
+        );
+        assert!(
+            schema["properties"]["action"].get("const").is_none(),
+            "a single const would pin the tag to one branch"
+        );
+
+        let augmented = augment(schema);
+        assert!(augmented["properties"][INTENT_KEY].is_object());
+        assert_eq!(augmented["required"], serde_json::json!(["action"]));
+    }
+
+    #[test]
+    fn folded_tag_description_names_each_operations_own_required_fields() {
+        let schema = derive_params_schema::<Tagged>();
+
+        let description = schema["properties"]["action"]["description"]
+            .as_str()
+            .expect("the tag carries a description");
+        assert!(description.contains("create"), "{description}");
+        assert!(description.contains("title, steps"), "{description}");
+        assert!(
+            description.contains("create: Open a plan; requires title, steps."),
+            "{description}"
+        );
+        assert!(
+            description.contains("pop requires expected_revision"),
+            "{description}"
+        );
+    }
+
+    #[test]
+    fn folding_keeps_the_nullable_subschema_when_branches_disagree_on_nullability() {
+        let schema = derive_params_schema::<Tagged>();
+
+        assert_eq!(
+            schema["properties"]["expected_revision"]["type"],
+            serde_json::json!(["integer", "null"]),
+            "the nullable branch admits everything the required branch does"
+        );
+        assert_eq!(
+            schema["properties"]["title"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+    }
+
+    #[test]
+    fn folding_unions_genuinely_different_subschemas_instead_of_choosing_one() {
+        let schema = derive_params_schema::<Tagged>();
+
+        let alternatives = schema["properties"]["steps"]["anyOf"]
+            .as_array()
+            .expect("two item shapes become an anyOf");
+        assert_eq!(alternatives.len(), 2);
+        assert_eq!(
+            alternatives[0]["items"]["required"],
+            serde_json::json!(["title"])
+        );
+        assert_eq!(
+            alternatives[1]["items"]["required"],
+            serde_json::json!(["id"])
+        );
+    }
+
+    #[derive(JsonSchema, serde::Deserialize)]
+    #[serde(tag = "action", rename_all = "snake_case")]
+    #[allow(
+        dead_code,
+        reason = "the variants are consumed only by the JsonSchema derive in this schema fixture"
+    )]
+    enum Paged {
+        List {
+            /// Page size, 1 through 50.
+            limit: Option<u32>,
+            /// Opaque cursor.
+            cursor: Option<String>,
+        },
+        Search {
+            query: String,
+            /// Page size, 1 through 20.
+            limit: Option<u32>,
+            /// Opaque cursor.
+            cursor: Option<String>,
+        },
+    }
+
+    #[test]
+    fn folding_attributes_differing_descriptions_instead_of_duplicating_the_shape() {
+        // `notes` declares `limit` in three operations with two page ceilings; the
+        // shape is the same integer every time, so the wire carries one property whose
+        // description says which operation has which ceiling.
+        let schema = derive_params_schema::<Paged>();
+
+        let limit = &schema["properties"]["limit"];
+        assert!(limit.get("anyOf").is_none(), "{limit}");
+        assert_eq!(limit["type"], serde_json::json!(["integer", "null"]));
+        assert_eq!(
+            limit["description"],
+            "list: Page size, 1 through 50. search: Page size, 1 through 20."
+        );
+        assert_eq!(
+            schema["properties"]["cursor"]["description"], "Opaque cursor.",
+            "an identical description is not attributed"
+        );
+    }
+
+    #[test]
+    fn folding_is_deterministic_across_derivations() {
+        assert_eq!(
+            derive_params_schema::<Tagged>(),
+            derive_params_schema::<Tagged>()
+        );
+    }
+
+    #[derive(JsonSchema)]
+    #[serde(tag = "action")]
+    #[allow(
+        dead_code,
+        reason = "the fields are consumed only by the JsonSchema derive in this schema fixture"
+    )]
+    enum Recursive {
+        Leaf { value: i64 },
+        Node { children: Vec<Recursive> },
+    }
+
+    #[test]
+    fn a_folded_tagged_enum_keeps_the_definitions_its_refs_point_at() {
+        // A recursive variant field makes schemars emit a root `definitions` (or `$defs`)
+        // map even with inlining on; the fold rebuilds the root and must carry it over,
+        // otherwise every `$ref` under `properties` dangles.
+        let raw = schemars::generate::SchemaSettings::draft07()
+            .into_generator()
+            .into_root_schema_for::<Recursive>()
+            .to_value();
+        let schema = derive_params_schema::<Recursive>();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            serde_json::json!(["Leaf", "Node"])
+        );
+
+        for key in ["definitions", "$defs"] {
+            if raw.get(key).is_some() {
+                assert_eq!(
+                    schema.get(key),
+                    raw.get(key),
+                    "the fold must keep the root {key} map its $ref targets live in"
+                );
+            }
+        }
+        // Every `$ref` still resolves: `#` names the folded root itself (an object schema
+        // whose `properties` now hold the recursion), and a pointer into a definitions
+        // map needs that map to have survived the fold.
+        fn refs(value: &Value, out: &mut Vec<String>) {
+            match value {
+                Value::Object(map) => {
+                    if let Some(Value::String(target)) = map.get("$ref") {
+                        out.push(target.clone());
+                    }
+                    map.values().for_each(|child| refs(child, out));
+                }
+                Value::Array(items) => items.iter().for_each(|child| refs(child, out)),
+                _ => {}
+            }
+        }
+        let mut targets = Vec::new();
+        refs(&schema, &mut targets);
+        assert!(
+            !targets.is_empty(),
+            "a recursive variant must reference itself"
+        );
+        for target in targets {
+            if target == "#" {
+                continue;
+            }
+            let map = if target.starts_with("#/definitions/") {
+                "definitions"
+            } else if target.starts_with("#/$defs/") {
+                "$defs"
+            } else {
+                panic!("unexpected $ref shape {target}");
+            };
+            let name = target
+                .rsplit('/')
+                .next()
+                .expect("a $ref names a definition");
+            assert!(
+                schema[map].get(name).is_some(),
+                "{target} dangles after the fold: {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn unions_that_are_not_tagged_enums_still_normalize_to_an_empty_object() {
+        for schema in [
+            derive_params_schema::<ExternallyTagged>(),
+            derive_params_schema::<Untagged>(),
+        ] {
+            assert_eq!(
+                schema,
+                serde_json::json!({ "type": "object", "properties": {} }),
+                "no shared const tag means no fold"
+            );
+        }
     }
 }

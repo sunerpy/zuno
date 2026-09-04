@@ -530,11 +530,11 @@ fn sandbox(args: &DebugSandboxArgs, context: &Context) -> Result<(), String> {
         CliSandboxMode::DangerFullAccess => zuno_sandbox::SandboxMode::DangerFullAccess,
     };
     let network = sandbox_network(mode, args.network);
-    let report = zuno_sandbox::deployment_report_with_action(
+    let report = zuno_sandbox::deployment_report_with_request(
         &context.directory,
         mode,
         network,
-        super::tool_runtime::sandbox_unavailable_action(&context.config),
+        super::tool_runtime::sandbox_backend_request(&context.config),
     );
     print_json(&report)?;
     if args.check && !report.ready {

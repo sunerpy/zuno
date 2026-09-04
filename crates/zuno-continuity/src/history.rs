@@ -158,3 +158,42 @@ impl TypedTool for HistoryTool {
         Ok(ToolOutput::text(HISTORY_TOOL_ID, output).with_metadata("continuityKind", "history"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_wire_schema_exposes_every_action() {
+        // A root `#[serde(tag = "action")]` enum used to reach the provider as an empty
+        // object schema, so the model had to infer the operation names from prose.
+        let schema = zuno_tool::schema::params_schema::<HistoryParams>();
+
+        assert_eq!(schema["type"], "object");
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            serde_json::json!(["list_windows", "list_items", "read_item", "search_contents"])
+        );
+        assert_eq!(schema["required"], serde_json::json!(["action"]));
+        for field in [
+            "cursor",
+            "limit",
+            "window_id",
+            "item_id",
+            "query",
+            zuno_tool::schema::INTENT_KEY,
+        ] {
+            assert!(
+                schema["properties"][field].is_object(),
+                "{field} must reach the provider"
+            );
+        }
+        let description = schema["properties"]["action"]["description"]
+            .as_str()
+            .expect("action explains each operation");
+        assert!(
+            description.contains("read_item") && description.contains("item_id"),
+            "{description}"
+        );
+    }
+}

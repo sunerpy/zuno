@@ -48,13 +48,28 @@ model asks to run a command
 
 ### 如何选择无沙箱执行
 
-无 OS 约束执行有两种不同含义。请按部署意图选择：
+无 OS 约束执行有三种不同含义。请按部署意图选择：
 
 | 意图 | 设置 | 实际行为 |
 | --- | --- | --- |
 | 必须有沙箱 | `workspace-write` 加 `onUnavailable: "deny"` | 默认行为。后端不可用时停止组装 Shell。 |
-| 优先使用沙箱，仅在不可用时允许降级 | `workspace-write` 加 `onUnavailable: "run-unconfined"` | Zuno 先探测并验证受限后端，只在符合条件的类型化不可用错误下才降级。 |
-| 始终使用宿主进程后端 | `danger-full-access` | Zuno 跳过受限后端发现，在所有受支持平台上直接原生执行。 |
+| 优先使用沙箱，仅在不可用时允许降级 | `workspace-write` 加 `onUnavailable: "run-unconfined"` | Zuno 先探测并验证受限后端，只在具备写能力的请求遇到符合条件的类型化不可用错误时才降级。 |
+| 让每个 Agent 都原生运行，同时保留权限模式 | `backend: "native"` | Zuno 跳过受限后端发现，让每个 Agent 的 Shell（包括只读契约）原生运行；已配置的权限模式、规则、审批与风险门禁全部保留，请求的契约被记录为未强制执行。 |
+| 始终使用宿主进程后端且不弹审批提示 | `danger-full-access` | Zuno 跳过受限后端发现，在所有受支持平台上直接原生执行，并把生效权限模式设为 `allow_all`。 |
+
+`backend: "native"` 是为没有 OS 沙箱的主机（今天的 macOS 与 Windows）而准备的选择，用于
+权限层必须继续生效的场景。它是一项受信的主机声明，而不是降级：没有任何探测，也没有任何
+失败在先。在它之下，像 `plan` 这样的只读 Agent 仍保留工具白名单、权限规则与 Shell 风险
+门禁，而“只读”此时的含义正是这一点——一道角色边界，而不是 OS 边界。可以在受信层设置，
+也可以用 `zuno --sandbox-backend native` 或 `ZUNO_SANDBOX_BACKEND=native` 只作用于一次调用：
+
+```json
+{
+  "sandbox": {
+    "backend": "native"
+  }
+}
+```
 
 一次性显式使用无沙箱模式：
 
@@ -178,15 +193,48 @@ zuno debug sandbox
 
 ### 其他平台
 
-OS 约束后端已在 Linux 上实现。在 macOS 与 Windows 上，受限模式报告：
+OS 约束后端已在 Linux 上实现。macOS 与 Windows 根本没有受约束后端，所以受限模式在这两个
+平台上是失败即拒绝，而不是悄悄降级。这条拒绝信息是写给人照着做的：它会点明平台、说明受信的
+`run-unconfined` 降级是否适用于**当前这次**请求、逐条列出补救方式以及可以设置它的配置层，
+并且明确说明这些补救方式都不是沙箱隔离。它的开头仍是早先版本单独打印的那条类型化原因：
 
 ```
-OS sandbox is not implemented for platform `macos`
+OS sandbox is not implemented for platform `macos`: macos has no confined sandbox
+backend, so the Shell tool cannot be registered under the requested
+`workspace-write` authority. …
 ```
 
-默认仍然失败即拒绝。受信的 `run-unconfined` 可以让具备写能力的
-`workspace-write` Agent 原生继续；只读 Agent 仍会拒绝。`danger-full-access`
-始终直接选择原生执行。
+- 具备写能力的 `workspace-write` 请求符合降级条件，因此拒绝信息会给出
+  `--sandbox-on-unavailable run-unconfined`、`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`，
+  以及在受信层（全局、受管、环境、CLI）里设置
+  `"sandbox": {"onUnavailable": "run-unconfined"}` —— 项目层无法启用它。
+- 只读请求永远不会降级，拒绝信息会直接这么说，而不是列出一条其实不适用的补救方式。它的
+  补救方式是显式选择原生后端：`--sandbox-backend native`、`ZUNO_SANDBOX_BACKEND=native`，
+  或在受信层设置 `"sandbox": {"backend": "native"}`（项目层无法选择它），让这个 Agent 的
+  Shell 原生运行，同时保留你的权限模式。此时请求的 `read-only` 权限会被记录但不由 OS 强制
+  执行：留下的是 Agent 的工具契约、你的权限规则与 Shell 风险门禁——这是一道角色边界，
+  不是 OS 边界。
+- 具备写能力的请求的拒绝信息会在降级方式旁边一并列出原生后端，并说明 `danger-full-access`
+  还会额外把生效权限模式设为 `allow_all`。
+
+在这类主机上交互式启动 `zuno` 时，会在终端进入 raw mode 之前询问一次，是否以原生方式运行
+本次会话。只要请求在这台主机上无法被约束就会询问——只读 Agent 的请求也包括在内——但前提是
+没有任何配置层设置过 `sandbox.onUnavailable` 或 `sandbox.backend`，并且标准输入与
+标准错误都是终端。回答 yes 时，本进程的解析结果与传入 `--sandbox-backend native` 完全一致（`resolutionKind`
+为 `trusted_native`），并对该进程之后的每一次组合都生效，包括之后切换到只读 Agent；回答 no
+则以上面那条拒绝信息退出。`run`、`acp`、`serve` 以及任何没有终端的启动都不会询问，仍然需要
+命令行标志、环境变量或受信配置层。
+
+这个回答只属于当前这个进程。在 macOS 上，命令行标志会由启动时那一次 re-exec 写入真实环境
+变量，因此工具启动的嵌套 `zuno` 会继承它；而在提示里输入的回答发生在那次 re-exec 之后，
+不会被继承。如果嵌套的 Zuno 进程也需要同样的答案，请设置环境变量或受信配置层。参见
+[沙箱模式与后端不可用策略](/zh/config/reference#沙箱模式与后端不可用策略)。
+
+切换到一个无法注册 Shell 的 Agent 时，Zuno 会保留当前 Agent 并在 transcript 上给出同样的
+拒绝信息，而不是因为一次可以撤销的切换就结束会话。
+
+`danger-full-access` 始终直接选择原生执行。它和降级都不是沙箱隔离：命令以 Zuno 进程用户的
+宿主权限运行，但已配置的权限模式、显式拒绝与灾难性命令拒绝依然生效。
 
 ## 权限模式
 
@@ -320,10 +368,11 @@ Windows 的逐字 `\\?\` 前缀 —— 是 `C:/build-cache/*`，绝不是 `\\?\C
 | `workspace-write` + 默认 `deny`，且没有后端 | Shell 不会被组装。什么都不会运行。 |
 | `workspace-write` + 受信的 `run-unconfined`，且发生可降级不可用错误 | 命令使用宿主权限；已配置权限模式和硬拒绝仍然保留。 |
 | `read-only` + `run-unconfined`，且没有后端 | Shell 不会被组装。只读执行绝不降级。 |
+| `read-only` + 受信的 `backend: "native"` | Shell 原生运行，权限模式保持不变。只读契约是工具、权限与风险门禁边界，不是 OS 边界；记录中写明 `trusted_native` 与 `requestedMode: read-only`。 |
 
 ## Agent 契约只收窄，绝不放宽
 
-无论配置要求什么，只读 Agent 都被钉在 `read-only`。这个方向按设计是单向的：Agent 契约只能削减权限，因此选择一个只读 Agent 是一项保证，而不是一个可被配置悄悄反转的默认值。这也意味着只读 Agent 永远不会使用 `run-unconfined`。
+无论配置要求什么，只读 Agent 都被钉在 `read-only`。这个方向按设计是单向的：Agent 契约只能削减权限，因此选择一个只读 Agent 是一项保证，而不是一个可被配置悄悄反转的默认值。这也意味着只读 Agent 永远不会使用 `run-unconfined`。它的 Shell 唯一的原生运行方式是受信的 `sandbox.backend: native` 选择：那是一项显式的主机声明而非降级，契约作为工具与权限边界继续生效，只是不再有 OS 边界。
 
 Agent 契约默认拒绝，因此契约没有点名的工具是被**隐藏**，而不只是未获授权：对一个未被点名的工具 id 来说，契约开头那条 `"*": "deny"` 就是最后一条匹配规则，模型根本不会被提供这个工具。默认授予里有两条正是由此而来。凡是授予 `shell` 的地方都会一并授予 `bg`，只读角色也不例外，因为后台执行由 `shell` 启动、只能通过 `bg` 读回——大到无法完整返回的结果也是如此。`job` 只授予可以委派的 Agent，因为一个 Job 只对创建它的那次 `task` 所属的会话才能解析出来。
 

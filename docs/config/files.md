@@ -121,12 +121,13 @@ not the whole story.
 | Layer | Sandbox authority |
 | --- | --- |
 | Trusted global, explicit config, managed, environment, CLI | May select any mode |
-| Project `zuno.json[c]` and `.zuno` | May only narrow to `read-only`, deny networking, add protected paths, or set `onUnavailable` to `deny` |
+| Project `zuno.json[c]` and `.zuno` | May only narrow to `read-only`, deny networking, add protected paths, set `onUnavailable` to `deny`, or set `backend` to `auto` |
 
 A project layer cannot select a wider mode, grant host networking, or add external writable
-roots. It also cannot enable `run-unconfined`. A checked-in repository configuration
-therefore cannot escalate its own confinement, which is the property that makes cloning an
-unfamiliar repository safe.
+roots. It also cannot enable `run-unconfined` or select the native backend
+(`backend: "native"`). A checked-in repository configuration therefore cannot escalate its
+own confinement or move its Shell out of confinement, which is the property that makes
+cloning an unfamiliar repository safe.
 
 A project layer that names an executable is refused. When a project `zuno.json[c]` or
 `.zuno` file sets `shell`, a local `mcp.*.command`, an `lsp.*.command`, a
@@ -163,12 +164,16 @@ Use a trusted one-invocation override when a wider mode is genuinely wanted:
 zuno --sandbox read-only
 zuno --sandbox danger-full-access
 zuno --sandbox workspace-write --sandbox-on-unavailable run-unconfined
+zuno --sandbox-backend native
 ```
 
 The environment equivalent for unavailable-only fallback is
-`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`. Managed policy has later precedence and may
-still narrow either override or force the unavailable action back to `deny`. See
-[Permissions and sandboxing](/guide/permissions).
+`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`, and for the native backend it is
+`ZUNO_SANDBOX_BACKEND=native`. `--sandbox-backend native` selects the native backend for
+every Agent of the invocation, read-only ones included, with the permission mode kept; it
+is not confinement. Managed policy has later precedence and may still narrow any of these
+overrides, force the unavailable action back to `deny`, or force the backend back to
+`auto`. See [Permissions and sandboxing](/guide/permissions).
 
 ## Where other assets are discovered
 

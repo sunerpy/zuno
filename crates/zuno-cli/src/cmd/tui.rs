@@ -85,13 +85,14 @@ use super::child_turn::{
     ChildSessionOpened, ChildTurnObserver, DetachedTurnObserver, InteractiveChildInput,
     InteractiveChildInputContext,
 };
+use super::tool_runtime::UnsupportedPlatformDecision;
 use super::tui_permission::{AutoApproval, PermissionBridge, PermissionBroker};
 use super::tui_question::{QuestionBridge, QuestionBroker};
 use super::turn::{
     SessionChoice, SessionTitleSink, TurnHost, TurnHostRuntimeDependencies, TurnOptions, TurnPlan,
-    background_execution_projections, persisted_session_agent,
+    background_execution_projections,
 };
-use crate::command::TuiArgs;
+use crate::command::{CliSandboxBackend, TuiArgs};
 use crate::environment::StartupEnvironment;
 
 /// How many prompts may wait for durable admission.
@@ -240,10 +241,9 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     let options = TurnOptions {
         directory: None,
         model: args.model.clone(),
-        agent: args
-            .agent
-            .clone()
-            .or_else(|| persisted_session_agent(&session)),
+        // No per-surface hint: `TurnPlan::resolve` restores the Agent, model and
+        // reasoning level saved on a resumed session below these explicit flags.
+        agent: args.agent.clone(),
         preset: None,
         session,
         title: None,
@@ -260,12 +260,17 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         .enable_all()
         .build()
         .map_err(to_string)?;
+    // Owned here because the first composition may still change it: an interactive
+    // start on a platform without a confined sandbox backend can choose native
+    // execution, and that answer has to hold for every later composition of this
+    // process exactly as `--sandbox-on-unavailable run-unconfined` would.
+    let mut environment = environment.clone();
 
     loop {
-        match execute_once(args, environment, &runtime, request, &mut terminal) {
+        match execute_once(args, &mut environment, &runtime, request, &mut terminal) {
             Err(error) => {
                 drop(terminal.take());
-                return match shutdown_tui_background_jobs(&runtime, environment) {
+                return match shutdown_tui_background_jobs(&runtime, &environment) {
                     Ok(()) => Err(error),
                     Err(shutdown) => Err(format!(
                         "{error}; background job shutdown also failed: {shutdown}"
@@ -277,7 +282,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
                 // terminal mounted across composition changes, but restore it before this
                 // final line exactly as a one-composition run does.
                 drop(terminal.take());
-                shutdown_tui_background_jobs(&runtime, environment)?;
+                shutdown_tui_background_jobs(&runtime, &environment)?;
                 if identity.is_materialized() {
                     println!("{}", resume_hint(identity.id()));
                 }
@@ -305,6 +310,62 @@ fn shutdown_tui_background_jobs(
                 )
             })
     })
+}
+
+/// What a composition for `plan` should do about a host with no confined sandbox.
+///
+/// Discovers the backend the way production does; [`decide_for_plan`] owns the rest so
+/// a test can act as a host without one.
+fn sandbox_decision(plan: &TurnPlan, interactive: bool) -> UnsupportedPlatformDecision {
+    decide_for_plan(
+        plan,
+        &super::tool_runtime::system_sandbox_probe,
+        interactive,
+    )
+}
+
+/// The same decision against a caller-supplied backend discovery.
+///
+/// Typed end to end: the preflight resolves the same Shell policy assembly will, with
+/// the manifest the default profile registers, and the decision reads the configured
+/// `sandbox.onUnavailable` and `sandbox.backend` as the `Option`s they are — `None` is
+/// "nobody chose", which is the only state an interactive start may ask about. `probe`
+/// is the seam both callers of [`sandbox_decision`] are otherwise undrivable through:
+/// a Linux test host always answers its own platform, so only an injected probe can
+/// stand in for a Windows or macOS one.
+pub(super) fn decide_for_plan(
+    plan: &TurnPlan,
+    probe: &dyn Fn(&zuno_sandbox::SandboxPolicy) -> Result<(), zuno_sandbox::SandboxError>,
+    interactive: bool,
+) -> UnsupportedPlatformDecision {
+    let refusal = super::tool_runtime::sandbox_preflight(
+        plan.directory(),
+        plan.config(),
+        plan.agent_profile(),
+        &zuno_harness::ToolManifest::standard(),
+        probe,
+    );
+    let configured = super::tool_runtime::ConfiguredNativeChoices::from_config(plan.config());
+    super::tool_runtime::decide_unsupported_platform(refusal.as_ref(), configured, interactive)
+}
+
+/// The environment this process runs under once the user accepted the offer.
+///
+/// One mechanism for every request: acceptance selects the native backend
+/// (`ZUNO_SANDBOX_BACKEND=native`, the path `--sandbox-backend native` takes) rather
+/// than the write-capable-only `run-unconfined` fallback, so the answer also covers a
+/// later switch to a read-only Agent and every composition of this process records
+/// `trusted_native`.
+pub(super) fn accept_native_execution(environment: &StartupEnvironment) -> StartupEnvironment {
+    environment.with_sandbox_backend(CliSandboxBackend::Native)
+}
+
+fn permission_mode_name(config: &zuno_config::schema::Config) -> &'static str {
+    match config.effective_permission_mode() {
+        zuno_config::schema::permission::PermissionMode::Standard => "standard",
+        zuno_config::schema::permission::PermissionMode::Strict => "strict",
+        zuno_config::schema::permission::PermissionMode::AllowAll => "allow_all",
+    }
 }
 
 enum TuiRunOutcome {
@@ -375,7 +436,7 @@ struct MountedTerminal {
 
 fn execute_once(
     args: &TuiArgs,
-    environment: &StartupEnvironment,
+    environment: &mut StartupEnvironment,
     runtime: &tokio::runtime::Runtime,
     request: RemountRequest,
     terminal: &mut Option<MountedTerminal>,
@@ -390,7 +451,44 @@ fn execute_once(
     let (engine_sender, engine_receiver) = event_channel();
     let (prompt_sender, prompt_receiver) = mpsc::channel(PROMPT_CHANNEL_CAPACITY);
 
-    let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
+    let mut plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
+    // Before raw mode, and only for the first composition: the terminal is still the
+    // shell's, so a question can be asked and an answer typed. A remount never asks —
+    // it inherits this answer through `environment`, and a refusal it meets is the
+    // same actionable text, printed once by `execute`.
+    if terminal.is_none() {
+        match sandbox_decision(&plan, super::terminal_prompt::is_interactive()) {
+            UnsupportedPlatformDecision::Proceed => {}
+            UnsupportedPlatformDecision::OfferNativeExecution {
+                platform,
+                requested_mode,
+            } => {
+                let permission_mode = permission_mode_name(plan.config());
+                eprintln!(
+                    "{}",
+                    super::tool_runtime::native_execution_offer(
+                        &platform,
+                        requested_mode,
+                        permission_mode
+                    )
+                );
+                let accepted = super::terminal_prompt::confirm(&format!(
+                    "Run this session natively without OS confinement? Your permission mode \
+                     stays {permission_mode}."
+                ))?;
+                if !accepted {
+                    return Err(super::tool_runtime::unsupported_platform_refusal(
+                        &platform,
+                        requested_mode,
+                    ));
+                }
+                *environment = accept_native_execution(environment);
+                plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
+            }
+            UnsupportedPlatformDecision::Refuse { message } => return Err(message),
+        }
+    }
+    let environment: &StartupEnvironment = environment;
     let concurrency = plan.config().resolved_concurrency();
     let layout = zuno_paths::Layout::resolve(environment.resolved());
     let snapshot_store = zuno_snapshot::Store::open(
@@ -1935,6 +2033,42 @@ where
     Ok(())
 }
 
+/// Why a guarded replacement did not install its candidate.
+#[derive(Debug)]
+enum ReplacementRefusal {
+    /// The candidate would refuse Shell for want of a platform sandbox backend. The
+    /// current host was never asked to stop, so the session still has it.
+    UnsupportedPlatform(String),
+    /// The old host's stop or the candidate's start failed, so the composition is no
+    /// longer quiescent.
+    Failed(String),
+}
+
+/// Replace a host only when the candidate composition may register its Shell here.
+///
+/// The guard is inside the replacement rather than beside it, because [`replace_host`]
+/// stops the current host before it starts the candidate: a refusal noticed after that
+/// call would have ended the session over a switch the user could otherwise undo. Made
+/// structural, and thereby testable, after a review found the ordering pinned only by a
+/// source scan that would still pass with the check moved below the call.
+async fn replace_host_unless_refused<H, Start, Started>(
+    current: &mut H,
+    decision: UnsupportedPlatformDecision,
+    start: Start,
+) -> Result<(), ReplacementRefusal>
+where
+    H: HostLifecycle,
+    Start: FnOnce() -> Started,
+    Started: std::future::Future<Output = Result<H, String>>,
+{
+    if let UnsupportedPlatformDecision::Refuse { message } = decision {
+        return Err(ReplacementRefusal::UnsupportedPlatform(message));
+    }
+    replace_host(current, start)
+        .await
+        .map_err(ReplacementRefusal::Failed)
+}
+
 enum SelectionOutcome {
     Rebuilt(TurnEventSender),
     Remount(Box<RemountRequest>),
@@ -1953,15 +2087,18 @@ async fn apply_selection(
         }
         _ => None,
     };
+    let previous_model = host.persisted_model_reference();
     let mut next = rebuild.options.clone();
     next.session = host.rebuild_session_choice();
     // Seeded from the live host, not from the launch options, for the reason
     // `refresh_mcp_host` does the same: the host is what the previous selection actually
     // produced. Reading the launch options alone made each pick discard the one before
     // it — choose a model, then an agent, and the model reverted to the launched one.
+    // Only the surface's own picks are carried: the configured preset and the model,
+    // Agent and level saved on the session are re-read by every resolution.
     next.model = host.model_override().map(str::to_owned);
     next.agent = Some(host.agent_name().to_owned());
-    next.preset = host.preset_name().map(str::to_owned);
+    next.preset = host.preset_override().map(str::to_owned);
     next.effort = host.effort_override();
     next.extension_composition = super::turn::ExtensionComposition::Active;
     match selection {
@@ -2019,11 +2156,26 @@ async fn apply_selection(
                     return SelectionOutcome::Unchanged;
                 }
             };
-            if let Some(agent) = target.agent.clone() {
-                next.agent = Some(agent);
-            }
+            // The target's own saved Agent, model and reasoning level are restored by
+            // `TurnPlan::resolve`; carrying this host's picks across would override them.
+            next.model = None;
+            next.agent = None;
+            next.preset = None;
+            next.effort = None;
             next.directory = Some(PathBuf::from(target.directory));
             next.session = SessionChoice::Existing(target.id);
+            if let Err(message) = remount_preflight(&next, rebuild).await {
+                let _reported = rebuild
+                    .events
+                    .publish(TurnEvent::Provider {
+                        step: 0,
+                        event: StreamEvent::StatusDetail {
+                            detail: format!("warning: keeping the current turn host: {message}"),
+                        },
+                    })
+                    .await;
+                return SelectionOutcome::Unchanged;
+            }
             return SelectionOutcome::Remount(Box::new(RemountRequest::plain(next)));
         }
         zuno_tui::views::session::Selection::SessionRename { id, title } => {
@@ -2172,10 +2324,34 @@ async fn apply_selection(
             if deleting_current {
                 match replacement {
                     Some(session) => {
-                        if let Some(agent) = session.agent {
-                            next.agent = Some(agent);
+                        // As for `/session`: the replacement restores its own saved
+                        // Agent, model and level, unless this platform would refuse its
+                        // Shell — the deleted session cannot be kept, so that case opens
+                        // an empty conversation with this host's picks instead.
+                        next.model = None;
+                        next.agent = None;
+                        next.preset = None;
+                        next.effort = None;
+                        next.session = SessionChoice::Existing(session.id.clone());
+                        if let Err(message) = remount_preflight(&next, rebuild).await {
+                            let _reported = rebuild
+                                .events
+                                .publish(TurnEvent::Provider {
+                                    step: 0,
+                                    event: StreamEvent::StatusDetail {
+                                        detail: format!(
+                                            "warning: opening a new session instead of {}: {message}",
+                                            session.id
+                                        ),
+                                    },
+                                })
+                                .await;
+                            next.model = host.model_override().map(str::to_owned);
+                            next.agent = Some(host.agent_name().to_owned());
+                            next.preset = host.preset_override().map(str::to_owned);
+                            next.effort = host.effort_override();
+                            next.session = SessionChoice::New;
                         }
-                        next.session = SessionChoice::Existing(session.id);
                     }
                     None => next.session = SessionChoice::New,
                 }
@@ -2260,8 +2436,12 @@ async fn apply_selection(
             return SelectionOutcome::Unchanged;
         }
     };
+    // The terminal is in raw mode here, so an unsupported platform never asks: the
+    // switch keeps its host and says why. `replace_host_unless_refused` owns the
+    // ordering, because the refusal has to arrive before the current host is stopped.
+    let decision = sandbox_decision(&plan, false);
     let continuity = rebuild.continuity.clone();
-    match replace_host(host, || async move {
+    match replace_host_unless_refused(host, decision, || async move {
         continuity
             .open_host(
                 plan,
@@ -2282,11 +2462,50 @@ async fn apply_selection(
                     "the collaboration mode changed in memory but could not be persisted: {error}"
                 ));
             }
+            // Whatever the pick was — model, level, preset, or an Agent whose switch
+            // re-routed the model — the row records the pair the host now runs with, so
+            // a resume and the next rebuild both start from it.
+            if host.persisted_model_reference() != previous_model
+                && let Err(error) = host.persist_active_model()
+            {
+                return SelectionOutcome::Shutdown(format!(
+                    "the model selection changed in memory but could not be persisted: {error}"
+                ));
+            }
             SelectionOutcome::Rebuilt(rebuild.events.clone())
         }
-        Err(message) => SelectionOutcome::Shutdown(format!(
+        Err(ReplacementRefusal::UnsupportedPlatform(message)) => {
+            let _reported = rebuild
+                .events
+                .publish(TurnEvent::Provider {
+                    step: 0,
+                    event: StreamEvent::StatusDetail {
+                        detail: format!("warning: keeping the current turn host: {message}"),
+                    },
+                })
+                .await;
+            SelectionOutcome::Unchanged
+        }
+        Err(ReplacementRefusal::Failed(message)) => SelectionOutcome::Shutdown(format!(
             "turn host replacement could not establish a quiescent composition: {message}"
         )),
+    }
+}
+
+/// Resolve `next` and run the non-interactive Shell preflight before a remount.
+///
+/// A remount tears the current composition down before `execute_once` resolves the
+/// target, so a target whose Shell this platform refuses — a read-only Agent saved on
+/// the session, on a host with no confined backend — would otherwise end the terminal
+/// session over a switch the user could have kept. Asked here, while the current host
+/// still runs, the refusal is the same warning an Agent switch shows. Never
+/// interactive: the terminal is in raw mode, so the decision is `Proceed` or `Refuse`.
+async fn remount_preflight(next: &TurnOptions, rebuild: &TurnRebuild<'_>) -> Result<(), String> {
+    let plan = TurnPlan::resolve(next, rebuild.environment).await?;
+    match sandbox_decision(&plan, false) {
+        UnsupportedPlatformDecision::Refuse { message } => Err(message),
+        UnsupportedPlatformDecision::Proceed
+        | UnsupportedPlatformDecision::OfferNativeExecution { .. } => Ok(()),
     }
 }
 
@@ -2910,7 +3129,7 @@ async fn drive_turns(
             next.session = driver.host.rebuild_session_choice();
             next.model = driver.host.model_override().map(str::to_owned);
             next.agent = Some(driver.host.agent_name().to_owned());
-            next.preset = driver.host.preset_name().map(str::to_owned);
+            next.preset = driver.host.preset_override().map(str::to_owned);
             next.effort = driver.host.effort_override();
             next.extension_composition = super::turn::ExtensionComposition::Desired;
             driver.remount.request(RemountRequest::plain(next));
@@ -6352,6 +6571,95 @@ mod tests {
         })
         .await
         .expect("replacement succeeds");
+
+        assert_eq!(current.name, "new");
+        assert_eq!(
+            *log.lock().expect("lifecycle log"),
+            ["stop:old", "start:new"]
+        );
+    }
+
+    /// The agent-switch guard, driven rather than scanned for.
+    ///
+    /// A candidate whose Shell cannot be registered on this platform must be refused
+    /// while the current host is still running: `replace_host` stops the old host
+    /// first, so a refusal below it would leave the session with no host at all. The
+    /// empty lifecycle log is the assertion that matters — it fails if the check is
+    /// removed, and it fails if the check moves after the replacement.
+    #[tokio::test]
+    async fn a_candidate_refused_for_its_platform_never_stops_the_current_host() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut current = FakeLifecycleHost {
+            name: "old",
+            log: Arc::clone(&log),
+            fail_shutdown: false,
+        };
+        let candidate_log = Arc::clone(&log);
+        let refusal = crate::cmd::tool_runtime::unsupported_platform_refusal(
+            "windows",
+            zuno_sandbox::SandboxMode::WorkspaceWrite,
+        );
+        let outcome = replace_host_unless_refused(
+            &mut current,
+            UnsupportedPlatformDecision::Refuse {
+                message: refusal.clone(),
+            },
+            || async move {
+                candidate_log
+                    .lock()
+                    .expect("lifecycle log")
+                    .push("start:new".to_owned());
+                Ok(FakeLifecycleHost {
+                    name: "new",
+                    log: candidate_log,
+                    fail_shutdown: false,
+                })
+            },
+        )
+        .await
+        .expect_err("a candidate that would refuse Shell is never installed");
+
+        match outcome {
+            ReplacementRefusal::UnsupportedPlatform(message) => assert_eq!(message, refusal),
+            ReplacementRefusal::Failed(message) => {
+                panic!("a platform refusal is not a replacement failure: {message}")
+            }
+        }
+        assert_eq!(current.name, "old");
+        let entries = log.lock().expect("lifecycle log").clone();
+        assert!(
+            entries.is_empty(),
+            "the current host keeps running and the candidate never starts: {entries:?}"
+        );
+    }
+
+    /// The same wrapper installs a candidate the platform decision cleared.
+    #[tokio::test]
+    async fn a_cleared_candidate_replaces_the_host_through_the_guard() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut current = FakeLifecycleHost {
+            name: "old",
+            log: Arc::clone(&log),
+            fail_shutdown: false,
+        };
+        let candidate_log = Arc::clone(&log);
+        replace_host_unless_refused(
+            &mut current,
+            UnsupportedPlatformDecision::Proceed,
+            || async move {
+                candidate_log
+                    .lock()
+                    .expect("lifecycle log")
+                    .push("start:new".to_owned());
+                Ok(FakeLifecycleHost {
+                    name: "new",
+                    log: candidate_log,
+                    fail_shutdown: false,
+                })
+            },
+        )
+        .await
+        .expect("a cleared candidate replaces the host");
 
         assert_eq!(current.name, "new");
         assert_eq!(

@@ -6055,3 +6055,173 @@ async fn acp_withdrawing_an_admitted_prompt_cancels_its_durable_row() {
         "a withdrawn or steered prompt was left pending: {pending:?}"
     );
 }
+
+/// `session/load` reopens a session as it last ran: the model and thought level a Zed
+/// client selected are persisted on the session row and restored by the next load, a
+/// dormant reconfiguration persists through the same path, and a saved model the catalog
+/// no longer offers falls back to configuration instead of failing the load.
+#[test]
+fn acp_load_restores_the_saved_model_and_thought_level_and_survives_a_missing_model() {
+    let root = tempfile::tempdir().expect("ACP test root");
+    let mut config: Value =
+        serde_json::from_str(&config_with_second_model("https://example.invalid"))
+            .expect("second-model test config");
+    config["provider"]["test"]["models"]["test-model"]["reasoning"] = json!(true);
+    config["provider"]["test"]["models"]["test-model"]["variants"] = json!({
+        "high": {"reasoningEffort": "high"}
+    });
+    let config = serde_json::to_string(&config).expect("encode reasoning config");
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    let option = |response: &Value, id: &str| -> Option<Value> {
+        response["configOptions"]
+            .as_array()
+            .and_then(|options| options.iter().find(|option| option["id"] == id))
+            .map(|option| option["currentValue"].clone())
+    };
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    assert_eq!(option(&created, "model"), Some(json!("test/test-model")));
+
+    // A live thought-level selection is persisted on the row.
+    let raised = request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/set_config_option",
+        json!({"sessionId": &session_id, "configId": "reasoning_effort", "value": "high"}),
+    );
+    assert_eq!(option(&raised, "reasoning_effort"), Some(json!("high")));
+    request(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    let (loaded, _replay) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/load",
+        json!({"sessionId": &session_id, "cwd": root.path(), "mcpServers": []}),
+    );
+    assert_eq!(loaded["modes"]["currentModeId"], "build");
+    assert_eq!(option(&loaded, "model"), Some(json!("test/test-model")));
+    assert_eq!(
+        option(&loaded, "reasoning_effort"),
+        Some(json!("high")),
+        "the saved thought level is the level in force after a load: {loaded}"
+    );
+
+    // A dormant model reconfiguration persists through the same row.
+    let switched = request(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "session/set_config_option",
+        json!({"sessionId": &session_id, "configId": "model", "value": "test/test-model-2"}),
+    );
+    assert_eq!(option(&switched, "model"), Some(json!("test/test-model-2")));
+    request(
+        &mut stdin,
+        &mut stdout,
+        7,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    let (reloaded, _replay) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        8,
+        "session/load",
+        json!({"sessionId": &session_id, "cwd": root.path(), "mcpServers": []}),
+    );
+    assert_eq!(
+        option(&reloaded, "model"),
+        Some(json!("test/test-model-2")),
+        "a load must reopen the session on the model it last ran with: {reloaded}"
+    );
+    assert_eq!(
+        option(&reloaded, "reasoning_effort"),
+        None,
+        "a non-reasoning model offers no thought-level selector"
+    );
+    let stored = {
+        let connection = zuno_db::open::open(&zuno_paths::DbLocation::File(
+            root.path().join("zuno-acp.db"),
+        ))
+        .expect("open ACP database");
+        zuno_db::session::get(&connection, &session_id).expect("read session row")
+    };
+    assert_eq!(
+        stored.model.as_deref(),
+        Some(zuno_db::session::model_reference("test", "test-model-2").as_str()),
+        "the row records the model without a variant for a model that declares none"
+    );
+
+    // A saved model the catalog no longer offers falls back to `config.model`.
+    {
+        let connection = zuno_db::open::open(&zuno_paths::DbLocation::File(
+            root.path().join("zuno-acp.db"),
+        ))
+        .expect("open ACP database");
+        connection
+            .execute(
+                "UPDATE session SET model = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    zuno_db::session::model_reference("test", "gone"),
+                    session_id
+                ],
+            )
+            .expect("retire the saved model");
+    }
+    request(
+        &mut stdin,
+        &mut stdout,
+        9,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    let (fallen_back, _replay) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        10,
+        "session/load",
+        json!({"sessionId": &session_id, "cwd": root.path(), "mcpServers": []}),
+    );
+    assert_eq!(
+        option(&fallen_back, "model"),
+        Some(json!("test/test-model")),
+        "a retired saved model must not make the session unloadable: {fallen_back}"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP process");
+    assert!(status.success(), "ACP process exited with {status}");
+}

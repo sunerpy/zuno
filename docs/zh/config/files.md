@@ -104,10 +104,11 @@ ZUNO_CONFIG_DIR="$HOME/.config/zuno/profiles/kiro" zuno
 | 层 | 沙箱权限 |
 | --- | --- |
 | 受信的全局、显式配置、受管、环境、CLI | 可以选择任意模式 |
-| 项目 `zuno.json[c]` 与 `.zuno` | 只能收窄为 `read-only`、拒绝网络、添加受保护路径，或把 `onUnavailable` 设为 `deny` |
+| 项目 `zuno.json[c]` 与 `.zuno` | 只能收窄为 `read-only`、拒绝网络、添加受保护路径、把 `onUnavailable` 设为 `deny`，或把 `backend` 设为 `auto` |
 
 项目层无法选择更宽的模式、授予宿主网络、添加外部可写根目录，也不能启用
-`run-unconfined`。因此一份被检入仓库的配置无法提升自己的约束级别，正是这个性质让克隆一个陌生仓库变得安全。
+`run-unconfined` 或选择原生后端（`backend: "native"`）。因此一份被检入仓库的配置既无法提升
+自己的约束级别，也无法把自己的 Shell 挪出沙箱，正是这个性质让克隆一个陌生仓库变得安全。
 
 点名可执行文件的项目层会被拒绝。项目 `zuno.json[c]` 或 `.zuno` 文件设置了 `shell`、本地
 `mcp.*.command`、`lsp.*.command`、`formatter.*.command`，或
@@ -139,11 +140,14 @@ macOS 受管偏好。被接纳的声明仍会逐个键记入日志，运维日�
 zuno --sandbox read-only
 zuno --sandbox danger-full-access
 zuno --sandbox workspace-write --sandbox-on-unavailable run-unconfined
+zuno --sandbox-backend native
 ```
 
 仅在后端不可用时降级的环境变量写法是
-`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`。受管策略的优先级更靠后，仍可收窄这些覆盖，
-或把不可用动作强制改回 `deny`。参见[权限与沙箱](/zh/guide/permissions)。
+`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`，原生后端的环境变量写法是
+`ZUNO_SANDBOX_BACKEND=native`。`--sandbox-backend native` 为本次调用的每个 Agent（包括只读
+Agent）选择原生后端并保留权限模式，它不是沙箱隔离。受管策略的优先级更靠后，仍可收窄这些
+覆盖，把不可用动作强制改回 `deny`，或把后端强制改回 `auto`。参见[权限与沙箱](/zh/guide/permissions)。
 
 ## 其他资产在哪里被发现
 

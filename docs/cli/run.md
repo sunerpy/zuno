@@ -6,7 +6,9 @@ form to use in scripts, CI jobs, and git hooks, where there is no interactive se
 attach to and the output needs to be machine-readable.
 
 It can start a fresh session, continue the most recent one in the current directory, or
-target an exact session id.
+target an exact session id. A continued or targeted session resumes on the Agent, model,
+and reasoning level it last ran with; `--agent`, `--model`, `--variant`, and `--thinking`
+outrank those saved values for the run.
 
 ## Synopsis
 
@@ -32,6 +34,7 @@ zuno run [OPTIONS] [message]...
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
+| `--sandbox-backend <BACKEND>` | Select the Shell execution backend for this invocation; `native` is not confinement. Possible values: `auto`, `native` | `auto` |
 | `-m`, `--model <MODEL>` | The model to use, as `provider/model` | |
 | `--agent <AGENT>` | The agent to use | |
 | `--format <FORMAT>` | Output format. Possible values: `default`, `json` | `default` |
@@ -58,7 +61,8 @@ Run a single message and print the default human-readable result.
 zuno run "explain what changed in the last commit"
 ```
 
-Continue the most recent session in this directory instead of starting a new one.
+Continue the most recent session in this directory instead of starting a new one. The
+turn runs on the Agent and model that session last used.
 
 ```sh
 zuno run --continue "now add tests for the new branch"
@@ -83,7 +87,8 @@ reasoning are never rendered. Each block is delimited by
 ends with an error. `--show-reasoning` cannot be combined with `--format json`;
 JSON mode keeps the existing structured event stream.
 
-Target an exact session and choose a different agent for this turn.
+Target an exact session and choose a different agent for this turn. Naming another Agent
+re-routes the model through configuration; add `--model` to keep the session's model.
 
 ```sh
 zuno run --session ses_1a2b3c --agent plan "what would a safe migration look like?"

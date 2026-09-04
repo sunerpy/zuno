@@ -118,6 +118,22 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
 启用它，只读 Agent 永远不会使用它，受管策略也可以把它强制改回 `deny`。精确的降级边界见
 [权限与沙箱](/zh/guide/permissions)。
 
+如果要让每个 Agent 的 Shell（包括只读 Agent）都原生运行，同时保留已配置的权限模式，
+请显式选择后端而不是模式：
+
+```json
+{
+  "sandbox": {
+    "backend": "native"
+  }
+}
+```
+
+`native` 是对一台没有 OS 沙箱的主机作出的声明，既不是降级也不是沙箱隔离：请求的权限会被
+记录但不由 OS 强制执行，只读 Agent 的契约变成一道由工具、权限与风险门禁构成的边界。它只
+接受来自同样那些受信层，项目层只能写 `auto`，受管策略可以强制改回 `auto`。单次调用的写法是
+`zuno --sandbox-backend native` 与 `ZUNO_SANDBOX_BACKEND=native`。
+
 项目层声明本机命令会被拒绝。项目 `zuno.json[c]` 或 `.zuno` 中的 `shell`、本地
 `mcp.*.command`、未被禁用的 `lsp.*.command` 与 `formatter.*.command`，以及
 `productAgent.*.command`，都会让配置发现以校验错误失败；远程 MCP server 不受影响。

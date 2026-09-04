@@ -918,7 +918,7 @@ fn login_well_known(
         eprintln!(
             "Running it without confirmation because {TRUST_REMOTE_COMMAND_FLAG} was passed."
         );
-    } else if !terminal_prompt::confirm("Run this command")? {
+    } else if !terminal_prompt::confirm_choice("Run this command")? {
         return Err(
             "well-known provider login cancelled; nothing was run and nothing was stored"
                 .to_owned(),

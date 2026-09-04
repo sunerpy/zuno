@@ -4,7 +4,7 @@
 再把结果写到 stdout。这是在脚本、CI 任务和 git hook 中该用的形式 —— 那些场景里没有可
 附着的交互式 session，而输出需要可被机器解析。
 
-它可以开启一个全新 session、继续当前目录中最近的那个，或者指向一个确切的 session id。
+它可以开启一个全新 session、继续当前目录中最近的那个，或者指向一个确切的 session id。被继续或被指向的 session 会沿用它上次使用的 Agent、模型与推理强度；`--agent`、`--model`、`--variant` 与 `--thinking` 在本次运行中优先于这些保存的值。
 
 ## 用法
 
@@ -30,6 +30,7 @@ zuno run [OPTIONS] [message]...
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
+| `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
 | `-m`, `--model <MODEL>` | 要使用的模型，写成 `provider/model` | |
 | `--agent <AGENT>` | 要使用的 Agent | |
 | `--format <FORMAT>` | 输出格式。可选值：`default`、`json` | `default` |
@@ -54,7 +55,7 @@ zuno run [OPTIONS] [message]...
 zuno run "explain what changed in the last commit"
 ```
 
-继续本目录中最近的 session，而不是新开一个。
+继续本目录中最近的 session，而不是新开一个。这一轮会在该 session 上次使用的 Agent 与模型上运行。
 
 ```sh
 zuno run --continue "now add tests for the new branch"
@@ -74,7 +75,7 @@ zuno run --show-reasoning "inspect the failure" > answer.txt 2> progress.txt
 
 只显示 provider 明确给出的 reasoning delta；signed thinking 与 encrypted reasoning 永不渲染。每个区块使用 `<<<zuno:reasoning>>>` 与 `<<<zuno:end-reasoning>>>` 标记，即使流以错误结束也会闭合。`--show-reasoning` 不能与 `--format json` 组合；JSON 模式继续使用现有结构化事件流。
 
-指向一个确切的 session，并为本轮换用另一个 Agent。
+指向一个确切的 session，并为本轮换用另一个 Agent。换用另一个 Agent 会让模型按配置重新路由；要保留 session 的模型就再加上 `--model`。
 
 ```sh
 zuno run --session ses_1a2b3c --agent plan "what would a safe migration look like?"

@@ -2484,10 +2484,36 @@
       },
       "type": "object"
     },
+    "SandboxBackendSelection": {
+      "description": "Which execution backend resolves model-initiated Shell calls.\n\nOrthogonal to `mode`: the mode is the authority an Agent is granted, the\nbackend is what enforces it. `native` enforces nothing at the OS level and\nsays so in every record and notice.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Discover the platform's confined backend and apply `onUnavailable` when it\ncannot be deployed.",
+          "type": "string"
+        },
+        {
+          "const": "native",
+          "description": "Run every Agent's Shell, read-only contracts included, on the native process\nbackend with the configured permission mode kept. The requested authority is\nrecorded but not OS-enforced.",
+          "type": "string"
+        }
+      ]
+    },
     "SandboxConfig": {
       "additionalProperties": false,
       "description": "Policy additions shared by every Shell call in one resolved profile.",
       "properties": {
+        "backend": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SandboxBackendSelection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Backend selection. `auto` (default) discovers the platform's confined\nbackend and applies `onUnavailable`. `native` runs every Agent's Shell,\nread-only contracts included, on the native process backend with the\nconfigured permission mode kept; the requested authority is recorded but\nnot OS-enforced. Accepted only from a trusted configuration layer."
+        },
         "mode": {
           "anyOf": [
             {

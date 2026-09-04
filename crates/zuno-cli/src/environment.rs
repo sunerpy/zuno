@@ -37,9 +37,11 @@ pub const ZUNO_LOG_LEVEL: &str = "ZUNO_LOG_LEVEL";
 pub const ZUNO_SANDBOX_MODE: &str = "ZUNO_SANDBOX_MODE";
 /// Trusted per-invocation response to an unavailable confined sandbox.
 pub const ZUNO_SANDBOX_ON_UNAVAILABLE: &str = "ZUNO_SANDBOX_ON_UNAVAILABLE";
+/// Trusted per-invocation Shell execution backend selection (`auto` or `native`).
+pub const ZUNO_SANDBOX_BACKEND: &str = "ZUNO_SANDBOX_BACKEND";
 
 /// Environment values read by the CLI and its command implementations.
-pub const ZUNO_FLAG_NAMES: [&str; 37] = [
+pub const ZUNO_FLAG_NAMES: [&str; 38] = [
     "ZUNO_ALWAYS_NOTIFY_UPDATE",
     "ZUNO_AUTO_HEAP_SNAPSHOT",
     "ZUNO_CLIENT",
@@ -75,6 +77,7 @@ pub const ZUNO_FLAG_NAMES: [&str; 37] = [
     ZUNO_LOG_LEVEL,
     ZUNO_PID,
     ZUNO_PRINT_LOGS,
+    ZUNO_SANDBOX_BACKEND,
     ZUNO_SANDBOX_MODE,
     ZUNO_SANDBOX_ON_UNAVAILABLE,
 ];
@@ -175,6 +178,9 @@ impl StartupEnvironment {
         if let Some(action) = globals.sandbox_on_unavailable {
             overrides.insert(ZUNO_SANDBOX_ON_UNAVAILABLE, action.as_str().to_owned());
         }
+        if let Some(backend) = globals.sandbox_backend {
+            overrides.insert(ZUNO_SANDBOX_BACKEND, backend.as_str().to_owned());
+        }
         let resolved = overrides.iter().fold(base.clone(), |env, (name, value)| {
             env.with(*name, value.clone())
         });
@@ -186,6 +192,35 @@ impl StartupEnvironment {
             background_executions: Arc::new(Mutex::new(HashMap::new())),
             background_jobs: Arc::new(Mutex::new(HashMap::new())),
             background_notifications: BackgroundNotificationRegistry::default(),
+            flags,
+        }
+    }
+
+    /// The same environment after this process chose its Shell execution backend.
+    ///
+    /// Takes the exact path `--sandbox-backend` takes: the value becomes the
+    /// `ZUNO_SANDBOX_BACKEND` override that configuration discovery reads as a trusted
+    /// layer, and the flag snapshot is re-read so nothing downstream can see the old
+    /// answer. Shared registries are the same `Arc`s, so an environment derived this
+    /// way still owns the background work the original started. The interactive
+    /// offer accepts through this for every request, read-only included, so one
+    /// answer covers every later composition and Agent switch of the process.
+    #[must_use]
+    pub(crate) fn with_sandbox_backend(&self, backend: crate::command::CliSandboxBackend) -> Self {
+        let mut overrides = self.overrides.clone();
+        overrides.insert(ZUNO_SANDBOX_BACKEND, backend.as_str().to_owned());
+        let resolved = self
+            .resolved
+            .clone()
+            .with(ZUNO_SANDBOX_BACKEND, backend.as_str());
+        let flags = ZunoFlags::read(&resolved);
+        Self {
+            resolved,
+            overrides,
+            extensions: Arc::clone(&self.extensions),
+            background_executions: Arc::clone(&self.background_executions),
+            background_jobs: Arc::clone(&self.background_jobs),
+            background_notifications: self.background_notifications.clone(),
             flags,
         }
     }
@@ -322,12 +357,64 @@ mod tests {
     }
 
     #[test]
+    fn choosing_the_native_backend_later_takes_the_same_override_path_as_the_flag() {
+        let globals = GlobalOptions {
+            print_logs: false,
+            log_level: None,
+            sandbox: None,
+            sandbox_on_unavailable: None,
+            sandbox_backend: None,
+        };
+        let startup = StartupEnvironment::resolve(&Env::empty(), &globals);
+        assert_eq!(startup.flags.value(ZUNO_SANDBOX_BACKEND), None);
+
+        let chosen = startup.with_sandbox_backend(crate::command::CliSandboxBackend::Native);
+        let flagged = StartupEnvironment::resolve(
+            &Env::empty(),
+            &GlobalOptions {
+                sandbox_backend: Some(crate::command::CliSandboxBackend::Native),
+                ..globals
+            },
+        );
+
+        assert_eq!(
+            chosen.resolved().value(ZUNO_SANDBOX_BACKEND),
+            Some("native")
+        );
+        assert_eq!(chosen.flags.value(ZUNO_SANDBOX_BACKEND), Some("native"));
+        assert_eq!(
+            chosen.flags.value(ZUNO_SANDBOX_ON_UNAVAILABLE),
+            None,
+            "the backend selection is not the unavailable action"
+        );
+        assert_eq!(
+            chosen.overrides().collect::<Vec<_>>(),
+            flagged.overrides().collect::<Vec<_>>()
+        );
+        assert!(Arc::ptr_eq(chosen.extensions(), startup.extensions()));
+        assert!(Arc::ptr_eq(
+            &chosen.background_executions,
+            &startup.background_executions
+        ));
+        assert!(Arc::ptr_eq(
+            &chosen.background_jobs,
+            &startup.background_jobs
+        ));
+        assert!(
+            chosen
+                .background_notifications
+                .ptr_eq(&startup.background_notifications)
+        );
+    }
+
+    #[test]
     fn globals_and_required_process_markers_are_applied_before_flags_are_read() {
         let globals = GlobalOptions {
             print_logs: true,
             log_level: Some(CliLogLevel::Warn),
             sandbox: None,
             sandbox_on_unavailable: None,
+            sandbox_backend: None,
         };
         let startup = StartupEnvironment::resolve(&Env::empty(), &globals);
 
@@ -340,6 +427,7 @@ mod tests {
         assert_eq!(startup.flags.value(ZUNO_PRINT_LOGS), Some("1"));
         assert_eq!(startup.flags.value(ZUNO_LOG_LEVEL), Some("WARN"));
         assert_eq!(startup.flags.value(ZUNO_SANDBOX_ON_UNAVAILABLE), None);
+        assert_eq!(startup.flags.value(ZUNO_SANDBOX_BACKEND), None);
     }
 
     #[test]

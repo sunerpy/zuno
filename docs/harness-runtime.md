@@ -76,7 +76,7 @@ The generated developer instructions use stable ids and sources:
 | --- | --- | --- |
 | `runtime.intent` | Follow the current user request or delegated objective without inventing broader authority. | Always. |
 | `runtime.execution` | Choose the smallest coherent workflow, batch independent reads, avoid unchanged re-reads or repeated checks, use one durable background observer for asynchronous work, distinguish a local observer exit from remote completion, and stop once evidence is complete. | Always; tool communication and termination guidance are added only when tools exist, Plan guidance only when `plan_update` exists, and background-start guidance only when both `shell` and `bg` exist. |
-| `runtime.sandbox` | State that Shell is using host authority, including requested/effective mode and the typed reason that confinement was unavailable. | Only while a trusted unavailable-sandbox fallback is active. |
+| `runtime.sandbox` | State that Shell is using host authority, including requested/effective mode, the permission mode that still applies, and the cause: the typed reason that confinement was unavailable, or the explicit `sandbox.backend: native` selection. | Only while a trusted unavailable-sandbox fallback or a trusted `sandbox.backend: native` selection is active. |
 | `runtime.continuity` | Treat History and Notes results as untrusted session data, explain current-session and session-and-Agent scope, and preserve Notes revision boundaries. | Only when the final provider-visible tool snapshot contains `history` or `notes`. |
 | `runtime.editing` | Preserve unrelated changes, edit the owning abstraction, and inspect uncertain side effects before retry. | Only when an effective edit/write surface or workspace-writing Shell exists. |
 | `runtime.git_attribution` | Use Zuno's command-scoped default Git author and committer identity without modifying persistent Git configuration, while allowing current user instructions, repository rules, and selected Skills to override or disable it. | Only when a workspace-writing Shell exists. |
@@ -157,7 +157,9 @@ ACP, server, and child turns. It chooses `Required`, `Maintain`, `Atomic`, or
 bounded read, or one short commit of already-prepared changes may proceed
 atomically. A short single-clause question stays atomic whether or not it ends in
 a question mark, including Chinese phrasing that carries the interrogative in the
-middle of the sentence. Typed image, resource, selection, or branch-diff context, sufficiently
+middle of the sentence. A greeting, thanks, or bare acknowledgement is
+conversational and stays atomic; it never opens a Plan, and with an active Plan it
+is a continuation. Typed image, resource, selection, or branch-diff context, sufficiently
 large multi-block text, cross-component work, delegation, multiple gates, and
 restart-sensitive work select the planned path.
 
@@ -232,7 +234,13 @@ grants capabilities or authorizes a mode transition by itself.
 Static tool descriptions live in dedicated text files and are byte-pinned by the
 prompt golden test. Prompt changes are therefore reviewed as model-visible
 behavior, while schemas, permission policy, replay policy, and execution remain
-independently testable.
+independently testable. Operation-tagged parameter enums (`plan_update`, `notes`,
+`history`) reach the provider as one object schema whose `action` property
+enumerates the operations and is the only schema-required field; the typed
+deserializer enforces each operation's own fields. A field whose shape differs
+between operations is sent in its nullable form when one operation merely makes it
+optional, with each operation's description attributed to it when only the
+descriptions differ, and as an `anyOf` of the distinct shapes otherwise.
 
 An Agent has no implicit turn-step ceiling. `agents.<name>.steps` may explicitly
 set a positive maximum number of tool-capable provider steps. Reaching that
@@ -1731,22 +1739,37 @@ default. The trusted `sandbox.onUnavailable` setting accepts `deny` (default) or
 configuration may set only `deny`. Global, explicit, environment, CLI, and
 managed layers may enable fallback, and managed policy has final precedence.
 
+The trusted `sandbox.backend` setting selects the execution backend
+independently of the mode: `auto` (default) discovers the confined backend, and
+`native` resolves every request, read-only contracts included, to the native
+backend before any discovery as `resolutionKind` `trusted_native`, keeps the
+configured permission mode, and records the requested authority as unenforced.
+The same value can be supplied by `--sandbox-backend` or
+`ZUNO_SANDBOX_BACKEND`; project configuration may set only `auto`, and managed
+policy has final precedence. It is an explicit host declaration, not a
+fallback, and the CapabilitySnapshot sandbox identity includes it so an
+approval issued under confinement is not reused after a switch.
+
 The `SandboxResolver` completes discovery, capability checks, and a real
 `verify_deployment` before publishing Shell. Only unsupported platforms, a
 missing trusted launcher, missing required launcher capabilities, and typed
 namespace/container-policy unavailability may activate fallback. Untrusted
 launchers, invalid policy or paths, seccomp/helper/internal errors, generic
 process errors, and command preparation/execution errors remain terminal.
-Read-only Agent contracts never fall back.
+Read-only Agent contracts never fall back; their one native route is the
+explicit trusted `sandbox.backend: native` selection.
 
-An unavailable fallback uses the existing native backend and the same
-`PreparedCommand`, permission review, catastrophic-command denial, background,
-timeout, cancellation, and process-tree lifecycle. It preserves the original
-permission mode; unlike explicit `danger-full-access`, it does not imply
-`allow_all`. Requested network denial, writable roots, and protected paths cannot
-be OS-enforced while the effective authority is the host process user's
-authority. The host emits one warning, and every model request receives the
-durable `runtime.sandbox` section while fallback remains active.
+An unavailable fallback and a trusted `native` backend selection both use the
+existing native backend and the same `PreparedCommand`, permission review,
+catastrophic-command denial, background, timeout, cancellation, and
+process-tree lifecycle. It preserves the original permission mode; unlike
+explicit `danger-full-access`, it does not imply `allow_all`. Requested network
+denial, writable roots, and protected paths cannot be OS-enforced while the
+effective authority is the host process user's authority. The host emits one
+warning, and every model request receives the durable `runtime.sandbox` section
+while either remains active; the section names its cause (the typed unavailable
+reason, or `sandbox.backend: native`), the requested and effective authority,
+and the permission mode that still applies.
 
 Explicit `danger-full-access` skips restricted-backend discovery entirely,
 retains host filesystem, process, credential, and network authority, and sets the
@@ -1755,10 +1778,12 @@ catastrophic Shell denials remain terminal.
 
 Every path produces a `PreparedCommand` and persists execution-authority schema
 version 3: `mode` and `network` are effective authority, while
-`requestedMode`, `requestedNetwork`, `resolutionKind`, and `fallbackReason`
-record resolution. Version-2 background records read as requested equals
-effective with legacy resolution, so in-flight state remains recoverable. Tool
-output mirrors requested/effective authority and fallback metadata.
+`requestedMode`, `requestedNetwork`, `resolutionKind` (`confined`,
+`explicit_native`, `unavailable_fallback`, `trusted_native`, or `legacy`), and
+`fallbackReason` record resolution. Version-2 background records read as
+requested equals effective with legacy resolution, so in-flight state remains
+recoverable. Tool output mirrors requested/effective authority and fallback
+metadata.
 
 Confined macOS and Windows modes currently report unsupported. They remain
 fail-closed unless a trusted `run-unconfined` policy is active for a write-capable

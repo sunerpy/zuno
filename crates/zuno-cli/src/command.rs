@@ -72,6 +72,8 @@ pub struct GlobalOptions {
     pub sandbox: Option<CliSandboxMode>,
     /// Override the response to an unavailable confined sandbox.
     pub sandbox_on_unavailable: Option<CliSandboxUnavailableAction>,
+    /// Override the Shell execution backend selection.
+    pub sandbox_backend: Option<CliSandboxBackend>,
 }
 
 /// The root command parser.
@@ -107,6 +109,10 @@ pub struct Cli {
     #[arg(long, global = true, value_enum, value_name = "ACTION")]
     pub sandbox_on_unavailable: Option<CliSandboxUnavailableAction>,
 
+    /// Select the Shell execution backend for this invocation; `native` is not confinement.
+    #[arg(long, global = true, value_enum, value_name = "BACKEND")]
+    pub sandbox_backend: Option<CliSandboxBackend>,
+
     /// The default command's own options, accepted without naming it.
     #[command(flatten)]
     pub tui: TuiArgs,
@@ -125,6 +131,7 @@ impl Cli {
             log_level: self.log_level,
             sandbox: self.sandbox,
             sandbox_on_unavailable: self.sandbox_on_unavailable,
+            sandbox_backend: self.sandbox_backend,
         }
     }
 
@@ -179,6 +186,27 @@ impl CliSandboxUnavailableAction {
         match self {
             Self::Deny => "deny",
             Self::RunUnconfined => "run-unconfined",
+        }
+    }
+}
+
+/// Shell execution backends the CLI may select for one invocation.
+///
+/// `native` is a trusted host declaration, accepted like `--sandbox-on-unavailable`
+/// from the invocation only: it runs every Agent's Shell natively with the configured
+/// permission mode kept, and it is not confinement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliSandboxBackend {
+    Auto,
+    Native,
+}
+
+impl CliSandboxBackend {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Native => "native",
         }
     }
 }
@@ -1289,6 +1317,43 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    /// `--sandbox-backend` is exported exactly like `--sandbox-on-unavailable`: the
+    /// value becomes the trusted `ZUNO_SANDBOX_BACKEND` environment layer, before or
+    /// after the subcommand, and an unknown spelling is a parse error.
+    #[test]
+    fn sandbox_backend_is_a_global_trusted_invocation_override() {
+        for (spelling, expected) in [("auto", "auto"), ("native", "native")] {
+            for args in [
+                vec!["zuno", "--sandbox-backend", spelling, "run"],
+                vec!["zuno", "run", "--sandbox-backend", spelling],
+            ] {
+                let cli = Cli::try_parse_from(args.clone())
+                    .unwrap_or_else(|error| panic!("{args:?} must parse: {error}"));
+                let Action::Dispatch(request) = cli.action(&Env::empty()) else {
+                    panic!("sandbox backend override must still dispatch");
+                };
+                assert_eq!(
+                    request.environment.flags.value(crate::ZUNO_SANDBOX_BACKEND),
+                    Some(expected),
+                    "{args:?}"
+                );
+            }
+        }
+        assert!(
+            Cli::try_parse_from(["zuno", "--sandbox-backend", "none", "run"]).is_err(),
+            "only `auto` and `native` are backend selections"
+        );
+        let unset = Cli::try_parse_from(["zuno", "run"]).expect("plain run parses");
+        let Action::Dispatch(request) = unset.action(&Env::empty()) else {
+            panic!("plain run dispatches");
+        };
+        assert_eq!(
+            request.environment.flags.value(crate::ZUNO_SANDBOX_BACKEND),
+            None,
+            "absence selects nothing, so discovery keeps the configured or default `auto`"
+        );
     }
 
     #[test]

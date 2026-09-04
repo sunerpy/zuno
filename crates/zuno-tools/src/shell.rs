@@ -953,7 +953,10 @@ impl ShellTool {
 
         let git_metadata_writable = mutates_git_metadata(analysis, self.syntax());
         if git_metadata_writable {
-            if self.sandbox_policy.mode() == SandboxMode::ReadOnly {
+            // The requested contract, not the execution policy: under a trusted native
+            // backend the execution policy is `danger-full-access` while the Agent's
+            // contract is still read-only, and that contract is what this refusal keeps.
+            if self.sandbox_policy.requested_mode() == SandboxMode::ReadOnly {
                 return Err(failed(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "this Agent's Shell policy is read-only and cannot modify Git metadata",

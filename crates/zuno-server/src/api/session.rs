@@ -895,7 +895,7 @@ pub async fn prompt(
             provider_id: model.provider_id,
             model_id: model.id,
         }),
-        None => session_model(session.model.as_deref())?,
+        None => session_model(session.model.as_deref()),
     };
     let persisted = PersistedUserPrompt {
         prompt: prompt.clone(),
@@ -1148,7 +1148,7 @@ fn human_answer_execution(
             )
         })?
         .to_owned();
-    let model = session_model(session.model.as_deref()).map_err(|error| error.to_string())?;
+    let model = session_model(session.model.as_deref());
     Ok(SessionPromptExecution {
         session_id: input.session_id,
         directory: session.directory.into(),
@@ -1173,7 +1173,7 @@ fn report_execution(
         .sessions()
         .get(session_id)
         .map_err(|error| error.to_string())?;
-    let model = session_model(session.model.as_deref()).map_err(|error| error.to_string())?;
+    let model = session_model(session.model.as_deref());
     Ok(SessionReportExecution {
         session_id: session_id.to_owned(),
         directory: session.directory.into(),
@@ -1370,7 +1370,7 @@ pub(crate) async fn compact_session(
         agent: session.agent,
         model: match requested_model {
             Some(model) => Some(model),
-            None => session_model(session.model.as_deref())?,
+            None => session_model(session.model.as_deref()),
         },
         automatic,
     };
@@ -1525,16 +1525,18 @@ fn require_idle(
     Ok(session)
 }
 
-fn session_model(raw: Option<&str>) -> Result<Option<SessionModelSelection>, ApiError> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let model: ModelRefBody =
-        serde_json::from_str(raw).map_err(|error| ApiError::MutationFailed(error.to_string()))?;
-    Ok(Some(SessionModelSelection {
+/// The model a request without one runs on: the session's saved model, decoded by the
+/// same tolerant reader the CLI surfaces use.
+///
+/// A row an older writer stored as a plain `provider/model` string, or one this server
+/// cannot read at all, yields `None` and lets turn resolution route from configuration
+/// rather than failing a request over a column the caller did not send.
+fn session_model(raw: Option<&str>) -> Option<SessionModelSelection> {
+    let model = zuno_db::session::decode_model_reference(raw?)?;
+    Some(SessionModelSelection {
         provider_id: model.provider_id,
-        model_id: model.id,
-    }))
+        model_id: model.model_id,
+    })
 }
 
 fn message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {

@@ -236,7 +236,8 @@ impl PlanningPolicy {
             && (direct_answer(prompt)
                 || single_read(prompt)
                 || atomic_commit(prompt)
-                || active_plan_continuation(prompt))
+                || active_plan_continuation(prompt)
+                || conversational(prompt))
         {
             return PlanningDecision::Maintain(reason(
                 "active_plan_continuation",
@@ -256,6 +257,12 @@ impl PlanningPolicy {
             return PlanningDecision::Atomic(reason(
                 "direct_answer",
                 "a direct answer does not benefit from durable execution state",
+            ));
+        }
+        if conversational(prompt) {
+            return PlanningDecision::Atomic(reason(
+                "conversational",
+                "a greeting, thanks, or acknowledgement names no work and does not open a plan",
             ));
         }
         if single_read(prompt) {
@@ -395,6 +402,107 @@ fn single_clause(prompt: &str) -> bool {
         && !["然后", "还要", "同时", "以及", " and ", " then "]
             .iter()
             .any(|joiner| prompt.contains(joiner))
+}
+
+/// Longest message that can be a greeting or acknowledgement rather than a request.
+///
+/// `thank you very much!` fits. A request that opens with a pleasantry runs longer, and
+/// a longer message is judged on its verbs like any other prompt.
+const CONVERSATIONAL_MAX_CHARS: usize = 24;
+
+/// Words that may accompany a social marker without turning the message into work:
+/// `thank you very much`, `hey there`, `thanks all`.
+const CONVERSATIONAL_FILLER: [&str; 21] = [
+    "there", "you", "u", "all", "so", "much", "very", "a", "lot", "and", "too", "again",
+    "everyone", "team", "me", "guys", "friend", "mate", "good", "night", "nice",
+];
+
+/// Chinese particles that may accompany a marker: `谢谢你`, `好的呀`.
+const CONVERSATIONAL_CJK_FILLER: [&str; 9] = ["你", "您", "了", "啦", "哦", "呀", "啊", "哈", "嘿"];
+
+/// Words that mark a social message. ASCII entries match whole words; CJK entries match
+/// as substrings, as [`action_count`] already does for Chinese.
+const CONVERSATIONAL_MARKERS: [&str; 30] = [
+    "hi",
+    "hello",
+    "hey",
+    "hiya",
+    "howdy",
+    "thanks",
+    "thank",
+    "thx",
+    "cheers",
+    "morning",
+    "afternoon",
+    "evening",
+    "bye",
+    "goodbye",
+    "ok",
+    "okay",
+    "你好",
+    "您好",
+    "嗨",
+    "哈喽",
+    "早上好",
+    "早安",
+    "下午好",
+    "晚上好",
+    "晚安",
+    "谢谢",
+    "多谢",
+    "感谢",
+    "好的",
+    "再见",
+];
+
+/// Whether the prompt is a greeting, thanks, or bare acknowledgement.
+///
+/// `hi` reached the `require_plan` fallthrough because it is neither a question nor a
+/// read, commit, or bounded action. The runtime instruction then told the `deep` Agent to
+/// read and create a durable Plan, and it opened one titled "Acknowledge greeting" before
+/// saying hello. A message that names no work is not an objective: it never opens a Plan
+/// and, when one is active, it continues that Plan rather than replacing it. Short and
+/// action-free on purpose, so `thanks, now fix the failing test` still classifies as work.
+fn conversational(prompt: &str) -> bool {
+    let lower = normalized(prompt).to_lowercase();
+    if lower.chars().count() > CONVERSATIONAL_MAX_CHARS
+        || multi_stage(prompt)
+        || action_count(prompt) > 0
+    {
+        return false;
+    }
+    // The message must be *bare*: once every social marker and filler word is taken
+    // out, nothing else may remain. `hi, review my PR` and `ok, deploy prod` carry a
+    // marker but also name work in verbs the action list does not know, and a request
+    // is never demoted to small talk because it opened politely.
+    let mut saw_marker = false;
+    let mut rest = lower.clone();
+    for marker in CONVERSATIONAL_MARKERS
+        .iter()
+        .filter(|marker| !marker.is_ascii())
+    {
+        if rest.contains(marker) {
+            saw_marker = true;
+            rest = rest.replace(marker, " ");
+        }
+    }
+    for particle in CONVERSATIONAL_CJK_FILLER {
+        rest = rest.replace(particle, " ");
+    }
+    if rest
+        .chars()
+        .any(|character| character.is_alphabetic() && !character.is_ascii())
+    {
+        return false;
+    }
+    for word in english_words(&rest) {
+        if CONVERSATIONAL_MARKERS.contains(&word) {
+            saw_marker = true;
+        } else if !CONVERSATIONAL_FILLER.contains(&word) {
+            return false;
+        }
+    }
+    saw_marker
 }
 
 fn single_read(prompt: &str) -> bool {
@@ -827,5 +935,103 @@ mod tests {
                 .contains("Todo items are optional concrete work beneath plan steps")
         );
         assert!(!decision.guidance().contains("one Todo per Plan step"));
+    }
+
+    #[test]
+    fn a_greeting_or_acknowledgement_never_requires_a_plan() {
+        // The reported session. `hi` to the `deep` Agent matched no atomic shape and reached
+        // the `require_plan` fallthrough; the runtime instruction then told the model to read
+        // and create a durable Plan, and it opened one titled "Acknowledge greeting" before
+        // saying hello. A message that names no work is not an objective.
+        for prompt in [
+            "hi",
+            "Hi!",
+            "hello",
+            "hey there",
+            "thanks",
+            "thank you",
+            "ok",
+            "good morning",
+            "你好",
+            "谢谢",
+            "好的",
+            "thank you very much!",
+            "thanks all",
+            "谢谢你",
+            "好的呀",
+        ] {
+            let decision = PlanningPolicy::classify(PlanningInput::new(prompt, "deep"));
+            assert!(
+                matches!(decision, PlanningDecision::Atomic(_)),
+                "{prompt:?} names no work and must not require a durable Plan: {decision:?}"
+            );
+            assert_eq!(decision.rationale().code(), "conversational", "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn a_greeting_with_an_active_plan_maintains_it() {
+        for prompt in ["thanks", "hi", "好的"] {
+            let decision = PlanningPolicy::classify(
+                PlanningInput::new(prompt, "build").with_existing_plan(ExistingPlanState::Active),
+            );
+            assert!(
+                matches!(decision, PlanningDecision::Maintain(_)),
+                "{prompt:?} must keep the active plan, not replace it: {decision:?}"
+            );
+            assert_eq!(decision.rationale().code(), "active_plan_continuation");
+        }
+    }
+
+    #[test]
+    fn a_greeting_after_a_finished_plan_does_not_replace_it() {
+        let decision = PlanningPolicy::classify(
+            PlanningInput::new("thanks", "build").with_existing_plan(ExistingPlanState::Terminal),
+        );
+
+        assert!(
+            matches!(decision, PlanningDecision::Atomic(_)),
+            "{decision:?}"
+        );
+        assert_eq!(decision.rationale().code(), "conversational");
+    }
+
+    #[test]
+    fn a_greeting_with_typed_context_still_selects_the_planned_path() {
+        // Same rule as a question: an image, resource, selection, or branch diff attached
+        // to the text is the work, whatever the text says.
+        let decision = PlanningPolicy::classify(
+            PlanningInput::new("thanks", "deep")
+                .with_content(PlanningContentFacts::new(1, 1, 32_000, true)),
+        );
+
+        assert!(
+            matches!(decision, PlanningDecision::Required(_)),
+            "{decision:?}"
+        );
+        assert_eq!(decision.rationale().code(), "typed_context");
+    }
+
+    #[test]
+    fn a_social_word_does_not_hide_work() {
+        for prompt in [
+            "thanks, now fix the failing test and rerun it",
+            "hello, implement the auth feature",
+            "好的，修复这个 bug 并测试",
+            // Short, polite, and naming work in a verb the action list does not know:
+            // a marker beside any other word is a request, not small talk.
+            "hi, review my PR",
+            "ok, deploy prod",
+            "thanks, merge the PR",
+            "great, deploy prod",
+            "好的，部署一下",
+            "hello world in rust",
+        ] {
+            let decision = PlanningPolicy::classify(PlanningInput::new(prompt, "deep"));
+            assert!(
+                matches!(decision, PlanningDecision::Required(_)),
+                "{prompt:?} asks for work and must still create a durable Plan: {decision:?}"
+            );
+        }
     }
 }

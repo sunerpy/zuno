@@ -134,6 +134,24 @@ managed layer. Project configuration cannot enable it, read-only Agents never us
 managed policy may force it back to `deny`. See
 [Permissions and sandboxing](/guide/permissions) for the exact fallback boundary.
 
+To run every Agent's Shell natively, read-only Agents included, while keeping the
+configured permission mode, select the backend explicitly instead of a mode:
+
+```json
+{
+  "sandbox": {
+    "backend": "native"
+  }
+}
+```
+
+`native` is a host declaration for a machine without an OS sandbox, not a fallback and
+not confinement: the requested authority is recorded but not OS-enforced, and a read-only
+Agent's contract becomes a tool, permission and risk-gate boundary. It is accepted only
+from the same trusted layers, a project layer may only say `auto`, and managed policy may
+force `auto`. The one-invocation spellings are `zuno --sandbox-backend native` and
+`ZUNO_SANDBOX_BACKEND=native`.
+
 A project layer that declares a host command is refused. `shell`, a local `mcp.*.command`,
 an `lsp.*.command` or `formatter.*.command` that is not disabled, and a
 `productAgent.*.command` in a project `zuno.json[c]` or `.zuno` file all fail validation;

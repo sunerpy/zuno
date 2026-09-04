@@ -106,9 +106,14 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 过滤隐藏了 `plan_update`，已有 Plan 仍会持久化、投影并在重启后恢复，但模型不能创建
 或修改新的战略步骤。宿主分类器只判断 `Required / Maintain / Atomic / Unavailable`，
 不会生成 `Establish scope / Execute / Integrate / Verify` 一类通用骨架。单句短问句
-无论是否以问号结尾都归为 `Atomic`，包括疑问词位于句中的中文问法。模型使用
+无论是否以问号结尾都归为 `Atomic`，包括疑问词位于句中的中文问法。问候、致谢或单纯的
+确认属于对话输入，同样归为 `Atomic`，不会打开 Plan；已有活跃 Plan 时视为继续维护。模型使用
 `create / patch / append / push / pop` 操作维护 Plan，step id 由宿主生成，已有 Plan
-修改都受 `expected_revision` 保护。
+修改都受 `expected_revision` 保护。`plan_update`、`notes`、`history` 这类以操作为标签的
+参数枚举以单个对象 schema 发送给 provider：`action` 属性枚举全部操作，也是 schema 中唯一
+必填的字段；每个操作自身需要的字段由类型化反序列化器校验。同一字段在不同操作间形状不同时，
+若只是某个操作把它变为可选，就发送可为空的形式；若只有描述不同，则按操作归属各自的描述；
+形状确实不同时发送 `anyOf`。
 
 机器执行阶段单独持久化为 `DriverPhase`，不进入用户可见 Plan。最终回复前，
 `PlanReconciliationDriver` 只检查 Plan、Todo、Job、Goal、工具结果与验证记录：
@@ -285,7 +290,7 @@ Zuno 不监听 `~/.zuno` 或远端 Skill 缓存；缓存只在配置远端索引
 标准共享根 `~/.agents/skills` 只在启动时已经存在时监听，其他共享目录需要通过
 `skills.paths` 显式配置以支持运行中安装。
 
-Shell 执行受 OS 沙箱约束。`read-only` 与 `workspace-write` 都要求一个已验证的约束后端，不可用时拒绝启动而非降级。详见 [权限与沙箱](/zh/guide/permissions)。
+Shell 执行受 OS 沙箱约束。`read-only` 与 `workspace-write` 都要求一个已验证的约束后端，默认在不可用时拒绝启动而非降级；受信层可以用 `sandbox.onUnavailable: run-unconfined` 让具备写能力的请求在符合条件的不可用错误下降级，或用 `sandbox.backend: native` 让每个 Agent（包括只读 Agent）显式走原生后端并保留权限模式，持久化记录中的 `resolutionKind` 为 `trusted_native`。两者都不是沙箱隔离。详见 [权限与沙箱](/zh/guide/permissions)。
 
 Linux bubblewrap 后端的发现结果按进程缓存，键为规范化 workspace 加 helper 可执行文件；每次命中前重新校验可信 launcher、可信 `true` 与 helper 在磁盘上的身份，校验失败即逐出并重新探测；发现失败绝不缓存，缓存也不跨进程持久化。`zuno debug sandbox` 与部署报告绕过缓存，始终重新探测。
 

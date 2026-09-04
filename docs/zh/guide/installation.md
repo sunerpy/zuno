@@ -22,13 +22,15 @@ ACP 与 HTTP 客户端。
 
 | 平台 | 受约束的 `read-only` / `workspace-write` | 原生执行 |
 | --- | --- | --- |
-| Linux | 需要受信的 bubblewrap 0.8.0 或更新版本 | 显式 `danger-full-access`，或符合条件且受信的 `workspace-write` `run-unconfined` 降级 |
-| macOS | 尚未实现 | 显式 `danger-full-access`，或符合条件且受信的 `workspace-write` `run-unconfined` 降级 |
-| Windows | 尚未实现 | 显式 `danger-full-access`，或符合条件且受信的 `workspace-write` `run-unconfined` 降级 |
+| Linux | 需要受信的 bubblewrap 0.8.0 或更新版本 | 显式 `danger-full-access`、对每个 Agent 生效的受信 `sandbox.backend: native`，或符合条件且受信的 `workspace-write` `run-unconfined` 降级 |
+| macOS | 尚未实现 | 显式 `danger-full-access`、对每个 Agent 生效的受信 `sandbox.backend: native`，或符合条件且受信的 `workspace-write` `run-unconfined` 降级 |
+| Windows | 尚未实现 | 显式 `danger-full-access`、对每个 Agent 生效的受信 `sandbox.backend: native`，或符合条件且受信的 `workspace-write` `run-unconfined` 降级 |
 
 `run-unconfined` 不是通用的“忽略沙箱”开关。它只在具备写能力的
 `workspace-write` 请求遇到 typed、符合条件的后端不可用错误时生效。`read-only`
-永不降级，仍然失败即拒绝。参见[权限与沙箱](/zh/guide/permissions)。
+永不降级，仍然失败即拒绝；只读 Agent 唯一的原生路径是显式受信的
+`sandbox.backend: native`（`--sandbox-backend native`），它保留权限模式，并把契约记录为
+未强制执行。参见[权限与沙箱](/zh/guide/permissions)。
 
 ## Release 安装器
 

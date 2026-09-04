@@ -1615,4 +1615,71 @@ mod tests {
             )
         ));
     }
+
+    /// The `plan_update` incident: the model sent `{"intent": …}` with no `action`, the
+    /// schema validator accepted it because the tagged enum had been normalized to an empty
+    /// object schema, and only the typed parse blocked the call. With the fold the
+    /// validator rejects the call first, naming the field the model must supply.
+    #[test]
+    fn intent_only_arguments_are_rejected_by_the_validator_for_a_folded_enum() {
+        #[derive(schemars::JsonSchema, serde::Deserialize)]
+        #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+        #[allow(
+            dead_code,
+            reason = "the variants are consumed only by the JsonSchema derive in this fixture"
+        )]
+        enum Mutation {
+            Create {
+                title: String,
+                steps: Vec<StepInput>,
+            },
+            Patch {
+                expected_revision: i64,
+                steps: Vec<StepPatch>,
+            },
+            Pop {
+                expected_revision: i64,
+            },
+        }
+        #[derive(schemars::JsonSchema, serde::Deserialize)]
+        #[allow(
+            dead_code,
+            reason = "the fields are consumed only by the JsonSchema derive in this fixture"
+        )]
+        struct StepInput {
+            title: String,
+        }
+        #[derive(schemars::JsonSchema, serde::Deserialize)]
+        #[allow(
+            dead_code,
+            reason = "the fields are consumed only by the JsonSchema derive in this fixture"
+        )]
+        struct StepPatch {
+            id: String,
+        }
+
+        let schema = zuno_tool::schema::params_schema::<Mutation>();
+
+        let error = validate_arguments(&schema, &serde_json::json!({ "intent": "open a plan" }))
+            .expect_err("a call without an operation must fail schema validation");
+        assert!(
+            error.contains("\"action\" is a required property"),
+            "the validator names the missing tag: {error}"
+        );
+        assert!(
+            validate_arguments(&schema, &serde_json::json!({ "action": "drop" })).is_err(),
+            "an unknown operation is rejected by the enum"
+        );
+        for accepted in [
+            serde_json::json!({ "action": "pop", "expected_revision": 3, "intent": "close" }),
+            serde_json::json!({ "action": "create", "title": "t", "steps": [{ "title": "s" }] }),
+            serde_json::json!({ "action": "patch", "expected_revision": 1, "steps": [{ "id": "s" }] }),
+        ] {
+            assert_eq!(
+                validate_arguments(&schema, &accepted),
+                Ok(()),
+                "every operation's own payload validates, including the patch item shape"
+            );
+        }
+    }
 }
