@@ -480,7 +480,8 @@ pub enum ProvidersCommand {
         /// Run the program named by the URL's `/.well-known/zuno` document without an
         /// interactive confirmation. The remote host chooses that program and its
         /// arguments, and it runs with your privileges: pass this only for a host you
-        /// already trust. Without it, a URL login refuses when stdin is not a terminal.
+        /// already trust. Without it, a URL login refuses when stdin or stderr is not a
+        /// terminal.
         #[arg(long, requires = "target")]
         trust_remote_command: bool,
     },
