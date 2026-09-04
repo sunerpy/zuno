@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -103,7 +104,7 @@ impl TypedTool for InspectTool {
                     "id": entry.package.id,
                     "description": entry.package.description,
                     "state": "running",
-                    "source": {"lifetime": "static", "manifest": manifest},
+                    "source": manifest_source(&entry.package.id, manifest),
                     "agents": entry.package.agents.keys().collect::<Vec<_>>(),
                     "workflows": entry.package.workflows.keys().collect::<Vec<_>>(),
                     "skills": entry.package.skills.iter().map(|skill| &skill.name).collect::<Vec<_>>(),
@@ -135,6 +136,39 @@ impl TypedTool for InspectTool {
             serde_json::to_string_pretty(&statuses).map_err(|error| failed(self.id(), error))?;
         Ok(ToolOutput::text("Zuno extensions", output)
             .with_metadata("count", json!(statuses.len())))
+    }
+}
+
+/// The `source` object `extension_inspect` reports for a statically loaded package.
+///
+/// The manifest path crosses this boundary byte for byte, never through a display
+/// rendering. `zuno_paths::wire_path` is `display_path(path).replace('\\', "/")` on every
+/// platform, and on Linux and macOS `\` is an ordinary filename byte: folding it reports a
+/// package under a directory the user named `zuno\ws` at `.../zuno/ws/...`, a different and
+/// possibly existing path. This field is model-visible prose the model acts on — the step
+/// after inspecting a package is to `read` or `grep` the manifest it names — so it carries
+/// the same single rule as `crate::host::plugin_path_literal`: the exact bytes or nothing.
+///
+/// A path that is not valid UTF-8 has no JSON spelling at all, so it is reported as `null`
+/// beside `manifestUnrepresentable`, never substituted with U+FFFD. Inspection is read-only
+/// and still lists every other package and every other field of this one, so an
+/// unrepresentable path is an unresolvable field rather than a failed call; the operator
+/// gets the lossy rendering in a log, where nothing acts on it.
+fn manifest_source(package: &str, manifest: &Path) -> Value {
+    match manifest.to_str() {
+        Some(literal) => json!({"lifetime": "static", "manifest": literal}),
+        None => {
+            tracing::warn!(
+                package,
+                manifest = %zuno_paths::display_path(manifest),
+                "extension manifest path is not valid UTF-8; inspection reports it as unresolvable"
+            );
+            json!({
+                "lifetime": "static",
+                "manifest": null,
+                "manifestUnrepresentable": true,
+            })
+        }
     }
 }
 
