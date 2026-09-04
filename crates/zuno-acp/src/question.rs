@@ -12,6 +12,7 @@ use zuno_goal::GoalStore;
 use zuno_tools::question::{Answer, QuestionAsker, QuestionOutcome, QuestionRequest};
 
 use crate::ClientConnection;
+use crate::settlement::Settlement;
 
 const QUESTION_TOOL: &str = "question";
 
@@ -57,13 +58,22 @@ impl AcpQuestionAsker {
 
     /// Present and settle one request that survived its originating process.
     ///
-    /// An answered request is admitted to the durable inbox before this returns;
-    /// the abandoned provider/tool request is never revived.
+    /// Every reply the client returns — an answer, a decline, or a form this build
+    /// cannot read — is admitted to the durable inbox before this returns, because the
+    /// caller turns a `true` into a hard failure when the settlement produced no
+    /// model-visible input. The abandoned provider/tool request is never revived.
+    ///
+    /// `false` means this surface settled nothing and the row is untouched: it is
+    /// still pending, still the only evidence of what was asked, and still answerable
+    /// by another surface.
     pub async fn answer_pending(&self, request_id: &str) -> Result<bool, ToolError> {
         let durable = locked(&self.durable)
             .clone()
             .ok_or_else(|| question_failure("durable question store is not attached"))?;
-        let request = durable
+        // A row another surface settled between the caller's `pending()` read and this
+        // call is not this surface's work. Reporting it as a failure would turn a
+        // benign cross-surface race into a failed `session/prompt`.
+        let Some(request) = durable
             .store
             .get(request_id)
             .map_err(question_store_failure)?
@@ -71,61 +81,73 @@ impl AcpQuestionAsker {
                 request.kind == HumanRequestKind::Input
                     && request.state == HumanRequestState::Pending
             })
-            .ok_or_else(|| question_failure(format!("question `{request_id}` is not pending")))?;
-        let questions = serde_json::from_value::<Vec<QuestionRequest>>(
-            request
-                .payload
-                .get("questions")
-                .cloned()
-                .ok_or_else(|| question_failure("durable question has no `questions` array"))?,
-        )
-        .map_err(|error| question_failure(error.to_string()))?;
+        else {
+            return Ok(false);
+        };
+        // A stored question this surface cannot present is skipped, never settled and
+        // never rewritten. `Ok(false)` already stops recovery from re-failing the
+        // prompt; resolving the row on top of that would drop it out of
+        // `HumanRequestStore::pending`, so the TUI and the HTTP broker could no longer
+        // answer a request the user is still waiting on, and a goal-attached row would
+        // be parked behind `resume_for_work`'s answered-only guard. The payload stays
+        // exactly as written, which is the recovery evidence.
+        let Some(questions) = stored_questions(&request.payload) else {
+            return Ok(false);
+        };
         let call = request
             .message_id
             .as_deref()
             .zip(request.call_id.as_deref());
-        let outcome = self
-            .ask_client(&request.session_id, &questions, call)
-            .await?;
-        let now = zuno_db::message::now_millis();
-        let answered = match &outcome {
-            QuestionOutcome::Answered(answers) => durable
-                .store
-                .answer_with_input(request_id, json!({"answers": answers}), now)
-                .map_err(question_store_failure)?
-                .is_some(),
-            QuestionOutcome::Cancelled => durable
-                .store
-                .resolve(request_id, HumanRequestState::Cancelled, None, now)
-                .map_err(question_store_failure)?
-                .is_some(),
-            QuestionOutcome::Expired => durable
-                .store
-                .resolve(request_id, HumanRequestState::Expired, None, now)
-                .map_err(question_store_failure)?
-                .is_some(),
-            QuestionOutcome::Failed => durable
-                .store
-                .resolve(request_id, HumanRequestState::Failed, None, now)
-                .map_err(question_store_failure)?
-                .is_some(),
+        let Ok(elicitation) = self.elicitation(&request.session_id, &questions, call) else {
+            return Ok(false);
         };
-        if answered && matches!(outcome, QuestionOutcome::Answered(_)) && request.goal_id.is_some()
-        {
-            durable
-                .goals
-                .resume_for_work(&request.session_id)
-                .map_err(|error| question_failure(error.to_string()))?;
-        }
-        Ok(answered && matches!(outcome, QuestionOutcome::Answered(_)))
+        // A form that never reached the client is not an outcome. Recovery owns a row
+        // it did not create, so an undeliverable re-presentation leaves it pending and
+        // answerable by the TUI, the HTTP broker, or the next attempt, instead of
+        // discarding the question the user is still waiting on.
+        let Some(outcome) = self.deliver(elicitation, &questions).await else {
+            return Ok(false);
+        };
+        // Everything the client actually replied — answered, declined, withdrawn,
+        // expired, or unreadable — is a decision the loop has to be told about, so all
+        // of it settles and resumes through the one rule.
+        self.settle(&durable, request_id, &outcome, Settlement::DurableInput)
     }
 
-    async fn ask_client(
+    /// Record one settled question through the crate's single settlement rule.
+    ///
+    /// The rule — every terminal outcome resolves `answered` and resumes whatever Goal
+    /// the settled row itself carries — lives in [`crate::settlement::settle`], shared
+    /// with [`crate::AcpPermissionAsker`]. This wrapper only chooses the durable
+    /// response and labels a failure with this tool.
+    fn settle(
+        &self,
+        durable: &DurableQuestions,
+        request_id: &str,
+        outcome: &QuestionOutcome,
+        settlement: Settlement,
+    ) -> Result<bool, ToolError> {
+        let settled = crate::settlement::settle(
+            &durable.store,
+            &durable.goals,
+            request_id,
+            settled_response(outcome),
+            settlement,
+        )
+        .map_err(|source| ToolError::Failed {
+            tool: QUESTION_TOOL.to_owned(),
+            source,
+        })?;
+        Ok(settled.is_some())
+    }
+
+    /// Build the client form, rejecting a question that cannot be rendered.
+    fn elicitation(
         &self,
         session_id: &str,
         questions: &[QuestionRequest],
         call: Option<(&str, &str)>,
-    ) -> Result<QuestionOutcome, ToolError> {
+    ) -> Result<Value, ToolError> {
         let routed = self.route.as_ref().map_or_else(
             || crate::RoutedSession::direct(session_id),
             |route| route.resolve(session_id),
@@ -138,11 +160,24 @@ impl AcpQuestionAsker {
                 },
             });
         }
-        let response = match self.client.request("elicitation/create", request).await {
-            Ok(response) => response,
-            Err(_) => return Ok(QuestionOutcome::Failed),
-        };
-        Ok(elicitation_outcome(&response, questions))
+        Ok(request)
+    }
+
+    /// Deliver a built form, reporting `None` when it never reached the client.
+    ///
+    /// A transport failure is never an error here: the caller still owns a durable
+    /// row, and only the caller knows whether an undelivered form must be settled
+    /// (its own live call is being failed) or left pending (recovery holds a row
+    /// another surface may still present).
+    async fn deliver(
+        &self,
+        elicitation: Value,
+        questions: &[QuestionRequest],
+    ) -> Option<QuestionOutcome> {
+        match self.client.request("elicitation/create", elicitation).await {
+            Ok(response) => Some(elicitation_outcome(&response, questions)),
+            Err(_) => None,
+        }
     }
 }
 
@@ -154,6 +189,10 @@ impl QuestionAsker for AcpQuestionAsker {
         questions: &[QuestionRequest],
         call: Option<(&str, &str)>,
     ) -> Result<QuestionOutcome, ToolError> {
+        // Render before persisting. A durable row created for a question the client
+        // can never be shown stays pending, and every later recovery pass in the
+        // session re-fails on that one row.
+        let elicitation = self.elicitation(session_id, questions, call)?;
         let request_id = format!("que_{}", Uuid::new_v4().simple());
         if let Some(durable) = locked(&self.durable).clone() {
             durable
@@ -173,29 +212,54 @@ impl QuestionAsker for AcpQuestionAsker {
                 })
                 .map_err(question_store_failure)?;
         }
-        let outcome = self.ask_client(session_id, questions, call).await?;
+        // This process owns the row it just created, so an undelivered form settles
+        // here rather than staying pending: the tool call it belongs to is ending, and
+        // a row left open would have ACP recovery re-present a question already
+        // answered by its own failure.
+        let outcome = self
+            .deliver(elicitation, questions)
+            .await
+            .unwrap_or(QuestionOutcome::Failed);
         if let Some(durable) = locked(&self.durable).clone() {
-            let (state, response) = match &outcome {
-                QuestionOutcome::Answered(answers) => (
-                    HumanRequestState::Answered,
-                    Some(json!({"answers": answers})),
-                ),
-                QuestionOutcome::Cancelled => (HumanRequestState::Cancelled, None),
-                QuestionOutcome::Expired => (HumanRequestState::Expired, None),
-                QuestionOutcome::Failed => (HumanRequestState::Failed, None),
-            };
-            durable
-                .store
-                .resolve(
-                    &request_id,
-                    state,
-                    response.as_ref(),
-                    zuno_db::message::now_millis(),
-                )
-                .map_err(question_store_failure)?;
+            let _settled = self.settle(&durable, &request_id, &outcome, Settlement::ResolveOnly)?;
         }
         Ok(outcome)
     }
+}
+
+/// The durable response recorded for one settled question.
+///
+/// An answered question keeps the plain `{"answers": …}` shape every other surface
+/// writes. Every other terminal outcome records no answers plus the discriminator,
+/// so durable history never claims a withdrawn, expired, or unreadable form was an
+/// answer the user gave — the state column cannot carry that distinction, because
+/// `GoalStore::resume_for_work` accepts only `answered`.
+///
+/// This is the only place a [`QuestionOutcome`] is inspected on the settlement path.
+/// It decides the recorded payload and nothing else: a fifth outcome variant would
+/// have to compile against this one exhaustive match, and whatever it recorded, the
+/// row would still settle and its Goal would still resume, because neither of those
+/// is expressed per arm.
+fn settled_response(outcome: &QuestionOutcome) -> Value {
+    match outcome {
+        QuestionOutcome::Answered(answers) => json!({"answers": answers}),
+        QuestionOutcome::Cancelled => withdrawn_response("cancelled"),
+        QuestionOutcome::Expired => withdrawn_response("expired"),
+        QuestionOutcome::Failed => withdrawn_response("failed"),
+    }
+}
+
+/// A settled question that produced no answer, and why.
+fn withdrawn_response(outcome: &str) -> Value {
+    json!({"answers": [], "outcome": outcome})
+}
+
+/// The questions a stored payload holds, or `None` when this build cannot read it.
+///
+/// A payload written by a different `QuestionRequest` shape is not corruption to
+/// repair; it is a row this surface has no form for. The caller skips it.
+fn stored_questions(payload: &Value) -> Option<Vec<QuestionRequest>> {
+    serde_json::from_value::<Vec<QuestionRequest>>(payload.get("questions")?.clone()).ok()
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -465,10 +529,131 @@ fn is_offered(question: &QuestionRequest, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::test_client::ScriptedClient;
     use zuno_tools::question::QuestionOption;
 
     fn option(label: &str, description: &str) -> QuestionOption {
         QuestionOption::new(label, description)
+    }
+
+    struct Durable {
+        _spill: tempfile::TempDir,
+        goals: Arc<GoalStore>,
+        store: HumanRequestStore,
+    }
+
+    /// Insert the `project` and `session` rows the durable inbox has a foreign key on.
+    ///
+    /// `answer_with_input` admits a `session_input` row in the same transaction, and
+    /// that table references `session`. Without these rows a recovery test fails on
+    /// the constraint instead of on the behaviour under test.
+    fn materialize_session(goals: &GoalStore, session_id: &str) {
+        let connection = goals.pool().get().expect("check out a connection");
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO project \
+                 (id,worktree,vcs,name,icon_url,icon_url_override,icon_color,time_created,\
+                  time_updated,time_initialized,sandboxes,commands) \
+                 VALUES ('acp-fixture','/tmp',NULL,NULL,NULL,NULL,NULL,1,1,NULL,'[]',NULL)",
+                (),
+            )
+            .expect("insert the fixture project");
+        connection
+            .execute(
+                &format!(
+                    "INSERT OR IGNORE INTO session \
+                     (id,project_id,slug,directory,title,version,time_created,time_updated) \
+                     VALUES ('{session_id}','acp-fixture','{session_id}','/tmp',\
+                             '{session_id}','test',1,1)"
+                ),
+                (),
+            )
+            .expect("insert the fixture session");
+    }
+
+    fn durable_store() -> Durable {
+        let spill = tempfile::tempdir().expect("spill directory");
+        let goals = Arc::new(
+            GoalStore::open_memory(spill.path().to_path_buf()).expect("in-memory goal store"),
+        );
+        let store = goals.human_requests();
+        Durable {
+            _spill: spill,
+            goals,
+            store,
+        }
+    }
+
+    /// A pending, goal-attached question row, as a dead process left it.
+    ///
+    /// `request_human_input` is the path a Goal blocker takes, so the Goal is really
+    /// paused on this request and only a settlement `resume_for_work` accepts can
+    /// lift that pause.
+    fn abandoned_question(durable: &Durable, session_id: &str) -> String {
+        materialize_session(&durable.goals, session_id);
+        let goal = durable
+            .goals
+            .create_goal(session_id, "recover an abandoned question", None)
+            .expect("create an active goal");
+        durable
+            .goals
+            .request_human_input(
+                session_id,
+                goal.revision,
+                format!("que_{session_id}"),
+                json!({ "source": QUESTION_TOOL, "questions": [strict_single()] }),
+                None,
+                None,
+            )
+            .expect("pause the goal on a pending question")
+            .id
+    }
+
+    fn goal_status(durable: &Durable, session_id: &str) -> zuno_goal::GoalStatus {
+        durable
+            .goals
+            .goal(session_id)
+            .expect("read the goal")
+            .expect("the goal exists")
+            .status
+    }
+
+    /// The durable inbox ids admitted for one session.
+    ///
+    /// `zuno-cli` turns a `true` from `answer_pending` into a hard `-32603` when the
+    /// settlement admitted no durable input, so the admission is part of the contract
+    /// rather than an implementation detail.
+    fn admitted_inputs(durable: &Durable, session_id: &str) -> Vec<String> {
+        let connection = durable.goals.pool().get().expect("check out a connection");
+        let mut statement = connection
+            .prepare("SELECT id FROM session_input WHERE session_id = ?1 ORDER BY id")
+            .expect("prepare the inbox read");
+        statement
+            .query_map([session_id], |row| row.get::<_, String>(0))
+            .expect("read the admitted inputs")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode the admitted inputs")
+    }
+
+    /// The id of the one question row a session holds.
+    ///
+    /// `ask` generates its own request id, so a live-path assertion has to find the row
+    /// rather than name it.
+    fn only_request_id(durable: &Durable, session_id: &str) -> String {
+        let connection = durable.goals.pool().get().expect("check out a connection");
+        connection
+            .query_row(
+                "SELECT id FROM human_request WHERE session_id = ?1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("exactly one question row exists")
+    }
+
+    fn duplicate_labels() -> QuestionRequest {
+        let mut question = strict_single();
+        question.options.push(option("Stable", "Duplicate label."));
+        question
     }
 
     fn strict_single() -> QuestionRequest {
@@ -753,5 +938,389 @@ mod tests {
         let error = elicitation_request("ses-1", &[question], None)
             .expect_err("duplicate enum labels make oneOf ambiguous");
         assert_eq!(error.tool(), QUESTION_TOOL);
+    }
+
+    #[tokio::test]
+    async fn an_unrenderable_question_is_rejected_before_it_is_persisted() {
+        let durable = durable_store();
+        let client = ScriptedClient::unreachable();
+        let asker = AcpQuestionAsker::new(client.connection());
+        asker.attach_durable(durable.store.clone(), Arc::clone(&durable.goals));
+
+        let error = asker
+            .ask(
+                "ses_reject",
+                &[duplicate_labels()],
+                Some(("msg_reject", "call_reject")),
+            )
+            .await
+            .expect_err("a duplicate label cannot be rendered");
+
+        assert!(matches!(error, ToolError::InvalidArgs { .. }), "{error:?}");
+        assert!(
+            durable
+                .store
+                .pending(Some("ses_reject"))
+                .expect("read pending questions")
+                .is_empty(),
+            "a rejected question must leave no pending row for recovery to re-fail on"
+        );
+        assert!(client.methods().is_empty(), "{:?}", client.methods());
+    }
+
+    /// A stored question this surface cannot present must survive untouched.
+    ///
+    /// Recovery has to advance, but the row is durable user state: the payload is the
+    /// only evidence of what was asked, another surface must still be able to answer
+    /// it, and its Goal must still be resumable afterwards.
+    #[tokio::test]
+    async fn a_stored_question_that_cannot_be_presented_is_skipped_not_destroyed() {
+        for payload in [
+            json!({ "source": QUESTION_TOOL, "questions": [duplicate_labels()] }),
+            json!({ "source": QUESTION_TOOL }),
+            json!({ "source": QUESTION_TOOL, "questions": "not an array" }),
+        ] {
+            let durable = durable_store();
+            let client = ScriptedClient::unreachable();
+            let asker = AcpQuestionAsker::new(client.connection());
+            asker.attach_durable(durable.store.clone(), Arc::clone(&durable.goals));
+            materialize_session(&durable.goals, "ses_recover");
+            let goal = durable
+                .goals
+                .create_goal("ses_recover", "recover an abandoned question", None)
+                .expect("create an active goal");
+            durable
+                .goals
+                .request_human_input(
+                    "ses_recover",
+                    goal.revision,
+                    "que_stored".to_owned(),
+                    payload.clone(),
+                    None,
+                    None,
+                )
+                .expect("pause the goal on a pending question");
+
+            let answered = asker
+                .answer_pending("que_stored")
+                .await
+                .expect("recovery must advance instead of failing the prompt");
+
+            assert!(!answered, "an unpresented question admits no durable input");
+            let stored = durable
+                .store
+                .get("que_stored")
+                .expect("read the stored question")
+                .expect("the row survives");
+            assert_eq!(
+                stored.state,
+                HumanRequestState::Pending,
+                "the row must stay answerable: {payload}"
+            );
+            assert_eq!(
+                stored.payload, payload,
+                "the stored payload is the recovery evidence"
+            );
+            assert_eq!(stored.response, None, "{stored:?}");
+            assert_eq!(
+                durable
+                    .store
+                    .pending(Some("ses_recover"))
+                    .expect("read pending questions")
+                    .len(),
+                1,
+                "another surface must still find the row: {payload}"
+            );
+            durable
+                .store
+                .answer_with_input("que_stored", json!({"answers": [["ok"]]}), 2_000)
+                .expect("another surface answers the skipped row")
+                .expect("the skipped row is still pending");
+            assert_eq!(
+                durable
+                    .goals
+                    .resume_for_work("ses_recover")
+                    .expect("resume the goal")
+                    .expect("the goal exists")
+                    .status,
+                zuno_goal::GoalStatus::Active,
+                "a skipped row leaves its Goal resumable: {payload}"
+            );
+            assert!(client.methods().is_empty(), "{:?}", client.methods());
+        }
+    }
+
+    /// A row another surface already answered is skipped, not reported as a failure.
+    ///
+    /// The caller reads `pending()` before calling this, so the TUI or the HTTP broker
+    /// may settle the row in between. Failing here turned that benign race into a
+    /// `-32603` on the user's `session/prompt` and re-presented a settled question.
+    #[tokio::test]
+    async fn a_question_another_surface_already_answered_is_skipped() {
+        let durable = durable_store();
+        let client = ScriptedClient::unreachable();
+        let asker = AcpQuestionAsker::new(client.connection());
+        asker.attach_durable(durable.store.clone(), Arc::clone(&durable.goals));
+        materialize_session(&durable.goals, "ses_raced");
+        let goal = durable
+            .goals
+            .create_goal("ses_raced", "recover a raced question", None)
+            .expect("create an active goal");
+        durable
+            .goals
+            .request_human_input(
+                "ses_raced",
+                goal.revision,
+                "que_raced".to_owned(),
+                json!({ "source": QUESTION_TOOL, "questions": [strict_single()] }),
+                None,
+                None,
+            )
+            .expect("pause the goal on a pending question");
+        let elsewhere = json!({"answers": [["left"]]});
+        durable
+            .store
+            .answer_with_input("que_raced", elsewhere.clone(), 2_000)
+            .expect("another surface answers the row")
+            .expect("the pending row is settled there");
+
+        let answered = asker
+            .answer_pending("que_raced")
+            .await
+            .expect("a settled row is not this surface's work");
+
+        assert!(!answered);
+        let stored = durable
+            .store
+            .get("que_raced")
+            .expect("read the stored question")
+            .expect("the row survives");
+        assert_eq!(stored.state, HumanRequestState::Answered);
+        assert_eq!(
+            stored.response,
+            Some(elsewhere),
+            "the answer the user gave elsewhere must not be overwritten"
+        );
+        assert!(client.methods().is_empty(), "{:?}", client.methods());
+    }
+
+    /// A declined recovery is a decision the Goal must continue past.
+    ///
+    /// The exact input: the client answers `elicitation/create` with
+    /// `{"action":"decline"}` for a row `request_human_input` created, so the Goal is
+    /// genuinely paused on it. `resume_for_work` lifts a human-input pause only while
+    /// its request is exactly `answered`, so recording the withdrawal as `cancelled`
+    /// left the Goal paused with no route out and no pending row for any surface to
+    /// answer — the user's objective silently abandoned by one remote reply.
+    #[tokio::test]
+    async fn a_declined_recovered_question_resumes_the_paused_goal() {
+        let durable = durable_store();
+        let client = ScriptedClient::new(|_method, _params| Ok(json!({ "action": "decline" })));
+        let asker = AcpQuestionAsker::new(client.connection());
+        asker.attach_durable(durable.store.clone(), Arc::clone(&durable.goals));
+        let request_id = abandoned_question(&durable, "ses_declined");
+
+        let settled = asker
+            .answer_pending(&request_id)
+            .await
+            .expect("present the recovered question");
+
+        // Liveness first: this is the assertion the durable label exists to serve.
+        assert_eq!(
+            goal_status(&durable, "ses_declined"),
+            zuno_goal::GoalStatus::Active,
+            "a declined question must not park the Goal"
+        );
+        assert_eq!(
+            durable
+                .goals
+                .pause_state("ses_declined")
+                .expect("read the pause state"),
+            None,
+            "the human-input pause must be consumed"
+        );
+        assert!(settled, "a decided dialog is settled work, not a skip");
+        assert_eq!(
+            admitted_inputs(&durable, "ses_declined"),
+            vec![format!("human_{request_id}")],
+            "a `true` with no durable input is a -32603 in zuno-cli"
+        );
+        let stored = durable
+            .store
+            .get(&request_id)
+            .expect("read the stored question")
+            .expect("the row survives");
+        assert_eq!(stored.state, HumanRequestState::Answered);
+        assert_eq!(
+            stored.response,
+            Some(json!({"answers": [], "outcome": "cancelled"})),
+            "durable history must not claim the user answered"
+        );
+        assert!(
+            durable
+                .store
+                .pending(Some("ses_declined"))
+                .expect("read pending questions")
+                .is_empty(),
+            "a decided question is not re-presented"
+        );
+        assert_eq!(client.methods(), vec![String::from("elicitation/create")]);
+    }
+
+    /// A recovery the client cannot receive leaves the row answerable elsewhere.
+    ///
+    /// The exact input: the client answers `elicitation/create` with a JSON-RPC error.
+    /// A form that never reached the client is not a decision, so nothing is written —
+    /// settling it would drop the row out of `pending` and discard a question the user
+    /// is still waiting on, while its Goal stays resumable through the answer that row
+    /// is still owed.
+    #[tokio::test]
+    async fn an_undeliverable_recovered_question_leaves_the_row_pending() {
+        let durable = durable_store();
+        let client = ScriptedClient::unreachable();
+        let asker = AcpQuestionAsker::new(client.connection());
+        asker.attach_durable(durable.store.clone(), Arc::clone(&durable.goals));
+        let request_id = abandoned_question(&durable, "ses_unreachable");
+
+        let settled = asker
+            .answer_pending(&request_id)
+            .await
+            .expect("recovery must advance instead of failing the prompt");
+
+        assert!(!settled);
+        let stored = durable
+            .store
+            .get(&request_id)
+            .expect("read the stored question")
+            .expect("the row survives");
+        assert_eq!(
+            stored.state,
+            HumanRequestState::Pending,
+            "a client that could not be reached decided nothing"
+        );
+        assert_eq!(stored.response, None, "{stored:?}");
+        assert!(
+            admitted_inputs(&durable, "ses_unreachable").is_empty(),
+            "a skip admits no durable input"
+        );
+        assert_eq!(
+            durable
+                .store
+                .pending(Some("ses_unreachable"))
+                .expect("read pending questions")
+                .len(),
+            1,
+            "another surface must still find the row"
+        );
+        durable
+            .store
+            .answer_with_input(&request_id, json!({"answers": [["ok"]]}), 2_000)
+            .expect("another surface answers the row")
+            .expect("the skipped row is still pending");
+        assert_eq!(
+            durable
+                .goals
+                .resume_for_work("ses_unreachable")
+                .expect("resume the goal")
+                .expect("the goal exists")
+                .status,
+            zuno_goal::GoalStatus::Active,
+            "the Goal is resumable through the answer the row is still owed"
+        );
+        assert_eq!(client.methods(), vec![String::from("elicitation/create")]);
+    }
+
+    /// The live sibling of the recovery path settles the same way.
+    ///
+    /// `ask` creates its own row, so a dismissed form settles here rather than staying
+    /// pending for recovery to re-present. It records the withdrawal, not an answer,
+    /// and it still returns the outcome the tool reports to the model itself.
+    #[tokio::test]
+    async fn a_dismissed_live_question_is_settled_as_a_withdrawal() {
+        let durable = durable_store();
+        let client = ScriptedClient::new(|_method, _params| Ok(json!({ "action": "cancel" })));
+        let asker = AcpQuestionAsker::new(client.connection());
+        asker.attach_durable(durable.store.clone(), Arc::clone(&durable.goals));
+
+        let outcome = asker
+            .ask(
+                "ses_live",
+                &[strict_single()],
+                Some(("msg_live", "call_live")),
+            )
+            .await
+            .expect("a dismissed form is an outcome, not an error");
+
+        assert_eq!(outcome, QuestionOutcome::Cancelled);
+        assert!(
+            durable
+                .store
+                .pending(Some("ses_live"))
+                .expect("read pending questions")
+                .is_empty(),
+            "the live row is settled, not left for recovery"
+        );
+        let stored = durable
+            .store
+            .get(&only_request_id(&durable, "ses_live"))
+            .expect("read the settled question")
+            .expect("the row survives");
+        assert_eq!(stored.state, HumanRequestState::Answered);
+        assert_eq!(
+            stored.response,
+            Some(json!({"answers": [], "outcome": "cancelled"})),
+            "durable history must not claim the user answered"
+        );
+    }
+
+    /// A row the released build already resolved still reads, and is left alone.
+    ///
+    /// 0.6.6 recorded a dismissed ACP question as `cancelled` with no response. Those
+    /// rows are on disk now: this build must read them, skip them, and never rewrite
+    /// them. A read that refused, or a repair pass, would be the same harm as a failed
+    /// migration.
+    #[tokio::test]
+    async fn a_question_the_released_build_resolved_still_reads_and_is_skipped() {
+        for (session_id, state) in [
+            ("ses_legacy_cancelled", HumanRequestState::Cancelled),
+            ("ses_legacy_expired", HumanRequestState::Expired),
+            ("ses_legacy_failed", HumanRequestState::Failed),
+        ] {
+            let durable = durable_store();
+            let client = ScriptedClient::unreachable();
+            let asker = AcpQuestionAsker::new(client.connection());
+            asker.attach_durable(durable.store.clone(), Arc::clone(&durable.goals));
+            let request_id = abandoned_question(&durable, session_id);
+            let payload = durable
+                .store
+                .get(&request_id)
+                .expect("read the stored question")
+                .expect("the row survives")
+                .payload;
+            durable
+                .store
+                .resolve(&request_id, state, None, 2_000)
+                .expect("the released build resolved this row")
+                .expect("the pending row is resolved there");
+
+            let settled = asker
+                .answer_pending(&request_id)
+                .await
+                .expect("a row this build did not settle is not an error");
+
+            assert!(!settled);
+            let stored = durable
+                .store
+                .get(&request_id)
+                .expect("read the stored question")
+                .expect("the row survives");
+            assert_eq!(
+                stored.state, state,
+                "an already-settled row is not rewritten"
+            );
+            assert_eq!(stored.response, None, "{stored:?}");
+            assert_eq!(stored.payload, payload, "the payload is untouched");
+            assert!(client.methods().is_empty(), "{:?}", client.methods());
+        }
     }
 }

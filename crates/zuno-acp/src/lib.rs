@@ -7,6 +7,7 @@ mod projection;
 mod question;
 mod replay;
 mod routing;
+mod settlement;
 mod transport;
 
 pub mod conformance;
