@@ -19,6 +19,7 @@ The default model-visible surface is deliberately small:
 | `shell` | Run a command under the active sandbox | Side-effecting |
 | `bg` | Inspect or cancel background commands, and page output kept out of the transcript | Read-only inspection; `cancel` is side-effecting |
 | `task` | Delegate a bounded objective to another agent | Delegating |
+| `session_message` | Send attributed durable peer context to another root or this root's child | Side-effecting; root sessions only |
 | `job` | Inspect background job state | Read-only |
 | `webfetch` | Retrieve one URL | Read-only |
 | `web_search` | Batch web search | Read-only |
@@ -28,6 +29,13 @@ The default model-visible surface is deliberately small:
 Durable work state adds `plan_get`, `plan_update`, `todo_get`, `todo_update`, and
 `goal_get`/`goal_update`. `memory_propose` appears when memory is enabled, and
 `council_run` when the active agent can reach it.
+
+`session_message` is filtered out of every delegated child tool snapshot, even when the
+parent Attempt contained its schema. At execution it verifies again that the source is a
+root, the target is active and in the same project, and a child target descends from that
+source root. The durable target input explicitly identifies the source session, Agent,
+and title and says that peer context is not user authorization. Permission rules still
+govern each send.
 
 When connected MCP tools survive capability and permission filtering, Zuno keeps their
 implementations executable but normally withholds their full JSON schemas. A conditional
@@ -63,6 +71,17 @@ the Plan. Every existing-Plan mutation requires the current
 `notes`, and `history`, `action` is a required enum: the wire schema lists every
 operation and the fields each one needs, so a call that names no operation is
 rejected before it reaches the tool.
+
+`plan_get` and `todo_get` attach a semantic progress fingerprint to their result.
+Cross-cutting arguments such as `intent` are excluded. Three unchanged, consecutive,
+single-read steps stop with `stagnant_tool_loop` instead of spending provider requests
+indefinitely. A mutation changes the fingerprint and resets the count.
+
+`plan_update` and `todo_update` also request dynamic-context invalidation. If another
+provider request will run, the host must rebuild Goal/Plan/Todo/Job projection from the
+committed database first. A Plan mutation changes the one-time Required instruction to
+Maintain. A missing or failed refresher pauses the turn rather than knowingly sending a
+stale developer-priority snapshot.
 
 Before successful delivery, a durable reconciliation driver checks Plan, Todo,
 Job, Goal, tool-result, and verification state. Ordinary sessions holding

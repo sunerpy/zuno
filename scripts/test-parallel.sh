@@ -154,10 +154,12 @@ for line in open(f'{work}/artifacts.json'):
         continue
     seen.add(exe)
     target = m.get('target', {}).get('name', os.path.basename(exe))
-    rows.append((exe, os.path.dirname(m['manifest_path']), target))
+    cwd = os.path.dirname(m['manifest_path'])
+    suite_key = f'{os.path.basename(cwd)}:{target}'
+    rows.append((exe, cwd, target, suite_key))
 with open(f'{work}/suites.tsv', 'w') as fh:
-    for exe, cwd, target in rows:
-        fh.write(f'{exe}\t{cwd}\t{target}\n')
+    for exe, cwd, target, suite_key in rows:
+        fh.write(f'{exe}\t{cwd}\t{target}\t{suite_key}\n')
 print(f'    {len(rows)} test binaries')
 PY
 
@@ -224,7 +226,8 @@ capture_done=$(date +%s.%N)
 echo "==> running $suites suites (at most $JOBS binaries concurrently, $THREADS harness threads each, timeout=${SUITE_TIMEOUT}s)"
 start=$(date +%s.%N)
 
-"$PYTHON" - "$WORK" "$JOBS" "$THREADS" "$runner_var" "$SUITE_TIMEOUT" <<'PY'
+"$PYTHON" - "$WORK" "$JOBS" "$THREADS" "$runner_var" "$SUITE_TIMEOUT" \
+  "$ROOT/scripts/test-parallel-duration-hints.json" <<'PY'
 import concurrent.futures as cf
 import json, os, shutil, signal, subprocess, sys, time
 
@@ -233,6 +236,7 @@ jobs = int(sys.argv[2])
 threads = int(sys.argv[3])
 runner_var = sys.argv[4]
 suite_timeout = int(sys.argv[5])
+duration_hints = sys.argv[6]
 if jobs < 1 or threads < 1:
     raise SystemExit(f'JOBS and THREADS must be positive, got {jobs} and {threads}')
 
@@ -248,10 +252,14 @@ rows = [l.rstrip('\n').split('\t') for l in open(f'{work}/suites.tsv') if l.stri
 
 cache = f'{os.path.dirname(work)}/test-parallel-durations.json'
 try:
-    known = json.load(open(cache))
+    known = json.load(open(duration_hints))
 except (OSError, ValueError):
     known = {}
-rows.sort(key=lambda r: -known.get(os.path.basename(r[0]), 0.0))
+try:
+    known.update(json.load(open(cache)))
+except (OSError, ValueError):
+    pass
+rows.sort(key=lambda r: -known.get(r[3], 0.0))
 
 def terminate_tree(process):
     if os.name == 'nt':
@@ -311,7 +319,7 @@ def run_once(exe, cwd, target, suite_env):
     return code, output, elapsed
 
 def run(indexed):
-    index, (exe, cwd, target) = indexed
+    index, (exe, cwd, target, suite_key) = indexed
     suite_env = dict(env)
     # Cargo sets these per-package; a stale value from the captured package
     # would point a suite at the wrong manifest.
@@ -321,7 +329,7 @@ def run(indexed):
     code, output, elapsed = run_once(exe, cwd, target, suite_env)
     with open(f'{work}/logs/{index}.log', 'w') as fh:
         fh.write(output)
-    return index, code, exe, target, elapsed
+    return index, code, exe, target, suite_key, elapsed
 
 def publish_startup_measurement(index):
     source = f'{work}/logs/{index}.log'
@@ -370,7 +378,7 @@ failure_details = 0
 
 def report(result, completed, total):
     global failure_details
-    index, code, exe, target, elapsed = result
+    index, code, exe, target, _, elapsed = result
     state = 'ok' if code == 0 else f'exit {code}'
     print(
         f'    completed {completed}/{total}: '
@@ -416,10 +424,10 @@ with cf.ThreadPoolExecutor(max_workers=jobs) as pool:
             report(result, completed, len(rows))
 
 with open(f'{work}/codes.tsv', 'w') as fh:
-    for _, code, exe, _, elapsed in sorted(results):
+    for _, code, exe, _, _, elapsed in sorted(results):
         fh.write(f'{code}\t{elapsed:.3f}\t{exe}\n')
 
-known.update({os.path.basename(exe): elapsed for _, _, exe, _, elapsed in results})
+known.update({suite_key: elapsed for _, _, _, _, suite_key, elapsed in results})
 try:
     json.dump(known, open(cache, 'w'), indent=0, sort_keys=True)
 except OSError:

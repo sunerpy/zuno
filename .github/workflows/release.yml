@@ -147,6 +147,22 @@ jobs:
             echo "previous_head_sha=${previous_head_sha}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Require patch-only rapid-development version
+        if: steps.release_pr.outputs.dispatch == 'true'
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.release_pr.outputs.head_sha }}
+          HEAD_REF: ${{ steps.release_pr.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$HEAD_REF"
+          current=$(jq -er '."."' .release-please-manifest.json)
+          candidate=$(
+            git show "${HEAD_SHA}:.release-please-manifest.json" \
+              | jq -er '."."'
+          )
+          python3 .github/scripts/require-patch-release.py "$current" "$candidate"
+
       - name: Dispatch exact candidate ref
         if: steps.release_pr.outputs.dispatch == 'true'
         shell: bash
@@ -304,6 +320,17 @@ jobs:
             echo "::error title=Release identity::tag ${TAG} disagrees with Cargo.toml version ${version}"
             exit 1
           fi
+          previous_tag=$(
+            git tag --merged HEAD --sort=-version:refname \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | grep -Fxv "$TAG" \
+              | head -n 1
+          )
+          if [ -z "$previous_tag" ]; then
+            echo "::error title=Release identity::no prior stable tag exists for patch-only validation"
+            exit 1
+          fi
+          python3 .github/scripts/require-patch-release.py "${previous_tag#v}" "$version"
           # The REST "release by tag" endpoint returns 404 for drafts. The
           # GitHub CLI resolves authenticated drafts through the releases list,
           # which is the same behavior used by the publication step below.

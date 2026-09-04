@@ -313,6 +313,48 @@ pub struct TuiArgs {
     /// ruleset would have stopped to ask about proceeds unattended.
     #[arg(long)]
     pub auto: bool,
+    /// Run the TUI inside the persistent local supervisor and attach to it.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "attach",
+            "background_list",
+            "background_stop",
+            "background_shutdown"
+        ]
+    )]
+    pub background: bool,
+    /// Attach to a retained background TUI by PTY id.
+    #[arg(
+        long,
+        value_name = "PTY_ID",
+        conflicts_with_all = [
+            "background",
+            "background_list",
+            "background_stop",
+            "background_shutdown"
+        ]
+    )]
+    pub attach: Option<String>,
+    /// List retained background TUI sessions.
+    #[arg(
+        long,
+        conflicts_with_all = ["background", "attach", "background_stop", "background_shutdown"]
+    )]
+    pub background_list: bool,
+    /// Stop and remove one retained background TUI session.
+    #[arg(
+        long,
+        value_name = "PTY_ID",
+        conflicts_with_all = ["background", "attach", "background_list", "background_shutdown"]
+    )]
+    pub background_stop: Option<String>,
+    /// Stop the persistent local background-TUI supervisor.
+    #[arg(
+        long,
+        conflicts_with_all = ["background", "attach", "background_list", "background_stop"]
+    )]
+    pub background_shutdown: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -332,6 +374,9 @@ pub struct ServeArgs {
     /// Enable one-time loopback browser bootstrap and signed session cookies.
     #[arg(long, default_value_t = false)]
     pub browser_auth: bool,
+    /// Publish the bound supervisor listener and credentials for a detached parent.
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub supervisor_state: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]

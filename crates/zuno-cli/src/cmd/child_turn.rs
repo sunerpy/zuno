@@ -14,7 +14,7 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -165,15 +165,35 @@ struct TaskVerificationRecord {
 }
 
 /// One process-local generation shared by every host observing the same work.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ChangeNotifier {
     sender: watch::Sender<u64>,
+    observers: Arc<Mutex<Vec<Weak<dyn zuno_tools::WorkStateObserver>>>>,
 }
 
 impl Default for ChangeNotifier {
     fn default() -> Self {
         let (sender, _receiver) = watch::channel(0);
-        Self { sender }
+        Self {
+            sender,
+            observers: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl std::fmt::Debug for ChangeNotifier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChangeNotifier")
+            .field(
+                "observers",
+                &self
+                    .observers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -182,10 +202,46 @@ impl ChangeNotifier {
         self.sender.send_modify(|generation| {
             *generation = generation.wrapping_add(1);
         });
+        self.notify_observers(|observer| observer.changed());
+    }
+
+    pub(crate) fn plan_changed(&self, plan: &zuno_tools::WorkPlan) {
+        self.sender.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+        self.notify_observers(|observer| observer.plan_changed(plan));
+    }
+
+    pub(crate) fn items_changed(&self, items: &[zuno_tools::WorkItem]) {
+        self.sender.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+        self.notify_observers(|observer| observer.items_changed(items));
     }
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
         self.sender.subscribe()
+    }
+
+    pub(crate) fn attach_observer(&self, observer: &Arc<dyn zuno_tools::WorkStateObserver>) {
+        self.observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Arc::downgrade(observer));
+    }
+
+    fn notify_observers(&self, notify: impl Fn(&dyn zuno_tools::WorkStateObserver)) {
+        let mut observers = self
+            .observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        observers.retain(|observer| {
+            let Some(observer) = observer.upgrade() else {
+                return false;
+            };
+            notify(observer.as_ref());
+            true
+        });
     }
 }
 
@@ -1773,18 +1829,71 @@ impl InteractiveChildInput {
                 zuno_db::message::now_millis(),
             ))
             .map_err(to_string)?;
+        self.schedule_delivery(input.clone(), text, SoftInterruptSource::User);
+        Ok(input.id)
+    }
 
+    /// Wake durable peer-session messages addressed to descendants of `parent_session_id`.
+    ///
+    /// Root-session messages are owned by that root's TUI driver. This scanner handles only
+    /// child sessions because their turn hosts are opened on demand by this service.
+    pub(crate) fn wake_pending_session_messages(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<usize, String> {
+        let connection = self.database.open_connection().map_err(to_string)?;
+        let mut statement = connection
+            .prepare(
+                "WITH RECURSIVE descendants(id, depth) AS (\
+                     SELECT id, 1 FROM session WHERE parent_id = ?1 \
+                     UNION ALL \
+                     SELECT child.id, descendants.depth + 1 \
+                     FROM session child JOIN descendants ON child.parent_id = descendants.id \
+                     WHERE descendants.depth < 64\
+                 ) \
+                 SELECT id FROM descendants ORDER BY depth, id",
+            )
+            .map_err(to_string)?;
+        let session_ids = statement
+            .query_map([parent_session_id], |row| row.get::<_, String>(0))
+            .map_err(to_string)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_string)?;
+        let mut scheduled = 0_usize;
+        for session_id in session_ids {
+            for input in self.inbox.pending(&session_id).map_err(to_string)? {
+                let kind = zuno_db::inbox::DurableInputKind::classify(&input.prompt);
+                if kind != Some(zuno_db::inbox::DurableInputKind::SessionMessage) {
+                    continue;
+                }
+                let Some(text) = kind.and_then(|kind| kind.plain_text(&input.prompt)) else {
+                    let error = "session message has no model-visible text".to_owned();
+                    let _failed = self.inbox.mark_failed(&session_id, &input.id, error);
+                    continue;
+                };
+                self.schedule_delivery(
+                    input.clone(),
+                    text.to_owned(),
+                    SoftInterruptSource::PeerSession,
+                );
+                scheduled = scheduled.saturating_add(1);
+            }
+        }
+        Ok(scheduled)
+    }
+
+    fn schedule_delivery(&self, input: SessionInput, text: String, source: SoftInterruptSource) {
         let coordinator = self.coordinator.clone();
         let inbox = self.inbox.clone();
-        let control = self.runs.control(session_id.to_owned());
+        let control = self.runs.control(input.session_id.clone());
         let observer = self.observer.as_ref().map(Arc::clone);
-        let task_session_id = session_id.to_owned();
-        let task_input_id = input_id.clone();
+        let task_session_id = input.session_id.clone();
+        let task_input_id = input.id.clone();
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
         self.supervisor.spawn(
-            format!("interactive-{input_id}"),
-            session_id.to_owned(),
+            format!("interactive-{}", input.id),
+            input.session_id,
             cancellation,
             async move {
                 let delivery = coordinator.deliver(
@@ -1796,7 +1905,7 @@ impl InteractiveChildInput {
                         images: Vec::new(),
                         attachments: Vec::new(),
                         urgent: false,
-                        source: SoftInterruptSource::User,
+                        source,
                     },
                 );
                 tokio::pin!(delivery);
@@ -1834,12 +1943,11 @@ impl InteractiveChildInput {
                         session_id = %task_session_id,
                         input_id = %task_input_id,
                         %error,
-                        "interactive child input failed"
+                        "interactive session input failed"
                     );
                 }
             },
         );
-        Ok(input.id)
     }
 }
 

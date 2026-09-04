@@ -508,6 +508,9 @@ pub(crate) fn assemble(
     ) {
         builder.register_configured_builtin(tool);
     }
+    builder.register_configured_builtin(erase(zuno_tools::SessionMessageTool::new(Arc::clone(
+        &selection.todo_store,
+    ))));
 
     let registry = builder.build();
     let mut suppressions = registry
@@ -535,6 +538,7 @@ pub(crate) fn assemble(
         zuno_goal::REQUEST_GOAL_INPUT_TOOL_ID => {
             selection.interaction_policy.allows_goal_request_input()
         }
+        zuno_tools::SESSION_MESSAGE_TOOL_ID => selection.tool_authority.is_none(),
         _ => true,
     });
     if let Some(authority) = selection.tool_authority.as_deref() {
@@ -966,6 +970,7 @@ fn native_tool_name(name: &str, harness_tool_names: &BTreeSet<String>) -> bool {
             zuno_tools::PLAN_UPDATE_TOOL_ID,
             zuno_tools::TODO_GET_TOOL_ID,
             zuno_tools::TODO_UPDATE_TOOL_ID,
+            zuno_tools::SESSION_MESSAGE_TOOL_ID,
             zuno_tools::WORKFLOW_WIRE_ID,
             zuno_tools::COUNCIL_WIRE_ID,
             zuno_continuity::HISTORY_TOOL_ID,

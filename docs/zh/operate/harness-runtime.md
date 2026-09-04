@@ -115,6 +115,16 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 若只是某个操作把它变为可选，就发送可为空的形式；若只有描述不同，则按操作归属各自的描述；
 形状确实不同时发送 `anyOf`。
 
+工作状态工具还参与两项类型化引擎契约。读取会公布
+`ToolProgressObservation`，其指纹只包含权威 Plan/Todo 状态，不包含自由文本 `intent`；
+mutation 会公布 `ToolDynamicContextRefresh::WorkPlan` 或 `WorkItems`。若确实还要发送下一次
+provider 请求，引擎把已提交连接交给宿主刷新器；CLI 宿主从 SQL 重新生成
+Goal/Plan/Todo/Job 上下文，Plan mutation 还会把一次性的 Required 指令切换成 Maintain。
+
+连续三次成功、单工具、同一工作状态指纹的读取会以 `StagnantToolLoop` 停止。第三次结果先
+持久化并投影；换工具、失败/阻塞/中断、写入路径、continuation 或状态变化都会重置序列。
+恢复策略是 Pause，活跃 Goal 记录 `no_progress`，不会自动重复同一付费读取。
+
 机器执行阶段单独持久化为 `DriverPhase`，不进入用户可见 Plan。最终回复前，
 `PlanReconciliationDriver` 只检查 Plan、Todo、Job、Goal、工具结果与验证记录：
 没有记录任何持久工作的会话在第一次回复后直接结束；普通会话在持有未对账的持久工作时
@@ -129,6 +139,11 @@ ACP 通过会话级投影器订阅 `TurnHost::work_state_changes()`，而不是�
 重复与旧 revision 覆盖新状态，Plan 被移除时发送空 entries 清除客户端旧面板。
 实时变更、prompt 结束前 flush、load、resume、后台 continuation 与 host 重建共用同一
 投影器。
+
+根会话消息是独立的持久输入能力。只有没有 parent tool authority 的 turn 才能看到
+`session_message`；执行时还会再次确认来源是 root。同项目 root 可以互发，root 也可发送给
+自己的后代；其他 root 的 child、归档目标、自己与跨项目目标都会被拒绝。TUI、ACP 与 server
+消费同一个 `sessionMessage` 形状；在线进程可在安全点 steer，否则输入保持 queued。
 
 ## 原生会话命令、压缩与硬中断
 

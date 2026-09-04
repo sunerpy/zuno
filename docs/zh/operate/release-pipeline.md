@@ -166,6 +166,30 @@ release-please 创建 tag 和 draft release。晋级过程只在 draft 状态上
 这样正常路径始终只有一条，同时允许运维者从 artifact 过期或最终发布中断中恢复，而不降低
 身份校验强度。
 
+## 快速开发版本规则
+
+在 `AGENTS.md` 中对应规则被删除之前，每次发布都必须恰好增加一次 patch：
+`x.y.z` 变成 `x.y.(z+1)`。`feat` 与 `fix` 仍用于组织 changelog，但 1.0 之前的 feature
+通过 `bump-patch-for-minor-pre-major` 保持 patch。贡献者不得用 `!`、
+`BREAKING CHANGE` 或 `Release-As` 请求更高版本位。
+
+发布控制器不会只依赖约定。候选调度前，它用
+`.github/scripts/require-patch-release.py` 比较当前 manifest 与 release PR manifest；
+发布时再比较上一条稳定 tag 与候选 tag。minor、major、跳 patch 或 prerelease 候选都会在
+认证或公开发布前失败关闭。
+
+## CI 临界路径
+
+2026-09-04 的基线 run `33884240281` 在 classify 后约 16.8 分钟完成。Linux 先花 229 秒
+执行 Clippy，之后才开始 634 秒 test step；现在两者分别作为 `Linux static checks` 与
+`Linux tests` 并行运行，而且都仍是 `zuno/pr-gate` 的必需 job。
+
+原生 Windows 继续按 Cargo test suite 粒度运行，而不是为每个 test case 启动进程。实测
+844 秒中，build/link 占 548 秒，230 个 suite 执行占 292 秒。scheduler 现在使用稳定的
+`crate-directory:target` 时长键与该次运行审阅后的 hint，因此全新 runner 会立即启动
+170 秒 attachment suite、132 秒 tools suite 与 66 秒 TUI suite，不再让它们成为最后长尾。
+捕获的私有 Cargo 环境永远不会上传。
+
 ## 时延证据
 
 从 release PR 创建开始计时，到公开 release 发布结束，runner 排队也计入。只有连续三次

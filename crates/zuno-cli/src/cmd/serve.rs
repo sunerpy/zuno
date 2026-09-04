@@ -626,6 +626,13 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             .bind()
             .await
             .map_err(|error| error.to_string())?;
+        let supervisor_state = args
+            .supervisor_state
+            .as_deref()
+            .map(|path| {
+                super::tui_supervisor::publish_server_state(path, server.local_addr(), &directory)
+            })
+            .transpose()?;
         println!("{}", server_readiness_message(server.local_addr()));
         if let Some(uri) = server.take_browser_bootstrap_uri() {
             println!("Browser authentication: {uri}");
@@ -634,6 +641,7 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             .flush()
             .map_err(|error| error.to_string())?;
         let result = server.serve().await.map_err(|error| error.to_string());
+        drop(supervisor_state);
         environment.cancel_background_jobs();
         environment.wait_background_jobs().await;
         if let Some(mcp) = mcp {
@@ -713,6 +721,7 @@ mod tests {
             port,
             hostname: hostname.map(str::to_owned),
             browser_auth: false,
+            supervisor_state: None,
         }
     }
 

@@ -1115,18 +1115,18 @@ const REMOVED_RUN_OPTIONS: &[&str] = &[
 ///
 /// A `zuno run` command line, on any page, may not name any of the eight — that is
 /// what a reader copies. The two `run` reference pages may not carry an option row
-/// for one either, which is the table a reader trusts over the prose. And the four
-/// that no Zuno command accepts at all — `--fork`, `--share`, `--attach`,
-/// `--interactive` — may appear only on the one page per language that records the
+/// for one either, which is the table a reader trusts over the prose. And the three
+/// that no Zuno command accepts at all — `--fork`, `--share`, `--interactive` —
+/// may appear only on the one page per language that records the
 /// removal, because a mention anywhere else is a page that has not been updated.
-/// `--port` and `--auto` are excluded from that last rule: `zuno serve --port` and
-/// `zuno tui --auto` are real.
+/// `--attach`, `--port`, and `--auto` are excluded from that last rule:
+/// `zuno tui --attach`, `zuno serve --port`, and `zuno tui --auto` are real.
 #[test]
 fn surface_documentation_never_offers_a_run_option_the_parser_rejects() {
     /// The one page per language that says these options were removed.
     const REMOVAL_RECORD: &[&str] = &["docs/cli/run.md", "docs/zh/cli/run.md"];
     /// The subset no Zuno command accepts under any name.
-    const RETIRED_OUTRIGHT: &[&str] = &["--fork", "--share", "--attach", "--interactive"];
+    const RETIRED_OUTRIGHT: &[&str] = &["--fork", "--share", "--interactive"];
 
     let mut offences = Vec::new();
     for (page, text) in documentation_pages() {

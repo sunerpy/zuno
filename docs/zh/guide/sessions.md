@@ -35,6 +35,20 @@ Driver 按 FIFO 顺序提升输入。提升是事务性的，并且可以针对�
 
 这就是为什么带 `reportDelivery: nextStep` 的后台委派不会因轮询竞态而丢掉报告：结算、准入和唤醒是一个事务序列。
 
+根会话之间的 peer message 使用同一条持久准入边界。仅根会话可见的
+`session_message` 工具会向目标 inbox 写入类型化 `sessionMessage`。它可以发送给同一项目
+中的另一个根会话，或当前 root 的后代；child 不能发送，一个 root 也不能直接控制另一个
+root 的 child。渲染文本会标出来源 session、Agent 与标题，并明确 peer context 不是用户
+授权。
+
+TUI、HTTP server 与 ACP driver 都把这种输入识别为模型可见文本。活跃目标在安全点收到软
+输入；空闲且有常驻运行时的目标启动一个回合；离线目标则保留 queued 行，直到再次加载。
+
+对于通过 SSH 使用的 TUI，`zuno tui --background` 提供这个常驻所有者。只绑定 loopback 的
+supervisor 会保留 PTY、TUI 进程、scrollback 与活跃回合，而每个 SSH 客户端只是
+attachment。`Ctrl+]` 用于 detach；`--background-shutdown` 是停止全部 retained child 的
+显式生命周期边界。
+
 ## 提示词溯源
 
 提示词组装使用稳定的分段标识符、确切来源、有序内容和内容摘要。Hook 之后的提示词在 provider 请求之前落盘，因此模型看到了什么是一个持久事实，而不是事后重构。
@@ -113,6 +127,15 @@ export/import 会保留 Notes 及其幂等 ledger。sanitize export 会脱敏文
 
 持久存储遵守同一套类型化划分。读取或记账 Goal 预算时遇到 SQLite 写者争用，或宿主写入 Plan 对账、人工请求等 Goal 所属状态时遇到争用，会落盘一条 `database_busy` 重试，Goal 保持活跃，因为别的写者持有锁是会自行消失的状况。读取或记账预算时遇到的其他任何数据库失败，会以 `usage_unknown` 停止回合并暂停 Goal，让人先检查数据库；此构建完全无法读取的持久状态会阻塞 Goal。重启后的进程读回的是落盘的 `goal_retry` 行，因此重启既不会丢掉也不会缩短这段等待。
 
+引擎还会检测工作状态只读但没有进展的循环。`plan_get` 与 `todo_get` 会公布权威状态的
+语义指纹；模型自由编写的 `intent` 不进入指纹。连续三次只调用一个读取工具且指纹相同，会以
+类型化 `stagnant_tool_loop` 停止。活跃 Goal 会持久化为 `paused(no_progress)`，需要显式
+resume；Plan 或 Todo 指纹变化会重置计数。
+
+成功的 `plan_update` 与 `todo_update` 会使易变提示投影失效。下一次 provider 请求之前，
+宿主从 SQLite 重新生成 Goal/Plan/Todo/Job 上下文。Plan 变更后，一次性的创建/替换指令也会
+切换成维护指令，避免 `runtime.work_state` 在同一回合里继续描述旧 Plan。
+
 对端要求的等待超过同请求恢复所剩时间时，结果同样由夹取决定。provider 层对同一个请求最多恢复 180 秒；超过这个窗口所剩时间的 `Retry-After` 既不会被睡过去，也不会被换成更短的本地退避。回合以对端的错误结束，Goal 级重试等待的是对端值按 `max_delay_ms` 截断后的结果。
 
 ## 续跑会话
@@ -130,6 +153,12 @@ zuno run --session ses_1a2b3c --agent plan "what would a safe migration look lik
 | Agent | `--agent` 或选择器 > 会话上保存的值 > `default_agent` > `orchestrator` |
 | 模型 | `--model` 或选择器 > 本进程中选定的 preset > 会话上保存的值 > 按配置路由 |
 | 推理强度 | `--variant`、`--thinking` 或选择器 > 随会话模型一同保存的值 > 配置默认值 |
+
+ACP stdio 的生命周期归启动它的编辑器所有。Zed 关闭或丢失该进程后，应重新启动
+`zuno acp` 并按持久 session id 加载；旧 stdio transport 不会继续存在。稳定 ACP v1 以
+load 作为权威重连路径。支持协商 resume 的客户端可以使用该操作，但 transport 重连不会替代
+SQLite inbox、事件、Goal、Plan 与 prompt receipt 的恢复。background-TUI supervisor 只包装
+TUI PTY，不包装 ACP stdio。
 
 一句话概括：参数 > 会话 > 配置默认值。会话行记录的是它上次运行时的那一组值：TUI 中的模型、强度、preset 或 Agent 选择、ACP 的配置变更，以及会话创建，都会把模型引用（连同其 `variant`）写回，下一次续跑就从这里开始；`zuno run` 的参数只作用于那一次运行，不会改写会话行。指定一个与保存值*不同*的 Agent 时，模型会按配置重新路由，与在活动会话里切换 Agent 完全一致；要固定模型就传 `--model`。当保存的 Agent 已不在名册中，或保存的模型已不在目录里，续跑会回退到下一条规则，并以一条状态提示说明，而不是失败；模型不再声明的已保存强度也会以同类提示丢弃。
 

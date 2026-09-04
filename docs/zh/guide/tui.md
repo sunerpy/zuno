@@ -9,6 +9,32 @@ zuno tui --session ses_1a2b3c --sandbox read-only
 zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 ```
 
+## 后台 TUI 与 SSH 重连
+
+`zuno tui --background` 会启动或复用当前用户的 supervisor，在一个保留型伪终端中运行真正
+的 `zuno tui`，再把当前终端连接上去。supervisor 拥有子进程与 scrollback，attachment
+只拥有当前 SSH 终端。因此 SSH 断开只会关闭 attachment，不会向 TUI 发送 shutdown。
+
+```sh
+zuno tui --background
+# 用 Ctrl+] detach
+
+zuno tui --background-list
+zuno tui --attach pty_01abc...
+```
+
+重新连接会从头重放保留的终端内容，然后无缝切换到实时输出。连接期间客户端也会转发终端尺寸
+变化。`--background-stop <pty-id>` 终止一个后台 TUI；
+`--background-shutdown` 停止 supervisor 及其拥有的全部 PTY。
+
+控制 server 只绑定 `127.0.0.1` 的系统分配端口。它使用随机 Basic-auth 密码；在 Unix 上，
+密码位于 mode `0700` 数据目录中的 mode `0600` 状态文件。连接还需要一张带作用域、单次使用的
+PTY ticket。只有这个显式的 loopback 控制面会绕过环境代理。Unix 通过 `nohup` 加新进程组脱离
+SSH，Windows 使用 detached process flags。
+
+保留型终端维持的是同一个 TUI 进程，活跃回合也随之继续。它不同于普通 `--session` 续跑：
+后者是在旧进程结束后启动新进程，并从 SQLite 重建会话视图。
+
 ## 屏幕区域
 
 | 区域 | 内容 |
@@ -23,6 +49,10 @@ zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 身份行会跟在较短回复的末尾，一旦内容填满视口，它就会吸附在编辑区上方。末行以中性徽标重复当前的 Agent、模型和强度，因此在回合运行期间，为下一回合所做的选择仍然可见。按 Tab 会立即更新这个徽标，而真正的宿主替换仍推迟到回合边界。以 `--continue` 或 `--session` 打开应用时，身份行显示的是该会话上次使用的 Agent、模型与推理强度；`--model` 或 `--agent` 参数在本进程内优先于保存的值。
 
 短暂的「working」行不会插入对话记录。持久活动、错误、中断标记和 assistant 内容会。
+
+Plan 与 Todo 侧边栏由提交 SQLite mutation 的同一个 `WorkStateObserver` 推送。挂载的 root
+按 session id 过滤后立即应用精确的新 revision 并唤醒界面；侧边栏不再等待 provider 回合结束，
+child Plan 也不能覆盖 root 面板。
 
 上下文占用率是最近一次完整的 provider 提示词除以目录中的上下文上限。它在每次 provider 报告时被替换，而不是在整个会话中累加；累计的 Token 桶位于用量投影与侧边栏。
 
@@ -73,6 +103,12 @@ zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 | `diff_open` | `<leader>d` | Diff 浏览器 |
 | `app_exit` | `ctrl+c`、`ctrl+d`、`<leader>q` | 退出 |
 
+`Ctrl+C` 与 `Ctrl+D` 都需要确认。第一次按下后，末行显示
+`ctrl+c again to exit` 或 `ctrl+d again to exit`；必须在 1.5 秒内再次按下同一个组合键。
+回合运行中第一次按键还会请求硬中断。换成另一个组合键，或超过时间窗口，只会重新开始确认，
+不会意外退出。`Ctrl+]` 属于外层后台 attachment，只做 detach，不会把退出键发送给被保留的
+TUI。
+
 `leader_timeout` 默认 5000 毫秒，因此续接提示的浮层会保持可读五秒，除非有另一个按键完成或取消该序列。浮层打开期间的交互会重置这个截止时间。重新绑定见[主题与快捷键](/zh/config/theming)。
 
 ## 在子会话之间导航
@@ -87,6 +123,12 @@ zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 | `session_parent` | `<leader>up` | 返回父级 |
 
 每个子级都保有自己的编辑区草稿。在一个正在运行的子级中按 Enter，会把文本准入该子级的持久 inbox 并引导它的活跃回合；在它结算之后按 Enter，会以其解析出的 Agent、模型、强度、权限和血缘唤醒同一个子级身份。子级中的文本是字面文本，所以在子级里输入 `/help` 会被发送给该子级，而不是作为根命令执行。
+
+根 Agent 还会得到仅根会话可见的 `session_message` 工具。它可以向同一项目中的另一个根会话，
+或当前根会话的后代发送持久 peer context。子 Agent 看不到发送工具；即使重放了过期 schema，
+运行时仍会拒绝 child 源、跨项目、发送给自己、已归档目标，以及其他根会话的 child。消息会明确
+标注为 peer context，而不是用户授权。活跃 root/child 在下一个安全点接收；空闲 TUI 轮询持久
+inbox 并启动目标回合；离线目标则一直保留 queued 行，直到再次加载。
 
 产品 Agent 调用和 workflow 投影不会被呈现为可续跑的子对话。
 

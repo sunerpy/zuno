@@ -50,7 +50,8 @@ use zuno_orchestration::{
 };
 use zuno_tool::{
     FileDiff, METADATA_HUMAN_REQUEST_ID_KEY, ToolConcurrencyPolicy, ToolContinuation,
-    ToolDefinition, ToolOutput, ToolReplayPolicy, ToolResultPresentation, ToolUiIntent,
+    ToolDefinition, ToolDynamicContextRefresh, ToolOutput, ToolReplayPolicy,
+    ToolResultPresentation, ToolUiIntent,
 };
 
 use crate::budget::{
@@ -75,6 +76,7 @@ pub const TURN_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// Text used to close an unanswered tool call before its transcript is replayed.
 pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution was interrupted]";
+const STAGNANT_WORK_STATE_READ_LIMIT: u8 = 3;
 
 /// Text closing a call whose side effects may have landed unobserved.
 ///
@@ -679,6 +681,12 @@ pub enum TurnError {
         "provider emitted malformed tool arguments {count} consecutive times; last tool was `{tool}`"
     )]
     InvalidToolCalls { count: u8, tool: String },
+    #[error(
+        "tool `{tool}` returned the same successful result {count} consecutive times without progress"
+    )]
+    StagnantToolLoop { count: u8, tool: String },
+    #[error("dynamic context refresh failed after a durable tool mutation: {detail}")]
+    DynamicContextRefresh { detail: String },
     #[error("the turn event consumer closed")]
     EventConsumerClosed,
     #[error("plugin hook failed: {0}")]
@@ -754,6 +762,8 @@ impl TurnError {
             Self::ToolUseEndWithoutStart { .. } => "tool_end_without_start",
             Self::ToolSignatureWithoutStart { .. } => "tool_signature_without_start",
             Self::InvalidToolCalls { .. } => "invalid_tool_calls",
+            Self::StagnantToolLoop { .. } => "stagnant_tool_loop",
+            Self::DynamicContextRefresh { .. } => "dynamic_context_refresh",
             Self::EventConsumerClosed => "event_consumer_closed",
             Self::Hook(_) => "hook",
             Self::Database(_) => "database",
@@ -842,7 +852,9 @@ impl TurnError {
             }
             Self::Provider(ProviderError::Auth { .. })
             | Self::EventConsumerClosed
-            | Self::BudgetLimited { .. } => TurnRecovery::Pause,
+            | Self::BudgetLimited { .. }
+            | Self::StagnantToolLoop { .. }
+            | Self::DynamicContextRefresh { .. } => TurnRecovery::Pause,
             Self::Provider(
                 ProviderError::Refused { .. }
                 | ProviderError::UnsupportedCapability { .. }
@@ -1209,6 +1221,20 @@ pub trait ToolDispatcher: Send + Sync {
     }
 }
 
+/// Rebuilds volatile provider context after a successful tool mutation invalidates it.
+///
+/// The engine owns when a refresh is required, while the host owns how Goal, Plan, Todo,
+/// Job, and other interface-neutral durable state are projected. Passing the active
+/// connection keeps the refreshed snapshot ordered after the committed tool result.
+pub trait DynamicContextRefresher: Send + Sync {
+    fn refresh(
+        &self,
+        connection: &Connection,
+        session_id: &str,
+        refresh: ToolDynamicContextRefresh,
+    ) -> Result<DynamicContext, String>;
+}
+
 /// Stable caller-owned identity and volatile suffix for one run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunTurnRequest {
@@ -1263,6 +1289,7 @@ pub struct TurnContext<'a> {
     budget: Arc<dyn TurnBudgetPolicy>,
     live_inputs: Option<LiveInputs<'a>>,
     attachments: Option<Arc<zuno_attachment::AttachmentStore>>,
+    dynamic_context_refresher: Option<&'a dyn DynamicContextRefresher>,
     tool_concurrency: ToolConcurrencyLimit,
 }
 
@@ -1290,6 +1317,7 @@ impl<'a> TurnContext<'a> {
             budget: Arc::new(NoopBudgetPolicy),
             live_inputs: None,
             attachments: None,
+            dynamic_context_refresher: None,
             tool_concurrency: ToolConcurrencyLimit::SERIAL,
         }
     }
@@ -1320,6 +1348,16 @@ impl<'a> TurnContext<'a> {
     #[must_use]
     pub fn with_attachments(mut self, attachments: Arc<zuno_attachment::AttachmentStore>) -> Self {
         self.attachments = Some(attachments);
+        self
+    }
+
+    /// Bind the host projection used after a durable tool mutation invalidates context.
+    #[must_use]
+    pub fn with_dynamic_context_refresher(
+        mut self,
+        refresher: &'a dyn DynamicContextRefresher,
+    ) -> Self {
+        self.dynamic_context_refresher = Some(refresher);
         self
     }
 
@@ -1878,6 +1916,9 @@ async fn run_turn_in_span(
     let mut unresolved_tool_failures = BTreeMap::<String, ToolFailureRecovery>::new();
     let mut resolved_attachments = ResolvedAttachments::new();
     let mut consecutive_invalid_tool_calls = 0_u8;
+    let mut stagnant_work_state_read: Option<(String, String, u8)> = None;
+    let mut current_dynamic_context = request.dynamic_context.clone();
+    let mut cumulative_dynamic_context_refresh = None;
     let mut step_limit_finalization_attempted = false;
     let mut turn_usage = empty_turn_usage();
     let mut last_request = ProviderRequestUsage::default();
@@ -2048,17 +2089,16 @@ async fn run_turn_in_span(
                 .map_err(TurnError::Hook)?;
         }
         let cache = prompt_cache.get_or_insert_with(|| PromptCache::new(system_prompt.clone()));
-        let dynamic_context = if step_limit_finalization.is_some() {
-            request
-                .dynamic_context
+        let step_dynamic_context = if step_limit_finalization.is_some() {
+            current_dynamic_context
                 .clone()
                 .with_runtime_instruction(STEP_LIMIT_FINALIZATION_INSTRUCTION)
         } else {
-            request.dynamic_context.clone()
+            current_dynamic_context.clone()
         };
         let prepared = cache.prepare_turn_owned_with_tool_revision(
             stable_history,
-            dynamic_context,
+            step_dynamic_context,
             &definitions,
             available.mcp_status,
             available.revision,
@@ -2840,6 +2880,8 @@ async fn run_turn_in_span(
         let mut injected = inject_live_inputs(&mut context, &request, &requested)?;
         let mut yield_until_input = false;
         let mut waiting_for_human = None;
+        let mut work_state_read = None;
+        let mut step_dynamic_context_refresh = None;
         if !injected.skip_remaining_tools {
             let mut next_call = 0;
             while next_call < calls.len() && !injected.skip_remaining_tools {
@@ -2959,6 +3001,38 @@ async fn run_turn_in_span(
                     .collect::<Vec<_>>()
                     .await
                 };
+                if calls.len() == 1
+                    && completed.len() == 1
+                    && let Some((_, call, _, _, dispatch)) = completed.first()
+                    && !dispatch.is_error
+                    && dispatch.recovery.is_none()
+                    && dispatch.blocked.is_none()
+                    && dispatch.interruption.is_none()
+                    && dispatch.uncertain.is_none()
+                    && dispatch.output.continuation == ToolContinuation::Continue
+                    && dispatch.output.written_paths().is_empty()
+                    && let Some(observation) = dispatch.output.progress_observation()
+                {
+                    work_state_read = Some((
+                        call.name.clone(),
+                        observation.scope().to_owned(),
+                        observation.fingerprint().to_owned(),
+                    ));
+                }
+                for (_, _, _, _, dispatch) in &completed {
+                    if !dispatch.is_error
+                        && dispatch.recovery.is_none()
+                        && dispatch.blocked.is_none()
+                        && dispatch.interruption.is_none()
+                        && dispatch.uncertain.is_none()
+                        && let Some(refresh) = dispatch.output.dynamic_context_refresh()
+                    {
+                        step_dynamic_context_refresh = Some(merge_dynamic_context_refresh(
+                            step_dynamic_context_refresh,
+                            refresh,
+                        ));
+                    }
+                }
                 // Every entry ran to a result, whether it succeeded, was blocked, or was
                 // interrupted, so this is the truthful count of tool work the turn did;
                 // the next `before_request` reads it.
@@ -3093,6 +3167,26 @@ async fn run_turn_in_span(
             })
             .await?;
 
+        if let Some((tool, scope, fingerprint)) = work_state_read {
+            let count = match &mut stagnant_work_state_read {
+                Some((previous_scope, previous_fingerprint, count))
+                    if *previous_scope == scope && *previous_fingerprint == fingerprint =>
+                {
+                    *count = count.saturating_add(1);
+                    *count
+                }
+                previous => {
+                    *previous = Some((scope, fingerprint, 1));
+                    1
+                }
+            };
+            if count >= STAGNANT_WORK_STATE_READ_LIMIT {
+                return Err(TurnError::StagnantToolLoop { count, tool });
+            }
+        } else {
+            stagnant_work_state_read = None;
+        }
+
         if let Some(request_id) = waiting_for_human {
             events
                 .send(TurnEvent::TurnWaitingForHuman {
@@ -3106,6 +3200,24 @@ async fn run_turn_in_span(
                 steps,
                 request_id,
             });
+        }
+
+        let another_provider_request =
+            injected.count > 0 || (!yield_until_input && !calls.is_empty());
+        if another_provider_request && let Some(refresh) = step_dynamic_context_refresh {
+            let refresh =
+                merge_dynamic_context_refresh(cumulative_dynamic_context_refresh, refresh);
+            cumulative_dynamic_context_refresh = Some(refresh);
+            let refresher = context.dynamic_context_refresher.ok_or_else(|| {
+                TurnError::DynamicContextRefresh {
+                    detail: format!(
+                        "the tool requested `{refresh:?}`, but the host installed no refresher"
+                    ),
+                }
+            })?;
+            current_dynamic_context = refresher
+                .refresh(context.connection, &request.session_id, refresh)
+                .map_err(|detail| TurnError::DynamicContextRefresh { detail })?;
         }
 
         if injected.count > 0 {
@@ -3145,6 +3257,18 @@ async fn run_turn_in_span(
             steps,
             unresolved_tool_failures: unresolved_tool_failures.into_values().collect(),
         });
+    }
+}
+
+fn merge_dynamic_context_refresh(
+    current: Option<ToolDynamicContextRefresh>,
+    next: ToolDynamicContextRefresh,
+) -> ToolDynamicContextRefresh {
+    match (current, next) {
+        (Some(ToolDynamicContextRefresh::WorkPlan), _)
+        | (_, ToolDynamicContextRefresh::WorkPlan) => ToolDynamicContextRefresh::WorkPlan,
+        (Some(ToolDynamicContextRefresh::WorkItems), ToolDynamicContextRefresh::WorkItems)
+        | (None, ToolDynamicContextRefresh::WorkItems) => ToolDynamicContextRefresh::WorkItems,
     }
 }
 

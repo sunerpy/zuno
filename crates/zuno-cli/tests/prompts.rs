@@ -192,6 +192,11 @@ fn descriptions() -> Vec<Description> {
             text: zuno_tools::TODO_UPDATE_DESCRIPTION,
         },
         Description {
+            wire_id: "session_message",
+            file: "crates/zuno-tools/src/description/session-message.txt",
+            text: zuno_tools::SESSION_MESSAGE_DESCRIPTION,
+        },
+        Description {
             wire_id: "goal_update",
             file: "crates/zuno-goal/src/description/update-goal.txt",
             text: zuno_goal::tools::UPDATE_DESCRIPTION,

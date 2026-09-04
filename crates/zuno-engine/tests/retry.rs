@@ -129,6 +129,13 @@ fn every_terminal_turn_error_has_an_explicit_goal_recovery_decision() {
         ),
         (TurnError::EventConsumerClosed, TurnRecovery::Pause),
         (
+            TurnError::StagnantToolLoop {
+                count: 3,
+                tool: "plan_get".to_owned(),
+            },
+            TurnRecovery::Pause,
+        ),
+        (
             TurnError::Provider(ProviderError::Fatal {
                 status: Some(400),
                 source: None,

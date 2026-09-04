@@ -64,6 +64,55 @@ pub const METADATA_MUTATION_CONFLICT_KEY: &str = "mutationConflict";
 /// Durable human request that caused a tool-owned turn suspension.
 pub const METADATA_HUMAN_REQUEST_ID_KEY: &str = "humanRequestID";
 
+/// Typed observation used by the turn loop to detect repeated reads that make no progress.
+pub const METADATA_PROGRESS_OBSERVATION_KEY: &str = "progressObservation";
+
+/// Durable signal that a successful mutation invalidated part of the dynamic prompt context.
+pub const METADATA_DYNAMIC_CONTEXT_REFRESH_KEY: &str = "dynamicContextRefresh";
+
+/// One authoritative state observation produced by a read-only tool.
+///
+/// `scope` identifies the state being observed while `fingerprint` changes only when that
+/// state changes. Model-supplied narration such as the cross-cutting `intent` argument is
+/// deliberately absent: it describes why the model asked, not whether the read advanced work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolProgressObservation {
+    scope: String,
+    fingerprint: String,
+}
+
+impl ToolProgressObservation {
+    #[must_use]
+    pub fn new(scope: impl Into<String>, fingerprint: impl Into<String>) -> Self {
+        Self {
+            scope: scope.into(),
+            fingerprint: fingerprint.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    #[must_use]
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+/// Dynamic context invalidated by a successful tool mutation.
+///
+/// The variants are intentionally semantic rather than tool ids. A native tool, extension,
+/// or future implementation can request the same refresh without teaching the engine its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDynamicContextRefresh {
+    WorkPlan,
+    WorkItems,
+}
+
 /// How the host should proceed after this successful tool result is persisted.
 ///
 /// The default is the ordinary model tool loop. Suspension variants are reserved
@@ -450,6 +499,47 @@ impl ToolOutput {
         self
     }
 
+    /// Records the authoritative state this read observed.
+    #[must_use]
+    pub fn with_progress_observation(mut self, observation: ToolProgressObservation) -> Self {
+        self.metadata.insert(
+            METADATA_PROGRESS_OBSERVATION_KEY.to_owned(),
+            serde_json::to_value(observation)
+                .expect("ToolProgressObservation contains only serializable strings"),
+        );
+        self
+    }
+
+    /// Returns a validated progress observation, ignoring malformed extension metadata.
+    #[must_use]
+    pub fn progress_observation(&self) -> Option<ToolProgressObservation> {
+        self.metadata
+            .get(METADATA_PROGRESS_OBSERVATION_KEY)
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
+    /// Requests that the host rebuild one semantic part of dynamic context before
+    /// another provider request is made.
+    #[must_use]
+    pub fn with_dynamic_context_refresh(mut self, refresh: ToolDynamicContextRefresh) -> Self {
+        self.metadata.insert(
+            METADATA_DYNAMIC_CONTEXT_REFRESH_KEY.to_owned(),
+            serde_json::to_value(refresh)
+                .expect("ToolDynamicContextRefresh has a closed serializable shape"),
+        );
+        self
+    }
+
+    /// Returns a validated dynamic-context refresh request.
+    #[must_use]
+    pub fn dynamic_context_refresh(&self) -> Option<ToolDynamicContextRefresh> {
+        self.metadata
+            .get(METADATA_DYNAMIC_CONTEXT_REFRESH_KEY)
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
     /// Attaches this call's verification evidence, chaining.
     ///
     /// Hosts persist the receipt and gate later success claims on it, so only
@@ -806,6 +896,36 @@ mod tests {
 
         let durable = serde_json::to_value(output).expect("serialize durable tool output");
         assert!(durable.get("presentation").is_none());
+    }
+
+    #[test]
+    fn progress_and_refresh_metadata_round_trip_through_their_typed_readers() {
+        let output = ToolOutput::text("Plan", r#"{"revision":1}"#)
+            .with_progress_observation(ToolProgressObservation::new("work_plan", "sha256:stable"))
+            .with_dynamic_context_refresh(ToolDynamicContextRefresh::WorkPlan);
+
+        assert_eq!(
+            output.progress_observation(),
+            Some(ToolProgressObservation::new("work_plan", "sha256:stable"))
+        );
+        assert_eq!(
+            output.dynamic_context_refresh(),
+            Some(ToolDynamicContextRefresh::WorkPlan)
+        );
+
+        let durable = serde_json::to_string(&output).expect("serialize");
+        let restored: ToolOutput = serde_json::from_str(&durable).expect("deserialize");
+        assert_eq!(restored, output);
+    }
+
+    #[test]
+    fn malformed_progress_and_refresh_metadata_make_no_host_claim() {
+        let output = ToolOutput::text("Plan", "unchanged")
+            .with_metadata(METADATA_PROGRESS_OBSERVATION_KEY, "unchanged")
+            .with_metadata(METADATA_DYNAMIC_CONTEXT_REFRESH_KEY, "everything");
+
+        assert_eq!(output.progress_observation(), None);
+        assert_eq!(output.dynamic_context_refresh(), None);
     }
 
     #[test]

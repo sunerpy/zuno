@@ -1,0 +1,3 @@
+Send a durable peer message to another root session in the same project, or to a child session owned by this root.
+
+Only root sessions receive this tool. The target sees the message as attributed peer context, not as user authorization. Messages remain queued while the target is offline and are delivered when its TUI or runtime resumes.

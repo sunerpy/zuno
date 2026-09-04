@@ -123,6 +123,8 @@ pub enum DurableInputKind {
     BackgroundExecutionReport,
     /// An answered durable human request routed back into the session.
     HumanRequestAnswer,
+    /// A durable message sent by one root session to another root or its own child.
+    SessionMessage,
     /// A turn host message admitted, promoted, and consumed in one transaction.
     ///
     /// This shape carries no `kind` and is never observed pending.
@@ -143,6 +145,7 @@ impl DurableInputKind {
             Some("councilReport") => Some(Self::CouncilReport),
             Some("backgroundExecutionReport") => Some(Self::BackgroundExecutionReport),
             Some("humanRequestAnswer") => Some(Self::HumanRequestAnswer),
+            Some("sessionMessage") => Some(Self::SessionMessage),
             Some(_) => None,
             None => prompt.get("message").is_some().then_some(Self::HostMessage),
         }
@@ -161,6 +164,7 @@ impl DurableInputKind {
             Self::CouncilReport => Some("councilReport"),
             Self::BackgroundExecutionReport => Some("backgroundExecutionReport"),
             Self::HumanRequestAnswer => Some("humanRequestAnswer"),
+            Self::SessionMessage => Some("sessionMessage"),
             Self::HostMessage => None,
         }
     }
@@ -188,6 +192,7 @@ impl DurableInputKind {
         match self {
             Self::AcpPrompt
             | Self::HumanRequestAnswer
+            | Self::SessionMessage
             | Self::SubagentReport
             | Self::ProductAgentReport
             | Self::WorkflowReport
@@ -209,6 +214,7 @@ impl DurableInputKind {
             | Self::User
             | Self::HostMessage
             | Self::HumanRequestAnswer
+            | Self::SessionMessage
             | Self::SubagentReport
             | Self::ProductAgentReport
             | Self::WorkflowReport
@@ -517,7 +523,12 @@ pub(crate) fn validate_input(input: &NewSessionInput) -> Result<(), DbError> {
     Ok(())
 }
 
-pub(crate) fn admit_in(
+/// Admit one input inside a caller-owned transaction.
+///
+/// Cross-component services use this when session validation and inbox admission must
+/// commit atomically. The same validation and event append path as [`SessionInbox::admit`]
+/// is retained; only transaction ownership differs.
+pub fn admit_in(
     transaction: &Transaction<'_>,
     input: NewSessionInput,
 ) -> Result<SessionInput, DbError> {

@@ -29,6 +29,11 @@ zuno tui [OPTIONS]
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
 | `--sandbox-backend <BACKEND>` | 为本次调用选择 Shell 执行后端；`native` 不是沙箱隔离。可选值：`auto`、`native` | `auto` |
 | `--auto` | 不询问就准入每一项未被显式拒绝的权限。上游自己的描述以 "(dangerous!)" 结尾，而且名副其实：这等于把权限提示处的人替换掉，于是默认规则集本来会停下来征询的工具调用会无人看管地继续执行 | |
+| `--background` | 在持久的本地 supervisor 中启动 TUI，并立即连接 | |
+| `--attach <PTY_ID>` | 连接一个已经保留的后台 TUI | |
+| `--background-list` | 列出后台 TUI；supervisor 不存在时不会自动启动 | |
+| `--background-stop <PTY_ID>` | 停止并移除一个后台 TUI | |
+| `--background-shutdown` | 停止本地后台 TUI supervisor 及其拥有的全部 PTY | |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ## 示例
@@ -56,6 +61,21 @@ zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 ```sh
 zuno tui --session ses_1a2b3c --sandbox read-only
 ```
+
+让 TUI 在 SSH 断开后继续运行。`Ctrl+]` 只断开本地终端，不停止后台 TUI：
+
+```sh
+zuno tui --background --session ses_1a2b3c
+zuno tui --background-list
+zuno tui --attach pty_01abc...
+zuno tui --background-stop pty_01abc...
+zuno tui --background-shutdown
+```
+
+supervisor 只绑定 loopback，生成随机 Basic-auth 密码，并把状态保存在权限受限的 Zuno
+数据目录。`--background-list` 不会为了列空列表而启动 supervisor。正常退出 TUI 仍要求在
+1.5 秒内连续按两次相同的 `Ctrl+C` 或 `Ctrl+D`；这会退出被保留的子进程，而 `Ctrl+]`
+只负责 detach。
 
 ## 参见
 

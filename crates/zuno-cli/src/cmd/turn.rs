@@ -52,9 +52,10 @@ use zuno_engine::compaction::{CompactionState, TokenWindow};
 use zuno_engine::dispatch::{AuthorizationPolicy, ToolRegistryDispatcher};
 use zuno_engine::driver::AgentDriver;
 use zuno_engine::r#loop::{
-    AgentModelResolver, NoticeSeverity, ResolvedAgent, ResolvedModel as EngineModel,
-    RunTurnRequest, ToolConcurrencyLimit, ToolDispatcher as _, ToolFailureRecovery, TurnContext,
-    TurnError, TurnEvent, TurnEventSender, TurnOutcome, TurnRecovery,
+    AgentModelResolver, DynamicContextRefresher, NoticeSeverity, ResolvedAgent,
+    ResolvedModel as EngineModel, RunTurnRequest, ToolConcurrencyLimit, ToolDispatcher as _,
+    ToolFailureRecovery, TurnContext, TurnError, TurnEvent, TurnEventSender, TurnOutcome,
+    TurnRecovery,
 };
 use zuno_engine::plan_driver::{
     PlanReconciliationDecision, PlanReconciliationDriver, PlanReconciliationInput,
@@ -111,7 +112,7 @@ use zuno_orchestration::{
 };
 use zuno_provider_compatible::{ReqwestTransport, Transport};
 use zuno_runtime::HarnessRuntime;
-use zuno_tool::{PermissionAsker, ToolReplayPolicy, erase};
+use zuno_tool::{PermissionAsker, ToolDynamicContextRefresh, ToolReplayPolicy, erase};
 
 use crate::environment::StartupEnvironment;
 
@@ -135,6 +136,48 @@ pub(crate) const DEFAULT_AGENT: &str = "orchestrator";
 
 const ZUNO_ENABLE_EXPERIMENTAL_MODELS: &str = "ZUNO_ENABLE_EXPERIMENTAL_MODELS";
 const SUBAGENT_MODEL_POLICY_EVENT: &str = "session.subagent-model-policy";
+
+#[derive(Debug, Clone)]
+enum DynamicContextRefreshInstruction {
+    Planning(PlanningDecision),
+    Fixed(String),
+}
+
+impl DynamicContextRefreshInstruction {
+    fn apply(&self, context: DynamicContext, refresh: ToolDynamicContextRefresh) -> DynamicContext {
+        let instruction = match self {
+            Self::Planning(PlanningDecision::Required(_))
+                if refresh == ToolDynamicContextRefresh::WorkPlan =>
+            {
+                Some(maintain_plan_runtime_instruction())
+            }
+            Self::Planning(decision) => planning_runtime_instruction(decision),
+            Self::Fixed(instruction) => Some(instruction.clone()),
+        };
+        match instruction {
+            Some(instruction) => context.with_runtime_instruction(instruction),
+            None => context,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HostDynamicContextRefresher {
+    goal_continuation: GoalContinuation,
+    instruction: DynamicContextRefreshInstruction,
+}
+
+impl DynamicContextRefresher for HostDynamicContextRefresher {
+    fn refresh(
+        &self,
+        connection: &zuno_db::Connection,
+        session_id: &str,
+        refresh: ToolDynamicContextRefresh,
+    ) -> Result<DynamicContext, String> {
+        let context = goal_dynamic_context_from(connection, &self.goal_continuation, session_id)?;
+        Ok(self.instruction.apply(context, refresh))
+    }
+}
 
 /// A native session-command failure with enough type information for each client surface.
 #[derive(Debug)]
@@ -2418,6 +2461,9 @@ impl TurnFailure {
                 Self::Engine(TurnError::BudgetLimited { .. }) => {
                     zuno_goal::GoalPauseReason::TurnBudget
                 }
+                Self::Engine(TurnError::StagnantToolLoop { .. }) => {
+                    zuno_goal::GoalPauseReason::NoProgress
+                }
                 Self::Engine(_)
                 | Self::Database(_)
                 | Self::Host(_)
@@ -2492,6 +2538,14 @@ impl MemoryObserver for super::child_turn::ChangeNotifier {
 impl zuno_tools::WorkStateObserver for super::child_turn::ChangeNotifier {
     fn changed(&self) {
         self.changed();
+    }
+
+    fn plan_changed(&self, plan: &zuno_tools::WorkPlan) {
+        self.plan_changed(plan);
+    }
+
+    fn items_changed(&self, items: &[zuno_tools::WorkItem]) {
+        self.items_changed(items);
     }
 }
 
@@ -7404,8 +7458,14 @@ impl TurnHost {
         if let Some(instruction) = planning_runtime_instruction(planning) {
             dynamic_context = dynamic_context.with_runtime_instruction(instruction);
         }
-        self.execute_turn_unaccounted(dynamic_context, routing, guard, events)
-            .await
+        self.execute_turn_unaccounted(
+            dynamic_context,
+            DynamicContextRefreshInstruction::Planning(planning.clone()),
+            routing,
+            guard,
+            events,
+        )
+        .await
     }
 
     fn persist_user_input(
@@ -7599,8 +7659,14 @@ impl TurnHost {
         report_prelude(&events, &self.notes, &self.instruction_admission, &prelude)
             .await
             .map_err(TurnFailure::event_consumer)?;
-        self.execute_turn_unaccounted(dynamic_context, None, prepared.run_guard(), events)
-            .await
+        self.execute_turn_unaccounted(
+            dynamic_context,
+            DynamicContextRefreshInstruction::Planning(planning),
+            None,
+            prepared.run_guard(),
+            events,
+        )
+        .await
     }
 
     fn ensure_goal_turn_anchor(&mut self) -> Result<zuno_goal::Goal, String> {
@@ -7646,6 +7712,7 @@ impl TurnHost {
     async fn execute_turn_unaccounted(
         &mut self,
         mut dynamic_context: DynamicContext,
+        mut refresh_instruction: DynamicContextRefreshInstruction,
         routing: Option<&PromptRouting>,
         guard: &SessionRunGuard,
         events: TurnEventSender,
@@ -7656,8 +7723,18 @@ impl TurnHost {
             .begin(&self.session_id, &proposed_cycle_id)
             .map_err(TurnFailure::Database)?;
         loop {
+            let dynamic_context_refresher = HostDynamicContextRefresher {
+                goal_continuation: self.goal_continuation.clone(),
+                instruction: refresh_instruction.clone(),
+            };
             let outcome = self
-                .execute_one_turn_unaccounted(dynamic_context, routing, guard, events.clone())
+                .execute_one_turn_unaccounted(
+                    dynamic_context,
+                    &dynamic_context_refresher,
+                    routing,
+                    guard,
+                    events.clone(),
+                )
                 .await?;
             let TurnOutcome::Completed {
                 assistant_message_id,
@@ -7688,16 +7765,18 @@ impl TurnHost {
                     return Ok(Some(outcome));
                 }
                 PlanReconciliationDecision::ContinueOrdinary { attempt } => {
+                    let instruction = format!(
+                        "Durable work reconciliation attempt {attempt}/2: the current \
+                         Plan, Todo, or Job state is not terminal. Inspect it through the \
+                         typed tools, perform any remaining work, and commit only the \
+                         necessary operation-based state changes. Do not infer completion \
+                         from prior assistant prose."
+                    );
                     dynamic_context = self
                         .goal_dynamic_context()
                         .map_err(TurnFailure::host)?
-                        .with_runtime_instruction(format!(
-                            "Durable work reconciliation attempt {attempt}/2: the current \
-                             Plan, Todo, or Job state is not terminal. Inspect it through the \
-                             typed tools, perform any remaining work, and commit only the \
-                             necessary operation-based state changes. Do not infer completion \
-                             from prior assistant prose."
-                        ));
+                        .with_runtime_instruction(instruction.clone());
+                    refresh_instruction = DynamicContextRefreshInstruction::Fixed(instruction);
                 }
                 PlanReconciliationDecision::WaitForHuman { reason } => {
                     let request_id = format!("que_{}", Uuid::now_v7().simple());
@@ -7760,6 +7839,7 @@ impl TurnHost {
     async fn execute_one_turn_unaccounted(
         &mut self,
         dynamic_context: DynamicContext,
+        dynamic_context_refresher: &dyn DynamicContextRefresher,
         routing: Option<&PromptRouting>,
         guard: &SessionRunGuard,
         events: TurnEventSender,
@@ -7818,6 +7898,7 @@ impl TurnHost {
         )
         .with_live_inputs(guard, &self.inbox)
         .with_attachments(Arc::clone(&self.attachments))
+        .with_dynamic_context_refresher(dynamic_context_refresher)
         .with_tool_concurrency(self.tool_concurrency)
         // Installed on every turn, not only a goal-driven one. The policy is documented
         // to leave a session with no goal, or a goal with no token budget, alone, so
@@ -7957,19 +8038,7 @@ impl TurnHost {
     }
 
     fn goal_dynamic_context(&self) -> Result<DynamicContext, String> {
-        let mut context = self
-            .goal_continuation
-            .injection(&self.session_id)
-            .map_err(to_string)
-            .map(|entry| {
-                entry.map_or_else(DynamicContext::default, |entry| {
-                    dynamic_context_from_goal_entry(&entry)
-                })
-            })?;
-        if let Some(work) = durable_work_context(&self.connection, &self.session_id)? {
-            context = context.with_runtime_instruction(work);
-        }
-        Ok(context)
+        goal_dynamic_context_from(&self.connection, &self.goal_continuation, &self.session_id)
     }
 
     fn finish_goal_turn(
@@ -8778,6 +8847,25 @@ fn render_durable_work_context(mut snapshot: DurableWorkContextSnapshot) -> Resu
     }
 }
 
+fn goal_dynamic_context_from(
+    connection: &rusqlite::Connection,
+    goal_continuation: &GoalContinuation,
+    session_id: &str,
+) -> Result<DynamicContext, String> {
+    let mut context = goal_continuation
+        .injection(session_id)
+        .map_err(to_string)
+        .map(|entry| {
+            entry.map_or_else(DynamicContext::default, |entry| {
+                dynamic_context_from_goal_entry(&entry)
+            })
+        })?;
+    if let Some(work) = durable_work_context(connection, session_id)? {
+        context = context.with_runtime_instruction(work);
+    }
+    Ok(context)
+}
+
 fn durable_work_context(
     connection: &rusqlite::Connection,
     session_id: &str,
@@ -9047,13 +9135,15 @@ fn planning_runtime_instruction(decision: &PlanningDecision) -> Option<String> {
              finishing."
                 .to_owned(),
         ),
-        PlanningDecision::Maintain(_) => Some(
-            "Keep the existing durable Plan current through operation-based patches. Reconcile \
-             typed Plan/Todo/Job state before finishing; assistant prose is not execution state."
-                .to_owned(),
-        ),
+        PlanningDecision::Maintain(_) => Some(maintain_plan_runtime_instruction()),
         PlanningDecision::Atomic(_) | PlanningDecision::Unavailable(_) => None,
     }
+}
+
+fn maintain_plan_runtime_instruction() -> String {
+    "Keep the existing durable Plan current through operation-based patches. Reconcile typed \
+     Plan/Todo/Job state before finishing; assistant prose is not execution state."
+        .to_owned()
 }
 
 fn planning_content_facts(content: Option<&[RequestContentBlock]>) -> PlanningContentFacts {

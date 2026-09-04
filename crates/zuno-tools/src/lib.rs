@@ -119,6 +119,7 @@ pub mod navigation;
 pub mod output_policy;
 pub mod read;
 pub mod risk;
+pub mod session_message;
 pub mod shell;
 pub mod timeout;
 pub mod write;
@@ -196,6 +197,9 @@ pub use crate::experience_search::{
 pub use crate::glob::{GlobParams, GlobTool};
 pub use crate::grep::{GrepParams, GrepTool};
 pub use crate::search_common::{RESULT_LIMIT, SearchScope, SearchTooling};
+pub use crate::session_message::{
+    SESSION_MESSAGE_DESCRIPTION, SESSION_MESSAGE_TOOL_ID, SessionMessageParams, SessionMessageTool,
+};
 
 pub mod webfetch;
 pub mod websearch;

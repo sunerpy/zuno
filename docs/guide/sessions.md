@@ -53,6 +53,17 @@ This is why a background delegation with `reportDelivery: nextStep` cannot lose 
 report to a polling race: the settle, the admission, and the wake are one transactional
 sequence.
 
+Root-session peer messages use the same durable admission boundary. The root-only
+`session_message` tool writes a typed `sessionMessage` row into the target inbox. It may
+address another root in the same project or a descendant of the current root; children
+cannot send, and one root cannot address another root's child. The rendered text names
+the source session, Agent, and title and states that peer context is not user
+authorization.
+
+TUI, HTTP server, and ACP drivers all recognize this shape as model-visible text. An
+active target receives a soft input at a safe point, an idle resident target starts a
+turn, and an offline target keeps the row queued until it is loaded again.
+
 Product-agent, workflow, council, and durable background-command completions use
 the same continuation rule. The previous assistant reply may already have ended
 with a message such as “the background task is still running; I will wait.”
@@ -67,6 +78,11 @@ session eligible for background continuation. Closing a session unregisters its
 resident notification watcher, interrupts and joins any detached continuation,
 then applies the surface's lifecycle policy to owned work. It does not promise
 that a non-resident process will continue generating.
+
+For an SSH-hosted TUI, `zuno tui --background` supplies that resident owner. A detached
+loopback supervisor retains the PTY, TUI process, scrollback, and active turn while each
+SSH client is only an attachment. `Ctrl+]` detaches; `--background-shutdown` is the
+explicit lifecycle boundary that stops every retained child.
 
 ## Prompt provenance
 
@@ -179,6 +195,20 @@ so a person can inspect the database; durable state this build cannot read at al
 the Goal. The persisted `goal_retry` row is what a restarted process reads back, so a
 restart neither loses nor shortens the wait.
 
+The engine also detects a no-progress work-state read loop. `plan_get` and `todo_get`
+publish a semantic fingerprint of the authoritative state they observed; model-supplied
+`intent` narration is deliberately excluded. Three consecutive single-tool reads of the
+same fingerprint stop with typed `stagnant_tool_loop`. For an active Goal this persists
+`paused(no_progress)` and requires explicit resume. A changed Plan or Todo fingerprint
+resets the count.
+
+Successful `plan_update` and `todo_update` calls invalidate the volatile prompt
+projection. Before the next provider request, the host rebuilds Goal/Plan/Todo/Job
+context from SQLite. A successful Plan mutation also replaces the one-time
+create-or-replace instruction with the maintenance instruction, so
+`runtime.work_state` cannot keep describing the Plan that existed before this turn
+changed it.
+
 Clamping also decides what happens when a peer asks for more time than the same-request
 recovery has left. The provider layer retries one request for at most 180 seconds; a
 `Retry-After` longer than what remains of that window is neither slept through nor replaced
@@ -203,6 +233,13 @@ still wins and configuration is only the fallback:
 | Agent | `--agent` or picker > saved on the session > `default_agent` > `orchestrator` |
 | Model | `--model` or picker > a preset chosen in this process > saved on the session > routed through configuration |
 | Reasoning level | `--variant`, `--thinking`, or picker > saved with the session's model > configured defaults |
+
+ACP stdio lifetime belongs to the editor that launched it. If Zed closes or loses that
+process, relaunch `zuno acp` and load the durable session id; the old stdio transport
+does not survive. Stable ACP v1 uses load as the authoritative reconnection path. A
+negotiated resume operation may be used by supporting clients, but transport
+reconnection never replaces SQLite inbox, event, Goal, Plan, and prompt-receipt
+recovery. The background-TUI supervisor intentionally wraps TUI PTYs, not ACP stdio.
 
 In short: flag > session > config default. The session row records the pair it last ran
 with: a model, level, preset, or Agent pick in the TUI, an ACP configuration change, and
