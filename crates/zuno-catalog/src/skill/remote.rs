@@ -32,13 +32,22 @@
 //! in flight. Same shape as `zuno_config::instructions`, which proved the pattern
 //! against a hanging server.
 //!
-//! # One deliberate hardening
+//! # Two deliberate hardenings
 //!
-//! `index.json` is remote input, and the oracle joins `file` onto the cache root
-//! with no traversal check — a `"files": ["../../../.bashrc"]` entry would write
-//! outside the cache. This port rejects any entry file that escapes its skill
-//! root, with a warning. It only rejects what the oracle should not have
-//! accepted; a well-formed index is unaffected.
+//! `index.json` is remote input, and the oracle joins both `name` and `file` onto
+//! the cache root with no traversal check. A `"files": ["../../../.bashrc"]` entry
+//! would write outside the cache; a `"name": "../../../.config/zuno"` entry is
+//! worse still, because [`swap`] renames whatever already occupies that directory
+//! out of the way and then deletes it. So this port requires `name` to be a single
+//! directory segment and rejects any entry file that escapes its skill root, each
+//! with a warning. It only rejects what the oracle should not have accepted; a
+//! well-formed index is unaffected.
+//!
+//! Both checks decide `/`, `\`, and `:` themselves, before any platform-native path
+//! parsing, so that one index yields the same file set and the same warnings on Linux,
+//! macOS, and Windows. `:` is the one that is not a separator: `C:evil` is a drive-
+//! relative `Prefix` component on Windows and an ordinary file name on Linux, and a
+//! Windows alternate data stream (`SKILL.md:$DATA`) is spelled the same way.
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
@@ -136,6 +145,15 @@ pub async fn pull(url: &str, cache_root: &Path) -> Pulled {
 
     let mut usable = Vec::new();
     for entry in index.skills {
+        if !safe_name(&entry.name) {
+            pulled.push(
+                index_url.as_str(),
+                SkillWarningKind::UnsafeIndexName {
+                    skill: entry.name.clone(),
+                },
+            );
+            continue;
+        }
         if !entry.files.iter().any(|file| file == SKILL_FILENAME) {
             pulled.push(
                 index_url.as_str(),
@@ -257,6 +275,30 @@ async fn refresh(
     out
 }
 
+/// Whether `name` is a single directory segment, and so names a directory *inside*
+/// the cache root.
+///
+/// [`refresh`] joins `name` onto the cache root and [`swap`] renames whatever is
+/// already at the result aside before deleting it, so an absolute or `..`-bearing
+/// name lets a remote index destroy and replace an arbitrary directory — the user's
+/// config directory being the obvious target.
+///
+/// Both separators and `:` are refused on every platform, before the component
+/// check, so that an index entry cannot mean one thing on Windows and another on
+/// Linux. `:` matters because a drive-relative `C:evil` parses as a `Prefix`
+/// component on Windows and as a plain `Normal` directory name on Linux, and a
+/// Windows alternate data stream is spelled the same way; refusing the character
+/// outright decides both the same way everywhere, on the deny side. Whatever
+/// survives is then required to be exactly one `Normal` component, which is what
+/// rules out `""`, `.`, `..`, and every rooted form.
+fn safe_name(name: &str) -> bool {
+    if name.contains(['/', '\\', ':']) {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
 /// Drop any entry file that would escape its skill root, and de-duplicate.
 fn safe_files(entry: &IndexEntry, warnings: &mut Vec<SkillWarning>) -> Option<Vec<String>> {
     let mut files = BTreeSet::new();
@@ -280,7 +322,20 @@ fn safe_files(entry: &IndexEntry, warnings: &mut Vec<SkillWarning>) -> Option<Ve
     Some(files.into_iter().collect())
 }
 
+/// Whether `file` would resolve anywhere other than inside its own skill root.
+///
+/// `:` is refused before any platform-native parsing for the same reason
+/// [`safe_name`] refuses it: `C:evil` is a `Prefix` component on Windows and a plain
+/// `Normal` file name on Linux, so leaving it to the platform makes one index produce
+/// two different file sets and two different warning lists. Refusing the character
+/// decides it the same way everywhere, and on the deny side — a file the check drops
+/// is warned about and not downloaded, never silently accepted somewhere new. It is
+/// deliberately the whole character rather than a drive-letter pattern, because
+/// `SKILL.md:$DATA` names a Windows alternate data stream with no drive letter in it.
 fn escapes(file: &str) -> bool {
+    if file.contains(':') {
+        return true;
+    }
     let path = Path::new(file);
     if path.is_absolute() {
         return true;
@@ -491,6 +546,52 @@ mod tests {
         }
         for file in ["SKILL.md", "./SKILL.md", "scripts/run.sh", "a/../b.md"] {
             assert!(!escapes(file), "{file} must be accepted");
+        }
+    }
+
+    /// The same platform divergence [`safe_name`] refuses for `name`. `Path::new`
+    /// classifies `C:evil` as a `Prefix` component on Windows and as a `Normal` file
+    /// name on Linux, so without the `:` pre-check this index downloaded a literal
+    /// `C:evil` on Linux and warned about it on Windows — one index, two file sets.
+    /// The stream spelling has no drive letter and so needs the character, not a
+    /// drive-letter pattern.
+    #[test]
+    fn drive_prefixed_and_stream_entry_files_are_rejected_on_every_platform() {
+        for file in [
+            "C:evil",
+            "C:\\Windows\\Temp\\evil",
+            "SKILL.md:$DATA",
+            "nested/a:b",
+        ] {
+            assert!(
+                escapes(file),
+                "{file} must be rejected on every platform, not only where the \
+                 platform's own path parser happens to reject it"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_single_segment_entry_name_is_accepted() {
+        for name in ["alpha", "with space", "a.b", "..hidden"] {
+            assert!(safe_name(name), "{name} must be accepted");
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "../../../.config/zuno",
+            "nested/skill",
+            "nested\\skill",
+            "/etc/zuno",
+            // Drive-relative on Windows, a literal directory name on Linux. The
+            // decision has to be the same on both, and deny is the safe one.
+            "C:evil",
+            "C:\\Windows\\Temp",
+            "skill:$DATA",
+        ] {
+            assert!(!safe_name(name), "{name} must be rejected");
         }
     }
 
