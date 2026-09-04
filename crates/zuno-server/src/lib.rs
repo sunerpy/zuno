@@ -33,7 +33,7 @@ pub use events::{
 };
 pub use request_broker::{
     PermissionRequest, PermissionResolution, QuestionAnswers, QuestionDecision, QuestionRequest,
-    QuestionResolution, QuestionToolCall, RequestBroker, RequestSource,
+    QuestionResolution, QuestionToolCall, RequestBroker, RequestSource, SettleError, Settled,
 };
 pub use server::{
     BoundServer, ServerBuilder, ServerConfig, ServerError, ServerServices, SessionCompactExecution,

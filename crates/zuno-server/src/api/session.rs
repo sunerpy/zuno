@@ -757,6 +757,20 @@ pub async fn history(
     }))
 }
 
+/// Keeps an unknown session a `404` now that the switch travels through the event log.
+///
+/// `switch_agent_at` reports a missing session as `DbError::NotFound`, which the direct
+/// store call surfaced as `404`. Wrapped in an `EventStreamError` it would otherwise
+/// fall through to the generic `500`.
+fn switch_failed(error: crate::EventStreamError) -> ApiError {
+    match error {
+        crate::EventStreamError::Database(error @ zuno_error::DbError::NotFound { .. }) => {
+            ApiError::Database(error)
+        }
+        other => ApiError::Event(other),
+    }
+}
+
 pub async fn switch_agent(
     State(state): State<ApiState>,
     Extension(services): Extension<ServerServices>,
@@ -766,26 +780,35 @@ pub async fn switch_agent(
     require_idle(&state, &services, &session_id)?;
     let message_id = format!("msg_{}", Uuid::new_v4().simple());
     let switched = zuno_db::message::now_millis();
-    if let Some(events) = state.events() {
-        let properties = json!({
-            "timestamp": switched,
-            "sessionID": session_id,
-            "messageID": message_id,
-            "agent": input.agent,
+    // The event and the selection it asserts commit in one transaction. Publishing
+    // first leaves an event claiming a switch a failed write never made; writing first
+    // leaves a committed switch the durable stream cannot reconstruct. Both are lies,
+    // so neither order is used where the atomic primitive exists.
+    let Some(events) = state.events() else {
+        // No event log in this wiring, so there is no event for the write to disagree
+        // with and nothing to make the switch atomic with.
+        state
+            .sessions()
+            .switch_agent_at(&session_id, &message_id, &input.agent, switched)?;
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    let properties = json!({
+        "timestamp": switched,
+        "sessionID": session_id,
+        "messageID": message_id,
+        "agent": input.agent,
+    })
+    .as_object()
+    .expect("the agent switch event is an object")
+    .clone();
+    let event = crate::NewEvent::new("session.next.agent.switched", properties)?;
+    let (target, message, agent) = (session_id.clone(), message_id.clone(), input.agent.clone());
+    events
+        .publish_with(&session_id, event, move |transaction| {
+            zuno_db::session::switch_agent_at(transaction, &target, &message, &agent, switched)
         })
-        .as_object()
-        .expect("the agent switch event is an object")
-        .clone();
-        events
-            .publish(
-                &session_id,
-                crate::NewEvent::new("session.next.agent.switched", properties)?,
-            )
-            .await?;
-    }
-    state
-        .sessions()
-        .switch_agent_at(&session_id, &message_id, &input.agent, switched)?;
+        .await
+        .map_err(switch_failed)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -800,26 +823,30 @@ pub async fn switch_model(
         .map_err(|error| ApiError::MutationFailed(error.to_string()))?;
     let message_id = format!("msg_{}", Uuid::new_v4().simple());
     let switched = zuno_db::message::now_millis();
-    if let Some(events) = state.events() {
-        let properties = json!({
-            "timestamp": switched,
-            "sessionID": session_id,
-            "messageID": message_id,
-            "model": input.model,
+    // One transaction, for the reason spelled out in `switch_agent`.
+    let Some(events) = state.events() else {
+        state
+            .sessions()
+            .switch_model_at(&session_id, &message_id, &model, switched)?;
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    let properties = json!({
+        "timestamp": switched,
+        "sessionID": session_id,
+        "messageID": message_id,
+        "model": input.model,
+    })
+    .as_object()
+    .expect("the model switch event is an object")
+    .clone();
+    let event = crate::NewEvent::new("session.next.model.switched", properties)?;
+    let (target, message) = (session_id.clone(), message_id.clone());
+    events
+        .publish_with(&session_id, event, move |transaction| {
+            zuno_db::session::switch_model_at(transaction, &target, &message, &model, switched)
         })
-        .as_object()
-        .expect("the model switch event is an object")
-        .clone();
-        events
-            .publish(
-                &session_id,
-                crate::NewEvent::new("session.next.model.switched", properties)?,
-            )
-            .await?;
-    }
-    state
-        .sessions()
-        .switch_model_at(&session_id, &message_id, &model, switched)?;
+        .await
+        .map_err(switch_failed)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

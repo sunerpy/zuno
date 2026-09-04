@@ -1,3 +1,4 @@
+mod blocking;
 pub(crate) mod catalog;
 pub(crate) mod error;
 mod fs;

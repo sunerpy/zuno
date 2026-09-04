@@ -14,6 +14,7 @@ use zuno_db::session_prune::{
     SessionPruneAction, SessionPruneProgress, SessionPruneRequest, SessionPruneScope,
 };
 
+use super::blocking::Budget;
 use super::error::ApiError;
 use super::state::ApiState;
 use crate::ServerServices;
@@ -94,10 +95,10 @@ pub async fn preview(
 ) -> Result<Response, ApiError> {
     let now_ms = unix_millis()?;
     run(
-        &state,
+        state,
         input.older_than,
         input.all_projects,
-        input.project.as_deref(),
+        input.project,
         input.by,
         SessionPruneAction::Preview,
         input.include_shared,
@@ -105,8 +106,9 @@ pub async fn preview(
         false,
         false,
         now_ms,
-        &services,
+        services,
     )
+    .await
 }
 
 pub async fn mutate(
@@ -125,10 +127,10 @@ pub async fn mutate(
         MutationAction::Delete => SessionPruneAction::Delete,
     };
     run(
-        &state,
+        state,
         input.older_than,
         input.all_projects,
-        input.project.as_deref(),
+        input.project,
         input.by,
         action,
         input.include_shared,
@@ -136,15 +138,72 @@ pub async fn mutate(
         input.force,
         true,
         now_ms,
-        &services,
+        services,
     )
+    .await
+}
+
+/// Runs the prune off the reactor, inside the maintenance budget, and renders its
+/// report.
+///
+/// The scan, the artifact unlinks, and the database writes are all synchronous and
+/// unbounded in the size of the database, and `zuno serve` polls this router on a
+/// single-threaded runtime. Left in the handler future they freeze every SSE stream
+/// in the process — including the progress stream this endpoint exists to feed,
+/// whose subscribers cannot be polled while the same thread is inside the scan.
+///
+/// A bare `spawn_blocking` is not the answer either:
+/// `GET /api/session/prune?olderThan=0&allProjects=true` is a full retention scan over
+/// every project, the route is unauthenticated unless the operator sets
+/// `ZUNO_SERVER_PASSWORD`, and N concurrent requests would occupy up to the blocking
+/// pool's 512 threads — the same pool the durable event commits, permission settles,
+/// and goal resumes the agent loop depends on run in. It is charged to
+/// [`Budget::Maintenance`] for that reason, which queues the surplus rather than
+/// refusing it: an operator dashboard issuing a handful of concurrent previews is
+/// ordinary input, while a queued request that its client abandons never starts the
+/// scan at all.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "preview and mutate share this policy path, whose inputs mirror the request plus execution context"
+)]
+async fn run(
+    state: ApiState,
+    older_than_days: u64,
+    all_projects: bool,
+    project: Option<String>,
+    by: RetentionBy,
+    action: SessionPruneAction,
+    include_shared: bool,
+    include_recent: bool,
+    force: bool,
+    confirm_delete: bool,
+    now_ms: i64,
+    services: ServerServices,
+) -> Result<Response, ApiError> {
+    super::blocking::run(Budget::Maintenance, move || {
+        execute(
+            &state,
+            older_than_days,
+            all_projects,
+            project.as_deref(),
+            by,
+            action,
+            include_shared,
+            include_recent,
+            force,
+            confirm_delete,
+            now_ms,
+            &services,
+        )
+    })
+    .await
 }
 
 #[allow(
     clippy::too_many_arguments,
     reason = "preview and mutate share this policy path, whose inputs mirror the request plus execution context"
 )]
-fn run(
+fn execute(
     state: &ApiState,
     older_than_days: u64,
     all_projects: bool,
@@ -238,4 +297,64 @@ fn unix_millis() -> Result<i64, ApiError> {
         .as_millis();
     i64::try_from(millis)
         .map_err(|_| ApiError::InvalidRequest("system clock is outside the supported range"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// The reviewed input, spelled exactly as the reviewer sent it.
+    ///
+    /// `GET /api/session/prune?olderThan=0&allProjects=true` is a full retention scan
+    /// over every project on a route that is unauthenticated unless the operator sets
+    /// `ZUNO_SERVER_PASSWORD`. Wrapped in a bare `spawn_blocking`, N concurrent copies
+    /// occupy up to the blocking pool's 512 threads, which is where the durable event
+    /// commits and the permission settles the agent loop depends on also run.
+    ///
+    /// The oracle is the handler waiting: with the maintenance budget fully held, this
+    /// preview cannot start. It completes as soon as a permit frees, so the bound
+    /// queues the scan rather than refusing it.
+    ///
+    /// The wait is a real-clock window rather than a poll count. A poll count passes
+    /// vacuously — a scan that *did* start off the budget also needs more than 64
+    /// yields to finish — while a handler that is waiting for a permit that nothing
+    /// releases stays pending for any window at all. Measured against the bare
+    /// `spawn_blocking` this replaces, the same scan completed well inside this window.
+    #[tokio::test]
+    async fn a_full_retention_scan_waits_for_the_maintenance_budget() {
+        let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+        let services = ServerServices::new(64);
+        let uri: axum::http::Uri =
+            "http://127.0.0.1/api/session/prune?olderThan=0&allProjects=true"
+                .parse()
+                .expect("the reviewed request URI parses");
+        let Query(input) =
+            Query::<PreviewQuery>::try_from_uri(&uri).expect("the reviewed query parses");
+
+        let held = Budget::Maintenance.hold_all().await;
+        let mut previewing =
+            std::pin::pin!(preview(State(state), Extension(services), Query(input)));
+        let window = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < window {
+            assert!(
+                futures::poll!(&mut previewing).is_pending(),
+                "a full retention scan started outside the maintenance budget, so \
+                 concurrent previews can occupy the blocking pool that the durable \
+                 event commits and permission settles share"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        drop(held);
+        let response = previewing
+            .await
+            .expect("the preview runs once the budget frees");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the budget must queue the scan, not refuse it"
+        );
+    }
 }

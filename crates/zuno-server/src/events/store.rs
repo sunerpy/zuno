@@ -43,6 +43,15 @@ impl Store {
         self.subscriber_capacity
     }
 
+    /// The application database this log writes through.
+    ///
+    /// Exposed for the one caller that has to commit two durable rows of its own in
+    /// a single transaction and has no event to attach them to; see
+    /// [`super::EventService::application_pool`].
+    pub(super) fn pool(&self) -> Arc<Pool> {
+        Arc::clone(&self.pool)
+    }
+
     /// Commit one event in its own transaction.
     ///
     /// The row layout, the identifier scheme, the version suffix, and the

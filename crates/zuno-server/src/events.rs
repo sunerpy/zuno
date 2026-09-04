@@ -110,6 +110,20 @@ impl EventService {
         Ok(stored)
     }
 
+    /// The application database this event log writes through.
+    ///
+    /// [`Self::publish_with`] is the way to commit a mutation atomically *with* an
+    /// event. A caller that must commit two durable rows of its own in one
+    /// transaction and has no event to publish has no other handle on the pool from
+    /// inside this crate, so it borrows this one. Every wiring builds the event
+    /// service and the other stores over the same database (`zuno serve` and
+    /// `zuno-server`'s `main` both open one pool and hand it to both), and the one
+    /// caller reads its row back through its own store afterwards, so a mismatched
+    /// wiring fails closed instead of authorizing on a row nobody else can see.
+    pub(crate) fn application_pool(&self) -> Arc<Pool> {
+        self.store.pool()
+    }
+
     /// Reads committed events strictly after an optional cursor.
     pub async fn replay(
         &self,

@@ -306,24 +306,34 @@ async fn session_sse_never_outpaces_the_history_route() {
     forwarder.await.expect("event forwarder does not panic");
 }
 
-#[tokio::test]
-async fn dropping_the_only_session_observer_rejects_a_question() {
+/// A session, a broker, and a router that serves both the SSE and the reply routes.
+fn observed_question_app(session_id: &str) -> (RequestBroker, axum::Router) {
     let (pool, events) = event_service(8);
-    create_session(&pool, "ses_observed");
+    create_session(&pool, session_id);
     let requests = RequestBroker::default();
     let services = ServerServices::new(8).with_requests(requests.clone());
     let app = ServerBuilder::new(ServerConfig::default())
         .with_services(services)
         .with_routes(events_router(events))
         .router();
-    let observer = open_stream(&app, "ses_observed", None).await;
-    let mut answer = tokio::spawn({
+    (requests, app)
+}
+
+/// Parks an asker on a question and returns once the broker is showing it.
+async fn ask_observed_question(
+    requests: &RequestBroker,
+    session_id: &str,
+    request_id: &str,
+) -> tokio::task::JoinHandle<QuestionDecision> {
+    let asker = tokio::spawn({
         let requests = requests.clone();
+        let session_id = session_id.to_owned();
+        let request_id = request_id.to_owned();
         async move {
             requests
                 .ask_question(QuestionRequest {
-                    id: "que_observed".to_owned(),
-                    session_id: "ses_observed".to_owned(),
+                    id: request_id,
+                    session_id,
                     questions: vec![json!({"question": "Continue?"})],
                     tool: None,
                 })
@@ -333,19 +343,75 @@ async fn dropping_the_only_session_observer_rejects_a_question() {
     while requests.questions(None).is_empty() {
         tokio::task::yield_now().await;
     }
+    asker
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_the_only_session_observer_cancels_a_question_after_the_grace_window() {
+    let (requests, app) = observed_question_app("ses_observed");
+    let observer = open_stream(&app, "ses_observed", None).await;
+    let mut answer = ask_observed_question(&requests, "ses_observed", "que_observed").await;
 
     drop(observer);
 
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), &mut answer)
+    // A dropped stream is a network event, not a decision, so the ask has to outlive it
+    // long enough for the same client to reconnect and answer.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), &mut answer)
             .await
-            .expect("dropping the only observer must release the question asker")
+            .is_err(),
+        "losing the only observer must not immediately answer the question"
+    );
+    assert!(
+        !requests.questions(None).is_empty(),
+        "the question must still be pending inside the reconnect window"
+    );
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(120), &mut answer)
+            .await
+            .expect("an unobserved question must be released once the grace window closes")
             .expect("question asker task does not panic"),
         QuestionDecision::Cancelled
     );
     assert!(
         requests.questions(None).is_empty(),
-        "observer-zero cleanup must remove the rejected question"
+        "observer-zero cleanup must remove the cancelled question"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnecting_inside_the_grace_window_keeps_a_question_answerable() {
+    let (requests, app) = observed_question_app("ses_resumed");
+    let observer = open_stream(&app, "ses_resumed", None).await;
+    let mut answer = ask_observed_question(&requests, "ses_resumed", "que_resumed").await;
+
+    drop(observer);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let _reconnected = open_stream(&app, "ses_resumed", None).await;
+    // Long enough that the window opened by the first drop has certainly elapsed.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+
+    assert!(
+        requests
+            .questions(None)
+            .iter()
+            .any(|request| request.id == "que_resumed"),
+        "a reconnected stream must not lose the question it came back for"
+    );
+    let resolution = requests
+        .claim_question("ses_resumed", "que_resumed")
+        .expect("the reconnected client can still claim the question");
+    resolution
+        .settle(QuestionDecision::Answered(vec![vec!["yes".to_owned()]]))
+        .await
+        .expect("the answer reaches the waiting ask");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), &mut answer)
+            .await
+            .expect("the answered question releases its asker")
+            .expect("question asker task does not panic"),
+        QuestionDecision::Answered(vec![vec!["yes".to_owned()]])
     );
 }
 
