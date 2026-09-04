@@ -9,7 +9,7 @@
 
 use crate::search_common::{
     InterruptCancellation, RESULT_LIMIT, SearchTooling, TargetKind, assert_external_directory,
-    map_search_error,
+    map_search_error, one_line,
 };
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -31,6 +31,25 @@ pub const DESCRIPTION: &str = include_str!("description/grep.txt");
 /// The oracle's wording (`grep.ts:33`) says "No files found" even though the search
 /// was over contents. Reproduced because the model has been trained on it.
 const EMPTY_OUTPUT: &str = "No files found";
+
+/// What the tool emits when the engine found matches but could report none of them.
+///
+/// The engine drops a match whose file name is not valid text, because a path it
+/// cannot spell is not an identifier the model can feed back, and it says so through
+/// `truncated`. Before this text existed the tool answered [`EMPTY_OUTPUT`] with
+/// `truncated: false` for that case — a confident "it isn't there" for a pattern the
+/// engine knew was present, and an attacker only needs to plant one such file name.
+const UNREPORTABLE_OUTPUT: &str = "Found matches that cannot be reported: every matching \
+                                   file has a name that cannot be spelled as text, so no \
+                                   path can be shown. (Results truncated.)";
+
+/// The trailer when a match was dropped for its name while the list is under the limit.
+///
+/// Distinct from the oracle's limit trailer because "a more specific path or pattern"
+/// is advice for the limit, not for a file the engine cannot name.
+const UNNAMEABLE_TRAILER: &str = "(Results truncated: at least one match is in a file \
+                                  whose name cannot be spelled as text and cannot be \
+                                  shown.)";
 
 /// `grep`'s arguments.
 ///
@@ -143,7 +162,13 @@ impl TypedTool for GrepTool {
             .map_err(|error| map_search_error(self.id(), error))?;
 
         if results.items.is_empty() {
-            return Ok(empty(&params.pattern));
+            // Read the engine's flag before concluding absence: an empty list with
+            // `truncated` set means every match was dropped, not that none existed.
+            return Ok(if results.truncated {
+                unreportable(&params.pattern)
+            } else {
+                empty(&params.pattern)
+            });
         }
 
         // The base the oracle resolves each row against (`grep.ts:72-75`) is the
@@ -161,7 +186,11 @@ impl TypedTool for GrepTool {
             })
             .collect();
 
-        let truncated = rows.len() == RESULT_LIMIT;
+        // The engine's own flag first — it is set when a match was dropped for a name
+        // the engine cannot spell, which no length test can see — then the oracle's
+        // weaker test (`grep.ts:80`), which claims truncation for exactly 100 rows.
+        let at_limit = rows.len() == RESULT_LIMIT;
+        let truncated = results.truncated || at_limit;
         let total = rows.len();
         let files: Vec<String> = rows
             .iter()
@@ -189,16 +218,18 @@ impl TypedTool for GrepTool {
                     lines.push(String::new());
                 }
                 current = Some(row.path.as_path());
-                lines.push(format!("{}:", row.path.display()));
+                lines.push(format!("{}:", one_line(&row.path)));
             }
             lines.push(format!("  Line {}: {}", row.line, row.text));
         }
 
         if truncated {
             lines.push(String::new());
-            lines.push(
-                "(Results truncated. Consider using a more specific path or pattern.)".to_owned(),
-            );
+            lines.push(if at_limit {
+                "(Results truncated. Consider using a more specific path or pattern.)".to_owned()
+            } else {
+                UNNAMEABLE_TRAILER.to_owned()
+            });
         }
 
         Ok(ToolOutput::text(&params.pattern, lines.join("\n"))
@@ -231,6 +262,13 @@ fn empty(pattern: &str) -> ToolOutput {
     ToolOutput::text(pattern, EMPTY_OUTPUT)
         .with_metadata("matches", 0)
         .with_metadata("truncated", false)
+        .with_metadata("files", json!([]))
+}
+
+fn unreportable(pattern: &str) -> ToolOutput {
+    ToolOutput::text(pattern, UNREPORTABLE_OUTPUT)
+        .with_metadata("matches", 0)
+        .with_metadata("truncated", true)
         .with_metadata("files", json!([]))
 }
 
@@ -434,6 +472,125 @@ mod tests {
                 .output
                 .ends_with("(Results truncated. Consider using a more specific path or pattern.)")
         );
+    }
+
+    /// A file whose name is not valid UTF-8, which the engine therefore cannot spell.
+    ///
+    /// Unix-only because Windows file names are UTF-16 and cannot hold a lone `0xff`
+    /// byte; the Windows shape of an unspellable name is a lone surrogate, and the
+    /// engine's own tests own that platform.
+    #[cfg(unix)]
+    fn unnameable_file(dir: &Path, name: &[u8], content: &str) {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = dir.join(std::ffi::OsStr::from_bytes(name));
+        std::fs::write(&path, content).expect("a fixture file with a non-UTF-8 name");
+        assert!(
+            std::fs::read_dir(dir)
+                .expect("the fixture directory lists")
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().as_encoded_bytes() == name),
+            "the non-UTF-8 name must really have landed on disk"
+        );
+    }
+
+    /// The engine answers `Ok(items: [], truncated: true)` for a tree whose every match
+    /// lives in a file it cannot name. Before the fix the tool returned `empty()` —
+    /// "No files found" with `truncated: false` — before it ever read the flag.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_match_that_lives_only_in_an_unnameable_file_is_reported_as_dropped_not_absent() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        unnameable_file(dir.path(), b"bad\xff.txt", "needle here\n");
+        std::fs::write(dir.path().join("clean.txt"), "nothing\n").expect("a fixture file");
+
+        let output = erase(GrepTool::new(SearchTooling::new(dir.path())))
+            .execute(json!({ "pattern": "needle" }), context())
+            .await
+            .expect("a dropped match is not an error");
+
+        assert_ne!(
+            output.output, EMPTY_OUTPUT,
+            "a dropped match is not absence"
+        );
+        assert_eq!(output.output, UNREPORTABLE_OUTPUT);
+        assert_eq!(output.metadata["truncated"], true);
+        assert_eq!(output.metadata["matches"], 0);
+        assert_eq!(output.metadata["files"], json!([]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unnameable_match_beside_a_nameable_one_marks_the_result_truncated() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        unnameable_file(dir.path(), b"bad\xff.txt", "needle here\n");
+        std::fs::write(dir.path().join("good.txt"), "needle too\n").expect("a fixture file");
+
+        let output = erase(GrepTool::new(SearchTooling::new(dir.path())))
+            .execute(json!({ "pattern": "needle" }), context())
+            .await
+            .expect("the grep succeeds");
+
+        assert_eq!(output.metadata["matches"], 1);
+        assert_eq!(output.metadata["truncated"], true);
+        assert!(
+            output
+                .output
+                .starts_with("Found 1 matches (more matches available)"),
+            "{}",
+            output.output
+        );
+        assert!(
+            output.output.ends_with(UNNAMEABLE_TRAILER),
+            "{}",
+            output.output
+        );
+        assert!(
+            !output.output.contains("more specific path"),
+            "the limit advice is not advice for a name the engine cannot spell"
+        );
+    }
+
+    /// The engine returns a newline-bearing file name as one path; the header the
+    /// tool renders for it must be one line too, or the model reads two files.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_name_with_a_line_break_renders_as_one_header_line() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(dir.path().join("good.txt"), "needle\n").expect("a fixture file");
+        std::fs::write(dir.path().join("two\nlines.txt"), "needle\n").expect("a fixture file");
+
+        let output = erase(GrepTool::new(SearchTooling::new(dir.path())))
+            .execute(json!({ "pattern": "needle" }), context())
+            .await
+            .expect("the grep succeeds");
+
+        let headers: Vec<&str> = output
+            .output
+            .lines()
+            .filter(|line| line.ends_with(':'))
+            .collect();
+        assert_eq!(
+            headers.len(),
+            2,
+            "one header line per file: {}",
+            output.output
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|line| line.ends_with(r"two\nlines.txt:")),
+            "the break is spelled the way Debug spells it: {headers:?}"
+        );
+        assert_eq!(
+            output.metadata["files"],
+            json!([
+                dir.path().join("good.txt"),
+                dir.path().join("two\nlines.txt")
+            ]),
+            "the structured list keeps the exact bytes"
+        );
+        assert_eq!(output.metadata["truncated"], false);
     }
 
     /// A stand-in for `rg` that never finishes on its own.

@@ -611,28 +611,140 @@ fn normalize_absolute(path: &Path) -> PathBuf {
     normalized
 }
 
+/// `path` with its deepest existing ancestor resolved and the missing tail re-joined.
+///
+/// The cost is bounded by the number of filesystem calls, not by the length of the
+/// argument: one `canonicalize` of the whole path, then a binary search over the
+/// component count for the deepest prefix that exists — `⌈log₂ n⌉` `metadata` calls —
+/// then one `canonicalize` of that prefix. The previous shape walked up one component
+/// per failed `canonicalize`, and every `canonicalize` is itself a kernel walk of every
+/// component below it, so a 500-deep existing tree with a 500-component missing tail —
+/// 1003 components, well inside any byte or component cap — cost 1.6–2.1 s of blocking
+/// `std::fs` on the reactor per `read`, `edit`, `write` or `apply_patch` call, and the
+/// caller's own `mkdir -p` was enough to build that tree. The same input now costs
+/// twelve calls.
+///
+/// Semantics are unchanged: `metadata` follows symlinks exactly as `canonicalize` does,
+/// so a dangling link is "missing" in both; the kernel resolves a path left to right and
+/// stops at the first component it cannot enter, so once the whole path is `NotFound`
+/// every shorter prefix either exists or is `NotFound` too — the property the search
+/// relies on — and a file in the middle (`NotADirectory`), a permission refusal or a
+/// link loop is reported by the first `canonicalize` before any search runs.
 fn canonicalize_allow_missing(path: &Path) -> io::Result<PathBuf> {
-    let mut anchor = path.to_owned();
-    let mut suffix = Vec::<OsString>::new();
-    loop {
-        match anchor.canonicalize() {
-            Ok(mut canonical) => {
-                for part in suffix.iter().rev() {
-                    canonical.push(part);
-                }
-                return Ok(canonical);
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let Some(name) = anchor.file_name().map(ToOwned::to_owned) else {
-                    return Err(error);
-                };
-                suffix.push(name);
-                let Some(parent) = anchor.parent() else {
-                    return Err(error);
-                };
-                anchor = parent.to_owned();
-            }
+    let missing = match path.canonicalize() {
+        Ok(canonical) => return Ok(canonical),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => error,
+        Err(error) => return Err(error),
+    };
+    let components: Vec<Component<'_>> = path.components().collect();
+    let prefix = |count: usize| -> PathBuf { components[..count].iter().collect() };
+    // Every prefix of `existing` components exists; the prefix of `absent` does not.
+    let (mut existing, mut absent) = (0_usize, components.len());
+    while absent - existing > 1 {
+        let probe = existing + (absent - existing) / 2;
+        match std::fs::metadata(prefix(probe)) {
+            Ok(_) => existing = probe,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => absent = probe,
             Err(error) => return Err(error),
         }
+    }
+    if existing == 0 {
+        return Err(missing);
+    }
+    let mut canonical = prefix(existing).canonicalize()?;
+    for component in &components[existing..] {
+        canonical.push(component.as_os_str());
+    }
+    Ok(canonical)
+}
+
+#[cfg(test)]
+mod canonicalize_tests {
+    use super::*;
+
+    fn deep(base: &Path, prefix: &str, count: usize) -> PathBuf {
+        let mut path = base.to_path_buf();
+        for index in 0..count {
+            path.push(format!("{prefix}{index}"));
+        }
+        path
+    }
+
+    #[test]
+    fn an_existing_path_and_a_missing_tail_resolve_as_before() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        std::fs::create_dir_all(root.join("a/b")).expect("tree");
+
+        assert_eq!(
+            canonicalize_allow_missing(&root.join("a/b")).expect("existing"),
+            root.join("a/b")
+        );
+        assert_eq!(
+            canonicalize_allow_missing(&root.join("a/b/c/d/e.txt")).expect("missing tail"),
+            root.join("a/b/c/d/e.txt")
+        );
+        assert_eq!(
+            canonicalize_allow_missing(&root.join("nothing/here")).expect("missing at the root"),
+            root.join("nothing/here")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_ancestor_is_resolved_and_a_dangling_link_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        std::fs::create_dir_all(root.join("real/inner")).expect("tree");
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).expect("link");
+        std::os::unix::fs::symlink(root.join("gone"), root.join("dangling")).expect("link");
+
+        assert_eq!(
+            canonicalize_allow_missing(&root.join("alias/inner/new.txt"))
+                .expect("through the link"),
+            root.join("real/inner/new.txt")
+        );
+        assert_eq!(
+            canonicalize_allow_missing(&root.join("dangling/new.txt"))
+                .expect("dangling is missing"),
+            root.join("dangling/new.txt")
+        );
+    }
+
+    #[test]
+    fn a_file_in_the_middle_is_an_error_not_a_missing_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        std::fs::write(root.join("file"), "x").expect("file");
+
+        let error = canonicalize_allow_missing(&root.join("file/child")).expect_err("ENOTDIR");
+        assert_ne!(error.kind(), io::ErrorKind::NotFound, "{error}");
+    }
+
+    /// The S8 reviewer's input: a real 500-deep tree plus a 500-component missing tail,
+    /// inside every byte and component cap. Measured 1.57 s here and 2.09 s on the
+    /// reviewer's host with the upward walk; a dozen filesystem calls after.
+    #[test]
+    fn a_deep_existing_tree_with_a_deep_missing_tail_costs_a_dozen_calls_not_a_thousand() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let existing = deep(&root, "d", 500);
+        std::fs::create_dir_all(&existing).expect("deep tree");
+        let target = deep(&existing, "m", 500);
+        assert_eq!(
+            target.components().count(),
+            root.components().count() + 1000
+        );
+
+        let started = std::time::Instant::now();
+        let resolved = canonicalize_allow_missing(&target).expect("resolves");
+        let elapsed = started.elapsed();
+
+        assert_eq!(resolved, target);
+        eprintln!("deep500+missing500 canonicalize_allow_missing: {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "the deep-tree resolve must be bounded by the call count, not the depth: {elapsed:?}"
+        );
     }
 }

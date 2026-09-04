@@ -3,7 +3,7 @@ mod authority;
 use crate::output_policy::OutputPolicy;
 use crate::risk::{
     GIT_REPOSITORY_ENVIRONMENT_VARIABLES, GateOutcome, RiskAssessment, RiskContext,
-    assess_and_gate, git_subcommand, git_uses_repository_override,
+    assess_and_gate, git_subcommand, git_uses_repository_override, nested_command_resources,
 };
 use crate::search_common::directory_grant_pattern;
 use crate::timeout::{
@@ -905,21 +905,43 @@ impl ShellTool {
                 metadata.insert("target".to_owned(), Value::String(target.clone()));
             }
         }
+        // The command line each resource runs through a wrapper or an inline script is
+        // asked for as well, so a `deny` written as `rm -rf*` reaches the `rm -rf /`
+        // inside `sh -c 'rm -rf /'`, `env rm -rf /` or `nice rm -rf /` — the permission
+        // layer matches one flattened line and answered Ask for all three. The engine
+        // refuses as soon as any pattern is denied, so this can only widen a deny; a
+        // nested pattern left at ask can turn an allow into a prompt, never the reverse.
+        // The inner shapes join `always` so one standing grant covers what was shown.
+        let nested: Vec<CommandResource> = resources
+            .iter()
+            .flat_map(|resource| nested_command_resources(resource, self.syntax()))
+            .filter(|resource| !resource.changes_directory)
+            .collect();
+        let mut patterns: Vec<String> = if resources.is_empty() {
+            vec![command.to_owned()]
+        } else {
+            resources
+                .iter()
+                .map(|resource| resource.source.clone())
+                .collect()
+        };
+        let mut always: Vec<String> = resources
+            .iter()
+            .map(|resource| resource.always.clone())
+            .collect();
+        for resource in &nested {
+            if !patterns.contains(&resource.source) {
+                patterns.push(resource.source.clone());
+            }
+            if !always.contains(&resource.always) {
+                always.push(resource.always.clone());
+            }
+        }
         let ask = PermissionAsk {
             permission: TOOL_ID.to_owned(),
-            patterns: if resources.is_empty() {
-                vec![command.to_owned()]
-            } else {
-                resources
-                    .iter()
-                    .map(|resource| resource.source.clone())
-                    .collect()
-            },
+            patterns,
             metadata,
-            always: resources
-                .iter()
-                .map(|resource| resource.always.clone())
-                .collect(),
+            always,
             ..PermissionAsk::default()
         };
         let ask = if risk_confirmation.is_some() {
@@ -2257,10 +2279,28 @@ pub fn analyze_command(command: &str, syntax: ShellSyntax) -> Result<ShellAnalys
         .ok_or_else(|| failed(io::Error::other("tree-sitter returned no syntax tree")))?;
     let mut nodes = Vec::new();
     collect_commands(tree.root_node(), &mut nodes);
-    let commands = nodes
+    let mut commands: Vec<CommandResource> = nodes
         .into_iter()
         .filter_map(|node| command_resource(node, command.as_bytes()))
         .collect();
+    // A tree with an error node is a tree whose command list cannot be trusted: the
+    // parser recovers by skipping text, so `r[m] -rf /` — a subscript to the grammar,
+    // `rm -rf /` to bash once a file named `rm` sits in the cwd — yielded the single
+    // command `rf /`, and every gate saw a harmless `rf`. The line as written, tokenised
+    // lexically, joins the list so the gates also see the program the shell would
+    // resolve (here a glob, so dynamic). Deny-side only: the fragments stay, and a
+    // well-formed command adds nothing. Bash only, because `lexical_tokens` is a POSIX
+    // tokenizer and PowerShell quoting is not.
+    if syntax == ShellSyntax::Bash && tree.root_node().has_error() {
+        let source = command.trim();
+        if !source.is_empty()
+            && !commands.iter().any(|resource| resource.source == source)
+            && let Some(resource) =
+                resource_from_tokens(source.to_owned(), lexical_tokens(source), false)
+        {
+            commands.push(resource);
+        }
+    }
     Ok(ShellAnalysis { commands })
 }
 
@@ -2296,6 +2336,18 @@ fn command_resource(node: Node<'_>, source_bytes: &[u8]) -> Option<CommandResour
     let mut tokens = command_parts(node, source_bytes);
     if tokens.is_empty() {
         tokens = lexical_tokens(&source);
+    }
+    resource_from_tokens(source, tokens, stdin_from_pipeline)
+}
+
+/// The resource for `source` once its words are known, however they were found.
+fn resource_from_tokens(
+    source: String,
+    tokens: Vec<String>,
+    stdin_from_pipeline: bool,
+) -> Option<CommandResource> {
+    if tokens.is_empty() {
+        return None;
     }
     let command = tokens
         .first()
@@ -2341,6 +2393,14 @@ fn command_parts(node: Node<'_>, source: &[u8]) -> Vec<String> {
         // `10` in `nice -n 10 rg foo`. Dropping it shifted every later argument one
         // place left, so a wrapper option that takes a value swallowed the program
         // instead, and both the risk gate and the navigation gate lost sight of it.
+        //
+        // `ansi_c_string` (`$'…'`) and `translated_string` (`$"…"`) are words too.
+        // Dropping them made `sh -c $'rm -rf /'` a `sh -c` with no script and
+        // `rm -rf $'/'` an `rm -rf` with no target, so neither gate saw anything. A
+        // bare expansion or substitution (`$SUB`, `${DIR}`, `$(cmd)`, `$((n))`,
+        // `<(cmd)`) is a word the shell computes; dropping it made `git $SUB --force`
+        // a `git --force` with no subcommand. Kept as written, its `$` is what tells
+        // the gates the word is dynamic.
         if matches!(
             child.kind(),
             "command_name"
@@ -2349,6 +2409,13 @@ fn command_parts(node: Node<'_>, source: &[u8]) -> Vec<String> {
                 | "number"
                 | "string"
                 | "raw_string"
+                | "ansi_c_string"
+                | "translated_string"
+                | "simple_expansion"
+                | "expansion"
+                | "command_substitution"
+                | "arithmetic_expansion"
+                | "process_substitution"
                 | "concatenation"
         ) && let Ok(text) = child.utf8_text(source)
         {
@@ -2948,6 +3015,58 @@ fn interrupted() -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// tree-sitter-bash reads `r[m]` as a subscript, recovers from the error by skipping
+    /// text, and leaves `rf /` as the only command — so the risk gate assessed `rf` and
+    /// the permission layer was asked for `rf /`, while bash, given a file named `rm` in
+    /// the cwd, runs `rm -rf /`. An error tree adds the line as written.
+    #[test]
+    fn a_parse_error_adds_the_whole_line_so_no_gate_sees_only_a_fragment() {
+        let analysis = analyze_command("r[m] -rf /", ShellSyntax::Bash).expect("analysis");
+        let sources: Vec<&str> = analysis
+            .commands
+            .iter()
+            .map(|resource| resource.source.as_str())
+            .collect();
+        assert_eq!(sources, vec!["rf /", "r[m] -rf /"]);
+        assert_eq!(
+            analysis.commands[1].tokens,
+            vec!["r[m]".to_owned(), "-rf".to_owned(), "/".to_owned()]
+        );
+
+        let malformed = analyze_command("echo 'unterminated", ShellSyntax::Bash).expect("analysis");
+        assert!(
+            malformed
+                .commands
+                .iter()
+                .any(|resource| resource.source == "echo 'unterminated"),
+            "{malformed:?}"
+        );
+
+        // A well-formed simple command is exactly its one parsed resource, and a
+        // well-formed compound never gains its whole line as a resource.
+        for simple in ["rm -rf /", "sh -c 'rm -rf /'"] {
+            let analysis = analyze_command(simple, ShellSyntax::Bash).expect("analysis");
+            assert_eq!(analysis.commands.len(), 1, "{simple:?} -> {analysis:?}");
+            assert_eq!(analysis.commands[0].source, simple);
+        }
+        for compound in [
+            "for f in *.rs; do echo $f; done",
+            "[[ -f x ]] && echo y",
+            "(cd x && make)",
+            "echo a && echo b || echo c",
+            "cargo test 2>&1 | tail -20",
+        ] {
+            let analysis = analyze_command(compound, ShellSyntax::Bash).expect("analysis");
+            assert!(
+                !analysis
+                    .commands
+                    .iter()
+                    .any(|resource| resource.source == compound),
+                "a well-formed line gains no whole-line resource: {compound:?} -> {analysis:?}"
+            );
+        }
+    }
 
     /// The pre-flight phase spends its ceiling once, not twice.
     ///
