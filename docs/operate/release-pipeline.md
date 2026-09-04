@@ -35,19 +35,26 @@ has exactly that commit as its sole parent, and confirms the same base/head pair
 with a second PR read. A stale API view is retried for a bounded period and is
 never dispatched as the expected candidate SHA.
 
-release-please reads the squash commit of every merged pull request with a
-conventional-commits parser, and one unparsable commit is skipped silently: the
-release run still succeeds, logs `commit could not be parsed` and `Considering:
-0 commits`, and opens no release PR. A squash merge without an explicit body
-lets GitHub concatenate every branch commit into the commit body, where a
-footer-shaped line with an unbalanced parenthesis is enough to abort the parse
-(the 51-commit batch-3 merge produced an 1,891-line body and no 0.10.1 PR). Merge
-a multi-commit pull request with `gh pr merge --squash --subject '<conventional
-subject>' --body '<short body>'`, or carry the intended message in a
-`BEGIN_COMMIT_OVERRIDE` … `END_COMMIT_OVERRIDE` block, and after every merge to
-`main` confirm that a `chore: release X.Y.Z` pull request appeared. When a merge
-was already skipped, land a small follow-up pull request whose squash body
-carries the override block for the missed change; release-please then records it.
+release-please reads every merged pull request with a conventional-commits
+parser, and one unparsable entry is skipped silently: the release run still
+succeeds, logs `commit could not be parsed` and `Considering: 0 commits`, and
+opens no release PR. The text it parses is the pull request *description* when
+that description contains `BEGIN_COMMIT_OVERRIDE`, otherwise the squash commit
+message. A squash merge without an explicit body lets GitHub concatenate every
+branch commit into the commit message, where one footer-shaped line with an
+unbalanced parenthesis aborts the parse (the 51-commit batch-3 merge produced an
+1,891-line message and no 0.10.1 PR). The override is taken as everything after
+the first occurrence of the marker word up to `END_COMMIT_OVERRIDE`, trimmed, and
+parsed as one conventional commit, so a description that merely *mentions* the
+marker word in prose hands the parser that prose (`unexpected token ' ' at 1:2`).
+Rules: keep a multi-commit squash message to a conventional subject and a short
+body (`gh pr merge --squash --subject … --body …`); when the description carries an
+override block, let it hold exactly one conventional message (a header line and an
+optional body) and never write the marker words anywhere else in the
+description; after every merge to `main`, confirm that a `chore: release X.Y.Z`
+pull request appeared. A merge that was already skipped is recovered by editing
+that pull request's description to carry an override block; release-please
+re-reads descriptions on its next run.
 
 If a documentation-only or otherwise non-releasable commit advances `main`,
 release-please may leave the existing release PR head on its older parent. After
