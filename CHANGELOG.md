@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.3](https://github.com/sunerpy/zuno/compare/v0.10.2...v0.10.3) (2026-09-05)
+
+
+### Bug Fixes
+
+* **installer:** 安全更新 Windows 用户 PATH ([d09d5f1](https://github.com/sunerpy/zuno/commit/d09d5f1c0f6536b32a487f880de9b9e7b594695d))
+
 ## [0.10.2](https://github.com/sunerpy/zuno/compare/v0.10.1...v0.10.2) (2026-09-05)
 
 
