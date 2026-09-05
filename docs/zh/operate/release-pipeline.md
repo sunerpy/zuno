@@ -89,11 +89,20 @@ MSVC 版 `zuno.exe` 通过仅作用于该二进制的 build-script linker 参数
 全局 `RUSTFLAGS`，因此库和约两百个测试二进制仍可复用原有编译缓存身份。
 
 两个工作流都使用固定提交的官方 sccache action 及其 GitHub Actions 后端。CI 设置
-`CARGO_INCREMENTAL=0`，Cargo registry/Git 下载使用按平台隔离的缓存。普通 CI、候选测试、
-Linux 发布目标和 Windows 发布目标都设置 `cache-targets: false`，不会上传大型 `target/`
-目录。只有两个 macOS 候选 leg 启用 Rust 依赖 target 缓存；缓存 key 包含精确 Rust target，
-并显式设置 `cache-workspace-crates: false`，因此 `x86_64-apple-darwin` 与
-`aarch64-apple-darwin` 不会相互恢复对方的 target 产物。
+`CARGO_INCREMENTAL=0`，Cargo registry/Git 下载使用按平台隔离的缓存。实测位于 PR
+临界路径上的 Linux tests、原生 Windows tests 和主机 release smoke 还会恢复按用途隔离的
+Cargo target cache。候选的 macOS 与 Windows artifact leg 则按精确 Rust target 隔离。
+每一份 target cache 都设置 `cache-workspace-crates: false`：复用第三方依赖产物，但始终从
+本次提交重新构建 Zuno 自身 crate。静态分析、Windows Clippy、release delta 门禁和 Linux
+发布目标仍只缓存 registry。通过 `workflow_dispatch` 在 `main` 上运行一次可以为后续 PR
+写入默认分支缓存；首次冷运行不代表稳态耗时。
+
+候选不会把 release-please 标签本身当作无害 diff 的证据。automatic 与 dry-run 模式要求
+release head 是精确 PR base 之上的单个 commit，变更文件集合必须恰好是
+`.release-please-manifest.json`、`CHANGELOG.md`、`Cargo.lock` 与 `Cargo.toml`，同时拒绝
+空白错误并验证只增加一个 patch。只有证明这一点后，轻量候选门禁才检查 locked metadata
+与供应链策略。功能 PR 已运行完整 Linux/Windows 测试矩阵，而候选仍会编译并实际执行每个
+最终平台制品；release PR 一旦修改可执行源码，会在进入轻量门禁前失败。
 
 Artifact 传输固定到 `actions/upload-artifact` v7.0.1 和
 `actions/download-artifact` v8.0.1 的精确提交，这两个 action 使用 Node 24 runtime。
@@ -105,7 +114,7 @@ Linux 作业会安装发行版提供的 `bwrap-userns-restrict` AppArmor profile
 分别验证 user/mount/PID namespace 路径和 network namespace 路径。它不会关闭 Ubuntu
 宿主级的非特权 user namespace 限制。部署依据见[沙箱 FAQ](faq.md)。
 
-装上后端并不等于证明它真的做了限制，因此两个 Linux 门禁作业随后都会运行
+装上后端并不等于证明它真的做了限制，因此功能 PR 的 Linux test job 会运行
 `make test-sandbox-e2e`。该 target 会构建沙箱所需的 `zuno` helper 可执行文件，并运行
 边界测试：在 `bwrap` 下执行一个真实进程，要求工作区内写入成功，而写入 `.git`、`.zuno`、
 `.agents`、工作区外目录以及指向工作区外的符号链接全部失败；要求有效 capability 集合与
@@ -113,8 +122,10 @@ Linux 作业会安装发行版提供的 `bwrap-userns-restrict` AppArmor profile
 `EPERM`，同时 `AF_UNIX` socketpair IPC 仍然可用；并要求 `read-only` 策略拒绝同一次写入。
 
 当宿主没有 bubblewrap 或没有 helper 可执行文件时，该测试会以具名原因 skip，因此在开发机
-上执行 `make test` 不会受影响。两个门禁作业都设置 `ZUNO_SANDBOX_E2E_REQUIRE=1`，把这种
-skip 变成失败。本地可用 `make test-sandbox-e2e` 运行同一道门禁，`make pre-ci` 已包含它。
+上执行 `make test` 不会受影响。功能 PR 门禁设置 `ZUNO_SANDBOX_E2E_REQUIRE=1`，把这种
+skip 变成失败。release candidate 只有在证明 head 是位于已通过功能测试的 `main` 之上的
+精确四文件发布增量后，才可以省略这套重复边界测试；两个 Linux artifact leg 仍会安装后端并
+执行归档内二进制。本地可用 `make test-sandbox-e2e` 运行同一道门禁，`make pre-ci` 已包含它。
 
 提交 CI 前，Linux 开发者运行 `make pre-ci`。它会执行主机侧源码门禁、构建并 smoke
 打包后的主机归档，并通过 Zig 对完整 workspace 执行 `x86_64-pc-windows-gnu` Clippy，
@@ -180,9 +191,16 @@ release-please 创建 tag 和 draft release。晋级过程只在 draft 状态上
 
 ## CI 临界路径
 
-2026-09-04 的基线 run `33884240281` 在 classify 后约 16.8 分钟完成。Linux 先花 229 秒
-执行 Clippy，之后才开始 634 秒 test step；现在两者分别作为 `Linux static checks` 与
-`Linux tests` 并行运行，而且都仍是 `zuno/pr-gate` 的必需 job。
+第一轮拆分没有缩短端到端时间。基线 PR run `33884240281` 用时 17 分 45 秒；run
+`33935212394` 用时 18 分 14 秒。Linux 从 16 分 36 秒的组合 job 改为 14 分 13 秒的
+test job 与 4 分 41 秒的 static checks 并行，但主机 artifact smoke 从 9 分 53 秒退化到
+18 分 01 秒，反而成为临界路径。release candidate 也几乎没有变化：
+`33880945283` 用时 17 分 10 秒，`33936248015` 用时 16 分 59 秒，其中原生
+x86_64 Windows 制品构建单独占 16 分 12 秒。
+
+第二轮因此优化编译依赖复用，而不是继续增加 job。按 target/用途隔离的缓存覆盖三个实测 PR
+瓶颈与两个原生 Windows 候选 leg。release-only delta 证明则移除 13 分钟的候选重复全量
+测试，同时不减少功能 PR 的完整测试，也不减少任何最终制品的 smoke 与 attestation。
 
 原生 Windows 继续按 Cargo test suite 粒度运行，而不是为每个 test case 启动进程。实测
 844 秒中，build/link 占 548 秒，230 个 suite 执行占 292 秒。scheduler 现在使用稳定的

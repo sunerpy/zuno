@@ -124,13 +124,26 @@ binaries retain their normal cache identity.
 
 Both workflows use the pinned official sccache action and its GitHub Actions
 backend. `CARGO_INCREMENTAL=0` avoids CI-only incremental state, while Cargo
-registry and Git downloads use a platform-scoped cache. Ordinary CI, candidate
-tests, Linux release targets, and Windows release targets set
-`cache-targets: false`, so they do not upload large `target/` trees. The two
-macOS candidate legs alone enable the Rust dependency target cache. Their cache
-key includes the exact Rust target, and `cache-workspace-crates: false` keeps
-workspace outputs out of the cache, so `x86_64-apple-darwin` and
-`aarch64-apple-darwin` cannot restore each other's target artifacts.
+registry and Git downloads use a platform-scoped cache. The measured PR critical
+paths — Linux tests, native Windows tests, and host release smoke — also restore
+purpose-specific Cargo target caches. Candidate macOS and Windows artifact legs
+restore a cache keyed by their exact Rust target. Every target cache sets
+`cache-workspace-crates: false`: it reuses third-party dependency artifacts but
+rebuilds Zuno's own crates from the submitted source. Static analysis, Windows
+Clippy, the release-delta gate, and Linux release targets retain registry-only
+caching. A `workflow_dispatch` run on `main` seeds the default-branch caches that
+future pull requests may restore; a cold first run is not steady-state timing.
+
+The candidate does not trust a release-please label as evidence that the diff is
+harmless. In automatic and dry-run modes it requires the release head to be one
+commit directly above the exact PR base, requires the changed-file set to be
+exactly `.release-please-manifest.json`, `CHANGELOG.md`, `Cargo.lock`, and
+`Cargo.toml`, rejects whitespace errors, and verifies one patch increment. Only
+after that proof does the lightweight candidate gate check locked metadata and
+supply-chain policy. The feature PR already ran the full Linux and Windows test
+matrix, while the candidate still compiles and executes every final platform
+artifact. A release PR that changes executable source fails before this reduced
+gate can run.
 
 Artifact transfer uses commit-pinned `actions/upload-artifact` v7.0.1 and
 `actions/download-artifact` v8.0.1, whose action runtimes are Node 24. The Linux
@@ -144,9 +157,9 @@ prove both the user/mount/PID namespace path and the network namespace path befo
 running Zuno. They do not disable Ubuntu's host-wide unprivileged-user-namespace
 restriction. See the [sandbox FAQ](../faq.md) for the deployment rationale.
 
-Installing that backend is not the same as proving it confines anything, so both
-Linux gate jobs then run `make test-sandbox-e2e`. The target builds the `zuno`
-executable the sandbox needs as its helper and runs the boundary test, which
+Installing that backend is not the same as proving it confines anything, so the
+feature PR's Linux test job runs `make test-sandbox-e2e`. The target builds the
+`zuno` executable the sandbox needs as its helper and runs the boundary test, which
 executes a real process under `bwrap` and requires that the workspace write
 succeeds while writes to `.git`, `.zuno`, `.agents`, an outside directory, and a
 symlink pointing out of the workspace all fail, that the effective capability set
@@ -155,9 +168,13 @@ and `NoNewPrivs` are as declared, that `AF_INET` sockets, `ptrace`, and
 that a `read-only` policy refuses the same write.
 
 The test reports a named skip when the host has no bubblewrap or no helper
-executable, which keeps it harmless in `make test` on a developer machine. Both
-gate jobs set `ZUNO_SANDBOX_E2E_REQUIRE=1`, which turns that skip into a failure.
-Run the same gate locally with `make test-sandbox-e2e`; `make pre-ci` includes it.
+executable, which keeps it harmless in `make test` on a developer machine. The
+feature PR gate sets `ZUNO_SANDBOX_E2E_REQUIRE=1`, which turns that skip into a
+failure. A release candidate may omit the duplicate suite only after proving its
+head is the exact four-file release delta above a feature-tested `main`; its two
+Linux artifact legs still install the backend and execute the packaged binary.
+Run the same boundary gate locally with `make test-sandbox-e2e`; `make pre-ci`
+includes it.
 
 Before dispatching CI, Linux contributors run `make pre-ci`. It executes the host
 source gates, builds and smokes the packaged host archive, and uses Zig to Clippy
@@ -238,10 +255,21 @@ prerelease candidate fails closed before certification or publication.
 
 ## CI critical path
 
-The measured 2026-09-04 baseline run `33884240281` completed in about 16.8
-minutes after classification. Linux spent 229 seconds in Clippy before beginning
-a 634-second test step; those independent surfaces now run as `Linux static
-checks` and `Linux tests`. Both remain required by `zuno/pr-gate`.
+The first split did not reduce end-to-end time. Baseline PR run `33884240281`
+completed in 17 minutes 45 seconds; run `33935212394` completed in 18 minutes
+14 seconds. Linux improved from a 16-minute-36-second combined job to a
+14-minute-13-second test job running beside 4-minute-41-second static checks,
+but host artifact smoke regressed from 9 minutes 53 seconds to 18 minutes
+1 second and became the critical path. Release candidate runs were effectively
+flat as well: `33880945283` took 17 minutes 10 seconds and `33936248015` took
+16 minutes 59 seconds, with native x86_64 Windows artifact construction alone
+taking 16 minutes 12 seconds.
+
+The second optimization therefore targets compiled dependency reuse rather than
+job count. Target-isolated caches cover the three measured PR bottlenecks and
+both native Windows candidate legs. The release-only delta proof removes the
+13-minute duplicate candidate test matrix without weakening the feature PR's
+full tests or any final-artifact smoke and attestation.
 
 Native Windows test-binary execution remains one process per Cargo suite rather
 than one process per test case. Its measured 844-second step consisted of 548

@@ -145,8 +145,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
-          cache-targets: false
+          shared-key: pr-linux-tests-v1-${{ runner.os }}-${{ runner.arch }}
+          cache-targets: true
+          cache-workspace-crates: false
 
       - name: Configure compiler cache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -195,8 +196,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
-          cache-targets: false
+          shared-key: pr-host-release-v1-${{ runner.os }}-${{ runner.arch }}
+          cache-targets: true
+          cache-workspace-crates: false
 
       - name: Configure compiler cache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -268,8 +270,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
-          cache-targets: false
+          shared-key: pr-windows-tests-v1-${{ runner.os }}-${{ runner.arch }}
+          cache-targets: true
+          cache-workspace-crates: false
 
       - name: Configure compiler cache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
