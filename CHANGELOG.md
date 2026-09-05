@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.5](https://github.com/sunerpy/zuno/compare/v0.10.4...v0.10.5) (2026-09-05)
+
+
+### Features
+
+* **auth:** 增加 Bedrock bearer 登录 ([#120](https://github.com/sunerpy/zuno/issues/120)) ([60ae842](https://github.com/sunerpy/zuno/commit/60ae8428f56e19bb5a8f9e78e47f8b598853249b))
+
 ## [0.10.4](https://github.com/sunerpy/zuno/compare/v0.10.3...v0.10.4) (2026-09-05)
 
 
