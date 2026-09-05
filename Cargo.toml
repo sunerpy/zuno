@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.10.4" # x-release-please-version
+version = "0.10.5" # x-release-please-version
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -43,51 +43,51 @@ all = "warn"
 # first-party crates in lockstep and catches accidental drift. The workspace is
 # distributed as prebuilt GitHub Release binaries, not as registry packages;
 # release-please still updates every annotated line.
-zuno-acp = { version = "0.10.4", path = "crates/zuno-acp" } # x-release-please-version
-zuno-agent = { version = "0.10.4", path = "crates/zuno-agent" } # x-release-please-version
-zuno-atomic-file = { version = "0.10.4", path = "crates/zuno-atomic-file" } # x-release-please-version
-zuno-aws-auth = { version = "0.10.4", path = "crates/zuno-aws-auth" } # x-release-please-version
-zuno-attachment = { version = "0.10.4", path = "crates/zuno-attachment" } # x-release-please-version
-zuno-auth = { version = "0.10.4", path = "crates/zuno-auth" } # x-release-please-version
-zuno-catalog = { version = "0.10.4", path = "crates/zuno-catalog" } # x-release-please-version
-zuno-config = { version = "0.10.4", path = "crates/zuno-config" } # x-release-please-version
-zuno-continuity = { version = "0.10.4", path = "crates/zuno-continuity" } # x-release-please-version
-zuno-db = { version = "0.10.4", path = "crates/zuno-db" } # x-release-please-version
-zuno-engine = { version = "0.10.4", path = "crates/zuno-engine" } # x-release-please-version
-zuno-error = { version = "0.10.4", path = "crates/zuno-error" } # x-release-please-version
-zuno-eval = { version = "0.10.4", path = "crates/zuno-eval" } # x-release-please-version
-zuno-extension = { version = "0.10.4", path = "crates/zuno-extension" } # x-release-please-version
-zuno-goal = { version = "0.10.4", path = "crates/zuno-goal" } # x-release-please-version
-zuno-harness = { version = "0.10.4", path = "crates/zuno-harness" } # x-release-please-version
-zuno-llm = { version = "0.10.4", path = "crates/zuno-llm" } # x-release-please-version
-zuno-lsp = { version = "0.10.4", path = "crates/zuno-lsp" } # x-release-please-version
-zuno-learning = { version = "0.10.4", path = "crates/zuno-learning" } # x-release-please-version
-zuno-mcp = { version = "0.10.4", path = "crates/zuno-mcp" } # x-release-please-version
-zuno-memory = { version = "0.10.4", path = "crates/zuno-memory" } # x-release-please-version
-zuno-network = { version = "0.10.4", path = "crates/zuno-network" } # x-release-please-version
-zuno-observability = { version = "0.10.4", path = "crates/zuno-observability" } # x-release-please-version
-zuno-orchestration = { version = "0.10.4", path = "crates/zuno-orchestration" } # x-release-please-version
-zuno-paths = { version = "0.10.4", path = "crates/zuno-paths" } # x-release-please-version
-zuno-permission = { version = "0.10.4", path = "crates/zuno-permission" } # x-release-please-version
-zuno-process = { version = "0.10.4", path = "crates/zuno-process" } # x-release-please-version
-zuno-product-agent = { version = "0.10.4", path = "crates/zuno-product-agent" } # x-release-please-version
-zuno-provider-anthropic = { version = "0.10.4", path = "crates/zuno-provider-anthropic" } # x-release-please-version
-zuno-provider-bedrock = { version = "0.10.4", path = "crates/zuno-provider-bedrock" } # x-release-please-version
-zuno-provider-compatible = { version = "0.10.4", path = "crates/zuno-provider-compatible" } # x-release-please-version
-zuno-provider-google = { version = "0.10.4", path = "crates/zuno-provider-google" } # x-release-please-version
-zuno-provider-openai = { version = "0.10.4", path = "crates/zuno-provider-openai" } # x-release-please-version
-zuno-pty = { version = "0.10.4", path = "crates/zuno-pty" } # x-release-please-version
-zuno-runtime = { version = "0.10.4", path = "crates/zuno-runtime" } # x-release-please-version
-zuno-search = { version = "0.10.4", path = "crates/zuno-search" } # x-release-please-version
-zuno-sandbox = { version = "0.10.4", path = "crates/zuno-sandbox" } # x-release-please-version
-zuno-server = { version = "0.10.4", path = "crates/zuno-server" } # x-release-please-version
-zuno-snapshot = { version = "0.10.4", path = "crates/zuno-snapshot" } # x-release-please-version
+zuno-acp = { version = "0.10.5", path = "crates/zuno-acp" } # x-release-please-version
+zuno-agent = { version = "0.10.5", path = "crates/zuno-agent" } # x-release-please-version
+zuno-atomic-file = { version = "0.10.5", path = "crates/zuno-atomic-file" } # x-release-please-version
+zuno-aws-auth = { version = "0.10.5", path = "crates/zuno-aws-auth" } # x-release-please-version
+zuno-attachment = { version = "0.10.5", path = "crates/zuno-attachment" } # x-release-please-version
+zuno-auth = { version = "0.10.5", path = "crates/zuno-auth" } # x-release-please-version
+zuno-catalog = { version = "0.10.5", path = "crates/zuno-catalog" } # x-release-please-version
+zuno-config = { version = "0.10.5", path = "crates/zuno-config" } # x-release-please-version
+zuno-continuity = { version = "0.10.5", path = "crates/zuno-continuity" } # x-release-please-version
+zuno-db = { version = "0.10.5", path = "crates/zuno-db" } # x-release-please-version
+zuno-engine = { version = "0.10.5", path = "crates/zuno-engine" } # x-release-please-version
+zuno-error = { version = "0.10.5", path = "crates/zuno-error" } # x-release-please-version
+zuno-eval = { version = "0.10.5", path = "crates/zuno-eval" } # x-release-please-version
+zuno-extension = { version = "0.10.5", path = "crates/zuno-extension" } # x-release-please-version
+zuno-goal = { version = "0.10.5", path = "crates/zuno-goal" } # x-release-please-version
+zuno-harness = { version = "0.10.5", path = "crates/zuno-harness" } # x-release-please-version
+zuno-llm = { version = "0.10.5", path = "crates/zuno-llm" } # x-release-please-version
+zuno-lsp = { version = "0.10.5", path = "crates/zuno-lsp" } # x-release-please-version
+zuno-learning = { version = "0.10.5", path = "crates/zuno-learning" } # x-release-please-version
+zuno-mcp = { version = "0.10.5", path = "crates/zuno-mcp" } # x-release-please-version
+zuno-memory = { version = "0.10.5", path = "crates/zuno-memory" } # x-release-please-version
+zuno-network = { version = "0.10.5", path = "crates/zuno-network" } # x-release-please-version
+zuno-observability = { version = "0.10.5", path = "crates/zuno-observability" } # x-release-please-version
+zuno-orchestration = { version = "0.10.5", path = "crates/zuno-orchestration" } # x-release-please-version
+zuno-paths = { version = "0.10.5", path = "crates/zuno-paths" } # x-release-please-version
+zuno-permission = { version = "0.10.5", path = "crates/zuno-permission" } # x-release-please-version
+zuno-process = { version = "0.10.5", path = "crates/zuno-process" } # x-release-please-version
+zuno-product-agent = { version = "0.10.5", path = "crates/zuno-product-agent" } # x-release-please-version
+zuno-provider-anthropic = { version = "0.10.5", path = "crates/zuno-provider-anthropic" } # x-release-please-version
+zuno-provider-bedrock = { version = "0.10.5", path = "crates/zuno-provider-bedrock" } # x-release-please-version
+zuno-provider-compatible = { version = "0.10.5", path = "crates/zuno-provider-compatible" } # x-release-please-version
+zuno-provider-google = { version = "0.10.5", path = "crates/zuno-provider-google" } # x-release-please-version
+zuno-provider-openai = { version = "0.10.5", path = "crates/zuno-provider-openai" } # x-release-please-version
+zuno-pty = { version = "0.10.5", path = "crates/zuno-pty" } # x-release-please-version
+zuno-runtime = { version = "0.10.5", path = "crates/zuno-runtime" } # x-release-please-version
+zuno-search = { version = "0.10.5", path = "crates/zuno-search" } # x-release-please-version
+zuno-sandbox = { version = "0.10.5", path = "crates/zuno-sandbox" } # x-release-please-version
+zuno-server = { version = "0.10.5", path = "crates/zuno-server" } # x-release-please-version
+zuno-snapshot = { version = "0.10.5", path = "crates/zuno-snapshot" } # x-release-please-version
 zuno-testkit = { path = "crates/zuno-testkit" }
-zuno-tool = { version = "0.10.4", path = "crates/zuno-tool" } # x-release-please-version
-zuno-tools = { version = "0.10.4", path = "crates/zuno-tools" } # x-release-please-version
-zuno-tui = { version = "0.10.4", path = "crates/zuno-tui" } # x-release-please-version
-zuno-types = { version = "0.10.4", path = "crates/zuno-types" } # x-release-please-version
-zuno-watch = { version = "0.10.4", path = "crates/zuno-watch" } # x-release-please-version
+zuno-tool = { version = "0.10.5", path = "crates/zuno-tool" } # x-release-please-version
+zuno-tools = { version = "0.10.5", path = "crates/zuno-tools" } # x-release-please-version
+zuno-tui = { version = "0.10.5", path = "crates/zuno-tui" } # x-release-please-version
+zuno-types = { version = "0.10.5", path = "crates/zuno-types" } # x-release-please-version
+zuno-watch = { version = "0.10.5", path = "crates/zuno-watch" } # x-release-please-version
 
 # -- async runtime ----------------------------------------------------------
 async-trait = "0.1.91"
