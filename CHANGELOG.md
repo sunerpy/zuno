@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.4](https://github.com/sunerpy/zuno/compare/v0.10.3...v0.10.4) (2026-09-05)
+
+
+### Bug Fixes
+
+* **agent:** 优化 Agent 工作流并修复 Bedrock ([#118](https://github.com/sunerpy/zuno/issues/118)) ([9f1df29](https://github.com/sunerpy/zuno/commit/9f1df29f5c86a123cbb16cfac7300faa446dbd00))
+
 ## [0.10.3](https://github.com/sunerpy/zuno/compare/v0.10.2...v0.10.3) (2026-09-05)
 
 
