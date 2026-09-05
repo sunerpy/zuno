@@ -7,8 +7,8 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use serde::Deserialize;
 use url::Url;
 use zuno_auth::{
-    API_KEY_METHOD, BrowserAuthorization, Credential, LoginMethod, LoginMethodKind,
-    LoginMethodRegistry, OpenAiOauthClient, Secret,
+    API_KEY_METHOD, BEDROCK_BEARER_METHOD, BrowserAuthorization, Credential, LoginMethod,
+    LoginMethodKind, LoginMethodRegistry, OpenAiOauthClient, Secret,
 };
 use zuno_config::schema::provider::ProviderTransport;
 use zuno_llm::catalog::{Catalog, CatalogDocument, CatalogSource, ResolveInput, ResolvedProvider};
@@ -16,6 +16,14 @@ use zuno_llm::catalog::{Catalog, CatalogDocument, CatalogSource, ResolveInput, R
 use super::terminal_prompt::{self, Choice};
 use crate::command::{ProvidersArgs, ProvidersCommand};
 use crate::environment::StartupEnvironment;
+
+const BEDROCK_AUTH_GUIDANCE: &str = "\
+Amazon Bedrock authentication priority:
+  1. Bearer token (AWS_BEARER_TOKEN_BEDROCK or `zuno providers login`)
+  2. AWS credential chain (profile, access keys, IAM roles, EKS IRSA)
+
+Configure via zuno.json options (profile, region, endpoint) or
+AWS environment variables (AWS_PROFILE, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_WEB_IDENTITY_TOKEN_FILE).";
 
 pub(super) fn execute(
     args: &ProvidersArgs,
@@ -172,6 +180,9 @@ fn login(
     };
 
     let selected = select_login_method(&registry, &provider_id, method)?;
+    if selected.id() == BEDROCK_BEARER_METHOD {
+        return login_bedrock_bearer(store, &provider_id);
+    }
     match selected.kind() {
         LoginMethodKind::ApiKey => login_api_key(store, &provider_id),
         LoginMethodKind::OAuthBrowser => login_chatgpt_browser(store, &provider_id),
@@ -195,6 +206,13 @@ fn select_login_method(
             .map_err(|error| error.to_string());
     }
     if !std::io::stdin().is_terminal() {
+        let methods = registry.methods_for(provider);
+        if methods.len() == 1 && methods[0].id() == BEDROCK_BEARER_METHOD {
+            return methods
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("provider {provider:?} has no login methods"));
+        }
         return registry
             .resolve(provider, Some(API_KEY_METHOD))
             .map_err(|error| error.to_string());
@@ -236,6 +254,26 @@ fn login_api_key(store: &zuno_auth::AuthStore, provider: &str) -> Result<(), Str
         )
         .map_err(|error| error.to_string())?;
     println!("Stored API key for {provider}");
+    Ok(())
+}
+
+fn login_bedrock_bearer(store: &zuno_auth::AuthStore, provider: &str) -> Result<(), String> {
+    println!("{BEDROCK_AUTH_GUIDANCE}");
+    let key = read_secret(
+        "Enter Amazon Bedrock bearer token: ",
+        "Amazon Bedrock bearer token is required",
+        "Amazon Bedrock bearer token entry cancelled",
+    )?;
+    store
+        .set(
+            provider,
+            Credential::Api {
+                key: Secret::new(key),
+                metadata: None,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    println!("Stored Amazon Bedrock bearer token for {provider}");
     Ok(())
 }
 
@@ -360,13 +398,30 @@ fn login_method_registry(
     for (provider_id, provider) in resolved.providers() {
         if configured.is_none_or(|providers| !providers.contains_key(provider_id))
             || provider_id == "openai"
-            || !accepts_stored_api_key(provider)
         {
             continue;
         }
-        methods.register_api_key(provider_id.clone());
+        if uses_only_bedrock_transports(provider) {
+            methods.register_bedrock_bearer(provider_id.clone());
+        } else if accepts_stored_api_key(provider) {
+            methods.register_api_key(provider_id.clone());
+        }
     }
     methods
+}
+
+fn uses_only_bedrock_transports(provider: &ResolvedProvider) -> bool {
+    !provider.models.is_empty()
+        && provider.models.values().all(|model| {
+            matches!(
+                model.api.transport,
+                Some(
+                    ProviderTransport::Bedrock
+                        | ProviderTransport::BedrockMantle
+                        | ProviderTransport::BedrockRuntime
+                )
+            )
+        })
 }
 
 fn accepts_stored_api_key(provider: &ResolvedProvider) -> bool {
@@ -551,8 +606,16 @@ fn looks_like_url(value: &str) -> bool {
 }
 
 fn read_api_key() -> Result<String, String> {
+    read_secret(
+        "Enter API key: ",
+        "API key is required",
+        "API key entry cancelled",
+    )
+}
+
+fn read_secret(prompt: &str, required: &str, cancelled: &str) -> Result<String, String> {
     if std::io::stdin().is_terminal() {
-        return read_terminal_secret();
+        return read_terminal_secret(prompt, required, cancelled);
     }
     let mut input = String::new();
     std::io::stdin()
@@ -560,12 +623,12 @@ fn read_api_key() -> Result<String, String> {
         .map_err(|error| error.to_string())?;
     let value = input.trim().to_owned();
     if value.is_empty() {
-        return Err("API key is required".to_owned());
+        return Err(required.to_owned());
     }
     Ok(value)
 }
 
-fn read_terminal_secret() -> Result<String, String> {
+fn read_terminal_secret(prompt: &str, required: &str, cancelled: &str) -> Result<String, String> {
     struct RawModeGuard;
 
     impl Drop for RawModeGuard {
@@ -574,7 +637,7 @@ fn read_terminal_secret() -> Result<String, String> {
         }
     }
 
-    eprint!("Enter API key: ");
+    eprint!("{prompt}");
     std::io::stderr()
         .flush()
         .map_err(|error| error.to_string())?;
@@ -592,7 +655,7 @@ fn read_terminal_secret() -> Result<String, String> {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         drop(guard);
                         eprintln!();
-                        return Err("API key entry cancelled".to_owned());
+                        return Err(cancelled.to_owned());
                     }
                     KeyCode::Char(character)
                         if !key.modifiers.intersects(
@@ -615,7 +678,7 @@ fn read_terminal_secret() -> Result<String, String> {
     drop(guard);
     eprintln!();
     if value.trim().is_empty() {
-        return Err("API key is required".to_owned());
+        return Err(required.to_owned());
     }
     Ok(value.trim().to_owned())
 }
@@ -1080,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn ambient_credential_transports_do_not_advertise_api_key_login() {
+    fn bedrock_advertises_bearer_login_while_other_ambient_transports_do_not() {
         let document = CatalogDocument::new();
         let config: zuno_config::Config = serde_json::from_str(
             r#"{
@@ -1105,10 +1168,101 @@ mod tests {
                 .iter()
                 .map(|provider| provider.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["openai"]
+            vec!["openai", "bedrock"]
         );
-        assert!(methods.methods_for("bedrock").is_empty());
+        assert_eq!(
+            methods
+                .methods_for("bedrock")
+                .iter()
+                .map(LoginMethod::id)
+                .collect::<Vec<_>>(),
+            vec![BEDROCK_BEARER_METHOD]
+        );
         assert!(methods.methods_for("vertex").is_empty());
+    }
+
+    #[test]
+    fn a_model_level_bedrock_transport_registers_one_bearer_login() {
+        let document = CatalogDocument::new();
+        let config: zuno_config::Config = serde_json::from_str(
+            r#"{
+              "provider": {
+                "mixed": {
+                  "transport": "openai",
+                  "models": {
+                    "claude": {
+                      "name": "Claude",
+                      "provider": {"transport": "bedrock"}
+                    },
+                    "gpt": {
+                      "name": "GPT",
+                      "provider": {
+                        "transport": "bedrock-mantle",
+                        "surface": "responses"
+                      }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("config");
+        let methods = login_method_registry(&document, &config);
+        assert_eq!(
+            methods
+                .methods_for("mixed")
+                .iter()
+                .map(LoginMethod::id)
+                .collect::<Vec<_>>(),
+            vec![BEDROCK_BEARER_METHOD]
+        );
+    }
+
+    #[test]
+    fn a_provider_mixing_bedrock_and_non_bedrock_routes_is_not_given_bedrock_login() {
+        let document = CatalogDocument::new();
+        let config: zuno_config::Config = serde_json::from_str(
+            r#"{
+              "provider": {
+                "mixed": {
+                  "transport": "openai",
+                  "models": {
+                    "ordinary": {"name": "Ordinary"},
+                    "claude": {
+                      "name": "Claude",
+                      "provider": {"transport": "bedrock"}
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("config");
+        let methods = login_method_registry(&document, &config);
+        assert_eq!(
+            methods
+                .methods_for("mixed")
+                .iter()
+                .map(LoginMethod::id)
+                .collect::<Vec<_>>(),
+            vec![API_KEY_METHOD]
+        );
+    }
+
+    #[test]
+    fn bedrock_guidance_names_bearer_and_credential_chain_configuration() {
+        for expected in [
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS credential chain",
+            "profile, access keys, IAM roles, EKS IRSA",
+            "zuno.json options (profile, region, endpoint)",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+        ] {
+            assert!(
+                BEDROCK_AUTH_GUIDANCE.contains(expected),
+                "missing `{expected}` from guidance: {BEDROCK_AUTH_GUIDANCE}"
+            );
+        }
     }
 
     #[test]

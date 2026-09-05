@@ -89,8 +89,8 @@ pub mod store;
 pub use crate::error::AuthError;
 pub use crate::mcp::{ClientInfo, Entry, McpAuthStore, McpCredentials, Tokens};
 pub use crate::method::{
-    API_KEY_METHOD, CHATGPT_BROWSER_METHOD, CHATGPT_DEVICE_METHOD, LoginMethod, LoginMethodError,
-    LoginMethodKind, LoginMethodRegistry,
+    API_KEY_METHOD, BEDROCK_BEARER_METHOD, CHATGPT_BROWSER_METHOD, CHATGPT_DEVICE_METHOD,
+    LoginMethod, LoginMethodError, LoginMethodKind, LoginMethodRegistry,
 };
 pub use crate::openai::{
     BrowserAuthorization, CHATGPT_CODEX_BASE_URL, DeviceAuthorization, OPENAI_OAUTH_CLIENT_ID,

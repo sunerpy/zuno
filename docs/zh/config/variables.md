@@ -93,6 +93,10 @@
 4. 在配置中内联的 `{env:...}`。
 5. `zuno.json` 中字面量形式的 `apiKey` 字符串。
 
+Amazon Bedrock 是刻意保留的例外：`AWS_BEARER_TOKEN_BEDROCK` 优先于已存储的
+bearer token；两者都不存在时，由 AWS SDK credential chain 解析 profile、access key、
+web identity、容器凭据和 instance role。
+
 最后一种是受支持的，但会把密钥暴露给配置备份与源码管理。凭据优先级记录在[认证](/zh/config/authentication)。
 
 `ZUNO_AUTH_CONTENT` 可以用一个 JSON 对象完全取代凭据读取，这在什么都不应写入磁盘的受管或临时环境中是正确形态。

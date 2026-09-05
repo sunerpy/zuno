@@ -207,6 +207,16 @@ impl AwsAuthContext {
     }
 }
 
+/// Resolve the AWS region without requiring credentials.
+///
+/// Amazon Bedrock API keys authenticate with an HTTP bearer token rather than
+/// SigV4, but the endpoint still needs the same config/profile/environment
+/// region resolution as the credential-chain path.
+pub async fn resolve_region(config: &AwsAuthConfig) -> Result<String, AwsAuthError> {
+    let sdk_config = config::load_sdk_config(config).await?;
+    config::resolved_region(&sdk_config)
+}
+
 impl AwsAuthError {
     /// Whether retrying can recover from a temporary credential provider failure.
     #[must_use]

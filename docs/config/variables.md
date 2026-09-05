@@ -112,6 +112,11 @@ Order of preference, best first:
 4. `{env:...}` inline in configuration.
 5. A literal `apiKey` string in `zuno.json`.
 
+Amazon Bedrock is the deliberate exception: `AWS_BEARER_TOKEN_BEDROCK`
+outranks the stored bearer token, and when neither exists the AWS SDK credential
+chain resolves profile, access-key, web-identity, container, and instance-role
+credentials.
+
 The last is supported but exposes the secret to configuration backups and source control.
 Credential precedence is documented in [Authentication](/config/authentication).
 

@@ -32,6 +32,19 @@ extra command: a configured provider id receives only the API-key method when it
 resolved native transport actually consumes that credential, and an arbitrary or
 credential-only id is rejected before Zuno reads standard input.
 
+Bedrock is a provider-specific bearer flow backed by the same `api` credential
+shape:
+
+```sh
+zuno auth methods amazon-bedrock
+printf '%s' "$AWS_BEARER_TOKEN_BEDROCK" |
+  zuno auth login amazon-bedrock --method bedrock-bearer-token
+```
+
+The stored value becomes `Authorization: Bearer` for Bedrock requests. Without a
+bearer token, Zuno does not require an auth-store entry and uses the AWS SDK
+credential chain.
+
 ## Declaring where credentials come from
 
 | Key | Type | Default | Description |
@@ -82,6 +95,11 @@ silently picking up an ambient environment variable.
 An environment key is consumed directly and never copied into `auth.json`. This is
 why a provider can already be authenticated on a fresh machine where nobody ran a
 login command.
+
+For Bedrock, the exact precedence is `AWS_BEARER_TOKEN_BEDROCK`, then a non-empty
+`options.apiKey`, then the matching stored API credential, then the AWS SDK
+credential chain. Other AWS environment variables configure that chain; they are
+not bearer tokens.
 
 ## Where credentials live
 

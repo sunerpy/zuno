@@ -83,8 +83,9 @@ zuno auth methods myopenai
 
 In a terminal, a bare login opens a searchable provider picker. It includes the
 official OpenAI integration and configured providers whose resolved model route
-has a real API-key consumer. Catalog-only entries, historical credential ids,
-and ambient-credential transports such as Bedrock are not login choices:
+has a real credential consumer. This includes a configured Bedrock provider,
+whose stored key is used as an Amazon Bedrock bearer token. Catalog-only entries
+and historical credential ids are not login choices:
 
 ```sh
 zuno auth login
@@ -122,6 +123,21 @@ when its resolved native transport consumes that credential:
 printf '%s' "$MYOPENAI_API_KEY" | zuno auth login myopenai
 ```
 
+Any configured provider with a `bedrock`, `bedrock-mantle`, or
+`bedrock-runtime` model route receives the `bedrock-bearer-token` method:
+
+```sh
+zuno auth methods amazon-bedrock
+printf '%s' "$AWS_BEARER_TOKEN_BEDROCK" |
+  zuno auth login amazon-bedrock --method bedrock-bearer-token
+```
+
+The command first explains the authentication priority. A bearer token from
+`AWS_BEARER_TOKEN_BEDROCK` or `zuno auth login` takes precedence over the AWS
+credential chain. Without a bearer token, Zuno uses the configured profile,
+access keys, IAM role, EKS IRSA/web identity, container credentials, or IMDS
+through the AWS SDK.
+
 Configure a custom provider before logging in. An arbitrary or credential-only
 id such as `kiro-auth` is rejected before Zuno reads standard input or writes
 `auth.json`.
@@ -138,6 +154,18 @@ Credential precedence is:
 2. the matching entry in `auth.json`;
 3. the first non-empty variable declared by `provider.<id>.env`;
 4. no credential.
+
+Bedrock is intentionally more specific:
+
+1. `AWS_BEARER_TOKEN_BEDROCK`;
+2. non-empty `provider.<id>.options.apiKey`;
+3. the matching API credential stored by `zuno auth login`;
+4. the AWS SDK credential chain.
+
+Only the exact bearer variable is treated as a bearer token. `AWS_PROFILE`,
+`AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_WEB_IDENTITY_TOKEN_FILE`, container
+credential variables, and IAM role metadata stay with the AWS SDK and are never
+copied into `auth.json`.
 
 Putting `apiKey` in `zuno.json` is supported but exposes a secret to configuration backups and source control, so the credential store or an injected `ZUNO_AUTH_CONTENT` is preferable.
 
@@ -231,6 +259,12 @@ They send `store: false` unless the provider explicitly overrides `store`, so
 Zuno's durable session remains the authoritative history. Converse sends the
 AWS JSON request body and decodes binary Amazon EventStream frames; the model
 id is carried only in the URI path.
+
+Amazon Bedrock API keys use `Authorization: Bearer`. When one is supplied by
+`AWS_BEARER_TOKEN_BEDROCK`, `provider.<id>.options.apiKey`, or `zuno auth
+login`, Zuno does not load or sign with AWS credentials. Without a bearer token,
+the request uses SigV4 and the AWS SDK credential chain. AWS documents the wire
+contract in [Amazon Bedrock API keys](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html).
 
 The configured `region` wins over `AWS_REGION`, `AWS_DEFAULT_REGION`, and the
 profile's region. Zuno delegates credential resolution and SigV4 signing to

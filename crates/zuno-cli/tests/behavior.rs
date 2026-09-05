@@ -210,6 +210,66 @@ fn providers_headless_login_reads_the_key_from_stdin() {
 }
 
 #[test]
+fn bedrock_headless_login_prints_priority_and_stores_the_bearer_token() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut command = zuno();
+    command
+        .args(["providers", "login", "--provider", "Amazon Bedrock"])
+        .current_dir(root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    isolated(&mut command, root.path());
+    configure_models(&mut command);
+    command.env(
+        "ZUNO_CONFIG_CONTENT",
+        r#"{
+          "provider": {
+            "amazon-bedrock": {
+              "name": "Amazon Bedrock",
+              "transport": "bedrock",
+              "models": {"claude": {"name": "Claude"}}
+            }
+          }
+        }"#,
+    );
+    let mut child = command.spawn().expect("spawn Bedrock login");
+    child
+        .stdin
+        .take()
+        .expect("login stdin")
+        .write_all(b"bedrock-headless-secret\n")
+        .expect("write bearer token");
+    let output = child.wait_with_output().expect("wait for login");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "Amazon Bedrock authentication priority",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS credential chain",
+        "Stored Amazon Bedrock bearer token for amazon-bedrock",
+    ] {
+        assert!(stdout.contains(expected), "{stdout}");
+    }
+    assert!(!stdout.contains("bedrock-headless-secret"), "{stdout}");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("bedrock-headless-secret"),
+        "stderr leaked the bearer token"
+    );
+
+    let auth: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.path().join("data/zuno/auth.json")).expect("read auth"),
+    )
+    .expect("auth JSON");
+    assert_eq!(auth["amazon-bedrock"]["type"], "api");
+    assert_eq!(auth["amazon-bedrock"]["key"], "bedrock-headless-secret");
+}
+
+#[test]
 fn auth_methods_expose_openai_oauth_without_leaking_it_to_custom_providers() {
     let root = tempfile::tempdir().expect("tempdir");
 

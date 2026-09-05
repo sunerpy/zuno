@@ -12,9 +12,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::{TryStreamExt as _, stream};
 use http::Method;
-use tokio::sync::OnceCell;
 use url::Url;
-use zuno_aws_auth::{AwsAccessKeys, AwsAuthConfig, AwsAuthContext, AwsRequestToSign};
+use zuno_aws_auth::{AwsAccessKeys, AwsAuthConfig, AwsRequestToSign};
 use zuno_error::ProviderError;
 use zuno_llm::event::StreamEvent;
 use zuno_llm::http::{HttpTimeouts, RequestDeadlines, read_error_body};
@@ -24,7 +23,7 @@ use zuno_llm::registry::{
 use zuno_llm::sse::StreamIdleTimeout;
 use zuno_provider_openai::{OpenAiConfig, OpenAiDecoder, build_request_body};
 
-use crate::aws::{header_map, load_context, map_auth_error};
+use crate::aws::{BedrockBearerToken, BedrockRequestAuth, header_map};
 use crate::error::classify_bedrock_error_for;
 
 /// Provider identity for the Bedrock Mantle Responses endpoint.
@@ -198,7 +197,7 @@ impl BedrockResponsesConfig {
 pub struct BedrockResponsesProvider {
     config: BedrockResponsesConfig,
     client: reqwest::Client,
-    auth: Arc<OnceCell<AwsAuthContext>>,
+    auth: BedrockRequestAuth,
 }
 
 impl std::fmt::Debug for BedrockResponsesProvider {
@@ -213,13 +212,27 @@ impl std::fmt::Debug for BedrockResponsesProvider {
 impl BedrockResponsesProvider {
     /// Construct one provider with proxy-aware Bedrock traffic and SDK-owned credentials.
     pub fn new(config: BedrockResponsesConfig) -> Result<Self, BedrockResponsesBuildError> {
+        Self::new_with_bearer(config, None)
+    }
+
+    /// Construct one provider with an optional Amazon Bedrock API key.
+    pub fn new_with_bearer(
+        config: BedrockResponsesConfig,
+        bearer: Option<BedrockBearerToken>,
+    ) -> Result<Self, BedrockResponsesBuildError> {
         let client = zuno_network::client_builder()
             .build()
             .map_err(BedrockResponsesBuildError::HttpClient)?;
+        let auth = BedrockRequestAuth::new(
+            config.provider_id.clone(),
+            config.auth.clone(),
+            config.access_keys.clone(),
+            bearer,
+        );
         Ok(Self {
             config,
             client,
-            auth: Arc::new(OnceCell::new()),
+            auth,
         })
     }
 
@@ -229,6 +242,15 @@ impl BedrockResponsesProvider {
         endpoint: BedrockResponsesEndpoint,
     ) -> Result<Self, BedrockResponsesBuildError> {
         Self::new(BedrockResponsesConfig::from_spec(spec, endpoint)?)
+    }
+
+    /// Build an endpoint-specific provider with an optional bearer token.
+    pub fn from_spec_with_bearer(
+        spec: &Spec,
+        endpoint: BedrockResponsesEndpoint,
+        bearer: Option<BedrockBearerToken>,
+    ) -> Result<Self, BedrockResponsesBuildError> {
+        Self::new_with_bearer(BedrockResponsesConfig::from_spec(spec, endpoint)?, bearer)
     }
 
     /// Exact OpenAI Responses request body that will be signed.
@@ -248,15 +270,6 @@ impl BedrockResponsesProvider {
         &self.config
     }
 
-    async fn auth_context(&self) -> Result<&AwsAuthContext, ProviderError> {
-        let config = self.config.auth.clone();
-        let access_keys = self.config.access_keys.clone();
-        self.auth
-            .get_or_try_init(|| load_context(config, access_keys))
-            .await
-            .map_err(|source| map_auth_error(&self.config.provider_id, source))
-    }
-
     async fn open_stream(
         &self,
         mut request: CompletionRequest,
@@ -265,22 +278,24 @@ impl BedrockResponsesProvider {
         request.surface = ApiSurface::Responses;
         let body = serde_json::to_vec(&build_request_body(&request, &self.config.openai)?)
             .map_err(ProviderError::fatal)?;
-        let auth = self.auth_context().await?;
+        let region = self.auth.region().await?;
         if self.config.endpoint == BedrockResponsesEndpoint::Mantle
-            && !MANTLE_SUPPORTED_REGIONS.contains(&auth.region())
+            && !MANTLE_SUPPORTED_REGIONS.contains(&region)
         {
             return Err(ProviderError::fatal(
                 BedrockResponsesBuildError::UnsupportedMantleRegion {
-                    region: auth.region().to_owned(),
+                    region: region.to_owned(),
                 },
             ));
         }
-        let url = self.config.request_url_for_region(auth.region())?;
+        let url = self.config.request_url_for_region(region)?;
         let mut headers = BTreeMap::from([
             ("accept".to_owned(), "text/event-stream".to_owned()),
             ("content-type".to_owned(), "application/json".to_owned()),
-            ("x-amz-content-sha256".to_owned(), sha256_hex(&body)),
         ]);
+        if !self.auth.uses_bearer() {
+            headers.insert("x-amz-content-sha256".to_owned(), sha256_hex(&body));
+        }
         if self.config.endpoint == BedrockResponsesEndpoint::Mantle {
             headers.insert(
                 MANTLE_CLIENT_AGENT_HEADER.to_owned(),
@@ -292,17 +307,17 @@ impl BedrockResponsesProvider {
         if self.config.endpoint == BedrockResponsesEndpoint::Mantle {
             headers.retain(|name, _| !name.contains('_'));
         }
-        let signed = auth
-            .sign(AwsRequestToSign {
+        let authorized = self
+            .auth
+            .authorize(AwsRequestToSign {
                 method: Method::POST,
                 url: url.to_string(),
                 headers: header_map(&headers).map_err(ProviderError::fatal)?,
                 body: Bytes::copy_from_slice(&body),
             })
-            .await
-            .map_err(|source| map_auth_error(&self.config.provider_id, source))?;
-        let mut builder = self.client.post(signed.url).body(body);
-        for (name, value) in &signed.headers {
+            .await?;
+        let mut builder = self.client.post(authorized.url).body(body);
+        for (name, value) in &authorized.headers {
             if name != http::header::HOST {
                 builder = builder.header(name, value);
             }
@@ -413,11 +428,35 @@ pub fn mantle_factory(spec: Spec) -> Result<Arc<dyn Provider>, BedrockResponsesB
     )?))
 }
 
+/// Build the Mantle provider with an optional Amazon Bedrock API key.
+pub fn mantle_factory_with_bearer(
+    spec: Spec,
+    bearer: Option<BedrockBearerToken>,
+) -> Result<Arc<dyn Provider>, BedrockResponsesBuildError> {
+    Ok(Arc::new(BedrockResponsesProvider::from_spec_with_bearer(
+        &spec,
+        BedrockResponsesEndpoint::Mantle,
+        bearer,
+    )?))
+}
+
 /// Build the provider registered as `amazon-bedrock-runtime`.
 pub fn runtime_factory(spec: Spec) -> Result<Arc<dyn Provider>, BedrockResponsesBuildError> {
     Ok(Arc::new(BedrockResponsesProvider::from_spec(
         &spec,
         BedrockResponsesEndpoint::Runtime,
+    )?))
+}
+
+/// Build the Runtime Responses provider with an optional Amazon Bedrock API key.
+pub fn runtime_factory_with_bearer(
+    spec: Spec,
+    bearer: Option<BedrockBearerToken>,
+) -> Result<Arc<dyn Provider>, BedrockResponsesBuildError> {
+    Ok(Arc::new(BedrockResponsesProvider::from_spec_with_bearer(
+        &spec,
+        BedrockResponsesEndpoint::Runtime,
+        bearer,
     )?))
 }
 
@@ -548,7 +587,7 @@ enum BedrockResponsesProtocolError {
 mod tests {
     use futures::StreamExt as _;
     use serde_json::json;
-    use wiremock::matchers::{body_json, header_regex, method, path};
+    use wiremock::matchers::{body_json, header, header_regex, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use zuno_llm::event::{Message, Role};
 
@@ -711,5 +750,49 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn mantle_bearer_token_replaces_sigv4_and_decodes_the_same_stream() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .and(header("authorization", "Bearer bedrock-api-key"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n\
+                     data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+                    "text/event-stream",
+                ),
+            )
+            .mount(&server)
+            .await;
+        let provider = BedrockResponsesProvider::from_spec_with_bearer(
+            &spec(
+                MANTLE_PROVIDER_ID,
+                Some(format!("{}/openai/v1", server.uri())),
+            ),
+            BedrockResponsesEndpoint::Mantle,
+            Some(BedrockBearerToken::new("bedrock-api-key")),
+        )
+        .expect("provider");
+
+        let events = provider
+            .stream(CompletionRequest::new(
+                "openai.gpt-5.6-sol",
+                vec![Message::new(Role::User, "hello")],
+            ))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("complete stream");
+
+        assert!(events.contains(&StreamEvent::TextDelta("OK".to_owned())));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::MessageEnd { .. }))
+        );
     }
 }

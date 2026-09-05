@@ -6,6 +6,7 @@ mod eventstream;
 mod provider;
 mod responses;
 
+pub use aws::{AWS_BEARER_TOKEN_BEDROCK, BedrockBearerToken};
 pub use error::{PROVIDER_ID, classify_bedrock_error, classify_bedrock_error_for};
 pub use eventstream::{
     BedrockDecodeError, BedrockEventDecoder, BedrockPayloadError, CrcKind, EventStreamDecoder,
@@ -13,10 +14,10 @@ pub use eventstream::{
 };
 pub use provider::{
     BedrockBuildError, BedrockConfig, BedrockOperation, BedrockProvider, CONVERSE_PROVIDER_ID,
-    factory, mantle_surface,
+    factory, factory_with_bearer, mantle_surface,
 };
 pub use responses::{
     BedrockResponsesBuildError, BedrockResponsesConfig, BedrockResponsesEndpoint,
     BedrockResponsesProvider, MANTLE_PROVIDER_ID, MANTLE_SUPPORTED_REGIONS, RUNTIME_PROVIDER_ID,
-    mantle_factory, runtime_factory,
+    mantle_factory, mantle_factory_with_bearer, runtime_factory, runtime_factory_with_bearer,
 };

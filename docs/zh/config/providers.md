@@ -72,7 +72,7 @@ zuno auth methods openai
 zuno auth methods myopenai
 ```
 
-在终端中，不带参数的登录会打开一个可搜索的 provider 选择器。它包含官方 OpenAI 集成，以及那些解析出的模型路由确实有一个真实 API key 消费者的已配置 provider。仅存在于目录中的条目、历史遗留的凭据 id，以及像 Bedrock 这类使用环境凭据的传输方式，都不是登录选项：
+在终端中，不带参数的登录会打开一个可搜索的 provider 选择器。它包含官方 OpenAI 集成，以及那些解析出的模型路由确实有一个真实凭据消费者的已配置 provider。配置过的 Bedrock provider 也在其中；它存储的 key 会作为 Amazon Bedrock bearer token 使用。仅存在于目录中的条目和历史遗留的凭据 id 不是登录选项：
 
 ```sh
 zuno auth login
@@ -104,6 +104,20 @@ printf '%s' "$OPENAI_API_KEY" | zuno auth login openai --method api-key
 printf '%s' "$MYOPENAI_API_KEY" | zuno auth login myopenai
 ```
 
+任何含有 `bedrock`、`bedrock-mantle` 或 `bedrock-runtime` 模型路由的已配置
+provider，都会获得 `bedrock-bearer-token` 方法：
+
+```sh
+zuno auth methods amazon-bedrock
+printf '%s' "$AWS_BEARER_TOKEN_BEDROCK" |
+  zuno auth login amazon-bedrock --method bedrock-bearer-token
+```
+
+命令会先说明认证优先级。来自 `AWS_BEARER_TOKEN_BEDROCK` 或 `zuno auth login`
+的 bearer token 优先于 AWS credential chain。没有 bearer token 时，Zuno 通过
+AWS SDK 使用已配置 profile、access key、IAM role、EKS IRSA/web identity、容器凭据
+或 IMDS。
+
 登录之前请先配置好自定义 provider。像 `kiro-auth` 这样任意的、或仅有凭据的 id，会在 Zuno 读取标准输入或写入 `auth.json` 之前就被拒绝。
 
 使用 `transport: "openai"` 不会赋予一个自定义 provider OpenAI 的 ChatGPT OAuth 流程。`openai` 这个 id 拥有那套登录、刷新协议、ChatGPT 端点重写和账户头。一个自定义 OAuth provider 需要它自己注册的登录方法和请求侧消费者；仅有一个 OAuth 形状的 JSON 对象不会被视为一次完整集成。
@@ -118,6 +132,17 @@ printf '%s' "$MYOPENAI_API_KEY" | zuno auth login myopenai
 2. `auth.json` 中匹配的条目；
 3. `provider.<id>.env` 声明的第一个非空变量；
 4. 没有凭据。
+
+Bedrock 有一套更精确的优先级：
+
+1. `AWS_BEARER_TOKEN_BEDROCK`；
+2. 非空的 `provider.<id>.options.apiKey`；
+3. 由 `zuno auth login` 保存的匹配 API 凭据；
+4. AWS SDK credential chain。
+
+只有这个确切的 bearer 变量会被当作 token。`AWS_PROFILE`、`AWS_REGION`、
+`AWS_ACCESS_KEY_ID`、`AWS_WEB_IDENTITY_TOKEN_FILE`、容器凭据变量和 IAM role
+元数据始终交给 AWS SDK，不会复制进 `auth.json`。
 
 把 `apiKey` 放进 `zuno.json` 是受支持的，但会把密钥暴露给配置备份与源码管理，所以更可取的是凭据存储或注入的 `ZUNO_AUTH_CONTENT`。
 
@@ -194,6 +219,12 @@ Mantle 与 Runtime 固定使用 Responses surface 和 `text/event-stream`。除�
 显式覆盖 `store`，它们会发送 `store: false`，由 Zuno 的持久会话作为权威历史。
 Converse 则发送 AWS JSON 请求体并解码二进制 Amazon EventStream；模型 id 只存在于
 URI path，不会重复写进 body。
+
+Amazon Bedrock API key 使用 `Authorization: Bearer`。当 token 来自
+`AWS_BEARER_TOKEN_BEDROCK`、`provider.<id>.options.apiKey` 或 `zuno auth login`
+时，Zuno 不加载 AWS 凭据，也不进行 SigV4 签名；没有 bearer token 时才使用 SigV4
+和 AWS SDK credential chain。AWS 的线上协议见
+[Amazon Bedrock API key](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html)。
 
 配置里的 `region` 优先于 `AWS_REGION`、`AWS_DEFAULT_REGION` 与 profile 自带的
 region。Zuno 把凭据解析和 SigV4 签名交给 `aws-config` 与 `aws-sigv4`，结构与 Codex

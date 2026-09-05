@@ -105,14 +105,20 @@ that async callers reach.
 Every login method is an explicit registration. The shipped registry gives the
 official `openai` id `api-key`, `chatgpt-browser`, and `chatgpt-device`.
 Configured provider instances receive `api-key` only when their resolved models
-use a native transport that consumes stored API keys. Ambient-credential
-transports such as Bedrock and Vertex do not advertise a login method.
+use a native transport that consumes stored API keys. A configured provider with
+any Bedrock transport receives the distinct `bedrock-bearer-token` method:
+the stored `api` credential is consumed as `Authorization: Bearer`, while absence
+of that credential leaves the AWS SDK credential chain authoritative. Ambient-only
+transports such as Vertex do not advertise a login method.
 
 Catalog resolution receives the same registry. A stored OAuth credential makes a provider selectable only when that exact provider id has a native OAuth method. This joins the interface, provider, and consumer at the composition boundary:
 
 - `openai` plus a ChatGPT OAuth credential is selectable;
 - `myopenai` plus the same OAuth-shaped credential is not granted OpenAI OAuth behavior;
 - `myopenai` with a config block, API key, or declared environment key remains selectable normally.
+- a Bedrock provider with an API credential uses bearer authentication;
+- the same Bedrock provider with no bearer credential remains selectable and uses
+  profile, access-key, web-identity, container, or instance-role credentials.
 
 A future custom OAuth component must register its methods, implement authorization and refresh, and consume the resulting credential in its provider. Adding only a config value or credential shape is insufficient.
 
@@ -131,8 +137,8 @@ selects the method. Both pickers support arrows, paging, type-to-filter, Enter,
 and Escape/Ctrl+C cancellation. They are entered only when standard input and
 standard error are terminals. A redirected invocation remains deterministic:
 the provider must be explicit, and piped standard input selects its registered
-API-key method. An unsupported or unconfigured id fails before standard input is
-read or the credential file is changed.
+single credential method (`api-key` or `bedrock-bearer-token`). An unsupported or
+unconfigured id fails before standard input is read or the credential file is changed.
 
 ## OpenAI authentication
 

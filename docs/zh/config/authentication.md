@@ -19,6 +19,17 @@ printf '%s' "$OPENAI_API_KEY" | zuno auth login openai --method api-key
 
 `zuno auth` 是 `zuno providers` 的别名。先列出方法是值得多敲这一条命令的：一个配置的 provider id 只有在它解析出的原生传输方式确实会消费该凭据时，才会获得 API-key 方法；而一个任意的或仅有凭据的 id 会在 Zuno 读取标准输入之前就被拒绝。
 
+Bedrock 是一条 provider 特有的 bearer 流程，仍使用同一个 `api` 凭据形状：
+
+```sh
+zuno auth methods amazon-bedrock
+printf '%s' "$AWS_BEARER_TOKEN_BEDROCK" |
+  zuno auth login amazon-bedrock --method bedrock-bearer-token
+```
+
+存储的值会成为 Bedrock 请求的 `Authorization: Bearer`。没有 bearer token 时，
+Zuno 不要求凭据存储中必须有条目，而是使用 AWS SDK credential chain。
+
 ## 声明凭据来自哪里
 
 | 键 | 类型 | 默认值 | 说明 |
@@ -63,6 +74,10 @@ printf '%s' "$OPENAI_API_KEY" | zuno auth login openai --method api-key
 因此一个显式为空的 `apiKey` 会胜出，并产生「无凭据」的结果。这是刻意的 —— 它给了你一种方式来证明某个 provider 未经认证，而不是让它静默捡起一个环境里恰好存在的变量。
 
 来自环境变量的 key 会被直接使用，绝不会复制进 `auth.json`。这就是为什么在一台没人跑过登录命令的新机器上，某个 provider 也可能已经处于已认证状态。
+
+对 Bedrock，确切优先级是 `AWS_BEARER_TOKEN_BEDROCK`、非空的
+`options.apiKey`、匹配的已存储 API 凭据，最后是 AWS SDK credential chain。
+其他 AWS 环境变量用于配置 credential chain，不会被当作 bearer token。
 
 ## 凭据存放在哪里
 

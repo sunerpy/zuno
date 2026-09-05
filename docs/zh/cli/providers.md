@@ -107,6 +107,19 @@ Zuno 下载 `<url>/.well-known/zuno`，逐行、带引号地打印该文档指�
 登录会拒绝而不是提示；对已经信任的主机可传入 `--trust-remote-command`，
 不经确认直接运行远端指定的命令。该选项对 provider 登录会被拒绝。
 
+含有任一原生 Bedrock transport 的已配置 provider 会出现在选择器中，并暴露
+`bedrock-bearer-token`。选中后，Zuno 会先打印 bearer token 与 AWS credential
+chain 的优先级，再以关闭回显的方式读取 token。也支持管道登录：
+
+```sh
+printf '%s' "$AWS_BEARER_TOKEN_BEDROCK" |
+  zuno providers login amazon-bedrock --method bedrock-bearer-token
+```
+
+token 按该 provider id 存储，Unix 上权限为 `0600`。请求时若既没有环境 bearer token，
+也没有已存储 token，Bedrock 会改用 AWS SDK credential chain。
+`AWS_BEARER_TOKEN_BEDROCK` 的优先级高于已存储 token。
+
 ### zuno providers logout
 
 ```sh
@@ -145,6 +158,13 @@ zuno providers methods openai
 
 ```sh
 zuno providers login openai --method api-key
+```
+
+保存 Amazon Bedrock bearer token。
+
+```sh
+printf '%s' "$AWS_BEARER_TOKEN_BEDROCK" |
+  zuno providers login amazon-bedrock --method bedrock-bearer-token
 ```
 
 移除某一个 Provider 已存储的凭据。
