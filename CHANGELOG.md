@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.6](https://github.com/sunerpy/zuno/compare/v0.10.5...v0.10.6) (2026-09-05)
+
+
+### Features
+
+* **memory:** 增加会话级记忆策略与后台学习 ([723d2f7](https://github.com/sunerpy/zuno/commit/723d2f702b00a9c32ae6a88d4ee4f1bdd843fa1c))
+
 ## [0.10.5](https://github.com/sunerpy/zuno/compare/v0.10.4...v0.10.5) (2026-09-05)
 
 
