@@ -2782,6 +2782,8 @@ fn ci_uses_target_isolated_dependency_caches_on_the_measured_critical_paths() {
         "cargo deny --all-features check",
         "shared-key: candidate-release-delta-${{ runner.os }}-${{ runner.arch }}",
         "cache-targets: false",
+        "SCCACHE_GHA_ENABLED: \"false\"",
+        "RUSTC_WRAPPER: \"\"",
     ] {
         assert!(
             tests.contains(required),
@@ -2794,6 +2796,7 @@ fn ci_uses_target_isolated_dependency_caches_on_the_measured_critical_paths() {
         "make test-sandbox-e2e",
         "nextest@",
         "setup-linux-sandbox.sh",
+        "sccache-action@",
     ] {
         assert!(
             !tests.contains(forbidden),
