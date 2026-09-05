@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 
 /// Stable identifier for the generic API-key login method.
 pub const API_KEY_METHOD: &str = "api-key";
+/// Stable identifier for Amazon Bedrock bearer-token login.
+pub const BEDROCK_BEARER_METHOD: &str = "bedrock-bearer-token";
 /// Stable identifier for OpenAI's browser-based ChatGPT OAuth flow.
 pub const CHATGPT_BROWSER_METHOD: &str = "chatgpt-browser";
 /// Stable identifier for OpenAI's device-code ChatGPT OAuth flow.
@@ -127,6 +129,19 @@ impl LoginMethodRegistry {
                 LoginMethodKind::ApiKey,
             )
             .with_aliases(["api", "api key", "key"]),
+        );
+    }
+
+    /// Register Amazon Bedrock's long-lived API-key flow for one provider instance.
+    pub fn register_bedrock_bearer(&mut self, provider: impl Into<String>) {
+        self.register(
+            provider,
+            LoginMethod::new(
+                BEDROCK_BEARER_METHOD,
+                "Amazon Bedrock bearer token",
+                LoginMethodKind::ApiKey,
+            )
+            .with_aliases(["bedrock", "bearer", "bearer token", "api key"]),
         );
     }
 
@@ -266,6 +281,17 @@ mod tests {
             vec![API_KEY_METHOD]
         );
         assert!(!registry.supports_oauth("myopenai"));
+    }
+
+    #[test]
+    fn a_bedrock_bearer_method_is_registered_per_provider_instance() {
+        let mut registry = LoginMethodRegistry::native();
+        registry.register_bedrock_bearer("amazon-bedrock");
+        let method = registry
+            .resolve("amazon-bedrock", Some("bearer"))
+            .expect("bearer alias");
+        assert_eq!(method.id(), BEDROCK_BEARER_METHOD);
+        assert_eq!(method.kind(), LoginMethodKind::ApiKey);
     }
 
     #[test]

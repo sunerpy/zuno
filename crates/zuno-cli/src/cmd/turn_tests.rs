@@ -5285,6 +5285,65 @@ fn the_first_declared_provider_environment_key_is_the_final_credential_fallback(
     assert_eq!(credential_value(&from_store), "sk-from-store");
 }
 
+fn bedrock_provider(options: serde_json::Value) -> Catalog {
+    let document = zuno_llm::catalog::models_dev::CatalogDocument::new();
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "bedrock": {
+                "transport": "bedrock",
+                "env": ["AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION", "AWS_PROFILE"],
+                "options": options,
+                "models": {"claude": {"name": "Claude"}}
+            }
+        }
+    }))
+    .expect("Bedrock config");
+    Catalog::resolve(&document, &ResolveInput::new().with_config(&config))
+}
+
+#[test]
+fn bedrock_bearer_priority_is_environment_then_config_then_connect_store() {
+    let stored = Credential::Api {
+        key: zuno_auth::Secret::new("stored-bedrock-token"),
+        metadata: None,
+    };
+    let catalog = bedrock_provider(serde_json::json!({"apiKey": "configured-bedrock-token"}));
+    let provider = catalog.provider("bedrock").expect("Bedrock provider");
+    let env = Env::empty()
+        .with("AWS_BEARER_TOKEN_BEDROCK", "environment-bedrock-token")
+        .with("AWS_REGION", "us-east-2");
+
+    let environment =
+        resolved_credential(Some(provider), Some(&stored), &env).expect("environment bearer token");
+    assert_eq!(credential_value(&environment), "environment-bedrock-token");
+
+    let configured = resolved_credential(Some(provider), Some(&stored), &Env::empty())
+        .expect("configured bearer token");
+    assert_eq!(credential_value(&configured), "configured-bedrock-token");
+
+    let catalog = bedrock_provider(serde_json::json!({}));
+    let provider = catalog.provider("bedrock").expect("Bedrock provider");
+    let connected = resolved_credential(Some(provider), Some(&stored), &Env::empty())
+        .expect("stored bearer token");
+    assert_eq!(credential_value(&connected), "stored-bedrock-token");
+}
+
+#[test]
+fn bedrock_credential_chain_environment_is_not_mistaken_for_a_bearer_token() {
+    let catalog = bedrock_provider(serde_json::json!({}));
+    let provider = catalog.provider("bedrock").expect("Bedrock provider");
+    let env = Env::empty()
+        .with("AWS_REGION", "us-east-2")
+        .with("AWS_PROFILE", "us-claude")
+        .with("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+        .with("AWS_WEB_IDENTITY_TOKEN_FILE", "/tmp/token");
+
+    assert!(
+        resolved_credential(Some(provider), None, &env).is_none(),
+        "AWS credential-chain configuration must remain with the SDK instead of becoming a bearer token"
+    );
+}
+
 /// Why [`provider_api_key`]'s string test can never be reached from a config file.
 ///
 /// `ProviderOptions::api_key` is typed `Option<String>`

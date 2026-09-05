@@ -112,6 +112,21 @@ login refuses instead of prompting; pass `--trust-remote-command` to run the rem
 command without confirmation, for a host you already trust. The flag is refused for
 provider logins.
 
+A configured provider with any native Bedrock transport appears in the provider
+picker and exposes `bedrock-bearer-token`. Selecting it prints the bearer-token
+and AWS credential-chain priority before reading a hidden token. Piped login is
+also supported:
+
+```sh
+printf '%s' "$AWS_BEARER_TOKEN_BEDROCK" |
+  zuno providers login amazon-bedrock --method bedrock-bearer-token
+```
+
+The token is stored under that provider id with mode `0600` on Unix. If no
+stored or environment bearer token is present at request time, Bedrock uses the
+AWS SDK credential chain instead. `AWS_BEARER_TOKEN_BEDROCK` outranks the
+stored token.
+
 ### zuno providers logout
 
 ```sh
@@ -150,6 +165,13 @@ Authenticate with an explicit method instead of the interactive picker.
 
 ```sh
 zuno providers login openai --method api-key
+```
+
+Store an Amazon Bedrock bearer token.
+
+```sh
+printf '%s' "$AWS_BEARER_TOKEN_BEDROCK" |
+  zuno providers login amazon-bedrock --method bedrock-bearer-token
 ```
 
 Remove the stored credential for one provider.

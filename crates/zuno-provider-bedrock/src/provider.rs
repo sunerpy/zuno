@@ -5,9 +5,8 @@ use bytes::Bytes;
 use futures::{TryStreamExt as _, stream};
 use http::Method;
 use serde_json::{Map, Value, json};
-use tokio::sync::OnceCell;
 use url::Url;
-use zuno_aws_auth::{AwsAccessKeys, AwsAuthConfig, AwsAuthContext, AwsRequestToSign};
+use zuno_aws_auth::{AwsAccessKeys, AwsAuthConfig, AwsRequestToSign};
 use zuno_error::ProviderError;
 use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent, tool_arguments_text};
 use zuno_llm::http::{HttpTimeouts, RequestDeadlines, read_error_body};
@@ -16,7 +15,7 @@ use zuno_llm::registry::{
 };
 use zuno_llm::sse::{StreamIdleTimeout, upstream_stream_incomplete};
 
-use crate::aws::{header_map, load_context, map_auth_error};
+use crate::aws::{BedrockBearerToken, BedrockRequestAuth, header_map};
 use crate::error::classify_bedrock_error_for;
 use crate::eventstream::{BedrockDecodeError, BedrockEventDecoder};
 
@@ -341,7 +340,7 @@ fn string_option(spec: &Spec, name: &str) -> Option<String> {
 pub struct BedrockProvider {
     config: BedrockConfig,
     client: reqwest::Client,
-    auth: Arc<OnceCell<AwsAuthContext>>,
+    auth: BedrockRequestAuth,
 }
 
 impl std::fmt::Debug for BedrockProvider {
@@ -355,18 +354,40 @@ impl std::fmt::Debug for BedrockProvider {
 
 impl BedrockProvider {
     pub fn new(config: BedrockConfig) -> Result<Self, BedrockBuildError> {
+        Self::new_with_bearer(config, None)
+    }
+
+    /// Construct a provider with an optional Amazon Bedrock API key.
+    pub fn new_with_bearer(
+        config: BedrockConfig,
+        bearer: Option<BedrockBearerToken>,
+    ) -> Result<Self, BedrockBuildError> {
         let client = zuno_network::client_builder()
             .build()
             .map_err(BedrockBuildError::HttpClient)?;
+        let auth = BedrockRequestAuth::new(
+            config.provider_id.clone(),
+            config.auth.clone(),
+            config.access_keys.clone(),
+            bearer,
+        );
         Ok(Self {
             config,
             client,
-            auth: Arc::new(OnceCell::new()),
+            auth,
         })
     }
 
     pub fn from_spec(spec: &Spec) -> Result<Self, BedrockBuildError> {
         Self::new(BedrockConfig::from_spec(spec)?)
+    }
+
+    /// Build a provider from a registry spec and optional bearer token.
+    pub fn from_spec_with_bearer(
+        spec: &Spec,
+        bearer: Option<BedrockBearerToken>,
+    ) -> Result<Self, BedrockBuildError> {
+        Self::new_with_bearer(BedrockConfig::from_spec(spec)?, bearer)
     }
 
     /// The body one request will carry.
@@ -387,15 +408,6 @@ impl BedrockProvider {
             &self.config.generation,
             &self.config.tools,
         )
-    }
-
-    async fn auth_context(&self) -> Result<&AwsAuthContext, ProviderError> {
-        let config = self.config.auth.clone();
-        let access_keys = self.config.access_keys.clone();
-        self.auth
-            .get_or_try_init(|| load_context(config, access_keys))
-            .await
-            .map_err(|source| map_auth_error(&self.config.provider_id, source))
     }
 
     async fn open_stream(
@@ -435,17 +447,18 @@ impl BedrockProvider {
             ));
         }
         let body = serde_json::to_vec(&self.body_for(&request)?).map_err(ProviderError::fatal)?;
-        let auth = self.auth_context().await?;
-        let url = self.request_url(&request.model_id, auth.region())?;
-        let payload_hash = sha256_hex(&body);
+        let region = self.auth.region().await?;
+        let url = self.request_url(&request.model_id, region)?;
         let mut headers = BTreeMap::from([
             (
                 "accept".to_owned(),
                 "application/vnd.amazon.eventstream".to_owned(),
             ),
             ("content-type".to_owned(), "application/json".to_owned()),
-            ("x-amz-content-sha256".to_owned(), payload_hash),
         ]);
+        if !self.auth.uses_bearer() {
+            headers.insert("x-amz-content-sha256".to_owned(), sha256_hex(&body));
+        }
         if self.config.operation == BedrockOperation::InvokeModelWithResponseStream {
             headers.insert(
                 "x-amzn-bedrock-accept".to_owned(),
@@ -453,17 +466,17 @@ impl BedrockProvider {
             );
         }
         headers.extend(request.headers.clone());
-        let signed = auth
-            .sign(AwsRequestToSign {
+        let authorized = self
+            .auth
+            .authorize(AwsRequestToSign {
                 method: Method::POST,
                 url: url.to_string(),
                 headers: header_map(&headers).map_err(ProviderError::fatal)?,
                 body: Bytes::copy_from_slice(&body),
             })
-            .await
-            .map_err(|source| map_auth_error(&self.config.provider_id, source))?;
-        let mut builder = self.client.post(signed.url).body(body);
-        for (name, value) in &signed.headers {
+            .await?;
+        let mut builder = self.client.post(authorized.url).body(body);
+        for (name, value) in &authorized.headers {
             if name != http::header::HOST {
                 builder = builder.header(name, value);
             }
@@ -1306,6 +1319,16 @@ pub fn factory(spec: Spec) -> Result<Arc<dyn Provider>, BedrockBuildError> {
     Ok(Arc::new(BedrockProvider::from_spec(&spec)?))
 }
 
+/// Build the Converse provider with an optional Amazon Bedrock API key.
+pub fn factory_with_bearer(
+    spec: Spec,
+    bearer: Option<BedrockBearerToken>,
+) -> Result<Arc<dyn Provider>, BedrockBuildError> {
+    Ok(Arc::new(BedrockProvider::from_spec_with_bearer(
+        &spec, bearer,
+    )?))
+}
+
 fn aws_request_id(headers: &reqwest::header::HeaderMap) -> Option<&str> {
     ["x-amzn-requestid", "x-amzn-request-id"]
         .into_iter()
@@ -1316,6 +1339,10 @@ fn aws_request_id(headers: &reqwest::header::HeaderMap) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use futures::StreamExt as _;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
 
     #[test]
@@ -1336,6 +1363,39 @@ mod tests {
             "a provider configured with no generation controls must still send the \
              pre-`inferenceConfig` shape byte for byte"
         );
+    }
+
+    #[tokio::test]
+    async fn converse_bearer_token_reaches_the_authorization_header_without_leaking() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/model/us.anthropic.claude-opus-5/converse-stream"))
+            .and(header("authorization", "Bearer bedrock-api-key"))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(json!({"message": "request denied"})),
+            )
+            .mount(&server)
+            .await;
+        let spec = Spec::new("amazon-bedrock")
+            .with_region("us-east-2")
+            .with_base_url(server.uri());
+        let provider = BedrockProvider::from_spec_with_bearer(
+            &spec,
+            Some(BedrockBearerToken::new("bedrock-api-key")),
+        )
+        .expect("provider");
+
+        let error = provider
+            .stream(CompletionRequest::new(
+                "us.anthropic.claude-opus-5",
+                vec![Message::new(Role::User, "hello")],
+            ))
+            .next()
+            .await
+            .expect("one result")
+            .expect_err("fixture rejects the request");
+
+        assert!(!error.to_string().contains("bedrock-api-key"));
     }
 
     #[test]

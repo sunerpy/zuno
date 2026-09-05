@@ -107,6 +107,94 @@ fn bare_auth_login_selects_a_provider_and_stores_a_hidden_api_key() {
 }
 
 #[test]
+fn bare_auth_login_selects_bedrock_and_stores_a_hidden_bearer_token() {
+    let root = tempfile::tempdir().expect("temporary login environment");
+    let models = root.path().join("models.json");
+    fs::write(&models, "{}").expect("write empty provider catalog");
+
+    let data = root.path().join("data");
+    let config = root.path().join("config");
+    let cache = root.path().join("cache");
+    let home = root.path().join("home");
+    for directory in [&data, &config, &cache, &home] {
+        fs::create_dir_all(directory).expect("create isolated directory");
+    }
+    let zuno_config = config.join("zuno");
+    fs::create_dir_all(&zuno_config).expect("create Zuno config directory");
+    fs::write(
+        zuno_config.join("zuno.json"),
+        r#"{
+          "provider": {
+            "amazon-bedrock": {
+              "name": "Amazon Bedrock",
+              "transport": "bedrock",
+              "models": {"claude": {"name": "Claude"}}
+            }
+          }
+        }"#,
+    )
+    .expect("write configured provider");
+
+    let mut terminal = TestPty::spawn(
+        root.path(),
+        &[
+            ("HOME", home.as_path()),
+            ("XDG_DATA_HOME", data.as_path()),
+            ("XDG_CONFIG_HOME", config.as_path()),
+            ("XDG_CACHE_HOME", cache.as_path()),
+            ("ZUNO_MODELS_PATH", models.as_path()),
+        ],
+    );
+    assert!(
+        terminal.wait_for_output("Select provider"),
+        "{}",
+        terminal.output()
+    );
+    terminal.write(b"amazon-bedrock\r");
+    assert!(
+        terminal.wait_for_output("Amazon Bedrock authentication priority"),
+        "{}",
+        terminal.output()
+    );
+    assert!(
+        terminal.wait_for_output("Enter Amazon Bedrock bearer token"),
+        "{}",
+        terminal.output()
+    );
+    terminal.write(b"bedrock-interactive-secret\r");
+
+    let (status, output) = terminal.finish();
+    assert!(status.success(), "{output}");
+    for expected in [
+        "Select provider: Amazon Bedrock",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS credential chain",
+        "Stored Amazon Bedrock bearer token for amazon-bedrock",
+    ] {
+        assert!(output.contains(expected), "{output}");
+    }
+    assert!(
+        !output.contains("bedrock-interactive-secret"),
+        "the terminal echoed the bearer token: {output}"
+    );
+
+    let auth_path = data.join("zuno/auth.json");
+    let auth: serde_json::Value =
+        serde_json::from_slice(&fs::read(&auth_path).expect("read stored credential"))
+            .expect("parse stored credential");
+    assert_eq!(auth["amazon-bedrock"]["type"], "api");
+    assert_eq!(auth["amazon-bedrock"]["key"], "bedrock-interactive-secret");
+    assert_eq!(
+        fs::metadata(auth_path)
+            .expect("credential metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
 fn bare_auth_login_hides_catalog_only_and_credential_only_providers() {
     let root = tempfile::tempdir().expect("temporary login environment");
     let models = root.path().join("models.json");

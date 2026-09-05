@@ -10571,6 +10571,20 @@ fn is_bedrock_factory(factory_key: &str) -> bool {
     )
 }
 
+fn provider_uses_only_bedrock_transports(provider: &zuno_llm::catalog::ResolvedProvider) -> bool {
+    !provider.models.is_empty()
+        && provider.models.values().all(|model| {
+            matches!(
+                model.api.transport,
+                Some(
+                    ProviderTransport::Bedrock
+                        | ProviderTransport::BedrockMantle
+                        | ProviderTransport::BedrockRuntime
+                )
+            )
+        })
+}
+
 fn provider_registry(
     provider_id: &str,
     credential: Option<Credential>,
@@ -10597,16 +10611,19 @@ fn provider_registry(
         zuno_provider_openai::factory(move |_| openai_credential.clone(), auth_store),
     );
 
-    providers.register_fallible("amazon-bedrock", |spec| {
-        zuno_provider_bedrock::mantle_factory(spec)
+    let bedrock_bearer = credential.as_ref().and_then(bedrock_bearer_token);
+    let mantle_bearer = bedrock_bearer.clone();
+    providers.register_fallible("amazon-bedrock", move |spec| {
+        zuno_provider_bedrock::mantle_factory_with_bearer(spec, mantle_bearer.clone())
             .map_err(|error| zuno_llm::registry::Declined::Failed(ProviderError::fatal(error)))
     });
-    providers.register_fallible("amazon-bedrock-runtime", |spec| {
-        zuno_provider_bedrock::runtime_factory(spec)
+    let runtime_bearer = bedrock_bearer.clone();
+    providers.register_fallible("amazon-bedrock-runtime", move |spec| {
+        zuno_provider_bedrock::runtime_factory_with_bearer(spec, runtime_bearer.clone())
             .map_err(|error| zuno_llm::registry::Declined::Failed(ProviderError::fatal(error)))
     });
-    providers.register_fallible("amazon-bedrock-converse", |spec| {
-        zuno_provider_bedrock::factory(spec)
+    providers.register_fallible("amazon-bedrock-converse", move |spec| {
+        zuno_provider_bedrock::factory_with_bearer(spec, bedrock_bearer.clone())
             .map_err(|error| zuno_llm::registry::Declined::Failed(ProviderError::fatal(error)))
     });
 
@@ -10631,6 +10648,17 @@ fn provider_registry(
     );
 
     providers
+}
+
+fn bedrock_bearer_token(
+    credential: &Credential,
+) -> Option<zuno_provider_bedrock::BedrockBearerToken> {
+    match credential {
+        Credential::Api { key, .. } if !key.is_empty() => {
+            Some(zuno_provider_bedrock::BedrockBearerToken::new(key.expose()))
+        }
+        Credential::Api { .. } | Credential::Oauth { .. } | Credential::WellKnown { .. } => None,
+    }
 }
 
 /// The provider-option keys that name an endpoint, in precedence order.
@@ -10728,6 +10756,28 @@ fn resolved_credential(
     stored: Option<&Credential>,
     env: &zuno_paths::Env,
 ) -> Option<Credential> {
+    if provider.is_some_and(provider_uses_only_bedrock_transports) {
+        return env
+            .truthy_value(zuno_provider_bedrock::AWS_BEARER_TOKEN_BEDROCK)
+            .map(str::to_owned)
+            .or_else(|| provider_api_key(provider).filter(|key| !key.is_empty()))
+            .or_else(|| match stored {
+                Some(Credential::Api { key, .. }) if !key.is_empty() => {
+                    Some(key.expose().to_owned())
+                }
+                Some(
+                    Credential::Api { .. }
+                    | Credential::Oauth { .. }
+                    | Credential::WellKnown { .. },
+                )
+                | None => None,
+            })
+            .map(|key| Credential::Api {
+                key: zuno_auth::Secret::new(key),
+                metadata: None,
+            });
+    }
+
     provider_api_key(provider)
         .map(|key| Credential::Api {
             key: zuno_auth::Secret::new(key),

@@ -1089,6 +1089,7 @@ fn architecture_documents_pin_the_native_harness_decisions() {
             "LoginMethodRegistry",
             "chatgpt-browser",
             "chatgpt-device",
+            "bedrock-bearer-token",
             "ChatGPT-Account-Id",
             "ZUNO_AUTH_CONTENT",
             "transport",
@@ -2767,8 +2768,32 @@ fn providers_login_docs_pin_the_remote_command_confirmation_and_trust_flag() {
         ],
     );
     for relative in ["docs/reference/providers.md", "docs/zh/config/providers.md"] {
-        contains_all(relative, &["`--trust-remote-command`", "`providers login`"]);
+        contains_all(
+            relative,
+            &[
+                "`--trust-remote-command`",
+                "`providers login`",
+                "`bedrock-bearer-token`",
+                "`AWS_BEARER_TOKEN_BEDROCK`",
+            ],
+        );
     }
+    contains_all(
+        "docs/cli/providers.md",
+        &[
+            "`bedrock-bearer-token`",
+            "`AWS_BEARER_TOKEN_BEDROCK`",
+            "AWS SDK credential chain",
+        ],
+    );
+    contains_all(
+        "docs/zh/cli/providers.md",
+        &[
+            "`bedrock-bearer-token`",
+            "`AWS_BEARER_TOKEN_BEDROCK`",
+            "AWS SDK credential chain",
+        ],
+    );
 }
 
 /// The Shell gate's wrapper walk (`wrapper_readings` in `crates/zuno-tools/src/risk.rs`)
