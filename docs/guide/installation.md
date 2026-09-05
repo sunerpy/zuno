@@ -78,8 +78,12 @@ $env:ZUNO_INSTALL_DIR = Join-Path $HOME "bin"
 irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | iex
 ```
 
-Both installers print the `PATH` change when the destination is not already visible.
-Open a new terminal after changing the user `PATH`.
+The Windows installer safely prepends the destination to the user `PATH` when the
+exact entry is absent, then updates the current PowerShell process so `zuno --version`
+works immediately. It reads only the persisted user value, preserves entries such as
+`%JAVA_HOME%\bin`, and does not invoke `setx` or copy the process's merged system and
+user `PATH` back into the user value. Other terminals that were already running still
+need to be reopened.
 
 ## Release targets
 

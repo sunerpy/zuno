@@ -163,6 +163,11 @@ test-par:
 test-fast:
 	$(CARGO) test -p $(CLI_CRATE) --test docs --test release_surface $(OFFLINE)
 	sh -n scripts/install.sh
+	@if command -v pwsh > /dev/null 2>&1; then \
+		pwsh -NoLogo -NoProfile -File scripts/test-install.ps1; \
+	else \
+		echo "SKIP  pwsh is not installed; Windows CI runs scripts/test-install.ps1 on PowerShell 5.1 and 7"; \
+	fi
 
 hook-fmt: fmt
 

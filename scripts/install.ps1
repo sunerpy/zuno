@@ -22,6 +22,49 @@ function Die($Message) {
   exit 1
 }
 
+function Normalize-PathEntry($Entry) {
+  if ($null -eq $Entry) { return "" }
+
+  $Normalized = $Entry.Trim().Trim('"')
+  if ($Normalized.Length -gt 3) {
+    $Normalized = $Normalized.TrimEnd([char[]]@('\', '/'))
+  }
+  return $Normalized
+}
+
+function Get-PathEntries($PathValue) {
+  if ([string]::IsNullOrWhiteSpace($PathValue)) { return @() }
+
+  return @(
+    $PathValue -split ';' |
+      ForEach-Object { $_.Trim() } |
+      Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  )
+}
+
+function Test-PathContains($PathValue, $Entry) {
+  $Expected = Normalize-PathEntry $Entry
+  if ([string]::IsNullOrWhiteSpace($Expected)) { return $false }
+
+  foreach ($PathEntry in @(Get-PathEntries $PathValue)) {
+    if ((Normalize-PathEntry $PathEntry) -ieq $Expected) {
+      return $true
+    }
+  }
+  return $false
+}
+
+function Add-PathEntry($PathValue, $Entry) {
+  $Entry = $Entry.Trim()
+  if ([string]::IsNullOrWhiteSpace($Entry) -or (Test-PathContains $PathValue $Entry)) {
+    return $PathValue
+  }
+  if ([string]::IsNullOrWhiteSpace($PathValue)) {
+    return $Entry
+  }
+  return "$Entry;$PathValue"
+}
+
 switch ($env:PROCESSOR_ARCHITECTURE) {
   "AMD64" { $Arch = "x86_64" }
   "ARM64" { $Arch = "aarch64" }
@@ -79,11 +122,28 @@ try {
   Move-Item -Force -Path $Unpacked -Destination (Join-Path $InstallDir "$Bin.exe")
   Write-Host "Installed $Bin to $InstallDir\$Bin.exe"
 
-  $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-  if ($UserPath -notlike "*$InstallDir*") {
-    Write-Host "Add $InstallDir to PATH:"
-    Write-Host "  setx Path `"$InstallDir;`$env:Path`""
+  # Read and write only the persisted user PATH. `$env:Path` is the current
+  # process's merged user + system view and must never be copied back into it.
+  $UserPath = [Environment]::GetEnvironmentVariable(
+    "Path",
+    [EnvironmentVariableTarget]::User
+  )
+  $UpdatedUserPath = Add-PathEntry $UserPath $InstallDir
+  if ($UpdatedUserPath -cne $UserPath) {
+    [Environment]::SetEnvironmentVariable(
+      "Path",
+      $UpdatedUserPath,
+      [EnvironmentVariableTarget]::User
+    )
+    Write-Host "Added $InstallDir to user PATH."
   }
+
+  # Environment changes are not inherited by an already-running shell. Update
+  # this PowerShell process separately so the one-line installer can use Zuno now.
+  $env:Path = Add-PathEntry $env:Path $InstallDir
+  Write-Host ""
+  Write-Host "Run:"
+  Write-Host "  zuno --version"
 } finally {
   Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue
 }
