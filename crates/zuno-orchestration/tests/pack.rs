@@ -208,23 +208,21 @@ fn deepwork_declares_every_durable_state_reader_and_writer_it_uses() {
 
 /// The pack side of the contract the `zuno-cli` factory-default test enforces against
 /// the real permission overlays: a Skill is declared only for profiles that can see
-/// every tool it requires. `deep` and `general` do not see `goal_get`; `deep`,
-/// `fixer`, and `general` do not see `capability_claim`. Re-adding one of them here
-/// is not wrong in itself, but it has to come with the matching overlay change, and
-/// the cross-crate test is what says so.
+/// every tool it requires. `general` does not see `goal_get`; `deep`, `fixer`, and
+/// `general` do not see `capability_claim`. Re-adding one of them here is not wrong
+/// in itself, but it has to come with the matching overlay change, and the cross-crate
+/// test is what says so.
 #[test]
 fn skills_that_require_a_gated_tool_are_declared_only_where_the_gate_is_open() {
     let deepwork = skill("deepwork").expect("deepwork descriptor");
     assert_eq!(
         deepwork.allowed_profiles,
-        &["orchestrator", "build", "plan"]
+        &["orchestrator", "build", "plan", "deep"]
     );
-    for profile in ["deep", "general"] {
-        assert!(
-            !deepwork.allowed_profiles.contains(&profile),
-            "`{profile}` cannot see `goal_get` under its shipped overlay"
-        );
-    }
+    assert!(
+        !deepwork.allowed_profiles.contains(&"general"),
+        "`general` cannot see `goal_get` under its shipped overlay"
+    );
 
     let review =
         skill("bedrock-model-capability-review").expect("bedrock capability review descriptor");
@@ -235,6 +233,29 @@ fn skills_that_require_a_gated_tool_are_declared_only_where_the_gate_is_open() {
             "`{profile}` cannot see `capability_claim` under its shipped overlay"
         );
     }
+}
+
+#[test]
+fn generic_workflow_skill_descriptions_exclude_bounded_atomic_work() {
+    let workflow = skill("git-workflow").expect("git-workflow descriptor");
+    assert!(workflow.description.contains("commits, staging, branches"));
+    assert!(
+        workflow
+            .description
+            .contains("skip isolated disposable fixtures")
+    );
+
+    let verification = skill("verification-planning").expect("verification-planning descriptor");
+    assert!(
+        verification
+            .description
+            .contains("high-risk, multi-surface")
+    );
+    assert!(
+        verification
+            .description
+            .contains("skip routine bounded changes")
+    );
 }
 
 #[test]

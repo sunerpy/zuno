@@ -124,13 +124,13 @@ const USER_FACING_PROFILES: &[&str] = &[
 /// Profiles whose shipped permission overlay lets them read durable Goal state.
 ///
 /// `deepwork` requires `goal_get` (its body opens with "Read the current Goal, Plan,
-/// and Todo state"), and among the deny-by-default overlays only `plan` names
-/// `goal_get`; `orchestrator` and `build` see it through the allow-all base. `deep`
-/// and `general` grant the other four required tools but not this one, so declaring
-/// them here advertised a Skill that the visibility gate then dropped on every turn
-/// (audit OH-01). The contract test in `zuno-cli` (`agent::tests`) now runs that gate
-/// against the real overlays for every declared pair.
-const DEEPWORK_PROFILES: &[&str] = &["orchestrator", "build", "plan"];
+/// and Todo state"). `orchestrator` and `build` see it through the allow-all base;
+/// `plan` and `deep` name it in their deny-by-default overlays. `general` grants the
+/// other four required tools but not this one, so declaring it there would advertise a
+/// Skill that the visibility gate drops on every turn (audit OH-01). The contract test
+/// in `zuno-cli` (`agent::tests`) runs that gate against the real overlays for every
+/// declared pair.
+const DEEPWORK_PROFILES: &[&str] = &["orchestrator", "build", "plan", "deep"];
 
 const CODEMAP_PROFILES: &[&str] = &[
     "orchestrator",
@@ -267,7 +267,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 11] = [
     },
     BuiltinSkillDescriptor {
         name: "verification-planning",
-        description: "Define risk-proportional evidence, commands, fixtures, expected outputs, and acceptance surfaces before delivery.",
+        description: "Plan evidence for high-risk, multi-surface, release, migration, security, or explicitly requested verification work; skip routine bounded changes whose acceptance commands are already clear.",
         content: include_str!("skills/verification-planning.md"),
         source_id: pack_source_id!("skill/verification-planning"),
         location: pack_location!("verification-planning"),
@@ -300,7 +300,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 11] = [
     },
     BuiltinSkillDescriptor {
         name: "git-workflow",
-        description: "Inspect repository state, preserve user changes, scope commits, and verify staged delivery without destructive cleanup.",
+        description: "Use when commits, staging, branches, worktrees, delivery handoff, or a materially dirty repository require Git decisions; skip isolated disposable fixtures and ordinary uncommitted edits.",
         content: include_str!("skills/git-workflow.md"),
         source_id: pack_source_id!("skill/git-workflow"),
         location: pack_location!("git-workflow"),

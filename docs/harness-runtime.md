@@ -94,6 +94,13 @@ estimated tokens, and a SHA-256 digest. A prompt cannot describe an editor,
 delegation target, or durable-state tool that was removed by role policy,
 allowlists, permission visibility, a provider capability, or a request hook.
 
+Plan classification is value-based rather than phase-count-based. A bounded
+single-owner task does not create a Plan merely because it inspects, edits, and tests.
+Cross-component dependencies, delegation, independent gates, interruption recovery, or
+explicit ownership structure do. Active Goal criteria already provide durable gates, so
+the runtime asks for an additional Plan only when it adds ordering, ownership, or restart
+value. An existing Plan remains authoritative and is updated on material transitions.
+
 Remote delivery guidance is split along the same ownership boundary. The
 `github-delivery` Skill carries GitHub-, Actions-, artifact-, and release-specific
 method only when relevant. The runtime owns the generic safety contract: a Shell
@@ -204,6 +211,10 @@ typed Plan, Todo, Job, Goal, tool-result, and verification state:
 
 - a session that recorded no durable work finishes on its first answer;
 - terminal Plan state with no active Todo or Job may finish;
+- a completed answer from the built-in read-only `plan` Agent is a typed
+  planning handoff: its current Plan and Todos remain durable for Start Work
+  and do not trigger execution reconciliation; an active Job still prevents
+  handoff;
 - an active Goal owns the next durable continuation;
 - an ordinary session holding unreconciled durable work receives at most two
   reconciliation continuations;
@@ -633,6 +644,11 @@ identity is omitted. `skills.maxContextTokens` overrides the default character
 budget equal to two percent of a known context; an unknown context falls back
 to approximately 8,000 characters, while `skills.includeInstructions: false`
 disables prompt catalog injection.
+
+“Clearly matching” is specific to the trigger, not a synonym for “generally useful.”
+The generic Git and verification Skills exclude bounded disposable edits whose acceptance
+commands are already explicit; the runtime's own Git-safety and verification sections
+still apply without spending a provider step loading duplicate workflow instructions.
 
 Fully selected Skill bodies have a separate aggregate budget. By default it is
 ten percent of a known model context, with a 2,000-token floor and a

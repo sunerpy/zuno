@@ -2117,15 +2117,32 @@ fn resolve_learning_model(
 /// set while both looked correct.
 fn collaboration_mode_prompt(agent: &str) -> Option<&'static str> {
     match agent {
-        "plan" => Some(
-            "Collaboration mode: Plan. Inspect and reason in read-only mode. The durable plan and              work items are the authoritative result; prose alone does not change execution state.              Do not modify product files or start implementation. Ask only questions that materially              change the design. When the plan is decision-complete, tell the user to confirm Start              Work or run `/start-work`; never switch modes on the user's behalf.",
-        ),
-        "orchestrator" => Some(
-            "Collaboration mode: Orchestrated Work. Deliver the requested outcome and use              delegation only when specialization or safe parallelism provides clear value. Treat the              durable plan, goal, todos, jobs, and queued input as authoritative execution state. Keep              those records current, independently verify child results, and use `/start-plan` when a              new read-only design pass is required.",
-        ),
-        "build" => Some(
-            "Collaboration mode: Direct Work. Implement the requested outcome in this Agent              without delegation. Treat any durable plan, goal, todos, jobs, and queued input as              authoritative execution state. Keep those records current while work proceeds. Use              `/start-plan` when a new read-only design pass is required; do not represent a prose              checklist as durable plan state.",
-        ),
+        "plan" => Some(concat!(
+            "Collaboration mode: Plan. Inspect and reason in read-only mode. ",
+            "The durable plan and work items are the authoritative result; prose alone does not ",
+            "change execution state. Do not modify product files or start implementation. Ask ",
+            "only questions that materially change the design. When the plan is ",
+            "decision-complete, tell the user to confirm Start Work or run `/start-work`; never ",
+            "switch modes on the user's behalf."
+        )),
+        "orchestrator" => Some(concat!(
+            "Collaboration mode: Orchestrated Work. Deliver the requested outcome and use ",
+            "delegation only when specialization or safe parallelism provides clear value. Treat ",
+            "existing durable plan, goal, todos, jobs, and queued input as authoritative ",
+            "execution state, and update them when material state changes. Handle one bounded ",
+            "action directly without creating Plan or Todo ceremony; create durable structure ",
+            "when dependency, ownership, interruption, or delegation makes it useful. ",
+            "Independently verify child results, and use `/start-plan` when a new read-only design ",
+            "pass is required."
+        )),
+        "build" => Some(concat!(
+            "Collaboration mode: Direct Work. Implement the requested outcome in this Agent ",
+            "without delegation. Treat existing durable plan, goal, todos, jobs, and queued input ",
+            "as authoritative execution state, and update them when material state changes. Do ",
+            "not create Plan or Todo merely to mirror the inspect-edit-test phases of one bounded ",
+            "task. Use `/start-plan` when a new read-only design pass is required; do not ",
+            "represent a prose checklist as durable plan state."
+        )),
         _ => None,
     }
 }
@@ -7988,6 +8005,7 @@ impl TurnHost {
             active_todo,
             active_job,
             goal_active,
+            planning_handoff: self.agent == "plan",
         })
     }
 
