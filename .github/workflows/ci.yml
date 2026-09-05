@@ -283,6 +283,15 @@ jobs:
         with:
           tool: ripgrep
 
+      - name: Test Windows installer on PowerShell 5.1 and 7
+        shell: pwsh
+        run: |
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -NoLogo -NoProfile -File scripts/test-install.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoLogo -NoProfile -File scripts/test-install.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Verify runtime dependencies
         shell: bash
         run: rg --version

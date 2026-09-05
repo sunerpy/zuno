@@ -924,6 +924,29 @@ fn windows_arm64_is_installed_and_updated_from_the_native_msvc_asset() {
 }
 
 #[test]
+fn windows_installer_updates_only_the_user_path_without_setx() {
+    let installer =
+        std::fs::read_to_string(workspace_root().join("scripts/install.ps1")).expect("installer");
+    assert!(
+        !installer.to_ascii_lowercase().contains("setx"),
+        "the Windows installer must not use setx because it can truncate PATH and \
+         expands the current process's merged environment"
+    );
+    for required in [
+        "[Environment]::GetEnvironmentVariable(",
+        "[Environment]::SetEnvironmentVariable(",
+        "[EnvironmentVariableTarget]::User",
+        "$UpdatedUserPath = Add-PathEntry $UserPath $InstallDir",
+        "$env:Path = Add-PathEntry $env:Path $InstallDir",
+    ] {
+        assert!(
+            installer.contains(required),
+            "the Windows installer is missing safe PATH behavior {required:?}"
+        );
+    }
+}
+
+#[test]
 fn each_candidate_target_smokes_before_upload() {
     let text = workflow("release-candidate.yml");
     let jobs = job_names(&text);

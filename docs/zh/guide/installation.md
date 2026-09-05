@@ -73,7 +73,10 @@ $env:ZUNO_INSTALL_DIR = Join-Path $HOME "bin"
 irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | iex
 ```
 
-目标目录不在 `PATH` 时，安装器会打印需要添加的值。修改用户 `PATH` 后请打开新终端。
+Windows 安装器会在目标目录的确切条目缺失时，将它安全地前置到用户 `PATH`，再单独
+更新当前 PowerShell 进程，因此安装后可以立即运行 `zuno --version`。它只读取持久化
+的用户值，保留 `%JAVA_HOME%\bin` 等引用，不调用 `setx`，也不会把当前进程合并后的
+系统与用户 `PATH` 复制回用户值。其他已经打开的终端仍需重新启动。
 
 ## 发布目标
 
