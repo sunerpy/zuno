@@ -32,6 +32,17 @@ use crate::discovery::{self, LocalServerRegistration};
 use crate::{AuthConfig, EventFanout, RequestBroker};
 
 pub type SessionMutationFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
+pub type SessionMemoryPolicyFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    zuno_types::SessionMemoryPolicyProjection,
+                    SessionMemoryPolicyMutationError,
+                >,
+            > + Send
+            + 'static,
+    >,
+>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionModelSelection {
@@ -75,6 +86,28 @@ pub struct SessionCompactExecution {
     pub automatic: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionMemoryPolicyExecution {
+    pub session_id: String,
+    pub directory: PathBuf,
+    pub agent: Option<String>,
+    pub model: Option<SessionModelSelection>,
+    pub use_memories: bool,
+    pub generation: zuno_types::SessionMemoryGeneration,
+    pub expected_revision: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SessionMemoryPolicyMutationError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    Internal(String),
+}
+
 pub trait SessionMutationExecutor: Send + Sync + std::fmt::Debug {
     fn prompt(
         &self,
@@ -97,6 +130,18 @@ pub trait SessionMutationExecutor: Send + Sync + std::fmt::Debug {
         guard: SessionRunGuard,
         events: TurnEventSender,
     ) -> SessionMutationFuture;
+
+    fn memory_policy(
+        &self,
+        _request: SessionMemoryPolicyExecution,
+        _guard: SessionRunGuard,
+    ) -> SessionMemoryPolicyFuture {
+        Box::pin(async {
+            Err(SessionMemoryPolicyMutationError::Internal(
+                "session memory-policy mutation is not implemented by this executor".to_owned(),
+            ))
+        })
+    }
 }
 
 /// Bind, middleware, and fan-out settings.

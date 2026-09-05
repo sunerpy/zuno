@@ -33,6 +33,22 @@ The implementation is split between two native crates and typed database stores:
 evaluation contract. SQLite stores durable records; no client receives a private
 learning loop.
 
+## Enablement and session ownership
+
+`learning.enabled` is the master switch. Under it, `learning.use` and
+`learning.generate` resolve independently:
+
+- use without generate retrieves existing Experience without starting an
+  extractor provider;
+- generate without use records new evidence without injecting it into foreground
+  prompts;
+- `post_turn.enabled` controls only automatic extraction;
+- a session's durable `/memories` policy can narrow both use and generation
+  without changing global configuration.
+
+Projection and review remain readable when generation is disabled. Cleanup,
+rejection, undo, and forgetting never require an extractor model.
+
 ## Fast path: record after a useful task
 
 A completed turn is eligible when it includes at least one of:
@@ -43,11 +59,26 @@ A completed turn is eligible when it includes at least one of:
 - an explicit user correction;
 - explicit positive or negative feedback.
 
-The runtime serializes the replayed durable turn and admits an extraction job
-before invoking the extractor. The unique identity is
+The runtime serializes the replayed durable turn, redacts the active credential
+and sensitive process-environment values, and admits an extraction job before
+invoking the extractor. The original user Message remains unchanged. The unique identity is
 `(session_id, source_message_id, extractor_version)`. Retrying admission, losing a
 worker lease, or restarting the process therefore returns to the same job and
 cannot create a second experience batch.
+
+Automatic jobs do not run in the foreground completion path. By default they
+become due after six idle hours; a host-owned worker polls every 60 seconds and
+claims at most two jobs per wake. Claiming and the idle decision share one SQLite
+write transaction. A newer session activity timestamp, queued/steering/promoted
+input, a process-local live-turn lease, or a disabled/excluded session policy
+prevents the claim without spending an attempt. Manual `/reflect` is made
+immediately due, but still respects the session generation policy.
+
+When `post_turn.disable_on_external_context` is true, Web and MCP tools mark
+their successful results with a durable typed metadata bit. A completed turn
+that consumed that context moves the session to `generation=excluded` and skips
+its queued automatic extraction. The classifier reads stored tool metadata, not
+tool narration or a mutable registry guess.
 
 The extractor has no tools, network capability, filesystem capability, or
 foreground-session identity. Its request and terminal outcome are durable
@@ -254,7 +285,8 @@ disabled or the extractor model cannot start.
   updates. `session/delete` requires an explicit
   `cleanupDerivedExperiences` boolean.
 
-`/memory` remains the resident Memory review surface. `/learn` owns evidence,
+`/memory` remains the resident Memory review surface. `/memories` controls use
+and generation for the current session. `/learn` owns evidence,
 patterns, feedback, Skill review, evaluation, apply, and undo.
 
 ## Storage and migration
@@ -275,6 +307,12 @@ rebuilt or copied. Historical `memory_reflection_delivery` and
 `memory_reflection_job` rows remain readable as legacy history, but the runtime
 does not admit new work through that retired reflection pipeline.
 
+Schema format 9 adds `session_memory_policy`. The format-8 to format-9 migration
+creates an empty sidecar table without rewriting sessions or learning records.
+New sessions freeze their configuration default when materialized; child
+sessions inherit their parent's effective policy in the same transaction that
+admits the child job.
+
 Destructive transcript retention explicitly removes session-owned feedback and
 learning jobs. Experience, Memory, patterns, evaluations, and Skill candidates
 are project learning and survive transcript retention; nullable session/message
@@ -288,8 +326,16 @@ Learning is off by default and requires an explicit extractor model:
 {
   "learning": {
     "enabled": true,
+    "use": true,
+    "generate": true,
     "extractor_model": "provider/model",
-    "post_turn": { "enabled": true },
+    "post_turn": {
+      "enabled": true,
+      "idle_delay_ms": 21600000,
+      "poll_interval_ms": 60000,
+      "max_jobs_per_wake": 2,
+      "disable_on_external_context": false
+    },
     "aggregation": {
       "interval_ms": 86400000,
       "min_new_records": 3
@@ -311,7 +357,8 @@ Learning is off by default and requires an explicit extractor model:
 }
 ```
 
-The retired `memory.reflection` and `memory.nudge_interval` fields have no
+`use` and `generate` both default to true only after the `enabled` master switch
+is true. The retired `memory.reflection` and `memory.nudge_interval` fields have no
 compatibility aliases and are rejected as unknown keys. `small_model` remains an
 independent internal-model route; learning uses the explicit
 `learning.extractor_model`.

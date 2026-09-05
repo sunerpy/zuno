@@ -187,6 +187,7 @@ cannot shadow a runtime control.
 | `/new` | Open an empty conversation shell |
 | `/subagent` | Inspect seat and node progress |
 | `/memory` | Review, edit, approve, reject, remove, and undo durable memory changes |
+| `/memories` | Configure memory use and learning generation for the current session |
 | `/learn [action]` | Inspect or manage Experience, feedback, patterns, and reviewed Skill candidates |
 | `/reflect [turn\|session]` | Run the durable no-tools learning extractor manually |
 

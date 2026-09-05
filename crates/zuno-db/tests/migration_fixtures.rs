@@ -75,8 +75,20 @@ const FORMAT_SEVEN: Fixture = Fixture {
     table_count: 38,
 };
 
+const FORMAT_EIGHT_SQL: &str = concat!(
+    include_str!("fixtures/format-7.sql"),
+    include_str!("fixtures/format-8.sql")
+);
+
+const FORMAT_EIGHT: Fixture = Fixture {
+    format: 8,
+    release: "v0.10.5",
+    sql: FORMAT_EIGHT_SQL,
+    table_count: 39,
+};
+
 /// Every table `sqlite_master` lists once the current schema is in place.
-const CURRENT_TABLE_COUNT: usize = 39;
+const CURRENT_TABLE_COUNT: usize = 40;
 
 /// One additive upgrade step, described by what it must leave behind and by the
 /// first statement `schema.rs` runs for it (used to prove, from the statement
@@ -149,20 +161,29 @@ const VERIFICATION: Step = Step {
     columns: &[],
 };
 
+const MEMORY_POLICY: Step = Step {
+    name: "session memory policy (format 8 -> 9)",
+    first_statement: "CREATE TABLE `session_memory_policy`",
+    tables: &["session_memory_policy"],
+    indexes: &["session_memory_policy_generation_updated_idx"],
+    columns: &[],
+};
+
 /// The index created by the final DDL statement of every upgrade path. Index names
 /// are database-global, so an unrelated index that already owns this name makes
 /// exactly that statement fail after everything before it ran inside the same
 /// transaction. SQLite rejects the duplicate while *preparing* the statement, so
 /// it never reaches `SQLITE_TRACE_STMT`; the statement immediately before it is
 /// therefore the last one the trace can show before the rollback.
-const TRAP_INDEX: &str = "verification_receipt_session_time_idx";
-const STATEMENT_BEFORE_TRAP: &str = "CREATE UNIQUE INDEX `verification_receipt_call_idx`";
+const TRAP_INDEX: &str = "session_memory_policy_generation_updated_idx";
+const STATEMENT_BEFORE_TRAP: &str = "CREATE TABLE `session_memory_policy`";
 
 fn steps_after(format: u32) -> &'static [&'static Step] {
     match format {
-        5 => &[&LEARNING, &PLAN_STACK, &VERIFICATION],
-        6 => &[&PLAN_STACK, &VERIFICATION],
-        7 => &[&VERIFICATION],
+        5 => &[&LEARNING, &PLAN_STACK, &VERIFICATION, &MEMORY_POLICY],
+        6 => &[&PLAN_STACK, &VERIFICATION, &MEMORY_POLICY],
+        7 => &[&VERIFICATION, &MEMORY_POLICY],
+        8 => &[&MEMORY_POLICY],
         other => panic!("no fixture describes format {other}"),
     }
 }
@@ -207,6 +228,11 @@ const LEARNING_REPRESENTATIVE_VALUES: &[(&str, &str)] = &[
         "Exactly the right level of caution.",
     ),
 ];
+
+const VERIFICATION_REPRESENTATIVE_VALUES: &[(&str, &str)] = &[(
+    "SELECT summary FROM verification_receipt WHERE id = 'vrc_fixture_0001'",
+    "The format-8 verification receipt survives.",
+)];
 
 // ---------------------------------------------------------------------------
 // Structural inventory: what a database *is*, independent of how its DDL was spelled.
@@ -648,6 +674,9 @@ fn assert_fixture_is_the_old_format(fixture: &Fixture) {
     if fixture.format >= 6 {
         assert_literal_values(&connection, LEARNING_REPRESENTATIVE_VALUES, &context);
     }
+    if fixture.format >= 8 {
+        assert_literal_values(&connection, VERIFICATION_REPRESENTATIVE_VALUES, &context);
+    }
     // Sanity: the old file is not already the current shape in disguise.
     assert_ne!(
         inventory,
@@ -669,6 +698,11 @@ fn format_six_fixture_is_the_v0_2_2_database() {
 #[test]
 fn format_seven_fixture_is_the_v0_6_7_database() {
     assert_fixture_is_the_old_format(&FORMAT_SEVEN);
+}
+
+#[test]
+fn format_eight_fixture_is_the_v0_10_5_database() {
+    assert_fixture_is_the_old_format(&FORMAT_EIGHT);
 }
 
 // ---------------------------------------------------------------------------
@@ -696,6 +730,9 @@ fn assert_upgrade_preserves_rows_and_reaches_the_current_structure(fixture: &Fix
     assert_literal_values(&connection, REPRESENTATIVE_VALUES, &context);
     if fixture.format >= 6 {
         assert_literal_values(&connection, LEARNING_REPRESENTATIVE_VALUES, &context);
+    }
+    if fixture.format >= 8 {
+        assert_literal_values(&connection, VERIFICATION_REPRESENTATIVE_VALUES, &context);
     }
 
     // (d) Exactly the objects the remaining steps add are new; nothing was lost.
@@ -796,6 +833,11 @@ fn format_six_fixture_upgrades_to_the_current_structure_and_keeps_every_row() {
 #[test]
 fn format_seven_fixture_upgrades_to_the_current_structure_and_keeps_every_row() {
     assert_upgrade_preserves_rows_and_reaches_the_current_structure(&FORMAT_SEVEN);
+}
+
+#[test]
+fn format_eight_fixture_upgrades_to_the_current_structure_and_keeps_every_row() {
+    assert_upgrade_preserves_rows_and_reaches_the_current_structure(&FORMAT_EIGHT);
 }
 
 /// The one structural divergence between an upgraded database and a fresh one, and
@@ -972,7 +1014,7 @@ fn assert_failed_upgrade_leaves_the_database_untouched(fixture: &Fixture) {
         panic!("{context}: the upgrade never reached the trapped step: {traced:#?}")
     });
     assert!(
-        reached_trap > previous,
+        reached_trap >= previous,
         "{context}: the trapped step ran before an earlier step; trace = {traced:#?}"
     );
     let rollback = traced
@@ -1053,4 +1095,9 @@ fn a_failed_format_six_upgrade_leaves_the_v0_2_2_database_untouched() {
 #[test]
 fn a_failed_format_seven_upgrade_leaves_the_v0_6_7_database_untouched() {
     assert_failed_upgrade_leaves_the_database_untouched(&FORMAT_SEVEN);
+}
+
+#[test]
+fn a_failed_format_eight_upgrade_leaves_the_v0_10_5_database_untouched() {
+    assert_failed_upgrade_leaves_the_database_untouched(&FORMAT_EIGHT);
 }

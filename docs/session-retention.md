@@ -143,7 +143,7 @@ Generated from `zuno_db::prune::DELETE_ORDER`. The order is pinned by
 `crates/zuno-db/tests/prune.rs::prune_delete_order_and_true_related_table_count_are_pinned`,
 because the order is what keeps foreign keys satisfied mid-transaction.
 
-**20 tables**, in this order:
+**21 tables**, in this order:
 
 <!-- generated:BEGIN prune-tables -->
 | order | table |
@@ -164,10 +164,11 @@ because the order is what keeps foreign keys satisfied mid-transaction.
 | 14 | `part` |
 | 15 | `message` |
 | 16 | `session_share` |
-| 17 | `session` |
-| 18 | `event_sequence` |
-| 19 | `event` |
-| 20 | `verification_receipt` |
+| 17 | `session_memory_policy` |
+| 18 | `session` |
+| 19 | `event_sequence` |
+| 20 | `event` |
+| 21 | `verification_receipt` |
 <!-- generated:END prune-tables -->
 
 That table is the ordered part of the delete. After it, the same transaction sweeps every

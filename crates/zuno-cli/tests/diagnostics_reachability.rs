@@ -349,7 +349,8 @@ fn every_place_that_admits_a_turn_also_counts_the_session() {
             "compact_session",
             "continue_prompt_driver",
             "prompt",
-            "resume_pending_inputs"
+            "resume_pending_inputs",
+            "update_memory_policy"
         ],
         "every new server run admission must declare which session-count lifetime owns it"
     );
@@ -391,6 +392,14 @@ fn every_place_that_admits_a_turn_also_counts_the_session() {
             "zuno_observability::memory::SessionCount::enter()"
         )),
         "`compact_session` admits a live turn without counting the session"
+    );
+
+    let memory_policy = function("update_memory_policy");
+    assert!(
+        compact(memory_policy).contains(&compact(
+            "zuno_observability::memory::SessionCount::enter()"
+        )),
+        "`update_memory_policy` admits a live host without counting the session"
     );
 }
 

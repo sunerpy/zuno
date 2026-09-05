@@ -78,6 +78,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn learning_schema_publishes_independent_use_generation_and_worker_controls() {
+        let schema = document();
+        let learning = &schema["$defs"]["LearningConfig"];
+        let properties = learning["properties"]
+            .as_object()
+            .expect("LearningConfig properties");
+        for field in ["enabled", "use", "generate", "extractor_model", "post_turn"] {
+            assert!(
+                properties.contains_key(field),
+                "LearningConfig omitted `{field}`"
+            );
+        }
+        assert_eq!(learning["additionalProperties"], Value::Bool(false));
+        assert!(
+            properties["use"]["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("Defaults to true")),
+            "learning.use must publish its enabled default"
+        );
+        assert!(
+            properties["generate"]["description"]
+                .as_str()
+                .is_some_and(|text| {
+                    text.contains("Defaults to true") && text.contains("extractor model")
+                }),
+            "learning.generate must publish its default and extractor contract"
+        );
+
+        let post_turn = &schema["$defs"]["LearningPostTurnConfig"];
+        let post_turn_properties = post_turn["properties"]
+            .as_object()
+            .expect("LearningPostTurnConfig properties");
+        for (field, default) in [
+            ("idle_delay_ms", "21600000"),
+            ("poll_interval_ms", "60000"),
+            ("max_jobs_per_wake", "Defaults to 2"),
+            ("disable_on_external_context", "Defaults to false"),
+        ] {
+            assert!(
+                post_turn_properties[field]["description"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(default)),
+                "learning.post_turn.{field} must publish default {default}"
+            );
+        }
+        assert_eq!(post_turn["additionalProperties"], Value::Bool(false));
+    }
+
     /// The published schema and the parser's whitelist are two hand-maintained
     /// lists of the same thing. [`crate::schema::KNOWN_TOP_LEVEL_KEYS`] is what
     /// actually rejects a key at parse time, so a property that the schema

@@ -48,6 +48,8 @@ pub const OPERATIONS: &[(&str, &str)] = &[
     ("/api/session/active", "get"),
     ("/api/session/{sessionID}", "get"),
     ("/api/session/{sessionID}/learning", "get"),
+    ("/api/session/{sessionID}/memory-policy", "get"),
+    ("/api/session/{sessionID}/memory-policy", "put"),
     ("/api/session/{sessionID}/event", "get"),
     ("/api/session/{sessionID}/agent", "post"),
     ("/api/session/{sessionID}/model", "post"),
@@ -278,6 +280,12 @@ pub fn document() -> Value {
                 "SessionListResponse": schemars::schema_for!(super::session::SessionListResponse),
                 "SessionActive": schemars::schema_for!(super::session::SessionActive),
                 "SessionActiveResponse": schemars::schema_for!(super::session::SessionActiveResponse),
+                "MemoryPolicyResponse": schemars::schema_for!(
+                    super::Data<super::session::MemoryPolicyBody>
+                ),
+                "MemoryPolicyUpdate": schemars::schema_for!(
+                    super::session::UpdateMemoryPolicyBody
+                ),
                 "SessionPruneMutation": schemars::schema_for!(super::maintenance::MutationBody),
                 "PermissionRequestListResponse": schemars::schema_for!(
                     super::request::LocationResponse<crate::PermissionRequest>
@@ -314,6 +322,18 @@ fn bind_existing_body_schemas(operation: &mut Value, method: &str, path: &str) {
         }
         ("get", "/api/session/active") => bind_response(operation, "SessionActiveResponse"),
         ("get", "/api/session/{sessionID}") => bind_response(operation, "SessionResponse"),
+        ("get", "/api/session/{sessionID}/memory-policy") => {
+            bind_response(operation, "MemoryPolicyResponse");
+        }
+        ("put", "/api/session/{sessionID}/memory-policy") => {
+            bind_request(operation, "MemoryPolicyUpdate");
+            bind_response(operation, "MemoryPolicyResponse");
+            operation["responses"]["400"] = json!({"description": "The requested policy exceeds the active configuration or is malformed"});
+            operation["responses"]["404"] = json!({"description": "The session does not exist"});
+            operation["responses"]["409"] = json!({
+                "description": "The expectedRevision is stale, the session is excluded, or a live turn owns the session"
+            });
+        }
         ("get", "/api/permission/request") => {
             bind_response(operation, "PermissionRequestListResponse");
         }
@@ -351,6 +371,9 @@ fn operation_description(method: &str, path: &str) -> Option<&'static str> {
         }
         ("post", "/api/session/{sessionID}/question/{requestID}/reply") => Some(
             "Atomically settles one durable question and admits the model-visible answer to the session inbox.",
+        ),
+        ("put", "/api/session/{sessionID}/memory-policy") => Some(
+            "Updates useMemories and enabled|disabled generation through the session's active TurnHost. expectedRevision is a compare-and-set guard; excluded is host-owned and cannot be requested.",
         ),
         _ => None,
     }

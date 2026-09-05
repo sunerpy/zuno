@@ -5,7 +5,7 @@ use rusqlite::Transaction;
 use zuno_error::DbError;
 
 /// Number of application tables created by the current schema's single `up`.
-pub const TABLE_COUNT: usize = 38;
+pub const TABLE_COUNT: usize = 39;
 
 const CORE_SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -693,6 +693,23 @@ CREATE INDEX `verification_receipt_session_time_idx`
   ON `verification_receipt` (`session_id`,`time_created`,`id`);
 "#;
 
+const MEMORY_POLICY_SCHEMA_SQL: &str = r#"
+CREATE TABLE `session_memory_policy` (
+  `session_id` text PRIMARY KEY,
+  `use_memories` integer NOT NULL CHECK (`use_memories` IN (0,1)),
+  `generation` text NOT NULL CHECK (`generation` IN ('enabled','disabled','excluded')),
+  `reason` text NOT NULL CHECK (length(trim(`reason`)) > 0),
+  `source` text NOT NULL CHECK (length(trim(`source`)) > 0),
+  `revision` integer NOT NULL CHECK (`revision` >= 1),
+  `time_created` integer NOT NULL CHECK (`time_created` >= 0),
+  `time_updated` integer NOT NULL CHECK (`time_updated` >= `time_created`),
+  CONSTRAINT `fk_session_memory_policy_session_id_session_id_fk`
+    FOREIGN KEY (`session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE
+);
+CREATE INDEX `session_memory_policy_generation_updated_idx`
+  ON `session_memory_policy` (`generation`,`time_updated`,`session_id`);
+"#;
+
 /// Every table name the current schema's DDL declares, in declaration order.
 ///
 /// Read out of the DDL instead of restated as a list, so a table is enrolled everywhere that
@@ -709,6 +726,7 @@ pub(crate) fn declared_tables() -> Vec<&'static str> {
         CORE_SCHEMA_SQL,
         LEARNING_SCHEMA_SQL,
         VERIFICATION_SCHEMA_SQL,
+        MEMORY_POLICY_SCHEMA_SQL,
     ]
     .into_iter()
     .flat_map(declared_tables_in)
@@ -737,7 +755,8 @@ pub fn up(transaction: &Transaction<'_>) -> Result<(), DbError> {
         .execute_batch(CORE_SCHEMA_SQL)
         .map_err(migration::map_error)?;
     up_learning(transaction)?;
-    up_verification(transaction)
+    up_verification(transaction)?;
+    up_memory_policy(transaction)
 }
 
 /// Add the learning-flywheel tables to a format-5 database.
@@ -756,6 +775,13 @@ pub(crate) fn up_learning(transaction: &Transaction<'_>) -> Result<(), DbError> 
 pub(crate) fn up_verification(transaction: &Transaction<'_>) -> Result<(), DbError> {
     transaction
         .execute_batch(VERIFICATION_SCHEMA_SQL)
+        .map_err(migration::map_error)
+}
+
+/// Add the revisioned per-session memory policy to a format-8 database.
+pub(crate) fn up_memory_policy(transaction: &Transaction<'_>) -> Result<(), DbError> {
+    transaction
+        .execute_batch(MEMORY_POLICY_SCHEMA_SQL)
         .map_err(migration::map_error)
 }
 

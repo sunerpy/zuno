@@ -6,6 +6,9 @@ use zuno_db::job::{
     AgentJobStore, JobReconciliation, JobSettlement, JobStatus, JobSubject, JobWorkContext,
     NewAgentJob, ReportDelivery,
 };
+use zuno_db::session_memory_policy::{
+    SessionMemoryPolicyStore, SessionMemoryPolicyUpdate, SessionMemoryPolicyWrite,
+};
 use zuno_db::{Pool, migration, session};
 use zuno_orchestration::AttemptSnapshot;
 use zuno_paths::DbLocation;
@@ -813,6 +816,21 @@ fn fresh_child_and_logical_job_admission_are_one_transaction() {
     const SPECULATIVE_CHILD: &str = "ses_speculative_child";
     let pool = initialized(&DbLocation::Memory);
     let store = AgentJobStore::new(Arc::clone(&pool));
+    let policy_store = SessionMemoryPolicyStore::new(Arc::clone(&pool));
+    assert!(matches!(
+        policy_store
+            .set(SessionMemoryPolicyUpdate {
+                session_id: PARENT.to_owned(),
+                use_memories: false,
+                generation: zuno_types::SessionMemoryGeneration::Disabled,
+                reason: "parent policy".to_owned(),
+                source: "test".to_owned(),
+                expected_revision: 0,
+                time_updated: 5,
+            })
+            .expect("set parent policy"),
+        SessionMemoryPolicyWrite::Applied(_)
+    ));
     store
         .create_child_if_reconciled(
             running("job_existing", ReportDelivery::Quiet).with_logical_key("logical-review"),
@@ -841,6 +859,7 @@ fn fresh_child_and_logical_job_admission_are_one_transaction() {
             )
             .with_logical_key("logical-review")
             .with_evidence_start_rowid(17),
+            zuno_types::SessionMemoryPolicyProjection::default(),
         )
         .expect_err("the existing logical task blocks the fresh child and job");
     assert!(
@@ -881,6 +900,7 @@ fn fresh_child_and_logical_job_admission_are_one_transaction() {
             )
             .with_logical_key("logical-review")
             .with_evidence_start_rowid(17),
+            zuno_types::SessionMemoryPolicyProjection::default(),
         )
         .expect("reconciled logical task admits the child and job atomically");
     assert_eq!(admitted.evidence_start_rowid, 17);
@@ -891,6 +911,16 @@ fn fresh_child_and_logical_job_admission_are_one_transaction() {
             .as_deref(),
         Some(PARENT)
     );
+    let child_policy = policy_store
+        .get(SPECULATIVE_CHILD)
+        .expect("read child policy")
+        .expect("child policy is frozen");
+    assert!(!child_policy.use_memories);
+    assert_eq!(
+        child_policy.generation,
+        zuno_types::SessionMemoryGeneration::Disabled
+    );
+    assert_eq!(child_policy.source.as_deref(), Some("parent_session"));
 }
 
 #[test]

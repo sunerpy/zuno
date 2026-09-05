@@ -179,6 +179,7 @@ async fn an_html_page_converts_to_the_markdown_snapshot() {
     );
     assert_eq!(output.metadata["format"], "markdown");
     assert_eq!(output.metadata["url"], url);
+    assert!(output.contains_external_context());
 
     let requests = server.received_requests().await.expect("recorded requests");
     let accept = requests[0].headers[reqwest::header::ACCEPT.as_str()]
@@ -326,6 +327,7 @@ async fn an_image_comes_back_as_an_attachment_not_as_decoded_bytes() {
     .expect("image fetch");
 
     assert_eq!(output.output, "Image fetched successfully");
+    assert!(output.contains_external_context());
     assert_eq!(output.attachments.len(), 1);
     assert_eq!(output.attachments[0].mime, "image/png");
     assert_eq!(

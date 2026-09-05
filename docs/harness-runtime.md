@@ -953,6 +953,14 @@ it never edits the resident file directly. Candidates retain scope, action,
 reason, confidence, source session/message, timestamps, diagnostics, and exact
 before/after snapshots.
 
+Each durable session also owns a revisioned `session_memory_policy`.
+`use_memories=false` removes resident Memory and retrieved Experience sections
+from later prompt assemblies without deleting either store.
+`generation=disabled` stops new learning; `generation=excluded` is the
+fail-closed external-context state. The TUI exposes these controls through
+`/memories`, while `/memory` remains the reviewed mutation surface. Policy
+changes and their audit events commit together.
+
 Goal Markdown projections and promoted Resident Memory files share
 `zuno-atomic-file` for visibility-atomic replacement. The provider writes a
 completed sibling and uses `rename` on Unix or `ReplaceFileW` over an existing
@@ -979,7 +987,10 @@ the runtime compares the resident file with both stored snapshots and marks the
 observed result; it never replays the write or undo. Any third state becomes
 `uncertain` and requires user inspection.
 
-User learning is a separate native subsystem. A completed turn with tools,
+User learning is a separate native subsystem. `learning.use` and
+`learning.generate` are independent below the `learning.enabled` ceiling, so
+existing Experience can remain available when no extractor model is configured.
+A completed turn with tools,
 artifacts, recovery, correction, or explicit feedback admits an idempotent
 `learning_job` keyed by `(session, message, extractor_version)`. The dedicated
 `learning.extractor_model` receives the replayed durable transcript and a
@@ -999,6 +1010,18 @@ independent sessions. Global patterns require two projects and become a
 project-specific companion only after explicit promotion. Rejected evidence is
 suppressed until its digest changes.
 
+Automatic extraction itself is background idle work. Its default six-hour
+deadline, 60-second poll, and two-job wake cap are configurable under
+`learning.post_turn`. The claim transaction checks session activity, pending
+input, the process-local live-turn registry, and session policy before spending
+an attempt. Web and MCP results carry a durable external-context marker; when
+configured, consuming one excludes the session from automatic generation.
+Transcript copies are scrubbed at secret-value granularity before they enter a
+learning job or extraction event, while the original durable Message and
+non-secret evidence are preserved. Retryable extractor failures return the same
+durable job to a bounded exponential-backoff deadline; permanent failures settle
+it instead.
+
 Retrieved experience enters the stable `learning.experiences` prompt section.
 The post-hook prompt receipt stores each source identity, content, and digest, so
 the provider request is reconstructable without consulting current projections.
@@ -1011,7 +1034,8 @@ evaluation does not apply the file. Apply is a separate CAS-protected effect;
 source drift becomes `stale`, and restart reconciliation classifies before/after
 snapshots without replaying an uncertain write.
 
-`/memory` remains the resident Memory review surface. `/learn` and `/reflect`
+`/memory` remains the resident Memory review surface. `/memories` controls
+session use and generation. `/learn` and `/reflect`
 manage experience, feedback, patterns, Skill candidates, evaluation, and
 reviewed revocation. See [resident memory](design/memory-learning.md) and the
 [user learning flywheel](design/user-learning-flywheel.md).

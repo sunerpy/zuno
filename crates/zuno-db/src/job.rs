@@ -590,6 +590,7 @@ impl AgentJobStore {
         &self,
         child: session::SessionCreate,
         job: NewAgentJob,
+        parent_memory_policy_default: zuno_types::SessionMemoryPolicyProjection,
     ) -> Result<AgentJob, DbError> {
         validate_new_job(&job)?;
         let JobSubject::ChildSession { session_id } = &job.subject else {
@@ -613,6 +614,13 @@ impl AgentJobStore {
         self.pool.transaction(|transaction| {
             ensure_child_reconciled_in(transaction, &job, &child_session_id)?;
             session::create(transaction, &child)?;
+            crate::session_memory_policy::inherit_in(
+                transaction,
+                &job.parent_session_id,
+                &child_session_id,
+                parent_memory_policy_default,
+                job.time_created,
+            )?;
             create_in(transaction, job)
         })
     }

@@ -23,6 +23,33 @@ retrieval, pattern mining, and Skill evolution.
 Neither foreground models nor the learning extractor receive direct write access
 to resident files.
 
+## Session policy
+
+The global `memory` and `learning` configuration remains the capability ceiling.
+Each durable session also freezes a revisioned policy:
+
+- `use_memories` controls both resident `memory.global` / `memory.project`
+  sections and automatic `learning.experiences` retrieval;
+- `generation=enabled` permits explicit and automatic learning;
+- `generation=disabled` stops new generation and skips queued automatic
+  extraction while retaining existing Memory and Experience;
+- `generation=excluded` is the fail-closed state used when configured external
+  context makes the session ineligible. It cannot be changed back to enabled in
+  the same session.
+
+The policy lives in `session_memory_policy`, not opaque session metadata. New
+sessions freeze the current configuration default in the same transaction that
+materializes the session. Later changes use revision compare-and-set and append
+`session.memory.policy.changed` in the same transaction.
+
+`/memories` edits this policy for the current session. `/memory` remains the
+candidate and resident-entry review surface. Disabling use changes subsequent
+prompt assembly only; it never deletes resident files, Experience, or audit
+records. The Server `PUT /api/session/{sessionID}/memory-policy` route goes
+through a TurnHost-owned mutation while holding the session run lease; it cannot
+persist an enabled value when the resolved Memory or extractor capability is
+absent.
+
 ## Candidate record
 
 A `MemoryCandidate` records:

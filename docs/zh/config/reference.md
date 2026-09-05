@@ -551,6 +551,36 @@ Shell 门禁会穿过命令行前面的包装程序来阅读它——`sudo`、`d
 
 `memory` 配置持久候选、反思、评审、提升与撤销。记忆写入是提议而非直接生效：候选进入待评审状态，由人决定是否提升为常驻记忆。
 
+`learning` 将“使用已有 Experience”与“生成新学习”分开控制：
+
+```json
+{
+  "learning": {
+    "enabled": true,
+    "use": true,
+    "generate": true,
+    "extractor_model": "provider/model",
+    "post_turn": {
+      "enabled": true,
+      "idle_delay_ms": 21600000,
+      "poll_interval_ms": 60000,
+      "max_jobs_per_wake": 2,
+      "disable_on_external_context": false
+    }
+  }
+}
+```
+
+- `enabled` 默认为 `false`，并且是总上限；为 `false` 时，有效的 `use`、`generate` 都是 `false`。
+- `enabled: true` 时，未填写的 `use` 与 `generate` 均默认为 `true`。
+- `use: true, generate: false` 可以只读使用既有 Experience，不需要配置 `extractor_model`。
+- 只有有效 `generate` 为 `true` 时才要求非空 `extractor_model`。
+- `post_turn.enabled` 只控制符合条件任务完成后的自动抽取，不控制既有 Experience 的读取。
+- `post_turn.idle_delay_ms` 默认 `21600000`（六小时），可设为 `0` 表示自动任务立即具备运行资格。
+- `post_turn.poll_interval_ms` 默认 `60000` 且必须大于零；`post_turn.max_jobs_per_wake` 默认 `2` 且必须大于零。
+- `post_turn.disable_on_external_context` 默认 `false`；为 `true` 时，带外部上下文标记的完成回合会把该会话置为 `generation=excluded`，跳过已排队的自动抽取；只有新会话才能重新启用显式或自动生成。
+- 自动任务领取还会在同一 SQLite 事务中检查会话活动时间、待处理输入、当前进程的活跃回合以及会话策略；不符合条件时不会消耗 attempt。可重试的抽取器错误进入有界指数退避，不会立即永久失败。
+
 反思写入的经验与记忆都属于不可信的模型输出，写入端与渲染端的边界是两套不同的规则。写入时只拒绝无法还原为模型可读文本的**编码**：Unicode Tags 区（`U+E0000..=U+E007F`）、变体选择符补充区（`U+E0100..=U+E01EF`），以及除制表符、换行、回车之外的 C0/C1 控制字符。用 Tags 区改写的载荷不含 ASCII 的 `<`，任何文本扫描都看不见它。除此之外一律照常保存：变体选择符、软连字符、方向控制符，以及只是提到 `~/.ssh/config`、`AGENTS.md` 或引用了一次注入企图的普通工程叙述。记录攻击本身正是这个子系统存在的意义。
 
 拒绝以条目为单位，绝不牵连整批。被拒条目跳过，同一次抽取中干净的兄弟条目按抽取器原本的序号照常写入，任务以 `completed` 结束，原因持久化在任务 `result` JSON 的 `refusedItems` 中：每次丢弃一条记录，包含经验序号、责任字段（`experiences.summary`、`memories.content`、`memories.old_text`、`memories.reason`、`memories.experience_ordinal` 或 `memories.proposal`）与详情。只有使整个任务无法使用的失败（项目、会话或来源消息不存在，`memories[]` 指向抽取器列表之外，置信度不是概率）才会把任务判为 `failed`；学习任务最多尝试三次。常驻记忆仍保有自己的防线：由经验抽出的候选走正常评审路径，注入与外泄模式扫描仍作用于将写入常驻文件的确切文本，命中只否决这一个候选（记为 `memories.proposal`），来源经验照常保存。

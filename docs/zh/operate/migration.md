@@ -1,8 +1,8 @@
 # Zuno 数据库生命周期
 
-Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 8。空数据库直接创建为当前
+Zuno 管理自己的配置根目录和数据根目录。当前数据库格式为 9。空数据库直接创建为当前
 格式；受支持的旧格式通过受保护的前向迁移升级。format 5 是第一个受支持的历史格式，
-format 5、format 6 与 format 7 都会原地升级到 format 8，不需要重建数据库。
+format 5、format 6、format 7 与 format 8 都会原地升级到 format 9，不需要重建数据库。
 
 ## Channel 数据库
 
@@ -48,14 +48,15 @@ zuno session list
 
 数据库打开流程识别以下状态：
 
-1. **空数据库。** 完整的 format-8 schema 与唯一 `zuno_schema` marker 被原子创建。
-2. **Format 8。** 在执行应用查询前校验 marker 与当前格式要求的表。
-3. **Format 7。** 原地增加 `verification_receipt` 账本与其索引。
-4. **Format 6。** 原地增加 Plan 栈字段、`work_plan_archive` 与 `verification_receipt`
-   账本。
-5. **Format 5。** 在一个事务中增加 learning schema、Plan 栈 schema 与
-   `verification_receipt` 账本，并升级到 format 8。
-6. **其他任何状态。** 不受支持的更旧格式、未来格式、缺少 marker，或 marker 与必需
+1. **空数据库。** 完整的 format-9 schema 与唯一 `zuno_schema` marker 被原子创建。
+2. **Format 9。** 在执行应用查询前校验 marker 与当前格式要求的表。
+3. **Format 8。** 原地增加带 revision 的 `session_memory_policy` 表及其索引。
+4. **Format 7。** 原地增加 `verification_receipt` 账本，再增加 session memory policy。
+5. **Format 6。** 原地增加 Plan 栈字段、`work_plan_archive`、`verification_receipt`
+   账本与 session memory policy。
+6. **Format 5。** 在一个事务中增加 learning schema、Plan 栈 schema、
+   `verification_receipt` 账本与 session memory policy，并升级到 format 9。
+7. **其他任何状态。** 不受支持的更旧格式、未来格式、缺少 marker，或 marker 与必需
    表不匹配，都会失败关闭且不修改文件。
 
 两个进程同时打开或升级同一个数据库时，都按拿到 SQLite 写锁之前看到的 format 做决定。
@@ -63,22 +64,43 @@ zuno session list
 总共最多尝试四次。不支持的 format 仍然报告为 schema 不匹配；如果 format 在打开过程中
 持续变化，则以 `zuno_schema` marker 上的冲突失败关闭。两种路径都不会写库。
 
-### Format 5、6 或 7 到 format 8
+### Format 5、6、7 或 8 到 format 9
 
 受支持的迁移使用一个 SQLite `BEGIN IMMEDIATE` 事务：
 
-1. 重新读取表清单，并要求 marker 恰好为 format 5、6 或 7。
+1. 重新读取表清单，并要求 marker 恰好为 format 5、6、7 或 8。
 2. 在任何变更前要求历史 `session` 与 `work_plan` 表存在。
 3. 从 format 5 出发时，创建全部 format-6 learning 表和索引。
 4. 从 format 5 或 6 出发时，增加可空的 `parent_plan_id`、默认值为 0 的 `stack_depth`
    与 `work_plan_archive`，不重写活跃 Plan 行。
 5. 创建 `verification_receipt` 账本；它初始为空，不重写任何已有行。
-6. 通过带旧值条件的更新把 singleton marker 从 5、6 或 7 改为 8。
-7. 只有全部 schema 操作和 marker 更新成功后才提交。
+6. 创建 `session_memory_policy`；它初始为空，因此已有会话继续采用调用方给出的默认值。
+7. 通过带旧值条件的更新把 singleton marker 从 5、6、7 或 8 改为 9。
+8. 只有全部 schema 操作和 marker 更新成功后才提交。
 
 任何失败都会回滚整个事务。迁移不会重写已有的 `session`、`message`、
-`memory_candidate` 或 `work_plan` 值。测试构造精确的 format-5、format-6 与 format-7
-形态，比较迁移前后的代表性行，再查询新增 learning、Plan archive 与 verification 表。
+`memory_candidate`、`learning_job`、`verification_receipt` 或 `work_plan` 值。测试使用
+精确的 format-5、format-6、format-7 与 v0.10.5 format-8 fixture，比较迁移前后的
+全部旧行，再查询新增 policy 表。
+
+### Per-session memory policy
+
+`session_memory_policy` 是与 session 一对一的 sidecar，绝不写入不透明的
+`session.metadata`。
+
+- `use_memories` 控制该会话是否可以使用 resident 或 retrieved memory。
+- `generation` 只能是 `enabled`、`disabled` 或 `excluded`。
+- `reason`、`source` 与更新时间构成当前选择的审计依据。
+- `revision` 使用 compare-and-set；revision 0 表示尚不存在持久行。
+
+迁移后旧会话缺行时，单纯读取不会写数据库，reader 会返回调用方提供的精确默认值。
+新会话会在首次创建持久行时冻结该默认值，child session 在创建事务中继承父会话 policy。
+`set` 与 `exclude` 会在同一个事务中更新 policy，并向持久 session event stream 追加
+`session.memory.policy.changed`。revision 过期时既不写 policy，也不写 event。
+
+`disabled` 是可恢复的生成关闭状态，会把该会话已排队的自动 extraction job 标记为
+`skipped`；`excluded` 执行相同的队列结算，并记录该会话因配置的外部上下文而不能重新
+启用。running 或已终结的 job 不会被重放或改写。
 
 只修改 `zuno_schema.format` 永远不是有效修复：应用查询还需要与 marker 匹配的表和
 索引。不要手工提升或降低 marker。
@@ -89,9 +111,8 @@ Zuno 会在执行应用查询前拒绝不受支持的 schema 格式，绝不会�
 任何人工恢复前都应保留原文件并创建副本。
 
 重要数据应使用对应旧二进制导出，或实现并验证明确的前向迁移。不要猜测 schema、静默
-丢行，也不要要求当前二进制已经支持的格式重建数据库。有效的 format-5、format-6 或
-format-7 数据库应当自动
-打开并完成迁移。
+丢行，也不要要求当前二进制已经支持的格式重建数据库。有效的 format-5、format-6、
+format-7 或 format-8 数据库应当自动打开并完成迁移。
 
 ## 未来 schema 变更规则
 

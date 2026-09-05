@@ -193,6 +193,7 @@ fn supported_ui_commands_and_aliases_dispatch_actions() {
         ("/toggle-thinking", "display_thinking"),
         ("/ps", "ps_view"),
         ("/memory", "memory_view"),
+        ("/memories", "memories_view"),
         ("/exit", "app_exit"),
         ("/quit", "app_exit"),
         ("/q", "app_exit"),

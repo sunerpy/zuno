@@ -1312,9 +1312,15 @@ store:
   },
   "learning": {
     "enabled": true,
+    "use": true,
+    "generate": true,
     "extractor_model": "provider/model",
     "post_turn": {
-      "enabled": true
+      "enabled": true,
+      "idle_delay_ms": 21600000,
+      "poll_interval_ms": 60000,
+      "max_jobs_per_wake": 2,
+      "disable_on_external_context": false
     },
     "aggregation": {
       "interval_ms": 86400000,
@@ -1342,10 +1348,27 @@ store:
 - `promotion` is `review` (default), `high_confidence`, or `automatic`.
   `high_confidence` applies only candidates at or above `auto_confidence`.
 - `auto_confidence` is a finite value in `0..=1` and defaults to `0.9`.
-- `learning.enabled` defaults to `false`. When enabled,
-  `learning.extractor_model` is required and resolves independently of
-  `small_model`.
-- `post_turn.enabled` controls fast extraction after eligible completed tasks.
+- `learning.enabled` defaults to `false` and is the master upper bound. When it
+  is false, effective `use` and `generate` are both false.
+- With `learning.enabled: true`, omitted `use` and `generate` both default to
+  true. `use` admits already durable Experience records into retrieval and
+  prompt context; `generate` permits new extraction, aggregation, Memory
+  candidates, patterns, and Skill candidates.
+- `learning.extractor_model` resolves independently of `small_model` and is
+  required only when effective `generate` is true. A read-only configuration
+  with `use: true` and `generate: false` can consume existing Experience
+  records without configuring an extractor.
+- `post_turn.enabled` controls only automatic extraction after eligible
+  completed tasks. It does not disable existing-Experience use, and disabling it
+  does not turn off generation paths invoked explicitly.
+- `post_turn.idle_delay_ms` defaults to `21600000` (six hours), may be `0` for
+  immediate eligibility, and delays only automatic extraction jobs.
+- `post_turn.poll_interval_ms` defaults to `60000` and must be positive.
+- `post_turn.max_jobs_per_wake` defaults to `2` and must be positive.
+- `post_turn.disable_on_external_context` defaults to `false`. When true,
+  a completed turn marked as consuming external context moves that session to
+  `generation=excluded`, skips queued automatic extraction, and requires a new
+  session before explicit or automatic generation can resume.
 - project aggregation defaults to one 24-hour bucket and skips below three new
   records.
 - global aggregation defaults to one seven-day bucket and requires two projects.
@@ -1370,13 +1393,15 @@ learning. Skill candidates always require explicit review, offline evaluation,
 and a later apply action.
 
 `memory: false` disables resident injection and proposal tools. It does not
-disable durable Experience projection; `learning.enabled` controls new
-extraction and aggregation.
+disable durable Experience projection. `learning.use` controls consumption of
+existing Experience records, while `learning.generate` controls creation of new
+learning under the `learning.enabled` master switch.
 
 The retired `memory.reflection` and `memory.nudge_interval` keys are rejected
 instead of ignored. There are no compatibility aliases under `learning`.
 `/memory` reviews, edits, approves, rejects, removes, and undoes durable changes.
-`/learn` and `/reflect` manage Experience, feedback, patterns, and Skill
+`/memories` controls use and generation for the current session. `/learn` and
+`/reflect` manage Experience, feedback, patterns, and Skill
 candidates. See [resident memory](../design/memory-learning.md) and the
 [user learning flywheel](../design/user-learning-flywheel.md).
 

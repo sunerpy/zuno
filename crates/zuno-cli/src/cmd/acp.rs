@@ -1338,6 +1338,7 @@ async fn open_session_resources_with_mcp(
         let mut receiver = host.work_state_changes();
         let session_id = host.session_id().to_owned();
         let client = client.clone();
+        let pool = Arc::new(durable_pool().map_err(|error| error.to_string())?);
         tokio::spawn(async move {
             while receiver.changed().await.is_ok() {
                 let generation = *receiver.borrow_and_update();
@@ -1351,6 +1352,27 @@ async fn open_session_resources_with_mcp(
                         %error,
                         "ACP durable Plan projection could not follow a work-state change"
                     );
+                }
+                match replay_work_state(Arc::clone(&pool), &session_id) {
+                    Ok(work) => {
+                        if let Err(error) = client
+                            .session_update(&session_id, zuno_acp::durable_learning_update(&work))
+                            .await
+                        {
+                            tracing::debug!(
+                                session_id,
+                                generation,
+                                %error,
+                                "ACP durable learning projection could not follow a work-state change"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::debug!(
+                        session_id,
+                        generation,
+                        %error,
+                        "ACP durable learning state could not be replayed after a work-state change"
+                    ),
                 }
             }
         })
@@ -3023,8 +3045,16 @@ fn replay_work_state(
     let learning = zuno_learning::LearningProjectionService::new(Arc::clone(&pool))
         .snapshot(session_id, &session.project_id)
         .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+    let memory_policy =
+        zuno_db::session_memory_policy::SessionMemoryPolicyStore::new(Arc::clone(&pool))
+            .get_or(
+                session_id,
+                zuno_types::SessionMemoryPolicyProjection::default(),
+            )
+            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
     let mut work = replay_plan_work_state(pool, session_id)?;
     work.learning = learning;
+    work.memory_policy = memory_policy;
     Ok(work)
 }
 

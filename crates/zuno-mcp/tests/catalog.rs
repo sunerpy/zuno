@@ -350,6 +350,7 @@ async fn catalog_namespaced_call_reaches_the_right_server_under_the_local_name()
         .expect("call succeeds");
 
     assert_eq!(output.output, "wiki:search");
+    assert!(output.contains_external_context());
     assert_eq!(
         docs.calls.load(Ordering::SeqCst),
         0,
@@ -620,6 +621,7 @@ async fn catalog_list_resource_templates_reports_the_template_field() {
     );
     assert_eq!(payload["resourceTemplates"][0]["server"], json!("docs"));
     assert_eq!(output.title, "MCP resource templates: docs");
+    assert!(output.contains_external_context());
 }
 
 #[tokio::test]
@@ -651,6 +653,7 @@ async fn catalog_read_resource_renders_text_and_requires_both_arguments() {
     );
     assert_eq!(output.metadata["contents"], json!(1));
     assert_eq!(output.metadata["attachments"], json!(0));
+    assert!(output.contains_external_context());
 
     let error = read
         .execute(json!({ "server": "docs" }), context())
@@ -693,6 +696,7 @@ async fn catalog_read_resource_attaches_a_supported_blob_and_omits_the_rest() {
     assert_eq!(output.attachments.len(), 1, "only the small PNG attaches");
     assert_eq!(output.attachments[0].mime, "image/png");
     assert_eq!(output.attachments[0].url, "data:image/png;base64,aGk=");
+    assert!(output.contains_external_context());
     assert_eq!(
         output.attachments[0].filename.as_deref(),
         Some("mcp://png"),

@@ -18,7 +18,7 @@ const SSE_AGGREGATE_PREFIX: &str = "sse:";
 /// retention while losing only the deleted provenance pointer. `experience_record`
 /// follows the same policy so retained learning can be reviewed independently of
 /// transcript retention.
-pub const PRUNE_TABLES: [&str; 20] = [
+pub const PRUNE_TABLES: [&str; 21] = [
     "session_note_operation",
     "session_note",
     "memory_reflection_job",
@@ -35,6 +35,7 @@ pub const PRUNE_TABLES: [&str; 20] = [
     "part",
     "message",
     "session_share",
+    "session_memory_policy",
     "session",
     "event_sequence",
     "event",
@@ -56,7 +57,7 @@ pub const PRUNE_TABLES: [&str; 20] = [
 /// session's rows. Order does not matter for those: having no foreign key on the session key
 /// is exactly what puts them in that set. [`preview`] accounts for them too, so the
 /// projection and the delete describe the same operation.
-pub const DELETE_ORDER: [&str; 20] = PRUNE_TABLES;
+pub const DELETE_ORDER: [&str; 21] = PRUNE_TABLES;
 
 /// A reversible change to `session.time_archived`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -796,7 +797,7 @@ const OPTIONAL_TABLE_SPECS: [TableSpec; 2] = [
     },
 ];
 
-const TABLE_SPECS: [TableSpec; 18] = [
+const TABLE_SPECS: [TableSpec; 19] = [
     TableSpec {
         name: "memory_reflection_job",
         relation: Relation::SessionId,
@@ -1003,6 +1004,20 @@ const TABLE_SPECS: [TableSpec; 18] = [
             "id",
             "secret",
             "url",
+            "time_created",
+            "time_updated",
+        ],
+    },
+    TableSpec {
+        name: "session_memory_policy",
+        relation: Relation::SessionId,
+        columns: &[
+            "session_id",
+            "use_memories",
+            "generation",
+            "reason",
+            "source",
+            "revision",
             "time_created",
             "time_updated",
         ],

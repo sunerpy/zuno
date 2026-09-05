@@ -1,15 +1,17 @@
 use crate::Result;
-use crate::extraction::ExtractionRequest;
+use crate::extraction::{ExtractionJobPayload, ExtractionRequest, ExtractionTrigger};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 use zuno_config::ResolvedLearningConfig;
 use zuno_db::experience::ExperienceStore;
 use zuno_db::learning_job::{
-    LearningJobInsert, LearningJobKind, LearningJobRecord, LearningJobStatus, LearningJobStore,
-    LeaseReconciliation, NewLearningJob,
+    ExtractionJobInsert, LearningJobInsert, LearningJobKind, LearningJobRecord, LearningJobStatus,
+    LearningJobStore, LeaseReconciliation, NewLearningJob,
 };
+use zuno_types::SessionMemoryGeneration;
 
 /// How many times one learning job may be handed to a worker before it is settled
 /// `Failed` instead of claimed again.
@@ -26,6 +28,8 @@ use zuno_db::learning_job::{
 /// requeue or claim an over-cap row in SQL, so a caller that bypasses this scheduler
 /// is bounded too — is an integrator seam in `zuno-db`, which this lane does not own.
 const MAX_JOB_ATTEMPTS: u32 = 3;
+const RETRY_INITIAL_DELAY_MS: i64 = 1_000;
+const RETRY_MAX_DELAY_MS: i64 = 5 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletedTaskSignals {
@@ -35,6 +39,8 @@ pub struct CompletedTaskSignals {
     pub recovered_from_error: bool,
     pub user_corrected: bool,
     pub explicit_feedback: bool,
+    #[serde(default)]
+    pub external_context: bool,
 }
 
 impl CompletedTaskSignals {
@@ -53,6 +59,7 @@ impl CompletedTaskSignals {
 pub enum LearningScheduleOutcome {
     Disabled,
     Ineligible,
+    Excluded,
     SkippedInsufficientRecords { observed: u32, required: u32 },
     Queued(LearningJobRecord),
     Existing(LearningJobRecord),
@@ -94,6 +101,30 @@ impl LearningScheduler {
         self
     }
 
+    /// Whether durable Experience records may be retrieved for model context.
+    #[must_use]
+    pub const fn use_existing(&self) -> bool {
+        self.config.use_existing
+    }
+
+    /// Whether automatic extraction should exclude turns that consumed external context.
+    #[must_use]
+    pub const fn excludes_external_context(&self) -> bool {
+        self.config.disable_on_external_context
+    }
+
+    /// Background automatic-extraction poll interval.
+    #[must_use]
+    pub const fn post_turn_poll_interval_ms(&self) -> u64 {
+        self.config.post_turn_poll_interval_ms
+    }
+
+    /// Maximum jobs one automatic worker wake may claim.
+    #[must_use]
+    pub const fn post_turn_max_jobs_per_wake(&self) -> u32 {
+        self.config.post_turn_max_jobs_per_wake
+    }
+
     pub fn schedule_post_turn(
         &self,
         project_id: &str,
@@ -103,8 +134,11 @@ impl LearningScheduler {
         signals: CompletedTaskSignals,
         now: i64,
     ) -> Result<LearningScheduleOutcome> {
-        if !self.config.enabled || !self.config.post_turn_enabled {
+        if !self.config.generate || !self.config.post_turn_enabled {
             return Ok(LearningScheduleOutcome::Disabled);
+        }
+        if self.config.disable_on_external_context && signals.external_context {
+            return Ok(LearningScheduleOutcome::Excluded);
         }
         if !signals.eligible() {
             return Ok(LearningScheduleOutcome::Ineligible);
@@ -120,7 +154,13 @@ impl LearningScheduler {
             user_corrected: signals.user_corrected,
             explicit_feedback: signals.explicit_feedback,
         };
-        self.enqueue_extraction(request, now)
+        let delay = i64::try_from(self.config.post_turn_idle_delay_ms).unwrap_or(i64::MAX);
+        self.enqueue_extraction(
+            request,
+            ExtractionTrigger::AutomaticPostTurn,
+            now.saturating_add(delay),
+            now,
+        )
     }
 
     pub fn schedule_manual_reflection(
@@ -128,10 +168,10 @@ impl LearningScheduler {
         request: ExtractionRequest,
         now: i64,
     ) -> Result<LearningScheduleOutcome> {
-        if !self.config.enabled {
+        if !self.config.generate {
             return Ok(LearningScheduleOutcome::Disabled);
         }
-        self.enqueue_extraction(request, now)
+        self.enqueue_extraction(request, ExtractionTrigger::Manual, now, now)
     }
 
     pub fn schedule_project_aggregation(
@@ -139,7 +179,7 @@ impl LearningScheduler {
         project_id: &str,
         now: i64,
     ) -> Result<LearningScheduleOutcome> {
-        if !self.config.enabled {
+        if !self.config.generate {
             return Ok(LearningScheduleOutcome::Disabled);
         }
         let interval = i64::try_from(self.config.aggregation_interval_ms).unwrap_or(i64::MAX);
@@ -171,7 +211,7 @@ impl LearningScheduler {
         evidence_digest: &str,
         now: i64,
     ) -> Result<LearningScheduleOutcome> {
-        if !self.config.enabled {
+        if !self.config.generate {
             return Ok(LearningScheduleOutcome::Disabled);
         }
         if evidence_digest.trim().is_empty() {
@@ -216,9 +256,27 @@ impl LearningScheduler {
         now: i64,
         lease_expires: i64,
     ) -> Result<Option<LearningJobRecord>> {
-        let claimed = self
-            .jobs
-            .claim_due_for_project(project_id, owner_id, now, lease_expires)?;
+        self.claim_due_for_project_excluding(project_id, owner_id, now, lease_expires, &[])
+    }
+
+    /// Claim project work while withholding extraction for process-local live sessions.
+    pub fn claim_due_for_project_excluding(
+        &self,
+        project_id: &str,
+        owner_id: &str,
+        now: i64,
+        lease_expires: i64,
+        busy_session_ids: &[String],
+    ) -> Result<Option<LearningJobRecord>> {
+        let idle_delay = i64::try_from(self.config.post_turn_idle_delay_ms).unwrap_or(i64::MAX);
+        let claimed = self.jobs.claim_due_for_project_eligible_excluding(
+            project_id,
+            owner_id,
+            now,
+            lease_expires,
+            now.saturating_sub(idle_delay),
+            busy_session_ids,
+        )?;
         self.bound_attempts(claimed, owner_id, now)
     }
 
@@ -230,7 +288,26 @@ impl LearningScheduler {
         now: i64,
         lease_expires: i64,
     ) -> Result<Option<LearningJobRecord>> {
-        let claimed = self.jobs.claim(job_id, owner_id, now, lease_expires)?;
+        let record = self.jobs.get(job_id)?;
+        let manual = record.kind == LearningJobKind::Extraction
+            && record
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("trigger"))
+                .and_then(serde_json::Value::as_str)
+                == Some("manual");
+        let claimed = if record.kind == LearningJobKind::Extraction && !manual {
+            let idle_delay = i64::try_from(self.config.post_turn_idle_delay_ms).unwrap_or(i64::MAX);
+            self.jobs.claim_automatic_extraction(
+                job_id,
+                owner_id,
+                now,
+                lease_expires,
+                now.saturating_sub(idle_delay),
+            )?
+        } else {
+            self.jobs.claim(job_id, owner_id, now, lease_expires)?
+        };
         self.bound_attempts(claimed, owner_id, now)
     }
 
@@ -290,6 +367,29 @@ impl LearningScheduler {
             .map_err(Into::into)
     }
 
+    pub fn retry(
+        &self,
+        job_id: &str,
+        owner_id: &str,
+        error: &str,
+        retry_after: Option<Duration>,
+        now: i64,
+    ) -> Result<()> {
+        let attempt = self.jobs.get(job_id)?.attempt.max(1);
+        let exponent = attempt.saturating_sub(1).min(20);
+        let local_delay = RETRY_INITIAL_DELAY_MS
+            .checked_shl(exponent)
+            .unwrap_or(i64::MAX);
+        let requested_delay = retry_after
+            .map(|delay| i64::try_from(delay.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        let delay = local_delay.max(requested_delay).min(RETRY_MAX_DELAY_MS);
+        self.jobs
+            .retry(job_id, owner_id, error, now.saturating_add(delay), now)
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
     pub fn complete(
         &self,
         job_id: &str,
@@ -321,18 +421,50 @@ impl LearningScheduler {
     fn enqueue_extraction(
         &self,
         request: ExtractionRequest,
+        trigger: ExtractionTrigger,
+        scheduled_at: i64,
         now: i64,
     ) -> Result<LearningScheduleOutcome> {
-        let payload = serde_json::to_value(&request).expect("ExtractionRequest is serializable");
-        self.enqueue(NewLearningJob::extraction(
+        let project_id = request.project_id.clone();
+        let session_id = request.session_id.clone();
+        let source_message_id = request.source_message_id.clone();
+        let payload = serde_json::to_value(ExtractionJobPayload { trigger, request })
+            .expect("ExtractionJobPayload is serializable");
+        let mut job = NewLearningJob::extraction(
             format!("lrn_{}", Uuid::now_v7().simple()),
-            request.project_id,
-            request.session_id,
-            request.source_message_id,
+            project_id,
+            session_id,
+            source_message_id,
             self.extractor_version.clone(),
-            payload,
+            payload.clone(),
             now,
-        ))
+        );
+        job.scheduled_at = scheduled_at;
+        let LearningJobInsert {
+            mut record,
+            inserted,
+        } = match self.jobs.enqueue_extraction_if_enabled(job)? {
+            ExtractionJobInsert::Admitted(insert) => *insert,
+            ExtractionJobInsert::Blocked(SessionMemoryGeneration::Disabled) => {
+                return Ok(LearningScheduleOutcome::Disabled);
+            }
+            ExtractionJobInsert::Blocked(SessionMemoryGeneration::Excluded) => {
+                return Ok(LearningScheduleOutcome::Excluded);
+            }
+            ExtractionJobInsert::Blocked(SessionMemoryGeneration::Enabled) => {
+                unreachable!("enabled session generation admits extraction")
+            }
+        };
+        if trigger == ExtractionTrigger::Manual {
+            record = self
+                .jobs
+                .expedite_manual_extraction(&record.id, &payload, now)?;
+        }
+        Ok(if inserted {
+            LearningScheduleOutcome::Queued(record)
+        } else {
+            LearningScheduleOutcome::Existing(record)
+        })
     }
 
     fn enqueue(&self, job: NewLearningJob) -> Result<LearningScheduleOutcome> {
@@ -359,8 +491,7 @@ mod tests {
     use zuno_db::migration;
     use zuno_paths::DbLocation;
 
-    #[test]
-    fn post_turn_requires_a_completed_learning_signal_and_is_idempotent() {
+    fn pool() -> Arc<zuno_db::Pool> {
         let pool = Arc::new(zuno_db::Pool::open(&DbLocation::Memory).expect("pool"));
         {
             let mut connection = pool.get().expect("connection");
@@ -377,66 +508,398 @@ mod tests {
                 )
                 .expect("fixture");
         }
-        let scheduler = LearningScheduler::new(
-            pool,
-            ResolvedLearningConfig {
-                enabled: true,
-                extractor_model: Some("provider/extractor-v1".to_owned()),
-                ..ResolvedLearningConfig::default()
-            },
-        );
-        let no_signal = scheduler
-            .schedule_post_turn(
-                "project-1",
-                "session-1",
-                "assistant-1",
-                "transcript",
-                CompletedTaskSignals {
-                    completed: true,
-                    had_tool_calls: false,
-                    had_artifacts: false,
-                    recovered_from_error: false,
-                    user_corrected: false,
-                    explicit_feedback: false,
-                },
-                10,
-            )
-            .expect("ineligible");
-        assert_eq!(no_signal, LearningScheduleOutcome::Ineligible);
-        let signals = CompletedTaskSignals {
+        pool
+    }
+
+    fn config() -> ResolvedLearningConfig {
+        ResolvedLearningConfig {
+            generate: true,
+            extractor_model: Some("provider/extractor-v1".to_owned()),
+            post_turn_enabled: true,
+            post_turn_idle_delay_ms: 25,
+            disable_on_external_context: true,
+            ..ResolvedLearningConfig::default()
+        }
+    }
+
+    const fn useful_signals() -> CompletedTaskSignals {
+        CompletedTaskSignals {
             completed: true,
             had_tool_calls: true,
             had_artifacts: false,
             recovered_from_error: false,
             user_corrected: false,
             explicit_feedback: false,
-        };
-        assert!(matches!(
+            external_context: false,
+        }
+    }
+
+    fn request() -> ExtractionRequest {
+        ExtractionRequest {
+            project_id: "project-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            source_message_id: "assistant-1".to_owned(),
+            transcript: "transcript".to_owned(),
+            had_tool_calls: true,
+            had_artifacts: false,
+            recovered_from_error: false,
+            user_corrected: false,
+            explicit_feedback: false,
+        }
+    }
+
+    #[test]
+    fn post_turn_outcomes_separate_disabled_ineligible_and_excluded() {
+        let mut disabled = config();
+        disabled.generate = false;
+        assert_eq!(
+            LearningScheduler::new(pool(), disabled)
+                .schedule_post_turn(
+                    "project-1",
+                    "session-1",
+                    "assistant-1",
+                    "transcript",
+                    useful_signals(),
+                    10,
+                )
+                .expect("disabled"),
+            LearningScheduleOutcome::Disabled
+        );
+
+        let mut disabled = config();
+        disabled.post_turn_enabled = false;
+        assert_eq!(
+            LearningScheduler::new(pool(), disabled)
+                .schedule_post_turn(
+                    "project-1",
+                    "session-1",
+                    "assistant-1",
+                    "transcript",
+                    useful_signals(),
+                    10,
+                )
+                .expect("post-turn disabled"),
+            LearningScheduleOutcome::Disabled
+        );
+
+        let scheduler = LearningScheduler::new(pool(), config());
+        assert_eq!(
             scheduler
                 .schedule_post_turn(
                     "project-1",
                     "session-1",
                     "assistant-1",
                     "transcript",
-                    signals,
-                    11,
+                    CompletedTaskSignals {
+                        completed: true,
+                        had_tool_calls: false,
+                        had_artifacts: false,
+                        recovered_from_error: false,
+                        user_corrected: false,
+                        explicit_feedback: false,
+                        external_context: false,
+                    },
+                    10,
                 )
-                .expect("queued"),
+                .expect("ineligible"),
+            LearningScheduleOutcome::Ineligible
+        );
+        assert_eq!(
+            scheduler
+                .schedule_post_turn(
+                    "project-1",
+                    "session-1",
+                    "assistant-1",
+                    "transcript",
+                    CompletedTaskSignals {
+                        external_context: true,
+                        ..useful_signals()
+                    },
+                    10,
+                )
+                .expect("excluded"),
+            LearningScheduleOutcome::Excluded
+        );
+
+        let mut allowed = config();
+        allowed.disable_on_external_context = false;
+        assert!(matches!(
+            LearningScheduler::new(pool(), allowed)
+                .schedule_post_turn(
+                    "project-1",
+                    "session-1",
+                    "assistant-1",
+                    "transcript",
+                    CompletedTaskSignals {
+                        external_context: true,
+                        ..useful_signals()
+                    },
+                    10,
+                )
+                .expect("external context allowed"),
             LearningScheduleOutcome::Queued(_)
         ));
-        assert!(matches!(
+    }
+
+    #[test]
+    fn durable_session_policy_blocks_new_automatic_and_manual_extraction() {
+        let pool = pool();
+        {
+            let connection = pool.get().expect("connection");
+            connection
+                .execute(
+                    "INSERT INTO session_memory_policy (
+                       session_id, use_memories, generation, reason, source, revision,
+                       time_created, time_updated
+                     ) VALUES (
+                       'session-1', 1, 'disabled', 'user choice', 'test', 1, 1, 1
+                     )",
+                    [],
+                )
+                .expect("disable generation");
+        }
+        let scheduler =
+            LearningScheduler::new(Arc::clone(&pool), config()).with_extractor_version("v1");
+        assert_eq!(
             scheduler
                 .schedule_post_turn(
                     "project-1",
                     "session-1",
                     "assistant-1",
                     "transcript",
-                    signals,
-                    12,
+                    useful_signals(),
+                    10,
                 )
-                .expect("existing"),
-            LearningScheduleOutcome::Existing(_)
-        ));
+                .expect("disabled automatic admission"),
+            LearningScheduleOutcome::Disabled
+        );
+        assert_eq!(
+            scheduler
+                .schedule_manual_reflection(request(), 10)
+                .expect("disabled manual admission"),
+            LearningScheduleOutcome::Disabled
+        );
+
+        {
+            let connection = pool.get().expect("connection");
+            connection
+                .execute(
+                    "UPDATE session_memory_policy
+                     SET generation = 'excluded', revision = 2, time_updated = 2
+                     WHERE session_id = 'session-1'",
+                    [],
+                )
+                .expect("exclude generation");
+        }
+        assert_eq!(
+            scheduler
+                .schedule_post_turn(
+                    "project-1",
+                    "session-1",
+                    "assistant-1",
+                    "transcript",
+                    useful_signals(),
+                    11,
+                )
+                .expect("excluded automatic admission"),
+            LearningScheduleOutcome::Excluded
+        );
+        assert_eq!(
+            scheduler
+                .schedule_manual_reflection(request(), 11)
+                .expect("excluded manual admission"),
+            LearningScheduleOutcome::Excluded
+        );
+
+        let connection = pool.get().expect("connection");
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM learning_job", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count jobs"),
+            0
+        );
+    }
+
+    #[test]
+    fn manual_reflection_revives_an_automatic_job_skipped_by_a_temporary_disable() {
+        let pool = pool();
+        let scheduler =
+            LearningScheduler::new(Arc::clone(&pool), config()).with_extractor_version("v1");
+        let queued = scheduler
+            .schedule_post_turn(
+                "project-1",
+                "session-1",
+                "assistant-1",
+                "automatic transcript",
+                useful_signals(),
+                10,
+            )
+            .expect("queue automatic");
+        let LearningScheduleOutcome::Queued(automatic) = queued else {
+            panic!("automatic extraction must be queued");
+        };
+        let policies =
+            zuno_db::session_memory_policy::SessionMemoryPolicyStore::new(Arc::clone(&pool));
+        policies
+            .set(zuno_db::session_memory_policy::SessionMemoryPolicyUpdate {
+                session_id: "session-1".to_owned(),
+                use_memories: true,
+                generation: SessionMemoryGeneration::Disabled,
+                reason: "temporary pause".to_owned(),
+                source: "test".to_owned(),
+                expected_revision: 0,
+                time_updated: 20,
+            })
+            .expect("disable generation");
+        assert_eq!(
+            LearningJobStore::new(Arc::clone(&pool))
+                .get(&automatic.id)
+                .expect("skipped automatic")
+                .status,
+            LearningJobStatus::Skipped
+        );
+        policies
+            .set(zuno_db::session_memory_policy::SessionMemoryPolicyUpdate {
+                session_id: "session-1".to_owned(),
+                use_memories: true,
+                generation: SessionMemoryGeneration::Enabled,
+                reason: "resume explicit reflection".to_owned(),
+                source: "test".to_owned(),
+                expected_revision: 1,
+                time_updated: 30,
+            })
+            .expect("enable generation");
+
+        let manual = scheduler
+            .schedule_manual_reflection(request(), 40)
+            .expect("manual reflection");
+        let LearningScheduleOutcome::Existing(manual) = manual else {
+            panic!("manual reflection keeps the original idempotency identity");
+        };
+        assert_eq!(manual.id, automatic.id);
+        assert_eq!(manual.status, LearningJobStatus::Queued);
+        assert_eq!(manual.attempt, 0);
+        let claimed = scheduler
+            .claim(&manual.id, "worker", 40, 60)
+            .expect("claim manual")
+            .expect("revived manual job");
+        assert_eq!(
+            claimed.payload.expect("payload")["trigger"],
+            json!("manual")
+        );
+    }
+
+    #[test]
+    fn post_turn_is_delayed_and_idempotent_with_an_automatic_payload() {
+        let scheduler =
+            LearningScheduler::new(pool(), config()).with_extractor_version("extractor-v1");
+        let queued = scheduler
+            .schedule_post_turn(
+                "project-1",
+                "session-1",
+                "assistant-1",
+                "transcript",
+                useful_signals(),
+                11,
+            )
+            .expect("queued");
+        let LearningScheduleOutcome::Queued(job) = queued else {
+            panic!("first admission must queue");
+        };
+        assert_eq!(job.scheduled_at, 36);
+        assert_eq!(job.time_created, 11);
+        let payload = crate::decode_extraction_job_payload(job.payload.clone().expect("payload"))
+            .expect("decode payload");
+        assert_eq!(payload.trigger, ExtractionTrigger::AutomaticPostTurn);
+        assert_eq!(payload.request, request());
+
+        let existing = scheduler
+            .schedule_post_turn(
+                "project-1",
+                "session-1",
+                "assistant-1",
+                "ignored duplicate",
+                useful_signals(),
+                12,
+            )
+            .expect("existing");
+        let LearningScheduleOutcome::Existing(existing) = existing else {
+            panic!("duplicate admission must return the durable job");
+        };
+        assert_eq!(existing.id, job.id);
+        assert_eq!(existing.scheduled_at, 36);
+        assert_eq!(existing.payload, job.payload);
+    }
+
+    #[test]
+    fn manual_reflection_is_immediate_and_bypasses_post_turn_policy() {
+        let mut policy = config();
+        policy.post_turn_enabled = false;
+        policy.disable_on_external_context = true;
+        let scheduler =
+            LearningScheduler::new(pool(), policy).with_extractor_version("extractor-v1");
+
+        let queued = scheduler
+            .schedule_manual_reflection(request(), 50)
+            .expect("manual reflection");
+        let LearningScheduleOutcome::Queued(job) = queued else {
+            panic!("manual reflection must queue");
+        };
+        assert_eq!(job.scheduled_at, 50);
+        let payload = crate::decode_extraction_job_payload(job.payload.expect("payload"))
+            .expect("decode payload");
+        assert_eq!(payload.trigger, ExtractionTrigger::Manual);
+        assert_eq!(payload.request, request());
+
+        let mut disabled = config();
+        disabled.generate = false;
+        assert_eq!(
+            LearningScheduler::new(pool(), disabled)
+                .schedule_manual_reflection(request(), 51)
+                .expect("generation disabled"),
+            LearningScheduleOutcome::Disabled
+        );
+    }
+
+    #[test]
+    fn retryable_worker_failure_uses_bounded_backoff_and_preserves_attempt_count() {
+        let pool = pool();
+        let scheduler = LearningScheduler::new(Arc::clone(&pool), config());
+        let jobs = LearningJobStore::new(pool);
+        jobs.enqueue(NewLearningJob::extraction(
+            "job-retry",
+            "project-1",
+            "session-1",
+            "assistant-1",
+            "extractor-v1",
+            json!({"trigger":"manual","request":{"transcript":"durable"}}),
+            10,
+        ))
+        .expect("enqueue");
+        scheduler
+            .claim("job-retry", "worker-1", 10, 100)
+            .expect("claim")
+            .expect("running job");
+
+        scheduler
+            .retry(
+                "job-retry",
+                "worker-1",
+                "provider unavailable",
+                Some(Duration::from_secs(10 * 60)),
+                20,
+            )
+            .expect("retry");
+        let job = jobs.get("job-retry").expect("job");
+        assert_eq!(job.status, LearningJobStatus::Queued);
+        assert_eq!(job.attempt, 1);
+        assert_eq!(
+            job.scheduled_at,
+            20 + RETRY_MAX_DELAY_MS,
+            "peer retry hints are clamped to the configured ceiling"
+        );
     }
 
     /// The second half of the unbounded-requeue fix, independent of whether the
@@ -469,8 +932,7 @@ mod tests {
         let scheduler = LearningScheduler::new(
             Arc::clone(&pool),
             ResolvedLearningConfig {
-                enabled: true,
-                extractor_model: Some("provider/extractor-v1".to_owned()),
+                generate: true,
                 ..ResolvedLearningConfig::default()
             },
         );
@@ -542,8 +1004,7 @@ mod tests {
         let scheduler = LearningScheduler::new(
             pool,
             ResolvedLearningConfig {
-                enabled: true,
-                extractor_model: Some("provider/extractor-v1".to_owned()),
+                generate: true,
                 ..ResolvedLearningConfig::default()
             },
         );

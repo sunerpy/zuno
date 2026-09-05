@@ -67,6 +67,7 @@ pub mod session_export;
 /// Session-keyed tables the schema leaves without a cascade, shared by both delete paths.
 mod session_keys;
 pub mod session_list;
+pub mod session_memory_policy;
 pub mod session_prune;
 pub mod skill_candidate;
 pub mod vacuum;

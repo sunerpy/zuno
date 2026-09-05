@@ -931,6 +931,7 @@ pub(crate) struct ChildSessionContext {
     pub(crate) parent_agent: String,
     pub(crate) parent_model: String,
     pub(crate) parent_effort: Option<zuno_llm::effort::ReasoningEffort>,
+    pub(crate) parent_memory_policy: zuno_types::SessionMemoryPolicyProjection,
     pub(crate) delegation_limiter: DelegationLimiter,
     pub(crate) supervisor: BackgroundJobSupervisor,
 }
@@ -966,6 +967,7 @@ pub(crate) struct ChildSessionHost {
     supervisor: BackgroundJobSupervisor,
     job_store: AgentJobStore,
     inbox: SessionInbox,
+    parent_memory_policy: zuno_types::SessionMemoryPolicyProjection,
 }
 
 impl ChildSessionHost {
@@ -1010,6 +1012,7 @@ impl ChildSessionHost {
             supervisor: context.supervisor,
             job_store: AgentJobStore::new(context.database),
             inbox,
+            parent_memory_policy: context.parent_memory_policy,
         })
     }
 
@@ -1030,6 +1033,7 @@ impl ChildSessionHost {
             supervisor,
             job_store: AgentJobStore::new(Arc::clone(&pool)),
             inbox: SessionInbox::new(pool),
+            parent_memory_policy: zuno_types::SessionMemoryPolicyProjection::default(),
         })
     }
 
@@ -1285,9 +1289,11 @@ impl ChildSessionHost {
             job = job.queued();
         }
         let admitted = match admission.create {
-            Some(child) => self
-                .job_store
-                .create_child_session_if_reconciled(child, job),
+            Some(child) => self.job_store.create_child_session_if_reconciled(
+                child,
+                job,
+                self.parent_memory_policy.clone(),
+            ),
             None => self.job_store.create_child_if_reconciled(job),
         }
         .map_err(|error| ChildTurnError::Host(zuno_error::source::describe(&error)))?;

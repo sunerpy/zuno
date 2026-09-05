@@ -310,7 +310,8 @@ impl TypedTool for WebSearchTool {
         let mut output = ToolOutput::text(title, format_output(&result))
             .with_metadata("provider", self.provider.id())
             .with_metadata("queries", json!(queries))
-            .with_metadata("truncated", result.truncated);
+            .with_metadata("truncated", result.truncated)
+            .with_external_context();
         output
             .metadata
             .insert("sources".to_owned(), json!(result.sources));

@@ -29,6 +29,7 @@ pub struct ApiState {
     project_id: Arc<str>,
     /// The project root `location.project.directory` reports.
     project_directory: Arc<str>,
+    memory_policy_default: Arc<zuno_types::SessionMemoryPolicyProjection>,
     /// The parsed models.dev document, loaded at most once per process.
     ///
     /// Re-reading and re-parsing it per request would put a multi-megabyte parse
@@ -132,6 +133,7 @@ impl ApiState {
             env: Arc::new(Env::from_process()),
             project_id: Arc::from(project.id),
             project_directory,
+            memory_policy_default: Arc::new(zuno_types::SessionMemoryPolicyProjection::default()),
             models: Arc::new(Mutex::new(None)),
         })
     }
@@ -166,6 +168,21 @@ impl ApiState {
     pub fn with_env(mut self, env: Env) -> Self {
         self.env = Arc::new(env);
         self
+    }
+
+    #[must_use]
+    pub fn with_memory_policy_default(
+        mut self,
+        policy: zuno_types::SessionMemoryPolicyProjection,
+    ) -> Self {
+        debug_assert_eq!(policy.revision, 0);
+        self.memory_policy_default = Arc::new(policy);
+        self
+    }
+
+    #[must_use]
+    pub(super) fn memory_policy_default(&self) -> zuno_types::SessionMemoryPolicyProjection {
+        self.memory_policy_default.as_ref().clone()
     }
 
     /// The environment catalogue resolution reads.

@@ -28,7 +28,8 @@ use super::Data;
 use super::error::ApiError;
 use super::state::ApiState;
 use crate::{
-    ServerServices, SessionCompactExecution, SessionModelSelection, SessionPromptExecution,
+    ServerServices, SessionCompactExecution, SessionMemoryPolicyExecution,
+    SessionMemoryPolicyMutationError, SessionModelSelection, SessionPromptExecution,
     SessionReportExecution,
 };
 
@@ -65,6 +66,64 @@ pub struct CreateSessionBody {
     id: Option<String>,
     agent: Option<String>,
     location: Option<LocationRef>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryPolicyGeneration {
+    Enabled,
+    Disabled,
+    Excluded,
+}
+
+impl From<zuno_types::SessionMemoryGeneration> for MemoryPolicyGeneration {
+    fn from(value: zuno_types::SessionMemoryGeneration) -> Self {
+        match value {
+            zuno_types::SessionMemoryGeneration::Enabled => Self::Enabled,
+            zuno_types::SessionMemoryGeneration::Disabled => Self::Disabled,
+            zuno_types::SessionMemoryGeneration::Excluded => Self::Excluded,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryPolicyGenerationUpdate {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMemoryPolicyBody {
+    use_memories: bool,
+    generation: MemoryPolicyGenerationUpdate,
+    expected_revision: i64,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryPolicyBody {
+    use_memories: bool,
+    generation: MemoryPolicyGeneration,
+    reason: Option<String>,
+    source: Option<String>,
+    time: Option<i64>,
+    revision: i64,
+}
+
+impl From<zuno_types::SessionMemoryPolicyProjection> for MemoryPolicyBody {
+    fn from(value: zuno_types::SessionMemoryPolicyProjection) -> Self {
+        Self {
+            use_memories: value.use_memories,
+            generation: value.generation.into(),
+            reason: value.reason,
+            source: value.source,
+            time: value.time,
+            revision: value.revision,
+        }
+    }
 }
 
 pub(crate) struct SessionCreateInput {
@@ -524,7 +583,24 @@ pub(crate) async fn create_session(
         .map(|value| serde_json::to_string(&value))
         .transpose()
         .map_err(|error| ApiError::MutationFailed(error.to_string()))?;
-    let session = state.sessions().create(&create)?.into_session();
+    let now = zuno_db::message::now_millis();
+    create.time = Some(now);
+    let memory_policy_default = state.memory_policy_default();
+    let session = state.pool().transaction(|transaction| {
+        let creation = zuno_db::session::create(transaction, &create)?;
+        if creation.was_inserted() {
+            zuno_db::session_memory_policy::seed_in(
+                transaction,
+                &id,
+                memory_policy_default.use_memories,
+                memory_policy_default.generation,
+                "server session memory defaults frozen at creation",
+                "configuration",
+                now,
+            )?;
+        }
+        Ok(creation.into_session())
+    })?;
     let info = SessionInfo::from(session);
     if let Some(events) = state.events() {
         let properties = json!({"sessionID": id, "info": &info})
@@ -574,6 +650,69 @@ pub async fn learning(
     let projection = zuno_learning::LearningProjectionService::new(state.pool_arc())
         .snapshot(&session_id, &session.project_id)?;
     Ok(Json(Data::new(projection)))
+}
+
+pub async fn memory_policy(
+    State(state): State<ApiState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Data<MemoryPolicyBody>>, ApiError> {
+    state.sessions().get(&session_id)?;
+    let policy = zuno_db::session_memory_policy::SessionMemoryPolicyStore::new(state.pool_arc())
+        .get_or(&session_id, state.memory_policy_default())?;
+    Ok(Json(Data::new(policy.into())))
+}
+
+pub async fn update_memory_policy(
+    State(state): State<ApiState>,
+    Extension(services): Extension<ServerServices>,
+    Path(session_id): Path<String>,
+    Json(body): Json<UpdateMemoryPolicyBody>,
+) -> Result<Json<Data<MemoryPolicyBody>>, ApiError> {
+    if body.expected_revision < 0 {
+        return Err(ApiError::InvalidRequest(
+            "expectedRevision must not be negative",
+        ));
+    }
+    let session = state.sessions().get(&session_id)?;
+    let executor = Arc::clone(services.mutations.as_ref().ok_or_else(|| {
+        ApiError::BackendUnavailable("PUT /api/session/{sessionID}/memory-policy".to_owned())
+    })?);
+    let guard = services
+        .runs
+        .begin_turn(&session_id)
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+    let _session = zuno_observability::memory::SessionCount::enter();
+    let generation = match body.generation {
+        MemoryPolicyGenerationUpdate::Enabled => zuno_types::SessionMemoryGeneration::Enabled,
+        MemoryPolicyGenerationUpdate::Disabled => zuno_types::SessionMemoryGeneration::Disabled,
+    };
+    let request = SessionMemoryPolicyExecution {
+        session_id: session_id.clone(),
+        directory: session.directory.into(),
+        agent: session.agent,
+        model: session_model(session.model.as_deref()),
+        use_memories: body.use_memories,
+        generation,
+        expected_revision: body.expected_revision,
+        reason: body
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or("updated through the server memory-policy API")
+            .to_owned(),
+    };
+    let policy = executor
+        .memory_policy(request, guard)
+        .await
+        .map_err(|error| match error {
+            SessionMemoryPolicyMutationError::Invalid(error) => {
+                ApiError::InvalidRequestMessage(error)
+            }
+            SessionMemoryPolicyMutationError::Conflict(error) => ApiError::Conflict(error),
+            SessionMemoryPolicyMutationError::Internal(error) => ApiError::MutationFailed(error),
+        })?;
+    Ok(Json(Data::new(policy.into())))
 }
 
 pub async fn messages(

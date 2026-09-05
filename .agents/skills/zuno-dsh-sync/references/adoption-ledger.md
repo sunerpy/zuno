@@ -4,9 +4,9 @@ This ledger records reviewed upstream behavior. It does not promise API compatib
 
 ## Baseline
 
-- DSH: `dsh-v0.1.1-rc.2` at `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`
-- Zuno review point: `45d1d0c`
-- Reviewed: 2026-08-22
+- DSH: `dsh-v0.1.2-alpha.2` at `0a53fb55bea101816fa226bb964ae2bed71c343b`
+- Zuno review point: `160456a9f3c3fcf2f46cf7d7e5eeab9e534a724a`
+- Reviewed: 2026-08-31
 
 ## Already Covered
 
@@ -178,6 +178,25 @@ delta has not been reviewed.
 | Per-assistant-message feedback sidecar with persisted-target validation and compare-and-set revisions | `adapt` | Keep a typed `FeedbackService` and stale-revision rejection. Zuno additionally appends `learning.feedback.changed` to the durable session audit log instead of making feedback projection-only state. |
 | Code-review Skill maintenance produces a complete candidate, diff, evidence manifest, independent review, gates, and a source-blob drift check | `adapt` | Store complete `SkillCandidate` content, diff, Experience evidence, source identity/digest, immutable cassette evaluation, explicit human review, and CAS apply. Zuno does not create a PR or rerun real side effects. |
 | Direct or silent replacement of a Skill from learned output | `reject` | A candidate cannot apply automatically. Built-in/read-only sources create a differently named project companion, source drift becomes `stale`, and applied changes can only be removed through reviewed revocation or explicit undo. |
+
+## 2026-09-05 dsh-v0.1.3-alpha.1 targeted memory review
+
+`dsh_delta.py` fetched `origin/master` successfully and compared the recorded
+`0a53fb55bea101816fa226bb964ae2bed71c343b` baseline
+(`dsh-v0.1.2-alpha.2`) with
+`d347e703908d0406b7a7ef80e3a0e594d86b2215`
+(`dsh-v0.1.3-alpha.1`). The fresh range contains 750 commits and 3,995 changed
+files. This review classified only memory-adjacent session-reference,
+compaction, and context-provenance behavior; the baseline JSON is not advanced
+because the remaining material delta is still unreviewed.
+
+| DSH idea | Classification | Zuno action |
+| --- | --- | --- |
+| Explicit cross-session references with exact source session ids, captured sequence, byte budgets, retained/omitted counts, truncation facts, self-reference rejection, and nested-reference suppression | `adapt-later` | Add only through a typed session-reference capability and durable prompt section. It must remain explicit user recall, never an ambient memory writer, and every client must show completeness before presenting recalled text as context. |
+| Recalled session text is fenced as untrusted, read-only background data and logged immediately after the citing message | `adapt` | Preserve the same provenance rule for external context used by learning eligibility: tools mark external context durably, the session policy records exclusion, and prompt receipts remain the authoritative account of bytes the model saw. |
+| Recall UI associates labels only with the directly preceding citing message and renders unknown source shapes opaquely | `adapt-later` | Reuse this rule when Zuno gains session references; do not overload resident Memory or Experience retrieval with UI-local adjacency guesses. |
+| Mutable or background long-term memory writer | `reject as absent` | Alpha.1 adds no such subsystem. Zuno keeps Experience extraction, reviewed Memory candidates, deterministic pattern mining, Skill evaluation, and at-most-once effects as its native learning path. |
+| Compaction summaries remain durable context while resident prompt memory stays outside the summary stream | `already-covered` | `SessionMemory` freezes stable prompt sections, prompt receipts retain their exact source/digest, and tests prove both memory scopes survive repeated compaction without entering the summary request. |
 
 ## Next Review
 

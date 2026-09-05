@@ -883,7 +883,7 @@ fn prune_delete_sweeps_every_session_keyed_table_no_cascade_reaches() {
 fn prune_delete_order_and_true_related_table_count_are_pinned() {
     assert_eq!(
         PRUNE_TABLES.len(),
-        20,
+        21,
         "every session-owned schema table must be explicit"
     );
     assert_eq!(
@@ -905,6 +905,7 @@ fn prune_delete_order_and_true_related_table_count_are_pinned() {
             "part",
             "message",
             "session_share",
+            "session_memory_policy",
             "session",
             "event_sequence",
             "event",

@@ -21,8 +21,9 @@ pub use crate::experience::{
 };
 pub use crate::extraction::{
     ExtractedEvidence, ExtractedEvidenceKind, ExtractedExperience, ExtractedExperienceKind,
-    ExtractedMemory, ExtractedMemoryAction, ExtractedMemoryScope, ExtractionRequest,
-    LearningExtraction, LearningExtractor,
+    ExtractedMemory, ExtractedMemoryAction, ExtractedMemoryScope, ExtractionJobPayload,
+    ExtractionRequest, ExtractionTrigger, LearningExtraction, LearningExtractor,
+    decode_extraction_job_payload,
 };
 pub use crate::feedback::FeedbackService;
 pub use crate::pattern::PatternMiner;
@@ -49,7 +50,7 @@ pub enum LearningServiceError {
     Memory(#[from] MemoryServiceError),
     #[error(transparent)]
     Evaluation(#[from] EvaluationError),
-    #[error("learning extractor `{version}` failed")]
+    #[error("learning extractor `{version}` failed: {source}")]
     Extractor {
         version: String,
         #[source]

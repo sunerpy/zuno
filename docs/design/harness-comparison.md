@@ -142,10 +142,29 @@ those principles in a concise role prompt; sandbox, approval, durability, and
 completion remain runtime contracts.
 
 Codex's memory writer separates rollout extraction from later consolidation.
-Zuno adapts that foreground/background split into durable `ExperienceRecord`
-extraction followed by interval-bucketed pattern mining. Model-visible retrieval
-uses prompt receipts with stable source identities and digests, while resident
-Memory remains an atomic `MemoryCandidate` add/replace/remove operation.
+The `openai/codex` main snapshot `068336858475fd96e20e5b2590da869326822826`
+was inspected through `codex-rs/memories/write/src/{start,guard,phase1,phase2,runtime}.rs`
+and `codex-rs/config/src/types.rs`; the SHA identifies the reviewed tree rather
+than a memory-specific introducing commit. In that tree each thread durably
+freezes whether it may contribute, external-context tools can make that thread
+ineligible, Phase 1 claims only idle interactive rollouts under bounded startup
+and age limits, redacts secrets before model extraction, and Phase 2 runs under
+a global lease with a separate model, restricted workspace, no network, no
+delegation, a watermark, heartbeat, and artifact validation. Its defaults
+include a six-hour idle floor, two rollouts per startup, and a 25-percent
+remaining-rate-limit gate.
+
+Zuno adapts the control and scheduling invariants, not Codex's mutable memory
+workspace. Session policy separates using existing memory from generating new
+learning; automatic extraction is durable, idle-delayed, bounded per worker
+wake, and can be excluded after external context. Model-visible retrieval keeps
+prompt receipts with stable source identities and digests. Resident Memory
+remains an atomic reviewed `MemoryCandidate` add/replace/remove operation, while
+slow consolidation remains evidence-backed pattern mining and separately
+reviewed Skill evaluation. Zuno does not let a background Agent rewrite Memory
+files directly. Zuno has not adopted Codex's 25-percent quota gate because the
+provider layer does not yet expose one uniform typed remaining-quota snapshot;
+that gate is `adapt-later`, not a current scheduling invariant.
 
 OpenAI trace grading and dataset regression, DSPy's metric-oriented optimization,
 and Warp's candidate-diff presentation inform the Skill path. Zuno narrows them

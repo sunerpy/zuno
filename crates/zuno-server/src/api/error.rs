@@ -14,6 +14,8 @@ pub enum ApiError {
     #[error("{0}")]
     InvalidRequest(&'static str),
     #[error("{0}")]
+    InvalidRequestMessage(String),
+    #[error("{0}")]
     InvalidPrompt(String),
     #[error("forbidden")]
     Forbidden,
@@ -143,6 +145,9 @@ impl IntoResponse for ApiError {
                 "invalid_request",
                 message.to_owned(),
             ),
+            Self::InvalidRequestMessage(message) => {
+                (StatusCode::BAD_REQUEST, "invalid_request", message)
+            }
             Self::InvalidPrompt(message) => (StatusCode::BAD_REQUEST, "invalid_request", message),
             Self::Forbidden => (
                 StatusCode::FORBIDDEN,
