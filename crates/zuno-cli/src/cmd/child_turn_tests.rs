@@ -804,6 +804,55 @@ async fn interactive_child_input_reopens_an_idle_child_through_the_pending_drive
     );
 }
 
+#[tokio::test]
+async fn durable_session_message_wakes_an_active_child_as_peer_context() {
+    let (pool, inbox, jobs) = interactive_input_fixture();
+    let runs = zuno_engine::status::SessionRunRegistry::new();
+    let guard = runs
+        .begin_turn("ses_child")
+        .expect("the child turn is active");
+    let driver = Arc::new(PromotingInputDriver::new(inbox.clone()));
+    let input = InteractiveChildInput::with_driver(Arc::clone(&pool), runs, jobs.clone(), driver);
+    inbox
+        .admit(zuno_db::inbox::NewSessionInput::new(
+            "inp_peer_child",
+            "ses_child",
+            serde_json::json!({
+                "kind": "sessionMessage",
+                "schemaVersion": 1,
+                "fromSessionID": "ses_parent",
+                "fromAgent": "orchestrator",
+                "text": "inspect the child trace"
+            }),
+            zuno_db::inbox::InputDelivery::Queue,
+            2,
+        ))
+        .expect("admit child peer message");
+
+    assert_eq!(
+        input
+            .wake_pending_session_messages("ses_parent")
+            .expect("scan child messages"),
+        1
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !guard.soft_interrupt_signal().is_set() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer message steers the active child");
+    let delivered = guard.take_soft_interrupts_at_safe_point();
+    assert_eq!(delivered.messages.len(), 1);
+    assert_eq!(delivered.messages[0].content, "inspect the child trace");
+    assert_eq!(
+        delivered.messages[0].source,
+        zuno_engine::interrupt::SoftInterruptSource::PeerSession
+    );
+    drop(guard);
+    jobs.wait_all().await;
+}
+
 impl RecordingWake {
     fn fail_with(&self, error: &str) {
         *self.failure.lock().expect("wake failure lock") = Some(error.to_owned());

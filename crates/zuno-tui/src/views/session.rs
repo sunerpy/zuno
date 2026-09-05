@@ -27,7 +27,7 @@
 //! terminal channel already has 64 events queued, and blocking here would stall the
 //! render loop that has to drain them.
 //!
-//! # Escape confirms interruption; an exit chord remains the emergency way out
+//! # Escape confirms interruption; exit chords confirm shutdown
 //!
 //! A single accidental escape must not discard a running turn. The session interrupt
 //! action therefore arms a short confirmation window; a second press inside it asks
@@ -37,14 +37,15 @@
 //! the same running turn, so the user's second physical press still confirms
 //! cancellation. The arm is transient UI state and is cleared at turn boundaries.
 //!
-//! The application exit chord keeps the older two-stage emergency behavior: first it
-//! cancels, then it leaves unconditionally. Reading
+//! Application exit chords use the same short confirmation discipline. The first press
+//! arms a footer hint and, when a turn is running, also requests cancellation. A second
+//! press of the same chord inside the window leaves. Reading
 //! "has a turn been cancelled already" off the reply identity's running state looks
 //! equivalent and is not: a turn parked on a permission ask never reaches the
 //! engine's interrupt check, so it stays running after an abort and the projection never
 //! clears. A screen that re-derived its answer from that projection would cancel forever
-//! and never leave — the same trap in a politer form. One press is therefore
-//! remembered explicitly, and cleared when a new turn starts.
+//! and never leave — the same trap in a politer form. The explicit exit arm remains
+//! independent of the running projection and expires on its own deadline.
 //!
 //! For the same reason cancellation never gets to swallow the key: with no sink
 //! attached, or a sink that refuses, the chord falls straight through to shutdown. A
@@ -52,7 +53,7 @@
 //! never the ability to leave.
 
 use crate::app::{AppEvent, Component, EventResult, TerminalEvent};
-use crate::keybind::{APP_EXIT, ActionComponent, Definition, is_exit_request};
+use crate::keybind::{APP_EXIT, ActionComponent, Chord, Definition, is_exit_request};
 use crate::views::ViewContext;
 use crate::views::autocomplete::{AutocompleteStep, AutocompleteView, SlashSource};
 use crate::views::editor::{EditorSignal, InputEditor};
@@ -270,6 +271,7 @@ const PROMPT_PLACEHOLDER: &str = "ask anything, or / for commands";
 
 /// How long the first session-interrupt action arms the second.
 const INTERRUPT_CONFIRM_WINDOW_MS: u64 = 1_500;
+const EXIT_CONFIRM_WINDOW_MS: u64 = 1_500;
 
 /// What separates the info row's right-hand facts from each other.
 ///
@@ -647,6 +649,8 @@ pub struct SessionScreen {
     cancellations: usize,
     cancel_requested: bool,
     interrupt_armed_at_ms: Option<u64>,
+    exit_armed_at_ms: Option<u64>,
+    exit_armed_chord: Option<Chord>,
     sidebar_visible: bool,
     /// The resolved palette and configuration, for the pickers this screen builds.
     context: ViewContext,
@@ -1039,6 +1043,8 @@ impl SessionScreen {
             cancellations: 0,
             cancel_requested: false,
             interrupt_armed_at_ms: None,
+            exit_armed_at_ms: None,
+            exit_armed_chord: None,
             sidebar_visible: true,
             keymap: None,
             catalog: SessionCatalog::default(),
@@ -2843,7 +2849,9 @@ impl SessionScreen {
             return;
         }
         crate::views::fill(frame.buffer_mut(), area, self.context.surface());
-        let line = if self.status.is_running() || self.interrupt_notice_at(now_ms).is_some() {
+        let line = if let Some(chord) = self.exit_notice_at(now_ms) {
+            self.exit_info_line(area.width, chord)
+        } else if self.status.is_running() || self.interrupt_notice_at(now_ms).is_some() {
             self.live_info_line(area.width, now_ms)
         } else {
             self.info_line(area.width)
@@ -2853,6 +2861,30 @@ impl SessionScreen {
             area,
             frame.buffer_mut(),
         );
+    }
+
+    fn exit_info_line(&self, width: u16, chord: Option<Chord>) -> ratatui::text::Line<'static> {
+        let key = chord.map_or_else(
+            || {
+                crate::views::key_label(APP_EXIT, &self.context)
+                    .unwrap_or_else(|| String::from("exit"))
+            },
+            |chord| chord.to_string(),
+        );
+        let prefix = if self.cancel_requested {
+            " cancelling… · "
+        } else {
+            " "
+        };
+        let spans = vec![
+            ratatui::text::Span::styled(prefix.to_owned(), self.context.warning()),
+            ratatui::text::Span::styled(key, self.context.title()),
+            ratatui::text::Span::styled(String::from(" again to exit"), self.context.warning()),
+        ];
+        ratatui::text::Line::from(crate::views::markdown::truncate_row(
+            spans,
+            usize::from(width),
+        ))
     }
 
     /// The active turn's one-line control surface.
@@ -3160,12 +3192,29 @@ impl SessionScreen {
             .map(|_| InterruptNotice::Confirm)
     }
 
+    fn exit_notice_at(&self, now_ms: u64) -> Option<Option<Chord>> {
+        self.exit_armed_at_ms
+            .filter(|armed| now_ms.saturating_sub(*armed) <= EXIT_CONFIRM_WINDOW_MS)
+            .map(|_| self.exit_armed_chord)
+    }
+
     fn prune_interrupt_at(&mut self, now_ms: u64) -> bool {
         let expired = self
             .interrupt_armed_at_ms
             .is_some_and(|armed| now_ms.saturating_sub(armed) > INTERRUPT_CONFIRM_WINDOW_MS);
         if expired {
             self.interrupt_armed_at_ms = None;
+        }
+        expired
+    }
+
+    fn prune_exit_at(&mut self, now_ms: u64) -> bool {
+        let expired = self
+            .exit_armed_at_ms
+            .is_some_and(|armed| now_ms.saturating_sub(armed) > EXIT_CONFIRM_WINDOW_MS);
+        if expired {
+            self.exit_armed_at_ms = None;
+            self.exit_armed_chord = None;
         }
         expired
     }
@@ -3189,8 +3238,11 @@ impl SessionScreen {
                 EventResult::IGNORED
             };
         }
-        if matches!(event, AppEvent::AnimationFrame) && self.prune_interrupt_at(now_ms) {
-            return EventResult::REDRAW;
+        if matches!(event, AppEvent::AnimationFrame) {
+            let changed = self.prune_interrupt_at(now_ms) | self.prune_exit_at(now_ms);
+            if changed {
+                return EventResult::REDRAW;
+            }
         }
         EventResult::IGNORED
     }
@@ -3322,6 +3374,8 @@ impl SessionScreen {
     fn mark_turn_accepted(&mut self) {
         self.cancel_requested = false;
         self.interrupt_armed_at_ms = None;
+        self.exit_armed_at_ms = None;
+        self.exit_armed_chord = None;
         self.transcript.transcript_mut().mark_running();
         self.status.mark_running();
     }
@@ -4115,11 +4169,25 @@ impl SessionScreen {
         EventResult::REDRAW
     }
 
-    /// Cancel a running turn, or leave the application when none is running.
-    ///
-    /// Falling through to shutdown when the sink is missing or refuses is what keeps
-    /// this from becoming the trap described in the module docs.
-    fn request_exit(&mut self) -> EventResult {
+    /// Arm a bounded exit confirmation and cancel a running turn on the first press.
+    fn request_exit(&mut self, event: &KeyEvent) -> EventResult {
+        self.request_exit_at(event, self.now_ms())
+    }
+
+    fn request_exit_at(&mut self, event: &KeyEvent, now_ms: u64) -> EventResult {
+        let chord =
+            Chord::from_key_event(event).filter(|chord| crate::keybind::is_exit_chord(*chord));
+        let confirmed = self
+            .exit_armed_at_ms
+            .is_some_and(|armed| now_ms.saturating_sub(armed) <= EXIT_CONFIRM_WINDOW_MS)
+            && self.exit_armed_chord == chord;
+        if confirmed {
+            self.exit_armed_at_ms = None;
+            self.exit_armed_chord = None;
+            let _requested = self.shutdown.try_send(TerminalEvent::Shutdown);
+            return EventResult::REDRAW;
+        }
+
         if self.status.is_running()
             && !self.cancel_requested
             && let Some(cancels) = self.cancels.as_ref()
@@ -4133,12 +4201,9 @@ impl SessionScreen {
             self.cancel_requested = true;
             self.interrupt_armed_at_ms = None;
             self.cancellations += 1;
-            self.toasts.push(Toast::info(
-                "cancelling the turn; press the same exit key again to leave",
-            ));
-            return EventResult::REDRAW;
         }
-        let _requested = self.shutdown.try_send(TerminalEvent::Shutdown);
+        self.exit_armed_at_ms = Some(now_ms);
+        self.exit_armed_chord = chord;
         EventResult::REDRAW
     }
 
@@ -4899,7 +4964,7 @@ impl ActionComponent for SessionScreen {
         }
         if self.live_session.is_some() {
             if action.name == APP_EXIT || is_exit_request(event) {
-                return self.request_exit();
+                return self.request_exit(event);
             }
             let navigation = match action.name {
                 "session_parent" => self.return_to_parent_session(),
@@ -4990,7 +5055,7 @@ impl ActionComponent for SessionScreen {
         let editor_owns_chord =
             !self.editor.text().is_empty() && matches!(action.name, "input_clear" | "input_delete");
         if action.name == APP_EXIT || (is_exit_request(event) && !editor_owns_chord) {
-            return self.request_exit();
+            return self.request_exit(event);
         }
         if action.name == "messages_copy"
             && let Some(text) = self.transcript.selected_text()

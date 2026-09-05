@@ -331,6 +331,36 @@ fn a_greeting_is_atomic_and_injects_no_planning_instruction() {
     );
 }
 
+#[test]
+fn a_plan_mutation_replaces_the_one_time_required_instruction_with_maintenance() {
+    let decision = PlanningPolicy::classify(PlanningInput::new(
+        "Investigate the DCV failure, collect evidence, and verify the recovery path.",
+        "deep",
+    ));
+    assert!(matches!(decision, PlanningDecision::Required(_)));
+    let refresh = DynamicContextRefreshInstruction::Planning(decision.clone());
+
+    assert_eq!(
+        refresh.apply(
+            DynamicContext::new("CURRENT PLAN revision 1"),
+            ToolDynamicContextRefresh::WorkPlan,
+        ),
+        DynamicContext::new("CURRENT PLAN revision 1")
+            .with_runtime_instruction(maintain_plan_runtime_instruction()),
+        "a successful Plan mutation satisfies the one-time create-or-replace instruction"
+    );
+    assert_eq!(
+        refresh.apply(
+            DynamicContext::new("OLD PLAN revision 2"),
+            ToolDynamicContextRefresh::WorkItems,
+        ),
+        DynamicContext::new("OLD PLAN revision 2").with_runtime_instruction(
+            planning_runtime_instruction(&decision).expect("required instruction")
+        ),
+        "changing Todo detail alone must not claim the required Plan was replaced"
+    );
+}
+
 #[tokio::test]
 async fn hiding_plan_update_does_not_create_a_private_host_plan() {
     let directory = tempfile::TempDir::new().expect("temporary workspace");
@@ -6948,6 +6978,13 @@ fn every_turn_error() -> Vec<TurnError> {
             count: 3,
             tool: "write-in-the-message".to_owned(),
         },
+        TurnError::StagnantToolLoop {
+            count: 3,
+            tool: "plan_get-in-the-message".to_owned(),
+        },
+        TurnError::DynamicContextRefresh {
+            detail: "work-state refresh-in-the-message".to_owned(),
+        },
         TurnError::MissingHumanRequestId {
             tool: "goal_request_input".to_owned(),
         },
@@ -7040,6 +7077,8 @@ fn the_variant_table_covers_the_whole_enum() {
             TurnError::ToolUseEndWithoutStart { .. } => "ToolUseEndWithoutStart",
             TurnError::ToolSignatureWithoutStart { .. } => "ToolSignatureWithoutStart",
             TurnError::InvalidToolCalls { .. } => "InvalidToolCalls",
+            TurnError::StagnantToolLoop { .. } => "StagnantToolLoop",
+            TurnError::DynamicContextRefresh { .. } => "DynamicContextRefresh",
             TurnError::MissingHumanRequestId { .. } => "MissingHumanRequestId",
             TurnError::EventConsumerClosed => "EventConsumerClosed",
             TurnError::Hook(_) => "Hook",
@@ -7055,7 +7094,7 @@ fn the_variant_table_covers_the_whole_enum() {
 
     assert_eq!(
         named.len(),
-        23,
+        25,
         "the table covers only {named:?}; every variant needs a value or the rendering \
          claims above are vacuous for the ones missing"
     );
@@ -7736,6 +7775,44 @@ mod production_registry {
 
         assert!(fixture.ids.iter().any(|id| id == DYNAMIC_TOOL_ID));
         assert_eq!(fixture.deferred_ids, [DYNAMIC_TOOL_ID]);
+    }
+
+    #[test]
+    fn session_message_is_root_only_even_when_parent_authority_contains_it() {
+        let root = try_assemble_for_agent_runtime(
+            "orchestrator",
+            zuno_catalog::skill::Skills::default(),
+            zuno_config::schema::Config::default(),
+            None,
+            None,
+        )
+        .expect("root registry assembles");
+        assert!(
+            root.ids
+                .iter()
+                .any(|id| id == zuno_tools::SESSION_MESSAGE_TOOL_ID)
+        );
+
+        let parent_tool: Arc<dyn zuno_tool::Tool> =
+            zuno_tool::erase(zuno_tools::SessionMessageTool::new(Arc::new(
+                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("parent tool database"),
+            )));
+        let child = try_assemble_for_agent_runtime(
+            "deep",
+            zuno_catalog::skill::Skills::default(),
+            zuno_config::schema::Config::default(),
+            None,
+            Some(authority_for(&parent_tool)),
+        )
+        .expect("child registry assembles");
+        assert!(
+            child
+                .ids
+                .iter()
+                .all(|id| id != zuno_tools::SESSION_MESSAGE_TOOL_ID),
+            "delegated children must not receive root-to-root messaging authority: {:?}",
+            child.ids
+        );
     }
 
     #[test]

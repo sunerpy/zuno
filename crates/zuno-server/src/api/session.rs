@@ -297,8 +297,8 @@ enum DrivenInput {
     UserPrompt,
     /// A settled asynchronous report, driven together with the session's whole batch.
     Report,
-    /// An answered human request, delivered as plain text on its own.
-    HumanAnswer,
+    /// One attributed plain-text input delivered on its own.
+    PlainText,
 }
 
 impl DrivenInput {
@@ -323,7 +323,9 @@ impl DrivenInput {
             | DurableInputKind::WorkflowReport
             | DurableInputKind::CouncilReport
             | DurableInputKind::BackgroundExecutionReport => Some(Self::Report),
-            DurableInputKind::HumanRequestAnswer => Some(Self::HumanAnswer),
+            DurableInputKind::HumanRequestAnswer | DurableInputKind::SessionMessage => {
+                Some(Self::PlainText)
+            }
             DurableInputKind::TuiPrompt
             | DurableInputKind::AcpPrompt
             | DurableInputKind::HostMessage => None,
@@ -335,8 +337,8 @@ impl DrivenInput {
 enum DrivenPromotion {
     /// An HTTP prompt body with its own agent and model overrides.
     Prompt(SessionInput),
-    /// One answered human request.
-    HumanAnswer(SessionInput),
+    /// One answered human request or peer-session message.
+    PlainText(SessionInput),
     /// Every settled report the session had pending, as one provider request.
     Reports(ReportBatch),
 }
@@ -345,7 +347,7 @@ impl DrivenPromotion {
     /// The durable rows this promotion is responsible for settling.
     fn input_ids(&self) -> Vec<String> {
         match self {
-            Self::Prompt(input) | Self::HumanAnswer(input) => vec![input.id.clone()],
+            Self::Prompt(input) | Self::PlainText(input) => vec![input.id.clone()],
             Self::Reports(batch) => batch
                 .reports()
                 .iter()
@@ -1051,9 +1053,9 @@ fn promote_next_driven(
                     return Ok(Some(DrivenPromotion::Prompt(promoted)));
                 }
             }
-            DrivenInput::HumanAnswer => {
+            DrivenInput::PlainText => {
                 if let Some(promoted) = inbox.promote_id(session_id, &pending.id)? {
-                    return Ok(Some(DrivenPromotion::HumanAnswer(promoted)));
+                    return Ok(Some(DrivenPromotion::PlainText(promoted)));
                 }
             }
         }
@@ -1100,8 +1102,8 @@ fn driven_request(
 ) -> Result<DrivenRequest, String> {
     match promoted {
         DrivenPromotion::Prompt(input) => prompt_execution(state, input).map(DrivenRequest::Prompt),
-        DrivenPromotion::HumanAnswer(input) => {
-            human_answer_execution(state, input).map(DrivenRequest::Prompt)
+        DrivenPromotion::PlainText(input) => {
+            plain_text_execution(state, input).map(DrivenRequest::Prompt)
         }
         DrivenPromotion::Reports(batch) => {
             report_execution(state, session_id, batch).map(DrivenRequest::Reports)
@@ -1131,7 +1133,7 @@ fn prompt_execution(
     })
 }
 
-fn human_answer_execution(
+fn plain_text_execution(
     state: &ApiState,
     input: SessionInput,
 ) -> Result<SessionPromptExecution, String> {

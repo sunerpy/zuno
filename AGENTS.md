@@ -60,6 +60,11 @@ Zuno is a released, fast-moving Rust agent harness. Prefer the correct foundatio
 - Every code change includes a documentation-impact review. A user-visible behavior, configuration, CLI, protocol, persistence, permission, platform, deployment, or operational change updates the relevant English and Chinese guides or references in the same change; generated CLI/schema material and documentation contract tests must be refreshed when applicable. A genuinely internal-only change records why no user documentation changed instead of silently skipping the review.
 - Adding, renaming, or removing a documentation page also updates repository entry links and the FirLab site navigation or sync contract so the published page is discoverable. A documentation-bearing delivery is not complete until the `Publish docs` workflow succeeds and the corresponding live route is verified after the source change reaches `main`.
 - Tests describe Zuno behavior. Remove tests whose only purpose is cross-product parity.
+- Rapid-development releases are patch-only until this rule is removed. `feat` and `fix`
+  may change changelog grouping but must not change the major or minor component; do not
+  use `!`, `BREAKING CHANGE`, `Release-As`, or another override that would produce anything
+  except the next `x.y.(z+1)` version. The release controller must fail closed on any other
+  candidate.
 
 ## Checks
 

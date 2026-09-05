@@ -11,9 +11,10 @@ use std::fmt;
 use std::sync::Arc;
 use zuno_db::Pool;
 use zuno_error::{DbError, ToolError};
+use zuno_orchestration::sha256_json;
 use zuno_tool::{
-    PermissionAsk, Tool, ToolConcurrencyPolicy, ToolContext, ToolEffect, ToolOutput,
-    ToolReplayPolicy, TypedTool, erase,
+    PermissionAsk, Tool, ToolConcurrencyPolicy, ToolContext, ToolDynamicContextRefresh, ToolEffect,
+    ToolOutput, ToolProgressObservation, ToolReplayPolicy, TypedTool, erase,
 };
 
 pub const PLAN_GET_TOOL_ID: &str = "plan_get";
@@ -198,6 +199,14 @@ impl WorkStateError {
 
 pub trait WorkStateObserver: Send + Sync {
     fn changed(&self);
+
+    fn plan_changed(&self, _plan: &WorkPlan) {
+        self.changed();
+    }
+
+    fn items_changed(&self, _items: &[WorkItem]) {
+        self.changed();
+    }
 }
 
 #[derive(Clone)]
@@ -230,9 +239,15 @@ impl WorkStateStore {
         self
     }
 
-    fn notify_changed(&self) {
+    fn notify_plan_changed(&self, plan: &WorkPlan) {
         if let Some(observer) = &self.observer {
-            observer.changed();
+            observer.plan_changed(plan);
+        }
+    }
+
+    fn notify_items_changed(&self, items: &[WorkItem]) {
+        if let Some(observer) = &self.observer {
+            observer.items_changed(items);
         }
     }
 
@@ -406,8 +421,8 @@ impl WorkStateStore {
                 )
             }
         };
-        if result.is_ok() {
-            self.notify_changed();
+        if let Ok(plan) = &result {
+            self.notify_plan_changed(plan);
         }
         result
     }
@@ -776,14 +791,18 @@ impl WorkStateStore {
             ));
         }
         let now = zuno_db::message::now_millis();
-        self.pool.try_transaction(|tx| {
+        let result = self.pool.try_transaction(|tx| {
             for change in &changes {
                 apply_item_change(tx, session_id, change, now)?;
             }
             let items = list_items_in(tx, session_id)?;
             validate_item_graph(&items, plan_in(tx, session_id)?.as_ref())?;
             Ok(items)
-        })
+        });
+        if let Ok(items) = &result {
+            self.notify_items_changed(items);
+        }
+        result
     }
 
     /// Advance one runtime-owned item without letting a model forge metering fields.
@@ -1858,7 +1877,7 @@ impl TypedTool for PlanGetTool {
             .await
             .map_err(|error| failed(PLAN_GET_TOOL_ID, error))?
             .map_err(|error| map_error(PLAN_GET_TOOL_ID, error))?;
-        output(PLAN_GET_TOOL_ID, "Plan", "plan", plan)
+        observed_output(PLAN_GET_TOOL_ID, "Plan", "plan", "work_plan", plan)
     }
 }
 
@@ -1884,6 +1903,7 @@ impl TypedTool for PlanUpdateTool {
             .map_err(|error| failed(PLAN_UPDATE_TOOL_ID, error))?
             .map_err(|error| map_error(PLAN_UPDATE_TOOL_ID, error))?;
         output(PLAN_UPDATE_TOOL_ID, title, "plan", Some(plan))
+            .map(|output| output.with_dynamic_context_refresh(ToolDynamicContextRefresh::WorkPlan))
     }
 }
 
@@ -1912,10 +1932,11 @@ impl TypedTool for TodoGetTool {
             .await
             .map_err(|error| failed(TODO_GET_TOOL_ID, error))?
             .map_err(|error| map_error(TODO_GET_TOOL_ID, error))?;
-        output(
+        observed_output(
             TODO_GET_TOOL_ID,
             &format!("{} work items", items.len()),
             "todos",
+            "work_items",
             items,
         )
     }
@@ -1948,6 +1969,7 @@ impl TypedTool for TodoUpdateTool {
             "todos",
             items,
         )
+        .map(|output| output.with_dynamic_context_refresh(ToolDynamicContextRefresh::WorkItems))
     }
 }
 
@@ -1994,6 +2016,22 @@ fn output<T: Serialize>(
     let value = serde_json::to_value(value).map_err(|error| failed(tool, error))?;
     let rendered = serde_json::to_string_pretty(&value).map_err(|error| failed(tool, error))?;
     Ok(ToolOutput::text(title, rendered).with_metadata(key, value))
+}
+
+fn observed_output<T: Serialize>(
+    tool: &str,
+    title: &str,
+    key: &str,
+    scope: &str,
+    value: T,
+) -> Result<ToolOutput, ToolError> {
+    let output = output(tool, title, key, value)?;
+    let fingerprint = output
+        .metadata
+        .get(key)
+        .map(sha256_json)
+        .expect("output inserted the observed metadata value");
+    Ok(output.with_progress_observation(ToolProgressObservation::new(scope, fingerprint)))
 }
 
 fn map_error(tool: &str, error: WorkStateError) -> ToolError {

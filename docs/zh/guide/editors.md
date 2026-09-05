@@ -131,7 +131,29 @@ zuno models
 
 在 Windows 上请使用转义后的绝对路径。多个 Zed 条目可以用不同的 `ZUNO_CONFIG_DIR` 覆盖层启动同一个 Zuno 二进制。
 
-## 4. 选择 `deep` 或其他会话 Agent
+## 4. 进程丢失、重连与后台工作
+
+ACP stdio 归启动 `zuno acp` 的编辑器进程所有。该进程退出时，JSON-RPC transport 与实时
+投影订阅会消失，但持久 session 不会：message、inbox、Goal、Plan、Todo、Job、usage、
+prompt receipt、待处理人工请求和重试截止时间仍在 SQLite。
+
+重连后：
+
+1. 启动新的 `zuno acp`；
+2. 用客户端保存的 session id 调用 `session/load`；
+3. 只有协商出的能力确实暴露该操作时才使用 `session/resume`；
+4. 让 Zuno 重放持久状态并恢复符合条件的 continuation。
+
+稳定 ACP v1 的基线重连契约是 load。将来或协商出的 resume 可以改善客户端体验，但不会替代
+持久 load。TUI 文档中的 background supervisor 只保留 PTY，刻意不包装 ACP stdio；需要常驻
+ACP 的部署应使用编辑器拥有的远程进程、service manager，或真正保留 ACP 进程的 transport
+supervisor。
+
+peer-session message 同样持久。根 Agent 可以用 `session_message` 向同项目另一个 root 发送。
+本 ACP session 在线时，它作为带来源的纯文本 peer context 被驱动；离线时保持 queued，并在
+load 后处理。child Agent 永远拿不到发送工具。
+
+## 5. 选择 `deep` 或其他会话 Agent
 
 一个新的 ACP 会话会解析 Zuno 常规的默认 Agent 与模型。随后 Zuno 向 Zed 发布这些会话控制项：
 
@@ -152,7 +174,7 @@ Plan 模式总是激活只读的 `plan` Agent。回到 Build 模式会恢复所�
 
 `zuno acp` 不接受 `--agent` 启动参数。Agent 选择是一个 ACP 会话配置操作，不是第二个进程级配置面。
 
-## 5. 斜杠命令与 Skill
+## 6. 斜杠命令与 Skill
 
 在会话创建、加载、恢复或一次成功的重新配置之后，Zuno 会发布原生会话控制项、来自其常规命令目录的可执行命令，以及可用斜杠调用的无歧义 Skill。随后 Zed 会在 `/` 补全中暴露它们。
 
@@ -172,7 +194,7 @@ Plan 模式总是激活只读的 `plan` Agent。回到 Build 模式会恢复所�
 
 执行 `/name arguments` 使用 Zuno 已有的命令模板或 Skill driver，包括常规的权限与持久会话行为。ACP 不会创建产品特定的 `/dual-review`、`/auto-release` 或其他工作流；用户可以在自己的命令或 Skill 目录中定义它们。
 
-## 6. 图像、选区、分支 diff 与附件
+## 7. 图像、选区、分支 diff 与附件
 
 Zuno 公布对 ACP `image` 与 `embeddedContext` 的支持。在 Zed 中这会启用图像附件以及通用的嵌入上下文，例如当前选区、诊断信息、抓取的上下文和分支 diff。
 
@@ -184,7 +206,7 @@ Zuno 公布对 ACP `image` 与 `embeddedContext` 的支持。在 Zed 中这会�
 
 所选的 provider/model 也必须公布图像输入能力。ACP 的能力协商无法让一个纯文本模型接受图像。
 
-## 7. 权限、工具、diff 与生命周期
+## 8. 权限、工具、diff 与生命周期
 
 Zed 呈现权限与征询请求，但策略拥有者仍然是 Zuno：
 
@@ -281,7 +303,7 @@ ACP 提供的 MCP 公布 stdio 与 Streamable HTTP，SSE 仍不支持。每次 n
 
 历史文件引用不会仅因为它们是持久的就被信任。只有那些确实存在、且规范化后位于项目 worktree 内的普通文件，才仍然可作为 diff 路径、位置或本地资源链接使用。缺失的、外部的或通过符号链接逃逸的本地资源会显示为不可操作的说明文本。一个 ACP stdio 连接最多保留 32 个打开的会话；`session/close` 会释放该槽位，并关停任何已激活的宿主与 MCP 运行时。
 
-## 8. 排障
+## 9. 排障
 
 ### Agent 启动失败
 
@@ -364,7 +386,7 @@ dev: open acp logs
 
 `kiro-provider` v0.5.0 及以后版本还会区分可重试的流失败与致命的协议失败。Zuno 只重试 `upstream_stream_error`、`upstream_stream_incomplete`、`upstream_stream_idle_timeout`、`malformed_upstream_tool_arguments` 和 `request_deadline_exceeded`；旧式的通用 `upstream_error` 不足以授权重试。provider 只能在模型已经完成工具调用、但参数载荷不是合法 JSON 时使用 `malformed_upstream_tool_arguments`；工具调用的结构性错误仍须使用永久失败的 `invalid_upstream_tool_call`。每次调用都记录在 `session.provider.attempt.1` 之下，并复用同一份持久会话亲和性。由于 ACP 无法撤回一个已追加的消息块，Zuno 只在该次尝试被打上检查点之后才提交 provider 文本、推理和待处理的工具行。一次失败的部分尝试会被丢弃，而不是与它的替代者拼接在一起。
 
-## 9. 验收检查
+## 10. 验收检查
 
 配置完成之后：
 

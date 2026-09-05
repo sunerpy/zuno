@@ -338,7 +338,8 @@ CREATE TABLE IF NOT EXISTS goal_pause (
         'permission',
         'authentication',
         'uncertain_side_effect',
-        'turn_budget'
+        'turn_budget',
+        'no_progress'
     )),
     human_request_id TEXT,
     paused_at_ms INTEGER NOT NULL
@@ -1028,7 +1029,8 @@ impl GoalStore {
                 GoalPauseReason::UserInterruption
                 | GoalPauseReason::Authentication
                 | GoalPauseReason::UncertainSideEffect
-                | GoalPauseReason::TurnBudget => false,
+                | GoalPauseReason::TurnBudget
+                | GoalPauseReason::NoProgress => false,
                 GoalPauseReason::HumanInput | GoalPauseReason::Permission => {
                     unreachable!("human request reasons handled by the guard")
                 }

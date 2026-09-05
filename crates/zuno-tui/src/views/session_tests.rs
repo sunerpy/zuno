@@ -1483,15 +1483,20 @@ fn session_screen_empty_external_editor_result_keeps_the_prompt() {
 }
 
 #[test]
-fn session_screen_resolving_app_exit_requests_shutdown_through_the_channel() {
+fn session_screen_resolving_app_exit_requires_confirmation_before_shutdown() {
     // The property the boot path depends on: `App::run` returns on nothing but a
-    // `Shutdown` event, so a screen that only returned a flag would never end.
+    // `Shutdown` event. The first action arms the footer; the second sends it.
     let (mut screen, mut shutdown) = screen();
+    screen.handle_action(action("app_exit"), &press_none());
+    assert!(
+        shutdown.try_recv().is_err(),
+        "resolving `app_exit` shut down on the first press"
+    );
     screen.handle_action(action("app_exit"), &press_none());
 
     assert!(
         matches!(shutdown.try_recv(), Ok(TerminalEvent::Shutdown)),
-        "resolving `app_exit` did not put a shutdown on the terminal channel"
+        "confirming `app_exit` did not put a shutdown on the terminal channel"
     );
 }
 
@@ -1521,9 +1526,9 @@ fn exit_key_event() -> KeyEvent {
 
 #[test]
 fn session_screen_the_exit_key_clears_a_typed_prompt_before_it_leaves() {
-    // The two-press behaviour the reference TUI has: the first press throws away
-    // what was typed, and only a press with nothing to clear ends the session. A
-    // screen that exited on the first press would lose a half-written prompt.
+    // The editor keeps the first press to clear the draft. Once empty, exit itself
+    // requires two presses; a screen that treated the clearing press as the first
+    // confirmation would still lose a half-written prompt too easily.
     let (mut screen, mut shutdown) = screen();
     screen.editor.set_text("half-written");
     screen.handle_action(action("input_clear"), &exit_key_event());
@@ -1539,8 +1544,13 @@ fn session_screen_the_exit_key_clears_a_typed_prompt_before_it_leaves() {
 
     screen.handle_action(action("input_clear"), &exit_key_event());
     assert!(
+        shutdown.try_recv().is_err(),
+        "the first press with nothing to clear must arm confirmation"
+    );
+    screen.handle_action(action("input_clear"), &exit_key_event());
+    assert!(
         matches!(shutdown.try_recv(), Ok(TerminalEvent::Shutdown)),
-        "a press with nothing to clear must request shutdown"
+        "the confirmed empty-prompt exit did not request shutdown"
     );
 }
 
@@ -1563,8 +1573,13 @@ fn session_screen_ctrl_d_only_leaves_when_the_prompt_is_empty() {
     screen.editor.set_text("");
     screen.handle_action(action("input_delete"), &key_event("ctrl+d"));
     assert!(
+        shutdown.try_recv().is_err(),
+        "the first ctrl+d with an empty prompt did not arm confirmation"
+    );
+    screen.handle_action(action("input_delete"), &key_event("ctrl+d"));
+    assert!(
         matches!(shutdown.try_recv(), Ok(TerminalEvent::Shutdown)),
-        "ctrl+d with an empty prompt did not request shutdown"
+        "confirmed ctrl+d with an empty prompt did not request shutdown"
     );
 }
 
@@ -1654,8 +1669,9 @@ fn session_screen_places_permission_prompts_in_the_composer_region() {
 ///
 /// Asserted through the real tree at the real focused scope chain, because every
 /// layer in it may decline to forward and the defect lived in exactly one of them.
+/// The first press arms the confirmation; the second leaves.
 #[test]
-fn session_screen_the_exit_chord_leaves_even_while_a_modal_owns_the_keyboard() {
+fn session_screen_the_exit_chord_confirms_even_while_a_modal_owns_the_keyboard() {
     for spelling in exit_chord_spellings() {
         let (screen, mut shutdown) = screen();
         let mut host =
@@ -1668,6 +1684,13 @@ fn session_screen_the_exit_chord_leaves_even_while_a_modal_owns_the_keyboard() {
             Box::new(host),
         );
 
+        dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(key_event(&spelling)),
+        )));
+        assert!(
+            shutdown.try_recv().is_err(),
+            "`{spelling}` left on the first press instead of arming confirmation"
+        );
         dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
             crossterm::event::Event::Key(key_event(&spelling)),
         )));
@@ -1747,13 +1770,14 @@ fn session_screen_a_non_exit_spelling_of_the_same_action_does_not_leave() {
     );
 }
 
-/// An exit chord during a running turn cancels the turn; the next one always leaves.
+/// An exit chord during a running turn cancels the turn; the next one inside the
+/// confirmation window leaves.
 ///
 /// The second press is asserted **without** delivering `TurnInterrupted`, because
 /// that is the case a real terminal exposed: a turn parked on a permission ask never
 /// reaches the engine's interrupt check, so it stays "running" after an abort. A
 /// screen that decided by re-reading the strip cancelled forever and never left. The
-/// only safe rule is that one press is remembered and the next one leaves regardless.
+/// only safe rule is that one press is remembered independently of the running strip.
 #[test]
 fn session_screen_the_second_exit_chord_leaves_even_if_the_cancelled_turn_never_ends() {
     let (sender, mut shutdown) = terminal_event_channel();
@@ -1787,6 +1811,62 @@ fn session_screen_the_second_exit_chord_leaves_even_if_the_cancelled_turn_never_
         1,
         "the second press must leave, not cancel again"
     );
+}
+
+#[test]
+fn session_screen_idle_exit_is_confirmed_in_the_footer() {
+    let (mut screen, mut shutdown) = screen();
+    let key = key_event("ctrl+c");
+
+    screen.request_exit_at(&key, 1_000);
+    assert!(
+        shutdown.try_recv().is_err(),
+        "the first idle exit press left without confirmation"
+    );
+    let frame = rows(&render_offscreen(&mut screen, 80, 24).expect("infallible"));
+    let hint = frame
+        .iter()
+        .position(|row| row.contains("ctrl+c again to exit"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the exit confirmation was not rendered in the footer:\n{}",
+                frame.join("\n")
+            )
+        });
+    let prompt = frame
+        .iter()
+        .position(|row| row.contains(PROMPT_PLACEHOLDER))
+        .expect("the empty composer is visible");
+    assert!(
+        hint > prompt,
+        "the exit confirmation belongs below the composer:\n{}",
+        frame.join("\n")
+    );
+
+    screen.request_exit_at(&key, 1_001);
+    assert!(matches!(shutdown.try_recv(), Ok(TerminalEvent::Shutdown)));
+}
+
+#[test]
+fn session_screen_exit_confirmation_expires_and_requires_the_same_chord() {
+    let (mut screen, mut shutdown) = screen();
+    let ctrl_c = key_event("ctrl+c");
+    let ctrl_d = key_event("ctrl+d");
+
+    screen.request_exit_at(&ctrl_c, 1_000);
+    screen.request_exit_at(&ctrl_c, 1_000 + EXIT_CONFIRM_WINDOW_MS + 1);
+    assert!(
+        shutdown.try_recv().is_err(),
+        "an expired exit arm still shut the application down"
+    );
+
+    screen.request_exit_at(&ctrl_d, 3_000);
+    assert!(
+        shutdown.try_recv().is_err(),
+        "a different exit chord confirmed the earlier chord"
+    );
+    screen.request_exit_at(&ctrl_d, 3_001);
+    assert!(matches!(shutdown.try_recv(), Ok(TerminalEvent::Shutdown)));
 }
 
 #[test]
@@ -1997,9 +2077,9 @@ fn session_screen_a_new_turn_can_be_cancelled_after_an_earlier_one_was() {
     assert_eq!(screen.cancellations(), 2);
 }
 
-/// A refusing cancel sink must cost a cancellation, never the way out.
+/// A refusing cancel sink must not trap the application: confirmation still exits.
 #[test]
-fn session_screen_a_full_cancel_sink_falls_through_to_shutdown() {
+fn session_screen_a_full_cancel_sink_still_allows_confirmed_shutdown() {
     let (sender, mut shutdown) = terminal_event_channel();
     let (cancels, _held) = mpsc::channel(1);
     let mut screen =
@@ -2009,6 +2089,11 @@ fn session_screen_a_full_cancel_sink_falls_through_to_shutdown() {
         .try_send(tui_interrupt(HardInterruptReason::UserCancel))
         .expect("the sink starts empty");
 
+    screen.handle_action(action("app_exit"), &press_none());
+    assert!(
+        shutdown.try_recv().is_err(),
+        "a full cancel sink bypassed the exit confirmation"
+    );
     screen.handle_action(action("app_exit"), &press_none());
 
     assert!(
@@ -2151,6 +2236,10 @@ async fn session_screen_exit_key_ends_the_application_loop() {
         kind: crossterm::event::KeyEventKind::Press,
         state: crossterm::event::KeyEventState::NONE,
     };
+    terminal_sender
+        .send(TerminalEvent::Input(crossterm::event::Event::Key(event)))
+        .await
+        .expect("the application is listening");
     terminal_sender
         .send(TerminalEvent::Input(crossterm::event::Event::Key(event)))
         .await

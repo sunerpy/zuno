@@ -13,9 +13,9 @@ use zuno_db::{Connection, migration, open};
 use zuno_engine::dispatch::ToolRegistryDispatcher;
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::{
-    AgentModelResolver, ResolvedAgent, ResolvedModel, RunTurnRequest, ToolBlockKind,
-    ToolConcurrencyLimit, ToolFailureRecovery, TurnContext, TurnEvent, TurnOutcome, event_channel,
-    run_turn,
+    AgentModelResolver, DynamicContextRefresher, ResolvedAgent, ResolvedModel, RunTurnRequest,
+    ToolBlockKind, ToolConcurrencyLimit, ToolFailureRecovery, TurnContext, TurnError, TurnEvent,
+    TurnOutcome, TurnRecovery, event_channel, run_turn,
 };
 use zuno_error::{ProviderError, ToolError};
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
@@ -26,8 +26,8 @@ use zuno_llm::registry::{
 use zuno_permission::{PermissionAction, Rule};
 use zuno_tool::{
     AllowAll, METADATA_HUMAN_REQUEST_ID_KEY, QuestionResultPresentation, QuestionResultStatus,
-    Tool, ToolConcurrencyPolicy, ToolContext, ToolContinuation, ToolOutput, ToolReplayPolicy,
-    ToolResultPresentation,
+    Tool, ToolConcurrencyPolicy, ToolContext, ToolContinuation, ToolDynamicContextRefresh,
+    ToolEffect, ToolOutput, ToolProgressObservation, ToolReplayPolicy, ToolResultPresentation,
 };
 
 const SESSION_ID: &str = "ses_dispatch_loop";
@@ -35,13 +35,19 @@ const SESSION_ID: &str = "ses_dispatch_loop";
 #[derive(Debug)]
 struct ScriptedProvider {
     responses: Mutex<VecDeque<Vec<StreamEvent>>>,
+    requests: Mutex<Vec<CompletionRequest>>,
 }
 
 impl ScriptedProvider {
     fn new(responses: Vec<Vec<StreamEvent>>) -> Self {
         Self {
             responses: Mutex::new(responses.into()),
+            requests: Mutex::new(Vec::new()),
         }
+    }
+
+    fn requests(&self) -> Vec<CompletionRequest> {
+        self.requests.lock().expect("request lock").clone()
     }
 }
 
@@ -57,7 +63,8 @@ impl Provider for ScriptedProvider {
         }
     }
 
-    fn stream(&self, _request: CompletionRequest) -> ProviderStream<'_> {
+    fn stream(&self, request: CompletionRequest) -> ProviderStream<'_> {
+        self.requests.lock().expect("request lock").push(request);
         let events = self
             .responses
             .lock()
@@ -183,6 +190,91 @@ impl Tool for ParallelTool {
             .push(command.to_owned());
         self.state.active.fetch_sub(1, Ordering::SeqCst);
         Ok(ToolOutput::text("parallel", format!("completed {command}")))
+    }
+}
+
+struct PlanProbeTool {
+    calls: AtomicUsize,
+    stable: bool,
+}
+
+struct PlanMutationTool;
+
+#[async_trait]
+impl Tool for PlanMutationTool {
+    fn id(&self) -> &str {
+        "plan_update"
+    }
+
+    fn description(&self) -> &str {
+        "Replace the current durable plan."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "intent": { "type": "string" } },
+            "required": ["intent"]
+        })
+    }
+
+    async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("Plan", r#"{"revision":2}"#)
+            .with_dynamic_context_refresh(ToolDynamicContextRefresh::WorkPlan))
+    }
+}
+
+struct RecordingContextRefresher {
+    calls: AtomicUsize,
+}
+
+impl DynamicContextRefresher for RecordingContextRefresher {
+    fn refresh(
+        &self,
+        _connection: &Connection,
+        session_id: &str,
+        refresh: ToolDynamicContextRefresh,
+    ) -> Result<DynamicContext, String> {
+        assert_eq!(session_id, SESSION_ID);
+        assert_eq!(refresh, ToolDynamicContextRefresh::WorkPlan);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(DynamicContext::new("CURRENT PLAN revision 2"))
+    }
+}
+
+#[async_trait]
+impl Tool for PlanProbeTool {
+    fn id(&self) -> &str {
+        "plan_get"
+    }
+
+    fn description(&self) -> &str {
+        "Read the current durable plan."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "intent": { "type": "string" } },
+            "required": ["intent"]
+        })
+    }
+
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
+    async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let revision = if self.stable { 1 } else { call };
+        Ok(ToolOutput::text(
+            "Plan",
+            format!(r#"{{"revision":{revision},"title":"diagnose DCV"}}"#),
+        )
+        .with_progress_observation(ToolProgressObservation::new(
+            "work_plan",
+            format!("revision:{revision}"),
+        )))
     }
 }
 
@@ -507,6 +599,69 @@ fn mixed_provider_events(calls: &[(&str, &str, &str)]) -> Vec<Vec<StreamEvent>> 
         first,
         vec![
             StreamEvent::TextDelta("tools completed".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ],
+    ]
+}
+
+fn repeated_plan_events(count: usize, with_final_text: bool) -> Vec<Vec<StreamEvent>> {
+    let mut responses = (0..count)
+        .map(|index| {
+            let id = format!("call_plan_{index}");
+            vec![
+                StreamEvent::ToolUseStart {
+                    id: id.clone(),
+                    name: "plan_get".to_owned(),
+                },
+                StreamEvent::ToolInputDelta {
+                    id: id.clone(),
+                    delta: json!({
+                        "intent": format!(
+                            "inspect the current plan with distinct incident wording {index}"
+                        )
+                    })
+                    .to_string(),
+                },
+                StreamEvent::ToolUseEnd { id },
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(FinishReason::ToolCalls),
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    if with_final_text {
+        responses.push(vec![
+            StreamEvent::TextDelta("continued after real plan progress".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ]);
+    }
+    responses
+}
+
+fn plan_mutation_events() -> Vec<Vec<StreamEvent>> {
+    vec![
+        vec![
+            StreamEvent::ToolUseStart {
+                id: "call_plan_update".to_owned(),
+                name: "plan_update".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call_plan_update".to_owned(),
+                delta: json!({"intent": "replace the stale plan"}).to_string(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call_plan_update".to_owned(),
+            },
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::ToolCalls),
+            },
+        ],
+        vec![
+            StreamEvent::TextDelta("continued with the refreshed plan".to_owned()),
             StreamEvent::MessageEnd {
                 stop_reason: Some(FinishReason::Stop),
             },
@@ -1413,6 +1568,178 @@ async fn dispatch_loop_keeps_only_the_latest_failure_recovery_for_each_tool() {
             "call-terminal:error",
             "call-terminal:result:error",
         ]
+    );
+}
+
+#[tokio::test]
+async fn dispatch_loop_pauses_after_three_identical_plan_reads_with_different_intents() {
+    let mut connection = seeded();
+    let provider = Arc::new(ScriptedProvider::new(repeated_plan_events(3, false)));
+    let providers = registry(provider);
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(PlanProbeTool {
+            calls: AtomicUsize::new(0),
+            stable: true,
+        })],
+        vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }],
+        Arc::new(AllowAll),
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
+        McpToolStatus::Ready,
+    );
+    let resolver = Resolver;
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        RunTurnRequest::new(SESSION_ID, "turn-stagnant-plan", DynamicContext::default()),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    let error = outcome.expect_err("the third identical plan read must stop the turn");
+    assert!(matches!(
+        error,
+        TurnError::StagnantToolLoop {
+            count: 3,
+            ref tool
+        } if tool == "plan_get"
+    ));
+    assert_eq!(error.recovery(), TurnRecovery::Pause);
+    assert_eq!(
+        lifecycle(&events)
+            .into_iter()
+            .filter(|event| event.ends_with(":result:ok"))
+            .count(),
+        3,
+        "every settled read remains model-visible before the typed pause"
+    );
+    let tool_parts = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate the paused turn")
+        .into_iter()
+        .flat_map(|message| message.parts)
+        .filter(|part| part.kind == PartKind::Tool)
+        .count();
+    assert_eq!(tool_parts, 3);
+}
+
+#[tokio::test]
+async fn dispatch_loop_allows_repeated_plan_reads_when_the_result_changes() {
+    let mut connection = seeded();
+    let provider = Arc::new(ScriptedProvider::new(repeated_plan_events(3, true)));
+    let providers = registry(provider);
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(PlanProbeTool {
+            calls: AtomicUsize::new(0),
+            stable: false,
+        })],
+        vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }],
+        Arc::new(AllowAll),
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
+        McpToolStatus::Ready,
+    );
+    let resolver = Resolver;
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        RunTurnRequest::new(SESSION_ID, "turn-changing-plan", DynamicContext::default()),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 4, .. })
+    ));
+}
+
+#[tokio::test]
+async fn dispatch_loop_refreshes_dynamic_context_after_a_plan_mutation() {
+    let mut connection = seeded();
+    let provider = Arc::new(ScriptedProvider::new(plan_mutation_events()));
+    let providers = registry(Arc::clone(&provider));
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(PlanMutationTool)],
+        vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }],
+        Arc::new(AllowAll),
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
+        McpToolStatus::Ready,
+    );
+    let resolver = Resolver;
+    let interrupt = InterruptSignal::new();
+    let refresher = RecordingContextRefresher {
+        calls: AtomicUsize::new(0),
+    };
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        RunTurnRequest::new(
+            SESSION_ID,
+            "turn-refresh-plan-context",
+            DynamicContext::new("STALE PLAN revision 1"),
+        ),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        )
+        .with_dynamic_context_refresher(&refresher),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 2, .. })
+    ));
+    assert_eq!(refresher.calls.load(Ordering::SeqCst), 1);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0]
+            .developer_context
+            .iter()
+            .any(|section| section == "STALE PLAN revision 1")
+    );
+    assert!(
+        requests[1]
+            .developer_context
+            .iter()
+            .any(|section| section == "CURRENT PLAN revision 2")
+    );
+    assert!(
+        requests[1]
+            .developer_context
+            .iter()
+            .all(|section| section != "STALE PLAN revision 1"),
+        "the next provider request must not retain the invalidated snapshot"
     );
 }
 

@@ -173,7 +173,36 @@ An `env` object attached to one ACP-provided stdio MCP server belongs only to
 that child process; it does not rewrite Zuno's process environment or other
 session traffic.
 
-## 4. Select `deep` or another session Agent
+## 4. Process loss, reconnect, and background work
+
+ACP stdio is owned by the editor process that launched `zuno acp`. If that
+process exits, the JSON-RPC transport and its live projection subscriptions are
+gone. The durable session is not: messages, inbox rows, Goal, Plan, Todo, Job,
+usage, prompt receipts, pending human requests, and retry deadlines remain in
+SQLite.
+
+After reconnect:
+
+1. launch a fresh `zuno acp` process;
+2. use the client's saved session id with `session/load`;
+3. use `session/resume` only when the negotiated client/server capability exposes
+   that operation;
+4. let Zuno replay durable state and recover eligible pending continuation work.
+
+Stable ACP v1 load is the baseline reconnection contract. A future or negotiated
+resume operation can improve client ergonomics, but it does not replace durable
+load. The background-TUI supervisor described in the TUI guide intentionally
+retains PTYs and does not wrap ACP stdio; an ACP deployment that must remain
+resident should use an editor-owned remote process, service manager, or another
+transport supervisor that preserves the ACP process itself.
+
+Peer-session messages are also durable. A root Agent may use `session_message` to
+address another root in the same project. When this ACP session is active, the
+message is driven as attributed plain-text peer context; when it is offline, the
+row remains queued and is handled after load. Child Agents never receive the
+sending tool.
+
+## 5. Select `deep` or another session Agent
 
 A new ACP session resolves Zuno's normal default Agent and model. Zuno then
 publishes these session controls to Zed:
@@ -213,7 +242,7 @@ selected Agent, model, reasoning value, or credentials.
 ACP session configuration operation, not a second process-level configuration
 surface.
 
-## 5. Slash commands and Skills
+## 6. Slash commands and Skills
 
 After session creation, loading, resuming, or a successful reconfiguration,
 Zuno publishes native session controls, executable commands from its normal
@@ -282,7 +311,7 @@ driver, including normal permission and durable-session behavior. ACP does not
 create product-specific `/dual-review`, `/auto-release`, or other workflows;
 users may define those in their own command or Skill directories.
 
-## 6. Images, selection, branch diff, and attachments
+## 7. Images, selection, branch diff, and attachments
 
 Zuno advertises ACP `image` and `embeddedContext` support. In Zed this enables
 image attachments and generic embedded context such as the current selection,
@@ -300,7 +329,7 @@ diagnostics, fetched context, and branch diff.
 The selected provider/model must also advertise image input. ACP capability
 negotiation cannot make a text-only model accept an image.
 
-## 7. Permissions, tools, diffs, and lifecycle
+## 8. Permissions, tools, diffs, and lifecycle
 
 Zed presents permission and elicitation requests, but Zuno remains the policy
 owner:
@@ -526,7 +555,7 @@ explanatory text. One ACP stdio connection may retain at most 32 open sessions;
 `session/close` releases the slot and shuts down any activated host and MCP
 runtime.
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 ### Agent fails to start
 
@@ -663,7 +692,7 @@ replacement. A durable accepted-question result is not attempt-scoped: its
 `in_progress` continuation marker survives `RetryRollback`, and its terminal
 tool update is emitted with the successful replacement checkpoint.
 
-## 9. Acceptance checks
+## 10. Acceptance checks
 
 After configuration:
 

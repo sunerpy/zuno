@@ -883,7 +883,7 @@ fn run_empty_welcome_under_pty_with_mcp(
                 .stdin
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("welcome stdin was not piped"))?;
-            stdin.write_all(b"\x03")?;
+            stdin.write_all(b"\x03\x03")?;
             stdin.flush()?;
             exit_sent = true;
         }
@@ -1449,7 +1449,7 @@ fn run_session_picker_action_under_pty(
                 .stdin
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("picker stdin was not piped"))?;
-            stdin.write_all(b"\x03")?;
+            stdin.write_all(b"\x03\x03\x03")?;
             stdin.flush()?;
             exit_sent = true;
         }
@@ -1684,7 +1684,7 @@ fn run_consecutive_session_deletes_under_pty(
             && text.matches(PICKER_THIRD_TITLE).count() > third_title_count_before_remount
         {
             // The final picker render proves it was reopened after the second deletion.
-            stdin.write_all(b"\x03")?;
+            stdin.write_all(b"\x03\x03\x03")?;
             stdin.flush()?;
             exit_sent = true;
         }
@@ -2317,7 +2317,7 @@ fn run_session_resume_under_pty(env: &ScriptedEnv) -> Result<ResumeTranscript, s
                 });
             if persisted {
                 saw_persisted = true;
-                stdin.write_all(b"\x03")?;
+                stdin.write_all(b"\x03\x03")?;
                 stdin.flush()?;
                 exit_sent = true;
             }

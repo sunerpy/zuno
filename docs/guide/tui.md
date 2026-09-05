@@ -11,6 +11,37 @@ zuno tui --session ses_1a2b3c --sandbox read-only
 zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 ```
 
+## Background TUI and SSH reconnection
+
+`zuno tui --background` starts or reuses one per-user supervisor, launches the real
+`zuno tui` inside a retained pseudo-terminal, and attaches the current terminal. The
+supervisor owns the child process and scrollback; the attachment owns only the current
+SSH terminal. A dropped SSH connection therefore closes the attachment without sending
+shutdown to the TUI.
+
+```sh
+zuno tui --background
+# Detach with Ctrl+]
+
+zuno tui --background-list
+zuno tui --attach pty_01abc...
+```
+
+Reattachment replays the retained terminal from the beginning, then hands off to live
+output without a gap. The client forwards terminal resize changes while attached.
+`--background-stop <pty-id>` terminates one retained TUI, and
+`--background-shutdown` stops the supervisor and every PTY it owns.
+
+The control server binds to `127.0.0.1` on an operating-system-assigned port. It uses a
+random Basic-auth password stored with mode `0600` in a mode-`0700` data directory on
+Unix. The connection also uses a scoped, single-use PTY ticket. Ambient HTTP proxies are
+bypassed only for this declared loopback control plane. The supervisor is detached with
+`nohup` plus a new process group on Unix and detached process flags on Windows.
+
+This retained-terminal mode preserves the exact TUI process, including an active turn.
+It is different from ordinary `--session` resume, which starts a new process and rebuilds
+the session view from SQLite after the previous process ended.
+
 ## Screen regions
 
 | Region | Contents |
@@ -32,6 +63,11 @@ with; a `--model` or `--agent` flag outranks the saved value for this process.
 
 Transient "working" rows are not inserted into the transcript. Durable activity, errors,
 interruption markers, and assistant content are.
+
+Plan and Todo sidebar state is pushed by the same `WorkStateObserver` that commits the
+SQLite mutation. The mounted root session is filtered by session id, then its exact new
+revision is applied and the screen is woken immediately; the sidebar does not wait for
+the provider turn to finish, and a child Plan cannot overwrite the root panel.
 
 Context occupancy is the most recent complete provider prompt divided by the catalog
 context limit. It is replaced on each provider report rather than accumulated across the
@@ -89,6 +125,13 @@ next turn. It is never lost or duplicated.
 | `diff_open` | `<leader>d` | Diff browser |
 | `app_exit` | `ctrl+c`, `ctrl+d`, `<leader>q` | Exit |
 
+`Ctrl+C` and `Ctrl+D` are confirmed exits. The first press shows
+`ctrl+c again to exit` or `ctrl+d again to exit` in the final row; the same chord must be
+pressed again within 1.5 seconds. During a turn, the first press also requests a hard
+interrupt. A different chord or an expired window starts a new confirmation rather than
+exiting accidentally. `Ctrl+]` belongs to the outer background attachment and detaches
+without sending either exit chord to the retained TUI.
+
 `leader_timeout` defaults to 5000 milliseconds, so the continuation overlay stays readable
 for five seconds unless another key completes or cancels the sequence. Interaction while
 it is open restarts the deadline. Rebinding is covered in
@@ -111,6 +154,15 @@ that child's durable inbox and steers its active turn; pressing Enter after it s
 wakes the same child identity with its resolved agent, model, effort, permissions, and
 lineage. Child text is literal, so `/help` typed in a child is sent to the child rather
 than executed as a root command.
+
+Root Agents also receive the root-only `session_message` tool. It can send durable peer
+context to another root session in the same project or to a descendant of the current
+root. A child never receives the sending tool, and runtime validation rejects child,
+cross-project, self, archived, or foreign-child targets even if a stale schema were
+replayed. Messages are attributed as peer context rather than user authorization. An
+active root or child receives them at its next safe point; an idle TUI polls the durable
+inbox and starts the target turn; an offline target keeps the queued row until it is
+loaded again.
 
 Product-agent invocations and workflow projections are not presented as resumable child
 conversations.

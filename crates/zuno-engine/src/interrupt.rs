@@ -64,6 +64,7 @@ pub enum SoftInterruptSource {
     User,
     System,
     BackgroundTask,
+    PeerSession,
 }
 
 /// A reset-safe interruption signal readable by sync code and awaitable by async code.

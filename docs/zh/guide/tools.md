@@ -16,6 +16,7 @@
 | `shell` | 在当前沙箱下运行命令 | 有副作用 |
 | `bg` | 检查或取消后台命令，并分页读回未进入对话记录的输出 | 只读检查；`cancel` 有副作用 |
 | `task` | 把一个有界目标委派给另一个 Agent | 委派型 |
+| `session_message` | 向另一个 root 或本 root 的 child 发送带来源的持久 peer context | 有副作用；仅 root 可见 |
 | `job` | 检查后台 job 状态 | 只读 |
 | `webfetch` | 获取一个 URL | 只读 |
 | `web_search` | 批量网络搜索 | 只读 |
@@ -23,6 +24,11 @@
 | `question` | 在 Plan 中向用户提出结构化澄清问题 | 用户中介型 |
 
 持久工作状态会额外加入 `plan_get`、`plan_update`、`todo_get`、`todo_update` 以及 `goal_get`/`goal_update`。启用记忆时会出现 `memory_propose`，当前 Agent 能够触达时会出现 `council_run`。
+
+即使父 Attempt 包含它的 schema，`session_message` 也会从每个 delegated child 的工具快照中
+移除。执行时还会再次校验：来源必须是 root，目标必须未归档且属于同一项目，child 目标必须是
+该来源 root 的后代。持久目标输入会明确记录来源 session、Agent 与标题，并说明 peer context
+不是用户授权。每次发送仍受权限规则控制。
 
 当已连接的 MCP 工具通过能力与权限过滤后，Zuno 仍保留其可执行实现，但默认不把所有
 完整 JSON schema 注入模型请求。此时会条件性出现 `tool_search`：它搜索紧凑元数据，
@@ -50,6 +56,15 @@ Notes 从不暴露宿主路径。每个作用域最多 100 个文档，单文档
 `completed` 和 `superseded` 都是终态。`plan_update`、`notes`、`history` 的 `action`
 是必填枚举：线上 schema 列出每个操作以及它需要的字段，没有指明操作的调用在到达工具之前
 就会被拒绝。
+
+`plan_get` 与 `todo_get` 会在结果中附带语义进展指纹；`intent` 等跨工具参数不进入指纹。
+连续三次只有一个读取工具且状态不变时，以 `stagnant_tool_loop` 停止，而不是无限消耗
+provider 请求。真实 mutation 会改变指纹并重置计数。
+
+`plan_update` 与 `todo_update` 还会请求动态上下文失效。若下一次 provider 请求仍会运行，
+宿主必须先从已提交数据库重新生成 Goal/Plan/Todo/Job 投影。Plan mutation 会把一次性的
+Required 指令切换成 Maintain。刷新器缺失或失败时回合会暂停，而不是明知上下文过期仍发送
+developer 优先级快照。
 
 成功交付前，durable reconciliation driver 会检查 Plan、Todo、Job、Goal、工具结果与
 验证记录。普通会话在持有未对账的持久工作时最多执行两次对账续跑，仍不一致则进入

@@ -222,6 +222,35 @@ This keeps the normal path singular while allowing an operator to recover from
 expired artifacts or an interrupted finalization without weakening identity
 checks.
 
+## Rapid-development version rule
+
+Until the matching rule is removed from `AGENTS.md`, every release is exactly one
+patch increment: `x.y.z` to `x.y.(z+1)`. `feat` and `fix` still organize the
+changelog, but feature commits below 1.0 use
+`bump-patch-for-minor-pre-major`. Contributors must not use `!`,
+`BREAKING CHANGE`, or `Release-As` to request a higher component.
+
+The release controller does not rely on that convention alone. Before candidate
+dispatch it compares the current and release-PR manifests with
+`.github/scripts/require-patch-release.py`. Publication repeats the check between
+the previous stable tag and the candidate tag. A minor, major, skipped-patch, or
+prerelease candidate fails closed before certification or publication.
+
+## CI critical path
+
+The measured 2026-09-04 baseline run `33884240281` completed in about 16.8
+minutes after classification. Linux spent 229 seconds in Clippy before beginning
+a 634-second test step; those independent surfaces now run as `Linux static
+checks` and `Linux tests`. Both remain required by `zuno/pr-gate`.
+
+Native Windows test-binary execution remains one process per Cargo suite rather
+than one process per test case. Its measured 844-second step consisted of 548
+seconds building/linking and 292 seconds running 230 suites. The scheduler now
+uses a stable `crate-directory:target` duration key plus reviewed hints from that
+run, so the 170-second attachment suite, 132-second tools suite, and 66-second TUI
+suite start immediately on a fresh runner instead of becoming final stragglers.
+The private captured Cargo environment is never uploaded.
+
 ## Timing evidence
 
 Measure from release-PR creation to public release publication, including runner

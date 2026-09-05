@@ -48,10 +48,13 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use tokio::sync::{mpsc, watch};
-use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
+use zuno_engine::interrupt::{
+    HardInterruptReason, HardInterruptRequest, HardInterruptSource, SoftInterruptMessage,
+    SoftInterruptSource,
+};
 use zuno_engine::r#loop::{NoticeSeverity, TurnEvent, TurnEventSender, event_channel};
 use zuno_engine::session_command::SessionCommand;
-use zuno_engine::status::SessionRunRegistry;
+use zuno_engine::status::{SessionControl, SessionRunRegistry};
 use zuno_engine::terminal_lease::{TerminalLease, TerminalLeaseCleanup};
 use zuno_llm::event::StreamEvent;
 use zuno_tool::PermissionAsker;
@@ -134,6 +137,7 @@ const QUEUE_MUTATION_CHANNEL_CAPACITY: usize = 8;
 const EDITOR_CHANNEL_CAPACITY: usize = 1;
 
 const WORKER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const SESSION_MESSAGE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How many submitted prompts may be waiting to be written down.
 ///
@@ -229,6 +233,14 @@ impl EditorProcessLauncher for ContainedEditorLauncher {
 }
 
 pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Result<(), String> {
+    if args.background
+        || args.attach.is_some()
+        || args.background_list
+        || args.background_stop.is_some()
+        || args.background_shutdown
+    {
+        return super::tui_supervisor::execute(args);
+    }
     if !std::io::stdout().is_terminal() {
         return Err(
             "the interactive TUI requires a terminal; use `run <message>` for a \
@@ -534,6 +546,7 @@ fn execute_once(
         .unwrap_or_else(|| plan.directory())
         .to_path_buf();
     let reference_root = lsp_workspace.clone();
+    let plan_directory = plan.directory().to_path_buf();
     let mcp_configs = plan
         .config()
         .mcp
@@ -661,6 +674,15 @@ fn execute_once(
         supervisor: environment.background_jobs(&reference_root),
     });
     let work_state = WorkState::new(host.work_state()?);
+    let work_observer: Arc<dyn zuno_tools::WorkStateObserver> = Arc::new(TuiWorkObserver {
+        session_id: host.session_id().to_owned(),
+        projection: work_state.clone(),
+        wake: terminal_sender.clone(),
+    });
+    environment
+        .background_jobs(plan_directory.as_path())
+        .notifier()
+        .attach_observer(&work_observer);
     let queued_inputs = QueuedInputProjection::new(project_queued_inputs(
         &host.session_inbox(),
         host.session_id(),
@@ -884,6 +906,7 @@ fn execute_once(
                 snapshots: SnapshotHistory::new(snapshot_store),
                 work_state,
                 work_wake,
+                _work_observer: work_observer,
                 queued_inputs,
                 queue_wake,
                 continuity,
@@ -1102,6 +1125,12 @@ struct TitleProjectionSink {
     wake: mpsc::Sender<TerminalEvent>,
 }
 
+struct TuiWorkObserver {
+    session_id: String,
+    projection: WorkState,
+    wake: mpsc::Sender<TerminalEvent>,
+}
+
 /// Projects independently running child hosts into the mounted session screen.
 struct TuiChildObserver {
     sessions: LiveSessions,
@@ -1254,6 +1283,90 @@ impl super::turn::SessionTitleSink for TitleProjectionSink {
     fn publish(&self, title: &str) {
         self.projection.replace(Some(title.to_owned()));
         let _nudged = self.wake.try_send(TerminalEvent::Wake);
+    }
+}
+
+impl zuno_tools::WorkStateObserver for TuiWorkObserver {
+    fn changed(&self) {}
+
+    fn plan_changed(&self, plan: &zuno_tools::WorkPlan) {
+        if plan.session_id != self.session_id {
+            return;
+        }
+        let mut work = self.projection.snapshot();
+        let span = work
+            .plan
+            .as_ref()
+            .filter(|current| current.id == plan.id)
+            .map_or_else(zuno_types::ExecutionSpan::default, |current| current.span);
+        work.plan = Some(zuno_types::PlanProjection {
+            id: plan.id.clone(),
+            parent_plan_id: plan.parent_plan_id.clone(),
+            stack_depth: plan.stack_depth,
+            goal_id: plan.goal_id.clone(),
+            revision: plan.revision,
+            title: plan.title.clone(),
+            steps: plan
+                .steps
+                .iter()
+                .map(|step| zuno_types::PlanStepProjection {
+                    id: step.id.clone(),
+                    title: step.title.clone(),
+                    status: step.status.as_str().to_owned(),
+                })
+                .collect(),
+            span,
+            time_created: plan.time_created,
+            time_updated: plan.time_updated,
+        });
+        self.projection.replace(work);
+        let _nudged = self.wake.try_send(TerminalEvent::Wake);
+    }
+
+    fn items_changed(&self, items: &[zuno_tools::WorkItem]) {
+        if items
+            .first()
+            .is_some_and(|item| item.session_id != self.session_id)
+        {
+            return;
+        }
+        let mut work = self.projection.snapshot();
+        work.todos = items.iter().map(project_tui_work_item).collect();
+        self.projection.replace(work);
+        let _nudged = self.wake.try_send(TerminalEvent::Wake);
+    }
+}
+
+fn project_tui_work_item(item: &zuno_tools::WorkItem) -> zuno_types::TodoProjection {
+    let completed_at = matches!(
+        item.status,
+        zuno_tools::WorkItemStatus::Completed
+            | zuno_tools::WorkItemStatus::Cancelled
+            | zuno_tools::WorkItemStatus::Blocked
+    )
+    .then_some(item.time_updated);
+    zuno_types::TodoProjection {
+        id: item.id.clone(),
+        goal_id: item.goal_id.clone(),
+        plan_step_id: item.plan_step_id.clone(),
+        parent_id: item.parent_id.clone(),
+        subject: item.subject.clone(),
+        description: item.description.clone(),
+        active_form: item.active_form.clone(),
+        status: item.status.as_str().to_owned(),
+        priority: item.priority.as_str().to_owned(),
+        dependencies: item.dependencies.clone(),
+        owner: item.owner.clone(),
+        revision: item.revision,
+        span: zuno_types::ExecutionSpan::from_aggregate(
+            item.time_created,
+            completed_at,
+            u64::try_from(item.time_used_ms).unwrap_or_default(),
+            u64::try_from(item.tokens_used).unwrap_or_default(),
+            item.usage_known,
+        ),
+        time_created: item.time_created,
+        time_updated: item.time_updated,
     }
 }
 
@@ -2537,6 +2650,7 @@ struct TurnDriver {
     snapshots: SnapshotHistory,
     work_state: WorkState,
     work_wake: mpsc::Sender<TerminalEvent>,
+    _work_observer: Arc<dyn zuno_tools::WorkStateObserver>,
     queued_inputs: QueuedInputProjection,
     queue_wake: mpsc::Sender<TerminalEvent>,
     continuity: TuiHostContinuity,
@@ -2857,6 +2971,9 @@ async fn drive_turns(
     let mut work_changes = driver.host.work_state_changes();
     let mut queue_mutations_open = true;
     let mut root_prompts = VecDeque::new();
+    let mut session_message_poll = tokio::time::interval(SESSION_MESSAGE_POLL_INTERVAL);
+    session_message_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    session_message_poll.tick().await;
     'driver: loop {
         while let Ok(prompt) = prompts.try_recv() {
             route_targeted_prompt(
@@ -3079,6 +3196,19 @@ async fn drive_turns(
                     .await;
                     work_changes.borrow_and_update();
                     continue;
+                }
+                _ = session_message_poll.tick() => {
+                    if let Err(error) = driver
+                        .interactive_children
+                        .wake_pending_session_messages(driver.host.session_id())
+                    {
+                        report_turn_failure(
+                            &events,
+                            format!("session-message child wake failed: {error}"),
+                        )
+                        .await;
+                    }
+                    continue 'driver;
                 }
             },
         };
@@ -3482,6 +3612,10 @@ async fn drive_one(
                 )));
             }
             let mut prompts_open = true;
+            let mut session_message_poll = tokio::time::interval(SESSION_MESSAGE_POLL_INTERVAL);
+            session_message_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            session_message_poll.tick().await;
+            let mut offered_session_messages = BTreeSet::new();
             let mut turn = Box::pin(drive_submission(
                 host,
                 prompt,
@@ -3542,6 +3676,27 @@ async fn drive_one(
                                 }
                             }
                             None => prompts_open = false,
+                        }
+                    }
+                    _ = session_message_poll.tick() => {
+                        match steer_pending_session_messages(
+                            &inbox,
+                            &control,
+                            &mut offered_session_messages,
+                        ) {
+                            Ok(_) => {}
+                            Err(message) => {
+                                report_input_failure(&admission_events, message).await;
+                            }
+                        }
+                        if let Err(error) = interactive_children
+                            .wake_pending_session_messages(control.session_id())
+                        {
+                            report_input_failure(
+                                &admission_events,
+                                format!("session-message child wake failed: {error}"),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -3942,6 +4097,43 @@ fn decode_pending_prompt(input: &zuno_db::inbox::SessionInput) -> Option<PromptS
     Some(PromptSubmission::Content { text, content })
 }
 
+fn steer_pending_session_messages(
+    inbox: &zuno_db::inbox::SessionInbox,
+    control: &SessionControl,
+    offered: &mut BTreeSet<String>,
+) -> Result<usize, String> {
+    let pending = inbox.pending(control.session_id()).map_err(to_string)?;
+    let mut queued = 0_usize;
+    for input in pending {
+        if offered.contains(&input.id) {
+            continue;
+        }
+        let kind = zuno_db::inbox::DurableInputKind::classify(&input.prompt);
+        if kind != Some(zuno_db::inbox::DurableInputKind::SessionMessage) {
+            continue;
+        }
+        let text = kind
+            .and_then(|kind| kind.plain_text(&input.prompt))
+            .ok_or_else(|| format!("session message `{}` has no text", input.id))?
+            .to_owned();
+        if control
+            .queue_soft_interrupt(SoftInterruptMessage {
+                input_id: Some(input.id.clone()),
+                content: text,
+                images: Vec::new(),
+                attachments: Vec::new(),
+                urgent: false,
+                source: SoftInterruptSource::PeerSession,
+            })
+            .is_ok()
+        {
+            offered.insert(input.id);
+            queued = queued.saturating_add(1);
+        }
+    }
+    Ok(queued)
+}
+
 async fn report_input_failure(events: &TurnEventSender, message: String) {
     let _reported = events
         .publish(TurnEvent::Provider {
@@ -4222,6 +4414,64 @@ mod tests {
         }
     }
 
+    fn work_plan(session_id: &str, title: &str, revision: i64) -> zuno_tools::WorkPlan {
+        zuno_tools::WorkPlan {
+            id: format!("plan_{revision}"),
+            session_id: session_id.to_owned(),
+            parent_plan_id: None,
+            stack_depth: 0,
+            goal_id: None,
+            revision,
+            title: title.to_owned(),
+            steps: vec![zuno_tools::PlanStep {
+                id: format!("step_{revision}"),
+                title: format!("step for {title}"),
+                status: zuno_tools::PlanStepStatus::InProgress,
+            }],
+            time_created: 1,
+            time_updated: revision,
+        }
+    }
+
+    #[test]
+    fn tui_work_observer_projects_the_current_sessions_plan_before_turn_completion() {
+        let projection = WorkState::default();
+        let (wake, mut wakes) = zuno_tui::app::terminal_event_channel();
+        let observer: Arc<dyn zuno_tools::WorkStateObserver> = Arc::new(TuiWorkObserver {
+            session_id: "ses_root".to_owned(),
+            projection: projection.clone(),
+            wake,
+        });
+        let notifier = super::super::child_turn::ChangeNotifier::default();
+        notifier.attach_observer(&observer);
+
+        zuno_tools::WorkStateObserver::plan_changed(
+            &notifier,
+            &work_plan("ses_child", "child plan", 1),
+        );
+        assert!(
+            projection.snapshot().plan.is_none(),
+            "a child plan replaced the mounted root sidebar"
+        );
+        assert!(
+            wakes.try_recv().is_err(),
+            "a filtered child plan caused a pointless repaint"
+        );
+
+        zuno_tools::WorkStateObserver::plan_changed(
+            &notifier,
+            &work_plan("ses_root", "current plan", 2),
+        );
+        let plan = projection
+            .snapshot()
+            .plan
+            .expect("the root plan is projected immediately");
+        assert_eq!(plan.title, "current plan");
+        assert_eq!(plan.revision, 2);
+        assert_eq!(plan.steps[0].title, "step for current plan");
+        assert!(matches!(wakes.try_recv(), Ok(TerminalEvent::Wake)));
+    }
+
     /// The terminal driver shares one inbox with ACP and HTTP. A row it cannot run
     /// must stay pending for the surface that can, because failing on it would end
     /// the terminal session over another client's input.
@@ -4252,6 +4502,19 @@ mod tests {
         .expect("an asynchronous report decodes as text");
         assert!(matches!(report, PromptSubmission::Text(text) if text == "workflow finished"));
 
+        let peer = decode_pending_prompt(&pending_row(
+            "inp_peer",
+            json!({
+                "kind": "sessionMessage",
+                "schemaVersion": 1,
+                "fromSessionID": "ses_other",
+                "fromAgent": "deep",
+                "text": "peer context"
+            }),
+        ))
+        .expect("a peer-session message decodes as text");
+        assert!(matches!(peer, PromptSubmission::Text(text) if text == "peer context"));
+
         for (id, prompt) in [
             (
                 "inp_http",
@@ -4273,6 +4536,63 @@ mod tests {
                 "`{id}` must stay queued for the surface that owns it"
             );
         }
+    }
+
+    #[test]
+    fn active_root_turn_is_steered_once_by_each_durable_session_message() {
+        let pool =
+            Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
+        let mut connection = pool.open_connection().expect("open connection");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project_peer', '/workspace', 1, 1, '[]'); \
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES ('ses_root', 'project_peer', 'root', '/workspace', 'root', 'test', 1, 1);",
+            )
+            .expect("seed session");
+        drop(connection);
+        let inbox = zuno_db::inbox::SessionInbox::new(pool);
+        inbox
+            .admit(zuno_db::inbox::NewSessionInput::new(
+                "inp_peer",
+                "ses_root",
+                json!({
+                    "kind": "sessionMessage",
+                    "schemaVersion": 1,
+                    "fromSessionID": "ses_other",
+                    "fromAgent": "deep",
+                    "text": "peer context"
+                }),
+                zuno_db::inbox::InputDelivery::Queue,
+                2,
+            ))
+            .expect("admit peer message");
+        let runs = SessionRunRegistry::new();
+        let guard = runs.begin_turn("ses_root").expect("active root turn");
+        let control = runs.control("ses_root");
+        let mut offered = BTreeSet::new();
+
+        assert_eq!(
+            steer_pending_session_messages(&inbox, &control, &mut offered)
+                .expect("queue soft input"),
+            1
+        );
+        assert_eq!(
+            steer_pending_session_messages(&inbox, &control, &mut offered)
+                .expect("deduplicate soft input"),
+            0
+        );
+        let delivery = guard.take_soft_interrupts_at_safe_point();
+        assert_eq!(delivery.messages.len(), 1);
+        assert_eq!(delivery.messages[0].input_id.as_deref(), Some("inp_peer"));
+        assert_eq!(delivery.messages[0].content, "peer context");
+        assert_eq!(
+            delivery.messages[0].source,
+            SoftInterruptSource::PeerSession
+        );
     }
 
     #[test]

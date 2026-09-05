@@ -4265,7 +4265,7 @@ struct AcpDurableInput {
 enum DurableInputScope {
     /// Answers to durable human requests, settled by the surface that asked.
     Answers,
-    /// Prompts this surface admitted, which only it drains.
+    /// ACP prompts plus attributed peer-session messages this surface can drive.
     Prompts,
 }
 
@@ -4278,7 +4278,11 @@ impl DurableInputScope {
         let kind = zuno_db::inbox::DurableInputKind::classify(&input.prompt)?;
         let owned = match self {
             Self::Answers => kind == zuno_db::inbox::DurableInputKind::HumanRequestAnswer,
-            Self::Prompts => kind == zuno_db::inbox::DurableInputKind::AcpPrompt,
+            Self::Prompts => matches!(
+                kind,
+                zuno_db::inbox::DurableInputKind::AcpPrompt
+                    | zuno_db::inbox::DurableInputKind::SessionMessage
+            ),
         };
         if !owned {
             return None;
@@ -4526,6 +4530,49 @@ mod tests {
         assert_eq!(capabilities["image"], true);
         assert_eq!(capabilities["embeddedContext"], true);
         assert_eq!(capabilities["audio"], false);
+    }
+
+    #[test]
+    fn acp_prompt_scope_accepts_peer_session_messages_but_not_foreign_surface_rows() {
+        let input = |id: &str, prompt: Value| zuno_db::inbox::SessionInput {
+            id: id.to_owned(),
+            session_id: "ses_acp".to_owned(),
+            prompt,
+            delivery: zuno_db::inbox::InputDelivery::Queue,
+            state: zuno_db::inbox::SubmissionState::Queued,
+            revision: 1,
+            admitted_sequence: 1,
+            promoted_sequence: None,
+            error: None,
+            time_created: 1,
+            time_updated: 1,
+        };
+        let peer = input(
+            "inp_peer",
+            json!({
+                "kind": "sessionMessage",
+                "schemaVersion": 1,
+                "fromSessionID": "ses_other",
+                "fromAgent": "deep",
+                "text": "peer context"
+            }),
+        );
+        assert_eq!(
+            DurableInputScope::Prompts
+                .admits(&peer)
+                .expect("peer message is drivable")
+                .text,
+            "peer context"
+        );
+        let tui = input(
+            "inp_tui",
+            json!({
+                "kind": "tuiPrompt",
+                "submission": {"kind": "text", "data": "TUI-owned"}
+            }),
+        );
+        assert!(DurableInputScope::Prompts.admits(&tui).is_none());
+        assert!(DurableInputScope::Answers.admits(&peer).is_none());
     }
 
     #[test]

@@ -64,6 +64,11 @@ provided/required service types, and scrubbed diagnostics without coupling a
 client to the runtime implementation. The TUI projects this inventory today; the
 same value is available to future server, ACP, and GUI surfaces.
 
+The background TUI supervisor is a process-lifetime owner outside the agent loop. It
+binds a password-protected loopback server, creates the normal TUI as a retained PTY
+child, and lets attachments come and go without closing that child. Detach is not session
+close; explicit PTY removal or supervisor shutdown is.
+
 ## Agent and prompt contracts
 
 Agent prompts define role ownership, negative boundaries, a small amount of
@@ -183,6 +188,14 @@ step. Completed verification remains immutable evidence, so a changed commit,
 build, tag, deployment, configuration, or other relevant input requires a new
 artifact-scoped verification step.
 
+Work-state tools participate in two typed engine contracts. Reads publish a semantic
+`ToolProgressObservation` whose fingerprint contains authoritative Plan or Todo state,
+not free-form call narration. Mutations publish
+`ToolDynamicContextRefresh::WorkPlan` or `WorkItems`. If another provider request will
+run, the engine passes the committed connection to a host-owned
+`DynamicContextRefresher`; the CLI host regenerates Goal/Plan/Todo/Job context from SQL,
+and a Plan mutation replaces the one-time Required instruction with Maintain.
+
 Machine execution state does not leak into the visible Plan. The
 `PlanReconciliationDriver` persists `idle`, `executing`, `reconciling`,
 `waiting_retry`, `waiting_human`, and `terminal` phase events in the existing
@@ -224,6 +237,14 @@ remains in `runtime.work_state` until that linked step reaches a terminal state.
 An explicit new Goal objective may supersede the step, but it never settles or
 cancels the linked Job implicitly.
 
+Root-session messaging is a separate durable-input capability. `session_message` exists
+only when the turn has no immutable parent tool authority, and execution verifies again
+that the source is a root. Same-project roots may address one another, and a root may
+address its own descendants; foreign children, archived targets, self targets, and
+cross-project targets are rejected. TUI, ACP, and server drivers consume the same
+`sessionMessage` shape. An online process may steer at a safe point; otherwise the row
+remains queued.
+
 Plan and Work are also typed collaboration contracts. `collaboration.mode` is a
 runtime-trust prompt block, separate from the native kernel, agent role, project
 instructions, work state, and user input. Plan tells the model to inspect and
@@ -259,6 +280,13 @@ complete, the Agent must stop calling tools and answer. The provider-driven loop
 continues while the model requests follow-up work, subject to interruption,
 context management, durable goal state, and an optional operator-configured
 step ceiling.
+
+There is one narrow host convergence guard: three consecutive successful single-tool
+reads carrying the same semantic work-state observation end with
+`StagnantToolLoop`. The third result is persisted and projected before the error. A
+different tool, failed/blocked/interrupted result, written path, continuation request, or
+changed observation resets the sequence. Recovery is `Pause`, and an active Goal records
+`no_progress`; automatic retry would only repeat the same paid read.
 
 ### Instruction file admission
 

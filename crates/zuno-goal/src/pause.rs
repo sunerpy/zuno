@@ -30,11 +30,13 @@ pub enum GoalPauseReason {
     /// still has budget left and the work is still resumable — but not automatically,
     /// because the next turn would spend the same allowance the same way.
     TurnBudget,
+    /// The model repeated an identical successful read without changing state.
+    NoProgress,
 }
 
 impl GoalPauseReason {
     /// Closed set persisted in SQLite and exposed on status surfaces.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::UserInterruption,
         Self::PlanMode,
         Self::HumanInput,
@@ -42,6 +44,7 @@ impl GoalPauseReason {
         Self::Authentication,
         Self::UncertainSideEffect,
         Self::TurnBudget,
+        Self::NoProgress,
     ];
 
     /// Stable storage and wire spelling.
@@ -55,6 +58,7 @@ impl GoalPauseReason {
             Self::Authentication => "authentication",
             Self::UncertainSideEffect => "uncertain_side_effect",
             Self::TurnBudget => "turn_budget",
+            Self::NoProgress => "no_progress",
         }
     }
 

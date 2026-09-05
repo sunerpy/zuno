@@ -465,6 +465,16 @@ fn published_prompt_shapes() -> Vec<(DurableInputKind, serde_json::Value)> {
             }),
         ),
         (
+            DurableInputKind::SessionMessage,
+            json!({
+                "kind": "sessionMessage",
+                "schemaVersion": 1,
+                "fromSessionID": "ses_source",
+                "fromAgent": "orchestrator",
+                "text": "peer context"
+            }),
+        ),
+        (
             DurableInputKind::HostMessage,
             json!({"message": {"id": "msg_1"}, "parts": []}),
         ),

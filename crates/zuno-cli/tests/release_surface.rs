@@ -1280,11 +1280,18 @@ fn ci_runs_before_the_protected_merge_without_a_duplicate_push_run() {
         );
     }
 
-    let test = job_body(&text, "test").join("\n");
+    let static_checks = job_body(&text, "linux-static").join("\n");
     for required in ["tool: cargo-deny", "cargo deny --all-features check"] {
         assert!(
-            test.contains(required),
-            "the consolidated test job lost the supply-chain gate {required:?}"
+            static_checks.contains(required),
+            "the Linux static-check job lost the supply-chain gate {required:?}"
+        );
+    }
+    let linux_tests = job_body(&text, "linux-test").join("\n");
+    for required in ["make test-nextest", "make test-sandbox-e2e"] {
+        assert!(
+            linux_tests.contains(required),
+            "the parallel Linux test job lost {required:?}"
         );
     }
     for forbidden in ["HOSTED_RUNNERS", "codebuild-"] {
@@ -1316,7 +1323,13 @@ fn ci_runs_before_the_protected_merge_without_a_duplicate_push_run() {
              {forbidden:?}"
         );
     }
-    for job in ["test", "artifact", "windows-clippy", "windows-test"] {
+    for job in [
+        "linux-static",
+        "linux-test",
+        "artifact",
+        "windows-clippy",
+        "windows-test",
+    ] {
         let body = job_body(&text, job).join("\n");
         for required in [
             "needs: classify",
@@ -1332,7 +1345,7 @@ fn ci_runs_before_the_protected_merge_without_a_duplicate_push_run() {
     let gate = job_body(&text, "ci-success").join("\n");
     for required in [
         "Release PR routed to candidate",
-        "needs: [classify, test, artifact, windows-clippy, windows-test]",
+        "needs: [classify, linux-static, linux-test, artifact, windows-clippy, windows-test]",
         "RELEASE_PR: ${{ needs.classify.outputs.release_pr }}",
         "elif $release_pr == \"true\" then",
         "release-please PR is delegated to release-candidate.yml",
@@ -1382,6 +1395,11 @@ fn automated_release_prs_keep_the_manual_actions_approval_gate() {
             "release PR header lost manual approval instruction {required:?}"
         );
     }
+    assert_eq!(
+        config["packages"]["."]["bump-patch-for-minor-pre-major"],
+        serde_json::json!(true),
+        "pre-1.0 feature commits must remain patch releases"
+    );
     for forbidden in ["[skip ci]", "[ci skip]", "pull_request_target"] {
         if forbidden == "pull_request_target" {
             assert!(
@@ -1411,6 +1429,21 @@ fn automated_release_prs_keep_the_manual_actions_approval_gate() {
             "release controller does not surface required operator action {required:?}"
         );
     }
+    for required in [
+        "name: Require patch-only rapid-development version",
+        ".github/scripts/require-patch-release.py",
+        "git show \"${HEAD_SHA}:.release-please-manifest.json\"",
+    ] {
+        assert!(
+            dispatch.contains(required),
+            "release candidate dispatch lost patch-only gate {required:?}"
+        );
+    }
+    let resolve = job_body(&release, "resolve_release").join("\n");
+    assert!(
+        resolve.contains("require-patch-release.py \"${previous_tag#v}\" \"$version\""),
+        "release publication can bypass the patch-only rapid-development gate"
+    );
 }
 
 #[test]
@@ -2516,7 +2549,6 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
         "SUITE_TIMEOUT: \"300\"",
         "name: Upload Windows test diagnostics",
         "if: failure()",
-        "target/test-parallel/cargo-env.json",
         "target/test-parallel/artifacts.json",
         "target/test-parallel/suites.tsv",
         "target/test-parallel/codes.tsv",
@@ -2532,6 +2564,10 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
         !windows.contains("cargo nextest"),
         "native Windows CI must not spawn one process per test case; use the binary-level \
          scheduler instead"
+    );
+    assert!(
+        !windows.contains("target/test-parallel/cargo-env.json"),
+        "the private captured Cargo environment must never be uploaded"
     );
     assert!(
         !ci.contains("cargo test --workspace --no-fail-fast"),
@@ -2554,6 +2590,9 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
         r#""$candidate" -c 'import json, os, sys'"#,
         r#"PYTHON=$(command -v "$candidate")"#,
         "runner_python_for_cargo",
+        "test-parallel-duration-hints.json",
+        "suite_key",
+        "known.get(r[3]",
         "Cargo runner path must not contain whitespace",
         "cargo-env.json",
         "json.dump(dict(os.environ)",
@@ -2638,14 +2677,16 @@ fn ci_limits_target_caches_to_target_isolated_macos_candidate_legs() {
             "ordinary CI must keep registry-only Cargo caching; missing {required:?}"
         );
     }
-    let linux = job_body(&ci, "test").join("\n");
-    for required in ["make lint", "make test-nextest"] {
-        assert!(
-            linux.contains(required),
-            "Linux Clippy and tests must share one job-local target directory; missing \
-             {required:?}"
-        );
-    }
+    let linux_static = job_body(&ci, "linux-static").join("\n");
+    let linux_test = job_body(&ci, "linux-test").join("\n");
+    assert!(
+        linux_static.contains("make lint")
+            && !linux_static.contains("make test-nextest")
+            && linux_test.contains("make test-nextest")
+            && linux_test.contains("make test-sandbox-e2e")
+            && !linux_test.contains("make lint"),
+        "Linux static analysis and tests must remain independent parallel jobs"
+    );
 
     let windows_clippy = job_body(&ci, "windows-clippy").join("\n");
     let windows_test = job_body(&ci, "windows-test").join("\n");
