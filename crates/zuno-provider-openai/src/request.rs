@@ -164,7 +164,7 @@ fn build_chat_body(
             .map(|content| json!({"role": "developer", "content": content})),
     );
     root.insert("messages".to_owned(), Value::Array(messages));
-    insert_tools(&mut root, config);
+    insert_tools(&mut root, request, config, ApiSurface::Chat);
     root.insert("stream".to_owned(), Value::Bool(true));
     root.insert(
         "stream_options".to_owned(),
@@ -204,7 +204,7 @@ fn build_responses_body(
         root.insert("instructions".to_owned(), Value::String(instructions));
     }
     root.insert("input".to_owned(), Value::Array(input));
-    insert_tools(&mut root, config);
+    insert_tools(&mut root, request, config, ApiSurface::Responses);
     if let Some(store) = config.store() {
         root.insert("store".to_owned(), Value::Bool(store));
     }
@@ -229,12 +229,58 @@ fn build_responses_body(
     Ok(Value::Object(root))
 }
 
-fn insert_tools(root: &mut Map<String, Value>, config: &OpenAiConfig) {
-    if !config.tools().is_empty() {
-        root.insert("tools".to_owned(), Value::Array(config.tools().to_vec()));
+fn insert_tools(
+    root: &mut Map<String, Value>,
+    request: &CompletionRequest,
+    config: &OpenAiConfig,
+    surface: ApiSurface,
+) {
+    let locked_names = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut tools = config
+        .tools()
+        .iter()
+        .filter(|tool| {
+            configured_tool_name(tool, surface).is_none_or(|name| !locked_names.contains(name))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    tools.extend(request.tools.iter().map(|tool| match surface {
+        ApiSurface::Chat => json!({
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            }
+        }),
+        ApiSurface::Responses | ApiSurface::Default | ApiSurface::Messages => json!({
+            "type": "function",
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        }),
+    }));
+    if !tools.is_empty() {
+        root.insert("tools".to_owned(), Value::Array(tools));
     }
     if let Some(tool_choice) = config.tool_choice() {
         root.insert("tool_choice".to_owned(), tool_choice.clone());
+    }
+}
+
+fn configured_tool_name(tool: &Value, surface: ApiSurface) -> Option<&str> {
+    match surface {
+        ApiSurface::Chat => tool
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str),
+        ApiSurface::Responses | ApiSurface::Default | ApiSurface::Messages => {
+            tool.get("name").and_then(Value::as_str)
+        }
     }
 }
 
@@ -1167,5 +1213,65 @@ mod tests {
         let body = build_request_body(&request, &OpenAiConfig::default()).expect("body");
 
         assert_eq!(body["input"][0]["arguments"], json!(r#"{"command":"ls"}"#));
+    }
+
+    #[test]
+    fn the_locked_tool_snapshot_reaches_both_openai_surfaces() {
+        let tool = zuno_llm::registry::ToolSchema {
+            name: "read_file".to_owned(),
+            description: "Read one file.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        };
+        let base = CompletionRequest::new("gpt-5.6-sol", vec![Message::new(Role::User, "inspect")])
+            .with_tools(vec![tool]);
+
+        let responses =
+            build_request_body(&base, &OpenAiConfig::default()).expect("Responses body");
+        assert_eq!(responses["tools"][0]["type"], "function");
+        assert_eq!(responses["tools"][0]["name"], "read_file");
+        assert_eq!(responses["tools"][0]["parameters"]["required"][0], "path");
+
+        let chat = build_request_body(&base.on_surface(ApiSurface::Chat), &OpenAiConfig::default())
+            .expect("Chat body");
+        assert_eq!(chat["tools"][0]["type"], "function");
+        assert_eq!(chat["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(
+            chat["tools"][0]["function"]["parameters"]["required"][0],
+            "path"
+        );
+    }
+
+    #[test]
+    fn a_locked_tool_supersedes_a_configured_declaration_of_the_same_name() {
+        let config = OpenAiConfig::default().with_tools(vec![
+            json!({"type":"web_search_preview"}),
+            json!({
+                "type": "function",
+                "name": "read_file",
+                "description": "stale",
+                "parameters": {"type": "object"}
+            }),
+        ]);
+        let request =
+            CompletionRequest::new("gpt-5.6-sol", vec![Message::new(Role::User, "inspect")])
+                .with_tools(vec![zuno_llm::registry::ToolSchema {
+                    name: "read_file".to_owned(),
+                    description: "authoritative".to_owned(),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}}
+                    }),
+                }]);
+
+        let body = build_request_body(&request, &config).expect("Responses body");
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "web_search_preview");
+        assert_eq!(tools[1]["name"], "read_file");
+        assert_eq!(tools[1]["description"], "authoritative");
     }
 }

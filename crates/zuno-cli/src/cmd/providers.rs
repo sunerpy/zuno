@@ -384,6 +384,7 @@ fn accepts_stored_api_key(provider: &ResolvedProvider) -> bool {
             Some(
                 ProviderTransport::Bedrock
                 | ProviderTransport::BedrockMantle
+                | ProviderTransport::BedrockRuntime
                 | ProviderTransport::GoogleVertex
                 | ProviderTransport::GoogleVertexAnthropic,
             )

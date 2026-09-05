@@ -78,6 +78,11 @@ ZUNO_PRINT_LOGS=1 zuno
 会增加一个 stderr sink；stdout 永远不作为日志目的地，因为 ACP 和其他 stdio 协议在那里
 封帧数据。
 
+可能输出 access key 标识或 SigV4 内部信息的 AWS SDK target 带有不可覆盖的 `WARN`
+下限。即使全局选择 `DEBUG`/`TRACE`，或显式设置 `RUST_LOG='aws_config=trace'`，该下限仍然
+生效；Provider 请求元数据继续通过 Zuno 自己的 span 与状态事件提供，不会把凭据标识复制进
+运维日志。
+
 没有设置显式的 Zuno 级别时，可以使用标准的、按 target 过滤的 Rust 方式：
 
 ```sh

@@ -10537,7 +10537,10 @@ fn effort_family(transport: Option<ProviderTransport>) -> Option<zuno_llm::effor
         ProviderTransport::Anthropic | ProviderTransport::GoogleVertexAnthropic => {
             ProviderFamily::Anthropic
         }
-        ProviderTransport::Bedrock | ProviderTransport::BedrockMantle => ProviderFamily::Bedrock,
+        ProviderTransport::Bedrock => ProviderFamily::Bedrock,
+        ProviderTransport::BedrockMantle | ProviderTransport::BedrockRuntime => {
+            ProviderFamily::OpenAi
+        }
         ProviderTransport::Google | ProviderTransport::GoogleVertex => ProviderFamily::Google,
         ProviderTransport::Openrouter => ProviderFamily::OpenRouter,
         ProviderTransport::Openai | ProviderTransport::OpenaiCompatible => ProviderFamily::OpenAi,
@@ -10548,8 +10551,9 @@ fn effort_family(transport: Option<ProviderTransport>) -> Option<zuno_llm::effor
 fn provider_factory_key(transport: Option<ProviderTransport>) -> Option<&'static str> {
     match transport? {
         ProviderTransport::Anthropic => Some("anthropic"),
-        ProviderTransport::Bedrock => Some("amazon-bedrock"),
-        ProviderTransport::BedrockMantle => Some("amazon-bedrock/mantle"),
+        ProviderTransport::Bedrock => Some("amazon-bedrock-converse"),
+        ProviderTransport::BedrockMantle => Some("amazon-bedrock"),
+        ProviderTransport::BedrockRuntime => Some("amazon-bedrock-runtime"),
         ProviderTransport::Google => Some("google"),
         ProviderTransport::GoogleVertex => Some("google-vertex"),
         ProviderTransport::GoogleVertexAnthropic => Some("google-vertex/anthropic"),
@@ -10558,6 +10562,13 @@ fn provider_factory_key(transport: Option<ProviderTransport>) -> Option<&'static
             Some(COMPATIBLE_PROVIDER)
         }
     }
+}
+
+fn is_bedrock_factory(factory_key: &str) -> bool {
+    matches!(
+        factory_key,
+        "amazon-bedrock" | "amazon-bedrock-runtime" | "amazon-bedrock-converse"
+    )
 }
 
 fn provider_registry(
@@ -10587,10 +10598,14 @@ fn provider_registry(
     );
 
     providers.register_fallible("amazon-bedrock", |spec| {
-        zuno_provider_bedrock::factory(spec)
+        zuno_provider_bedrock::mantle_factory(spec)
             .map_err(|error| zuno_llm::registry::Declined::Failed(ProviderError::fatal(error)))
     });
-    providers.register_fallible("amazon-bedrock/mantle", |spec| {
+    providers.register_fallible("amazon-bedrock-runtime", |spec| {
+        zuno_provider_bedrock::runtime_factory(spec)
+            .map_err(|error| zuno_llm::registry::Declined::Failed(ProviderError::fatal(error)))
+    });
+    providers.register_fallible("amazon-bedrock-converse", |spec| {
         zuno_provider_bedrock::factory(spec)
             .map_err(|error| zuno_llm::registry::Declined::Failed(ProviderError::fatal(error)))
     });
@@ -11046,12 +11061,27 @@ fn model_spec(
         // to run.
         ProviderTransport::OpenaiCompatible => ApiSurface::Default,
         ProviderTransport::Openrouter => ApiSurface::Chat,
+        ProviderTransport::BedrockMantle | ProviderTransport::BedrockRuntime => {
+            ApiSurface::Responses
+        }
         _ => ApiSurface::Default,
     };
     let mut spec = Spec::new(&model.provider_id)
         .with_factory(factory_key)
         .with_surface(surface);
-    if let Some(endpoint) = provider_endpoint(provider, model) {
+    // Native Bedrock owns region resolution. Its catalog URLs contain
+    // `${AWS_REGION}`, and expanding those through the generic environment pass
+    // before the typed config region is applied would let ambient state override
+    // `provider.<id>.options.region`. Only an explicit endpoint override wins here;
+    // otherwise each Bedrock provider constructs its URL from the resolved region.
+    let endpoint = if is_bedrock_factory(factory_key) {
+        provider_option_endpoint(provider)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    } else {
+        provider_endpoint(provider, model)
+    };
+    if let Some(endpoint) = endpoint {
         spec = spec.with_base_url(expand_variables(&endpoint, env));
     } else if factory_key == COMPATIBLE_PROVIDER {
         return Err(format!(
@@ -11060,7 +11090,7 @@ fn model_spec(
             model.provider_id, model.provider_id
         ));
     }
-    if (factory_key == "amazon-bedrock" || factory_key == "amazon-bedrock/mantle")
+    if is_bedrock_factory(factory_key)
         && let Some(region) = provider_string_option(provider, "region")
             .or_else(|| env.value("AWS_REGION").map(str::to_owned))
             .or_else(|| env.value("AWS_DEFAULT_REGION").map(str::to_owned))

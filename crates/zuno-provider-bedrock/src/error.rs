@@ -11,10 +11,20 @@ pub fn classify_bedrock_error(
     headers: &BTreeMap<String, String>,
     body: &[u8],
 ) -> ProviderError {
+    classify_bedrock_error_for(PROVIDER_ID, status, headers, body)
+}
+
+pub fn classify_bedrock_error_for(
+    provider: &str,
+    status: u16,
+    headers: &BTreeMap<String, String>,
+    body: &[u8],
+) -> ProviderError {
     let parsed = serde_json::from_slice::<Value>(body).ok();
     let code = parsed.as_ref().and_then(error_code);
     let retry_after = retry_after(headers, parsed.as_ref());
-    let source = || service_error_source(status, code, parsed.as_ref());
+    let request_id = request_id(headers);
+    let source = || service_error_source(status, code, request_id, parsed.as_ref());
 
     if status == 429 || code.is_some_and(is_rate_limit_code) {
         return ProviderError::RateLimited { retry_after };
@@ -33,13 +43,13 @@ pub fn classify_bedrock_error(
     }
     if matches!(status, 401 | 403) || code.is_some_and(is_auth_code) {
         return ProviderError::Auth {
-            provider: PROVIDER_ID.to_owned(),
+            provider: provider.to_owned(),
             source: Some(source()),
         };
     }
     if code.is_some_and(is_refusal_code) {
         return ProviderError::Refused {
-            provider: PROVIDER_ID.to_owned(),
+            provider: provider.to_owned(),
             provider_text: parsed
                 .as_ref()
                 .and_then(|value| value.get("message"))
@@ -73,6 +83,17 @@ fn error_code(value: &Value) -> Option<&str> {
         .into_iter()
         .find_map(|key| value.get(key).and_then(Value::as_str))
         .map(|code| code.rsplit('#').next().unwrap_or(code))
+}
+
+fn request_id(headers: &BTreeMap<String, String>) -> Option<&str> {
+    ["x-amzn-requestid", "x-amzn-request-id"]
+        .into_iter()
+        .find_map(|wanted| {
+            headers.iter().find_map(|(name, value)| {
+                name.eq_ignore_ascii_case(wanted).then_some(value.as_str())
+            })
+        })
+        .filter(|value| !value.is_empty())
 }
 
 fn retry_after(headers: &BTreeMap<String, String>, body: Option<&Value>) -> Option<Duration> {
@@ -141,10 +162,16 @@ fn is_transient_code(code: &str) -> bool {
     )
 }
 
-fn service_error_source(status: u16, code: Option<&str>, body: Option<&Value>) -> BoxSource {
+fn service_error_source(
+    status: u16,
+    code: Option<&str>,
+    request_id: Option<&str>,
+    body: Option<&Value>,
+) -> BoxSource {
     Box::new(BedrockServiceError {
         status,
         code: code.map(str::to_owned),
+        request_id: request_id.map(str::to_owned),
         provider_text: body
             .and_then(|value| value.get("message"))
             .and_then(Value::as_str)
@@ -153,10 +180,13 @@ fn service_error_source(status: u16, code: Option<&str>, body: Option<&Value>) -
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("Bedrock service error status={status} code={code:?}: {provider_text:?}")]
+#[error(
+    "Bedrock service error status={status} code={code:?} request_id={request_id:?}: {provider_text:?}"
+)]
 struct BedrockServiceError {
     status: u16,
     code: Option<String>,
+    request_id: Option<String>,
     provider_text: Option<String>,
 }
 
@@ -206,5 +236,27 @@ mod tests {
     fn a_malformed_retry_after_is_dropped_rather_than_guessed() {
         let headers = BTreeMap::from([("retry-after".to_owned(), "soon".to_owned())]);
         assert_eq!(retry_after(&headers, None), None);
+    }
+
+    #[test]
+    fn a_service_error_keeps_the_aws_request_id_and_provider_identity() {
+        let headers =
+            BTreeMap::from([("X-Amzn-RequestId".to_owned(), "req-runtime-42".to_owned())]);
+        let error = classify_bedrock_error_for(
+            "amazon-bedrock-runtime",
+            403,
+            &headers,
+            br#"{"code":"AccessDeniedException","message":"denied"}"#,
+        );
+        let ProviderError::Auth { provider, source } = error else {
+            panic!("expected an auth failure");
+        };
+        assert_eq!(provider, "amazon-bedrock-runtime");
+        assert!(
+            source
+                .expect("service source")
+                .to_string()
+                .contains("req-runtime-42")
+        );
     }
 }

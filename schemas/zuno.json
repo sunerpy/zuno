@@ -2371,12 +2371,17 @@
         },
         {
           "const": "bedrock",
-          "description": "AWS Bedrock Converse/Invoke transport.",
+          "description": "AWS Bedrock Converse/EventStream transport.",
           "type": "string"
         },
         {
           "const": "bedrock-mantle",
           "description": "Bedrock through the Mantle OpenAI-compatible endpoint.",
+          "type": "string"
+        },
+        {
+          "const": "bedrock-runtime",
+          "description": "Bedrock Runtime's OpenAI-compatible Responses endpoint.",
           "type": "string"
         },
         {

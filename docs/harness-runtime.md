@@ -2131,8 +2131,12 @@ query text, authorization headers, and API keys are forbidden from `Debug`,
 
 ## Network egress
 
-`zuno-network` owns the outbound HTTP construction policy shared by providers,
-authentication, catalogs, remote instructions, remote MCP, and web tools.
+`zuno-network` owns the outbound HTTP construction policy shared by model
+provider requests, Zuno-managed authentication, catalogs, remote instructions,
+remote MCP, and web tools. AWS credential discovery is the deliberate exception:
+`zuno-aws-auth` delegates the standard chain, refresh, and SigV4 signing to the
+AWS Rust SDK, while the signed Bedrock model request still travels through
+`zuno-network`.
 Session traffic uses `SessionNetworkPolicy::ProcessEnvironment`, which resolves
 the standard HTTP, HTTPS, all-proxy, and no-proxy environment variables when a
 connection pool is constructed. A capability that constructs reqwest directly
@@ -2140,10 +2144,11 @@ bypasses this product contract and is incomplete.
 
 `SessionNetworkPolicy::Direct` is an explicit security boundary, not a fallback.
 Its caller must declare `DirectPurpose::LoopbackControlPlane` or
-`DirectPurpose::CloudMetadata`. Bedrock therefore has two transports with
-separate lifecycles: runtime and SSO traffic is proxy-aware, while IMDS and
-approved local ECS credential endpoints are direct. Remote HTTPS container
-credential endpoints remain on the proxy-aware transport.
+`DirectPurpose::CloudMetadata`. Bedrock model traffic is proxy-aware through the
+ordinary session client. Credential-provider traffic, including IAM Identity
+Center, STS, web identity, container credentials, and IMDS, is owned by the AWS
+SDK and follows that SDK release's HTTP configuration rather than a second Zuno
+credential transport.
 
 Public web fetch uses the separate `PublicHttpClient` security capability. It
 accepts only credential-free HTTP(S) and disables automatic redirects. Each

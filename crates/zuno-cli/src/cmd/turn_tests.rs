@@ -2968,8 +2968,9 @@ fn model_selection_splits_only_the_provider_prefix() {
 fn every_declared_wire_transport_selects_its_production_registry_key() {
     let cases = [
         (ProviderTransport::Anthropic, "anthropic"),
-        (ProviderTransport::Bedrock, "amazon-bedrock"),
-        (ProviderTransport::BedrockMantle, "amazon-bedrock/mantle"),
+        (ProviderTransport::Bedrock, "amazon-bedrock-converse"),
+        (ProviderTransport::BedrockMantle, "amazon-bedrock"),
+        (ProviderTransport::BedrockRuntime, "amazon-bedrock-runtime"),
         (ProviderTransport::Google, "google"),
         (ProviderTransport::GoogleVertex, "google-vertex"),
         (
@@ -3765,7 +3766,7 @@ async fn production_catalog_native_openai_honors_advertised_chat() {
 #[tokio::test]
 async fn production_bedrock_registration_dispatches_and_decodes_recorded_eventstream() {
     replay_production_registration(RegistrationCase {
-        registry_key: "amazon-bedrock",
+        registry_key: "amazon-bedrock-converse",
         transport: ProviderTransport::Bedrock,
         model_id: "us.amazon.nova-micro-v1:0",
         cassette: "bedrock-converse/streams-text",
@@ -3784,18 +3785,37 @@ async fn production_bedrock_registration_dispatches_and_decodes_recorded_eventst
 #[tokio::test]
 async fn production_bedrock_mantle_registration_dispatches_and_decodes_recorded_eventstream() {
     replay_production_registration(RegistrationCase {
-        registry_key: "amazon-bedrock/mantle",
+        registry_key: "amazon-bedrock",
         transport: ProviderTransport::BedrockMantle,
-        model_id: "openai.gpt-oss-120b",
-        cassette: "bedrock-converse/streams-text",
+        model_id: "openai.gpt-5.6-sol",
+        cassette: "openai-responses/gpt-5-5-streams-text",
         extra_options: serde_json::json!({
             "region": "us-east-1",
             "accessKeyId": "AKIAREPLAY",
             "secretAccessKey": "replay-secret"
         }),
-        endpoint_suffix: "/model/openai.gpt-oss-120b/converse-stream",
-        expected_body_key: "messages",
-        expected_text: "Hello",
+        endpoint_suffix: "/responses",
+        expected_body_key: "input",
+        expected_text: "Hello!",
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn production_bedrock_runtime_registration_dispatches_and_decodes_recorded_sse() {
+    replay_production_registration(RegistrationCase {
+        registry_key: "amazon-bedrock-runtime",
+        transport: ProviderTransport::BedrockRuntime,
+        model_id: "global.openai.gpt-5.6-sol",
+        cassette: "openai-responses/gpt-5-5-streams-text",
+        extra_options: serde_json::json!({
+            "region": "us-east-2",
+            "accessKeyId": "AKIAREPLAY",
+            "secretAccessKey": "replay-secret"
+        }),
+        endpoint_suffix: "/responses",
+        expected_body_key: "input",
+        expected_text: "Hello!",
     })
     .await;
 }
@@ -4916,6 +4936,45 @@ fn every_endpoint_rung_is_expanded_after_it_wins() {
             "{why}"
         );
     }
+}
+
+#[test]
+fn a_bedrock_config_region_outranks_the_ambient_region_in_a_catalog_url() {
+    let document = serde_json::from_str(
+        r#"{"amazon-bedrock":{
+             "id":"amazon-bedrock",
+             "name":"Amazon Bedrock",
+             "env":[],
+             "npm":"@ai-sdk/amazon-bedrock/mantle",
+             "api":"https://bedrock-mantle.${AWS_REGION}.api.aws/openai/v1",
+             "models":{"openai.gpt-5.6-sol":{
+               "id":"openai.gpt-5.6-sol",
+               "name":"GPT-5.6 Sol",
+               "reasoning":true,
+               "tool_call":true,
+               "limit":{"context":272000,"output":65536}}}}}"#,
+    )
+    .expect("Bedrock catalog");
+    let config = serde_json::from_str(
+        r#"{"provider":{"amazon-bedrock":{
+             "surface":"responses",
+             "options":{"profile":"us","region":"us-east-2"}}}}"#,
+    )
+    .expect("Bedrock config");
+    let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
+    let model = catalog
+        .model("amazon-bedrock", "openai.gpt-5.6-sol")
+        .expect("Bedrock model");
+    let env = Env::empty().with("AWS_REGION", "cn-northwest-1");
+
+    let spec = model_spec(&catalog, model, &env).expect("Bedrock spec");
+
+    assert_eq!(spec.factory(), "amazon-bedrock");
+    assert_eq!(spec.region.as_deref(), Some("us-east-2"));
+    assert!(
+        spec.base_url.is_none(),
+        "the catalog placeholder must not be expanded with the ambient China region: {spec:?}"
+    );
 }
 
 /// A rung is chosen on its unexpanded text, and expanded only afterwards.

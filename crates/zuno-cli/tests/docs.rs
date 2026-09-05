@@ -1234,6 +1234,13 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
             "provider.reasoning.item",
             "provider_reasoning_item",
             "encryptedContent",
+            "`bedrock-mantle`",
+            "`bedrock-runtime`",
+            "`amazon-bedrock-converse`",
+            "`bedrock-mantle` | `amazon-bedrock`",
+            "`store: false`",
+            "`openai.gpt-5.6-sol`",
+            "`global.openai.gpt-5.6-sol`",
         ],
     );
     contains_all(
@@ -1245,6 +1252,12 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
             "provider.reasoning.item",
             "provider_reasoning_item",
             "encryptedContent",
+            "`bedrock-mantle`",
+            "`bedrock-runtime`",
+            "`amazon-bedrock-converse`",
+            "`store: false`",
+            "`openai.gpt-5.6-sol`",
+            "`global.openai.gpt-5.6-sol`",
         ],
     );
     contains_all(
@@ -2659,6 +2672,9 @@ fn batch3_docs_pin_the_admission_budget_standing_rows_and_upgrade_boundary() {
             "Zuno's own emitters keep\n  external text out of `message`",
             "is logged under\n  `stderr`, which is redacted",
             "`no_crate_emits_an_unexpected_message_field`",
+            "AWS SDK targets",
+            "non-overridable `WARN` floor",
+            "aws_config=trace",
         ],
     );
     contains_all(
@@ -2667,6 +2683,9 @@ fn batch3_docs_pin_the_admission_budget_standing_rows_and_upgrade_boundary() {
             "不会把外部文本放进 `message`",
             "记录在 `stderr`",
             "`no_crate_emits_an_unexpected_message_field`",
+            "AWS SDK target",
+            "不可覆盖的 `WARN`",
+            "aws_config=trace",
         ],
     );
     for (relative, retired) in [

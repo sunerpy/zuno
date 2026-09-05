@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::{TryStreamExt as _, stream};
+use http::Method;
 use serde_json::{Map, Value, json};
-use time::OffsetDateTime;
-use time::macros::format_description;
+use tokio::sync::OnceCell;
 use url::Url;
+use zuno_aws_auth::{AwsAccessKeys, AwsAuthConfig, AwsAuthContext, AwsRequestToSign};
 use zuno_error::ProviderError;
 use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent, tool_arguments_text};
 use zuno_llm::http::{HttpTimeouts, RequestDeadlines, read_error_body};
@@ -14,16 +16,18 @@ use zuno_llm::registry::{
 };
 use zuno_llm::sse::{StreamIdleTimeout, upstream_stream_incomplete};
 
-use crate::credentials::{CredentialChainConfig, CredentialResolver};
-use crate::error::{PROVIDER_ID, classify_bedrock_error};
+use crate::aws::{header_map, load_context, map_auth_error};
+use crate::error::classify_bedrock_error_for;
 use crate::eventstream::{BedrockDecodeError, BedrockEventDecoder};
-use crate::sigv4::{SigV4Signer, encode_path_segment};
 
 /// The cap sent on the Anthropic-native path when nothing is configured.
 ///
 /// The oracle's own fallback for the same required field
 /// (`packages/llm/src/protocols/anthropic-messages.ts:510`).
 const ANTHROPIC_NATIVE_DEFAULT_MAX_TOKENS: u64 = 4096;
+
+/// Provider identity for the Bedrock Converse/EventStream transport.
+pub const CONVERSE_PROVIDER_ID: &str = "amazon-bedrock-converse";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BedrockOperation {
@@ -42,13 +46,29 @@ impl BedrockOperation {
     }
 }
 
+fn encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
+}
+
 #[derive(Debug, Clone)]
 pub struct BedrockConfig {
     pub provider_id: String,
-    pub region: String,
+    pub region: Option<String>,
     pub endpoint: Option<Url>,
     pub operation: BedrockOperation,
-    pub credentials: CredentialChainConfig,
+    pub auth: AwsAuthConfig,
+    pub access_keys: Option<AwsAccessKeys>,
     pub generation: BedrockGeneration,
     /// Which models may be sent tool definitions.
     pub tools: BedrockToolPolicy,
@@ -241,12 +261,18 @@ fn numeric_option(spec: &Spec, keys: &[&str]) -> Option<f64> {
 impl BedrockConfig {
     #[must_use]
     pub fn new(region: impl Into<String>) -> Self {
+        let region = region.into();
         Self {
-            provider_id: PROVIDER_ID.to_owned(),
-            region: region.into(),
+            provider_id: CONVERSE_PROVIDER_ID.to_owned(),
+            region: Some(region.clone()),
             endpoint: None,
             operation: BedrockOperation::ConverseStream,
-            credentials: CredentialChainConfig::default(),
+            auth: AwsAuthConfig {
+                profile: None,
+                region: Some(region),
+                service: "bedrock".to_owned(),
+            },
+            access_keys: None,
             generation: BedrockGeneration::default(),
             tools: BedrockToolPolicy::default(),
         }
@@ -256,27 +282,22 @@ impl BedrockConfig {
         let region = spec
             .region
             .clone()
-            .or_else(|| string_option(spec, "region"))
-            .or_else(|| std::env::var("AWS_REGION").ok())
-            .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-            .unwrap_or_else(|| "us-east-1".to_owned());
+            .or_else(|| string_option(spec, "region"));
         let endpoint = spec
             .base_url
             .as_deref()
             .map(Url::parse)
             .transpose()
             .map_err(BedrockBuildError::InvalidEndpoint)?;
-        let explicit = match (
+        let access_keys = match (
             string_option(spec, "accessKeyId"),
             string_option(spec, "secretAccessKey"),
         ) {
-            (Some(access_key), Some(secret_key)) => {
-                let mut credentials = crate::AwsCredentials::new(access_key, secret_key);
-                if let Some(token) = string_option(spec, "sessionToken") {
-                    credentials = credentials.with_session_token(token);
-                }
-                Some(credentials)
-            }
+            (Some(access_key_id), Some(secret_access_key)) => Some(AwsAccessKeys {
+                access_key_id,
+                secret_access_key,
+                session_token: string_option(spec, "sessionToken"),
+            }),
             (None, None) => None,
             _ => return Err(BedrockBuildError::IncompleteExplicitCredentials),
         };
@@ -287,18 +308,22 @@ impl BedrockConfig {
         };
         Ok(Self {
             provider_id: if spec.provider.is_empty() {
-                PROVIDER_ID.to_owned()
+                CONVERSE_PROVIDER_ID.to_owned()
             } else {
                 spec.provider.clone()
             },
             region,
             endpoint,
             operation,
-            credentials: CredentialChainConfig {
-                explicit,
+            auth: AwsAuthConfig {
                 profile: string_option(spec, "profile"),
-                ..CredentialChainConfig::default()
+                region: spec
+                    .region
+                    .clone()
+                    .or_else(|| string_option(spec, "region")),
+                service: "bedrock".to_owned(),
             },
+            access_keys,
             generation: BedrockGeneration::from_spec(spec),
             tools: BedrockToolPolicy::from_spec(spec),
         })
@@ -316,7 +341,7 @@ fn string_option(spec: &Spec, name: &str) -> Option<String> {
 pub struct BedrockProvider {
     config: BedrockConfig,
     client: reqwest::Client,
-    credentials: CredentialResolver,
+    auth: Arc<OnceCell<AwsAuthContext>>,
 }
 
 impl std::fmt::Debug for BedrockProvider {
@@ -333,13 +358,10 @@ impl BedrockProvider {
         let client = zuno_network::client_builder()
             .build()
             .map_err(BedrockBuildError::HttpClient)?;
-        let credentials =
-            CredentialResolver::with_network_client(config.credentials.clone(), client.clone())
-                .map_err(BedrockBuildError::HttpClient)?;
         Ok(Self {
             config,
             client,
-            credentials,
+            auth: Arc::new(OnceCell::new()),
         })
     }
 
@@ -367,12 +389,26 @@ impl BedrockProvider {
         )
     }
 
+    async fn auth_context(&self) -> Result<&AwsAuthContext, ProviderError> {
+        let config = self.config.auth.clone();
+        let access_keys = self.config.access_keys.clone();
+        self.auth
+            .get_or_try_init(|| load_context(config, access_keys))
+            .await
+            .map_err(|source| map_auth_error(&self.config.provider_id, source))
+    }
+
     async fn open_stream(
         &self,
-        mut request: CompletionRequest,
+        request: CompletionRequest,
     ) -> Result<ProviderStream<'static>, ProviderError> {
-        if request.surface == ApiSurface::Default && self.config.provider_id.ends_with("/mantle") {
-            request.surface = mantle_surface(&request.model_id);
+        if request.model_id.starts_with("openai.gpt-") || request.model_id.contains(".openai.gpt-")
+        {
+            return Err(ProviderError::fatal(
+                BedrockProtocolError::OpenAiModelRequiresResponses {
+                    model: request.model_id,
+                },
+            ));
         }
         // `invoke-with-response-stream` frames Anthropic Messages events, and this crate
         // decodes only those. An OpenAI Chat chunk or Responses event arrives inside the
@@ -399,20 +435,8 @@ impl BedrockProvider {
             ));
         }
         let body = serde_json::to_vec(&self.body_for(&request)?).map_err(ProviderError::fatal)?;
-        let url = self.request_url(&request.model_id)?;
-        let resolved = self
-            .credentials
-            .resolve()
-            .await
-            .map_err(|source| ProviderError::Auth {
-                provider: self.config.provider_id.clone(),
-                source: Some(Box::new(source)),
-            })?;
-        let amz_date = OffsetDateTime::now_utc()
-            .format(format_description!(
-                "[year][month][day]T[hour][minute][second]Z"
-            ))
-            .map_err(ProviderError::fatal)?;
+        let auth = self.auth_context().await?;
+        let url = self.request_url(&request.model_id, auth.region())?;
         let payload_hash = sha256_hex(&body);
         let mut headers = BTreeMap::from([
             (
@@ -429,19 +453,18 @@ impl BedrockProvider {
             );
         }
         headers.extend(request.headers.clone());
-        let signing = SigV4Signer::new(&self.config.region, "bedrock")
-            .sign(
-                "POST",
-                &url,
-                &headers,
-                &body,
-                &resolved.credentials,
-                &amz_date,
-            )
-            .map_err(ProviderError::fatal)?;
-        let mut builder = self.client.post(url).body(body);
-        for (name, value) in signing.headers {
-            if name != "host" {
+        let signed = auth
+            .sign(AwsRequestToSign {
+                method: Method::POST,
+                url: url.to_string(),
+                headers: header_map(&headers).map_err(ProviderError::fatal)?,
+                body: Bytes::copy_from_slice(&body),
+            })
+            .await
+            .map_err(|source| map_auth_error(&self.config.provider_id, source))?;
+        let mut builder = self.client.post(signed.url).body(body);
+        for (name, value) in &signed.headers {
+            if name != http::header::HOST {
                 builder = builder.header(name, value);
             }
         }
@@ -467,7 +490,8 @@ impl BedrockProvider {
                 })
                 .collect();
             let response_body = read_error_body(&provider, response).await?.into_bytes();
-            return Err(classify_bedrock_error(
+            return Err(classify_bedrock_error_for(
+                &provider,
                 status,
                 &response_headers,
                 &response_body,
@@ -484,10 +508,16 @@ impl BedrockProvider {
             ));
         }
 
+        let mut queued = VecDeque::new();
+        if let Some(request_id) = aws_request_id(response.headers()) {
+            queued.push_back(StreamEvent::StatusDetail {
+                detail: format!("AWS request ID {request_id}"),
+            });
+        }
         let state = ResponseState {
             response,
             decoder: BedrockEventDecoder::new(),
-            queued: VecDeque::new(),
+            queued,
             finished: false,
             message_ended: false,
             provider,
@@ -534,14 +564,11 @@ impl BedrockProvider {
         Ok(Box::pin(output))
     }
 
-    fn request_url(&self, model_id: &str) -> Result<Url, ProviderError> {
+    fn request_url(&self, model_id: &str, region: &str) -> Result<Url, ProviderError> {
         let base = match &self.config.endpoint {
             Some(endpoint) => endpoint.clone(),
-            None => Url::parse(&format!(
-                "https://bedrock-runtime.{}.amazonaws.com",
-                self.config.region
-            ))
-            .map_err(ProviderError::fatal)?,
+            None => Url::parse(&format!("https://bedrock-runtime.{region}.amazonaws.com"))
+                .map_err(ProviderError::fatal)?,
         };
         base.join(&self.config.operation.path(model_id))
             .map_err(ProviderError::fatal)
@@ -663,13 +690,7 @@ fn converse_body(
             .filter(|content| !content.trim().is_empty())
             .map(|content| json!({"text": content})),
     );
-    let mut body = Map::from_iter([
-        (
-            "modelId".to_owned(),
-            Value::String(request.model_id.clone()),
-        ),
-        ("messages".to_owned(), Value::Array(messages)),
-    ]);
+    let mut body = Map::from_iter([("messages".to_owned(), Value::Array(messages))]);
     if !system.is_empty() {
         body.insert("system".to_owned(), Value::Array(system));
     }
@@ -1262,6 +1283,12 @@ enum RequestShapeError {
 enum BedrockProtocolError {
     #[error("Bedrock streaming response did not use application/vnd.amazon.eventstream")]
     UnexpectedContentType,
+    #[error(
+        "model `{model}` uses the OpenAI Responses protocol; select `amazon-bedrock` for \
+         Mantle or `amazon-bedrock-runtime` for Runtime instead of \
+         `amazon-bedrock-converse`"
+    )]
+    OpenAiModelRequiresResponses { model: String },
     /// An OpenAI-shaped body was about to be posted to `invoke-with-response-stream`,
     /// whose reply this crate cannot decode.
     ///
@@ -1277,6 +1304,14 @@ enum BedrockProtocolError {
 
 pub fn factory(spec: Spec) -> Result<Arc<dyn Provider>, BedrockBuildError> {
     Ok(Arc::new(BedrockProvider::from_spec(&spec)?))
+}
+
+fn aws_request_id(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    ["x-amzn-requestid", "x-amzn-request-id"]
+        .into_iter()
+        .find_map(|name| headers.get(name))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -1295,7 +1330,6 @@ mod tests {
         assert_eq!(
             converse_body(&request, &BedrockGeneration::default()).expect("request body"),
             json!({
-                "modelId": "us.amazon.nova-micro-v1:0",
                 "messages": [{"role": "user", "content": [{"text": "Say hello."}]}],
                 "system": [{"text": "Reply with one word."}]
             }),
@@ -1799,125 +1833,46 @@ mod tests {
         );
     }
 
-    /// A Mantle provider exactly as the CLI registers it, plus the operation under test.
-    ///
-    /// Explicit credentials keep the resolver off the ambient environment, so an
-    /// assertion about the refusal cannot be satisfied by a missing-credential failure
-    /// instead.
-    fn mantle_provider(operation: BedrockOperation, endpoint: Option<Url>) -> BedrockProvider {
+    fn converse_provider(operation: BedrockOperation) -> BedrockProvider {
         let mut config = BedrockConfig::new("us-east-1");
-        config.provider_id = "amazon-bedrock/mantle".to_owned();
         config.operation = operation;
-        config.endpoint = endpoint;
-        config.credentials = CredentialChainConfig {
-            explicit: Some(crate::AwsCredentials::new("AKIAREPLAY", "replay-secret")),
-            ..CredentialChainConfig::default()
-        };
-        BedrockProvider::new(config).expect("a Mantle provider with explicit credentials")
+        config.access_keys = Some(AwsAccessKeys {
+            access_key_id: "AKIAREPLAY".to_owned(),
+            secret_access_key: "replay-secret".to_owned(),
+            session_token: None,
+        });
+        BedrockProvider::new(config).expect("a Converse provider with explicit credentials")
     }
 
-    /// The surface an [`BedrockProtocolError::UndecodableInvokeResponse`] named, when that
-    /// is what the failure is.
+    /// OpenAI GPT model ids never reach the Converse or native-model invocation paths.
     ///
-    /// Reads the typed source rather than the rendered message, so the test still fails if
-    /// the refusal is downgraded to a transient class that keeps its wording.
-    fn refusal_surface(error: &ProviderError) -> Option<&'static str> {
-        let ProviderError::Fatal {
-            source: Some(source),
-            ..
-        } = error
-        else {
-            return None;
-        };
-        if let Some(BedrockProtocolError::UndecodableInvokeResponse { surface }) =
-            source.downcast_ref::<BedrockProtocolError>()
-        {
-            Some(surface)
-        } else {
-            None
-        }
-    }
-
-    /// `bedrock-mantle` with `options.operation: "invoke-with-response-stream"`.
-    ///
-    /// That pairing posts a real OpenAI Responses body and then reads the reply with an
-    /// Anthropic Messages decoder;
-    /// `eventstream::tests::openai_shaped_invoke_chunks_yield_no_events_at_all` pins that
-    /// decode at zero events for both OpenAI shapes. Sent anyway, the turn spends a full
-    /// billed invocation, produces nothing, and ends as `upstream_stream_incomplete` — a
-    /// transient class the engine retries, so the charge repeats per attempt. The refusal
-    /// therefore has to land before signing and has to be fatal.
+    /// This guard is before credential resolution and signing, so a wrong provider cannot
+    /// bill a request before telling the user which Responses provider owns the model.
     #[tokio::test]
-    async fn a_mantle_invoke_stream_is_refused_before_it_is_signed_and_billed() {
+    async fn an_openai_model_is_refused_by_converse_before_credentials_or_network() {
         use futures::StreamExt as _;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let request = CompletionRequest::new(
             "openai.gpt-oss-120b",
             vec![Message::new(Role::User, "Say hello.")],
         );
-        let mantle_invoke = mantle_provider(BedrockOperation::InvokeModelWithResponseStream, None);
-
-        assert!(
-            mantle_invoke
-                .body_for(&request.clone().on_surface(ApiSurface::Responses))
-                .expect("Mantle Responses body")
-                .get("input")
-                .is_some(),
-            "the request half stays inspectable through `body_for`; only the reply this \
-             crate cannot read back is refused"
-        );
-
-        let refused = mantle_invoke
-            .stream(request.clone())
+        let refused = converse_provider(BedrockOperation::ConverseStream)
+            .stream(request)
             .next()
             .await
             .expect("the refusal is the first item of the stream")
-            .expect_err("an undecodable response must not be requested");
-        assert_eq!(
-            refusal_surface(&refused),
-            Some("Responses"),
-            "the surface `mantle_surface` resolved for this model must be named: {refused:?}"
-        );
+            .expect_err("an OpenAI model must not be requested through Converse");
         assert!(
             !refused.is_retryable(),
             "a mismatch the peer cannot fix must not bill a second invocation: {refused:?}"
         );
-
-        // The control isolates the operation: same provider id, same model, same promoted
-        // surface. `converse-stream` sends an Anthropic-shaped body this crate can decode,
-        // so it must still reach the socket — the mock's `expect(1)` is the proof.
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/model/openai.gpt-oss-120b/converse-stream"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let converse = mantle_provider(
-            BedrockOperation::ConverseStream,
-            Some(Url::parse(&server.uri()).expect("a mock endpoint")),
-        );
-        let answered = converse
-            .stream(request)
-            .next()
-            .await
-            .expect("one item")
-            .expect_err("the mock answers application/json, not an eventstream");
-        assert_eq!(
-            refusal_surface(&answered),
-            None,
-            "converse-stream must not be refused: {answered:?}"
-        );
         assert!(
-            matches!(&answered, ProviderError::Fatal { source: Some(source), .. }
+            matches!(&refused, ProviderError::Fatal { source: Some(source), .. }
             if matches!(
                 source.downcast_ref::<BedrockProtocolError>(),
-                Some(BedrockProtocolError::UnexpectedContentType)
+                Some(BedrockProtocolError::OpenAiModelRequiresResponses { .. })
             )),
-            "the signed request reached the mock and its content type was rejected: \
-             {answered:?}"
+            "the typed repair must name the Responses provider: {refused:?}"
         );
     }
 

@@ -25,6 +25,24 @@ pub const ENABLED: &str = "1";
 pub const LOG_FILE_PREFIX: &str = "zuno";
 pub const LOG_FILE_SUFFIX: &str = "log";
 
+/// AWS SDK targets whose INFO/DEBUG records may contain credential identifiers
+/// or request-signing internals.
+///
+/// This is a security floor, not a noise preference. User `RUST_LOG` directives
+/// cannot lower these targets below WARN.
+const SENSITIVE_AWS_LOG_TARGETS: &[&str] = &[
+    "aws_config",
+    "aws_credential_types",
+    "aws_runtime",
+    "aws_sdk_signin",
+    "aws_sdk_sso",
+    "aws_sdk_ssooidc",
+    "aws_sdk_sts",
+    "aws_sigv4",
+    "aws_smithy_http_client",
+    "aws_smithy_runtime",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum LogLevel {
     Trace,
@@ -199,12 +217,19 @@ impl LogConfig {
                 .flatten()
                 .filter(|value| !value.trim().is_empty())
         });
-        match directives {
+        let mut filter = match directives {
             Some(directives) => builder
                 .parse(&directives)
                 .map_err(|source| crate::LogInitError::Directives { directives, source }),
             None => Ok(builder.parse_lossy("")),
+        }?;
+        for target in SENSITIVE_AWS_LOG_TARGETS {
+            let directive = format!("{target}=warn")
+                .parse()
+                .expect("the static AWS log directive is valid");
+            filter = filter.add_directive(directive);
         }
+        Ok(filter)
     }
 
     pub(crate) fn retention(&self) -> RetentionPolicy {
@@ -300,6 +325,31 @@ mod tests {
             panic!("invalid directives should not build a filter");
         };
         assert_eq!(directives, "this=is=not=valid");
+    }
+
+    #[test]
+    fn aws_sdk_credential_targets_are_forced_to_warn_even_under_trace() {
+        let filter = LogConfig::from_env("/tmp/zuno-observability-unit")
+            .with_directives("trace,aws_config=trace,aws_sigv4=trace")
+            .build_filter()
+            .expect("filter");
+        let rendered = format!("{filter:?}");
+        for target in SENSITIVE_AWS_LOG_TARGETS {
+            assert!(
+                rendered.contains(&format!(
+                    "target: Some(\"{target}\"), field_names: [], level: LevelFilter::WARN"
+                )),
+                "AWS credential target `{target}` lost its WARN floor: {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains(
+                "target: Some(\"aws_config\"), field_names: [], level: LevelFilter::TRACE"
+            ) && !rendered.contains(
+                "target: Some(\"aws_sigv4\"), field_names: [], level: LevelFilter::TRACE"
+            ),
+            "user directives overrode the AWS credential floor: {rendered}"
+        );
     }
 
     #[test]

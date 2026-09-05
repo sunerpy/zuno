@@ -337,6 +337,14 @@ impl ResponsesDecoder {
     }
 
     fn frame(&mut self, frame: &SseEvent) -> Result<Vec<StreamEvent>, ProviderError> {
+        // Bedrock Runtime Responses emits the OpenAI-compatible `[DONE]` sentinel
+        // after its typed `response.completed` event. The typed terminal event remains
+        // authoritative: ignoring this trailing compatibility frame is safe, while a
+        // stream that sends `[DONE]` without a terminal response still fails in
+        // `finish()` because `ended` was never set.
+        if frame.data.trim() == "[DONE]" {
+            return Ok(Vec::new());
+        }
         let event: ResponsesEvent = frame.deserialize(&self.provider, &self.model)?;
         match event {
             ResponsesEvent::OutputTextDelta { delta } => {
@@ -849,6 +857,43 @@ mod tests {
     fn an_empty_two_hundred_response_is_a_retryable_stream_failure() {
         let mut decoder = OpenAiDecoder::new("openai", "gpt-5", ApiSurface::Responses);
         truncation_failure(decoder.finish());
+    }
+
+    #[test]
+    fn responses_accepts_a_done_sentinel_after_the_typed_completion() {
+        let mut decoder =
+            OpenAiDecoder::new("amazon-bedrock-runtime", "gpt-5.6", ApiSurface::Responses);
+        let frames = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "usage": {"input_tokens": 3, "output_tokens": 1}
+                }
+            })
+        );
+        let mut events = decoder.push(frames.as_bytes());
+        events.extend(decoder.finish());
+        let events = events
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the compatibility sentinel after completion is harmless");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop)
+            }
+        )));
+    }
+
+    #[test]
+    fn responses_done_without_a_typed_terminal_event_is_still_incomplete() {
+        let mut decoder =
+            OpenAiDecoder::new("amazon-bedrock-runtime", "gpt-5.6", ApiSurface::Responses);
+        let mut events = decoder.push(b"data: [DONE]\n\n");
+        events.extend(decoder.finish());
+        truncation_failure(events);
     }
 
     #[test]
