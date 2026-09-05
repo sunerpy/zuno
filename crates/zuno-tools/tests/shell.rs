@@ -1307,8 +1307,7 @@ async fn shell_injected_hard_ceiling_really_terminates_the_process_under_four_se
         )
         .await
     });
-    wait_for_file(&pid_file).await;
-    let pid = read_pid(&pid_file);
+    let pid = wait_for_pid(&pid_file).await;
 
     let error = tokio::time::timeout(Duration::from_secs(4), running)
         .await
@@ -1931,6 +1930,24 @@ async fn wait_for_file(path: &Path) {
     })
     .await
     .unwrap_or_else(|_| panic!("{} was not created", path.display()));
+}
+
+#[cfg(unix)]
+async fn wait_for_pid(path: &Path) -> u32 {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(path)
+                && let Ok(pid) = contents.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            // File creation precedes the shell's write. Waiting only for the path can
+            // observe the inode while its contents are still empty on a busy runner.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} never contained a numeric pid", path.display()))
 }
 
 #[cfg(unix)]
