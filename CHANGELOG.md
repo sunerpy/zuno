@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.10.2](https://github.com/sunerpy/zuno/compare/v0.10.1...v0.10.2) (2026-09-05)
+
+
+### Features
+
+* **runtime:** 增加可恢复会话与协作控制 ([7d95869](https://github.com/sunerpy/zuno/commit/7d95869e59022616be17f26ddad7e7458ab5db46))
+
+
+### Bug Fixes
+
+* **ci:** 清空轻量候选的编译包装器 ([903d558](https://github.com/sunerpy/zuno/commit/903d558276b29d6dabdacfc90a907e0310047a54))
+* **ci:** 缩短发布关键路径并去除重复门禁 ([74afa83](https://github.com/sunerpy/zuno/commit/74afa83d92b6c0ccc6e4736f5f0d64ec6e71cbb5))
+* **test:** 等待PID内容写入后再解析 ([1567851](https://github.com/sunerpy/zuno/commit/1567851ef7fa25b9404a0616ffb12bbbba0d6fa8))
+
 ## [0.10.1](https://github.com/sunerpy/zuno/compare/v0.10.0...v0.10.1) (2026-09-04)
 
 
