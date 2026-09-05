@@ -59,6 +59,7 @@ jobs:
       tree_sha: ${{ steps.identity.outputs.tree_sha }}
       pr_head_sha: ${{ steps.identity.outputs.pr_head_sha }}
       head_branch: ${{ steps.identity.outputs.head_branch }}
+      base_sha: ${{ steps.identity.outputs.base_sha }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -93,12 +94,17 @@ jobs:
           base=$(jq -r '.base.ref' <<<"$pr")
           state=$(jq -r '.state' <<<"$pr")
           merged_at=$(jq -r '.merged_at // empty' <<<"$pr")
+          base_sha=$(jq -r '.base.sha' <<<"$pr")
           head_sha=$(jq -r '.head.sha' <<<"$pr")
           head_branch=$(jq -r '.head.ref' <<<"$pr")
           head_repo=$(jq -r '.head.repo.full_name' <<<"$pr")
 
           if [ "$base" != main ] || [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
             echo "::error title=Candidate identity::candidate PR must target main from this repository"
+            exit 1
+          fi
+          if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Candidate identity::release PR base is not a full commit SHA"
             exit 1
           fi
           case "$MODE" in
@@ -151,12 +157,35 @@ jobs:
             echo "::error title=Candidate identity::invalid workspace version ${version:-<missing>}"
             exit 1
           fi
+          if [ "$MODE" != backfill ]; then
+            parent_sha=$(git show -s --format=%P "$EXPECTED_HEAD_SHA")
+            if [ "$parent_sha" != "$base_sha" ]; then
+              echo "::error title=Candidate identity::release PR head must have its exact base as its single parent"
+              exit 1
+            fi
+
+            expected_files=$'.release-please-manifest.json\nCHANGELOG.md\nCargo.lock\nCargo.toml'
+            changed_files=$(git diff --name-only "$base_sha" "$EXPECTED_HEAD_SHA" | LC_ALL=C sort)
+            if [ "$changed_files" != "$expected_files" ]; then
+              echo "::error title=Candidate identity::release PR changed files outside the four-file release delta"
+              printf 'expected:\n%s\nactual:\n%s\n' "$expected_files" "$changed_files"
+              exit 1
+            fi
+            git diff --check "$base_sha" "$EXPECTED_HEAD_SHA"
+
+            previous_version=$(
+              git show "${base_sha}:.release-please-manifest.json" |
+                jq -er '.["."]'
+            )
+            python3 .github/scripts/require-patch-release.py "$previous_version" "$version"
+          fi
 
           {
             echo "version=${version}"
             echo "tree_sha=$(git rev-parse 'HEAD^{tree}')"
             echo "pr_head_sha=${head_sha}"
             echo "head_branch=${head_branch}"
+            echo "base_sha=${base_sha}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Mark automatic candidate pending
@@ -175,7 +204,7 @@ jobs:
             >/dev/null
 
   test:
-    name: Candidate tests
+    name: Candidate release delta
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -189,64 +218,25 @@ jobs:
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.98.0"
-          components: rustfmt,clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
           cache-targets: false
 
-      - name: Configure compiler cache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: "v0.16.0"
-
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
-        with:
-          tool: nextest@0.9.103
-
       - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: cargo-deny
 
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
-        with:
-          tool: ripgrep
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-
-      - name: Install CI tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm install --global oxfmt@0.59.0
-          oxfmt --version
-          rg --version
-
-      - name: Install and verify sandbox backend
-        shell: bash
-        run: .github/scripts/setup-linux-sandbox.sh
-
       - name: Populate the cargo registry
         run: cargo fetch --locked
 
-      - name: Verify lock file and supply chain
+      - name: Verify release metadata and supply chain
         shell: bash
         run: |
           set -euo pipefail
           cargo metadata --locked --format-version 1 > /dev/null
           cargo deny --all-features check
-
-      - name: Repository gates
-        shell: bash
-        run: |
-          set -euo pipefail
-          make fmt-check
-          make lint
-          make test-nextest
-          ZUNO_SANDBOX_E2E_REQUIRE=1 make test-sandbox-e2e
 
   artifact:
     name: Build and smoke ${{ matrix.target }}
@@ -291,13 +281,13 @@ jobs:
             runner: windows-2022
             platform: windows
             use_zigbuild: false
-            cache_target: false
+            cache_target: true
             archive: zip
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             platform: windows
             use_zigbuild: false
-            cache_target: false
+            cache_target: true
             archive: zip
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0

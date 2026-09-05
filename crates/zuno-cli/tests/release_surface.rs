@@ -1194,12 +1194,13 @@ fn linux_ci_loads_the_reviewed_bubblewrap_profile_without_weakening_user_namespa
 /// Installing bubblewrap proves nothing by itself. The only test that runs a real
 /// Zuno process inside bwrap and checks the filesystem, network, capability, and
 /// syscall boundaries needs host namespaces and a built executable, so it reports a
-/// named skip when either is missing. Both Linux gate jobs must therefore supply
+/// named skip when either is missing. The feature PR gate must therefore supply
 /// them and demand real evidence, and the test must stay out of `#[ignore]`.
-/// Otherwise the sandbox setup step installs a backend that nothing exercises, and
-/// a confinement regression reaches a release unnoticed.
+/// A release-only candidate proves its four-file delta before it skips this
+/// duplicate full-suite gate; its Linux artifact legs still install the backend
+/// and execute the packaged binary on the target host.
 #[test]
-fn both_linux_gate_jobs_execute_the_real_bubblewrap_boundary_test() {
+fn feature_pr_executes_the_real_bubblewrap_boundary_before_release_candidates() {
     let makefile = std::fs::read_to_string(workspace_root().join("Makefile"))
         .expect("the workspace has a Makefile");
     let recipe: String = makefile
@@ -1239,24 +1240,41 @@ fn both_linux_gate_jobs_execute_the_real_bubblewrap_boundary_test() {
          a gate that demands real confinement evidence"
     );
 
-    for workflow_name in ["ci.yml", "release-candidate.yml"] {
-        let text = workflow(workflow_name);
-        let gate = text
-            .find("make test-sandbox-e2e")
-            .unwrap_or_else(|| panic!("{workflow_name} never runs `make test-sandbox-e2e`"));
-        let setup = text
-            .find(".github/scripts/setup-linux-sandbox.sh")
-            .unwrap_or_else(|| panic!("{workflow_name} never installs the sandbox backend"));
-        assert!(
-            setup < gate,
-            "{workflow_name} runs the confinement boundary gate before installing bwrap"
-        );
-        assert!(
-            text.contains("ZUNO_SANDBOX_E2E_REQUIRE"),
-            "{workflow_name} does not set ZUNO_SANDBOX_E2E_REQUIRE, so an unavailable \
-             bubblewrap backend would be reported as a passing gate"
-        );
-    }
+    let ci = workflow("ci.yml");
+    let gate = ci
+        .find("make test-sandbox-e2e")
+        .expect("ci.yml never runs `make test-sandbox-e2e`");
+    let setup = ci
+        .find(".github/scripts/setup-linux-sandbox.sh")
+        .expect("ci.yml never installs the sandbox backend");
+    assert!(
+        setup < gate,
+        "ci.yml runs the confinement boundary gate before installing bwrap"
+    );
+    assert!(
+        ci.contains("ZUNO_SANDBOX_E2E_REQUIRE"),
+        "ci.yml does not set ZUNO_SANDBOX_E2E_REQUIRE, so an unavailable bubblewrap \
+         backend would be reported as a passing gate"
+    );
+
+    let candidate = workflow("release-candidate.yml");
+    assert!(
+        candidate.contains("release PR changed files outside the four-file release delta")
+            && !candidate.contains("make test-sandbox-e2e"),
+        "the candidate may skip the duplicate boundary suite only behind its release-only \
+         delta proof"
+    );
+    let artifact = job_body(&candidate, "artifact").join("\n");
+    let setup = artifact
+        .find("name: Install Linux sandbox backend")
+        .expect("candidate Linux artifacts never install the sandbox backend");
+    let smoke = artifact
+        .find("name: Smoke packaged artifact (Linux)")
+        .expect("candidate Linux artifacts never execute the packaged binary");
+    assert!(
+        setup < smoke,
+        "candidate Linux artifact smoke runs before installing the sandbox backend"
+    );
 }
 
 #[test]
@@ -2644,7 +2662,7 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
 }
 
 #[test]
-fn ci_limits_target_caches_to_target_isolated_macos_candidate_legs() {
+fn ci_uses_target_isolated_dependency_caches_on_the_measured_critical_paths() {
     for name in ["ci.yml", "release-candidate.yml"] {
         let workflow = workflow(name);
         for required in [
@@ -2668,14 +2686,25 @@ fn ci_limits_target_caches_to_target_isolated_macos_candidate_legs() {
     }
 
     let ci = workflow("ci.yml");
-    for required in [
-        "shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}",
-        "cache-targets: false",
-    ] {
+    for job in ["linux-static", "windows-clippy"] {
+        let body = job_body(&ci, job).join("\n");
         assert!(
-            ci.contains(required),
-            "ordinary CI must keep registry-only Cargo caching; missing {required:?}"
+            body.contains("cache-targets: false"),
+            "{job} must keep registry-only caching because it is not on the measured critical path"
         );
+    }
+    for (job, key) in [
+        ("linux-test", "key: pr-linux-tests-v1"),
+        ("artifact", "key: pr-host-release-v1"),
+        ("windows-test", "key: pr-windows-tests-v1"),
+    ] {
+        let body = job_body(&ci, job).join("\n");
+        for required in [key, "cache-targets: true", "cache-workspace-crates: false"] {
+            assert!(
+                body.contains(required),
+                "{job} lost its target-isolated dependency cache contract {required:?}"
+            );
+        }
     }
     let linux_static = job_body(&ci, "linux-static").join("\n");
     let linux_test = job_body(&ci, "linux-test").join("\n");
@@ -2723,17 +2752,44 @@ fn ci_limits_target_caches_to_target_isolated_macos_candidate_legs() {
     );
 
     let candidate = workflow("release-candidate.yml");
+    let prepare = job_body(&candidate, "prepare").join("\n");
+    for required in [
+        "release PR head must have its exact base as its single parent",
+        "release PR changed files outside the four-file release delta",
+        ".release-please-manifest.json\\nCHANGELOG.md\\nCargo.lock\\nCargo.toml",
+        "git diff --check",
+        ".github/scripts/require-patch-release.py",
+    ] {
+        assert!(
+            prepare.contains(required),
+            "candidate identity validation lost the release-only delta guard {required:?}"
+        );
+    }
+
     let tests = job_body(&candidate, "test").join("\n");
     for required in [
-        "make lint",
-        "make test-nextest",
+        "name: Candidate release delta",
+        "cargo metadata --locked --format-version 1",
+        "cargo deny --all-features check",
         "shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}",
         "cache-targets: false",
     ] {
         assert!(
             tests.contains(required),
-            "candidate Clippy and tests must share one job-local target directory; missing \
-             {required:?}"
+            "candidate release-delta verification lost {required:?}"
+        );
+    }
+    for forbidden in [
+        "make lint",
+        "make test-nextest",
+        "make test-sandbox-e2e",
+        "nextest@",
+        "setup-linux-sandbox.sh",
+    ] {
+        assert!(
+            !tests.contains(forbidden),
+            "release-only candidate verification must not repeat the feature PR gate: \
+             {forbidden:?}"
         );
     }
 
@@ -2750,20 +2806,20 @@ fn ci_limits_target_caches_to_target_isolated_macos_candidate_legs() {
              {required:?}"
         );
     }
-    for target in ["x86_64-apple-darwin", "aarch64-apple-darwin"] {
+    for target in [
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc",
+    ] {
         assert!(
             matrix_entry(&candidate, "artifact", target)
                 .join("\n")
                 .contains("cache_target: true"),
-            "{target} must retain the macOS dependency target cache"
+            "{target} must retain its measured dependency target cache"
         );
     }
-    for target in [
-        "x86_64-unknown-linux-musl",
-        "aarch64-unknown-linux-musl",
-        "x86_64-pc-windows-msvc",
-        "aarch64-pc-windows-msvc",
-    ] {
+    for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
         assert!(
             matrix_entry(&candidate, "artifact", target)
                 .join("\n")
