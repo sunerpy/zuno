@@ -221,7 +221,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
+          shared-key: candidate-release-delta-${{ runner.os }}-${{ runner.arch }}
           cache-targets: false
 
       - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
@@ -303,8 +303,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
-          key: candidate-${{ matrix.target }}
+          shared-key: candidate-${{ matrix.target }}
           cache-targets: ${{ matrix.cache_target }}
           cache-workspace-crates: false
 

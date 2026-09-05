@@ -145,8 +145,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
-          key: pr-linux-tests-v1
+          shared-key: pr-linux-tests-v1-${{ runner.os }}-${{ runner.arch }}
           cache-targets: true
           cache-workspace-crates: false
 
@@ -197,8 +196,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
-          key: pr-host-release-v1
+          shared-key: pr-host-release-v1-${{ runner.os }}-${{ runner.arch }}
           cache-targets: true
           cache-workspace-crates: false
 
@@ -272,8 +270,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
-          key: pr-windows-tests-v1
+          shared-key: pr-windows-tests-v1-${{ runner.os }}-${{ runner.arch }}
           cache-targets: true
           cache-workspace-crates: false
 

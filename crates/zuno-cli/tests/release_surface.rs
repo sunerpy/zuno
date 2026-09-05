@@ -2694,9 +2694,18 @@ fn ci_uses_target_isolated_dependency_caches_on_the_measured_critical_paths() {
         );
     }
     for (job, key) in [
-        ("linux-test", "key: pr-linux-tests-v1"),
-        ("artifact", "key: pr-host-release-v1"),
-        ("windows-test", "key: pr-windows-tests-v1"),
+        (
+            "linux-test",
+            "shared-key: pr-linux-tests-v1-${{ runner.os }}-${{ runner.arch }}",
+        ),
+        (
+            "artifact",
+            "shared-key: pr-host-release-v1-${{ runner.os }}-${{ runner.arch }}",
+        ),
+        (
+            "windows-test",
+            "shared-key: pr-windows-tests-v1-${{ runner.os }}-${{ runner.arch }}",
+        ),
     ] {
         let body = job_body(&ci, job).join("\n");
         for required in [key, "cache-targets: true", "cache-workspace-crates: false"] {
@@ -2771,7 +2780,7 @@ fn ci_uses_target_isolated_dependency_caches_on_the_measured_critical_paths() {
         "name: Candidate release delta",
         "cargo metadata --locked --format-version 1",
         "cargo deny --all-features check",
-        "shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}",
+        "shared-key: candidate-release-delta-${{ runner.os }}-${{ runner.arch }}",
         "cache-targets: false",
     ] {
         assert!(
@@ -2795,8 +2804,7 @@ fn ci_uses_target_isolated_dependency_caches_on_the_measured_critical_paths() {
 
     let artifacts = job_body(&candidate, "artifact").join("\n");
     for required in [
-        "shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}",
-        "key: candidate-${{ matrix.target }}",
+        "shared-key: candidate-${{ matrix.target }}",
         "cache-targets: ${{ matrix.cache_target }}",
         "cache-workspace-crates: false",
     ] {
