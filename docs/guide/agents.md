@@ -26,7 +26,9 @@ configuration can quietly reverse.
 `orchestrator` is the default and the only native primary agent exposing the `task`
 delegation tool. `deep` has mode `all`, so it can be selected directly as a session agent
 while `orchestrator` can also target it; direct selection does not grant it recursive
-delegation.
+delegation. `deep` can read, create, update, and request input for the current durable
+Goal, so a directly selected deep-work session can close the same evidence-gated objective
+it implements. Goal ownership does not add child-Agent authority.
 
 ## Choosing one
 
@@ -112,6 +114,12 @@ title, revision, and completed-step count. The model can recommend starting work
 cannot select it for you. A confirmed selection is persisted as the session agent, so
 `--continue`, `--session`, the `/session` picker, and ACP `session/load` all restore the
 mode, together with the model and reasoning level the session last ran with.
+
+When the built-in `plan` Agent completes its answer, the current durable Plan and Todos
+are the handoff to Start Work. Their execution statuses remain intact and do not trigger
+automatic execution-reconciliation turns or overwrite the completed planning answer.
+An active Job still prevents handoff; the Plan Agent cannot use `job` in the built-in
+profile.
 
 ## Inspecting what an agent actually resolves to
 

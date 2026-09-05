@@ -99,6 +99,12 @@ RUST_LOG='zuno_engine=trace,zuno_tools=debug,zuno_db=warn' zuno
 An explicit `--log-level` or `ZUNO_LOG_LEVEL` is the process-wide override and
 takes precedence over `RUST_LOG`.
 
+AWS SDK targets that can emit access-key identifiers or SigV4 internals have a
+non-overridable `WARN` floor. This applies even under global `DEBUG`/`TRACE` or
+an explicit `RUST_LOG='aws_config=trace'`; provider request metadata remains
+available through Zuno's own spans and status events without copying credential
+identifiers into operational logs.
+
 ## Optional plaintext
 
 Plaintext is disabled by default. Enable it only for a bounded debugging session:

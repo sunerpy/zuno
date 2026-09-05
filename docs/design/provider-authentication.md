@@ -1,6 +1,6 @@
 # Provider authentication
 
-Status: 2026-08-22.
+Status: 2026-09-05.
 
 Provider authentication has three separate roles. A feature is complete only when all three are present:
 
@@ -28,6 +28,28 @@ A turn resolves one credential in this order:
 An explicitly empty `options.apiKey` is intentional and prevents fallback. This lets a local endpoint declare that it accepts no key without accidentally receiving a stored vendor credential.
 
 Environment credentials remain process inputs. They are not copied into the credential file. Stored credentials live at `$XDG_DATA_HOME/zuno/auth.json`, normally `~/.local/share/zuno/auth.json`. `ZUNO_AUTH_CONTENT` supplies an in-memory read override for managed environments.
+
+### Amazon Bedrock is an AWS SDK credential consumer
+
+Bedrock does not use the generic API-key ladder above when SigV4 is selected.
+`zuno-aws-auth` follows Codex's `codex-aws-auth` structure and delegates to
+`aws-config` and `aws-sigv4`:
+
+- `amazon-bedrock` signs Mantle Responses with service `bedrock-mantle`;
+- `amazon-bedrock-runtime` signs Runtime Responses with service `bedrock`;
+- `amazon-bedrock-converse` signs ConverseStream with service `bedrock`.
+
+An explicitly configured `profile` uses the SDK's profile-only credential
+provider, so ambient `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` values
+cannot silently select another account. Without an explicit profile, the AWS SDK
+default chain owns environment credentials, shared profiles,
+`credential_process`, IAM Identity Center, web identity, container credentials,
+IMDS, refresh, and expiration. An explicit provider region is passed to the SDK
+and therefore outranks environment and profile region sources.
+
+The provider crates retain no hand-written credential chain or SigV4 signer.
+They construct the protocol body and endpoint, ask `zuno-aws-auth` to sign the
+exact bytes, and send the signed request through `zuno-network`.
 
 ## Credential file integrity
 
@@ -138,5 +160,7 @@ This boundary is intentional: `openai` provider OAuth authenticates Zuno's in-pr
 - Browser state and PKCE verifier values are omitted from debug output.
 - API-key login disables terminal echo interactively and reads standard input in pipelines, avoiding command-line arguments and shell history.
 - OAuth transport and protocol failures remain typed so retry policy does not depend on rendered text.
+- AWS SDK targets that may log access-key identifiers or signing internals are
+  forced to `WARN` even when the user requests global `DEBUG` or `TRACE`.
 
 Windows uses inherited filesystem ACLs because Unix mode bits are unavailable. An OS keyring is not currently an authentication backend; the durable backend is the protected Zuno credential file.

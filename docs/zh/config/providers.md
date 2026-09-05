@@ -146,11 +146,17 @@ Codex 与 Claude Code 产品子 Agent 是一项独立能力。它们继承对应
 4. 该 provider 为那个 surface 构建 Responses 或 Chat Completions JSON，应用请求本地的推理控制，然后用 `reqwest` 发送请求。
 5. `zuno-llm` 解析 SSE 分帧，provider crate 把数据块翻译成引擎消费的共享流事件。
 
-`openai-compatible` 传输方式由 `zuno-provider-compatible` 单独实现，默认走 `/chat/completions`；规则驱动的 compatible provider 可以选择 `/responses`。`anthropic`、`bedrock` 和 Google 系传输方式使用各自独立的原生 crate，因为它们的请求与流协议与 OpenAI 不兼容。
+`openai-compatible` 传输方式由 `zuno-provider-compatible` 单独实现，默认走
+`/chat/completions`；规则驱动的 compatible provider 可以选择 `/responses`。
+`anthropic`、Bedrock Converse 与 Google 系传输方式使用各自独立的原生协议。
+Bedrock Mantle 和 Bedrock Runtime 则复用原生 OpenAI adapter 的类型化 Responses
+请求构造器与 SSE decoder，只把认证替换为 AWS 凭据。
 
 对于前台的 Responses 请求，引擎会提供一个私有的类型化路由上下文，其中包含持久的根会话或子会话身份。官方 OpenAI 适配器以及用于自定义 OpenAI `baseURL` 的 compatible 适配器会把它投影为 `metadata.zuno_session_id`；工具续跑复用它，而标题、摘要、压缩、反思和 Council 调用是隔离的。该字段对 `extraBody` 与请求参数覆盖是保留的，并且绝不会被复制进模型输入、instructions、头或工具定义。Chat Completions 与 Messages surface 忽略这个路由上下文。
 
-受支持的配置取值是 `openai`、`openai-compatible`、`openrouter`、`anthropic`、`bedrock`、`bedrock-mantle`、`google`、`google-vertex` 和 `google-vertex-anthropic`。Provider 配置没有 `npm` 字段。
+受支持的配置取值是 `openai`、`openai-compatible`、`openrouter`、`anthropic`、
+`bedrock`、`bedrock-mantle`、`bedrock-runtime`、`google`、`google-vertex` 和
+`google-vertex-anthropic`。Provider 配置没有 `npm` 字段。
 
 重要选项包括：
 
@@ -165,14 +171,77 @@ Codex 与 Claude Code 产品子 Agent 是一项独立能力。它们继承对应
 | `headerTimeout` | 响应头超时（毫秒），或 `false` |
 | `chunkTimeout` | 流式数据块之间的最大间隔（毫秒） |
 | `maxTokens`、`temperature`、`topP`、`toolChoice` | 由原生 provider 转发的生成控制项 |
-| `toolCalls` | 仅 Bedrock：对该 provider 条目服务的所有模型给出 `true` 或 `false`，覆盖内置的 Converse 工具调用表 |
-| `modelCapabilities` | 仅 Bedrock：`<model id>.tool_calls` 只决定这一个模型 id，不影响其他模型 |
+| `toolCalls` | 仅 Bedrock Converse：对该 provider 条目服务的所有模型给出 `true` 或 `false`，覆盖内置的 Converse 工具调用表 |
+| `modelCapabilities` | 仅 Bedrock Converse：`<model id>.tool_calls` 只决定这一个模型 id，不影响其他模型 |
 | `responsesTextBlocks` | Responses 文本投影：默认 `multiple`，对只暴露一个上游文本字段的网关使用 `single` |
 | `reasoningReplay` | 默认 `off`；对会封装推理的 Responses 端点使用 `encrypted` |
 | `reasoningReplayMaxAge` | Zuno 仍会重放的最旧封装推理信封年龄（毫秒） |
 | `extraBody` | 在受保护字段组装完成之后追加的请求字段 |
 
 `responsesTextBlocks: "single"` 是一项兼容性声明，不是从 provider id 推断出的模型能力。它让 Zuno 的持久提示词 part 保持类型化，但会在构建 compatible Responses 请求之前，用一个空行把它们的文本投影连接起来。内联图像仍然是独立的内容块。只有当目标端点拒绝一条消息中出现多个 `input_text` 块时才使用它；符合标准的端点应当保持默认的 `multiple` 行为。不要把它用于 2026-08-28 的 `kiro-provider` 构建：那个 provider 现在会把连续的全文本块逐字节拼接、不加分隔符，而这个选项会有意插入一个空行。
+
+## Amazon Bedrock Responses 与 Converse
+
+Zuno 明确区分三条 AWS 传输：
+
+| transport | 注册 factory | endpoint | SigV4 service | 模型 id 示例 |
+| --- | --- | --- | --- | --- |
+| `bedrock-mantle` | `amazon-bedrock` | `https://bedrock-mantle.{region}.api.aws/openai/v1/responses` | `bedrock-mantle` | `openai.gpt-5.6-sol` |
+| `bedrock-runtime` | `amazon-bedrock-runtime` | `https://bedrock-runtime.{region}.amazonaws.com/openai/v1/responses` | `bedrock` | `global.openai.gpt-5.6-sol` |
+| `bedrock` | `amazon-bedrock-converse` | `https://bedrock-runtime.{region}.amazonaws.com/model/{model}/converse-stream` | `bedrock` | `us.anthropic.claude-opus-5` |
+
+Mantle 与 Runtime 固定使用 Responses surface 和 `text/event-stream`。除非 provider
+显式覆盖 `store`，它们会发送 `store: false`，由 Zuno 的持久会话作为权威历史。
+Converse 则发送 AWS JSON 请求体并解码二进制 Amazon EventStream；模型 id 只存在于
+URI path，不会重复写进 body。
+
+配置里的 `region` 优先于 `AWS_REGION`、`AWS_DEFAULT_REGION` 与 profile 自带的
+region。Zuno 把凭据解析和 SigV4 签名交给 `aws-config` 与 `aws-sigv4`，结构与 Codex
+的 `codex-aws-auth` 一致：显式配置的 `profile` 使用 SDK 的仅 profile provider，
+环境 access key 无法覆盖它。没有显式 profile 时，AWS SDK 默认链负责环境凭据、共享
+profile、`credential_process`、IAM Identity Center、web identity、容器凭据、IMDS、
+刷新与过期。
+
+下面的 Mantle 配置使用与 Codex 相同的 provider/model：
+
+```json
+{
+  "model": "amazon-bedrock/openai.gpt-5.6-sol",
+  "provider": {
+    "amazon-bedrock": {
+      "name": "Amazon Bedrock Mantle",
+      "transport": "bedrock-mantle",
+      "surface": "responses",
+      "whitelist": ["openai.gpt-5.6-sol"],
+      "options": {
+        "profile": "us",
+        "region": "us-east-2",
+        "reasoningReplay": "encrypted"
+      },
+      "models": {
+        "openai.gpt-5.6-sol": {
+          "name": "GPT-5.6 Sol",
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": false,
+          "limit": {"context": 272000, "output": 65536},
+          "variants": {
+            "low": {"reasoningEffort": "low"},
+            "medium": {"reasoningEffort": "medium"},
+            "high": {"reasoningEffort": "high"},
+            "xhigh": {"reasoningEffort": "xhigh"},
+            "max": {"reasoningEffort": "max"}
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Mantle 会在发请求前校验其已发布的 region 集合；Runtime 与 Converse 由 AWS 返回区域或
+entitlement 可用性。若把 OpenAI GPT 模型配置给 Converse，Zuno 会在解析凭据和签名计费
+请求之前本地拒绝，并指出两个 Responses provider。
 
 ### 工具声明与 `toolChoice`
 
@@ -216,9 +285,9 @@ Bedrock 明确记载 Converse 支持工具调用的家族发送工具声明：`a
   仍由 `toolCalls` 或上面的表决定。键是配置里写的完整模型 id，拼写与 OpenAI-compatible
   provider 已经读取的那一份完全相同。
 
-`bedrock-mantle` 发送的是 OpenAI Chat 或 Responses 请求体而不是 Converse 请求体，因此
-Converse 的那张表并不描述它：除非 `toolCalls: false` 或逐模型条目另有说明，这两个 surface
-会照常携带工具声明。
+`bedrock-mantle` 与 `bedrock-runtime` 发送的是 OpenAI Responses 请求体，而不是
+Converse 请求体，因此 Converse 的那张表并不描述它们。逐轮锁定的工具快照会被序列化为
+Responses function tools；同名的配置工具会由锁定声明覆盖。
 
 ### 加密推理重放
 
@@ -296,12 +365,17 @@ SOCKS4 或 SOCKS5 路由连接一个已校验 IP，同时保留原始 Host heade
 
 由 shell 工具、格式化器、语言服务器和本地 MCP server 启动的命令会继承 Zuno 的进程环境。它们各自显式的环境配置可以覆盖个别代理变量。
 
-Amazon Bedrock 运行时请求与 AWS SSO 凭据请求使用同一套环境代理策略。这意味着一个只能通过网关访问的 region 不需要 Bedrock 专用的代理选项：
+Amazon Bedrock 模型请求仍通过 Zuno 共享的 route-aware HTTP client，因此一个只能通过
+网关访问的 region 不需要 Bedrock 专用的代理选项：
 
 ```sh
 HTTPS_PROXY=http://127.0.0.1:1080 zuno
 ```
 
-要做直连与走代理的对比，请把解析出的 Bedrock 主机名加入 `NO_PROXY`，例如 `bedrock-runtime.us-east-1.amazonaws.com`。IMDS 与 AWS 认可的本地 ECS 凭据端点始终直连，即使设置了 `HTTP_PROXY` 或 `ALL_PROXY` 也是如此；把那些元数据请求转发给一个环境中的代理可能会暴露临时 AWS 凭据。远端 HTTPS 的 `AWS_CONTAINER_CREDENTIALS_FULL_URI` 仍然感知代理，并且仍然遵循 `NO_PROXY`。
+要做直连与走代理的对比，请把解析出的 Bedrock 主机名加入 `NO_PROXY`，例如
+`bedrock-runtime.us-east-2.amazonaws.com` 或 `bedrock-mantle.us-east-2.api.aws`。
+凭据发现由 AWS SDK 而不是 Zuno 的模型请求 client 负责。静态共享 profile 不需要发起
+凭据网络请求；IAM Identity Center、STS、web identity、容器凭据与 IMDS 的行为遵循所选
+AWS SDK 版本及其配置。
 
 归属与扩展契约在 [Provider 认证](https://github.com/sunerpy/zuno/blob/main/docs/design/provider-authentication.md)中规定。

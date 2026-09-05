@@ -501,13 +501,14 @@ A plan carries stages, their dependency order, and their acceptance status. It e
 that progress visibility, interruption recovery, and verification survive a restart or a
 context compaction.
 
-Use one for normal research-modify-verify work. Keep one current for anything
-cross-component, anything involving delegation, anything with multiple acceptance gates,
-and anything likely to be interrupted. A direct answer, one bounded read, or a genuinely
-atomic operation does not need a plan; a short single-clause question is a direct answer
+Use one when durable coordination adds information: cross-component work, delegation,
+independent acceptance gates or dependencies, and work likely to be interrupted. A
+bounded single-owner change does not need a plan merely because it has inspect, edit, and
+test phases. When active Goal criteria already name the gates, add a Plan only when it
+contributes ordering, ownership, or restart value. A direct answer, one bounded read, or a
+genuinely atomic operation also does not need a plan; a short single-clause question is a direct answer
 whether or not it ends in a question mark. A greeting, thanks, or bare acknowledgement is
-conversational: it never opens a plan, and it keeps an active plan current rather than
-replacing it.
+conversational: it never opens a plan, and it keeps an active plan current rather than replacing it.
 
 Rules that matter in practice:
 

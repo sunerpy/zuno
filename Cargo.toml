@@ -46,6 +46,7 @@ all = "warn"
 zuno-acp = { version = "0.10.3", path = "crates/zuno-acp" } # x-release-please-version
 zuno-agent = { version = "0.10.3", path = "crates/zuno-agent" } # x-release-please-version
 zuno-atomic-file = { version = "0.10.3", path = "crates/zuno-atomic-file" } # x-release-please-version
+zuno-aws-auth = { version = "0.10.3", path = "crates/zuno-aws-auth" } # x-release-please-version
 zuno-attachment = { version = "0.10.3", path = "crates/zuno-attachment" } # x-release-please-version
 zuno-auth = { version = "0.10.3", path = "crates/zuno-auth" } # x-release-please-version
 zuno-catalog = { version = "0.10.3", path = "crates/zuno-catalog" } # x-release-please-version
@@ -93,6 +94,16 @@ async-trait = "0.1.91"
 futures = "0.3.33"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = { version = "0.7.19", features = ["io", "codec"] }
+
+# -- AWS authentication -----------------------------------------------------
+#
+# Zuno sends Bedrock HTTP requests itself so provider traffic continues to use
+# zuno-network's route-aware reqwest client. The AWS SDK is used only for the
+# standard credential chain and the maintained SigV4 implementation.
+aws-config = { version = "1", features = ["credentials-login"] }
+aws-credential-types = "1"
+aws-sigv4 = "1"
+aws-types = "1"
 
 # -- HTTP client ------------------------------------------------------------
 # `default-features = false` is mandatory: reqwest's default TLS is native-tls,

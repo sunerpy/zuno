@@ -193,6 +193,14 @@ separate, verifies the staged diff, and applies Zuno's default
 Explicit current-user instructions, repository rules, and selected Skills take
 precedence over that fallback.
 
+The built-in trigger descriptions are deliberately narrower than their bodies.
+`git-workflow` is for material Git decisions such as staging, commits, branches,
+worktrees, delivery handoff, or preserving a dirty repository; an isolated disposable
+fixture or ordinary uncommitted edit does not select it. `verification-planning` is for
+high-risk, multi-surface, release, migration, security, or explicitly requested evidence
+design; a bounded change whose acceptance commands are already clear proceeds under the
+runtime verification contract without loading a second workflow.
+
 ## Skills in delegated turns
 
 Every initial or resumed child host performs discovery independently. Parent-loaded bodies

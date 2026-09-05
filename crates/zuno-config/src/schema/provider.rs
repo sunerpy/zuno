@@ -57,10 +57,12 @@ pub struct ProviderConfig {
 pub enum ProviderTransport {
     /// Anthropic Messages.
     Anthropic,
-    /// AWS Bedrock Converse/Invoke transport.
+    /// AWS Bedrock Converse/EventStream transport.
     Bedrock,
     /// Bedrock through the Mantle OpenAI-compatible endpoint.
     BedrockMantle,
+    /// Bedrock Runtime's OpenAI-compatible Responses endpoint.
+    BedrockRuntime,
     /// Google Generative AI.
     Google,
     /// Google Vertex Gemini.
@@ -84,6 +86,7 @@ impl ProviderTransport {
             Self::Anthropic => "anthropic",
             Self::Bedrock => "bedrock",
             Self::BedrockMantle => "bedrock-mantle",
+            Self::BedrockRuntime => "bedrock-runtime",
             Self::Google => "google",
             Self::GoogleVertex => "google-vertex",
             Self::GoogleVertexAnthropic => "google-vertex-anthropic",

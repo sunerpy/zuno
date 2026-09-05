@@ -73,6 +73,10 @@ typed `PlanUnreconciled` 人工等待，而不是声称完成。只有实际写�
 原本预期它需要 Plan。禁用 `plan_update` 会阻止模型创建或修改；已有 Plan 仍会
 持久化、投影并恢复。
 
+内置只读 `plan` Agent 有一条例外的带类型交接语义：规划回答完成后，当前 Plan
+与 Todo 会保留各自已有状态，作为后续 Start Work 回合的执行工作，不消耗对账
+续轮；活动 Job 仍会阻止交接。
+
 完整的开启/关闭、profile 覆盖、权限、revision 与重启说明见
 [History 与 Notes 连续性配置](/zh/config/continuity)。
 

@@ -370,6 +370,12 @@ PowerShell 仍然只是那个守护器的后端依赖，而不是运行 CLI 的�
 
 网络出口受沙箱的网络授权控制。`deny` 会创建私有网络命名空间并拒绝网络系统调用，而不是一条可被绕过的防火墙规则。
 
+模型 provider 请求、Zuno 自管认证、目录、远程 instructions、远程 MCP 与 web tools
+共用 `zuno-network`。AWS 凭据发现是有意的例外：`zuno-aws-auth` 把标准凭据链、刷新与
+SigV4 签名交给 AWS Rust SDK；签名后的 Bedrock 模型请求仍通过 `zuno-network`，因此继续
+遵循进程代理。IAM Identity Center、STS、web identity、容器凭据与 IMDS 等凭据 provider
+流量由 AWS SDK 自己负责，并遵循所选 SDK 版本的 HTTP 配置。
+
 公开网页抓取使用独立 `PublicHttpClient`：只接受无凭据 HTTP(S)，遵循进程级
 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与 `NO_PROXY`，并且代理失败不会静默
 改为直连。每次请求和每次重定向都重新解析、校验全部地址，通过代理连接已校验的目标 IP，

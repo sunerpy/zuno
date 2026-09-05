@@ -1,23 +1,22 @@
-//! Amazon Bedrock: SigV4 signing and the binary EventStream framing.
+//! Amazon Bedrock Mantle/Runtime Responses and Converse/EventStream transports.
 
-mod credentials;
+mod aws;
 mod error;
 mod eventstream;
 mod provider;
-mod sigv4;
+mod responses;
 
-pub use credentials::{
-    CREDENTIAL_CHAIN_ORDER, CredentialChainConfig, CredentialError, CredentialResolver,
-    CredentialSource, ResolvedCredentials,
-};
-pub use error::{PROVIDER_ID, classify_bedrock_error};
+pub use error::{PROVIDER_ID, classify_bedrock_error, classify_bedrock_error_for};
 pub use eventstream::{
     BedrockDecodeError, BedrockEventDecoder, BedrockPayloadError, CrcKind, EventStreamDecoder,
     EventStreamError, EventStreamMessage, HeaderValue,
 };
 pub use provider::{
-    BedrockBuildError, BedrockConfig, BedrockOperation, BedrockProvider, factory, mantle_surface,
+    BedrockBuildError, BedrockConfig, BedrockOperation, BedrockProvider, CONVERSE_PROVIDER_ID,
+    factory, mantle_surface,
 };
-pub use sigv4::{
-    AwsCredentials, CanonicalRequest, Redacted, SigV4Error, SigV4Signer, SigningOutput,
+pub use responses::{
+    BedrockResponsesBuildError, BedrockResponsesConfig, BedrockResponsesEndpoint,
+    BedrockResponsesProvider, MANTLE_PROVIDER_ID, MANTLE_SUPPORTED_REGIONS, RUNTIME_PROVIDER_ID,
+    mantle_factory, runtime_factory,
 };

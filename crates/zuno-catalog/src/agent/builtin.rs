@@ -335,9 +335,10 @@ impl Builtin {
     ///
     /// Every delegable Agent is deny-by-default. The primary `orchestrator`
     /// inherits the common tool set and may delegate; direct `build` explicitly
-    /// denies delegation. `deep` is directly selectable and delegable but still has
-    /// no child tools. `plan` may inspect and write only its plan document; the
-    /// path-specific edit grants are added by the CLI composition root.
+    /// denies delegation. `deep` is directly selectable and delegable, has no child
+    /// tools, and may own the same durable Goal lifecycle as a primary writer. `plan`
+    /// may inspect and write only its plan document; the path-specific edit grants are
+    /// added by the CLI composition root.
     ///
     /// Two grants are here because a deny-by-default overlay hides anything it does not
     /// name, and both were unnamed. `bg` accompanies every `shell` grant: a background
@@ -397,6 +398,11 @@ impl Builtin {
                 ("bg", allow()),
                 ("webfetch", allow()),
                 ("web_search", allow()),
+                ("question", allow()),
+                ("goal_get", allow()),
+                ("goal_propose", allow()),
+                ("goal_update", allow()),
+                ("goal_request_input", allow()),
                 ("plan_get", allow()),
                 ("plan_update", allow()),
                 ("todo_get", allow()),
@@ -707,14 +713,28 @@ mod tests {
         assert_eq!(get("build").expect("build").mode, AgentMode::Primary);
         assert_eq!(get("plan").expect("plan").mode, AgentMode::Primary);
         assert_eq!(get("deep").expect("deep").mode, AgentMode::All);
+        let deep = get("deep")
+            .expect("deep")
+            .permission_overlay()
+            .expect("deep permissions")
+            .rules;
+        for capability in [
+            "question",
+            "goal_get",
+            "goal_propose",
+            "goal_update",
+            "goal_request_input",
+        ] {
+            assert_eq!(
+                deep.get(capability),
+                Some(&PermissionRule::Action(PermissionAction::Allow)),
+                "direct deep work must be able to own `{capability}`"
+            );
+        }
         assert_ne!(
-            get("deep")
-                .expect("deep")
-                .permission_overlay()
-                .expect("deep permissions")
-                .rules
-                .get("question"),
-            Some(&PermissionRule::Action(PermissionAction::Allow))
+            deep.get("task"),
+            Some(&PermissionRule::Action(PermissionAction::Allow)),
+            "Goal ownership must not grant recursive delegation"
         );
     }
 

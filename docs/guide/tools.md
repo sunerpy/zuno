@@ -92,6 +92,11 @@ finishes on its first answer even when the host classifier expected a Plan. Disa
 `plan_update` prevents model creation or mutation; an existing Plan is still
 persisted, projected, and restored.
 
+The built-in read-only `plan` Agent has one typed handoff exception: a completed planning
+answer leaves the current Plan and Todos, with their existing statuses, as execution work
+for a later Start Work turn and does not spend reconciliation continuations. An active
+Job still blocks the handoff.
+
 See [History and Notes continuity](/config/continuity) for complete enable/disable,
 profile-overlay, permission, revision, and restart guidance.
 

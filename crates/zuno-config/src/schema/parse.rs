@@ -307,13 +307,27 @@ fn check_reasoning_replay_routing(
     if mode != Some(provider::ReasoningReplay::Encrypted) {
         return;
     }
-    match routing.transport.filter(|_| routing.transport_governs) {
-        Some(provider::ProviderTransport::Openai) | None => {}
+    let transport = routing.transport.filter(|_| routing.transport_governs);
+    let forces_responses = matches!(
+        transport,
+        Some(
+            provider::ProviderTransport::BedrockMantle
+                | provider::ProviderTransport::BedrockRuntime
+        )
+    );
+    match transport {
+        Some(
+            provider::ProviderTransport::Openai
+            | provider::ProviderTransport::BedrockMantle
+            | provider::ProviderTransport::BedrockRuntime,
+        )
+        | None => {}
         Some(other) => issues.push(ConfigIssue::new(
             path.iter().copied(),
             format!(
-                "encrypted reasoning replay is an OpenAI Responses feature; transport \
-                 \"{other}\" cannot carry it, set transport \"openai\""
+                "encrypted reasoning replay requires an OpenAI Responses wire protocol; \
+                 transport \"{other}\" cannot carry it, set transport \"openai\", \
+                 \"bedrock-mantle\", or \"bedrock-runtime\""
             ),
         )),
     }
@@ -326,7 +340,7 @@ fn check_reasoning_replay_routing(
             path.iter().copied(),
             "encrypted reasoning replay requires surface \"responses\"",
         )),
-        None if routing.custom_endpoint => issues.push(ConfigIssue::new(
+        None if routing.custom_endpoint && !forces_responses => issues.push(ConfigIssue::new(
             path.iter().copied(),
             "an OpenAI provider with a custom endpoint and no declared surface resolves \
              to Chat Completions; set surface \"responses\" for encrypted reasoning replay",

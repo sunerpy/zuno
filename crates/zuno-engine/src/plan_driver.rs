@@ -68,6 +68,9 @@ pub struct PlanReconciliationInput {
     pub active_job: bool,
     /// A durable Goal remains active and owns continuation.
     pub goal_active: bool,
+    /// A read-only Plan Agent completed its planning turn and is handing the
+    /// durable Plan/Todos to a later Start Work turn.
+    pub planning_handoff: bool,
 }
 
 impl PlanReconciliationInput {
@@ -194,6 +197,16 @@ impl PlanReconciliationDriver {
         input: PlanReconciliationInput,
     ) -> Result<PlanReconciliationDecision, DbError> {
         let attempt = self.attempts_for_cycle(session_id, cycle_id)?;
+        if input.planning_handoff && !input.active_job {
+            self.record(
+                session_id,
+                cycle_id,
+                DriverPhase::Terminal,
+                attempt,
+                Some("planning_handoff_ready".to_owned()),
+            )?;
+            return Ok(PlanReconciliationDecision::Finish);
+        }
         if input.settled() {
             self.record(
                 session_id,
@@ -338,6 +351,7 @@ mod tests {
             active_todo: false,
             active_job: false,
             goal_active: false,
+            planning_handoff: false,
         }
     }
 
@@ -398,6 +412,7 @@ mod tests {
             active_todo: false,
             active_job: false,
             goal_active: false,
+            planning_handoff: false,
         };
 
         assert_eq!(
@@ -410,6 +425,40 @@ mod tests {
         let projection = driver.projection("ses").expect("projection").unwrap();
         assert_eq!(projection.phase, DriverPhase::Terminal);
         assert_eq!(projection.reason.as_deref(), Some("durable_work_settled"));
+    }
+
+    #[test]
+    fn a_read_only_planning_handoff_finishes_without_executing_future_work() {
+        let driver = PlanReconciliationDriver::new(pool());
+        let mut handoff = unfinished();
+        handoff.active_todo = true;
+        handoff.goal_active = true;
+        handoff.planning_handoff = true;
+
+        assert_eq!(
+            driver.reconcile("ses", "cycle", handoff).expect("decision"),
+            PlanReconciliationDecision::Finish
+        );
+        let projection = driver.projection("ses").expect("projection").unwrap();
+        assert_eq!(projection.phase, DriverPhase::Terminal);
+        assert_eq!(projection.reason.as_deref(), Some("planning_handoff_ready"));
+
+        let mut active_job = handoff;
+        active_job.active_job = true;
+        assert_eq!(
+            driver
+                .reconcile("ses_job", "cycle", active_job)
+                .expect("active jobs still reconcile"),
+            PlanReconciliationDecision::ContinueGoal
+        );
+
+        active_job.goal_active = false;
+        assert_eq!(
+            driver
+                .reconcile("ses_job_without_goal", "cycle", active_job)
+                .expect("ordinary active jobs still reconcile"),
+            PlanReconciliationDecision::ContinueOrdinary { attempt: 1 }
+        );
     }
 
     #[test]

@@ -166,7 +166,12 @@ The request path is native Rust:
 4. The provider builds Responses or Chat Completions JSON for that surface, applies request-local reasoning controls, then sends the request with `reqwest`.
 5. `zuno-llm` parses SSE framing and the provider crate translates chunks into shared stream events consumed by the engine.
 
-The `openai-compatible` transport is implemented separately by `zuno-provider-compatible` and defaults to `/chat/completions`; rule-driven compatible providers may select `/responses`. `anthropic`, `bedrock`, and the Google transports use separate native crates because their request and stream protocols are not OpenAI-compatible.
+The `openai-compatible` transport is implemented separately by
+`zuno-provider-compatible` and defaults to `/chat/completions`; rule-driven
+compatible providers may select `/responses`. `anthropic`, Bedrock Converse,
+and the Google transports use separate native protocols. Bedrock Mantle and
+Bedrock Runtime reuse the same typed OpenAI Responses request builder and SSE
+decoder as the native OpenAI adapter, but authenticate with AWS credentials.
 
 For foreground Responses requests, the engine supplies a private typed routing
 context containing the durable root or child session identity. The official
@@ -177,7 +182,10 @@ field is reserved against `extraBody` and request-parameter overrides and is
 never copied into model input, instructions, headers, or tool definitions.
 Chat Completions and Messages surfaces ignore this routing context.
 
-Supported configuration values are `openai`, `openai-compatible`, `openrouter`, `anthropic`, `bedrock`, `bedrock-mantle`, `google`, `google-vertex`, and `google-vertex-anthropic`. Provider configuration has no `npm` field.
+Supported configuration values are `openai`, `openai-compatible`, `openrouter`,
+`anthropic`, `bedrock`, `bedrock-mantle`, `bedrock-runtime`, `google`,
+`google-vertex`, and `google-vertex-anthropic`. Provider configuration has no
+`npm` field.
 
 Important options include:
 
@@ -192,8 +200,8 @@ Important options include:
 | `headerTimeout` | response-header timeout in milliseconds, or `false` |
 | `chunkTimeout` | maximum gap between streamed chunks in milliseconds |
 | `maxTokens`, `temperature`, `topP`, `toolChoice` | generation controls forwarded by the native provider |
-| `toolCalls` | Bedrock only: `true` or `false` for every model this provider entry serves, overriding the built-in Converse tool-use table |
-| `modelCapabilities` | Bedrock only: `<model id>.tool_calls` decides exactly that model id and nothing else |
+| `toolCalls` | Bedrock Converse only: `true` or `false` for every model this provider entry serves, overriding the built-in Converse tool-use table |
+| `modelCapabilities` | Bedrock Converse only: `<model id>.tool_calls` decides exactly that model id and nothing else |
 | `responsesTextBlocks` | Responses text projection: `multiple` by default, or `single` for gateways that expose only one upstream text field |
 | `reasoningReplay` | `off` by default, or `encrypted` for a Responses endpoint that seals reasoning |
 | `reasoningReplayMaxAge` | oldest sealed reasoning envelope Zuno still replays, in milliseconds |
@@ -202,11 +210,79 @@ Important options include:
 `timeout`, `headerTimeout`, and `chunkTimeout` are read only by the
 OpenAI-compatible transports, which default to a 330-second response-header
 deadline and a 120-second streamed-chunk idle allowance. The native `openai`,
-`anthropic`, `google`, and `bedrock` providers ignore all three. Each applies a
+`anthropic`, `google`, and native Bedrock providers ignore all three. Each applies a
 fixed 330-second response-header deadline, no whole-request deadline, and the
 shared 300-second stream idle allowance that `ZUNO_STREAM_IDLE_TIMEOUT_SECS`
 overrides for every provider, so setting these keys on a native provider block
 does not change its deadlines.
+
+## Amazon Bedrock Responses and Converse
+
+Zuno keeps the three AWS transports explicit:
+
+| Transport | Registry factory | Endpoint | SigV4 service | Model id example |
+| --- | --- | --- | --- | --- |
+| `bedrock-mantle` | `amazon-bedrock` | `https://bedrock-mantle.{region}.api.aws/openai/v1/responses` | `bedrock-mantle` | `openai.gpt-5.6-sol` |
+| `bedrock-runtime` | `amazon-bedrock-runtime` | `https://bedrock-runtime.{region}.amazonaws.com/openai/v1/responses` | `bedrock` | `global.openai.gpt-5.6-sol` |
+| `bedrock` | `amazon-bedrock-converse` | `https://bedrock-runtime.{region}.amazonaws.com/model/{model}/converse-stream` | `bedrock` | `us.anthropic.claude-opus-5` |
+
+Mantle and Runtime always use the Responses surface and `text/event-stream`.
+They send `store: false` unless the provider explicitly overrides `store`, so
+Zuno's durable session remains the authoritative history. Converse sends the
+AWS JSON request body and decodes binary Amazon EventStream frames; the model
+id is carried only in the URI path.
+
+The configured `region` wins over `AWS_REGION`, `AWS_DEFAULT_REGION`, and the
+profile's region. Zuno delegates credential resolution and SigV4 signing to
+`aws-config` and `aws-sigv4`, following the same structure as Codex's
+`codex-aws-auth`: a configured `profile` is resolved through the SDK's
+profile-only provider so ambient access-key variables cannot override it.
+Without one, the AWS SDK default chain owns environment credentials, shared
+profiles, `credential_process`, IAM Identity Center, web identity, container
+credentials, IMDS, refresh, and expiration.
+
+This is a complete Mantle configuration using the same provider/model pair as
+Codex:
+
+```json
+{
+  "model": "amazon-bedrock/openai.gpt-5.6-sol",
+  "provider": {
+    "amazon-bedrock": {
+      "name": "Amazon Bedrock Mantle",
+      "transport": "bedrock-mantle",
+      "surface": "responses",
+      "whitelist": ["openai.gpt-5.6-sol"],
+      "options": {
+        "profile": "us",
+        "region": "us-east-2",
+        "reasoningReplay": "encrypted"
+      },
+      "models": {
+        "openai.gpt-5.6-sol": {
+          "name": "GPT-5.6 Sol",
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": false,
+          "limit": {"context": 272000, "output": 65536},
+          "variants": {
+            "low": {"reasoningEffort": "low"},
+            "medium": {"reasoningEffort": "medium"},
+            "high": {"reasoningEffort": "high"},
+            "xhigh": {"reasoningEffort": "xhigh"},
+            "max": {"reasoningEffort": "max"}
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Mantle validates its published region set before opening a request. Runtime and
+Converse let AWS report regional or entitlement availability. An OpenAI GPT
+model sent to Converse is rejected locally with the two Responses provider
+choices, before credentials are resolved or a billable request is signed.
 
 `responsesTextBlocks: "single"` is a compatibility declaration, not a model
 capability inferred from a provider id. It keeps Zuno's durable prompt parts
@@ -271,9 +347,10 @@ Bedrock model. Two options override that:
   key is the full model id as configured, in the same spelling the
   OpenAI-compatible provider already reads.
 
-`bedrock-mantle` posts an OpenAI Chat or Responses body instead of a Converse
-body, so the Converse table does not describe it: those two surfaces carry tool
-definitions unless `toolCalls: false` or a per-model entry says otherwise.
+`bedrock-mantle` and `bedrock-runtime` post an OpenAI Responses body instead of
+a Converse body, so the Converse table does not describe them. Their per-turn
+locked tool snapshot is serialized as Responses function tools; a configured
+tool with the same name is superseded by the locked declaration.
 
 ### Encrypted reasoning replay
 
@@ -435,21 +512,19 @@ Commands started by shell tools, formatters, language servers, and local MCP
 servers inherit the Zuno process environment. Their explicit environment
 configuration may override individual proxy variables.
 
-Amazon Bedrock runtime requests and AWS SSO credential requests use the same
-environment proxy policy. This means a region that is reachable only through a
-gateway needs no Bedrock-specific proxy option:
+Amazon Bedrock model requests continue through Zuno's shared route-aware HTTP
+client, so a region that is reachable only through a gateway needs no
+Bedrock-specific proxy option:
 
 ```sh
 HTTPS_PROXY=http://127.0.0.1:1080 zuno
 ```
 
 For a direct-versus-proxied comparison, add the resolved Bedrock hostname to
-`NO_PROXY`, for example
-`bedrock-runtime.us-east-1.amazonaws.com`. IMDS and the AWS-approved local ECS
-credential endpoints are always direct, even when `HTTP_PROXY` or `ALL_PROXY`
-is set; forwarding those metadata requests to an ambient proxy could expose
-temporary AWS credentials. A remote HTTPS
-`AWS_CONTAINER_CREDENTIALS_FULL_URI` remains proxy-aware and still honors
-`NO_PROXY`.
+`NO_PROXY`, for example `bedrock-runtime.us-east-2.amazonaws.com` or
+`bedrock-mantle.us-east-2.api.aws`. Credential discovery is owned by the AWS
+SDK rather than Zuno's model-request client. Static shared profiles need no
+credential network request; IAM Identity Center, STS, web identity, container,
+and IMDS behavior follows the selected AWS SDK release and its configuration.
 
 The ownership and extension contract is specified in [Provider authentication](../design/provider-authentication.md).

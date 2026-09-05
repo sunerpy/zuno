@@ -19,7 +19,7 @@ Agent 是一份契约：一段提示词、一条模型路由、一个确切的�
 | `oracle` | 只读的架构与根因评审 | 不递归委派 |
 | `looker` | 视觉产物检查 | 不递归委派 |
 
-`orchestrator` 是默认 Agent，也是唯一暴露 `task` 委派工具的原生主 Agent。`deep` 的 mode 是 `all`，因此它既可以被直接选为会话 Agent，也可以被 `orchestrator` 作为目标；直接选择并不会赋予它递归委派能力。
+`orchestrator` 是默认 Agent，也是唯一暴露 `task` 委派工具的原生主 Agent。`deep` 的 mode 是 `all`，因此它既可以被直接选为会话 Agent，也可以被 `orchestrator` 作为目标；直接选择并不会赋予它递归委派能力。`deep` 可以读取、创建、更新当前持久 Goal，也可以为 Goal 请求输入，因此直接选择的深度工作会话能够关闭自己实现的证据门禁目标；Goal 所有权不会带来子 Agent 权限。
 
 ## 如何选择
 
@@ -77,6 +77,10 @@ zuno run --agent plan "audit the retry policy"
 终端应用中的 `/plan` 会切换协作模式，而这项限制是在提示词之下由一层默认拒绝的能力覆盖层强制执行的：允许仓库检查、只读 LSP 与搜索、外部调研、提问、Skill、后台检查以及带类型的 Goal/Plan/Todo 操作，而文件修改、委派、`job` 与 `execute` 被拒绝。`shell` 在该角色获得的只读沙箱下仍然可用，因此命令可以取证，但不能改动工作树。
 
 回到 Work 模式要求已存在一个持久 plan，确认信息会指出它的标题、revision 和已完成步骤数。模型可以建议开始工作，但不能替你选择。一次确认过的选择会作为会话 Agent 落盘，因此 `--continue`、`--session`、`/session` 选择器以及 ACP 的 `session/load` 都会恢复该模式，连同该会话上次使用的模型与推理强度。
+
+当内置 `plan` Agent 完成回答时，当前持久 Plan 与 Todo 就是交给 Start Work 的
+工作；它们保留原有执行状态，不会触发自动执行对账续轮，也不会覆盖已经完成的
+规划回答。活动 Job 仍会阻止交接；内置 Plan profile 本身不允许调用 `job`。
 
 ## 检查一个 Agent 实际解析成什么
 

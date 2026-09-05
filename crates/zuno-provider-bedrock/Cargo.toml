@@ -1,6 +1,6 @@
 [package]
 name = "zuno-provider-bedrock"
-description = "Amazon Bedrock: SigV4 signing and the binary EventStream framing."
+description = "Amazon Bedrock Responses and Converse transports."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,17 +11,19 @@ publish.workspace = true
 
 [dependencies]
 base64 = { workspace = true }
-dirs = { workspace = true }
+bytes = { workspace = true }
 futures = { workspace = true }
+http = { workspace = true }
+zuno-aws-auth = { workspace = true }
 zuno-error = { workspace = true }
 zuno-llm = { workspace = true }
 zuno-network = { workspace = true }
+zuno-provider-openai = { workspace = true }
 reqwest = { workspace = true, features = ["query"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-time = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 

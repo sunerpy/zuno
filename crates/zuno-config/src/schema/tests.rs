@@ -1469,6 +1469,39 @@ fn encrypted_reasoning_replay_rejects_only_routing_that_cannot_carry_it() {
         }
     }))
     .expect("a declared OpenAI Responses gateway is the shape the feature was built for");
+
+    for transport in ["bedrock-mantle", "bedrock-runtime"] {
+        parse_value(json!({
+            "provider": {
+                "p": {
+                    "transport": transport,
+                    "options": {
+                        "region": "us-east-2",
+                        "profile": "us",
+                        "reasoningReplay": "encrypted"
+                    }
+                }
+            }
+        }))
+        .unwrap_or_else(|error| {
+            panic!("{transport} is a native Responses transport and must accept replay: {error}")
+        });
+
+        let wrong_surface = parse_value(json!({
+            "provider": {
+                "p": {
+                    "transport": transport,
+                    "surface": "chat",
+                    "options": { "reasoningReplay": "encrypted" }
+                }
+            }
+        }))
+        .expect_err("a Bedrock Responses transport cannot carry encrypted replay on Chat");
+        assert_eq!(
+            issue_path(&wrong_surface),
+            "provider.p.options.reasoningReplay"
+        );
+    }
 }
 
 /// A model overrides its provider's routing, so the model is where a proof lands.

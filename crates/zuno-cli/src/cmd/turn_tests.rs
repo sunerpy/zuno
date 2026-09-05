@@ -1668,6 +1668,333 @@ fn test_job_controller() -> Arc<dyn zuno_tools::job_cancel::JobController> {
     Arc::new(NoJobController)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ScriptedTurnBehavior {
+    PreserveWork,
+    SettlePlanOnSecondTurn,
+}
+
+#[derive(Debug)]
+struct ScriptedTurnDriver {
+    calls: std::sync::atomic::AtomicUsize,
+    work: zuno_tools::WorkStateStore,
+    behavior: ScriptedTurnBehavior,
+}
+
+impl ScriptedTurnDriver {
+    fn new(work: zuno_tools::WorkStateStore, behavior: ScriptedTurnBehavior) -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            work,
+            behavior,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl AgentDriver for ScriptedTurnDriver {
+    fn name(&self) -> &str {
+        "scripted-plan-reconciliation"
+    }
+
+    fn drive<'a>(
+        &'a self,
+        request: RunTurnRequest,
+        _context: TurnContext<'a>,
+        _events: TurnEventSender,
+    ) -> futures::future::BoxFuture<'a, Result<TurnOutcome, TurnError>> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let work = self.work.clone();
+        let behavior = self.behavior;
+        Box::pin(async move {
+            if matches!(behavior, ScriptedTurnBehavior::SettlePlanOnSecondTurn) && call == 2 {
+                let current = work
+                    .plan(&request.session_id)
+                    .expect("read scripted Plan")
+                    .expect("scripted Plan exists");
+                work.update_plan(
+                    &request.session_id,
+                    zuno_tools::PlanUpdateParams {
+                        expected_revision: Some(current.revision),
+                        goal_id: current.goal_id,
+                        title: current.title,
+                        steps: current
+                            .steps
+                            .into_iter()
+                            .map(|mut step| {
+                                step.status = zuno_tools::PlanStepStatus::Completed;
+                                step
+                            })
+                            .collect(),
+                    },
+                )
+                .expect("settle scripted Plan");
+            }
+            Ok(TurnOutcome::Completed {
+                assistant_message_id: format!("msg_scripted_{call}"),
+                steps: 1,
+                unresolved_tool_failures: Vec::new(),
+            })
+        })
+    }
+}
+
+async fn scripted_reconciliation_host(
+    agent_name: &str,
+    behavior: ScriptedTurnBehavior,
+) -> (
+    tempfile::TempDir,
+    TurnHost,
+    Arc<ScriptedTurnDriver>,
+    zuno_tools::WorkStateStore,
+) {
+    let directory = tempfile::tempdir().expect("scripted host workspace");
+    let session_id = format!("ses_scripted_{agent_name}");
+    let config = zuno_config::schema::Config::default();
+    let agent = agent(agent_name);
+    let profile = agent_profile(agent.clone(), directory.path(), &config);
+    let mut plan = plan_for(
+        directory.path().to_str().expect("UTF-8 workspace"),
+        SessionChoice::Existing(session_id.clone()),
+        agent,
+        profile,
+        config,
+    );
+    let endpoint = "http://127.0.0.1:9/v1";
+    let model = || {
+        EngineModel::new(
+            Spec::new(COMPATIBLE_PROVIDER)
+                .with_surface(ApiSurface::Chat)
+                .with_base_url(endpoint),
+            "model",
+            ApiSurface::Chat,
+        )
+    };
+    plan.resolver.spec = model().provider;
+    plan.internals.title.model = model();
+    plan.internals.compaction.model = model();
+    plan.internals.summary.model = model();
+    plan.internals.council_synth.model = model();
+    plan.credential = Some(zuno_auth::Credential::Api {
+        key: zuno_auth::Secret::new("scripted-test-key"),
+        metadata: None,
+    });
+    let database =
+        Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
+    {
+        let mut connection = database.open_connection().expect("open connection");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        let now = 1_780_000_000_000;
+        ensure_project(&connection, &plan.project, now).expect("persist project");
+        let transaction = connection.transaction().expect("open transaction");
+        let mut session = zuno_db::session::SessionCreate::new(
+            &session_id,
+            &session_id,
+            &plan.project.id,
+            directory.path().to_string_lossy(),
+            directory.path().to_string_lossy(),
+            "Scripted reconciliation",
+            crate::RUST_PACKAGE_VERSION,
+        )
+        .at(now);
+        session.agent = Some(agent_name.to_owned());
+        session.model = Some(zuno_db::session::model_reference_with_variant(
+            "provider", "model", None,
+        ));
+        zuno_db::session::create(&transaction, &session).expect("create scripted session");
+        transaction.commit().expect("commit scripted session");
+    }
+    let work = zuno_tools::WorkStateStore::new(Arc::clone(&database));
+    let driver = Arc::new(ScriptedTurnDriver::new(work.clone(), behavior));
+    let driver_service: Arc<dyn AgentDriver> = driver.clone();
+    plan.profile = zuno_harness::profile(
+        "scripted-plan-reconciliation",
+        driver_service,
+        zuno_harness::ToolManifest::new([]).expect("empty tool manifest"),
+    );
+    let environment = crate::environment::StartupEnvironment::resolve(
+        &Env::empty(),
+        &crate::GlobalOptions::default(),
+    );
+    let host = TurnHost::open_with_dependencies(
+        plan,
+        &environment,
+        TurnHostDependencies {
+            approval: Arc::new(zuno_tool::AllowAll),
+            question: None,
+            runs: SessionRunRegistry::new(),
+            mcp: None,
+            database,
+            child_observer: None,
+            detached_observer: None,
+        },
+    )
+    .await
+    .expect("open scripted host");
+    (directory, host, driver, work)
+}
+
+fn seed_scripted_plan(
+    work: &zuno_tools::WorkStateStore,
+    session_id: &str,
+    with_todo: bool,
+) -> zuno_tools::WorkStateSnapshot {
+    let plan = work
+        .update_plan(
+            session_id,
+            zuno_tools::PlanUpdateParams {
+                expected_revision: None,
+                goal_id: None,
+                title: "Future implementation".to_owned(),
+                steps: vec![zuno_tools::PlanStep {
+                    id: "step_future".to_owned(),
+                    title: "Implement after Start Work".to_owned(),
+                    status: zuno_tools::PlanStepStatus::InProgress,
+                }],
+            },
+        )
+        .expect("seed scripted Plan");
+    if with_todo {
+        work.update_items(
+            session_id,
+            vec![zuno_tools::WorkItemChange::Add {
+                id: Some("todo_future".to_owned()),
+                goal_id: None,
+                plan_step_id: Some(plan.steps[0].id.clone()),
+                parent_id: None,
+                subject: "Future implementation".to_owned(),
+                description: "Execute only after Start Work".to_owned(),
+                active_form: None,
+                status: zuno_tools::WorkItemStatus::Pending,
+                priority: zuno_tools::WorkItemPriority::Medium,
+                dependencies: Vec::new(),
+                owner: Some("build".to_owned()),
+            }],
+        )
+        .expect("seed scripted Todo");
+    }
+    work.snapshot(session_id).expect("snapshot scripted work")
+}
+
+#[tokio::test]
+async fn plan_handoff_finishes_one_host_turn_and_preserves_future_work() {
+    let (_directory, mut host, driver, work) =
+        scripted_reconciliation_host("plan", ScriptedTurnBehavior::PreserveWork).await;
+    let before = seed_scripted_plan(&work, &host.session_id, true);
+    host.goal_store
+        .create_goal(&host.session_id, "Implement after planning", None)
+        .expect("create active Goal");
+    let guard = host
+        .runs
+        .begin_turn(host.session_id.clone())
+        .expect("reserve scripted turn");
+    let (sender, receiver) = zuno_engine::r#loop::event_channel();
+
+    let (outcome, events) = tokio::join!(
+        host.execute_turn_unaccounted(
+            DynamicContext::default(),
+            DynamicContextRefreshInstruction::Fixed("scripted".to_owned()),
+            None,
+            &guard,
+            sender,
+        ),
+        collect_turn_events(receiver)
+    );
+
+    assert!(matches!(
+        outcome.expect("scripted Plan handoff"),
+        Some(TurnOutcome::Completed { .. })
+    ));
+    assert_eq!(
+        driver.calls(),
+        1,
+        "a completed Plan answer must not start a reconciliation turn"
+    );
+    assert_eq!(
+        work.snapshot(&host.session_id)
+            .expect("snapshot after handoff"),
+        before,
+        "Plan handoff must preserve future Plan and Todo state byte-for-byte"
+    );
+    let phase = host
+        .plan_reconciliation
+        .projection(&host.session_id)
+        .expect("read driver phase")
+        .expect("driver phase exists");
+    assert_eq!(phase.phase, zuno_engine::plan_driver::DriverPhase::Terminal);
+    assert_eq!(phase.reason.as_deref(), Some("planning_handoff_ready"));
+    assert_eq!(phase.reconciliation_attempt, 0);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::TurnCompleted { .. }))
+    );
+    assert_eq!(
+        host.goal_store
+            .goal(&host.session_id)
+            .expect("read Goal")
+            .expect("Goal remains")
+            .status,
+        zuno_goal::GoalStatus::Active
+    );
+    host.shutdown().await.expect("shutdown scripted Plan host");
+}
+
+#[tokio::test]
+async fn ordinary_build_still_runs_reconciliation_until_durable_work_settles() {
+    let (_directory, mut host, driver, work) =
+        scripted_reconciliation_host("build", ScriptedTurnBehavior::SettlePlanOnSecondTurn).await;
+    seed_scripted_plan(&work, &host.session_id, false);
+    let guard = host
+        .runs
+        .begin_turn(host.session_id.clone())
+        .expect("reserve scripted turn");
+    let (sender, receiver) = zuno_engine::r#loop::event_channel();
+
+    let (outcome, _events) = tokio::join!(
+        host.execute_turn_unaccounted(
+            DynamicContext::default(),
+            DynamicContextRefreshInstruction::Fixed("scripted".to_owned()),
+            None,
+            &guard,
+            sender,
+        ),
+        collect_turn_events(receiver)
+    );
+
+    assert!(matches!(
+        outcome.expect("scripted build reconciliation"),
+        Some(TurnOutcome::Completed { .. })
+    ));
+    assert_eq!(
+        driver.calls(),
+        2,
+        "ordinary work must receive one reconciliation turn before settlement"
+    );
+    let snapshot = work.snapshot(&host.session_id).expect("settled work state");
+    assert!(snapshot.items.is_empty());
+    assert!(
+        snapshot
+            .plan
+            .expect("settled Plan")
+            .steps
+            .iter()
+            .all(|step| step.status.is_terminal())
+    );
+    let phase = host
+        .plan_reconciliation
+        .projection(&host.session_id)
+        .expect("read driver phase")
+        .expect("driver phase exists");
+    assert_eq!(phase.phase, zuno_engine::plan_driver::DriverPhase::Terminal);
+    assert_eq!(phase.reason.as_deref(), Some("durable_work_settled"));
+    assert_eq!(phase.reconciliation_attempt, 1);
+    host.shutdown().await.expect("shutdown scripted build host");
+}
+
 #[test]
 fn plan_unreconciled_waiting_creates_a_typed_recoverable_human_request() {
     let request = plan_unreconciled_request(
@@ -2641,8 +2968,9 @@ fn model_selection_splits_only_the_provider_prefix() {
 fn every_declared_wire_transport_selects_its_production_registry_key() {
     let cases = [
         (ProviderTransport::Anthropic, "anthropic"),
-        (ProviderTransport::Bedrock, "amazon-bedrock"),
-        (ProviderTransport::BedrockMantle, "amazon-bedrock/mantle"),
+        (ProviderTransport::Bedrock, "amazon-bedrock-converse"),
+        (ProviderTransport::BedrockMantle, "amazon-bedrock"),
+        (ProviderTransport::BedrockRuntime, "amazon-bedrock-runtime"),
         (ProviderTransport::Google, "google"),
         (ProviderTransport::GoogleVertex, "google-vertex"),
         (
@@ -3438,7 +3766,7 @@ async fn production_catalog_native_openai_honors_advertised_chat() {
 #[tokio::test]
 async fn production_bedrock_registration_dispatches_and_decodes_recorded_eventstream() {
     replay_production_registration(RegistrationCase {
-        registry_key: "amazon-bedrock",
+        registry_key: "amazon-bedrock-converse",
         transport: ProviderTransport::Bedrock,
         model_id: "us.amazon.nova-micro-v1:0",
         cassette: "bedrock-converse/streams-text",
@@ -3457,18 +3785,37 @@ async fn production_bedrock_registration_dispatches_and_decodes_recorded_eventst
 #[tokio::test]
 async fn production_bedrock_mantle_registration_dispatches_and_decodes_recorded_eventstream() {
     replay_production_registration(RegistrationCase {
-        registry_key: "amazon-bedrock/mantle",
+        registry_key: "amazon-bedrock",
         transport: ProviderTransport::BedrockMantle,
-        model_id: "openai.gpt-oss-120b",
-        cassette: "bedrock-converse/streams-text",
+        model_id: "openai.gpt-5.6-sol",
+        cassette: "openai-responses/gpt-5-5-streams-text",
         extra_options: serde_json::json!({
             "region": "us-east-1",
             "accessKeyId": "AKIAREPLAY",
             "secretAccessKey": "replay-secret"
         }),
-        endpoint_suffix: "/model/openai.gpt-oss-120b/converse-stream",
-        expected_body_key: "messages",
-        expected_text: "Hello",
+        endpoint_suffix: "/responses",
+        expected_body_key: "input",
+        expected_text: "Hello!",
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn production_bedrock_runtime_registration_dispatches_and_decodes_recorded_sse() {
+    replay_production_registration(RegistrationCase {
+        registry_key: "amazon-bedrock-runtime",
+        transport: ProviderTransport::BedrockRuntime,
+        model_id: "global.openai.gpt-5.6-sol",
+        cassette: "openai-responses/gpt-5-5-streams-text",
+        extra_options: serde_json::json!({
+            "region": "us-east-2",
+            "accessKeyId": "AKIAREPLAY",
+            "secretAccessKey": "replay-secret"
+        }),
+        endpoint_suffix: "/responses",
+        expected_body_key: "input",
+        expected_text: "Hello!",
     })
     .await;
 }
@@ -4127,6 +4474,19 @@ fn a_turn_option_preset_overrides_the_configuration_default() {
 }
 
 #[test]
+fn work_collaboration_modes_keep_bounded_tasks_out_of_durable_plan_ceremony() {
+    let build = collaboration_mode_prompt("build").expect("build mode");
+    assert!(build.contains("one bounded task"));
+    assert!(build.contains("Do not create Plan or Todo"));
+
+    let orchestrator = collaboration_mode_prompt("orchestrator").expect("orchestrator mode");
+    assert!(orchestrator.contains("Handle one bounded action directly"));
+    assert!(orchestrator.contains("dependency, ownership, interruption, or delegation"));
+
+    assert!(collaboration_mode_prompt("deep").is_none());
+}
+
+#[test]
 fn all_internals_resolve_with_the_roster_prompt_and_a_reachable_model() {
     // Given: a catalog with two models and a per-agent override for `title` only.
     let (catalog, config) = catalog_with_two_models_and_a_title_override();
@@ -4576,6 +4936,45 @@ fn every_endpoint_rung_is_expanded_after_it_wins() {
             "{why}"
         );
     }
+}
+
+#[test]
+fn a_bedrock_config_region_outranks_the_ambient_region_in_a_catalog_url() {
+    let document = serde_json::from_str(
+        r#"{"amazon-bedrock":{
+             "id":"amazon-bedrock",
+             "name":"Amazon Bedrock",
+             "env":[],
+             "npm":"@ai-sdk/amazon-bedrock/mantle",
+             "api":"https://bedrock-mantle.${AWS_REGION}.api.aws/openai/v1",
+             "models":{"openai.gpt-5.6-sol":{
+               "id":"openai.gpt-5.6-sol",
+               "name":"GPT-5.6 Sol",
+               "reasoning":true,
+               "tool_call":true,
+               "limit":{"context":272000,"output":65536}}}}}"#,
+    )
+    .expect("Bedrock catalog");
+    let config = serde_json::from_str(
+        r#"{"provider":{"amazon-bedrock":{
+             "surface":"responses",
+             "options":{"profile":"us","region":"us-east-2"}}}}"#,
+    )
+    .expect("Bedrock config");
+    let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
+    let model = catalog
+        .model("amazon-bedrock", "openai.gpt-5.6-sol")
+        .expect("Bedrock model");
+    let env = Env::empty().with("AWS_REGION", "cn-northwest-1");
+
+    let spec = model_spec(&catalog, model, &env).expect("Bedrock spec");
+
+    assert_eq!(spec.factory(), "amazon-bedrock");
+    assert_eq!(spec.region.as_deref(), Some("us-east-2"));
+    assert!(
+        spec.base_url.is_none(),
+        "the catalog placeholder must not be expanded with the ambient China region: {spec:?}"
+    );
 }
 
 /// A rung is chosen on its unexpanded text, and expanded only afterwards.
