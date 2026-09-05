@@ -59,6 +59,7 @@ mod highlight;
 pub mod live_session;
 pub mod lsp;
 pub mod markdown;
+pub mod memories;
 pub mod memory;
 pub mod message;
 pub mod palette;

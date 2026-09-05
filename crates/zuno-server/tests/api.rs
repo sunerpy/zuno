@@ -30,6 +30,7 @@ use zuno_server::api::{self, ApiState};
 use zuno_server::{
     Delivery, EventService, NewEvent, PermissionRequest, QuestionDecision, QuestionRequest,
     RequestBroker, ServerBuilder, ServerConfig, ServerServices, SessionCompactExecution,
+    SessionMemoryPolicyExecution, SessionMemoryPolicyFuture, SessionMemoryPolicyMutationError,
     SessionMutationExecutor, SessionMutationFuture, SessionPromptExecution, SessionReportExecution,
 };
 
@@ -46,6 +47,72 @@ fn api_app_with_services(state: ApiState) -> (Router, ServerServices) {
         .with_routes(api::router(state))
         .router();
     (app, services)
+}
+
+#[derive(Debug)]
+struct MemoryPolicyMutationExecutor {
+    pool: Arc<Pool>,
+}
+
+impl SessionMutationExecutor for MemoryPolicyMutationExecutor {
+    fn prompt(
+        &self,
+        _request: SessionPromptExecution,
+        _guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn reports(
+        &self,
+        _request: SessionReportExecution,
+        _guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn compact(
+        &self,
+        _request: SessionCompactExecution,
+        _guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn memory_policy(
+        &self,
+        request: SessionMemoryPolicyExecution,
+        _guard: zuno_engine::status::SessionRunGuard,
+    ) -> SessionMemoryPolicyFuture {
+        let store =
+            zuno_db::session_memory_policy::SessionMemoryPolicyStore::new(Arc::clone(&self.pool));
+        Box::pin(async move {
+            let write = store
+                .set(zuno_db::session_memory_policy::SessionMemoryPolicyUpdate {
+                    session_id: request.session_id,
+                    use_memories: request.use_memories,
+                    generation: request.generation,
+                    reason: request.reason,
+                    source: "server".to_owned(),
+                    expected_revision: request.expected_revision,
+                    time_updated: zuno_db::message::now_millis(),
+                })
+                .map_err(|error| SessionMemoryPolicyMutationError::Internal(error.to_string()))?;
+            match write {
+                zuno_db::session_memory_policy::SessionMemoryPolicyWrite::Applied(applied) => {
+                    Ok(applied.policy)
+                }
+                zuno_db::session_memory_policy::SessionMemoryPolicyWrite::Stale(_) => {
+                    Err(SessionMemoryPolicyMutationError::Conflict(
+                        "memory policy changed concurrently; refresh and retry".to_owned(),
+                    ))
+                }
+            }
+        })
+    }
 }
 
 fn api_cancel() -> HardInterruptRequest {
@@ -675,7 +742,7 @@ fn fixture_operations(document: &Value) -> BTreeSet<(String, String)> {
 fn api_openapi_contains_only_registered_zuno_operations() {
     let generated = api::openapi();
     let actual = fixture_operations(&generated);
-    assert_eq!(actual.len(), 49, "the registered Zuno API surface changed");
+    assert_eq!(actual.len(), 51, "the registered Zuno API surface changed");
     for operation in [
         ("/api/permission/saved", "get"),
         ("/api/permission/saved/{id}", "delete"),
@@ -880,6 +947,174 @@ async fn api_session_learning_returns_the_shared_durable_projection_shape() {
             }
         })
     );
+}
+
+#[tokio::test]
+async fn api_session_create_freezes_the_resolved_memory_default_with_the_session() {
+    let temp = tempfile::tempdir().expect("temporary session-policy fixture");
+    let location = DbLocation::File(temp.path().join("zuno.db"));
+    let state = ApiState::from_pool(
+        Pool::open(&location).expect("open API pool"),
+        "/repo",
+        ArtifactGcPaths::from_data_root(temp.path()),
+    )
+    .expect("session-policy API state initializes")
+    .with_memory_policy_default(zuno_types::SessionMemoryPolicyProjection {
+        use_memories: false,
+        generation: zuno_types::SessionMemoryGeneration::Disabled,
+        reason: None,
+        source: None,
+        time: None,
+        revision: 0,
+    });
+    let app = api_app(state);
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session",
+            Some(json!({"id": "ses_policy_create"})),
+        ))
+        .await
+        .expect("session create responds");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let pool = Arc::new(Pool::open(&location).expect("open inspection pool"));
+    let policy = zuno_db::session_memory_policy::SessionMemoryPolicyStore::new(Arc::clone(&pool))
+        .get("ses_policy_create")
+        .expect("read policy")
+        .expect("new server session has a durable policy");
+    assert!(!policy.use_memories);
+    assert_eq!(
+        policy.generation,
+        zuno_types::SessionMemoryGeneration::Disabled
+    );
+    assert_eq!(policy.revision, 1);
+    let events = SessionEventLog::new(pool)
+        .read_after("ses_policy_create", None)
+        .expect("read session events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "session.memory.policy.changed");
+}
+
+#[tokio::test]
+async fn api_session_memory_policy_get_put_uses_revision_cas_and_rejects_busy_updates() {
+    let temp = tempfile::tempdir().expect("temporary memory-policy fixture");
+    let location = DbLocation::File(temp.path().join("zuno.db"));
+    let state = ApiState::from_pool(
+        Pool::open(&location).expect("open API pool"),
+        "/repo",
+        ArtifactGcPaths::from_data_root(temp.path()),
+    )
+    .expect("memory-policy API state initializes")
+    .with_memory_policy_default(zuno_types::SessionMemoryPolicyProjection {
+        use_memories: false,
+        generation: zuno_types::SessionMemoryGeneration::Disabled,
+        reason: None,
+        source: None,
+        time: None,
+        revision: 0,
+    });
+    let mutation_pool = Arc::new(Pool::open(&location).expect("open mutation pool"));
+    state
+        .sessions()
+        .create(&SessionCreate::new(
+            "ses_memory_policy",
+            "memory-policy-slug",
+            "global",
+            "/repo",
+            "/repo",
+            "memory policy",
+            "test",
+        ))
+        .expect("memory policy fixture session inserts");
+    let services = ServerServices::new(64).with_mutations(Arc::new(MemoryPolicyMutationExecutor {
+        pool: mutation_pool,
+    }));
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(state))
+        .router();
+
+    let initial = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/api/session/ses_memory_policy/memory-policy",
+            None,
+        ))
+        .await
+        .expect("initial memory policy responds");
+    assert_eq!(initial.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(initial).await,
+        json!({
+            "data": {
+                "useMemories": false,
+                "generation": "disabled",
+                "reason": null,
+                "source": null,
+                "time": null,
+                "revision": 0,
+            }
+        })
+    );
+
+    let updated = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            "/api/session/ses_memory_policy/memory-policy",
+            Some(json!({
+                "useMemories": false,
+                "generation": "disabled",
+                "expectedRevision": 0,
+                "reason": "private session"
+            })),
+        ))
+        .await
+        .expect("memory policy update responds");
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated = response_json(updated).await;
+    assert_eq!(updated["data"]["useMemories"], false);
+    assert_eq!(updated["data"]["generation"], "disabled");
+    assert_eq!(updated["data"]["reason"], "private session");
+    assert_eq!(updated["data"]["source"], "server");
+    assert_eq!(updated["data"]["revision"], 1);
+
+    let stale = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            "/api/session/ses_memory_policy/memory-policy",
+            Some(json!({
+                "useMemories": true,
+                "generation": "enabled",
+                "expectedRevision": 0
+            })),
+        ))
+        .await
+        .expect("stale memory policy update responds");
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+    let guard = services
+        .runs
+        .begin_turn("ses_memory_policy".to_owned())
+        .expect("mark session busy");
+    let busy = app
+        .oneshot(request(
+            Method::PUT,
+            "/api/session/ses_memory_policy/memory-policy",
+            Some(json!({
+                "useMemories": true,
+                "generation": "enabled",
+                "expectedRevision": 1
+            })),
+        ))
+        .await
+        .expect("busy memory policy update responds");
+    assert_eq!(busy.status(), StatusCode::CONFLICT);
+    drop(guard);
 }
 
 #[tokio::test]

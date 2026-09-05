@@ -425,6 +425,10 @@ const UI_SPECS: &[UiSpec] = &[
         action: "memory_view",
         aliases: &[],
     },
+    UiSpec {
+        action: "memories_view",
+        aliases: &[],
+    },
 ];
 
 fn ui_commands() -> Vec<SlashCommand> {

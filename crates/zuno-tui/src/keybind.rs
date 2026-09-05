@@ -2821,6 +2821,14 @@ pub const LOCAL_DEFINITIONS: &[Definition] = &[
         description: "Review resident memory",
     },
     Definition {
+        name: "memories_view",
+        scope: "memory",
+        keys: "none",
+        command: "memory.settings",
+        prevent_default: None,
+        description: "Configure memory use for this session",
+    },
+    Definition {
         name: "memory_apply",
         scope: "dialog.memory",
         keys: "a",

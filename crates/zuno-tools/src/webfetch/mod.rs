@@ -397,7 +397,8 @@ impl WebFetchTool {
                 .with_attachment(Attachment::new(
                     mime.clone(),
                     format!("data:{mime};base64,{}", base64(&body)),
-                )));
+                ))
+                .with_external_context());
         }
 
         let content = String::from_utf8_lossy(&body);
@@ -406,7 +407,8 @@ impl WebFetchTool {
         Ok(ToolOutput::text(title, output)
             .with_metadata("url", params.url.clone())
             .with_metadata("contentType", content_type)
-            .with_metadata("format", params.format.as_str()))
+            .with_metadata("format", params.format.as_str())
+            .with_external_context())
     }
 }
 

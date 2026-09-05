@@ -776,6 +776,10 @@ pub enum Selection {
         scope: zuno_types::MemoryScope,
         content: String,
     },
+    /// Enable or disable memory use for this session.
+    MemoryUseSet(bool),
+    /// Enable or disable learning generation for this session.
+    MemoryGenerationSet(bool),
     /// A different theme.
     Theme(String),
     /// A different reasoning level for subsequent turns.
@@ -3897,6 +3901,7 @@ impl SessionScreen {
             "session_child_cycle_reverse" => self.cycle_live_sibling(-1),
             "ps_view" => self.request(self.background_view()),
             "memory_view" => self.request(self.memory_view()),
+            "memories_view" => self.request(self.memories_view()),
             "mcp_list" => self.request(self.mcp_list()),
             "status_view" => self.request(self.status_panel()),
             "debug_view" => self.request(self.debug_panel()),
@@ -4038,6 +4043,13 @@ impl SessionScreen {
 
     fn memory_view(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
         Some(Box::new(crate::views::memory::MemoryView::new(
+            self.context.clone(),
+            self.work.clone(),
+        )))
+    }
+
+    fn memories_view(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        Some(Box::new(crate::views::memories::MemoryPolicyView::new(
             self.context.clone(),
             self.work.clone(),
         )))
@@ -4390,6 +4402,14 @@ impl SessionScreen {
             Selection::MemoryRemove { scope, .. } => {
                 format!("removing {} resident memory", scope.as_str())
             }
+            Selection::MemoryUseSet(enabled) => format!(
+                "{} memory use for this session",
+                if *enabled { "enabling" } else { "disabling" }
+            ),
+            Selection::MemoryGenerationSet(enabled) => format!(
+                "{} learning generation for this session",
+                if *enabled { "enabling" } else { "disabling" }
+            ),
             Selection::Theme(theme) => format!("theme {theme} selected"),
             Selection::Effort(effort) => {
                 format!("reasoning set to {effort} for the next turn")
@@ -4927,6 +4947,17 @@ impl ActionComponent for SessionScreen {
                     scope: *scope,
                     content: content.clone(),
                 });
+                self.toasts.push(Toast::new(level, notice));
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::MemoryUseSet { enabled } => {
+                let (notice, level) = self.commit_selection(Selection::MemoryUseSet(*enabled));
+                self.toasts.push(Toast::new(level, notice));
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::MemoryGenerationSet { enabled } => {
+                let (notice, level) =
+                    self.commit_selection(Selection::MemoryGenerationSet(*enabled));
                 self.toasts.push(Toast::new(level, notice));
                 EventResult::REDRAW
             }

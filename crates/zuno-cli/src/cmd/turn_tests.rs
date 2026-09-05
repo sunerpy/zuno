@@ -2806,6 +2806,98 @@ fn production_prompt_composition_honours_the_memory_master_switch() {
     assert_ne!(enabled.system_prompt.as_bytes(), base.as_bytes());
 }
 
+#[test]
+fn session_memory_policy_removes_only_memory_prompt_sections() {
+    let mut resolver = traced_resolver("AGENT");
+    resolver
+        .append_prompt_section("memory.global", "global", "GLOBAL_MEMORY")
+        .expect("global memory");
+    resolver
+        .append_prompt_section("memory.project", "project", "PROJECT_MEMORY")
+        .expect("project memory");
+    resolver
+        .append_prompt_section("instructions", "repo", "PROJECT_INSTRUCTIONS")
+        .expect("instructions");
+
+    let mut enabled = resolver.clone();
+    apply_session_memory_use(&mut enabled, true);
+    assert!(enabled.system_prompt.contains("GLOBAL_MEMORY"));
+    assert!(enabled.system_prompt.contains("PROJECT_MEMORY"));
+
+    apply_session_memory_use(&mut resolver, false);
+    assert!(!resolver.system_prompt.contains("GLOBAL_MEMORY"));
+    assert!(!resolver.system_prompt.contains("PROJECT_MEMORY"));
+    assert!(resolver.system_prompt.contains("AGENT"));
+    assert!(resolver.system_prompt.contains("PROJECT_INSTRUCTIONS"));
+}
+
+#[test]
+fn session_memory_policy_cannot_expand_absent_runtime_capabilities() {
+    let mut policy = zuno_types::SessionMemoryPolicyProjection::default();
+    restrict_memory_policy_to_capabilities(&mut policy, false, false);
+    assert!(!policy.use_memories);
+    assert_eq!(
+        policy.generation,
+        zuno_types::SessionMemoryGeneration::Disabled
+    );
+
+    policy.generation = zuno_types::SessionMemoryGeneration::Excluded;
+    restrict_memory_policy_to_capabilities(&mut policy, false, false);
+    assert_eq!(
+        policy.generation,
+        zuno_types::SessionMemoryGeneration::Excluded,
+        "capability narrowing must not weaken a fail-closed exclusion"
+    );
+}
+
+#[tokio::test]
+async fn host_rejects_enabling_generation_without_an_extractor_runtime() {
+    let (_directory, mut host, _driver, _work) =
+        scripted_reconciliation_host("build", ScriptedTurnBehavior::PreserveWork).await;
+    let error = host
+        .update_memory_policy(
+            host.memory_policy.use_memories,
+            zuno_types::SessionMemoryGeneration::Enabled,
+            host.memory_policy.revision,
+            "try to exceed configuration",
+            "test",
+        )
+        .expect_err("the session policy cannot create an extractor capability");
+    assert!(matches!(error, MemoryPolicyMutationError::Invalid(_)));
+}
+
+#[tokio::test]
+async fn legacy_policy_materialization_preserves_the_clients_revision_zero_first_write() {
+    let (_directory, mut host, _driver, _work) =
+        scripted_reconciliation_host("build", ScriptedTurnBehavior::PreserveWork).await;
+    assert!(host.memory_policy_seeded_from_legacy);
+    assert_eq!(host.memory_policy.revision, 1);
+
+    let updated = host
+        .update_memory_policy(
+            false,
+            zuno_types::SessionMemoryGeneration::Disabled,
+            0,
+            "first explicit session choice",
+            "test",
+        )
+        .expect("revision zero maps only across legacy default materialization");
+    assert_eq!(updated.revision, 2);
+    assert!(!updated.use_memories);
+    assert!(!host.memory_policy_seeded_from_legacy);
+
+    let stale = host
+        .update_memory_policy(
+            true,
+            zuno_types::SessionMemoryGeneration::Disabled,
+            0,
+            "stale retry",
+            "test",
+        )
+        .expect_err("later writes remain strict compare-and-set");
+    assert!(matches!(stale, MemoryPolicyMutationError::Conflict(_)));
+}
+
 #[tokio::test]
 async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order() {
     let root = tempfile::TempDir::new().expect("temporary prompt root");
@@ -11405,6 +11497,7 @@ mod learning_runtime {
             .expect("durable learning turn");
         assert!(turn.had_artifacts);
         assert!(turn.user_corrected);
+        assert!(!turn.external_context);
         assert_eq!(
             turn.transcript,
             TurnTranscript::new(vec![
@@ -11425,6 +11518,100 @@ mod learning_runtime {
                 .expect_err("missing delivered message must fail")
                 .contains("missing from durable history")
         );
+    }
+
+    #[test]
+    fn learning_external_context_requires_successful_durable_tool_metadata() {
+        let marked = json!({
+            "tool": "custom_remote_search",
+            "state": {
+                "status": "completed",
+                "metadata": {
+                    "externalContext": true
+                }
+            }
+        });
+        let builtin = json!({
+            "tool": "webfetch",
+            "state": {"status": "error", "error": "remote failed"}
+        });
+        let failed_marked = json!({
+            "tool": "custom_remote_search",
+            "state": {
+                "status": "error",
+                "metadata": {
+                    "externalContext": true
+                }
+            }
+        });
+        let local = json!({
+            "tool": "shell",
+            "state": {
+                "status": "completed",
+                "metadata": {
+                    "externalContext": "yes"
+                }
+            }
+        });
+
+        assert!(learning_tool_has_external_context(
+            marked.as_object().expect("marked object")
+        ));
+        assert!(!learning_tool_has_external_context(
+            builtin.as_object().expect("builtin object")
+        ));
+        assert!(!learning_tool_has_external_context(
+            failed_marked.as_object().expect("failed marked object")
+        ));
+        assert!(!learning_tool_has_external_context(
+            local.as_object().expect("local object")
+        ));
+    }
+
+    #[test]
+    fn learning_redaction_removes_the_presented_credential_before_derived_storage() {
+        let credential = "sk-learning-secret-sentinel";
+        let redacted = redact_learning_text(
+            &format!(
+                "request used {credential}\nauthorization: bearer another-secret\napi_key=third-secret"
+            ),
+            Some(credential),
+        );
+
+        assert!(!redacted.contains(credential));
+        assert!(!redacted.contains("another-secret"));
+        assert!(!redacted.contains("third-secret"));
+        assert_eq!(
+            redacted.matches(REDACTED_LEARNING_SECRET).count(),
+            3,
+            "{redacted}"
+        );
+    }
+
+    #[test]
+    fn learning_redaction_preserves_non_secret_evidence_in_serialized_transcript() {
+        let serialized = serde_json::to_string(&json!([
+            {
+                "type": "user",
+                "text": "verified cargo test; api_key=third-secret; keep this evidence"
+            },
+            {
+                "type": "tool",
+                "name": "web_search",
+                "output": "authorization: bearer another-secret result was relevant"
+            }
+        ]))
+        .expect("serialize transcript");
+
+        let redacted = redact_learning_text(&serialized, None);
+        assert!(!redacted.contains("third-secret"));
+        assert!(!redacted.contains("another-secret"));
+        assert!(redacted.contains("verified cargo test"));
+        assert!(redacted.contains("keep this evidence"));
+        assert!(redacted.contains("result was relevant"));
+        assert_eq!(redacted.matches(REDACTED_LEARNING_SECRET).count(), 2);
+        serde_json::from_str::<serde_json::Value>(&redacted)
+            .expect("value-level redaction keeps the transcript valid JSON");
     }
 }
 

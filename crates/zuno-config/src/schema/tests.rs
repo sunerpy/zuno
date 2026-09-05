@@ -586,8 +586,14 @@ fn memory_options_resolve_caps_and_component_flags() {
 fn learning_is_disabled_by_default_and_resolves_native_thresholds() {
     let learning = Config::default().resolved_learning();
     assert!(!learning.enabled);
+    assert!(!learning.use_existing);
+    assert!(!learning.generate);
     assert_eq!(learning.extractor_model, None);
-    assert!(learning.post_turn_enabled);
+    assert!(!learning.post_turn_enabled);
+    assert_eq!(learning.post_turn_idle_delay_ms, 21_600_000);
+    assert_eq!(learning.post_turn_poll_interval_ms, 60_000);
+    assert_eq!(learning.post_turn_max_jobs_per_wake, 2);
+    assert!(!learning.disable_on_external_context);
     assert_eq!(learning.aggregation_interval_ms, 86_400_000);
     assert_eq!(learning.aggregation_min_new_records, 3);
     assert_eq!(learning.global_promotion_interval_ms, 604_800_000);
@@ -613,12 +619,69 @@ fn enabled_learning_requires_an_extractor_and_skill_review() {
 }
 
 #[test]
+fn learning_master_switch_and_use_generate_matrix_resolve_independently() {
+    let defaults = parse(r#"{"learning":{"enabled":true,"extractor_model":"provider/extractor"}}"#)
+        .expect("enabled learning defaults both capabilities on")
+        .resolved_learning();
+    assert!(defaults.enabled);
+    assert!(defaults.use_existing);
+    assert!(defaults.generate);
+    assert!(defaults.post_turn_enabled);
+
+    let read_only = parse(r#"{"learning":{"enabled":true,"use":true,"generate":false}}"#)
+        .expect("read-only learning needs no extractor")
+        .resolved_learning();
+    assert!(read_only.enabled);
+    assert!(read_only.use_existing);
+    assert!(!read_only.generate);
+    assert!(!read_only.post_turn_enabled);
+    assert_eq!(read_only.extractor_model, None);
+
+    let generation_only = parse(
+        r#"{"learning":{"enabled":true,"use":false,"generate":true,"extractor_model":"provider/extractor"}}"#,
+    )
+    .expect("generation-only learning")
+    .resolved_learning();
+    assert!(generation_only.enabled);
+    assert!(!generation_only.use_existing);
+    assert!(generation_only.generate);
+    assert!(generation_only.post_turn_enabled);
+
+    let neither = parse(r#"{"learning":{"enabled":true,"use":false,"generate":false}}"#)
+        .expect("enabled learning may keep both capabilities off")
+        .resolved_learning();
+    assert!(neither.enabled);
+    assert!(!neither.use_existing);
+    assert!(!neither.generate);
+    assert!(!neither.post_turn_enabled);
+
+    let off = parse(
+        r#"{"learning":{"enabled":false,"use":true,"generate":true,"post_turn":{"enabled":true,"disable_on_external_context":true}}}"#,
+    )
+    .expect("the master switch caps subordinate switches")
+    .resolved_learning();
+    assert!(!off.enabled);
+    assert!(!off.use_existing);
+    assert!(!off.generate);
+    assert!(!off.post_turn_enabled);
+    assert!(!off.disable_on_external_context);
+}
+
+#[test]
 fn learning_options_resolve_exact_flywheel_limits() {
     let config = parse(
         r#"{"learning":{
           "enabled":true,
+          "use":false,
+          "generate":true,
           "extractor_model":"provider/extractor",
-          "post_turn":{"enabled":false},
+          "post_turn":{
+            "enabled":false,
+            "idle_delay_ms":0,
+            "poll_interval_ms":5000,
+            "max_jobs_per_wake":4,
+            "disable_on_external_context":true
+          },
           "aggregation":{"interval_ms":1000,"min_new_records":4},
           "global_promotion":{"interval_ms":2000,"min_projects":3},
           "retrieval":{"max_items":7,"max_context_tokens":1400},
@@ -628,11 +691,17 @@ fn learning_options_resolve_exact_flywheel_limits() {
     .expect("learning options parse");
     let learning = config.resolved_learning();
     assert!(learning.enabled);
+    assert!(!learning.use_existing);
+    assert!(learning.generate);
     assert_eq!(
         learning.extractor_model.as_deref(),
         Some("provider/extractor")
     );
     assert!(!learning.post_turn_enabled);
+    assert_eq!(learning.post_turn_idle_delay_ms, 0);
+    assert_eq!(learning.post_turn_poll_interval_ms, 5_000);
+    assert_eq!(learning.post_turn_max_jobs_per_wake, 4);
+    assert!(learning.disable_on_external_context);
     assert_eq!(learning.aggregation_interval_ms, 1_000);
     assert_eq!(learning.aggregation_min_new_records, 4);
     assert_eq!(learning.global_promotion_interval_ms, 2_000);
@@ -641,6 +710,35 @@ fn learning_options_resolve_exact_flywheel_limits() {
     assert_eq!(learning.retrieval_max_context_tokens, 1_400);
     assert_eq!(learning.skill_min_independent_sessions, 4);
     assert_eq!(learning.skill_max_learned_rules, 12);
+}
+
+#[test]
+fn learning_generation_requires_an_extractor_but_read_only_use_does_not() {
+    let read_only = parse(r#"{"learning":{"enabled":true,"use":true,"generate":false}}"#)
+        .expect("read-only use is valid without an extractor");
+    assert!(read_only.resolved_learning().use_existing);
+
+    let missing = parse(r#"{"learning":{"enabled":true,"use":false,"generate":true}}"#)
+        .expect_err("generation needs an extractor");
+    assert_eq!(issue_path(&missing), "learning.extractor_model");
+    assert!(issue_detail(&missing).contains("learning.generate"));
+}
+
+#[test]
+fn learning_worker_poll_and_batch_limits_must_be_positive() {
+    for (document, path) in [
+        (
+            r#"{"learning":{"enabled":false,"post_turn":{"poll_interval_ms":0}}}"#,
+            "learning.post_turn.poll_interval_ms",
+        ),
+        (
+            r#"{"learning":{"enabled":false,"post_turn":{"max_jobs_per_wake":0}}}"#,
+            "learning.post_turn.max_jobs_per_wake",
+        ),
+    ] {
+        let error = parse(document).expect_err("zero worker limits are unusable");
+        assert_eq!(issue_path(&error), path);
+    }
 }
 
 #[test]

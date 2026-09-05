@@ -998,6 +998,12 @@ pub const DEFAULT_LEARNING_GLOBAL_MIN_PROJECTS: u32 = 2;
 pub const DEFAULT_LEARNING_RETRIEVAL_MAX_ITEMS: u32 = 5;
 /// Default prompt budget for retrieved experiences.
 pub const DEFAULT_LEARNING_RETRIEVAL_MAX_CONTEXT_TOKENS: u32 = 1_200;
+/// Default idle delay before an automatic post-turn extraction becomes runnable.
+pub const DEFAULT_LEARNING_POST_TURN_IDLE_DELAY_MS: u64 = 21_600_000;
+/// Default interval between automatic extraction queue polls.
+pub const DEFAULT_LEARNING_POST_TURN_POLL_INTERVAL_MS: u64 = 60_000;
+/// Default number of automatic extraction jobs admitted by one worker wake.
+pub const DEFAULT_LEARNING_POST_TURN_MAX_JOBS_PER_WAKE: u32 = 2;
 /// Default independent-session floor for a Skill candidate.
 pub const DEFAULT_LEARNING_SKILL_MIN_INDEPENDENT_SESSIONS: u32 = 3;
 /// Hard cap for learned rules in one Skill.
@@ -1048,10 +1054,24 @@ impl<'de> Deserialize<'de> for MemoryConfidence {
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LearningConfig {
-    /// Master switch. Learning is disabled unless explicitly enabled.
+    /// Master switch. Defaults to false and caps both `use` and `generate`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Use durable Experience records produced by earlier runs.
+    ///
+    /// Defaults to true when `enabled` is true. The master switch remains an upper
+    /// bound, so `enabled: false` disables use even when this field is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#use: Option<bool>,
+    /// Generate new Experience, Memory candidates, patterns, and Skill candidates.
+    ///
+    /// Defaults to true when `enabled` is true. The extractor model is required only
+    /// when this resolves to true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate: Option<bool>,
     /// Dedicated model used by the no-tools structured extractor.
+    ///
+    /// Required only when effective generation is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extractor_model: Option<String>,
     /// Fast post-turn extraction.
@@ -1076,21 +1096,40 @@ impl LearningConfig {
     pub fn resolved(&self) -> ResolvedLearningConfig {
         let aggregation = self.aggregation.as_ref();
         let global = self.global_promotion.as_ref();
+        let post_turn = self.post_turn.as_ref();
         let retrieval = self.retrieval.as_ref();
         let skill = self.skill.as_ref();
+        let enabled = self.enabled.unwrap_or(false);
+        let use_existing = enabled && self.r#use.unwrap_or(true);
+        let generate = enabled && self.generate.unwrap_or(true);
         ResolvedLearningConfig {
-            enabled: self.enabled.unwrap_or(false),
+            enabled,
+            use_existing,
+            generate,
             extractor_model: self
                 .extractor_model
                 .as_deref()
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
                 .map(str::to_owned),
-            post_turn_enabled: self
-                .post_turn
-                .as_ref()
-                .and_then(|post_turn| post_turn.enabled)
-                .unwrap_or(true),
+            post_turn_enabled: generate
+                && post_turn.and_then(|config| config.enabled).unwrap_or(true),
+            post_turn_idle_delay_ms: post_turn
+                .and_then(|config| config.idle_delay_ms)
+                .unwrap_or(DEFAULT_LEARNING_POST_TURN_IDLE_DELAY_MS),
+            post_turn_poll_interval_ms: post_turn
+                .and_then(|config| config.poll_interval_ms)
+                .map_or(DEFAULT_LEARNING_POST_TURN_POLL_INTERVAL_MS, NonZeroU64::get),
+            post_turn_max_jobs_per_wake: post_turn
+                .and_then(|config| config.max_jobs_per_wake)
+                .map_or(
+                    DEFAULT_LEARNING_POST_TURN_MAX_JOBS_PER_WAKE,
+                    NonZeroU32::get,
+                ),
+            disable_on_external_context: generate
+                && post_turn
+                    .and_then(|config| config.disable_on_external_context)
+                    .unwrap_or(false),
             aggregation_interval_ms: aggregation
                 .and_then(|config| config.interval_ms)
                 .map_or(DEFAULT_LEARNING_AGGREGATION_INTERVAL_MS, NonZeroU64::get),
@@ -1132,8 +1171,26 @@ impl LearningConfig {
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LearningPostTurnConfig {
+    /// Enable automatic extraction after an eligible completed task. Defaults to true
+    /// when effective generation is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Delay before an automatic extraction job becomes runnable. Defaults to
+    /// 21600000 milliseconds (six hours).
+    ///
+    /// Zero keeps automatic extraction immediate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_delay_ms: Option<u64>,
+    /// Interval between background queue polls. Defaults to 60000 milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_interval_ms: Option<NonZeroU64>,
+    /// Maximum automatic extraction jobs admitted by one worker wake. Defaults to 2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_jobs_per_wake: Option<NonZeroU32>,
+    /// Skip automatic extraction when the completed turn consumed external context.
+    /// Defaults to false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_on_external_context: Option<bool>,
 }
 
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -1178,8 +1235,14 @@ pub struct LearningSkillConfig {
 #[derive(JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLearningConfig {
     pub enabled: bool,
+    pub use_existing: bool,
+    pub generate: bool,
     pub extractor_model: Option<String>,
     pub post_turn_enabled: bool,
+    pub post_turn_idle_delay_ms: u64,
+    pub post_turn_poll_interval_ms: u64,
+    pub post_turn_max_jobs_per_wake: u32,
+    pub disable_on_external_context: bool,
     pub aggregation_interval_ms: u64,
     pub aggregation_min_new_records: u32,
     pub global_promotion_interval_ms: u64,
@@ -1195,8 +1258,14 @@ impl Default for ResolvedLearningConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            use_existing: false,
+            generate: false,
             extractor_model: None,
-            post_turn_enabled: true,
+            post_turn_enabled: false,
+            post_turn_idle_delay_ms: DEFAULT_LEARNING_POST_TURN_IDLE_DELAY_MS,
+            post_turn_poll_interval_ms: DEFAULT_LEARNING_POST_TURN_POLL_INTERVAL_MS,
+            post_turn_max_jobs_per_wake: DEFAULT_LEARNING_POST_TURN_MAX_JOBS_PER_WAKE,
+            disable_on_external_context: false,
             aggregation_interval_ms: DEFAULT_LEARNING_AGGREGATION_INTERVAL_MS,
             aggregation_min_new_records: DEFAULT_LEARNING_MIN_NEW_RECORDS,
             global_promotion_interval_ms: DEFAULT_LEARNING_GLOBAL_PROMOTION_INTERVAL_MS,

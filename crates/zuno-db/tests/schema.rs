@@ -109,6 +109,10 @@ fn schema_session_delete_cascades_through_every_declared_dependent_table() {
              INSERT INTO session_share \
                (session_id, id, secret, url, time_created, time_updated) \
              VALUES ('session-1', 'share-1', 'secret', 'https://example.invalid', 1, 1);
+             INSERT INTO session_memory_policy \
+               (session_id, use_memories, generation, reason, source, revision, time_created, \
+                time_updated) \
+             VALUES ('session-1', 0, 'disabled', 'fixture policy', 'schema-test', 1, 1, 1);
              INSERT INTO agent_job \
                (id, parent_session_id, logical_key, subject_kind, subject_payload, status, \
                 report_delivery, evidence_start_rowid, created_seq, time_created, time_updated) \
@@ -128,6 +132,7 @@ fn schema_session_delete_cascades_through_every_declared_dependent_table() {
         "session_input",
         "session_context_epoch",
         "session_share",
+        "session_memory_policy",
         "agent_job",
     ];
     let before: Vec<_> = dependent_tables

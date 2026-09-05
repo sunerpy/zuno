@@ -70,6 +70,13 @@ pub const METADATA_PROGRESS_OBSERVATION_KEY: &str = "progressObservation";
 /// Durable signal that a successful mutation invalidated part of the dynamic prompt context.
 pub const METADATA_DYNAMIC_CONTEXT_REFRESH_KEY: &str = "dynamicContextRefresh";
 
+/// Durable marker that the tool result contains context obtained outside the local session.
+///
+/// Learning eligibility reads this marker from the persisted tool part instead of
+/// guessing from a tool name. A malformed value is deliberately treated as absent
+/// evidence rather than as permission to classify local output as external.
+pub const METADATA_EXTERNAL_CONTEXT_KEY: &str = "externalContext";
+
 /// One authoritative state observation produced by a read-only tool.
 ///
 /// `scope` identifies the state being observed while `fingerprint` changes only when that
@@ -540,6 +547,23 @@ impl ToolOutput {
             .and_then(|value| serde_json::from_value(value).ok())
     }
 
+    /// Mark this result as carrying context obtained outside the local session.
+    #[must_use]
+    pub fn with_external_context(mut self) -> Self {
+        self.metadata
+            .insert(METADATA_EXTERNAL_CONTEXT_KEY.to_owned(), Value::Bool(true));
+        self
+    }
+
+    /// Whether this result durably claims that it contains external context.
+    #[must_use]
+    pub fn contains_external_context(&self) -> bool {
+        self.metadata
+            .get(METADATA_EXTERNAL_CONTEXT_KEY)
+            .and_then(Value::as_bool)
+            == Some(true)
+    }
+
     /// Attaches this call's verification evidence, chaining.
     ///
     /// Hosts persist the receipt and gate later success claims on it, so only
@@ -902,7 +926,8 @@ mod tests {
     fn progress_and_refresh_metadata_round_trip_through_their_typed_readers() {
         let output = ToolOutput::text("Plan", r#"{"revision":1}"#)
             .with_progress_observation(ToolProgressObservation::new("work_plan", "sha256:stable"))
-            .with_dynamic_context_refresh(ToolDynamicContextRefresh::WorkPlan);
+            .with_dynamic_context_refresh(ToolDynamicContextRefresh::WorkPlan)
+            .with_external_context();
 
         assert_eq!(
             output.progress_observation(),
@@ -912,6 +937,7 @@ mod tests {
             output.dynamic_context_refresh(),
             Some(ToolDynamicContextRefresh::WorkPlan)
         );
+        assert!(output.contains_external_context());
 
         let durable = serde_json::to_string(&output).expect("serialize");
         let restored: ToolOutput = serde_json::from_str(&durable).expect("deserialize");
@@ -922,10 +948,12 @@ mod tests {
     fn malformed_progress_and_refresh_metadata_make_no_host_claim() {
         let output = ToolOutput::text("Plan", "unchanged")
             .with_metadata(METADATA_PROGRESS_OBSERVATION_KEY, "unchanged")
-            .with_metadata(METADATA_DYNAMIC_CONTEXT_REFRESH_KEY, "everything");
+            .with_metadata(METADATA_DYNAMIC_CONTEXT_REFRESH_KEY, "everything")
+            .with_metadata(METADATA_EXTERNAL_CONTEXT_KEY, "yes");
 
         assert_eq!(output.progress_observation(), None);
         assert_eq!(output.dynamic_context_refresh(), None);
+        assert!(!output.contains_external_context());
     }
 
     #[test]

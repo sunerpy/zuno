@@ -324,6 +324,7 @@ The TUI favors dense, keyboard-first operation:
   projects goal, todos, pending memory, user learning, token usage, LSP, MCP,
   and skills from shared state rather than polling;
 - `/ps` for process-owned background terminals, `/memory` for resident Memory,
+  `/memories` for the current session's use/generation policy,
   and `/learn` for Experience, patterns, feedback, and reviewed Skill
   candidates. `/reflect` manually admits the same no-tools extraction job used
   by the post-turn path;

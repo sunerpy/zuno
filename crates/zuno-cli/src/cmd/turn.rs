@@ -86,10 +86,11 @@ use zuno_goal::{
     GoalStatus, GoalStore, GoalTerminalFailure, GoalTurnMode, GoalTurnOutcome, QueuedUserInput,
 };
 use zuno_learning::{
-    CompletedTaskSignals, ExperienceRetriever, ExperienceService, ExtractionPersistence,
-    ExtractionRequest, FeedbackService, LearningExtraction, LearningExtractor,
-    LearningScheduleOutcome, LearningScheduler, ManualExperienceRequest, PatternMiner,
-    SkillCandidateService, SkillSourceResolver,
+    CompletedTaskSignals, ExperienceRetriever, ExperienceService, ExtractionJobPayload,
+    ExtractionPersistence, ExtractionRequest, FeedbackService, LearningExtraction,
+    LearningExtractor, LearningScheduleOutcome, LearningScheduler, LearningServiceError,
+    ManualExperienceRequest, PatternMiner, SkillCandidateService, SkillSourceResolver,
+    decode_extraction_job_payload,
 };
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
 use zuno_llm::catalog::resolved::ModelEndpoint;
@@ -2056,11 +2057,11 @@ fn resolve_learning_model(
     notes: &mut Vec<String>,
 ) -> Result<Option<LearningModelPlan>, String> {
     let learning = config.resolved_learning();
-    if !learning.enabled || !learning.post_turn_enabled {
+    if !learning.generate {
         return Ok(None);
     }
     let qualified = learning.extractor_model.as_deref().ok_or_else(|| {
-        "learning.enabled requires a non-empty learning.extractor_model".to_owned()
+        "learning.generate requires a non-empty learning.extractor_model".to_owned()
     })?;
     let Some((extractor_provider, extractor_model)) = qualified.split_once('/') else {
         notes.push(format!(
@@ -2320,6 +2321,11 @@ pub(crate) struct TurnHost {
     title_sink: Option<Arc<dyn SessionTitleSink>>,
     work_changes: super::child_turn::ChangeNotifier,
     memory: Option<Arc<MemoryService>>,
+    memory_policy_store: zuno_db::session_memory_policy::SessionMemoryPolicyStore,
+    memory_policy: zuno_types::SessionMemoryPolicyProjection,
+    can_use_memories: bool,
+    can_generate_learning: bool,
+    memory_policy_seeded_from_legacy: bool,
     learning_projection: zuno_learning::LearningProjectionService,
     learning: Option<LearningRuntime>,
     learning_maintenance_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -2333,17 +2339,32 @@ pub(crate) struct TurnHost {
     learning_retrieval_skip_noticed: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MemoryPolicyMutationError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    Internal(String),
+}
+
 struct LearningRuntime {
-    extractor: Arc<dyn LearningExtractor>,
-    evaluation: SkillEvaluationRuntime,
     scheduler: LearningScheduler,
     feedback: FeedbackService,
     experiences: ExperienceService,
     retriever: ExperienceRetriever,
     patterns: PatternMiner,
     skills: SkillCandidateService,
+    generation: Option<LearningGenerationRuntime>,
+}
+
+struct LearningGenerationRuntime {
+    extractor: Arc<dyn LearningExtractor>,
+    evaluation: SkillEvaluationRuntime,
     owner_id: String,
     maintenance_interval: Duration,
+    max_jobs_per_wake: u32,
 }
 
 impl Drop for TurnHost {
@@ -2598,7 +2619,7 @@ impl LearningExtractor for ProviderLearningExtractor {
     async fn extract(
         &self,
         request: ExtractionRequest,
-    ) -> Result<LearningExtraction, zuno_error::BoxSource> {
+    ) -> zuno_learning::Result<LearningExtraction> {
         let prompt = learning_extractor_prompt();
         let prompt_digest = sha256_hex(prompt.as_bytes());
         append_learning_event(
@@ -2619,7 +2640,8 @@ impl LearningExtractor for ProviderLearningExtractor {
                 "tools": [],
                 "request": &request,
             }),
-        )?;
+        )
+        .map_err(learning_extractor_error)?;
 
         let messages = vec![
             ProviderMessage::new(Role::System, prompt),
@@ -2683,11 +2705,11 @@ impl LearningExtractor for ProviderLearningExtractor {
                         "learning extractor provider request failed"
                     );
                 });
-                return Err(record_learning_failure(
+                return Err(learning_extractor_error(record_learning_failure(
                     &self.events,
                     &request.session_id,
                     error,
-                ));
+                )));
             }
         };
         if !saw_message_end {
@@ -2697,11 +2719,11 @@ impl LearningExtractor for ProviderLearningExtractor {
                 Some("stream_incomplete"),
                 None,
             );
-            return Err(record_learning_failure(
+            return Err(learning_extractor_error(record_learning_failure(
                 &self.events,
                 &request.session_id,
                 "learning extraction stream ended before MessageEnd",
-            ));
+            )));
         }
         zuno_observability::span::record_provider_outcome(&request_span, "completed", None, None);
         request_span.in_scope(|| {
@@ -2715,19 +2737,19 @@ impl LearningExtractor for ProviderLearningExtractor {
         });
 
         if !accumulator.tool_calls().is_empty() {
-            return Err(record_learning_failure(
+            return Err(learning_extractor_error(record_learning_failure(
                 &self.events,
                 &request.session_id,
                 "learning extractor attempted a tool call even though no tools were exposed",
-            ));
+            )));
         }
         let body = strip_json_fence(accumulator.text());
         let extraction: LearningExtraction = serde_json::from_str(body).map_err(|error| {
-            record_learning_failure(
+            learning_extractor_error(record_learning_failure(
                 &self.events,
                 &request.session_id,
                 format!("learning extractor returned invalid structured JSON: {error}"),
-            )
+            ))
         })?;
         append_learning_event(
             &self.events,
@@ -2741,7 +2763,8 @@ impl LearningExtractor for ProviderLearningExtractor {
                 "memoryCount": extraction.memories.len(),
                 "outputDigest": sha256_hex(body.as_bytes()),
             }),
-        )?;
+        )
+        .map_err(learning_extractor_error)?;
         Ok(extraction)
     }
 }
@@ -2980,6 +3003,13 @@ fn record_learning_failure(
     Box::new(std::io::Error::other(detail))
 }
 
+fn learning_extractor_error(source: zuno_error::BoxSource) -> LearningServiceError {
+    LearningServiceError::Extractor {
+        version: LEARNING_EXTRACTOR_VERSION.to_owned(),
+        source,
+    }
+}
+
 fn sha256_hex(input: &[u8]) -> String {
     Sha256::digest(input)
         .iter()
@@ -3156,6 +3186,58 @@ fn learning_title(text: &str) -> String {
     }
 }
 
+const REDACTED_LEARNING_SECRET: &str = "[REDACTED_SECRET]";
+
+fn redact_learning_text(value: &str, explicit_credential: Option<&str>) -> String {
+    let mut secrets = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = name.to_string_lossy().to_ascii_uppercase();
+            let sensitive = ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"]
+                .iter()
+                .any(|marker| name.contains(marker));
+            let value = value.to_string_lossy();
+            (sensitive && value.len() >= 4).then(|| value.into_owned())
+        })
+        .collect::<Vec<_>>();
+    if let Some(credential) = explicit_credential.filter(|credential| credential.len() >= 4) {
+        secrets.push(credential.to_owned());
+    }
+    secrets.sort();
+    secrets.dedup();
+
+    let mut redacted = value.to_owned();
+    for secret in secrets {
+        redacted = redacted.replace(&secret, REDACTED_LEARNING_SECRET);
+    }
+    for marker in ["authorization: bearer ", "api_key=", "apikey="] {
+        redacted = redact_inline_secret(redacted, marker);
+    }
+    redacted
+}
+
+fn redact_inline_secret(mut value: String, marker: &str) -> String {
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let Some(relative) = value[cursor..].to_ascii_lowercase().find(marker) else {
+            break;
+        };
+        let start = cursor + relative + marker.len();
+        let end = value[start..]
+            .find(|character: char| {
+                character.is_ascii_whitespace()
+                    || matches!(character, '"' | '\'' | '\\' | '&' | ',' | '}' | ']')
+            })
+            .map_or(value.len(), |relative| start + relative);
+        if end == start {
+            cursor = start;
+            continue;
+        }
+        value.replace_range(start..end, REDACTED_LEARNING_SECRET);
+        cursor = start + REDACTED_LEARNING_SECRET.len();
+    }
+    value
+}
+
 fn run_due_learning_maintenance(
     scheduler: &LearningScheduler,
     patterns: &PatternMiner,
@@ -3172,6 +3254,7 @@ fn run_due_learning_maintenance(
         LearningScheduleOutcome::Queued(job) | LearningScheduleOutcome::Existing(job) => Some(job),
         LearningScheduleOutcome::Disabled
         | LearningScheduleOutcome::Ineligible
+        | LearningScheduleOutcome::Excluded
         | LearningScheduleOutcome::SkippedInsufficientRecords { .. } => None,
     };
     if let Some(project_job) = project_job
@@ -3246,6 +3329,7 @@ fn run_due_learning_maintenance(
                 }
                 LearningScheduleOutcome::Disabled
                 | LearningScheduleOutcome::Ineligible
+                | LearningScheduleOutcome::Excluded
                 | LearningScheduleOutcome::SkippedInsufficientRecords { .. } => None,
             }
         }
@@ -3403,16 +3487,18 @@ async fn run_recovered_learning_job(
     owner_id: String,
     changes: super::child_turn::ChangeNotifier,
 ) {
-    let outcome = match job.kind {
+    let outcome: Result<(), (String, Recovery)> = match job.kind {
         zuno_db::learning_job::LearningJobKind::Extraction => {
             let request = job
                 .payload
                 .clone()
                 .ok_or_else(|| "learning extraction job has no durable request payload".to_owned())
                 .and_then(|payload| {
-                    serde_json::from_value::<ExtractionRequest>(payload)
+                    decode_extraction_job_payload(payload)
+                        .map(ExtractionJobPayload::into_request)
                         .map_err(|error| format!("learning extraction request is corrupt: {error}"))
-                });
+                })
+                .map_err(|error| (error, Recovery::Fail));
             match request {
                 Ok(request) => match extractor.extract(request).await {
                     Ok(extraction) => experiences
@@ -3422,7 +3508,7 @@ async fn run_recovered_learning_job(
                             extraction,
                             zuno_db::message::now_millis(),
                         )
-                        .map_err(to_string)
+                        .map_err(|error| (error.to_string(), error.recovery()))
                         .and_then(|persisted| {
                             // A recovered job has no turn to report into; the refusal
                             // lines go to the log here and stay durable in the job
@@ -3443,8 +3529,9 @@ async fn run_recovered_learning_job(
                                 &owner_id,
                                 zuno_db::message::now_millis(),
                             )
+                            .map_err(|error| (error, Recovery::Fail))
                         }),
-                    Err(error) => Err(error.to_string()),
+                    Err(error) => Err((error.to_string(), error.recovery())),
                 },
                 Err(error) => Err(error),
             }
@@ -3463,39 +3550,113 @@ async fn run_recovered_learning_job(
                     now: zuno_db::message::now_millis(),
                 },
             )
+            .map_err(|error| (error, Recovery::Fail))
         }
-        _ => Err(format!(
-            "project recovery worker cannot execute {} job `{}`",
-            job.kind.as_str(),
-            job.id
+        _ => Err((
+            format!(
+                "project recovery worker cannot execute {} job `{}`",
+                job.kind.as_str(),
+                job.id
+            ),
+            Recovery::Fail,
         )),
     };
     match outcome {
         Ok(()) => changes.changed(),
-        Err(error) => {
+        Err((error, recovery)) => {
             let still_running = scheduler.get(&job.id).is_ok_and(|current| {
                 current.status == zuno_db::learning_job::LearningJobStatus::Running
                     && current.owner_id.as_deref() == Some(owner_id.as_str())
             });
-            if still_running
-                && let Err(settle_error) =
-                    scheduler.fail(&job.id, &owner_id, &error, zuno_db::message::now_millis())
-            {
+            if still_running {
+                let now = zuno_db::message::now_millis();
+                let settlement = match recovery {
+                    Recovery::Retry { after } => {
+                        scheduler.retry(&job.id, &owner_id, &error, after, now)
+                    }
+                    Recovery::Reauthenticate | Recovery::Compact | Recovery::Fail => {
+                        scheduler.fail(&job.id, &owner_id, &error, now)
+                    }
+                };
+                if let Err(settle_error) = settlement {
+                    tracing::warn!(
+                        job_id = job.id,
+                        error = %settle_error,
+                        worker_error = %error,
+                        "recovered learning job failure could not be persisted"
+                    );
+                    return;
+                }
+            }
+            if matches!(recovery, Recovery::Retry { .. }) {
                 tracing::warn!(
                     job_id = job.id,
-                    error = %settle_error,
-                    worker_error = %error,
-                    "recovered learning job failure could not be persisted"
+                    error = %error,
+                    "recovered learning job scheduled a bounded retry"
                 );
-                return;
+            } else {
+                tracing::warn!(
+                    job_id = job.id,
+                    error = %error,
+                    "recovered learning job failed"
+                );
             }
-            tracing::warn!(
-                job_id = job.id,
-                error = %error,
-                "recovered learning job failed"
-            );
             changes.changed();
         }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the batch runner receives the already-mounted learning services and durable worker identity explicitly"
+)]
+async fn run_due_learning_batch(
+    scheduler: &LearningScheduler,
+    extractor: Arc<dyn LearningExtractor>,
+    experiences: &ExperienceService,
+    patterns: &PatternMiner,
+    skills: &SkillCandidateService,
+    project_id: &str,
+    project_root: &std::path::Path,
+    owner_id: &str,
+    changes: &super::child_turn::ChangeNotifier,
+    runs: &SessionRunRegistry,
+    max_jobs: u32,
+) {
+    for _ in 0..max_jobs {
+        let now = zuno_db::message::now_millis();
+        let busy_session_ids = runs.active_sessions().into_iter().collect::<Vec<_>>();
+        let job = match scheduler.claim_due_for_project_excluding(
+            project_id,
+            owner_id,
+            now,
+            now.saturating_add(LEARNING_LEASE_MILLIS),
+            &busy_session_ids,
+        ) {
+            Ok(Some(job)) => job,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(
+                    project_id,
+                    error = %error,
+                    "background learning queue could not be claimed"
+                );
+                break;
+            }
+        };
+        run_recovered_learning_job(
+            job,
+            Arc::clone(&extractor),
+            scheduler.clone(),
+            experiences.clone(),
+            patterns.clone(),
+            skills.clone(),
+            project_id.to_owned(),
+            project_root.to_path_buf(),
+            owner_id.to_owned(),
+            changes.clone(),
+        )
+        .await;
     }
 }
 
@@ -3618,6 +3779,7 @@ struct DurableLearningTurn {
     transcript: TurnTranscript,
     had_artifacts: bool,
     user_corrected: bool,
+    external_context: bool,
 }
 
 fn durable_learning_turn(
@@ -3667,6 +3829,7 @@ fn learning_turn_from_messages(
     let mut events = Vec::new();
     let mut had_artifacts = false;
     let mut user_corrected = false;
+    let mut external_context = false;
     for message in messages {
         for part in &message.parts {
             match (message.info.role, part.kind) {
@@ -3686,6 +3849,7 @@ fn learning_turn_from_messages(
                     }
                 }
                 (zuno_db::message::MessageRole::Assistant, zuno_db::message::PartKind::Tool) => {
+                    external_context |= learning_tool_has_external_context(&part.data);
                     if let Some(event) = learning_tool_event(&part.data) {
                         events.push(event);
                     }
@@ -3704,6 +3868,35 @@ fn learning_turn_from_messages(
         transcript: TurnTranscript::new(events),
         had_artifacts,
         user_corrected,
+        external_context,
+    }
+}
+
+fn learning_tool_has_external_context(data: &serde_json::Map<String, Value>) -> bool {
+    let Some(state) = data.get("state").and_then(Value::as_object) else {
+        return false;
+    };
+    if state.get("status").and_then(Value::as_str) != Some("completed") {
+        return false;
+    }
+    state
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(zuno_tool::METADATA_EXTERNAL_CONTEXT_KEY))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn restrict_memory_policy_to_capabilities(
+    policy: &mut zuno_types::SessionMemoryPolicyProjection,
+    can_use_memories: bool,
+    can_generate_learning: bool,
+) {
+    if !can_use_memories {
+        policy.use_memories = false;
+    }
+    if !can_generate_learning && policy.generation == zuno_types::SessionMemoryGeneration::Enabled {
+        policy.generation = zuno_types::SessionMemoryGeneration::Disabled;
     }
 }
 
@@ -4135,6 +4328,31 @@ impl TurnHost {
             let commands = commands?;
             let memory_settings = plan.config.resolved_memory();
             let learning_settings = plan.config.resolved_learning();
+            let memory_policy_store = zuno_db::session_memory_policy::SessionMemoryPolicyStore::new(
+                Arc::clone(&database),
+            );
+            let default_memory_policy = zuno_types::SessionMemoryPolicyProjection {
+                use_memories: memory_settings.resident || learning_settings.use_existing,
+                generation: if learning_settings.generate {
+                    zuno_types::SessionMemoryGeneration::Enabled
+                } else {
+                    zuno_types::SessionMemoryGeneration::Disabled
+                },
+                reason: None,
+                source: None,
+                time: None,
+                revision: 0,
+            };
+            let durable_memory_policy = if prepared.identity.is_materialized() {
+                memory_policy_store
+                    .get(prepared.identity.id())
+                    .map_err(to_string)?
+            } else {
+                None
+            };
+            let memory_policy_was_durable = durable_memory_policy.is_some();
+            let mut memory_policy = durable_memory_policy.unwrap_or(default_memory_policy);
+            let mut memory_policy_seeded_from_legacy = false;
             let memory_paths = ScopePaths::discover(memory_root);
             configure_resident_memory(&mut plan.resolver, &plan.config, memory_paths.clone())?;
             let background_jobs = environment.background_jobs(&plan.directory);
@@ -4193,83 +4411,111 @@ impl TurnHost {
             // above, in the async frame this closure cannot await from; all that is left
             // here is to report it in the position the note has always occupied.
             notes.extend(exclude_note);
-            let learning = match plan.learning_model.take() {
-                Some(learning_model) if learning_settings.enabled => {
-                    let model = learning_model.model;
-                    match providers.resolve(model.provider.clone()) {
-                        Ok(provider) => {
-                            let evaluator: Arc<dyn OfflineCaseEvaluator> =
-                                Arc::new(ProviderSkillEvaluator {
-                                    provider: Arc::clone(&provider),
-                                    model: model.clone(),
-                                    max_output_tokens: learning_model.max_output_tokens,
-                                });
-                            let extractor: Arc<dyn LearningExtractor> =
-                                Arc::new(ProviderLearningExtractor {
-                                    provider,
-                                    model: model.clone(),
-                                    events: zuno_db::event_log::SessionEventLog::new(Arc::clone(
-                                        &database,
-                                    )),
-                                });
-                            let scheduler = LearningScheduler::new(
-                                Arc::clone(&database),
-                                learning_settings.clone(),
-                            )
-                            .with_extractor_version(extractor.version());
-                            scheduler
-                                .reconcile_expired(zuno_db::message::now_millis())
-                                .map_err(to_string)?;
-                            let skills = SkillCandidateService::new(
-                                Arc::clone(&database),
-                                learning_settings.clone(),
-                            );
-                            skills
-                                .reconcile(zuno_db::message::now_millis())
-                                .map_err(to_string)?;
-                            Some(LearningRuntime {
-                                extractor,
-                                evaluation: SkillEvaluationRuntime {
-                                    evaluator,
-                                    model: format!(
-                                        "{}/{}",
-                                        model.catalog_provider_id, model.catalog_model_id
+            let learning = if learning_settings.use_existing || learning_settings.generate {
+                let mut scheduler =
+                    LearningScheduler::new(Arc::clone(&database), learning_settings.clone());
+                let generation = match plan.learning_model.take() {
+                    Some(learning_model) if learning_settings.generate => {
+                        let model = learning_model.model;
+                        match providers.resolve(model.provider.clone()) {
+                            Ok(provider) => {
+                                let evaluator: Arc<dyn OfflineCaseEvaluator> =
+                                    Arc::new(ProviderSkillEvaluator {
+                                        provider: Arc::clone(&provider),
+                                        model: model.clone(),
+                                        max_output_tokens: learning_model.max_output_tokens,
+                                    });
+                                let extractor: Arc<dyn LearningExtractor> =
+                                    Arc::new(ProviderLearningExtractor {
+                                        provider,
+                                        model: model.clone(),
+                                        events: zuno_db::event_log::SessionEventLog::new(
+                                            Arc::clone(&database),
+                                        ),
+                                    });
+                                scheduler = scheduler.with_extractor_version(extractor.version());
+                                Some(LearningGenerationRuntime {
+                                    extractor,
+                                    evaluation: SkillEvaluationRuntime {
+                                        evaluator,
+                                        model: format!(
+                                            "{}/{}",
+                                            model.catalog_provider_id, model.catalog_model_id
+                                        ),
+                                        max_output_tokens: learning_model.max_output_tokens,
+                                    },
+                                    owner_id: format!("learning_owner_{}", Uuid::new_v4().simple()),
+                                    maintenance_interval: Duration::from_millis(
+                                        scheduler
+                                            .post_turn_poll_interval_ms()
+                                            .min(learning_settings.aggregation_interval_ms)
+                                            .min(learning_settings.global_promotion_interval_ms),
                                     ),
-                                    max_output_tokens: learning_model.max_output_tokens,
-                                },
-                                scheduler,
-                                feedback: FeedbackService::new(Arc::clone(&database)),
-                                experiences: ExperienceService::new(
-                                    Arc::clone(&database),
-                                    memory.as_ref().map(Arc::clone),
-                                ),
-                                retriever: ExperienceRetriever::new(
-                                    Arc::clone(&database),
-                                    &learning_settings,
-                                ),
-                                patterns: PatternMiner::new(
-                                    Arc::clone(&database),
-                                    learning_settings.clone(),
-                                ),
-                                skills,
-                                owner_id: format!("learning_owner_{}", Uuid::new_v4().simple()),
-                                maintenance_interval: Duration::from_millis(
-                                    learning_settings
-                                        .aggregation_interval_ms
-                                        .min(learning_settings.global_promotion_interval_ms),
-                                ),
-                            })
-                        }
-                        Err(error) => {
-                            notes.push(format!(
-                                "learning disabled: extractor provider could not start ({error})"
-                            ));
-                            None
+                                    max_jobs_per_wake: scheduler.post_turn_max_jobs_per_wake(),
+                                })
+                            }
+                            Err(error) => {
+                                notes.push(format!(
+                                    "learning generation disabled: extractor provider could not start ({error})"
+                                ));
+                                None
+                            }
                         }
                     }
-                }
-                _ => None,
+                    _ => None,
+                };
+                scheduler
+                    .reconcile_expired(zuno_db::message::now_millis())
+                    .map_err(to_string)?;
+                let skills =
+                    SkillCandidateService::new(Arc::clone(&database), learning_settings.clone());
+                skills
+                    .reconcile(zuno_db::message::now_millis())
+                    .map_err(to_string)?;
+                Some(LearningRuntime {
+                    scheduler,
+                    feedback: FeedbackService::new(Arc::clone(&database)),
+                    experiences: ExperienceService::new(
+                        Arc::clone(&database),
+                        memory.as_ref().map(Arc::clone),
+                    ),
+                    retriever: ExperienceRetriever::new(Arc::clone(&database), &learning_settings),
+                    patterns: PatternMiner::new(Arc::clone(&database), learning_settings.clone()),
+                    skills,
+                    generation,
+                })
+            } else {
+                None
             };
+            let can_use_memories = memory_settings.resident || learning_settings.use_existing;
+            let can_generate_learning = learning
+                .as_ref()
+                .and_then(|runtime| runtime.generation.as_ref())
+                .is_some();
+            restrict_memory_policy_to_capabilities(
+                &mut memory_policy,
+                can_use_memories,
+                can_generate_learning,
+            );
+            if prepared.identity.is_materialized() && !memory_policy_was_durable {
+                memory_policy = memory_policy_store
+                    .seed(
+                        prepared.identity.id(),
+                        memory_policy.use_memories,
+                        memory_policy.generation,
+                        "session memory defaults frozen when the upgraded session was first opened",
+                        "configuration",
+                        zuno_db::message::now_millis(),
+                    )
+                    .map_err(to_string)?;
+                restrict_memory_policy_to_capabilities(
+                    &mut memory_policy,
+                    can_use_memories,
+                    can_generate_learning,
+                );
+                memory_policy_seeded_from_legacy = memory_policy.revision == 1
+                    && memory_policy.source.as_deref() == Some("configuration");
+            }
             plan.resolver.append_prompt_section(
                 "extensions",
                 "zuno-extension::active-packages",
@@ -4308,6 +4554,7 @@ impl TurnHost {
                     parent_agent: plan.agent.name().to_owned(),
                     parent_model: format!("{}/{}", plan.provider_id, plan.model_id),
                     parent_effort: plan.effort,
+                    parent_memory_policy: memory_policy.clone(),
                     delegation_limiter: delegation_limiter.clone(),
                     supervisor: background_jobs.clone(),
                 })?;
@@ -4344,12 +4591,15 @@ impl TurnHost {
             let background_notifications = environment.background_notifications();
             let background_notification_directory = plan.directory.clone();
             let delegation_agents = delegation_agents(&plan.agents, plan.vision_available)?;
-            let experience_search_tool = learning.as_ref().map(|learning| {
-                erase(zuno_tools::ExperienceSearchTool::new(
-                    learning.retriever.clone(),
-                    project_id.clone(),
-                ))
-            });
+            let experience_search_tool = learning
+                .as_ref()
+                .filter(|_| learning_settings.use_existing && memory_policy.use_memories)
+                .map(|learning| {
+                    erase(zuno_tools::ExperienceSearchTool::new(
+                        learning.retriever.clone(),
+                        project_id.clone(),
+                    ))
+                });
 
             let runtime_tools = super::tool_runtime::assemble(
                 &plan.directory,
@@ -4576,6 +4826,11 @@ impl TurnHost {
                 title_sink: None,
                 work_changes,
                 memory,
+                memory_policy_store,
+                memory_policy,
+                can_use_memories,
+                can_generate_learning,
+                memory_policy_seeded_from_legacy,
                 learning_projection,
                 learning,
                 learning_maintenance_cancel: None,
@@ -4678,12 +4933,25 @@ impl TurnHost {
         let transaction =
             zuno_db::open::immediate_transaction(&self.connection).map_err(to_string)?;
         zuno_db::session::create(&transaction, &input).map_err(to_string)?;
+        let memory_policy = zuno_db::session_memory_policy::seed_in(
+            &transaction,
+            self.session_identity.id(),
+            self.memory_policy.use_memories,
+            self.memory_policy.generation,
+            "session memory defaults frozen at creation",
+            "configuration",
+            input
+                .time
+                .expect("materialized session input has an explicit timestamp"),
+        )
+        .map_err(to_string)?;
         append_subagent_model_policy_in(
             &transaction,
             self.session_identity.id(),
             &self.subagent_model_policy,
         )?;
         transaction.commit().map_err(to_string)?;
+        self.memory_policy = memory_policy;
         self.session_materializer = SessionMaterializer::Existing;
         self.session_identity.mark_materialized();
         Ok(true)
@@ -5360,8 +5628,8 @@ impl TurnHost {
     }
 
     async fn learn_command(&mut self, arguments: &str) -> Result<String, SessionCommandError> {
-        self.learning_runtime()
-            .map_err(SessionCommandError::invalid_arguments)?;
+        self.refresh_memory_policy()
+            .map_err(SessionCommandError::internal)?;
         let arguments = arguments.trim();
         let mut parts = arguments.splitn(2, char::is_whitespace);
         let action = parts.next().unwrap_or_default();
@@ -5370,6 +5638,8 @@ impl TurnHost {
         let output = match action {
             "" | "get" | "show" | "list" => self.learning_status_value()?,
             "remember" => {
+                self.require_learning_generation()
+                    .map_err(SessionCommandError::invalid_arguments)?;
                 if value.is_empty() {
                     return Err(SessionCommandError::invalid_arguments(
                         "usage: /learn remember <stable fact, preference, or project rule>",
@@ -5428,6 +5698,8 @@ impl TurnHost {
                 json!({"experience": experience_value(&record), "memory": memory})
             }
             "issue" => {
+                self.require_learning_generation()
+                    .map_err(SessionCommandError::invalid_arguments)?;
                 if value.is_empty() {
                     return Err(SessionCommandError::invalid_arguments(
                         "usage: /learn issue <unresolved issue>",
@@ -5516,6 +5788,8 @@ impl TurnHost {
                 })
             }
             "promote" => {
+                self.require_learning_generation()
+                    .map_err(SessionCommandError::invalid_arguments)?;
                 if value.is_empty() {
                     return Err(SessionCommandError::invalid_arguments(
                         "usage: /learn promote <experience-id>",
@@ -5618,6 +5892,8 @@ impl TurnHost {
                 })
             }
             "pattern-promote" => {
+                self.require_learning_generation()
+                    .map_err(SessionCommandError::invalid_arguments)?;
                 if value.is_empty() {
                     return Err(SessionCommandError::invalid_arguments(
                         "usage: /learn pattern-promote <pattern-id>",
@@ -5678,14 +5954,19 @@ impl TurnHost {
                     let learning = self
                         .learning_runtime()
                         .map_err(SessionCommandError::internal)?;
+                    let generation = learning.generation.as_ref().ok_or_else(|| {
+                        SessionCommandError::invalid_arguments(
+                            "learning generation is disabled; Skill evaluation needs the configured extractor model",
+                        )
+                    })?;
                     let candidate = learning
                         .skills
                         .get(value)
                         .map_err(SessionCommandError::internal)?;
                     (
                         learning.skills.clone(),
-                        Arc::clone(&learning.evaluation.evaluator),
-                        learning.evaluation.attempt(toolset_digest),
+                        Arc::clone(&generation.evaluation.evaluator),
+                        generation.evaluation.attempt(toolset_digest),
                         candidate.projection.target_source,
                     )
                 };
@@ -5790,54 +6071,12 @@ impl TurnHost {
     }
 
     fn learning_status_value(&self) -> Result<Value, SessionCommandError> {
-        let learning = self
-            .learning_runtime()
-            .map_err(SessionCommandError::invalid_arguments)?;
-        let feedback = learning
-            .feedback
-            .list_for_session(&self.session_id)
-            .map_err(SessionCommandError::internal)?
-            .into_iter()
-            .map(|feedback| {
-                json!({
-                    "messageID": feedback.message_id,
-                    "rating": match feedback.rating {
-                        zuno_types::FeedbackRating::Positive => "positive",
-                        zuno_types::FeedbackRating::Negative => "negative",
-                    },
-                    "note": feedback.note,
-                    "revision": feedback.revision,
-                    "timeUpdated": feedback.time_updated,
-                })
-            })
-            .collect::<Vec<_>>();
-        let experiences = learning
-            .experiences
-            .list_for_project(&self.project_id, 100)
-            .map_err(SessionCommandError::internal)?
-            .iter()
-            .map(experience_value)
-            .collect::<Vec<_>>();
-        let patterns = learning
-            .patterns
-            .list_visible(&self.project_id, 50)
-            .map_err(SessionCommandError::internal)?
-            .iter()
-            .map(pattern_value)
-            .collect::<Vec<_>>();
-        let skill_candidates = learning
-            .skills
-            .list_for_project(&self.project_id, 50)
-            .map_err(SessionCommandError::internal)?
-            .iter()
-            .map(skill_candidate_value)
-            .collect::<Vec<_>>();
-        Ok(json!({
-            "feedback": feedback,
-            "experiences": experiences,
-            "patterns": patterns,
-            "skillCandidates": skill_candidates,
-        }))
+        serde_json::to_value(
+            self.learning_projection
+                .snapshot(&self.session_id, &self.project_id)
+                .map_err(SessionCommandError::internal)?,
+        )
+        .map_err(SessionCommandError::internal)
     }
 
     async fn manual_reflect(
@@ -5845,6 +6084,13 @@ impl TurnHost {
         scope: &str,
         source_message_override: Option<&str>,
     ) -> Result<Value, SessionCommandError> {
+        self.refresh_memory_policy()
+            .map_err(SessionCommandError::internal)?;
+        if self.memory_policy.generation != zuno_types::SessionMemoryGeneration::Enabled {
+            return Err(SessionCommandError::invalid_arguments(
+                "learning generation is disabled for this session; use /memories to enable it",
+            ));
+        }
         let scope = if scope.is_empty() { "turn" } else { scope };
         if !matches!(scope, "turn" | "session") {
             return Err(SessionCommandError::invalid_arguments(
@@ -5880,8 +6126,26 @@ impl TurnHost {
                     .map_err(SessionCommandError::internal)?;
             (source_message_id, turn)
         };
-        let transcript = serde_json::to_string(&learning_transcript_json(&turn.transcript))
-            .expect("durable learning transcript is serializable");
+        let excludes_external_context = self
+            .learning_runtime()
+            .map_err(SessionCommandError::invalid_arguments)?
+            .scheduler
+            .excludes_external_context();
+        if turn.external_context && excludes_external_context {
+            self.exclude_memory_generation(
+                "manual learning excluded because the selected transcript consumed external context",
+                "runtime.external_context",
+            )
+            .map_err(SessionCommandError::internal)?;
+            return Err(SessionCommandError::invalid_arguments(
+                "the selected transcript consumed external context, so learning generation is excluded for this session",
+            ));
+        }
+        let transcript = redact_learning_text(
+            &serde_json::to_string(&learning_transcript_json(&turn.transcript))
+                .expect("durable learning transcript is serializable"),
+            self.credential.as_deref(),
+        );
         let explicit_feedback = self
             .learning_runtime()
             .map_err(SessionCommandError::invalid_arguments)?
@@ -5911,13 +6175,16 @@ impl TurnHost {
             let learning = self
                 .learning_runtime()
                 .map_err(SessionCommandError::invalid_arguments)?;
+            let generation = learning.generation.as_ref().ok_or_else(|| {
+                SessionCommandError::invalid_arguments("learning generation is disabled")
+            })?;
             (
                 learning.scheduler.clone(),
-                Arc::clone(&learning.extractor),
+                Arc::clone(&generation.extractor),
                 learning.experiences.clone(),
                 learning.patterns.clone(),
                 learning.skills.clone(),
-                learning.owner_id.clone(),
+                generation.owner_id.clone(),
             )
         };
         let admitted = match scheduler
@@ -5931,6 +6198,7 @@ impl TurnHost {
                 ));
             }
             LearningScheduleOutcome::Ineligible
+            | LearningScheduleOutcome::Excluded
             | LearningScheduleOutcome::SkippedInsufficientRecords { .. } => {
                 return Err(SessionCommandError::internal(
                     "manual reflection was unexpectedly filtered by an automatic scheduling gate",
@@ -5961,18 +6229,22 @@ impl TurnHost {
             .clone()
             .ok_or_else(|| SessionCommandError::internal("learning job payload is missing"))
             .and_then(|payload| {
-                serde_json::from_value::<ExtractionRequest>(payload)
+                decode_extraction_job_payload(payload)
+                    .map(ExtractionJobPayload::into_request)
                     .map_err(SessionCommandError::internal)
             })?;
         let extraction = match extractor.extract(request).await {
             Ok(extraction) => extraction,
             Err(error) => {
-                let _ = scheduler.fail(
-                    &job.id,
-                    &owner_id,
-                    &error.to_string(),
-                    zuno_db::message::now_millis(),
-                );
+                let now = zuno_db::message::now_millis();
+                let _ = match error.recovery() {
+                    Recovery::Retry { after } => {
+                        scheduler.retry(&job.id, &owner_id, &error.to_string(), after, now)
+                    }
+                    Recovery::Reauthenticate | Recovery::Compact | Recovery::Fail => {
+                        scheduler.fail(&job.id, &owner_id, &error.to_string(), now)
+                    }
+                };
                 return Err(SessionCommandError::internal(error));
             }
         };
@@ -6231,6 +6503,19 @@ impl TurnHost {
             .learning_projection
             .snapshot(&self.session_id, &self.project_id)
             .map_err(to_string)?;
+        let mut memory_policy = if self.is_session_materialized() {
+            self.memory_policy_store
+                .get(&self.session_id)
+                .map_err(to_string)?
+                .unwrap_or_else(|| self.memory_policy.clone())
+        } else {
+            self.memory_policy.clone()
+        };
+        restrict_memory_policy_to_capabilities(
+            &mut memory_policy,
+            self.can_use_memories,
+            self.can_generate_learning,
+        );
         Ok(zuno_types::WorkStateProjection {
             goal,
             plan,
@@ -6240,6 +6525,7 @@ impl TurnHost {
             memory_candidates,
             memory_entries,
             learning,
+            memory_policy,
         })
     }
 
@@ -6251,13 +6537,21 @@ impl TurnHost {
         let Some(learning) = &self.learning else {
             return;
         };
-        for _ in 0..LEARNING_RECOVERY_BATCH_LIMIT {
+        let Some(generation) = &learning.generation else {
+            return;
+        };
+        let batch_limit = generation
+            .max_jobs_per_wake
+            .min(u32::try_from(LEARNING_RECOVERY_BATCH_LIMIT).unwrap_or(u32::MAX));
+        for _ in 0..batch_limit {
             let now = zuno_db::message::now_millis();
-            let job = match learning.scheduler.claim_due_for_project(
+            let busy_session_ids = self.runs.active_sessions().into_iter().collect::<Vec<_>>();
+            let job = match learning.scheduler.claim_due_for_project_excluding(
                 &self.project_id,
-                &learning.owner_id,
+                &generation.owner_id,
                 now,
                 now.saturating_add(LEARNING_LEASE_MILLIS),
+                &busy_session_ids,
             ) {
                 Ok(Some(job)) => job,
                 Ok(None) => break,
@@ -6277,14 +6571,14 @@ impl TurnHost {
                 .unwrap_or_else(|| self.session_id.clone());
             let task = tokio::spawn(run_recovered_learning_job(
                 job,
-                Arc::clone(&learning.extractor),
+                Arc::clone(&generation.extractor),
                 learning.scheduler.clone(),
                 learning.experiences.clone(),
                 learning.patterns.clone(),
                 learning.skills.clone(),
                 self.project_id.clone(),
                 self.project_root.clone(),
-                learning.owner_id.clone(),
+                generation.owner_id.clone(),
                 self.work_changes.clone(),
             ));
             self.background_jobs.supervise_handle(
@@ -6300,14 +6594,21 @@ impl TurnHost {
         let Some(learning) = &self.learning else {
             return;
         };
+        let Some(generation) = &learning.generation else {
+            return;
+        };
+        let extractor = Arc::clone(&generation.extractor);
         let scheduler = learning.scheduler.clone();
+        let experiences = learning.experiences.clone();
         let patterns = learning.patterns.clone();
         let skills = learning.skills.clone();
         let project_id = self.project_id.clone();
         let project_root = self.project_root.clone();
-        let owner_id = learning.owner_id.clone();
+        let owner_id = generation.owner_id.clone();
+        let max_jobs_per_wake = generation.max_jobs_per_wake;
         let changes = self.work_changes.clone();
-        let interval = learning.maintenance_interval;
+        let runs = self.runs.clone();
+        let interval = generation.maintenance_interval;
         let cancel = tokio_util::sync::CancellationToken::new();
         let task_cancel = cancel.clone();
         let task = tokio::spawn(async move {
@@ -6326,6 +6627,20 @@ impl TurnHost {
                             );
                             continue;
                         }
+                        run_due_learning_batch(
+                            &scheduler,
+                            Arc::clone(&extractor),
+                            &experiences,
+                            &patterns,
+                            &skills,
+                            &project_id,
+                            &project_root,
+                            &owner_id,
+                            &changes,
+                            &runs,
+                            max_jobs_per_wake,
+                        )
+                        .await;
                         match run_due_learning_maintenance(
                             &scheduler,
                             &patterns,
@@ -6348,6 +6663,229 @@ impl TurnHost {
         });
         self.learning_maintenance_cancel = Some(cancel);
         self.learning_maintenance_task = Some(task);
+    }
+
+    pub(super) fn set_memory_use(&mut self, enabled: bool, source: &str) -> Result<(), String> {
+        self.set_memory_policy(
+            enabled,
+            self.memory_policy.generation,
+            if enabled {
+                "the user enabled memory use for this session"
+            } else {
+                "the user disabled memory use for this session"
+            },
+            source,
+        )
+    }
+
+    pub(super) fn set_memory_generation(
+        &mut self,
+        enabled: bool,
+        source: &str,
+    ) -> Result<(), String> {
+        if enabled && self.memory_policy.generation == zuno_types::SessionMemoryGeneration::Excluded
+        {
+            return Err(
+                "learning generation is excluded for this session because it consumed external context; start a new session to enable it"
+                    .to_owned(),
+            );
+        }
+        self.set_memory_policy(
+            self.memory_policy.use_memories,
+            if enabled {
+                zuno_types::SessionMemoryGeneration::Enabled
+            } else {
+                zuno_types::SessionMemoryGeneration::Disabled
+            },
+            if enabled {
+                "the user enabled learning generation for this session"
+            } else {
+                "the user disabled learning generation for this session"
+            },
+            source,
+        )
+    }
+
+    pub(crate) fn update_memory_policy(
+        &mut self,
+        use_memories: bool,
+        generation: zuno_types::SessionMemoryGeneration,
+        expected_revision: i64,
+        reason: &str,
+        source: &str,
+    ) -> Result<zuno_types::SessionMemoryPolicyProjection, MemoryPolicyMutationError> {
+        if !self.is_session_materialized() {
+            return Err(MemoryPolicyMutationError::Invalid(
+                "memory policy can be changed after the session's first prompt is persisted"
+                    .to_owned(),
+            ));
+        }
+        if expected_revision < 0 {
+            return Err(MemoryPolicyMutationError::Invalid(
+                "memory policy expected revision must not be negative".to_owned(),
+            ));
+        }
+        if generation == zuno_types::SessionMemoryGeneration::Excluded {
+            return Err(MemoryPolicyMutationError::Invalid(
+                "excluded generation is host-owned and cannot be selected directly".to_owned(),
+            ));
+        }
+        if use_memories && !self.can_use_memories {
+            return Err(MemoryPolicyMutationError::Invalid(
+                "memory use cannot be enabled because the active configuration provides no resident or learned-memory retrieval capability"
+                    .to_owned(),
+            ));
+        }
+        if generation == zuno_types::SessionMemoryGeneration::Enabled && !self.can_generate_learning
+        {
+            return Err(MemoryPolicyMutationError::Invalid(
+                "learning generation cannot be enabled because the active configuration has no usable extractor runtime"
+                    .to_owned(),
+            ));
+        }
+        if self.memory_policy.generation == zuno_types::SessionMemoryGeneration::Excluded
+            && generation != zuno_types::SessionMemoryGeneration::Excluded
+        {
+            return Err(MemoryPolicyMutationError::Conflict(
+                "learning generation is excluded for this session; start a new session to enable it"
+                    .to_owned(),
+            ));
+        }
+        let store_expected_revision = if self.memory_policy_seeded_from_legacy
+            && expected_revision == 0
+            && self.memory_policy.revision == 1
+        {
+            1
+        } else {
+            expected_revision
+        };
+        let write = self
+            .memory_policy_store
+            .set(zuno_db::session_memory_policy::SessionMemoryPolicyUpdate {
+                session_id: self.session_id.clone(),
+                use_memories,
+                generation,
+                reason: reason.to_owned(),
+                source: source.to_owned(),
+                expected_revision: store_expected_revision,
+                time_updated: zuno_db::message::now_millis(),
+            })
+            .map_err(|error| MemoryPolicyMutationError::Internal(to_string(error)))?;
+        match write {
+            zuno_db::session_memory_policy::SessionMemoryPolicyWrite::Applied(applied) => {
+                self.memory_policy = applied.policy;
+                restrict_memory_policy_to_capabilities(
+                    &mut self.memory_policy,
+                    self.can_use_memories,
+                    self.can_generate_learning,
+                );
+                self.work_changes.changed();
+                self.memory_policy_seeded_from_legacy = false;
+                Ok(self.memory_policy.clone())
+            }
+            zuno_db::session_memory_policy::SessionMemoryPolicyWrite::Stale(current) => {
+                if let Some(current) = current {
+                    self.memory_policy = current;
+                    restrict_memory_policy_to_capabilities(
+                        &mut self.memory_policy,
+                        self.can_use_memories,
+                        self.can_generate_learning,
+                    );
+                    self.work_changes.changed();
+                }
+                self.memory_policy_seeded_from_legacy = false;
+                Err(MemoryPolicyMutationError::Conflict(
+                    "memory policy changed concurrently; refresh and retry".to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn set_memory_policy(
+        &mut self,
+        use_memories: bool,
+        generation: zuno_types::SessionMemoryGeneration,
+        reason: &str,
+        source: &str,
+    ) -> Result<(), String> {
+        self.update_memory_policy(
+            use_memories,
+            generation,
+            self.memory_policy.revision,
+            reason,
+            source,
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    fn refresh_memory_policy(&mut self) -> Result<(), String> {
+        if !self.is_session_materialized() {
+            return Ok(());
+        }
+        if let Some(policy) = self
+            .memory_policy_store
+            .get(&self.session_id)
+            .map_err(to_string)?
+        {
+            self.memory_policy = policy;
+            restrict_memory_policy_to_capabilities(
+                &mut self.memory_policy,
+                self.can_use_memories,
+                self.can_generate_learning,
+            );
+        }
+        Ok(())
+    }
+
+    fn exclude_memory_generation(&mut self, reason: &str, source: &str) -> Result<(), String> {
+        if self.memory_policy.generation == zuno_types::SessionMemoryGeneration::Excluded {
+            return Ok(());
+        }
+        let write = self
+            .memory_policy_store
+            .exclude(
+                zuno_db::session_memory_policy::SessionMemoryPolicyExclusion {
+                    session_id: self.session_id.clone(),
+                    use_memories: self.memory_policy.use_memories,
+                    reason: reason.to_owned(),
+                    source: source.to_owned(),
+                    expected_revision: self.memory_policy.revision,
+                    time_updated: zuno_db::message::now_millis(),
+                },
+            )
+            .map_err(to_string)?;
+        self.adopt_memory_policy_write(write)
+    }
+
+    fn adopt_memory_policy_write(
+        &mut self,
+        write: zuno_db::session_memory_policy::SessionMemoryPolicyWrite,
+    ) -> Result<(), String> {
+        match write {
+            zuno_db::session_memory_policy::SessionMemoryPolicyWrite::Applied(applied) => {
+                self.memory_policy = applied.policy;
+                restrict_memory_policy_to_capabilities(
+                    &mut self.memory_policy,
+                    self.can_use_memories,
+                    self.can_generate_learning,
+                );
+                self.work_changes.changed();
+                Ok(())
+            }
+            zuno_db::session_memory_policy::SessionMemoryPolicyWrite::Stale(current) => {
+                if let Some(current) = current {
+                    self.memory_policy = current;
+                    restrict_memory_policy_to_capabilities(
+                        &mut self.memory_policy,
+                        self.can_use_memories,
+                        self.can_generate_learning,
+                    );
+                    self.work_changes.changed();
+                }
+                Err("memory policy changed concurrently; refresh and retry".to_owned())
+            }
+        }
     }
 
     pub(super) fn memory_apply(&self, id: &str) -> Result<(), String> {
@@ -6417,6 +6955,19 @@ impl TurnHost {
         self.learning
             .as_ref()
             .ok_or_else(|| "user learning is disabled".to_owned())
+    }
+
+    fn require_learning_generation(&self) -> Result<(), String> {
+        if self.memory_policy.generation != zuno_types::SessionMemoryGeneration::Enabled {
+            return Err(
+                "learning generation is disabled for this session; use /memories to enable it"
+                    .to_owned(),
+            );
+        }
+        if self.learning_runtime()?.generation.is_none() {
+            return Err("learning generation is disabled".to_owned());
+        }
+        Ok(())
     }
 
     /// The active harness profile that assembled this session.
@@ -7518,6 +8069,16 @@ impl TurnHost {
                 let transaction =
                     zuno_db::open::immediate_transaction(&self.connection).map_err(to_string)?;
                 zuno_db::session::create(&transaction, &input).map_err(to_string)?;
+                let memory_policy = zuno_db::session_memory_policy::seed_in(
+                    &transaction,
+                    &self.session_id,
+                    self.memory_policy.use_memories,
+                    self.memory_policy.generation,
+                    "session memory defaults frozen at creation",
+                    "configuration",
+                    message.time_created,
+                )
+                .map_err(to_string)?;
                 append_subagent_model_policy_in(
                     &transaction,
                     &self.session_id,
@@ -7528,6 +8089,7 @@ impl TurnHost {
                 persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
                 consume_promoted_input(&transaction, &self.session_id, &durable_input_id)?;
                 transaction.commit().map_err(to_string)?;
+                self.memory_policy = memory_policy;
                 self.session_materializer = SessionMaterializer::Existing;
                 self.session_identity.mark_materialized();
                 Ok(true)
@@ -7861,7 +8423,9 @@ impl TurnHost {
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<TurnOutcome, TurnFailure> {
+        self.refresh_memory_policy().map_err(TurnFailure::host)?;
         let mut resolver = self.resolver.clone();
+        apply_session_memory_use(&mut resolver, self.memory_policy.use_memories);
         let skills = self.skill_catalog.snapshot();
         announce_skills(
             &mut resolver,
@@ -7875,7 +8439,10 @@ impl TurnHost {
                 .append_prompt_section(routing.id, routing.source, routing.content.clone())
                 .map_err(TurnFailure::host)?;
         }
-        if let Some(learning) = &self.learning {
+        if self.memory_policy.use_memories
+            && let Some(learning) = &self.learning
+            && learning.scheduler.use_existing()
+        {
             let query = latest_user_learning_query(&self.connection, &self.session_id)
                 .map_err(TurnFailure::host)?;
             let retrieved = learning
@@ -8117,6 +8684,7 @@ impl TurnHost {
         else {
             return;
         };
+        let scheduler = learning.scheduler.clone();
         let turn = match durable_learning_turn(
             &self.connection,
             &self.session_id,
@@ -8137,8 +8705,31 @@ impl TurnHost {
                 return;
             }
         };
+        if turn.external_context && scheduler.excludes_external_context() {
+            if let Err(error) = self.exclude_memory_generation(
+                "automatic learning excluded because the session consumed external context",
+                "runtime.external_context",
+            ) {
+                let _ = events
+                    .publish(TurnEvent::Provider {
+                        step: *steps,
+                        event: StreamEvent::StatusDetail {
+                            detail: format!(
+                                "warning: external-context learning exclusion could not be persisted: {error}"
+                            ),
+                        },
+                    })
+                    .await;
+            }
+            return;
+        }
+        if learning.generation.is_none()
+            || self.memory_policy.generation != zuno_types::SessionMemoryGeneration::Enabled
+        {
+            return;
+        }
         let now = zuno_db::message::now_millis();
-        if let Err(error) = learning.scheduler.reconcile_expired(now) {
+        if let Err(error) = scheduler.reconcile_expired(now) {
             let _ = events
                 .publish(TurnEvent::Provider {
                     step: *steps,
@@ -8175,9 +8766,12 @@ impl TurnHost {
                 return;
             }
         };
-        let transcript = serde_json::to_string(&learning_transcript_json(&transcript))
-            .expect("durable learning transcript is serializable");
-        let admitted = match learning.scheduler.schedule_post_turn(
+        let transcript = redact_learning_text(
+            &serde_json::to_string(&learning_transcript_json(&transcript))
+                .expect("durable learning transcript is serializable"),
+            self.credential.as_deref(),
+        );
+        let admitted = match scheduler.schedule_post_turn(
             &self.project_id,
             &self.session_id,
             assistant_message_id,
@@ -8189,6 +8783,7 @@ impl TurnHost {
                 recovered_from_error,
                 user_corrected: turn.user_corrected,
                 explicit_feedback,
+                external_context: turn.external_context,
             },
             now,
         ) {
@@ -8198,6 +8793,7 @@ impl TurnHost {
             Ok(
                 LearningScheduleOutcome::Disabled
                 | LearningScheduleOutcome::Ineligible
+                | LearningScheduleOutcome::Excluded
                 | LearningScheduleOutcome::SkippedInsufficientRecords { .. },
             ) => return,
             Err(error) => {
@@ -8214,142 +8810,12 @@ impl TurnHost {
                 return;
             }
         };
-        let claimed = match learning.scheduler.claim(
-            &admitted.id,
-            &learning.owner_id,
-            now,
-            now.saturating_add(LEARNING_LEASE_MILLIS),
-        ) {
-            Ok(Some(job)) => job,
-            Ok(None) => return,
-            Err(error) => {
-                let _ = events
-                    .publish(TurnEvent::Provider {
-                        step: *steps,
-                        event: StreamEvent::StatusDetail {
-                            detail: format!(
-                                "warning: learning extraction could not claim its durable job: {error}"
-                            ),
-                        },
-                    })
-                    .await;
-                return;
-            }
-        };
-        let request = match claimed
-            .payload
-            .clone()
-            .map(serde_json::from_value::<ExtractionRequest>)
-            .transpose()
-        {
-            Ok(Some(request)) => request,
-            Ok(None) => {
-                let detail = "learning extraction job has no durable request payload";
-                let _ = learning.scheduler.fail(
-                    &claimed.id,
-                    &learning.owner_id,
-                    detail,
-                    zuno_db::message::now_millis(),
-                );
-                return;
-            }
-            Err(error) => {
-                let detail = format!("learning extraction request is corrupt: {error}");
-                let _ = learning.scheduler.fail(
-                    &claimed.id,
-                    &learning.owner_id,
-                    &detail,
-                    zuno_db::message::now_millis(),
-                );
-                return;
-            }
-        };
-        let extractor = Arc::clone(&learning.extractor);
-        let experiences = learning.experiences.clone();
-        let scheduler = learning.scheduler.clone();
-        let patterns = learning.patterns.clone();
-        let skills = learning.skills.clone();
-        let owner_id = learning.owner_id.clone();
-        let job_id = claimed.id.clone();
-        let project_id = self.project_id.clone();
-        let project_root = self.project_root.clone();
-        let changes = self.work_changes.clone();
-        let events = events.clone();
-        let step = *steps;
-        let supervised = tokio::spawn(async move {
-            match extractor.extract(request).await {
-                Ok(extraction) => match experiences.persist_extraction(
-                    &job_id,
-                    &owner_id,
-                    extraction,
-                    zuno_db::message::now_millis(),
-                ) {
-                    Err(error) => {
-                        tracing::warn!(
-                            job_id,
-                            error = %error,
-                            "learning extraction outcome could not be persisted"
-                        );
-                    }
-                    Ok(persisted) => {
-                        // An extraction that stored two of three entries is a different
-                        // outcome from one that stored three. The reason is durable in
-                        // the job row; this is the line the user sees, on the same path
-                        // the other learning warnings above take.
-                        for detail in extraction_refusal_lines(&persisted) {
-                            tracing::warn!(
-                                job_id,
-                                refusal = %detail,
-                                "learning extraction refused one entry"
-                            );
-                            let _ = events
-                                .publish(TurnEvent::Provider {
-                                    step,
-                                    event: StreamEvent::StatusDetail { detail },
-                                })
-                                .await;
-                        }
-                        if let Err(error) = run_due_learning_maintenance(
-                            &scheduler,
-                            &patterns,
-                            &skills,
-                            &project_id,
-                            &project_root,
-                            &owner_id,
-                            zuno_db::message::now_millis(),
-                        ) {
-                            tracing::warn!(
-                                job_id,
-                                error = %error,
-                                "learning maintenance could not complete"
-                            );
-                        }
-                        changes.changed();
-                    }
-                },
-                Err(error) => {
-                    if let Err(settle_error) = scheduler.fail(
-                        &job_id,
-                        &owner_id,
-                        &error.to_string(),
-                        zuno_db::message::now_millis(),
-                    ) {
-                        tracing::warn!(
-                            job_id,
-                            error = %settle_error,
-                            extractor_error = %error,
-                            "learning extraction failure could not be persisted"
-                        );
-                    }
-                }
-            }
-        });
-        self.background_jobs.supervise_handle(
-            claimed.id,
-            self.session_id.clone(),
-            tokio_util::sync::CancellationToken::new(),
-            supervised,
+        tracing::debug!(
+            job_id = admitted.id,
+            scheduled_at = admitted.scheduled_at,
+            "automatic learning extraction queued for the background idle worker"
         );
+        self.work_changes.changed();
     }
 
     fn finish_goal_error(
@@ -10142,6 +10608,13 @@ fn configure_resident_memory(
         )?;
     }
     Ok(())
+}
+
+fn apply_session_memory_use(resolver: &mut Resolver, use_memories: bool) {
+    if !use_memories {
+        resolver.remove_prompt_section("memory.global");
+        resolver.remove_prompt_section("memory.project");
+    }
 }
 
 /// Render a failed turn: its category, then every cause it wraps, then what to do.

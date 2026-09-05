@@ -11,8 +11,10 @@ use zuno_server::api::{self, ApiState};
 use zuno_server::{
     AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventFanout, EventService, NewEvent,
     PermissionRequest, QuestionDecision, QuestionRequest, QuestionToolCall, RequestBroker,
-    ServerBuilder, ServerConfig, ServerServices, SessionCompactExecution, SessionMutationExecutor,
-    SessionMutationFuture, SessionPromptExecution, SessionReportExecution, events_router,
+    ServerBuilder, ServerConfig, ServerServices, SessionCompactExecution,
+    SessionMemoryPolicyExecution, SessionMemoryPolicyFuture, SessionMemoryPolicyMutationError,
+    SessionMutationExecutor, SessionMutationFuture, SessionPromptExecution, SessionReportExecution,
+    events_router,
 };
 use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin};
 use zuno_tools::question::{QuestionAsker, QuestionOutcome};
@@ -353,7 +355,7 @@ impl DetachedTurnObserver for ServerDetachedTurnObserver {
     }
 
     async fn work_state(&self, session_id: &str, work: &zuno_types::WorkStateProjection) {
-        let properties = match serde_json::to_value(&work.learning) {
+        let mut properties = match serde_json::to_value(&work.learning) {
             Ok(serde_json::Value::Object(properties)) => properties,
             Ok(_) => {
                 tracing::debug!(
@@ -371,6 +373,11 @@ impl DetachedTurnObserver for ServerDetachedTurnObserver {
                 return;
             }
         };
+        properties.insert(
+            "memoryPolicy".to_owned(),
+            serde_json::to_value(&work.memory_policy)
+                .expect("session memory policy contains only serializable fields"),
+        );
         let event = match NewEvent::new("learning.state.changed", properties) {
             Ok(event) => event,
             Err(error) => {
@@ -501,6 +508,51 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
             executor.finish_hosted(&spec, host, outcome).await
         })
     }
+
+    fn memory_policy(
+        &self,
+        request: SessionMemoryPolicyExecution,
+        guard: SessionRunGuard,
+    ) -> SessionMemoryPolicyFuture {
+        let executor = self.clone();
+        Box::pin(async move {
+            let spec = ServerHostSpec {
+                session_id: request.session_id,
+                directory: request.directory,
+                agent: request.agent,
+                model: request.model,
+            };
+            let mut host = executor
+                .open_active(&spec)
+                .await
+                .map_err(SessionMemoryPolicyMutationError::Internal)?;
+            let outcome = host
+                .update_memory_policy(
+                    request.use_memories,
+                    request.generation,
+                    request.expected_revision,
+                    &request.reason,
+                    "server",
+                )
+                .map_err(|error| match error {
+                    super::turn::MemoryPolicyMutationError::Invalid(error) => {
+                        SessionMemoryPolicyMutationError::Invalid(error)
+                    }
+                    super::turn::MemoryPolicyMutationError::Conflict(error) => {
+                        SessionMemoryPolicyMutationError::Conflict(error)
+                    }
+                    super::turn::MemoryPolicyMutationError::Internal(error) => {
+                        SessionMemoryPolicyMutationError::Internal(error)
+                    }
+                });
+            executor
+                .finish_hosted(&spec, host, Ok(()))
+                .await
+                .map_err(SessionMemoryPolicyMutationError::Internal)?;
+            drop(guard);
+            outcome
+        })
+    }
 }
 
 fn finish_server_mutation(
@@ -587,10 +639,25 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
         } else {
             server_config
         };
+        let memory = harness_config.resolved_memory();
+        let learning = harness_config.resolved_learning();
+        let memory_policy_default = zuno_types::SessionMemoryPolicyProjection {
+            use_memories: memory.resident || learning.use_existing,
+            generation: if learning.generate {
+                zuno_types::SessionMemoryGeneration::Enabled
+            } else {
+                zuno_types::SessionMemoryGeneration::Disabled
+            },
+            reason: None,
+            source: None,
+            time: None,
+            revision: 0,
+        };
         let state = ApiState::open_default(&directory)
             .map_err(|error| error.to_string())?
             .with_configured_shell(harness_config.shell.clone())
             .with_attachment_store(attachments)
+            .with_memory_policy_default(memory_policy_default)
             .with_events(events.clone());
         let goals = Arc::new(
             zuno_goal::GoalStore::from_pool(Arc::clone(&pool), zuno_goal::default_spill_dir())

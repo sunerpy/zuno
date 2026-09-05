@@ -163,6 +163,10 @@ pub enum DialogOutcome {
         scope: zuno_types::MemoryScope,
         content: String,
     },
+    /// Change whether this session uses resident and retrieved memories.
+    MemoryUseSet { enabled: bool },
+    /// Change whether this session may generate new durable learning.
+    MemoryGenerationSet { enabled: bool },
 }
 
 /// One of `§11.4`'s three fixed dialog widths.

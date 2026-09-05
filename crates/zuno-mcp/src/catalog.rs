@@ -997,7 +997,7 @@ impl Tool for McpToolProxy {
             });
         }
         let rendered = render_content(&result.content);
-        let mut output = ToolOutput::text(String::new(), rendered.text);
+        let mut output = ToolOutput::text(String::new(), rendered.text).with_external_context();
         output.attachments = rendered.attachments;
         Ok(output)
     }
@@ -1183,7 +1183,8 @@ impl Tool for ReadResourceTool {
             .await
             .map_err(|source| tool_error(self.id(), source))?;
         let rendered = render_resource_contents(&server, &uri, &contents);
-        let mut output = ToolOutput::text(format!("MCP resource: {uri}"), rendered.text);
+        let mut output =
+            ToolOutput::text(format!("MCP resource: {uri}"), rendered.text).with_external_context();
         output.attachments = rendered.attachments;
         output.metadata.insert("server".to_owned(), json!(server));
         output.metadata.insert("uri".to_owned(), json!(uri));
@@ -1328,7 +1329,7 @@ fn resource_output(title: String, payload: &Value, servers: &[String]) -> ToolOu
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
     let text = serde_json::to_string_pretty(payload).unwrap_or_else(|_| "{}".to_owned());
-    let mut output = ToolOutput::text(title, text);
+    let mut output = ToolOutput::text(title, text).with_external_context();
     output.metadata.insert("count".to_owned(), json!(count));
     output.metadata.insert("servers".to_owned(), json!(servers));
     output

@@ -2531,6 +2531,40 @@ async fn apply_selection(
             .await;
             return SelectionOutcome::Unchanged;
         }
+        zuno_tui::views::session::Selection::MemoryUseSet(enabled) => {
+            let changed = host.set_memory_use(enabled, "tui");
+            report_memory_action(
+                rebuild.events,
+                changed.clone(),
+                format!(
+                    "memory use {} for this session",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+            )
+            .await;
+            return if changed.is_ok() {
+                SelectionOutcome::Remount(Box::new(RemountRequest::plain(next)))
+            } else {
+                SelectionOutcome::Unchanged
+            };
+        }
+        zuno_tui::views::session::Selection::MemoryGenerationSet(enabled) => {
+            let changed = host.set_memory_generation(enabled, "tui");
+            report_memory_action(
+                rebuild.events,
+                changed.clone(),
+                format!(
+                    "learning generation {} for this session",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+            )
+            .await;
+            return if changed.is_ok() {
+                SelectionOutcome::Remount(Box::new(RemountRequest::plain(next)))
+            } else {
+                SelectionOutcome::Unchanged
+            };
+        }
         // A theme is owned and applied entirely by the view layer.
         zuno_tui::views::session::Selection::Theme(_) => return SelectionOutcome::Unchanged,
     }

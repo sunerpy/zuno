@@ -348,8 +348,16 @@
   },
   "learning": {
     "enabled": true,
+    "use": true,
+    "generate": true,
     "extractor_model": "anthropic/claude-haiku-4-5",
-    "post_turn": { "enabled": true },
+    "post_turn": {
+      "enabled": true,
+      "idle_delay_ms": 21600000,
+      "poll_interval_ms": 60000,
+      "max_jobs_per_wake": 2,
+      "disable_on_external_context": false
+    },
     "aggregation": {
       "interval_ms": 86400000,
       "min_new_records": 3

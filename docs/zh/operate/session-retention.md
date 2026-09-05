@@ -105,7 +105,7 @@ remote unshare failed for shared session <id>: <detail>; local rows were deleted
 `crates/zuno-db/tests/prune.rs::prune_delete_order_and_true_related_table_count_are_pinned`
 固定，因为这个顺序正是在事务中途保持外键约束成立的关键。
 
-**20 张表**，按此顺序：
+**21 张表**，按此顺序：
 
 <!-- generated:BEGIN prune-tables -->
 | order | table |
@@ -126,10 +126,11 @@ remote unshare failed for shared session <id>: <detail>; local rows were deleted
 | 14 | `part` |
 | 15 | `message` |
 | 16 | `session_share` |
-| 17 | `session` |
-| 18 | `event_sequence` |
-| 19 | `event` |
-| 20 | `verification_receipt` |
+| 17 | `session_memory_policy` |
+| 18 | `session` |
+| 19 | `event_sequence` |
+| 20 | `event` |
+| 21 | `verification_receipt` |
 <!-- generated:END prune-tables -->
 
 上面这张表是删除操作中有顺序的那一部分。在它之后，同一个事务还会清扫当前 schema 中所有以

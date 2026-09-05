@@ -52,6 +52,10 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/api/session/{sessionID}", get(session::get))
         .route("/api/session/{sessionID}/learning", get(session::learning))
+        .route(
+            "/api/session/{sessionID}/memory-policy",
+            get(session::memory_policy).put(session::update_memory_policy),
+        )
         .route("/api/agent", get(catalog::agents))
         .route("/api/command", get(catalog::commands))
         .route("/api/skill", get(catalog::skills))

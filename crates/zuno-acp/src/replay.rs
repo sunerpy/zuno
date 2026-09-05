@@ -261,6 +261,7 @@ pub fn durable_learning_update(work: &WorkStateProjection) -> Value {
         "_meta": {
             "zuno": {
                 "learning": work.learning,
+                "memoryPolicy": work.memory_policy,
             }
         },
     })
@@ -1773,5 +1774,10 @@ mod tests {
             update["_meta"]["zuno"]["learning"]["experiences"][0]["sourceMessageId"],
             "msg-1"
         );
+        assert_eq!(
+            update["_meta"]["zuno"]["memoryPolicy"]["generation"],
+            "enabled"
+        );
+        assert_eq!(update["_meta"]["zuno"]["memoryPolicy"]["useMemories"], true);
     }
 }

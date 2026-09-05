@@ -121,6 +121,7 @@ async fn exa_receives_one_request_per_distinct_query_with_profile_owned_limits()
 
     assert_eq!(output.title, "Web search: rust bounded fetch");
     assert!(output.output.contains("Rust"));
+    assert!(output.contains_external_context());
     assert_eq!(
         output.metadata["sources"],
         json!([{ "url": "https://www.rust-lang.org/", "title": "Rust" }])

@@ -82,12 +82,12 @@ pub use crate::context::{
 };
 pub use crate::output::{
     Attachment, FileDiff, LimitExceeded, METADATA_DYNAMIC_CONTEXT_REFRESH_KEY,
-    METADATA_FILE_DIFFS_KEY, METADATA_HUMAN_REQUEST_ID_KEY, METADATA_MUTATION_CONFLICT_KEY,
-    METADATA_PROGRESS_OBSERVATION_KEY, METADATA_WRITTEN_PATHS_KEY, MutationConflictPresentation,
-    MutationConflictPresentationKind, OutputLimits, QuestionResultPresentation,
-    QuestionResultStatus, SizeMeasurement, SizeVerdict, ToolContinuation,
-    ToolDynamicContextRefresh, ToolOutput, ToolProgressObservation, ToolResultPresentation,
-    UncertainMutationPresentation,
+    METADATA_EXTERNAL_CONTEXT_KEY, METADATA_FILE_DIFFS_KEY, METADATA_HUMAN_REQUEST_ID_KEY,
+    METADATA_MUTATION_CONFLICT_KEY, METADATA_PROGRESS_OBSERVATION_KEY, METADATA_WRITTEN_PATHS_KEY,
+    MutationConflictPresentation, MutationConflictPresentationKind, OutputLimits,
+    QuestionResultPresentation, QuestionResultStatus, SizeMeasurement, SizeVerdict,
+    ToolContinuation, ToolDynamicContextRefresh, ToolOutput, ToolProgressObservation,
+    ToolResultPresentation, UncertainMutationPresentation,
 };
 pub use crate::schema::{ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY};
 pub use crate::store::{StoredOutput, StoredWindow, ToolOutputStore};

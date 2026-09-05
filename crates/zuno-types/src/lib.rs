@@ -54,7 +54,8 @@ impl ActivityProjection {
 /// `unclassified` is used by work-state meters that receive only a trustworthy
 /// aggregate from a child process. It keeps that total honest without pretending the
 /// provider identified it as prompt, completion, reasoning, or cache usage.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TokenUsage {
     pub input: u64,
     pub output: u64,
@@ -187,7 +188,8 @@ pub struct UsageSnapshot {
 }
 
 /// Timing and usage owned by one Goal, Plan, WorkItem, Job, or workflow node.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExecutionSpan {
     pub started_at: i64,
     pub completed_at: Option<i64>,
@@ -216,7 +218,8 @@ impl ExecutionSpan {
 }
 
 /// Resident-memory scope shared by storage, tools, and clients.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryScope {
     Global,
     Project,
@@ -241,8 +244,88 @@ impl MemoryScope {
     }
 }
 
+/// Whether one session may generate durable learning from its transcript.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionMemoryGeneration {
+    /// Automatic extraction and explicit generation may run.
+    #[default]
+    Enabled,
+    /// Generation is disabled and queued automatic extraction work is skipped.
+    Disabled,
+    /// The session is excluded from generation and queued extraction work is skipped.
+    Excluded,
+}
+
+impl SessionMemoryGeneration {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Excluded => "excluded",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "enabled" => Some(Self::Enabled),
+            "disabled" => Some(Self::Disabled),
+            "excluded" => Some(Self::Excluded),
+            _ => None,
+        }
+    }
+}
+
+/// Frontend-neutral per-session memory and learning policy.
+///
+/// Revision zero denotes a caller-supplied default rather than a durable row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMemoryPolicyProjection {
+    /// Whether resident and retrieved memories may be used for this session.
+    #[serde(default = "default_use_memories")]
+    pub use_memories: bool,
+    /// Whether durable learning may be generated from this session.
+    #[serde(default)]
+    pub generation: SessionMemoryGeneration,
+    /// Human-readable reason for the current choice, absent for a caller default.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Stable source that selected the policy, absent for a caller default.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Unix milliseconds of the durable update, absent for a caller default.
+    #[serde(default)]
+    pub time: Option<i64>,
+    /// Zero for a caller default; positive for a durable row.
+    #[serde(default)]
+    pub revision: i64,
+}
+
+impl Default for SessionMemoryPolicyProjection {
+    fn default() -> Self {
+        Self {
+            use_memories: true,
+            generation: SessionMemoryGeneration::Enabled,
+            reason: None,
+            source: None,
+            time: None,
+            revision: 0,
+        }
+    }
+}
+
+const fn default_use_memories() -> bool {
+    true
+}
+
 /// One proposed resident-memory mutation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryAction {
     Add,
     Replace,
@@ -271,7 +354,8 @@ impl MemoryAction {
 }
 
 /// Provenance for a durable memory candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MemorySource {
     Reflection,
     Tool,
@@ -300,7 +384,8 @@ impl MemorySource {
 }
 
 /// Durable lifecycle of one proposed memory change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryCandidateStatus {
     Pending,
     Applying,
@@ -344,7 +429,8 @@ impl MemoryCandidateStatus {
 }
 
 /// Client-neutral memory candidate with audit provenance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MemoryCandidateProjection {
     pub id: String,
     pub scope: MemoryScope,
@@ -364,14 +450,15 @@ pub struct MemoryCandidateProjection {
 }
 
 /// One current resident-memory entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MemoryEntryProjection {
     pub scope: MemoryScope,
     pub content: String,
 }
 
 /// User feedback attached to one durable assistant message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedbackRating {
     Positive,
@@ -398,7 +485,7 @@ impl FeedbackRating {
 }
 
 /// Current feedback state for one durable message.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageFeedbackProjection {
     pub message_id: String,
@@ -411,7 +498,7 @@ pub struct MessageFeedbackProjection {
 }
 
 /// What one durable experience records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExperienceKind {
     Outcome,
@@ -455,7 +542,7 @@ impl ExperienceKind {
 }
 
 /// Lifecycle of one durable experience.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExperienceStatus {
     Active,
@@ -485,7 +572,7 @@ impl ExperienceStatus {
 }
 
 /// Frontend-neutral view of one learned experience.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExperienceProjection {
     pub id: String,
@@ -505,7 +592,7 @@ pub struct ExperienceProjection {
 }
 
 /// Lifecycle of one mined learning pattern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LearningPatternStatus {
     Pending,
@@ -538,7 +625,7 @@ impl LearningPatternStatus {
 }
 
 /// Frontend-neutral view of one mined pattern.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LearningPatternProjection {
     pub id: String,
@@ -556,7 +643,7 @@ pub struct LearningPatternProjection {
 }
 
 /// Lifecycle of a reviewable Skill change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillCandidateStatus {
     PendingReview,
@@ -610,7 +697,7 @@ impl SkillCandidateStatus {
 }
 
 /// Filesystem effect proposed by a Skill candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillCandidateOperation {
     Apply,
@@ -637,7 +724,7 @@ impl SkillCandidateOperation {
 }
 
 /// Review projection for a complete Skill candidate and its evaluation.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillCandidateProjection {
     pub id: String,
@@ -659,7 +746,7 @@ pub struct SkillCandidateProjection {
 }
 
 /// Frontend-neutral learning projection shared by TUI, Server, and ACP.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LearningStateProjection {
     pub feedback: Vec<MessageFeedbackProjection>,
@@ -669,7 +756,8 @@ pub struct LearningStateProjection {
 }
 
 /// Active goal summary shown by clients.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoalPauseProjection {
     pub reason: String,
     pub human_request_id: Option<String>,
@@ -677,7 +765,8 @@ pub struct GoalPauseProjection {
 }
 
 /// One persisted cross-turn Goal retry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoalRetryProjection {
     pub attempt: u32,
     pub reason: String,
@@ -687,7 +776,8 @@ pub struct GoalRetryProjection {
 }
 
 /// One persisted provider-request backoff checkpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderBackoffProjection {
     pub request_id: String,
     pub turn_id: String,
@@ -701,7 +791,8 @@ pub struct ProviderBackoffProjection {
 }
 
 /// One durable human request currently blocking Goal continuation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HumanRequestProjection {
     pub id: String,
     pub kind: String,
@@ -710,7 +801,8 @@ pub struct HumanRequestProjection {
 }
 
 /// Active goal summary shown by clients.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GoalStateProjection {
     pub id: String,
     pub revision: i64,
@@ -729,7 +821,8 @@ pub struct GoalStateProjection {
 }
 
 /// One stable step in the current durable plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PlanStepProjection {
     pub id: String,
     pub title: String,
@@ -737,7 +830,8 @@ pub struct PlanStepProjection {
 }
 
 /// The current durable plan shown by clients.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PlanProjection {
     pub id: String,
     pub parent_plan_id: Option<String>,
@@ -752,7 +846,8 @@ pub struct PlanProjection {
 }
 
 /// One durable work item shown by clients.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TodoProjection {
     pub id: String,
     pub goal_id: Option<String>,
@@ -772,7 +867,8 @@ pub struct TodoProjection {
 }
 
 /// The typed subject owned by one durable background job.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
 pub enum JobSubjectProjection {
     ChildSession {
         session_id: String,
@@ -794,7 +890,8 @@ pub enum JobSubjectProjection {
 }
 
 /// One durable child work item owned by a workflow or Council job.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JobChildProjection {
     pub id: String,
     pub subject: String,
@@ -804,7 +901,8 @@ pub struct JobChildProjection {
 }
 
 /// One durable background job shown by clients.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JobProjection {
     pub id: String,
     pub subject: JobSubjectProjection,
@@ -819,7 +917,8 @@ pub struct JobProjection {
 }
 
 /// One durable background terminal shown by clients.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BackgroundExecutionProjection {
     pub id: String,
     pub title: String,
@@ -835,7 +934,8 @@ pub struct BackgroundExecutionProjection {
 }
 
 /// Frontend-neutral durable work state for one session and project.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkStateProjection {
     pub goal: Option<GoalStateProjection>,
     pub plan: Option<PlanProjection>,
@@ -845,4 +945,38 @@ pub struct WorkStateProjection {
     pub memory_candidates: Vec<MemoryCandidateProjection>,
     pub memory_entries: Vec<MemoryEntryProjection>,
     pub learning: LearningStateProjection,
+    #[serde(default)]
+    pub memory_policy: SessionMemoryPolicyProjection,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_state_default_includes_the_compatible_memory_policy() {
+        let state = WorkStateProjection::default();
+        assert_eq!(
+            state.memory_policy,
+            SessionMemoryPolicyProjection::default()
+        );
+        assert!(state.memory_policy.use_memories);
+        assert_eq!(
+            state.memory_policy.generation,
+            SessionMemoryGeneration::Enabled
+        );
+        assert_eq!(state.memory_policy.revision, 0);
+    }
+
+    #[test]
+    fn session_memory_generation_has_stable_wire_spellings() {
+        for (generation, spelling) in [
+            (SessionMemoryGeneration::Enabled, "enabled"),
+            (SessionMemoryGeneration::Disabled, "disabled"),
+            (SessionMemoryGeneration::Excluded, "excluded"),
+        ] {
+            assert_eq!(generation.as_str(), spelling);
+            assert_eq!(SessionMemoryGeneration::parse(spelling), Some(generation));
+        }
+    }
 }

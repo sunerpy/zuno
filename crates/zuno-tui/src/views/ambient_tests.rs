@@ -253,6 +253,7 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
             content: "prefer concise explanations".to_owned(),
         }],
         learning: zuno_types::LearningStateProjection::default(),
+        memory_policy: zuno_types::SessionMemoryPolicyProjection::default(),
     };
     view.toggle(Section::Memory);
     let joined = view

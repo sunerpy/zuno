@@ -761,16 +761,23 @@
           "description": "Project-level pattern mining."
         },
         "enabled": {
-          "description": "Master switch. Learning is disabled unless explicitly enabled.",
+          "description": "Master switch. Defaults to false and caps both `use` and `generate`.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "extractor_model": {
-          "description": "Dedicated model used by the no-tools structured extractor.",
+          "description": "Dedicated model used by the no-tools structured extractor.\n\nRequired only when effective generation is enabled.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "generate": {
+          "description": "Generate new Experience, Memory candidates, patterns, and Skill candidates.\n\nDefaults to true when `enabled` is true. The extractor model is required only\nwhen this resolves to true.",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -817,6 +824,13 @@
             }
           ],
           "description": "Skill-candidate evidence and review thresholds."
+        },
+        "use": {
+          "description": "Use durable Experience records produced by earlier runs.\n\nDefaults to true when `enabled` is true. The master switch remains an upper\nbound, so `enabled: false` disables use even when this field is true.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -846,9 +860,44 @@
     "LearningPostTurnConfig": {
       "additionalProperties": false,
       "properties": {
-        "enabled": {
+        "disable_on_external_context": {
+          "description": "Skip automatic extraction when the completed turn consumed external context.\nDefaults to false.",
           "type": [
             "boolean",
+            "null"
+          ]
+        },
+        "enabled": {
+          "description": "Enable automatic extraction after an eligible completed task. Defaults to true\nwhen effective generation is enabled.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "idle_delay_ms": {
+          "description": "Delay before an automatic extraction job becomes runnable. Defaults to\n21600000 milliseconds (six hours).\n\nZero keeps automatic extraction immediate.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_jobs_per_wake": {
+          "description": "Maximum automatic extraction jobs admitted by one worker wake. Defaults to 2.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "poll_interval_ms": {
+          "description": "Interval between background queue polls. Defaults to 60000 milliseconds.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
             "null"
           ]
         }
