@@ -583,13 +583,13 @@ fn memory_options_resolve_caps_and_component_flags() {
 }
 
 #[test]
-fn learning_is_disabled_by_default_and_resolves_native_thresholds() {
+fn learning_is_enabled_by_default_and_resolves_native_thresholds() {
     let learning = Config::default().resolved_learning();
-    assert!(!learning.enabled);
-    assert!(!learning.use_existing);
-    assert!(!learning.generate);
+    assert!(learning.enabled);
+    assert!(learning.use_existing);
+    assert!(learning.generate);
     assert_eq!(learning.extractor_model, None);
-    assert!(!learning.post_turn_enabled);
+    assert!(learning.post_turn_enabled);
     assert_eq!(learning.post_turn_idle_delay_ms, 21_600_000);
     assert_eq!(learning.post_turn_poll_interval_ms, 60_000);
     assert_eq!(learning.post_turn_max_jobs_per_wake, 2);
@@ -606,27 +606,28 @@ fn learning_is_disabled_by_default_and_resolves_native_thresholds() {
 }
 
 #[test]
-fn enabled_learning_requires_an_extractor_and_skill_review() {
-    let missing =
-        parse(r#"{"learning":{"enabled":true}}"#).expect_err("enabled learning needs an extractor");
-    assert_eq!(issue_path(&missing), "learning.extractor_model");
+fn enabled_learning_allows_model_inheritance_and_requires_skill_review() {
+    let inherited = parse(r#"{"learning":{"enabled":true}}"#)
+        .expect("enabled learning may inherit its extractor model")
+        .resolved_learning();
+    assert!(inherited.generate);
+    assert_eq!(inherited.extractor_model, None);
 
-    let review = parse(
-        r#"{"learning":{"enabled":true,"extractor_model":"provider/model","skill":{"require_review":false}}}"#,
-    )
-    .expect_err("Skill review cannot be disabled");
+    let review = parse(r#"{"learning":{"enabled":true,"skill":{"require_review":false}}}"#)
+        .expect_err("Skill review cannot be disabled");
     assert_eq!(issue_path(&review), "learning.skill.require_review");
 }
 
 #[test]
 fn learning_master_switch_and_use_generate_matrix_resolve_independently() {
-    let defaults = parse(r#"{"learning":{"enabled":true,"extractor_model":"provider/extractor"}}"#)
+    let defaults = parse(r#"{"learning":{}}"#)
         .expect("enabled learning defaults both capabilities on")
         .resolved_learning();
     assert!(defaults.enabled);
     assert!(defaults.use_existing);
     assert!(defaults.generate);
     assert!(defaults.post_turn_enabled);
+    assert_eq!(defaults.extractor_model, None);
 
     let read_only = parse(r#"{"learning":{"enabled":true,"use":true,"generate":false}}"#)
         .expect("read-only learning needs no extractor")
@@ -637,11 +638,9 @@ fn learning_master_switch_and_use_generate_matrix_resolve_independently() {
     assert!(!read_only.post_turn_enabled);
     assert_eq!(read_only.extractor_model, None);
 
-    let generation_only = parse(
-        r#"{"learning":{"enabled":true,"use":false,"generate":true,"extractor_model":"provider/extractor"}}"#,
-    )
-    .expect("generation-only learning")
-    .resolved_learning();
+    let generation_only = parse(r#"{"learning":{"enabled":true,"use":false,"generate":true}}"#)
+        .expect("generation-only learning")
+        .resolved_learning();
     assert!(generation_only.enabled);
     assert!(!generation_only.use_existing);
     assert!(generation_only.generate);
@@ -713,15 +712,16 @@ fn learning_options_resolve_exact_flywheel_limits() {
 }
 
 #[test]
-fn learning_generation_requires_an_extractor_but_read_only_use_does_not() {
+fn learning_generation_and_read_only_use_both_allow_model_inheritance() {
     let read_only = parse(r#"{"learning":{"enabled":true,"use":true,"generate":false}}"#)
         .expect("read-only use is valid without an extractor");
     assert!(read_only.resolved_learning().use_existing);
 
-    let missing = parse(r#"{"learning":{"enabled":true,"use":false,"generate":true}}"#)
-        .expect_err("generation needs an extractor");
-    assert_eq!(issue_path(&missing), "learning.extractor_model");
-    assert!(issue_detail(&missing).contains("learning.generate"));
+    let generation = parse(r#"{"learning":{"enabled":true,"use":false,"generate":true}}"#)
+        .expect("generation may inherit an extractor");
+    let generation = generation.resolved_learning();
+    assert!(generation.generate);
+    assert_eq!(generation.extractor_model, None);
 }
 
 #[test]

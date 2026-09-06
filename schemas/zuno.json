@@ -761,21 +761,21 @@
           "description": "Project-level pattern mining."
         },
         "enabled": {
-          "description": "Master switch. Defaults to false and caps both `use` and `generate`.",
+          "description": "Master switch. Defaults to true and caps both `use` and `generate`.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "extractor_model": {
-          "description": "Dedicated model used by the no-tools structured extractor.\n\nRequired only when effective generation is enabled.",
+          "description": "Optional dedicated model used by the no-tools structured extractor.",
           "type": [
             "string",
             "null"
           ]
         },
         "generate": {
-          "description": "Generate new Experience, Memory candidates, patterns, and Skill candidates.\n\nDefaults to true when `enabled` is true. The extractor model is required only\nwhen this resolves to true.",
+          "description": "Generate new Experience, Memory candidates, patterns, and Skill candidates.\n\nDefaults to true when `enabled` is true. When no extractor model is named,\nruntime resolution prefers the active provider's `small_model` and then the\nactive session model.",
           "type": [
             "boolean",
             "null"

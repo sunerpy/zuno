@@ -987,16 +987,20 @@ the runtime compares the resident file with both stored snapshots and marks the
 observed result; it never replays the write or undo. Any third state becomes
 `uncertain` and requires user inspection.
 
-User learning is a separate native subsystem. `learning.use` and
-`learning.generate` are independent below the `learning.enabled` ceiling, so
-existing Experience can remain available when no extractor model is configured.
+User learning is a separate native subsystem and is enabled by default.
+`learning.use` and `learning.generate` are independent below the
+`learning.enabled` ceiling, so existing Experience can remain available when
+generation is explicitly disabled.
 A completed turn with tools,
 artifacts, recovery, correction, or explicit feedback admits an idempotent
 `learning_job` keyed by `(session, message, extractor_version)`. The dedicated
-`learning.extractor_model` receives the replayed durable transcript and a
-structured response schema with no tools, network, filesystem authority, or
-foreground-session identity. Request and terminal outcome are persisted as
-`learning.extraction.request` and `learning.extraction.outcome`.
+`learning.extractor_model` is authoritative when present. Without one, the
+runtime selects a reachable `small_model` from the active provider and then the
+active session model; it does not open another provider. The selected model
+receives the replayed durable transcript and a structured response schema with
+no tools, network, filesystem authority, or foreground-session identity.
+Request and terminal outcome are persisted as `learning.extraction.request` and
+`learning.extraction.outcome`.
 
 Extraction settlement atomically stores `ExperienceRecord` rows and evidence.
 Unresolved issues remain searchable but cannot become Memory, patterns, or Skill
@@ -1019,8 +1023,11 @@ configured, consuming one excludes the session from automatic generation.
 Transcript copies are scrubbed at secret-value granularity before they enter a
 learning job or extraction event, while the original durable Message and
 non-secret evidence are preserved. Retryable extractor failures return the same
-durable job to a bounded exponential-backoff deadline; permanent failures settle
-it instead.
+durable job to a bounded exponential-backoff deadline. Typed provider rate
+limits preserve `Retry-After`; authentication, context-limit, protocol, and
+other permanent failures settle instead of replaying the unchanged request.
+There is no quota-percentage, daily-token, or currency budget; eligibility,
+idempotency, the wake cap, and the three-attempt ceiling bound background work.
 
 Retrieved experience enters the stable `learning.experiences` prompt section.
 The post-hook prompt receipt stores each source identity, content, and digest, so

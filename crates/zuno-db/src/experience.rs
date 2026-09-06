@@ -18,6 +18,7 @@ const QUALIFIED_COLUMNS: &str = "experience_record.id, experience_record.project
     experience_record.resolution, experience_record.confidence, experience_record.fingerprint, \
     experience_record.status, experience_record.promoted_memory_candidate_id, \
     experience_record.time_created, experience_record.time_updated";
+const MAX_FTS_QUERY_TERMS: usize = 64;
 
 const EXPERIENCE_FTS_SQL: &str = r#"
 CREATE VIRTUAL TABLE IF NOT EXISTS experience_search_fts USING fts5(
@@ -308,6 +309,9 @@ impl ExperienceStore {
         if query.trim().is_empty() {
             return self.list_for_project(project_id, limit);
         }
+        let Some(query) = fts_match_query(query) else {
+            return Ok(Vec::new());
+        };
         self.ensure_fts()?;
         let connection = self.pool.get()?;
         query_records(
@@ -732,6 +736,53 @@ where
         .collect()
 }
 
+/// Convert arbitrary user text into a bounded literal FTS5 expression.
+///
+/// Raw prompts may contain column selectors, operators, unmatched quotes, or
+/// identifier punctuation such as `SMOKE-MEMORY-20260906`. Passing that text
+/// directly to `MATCH` lets FTS5 parse it as query syntax and turns ordinary
+/// foreground prompts into database failures. Quoted alphanumeric terms keep
+/// the existing all-term search semantics without granting the input an FTS
+/// grammar.
+fn fts_match_query(input: &str) -> Option<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let push = |terms: &mut Vec<String>, current: &mut String| {
+        if current.is_empty() || terms.len() >= MAX_FTS_QUERY_TERMS {
+            current.clear();
+            return;
+        }
+        if !terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case(current.as_str()))
+        {
+            terms.push(std::mem::take(current));
+        } else {
+            current.clear();
+        }
+    };
+
+    for character in input.chars() {
+        if character.is_alphanumeric() || character == '_' {
+            current.push(character);
+        } else {
+            push(&mut terms, &mut current);
+        }
+        if terms.len() >= MAX_FTS_QUERY_TERMS {
+            break;
+        }
+    }
+    push(&mut terms, &mut current);
+
+    (!terms.is_empty()).then(|| {
+        terms
+            .into_iter()
+            .map(|term| format!("\"{term}\""))
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
 fn read_required(connection: &rusqlite::Connection, id: &str) -> Result<ExperienceRecord, DbError> {
     let mut record = connection
         .query_row(
@@ -965,6 +1016,52 @@ mod tests {
             .expect("search");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].projection.id, "experience-1");
+    }
+
+    #[test]
+    fn fts_search_treats_prompt_syntax_as_literal_text() {
+        let (pool, store) = fixture();
+        LearningJobStore::new(pool)
+            .enqueue(NewLearningJob::extraction(
+                "job-1",
+                "project-1",
+                "session-1",
+                "assistant-1",
+                "extractor-v1",
+                json!({}),
+                10,
+            ))
+            .expect("enqueue");
+        let jobs = LearningJobStore::new(store.pool.clone());
+        jobs.claim_due("worker-1", 11, 30)
+            .expect("claim")
+            .expect("job");
+        let mut experience = extracted(ExperienceKind::Procedure);
+        experience.summary = "Release notes include the marker SMOKE-MEMORY-20260906.".to_owned();
+        store
+            .complete_extraction("job-1", "worker-1", &[experience], &json!({"count": 1}), 21)
+            .expect("complete");
+
+        let found = store
+            .search("project-1", "SMOKE-MEMORY-20260906", 5)
+            .expect("hyphenated literal search");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].projection.id, "experience-1");
+
+        let unmatched = store
+            .search(
+                "project-1",
+                r#"Inspect README.md using (read-only) tools: "remember this" OR title:other"#,
+                5,
+            )
+            .expect("prompt syntax is data, not FTS grammar");
+        assert!(unmatched.is_empty());
+        assert!(
+            store
+                .search("project-1", " -- (( )) \"\" ", 5)
+                .expect("punctuation-only query")
+                .is_empty()
+        );
     }
 
     #[test]

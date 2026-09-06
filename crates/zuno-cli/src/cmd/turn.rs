@@ -977,8 +977,15 @@ impl TurnPlan {
             },
             &mut notes,
         )?;
-        let learning_model =
-            resolve_learning_model(&config, &catalog, &provider_id, env, &mut notes)?;
+        let learning_model = resolve_learning_model(
+            &config,
+            &catalog,
+            &provider_id,
+            &model_id,
+            catalog_model,
+            env,
+            &mut notes,
+        )?;
         let delegation_facts = Arc::new(delegation_facts(&catalog));
         let subagent_model_policy = resolve_subagent_model_policy(&config, &catalog)?;
         let skill_options = zuno_catalog::skill::SkillOptions::from_config(
@@ -2048,11 +2055,17 @@ fn resolve_internals(
     })
 }
 
-/// Resolve the no-tools learning extractor onto its explicitly configured model.
+/// Resolve the no-tools learning extractor without opening another provider.
+///
+/// An explicit extractor remains authoritative. Without one, learning prefers a
+/// reachable `small_model` served by the active provider and finally inherits the
+/// active session model.
 fn resolve_learning_model(
     config: &zuno_config::schema::Config,
     catalog: &Catalog,
     provider_id: &str,
+    model_id: &str,
+    session_model: &zuno_llm::catalog::ResolvedModel,
     env: &zuno_paths::Env,
     notes: &mut Vec<String>,
 ) -> Result<Option<LearningModelPlan>, String> {
@@ -2060,40 +2073,81 @@ fn resolve_learning_model(
     if !learning.generate {
         return Ok(None);
     }
-    let qualified = learning.extractor_model.as_deref().ok_or_else(|| {
-        "learning.generate requires a non-empty learning.extractor_model".to_owned()
-    })?;
-    let Some((extractor_provider, extractor_model)) = qualified.split_once('/') else {
-        notes.push(format!(
-            "learning disabled: extractor_model must be provider/model, got `{qualified}`"
-        ));
-        return Ok(None);
-    };
-    if extractor_provider != provider_id {
-        notes.push(format!(
-            "learning disabled: `{qualified}` uses `{extractor_provider}`, but this turn only wires `{provider_id}` credentials"
-        ));
-        return Ok(None);
-    }
-    let Some(model) = catalog.model(extractor_provider, extractor_model) else {
-        notes.push(format!(
-            "learning disabled: extractor model `{qualified}` is not in the resolved catalog"
-        ));
-        return Ok(None);
-    };
-    if provider_factory_key(model.api.transport).is_none() {
-        notes.push(format!(
-            "learning disabled: extractor model `{qualified}` has no native provider transport"
-        ));
-        return Ok(None);
-    }
-    let resolved = match engine_model(catalog, model, env) {
-        Ok(resolved) => resolved,
-        Err(error) => {
+
+    let (model, resolved) = if let Some(qualified) = learning.extractor_model.as_deref() {
+        let Some((extractor_provider, extractor_model)) = qualified.split_once('/') else {
             notes.push(format!(
-                "learning disabled: extractor model `{qualified}` is unreachable ({error})"
+                "learning disabled: extractor_model must be provider/model, got `{qualified}`"
             ));
             return Ok(None);
+        };
+        if extractor_provider != provider_id {
+            notes.push(format!(
+                "learning disabled: `{qualified}` uses `{extractor_provider}`, but this turn only wires `{provider_id}` credentials"
+            ));
+            return Ok(None);
+        }
+        let Some(model) = catalog.model(extractor_provider, extractor_model) else {
+            notes.push(format!(
+                "learning disabled: extractor model `{qualified}` is not in the resolved catalog"
+            ));
+            return Ok(None);
+        };
+        if provider_factory_key(model.api.transport).is_none() {
+            notes.push(format!(
+                "learning disabled: extractor model `{qualified}` has no native provider transport"
+            ));
+            return Ok(None);
+        }
+        let resolved = match engine_model(catalog, model, env) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                notes.push(format!(
+                    "learning disabled: extractor model `{qualified}` is unreachable ({error})"
+                ));
+                return Ok(None);
+            }
+        };
+        (model, resolved)
+    } else {
+        let inherited = config.small_model.as_deref().and_then(|qualified| {
+            let Some((small_provider, small_model)) = qualified.split_once('/') else {
+                notes.push(format!(
+                    "learning extractor: small_model must be provider/model, got `{qualified}`; using `{provider_id}/{model_id}` instead"
+                ));
+                return None;
+            };
+            if small_provider != provider_id {
+                notes.push(format!(
+                    "learning extractor: `{qualified}` is served by `{small_provider}`, and only `{provider_id}` credentials are wired; using `{provider_id}/{model_id}` instead"
+                ));
+                return None;
+            }
+            let Some(model) = catalog.model(small_provider, small_model) else {
+                notes.push(format!(
+                    "learning extractor: small_model `{qualified}` is not in the resolved catalog; using `{provider_id}/{model_id}` instead"
+                ));
+                return None;
+            };
+            if provider_factory_key(model.api.transport).is_none() {
+                notes.push(format!(
+                    "learning extractor: small_model `{qualified}` has no native provider transport; using `{provider_id}/{model_id}` instead"
+                ));
+                return None;
+            }
+            match engine_model(catalog, model, env) {
+                Ok(resolved) => Some((model, resolved)),
+                Err(error) => {
+                    notes.push(format!(
+                        "learning extractor: small_model `{qualified}` is unreachable ({error}); using `{provider_id}/{model_id}` instead"
+                    ));
+                    None
+                }
+            }
+        });
+        match inherited {
+            Some(inherited) => inherited,
+            None => (session_model, engine_model(catalog, session_model, env)?),
         }
     };
     let declared_output = token_count(model.limit.output);
@@ -2604,6 +2658,14 @@ impl InternalProviders for RegistryProviders<'_> {
 
 const LEARNING_EXTRACTOR_VERSION: &str = "zuno-learning-extractor-v1";
 
+enum LearningExtractorRequestError {
+    Provider {
+        source: ProviderError,
+        detail: String,
+    },
+    Detail(String),
+}
+
 struct ProviderLearningExtractor {
     provider: Arc<dyn Provider>,
     model: EngineModel,
@@ -2660,7 +2722,7 @@ impl LearningExtractor for ProviderLearningExtractor {
             "learning_extraction",
         );
         let operation_span = request_span.clone();
-        let streamed: Result<(StreamAccumulator, bool), String> = async {
+        let streamed: Result<(StreamAccumulator, bool), LearningExtractorRequestError> = async {
             let mut stream = self.provider.stream(
                 CompletionRequest::new(self.model.model_id.clone(), messages)
                     .on_surface(self.model.surface)
@@ -2673,14 +2735,34 @@ impl LearningExtractor for ProviderLearningExtractor {
             let mut saw_message_end = false;
             while let Some(event) = stream.next().await {
                 match event {
-                    Ok(StreamEvent::Error { message, .. }) => return Err(message),
+                    Ok(StreamEvent::Error {
+                        message,
+                        retry_after: Some(retry_after),
+                    }) => {
+                        return Err(LearningExtractorRequestError::Provider {
+                            source: ProviderError::RateLimited {
+                                retry_after: Some(retry_after),
+                            },
+                            detail: message,
+                        });
+                    }
+                    Ok(StreamEvent::Error {
+                        message,
+                        retry_after: None,
+                    }) => return Err(LearningExtractorRequestError::Detail(message)),
                     Ok(event) => {
                         saw_message_end |= matches!(event, StreamEvent::MessageEnd { .. });
-                        accumulator
-                            .apply(&event)
-                            .map_err(|error| error.to_string())?;
+                        accumulator.apply(&event).map_err(|error| {
+                            LearningExtractorRequestError::Detail(error.to_string())
+                        })?;
                     }
-                    Err(error) => return Err(error.to_string()),
+                    Err(error) => {
+                        let detail = error.to_string();
+                        return Err(LearningExtractorRequestError::Provider {
+                            source: error,
+                            detail,
+                        });
+                    }
                 }
             }
             Ok((accumulator, saw_message_end))
@@ -2705,11 +2787,14 @@ impl LearningExtractor for ProviderLearningExtractor {
                         "learning extractor provider request failed"
                     );
                 });
-                return Err(learning_extractor_error(record_learning_failure(
-                    &self.events,
-                    &request.session_id,
-                    error,
-                )));
+                return Err(match error {
+                    LearningExtractorRequestError::Provider { source, detail } => {
+                        learning_provider_error(&self.events, &request.session_id, source, detail)
+                    }
+                    LearningExtractorRequestError::Detail(detail) => learning_extractor_error(
+                        record_learning_failure(&self.events, &request.session_id, detail),
+                    ),
+                });
             }
         };
         if !saw_message_end {
@@ -3010,6 +3095,28 @@ fn learning_extractor_error(source: zuno_error::BoxSource) -> LearningServiceErr
     }
 }
 
+fn learning_provider_error(
+    events: &zuno_db::event_log::SessionEventLog,
+    session_id: &str,
+    source: ProviderError,
+    detail: String,
+) -> LearningServiceError {
+    match append_learning_event(
+        events,
+        session_id,
+        "learning.extraction.outcome",
+        json!({"status":"failed","error":&detail}),
+    ) {
+        Ok(()) => LearningServiceError::ExtractorProvider {
+            version: LEARNING_EXTRACTOR_VERSION.to_owned(),
+            source,
+        },
+        Err(event_error) => learning_extractor_error(Box::new(std::io::Error::other(format!(
+            "{detail}; failed to persist learning outcome: {event_error}"
+        )))),
+    }
+}
+
 fn sha256_hex(input: &[u8]) -> String {
     Sha256::digest(input)
         .iter()
@@ -3246,12 +3353,17 @@ fn run_due_learning_maintenance(
     project_root: &std::path::Path,
     owner_id: &str,
     now: i64,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    let mut changed = false;
     let project_job = match scheduler
         .schedule_project_aggregation(project_id, now)
         .map_err(to_string)?
     {
-        LearningScheduleOutcome::Queued(job) | LearningScheduleOutcome::Existing(job) => Some(job),
+        LearningScheduleOutcome::Queued(job) => {
+            changed = true;
+            Some(job)
+        }
+        LearningScheduleOutcome::Existing(job) => Some(job),
         LearningScheduleOutcome::Disabled
         | LearningScheduleOutcome::Ineligible
         | LearningScheduleOutcome::Excluded
@@ -3267,6 +3379,7 @@ fn run_due_learning_maintenance(
             )
             .map_err(to_string)?
     {
+        changed = true;
         let result = (|| -> Result<Value, String> {
             let since = job
                 .payload
@@ -3324,9 +3437,11 @@ fn run_due_learning_maintenance(
                 .schedule_global_aggregation(&evidence_digest, now)
                 .map_err(to_string)?
             {
-                LearningScheduleOutcome::Queued(job) | LearningScheduleOutcome::Existing(job) => {
+                LearningScheduleOutcome::Queued(job) => {
+                    changed = true;
                     Some(job)
                 }
+                LearningScheduleOutcome::Existing(job) => Some(job),
                 LearningScheduleOutcome::Disabled
                 | LearningScheduleOutcome::Ineligible
                 | LearningScheduleOutcome::Excluded
@@ -3345,6 +3460,7 @@ fn run_due_learning_maintenance(
             )
             .map_err(to_string)?
     {
+        changed = true;
         match patterns.mine_global(now).map_err(to_string) {
             Ok(proposals) => {
                 let pattern_ids = proposals
@@ -3373,7 +3489,7 @@ fn run_due_learning_maintenance(
             }
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 struct ClaimedAggregationContext<'a> {
@@ -3529,6 +3645,7 @@ async fn run_recovered_learning_job(
                                 &owner_id,
                                 zuno_db::message::now_millis(),
                             )
+                            .map(|_| ())
                             .map_err(|error| (error, Recovery::Fail))
                         }),
                     Err(error) => Err((error.to_string(), error.recovery())),
@@ -6265,6 +6382,7 @@ impl TurnHost {
             &owner_id,
             zuno_db::message::now_millis(),
         )
+        .map(|_| ())
         .map_err(SessionCommandError::internal)?;
         self.work_changes.changed();
         Ok(json!({
@@ -6650,7 +6768,8 @@ impl TurnHost {
                             &owner_id,
                             now,
                         ) {
-                            Ok(()) => changes.changed(),
+                            Ok(true) => changes.changed(),
+                            Ok(false) => {}
                             Err(error) => tracing::warn!(
                                 project_id,
                                 error,

@@ -36,7 +36,7 @@ pub use crate::skill::{
 };
 pub use zuno_eval::EvaluationService;
 
-use zuno_error::{BoxSource, DbError, LearningError, Recoverable, Recovery};
+use zuno_error::{BoxSource, DbError, LearningError, ProviderError, Recoverable, Recovery};
 use zuno_eval::EvaluationError;
 use zuno_memory::MemoryServiceError;
 
@@ -50,6 +50,12 @@ pub enum LearningServiceError {
     Memory(#[from] MemoryServiceError),
     #[error(transparent)]
     Evaluation(#[from] EvaluationError),
+    #[error("learning extractor `{version}` provider failed: {source}")]
+    ExtractorProvider {
+        version: String,
+        #[source]
+        source: ProviderError,
+    },
     #[error("learning extractor `{version}` failed: {source}")]
     Extractor {
         version: String,
@@ -84,6 +90,7 @@ impl Recoverable for LearningServiceError {
             Self::Evaluation(
                 EvaluationError::InvalidSnapshot | EvaluationError::EmptySuite { .. },
             ) => Recovery::Fail,
+            Self::ExtractorProvider { source, .. } => Recoverable::recovery(source),
             Self::Evaluation(EvaluationError::Evaluator { .. }) | Self::Extractor { .. } => {
                 Recovery::Retry { after: None }
             }
@@ -96,4 +103,54 @@ pub type Result<T> = std::result::Result<T, LearningServiceError>;
 pub(crate) fn digest_text(text: &str) -> String {
     use sha2::{Digest as _, Sha256};
     hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn provider_failures_keep_their_typed_recovery() {
+        let retry_after = Duration::from_secs(37);
+        let rate_limit = LearningServiceError::ExtractorProvider {
+            version: "v1".to_owned(),
+            source: ProviderError::RateLimited {
+                retry_after: Some(retry_after),
+            },
+        };
+        assert_eq!(
+            rate_limit.recovery(),
+            Recovery::Retry {
+                after: Some(retry_after)
+            }
+        );
+
+        let auth = LearningServiceError::ExtractorProvider {
+            version: "v1".to_owned(),
+            source: ProviderError::Auth {
+                provider: "provider".to_owned(),
+                source: None,
+            },
+        };
+        assert_eq!(auth.recovery(), Recovery::Reauthenticate);
+
+        let context = LearningServiceError::ExtractorProvider {
+            version: "v1".to_owned(),
+            source: ProviderError::ContextLimit {
+                limit_tokens: Some(10),
+                used_tokens: Some(11),
+            },
+        };
+        assert_eq!(context.recovery(), Recovery::Compact);
+
+        let fatal = LearningServiceError::ExtractorProvider {
+            version: "v1".to_owned(),
+            source: ProviderError::Fatal {
+                status: Some(400),
+                source: None,
+            },
+        };
+        assert_eq!(fatal.recovery(), Recovery::Fail);
+    }
 }

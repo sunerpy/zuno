@@ -35,8 +35,8 @@ learning loop.
 
 ## Enablement and session ownership
 
-`learning.enabled` is the master switch. Under it, `learning.use` and
-`learning.generate` resolve independently:
+Learning is enabled by default. `learning.enabled` remains the master switch;
+under it, `learning.use` and `learning.generate` resolve independently:
 
 - use without generate retrieves existing Experience without starting an
   extractor provider;
@@ -48,6 +48,10 @@ learning loop.
 
 Projection and review remain readable when generation is disabled. Cleanup,
 rejection, undo, and forgetting never require an extractor model.
+
+The extractor model is resolved without opening another provider. An explicit
+`learning.extractor_model` is authoritative; otherwise the active provider's
+reachable `small_model` is preferred, then the active session model.
 
 ## Fast path: record after a useful task
 
@@ -73,6 +77,12 @@ write transaction. A newer session activity timestamp, queued/steering/promoted
 input, a process-local live-turn lease, or a disabled/excluded session policy
 prevents the claim without spending an attempt. Manual `/reflect` is made
 immediately due, but still respects the session generation policy.
+
+There is no quota-percentage, daily-token, or currency budget for automatic
+learning. Zuno's API-key providers do not expose one common remaining-quota
+snapshot. Actual provider rate limits retain their typed `Retry-After`; the idle
+delay, eligibility transaction, two-job wake cap, idempotency, and three-attempt
+ceiling bound the work instead.
 
 When `post_turn.disable_on_external_context` is true, Web and MCP tools mark
 their successful results with a durable typed metadata bit. A completed turn
@@ -143,6 +153,11 @@ Automatic retrieval is project-first and defaults to five records within a
 1,200-token context budget. The SQLite provider uses FTS5 over title, summary,
 and resolution. The `experience_search` tool exposes explicit deeper search
 without changing the default prompt budget.
+
+Foreground prompt text and explicit search text are converted to bounded quoted
+terms before `MATCH`. FTS5 operators, unmatched quotes, column selectors, and
+punctuated identifiers therefore remain input data instead of becoming SQL
+query grammar or failing the turn.
 
 Retrieved experience enters the prompt as the stable
 `learning.experiences` section. Each item carries its durable Experience id,
@@ -318,17 +333,14 @@ learning jobs. Experience, Memory, patterns, evaluations, and Skill candidates
 are project learning and survive transcript retention; nullable session/message
 provenance is detached by foreign-key policy.
 
-## Configuration migration
+## Configuration
 
-Learning is off by default and requires an explicit extractor model:
+Learning is on by default. The following object shows the tunable defaults; it
+does not need to be present to enable learning:
 
 ```json
 {
   "learning": {
-    "enabled": true,
-    "use": true,
-    "generate": true,
-    "extractor_model": "provider/model",
     "post_turn": {
       "enabled": true,
       "idle_delay_ms": 21600000,
@@ -357,11 +369,12 @@ Learning is off by default and requires an explicit extractor model:
 }
 ```
 
-`use` and `generate` both default to true only after the `enabled` master switch
-is true. The retired `memory.reflection` and `memory.nudge_interval` fields have no
-compatibility aliases and are rejected as unknown keys. `small_model` remains an
-independent internal-model route; learning uses the explicit
-`learning.extractor_model`.
+`enabled`, `use`, and `generate` default to true. Explicitly disabling the master
+switch caps both subordinate capabilities. The retired `memory.reflection` and
+`memory.nudge_interval` fields have no compatibility aliases and are rejected as
+unknown keys. An explicit `learning.extractor_model` wins; otherwise learning
+uses a reachable same-provider `small_model`, then the active session model.
+Existing durable session policies are not rewritten when this default changes.
 
 ## Non-goals
 
