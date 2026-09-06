@@ -1337,6 +1337,17 @@ usable model window and can be disabled with `compaction.auto: false`. A
 provider-confirmed context-limit failure retains its bounded recovery
 compaction, while a manual command is always eligible.
 
+The prelude checks persisted history before the first provider request. A long
+tool turn then checks the same proactive threshold before every subsequent
+provider request, so one turn cannot keep growing until the provider's hard
+limit. The check prefers the previous response's provider-reported context
+usage; if the provider supplied no usable measurement, it uses the current
+assembled prompt estimate. Reaching the threshold publishes an informational
+notice with stable code `context.compact` and returns
+`TurnError::CompactionRequired`. The host follows the existing typed
+compact-and-retry recovery path. With `compaction.auto: false`, the host
+attaches no proactive threshold and none of these between-request checks run.
+
 An automatic compaction consults the auto-continue hook only after the summary is
 durable and the prompt cache has been reset. If that hook fails, the session stays
 `Compacted`: the persisted summary stands, no continuation turn is synthesized because
@@ -1519,6 +1530,12 @@ Recovery is selected from typed errors, never rendered messages:
 - A budget policy may ask for compaction instead of a stop. That is classified as a
   context-limit failure and follows the same path: retained history is compacted, and
   the turn is retried.
+- A proactive context-threshold crossing inside a multi-step tool turn follows that
+  same typed path. Before every provider request after the first, the loop uses the
+  previous response's provider-reported context usage when available and otherwise
+  the current assembled prompt estimate. It emits `context.compact`, compacts the
+  retained history, and retries the turn; `compaction.auto: false` disables this
+  proactive trigger.
 - The budget policy is consulted before every provider request and after every
   response. The profile-published `TurnAllowance` may add a tool-call ceiling and a
   wall-clock ceiling that apply with or without a Goal; a reached ceiling stops the

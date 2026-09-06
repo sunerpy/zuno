@@ -69,12 +69,19 @@ same policy.
 
 Operational notices — a remote rule file that could not be fetched (its rules are not in
 force while the turn proceeds), a turn stopped by its
-token, tool-call, or wall-clock allowance, a compaction the budget policy requested —
+token, tool-call, or wall-clock allowance, or a compaction requested by the budget or
+context policy —
 are projected as `agent_thought_chunk` updates tagged `_meta.zuno.notice` with
 `severity` (`info`, `warning`, or `error`) and a stable `code` such as
-`instruction.not_in_force`, `budget.compact`, or `budget.token_budget`. The tag is how
-a client distinguishes them from model output; they are never part of the transcript
-the model sees.
+`instruction.not_in_force`, `budget.compact`, `budget.token_budget`, or
+`context.compact`. The tag is how a client distinguishes them from model output; they
+are never part of the transcript the model sees.
+
+For a known model context window, `ProviderRequestStarted` immediately publishes an
+ACP `usage_update` with the assembled prompt estimate. When provider token usage
+arrives, a second update replaces it with the measured value. These are absolute
+request-occupancy updates rather than cumulative percentages, so a request after
+compaction immediately recalculates the editor's context indicator.
 
 ## Goal continuation
 
