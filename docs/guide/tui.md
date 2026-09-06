@@ -197,8 +197,8 @@ otherwise it updates the current goal. Objective changes also reconcile an activ
 Plan by archiving the previous visible Plan and installing a new root bound to the current
 `goal_id` for multi-stage work. An atomic objective does not rebind an already terminal
 historical Plan; one that belongs to a previous Goal is archived as completed history.
-Explicit actions such as `/goal show`, `/goal edit ...`, `/goal budget
-<positive tokens|none>`, and `/goal complete` remain available.
+Explicit actions such as `/goal show`, `/goal edit ...`,
+`/goal budget <positive tokens|none>`, and `/goal complete` remain available.
 
 Zuno notices — a remote rule file that could not be fetched, a turn stopped by its token,
 tool-call, or wall-clock allowance, a compaction the budget policy requested — appear as
