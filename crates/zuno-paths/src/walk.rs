@@ -43,22 +43,16 @@ use std::path::{Path, PathBuf};
 
 use crate::node_path;
 
-/// Walk from `start` towards the filesystem root, collecting existing
-/// `<directory>/<target>` paths.
+/// Walk from `start` towards the filesystem root, returning every directory.
 ///
-/// See the module documentation for the `stop` semantics.
+/// `stop` follows [`up`]'s inclusive string-equality semantics.
 #[must_use]
-pub fn up(targets: &[&str], start: &Path, stop: Option<&Path>) -> Vec<PathBuf> {
-    let mut found = Vec::new();
+pub fn ancestors(start: &Path, stop: Option<&Path>) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
     let mut current = start.to_string_lossy().into_owned();
     let stop = stop.map(|path| path.to_string_lossy().into_owned());
     loop {
-        for target in targets {
-            let candidate = node_path::join(&current, target);
-            if Path::new(&candidate).exists() {
-                found.push(PathBuf::from(candidate));
-            }
-        }
+        directories.push(PathBuf::from(&current));
         if stop.as_deref() == Some(current.as_str()) {
             break;
         }
@@ -67,6 +61,25 @@ pub fn up(targets: &[&str], start: &Path, stop: Option<&Path>) -> Vec<PathBuf> {
             break;
         }
         current = parent;
+    }
+    directories
+}
+
+/// Walk from `start` towards the filesystem root, collecting existing
+/// `<directory>/<target>` paths.
+///
+/// See the module documentation for the `stop` semantics.
+#[must_use]
+pub fn up(targets: &[&str], start: &Path, stop: Option<&Path>) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for directory in ancestors(start, stop) {
+        let current = directory.to_string_lossy();
+        for target in targets {
+            let candidate = node_path::join(current.as_ref(), target);
+            if Path::new(&candidate).exists() {
+                found.push(PathBuf::from(candidate));
+            }
+        }
     }
     found
 }
@@ -117,6 +130,23 @@ mod tests {
             vec![
                 root.path().join("a/b/c").join(&marker),
                 root.path().join("a").join(&marker)
+            ]
+        );
+    }
+
+    #[test]
+    fn ancestors_are_nearest_first_and_include_the_stop_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let start = fixture_path(root.path(), "a/b/c");
+        let stop = fixture_path(root.path(), "a");
+        fs::create_dir_all(&start).expect("create tree");
+
+        assert_eq!(
+            ancestors(&start, Some(&stop)),
+            vec![
+                fixture_path(root.path(), "a/b/c"),
+                fixture_path(root.path(), "a/b"),
+                fixture_path(root.path(), "a"),
             ]
         );
     }

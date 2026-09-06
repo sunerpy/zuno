@@ -559,14 +559,21 @@ Zuno ensures those exact sources are loaded and de-duplicates sources already pr
 in the durable prompt. A missing name or multiple visible sources with the same name
 fails child startup; Zuno never silently picks the first discovery result.
 
-The live Skill catalog preserves the canonical user root
-`$XDG_CONFIG_HOME/zuno/skill` and explicit configured paths even before those
-directories exist. A missing root registers only the nearest existing ancestor
-and always does so non-recursively. After a filesystem event, the catalog
-consumer reconciles the subscription outside the native watcher callback,
-moves it one or more components toward the logical root, and enables recursion
-only when the exact root exists. Every move installs the narrower subscription
-before dropping the old one.
+The live Skill catalog watches exact project Skill roots rather than the
+worktree itself. For every directory from the session directory through the
+worktree, `.zuno/skill` remains a logical root unless project configuration is
+disabled, and `.agents/skills` remains one unless external Skills are disabled.
+The canonical user root `$XDG_CONFIG_HOME/zuno/skill` and explicit configured
+paths are likewise preserved even before those directories exist.
+
+A missing root registers only the nearest existing ancestor and always does so
+non-recursively. After a filesystem event, the catalog consumer reconciles the
+subscription outside the native watcher callback, moves it one or more
+components toward the logical root, and enables recursion only when the exact
+root exists. Every move installs the narrower subscription before dropping the
+old one. Ignore filtering is event policy, not a substitute for bounded native
+registration: Zuno never registers the whole worktree recursively merely to
+discover a future Skill root.
 
 Zuno does not watch `~/.zuno` or its remote Skill cache. The cache is private
 download state created only by configured remote indexes. The standard shared
