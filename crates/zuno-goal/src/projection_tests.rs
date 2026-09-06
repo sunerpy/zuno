@@ -857,6 +857,7 @@ fn the_render_is_atomic_under_a_concurrent_reader() {
     // windows on Windows runners.
     #[cfg(windows)]
     const RENDERS: i64 = 128;
+    const MIN_OVERLAP_READS: u64 = 50;
     const DEADLINE: Duration = Duration::from_secs(60);
 
     let fixture = Fixture::new();
@@ -923,11 +924,22 @@ fn the_render_is_atomic_under_a_concurrent_reader() {
         })
     };
 
-    for tokens_used in 0..RENDERS {
+    let writer_started = Instant::now();
+    let mut renders = 0_i64;
+    while (renders < RENDERS || reads.load(Ordering::Acquire) < MIN_OVERLAP_READS)
+        && writer_started.elapsed() < DEADLINE
+    {
         let mut goal = goal.clone();
-        goal.tokens_used = tokens_used;
-        goal.updated_at_ms = goal.created_at_ms + tokens_used;
+        goal.tokens_used = renders;
+        goal.updated_at_ms = goal.created_at_ms + renders;
         fixture.projection.write(&goal).expect("render");
+        renders = renders.saturating_add(1);
+        // On a loaded Windows runner the writer can complete all 128 replacements
+        // before the reader receives a time slice. Keep producing overlap until the
+        // reader has made the minimum number of successful observations, and yield
+        // explicitly so the concurrency assertion cannot pass or fail by scheduling
+        // luck alone.
+        std::thread::yield_now();
     }
     done.store(true, Ordering::Release);
     let failures = reader.join().expect("the reader thread must not panic");
@@ -943,9 +955,9 @@ fn the_render_is_atomic_under_a_concurrent_reader() {
     );
     let observed = reads.load(Ordering::Relaxed);
     assert!(
-        observed >= 50,
+        observed >= MIN_OVERLAP_READS,
         "the reader only completed {observed} reads, so it cannot have covered \
-         {RENDERS} renders and would have passed vacuously"
+         {renders} renders and would have passed vacuously"
     );
     let stragglers: Vec<String> = path
         .parent()
