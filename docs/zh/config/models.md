@@ -147,7 +147,12 @@ Variant 是模型自身的具名选项集，在 provider 目录中声明：
 | `provider` | object \| `null` | 无 | 支撑该模型的原生传输方式与 API 端点 |
 | `variants` | map \| `null` | 无 | 具名 variant |
 
-`limit.context` 是另外几项预算的推导依据 —— Skill 目录预算与被选中正文预算都是已知上下文的百分比。省略它意味着那些预算改用固定的近似值。
+`limit.context` 是 provider 可见的 prompt/input 上限。ACP 把它报告为可用上下文，
+运行时的 Prompt、压缩、Skill 目录与已选正文预算也从它推导。若 provider 把 1M
+配额拆成 872k input 与 128k output，应配置 `context: 872000` 和
+`output: 128000`；无需让 ACP 另外展示一个合成的 1M 窗口。`limit.output` 会原样
+进入 provider 请求；省略时 Zuno 使用保守的 32,000-token 默认值。非空的 provider
+或 Agent `maxTokens` 会显式覆盖模型声明，`null` 按未设置处理。
 
 ## 运行时切换团队
 

@@ -249,7 +249,6 @@ to watch the guard's parent process; <path> does not exist`，存在但无法启
       "surface": "responses",
       "options": {
         "baseURL": "http://127.0.0.1:8787/v1",
-        "maxTokens": null,
         "timeout": false,
         "headerTimeout": 330000,
         "chunkTimeout": 210000,
@@ -260,6 +259,9 @@ to watch the guard's parent process; <path> does not exist`，存在但无法启
   }
 }
 ```
+
+省略 `maxTokens`（或保留为 `null`）会让逐模型 `limit.output` 进入
+Responses 请求；只有非空的 provider 或 Agent 值才覆盖模型声明。
 
 `reasoningReplay: "encrypted"` 才会让网关封装推理、让 Zuno 重放它。没有它时每个请求依然成功，
 但网关会记录 `reasoning_replay_locked: false`，多次工具调用的一轮会在步骤之间丢掉模型自己的推理。

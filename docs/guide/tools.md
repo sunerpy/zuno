@@ -61,9 +61,11 @@ Notes never expose a host path. A scope may contain at most 100 documents,
 `call_id`, request digest, and revision make a repeated delivery idempotent while
 rejecting stale concurrent writes.
 
-The host classifier decides whether a request requires a durable strategic Plan,
-but it does not generate visible generic steps. The model uses
-`plan_update action=create` for the first Plan or a genuinely new objective;
+Explicit Plan collaboration mode requires durable strategic Plan state. In
+ordinary Work mode, the model decides whether a Plan adds value from the full
+conversation; the host does not parse prompt keywords or generate visible
+generic steps. The model uses `plan_update action=create` for the first Plan or
+a genuinely new objective;
 `patch` changes only named step ids, `append` adds host-identified steps, `push`
 opens a focused child, and `pop` restores the exact parent without retransmitting
 the Plan. Every existing-Plan mutation requires the current
@@ -79,18 +81,18 @@ indefinitely. A mutation changes the fingerprint and resets the count.
 
 `plan_update` and `todo_update` also request dynamic-context invalidation. If another
 provider request will run, the host must rebuild Goal/Plan/Todo/Job projection from the
-committed database first. A Plan mutation changes the one-time Required instruction to
-Maintain. A missing or failed refresher pauses the turn rather than knowingly sending a
-stale developer-priority snapshot.
+committed database first. In explicit Plan mode, a successful Plan mutation changes the
+one-time Required instruction to Maintain. A missing or failed refresher pauses the turn
+rather than knowingly sending a stale developer-priority snapshot.
 
 Before successful delivery, a durable reconciliation driver checks Plan, Todo,
 Job, Goal, tool-result, and verification state. Ordinary sessions holding
 unreconciled durable work receive at most two reconciliation continuations, then
 enter typed `PlanUnreconciled` human wait instead of claiming completion. Only
-durably recorded work counts: a session that recorded no Plan, Todo, or Job
-finishes on its first answer even when the host classifier expected a Plan. Disabling
-`plan_update` prevents model creation or mutation; an existing Plan is still
-persisted, projected, and restored.
+durably recorded work counts: a Work-mode session that records no Plan, Todo,
+or Job finishes on its first answer. Disabling `plan_update` prevents model
+creation or mutation; an existing Plan is still persisted, projected, and
+restored.
 
 The built-in read-only `plan` Agent has one typed handoff exception: a completed planning
 answer leaves the current Plan and Todos, with their existing statuses, as execution work

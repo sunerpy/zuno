@@ -1653,7 +1653,7 @@
       "description": "Token limits (`config/provider.ts:47-53`).",
       "properties": {
         "context": {
-          "description": "Total context window.",
+          "description": "Maximum provider-visible prompt/input tokens used for runtime budgeting.",
           "format": "double",
           "type": "number"
         },

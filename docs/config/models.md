@@ -192,9 +192,15 @@ before making it. The commonly set fields:
 | `provider` | object \| `null` | none | The native transport and API endpoint backing this model |
 | `variants` | map \| `null` | none | Named variants |
 
-`limit.context` is what several other budgets derive from — the Skill catalog budget
-and the selected-body budget are both percentages of a known context. Omitting it
-means those budgets fall back to fixed approximate values instead.
+`limit.context` is the provider-visible prompt/input ceiling. It is what ACP
+reports as the usable context limit and what runtime prompt, compaction, Skill
+catalog, and selected-body budgets derive from. For a provider that advertises a
+1M envelope as 872k input plus 128k output, configure `context: 872000` and
+`output: 128000`; Zuno does not need to display a synthetic 1M ACP window.
+`limit.output` reaches the provider request unchanged. When it is absent, Zuno
+uses a conservative 32,000-token default. A non-null provider or Agent
+`maxTokens` option explicitly overrides the model declaration; `null` is treated
+as unset.
 
 ## Switching teams at runtime
 

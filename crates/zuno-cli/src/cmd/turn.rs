@@ -9731,21 +9731,25 @@ fn ensure_host_plan(
 fn planning_runtime_instruction(decision: &PlanningDecision) -> Option<String> {
     match decision {
         PlanningDecision::Required(_) => Some(
-            "This request requires a durable strategic Plan. Read the current Plan first. If none \
-             exists, create it; if it belongs to a prior objective, replace it with create plus \
-             the current expected_revision. The host assigns step ids. Keep strategic Plan steps \
-             distinct from dynamic Todo detail, and reconcile typed Plan/Todo/Job state before \
-             finishing."
+            "This session is explicitly in Plan collaboration mode. Read the current durable Plan \
+             first. If none exists, create it; if it belongs to a prior objective, replace it with \
+             create plus the current expected_revision. The host assigns step ids. Keep strategic \
+             Plan steps distinct from dynamic Todo detail, and reconcile typed Plan/Todo/Job state \
+             before finishing."
                 .to_owned(),
         ),
         PlanningDecision::Maintain(_) => Some(maintain_plan_runtime_instruction()),
-        PlanningDecision::Atomic(_) | PlanningDecision::Unavailable(_) => None,
+        PlanningDecision::Optional(_)
+        | PlanningDecision::Atomic(_)
+        | PlanningDecision::Unavailable(_) => None,
     }
 }
 
 fn maintain_plan_runtime_instruction() -> String {
-    "Keep the existing durable Plan current through operation-based patches. Reconcile typed \
-     Plan/Todo/Job state before finishing; assistant prose is not execution state."
+    "Reconcile the existing durable Plan with the current objective. Patch it when the objective \
+     continues; replace or supersede it when the objective changes. Do not create filler steps for \
+     one bounded action. Reconcile typed Plan/Todo/Job state before finishing; assistant prose is \
+     not execution state."
         .to_owned()
 }
 
@@ -11286,29 +11290,19 @@ fn resolved_elsewhere(name: &str) -> bool {
     ENDPOINT_OPTIONS.contains(&name) || name == API_KEY_OPTION
 }
 
-/// The ceiling a build will accept even when a model's catalog entry claims more.
-///
-/// `ProviderTransform.OUTPUT_TOKEN_MAX` (`provider/transform.ts:18`).
-const OUTPUT_TOKEN_MAX: u64 = 32_000;
+/// Safe default when a model declares no output-token ceiling.
+const DEFAULT_OUTPUT_TOKEN_MAX: u64 = 32_000;
 
-/// The output-token ceiling for one model, as the oracle computes it.
+/// The output-token ceiling for one model.
 ///
-/// `Math.min(model.limit.output, OUTPUT_TOKEN_MAX) || OUTPUT_TOKEN_MAX`
-/// (`provider/transform.ts:1412-1414`). The `||` is load-bearing rather than
-/// defensive: a catalog entry that declares no output limit deserialises to `0`
-/// (`catalog/models_dev.rs:116-127` defaults the field), and sending `max_tokens: 0`
-/// asks a model for an empty completion. JavaScript's falsy `0` turns that into the
-/// ceiling; this reproduces the same choice explicitly.
-///
-/// # Why a ceiling exists at all
-///
-/// Without it a catalog entry advertising a million-token output would be forwarded
-/// verbatim, and providers differ on whether that is rejected outright or silently
-/// billed. Clamping keeps a bad catalog row from becoming a bad request.
+/// Zuno has native provider boundaries and does not inherit the old global 32k
+/// compatibility cap. A positive model declaration is authoritative and reaches the
+/// provider request unchanged; an absent declaration still gets the conservative 32k
+/// default so Zuno never emits `max_tokens: 0`.
 fn output_ceiling(model: &zuno_llm::catalog::ResolvedModel) -> u64 {
     let declared = token_count(model.limit.output);
-    match declared.min(OUTPUT_TOKEN_MAX) {
-        0 => OUTPUT_TOKEN_MAX,
+    match declared {
+        0 => DEFAULT_OUTPUT_TOKEN_MAX,
         ceiling => ceiling,
     }
 }
@@ -11761,11 +11755,12 @@ fn model_spec(
     for (name, value) in forwarded_options(provider, model) {
         spec = spec.with_option(name, value);
     }
-    if !spec
-        .options
-        .keys()
-        .any(|name| generation::MAX_TOKENS_KEYS.contains(&name.as_str()))
-    {
+    let has_explicit_output_ceiling = generation::MAX_TOKENS_KEYS.iter().any(|name| {
+        spec.options
+            .get(*name)
+            .is_some_and(|value| !value.is_null())
+    });
+    if !has_explicit_output_ceiling {
         spec = spec.with_option(generation::MAX_TOKENS, json!(output_ceiling(model)));
     }
     if factory_key == COMPATIBLE_PROVIDER {

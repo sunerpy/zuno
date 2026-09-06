@@ -184,7 +184,7 @@ pub struct CacheCost {
 /// Context and output ceilings — `provider.ts:1498-1502`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct ModelLimit {
-    /// Total context window in tokens.
+    /// Maximum provider-visible prompt/input tokens used for runtime budgeting.
     pub context: f64,
     /// Maximum input tokens, when it differs from the context window.
     pub input: Option<f64>,
