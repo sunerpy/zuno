@@ -247,6 +247,8 @@ fn bare_auth_login_hides_catalog_only_and_credential_only_providers() {
     );
     let output = terminal.output();
     assert!(output.contains("OpenAI"), "{output}");
+    assert!(output.contains("Amazon Bedrock"), "{output}");
+    assert!(output.contains("OpenAI-compatible"), "{output}");
     assert!(!output.contains("Acme Catalog Only"), "{output}");
     assert!(!output.contains("kiro-auth"), "{output}");
     assert!(!output.contains("Other"), "{output}");
@@ -322,6 +324,12 @@ fn openai_login_prompts_for_the_authentication_method() {
     );
     terminal.write(b"\r");
     assert!(
+        terminal.wait_for_frame("OpenAI connection"),
+        "{}",
+        terminal.output()
+    );
+    terminal.write(b"\r");
+    assert!(
         terminal.wait_for_frame("Login method"),
         "{}",
         terminal.output()
@@ -338,6 +346,186 @@ fn openai_login_prompts_for_the_authentication_method() {
     let (status, output) = terminal.finish();
     assert!(!status.success(), "{output}");
     assert!(output.contains("provider login cancelled"), "{output}");
+}
+
+#[test]
+fn empty_config_can_set_up_bedrock_with_one_visible_provider_and_the_aws_chain() {
+    let fixture = EmptyLoginFixture::new();
+    let mut terminal = fixture.spawn();
+    assert!(
+        terminal.wait_for_frame("Select provider"),
+        "{}",
+        terminal.output()
+    );
+    let picker = terminal.output();
+    assert!(picker.contains("Amazon Bedrock"), "{picker}");
+    assert!(!picker.contains("Bedrock Mantle"), "{picker}");
+    assert!(!picker.contains("Bedrock Runtime"), "{picker}");
+    assert!(!picker.contains("Converse"), "{picker}");
+    terminal.write(b"bedrock\r");
+
+    for (prompt, answer) in [
+        ("Bedrock model id", b"openai.gpt-5.6-sol\r".as_slice()),
+        ("Model display name", b"\r".as_slice()),
+        ("AWS region", b"\r".as_slice()),
+        ("AWS profile", b"us\r".as_slice()),
+    ] {
+        assert!(
+            terminal.wait_for_output(prompt),
+            "missing {prompt}: {}",
+            terminal.output()
+        );
+        terminal.write(answer);
+    }
+    assert!(
+        terminal.wait_for_frame("Amazon Bedrock authentication"),
+        "{}",
+        terminal.output()
+    );
+    terminal.write(b"\r");
+    assert!(
+        terminal.wait_for_frame("Use amazon-bedrock/openai.gpt-5.6-sol as the default model?"),
+        "{}",
+        terminal.output()
+    );
+    terminal.write(b"yes\r");
+
+    let (status, output) = terminal.finish();
+    assert!(status.success(), "{output}");
+    assert!(
+        output.contains("Amazon Bedrock will use the AWS credential chain"),
+        "{output}"
+    );
+    let config = fixture.config();
+    assert_eq!(config["model"], "amazon-bedrock/openai.gpt-5.6-sol");
+    assert_eq!(
+        config["provider"]["amazon-bedrock"]["transport"],
+        "bedrock-mantle"
+    );
+    assert_eq!(config["provider"]["amazon-bedrock"]["surface"], "responses");
+    assert_eq!(
+        config["provider"]["amazon-bedrock"]["options"]["region"],
+        "us-east-2"
+    );
+    assert_eq!(
+        config["provider"]["amazon-bedrock"]["options"]["profile"],
+        "us"
+    );
+    assert!(!fixture.auth_path().exists());
+}
+
+#[test]
+fn empty_config_can_set_up_openai_compatible_as_chat_completions() {
+    let fixture = EmptyLoginFixture::new();
+    let mut terminal = fixture.spawn();
+    assert!(
+        terminal.wait_for_frame("Select provider"),
+        "{}",
+        terminal.output()
+    );
+    terminal.write(b"compatible\r");
+    for (prompt, answer) in [
+        ("Provider id", b"local-compatible\r".as_slice()),
+        ("Provider display name", b"\r".as_slice()),
+        ("Base URL", b"http://127.0.0.1:8000/v1\r".as_slice()),
+        ("Model id", b"local-model\r".as_slice()),
+        ("Model display name", b"\r".as_slice()),
+    ] {
+        assert!(
+            terminal.wait_for_output(prompt),
+            "missing {prompt}: {}",
+            terminal.output()
+        );
+        terminal.write(answer);
+    }
+    assert!(
+        terminal.wait_for_frame("Use local-compatible/local-model as the default model?"),
+        "{}",
+        terminal.output()
+    );
+    terminal.write(b"\r");
+    assert!(
+        terminal.wait_for_output("Enter API key"),
+        "{}",
+        terminal.output()
+    );
+    terminal.write(b"compatible-secret\r");
+
+    let (status, output) = terminal.finish();
+    assert!(status.success(), "{output}");
+    let config = fixture.config();
+    assert_eq!(
+        config["provider"]["local-compatible"]["transport"],
+        "openai-compatible"
+    );
+    assert_eq!(config["provider"]["local-compatible"]["surface"], "chat");
+    assert_eq!(
+        fixture.auth()["local-compatible"]["key"],
+        "compatible-secret"
+    );
+}
+
+#[test]
+fn openai_custom_endpoint_is_written_as_native_responses() {
+    let fixture = EmptyLoginFixture::new();
+    let mut terminal = fixture.spawn();
+    assert!(
+        terminal.wait_for_frame("Select provider"),
+        "{}",
+        terminal.output()
+    );
+    terminal.write(b"\r");
+    assert!(
+        terminal.wait_for_frame("OpenAI connection"),
+        "{}",
+        terminal.output()
+    );
+    terminal.write(b"custom\r");
+    for (prompt, answer) in [
+        ("Provider id", b"custom-responses\r".as_slice()),
+        ("Provider display name", b"\r".as_slice()),
+        (
+            "Responses base URL",
+            b"https://gateway.example.test/v1\r".as_slice(),
+        ),
+        ("Model id", b"reasoning-model\r".as_slice()),
+        ("Model display name", b"\r".as_slice()),
+    ] {
+        assert!(
+            terminal.wait_for_output(prompt),
+            "missing {prompt}: {}",
+            terminal.output()
+        );
+        terminal.write(answer);
+    }
+    assert!(
+        terminal.wait_for_frame("Use custom-responses/reasoning-model as the default model?"),
+        "{}",
+        terminal.output()
+    );
+    terminal.write(b"\r");
+    assert!(
+        terminal.wait_for_output("Enter API key"),
+        "{}",
+        terminal.output()
+    );
+    terminal.write(b"responses-secret\r");
+
+    let (status, output) = terminal.finish();
+    assert!(status.success(), "{output}");
+    let config = fixture.config();
+    assert_eq!(
+        config["provider"]["custom-responses"]["transport"],
+        "openai"
+    );
+    assert_eq!(
+        config["provider"]["custom-responses"]["surface"],
+        "responses"
+    );
+    assert_eq!(
+        fixture.auth()["custom-responses"]["key"],
+        "responses-secret"
+    );
 }
 
 /// A URL login shows the remote-chosen command and waits for an explicit Yes.
@@ -498,6 +686,67 @@ struct TestPty {
     writer: Option<Box<dyn Write + Send>>,
     output: Arc<Mutex<Vec<u8>>>,
     reader: Option<JoinHandle<std::io::Result<()>>>,
+}
+
+struct EmptyLoginFixture {
+    root: tempfile::TempDir,
+    data: std::path::PathBuf,
+    config: std::path::PathBuf,
+    cache: std::path::PathBuf,
+    home: std::path::PathBuf,
+    models: std::path::PathBuf,
+}
+
+impl EmptyLoginFixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("temporary login environment");
+        let data = root.path().join("data");
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        let home = root.path().join("home");
+        let models = root.path().join("models.json");
+        for directory in [&data, &config, &cache, &home] {
+            fs::create_dir_all(directory).expect("create isolated directory");
+        }
+        fs::write(&models, "{}").expect("write empty provider catalog");
+        Self {
+            root,
+            data,
+            config,
+            cache,
+            home,
+            models,
+        }
+    }
+
+    fn spawn(&self) -> TestPty {
+        TestPty::spawn(
+            self.root.path(),
+            &[
+                ("HOME", self.home.as_path()),
+                ("XDG_DATA_HOME", self.data.as_path()),
+                ("XDG_CONFIG_HOME", self.config.as_path()),
+                ("XDG_CACHE_HOME", self.cache.as_path()),
+                ("ZUNO_MODELS_PATH", self.models.as_path()),
+            ],
+        )
+    }
+
+    fn config(&self) -> serde_json::Value {
+        serde_json::from_slice(
+            &fs::read(self.config.join("zuno/zuno.json")).expect("read configured provider"),
+        )
+        .expect("parse configured provider")
+    }
+
+    fn auth_path(&self) -> std::path::PathBuf {
+        self.data.join("zuno/auth.json")
+    }
+
+    fn auth(&self) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(self.auth_path()).expect("read stored credential"))
+            .expect("parse stored credential")
+    }
 }
 
 impl TestPty {

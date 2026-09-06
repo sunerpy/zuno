@@ -19,6 +19,12 @@ printf '%s' "$OPENAI_API_KEY" | zuno auth login openai --method api-key
 
 `zuno auth` 是 `zuno providers` 的别名。先列出方法是值得多敲这一条命令的：一个配置的 provider id 只有在它解析出的原生传输方式确实会消费该凭据时，才会获得 API-key 方法；而一个任意的或仅有凭据的 id 会在 Zuno 读取标准输入之前就被拒绝。
 
+在交互式终端中，`zuno auth login` 也可以先创建 provider，再完成认证。配置界面只暴露
+产品级概念：OpenAI、Amazon Bedrock 与 OpenAI-compatible，而不让用户选择底层
+Bedrock 路由。原生 Responses endpoint 使用 OpenAI transport；OpenAI-compatible
+默认使用 Chat Completions。生成的条目会先经过校验，再原子合并进全局配置，不会替换
+无关设置。
+
 Bedrock 是一条 provider 特有的 bearer 流程，仍使用同一个 `api` 凭据形状：
 
 ```sh

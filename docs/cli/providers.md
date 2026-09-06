@@ -112,10 +112,25 @@ login refuses instead of prompting; pass `--trust-remote-command` to run the rem
 command without confirmation, for a host you already trust. The flag is refused for
 provider logins.
 
-A configured provider with any native Bedrock transport appears in the provider
-picker and exposes `bedrock-bearer-token`. Selecting it prints the bearer-token
-and AWS credential-chain priority before reading a hidden token. Piped login is
-also supported:
+With no provider configuration, the interactive picker still offers three
+product-level choices:
+
+- **OpenAI** — official OpenAI, or a custom Responses endpoint. A custom endpoint
+  is written as `transport: "openai"` with `surface: "responses"`.
+- **Amazon Bedrock** — one user-facing provider. Setup asks for the model, region,
+  optional profile, and either the AWS credential chain or a Bedrock API key.
+- **OpenAI-compatible** — a custom endpoint using Chat Completions. Setup writes
+  `transport: "openai-compatible"` with `surface: "chat"`.
+
+Setup collects only non-secret provider fields in visible prompts, reads API
+keys with terminal echo disabled, then atomically merges one provider into the
+global `zuno.json`. Existing unrelated configuration is retained. A validation
+or credential-storage failure restores the previous file rather than leaving a
+half-configured provider.
+
+A configured Bedrock provider exposes `bedrock-bearer-token`. Selecting that
+method prints the bearer-token and AWS credential-chain priority before reading
+a hidden token. Piped login remains supported for already-configured providers:
 
 ```sh
 printf '%s' "$AWS_BEARER_TOKEN_BEDROCK" |

@@ -7232,6 +7232,7 @@ dependencies = [
  "zip",
  "zuno-acp",
  "zuno-agent",
+ "zuno-atomic-file",
  "zuno-attachment",
  "zuno-auth",
  "zuno-catalog",

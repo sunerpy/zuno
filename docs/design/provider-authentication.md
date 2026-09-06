@@ -125,12 +125,25 @@ A future custom OAuth component must register its methods, implement authorizati
 ## CLI selection
 
 `zuno auth login` owns a short-lived terminal picker rather than borrowing the
-resident TUI or putting selection policy in the provider registry. The official
-`openai` id is always present. Other rows require both a configured, selectable
-model route and an explicitly registered login method. A catalog entry or a
-stored credential alone never creates a row, and there is no `Other` escape
-hatch that stores an unusable credential. `enabled_providers` and
-`disabled_providers` are applied before the list is rendered.
+resident TUI or putting selection policy in the provider registry. Existing
+configured providers still require a selectable model route and an explicitly
+registered login method. In addition, the picker owns three typed setup
+templates: OpenAI, Amazon Bedrock, and OpenAI-compatible. A catalog entry or a
+stored credential alone never creates an arbitrary row.
+
+The templates encode protocol policy rather than asking the user for transport
+internals:
+
+- custom OpenAI endpoints use the native OpenAI transport and Responses surface;
+- OpenAI-compatible endpoints use the compatible transport and Chat surface;
+- Amazon Bedrock is one visible product entry; its generated transport remains an
+  implementation detail and authentication offers the AWS chain or bearer token.
+
+Setup builds and validates the candidate document in memory. It reads any secret
+before publishing configuration, atomically merges one provider into the global
+`zuno.json`, and rolls that file back if effective-config validation or credential
+storage fails. Existing top-level settings and other provider entries survive
+semantically.
 
 When the selected provider has several registered methods, a second picker
 selects the method. Both pickers support arrows, paging, type-to-filter, Enter,
@@ -138,7 +151,8 @@ and Escape/Ctrl+C cancellation. They are entered only when standard input and
 standard error are terminals. A redirected invocation remains deterministic:
 the provider must be explicit, and piped standard input selects its registered
 single credential method (`api-key` or `bedrock-bearer-token`). An unsupported or
-unconfigured id fails before standard input is read or the credential file is changed.
+unconfigured id that is not one of the setup templates fails before standard input
+is read or the credential file is changed.
 
 ## OpenAI authentication
 

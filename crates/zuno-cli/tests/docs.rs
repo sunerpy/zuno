@@ -2789,6 +2789,10 @@ fn providers_login_docs_pin_the_remote_command_confirmation_and_trust_flag() {
             "`bedrock-bearer-token`",
             "`AWS_BEARER_TOKEN_BEDROCK`",
             "AWS SDK credential chain",
+            "**OpenAI-compatible**",
+            "`surface: \"chat\"`",
+            "`surface: \"responses\"`",
+            "atomically merges one provider",
         ],
     );
     contains_all(
@@ -2797,6 +2801,10 @@ fn providers_login_docs_pin_the_remote_command_confirmation_and_trust_flag() {
             "`bedrock-bearer-token`",
             "`AWS_BEARER_TOKEN_BEDROCK`",
             "AWS SDK credential chain",
+            "**OpenAI-compatible**",
+            "`surface: \"chat\"`",
+            "`surface: \"responses\"`",
+            "原子合并进全局 `zuno.json`",
         ],
     );
 }

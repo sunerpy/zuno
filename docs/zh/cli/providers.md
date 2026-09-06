@@ -107,9 +107,22 @@ Zuno 下载 `<url>/.well-known/zuno`，逐行、带引号地打印该文档指�
 登录会拒绝而不是提示；对已经信任的主机可传入 `--trust-remote-command`，
 不经确认直接运行远端指定的命令。该选项对 provider 登录会被拒绝。
 
-含有任一原生 Bedrock transport 的已配置 provider 会出现在选择器中，并暴露
-`bedrock-bearer-token`。选中后，Zuno 会先打印 bearer token 与 AWS credential
-chain 的优先级，再以关闭回显的方式读取 token。也支持管道登录：
+即使没有任何 provider 配置，交互选择器仍会提供三个产品级入口：
+
+- **OpenAI** —— 官方 OpenAI，或自定义 Responses endpoint。自定义端点会写成
+  `transport: "openai"` 与 `surface: "responses"`。
+- **Amazon Bedrock** —— 用户只看到一个 Bedrock。配置会询问模型、Region、可选
+  Profile，并选择 AWS credential chain 或 Bedrock API key。
+- **OpenAI-compatible** —— 使用 Chat Completions 的自定义端点。配置会写成
+  `transport: "openai-compatible"` 与 `surface: "chat"`。
+
+配置过程只在可见提示中收集非密钥字段；API key 输入会关闭终端回显。随后 Zuno
+把一个 provider 原子合并进全局 `zuno.json`，保留其他无关配置。若校验或凭据存储
+失败，会恢复原文件，不留下半配置状态。
+
+已配置的 Bedrock provider 会暴露 `bedrock-bearer-token`。选中后，Zuno 会先打印
+bearer token 与 AWS credential chain 的优先级，再以关闭回显的方式读取 token。
+已配置 provider 仍支持管道登录：
 
 ```sh
 printf '%s' "$AWS_BEARER_TOKEN_BEDROCK" |
