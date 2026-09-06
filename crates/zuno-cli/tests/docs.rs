@@ -948,6 +948,8 @@ fn zed_acp_guide_documents_cross_platform_setup_and_agent_selection() {
             "stdout",
             "cargo test -p zuno --test acp_stdio",
             "https://zed.dev/docs/ai/external-agents",
+            "Opening the Agent Panel does not create history",
+            "absent from `session/list`",
         ],
     );
     for relative in ["README.md", "docs/readme/README.zh-CN.md", "docs/README.md"] {
@@ -955,7 +957,20 @@ fn zed_acp_guide_documents_cross_platform_setup_and_agent_selection() {
     }
     contains_all(
         "docs/design/zed-acp-integration.md",
-        &["../reference/zed-acp.md"],
+        &[
+            "../reference/zed-acp.md",
+            "`session/new` reserves an in-process id",
+            "closing an unused panel leaves no history row",
+        ],
+    );
+    contains_all(
+        "docs/zh/cli/acp.md",
+        &[
+            "不会创建持久 Session",
+            "不会让空的「New Agent Thread」",
+            "关闭从未",
+            "发送消息的面板不会留下历史行",
+        ],
     );
 }
 
@@ -1511,6 +1526,8 @@ fn self_update_documentation_pins_the_verified_release_contract() {
             "`--tag`",
             "`--force`",
             "`--yes`",
+            "replacement prompt is `[Y/n]`",
+            "pressing Enter",
             "x86_64-unknown-linux-musl",
             "SHA256SUMS",
             "atomic self-replace",
@@ -1519,6 +1536,10 @@ fn self_update_documentation_pins_the_verified_release_contract() {
             "HTTPS_PROXY",
             "NO_PROXY",
         ],
+    );
+    contains_all(
+        "docs/zh/operate/self-update.md",
+        &["替换提示为 `[Y/n]`", "直接按 Enter", "无法识别的答案会取消"],
     );
     for relative in ["README.md", "docs/readme/README.zh-CN.md", "docs/README.md"] {
         contains_all(relative, &["self-update", "reference/self-update.md"]);

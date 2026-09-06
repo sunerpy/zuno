@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 /// pointing at ACP rather than at the edit. Keep the headroom.
 const TEST_CONFIG: &str = r#"{"formatter":false,"lsp":false,"model":"test/test-model","provider":{"test":{"name":"test","id":"test","env":[],"transport":"openai-compatible","models":{"test-model":{"id":"test-model","name":"Test model","attachment":false,"reasoning":false,"temperature":false,"tool_call":true,"release_date":"2025-01-01","limit":{"context":200000,"output":10000},"cost":{"input":0,"output":0},"options":{}}},"options":{"apiKey":"acp-probe","baseURL":"https://example.invalid/v1"}}}}"#;
 
+use rusqlite::OptionalExtension as _;
 use serde_json::{Value, json};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -90,6 +91,67 @@ fn isolated_command_with_config(root: &std::path::Path, config: &str) -> Command
         .env("TEMP", &temp)
         .env("TMP", &temp);
     command
+}
+
+fn durable_session_configuration(
+    root: &std::path::Path,
+    session_id: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    let connection =
+        rusqlite::Connection::open(root.join("zuno-acp.db")).expect("open ACP database");
+    connection
+        .query_row(
+            "SELECT agent, model FROM session WHERE id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .expect("read ACP session row")
+}
+
+/// Create the durable parent row required by replay- and load-focused fixtures.
+///
+/// `session/new` intentionally reserves only a process-local identity. Tests whose
+/// subject is pre-existing durable state must therefore opt into creating that row
+/// instead of accidentally testing the old eager-materialization behavior.
+fn materialize_acp_fixture_session(
+    root: &std::path::Path,
+    session_id: &str,
+    model_id: &str,
+    variant: Option<&str>,
+) {
+    let location = zuno_paths::DbLocation::File(root.join("zuno-acp.db"));
+    let pool = zuno_db::Pool::open(&location).expect("open ACP fixture database");
+    let (project_id, worktree) = {
+        let connection = pool.get().expect("open ACP fixture connection");
+        connection
+            .query_row(
+                "SELECT id, worktree FROM project ORDER BY time_updated DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("session/new must persist the ACP project before replying")
+    };
+    let mut session = zuno_db::session::SessionCreate::new(
+        session_id,
+        "acp-fixture",
+        project_id,
+        worktree,
+        root.to_string_lossy(),
+        "ACP fixture session",
+        env!("CARGO_PKG_VERSION"),
+    );
+    session.agent = Some("orchestrator".to_owned());
+    session.model = Some(zuno_db::session::model_reference_with_variant(
+        "test", model_id, variant,
+    ));
+    let creation = zuno_db::session::Store::new(&pool)
+        .create(&session)
+        .expect("materialize ACP fixture session");
+    assert!(
+        creation.was_inserted(),
+        "ACP fixture session `{session_id}` was already materialized"
+    );
 }
 
 fn trusted_acp_process_config(config: Value) -> Value {
@@ -1797,7 +1859,6 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
         .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
-    let cwd = root.path().to_string_lossy().into_owned();
     let mut stdin = child.stdin.take().expect("ACP stdin");
     let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
 
@@ -2010,8 +2071,8 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
             .as_array()
             .is_some_and(|sessions| sessions
                 .iter()
-                .any(|session| { session["sessionId"] == session_id && session["cwd"] == cwd })),
-        "materialized ACP session missing from durable list: {listed}"
+                .all(|session| session["sessionId"] != session_id)),
+        "opening and configuring an unused ACP panel created durable history: {listed}"
     );
 
     request(
@@ -2029,26 +2090,6 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
         json!({"cwd": root.path()}),
     );
     assert!(after_close["sessions"].as_array().is_some_and(|sessions| {
-        sessions
-            .iter()
-            .any(|session| session["sessionId"] == session_id)
-    }));
-
-    request(
-        &mut stdin,
-        &mut stdout,
-        9,
-        "session/delete",
-        json!({"sessionId": session_id, "cleanupDerivedExperiences": false}),
-    );
-    let after_delete = request(
-        &mut stdin,
-        &mut stdout,
-        10,
-        "session/list",
-        json!({"cwd": root.path()}),
-    );
-    assert!(after_delete["sessions"].as_array().is_some_and(|sessions| {
         sessions
             .iter()
             .all(|session| session["sessionId"] != session_id)
@@ -2125,6 +2166,7 @@ async fn acp_compact_is_native_and_persists_a_summary_without_model_prompt_dispa
         "Summarize older context and keep the recent turn tail"
     );
 
+    materialize_acp_fixture_session(root.path(), &session_id, "test-model", None);
     request(
         &mut stdin,
         &mut stdout,
@@ -2499,6 +2541,7 @@ async fn acp_load_recovers_an_active_goal_without_a_prior_user_message() {
         .expect("session id")
         .to_owned();
     let _commands = read_session_update(&mut first_stdout);
+    materialize_acp_fixture_session(root.path(), &session_id, "test-model", None);
     request(
         &mut first_stdin,
         &mut first_stdout,
@@ -2707,6 +2750,7 @@ async fn acp_reconfiguration_reuses_mcp_while_load_rebuilds_resources() {
         .as_str()
         .expect("session id")
         .to_owned();
+    materialize_acp_fixture_session(root.path(), &session_id, "test-model", None);
     request(
         &mut stdin,
         &mut stdout,
@@ -3219,6 +3263,7 @@ fn acp_load_and_resume_recreate_only_the_mcp_list_supplied_by_the_client() {
         .to_owned();
     let first = wait_for_occurrences(&log, "start ", 1);
     let first_pid = started_pids(&first)[0];
+    materialize_acp_fixture_session(root.path(), &session_id, "test-model", None);
     request(
         &mut stdin,
         &mut stdout,
@@ -3546,6 +3591,10 @@ async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
         json!({"cwd": root.path(), "mcpServers": []}),
     );
     let session_id = created["sessionId"].as_str().expect("session id");
+    assert!(
+        durable_session_configuration(root.path(), session_id).is_none(),
+        "session/new must reserve only an in-process ACP identity"
+    );
     let configured = request(
         &mut stdin,
         &mut stdout,
@@ -3567,6 +3616,10 @@ async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
             }),
         "model selection did not rebuild the ACP session: {configured}"
     );
+    assert!(
+        durable_session_configuration(root.path(), session_id).is_none(),
+        "pre-prompt model selection must not create a durable session"
+    );
     let (command_completed, command_updates) = request_with_updates(
         &mut stdin,
         &mut stdout,
@@ -3585,6 +3638,17 @@ async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
         }),
         "configured slash command did not execute a real turn: {command_updates:?}"
     );
+    let (persisted_agent, persisted_model) = durable_session_configuration(root.path(), session_id)
+        .expect("the first accepted prompt must materialize the session");
+    assert_eq!(persisted_agent.as_deref(), Some("orchestrator"));
+    let persisted_model = zuno_db::session::decode_model_reference(
+        persisted_model
+            .as_deref()
+            .expect("materialized session model"),
+    )
+    .expect("decode materialized session model");
+    assert_eq!(persisted_model.provider_id, "test");
+    assert_eq!(persisted_model.model_id, "test-model-2");
     let resource_path = root.path().join("notes.md");
     std::fs::write(&resource_path, "# Design notes\n").expect("write ACP resource link target");
     let resource_uri = url::Url::from_file_path(&resource_path)
@@ -4940,6 +5004,7 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
         .as_str()
         .expect("session id")
         .to_owned();
+    materialize_acp_fixture_session(root.path(), &session_id, "test-model", None);
     request(
         &mut stdin,
         &mut stdout,
@@ -5143,6 +5208,7 @@ fn acp_load_replays_negotiated_child_sessions_on_their_own_routes() {
         .as_str()
         .expect("parent session id")
         .to_owned();
+    materialize_acp_fixture_session(root.path(), &parent_session_id, "test-model", None);
     request(
         &mut stdin,
         &mut stdout,
@@ -5433,6 +5499,7 @@ async fn acp_admits_a_second_prompt_durably_and_steers_it_into_the_live_turn() {
         .as_str()
         .expect("session id")
         .to_owned();
+    materialize_acp_fixture_session(root.path(), &session_id, "test-model", None);
 
     send_request(
         &mut stdin,
@@ -5654,6 +5721,7 @@ async fn acp_prompts_keep_working_when_another_surface_left_pending_input() {
         .as_str()
         .expect("session id")
         .to_owned();
+    materialize_acp_fixture_session(root.path(), &session_id, "test-model", None);
     admit_foreign_pending_input(
         root.path(),
         &session_id,
@@ -5977,6 +6045,7 @@ async fn acp_withdrawing_an_admitted_prompt_cancels_its_durable_row() {
         .as_str()
         .expect("session id")
         .to_owned();
+    materialize_acp_fixture_session(root.path(), &session_id, "test-model", None);
 
     send_request(
         &mut stdin,
@@ -6117,6 +6186,7 @@ fn acp_load_restores_the_saved_model_and_thought_level_and_survives_a_missing_mo
         json!({"sessionId": &session_id, "configId": "reasoning_effort", "value": "high"}),
     );
     assert_eq!(option(&raised, "reasoning_effort"), Some(json!("high")));
+    materialize_acp_fixture_session(root.path(), &session_id, "test-model", Some("high"));
     request(
         &mut stdin,
         &mut stdout,

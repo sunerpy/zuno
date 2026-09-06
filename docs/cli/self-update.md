@@ -9,6 +9,8 @@ The command overwrites the executable in place. Use `--check` to learn whether a
 release exists without changing anything, and `--yes` only when a script must proceed without
 the interactive confirmation. `--tag` pins an exact release, and `--force` reinstalls a
 release that is not newer, which is how you go back to a known-good version.
+The interactive prompt is `[Y/n]`: pressing Enter accepts the update, while `n`, `no`, or
+an unrecognized answer cancels it.
 
 ## Synopsis
 

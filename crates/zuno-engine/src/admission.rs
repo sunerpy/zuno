@@ -159,35 +159,49 @@ impl SessionInputAdmission {
         lease: TurnLease,
         steering: Option<SteeringContent>,
     ) -> Result<InputAdmission, DbError> {
-        let session_id = input.session_id.clone();
         let input = self.inbox.admit(input)?;
+        Ok(self.route_admitted(input, lease, steering))
+    }
+
+    /// Resolve turn ownership for an input a caller already committed durably.
+    ///
+    /// Used when the first input and its new Session row must share one
+    /// caller-owned transaction. This performs no database write.
+    #[must_use]
+    pub fn route_admitted(
+        &self,
+        input: SessionInput,
+        lease: TurnLease,
+        steering: Option<SteeringContent>,
+    ) -> InputAdmission {
+        let session_id = input.session_id.clone();
         let message = steering.map(|steering| steering.into_message(&input.id));
 
         if lease == TurnLease::Deferred {
-            return Ok(match message {
+            return match message {
                 Some(message) => match self.runs.queue_soft_interrupt(&session_id, message) {
                     Ok(()) => InputAdmission::Steered { input },
                     Err(_) => InputAdmission::Pending { input },
                 },
                 None => InputAdmission::Pending { input },
-            });
+            };
         }
 
         for _ in 0..LEASE_HANDOFF_ATTEMPTS {
             match self.runs.begin_turn(session_id.clone()) {
-                Ok(guard) => return Ok(InputAdmission::Drive { input, guard }),
+                Ok(guard) => return InputAdmission::Drive { input, guard },
                 Err(_busy) => {
                     let Some(message) = message.clone() else {
-                        return Ok(InputAdmission::Pending { input });
+                        return InputAdmission::Pending { input };
                     };
                     if self.runs.queue_soft_interrupt(&session_id, message).is_ok() {
-                        return Ok(InputAdmission::Steered { input });
+                        return InputAdmission::Steered { input };
                     }
                     // The turn ended between the refused lease and the steer. Try
                     // to own the next turn rather than reporting a lost race.
                 }
             }
         }
-        Ok(InputAdmission::Pending { input })
+        InputAdmission::Pending { input }
     }
 }

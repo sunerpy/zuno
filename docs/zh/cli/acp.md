@@ -10,6 +10,12 @@
 编辑器只启动并持有一个进程。那个进程就是提供协议服务的进程，因此终止它就结束该会话，它的
 管道也随之到达 EOF。参见[一次调用就是一个进程](/zh/cli/#一次调用就是一个进程)。
 
+在 Agent Panel 中打开 Zuno 会调用 ACP `session/new`，但此时只保留进程内 session id，
+并解析配置、命令、Skill 与 MCP；不会创建持久 Session，也不会让空的「New Agent Thread」
+出现在 `session/list`。第一条消息之前选择的 Agent、模型、Mode 与推理等级只保存在进程内。
+首条被接纳的用户 prompt 或持久原生命令会在同一事务中创建 Session 与首个输入；关闭从未
+发送消息的面板不会留下历史行。
+
 ## Agent、Mode 与 Plan 投影
 
 Agent selector 会显示 `plan`。`active_agent` 是唯一状态源：选择 `plan` 会自动切换到

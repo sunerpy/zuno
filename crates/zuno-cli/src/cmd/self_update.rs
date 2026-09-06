@@ -12,6 +12,7 @@ const REPOSITORY_OWNER: &str = "sunerpy";
 const REPOSITORY_NAME: &str = "zuno";
 const BINARY_NAME: &str = "zuno";
 const CHECKSUM_ASSET: &str = "SHA256SUMS";
+const REPLACE_CONFIRMATION_PROMPT: &str = "Replace the current Zuno executable? [Y/n] ";
 
 pub(crate) fn execute(args: &SelfUpdateArgs) -> Result<(), String> {
     execute_inner(args).map_err(|error| error.to_string())
@@ -413,7 +414,7 @@ fn confirm_replace() -> Result<bool, UpdateError> {
     if !io::stdin().is_terminal() {
         return Err(UpdateError::ConfirmationRequired);
     }
-    print!("Replace the current Zuno executable? [y/N] ");
+    print!("{REPLACE_CONFIRMATION_PROMPT}");
     io::stdout()
         .flush()
         .map_err(UpdateError::WriteConfirmation)?;
@@ -421,10 +422,14 @@ fn confirm_replace() -> Result<bool, UpdateError> {
     io::stdin()
         .read_line(&mut answer)
         .map_err(UpdateError::ReadConfirmation)?;
-    Ok(matches!(
+    Ok(confirmation_response(&answer))
+}
+
+fn confirmation_response(answer: &str) -> bool {
+    matches!(
         answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+        "" | "y" | "yes"
+    )
 }
 
 fn validate_replacement(path: &Path) -> Result<(), UpdateError> {
@@ -683,5 +688,19 @@ mod tests {
             verify_checksum(&archive, &expected),
             Err(UpdateError::ChecksumMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn self_update_confirmation_defaults_to_yes_and_fails_closed_on_other_input() {
+        assert_eq!(
+            REPLACE_CONFIRMATION_PROMPT,
+            "Replace the current Zuno executable? [Y/n] "
+        );
+        for answer in ["", " ", "\n", "y", "Y", "yes", " YES "] {
+            assert!(confirmation_response(answer), "{answer:?} must confirm");
+        }
+        for answer in ["n", "N", "no", "NO", "later", "1"] {
+            assert!(!confirmation_response(answer), "{answer:?} must cancel");
+        }
     }
 }

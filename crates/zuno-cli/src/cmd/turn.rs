@@ -5037,13 +5037,12 @@ impl TurnHost {
         self.session_identity.is_materialized()
     }
 
-    /// Acquire the durable row before a protocol client returns `session/new`.
-    ///
-    /// Interactive surfaces may remain lazy; an advertised ACP id must already be
-    /// listable and resumable before its first prompt.
-    pub(crate) fn materialize_session(&mut self) -> Result<bool, String> {
+    fn materialize_session_with<T>(
+        &mut self,
+        finish: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
         let SessionMaterializer::Pending(input) = &self.session_materializer else {
-            return Ok(false);
+            return Ok(None);
         };
         let mut input = input.clone();
         input.time = Some(zuno_db::message::now_millis());
@@ -5067,11 +5066,35 @@ impl TurnHost {
             self.session_identity.id(),
             &self.subagent_model_policy,
         )?;
+        let value = finish(&transaction)?;
         transaction.commit().map_err(to_string)?;
         self.memory_policy = memory_policy;
         self.session_materializer = SessionMaterializer::Existing;
         self.session_identity.mark_materialized();
-        Ok(true)
+        Ok(Some(value))
+    }
+
+    /// Acquire the durable row before a host-owned command writes session state.
+    ///
+    /// Ordinary model-bound input materializes the row and its first message in one
+    /// transaction. Native Goal, learning, and similar commands call this first when
+    /// they become the session's initial durable user action.
+    pub(crate) fn materialize_session(&mut self) -> Result<bool, String> {
+        Ok(self.materialize_session_with(|_| Ok(()))?.is_some())
+    }
+
+    /// Atomically create a pending Session row and admit its first user input.
+    ///
+    /// ACP uses this because its durable inbox owns admission before the TurnHost
+    /// drives the message. Returning `None` means another input already materialized
+    /// the Session while the caller waited for the host.
+    pub(crate) fn materialize_session_with_input(
+        &mut self,
+        input: zuno_db::inbox::NewSessionInput,
+    ) -> Result<Option<zuno_db::inbox::SessionInput>, String> {
+        self.materialize_session_with(|transaction| {
+            zuno_db::inbox::admit_in(transaction, input).map_err(to_string)
+        })
     }
 
     /// Durable usage restored with an existing session.

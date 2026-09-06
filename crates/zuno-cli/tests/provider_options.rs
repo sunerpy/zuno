@@ -49,7 +49,9 @@ use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
 
-use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config};
+use zuno_testkit::{
+    DbChoice, MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config,
+};
 
 /// A recorded tool-free text completion — the smallest thing a turn can complete on.
 const CASSETTE: &str = "openai-chat/streams-text";
@@ -80,6 +82,15 @@ fn echoed_key_body() -> Vec<u8> {
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
+}
+
+fn scripted_env() -> ScriptedEnv {
+    // This suite tests provider options through a real child process, not SQLite's
+    // shared-memory implementation. A file database is the production shape and stays
+    // stable when independent runtime services open their own pools concurrently.
+    ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile)
 }
 
 /// Where a key may be planted, so a test names its case instead of two bare `Option`s.
@@ -246,7 +257,7 @@ async fn observed_authorization(
         "provider_options::observed_authorization",
         "recorded provider option propagation was NOT tested",
     )?;
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = scripted_env();
     let provider = mock().await;
     let base_url = format!("{}/v1", provider.base_url());
     let config = provider_config(&base_url, keys, provider_options, model_options);
@@ -470,7 +481,7 @@ async fn a_model_level_option_overrides_the_provider_level_one_of_the_same_name(
 /// actionable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_key_anywhere_names_where_to_put_one_and_never_prints_a_key() {
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = scripted_env();
     let provider = unauthorized_mock().await;
     let base_url = format!("{}/v1", provider.base_url());
     let keys = Keys {
@@ -536,7 +547,7 @@ async fn a_gateway_that_echoes_the_rejected_key_still_prints_no_key_material() {
     ];
 
     for (keys, source) in sources {
-        let env = ScriptedEnv::new().expect("isolated environment");
+        let env = scripted_env();
         let provider = rejecting_mock(echoed_key_body()).await;
         let base_url = format!("{}/v1", provider.base_url());
         let config = provider_config(&base_url, keys, no_options(), no_options());
