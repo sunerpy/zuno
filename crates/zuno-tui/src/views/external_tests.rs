@@ -1176,20 +1176,15 @@ fn assert_hostile_native_copy_is_bounded(mode: HostileClipboardMode) -> Arc<Host
         }),
     );
     let (finished, outcome) = std::sync::mpsc::sync_channel(1);
-    let started = std::time::Instant::now();
     std::thread::spawn(move || {
         let result = clipboard.write("payload");
         let _reported = finished.send(result);
     });
 
-    let error = outcome
+    outcome
         .recv_timeout(std::time::Duration::from_millis(250))
         .expect("the component-facing clipboard call exceeded its hard bound")
         .expect_err("a hostile clipboard helper cannot report success");
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(250),
-        "the native fallback held the component path past its hard bound: {error}"
-    );
     state
 }
 

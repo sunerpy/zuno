@@ -194,6 +194,10 @@ impl SkillOptions {
 
     /// Logical roots that can change discovery, including roots not created yet.
     ///
+    /// Project roots name the exact `.zuno/skill` and `.agents/skills`
+    /// directories at every level from the session directory through the
+    /// worktree. The worktree itself is never a recursive watch root.
+    ///
     /// The list is de-duplicated and removes nested roots only when an existing
     /// parent is already watched recursively. Missing roots retain their exact
     /// identity so `zuno-watch` can follow them through non-recursive ancestor
@@ -205,12 +209,24 @@ impl SkillOptions {
     /// already exists; Zuno never asks a user to create it merely for file watching.
     #[must_use]
     pub fn watch_roots(&self) -> Vec<PathBuf> {
-        let mut candidates = vec![
-            self.worktree
-                .clone()
-                .unwrap_or_else(|| self.directory.clone()),
-            self.layout.config().join("skill"),
-        ];
+        let project_directories = walk::ancestors(&self.directory, self.worktree.as_deref());
+        let mut candidates = Vec::new();
+        if !self.layout.project_config_disabled() {
+            for directory in &project_directories {
+                for prefix in ZUNO_PREFIXES {
+                    candidates.push(directory.join(PROJECT_CONFIG_DIRECTORY).join(prefix));
+                }
+            }
+        }
+        for external in self.external_dirs() {
+            for directory in &project_directories {
+                for prefix in EXTERNAL_PREFIXES {
+                    candidates.push(directory.join(external).join(prefix));
+                }
+            }
+        }
+
+        candidates.push(self.layout.config().join("skill"));
         if let Some(extra) = self
             .layout
             .config_dir_override()
@@ -801,6 +817,12 @@ mod tests {
                 (Root::GlobalZuno, config),
             ]
         );
+        assert!(!options.watch_roots().contains(&canonical_or_normalized(
+            &fixture.dir.path().join("proj/.agents/skills")
+        )));
+        assert!(!options.watch_roots().contains(&canonical_or_normalized(
+            &fixture.home().join(".agents/skills")
+        )));
     }
 
     #[test]
@@ -821,6 +843,12 @@ mod tests {
             roots(&SkillSources::discover(&options)),
             vec![(Root::ProjectAgents, agents)]
         );
+        assert!(!options.watch_roots().contains(&canonical_or_normalized(
+            &fixture.dir.path().join("proj/.zuno/skill")
+        )));
+        assert!(options.watch_roots().contains(&canonical_or_normalized(
+            &fixture.dir.path().join("proj/.agents/skills")
+        )));
     }
 
     #[test]
@@ -1015,12 +1043,13 @@ mod tests {
     }
 
     #[test]
-    fn default_watch_roots_exclude_legacy_zuno_and_remote_cache_directories() {
+    fn default_watch_roots_use_exact_project_roots_and_exclude_private_state() {
         let fixture = Fixture::new();
         let project = fixture.dir.path().join("project");
-        fs::create_dir_all(&project).expect("project");
+        let directory = project.join("nested");
+        fs::create_dir_all(&directory).expect("project directory");
         let options = SkillOptions::new(
-            &project,
+            &directory,
             Some(&project),
             &fixture.env(),
             Vec::new(),
@@ -1028,8 +1057,24 @@ mod tests {
         );
 
         let roots = options.watch_roots();
+        for expected in [
+            project.join(".zuno/skill"),
+            project.join(".agents/skills"),
+            directory.join(".zuno/skill"),
+            directory.join(".agents/skills"),
+        ] {
+            assert!(
+                roots.contains(&canonical_or_normalized(&expected)),
+                "missing exact project Skill root {} from {roots:?}",
+                expected.display()
+            );
+        }
         assert!(
-            roots.contains(&canonical_or_normalized(&project)),
+            !roots.contains(&canonical_or_normalized(&project)),
+            "{roots:?}"
+        );
+        assert!(
+            !roots.contains(&canonical_or_normalized(&directory)),
             "{roots:?}"
         );
         assert!(

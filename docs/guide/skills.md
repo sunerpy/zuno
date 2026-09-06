@@ -58,13 +58,15 @@ ACP. Installing, editing, deleting, or renaming a Skill in an already-effective
 root is visible without restarting the session. A malformed edit retains the
 last valid entry and exposes a warning until the file is repaired.
 
-The canonical user root and explicit configured paths may be created while a
-session is running. Zuno watches only their nearest existing ancestor
-non-recursively, narrows the subscription as directories appear, and enables
-recursive watching only at the exact configured root. A shared
-`~/.agents/skills` root is watched when it already exists; create it before
-starting Zuno or select it through `skills.paths` when hot installation is
-required.
+Project `.zuno/skill` and `.agents/skills` roots may be created while a session
+is running at any directory from the session directory through the worktree.
+Zuno watches those exact logical roots rather than the worktree itself. The
+canonical user root and explicit configured paths have the same hot-install
+behavior: Zuno watches only their nearest existing ancestor non-recursively,
+narrows the subscription as directories appear, and enables recursive watching
+only at the exact root. A shared `~/.agents/skills` root is watched when it
+already exists; create it before starting Zuno or select it through
+`skills.paths` when hot installation is required.
 
 The remote download cache is private state. It is created only when
 `skills.urls` actually downloads a file and is never installed as a filesystem

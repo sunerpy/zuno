@@ -45,7 +45,9 @@ use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
 
-use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config};
+use zuno_testkit::{
+    DbChoice, MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config,
+};
 
 /// A recorded tool-free text completion — the smallest thing a turn can complete on.
 const CASSETTE: &str = "openai-chat/streams-text";
@@ -68,6 +70,14 @@ const PROBE_HOST: &str = "PROBE_HOST";
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
+}
+
+fn scripted_env() -> ScriptedEnv {
+    // These are provider-routing proofs, not in-memory database proofs. A file-backed
+    // database prevents concurrent shared-memory setup from masking the endpoint result.
+    ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile)
 }
 
 /// One OpenAI-compatible provider, with the endpoint placed wherever the caller says.
@@ -229,7 +239,7 @@ async fn an_empty_assistant_response_exits_non_zero_and_names_the_provider() {
     {
         return;
     }
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = scripted_env();
     let provider = empty_turn_mock().await;
     let base_url = format!("{}/v1", provider.base_url());
 
@@ -263,7 +273,7 @@ async fn options_base_url_alone_reaches_the_endpoint() {
     {
         return;
     }
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = scripted_env();
     let provider = mock().await;
     let base_url = format!("{}/v1", provider.base_url());
 
@@ -295,7 +305,7 @@ async fn endpoint_wins_over_base_url_when_both_are_set() {
     {
         return;
     }
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = scripted_env();
     let provider = mock().await;
     let endpoint = format!("{}/v1", provider.base_url());
 
@@ -331,7 +341,7 @@ async fn a_catalog_supplied_api_url_still_reaches_the_endpoint() {
     {
         return;
     }
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = scripted_env();
     let provider = mock().await;
     let api = format!("{}/v1", provider.base_url());
 
@@ -364,7 +374,7 @@ async fn a_placeholder_in_the_catalog_api_url_reaches_the_substituted_host() {
     {
         return;
     }
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = scripted_env();
     let provider = mock().await;
     let authority = provider.addr().to_string();
 
@@ -402,7 +412,7 @@ async fn a_placeholder_arriving_via_options_base_url_reaches_the_substituted_hos
     {
         return;
     }
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = scripted_env();
     let provider = mock().await;
     let authority = provider.addr().to_string();
 
@@ -458,7 +468,7 @@ async fn an_unset_variable_reaches_no_endpoint_rather_than_a_collapsed_one() {
     {
         return;
     }
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = scripted_env();
     let provider = mock().await;
     let authority = provider.addr().to_string();
 
@@ -501,7 +511,7 @@ async fn an_unset_variable_reaches_no_endpoint_rather_than_a_collapsed_one() {
 /// No mock is started: the whole point is that nothing is listening.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unreachable_endpoint_names_the_url_it_could_not_reach() {
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = scripted_env();
 
     let output = run_prompt(&env, provider_config(None, None, Some(DEAD_ENDPOINT))).await;
 
@@ -527,7 +537,7 @@ async fn an_unreachable_endpoint_names_the_url_it_could_not_reach() {
 /// it dials, and must say which key supplies it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_endpoint_anywhere_fails_fast_and_names_the_key() {
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = scripted_env();
     // No mock at all: nothing may be dialled, so nothing needs to listen.
     let output = run_prompt(&env, provider_config(None, None, None)).await;
 

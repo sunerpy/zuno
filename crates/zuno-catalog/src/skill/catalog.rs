@@ -621,6 +621,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watcher_registers_exact_project_roots_without_recursing_over_the_worktree() {
+        let root = tempfile::tempdir().expect("root");
+        let project = root.path().join("project");
+        let directory = project.join("nested");
+        std::fs::create_dir_all(&directory).expect("project directory");
+        let canonical_project = std::fs::canonicalize(&project).expect("canonical project");
+        let canonical_directory =
+            std::fs::canonicalize(&directory).expect("canonical project directory");
+        let env = isolated_env(root.path());
+        let service = SkillCatalogService::start(
+            SkillOptions::new(&directory, Some(&project), &env, Vec::new(), Vec::new()),
+            Vec::new(),
+            Arc::new(|_| true),
+        )
+        .await;
+
+        let scopes = service
+            .watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|watcher| {
+                let watcher = watcher
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    watcher.requested_root().to_path_buf(),
+                    watcher.active_root().map(Path::to_path_buf),
+                    watcher.watches_recursively(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (logical, active) in [
+            (
+                project.join(".zuno").join("skill"),
+                canonical_project.clone(),
+            ),
+            (
+                project.join(".agents").join("skills"),
+                canonical_project.clone(),
+            ),
+            (
+                directory.join(".zuno").join("skill"),
+                canonical_directory.clone(),
+            ),
+            (
+                directory.join(".agents").join("skills"),
+                canonical_directory.clone(),
+            ),
+        ] {
+            assert!(
+                scopes.iter().any(|(requested, current, recursive)| {
+                    requested == &logical
+                        && current.as_deref() == Some(active.as_path())
+                        && !recursive
+                }),
+                "missing bounded project Skill watch {logical:?} from {scopes:?}"
+            );
+        }
+        assert!(
+            scopes.iter().all(|(logical, _, recursive)| {
+                !recursive || (logical != &project && logical != &directory)
+            }),
+            "the worktree or session directory must never become a recursive Skill watch: {scopes:?}"
+        );
+        service.shutdown();
+    }
+
+    #[tokio::test]
     async fn watcher_follows_a_missing_canonical_skill_root_from_its_existing_ancestor() {
         let root = tempfile::tempdir().expect("root");
         let project = root.path().join("project");
