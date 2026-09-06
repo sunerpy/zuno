@@ -527,6 +527,122 @@ fn put_durable_part(
         .expect("persist durable part");
 }
 
+fn seed_assistant_only_compaction_tail(connection: &zuno_db::Connection, session_id: &str) {
+    let user_id = "msg_pre_compaction_user";
+    put_durable_message(
+        connection,
+        session_id,
+        user_id,
+        "user",
+        100,
+        json!({
+            "agent": "orchestrator",
+            "model": {"providerID": "test", "modelID": "test-model"}
+        }),
+    );
+    put_durable_part(
+        connection,
+        session_id,
+        user_id,
+        "prt_pre_compaction_user_text",
+        100,
+        json!({"type":"text","text":"historical request"}),
+    );
+
+    let assistant_id = "msg_compaction_tail_assistant";
+    put_durable_message(
+        connection,
+        session_id,
+        assistant_id,
+        "assistant",
+        200,
+        json!({
+            "parentID": user_id,
+            "agent": "orchestrator",
+            "providerID": "test",
+            "modelID": "test-model",
+            "mode": "build",
+            "finish": "stop",
+            "time": {"created": 200, "completed": 201},
+            "cost": 0.0,
+            "tokens": {
+                "input": 10,
+                "output": 2,
+                "reasoning": 0,
+                "cache": {"read": 0, "write": 0}
+            }
+        }),
+    );
+    put_durable_part(
+        connection,
+        session_id,
+        assistant_id,
+        "prt_compaction_tail_assistant_text",
+        200,
+        json!({"type":"text","text":"historical answer"}),
+    );
+
+    let marker_id = "msg_assistant_tail_compaction";
+    put_durable_message(
+        connection,
+        session_id,
+        marker_id,
+        "user",
+        300,
+        json!({
+            "agent": "compaction",
+            "model": {"providerID": "test", "modelID": "test-model"}
+        }),
+    );
+    put_durable_part(
+        connection,
+        session_id,
+        marker_id,
+        "prt_assistant_tail_compaction",
+        300,
+        json!({
+            "type": "compaction",
+            "auto": true,
+            "overflow": false,
+            "tail_start_id": assistant_id
+        }),
+    );
+
+    let summary_id = "msg_assistant_tail_summary";
+    put_durable_message(
+        connection,
+        session_id,
+        summary_id,
+        "assistant",
+        301,
+        json!({
+            "parentID": marker_id,
+            "agent": "compaction",
+            "providerID": "test",
+            "modelID": "test-model",
+            "mode": "compaction",
+            "summary": true,
+            "finish": "stop",
+            "time": {"created": 301, "completed": 302},
+            "cost": 0.0,
+            "tokens": {
+                "input": 10,
+                "output": 2,
+                "reasoning": 0,
+                "cache": {"read": 0, "write": 0}
+            }
+        }),
+    );
+    put_durable_part(
+        connection,
+        session_id,
+        summary_id,
+        "prt_assistant_tail_summary_text",
+        301,
+        json!({"type":"text","text":"summary before autonomous continuation"}),
+    );
+}
+
 fn seed_durable_replay(root: &std::path::Path, session_id: &str) {
     let location = zuno_paths::DbLocation::File(root.join("zuno-acp.db"));
     let connection = zuno_db::open::open(&location).expect("open ACP database");
@@ -2386,10 +2502,44 @@ async fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
                 .is_some_and(|text| text.contains("What is GOAL-TWO?"))
     }));
 
-    let invalid = request_failure(
+    let (_budgeted, budgeted_updates) = request_with_updates(
         &mut stdin,
         &mut stdout,
         6,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"/goal budget 256000000"}]
+        }),
+    );
+    assert!(budgeted_updates.iter().any(|update| {
+        update["sessionUpdate"] == "agent_message_chunk"
+            && update["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("256000000"))
+    }));
+
+    let (_unlimited, unlimited_updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        7,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"/goal budget none"}]
+        }),
+    );
+    assert!(unlimited_updates.iter().any(|update| {
+        update["sessionUpdate"] == "agent_message_chunk"
+            && update["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("\"token_budget\"") && text.contains("null"))
+    }));
+
+    let invalid = request_failure(
+        &mut stdin,
+        &mut stdout,
+        8,
         "session/prompt",
         json!({
             "sessionId": &session_id,
@@ -2402,7 +2552,7 @@ async fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
     let (plan, plan_updates) = request_with_updates(
         &mut stdin,
         &mut stdout,
-        7,
+        9,
         "session/prompt",
         json!({
             "sessionId": &session_id,
@@ -2420,7 +2570,7 @@ async fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
     request(
         &mut stdin,
         &mut stdout,
-        8,
+        10,
         "session/close",
         json!({"sessionId": &session_id}),
     );
@@ -2489,9 +2639,11 @@ async fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         "each native Goal objective must drive one tool turn and one completion turn"
     );
     assert!(
-        goal_turns
-            .iter()
-            .all(|body| !body.to_string().contains("/goal")),
+        goal_turns.iter().all(|body| {
+            let messages = body.get("messages").unwrap_or(&Value::Null).to_string();
+            !messages.contains("/goal What is GOAL-ONE?")
+                && !messages.contains("/goal What is GOAL-TWO?")
+        }),
         "native slash text must not enter provider input: {goal_turns:#?}"
     );
     assert!(
@@ -2503,7 +2655,7 @@ async fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn acp_load_recovers_an_active_goal_without_a_prior_user_message() {
+async fn acp_load_recovers_an_active_goal_without_a_retained_user_message() {
     let provider = MockServer::start().await;
     let responder = GoalCompletionTurnResponder::default();
     Mock::given(method("POST"))
@@ -2562,12 +2714,20 @@ async fn acp_load_recovers_an_active_goal_without_a_prior_user_message() {
     let objective = "What is RECOVERED-GOAL?";
     goals
         .create_goal(&session_id, objective, None)
-        .expect("seed active Goal without a user turn");
+        .expect("seed active Goal behind compacted history");
     let connection = pool.get().expect("open ACP message store");
+    seed_assistant_only_compaction_tail(&connection, &session_id);
     assert!(
-        !zuno_db::message::MessageStore::new(&connection)
+        zuno_db::message::MessageStore::new(&connection)
             .has_user_message_for_session(&session_id)
-            .expect("inspect pre-recovery messages")
+            .expect("inspect complete pre-recovery history"),
+        "the complete history contains a user turn, which was the production false positive"
+    );
+    let retained = zuno_engine::r#loop::hydrate_retained_history(&connection, &session_id)
+        .expect("hydrate provider-retained pre-recovery history");
+    assert!(
+        !zuno_engine::r#loop::has_requested_user_message(&retained),
+        "the latest compaction leaves no answerable user turn in the provider history"
     );
     drop(connection);
 
@@ -2640,21 +2800,24 @@ async fn acp_load_recovers_an_active_goal_without_a_prior_user_message() {
     let history = zuno_db::message::MessageStore::new(&connection)
         .hydrate_session(&session_id)
         .expect("hydrate recovered ACP session");
-    let user_messages = history
+    let objective_anchors = history
         .iter()
-        .filter(|message| message.info.role == zuno_db::message::MessageRole::User)
+        .filter(|message| {
+            message.info.role == zuno_db::message::MessageRole::User
+                && message
+                    .parts
+                    .iter()
+                    .any(|part| part.data.get("text").and_then(Value::as_str) == Some(objective))
+        })
         .collect::<Vec<_>>();
     assert_eq!(
-        user_messages.len(),
+        objective_anchors.len(),
         1,
         "Goal recovery must create exactly one durable user anchor"
     );
-    assert!(
-        user_messages[0]
-            .parts
-            .iter()
-            .any(|part| { part.data.get("text").and_then(Value::as_str) == Some(objective) })
-    );
+    let retained = zuno_engine::r#loop::hydrate_retained_history(&connection, &session_id)
+        .expect("hydrate recovered provider history");
+    assert!(zuno_engine::r#loop::has_requested_user_message(&retained));
     assert_eq!(
         connection
             .query_row(
@@ -2683,9 +2846,14 @@ async fn acp_load_recovers_an_active_goal_without_a_prior_user_message() {
         .collect::<Vec<_>>();
     assert_eq!(responder.tool_requests.load(Ordering::SeqCst), 2);
     assert!(
-        goal_turns
-            .iter()
-            .all(|body| !body.to_string().contains("/goal"))
+        goal_turns.iter().all(|body| {
+            !body
+                .get("messages")
+                .unwrap_or(&Value::Null)
+                .to_string()
+                .contains("/goal")
+        }),
+        "the literal native command must not enter provider messages: {goal_turns:#?}"
     );
     assert!(
         goal_turns

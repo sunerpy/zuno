@@ -450,7 +450,7 @@ pub struct Goal {
     pub status: GoalStatus,
     /// Stable explanation for a blocked goal.
     pub blocked_reason: Option<String>,
-    /// The token ceiling, or `None` for unlimited.
+    /// The Goal's own token ceiling, or `None` to defer to the host allowance.
     pub token_budget: Option<i64>,
     /// Tokens spent against this goal instance. Reset by a replacement.
     pub tokens_used: i64,
@@ -2340,22 +2340,45 @@ impl GoalStore {
         session_id: &str,
         token_budget: Option<i64>,
     ) -> Result<Option<Goal>, GoalError> {
+        self.set_token_budget_with_revision(session_id, token_budget, None)
+    }
+
+    /// Change the token budget only when `expected_revision` is still current.
+    pub fn set_token_budget_checked(
+        &self,
+        session_id: &str,
+        token_budget: Option<i64>,
+        expected_revision: i64,
+    ) -> Result<Option<Goal>, GoalError> {
+        self.set_token_budget_with_revision(session_id, token_budget, Some(expected_revision))
+    }
+
+    fn set_token_budget_with_revision(
+        &self,
+        session_id: &str,
+        token_budget: Option<i64>,
+        expected_revision: Option<i64>,
+    ) -> Result<Option<Goal>, GoalError> {
         let now_ms = now_ms()?;
-        let goal = self.pool.transaction(|tx| {
+        self.pool.transaction(|tx| {
             let goal = {
                 let mut statement = tx.prepare(SET_TOKEN_BUDGET).map_err(zuno_db::map_error)?;
                 read_optional(
                     &mut statement,
-                    params![token_budget, now_ms, session_id, Option::<i64>::None],
+                    params![token_budget, now_ms, session_id, expected_revision],
                 )
                 .map_err(into_db_error)?
             };
+            if goal.is_none()
+                && let Some(error) = revision_conflict(tx, session_id, expected_revision)?
+            {
+                return Ok(Err(error));
+            }
             if goal.as_ref().is_some_and(|goal| !goal.status.is_active()) {
                 clear_retry_state(tx, session_id)?;
             }
-            Ok(goal)
-        })?;
-        Ok(goal)
+            Ok(Ok(goal))
+        })?
     }
 
     /// Rewrite the objective, keeping the goal instance and its counters.

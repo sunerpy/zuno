@@ -2076,6 +2076,39 @@ fn goal_retry_settings_preserve_every_backoff_tunable() {
     assert_eq!(retry.poll_interval_ms.map(NonZeroU64::get), Some(250));
 }
 
+#[test]
+fn goal_default_token_budget_is_positive_and_opt_in() {
+    assert_eq!(
+        Config::default()
+            .goal
+            .and_then(|goal| goal.default_token_budget),
+        None,
+        "an omitted Goal configuration must not invent a token ceiling"
+    );
+
+    let configured = parse_value(json!({
+        "goal": {
+            "default_token_budget": 256_000_000
+        }
+    }))
+    .expect("positive Goal fallback budget parses");
+    assert_eq!(
+        configured
+            .goal
+            .and_then(|goal| goal.default_token_budget)
+            .map(NonZeroU64::get),
+        Some(256_000_000)
+    );
+
+    let error = parse_value(json!({
+        "goal": {
+            "default_token_budget": 0
+        }
+    }))
+    .expect_err("zero cannot express either a useful budget or unlimited");
+    assert_eq!(issue_path(&error), "goal.default_token_budget");
+}
+
 // ---------------------------------------------------------------------------
 // QA: the real corpora.
 // ---------------------------------------------------------------------------

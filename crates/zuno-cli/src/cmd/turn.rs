@@ -55,7 +55,7 @@ use zuno_engine::r#loop::{
     AgentModelResolver, DynamicContextRefresher, NoticeSeverity, ResolvedAgent,
     ResolvedModel as EngineModel, RunTurnRequest, ToolConcurrencyLimit, ToolDispatcher as _,
     ToolFailureRecovery, TurnContext, TurnError, TurnEvent, TurnEventSender, TurnOutcome,
-    TurnRecovery,
+    TurnRecovery, has_requested_user_message, hydrate_retained_history,
 };
 use zuno_engine::plan_driver::{
     PlanReconciliationDecision, PlanReconciliationDriver, PlanReconciliationInput,
@@ -1054,10 +1054,13 @@ impl TurnPlan {
             .iter()
             .map(|tool| tool.id().to_owned())
             .collect();
-        let mut profile = zuno_harness::default_profile_with_tools(extension_contributions)
-            .with_bundle(zuno_harness::orchestration_capabilities_bundle(Arc::clone(
-                &capability,
-            )));
+        let mut profile = zuno_harness::default_profile_with_tools_and_allowance(
+            extension_contributions,
+            configured_turn_allowance(&config),
+        )
+        .with_bundle(zuno_harness::orchestration_capabilities_bundle(Arc::clone(
+            &capability,
+        )));
         if let Some(bundle) = runtime_surface.take_bundle() {
             profile = profile.with_bundle(bundle);
         }
@@ -1862,6 +1865,24 @@ fn token_count(limit: f64) -> u64 {
         limit as u64
     } else {
         0
+    }
+}
+
+/// Resolve the standard profile's optional Goal fallback allowance.
+///
+/// Unset means unlimited. A durable Goal's own `token_budget` still wins in
+/// [`zuno_goal::GoalBudgetPolicy`], so this number applies only to Goals whose
+/// creator deliberately left that field empty.
+fn configured_turn_allowance(
+    config: &zuno_config::schema::Config,
+) -> zuno_engine::budget::TurnAllowance {
+    zuno_engine::budget::TurnAllowance {
+        default_token_budget: config
+            .goal
+            .as_ref()
+            .and_then(|goal| goal.default_token_budget)
+            .map(std::num::NonZeroU64::get),
+        ..zuno_engine::budget::TurnAllowance::UNLIMITED
     }
 }
 
@@ -5338,6 +5359,30 @@ impl TurnHost {
                 changed = true;
                 serde_json::to_value(goal).map_err(SessionCommandError::internal)?
             }
+            "budget" => {
+                let token_budget = parse_goal_token_budget(value)?;
+                let expected_revision = self
+                    .goal_store
+                    .goal(&self.session_id)
+                    .map_err(SessionCommandError::goal)?
+                    .ok_or_else(|| {
+                        SessionCommandError::invalid_arguments(
+                            "no goal exists; run /goal create <objective> first",
+                        )
+                    })?
+                    .revision;
+                let goal = self
+                    .goal_store
+                    .set_token_budget_checked(&self.session_id, token_budget, expected_revision)
+                    .map_err(SessionCommandError::goal)?
+                    .ok_or_else(|| {
+                        SessionCommandError::invalid_arguments(
+                            "no goal exists; run /goal create <objective> first",
+                        )
+                    })?;
+                changed = true;
+                serde_json::to_value(goal).map_err(SessionCommandError::internal)?
+            }
             "pause" | "resume" | "cancel" => {
                 let status = match action {
                     "pause" => zuno_goal::SystemStatus::Paused,
@@ -5463,6 +5508,7 @@ impl TurnHost {
 /goal show|history
 /goal create <objective>
 /goal edit <objective>
+/goal budget <positive tokens|none>
 /goal pause|resume|complete|cancel
 /goal block <reason>"
                     .to_owned());
@@ -8402,13 +8448,12 @@ impl TurnHost {
                     self.session_id
                 )
             })?;
-        let message_store = zuno_db::message::MessageStore::new(&self.connection);
-        if message_store
-            .has_user_message_for_session(&self.session_id)
-            .map_err(to_string)?
-        {
+        let retained =
+            hydrate_retained_history(&self.connection, &self.session_id).map_err(to_string)?;
+        if has_requested_user_message(&retained) {
             return Ok(goal);
         }
+        let message_store = zuno_db::message::MessageStore::new(&self.connection);
         let latest = message_store
             .latest_time_created(&self.session_id)
             .map_err(to_string)?;
@@ -9254,6 +9299,30 @@ fn human_request_belongs_to_goal(
     active_goal_id.is_some_and(|goal_id| request_goal_id == Some(goal_id))
 }
 
+fn parse_goal_token_budget(value: &str) -> Result<Option<i64>, SessionCommandError> {
+    if value.is_empty() {
+        return Err(SessionCommandError::invalid_arguments(
+            "usage: /goal budget <positive tokens|none>",
+        ));
+    }
+    match value {
+        "none" | "unlimited" => Ok(None),
+        value => {
+            let budget = value.parse::<i64>().map_err(|_| {
+                SessionCommandError::invalid_arguments(
+                    "goal budget must be a positive integer, `none`, or `unlimited`",
+                )
+            })?;
+            if budget <= 0 {
+                return Err(SessionCommandError::invalid_arguments(
+                    "goal budget must be a positive integer, `none`, or `unlimited`",
+                ));
+            }
+            Ok(Some(budget))
+        }
+    }
+}
+
 fn human_request_summary(payload: &Value) -> Option<String> {
     payload
         .get("questions")
@@ -9987,8 +10056,8 @@ fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<Goa
 /// response as it lands, because a ceiling checked only between turns cannot stop a
 /// runaway inside one. Charging the whole session delta again at the end would bill
 /// every request twice, so a goal would hit its ceiling at half the tokens its budget
-/// names — and with a default allowance in place that number is binding rather than
-/// decorative.
+/// names — and when a host fallback or explicit Goal budget is in force that number
+/// is binding rather than decorative.
 ///
 /// So the session delta is reduced by what the goal's own counter moved over the same
 /// window. What remains is the usage no request accounted for: compaction's model
@@ -10019,10 +10088,9 @@ fn goal_turn_unaccounted_tokens(before: GoalUsage, after: GoalUsage) -> i64 {
 /// The answer feeds a flag that only ever falls: the store writes
 /// `usage_known AND known`, because tokens spent without a measurement leave the
 /// total an underestimate for good. A goal whose flag is false stops before its next
-/// request, and with a default allowance installed for every session that stop now
-/// reaches goals that never named a budget. One false answer therefore ends the
-/// session's every later turn before it begins, so the flag falls on evidence of
-/// unmeasured spend and on nothing weaker.
+/// request. When a host fallback or explicit Goal budget is in force, one false
+/// answer therefore ends every later turn before it begins, so the flag falls on
+/// evidence of unmeasured spend and on nothing weaker.
 ///
 /// The order of the questions is the order of the evidence:
 ///

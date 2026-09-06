@@ -577,6 +577,15 @@
     "GoalConfig": {
       "description": "Persistent goal runtime settings.",
       "properties": {
+        "default_token_budget": {
+          "description": "Host fallback token budget for a Goal that has no budget of its own.\n\nOmit this field to leave unbudgeted Goals without a token ceiling. A\npositive value applies only when the durable Goal's `token_budget` is\nunset; an explicit per-Goal budget always wins.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "retry": {
           "anyOf": [
             {

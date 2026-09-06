@@ -20,11 +20,11 @@
 //!
 //! A goal nobody put a number on used to mean unlimited: the policy left it alone,
 //! and the only thing that stopped an autonomous run was a human noticing. The
-//! host now hands the policy a [`TurnAllowance`], and its `default_token_budget`
+//! host may hand the policy a [`TurnAllowance`], and its `default_token_budget`
 //! stands in for a goal's missing `token_budget` — charged against the same
-//! durable counters, with the same reserve — so `None` on the goal means "the
-//! host's default" and not "infinite". An explicit goal budget always wins, and a
-//! host that genuinely wants unlimited says so with [`TurnAllowance::UNLIMITED`].
+//! durable counters, with the same reserve. An explicit goal budget always wins.
+//! When both values are absent, the Goal has no token ceiling; the standard host
+//! uses that unlimited default unless `goal.default_token_budget` is configured.
 //! The allowance's tool-call and wall-time ceilings bound the turn itself, goal or
 //! no goal, because a turn that loops cheaply on tool calls is a runaway no token
 //! ceiling would ever notice.

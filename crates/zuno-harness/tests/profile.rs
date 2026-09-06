@@ -3,9 +3,9 @@ use std::sync::Arc;
 use zuno_engine::budget::TurnAllowance;
 use zuno_engine::driver::{AgentDriver, DefaultAgentDriver};
 use zuno_harness::{
-    DEFAULT_GOAL_TOKEN_BUDGET, DEFAULT_TURN_ALLOWANCE, HostPlanningCapability,
-    ProductCapabilityKind, ToolContributions, ToolManifest, default_profile,
-    default_profile_with_tools, default_profile_with_tools_and_allowance, named_capability_key,
+    DEFAULT_TURN_ALLOWANCE, HostPlanningCapability, ProductCapabilityKind, ToolContributions,
+    ToolManifest, default_profile, default_profile_with_tools,
+    default_profile_with_tools_and_allowance, named_capability_key,
     orchestration_capabilities_bundle, profile_with_tools, profile_with_tools_and_public_http,
     skill_capability_key, turn_allowance_bundle,
 };
@@ -373,7 +373,7 @@ fn duplicate_contributed_tool_ids_fail_before_mount() {
 }
 
 #[tokio::test]
-async fn the_default_profile_publishes_the_allowance_an_unbudgeted_goal_runs_under() {
+async fn the_default_profile_leaves_every_allowance_unbounded() {
     let runtime = HarnessRuntime::new("profile");
     runtime
         .activate_profile(default_profile())
@@ -385,13 +385,8 @@ async fn the_default_profile_publishes_the_allowance_an_unbudgeted_goal_runs_und
         .expect("the default host names the allowance a turn runs under");
     assert_eq!(*allowance, DEFAULT_TURN_ALLOWANCE);
     assert_eq!(
-        allowance.default_token_budget,
-        Some(DEFAULT_GOAL_TOKEN_BUDGET),
-        "a goal nobody put a number on must not mean unlimited"
-    );
-    assert_eq!(
-        DEFAULT_GOAL_TOKEN_BUDGET, 8_000_000,
-        "forty steps at the 200,000-token window the workspace assumes"
+        allowance.default_token_budget, None,
+        "an unbudgeted goal is unlimited unless configuration names a fallback"
     );
     assert_eq!(
         allowance.max_tool_calls, None,
@@ -404,21 +399,24 @@ async fn the_default_profile_publishes_the_allowance_an_unbudgeted_goal_runs_und
 }
 
 #[tokio::test]
-async fn a_host_that_wants_unlimited_autonomy_writes_that_choice_into_the_profile() {
+async fn a_host_may_publish_an_explicit_allowance() {
+    let configured = TurnAllowance {
+        default_token_budget: Some(8_000_000),
+        ..TurnAllowance::UNLIMITED
+    };
     let runtime = HarnessRuntime::new("profile");
     runtime
         .activate_profile(default_profile_with_tools_and_allowance(
             ToolContributions::default(),
-            TurnAllowance::UNLIMITED,
+            configured,
         ))
         .await
         .expect("default profile activates under an explicit allowance");
 
     let allowance = runtime
         .service::<TurnAllowance>()
-        .expect("an unlimited allowance is still published, so the choice is visible");
-    assert_eq!(*allowance, TurnAllowance::UNLIMITED);
-    assert_eq!(allowance.default_token_budget, None);
+        .expect("an explicit allowance is published, so the choice is visible");
+    assert_eq!(*allowance, configured);
 }
 
 #[tokio::test]
