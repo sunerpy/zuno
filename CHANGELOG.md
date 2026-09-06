@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.11](https://github.com/sunerpy/zuno/compare/v0.10.10...v0.10.11) (2026-09-06)
+
+
+### Bug Fixes
+
+* **cli:** 默认确认更新并延迟创建 ACP 会话 ([#132](https://github.com/sunerpy/zuno/issues/132)) ([daa96d0](https://github.com/sunerpy/zuno/commit/daa96d0ab99e0909c7b8966ba8bab1a34363e521))
+
 ## [0.10.10](https://github.com/sunerpy/zuno/compare/v0.10.9...v0.10.10) (2026-09-06)
 
 
