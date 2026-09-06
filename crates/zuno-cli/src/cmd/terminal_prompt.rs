@@ -96,6 +96,74 @@ pub(crate) fn confirm_choice(message: &str) -> Result<bool, String> {
     Ok(select(message, choices)?.as_deref() == Some(YES))
 }
 
+/// Read one visible text value from an interactive terminal.
+///
+/// An empty answer selects `default` when one exists. Without a default it is
+/// rejected rather than silently creating an incomplete provider definition.
+pub(crate) fn text(message: &str, default: Option<&str>) -> Result<String, String> {
+    text_with(message, default, is_interactive(), || {
+        let suffix = default.map_or(String::new(), |value| format!(" [{value}]"));
+        eprint!("? {message}{suffix}: ");
+        std::io::stderr()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .map_err(|error| error.to_string())?;
+        Ok(answer)
+    })
+}
+
+/// Read an optional visible text value from an interactive terminal.
+pub(crate) fn optional_text(
+    message: &str,
+    default: Option<&str>,
+) -> Result<Option<String>, String> {
+    optional_text_with(message, default, is_interactive(), || {
+        let suffix = default.map_or(String::new(), |value| format!(" [{value}]"));
+        eprint!("? {message}{suffix}: ");
+        std::io::stderr()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .map_err(|error| error.to_string())?;
+        Ok(answer)
+    })
+}
+
+fn text_with(
+    message: &str,
+    default: Option<&str>,
+    interactive: bool,
+    read_answer: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    let answer = optional_text_with(message, default, interactive, read_answer)?;
+    answer.ok_or_else(|| format!("{message} is required"))
+}
+
+fn optional_text_with(
+    message: &str,
+    default: Option<&str>,
+    interactive: bool,
+    read_answer: impl FnOnce() -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    if !interactive {
+        return Err(format!("{message} requires an interactive terminal"));
+    }
+    let answer = read_answer()?;
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return Ok(default
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned));
+    }
+    Ok(Some(answer.to_owned()))
+}
+
 /// Select one value with arrows, paging, and type-to-filter.
 pub(crate) fn select(message: &str, choices: Vec<Choice>) -> Result<Option<String>, String> {
     if choices.is_empty() {
@@ -452,6 +520,43 @@ mod tests {
         let error = confirm_with("Continue?", true, || Err("closed".to_owned()))
             .expect_err("a failed read is an error, not a no");
         assert_eq!(error, "closed");
+    }
+
+    #[test]
+    fn text_inputs_apply_defaults_require_values_and_fail_closed() {
+        assert_eq!(
+            text_with("Provider id", Some("custom"), true, || Ok("\n".to_owned()))
+                .expect("default"),
+            "custom"
+        );
+        assert_eq!(
+            text_with("Provider id", None, true, || Ok(
+                "  my-provider \n".to_owned()
+            ))
+            .expect("typed value"),
+            "my-provider"
+        );
+        assert_eq!(
+            text_with("Provider id", None, true, || Ok("\n".to_owned())).expect_err("required"),
+            "Provider id is required"
+        );
+        assert_eq!(
+            optional_text_with("AWS profile", None, true, || Ok("\n".to_owned()))
+                .expect("optional"),
+            None
+        );
+        assert_eq!(
+            optional_text_with("AWS profile", Some("us"), true, || Ok("\n".to_owned()))
+                .expect("default"),
+            Some("us".to_owned())
+        );
+        assert_eq!(
+            text_with("Provider id", Some("custom"), false, || {
+                panic!("a non-interactive prompt must not read")
+            })
+            .expect_err("no terminal"),
+            "Provider id requires an interactive terminal"
+        );
     }
 
     #[test]

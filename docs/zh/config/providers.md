@@ -72,7 +72,12 @@ zuno auth methods openai
 zuno auth methods myopenai
 ```
 
-在终端中，不带参数的登录会打开一个可搜索的 provider 选择器。它包含官方 OpenAI 集成，以及那些解析出的模型路由确实有一个真实凭据消费者的已配置 provider。配置过的 Bedrock provider 也在其中；它存储的 key 会作为 Amazon Bedrock bearer token 使用。仅存在于目录中的条目和历史遗留的凭据 id 不是登录选项：
+在终端中，不带参数的登录会打开一个可搜索的 provider 选择器。它包含官方 OpenAI
+集成，以及那些解析出的模型路由确实有一个真实凭据消费者的已配置 provider。配置过的
+Bedrock provider 也在其中；它存储的 key 会作为 Amazon Bedrock bearer token 使用。
+仅存在于目录中的条目和历史遗留的凭据 id 不是登录选项。没有匹配配置时，同一个选择器
+可以创建原生 OpenAI Responses、单一 Amazon Bedrock 或使用 Chat Completions 的
+OpenAI-compatible provider：
 
 ```sh
 zuno auth login
@@ -118,7 +123,8 @@ printf '%s' "$AWS_BEARER_TOKEN_BEDROCK" |
 AWS SDK 使用已配置 profile、access key、IAM role、EKS IRSA/web identity、容器凭据
 或 IMDS。
 
-登录之前请先配置好自定义 provider。像 `kiro-auth` 这样任意的、或仅有凭据的 id，会在 Zuno 读取标准输入或写入 `auth.json` 之前就被拒绝。
+交互配置会把生成的 provider 写入全局 `zuno.json`，随后才存储凭据。像 `kiro-auth`
+这样任意的、或仅有凭据的 id，仍会在 Zuno 读取标准输入或写入 `auth.json` 之前被拒绝。
 
 使用 `transport: "openai"` 不会赋予一个自定义 provider OpenAI 的 ChatGPT OAuth 流程。`openai` 这个 id 拥有那套登录、刷新协议、ChatGPT 端点重写和账户头。一个自定义 OAuth provider 需要它自己注册的登录方法和请求侧消费者；仅有一个 OAuth 形状的 JSON 对象不会被视为一次完整集成。
 

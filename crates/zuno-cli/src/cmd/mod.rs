@@ -14,6 +14,7 @@ mod mcp_runtime;
 mod models;
 mod plugin;
 mod product_agent;
+mod provider_setup;
 mod providers;
 mod run;
 mod self_update;

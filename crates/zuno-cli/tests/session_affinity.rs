@@ -12,7 +12,9 @@ use std::process::Output;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config};
+use zuno_testkit::{
+    DbChoice, MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config,
+};
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 const FINAL_MARKER: &str = "ZUNO_SESSION_AFFINITY_OK";
@@ -167,7 +169,11 @@ fn describe(output: &Output) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_session_keeps_affinity_across_a_real_responses_tool_loop() {
-    let env = ScriptedEnv::new().expect("isolated environment");
+    // This is a process-level routing proof, not an in-memory pool proof. A file
+    // database keeps concurrent shared-memory setup from masking session affinity.
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
     let fixture = env.working_dir().join("affinity-fixture.txt");
     std::fs::write(&fixture, "durable affinity fixture\n").expect("write read fixture");
     let scenario = Scenario::new("session-affinity")

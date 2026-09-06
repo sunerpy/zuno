@@ -13,9 +13,15 @@ use zuno_auth::{
 use zuno_config::schema::provider::ProviderTransport;
 use zuno_llm::catalog::{Catalog, CatalogDocument, CatalogSource, ResolveInput, ResolvedProvider};
 
+use super::provider_setup::{self, ProviderTemplate, SetupCredential};
 use super::terminal_prompt::{self, Choice};
 use crate::command::{ProvidersArgs, ProvidersCommand};
 use crate::environment::StartupEnvironment;
+
+const CONFIGURE_BEDROCK: &str = "__configure-amazon-bedrock";
+const CONFIGURE_OPENAI_COMPATIBLE: &str = "__configure-openai-compatible";
+const OPENAI_OFFICIAL: &str = "official";
+const OPENAI_RESPONSES: &str = "responses";
 
 const BEDROCK_AUTH_GUIDANCE: &str = "\
 Amazon Bedrock authentication priority:
@@ -172,12 +178,31 @@ fn login(
     let credentials = store.all().map_err(|error| error.to_string())?.entries;
     let registry = login_method_registry(&document, &config);
     let providers = ProviderIndex::new(&document, &config, &credentials, &registry);
-    let provider_id = match requested {
-        Some(requested) => providers
-            .resolve(requested)
-            .ok_or_else(|| unavailable_login_provider(requested))?,
+    let explicit_provider = requested.is_some();
+    let selection = match requested {
+        Some(requested) => resolve_login_selection(&providers, requested)?,
         None => select_provider(&providers)?,
     };
+    let ProviderSelection::Existing(provider_id) = selection else {
+        let ProviderSelection::Configure(template) = selection else {
+            unreachable!("provider selection has exactly two variants");
+        };
+        return configure_provider(store, env, layout, &document, template);
+    };
+    if !explicit_provider && method.is_none() && provider_id == "openai" {
+        match select_openai_connection()? {
+            OpenAiConnection::Official => {}
+            OpenAiConnection::CustomResponses => {
+                return configure_provider(
+                    store,
+                    env,
+                    layout,
+                    &document,
+                    ProviderTemplate::OpenAiResponses,
+                );
+            }
+        }
+    }
 
     let selected = select_login_method(&registry, &provider_id, method)?;
     if selected.id() == BEDROCK_BEARER_METHOD {
@@ -190,9 +215,163 @@ fn login(
     }
 }
 
-fn select_provider(providers: &ProviderIndex) -> Result<String, String> {
-    terminal_prompt::select("Select provider", providers.prompt_choices())?
-        .ok_or_else(|| "provider login cancelled".to_owned())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAiConnection {
+    Official,
+    CustomResponses,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProviderSelection {
+    Existing(String),
+    Configure(ProviderTemplate),
+}
+
+fn select_provider(providers: &ProviderIndex) -> Result<ProviderSelection, String> {
+    let mut choices = providers.prompt_choices();
+    if providers.resolve("amazon-bedrock").is_none() {
+        choices.push(
+            Choice::new(CONFIGURE_BEDROCK, "Amazon Bedrock")
+                .hinted("configure · AWS credential chain or API key"),
+        );
+    }
+    if providers.resolve("openai-compatible").is_none() {
+        choices.push(
+            Choice::new(CONFIGURE_OPENAI_COMPATIBLE, "OpenAI-compatible")
+                .hinted("configure · Chat Completions"),
+        );
+    }
+    let selected = terminal_prompt::select("Select provider", choices)?
+        .ok_or_else(|| "provider login cancelled".to_owned())?;
+    match selected.as_str() {
+        CONFIGURE_BEDROCK => Ok(ProviderSelection::Configure(
+            ProviderTemplate::AmazonBedrock,
+        )),
+        CONFIGURE_OPENAI_COMPATIBLE => Ok(ProviderSelection::Configure(
+            ProviderTemplate::OpenAiCompatible,
+        )),
+        _ => Ok(ProviderSelection::Existing(selected)),
+    }
+}
+
+fn resolve_login_selection(
+    providers: &ProviderIndex,
+    requested: &str,
+) -> Result<ProviderSelection, String> {
+    if let Some(provider) = providers.resolve(requested) {
+        return Ok(ProviderSelection::Existing(provider));
+    }
+    if !terminal_prompt::is_interactive() {
+        return Err(unavailable_login_provider(requested));
+    }
+    match requested.to_ascii_lowercase().as_str() {
+        "amazon-bedrock" | "bedrock" => Ok(ProviderSelection::Configure(
+            ProviderTemplate::AmazonBedrock,
+        )),
+        "openai-compatible" | "compatible" => Ok(ProviderSelection::Configure(
+            ProviderTemplate::OpenAiCompatible,
+        )),
+        "openai-responses" | "responses" => Ok(ProviderSelection::Configure(
+            ProviderTemplate::OpenAiResponses,
+        )),
+        _ => Err(unavailable_login_provider(requested)),
+    }
+}
+
+fn select_openai_connection() -> Result<OpenAiConnection, String> {
+    let selected = terminal_prompt::select(
+        "OpenAI connection",
+        vec![
+            Choice::new(OPENAI_OFFICIAL, "Official OpenAI")
+                .hinted("Responses · ChatGPT or API key"),
+            Choice::new(OPENAI_RESPONSES, "Custom Responses endpoint")
+                .hinted("native OpenAI Responses transport"),
+        ],
+    )?
+    .ok_or_else(|| "provider login cancelled".to_owned())?;
+    match selected.as_str() {
+        OPENAI_OFFICIAL => Ok(OpenAiConnection::Official),
+        OPENAI_RESPONSES => Ok(OpenAiConnection::CustomResponses),
+        _ => Err("unknown OpenAI connection choice".to_owned()),
+    }
+}
+
+fn configure_provider(
+    store: &zuno_auth::AuthStore,
+    env: &zuno_paths::Env,
+    layout: &zuno_paths::Layout,
+    document: &CatalogDocument,
+    template: ProviderTemplate,
+) -> Result<(), String> {
+    if !terminal_prompt::is_interactive() {
+        return Err("interactive provider setup requires a terminal".to_owned());
+    }
+    let setup = provider_setup::prepare(template, layout, env)?;
+    let credential = match setup.credential() {
+        SetupCredential::ApiKey => Some(Credential::Api {
+            key: Secret::new(read_api_key()?),
+            metadata: None,
+        }),
+        SetupCredential::BedrockBearer => {
+            println!("{BEDROCK_AUTH_GUIDANCE}");
+            Some(Credential::Api {
+                key: Secret::new(read_secret(
+                    "Enter Amazon Bedrock bearer token: ",
+                    "Amazon Bedrock bearer token is required",
+                    "Amazon Bedrock bearer token entry cancelled",
+                )?),
+                metadata: None,
+            })
+        }
+        SetupCredential::AwsCredentialChain => None,
+    };
+
+    setup.commit()?;
+    let effective = discovered_config(env).and_then(|config| {
+        let methods = login_method_registry(document, &config);
+        if methods.methods_for(setup.provider_id()).is_empty() {
+            Err(format!(
+                "provider {:?} is hidden by a higher-precedence configuration layer",
+                setup.provider_id()
+            ))
+        } else {
+            Ok(config)
+        }
+    });
+    if let Err(error) = effective {
+        return Err(with_rollback(error, &setup));
+    }
+    if let Some(credential) = credential
+        && let Err(error) = store.set(setup.provider_id(), credential)
+    {
+        return Err(with_rollback(error.to_string(), &setup));
+    }
+
+    println!(
+        "Configured {} in {}",
+        setup.display_name(),
+        setup.path().display()
+    );
+    match setup.credential() {
+        SetupCredential::ApiKey => println!("Stored API key for {}", setup.provider_id()),
+        SetupCredential::BedrockBearer => println!(
+            "Stored Amazon Bedrock bearer token for {}",
+            setup.provider_id()
+        ),
+        SetupCredential::AwsCredentialChain => {
+            println!("Amazon Bedrock will use the AWS credential chain")
+        }
+    }
+    Ok(())
+}
+
+fn with_rollback(error: String, setup: &provider_setup::PreparedProviderSetup) -> String {
+    match setup.rollback() {
+        Ok(()) => error,
+        Err(rollback) => {
+            format!("{error}; provider configuration rollback also failed: {rollback}")
+        }
+    }
 }
 
 fn select_login_method(

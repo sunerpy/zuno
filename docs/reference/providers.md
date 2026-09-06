@@ -85,7 +85,10 @@ In a terminal, a bare login opens a searchable provider picker. It includes the
 official OpenAI integration and configured providers whose resolved model route
 has a real credential consumer. This includes a configured Bedrock provider,
 whose stored key is used as an Amazon Bedrock bearer token. Catalog-only entries
-and historical credential ids are not login choices:
+and historical credential ids are not login choices. The same picker can create
+an OpenAI Responses provider, one Amazon Bedrock provider, or an
+OpenAI-compatible Chat Completions provider when no matching configuration
+exists:
 
 ```sh
 zuno auth login
@@ -138,9 +141,9 @@ credential chain. Without a bearer token, Zuno uses the configured profile,
 access keys, IAM role, EKS IRSA/web identity, container credentials, or IMDS
 through the AWS SDK.
 
-Configure a custom provider before logging in. An arbitrary or credential-only
-id such as `kiro-auth` is rejected before Zuno reads standard input or writes
-`auth.json`.
+Interactive setup writes the generated provider to the global `zuno.json` before
+storing its credential. An arbitrary or credential-only id such as `kiro-auth`
+is still rejected before Zuno reads standard input or writes `auth.json`.
 
 Using `transport: "openai"` does not grant a custom provider OpenAI's ChatGPT OAuth flow. The id `openai` owns that login, refresh protocol, ChatGPT endpoint rewrite, and account header. A custom OAuth provider needs its own registered login method and request-side consumer; an OAuth-shaped JSON object alone is not treated as a complete integration.
 

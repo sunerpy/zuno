@@ -32,6 +32,13 @@ extra command: a configured provider id receives only the API-key method when it
 resolved native transport actually consumes that credential, and an arbitrary or
 credential-only id is rejected before Zuno reads standard input.
 
+In an interactive terminal, `zuno auth login` can also create the provider before
+it authenticates it. The setup surface is intentionally product-level rather
+than transport-level: OpenAI, Amazon Bedrock, and OpenAI-compatible. Native
+Responses endpoints use the OpenAI transport; OpenAI-compatible defaults to
+Chat Completions. The generated entry is validated and atomically merged into
+the global configuration without replacing unrelated settings.
+
 Bedrock is a provider-specific bearer flow backed by the same `api` credential
 shape:
 
