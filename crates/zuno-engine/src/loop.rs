@@ -1243,6 +1243,12 @@ pub struct RunTurnRequest {
     pub dynamic_context: DynamicContext,
     /// Model context ceiling used to interpret the latest prompt occupancy.
     pub context_limit: Option<u64>,
+    /// Proactive context threshold enforced between provider steps.
+    ///
+    /// The host derives this from the same compaction policy its prelude uses. The
+    /// first request is exempt because the prelude has already checked persisted
+    /// history; later requests can otherwise grow indefinitely inside one tool loop.
+    context_compaction_threshold: Option<u64>,
     defer_success_terminal_event: bool,
 }
 
@@ -1259,6 +1265,7 @@ impl RunTurnRequest {
             turn_id: turn_id.into(),
             dynamic_context,
             context_limit: None,
+            context_compaction_threshold: None,
             defer_success_terminal_event: false,
         }
     }
@@ -1267,6 +1274,13 @@ impl RunTurnRequest {
     #[must_use]
     pub fn with_context_limit(mut self, context_limit: u64) -> Self {
         self.context_limit = (context_limit > 0).then_some(context_limit);
+        self
+    }
+
+    /// Attach the active compaction policy's proactive context threshold.
+    #[must_use]
+    pub fn with_context_compaction_threshold(mut self, threshold: u64) -> Self {
+        self.context_compaction_threshold = Some(threshold);
         self
     }
 
@@ -1395,6 +1409,19 @@ fn request_usage(accumulator: &StepAccumulator) -> ProviderRequestUsage {
     }
 }
 
+fn request_context_tokens(accumulator: &StepAccumulator) -> Option<u64> {
+    let accounting = accumulator.prompt_accounting?;
+    Some(
+        accounting
+            .prompt_total(
+                accumulator.input_tokens.unwrap_or(0),
+                accumulator.cache_read_input_tokens.unwrap_or(0),
+                accumulator.cache_write_input_tokens.unwrap_or(0),
+            )
+            .saturating_add(accumulator.output_tokens.unwrap_or(0)),
+    )
+}
+
 /// The turn total before any request has been accounted for.
 ///
 /// `accounted` starts `true` because nothing unaccounted has happened yet, which is
@@ -1480,6 +1507,41 @@ async fn honour_budget_decision(
             Err(TurnError::BudgetLimited { kind, detail })
         }
     }
+}
+
+async fn require_context_compaction_before_request(
+    events: &TurnEventSender,
+    step: u32,
+    threshold: Option<u64>,
+    last_context_tokens: Option<u64>,
+    estimated_prompt_tokens: u64,
+) -> Result<(), TurnError> {
+    if step <= 1 {
+        return Ok(());
+    }
+    let Some(threshold) = threshold else {
+        return Ok(());
+    };
+    let (used_tokens, source) = last_context_tokens
+        .filter(|tokens| *tokens > 0)
+        .map_or((estimated_prompt_tokens, "estimated prompt"), |tokens| {
+            (tokens, "provider-reported context")
+        });
+    if used_tokens < threshold {
+        return Ok(());
+    }
+    let reason = format!(
+        "{source} usage of {used_tokens} tokens reached the proactive compaction threshold of \
+         {threshold} before step {step}"
+    );
+    events
+        .send(TurnEvent::Notice {
+            severity: NoticeSeverity::Info,
+            code: "context.compact".to_owned(),
+            detail: reason.clone(),
+        })
+        .await?;
+    Err(TurnError::CompactionRequired { reason })
 }
 
 #[derive(Debug)]
@@ -1922,6 +1984,7 @@ async fn run_turn_in_span(
     let mut step_limit_finalization_attempted = false;
     let mut turn_usage = empty_turn_usage();
     let mut last_request = ProviderRequestUsage::default();
+    let mut last_context_tokens = None;
 
     loop {
         if context.interrupt.is_set() {
@@ -2179,6 +2242,14 @@ async fn run_turn_in_span(
             developer_context: &completion.developer_context,
         };
         let estimated_prompt_tokens = estimate_completion_prompt_tokens(&completion);
+        require_context_compaction_before_request(
+            &events,
+            step,
+            request.context_compaction_threshold,
+            last_context_tokens,
+            estimated_prompt_tokens,
+        )
+        .await?;
         ensure_prompt_context_budget(estimated_prompt_tokens, request.context_limit)?;
         // Consulted here and nowhere earlier: `estimated_prompt_tokens` is only the
         // size of the request about to be sent once the prompt is assembled, the
@@ -2573,6 +2644,7 @@ async fn run_turn_in_span(
         // Accounted before the step's disposition is examined, so a request whose
         // stream failed, was steered, or was interrupted still counts against the
         // allowance. Those requests were paid for; only their answers were lost.
+        last_context_tokens = request_context_tokens(&accumulator);
         last_request = request_usage(&accumulator);
         turn_usage = turn_usage.saturating_add(last_request);
         let provider_exit = match provider_result {

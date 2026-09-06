@@ -1139,6 +1139,11 @@ fn unified_diff_is_kept_as_an_extension_fallback_for_untyped_tools() {
 
 #[test]
 fn usage_updates_require_an_explicit_context_window() {
+    let started = TurnEvent::ProviderRequestStarted {
+        step: 1,
+        message_count: 1,
+        estimated_prompt_tokens: 80,
+    };
     let usage = TurnEvent::Provider {
         step: 1,
         event: StreamEvent::TokenUsage {
@@ -1151,28 +1156,42 @@ fn usage_updates_require_an_explicit_context_window() {
     };
 
     assert!(
+        TurnEventProjector::new().project(&started).is_none(),
+        "unknown context size must suppress estimated usage too"
+    );
+    assert!(
         TurnEventProjector::new().project(&usage).is_none(),
         "unknown context size must not be represented as a made-up ACP size"
     );
-    let update = TurnEventProjector::with_context_size(200_000)
+    let estimated = TurnEventProjector::with_context_size(200_000)
+        .project(&started)
+        .expect("known context size enables request-start usage projection");
+    assert_eq!(estimated["sessionUpdate"], "usage_update");
+    assert_eq!(estimated["used"], 80);
+    assert_eq!(estimated["size"], 200_000);
+    let measured = TurnEventProjector::with_context_size(200_000)
         .project(&usage)
         .expect("known context size enables usage projection");
-    assert_eq!(update["sessionUpdate"], "usage_update");
-    assert_eq!(update["used"], 175);
-    assert_eq!(update["size"], 200_000);
+    assert_eq!(measured["sessionUpdate"], "usage_update");
+    assert_eq!(measured["used"], 175);
+    assert_eq!(measured["size"], 200_000);
 }
 
 #[test]
 fn attempt_buffering_discards_failed_partial_output_before_acp_commit() {
     let mut projector = AttemptBufferedTurnEventProjector::with_context_size(200_000);
-    assert!(
-        projector
-            .project(&TurnEvent::ProviderRequestStarted {
-                step: 1,
-                message_count: 1,
-                estimated_prompt_tokens: 12,
-            })
-            .is_empty()
+    assert_eq!(
+        projector.project(&TurnEvent::ProviderRequestStarted {
+            step: 1,
+            message_count: 1,
+            estimated_prompt_tokens: 12,
+        }),
+        vec![json!({
+            "sessionUpdate": "usage_update",
+            "used": 12,
+            "size": 200_000,
+        })],
+        "request occupancy must reset immediately instead of waiting for the response"
     );
     assert!(
         projector
