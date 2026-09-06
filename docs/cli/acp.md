@@ -84,7 +84,13 @@ sent to the provider.
 
 `session/load` and `session/resume` rebuild the session runtime and automatically
 resume an active root Goal. No extra prompt is required, including for a session
-written by 0.6.0 that contains an active Goal but no user message.
+written by 0.6.0 that contains an active Goal but no user message, or for a
+compacted session whose retained tail starts with an assistant message.
+
+`/goal budget <positive tokens|none>` changes one Goal's explicit ceiling.
+`goal_update` accepts `in_progress` and `active` only as idempotent confirmation
+of an already-active Goal; a paused or blocked Goal still requires the user-owned
+`/goal resume` control.
 
 ## Session MCP servers
 

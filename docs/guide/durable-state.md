@@ -98,6 +98,7 @@ Inspect and manage it with `/goal` in the terminal application:
 /goal <objective>
 /goal create <objective>
 /goal edit <objective>
+/goal budget <positive tokens|none>
 /goal pause
 /goal resume
 /goal block <reason>
@@ -128,7 +129,9 @@ prompt. This also repairs sessions created by older releases that persisted an a
 but stopped before admitting the first user turn.
 
 Known action names take precedence when they are the first token: `show`, `get`, `status`,
-`history`, `create`, `edit`, `pause`, `resume`, `block`, `complete`, `cancel`, and `help`.
+`history`, `create`, `edit`, `budget`, `pause`, `resume`, `block`, `complete`, `cancel`,
+and `help`. `/goal budget 256000000` sets this Goal's explicit ceiling; `/goal budget
+none` removes it without changing the Goal's lifecycle status or accumulated usage.
 If an objective itself starts with one of those words, use `/goal create <objective>` or
 `/goal edit <objective>` to disambiguate it. `/goal help` prints the compact command
 summary.
@@ -361,22 +364,32 @@ status, which is a fact about the goal the model does have to see.
 
 ### The host's default allowance
 
-A goal whose `token_budget` is unset is not unbounded. `None` means "the host's default",
-and the harness's default profile publishes one: forty requests at a 200,000-token window,
-or 8,000,000 tokens. Every request re-sends the whole prompt and cache reads are charged, so
-that is close to the most one runaway turn can cost.
+A goal whose `token_budget` is unset is unbounded by default. The standard Harness profile
+publishes `TurnAllowance::UNLIMITED`; it does not invent a token, tool-call, or wall-time
+ceiling.
 
-An explicit goal budget always wins, and the default is never written into the goal row. A
-host that genuinely wants unbounded autonomy says so with `TurnAllowance::UNLIMITED`, not by
-leaving a field unset. The stop kind is `token_budget` either way, but the remedy differs: a
-user who set a budget is told to raise it, and a user who never set one is told to set one.
+A deployment that wants a shared fallback for unbudgeted Goals sets
+`goal.default_token_budget` in `zuno.json`:
+
+```json
+{
+  "goal": {
+    "default_token_budget": 256000000
+  }
+}
+```
+
+An explicit per-Goal budget always wins, and the configured fallback is never written into
+the Goal row. Remove the configuration key to restore the unbounded default, or use
+`/goal budget <positive tokens|none>` to change one existing Goal.
 
 One rule from the table above does not carry over. A provider that reports no usage stops a
 turn under a budget you set, because a budget that cannot be counted cannot be honoured and
-continuing on unreported numbers would quietly make it advisory. Under the default the turn
-continues: an endpoint that withholds usage is its own choice and not a runaway, and ending
-every such run on a limit nobody asked for leaves no remedy but to set one. The default still
-binds on whatever was counted, so a floor that crosses it stops above.
+continuing on unreported numbers would quietly make it advisory. Under a configured host
+fallback the turn continues: an endpoint that withholds usage is its own choice and not a
+runaway, and ending every such run on a limit nobody set on the Goal leaves no remedy but to
+set one. The fallback still binds on whatever was counted, so a floor that crosses it stops
+above.
 
 Two further ceilings bound the turn rather than the goal. Both are off unless the host sets
 them, and both apply whether or not a Goal is active, because a turn without a goal can loop

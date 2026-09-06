@@ -23,9 +23,9 @@ use zuno_engine::interrupt::{InterruptSignal, SoftInterruptMessage, SoftInterrup
 use zuno_engine::r#loop::{
     AgentModelResolver, AvailableTools, DispatchRequest, NoticeSeverity, PreparedToolDispatch,
     ResolvedAgent, ResolvedModel, RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext,
-    TurnError, TurnEvent, TurnOutcome, TurnRecovery, event_channel, hydrate_retained_history,
-    hydrate_retained_history_tail, project_history, project_history_owned, retained_history,
-    run_turn,
+    TurnError, TurnEvent, TurnOutcome, TurnRecovery, event_channel, has_requested_user_message,
+    hydrate_retained_history, hydrate_retained_history_tail, project_history,
+    project_history_owned, retained_history, run_turn,
 };
 use zuno_engine::prompt::{PromptAssembly, PromptAssemblyError, RuntimePromptPolicy};
 use zuno_engine::status::{SessionControl, SessionRunRegistry};
@@ -5192,6 +5192,46 @@ fn loop_failed_compaction_falls_back_to_byte_identical_full_history() {
     put_user(&connection, "msg_current_user", 40, "current request");
 
     assert_loader_projection_matches_full_reference(&connection);
+}
+
+#[test]
+fn assistant_only_compaction_tail_requires_a_fresh_user_anchor() {
+    let connection = seeded();
+    put_user(&connection, "msg_old_user", 10, "original request");
+    put_assistant_text(
+        &connection,
+        "msg_tail_assistant",
+        20,
+        "msg_old_user",
+        "latest answer",
+    );
+    put_successful_compaction(
+        &connection,
+        "msg_compaction_marker",
+        "msg_compaction_summary",
+        "msg_tail_assistant",
+        30,
+    );
+
+    let retained =
+        hydrate_retained_history(&connection, SESSION_ID).expect("hydrate assistant-only tail");
+    assert!(
+        !has_requested_user_message(&retained),
+        "the compaction marker is bookkeeping, not a user turn the engine may answer"
+    );
+
+    put_user(
+        &connection,
+        "msg_goal_anchor",
+        40,
+        "continue the durable goal",
+    );
+    let anchored =
+        hydrate_retained_history(&connection, SESSION_ID).expect("hydrate appended goal anchor");
+    assert!(
+        has_requested_user_message(&anchored),
+        "a fresh durable user anchor makes automatic continuation answerable again"
+    );
 }
 
 #[test]

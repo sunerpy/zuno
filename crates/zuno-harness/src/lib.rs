@@ -27,31 +27,13 @@ const PUBLIC_HTTP_COMPONENT_ID: &str = "zuno.public-http";
 const PRODUCT_CAPABILITY_SCOPE: &str = "profile";
 const PRODUCT_CAPABILITY_VERSION: CapabilityVersion = CapabilityVersion::new(1, 0);
 
-/// The token budget the default host grants a goal nobody put a number on.
-///
-/// Forty steps at a 200,000-token window. Both factors are already this workspace's:
-/// 200,000 is the context window the engine's own budget tests assume and the one the
-/// configuration fixtures use most, and a forty-step turn is the runaway the budget
-/// module names as the case it exists to stop. Every provider
-/// request re-sends the whole prompt, the prompt cannot exceed the window, and cache
-/// reads are charged, so 40 × 200,000 = 8,000,000 tokens is the most one such turn can
-/// cost. A goal that gets here without anyone having set a budget has had one full
-/// runaway's worth of allowance; the next number should come from a human, and the
-/// stop says so. A host that wants unlimited autonomy says so with
-/// [`TurnAllowance::UNLIMITED`] rather than with a larger number.
-pub const DEFAULT_GOAL_TOKEN_BUDGET: u64 = 40 * 200_000;
-
 /// The allowance the standard profile grants a turn.
 ///
-/// Only the token default is set. The tool-call and wall-time ceilings stay at none
-/// because the workspace assumes no number for them, and a ceiling invented here
-/// would stop legitimate long turns on a guess; a host that has measured its own
-/// turns sets them through [`default_profile_with_tools_and_allowance`].
-pub const DEFAULT_TURN_ALLOWANCE: TurnAllowance = TurnAllowance {
-    default_token_budget: Some(DEFAULT_GOAL_TOKEN_BUDGET),
-    max_tool_calls: None,
-    max_duration: None,
-};
+/// No ceiling is invented for a Goal, tool calls, or wall time. Deployments that
+/// have measured a useful bound publish it through
+/// [`default_profile_with_tools_and_allowance`]; the standard CLI does that when
+/// `goal.default_token_budget` is configured.
+pub const DEFAULT_TURN_ALLOWANCE: TurnAllowance = TurnAllowance::UNLIMITED;
 
 /// Product descriptor families projected into the runtime-named capability plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

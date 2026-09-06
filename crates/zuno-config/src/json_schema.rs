@@ -127,6 +127,20 @@ mod tests {
         assert_eq!(post_turn["additionalProperties"], Value::Bool(false));
     }
 
+    #[test]
+    fn goal_schema_publishes_an_opt_in_positive_fallback_budget() {
+        let schema = document();
+        let budget = &schema["$defs"]["GoalConfig"]["properties"]["default_token_budget"];
+        assert!(
+            budget["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("Omit this field")
+                    && text.contains("without a token ceiling")),
+            "the schema must make the unlimited default explicit: {budget}"
+        );
+        assert_eq!(budget["minimum"], Value::from(1));
+    }
+
     /// The published schema and the parser's whitelist are two hand-maintained
     /// lists of the same thing. [`crate::schema::KNOWN_TOP_LEVEL_KEYS`] is what
     /// actually rejects a key at parse time, so a property that the schema

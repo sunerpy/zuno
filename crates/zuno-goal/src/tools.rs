@@ -71,18 +71,27 @@ pub struct CreateGoalParams {
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateGoalStatus {
+    /// Confirm that an already-active Goal remains in progress.
+    InProgress,
+    /// Compatibility spelling for [`Self::InProgress`].
+    Active,
     /// The objective and every requirement are proven complete.
     Complete,
     /// The same true impasse persisted for three consecutive goal turns.
     Blocked,
 }
 
-impl From<UpdateGoalStatus> for ModelStatus {
-    fn from(status: UpdateGoalStatus) -> Self {
-        match status {
-            UpdateGoalStatus::Complete => Self::Complete,
-            UpdateGoalStatus::Blocked => Self::Blocked,
+impl UpdateGoalStatus {
+    fn model_status(self) -> Option<ModelStatus> {
+        match self {
+            Self::Complete => Some(ModelStatus::Complete),
+            Self::Blocked => Some(ModelStatus::Blocked),
+            Self::InProgress | Self::Active => None,
         }
+    }
+
+    fn is_progress(self) -> bool {
+        matches!(self, Self::InProgress | Self::Active)
     }
 }
 
@@ -112,8 +121,11 @@ pub struct WaivedCriterion {
 pub struct UpdateGoalParams {
     /// Revision returned by `goal_get`; stale revisions are rejected.
     pub expected_revision: i64,
-    /// Terminal status justified by the completion or blocked audit.
+    /// Terminal status justified by an audit, or an idempotent progress confirmation.
     pub status: UpdateGoalStatus,
+    /// Concise reason for this update, retained with the durable tool call.
+    #[serde(default)]
+    pub intent: Option<String>,
     /// Stable description of the impasse. Required only with `status: blocked`.
     #[serde(default)]
     pub blocking_condition: Option<String>,
@@ -314,7 +326,54 @@ impl TypedTool for UpdateGoalTool {
         }
         let store = Arc::clone(&self.store);
         let session_id = ctx.session_id;
-        let status = ModelStatus::from(params.status);
+        let progress = params.status.is_progress();
+        let status = params.status.model_status();
+        if progress {
+            if params.blocking_condition.is_some()
+                || !params.satisfy_criteria.is_empty()
+                || !params.waive_criteria.is_empty()
+            {
+                return Err(invalid(
+                    UPDATE_GOAL_TOOL_ID,
+                    "in_progress is an idempotent status confirmation and cannot change \
+                     blocking conditions or criteria",
+                ));
+            }
+            let read_store = Arc::clone(&store);
+            let read_session_id = session_id.clone();
+            let goal = tokio::task::spawn_blocking(move || read_store.goal(&read_session_id))
+                .await
+                .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
+                .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?
+                .ok_or_else(|| {
+                    invalid(
+                        UPDATE_GOAL_TOOL_ID,
+                        "cannot update goal because this session has no goal",
+                    )
+                })?;
+            if goal.revision != params.expected_revision {
+                return Err(map_goal_error(
+                    UPDATE_GOAL_TOOL_ID,
+                    GoalError::RevisionConflict {
+                        session_id,
+                        expected: params.expected_revision,
+                        actual: goal.revision,
+                    },
+                ));
+            }
+            if goal.status != crate::GoalStatus::Active {
+                return Err(invalid(
+                    UPDATE_GOAL_TOOL_ID,
+                    &format!(
+                        "status `{}` cannot be changed to in_progress by the model; \
+                         the user must run `/goal resume`",
+                        goal.status.as_str()
+                    ),
+                ));
+            }
+            return current_goal_output(&store, &session_id, Some(goal)).await;
+        }
+        let status = status.expect("non-progress Goal updates are terminal");
         // Evidence first, status second, in one call: a model that verified its work
         // and wants to finish should not have to choose which of the two writes to
         // make, and the completion audit that follows must see the citations this

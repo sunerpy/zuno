@@ -254,14 +254,19 @@ continuation 会查询当前目标下仍待处理的记录并再次暂停。`sta
   预算耗尽的 `budget_limited` 状态不同。
 - 预算策略可以要求压缩而不是停止。这被归类为上下文上限失败并走同一条路径：压缩保留的
   历史，然后重试该回合。
-- 每次 provider 请求前后都会咨询回合预算策略。默认 profile 发布的 `TurnAllowance` 把
-  未设预算的 Goal 置于 8,000,000 token 的宿主默认额度之下，并可另设工具调用次数上限与
-  墙上时间上限；这两道上限无论有没有 Goal 都生效，触顶时以 `tool_call_budget` 或 `time_budget` 停止。
-  在用户显式设定的 Goal 预算下，用量不可测时以 `usage_unknown` 停止；宿主默认额度则继续执行，
-  只按已计数的用量生效。上限优先于压缩请求或继续执行，但让位于 Goal 自身已产生的停止。
-  `None` 不再等于无限自治：只有不发布 allowance、或显式发布 `TurnAllowance::UNLIMITED` 的
-  profile 才没有上限。每次停止都是类型化的 `TurnError::BudgetLimited`，并以 `notice` 事件
+- 每次 provider 请求前后都会咨询回合预算策略。默认 profile 发布
+  `TurnAllowance::UNLIMITED`，不会为未设预算的 Goal 猜测 token 上限，也不会默认设置工具
+  调用次数或墙上时间上限。`goal.default_token_budget` 可为没有自身 `token_budget` 的 Goal
+  配置宿主兜底；Goal 自己的显式预算始终优先。自定义 profile 还可设置工具调用次数与墙上时间
+  上限；两者无论有没有 Goal 都生效，触顶时以 `tool_call_budget` 或 `time_budget` 停止。
+  在用户显式设定的 Goal 预算下，用量不可测时以 `usage_unknown` 停止；配置的宿主兜底额度
+  则继续执行，只按已计数的用量生效。上限优先于压缩请求或继续执行，但让位于 Goal 自身已产生的停止。
+  每次停止都是类型化的 `TurnError::BudgetLimited`，并以 `notice` 事件
   （code 为 `budget.<kind>`）投影给客户端；压缩请求的 code 为 `budget.compact`。
+
+自动 Goal 续跑会检查 provider 真正保留的历史，而不是整个 message 表。若压缩边界从 assistant
+消息开始，导致保留后缀里没有真实 user turn，宿主会在下一轮前把 Goal objective 重新持久化为
+user anchor；合成的 compaction marker 永远不被当成用户授权。
 
 ## 文件工具的路径权威
 
