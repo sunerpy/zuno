@@ -556,10 +556,6 @@ Shell 门禁会穿过命令行前面的包装程序来阅读它——`sudo`、`d
 ```json
 {
   "learning": {
-    "enabled": true,
-    "use": true,
-    "generate": true,
-    "extractor_model": "provider/model",
     "post_turn": {
       "enabled": true,
       "idle_delay_ms": 21600000,
@@ -571,15 +567,19 @@ Shell 门禁会穿过命令行前面的包装程序来阅读它——`sudo`、`d
 }
 ```
 
-- `enabled` 默认为 `false`，并且是总上限；为 `false` 时，有效的 `use`、`generate` 都是 `false`。
-- `enabled: true` 时，未填写的 `use` 与 `generate` 均默认为 `true`。
+- `enabled` 默认为 `true`，并且是总上限；显式设为 `false` 时，有效的 `use`、`generate` 都是 `false`。
+- 未填写的 `use` 与 `generate` 均默认为 `true`。
 - `use: true, generate: false` 可以只读使用既有 Experience，不需要配置 `extractor_model`。
-- 只有有效 `generate` 为 `true` 时才要求非空 `extractor_model`。
+- `extractor_model` 可选；显式值具有最高优先级，否则依次使用当前 provider 下可达的 `small_model`、当前会话模型。自动选择不会打开另一个 provider，也不会改写配置。
 - `post_turn.enabled` 只控制符合条件任务完成后的自动抽取，不控制既有 Experience 的读取。
 - `post_turn.idle_delay_ms` 默认 `21600000`（六小时），可设为 `0` 表示自动任务立即具备运行资格。
 - `post_turn.poll_interval_ms` 默认 `60000` 且必须大于零；`post_turn.max_jobs_per_wake` 默认 `2` 且必须大于零。
+- 自动学习不设置额度百分比、每日 token 或金额预算。provider 的限流错误会保留 typed `Retry-After`；六小时空闲、每次两个任务、资格检查、去重与最多三次尝试共同限制后台工作量。
 - `post_turn.disable_on_external_context` 默认 `false`；为 `true` 时，带外部上下文标记的完成回合会把该会话置为 `generation=excluded`，跳过已排队的自动抽取；只有新会话才能重新启用显式或自动生成。
 - 自动任务领取还会在同一 SQLite 事务中检查会话活动时间、待处理输入、当前进程的活跃回合以及会话策略；不符合条件时不会消耗 attempt。可重试的抽取器错误进入有界指数退避，不会立即永久失败。
+- 自动检索会先把提示词转换为有界的字面量 FTS 查询；引号、运算符、列选择器和标识符标点只作为数据处理，不会成为 SQLite FTS5 语法。
+
+新会话在物化时固化这些自动默认值；已有会话持久化的 `/memories` 策略继续生效，不会因默认值变化被追溯改写。只有项目范围且置信度至少为 `0.9` 的候选会自动写入；全局与低置信候选继续等待评审。
 
 反思写入的经验与记忆都属于不可信的模型输出，写入端与渲染端的边界是两套不同的规则。写入时只拒绝无法还原为模型可读文本的**编码**：Unicode Tags 区（`U+E0000..=U+E007F`）、变体选择符补充区（`U+E0100..=U+E01EF`），以及除制表符、换行、回车之外的 C0/C1 控制字符。用 Tags 区改写的载荷不含 ASCII 的 `<`，任何文本扫描都看不见它。除此之外一律照常保存：变体选择符、软连字符、方向控制符，以及只是提到 `~/.ssh/config`、`AGENTS.md` 或引用了一次注入企图的普通工程叙述。记录攻击本身正是这个子系统存在的意义。
 

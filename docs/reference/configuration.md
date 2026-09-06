@@ -1311,10 +1311,6 @@ store:
     "auto_confidence": 0.9
   },
   "learning": {
-    "enabled": true,
-    "use": true,
-    "generate": true,
-    "extractor_model": "provider/model",
     "post_turn": {
       "enabled": true,
       "idle_delay_ms": 21600000,
@@ -1348,16 +1344,16 @@ store:
 - `promotion` is `review` (default), `high_confidence`, or `automatic`.
   `high_confidence` applies only candidates at or above `auto_confidence`.
 - `auto_confidence` is a finite value in `0..=1` and defaults to `0.9`.
-- `learning.enabled` defaults to `false` and is the master upper bound. When it
+- `learning.enabled` defaults to `true` and is the master upper bound. When it
   is false, effective `use` and `generate` are both false.
-- With `learning.enabled: true`, omitted `use` and `generate` both default to
+- Omitted `use` and `generate` both default to
   true. `use` admits already durable Experience records into retrieval and
   prompt context; `generate` permits new extraction, aggregation, Memory
   candidates, patterns, and Skill candidates.
-- `learning.extractor_model` resolves independently of `small_model` and is
-  required only when effective `generate` is true. A read-only configuration
-  with `use: true` and `generate: false` can consume existing Experience
-  records without configuring an extractor.
+- `learning.extractor_model` is optional. An explicit value is authoritative;
+  otherwise the runtime uses a reachable `small_model` from the active provider,
+  then the active session model. It never opens another provider or rewrites
+  configuration to make that choice.
 - `post_turn.enabled` controls only automatic extraction after eligible
   completed tasks. It does not disable existing-Experience use, and disabling it
   does not turn off generation paths invoked explicitly.
@@ -1365,6 +1361,10 @@ store:
   immediate eligibility, and delays only automatic extraction jobs.
 - `post_turn.poll_interval_ms` defaults to `60000` and must be positive.
 - `post_turn.max_jobs_per_wake` defaults to `2` and must be positive.
+- Automatic learning has no quota-percentage, daily-token, or currency budget.
+  Provider rate limits retain their typed `Retry-After` value, while the idle
+  delay, wake cap, eligibility checks, deduplication, and three-attempt ceiling
+  bound background work.
 - `post_turn.disable_on_external_context` defaults to `false`. When true,
   a completed turn marked as consuming external context moves that session to
   `generation=excluded`, skips queued automatic extraction, and requires a new
@@ -1373,6 +1373,9 @@ store:
   records.
 - global aggregation defaults to one seven-day bucket and requires two projects.
 - automatic prompt retrieval is capped at five items and 1,200 context tokens.
+- Prompt text is converted to a bounded literal FTS query before SQLite sees it;
+  quotes, operators, column selectors, and identifier punctuation are data, not
+  FTS5 grammar.
 - `retrieval.max_context_tokens` is measured on the rendered
   `learning.experiences` section, escaping and `[U+XXXX]` markers included. A
   budget too small for the framed section plus its cheapest matching record
@@ -1389,8 +1392,13 @@ store:
 
 The extractor receives no tools, network, or filesystem authority. Only
 project-scoped Memory proposals at confidence `>= 0.9` can auto-apply through
-learning. Skill candidates always require explicit review, offline evaluation,
-and a later apply action.
+learning. Global and lower-confidence Memory proposals remain pending. Skill
+candidates always require explicit review, offline evaluation, and a later apply
+action.
+
+New sessions freeze these automatic defaults when they are materialized.
+Existing durable `/memories` policy rows remain authoritative and are not
+rewritten by a later configuration default.
 
 `memory: false` disables resident injection and proposal tools. It does not
 disable durable Experience projection. `learning.use` controls consumption of

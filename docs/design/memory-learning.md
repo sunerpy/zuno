@@ -114,5 +114,6 @@ Deleting learning evidence never silently removes applied Memory. Zuno creates a
 pending-review inverse candidate and retains the evidence needed to review it.
 
 The retired `memory.reflection` and `memory.nudge_interval` configuration fields
-are rejected. Post-task extraction now belongs to the explicit `learning`
-subsystem and uses `learning.extractor_model`.
+are rejected. Post-task extraction belongs to the default-enabled `learning`
+subsystem. An explicit `learning.extractor_model` wins; otherwise the active
+provider's `small_model` and then the session model are used.

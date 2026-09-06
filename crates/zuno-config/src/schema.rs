@@ -1054,7 +1054,7 @@ impl<'de> Deserialize<'de> for MemoryConfidence {
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LearningConfig {
-    /// Master switch. Defaults to false and caps both `use` and `generate`.
+    /// Master switch. Defaults to true and caps both `use` and `generate`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Use durable Experience records produced by earlier runs.
@@ -1065,13 +1065,12 @@ pub struct LearningConfig {
     pub r#use: Option<bool>,
     /// Generate new Experience, Memory candidates, patterns, and Skill candidates.
     ///
-    /// Defaults to true when `enabled` is true. The extractor model is required only
-    /// when this resolves to true.
+    /// Defaults to true when `enabled` is true. When no extractor model is named,
+    /// runtime resolution prefers the active provider's `small_model` and then the
+    /// active session model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generate: Option<bool>,
-    /// Dedicated model used by the no-tools structured extractor.
-    ///
-    /// Required only when effective generation is enabled.
+    /// Optional dedicated model used by the no-tools structured extractor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extractor_model: Option<String>,
     /// Fast post-turn extraction.
@@ -1099,7 +1098,7 @@ impl LearningConfig {
         let post_turn = self.post_turn.as_ref();
         let retrieval = self.retrieval.as_ref();
         let skill = self.skill.as_ref();
-        let enabled = self.enabled.unwrap_or(false);
+        let enabled = self.enabled.unwrap_or(true);
         let use_existing = enabled && self.r#use.unwrap_or(true);
         let generate = enabled && self.generate.unwrap_or(true);
         ResolvedLearningConfig {
@@ -1257,11 +1256,11 @@ pub struct ResolvedLearningConfig {
 impl Default for ResolvedLearningConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            use_existing: false,
-            generate: false,
+            enabled: true,
+            use_existing: true,
+            generate: true,
             extractor_model: None,
-            post_turn_enabled: false,
+            post_turn_enabled: true,
             post_turn_idle_delay_ms: DEFAULT_LEARNING_POST_TURN_IDLE_DELAY_MS,
             post_turn_poll_interval_ms: DEFAULT_LEARNING_POST_TURN_POLL_INTERVAL_MS,
             post_turn_max_jobs_per_wake: DEFAULT_LEARNING_POST_TURN_MAX_JOBS_PER_WAKE,

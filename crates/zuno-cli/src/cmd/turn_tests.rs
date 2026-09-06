@@ -4633,10 +4633,7 @@ fn internal_models_keep_the_responses_surface_selected_by_the_catalog() {
     let config: zuno_config::schema::Config = serde_json::from_str(
         r#"{
           "small_model": "kiro-local/gpt-5.6-sol",
-          "learning": {
-            "enabled": true,
-            "extractor_model": "kiro-local/gpt-5.6-sol"
-          },
+          "learning": {},
           "provider": {
             "kiro-local": {
               "transport": "openai",
@@ -4690,12 +4687,112 @@ fn internal_models_keep_the_responses_surface_selected_by_the_catalog() {
         );
     }
 
-    let learning = resolve_learning_model(&config, &catalog, "kiro-local", &env, &mut notes)
-        .expect("learning resolution succeeds")
-        .expect("learning is enabled by the explicit extractor model");
+    let learning = resolve_learning_model(
+        &config,
+        &catalog,
+        "kiro-local",
+        "gpt-5.6-sol",
+        model,
+        &env,
+        &mut notes,
+    )
+    .expect("learning resolution succeeds")
+    .expect("learning inherits the reachable small model");
     assert_eq!(learning.model.provider.surface, ApiSurface::Responses);
     assert_eq!(learning.model.surface, ApiSurface::Responses);
     assert_eq!(learning.max_output_tokens, 2_048);
+}
+
+#[test]
+fn learning_model_resolution_prefers_explicit_then_small_then_session() {
+    let (catalog, _) = catalog_with_two_models_and_a_title_override();
+    let session_model = catalog.model("test", "big").expect("the session model");
+    let env = Env::empty();
+
+    let explicit: zuno_config::schema::Config = serde_json::from_str(
+        r#"{"small_model":"test/small","learning":{"extractor_model":"test/big"}}"#,
+    )
+    .expect("explicit learning config");
+    let mut notes = Vec::new();
+    let learning = resolve_learning_model(
+        &explicit,
+        &catalog,
+        "test",
+        "big",
+        session_model,
+        &env,
+        &mut notes,
+    )
+    .expect("explicit extractor resolution")
+    .expect("learning model");
+    assert_eq!(learning.model.model_id, "big");
+    assert!(notes.is_empty(), "{notes:?}");
+
+    let small: zuno_config::schema::Config =
+        serde_json::from_str(r#"{"small_model":"test/small"}"#).expect("small model config");
+    let mut notes = Vec::new();
+    let learning = resolve_learning_model(
+        &small,
+        &catalog,
+        "test",
+        "big",
+        session_model,
+        &env,
+        &mut notes,
+    )
+    .expect("small model resolution")
+    .expect("learning model");
+    assert_eq!(learning.model.model_id, "small");
+    assert!(notes.is_empty(), "{notes:?}");
+
+    let mismatched: zuno_config::schema::Config =
+        serde_json::from_str(r#"{"small_model":"elsewhere/small"}"#)
+            .expect("mismatched small model config");
+    let mut notes = Vec::new();
+    let learning = resolve_learning_model(
+        &mismatched,
+        &catalog,
+        "test",
+        "big",
+        session_model,
+        &env,
+        &mut notes,
+    )
+    .expect("session fallback resolution")
+    .expect("learning model");
+    assert_eq!(learning.model.model_id, "big");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("only `test` credentials are wired")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn an_explicit_cross_provider_learning_model_disables_generation_without_fallback() {
+    let (catalog, _) = catalog_with_two_models_and_a_title_override();
+    let session_model = catalog.model("test", "big").expect("the session model");
+    let config: zuno_config::schema::Config = serde_json::from_str(
+        r#"{"small_model":"test/small","learning":{"extractor_model":"elsewhere/extractor"}}"#,
+    )
+    .expect("cross-provider extractor config");
+    let mut notes = Vec::new();
+    let resolved = resolve_learning_model(
+        &config,
+        &catalog,
+        "test",
+        "big",
+        session_model,
+        &Env::empty(),
+        &mut notes,
+    )
+    .expect("explicit mismatch is a visible capability downgrade");
+    assert!(resolved.is_none());
+    assert!(
+        notes.iter().any(|note| note.contains("learning disabled")),
+        "{notes:?}"
+    );
 }
 
 /// Every name the roster declares internal must resolve here.
@@ -11224,6 +11321,7 @@ mod learning_runtime {
     #[derive(Debug)]
     struct ScriptedProvider {
         events: Vec<StreamEvent>,
+        retry_after: Option<Duration>,
         requests: Arc<Mutex<Vec<CompletionRequest>>>,
     }
 
@@ -11241,6 +11339,11 @@ mod learning_runtime {
                 .lock()
                 .expect("learning request lock")
                 .push(request);
+            if let Some(retry_after) = self.retry_after {
+                return Box::pin(stream::iter([Err(ProviderError::RateLimited {
+                    retry_after: Some(retry_after),
+                })]));
+            }
             Box::pin(stream::iter(self.events.clone().into_iter().map(Ok)))
         }
     }
@@ -11275,6 +11378,7 @@ mod learning_runtime {
         let extractor = ProviderLearningExtractor {
             provider: Arc::new(ScriptedProvider {
                 events: provider_events,
+                retry_after: None,
                 requests: Arc::clone(&requests),
             }),
             model: EngineModel::new(
@@ -11285,6 +11389,21 @@ mod learning_runtime {
             events: zuno_db::event_log::SessionEventLog::new(pool),
         };
         (extractor, events, requests)
+    }
+
+    fn rate_limited_fixture(
+        retry_after: Duration,
+    ) -> (
+        ProviderLearningExtractor,
+        zuno_db::event_log::SessionEventLog,
+    ) {
+        let (mut extractor, events, requests) = fixture(Vec::new());
+        extractor.provider = Arc::new(ScriptedProvider {
+            events: Vec::new(),
+            retry_after: Some(retry_after),
+            requests,
+        });
+        (extractor, events)
     }
 
     fn request() -> ExtractionRequest {
@@ -11332,6 +11451,33 @@ mod learning_runtime {
         );
         assert_eq!(events[0].properties["tools"], json!([]));
         assert_eq!(events[1].properties["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn provider_learning_extractor_preserves_retry_after() {
+        let retry_after = Duration::from_secs(29);
+        let (extractor, events) = rate_limited_fixture(retry_after);
+        let error = extractor
+            .extract(request())
+            .await
+            .expect_err("provider rate limit must fail this attempt");
+        assert_eq!(
+            error.recovery(),
+            Recovery::Retry {
+                after: Some(retry_after)
+            }
+        );
+        let events = events
+            .read_after(SESSION_ID, None)
+            .expect("learning events");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["learning.extraction.request", "learning.extraction.outcome"]
+        );
+        assert_eq!(events[1].properties["status"], "failed");
     }
 
     #[tokio::test]

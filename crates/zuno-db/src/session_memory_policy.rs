@@ -650,6 +650,36 @@ mod tests {
     }
 
     #[test]
+    fn a_new_caller_default_never_rewrites_an_existing_session_policy() {
+        let (_pool, store) = fixture();
+        let original = store
+            .seed(
+                "session-1",
+                false,
+                SessionMemoryGeneration::Disabled,
+                "older configuration default",
+                "configuration",
+                7,
+            )
+            .expect("seed older default");
+        assert!(!original.use_memories);
+        assert_eq!(original.generation, SessionMemoryGeneration::Disabled);
+
+        let reopened = store
+            .seed(
+                "session-1",
+                true,
+                SessionMemoryGeneration::Enabled,
+                "new automatic default",
+                "configuration",
+                8,
+            )
+            .expect("reopen under new default");
+        assert_eq!(reopened, original);
+        assert_eq!(reopened.revision, 1);
+    }
+
+    #[test]
     fn child_inheritance_uses_the_parent_callers_default_when_no_row_exists() {
         let (pool, store) = fixture();
         pool.transaction(|transaction| {

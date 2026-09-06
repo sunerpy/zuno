@@ -110,12 +110,6 @@ fn validate_semantics(path: &Path, config: Config) -> Result<Config, ConfigError
 
     if let Some(learning) = &config.learning {
         let resolved = learning.resolved();
-        if resolved.generate && resolved.extractor_model.is_none() {
-            issues.push(ConfigIssue::new(
-                ["learning", "extractor_model"],
-                "a non-empty extractor_model is required when learning.generate is enabled",
-            ));
-        }
         if !resolved.skill_require_review {
             issues.push(ConfigIssue::new(
                 ["learning", "skill", "require_review"],
