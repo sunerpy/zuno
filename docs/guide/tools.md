@@ -169,10 +169,14 @@ name no file, and the same holds for the file a `grep` match lives in. On Linux 
 a filename containing a backslash comes back verbatim, because a backslash is an ordinary
 filename byte there; on Windows, ripgrep's backslash separators are reported as `/`,
 which that platform accepts. A file name containing a newline is returned as the single
-path it is. Matching lines are capped at 2000 UTF-16 code units and a single `rg` record
+path it is.
+
+Matching lines are capped at 2000 UTF-16 code units and a single `rg` record
 over 1 MiB is skipped. The rendered `glob`/`grep` output marks the result as truncated
 whenever a match was dropped, whether by the limit or because its path could not be named,
-and a path is returned exactly once, as the identifier of one real file. A directory the
+and a path is returned exactly once, as the identifier of one real file.
+
+A directory the
 walk cannot enter contributes no results and is reported as "No files found", not as a
 permission failure: ripgrep's per-path diagnostics are suppressed so that one unreadable
 directory elsewhere under the root cannot turn the common "my pattern matched nothing"

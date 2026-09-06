@@ -180,7 +180,9 @@ safely: C0/C1 controls, every whitespace character other than a plain space,
 format characters such as `U+00AD` and `U+FEFF`, bidi controls and isolates,
 `Default_Ignorable_Code_Point` characters such as `U+3164` HANGUL FILLER and the
 variation selectors, `U+2800` BRAILLE PATTERN BLANK, private-use code points,
-and noncharacters. The result is truncated on a character boundary to at most
+and noncharacters.
+
+The result is truncated on a character boundary to at most
 255 characters and 255 bytes. If nothing displayable remains -- a name that is
 `.` or `..` once forbidden characters are stripped and the ends trimmed, a
 control-only name, or an empty string -- the display name becomes `image`. A
@@ -245,7 +247,9 @@ A durable file part also carries a top-level `filename` beside the typed
 reference, because the TUI and ACP replays label a part with it, and a part
 written by an earlier release stores every field exactly as the client sent it.
 Zuno leaves the stored row as written and sanitizes each field on its way into a
-model request instead. `filename` gets the display-name reduction: only the final
+model request instead.
+
+`filename` gets the display-name reduction: only the final
 path segment is kept, control and format characters are stripped, and the result
 is capped at 255 characters and 255 bytes — the same reduction as [Declared media
 types and display names](#declared-media-types-and-display-names). A resource
@@ -257,7 +261,9 @@ same characters before it becomes the link's URI and is not capped, because it
 may be a `data:` URL. The `mime` of a historical inline image is a wire token
 rather than text: it is read the way a declared type is read above — parameters
 dropped, case folded, the same aliases mapped — and must name one of PNG, JPEG,
-GIF, or WebP. A row whose declared type does not is projected as a resource link
+GIF, or WebP.
+
+A row whose declared type does not is projected as a resource link
 when it has a `url` and contributes nothing to the request otherwise; earlier
 releases sent such a value to the provider, which rejected the whole request.
 When a stored file part carries inline image data under a media type Zuno cannot

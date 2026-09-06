@@ -221,7 +221,8 @@ loopback-only `--browser-auth` bootstrap. Browser auth prints one launch URI,
 consumes its token once, and issues an authority-bound signed cookie. It never
 makes a non-loopback listener acceptable. For ACP, stdout carries protocol
 framing, so send diagnostics to stderr with `--print-logs`. See
-[Editors and ACP](/reference/zed-acp).
+[Editors and ACP](/reference/zed-acp). The complete route, authentication,
+OpenAPI, and SSE contract is in [HTTP API and OpenAPI](/reference/http-api).
 
 Three details of the HTTP surface matter to a script that drives sessions.
 `POST /api/session/{id}/interrupt` cancels only a live turn; on an idle session it
@@ -253,7 +254,9 @@ eight catalogue discovery walks, and two inline image decodes for
 prompt whose `prompt.files[]` is non-empty — inline images and references to
 already-admitted attachments alike — and covers each decode in that
 prompt, so at most two decodes run at once across the whole process; a
-prompt without files never waits for a slot. A request over any budget waits for a
+prompt without files never waits for a slot.
+
+A request over any budget waits for a
 slot rather than being refused, and a caller that disconnects while waiting never
 starts the work at all. The budgets are cost bounds rather than tuning knobs — no
 request field, header, or configuration key raises one. Resolving a durable image
@@ -295,5 +298,6 @@ and archiving or deleting a session withdraws the grants that session made.
 
 - [zuno run](/cli/run)
 - [The terminal application](/guide/tui)
+- [HTTP API and OpenAPI](/reference/http-api)
 - [Permissions and sandboxing](/guide/permissions)
 - [Operational logging](/logging)

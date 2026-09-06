@@ -283,11 +283,14 @@ objective without resetting its lifecycle state, budget, or usage. Explicit
 `show`, `history`, `create <objective>`, `edit <objective>`, `pause`, `resume`,
 `budget <positive tokens|none>`, `block <reason>`, `complete`, and `cancel`
 actions remain available and take precedence when their name is the first token.
+
 Objective changes also supersede
 unfinished work by archiving the prior visible Plan and binding a fresh root
 Plan to the current Goal for multi-stage work. An atomic objective never rebinds an
 already terminal historical Plan; one that belongs to a previous Goal is archived as
-completed history and the panel is cleared. The command output is projected
+completed history and the panel is cleared.
+
+The command output is projected
 as an ordinary Agent message rather than as reasoning. Invalid arguments to an
 explicit action are returned as JSON-RPC invalid params, not as an internal
 session error. A successful create or edit then advances the active Goal
@@ -309,7 +312,9 @@ may collapse a rapid burst to its newest revision, and flushes the final
 revision before returning from a prompt. Removing a Plan sends empty entries so
 Zed clears its previous panel. Load and resume project the current Plan through
 the same path, and a host remount replaces the subscription without resetting
-the revision cursor. ACP has no native `superseded` status, so Zuno maps it to
+the revision cursor.
+
+ACP has no native `superseded` status, so Zuno maps it to
 `completed` and preserves the semantic outcome in
 `_meta.zuno.outcome: "superseded"`. Each non-empty Plan snapshot also carries
 `_meta.zuno.planId`, `revision`, `title`, and `stackDepth`, plus `goalId` when the Plan is

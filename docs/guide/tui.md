@@ -197,8 +197,8 @@ otherwise it updates the current goal. Objective changes also reconcile an activ
 Plan by archiving the previous visible Plan and installing a new root bound to the current
 `goal_id` for multi-stage work. An atomic objective does not rebind an already terminal
 historical Plan; one that belongs to a previous Goal is archived as completed history.
-Explicit actions such as `/goal show`, `/goal edit ...`, `/goal budget
-<positive tokens|none>`, and `/goal complete` remain available.
+Explicit actions such as `/goal show`, `/goal edit ...`,
+`/goal budget <positive tokens|none>`, and `/goal complete` remain available.
 
 Zuno notices — a remote rule file that could not be fetched, a turn stopped by its token,
 tool-call, or wall-clock allowance, a compaction the budget policy requested — appear as
@@ -273,7 +273,9 @@ looking at even over SSH or inside a multiplexer; when that write fails Zuno fal
 one local helper — `pbcopy` on macOS, `wl-copy`, `xclip`, or `xsel` on Linux, and
 `Set-Clipboard` through PowerShell on Windows — and reports both failures together rather
 than only the first. A host with no helper installed reports that no clipboard is
-available instead of appearing to copy. Every helper receives the selection on its
+available instead of appearing to copy.
+
+Every helper receives the selection on its
 standard input as clipboard data, never as a script to run, so a copy can never execute
 what the transcript contained. Transcript copy uses semantic message content: speaker labels, borders,
 padding, and terminal soft wraps are omitted; only explicit source newlines become

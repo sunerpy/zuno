@@ -228,9 +228,13 @@ This is not a failure, and it is not a work item. It says the run could not prov
 snapshot store belongs to the sessions being pruned, so it left those bytes alone; the
 same pass still reclaims tool output and attachment objects and reports their bytes.
 Preview and `--delete` report this identically, so the projection you approve is the
-operation you get. Nothing has to be done by hand: the next prune that runs against this
+operation you get.
+
+Nothing has to be done by hand: the next prune that runs against this
 database while at least one session survives evaluates the snapshot class and reclaims
-the store. Do not delete anything under `$ZUNO_DATA/snapshot` yourself — that directory
+the store.
+
+Do not delete anything under `$ZUNO_DATA/snapshot` yourself — that directory
 is shared, a store there can belong to another channel's database, and choosing which is
 exactly the judgement the run declined to make. The most common cause is running a
 source build against a release install's data directory — the two select different

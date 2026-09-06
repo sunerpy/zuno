@@ -1042,6 +1042,7 @@ composition of that process, including a switch to a read-only Agent. Answering
 no exits with the refusal. The prompt does not appear when any layer chose
 `deny`, `run-unconfined`, `auto`, or `native`, each of which is honoured as
 written, or off a terminal.
+
 `run`, `acp`, and `serve` never ask: they print the same refusal with the
 remedies, and a headless invocation still needs the flag, the environment
 variable, or a trusted configuration layer. Accepting the prompt is not
@@ -1084,7 +1085,9 @@ a trusted `sandbox.backend: native` selection runs every Agent natively with the
 permission mode kept — an interactive TUI start offers that selection once, before
 raw mode, when nobody configured `sandbox.onUnavailable` or `sandbox.backend` (see
 [unavailable confinement](#unavailable-confinement) and
-[native backend](#native-backend)). A read-only request is never run natively by
+[native backend](#native-backend)).
+
+A read-only request is never run natively by
 the first two routes; the native backend selection is its only one. See the
 [sandbox FAQ](../faq.md) for the security boundary, Ubuntu AppArmor setup, and
 nested-sandbox diagnosis.
@@ -1433,8 +1436,10 @@ instead of ignored. There are no compatibility aliases under `learning`.
 `/memory` reviews, edits, approves, rejects, removes, and undoes durable changes.
 `/memories` controls use and generation for the current session. `/learn` and
 `/reflect` manage Experience, feedback, patterns, and Skill
-candidates. See [resident memory](../design/memory-learning.md) and the
-[user learning flywheel](../design/user-learning-flywheel.md).
+candidates. Start with [Memory and learning](/guide/memory-learning); the
+[resident Memory](../design/memory-learning.md) and
+[user learning flywheel](../design/user-learning-flywheel.md) pages record the
+implementation design.
 
 ## Image attachment admission
 

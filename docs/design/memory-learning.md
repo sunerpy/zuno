@@ -7,6 +7,10 @@ sessions. It is distinct from the user learning flywheel:
 - Experience is concrete durable evidence;
 - a Skill candidate is a reusable method that requires review and evaluation.
 
+For the commands and review workflow, start with
+[Memory and learning](/guide/memory-learning). This page owns implementation
+boundaries and recovery rationale.
+
 See [user learning flywheel](user-learning-flywheel.md) for extraction,
 retrieval, pattern mining, and Skill evolution.
 

@@ -14,6 +14,7 @@ configuration, not here.
 - [Installation](guide/installation.md)
 - [Quick start](guide/quick-start.md)
 - [Your first session](guide/first-session.md)
+- [Project structure and execution flow](guide/project-structure.md)
 
 ## Configure and use
 
@@ -25,6 +26,7 @@ configuration, not here.
 - [Permissions and sandboxing](guide/permissions.md)
 - [Images and file references](reference/attachments.md)
 - [Use Zuno in Zed through ACP](reference/zed-acp.md)
+- [HTTP API and OpenAPI](reference/http-api.md)
 - [Plugins, custom agents, and workflows](plugins.md)
 - [Developing agents and extensions](guide/extension-development.md)
 
@@ -32,6 +34,7 @@ configuration, not here.
 
 - [Sessions and turns](guide/sessions.md)
 - [Goals, plans and todos](guide/durable-state.md)
+- [Memory and learning](guide/memory-learning.md)
 - [Agent orchestration and model routing](orchestration.md)
 - [Harness Runtime](harness-runtime.md)
 
@@ -55,6 +58,6 @@ configuration, not here.
 - [Provider authentication](design/provider-authentication.md)
 - [Product agents](design/product-agents.md)
 - [Zed ACP integration](design/zed-acp-integration.md)
-- [Resident memory](design/memory-learning.md)
-- [User learning flywheel](design/user-learning-flywheel.md)
+- [Resident Memory design](design/memory-learning.md)
+- [User learning flywheel design](design/user-learning-flywheel.md)
 - [Documentation architecture and coverage](design/documentation-coverage.md)

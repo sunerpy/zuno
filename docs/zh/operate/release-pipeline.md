@@ -34,7 +34,9 @@ Release PR 不会出现。它解析的文本，在 PR *描述*含有 `BEGIN_COMM
 footer、括号不配对，就足以让整条解析失败（51 个 commit 的批次 3 合并产生了 1891 行消息，0.10.1 的 PR
 因此没有被创建）。override 取的是描述中该标记词第一次出现之后、到 `END_COMMIT_OVERRIDE` 为止的全部文本，
 去掉首尾空白后按一条 conventional commit 解析——描述里哪怕只是在散文中提到这个标记词，解析器拿到的就是
-那段散文（`unexpected token ' ' at 1:2`）。规则：多 commit 的 squash 用 `gh pr merge --squash --subject …
+那段散文（`unexpected token ' ' at 1:2`）。
+
+规则：多 commit 的 squash 用 `gh pr merge --squash --subject …
 --body …` 保持一条 conventional 主题加简短正文；描述里若带 override 块，块内只放一条 conventional
 消息（一行标题，可带正文），标记词不得出现在描述的其他任何位置；每次合并到 `main` 之后确认
 `chore: release X.Y.Z` PR 确实出现。已被跳过的合并，编辑该 PR 的描述补上 override 块即可恢复，
@@ -67,7 +69,9 @@ pool 并发运行测试二进制，避免为每个 test case 单独启动 Window
 `startup` 墙钟性能基准会先在无竞争状态下单独执行一次，避免其他进程使预算测量失真；ACP、
 ConPTY 生命周期等所有功能 suite 仍留在并发池中，pool 之后不再追加串行队列。每个 suite
 都有超时；超时时会终止完整
-子进程树，调度期间也会持续输出进度。调度器通过原生 Python runner 将 Cargo 环境保存为
+子进程树，调度期间也会持续输出进度。
+
+调度器通过原生 Python runner 将 Cargo 环境保存为
 JSON，不再读取 Git Bash 文本格式的 `env`，因此 Windows `PATH` 等进程变量始终保持
 原生表示。Python 探测会实际执行一次 import，再把已验证解释器解析为绝对路径；写入
 Cargo runner 变量前还会转换成不含空格的 Windows short path，因此 Windows Store 的

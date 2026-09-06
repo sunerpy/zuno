@@ -76,6 +76,7 @@ macOS 与 Windows 的受约束模式目前返回一个带类型的不支持平�
 对具备写能力的 Agent 适用的 `zuno --sandbox-on-unavailable run-unconfined`、
 `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined` 或受信层（全局、受管、环境、CLI）里的
 `sandbox.onUnavailable`；以及 `zuno --sandbox danger-full-access`。项目层无法启用其中任何一项。
+
 在这类主机上交互式启动 `zuno` 时，会在进入 raw mode 之前询问一次是否以原生方式运行本次会话
 ——只要请求无法被约束就会询问，只读请求也包括在内，前提是没有任何层设置过
 `sandbox.onUnavailable` 或 `sandbox.backend`，且标准输入与标准错误都是终端；回答 yes 时选择
@@ -84,6 +85,7 @@ macOS 与 Windows 的受约束模式目前返回一个带类型的不支持平�
 通过启动时的 re-exec 写入真实环境变量，从而被嵌套的 Zuno 进程继承，而提示里的回答不会；
 如果嵌套的 `zuno` 也需要同样的答案，请设置 `ZUNO_SANDBOX_BACKEND=native` 或在受信层设置
 `sandbox.backend`。
+
 `run`、`acp` 与 `serve` 永远不会询问，仍然需要标志或环境变量。以上任何一种都不是沙箱隔离。
 切换到一个无法注册 Shell 的 Agent 时，会保留当前 Agent 并给出同样的提示，而不是结束会话。参见
 [Shell sandbox roadmap](https://github.com/sunerpy/zuno/blob/main/docs/design/shell-sandbox-roadmap.md)。
