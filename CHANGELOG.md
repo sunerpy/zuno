@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.12](https://github.com/sunerpy/zuno/compare/v0.10.11...v0.10.12) (2026-09-06)
+
+
+### Bug Fixes
+
+* **acp:** 在长回合达到阈值时主动压缩上下文 ([cab26a8](https://github.com/sunerpy/zuno/commit/cab26a8704428690460ad601395c435c2ef2f5af))
+* **goal:** 默认取消预算上限并修复压缩续跑 ([8264bef](https://github.com/sunerpy/zuno/commit/8264beffec61ab223a6c6917e92c9a4fe6875c6d))
+
 ## [0.10.11](https://github.com/sunerpy/zuno/compare/v0.10.10...v0.10.11) (2026-09-06)
 
 
