@@ -180,10 +180,11 @@ impl RuntimePromptPolicy {
         }
         if has("plan_update") {
             execution.push_str(
-                " Use a durable Plan for cross-component, delegated, interruptible, or ordered \
-                 work. Skip it for one bounded inspect-edit-test task or gates already carried by \
-                 an active Goal. Keep an existing Plan current. Todo is optional detail, not a \
-                 mirror. A new objective may open an epoch; resume or supersede old work.",
+                " Use Plan only for meaningfully multi-step work needing coordination, \
+                 ordering, delegation, or recovery. Skip straightforward and single-step work, \
+                 including one bounded inspect-edit-test task or gates owned by an active Goal. \
+                 Never create a single-step Plan. Keep the active Plan current; Todo is optional \
+                 detail, not a mirror.",
             );
         }
         if has("bg") && has("shell") {
@@ -1036,9 +1037,10 @@ mod tests {
         );
         assert!(!text.contains("web_search"));
         assert!(!text.contains("unavailable"));
-        assert!(text.contains("Use a durable Plan for cross-component, delegated, interruptible"));
-        assert!(text.contains("Skip it for one bounded inspect-edit-test task"));
-        assert!(text.contains("gates already carried by an active Goal"));
+        assert!(text.contains("Use Plan only for meaningfully multi-step"));
+        assert!(text.contains("Skip straightforward and single-step work"));
+        assert!(text.contains("Never create a single-step Plan"));
+        assert!(text.contains("gates owned by an active Goal"));
         assert!(text.contains("Todo is optional detail, not a mirror"));
         assert!(
             text.contains("Evidence applies only to the exact artifact and inputs inspected"),

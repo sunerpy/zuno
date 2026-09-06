@@ -49,7 +49,8 @@ Notes 从不暴露宿主路径。每个作用域最多 100 个文档，单文档
 1 MiB。两个写 action 都必须携带精确的 `expected_revision`；只有新建文档时使用
 `0`。可信 `call_id`、请求摘要和 revision 让重复投递保持幂等，同时拒绝过期的并发写入。
 
-宿主分类器决定请求是否需要持久战略 Plan，但不会生成用户可见的通用步骤。模型用
+显式 Plan 协作模式要求持久战略 Plan。普通 Work 模式由模型依据完整会话决定 Plan 是否
+增加价值；宿主不解析提示词关键词，也不会生成用户可见的通用步骤。模型用
 `plan_update action=create` 创建首个 Plan 或替换新目标；`patch` 只修改指定 id，
 `append` 追加由宿主生成 id 的步骤，`push` 打开聚焦子 Plan，`pop` 不重传整份 Plan
 而只恢复精确父 Plan。所有已有 Plan 修改都必须带当前 `expected_revision`；
@@ -62,16 +63,15 @@ Notes 从不暴露宿主路径。每个作用域最多 100 个文档，单文档
 provider 请求。真实 mutation 会改变指纹并重置计数。
 
 `plan_update` 与 `todo_update` 还会请求动态上下文失效。若下一次 provider 请求仍会运行，
-宿主必须先从已提交数据库重新生成 Goal/Plan/Todo/Job 投影。Plan mutation 会把一次性的
-Required 指令切换成 Maintain。刷新器缺失或失败时回合会暂停，而不是明知上下文过期仍发送
-developer 优先级快照。
+宿主必须先从已提交数据库重新生成 Goal/Plan/Todo/Job 投影。在显式 Plan 模式中，
+Plan mutation 会把一次性的 Required 指令切换成 Maintain。刷新器缺失或失败时回合会
+暂停，而不是明知上下文过期仍发送 developer 优先级快照。
 
 成功交付前，durable reconciliation driver 会检查 Plan、Todo、Job、Goal、工具结果与
 验证记录。普通会话在持有未对账的持久工作时最多执行两次对账续跑，仍不一致则进入
 typed `PlanUnreconciled` 人工等待，而不是声称完成。只有实际写入持久状态的工作才算
-未对账：没有记录任何 Plan、Todo 或 Job 的会话在第一次回复后就结束，即使宿主分类器
-原本预期它需要 Plan。禁用 `plan_update` 会阻止模型创建或修改；已有 Plan 仍会
-持久化、投影并恢复。
+未对账：Work 模式中没有记录任何 Plan、Todo 或 Job 的会话在第一次回复后就结束。禁用
+`plan_update` 会阻止模型创建或修改；已有 Plan 仍会持久化、投影并恢复。
 
 内置只读 `plan` Agent 有一条例外的带类型交接语义：规划回答完成后，当前 Plan
 与 Todo 会保留各自已有状态，作为后续 Start Work 回合的执行工作，不消耗对账

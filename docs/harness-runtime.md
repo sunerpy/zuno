@@ -94,10 +94,10 @@ estimated tokens, and a SHA-256 digest. A prompt cannot describe an editor,
 delegation target, or durable-state tool that was removed by role policy,
 allowlists, permission visibility, a provider capability, or a request hook.
 
-Plan classification is value-based rather than phase-count-based. A bounded
+Work-mode Plan use is value-based rather than phase-count-based. A bounded
 single-owner task does not create a Plan merely because it inspects, edits, and tests.
 Cross-component dependencies, delegation, independent gates, interruption recovery, or
-explicit ownership structure do. Active Goal criteria already provide durable gates, so
+explicit ownership structure may make one useful. Active Goal criteria already provide durable gates, so
 the runtime asks for an additional Plan only when it adds ordering, ownership, or restart
 value. An existing Plan remains authoritative and is updated on material transitions.
 
@@ -160,23 +160,28 @@ The built-in role prompts remain intentionally small:
   `Outcome`, `Evidence`, `Inspected/Changed`, and `Risks/Blocker`; the model is
   not required to invent a JSON or XML report protocol.
 
-Durable planning is host policy rather than model ceremony. The default profile
-publishes a typed `HostPlanningCapability`; custom profiles opt in explicitly.
-Before the first provider request for a user or resolved-command input, a host
-with that capability applies one deterministic classifier shared by CLI, TUI,
-ACP, server, and child turns. It chooses `Required`, `Maintain`, `Atomic`, or
-`Unavailable`; it never creates user-visible generic steps. A direct answer, one
-bounded read, or one short commit of already-prepared changes may proceed
-atomically. A short single-clause question stays atomic whether or not it ends in
-a question mark, including Chinese phrasing that carries the interrogative in the
-middle of the sentence. A greeting, thanks, or bare acknowledgement is
-conversational and stays atomic; it never opens a Plan, and with an active Plan it
-is a continuation. Typed image, resource, selection, or branch-diff context, sufficiently
-large multi-block text, cross-component work, delegation, multiple gates, and
-restart-sensitive work select the planned path.
+Durable planning separates collaboration mode from the optional Work-mode
+checklist. The default profile publishes a typed `HostPlanningCapability`;
+custom profiles opt in explicitly. Before the first provider request, the host
+applies state policy shared by CLI, TUI, ACP, server, and child turns:
 
-For `Required`, the runtime tells the model to read the current Plan and use one
-operation-based `plan_update` call:
+- explicit `plan` collaboration mode is `Required`;
+- an existing active Plan is `Maintain`;
+- ordinary Work input is `Optional`, including structured image, resource,
+  selection, branch-diff, and multi-block context;
+- host-generated input with no active Plan, or an empty input, is `Atomic`;
+- a hidden `plan_update` surface is `Unavailable`.
+
+The host never parses action verbs, question words, acknowledgements, or
+language-specific scope markers to guess complexity. In Work mode, model
+instructions use a Plan only for meaningfully multi-step coordination, ordering,
+delegation, or recovery; they skip straightforward and single-step work and
+never create a single-step Plan. Thus `OK, apply that change` and a complex
+cross-component request reach the same optional tool surface, while the model
+chooses whether durable coordination adds value from the full conversation.
+
+For explicit Plan mode, the runtime tells the model to read the current Plan and
+use operation-based `plan_update`:
 
 - `create` creates the first strategic Plan, or replaces the visible root for a
   genuinely new objective. The host generates every step id. Replacing an
@@ -221,11 +226,9 @@ typed Plan, Todo, Job, Goal, tool-result, and verification state:
 - unresolved work then creates `WaitingForHuman::PlanUnreconciled` and cannot be
   delivered as successful.
 
-Unreconciled work means durably recorded work. The classification that decided
-whether a turn should open a Plan is a host prediction, not recorded work, so a
-request classified as `Required` that recorded no Plan, Todo, or Job is settled
-rather than driven again; a misclassified question is answered once instead of
-spending two further turns on state that does not exist.
+Unreconciled work means durably recorded work. A Work-mode `Optional` decision
+is not recorded work, so a request that creates no Plan, Todo, or Job settles
+rather than being driven again.
 
 A process restart resumes an interrupted reconciliation cycle and its attempt
 count. Assistant prose is never parsed as evidence that work completed. Hiding

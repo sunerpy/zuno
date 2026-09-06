@@ -54,30 +54,28 @@ provider 请求前以 typed error 失败；不会静默截断 AGENTS、历史、
 ## 3. 什么时候需要 Plan
 
 默认 profile 提供类型化的宿主 Planning capability。该 capability 存在时，宿主会在
-第一次 provider request 之前运行确定性分类器；分类不依赖 `plan_update` 是否对模型可见：
+第一次 provider request 之前执行模式与持久状态策略，而不是解析提示词关键词：
 
-- session 已有 active Plan 且输入是明确继续：保持并继续维护；
-- 新的实质性多阶段目标：归档此前可见 Plan，并安装一个只包含新目标步骤的新根 Plan，
-  不把通用模板重复追加到同一个列表；
-- child report、steering、retry 不会自行创建 Plan；
-- 直接回答、一次有界读取、对已经准备好的修改执行一次短小 commit：可作为原子操作；
-  单句短问句无论是否带问号都属于直接回答，包括疑问词位于句中的中文问法；
-- 问候、致谢或单纯的确认（如 `你好`、`谢谢`、`好的`、`hi`、`thanks`）属于对话输入，
-  归为 `Atomic`，不会打开 Plan；已有活跃 Plan 时视为继续维护；
-- 图片、resource、selection、branch diff 等 typed context，以及足够大的多文本块
-  输入：默认进入 planned path；
-- 其他普通工程任务：宿主把请求分类为 `Required`，但不写入任何通用骨架；模型必须先
-  读取当前 Plan，再通过操作式 `plan_update` 创建战略步骤。
+- 显式 `plan` 协作模式为 `Required`，必须创建或维护 durable Plan；
+- session 已有 active Plan 时为 `Maintain`，模型按当前目标维护、替换或 supersede；
+- 普通 Work 输入为 `Optional`；图片、resource、selection、branch diff 和多文本块
+  仍是上下文，不会自动强制 Plan；
+- child report、steering、retry 在没有 active Plan 时为 `Atomic`，不会自行创建 Plan；
+- 隐藏 `plan_update` 时为 `Unavailable`。
+
+Work 模式由模型依据完整会话判断 Plan 是否增加价值：只有真正多步骤且需要协调、顺序、
+委派或恢复时才创建；简单或单步工作直接完成，绝不创建单步骤 Plan。「OK，你修改下吧」
+因此不需要专门的中文词表，复杂任务也不依赖动作词命中才获得 Plan。
 
 一个活跃步骤需要聚焦临时工作时，使用 `plan_update action=push` 持久暂停父 Plan，
 让子 Plan 暂时成为客户端唯一可见的 Plan；子步骤全部完成后使用 `action=pop`，父
 Plan 只恢复一次。工作开始、完成、阻塞或范围变化时立即更新活跃 Plan，最终回复前
 必须对账。
 
-因此“调研 → 修改 → 验证”通常会有 Plan；跨组件、委派、多个验收 gate，
-以及可能经历压缩或重启恢复的工作必须持续维护 Plan。模型可以通过
-最终仍可见的 `plan_update` 创建或维护战略 Plan，但不能决定宿主是否要求 durable
-execution state。隐藏 `plan_update` 会阻止模型创建或修改新 Plan；已有 Plan 仍会持久化、
+跨组件、委派、多个验收 gate，以及可能经历压缩或重启恢复的工作通常适合 Plan，
+但由模型结合完整会话决定。模型可以通过最终仍可见的 `plan_update` 创建或维护战略
+Plan；显式 Plan 模式和已有 active Plan 的持久状态仍由宿主强制。隐藏 `plan_update`
+会阻止模型创建或修改新 Plan；已有 Plan 仍会持久化、
 投影并在重启后恢复。
 Todo 是 Plan step 下可选的具体工作，用于更细的所有权、依赖或恢复跟踪，不要求
 和 Plan step 机械地一一对应。`create`、`append`、`push` 的 step id 由宿主生成；
@@ -542,8 +540,8 @@ zuno db --format json \
 
 截至本指南对应代码状态，以下边界仍需在验收报告中明确：
 
-1. 宿主分类器只判断是否需要 Plan，模型负责创建或维护战略步骤；模型仍可能把 Plan
-   或 Todo 拆得过细，因此
+1. Work 模式由模型判断是否需要 Plan，宿主只强制显式 Plan 模式与已有持久状态；
+   模型仍可能把 Plan 或 Todo 拆得过细，因此
    GPT/Opus 的 provider call 成本仍应通过真实遥测持续观察。
 2. `debug agent` 现在会主动连接当前配置的 MCP，并检查实时 schema；历史 request
    当时真正发送的最终 schema 仍应从对应 provider request/receipt 取证，不能用

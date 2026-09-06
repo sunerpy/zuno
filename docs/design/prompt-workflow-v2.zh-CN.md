@@ -580,21 +580,19 @@ side effect，并在同一事务内替换未消费的 uncertain report。
 ### 9.1 何时维护 Plan
 
 默认 profile 通过类型化 `HostPlanningCapability` 声明宿主规划能力；自定义 profile
-需要显式选择。能力存在时，宿主在第一次 provider request 之前执行统一分类：
+需要显式选择。能力存在时，宿主在第一次 provider request 之前只执行模式与持久状态
+策略，不分析提示词词汇：
 
-- 用户输入或已解析 command 可以被分类为需要创建 Plan；child report、steering、
-  retry 只能继续既有状态，不能自行触发新根 Plan；
-- 已有 active durable Plan 且输入是明确继续：继续维护；
-- 新的实质性多阶段目标：要求模型以 `action=create` 和当前 revision 替换根 Plan；
-  宿主归档旧根，但不生成通用步骤；
-- 直接回答、一次有界读取、一次短小的既有变更 commit：允许原子执行；
-- 图片、resource、selection、branch diff 等 typed context，以及足够大的多文本块
-  输入：进入 planned path；
-- 其他工程请求：分类为 `Required`，由模型创建用户可见的战略步骤。
+- 显式 `plan` 协作模式为 `Required`，必须创建或维护 durable Plan；
+- 已有 active durable Plan 为 `Maintain`，模型按当前目标 patch、replace 或 supersede；
+- 普通 Work 输入为 `Optional`，图片、resource、selection、branch diff 与多文本块也
+  只是上下文，不会自动强制 Plan；
+- child report、steering、retry 在没有 active Plan 时为 `Atomic`，不能自行触发新根 Plan；
+- 隐藏 `plan_update` 为 `Unavailable`。
 
-这使调研、修改、验证组成的普通多阶段工作默认可见，并确保跨组件、委派、多阶段
-验收及可能压缩/中断恢复的工作维护 durable Plan。宿主决定是否需要 Plan，模型负责
-战略步骤。隐藏 `plan_update` 会使分类结果成为 `Unavailable`，阻止新的模型修改；
+Work 模式提示模型仅在真正多步骤、需要协调、顺序、委派或恢复价值时创建 Plan；
+简单与单步工作直接执行，绝不创建单步骤 Plan。复杂度判断使用完整会话，不通过增加
+中英文关键词完成。隐藏 `plan_update` 会使结果成为 `Unavailable`，阻止新的模型修改；
 已有 Plan 仍会持久化、投影并恢复。`create`、`append`、`push` 的 id 由宿主生成，
 `patch` 只提交变化的 id；`completed` 与 `superseded` 都是终态。Todo 是 step 下的
 可选细化，不要求机械一一对应。
@@ -605,7 +603,7 @@ side effect，并在同一事务内替换未消费的 uncertain report。
 机器执行波次持久化为独立 `DriverPhase`，不写入用户 Plan。最终回复前的 driver 只
 检查 Plan、Todo、Job、Goal、工具结果与验证记录；没有记录任何持久工作的会话直接结算，
 持有未对账持久工作的普通会话最多触发两次 durable reconciliation continuation，仍无法
-对齐则进入 typed `PlanUnreconciled` 人工等待。宿主的 planning 分类只是预测，不构成
+对齐则进入 typed `PlanUnreconciled` 人工等待。Work 模式的 Optional 决策不构成
 未对账的持久工作。进程重启继续原 cycle，模型自然语言不作为完成证据。
 
 ### 9.2 执行波次
@@ -885,7 +883,7 @@ git diff --check
 5. typed `DelegationContract`、host-generated `TaskReportMetadata`、父子能力交集、
    前后台统一 logical task 去重、child+Job 原子 admission、每次委派 evidence
    游标、evidenced `job_reconcile`、Job/Goal barrier、同一 SQL snapshot 生成的
-   16 KiB `runtime.work_state`、无默认 step 上限、宿主 Plan 分类器和两个 debug
+   16 KiB `runtime.work_state`、无默认 step 上限、宿主 Plan 模式/状态策略和两个 debug
    命令已落地。
 6. GPT 5.6 Sol / Claude Opus 5 已分别完成原子任务、深度 Debug、并行委派和
    Plan-only E2E。

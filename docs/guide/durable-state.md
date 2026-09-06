@@ -505,10 +505,10 @@ Use one when durable coordination adds information: cross-component work, delega
 independent acceptance gates or dependencies, and work likely to be interrupted. A
 bounded single-owner change does not need a plan merely because it has inspect, edit, and
 test phases. When active Goal criteria already name the gates, add a Plan only when it
-contributes ordering, ownership, or restart value. A direct answer, one bounded read, or a
-genuinely atomic operation also does not need a plan; a short single-clause question is a direct answer
-whether or not it ends in a question mark. A greeting, thanks, or bare acknowledgement is
-conversational: it never opens a plan, and it keeps an active plan current rather than replacing it.
+contributes ordering, ownership, or restart value. In ordinary Work mode the model makes
+that decision from the full conversation; the host does not classify prompt vocabulary.
+Straightforward and single-step work proceeds directly, and a Plan must never contain only
+one step. Explicit Plan collaboration mode still requires durable Plan state.
 
 Rules that matter in practice:
 
@@ -517,10 +517,10 @@ Rules that matter in practice:
 - While steps remain pending, exactly one step is in progress.
 - Completed and superseded steps are terminal and cannot regress.
 - A fully completed plan has no in-progress step.
-- The host classifier decides whether a strategic Plan is required but never installs a
-  generic skeleton. The model creates the first root with `action=create`; a substantial
-  new objective uses `create` plus the current `expected_revision`, archiving the previous
-  root instead of appending generic steps.
+- Explicit Plan mode requires durable Plan state. Work mode leaves Plan creation optional;
+  when a Plan is useful, the model creates the first root with `action=create`. A new
+  objective uses `create` plus the current `expected_revision`, archiving the previous root
+  instead of appending generic steps.
 - `patch` sends only changed ids, `append` sends only new step definitions, and the host
   generates ids for `create`, `append`, and `push`.
 - A focused temporary workflow uses `plan_update` with `action=push`; the parent is
@@ -543,10 +543,11 @@ role to `SandboxMode::ReadOnly`, so a command can gather evidence and cannot cha
 tree. Returning to Work mode requires a durable plan to exist, and the confirmation names
 its title, revision, and completed-step count.
 
-The default host owns classification and final reconciliation through typed planning
-services; the model owns strategic step creation through operation-based `plan_update`.
-Disabling that tool prevents new model mutations, while existing Plan persistence, client
-projection, and restart recovery remain intact.
+The default host owns collaboration-mode enforcement, active-state reconciliation, and
+final reconciliation through typed planning services; the model owns the Work-mode
+decision and strategic step creation through operation-based `plan_update`. Disabling that
+tool prevents new model mutations, while existing Plan persistence, client projection, and
+restart recovery remain intact.
 
 Entering Plan while a Goal is active atomically records `paused(plan_mode)`. Start Work
 resumes only that exact pause and does so once, even after a process restart. It deliberately

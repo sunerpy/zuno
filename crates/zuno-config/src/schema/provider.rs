@@ -304,7 +304,7 @@ pub struct ModelCostTier {
 /// Token limits (`config/provider.ts:47-53`).
 #[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelLimit {
-    /// Total context window.
+    /// Maximum provider-visible prompt/input tokens used for runtime budgeting.
     pub context: f64,
     /// Maximum input tokens.
     #[serde(skip_serializing_if = "Option::is_none")]

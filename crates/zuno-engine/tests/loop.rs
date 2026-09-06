@@ -1978,8 +1978,9 @@ async fn runtime_policy_is_rendered_from_the_post_hook_tool_subset() {
         ["plan_update"]
     );
     let runtime = requests[0].developer_context.join("\n");
-    assert!(runtime.contains("Use a durable Plan for cross-component, delegated, interruptible"));
-    assert!(runtime.contains("Skip it for one bounded inspect-edit-test task"));
+    assert!(runtime.contains("Use Plan only for meaningfully multi-step work"));
+    assert!(runtime.contains("Skip straightforward and single-step work"));
+    assert!(runtime.contains("Never create a single-step Plan"));
     assert!(runtime.contains("Todo is optional detail, not a mirror"));
     assert!(runtime.contains("Durable Goal, Plan, Todo"));
     assert!(!runtime.contains("explorer"));

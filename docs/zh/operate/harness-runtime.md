@@ -112,10 +112,15 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 持久的 Goal、Plan、Todo、收件箱和 job 状态控制续跑，而不是自然语言。「接下来我会……」
 这类文字不构成进展。默认 profile 发布类型化的宿主 Planning capability；即使最终工具
 过滤隐藏了 `plan_update`，已有 Plan 仍会持久化、投影并在重启后恢复，但模型不能创建
-或修改新的战略步骤。宿主分类器只判断 `Required / Maintain / Atomic / Unavailable`，
-不会生成 `Establish scope / Execute / Integrate / Verify` 一类通用骨架。单句短问句
-无论是否以问号结尾都归为 `Atomic`，包括疑问词位于句中的中文问法。问候、致谢或单纯的
-确认属于对话输入，同样归为 `Atomic`，不会打开 Plan；已有活跃 Plan 时视为继续维护。模型使用
+或修改新的战略步骤。宿主只执行模式与持久状态策略：显式 `plan` 协作模式为
+`Required`，已有 active Plan 为 `Maintain`，普通 Work 输入为 `Optional`，没有 active
+Plan 的宿主生成输入或空输入为 `Atomic`，隐藏工具为 `Unavailable`。图片、resource、
+selection、branch diff 和多文本块在 Work 模式也只是结构化上下文，不会自动强制 Plan。
+
+宿主不再解析「修改」「修复」「全部」、问句、确认语或其他中英文关键词来猜复杂度。Work
+模式由模型依据完整会话判断：只有真正多步骤且需要协调、顺序、委派或恢复价值时才使用
+Plan；直接完成简单或单步任务，绝不创建单步骤 Plan。因此「OK，你修改下吧」无需专门词表，
+复杂任务仍可由模型主动建立 durable Plan。模型使用
 `create / patch / append / push / pop` 操作维护 Plan，step id 由宿主生成，已有 Plan
 修改都受 `expected_revision` 保护。`plan_update`、`notes`、`history` 这类以操作为标签的
 参数枚举以单个对象 schema 发送给 provider：`action` 属性枚举全部操作，也是 schema 中唯一
@@ -137,9 +142,8 @@ Goal/Plan/Todo/Job 上下文，Plan mutation 还会把一次性的 Required 指�
 `PlanReconciliationDriver` 只检查 Plan、Todo、Job、Goal、工具结果与验证记录：
 没有记录任何持久工作的会话在第一次回复后直接结束；普通会话在持有未对账的持久工作时
 最多续跑两次对账；仍不一致则进入 typed `PlanUnreconciled` 人工等待，不能以成功状态
-交付。「是否需要 Plan」只是宿主的分类预测，不是已记录的工作，因此被判为 `Required`
-却没有产生任何 Plan、Todo 或 Job 的请求视为已结算，不会再被续跑；一次被误分类的问题
-只回答一次，不会为不存在的状态再花两个回合。进程重启会继续原对账 cycle，不解析模型
+交付。Work 模式的 `Optional` 决策不是已记录工作；没有产生任何 Plan、Todo 或 Job 的
+请求视为已结算，不会为不存在的状态额外续跑。进程重启会继续原对账 cycle，不解析模型
 自然语言判断“已经完成”。
 
 ACP 通过会话级投影器订阅 `TurnHost::work_state_changes()`，而不是识别某个工具名。

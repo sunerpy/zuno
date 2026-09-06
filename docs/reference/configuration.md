@@ -147,7 +147,6 @@ Set the provider entry's `transport` to `openai` and its `surface` to
 ```json
 {
   "baseURL": "http://127.0.0.1:8787/v1",
-  "maxTokens": null,
   "timeout": false,
   "headerTimeout": 330000,
   "chunkTimeout": 210000,
@@ -156,9 +155,10 @@ Set the provider entry's `transport` to `openai` and its `surface` to
 }
 ```
 
-The null output default prevents Zuno's generic provider layer from injecting
-an unsupported 32,000-token cap. Declare each model's real `limit.output`
-instead. `timeout` bounds the complete HTTP request; `false` leaves long active
+Omit `maxTokens`, or leave it `null`, so each model's real `limit.output`
+reaches the provider request. A non-null provider or Agent value deliberately
+overrides the model declaration. `timeout` bounds the complete HTTP request;
+`false` leaves long active
 reasoning streams uncapped. `headerTimeout` bounds only the wait for response
 headers, while `chunkTimeout` is reset after every streamed body chunk. The
 values above leave a 30-second propagation margin beyond kiro-provider's
@@ -682,9 +682,9 @@ may still hide or deny them. Enabling continuity does not change the database
 format version; Notes creates additive component-owned tables when first used.
 
 Hiding `"tools": {"plan_update": false}` removes only the model-facing Plan
-mutation tool. The typed host-planning capability still classifies work and
-restores existing durable Plans, but it does not manufacture strategic steps
-when the model cannot call the tool.
+mutation tool. The typed host-planning capability still enforces explicit Plan
+mode and restores existing durable Plans, but Work mode cannot create or mutate
+strategic steps when the model cannot call the tool.
 
 For profile switching, ACP environment examples, final tool filters, Notes
 revision workflow, and verification commands, see

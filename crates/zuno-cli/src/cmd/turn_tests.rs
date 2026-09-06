@@ -206,7 +206,7 @@ fn resolver_step_limit_is_opt_in() {
 }
 
 #[test]
-fn host_planning_classifier_requires_multi_stage_work_without_seeding_visible_steps() {
+fn work_mode_leaves_plan_creation_to_the_model_without_seeding_visible_steps() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
     );
@@ -238,18 +238,18 @@ fn host_planning_classifier_requires_multi_stage_work_without_seeding_visible_st
             goal_id: None,
         },
     )
-    .expect("classify multi-stage work");
-    assert!(matches!(outcome.decision, PlanningDecision::Required(_)));
+    .expect("select Work-mode planning policy");
+    assert!(matches!(outcome.decision, PlanningDecision::Optional(_)));
     assert!(!outcome.changed);
     assert!(
         zuno_tools::WorkStateStore::new(Arc::clone(&pool))
             .plan("ses-plan-policy")
             .expect("read plan")
             .is_none(),
-        "machine planning classification must not create user-visible generic steps"
+        "the host planning policy must not create user-visible generic steps"
     );
 
-    let atomic = ensure_host_plan(
+    let bounded = ensure_host_plan(
         &pool,
         HostPlanningRequest {
             session_id: "ses-atomic-policy",
@@ -261,9 +261,9 @@ fn host_planning_classifier_requires_multi_stage_work_without_seeding_visible_st
             goal_id: None,
         },
     )
-    .expect("classify atomic work");
-    assert!(matches!(atomic.decision, PlanningDecision::Atomic(_)));
-    assert!(!atomic.changed);
+    .expect("classify bounded work");
+    assert!(matches!(bounded.decision, PlanningDecision::Optional(_)));
+    assert!(!bounded.changed);
     assert!(
         zuno_tools::WorkStateStore::new(pool)
             .plan("ses-atomic-policy")
@@ -273,7 +273,7 @@ fn host_planning_classifier_requires_multi_stage_work_without_seeding_visible_st
 }
 
 #[test]
-fn a_greeting_is_atomic_and_injects_no_planning_instruction() {
+fn a_greeting_is_not_forced_into_a_plan_and_injects_no_planning_instruction() {
     // The reported session: `hi` to the `deep` Agent was classified `Required`, the turn
     // appended "This request requires a durable strategic Plan …" as a runtime
     // instruction, and the model read and created a Plan titled "Acknowledge greeting"
@@ -311,11 +311,11 @@ fn a_greeting_is_atomic_and_injects_no_planning_instruction() {
         )
         .expect("classify a greeting");
         assert!(
-            matches!(outcome.decision, PlanningDecision::Atomic(_)),
-            "{prompt:?} must stay atomic: {:?}",
+            matches!(outcome.decision, PlanningDecision::Optional(_)),
+            "{prompt:?} must leave planning to the model: {:?}",
             outcome.decision
         );
-        assert_eq!(outcome.decision.rationale().code(), "conversational");
+        assert_eq!(outcome.decision.rationale().code(), "model_decides");
         assert!(!outcome.changed, "a greeting changes no durable work state");
         assert!(
             planning_runtime_instruction(&outcome.decision).is_none(),
@@ -335,7 +335,7 @@ fn a_greeting_is_atomic_and_injects_no_planning_instruction() {
 fn a_plan_mutation_replaces_the_one_time_required_instruction_with_maintenance() {
     let decision = PlanningPolicy::classify(PlanningInput::new(
         "Investigate the DCV failure, collect evidence, and verify the recovery path.",
-        "deep",
+        "plan",
     ));
     assert!(matches!(decision, PlanningDecision::Required(_)));
     let refresh = DynamicContextRefreshInstruction::Planning(decision.clone());
@@ -505,7 +505,7 @@ async fn hiding_plan_update_does_not_create_a_private_host_plan() {
 }
 
 #[test]
-fn model_create_replaces_terminal_work_after_host_classification() {
+fn model_create_replaces_terminal_work_after_work_mode_leaves_the_choice_open() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
     );
@@ -554,7 +554,7 @@ fn model_create_replaces_terminal_work_after_host_classification() {
     )
     .expect("classify the new objective");
 
-    assert!(matches!(outcome.decision, PlanningDecision::Required(_)));
+    assert!(matches!(outcome.decision, PlanningDecision::Optional(_)));
     assert!(!outcome.changed);
     assert_eq!(
         store
@@ -668,8 +668,11 @@ fn model_create_preempts_active_ordinary_work_for_a_new_user_objective() {
     )
     .expect("classify the new objective");
 
-    assert!(matches!(outcome.decision, PlanningDecision::Required(_)));
-    assert_eq!(outcome.decision.rationale().code(), "active_plan_replaced");
+    assert!(matches!(outcome.decision, PlanningDecision::Maintain(_)));
+    assert_eq!(
+        outcome.decision.rationale().code(),
+        "active_plan_reconciliation"
+    );
     assert!(!outcome.changed);
     let unchanged = store
         .plan("ses-plan-preempt")
@@ -731,7 +734,7 @@ fn model_create_preempts_active_ordinary_work_for_a_new_user_objective() {
 }
 
 #[test]
-fn host_planning_classifier_keeps_an_explicit_continuation_on_the_active_plan() {
+fn active_plan_state_policy_keeps_an_explicit_continuation_on_the_plan() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
     );
@@ -866,7 +869,7 @@ fn goal_objective_binding_precedes_model_owned_plan_replacement() {
     )
     .expect("classify plan for the Goal objective");
 
-    assert!(matches!(outcome.decision, PlanningDecision::Required(_)));
+    assert!(matches!(outcome.decision, PlanningDecision::Maintain(_)));
     assert!(outcome.changed);
     let bound = store
         .plan("ses-goal-plan")
@@ -966,7 +969,7 @@ fn atomic_goal_objective_rebinds_without_falsely_completing_active_work() {
     )
     .expect("reconcile atomic Goal");
 
-    assert!(matches!(outcome.decision, PlanningDecision::Atomic(_)));
+    assert!(matches!(outcome.decision, PlanningDecision::Maintain(_)));
     assert!(outcome.changed);
     let plan = store
         .plan("ses-atomic-goal")
@@ -1033,7 +1036,7 @@ fn atomic_goal_objective_archives_a_terminal_plan_of_a_previous_goal_instead_of_
     )
     .expect("classify atomic Goal with historical plan");
 
-    assert!(matches!(outcome.decision, PlanningDecision::Atomic(_)));
+    assert!(matches!(outcome.decision, PlanningDecision::Optional(_)));
     assert!(
         outcome.changed,
         "retiring the historical plan is a visible change"
@@ -1122,7 +1125,7 @@ fn a_terminal_plan_of_the_same_goal_or_of_no_goal_stays_visible() {
         )
         .expect("classify atomic Goal");
 
-        assert!(matches!(outcome.decision, PlanningDecision::Atomic(_)));
+        assert!(matches!(outcome.decision, PlanningDecision::Optional(_)));
         assert!(!outcome.changed, "{session}: nothing to retire");
         let plan = store
             .plan(session)
@@ -1182,7 +1185,7 @@ fn child_report_does_not_seed_a_plan_for_an_atomic_parent_session() {
 }
 
 #[test]
-fn production_turn_runs_the_host_planning_classifier_after_input_is_durable() {
+fn production_turn_runs_the_host_planning_policy_after_input_is_durable() {
     let turn = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
@@ -1207,16 +1210,16 @@ fn production_turn_runs_the_host_planning_classifier_after_input_is_durable() {
     let prepared = &turn[turn
         .find("    async fn drive_prepared(")
         .expect("accounted turn body")..];
-    let classified = prepared
+    let policy = prepared
         .find("self.ensure_durable_plan(")
-        .expect("host planning classifier call");
+        .expect("host planning policy call");
     let provider = prepared
         .find(".drive_input_unaccounted(")
         .expect("provider turn call");
 
     assert!(
-        classified < provider,
-        "the host must classify only after the user input is durable and before the provider call"
+        policy < provider,
+        "the host planning policy must run after durable admission and before the provider call"
     );
 }
 
@@ -10454,6 +10457,7 @@ fn model_defaults_reach_a_responses_request_as_reasoning_effort_and_summary() {
                 "models": {
                     "reasoner": {
                         "reasoning": true,
+                        "limit": {"context": 872000, "output": 128000},
                         "options": {
                             "reasoningEffort": "max",
                             "reasoningSummary": "auto"
@@ -10505,6 +10509,11 @@ fn model_defaults_reach_a_responses_request_as_reasoning_effort_and_summary() {
     assert!(
         body.get("messages").is_none(),
         "the configured Responses surface fell back to Chat Completions: {body}"
+    );
+    assert_eq!(
+        body["max_output_tokens"],
+        serde_json::json!(128_000),
+        "the Kiro-style Responses request did not receive the model's 128k output ceiling"
     );
 
     let selected = session_reasoning_options(
@@ -10741,21 +10750,20 @@ fn a_models_declared_output_limit_reaches_the_request_body() {
 }
 
 #[test]
-fn an_output_limit_above_the_ceiling_is_clamped_rather_than_forwarded() {
+fn a_large_declared_output_limit_is_forwarded_to_the_provider() {
     let catalog = generation_catalog(
-        "huge",
-        Some(1_000_000),
+        "large-output",
+        Some(128_000),
         serde_json::json!({
             "baseURL": "https://example.invalid/v1"
         }),
     );
-    let body = generation_body(&catalog, "huge", &agent("build"));
+    let body = generation_body(&catalog, "large-output", &agent("build"));
 
     assert_eq!(
         body.get("max_tokens"),
-        Some(&serde_json::json!(32_000)),
-        "a catalog row claiming a million output tokens was forwarded verbatim; \
-         `ProviderTransform.maxOutputTokens` clamps to 32_000"
+        Some(&serde_json::json!(128_000)),
+        "a valid model-specific output ceiling was replaced by the legacy global 32k cap"
     );
 }
 
@@ -10799,7 +10807,7 @@ fn a_configured_output_limit_outranks_the_catalogs_own() {
 }
 
 #[test]
-fn a_null_output_limit_suppresses_the_catalog_default_on_responses() {
+fn a_null_provider_output_override_yields_to_the_model_limit_on_responses() {
     let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
         "provider": {
             "stub": {
@@ -10831,9 +10839,10 @@ fn a_null_output_limit_suppresses_the_catalog_default_on_responses() {
     );
     let body = generation_body(&catalog, "mixed", &agent("build"));
 
-    assert!(
-        body.get("max_output_tokens").is_none(),
-        "`maxTokens: null` must suppress the generic output ceiling on Responses: {body}"
+    assert_eq!(
+        body.get("max_output_tokens"),
+        Some(&serde_json::json!(64_000)),
+        "`maxTokens: null` masked the model's declared Responses output ceiling: {body}"
     );
     assert!(
         body.get("max_tokens").is_none(),

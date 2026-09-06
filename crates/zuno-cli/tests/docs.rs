@@ -160,27 +160,26 @@ fn reconciliation_docs_pin_durable_work_as_the_only_unreconciled_work() {
     contains_all(
         "docs/harness-runtime.md",
         &[
-            "A short single-clause question stays atomic whether or not it ends in",
             "a session that recorded no durable work finishes on its first answer",
             "holding unreconciled durable work receives at most two",
             "Unreconciled work means durably recorded work.",
-            "recorded no Plan, Todo, or Job is settled",
+            "A Work-mode `Optional` decision",
+            "creates no Plan, Todo, or Job settles",
         ],
     );
     contains_all(
         "docs/zh/operate/harness-runtime.md",
         &[
-            "单句短问句",
             "没有记录任何持久工作的会话在第一次回复后直接结束",
             "普通会话在持有未对账的持久工作时",
-            "只是宿主的分类预测",
+            "Work 模式的 `Optional` 决策不是已记录工作",
         ],
     );
     contains_all(
         "docs/guide/tools.md",
         &[
             "unreconciled durable work receive at most two reconciliation continuations",
-            "durably recorded work counts: a session that recorded no Plan, Todo, or Job",
+            "durably recorded work counts: a Work-mode session that records no Plan, Todo",
         ],
     );
     contains_all(
@@ -192,15 +191,19 @@ fn reconciliation_docs_pin_durable_work_as_the_only_unreconciled_work() {
     );
     contains_all(
         "docs/guide/durable-state.md",
-        &["a short single-clause question is a direct answer"],
+        &[
+            "the model makes",
+            "that decision from the full conversation",
+            "a Plan must never contain only",
+        ],
     );
     contains_all(
         "docs/zh/guide/durable-state.md",
-        &["单句短问句无论是否带问号都算直接回答"],
+        &["普通 Work 模式由模型依据完整会话判断"],
     );
     contains_all(
         "docs/zh/operate/prompt-workflow.md",
-        &["单句短问句无论是否带问号都属于直接回答"],
+        &["Work 模式由模型依据完整会话判断 Plan 是否增加价值"],
     );
     contains_all(
         "docs/design/dsh-alpha2-adoption-ledger.md",
@@ -229,12 +232,14 @@ fn reconciliation_docs_pin_durable_work_as_the_only_unreconciled_work() {
 }
 
 #[test]
-fn planning_docs_pin_conversational_input_and_operation_enums_on_the_wire() {
+fn planning_docs_pin_codex_style_mode_boundaries_and_operation_enums() {
     contains_all(
         "docs/harness-runtime.md",
         &[
-            "A greeting, thanks, or bare acknowledgement is",
-            "conversational and stays atomic; it never opens a Plan, and with an active Plan it",
+            "explicit `plan` collaboration mode is `Required`",
+            "ordinary Work input is `Optional`",
+            "The host never parses action verbs",
+            "never create a single-step Plan",
             "reach the provider as one object schema whose `action` property",
             "is the only schema-required field",
         ],
@@ -242,38 +247,54 @@ fn planning_docs_pin_conversational_input_and_operation_enums_on_the_wire() {
     contains_all(
         "docs/zh/operate/harness-runtime.md",
         &[
-            "问候、致谢或单纯的",
-            "确认属于对话输入，同样归为 `Atomic`，不会打开 Plan；已有活跃 Plan 时视为继续维护",
+            "显式 `plan` 协作模式为",
+            "普通 Work 输入为 `Optional`",
+            "宿主不再解析「修改」「修复」「全部」",
+            "绝不创建单步骤 Plan",
             "`action` 属性枚举全部操作，也是 schema 中唯一",
         ],
     );
     contains_all(
         "docs/guide/durable-state.md",
         &[
-            "A greeting, thanks, or bare acknowledgement is",
-            "conversational: it never opens a plan, and it keeps an active plan current rather than",
+            "the model makes",
+            "that decision from the full conversation",
+            "the host does not classify prompt vocabulary",
+            "a Plan must never contain only",
+            "one step",
         ],
     );
     contains_all(
         "docs/zh/guide/durable-state.md",
         &[
-            "问候、致谢或单纯的确认属于对话输入：它不会打开 Plan，已有活跃 Plan 时只是继续维护，而不是替换",
+            "普通 Work 模式由模型依据完整会话判断",
+            "宿主不再解析中英文动作词",
+            "绝不创建只有一个步骤的 Plan",
         ],
     );
     contains_all(
         "docs/zh/operate/prompt-workflow.md",
         &[
-            "问候、致谢或单纯的确认（如 `你好`、`谢谢`、`好的`、`hi`、`thanks`）属于对话输入",
-            "归为 `Atomic`，不会打开 Plan；已有活跃 Plan 时视为继续维护；",
+            "宿主会在",
+            "第一次 provider request 之前执行模式与持久状态策略，而不是解析提示词关键词",
+            "普通 Work 输入为 `Optional`",
+            "绝不创建单步骤 Plan",
         ],
     );
     contains_all(
         "docs/guide/tools.md",
-        &["`notes`, and `history`, `action` is a required enum: the wire schema lists every"],
+        &[
+            "Explicit Plan collaboration mode requires durable strategic Plan state",
+            "ordinary Work mode, the model decides whether a Plan adds value",
+            "`notes`, and `history`, `action` is a required enum: the wire schema lists every",
+        ],
     );
     contains_all(
         "docs/zh/guide/tools.md",
-        &["是必填枚举：线上 schema 列出每个操作以及它需要的字段"],
+        &[
+            "普通 Work 模式由模型依据完整会话决定 Plan 是否",
+            "是必填枚举：线上 schema 列出每个操作以及它需要的字段",
+        ],
     );
 }
 
@@ -2807,6 +2828,45 @@ fn providers_login_docs_pin_the_remote_command_confirmation_and_trust_flag() {
             "原子合并进全局 `zuno.json`",
         ],
     );
+}
+
+#[test]
+fn model_limit_docs_pin_prompt_and_output_ceiling_semantics() {
+    contains_all(
+        "docs/config/models.md",
+        &[
+            "`limit.context` is the provider-visible prompt/input ceiling",
+            "configure `context: 872000`",
+            "`output: 128000`",
+            "`limit.output` reaches the provider request unchanged",
+            "`null` is treated",
+            "as unset",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/models.md",
+        &[
+            "`limit.context` 是 provider 可见的 prompt/input 上限",
+            "`context: 872000` 和",
+            "`output: 128000`",
+            "`limit.output` 会原样",
+            "`null` 按未设置处理",
+        ],
+    );
+    contains_all(
+        "docs/reference/configuration.md",
+        &[
+            "Omit `maxTokens`, or leave it `null`",
+            "each model's real `limit.output`",
+            "A non-null provider or Agent value deliberately",
+        ],
+    );
+    for relative in ["docs/zh/operate/faq.md", "docs/zh/guide/editors.md"] {
+        contains_all(
+            relative,
+            &["省略 `maxTokens`", "`null`", "逐模型", "`limit.output`"],
+        );
+    }
 }
 
 /// The Shell gate's wrapper walk (`wrapper_readings` in `crates/zuno-tools/src/risk.rs`)

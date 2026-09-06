@@ -369,7 +369,6 @@ dev: open acp logs
 ```json
 "options": {
   "baseURL": "http://127.0.0.1:8787/v1",
-  "maxTokens": null,
   "timeout": false,
   "headerTimeout": 330000,
   "chunkTimeout": 210000,
@@ -377,6 +376,9 @@ dev: open acp logs
   "reasoningReplayMaxAge": 86400000
 }
 ```
+
+省略 `maxTokens`（或将其留为 `null`）时，Zuno 使用逐模型的
+`limit.output`；只有非空值才覆盖模型声明。
 
 移除过期的 `responsesTextBlocks: "single"` 选项：Zuno 的通用兼容模式会插入一个空行，那会改变当前 provider 的确切投影。文本与非文本块混合、且 Kiro 无法保留其顺序时，仍然会失败即拒绝。如果纯文本仍然产生旧的错误，请确认 Zed 确实连到了新构建的 provider 进程。
 
