@@ -1710,6 +1710,7 @@ fn test_job_controller() -> Arc<dyn zuno_tools::job_cancel::JobController> {
 enum ScriptedTurnBehavior {
     PreserveWork,
     SettlePlanOnSecondTurn,
+    CompactThenComplete,
 }
 
 #[derive(Debug)]
@@ -1748,6 +1749,11 @@ impl AgentDriver for ScriptedTurnDriver {
         let work = self.work.clone();
         let behavior = self.behavior;
         Box::pin(async move {
+            if matches!(behavior, ScriptedTurnBehavior::CompactThenComplete) && call == 1 {
+                return Err(TurnError::CompactionRequired {
+                    reason: "provider-reported context crossed the proactive threshold".to_owned(),
+                });
+            }
             if matches!(behavior, ScriptedTurnBehavior::SettlePlanOnSecondTurn) && call == 2 {
                 let current = work
                     .plan(&request.session_id)
@@ -1777,6 +1783,49 @@ impl AgentDriver for ScriptedTurnDriver {
                 unresolved_tool_failures: Vec::new(),
             })
         })
+    }
+}
+
+#[derive(Debug)]
+struct ScriptedCompactionProvider {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl ScriptedCompactionProvider {
+    fn new() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Provider for ScriptedCompactionProvider {
+    fn id(&self) -> &str {
+        COMPATIBLE_PROVIDER
+    }
+
+    fn capabilities(&self) -> zuno_llm::registry::Capabilities {
+        zuno_llm::registry::Capabilities::text_only()
+    }
+
+    fn stream(&self, _request: CompletionRequest) -> zuno_llm::registry::ProviderStream<'_> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(futures::stream::iter(
+            [
+                StreamEvent::TextDelta(
+                    "## Objective\n- Resume after compacting the durable transcript.".to_owned(),
+                ),
+                StreamEvent::MessageEnd {
+                    stop_reason: Some(zuno_llm::event::FinishReason::Stop),
+                },
+            ]
+            .into_iter()
+            .map(Ok),
+        ))
     }
 }
 
@@ -2031,6 +2080,126 @@ async fn ordinary_build_still_runs_reconciliation_until_durable_work_settles() {
     assert_eq!(phase.reason.as_deref(), Some("durable_work_settled"));
     assert_eq!(phase.reconciliation_attempt, 1);
     host.shutdown().await.expect("shutdown scripted build host");
+}
+
+#[tokio::test]
+async fn proactive_compaction_is_recovered_inside_the_same_host_drive() {
+    let (_directory, mut host, driver, _work) =
+        scripted_reconciliation_host("build", ScriptedTurnBehavior::CompactThenComplete).await;
+    host.compaction_config.tail_turns = Some(1);
+    host.compaction_config.preserve_recent_tokens = Some(1);
+    persist_user_message(
+        &host.connection,
+        UserMessageInput {
+            session_id: &host.session_id,
+            agent: "build",
+            provider_id: "provider",
+            model_id: "model",
+            text: "old context that should be summarized",
+            message_id: Some("msg_compaction_old"),
+            now: 1_780_000_000_010,
+        },
+    )
+    .expect("persist old compaction context");
+    persist_user_message(
+        &host.connection,
+        UserMessageInput {
+            session_id: &host.session_id,
+            agent: "build",
+            provider_id: "provider",
+            model_id: "model",
+            text: "the newest request must remain verbatim",
+            message_id: Some("msg_compaction_recent"),
+            now: 1_780_000_000_020,
+        },
+    )
+    .expect("persist retained compaction tail");
+
+    let compaction = Arc::new(ScriptedCompactionProvider::new());
+    let compaction_service: Arc<dyn Provider> = compaction.clone();
+    let mut providers = ProviderRegistry::new();
+    providers.register(COMPATIBLE_PROVIDER, {
+        let compaction_service = Arc::clone(&compaction_service);
+        move |_spec| Arc::clone(&compaction_service)
+    });
+    host.providers = providers;
+
+    let guard = host
+        .runs
+        .begin_turn(host.session_id.clone())
+        .expect("reserve scripted turn");
+    let (sender, receiver) = zuno_engine::r#loop::event_channel();
+    let (outcome, events) = tokio::join!(
+        host.execute_turn_unaccounted(
+            DynamicContext::default(),
+            DynamicContextRefreshInstruction::Fixed("scripted".to_owned()),
+            None,
+            &guard,
+            sender,
+        ),
+        collect_turn_events(receiver)
+    );
+
+    assert!(matches!(
+        outcome.expect("the host compacts and retries"),
+        Some(TurnOutcome::Completed { .. })
+    ));
+    assert_eq!(
+        driver.calls(),
+        2,
+        "the internal compaction signal must retry the driver without another user wake"
+    );
+    assert_eq!(
+        compaction.calls(),
+        1,
+        "one threshold crossing must produce one bounded compaction request"
+    );
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                TurnEvent::SessionCommandOutput {
+                    command: SessionCommand::Compact,
+                    content,
+                } if content.contains("Resume after compacting")
+            )
+        }),
+        "live clients never received the durable compaction summary: {events:#?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::TurnFailed { .. })),
+        "an internal compact-and-retry intervention became a terminal client failure"
+    );
+    let failed_turns: i64 = host
+        .connection
+        .query_row(
+            "SELECT failed_turns FROM session WHERE id = ?1",
+            [&host.session_id],
+            |row| row.get(0),
+        )
+        .expect("read failed-turn audit");
+    assert_eq!(
+        failed_turns, 0,
+        "a recovered compaction must not increment the failed-turn audit"
+    );
+    let retained = hydrate_retained_history(&host.connection, &host.session_id)
+        .expect("hydrate compacted history");
+    assert!(
+        retained.iter().any(|message| {
+            message.parts.iter().any(|part| {
+                part.kind == zuno_db::message::PartKind::Text
+                    && part.data["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Resume after compacting"))
+            })
+        }),
+        "the summary shown live is not the summary retained durably"
+    );
+    host.shutdown()
+        .await
+        .expect("shutdown compact-and-retry host");
 }
 
 #[test]
@@ -7715,6 +7884,31 @@ fn every_turn_error() -> Vec<TurnError> {
         TurnError::Cache(zuno_llm::cache::CacheViolation::StaticPrefixChanged { turn: 2 }),
         TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable),
     ]
+}
+
+#[test]
+fn turn_failure_preserves_the_typed_context_limit_compaction_trigger() {
+    let provider = TurnFailure::Engine(TurnError::Provider(ProviderError::ContextLimit {
+        used_tokens: Some(632_985),
+        limit_tokens: Some(872_000),
+    }));
+    assert_eq!(
+        provider.compaction_trigger(),
+        Some(CompactionTrigger::ContextLimit {
+            used_tokens: Some(632_985),
+            limit_tokens: Some(872_000),
+        }),
+        "reactive provider recovery must enter the bounded context-limit budget"
+    );
+
+    let proactive = TurnFailure::Engine(TurnError::CompactionRequired {
+        reason: "threshold crossed".to_owned(),
+    });
+    assert_eq!(
+        proactive.compaction_trigger(),
+        Some(CompactionTrigger::Manual),
+        "the already-approved proactive intervention must compact without rechecking the threshold"
+    );
 }
 
 /// The category every existing assertion reads still leads the message.

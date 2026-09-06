@@ -63,6 +63,11 @@ failed 状态，保留已观察到的路径/diff，并设置 `_meta.zuno.outcome
 `instruction.not_in_force`、`budget.compact`、`budget.token_budget`、`context.compact`。
 客户端靠这个标记把它们与模型输出区分开；它们永远不进入模型看到的对话记录。
 
+压缩成功后，ACP 会收到完全相同的持久摘要：它以 `agent_message_chunk` 投影，并带
+`_meta.zuno.kind: "compaction_summary"`。回合中的自动压缩会在同一次 host drive 内、
+重试之前发送该摘要，因此编辑器不会先收到终端 prompt 失败，也不必等待下一次 wake。
+历史 load/resume replay 的是同一份摘要和同一标记。
+
 模型上下文窗口已知时，`ProviderRequestStarted` 会立即发布一条带 assembled prompt
 estimate 的 ACP `usage_update`；provider token usage 到达后，再发第二条用真实值更新。
 它们都是当前请求占用量的绝对值，而不是累计百分比，因此压缩后的请求可以立即让编辑器

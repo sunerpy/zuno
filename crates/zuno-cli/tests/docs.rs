@@ -2221,6 +2221,9 @@ fn acp_context_compaction_docs_pin_between_request_checks_and_usage_recalculatio
                 "assembled prompt estimate",
                 "`context.compact`",
                 "typed compact-and-retry path",
+                "same host drive",
+                "blank assistant message",
+                "five compactions",
             ],
         ),
         (
@@ -2231,6 +2234,9 @@ fn acp_context_compaction_docs_pin_between_request_checks_and_usage_recalculatio
                 "assembled prompt estimate",
                 "`context.compact`",
                 "`TurnError::CompactionRequired`",
+                "same driver cycle",
+                "does not emit a terminal turn failure",
+                "five compactions",
             ],
         ),
     ] {
@@ -2252,6 +2258,9 @@ fn acp_context_compaction_docs_pin_between_request_checks_and_usage_recalculatio
                 "当前刚组装完成的 prompt 估算",
                 "`context.compact`",
                 "“压缩并重试”路径",
+                "同一次 host drive",
+                "空白 assistant 消息",
+                "最多自动恢复五次",
             ],
         ),
         (
@@ -2263,6 +2272,9 @@ fn acp_context_compaction_docs_pin_between_request_checks_and_usage_recalculatio
                 "`context.compact`",
                 "`TurnError::CompactionRequired`",
                 "`compaction.auto: false`",
+                "同一次 drive",
+                "不会产生终端 turn failure",
+                "最多自动恢复五次",
             ],
         ),
     ] {
@@ -2282,6 +2294,8 @@ fn acp_context_compaction_docs_pin_between_request_checks_and_usage_recalculatio
             "assembled prompt estimate",
             "measured",
             "`context.compact`",
+            "`_meta.zuno.kind: \"compaction_summary\"`",
+            "same durable summary",
         ] {
             assert!(
                 contains_ignoring_whitespace(&text, needle),
@@ -2304,6 +2318,8 @@ fn acp_context_compaction_docs_pin_between_request_checks_and_usage_recalculatio
             estimate,
             measured,
             "`context.compact`",
+            "`_meta.zuno.kind: \"compaction_summary\"`",
+            "同一份",
         ] {
             assert!(
                 contains_ignoring_whitespace(&text, needle),

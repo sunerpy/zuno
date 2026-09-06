@@ -832,6 +832,10 @@ fn a_compacted_session_replays_only_the_tail_the_model_will_receive() {
         "the retained tail must be on screen: {rendered}",
     );
     assert!(
+        rendered.contains("a summary of what came before"),
+        "the compacted context anchor must be visible on resume: {rendered}",
+    );
+    assert!(
         !rendered.contains("the forgotten prompt"),
         "showing a compacted head the model has already forgotten is the same mismatch \
          pointed the other way: {rendered}",

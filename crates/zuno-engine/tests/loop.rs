@@ -6159,6 +6159,16 @@ async fn a_multi_step_turn_yields_for_compaction_after_crossing_the_context_thre
         1,
         "the first step's durable tool result must exist before compaction"
     );
+    assert_eq!(
+        scalar_count(
+            &run.connection,
+            "SELECT COUNT(*) FROM message \
+             WHERE session_id = 'ses_loop_test' \
+               AND json_extract(data, '$.role') = 'assistant'"
+        ),
+        1,
+        "the blocked second request must not leave a blank assistant checkpoint"
+    );
     assert!(
         run.events.iter().any(|event| {
             matches!(
@@ -6387,6 +6397,16 @@ async fn a_budget_policy_that_asks_for_compaction_ends_the_turn_with_a_compactio
     assert!(
         run.requests.is_empty(),
         "a request went out although the transcript had to shrink first"
+    );
+    assert_eq!(
+        scalar_count(
+            &run.connection,
+            "SELECT COUNT(*) FROM message \
+             WHERE session_id = 'ses_loop_test' \
+               AND json_extract(data, '$.role') = 'assistant'"
+        ),
+        0,
+        "a pre-request compaction decision must not create an empty assistant message"
     );
     assert!(
         run.events.contains(&TurnEvent::Notice {

@@ -423,6 +423,13 @@ Generated titles use ACP `session_info_update`, and other operational status or
 provider failure text is handled by lifecycle/error reporting rather than being
 rendered as model thought.
 
+Once compaction succeeds, Zed receives the exact durable summary as an
+`agent_message_chunk` tagged `_meta.zuno.kind: "compaction_summary"`. The live
+automatic path emits it before retrying in the same host drive; load and resume
+replay the same durable summary and tag. A successful internal compaction
+therefore does not surface as a terminal turn failure or require a second prompt
+to continue.
+
 When the selected model has a known context window, ACP sends an absolute
 `usage_update` as soon as each `ProviderRequestStarted` event arrives. Its
 `used` value is the assembled prompt estimate, so a request after compaction can

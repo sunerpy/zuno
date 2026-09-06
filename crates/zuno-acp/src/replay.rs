@@ -315,6 +315,13 @@ fn message_updates(stored: &MessageWithParts, policy: &ReplayPolicy) -> Vec<Valu
                         json!({ "type": "text", "text": text }),
                         &stored.info.id,
                     );
+                    if stored.info.data.get("summary").and_then(Value::as_bool) == Some(true) {
+                        update["_meta"] = json!({
+                            "zuno": {
+                                "kind": "compaction_summary",
+                            }
+                        });
+                    }
                     if let Some(metadata) = stored
                         .info
                         .data
@@ -760,6 +767,39 @@ mod tests {
         );
         assert_eq!(updates[5]["content"]["text"], "done");
         assert_eq!(updates[5]["messageId"], "msg-assistant");
+    }
+
+    #[test]
+    fn replay_exposes_the_durable_compaction_summary() {
+        let root = tempfile::tempdir().expect("replay root");
+        let mut summary = message(
+            "msg-summary",
+            "assistant",
+            vec![part(
+                "p-summary",
+                "msg-summary",
+                json!({
+                    "type": "text",
+                    "text": "## Objective\n- Resume from the compacted session."
+                }),
+            )],
+        );
+        summary
+            .info
+            .data
+            .insert("summary".to_owned(), Value::Bool(true));
+
+        let replay = durable_updates(&[summary], &ReplayPolicy::for_workspace(root.path()), 0);
+
+        assert_eq!(replay.updates.len(), 1);
+        assert_eq!(
+            replay.updates[0]["content"]["text"],
+            "## Objective\n- Resume from the compacted session."
+        );
+        assert_eq!(
+            replay.updates[0]["_meta"]["zuno"]["kind"],
+            "compaction_summary"
+        );
     }
 
     #[test]

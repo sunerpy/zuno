@@ -156,6 +156,11 @@ pub struct PreludeOutcome {
     pub title: Option<String>,
     /// Whether the history was compacted before the turn.
     pub compacted: bool,
+    /// The durable summary produced by compaction, when one ran.
+    ///
+    /// Keeping the exact persisted text lets every live client show the same
+    /// context anchor a resumed client and the next provider request will see.
+    pub compaction_summary: Option<String>,
     /// Whether the caller should enter the ordinary turn after the prelude.
     ///
     /// A plugin may suppress the synthetic continuation produced by automatic
@@ -185,6 +190,7 @@ pub async fn run_prelude(
     let mut outcome = PreludeOutcome {
         title: None,
         compacted: false,
+        compaction_summary: None,
         continue_turn: true,
         skipped: Vec::new(),
     };
@@ -196,6 +202,7 @@ pub async fn run_prelude(
     match compact_if_overflowing(session_id, context).await {
         Ok(compaction) => {
             outcome.compacted = compaction.compacted;
+            outcome.compaction_summary = compaction.summary;
             outcome.continue_turn = compaction.continue_turn;
         }
         Err(CompactionSkipped::Database(error)) => return Err(error),
@@ -320,10 +327,12 @@ pub enum CompactionSkipped {
 }
 
 /// The prelude-facing result of checking and, when needed, compacting history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreludeCompactionOutcome {
     /// Whether compaction replaced the old history with a summary.
     pub compacted: bool,
+    /// The exact summary persisted into durable session history.
+    pub summary: Option<String>,
     /// Whether the caller should immediately continue into the ordinary turn.
     pub continue_turn: bool,
 }
@@ -331,6 +340,7 @@ pub struct PreludeCompactionOutcome {
 impl PreludeCompactionOutcome {
     const NOT_NEEDED: Self = Self {
         compacted: false,
+        summary: None,
         continue_turn: true,
     };
 }
@@ -377,27 +387,22 @@ pub async fn compact_manually(
     session_id: &str,
     context: &mut PreludeContext<'_>,
 ) -> Result<bool, CompactionSkipped> {
-    compact_requested(session_id, context, false).await
+    compact_requested(session_id, context, CompactionTrigger::Manual, false)
+        .await
+        .map(|outcome| outcome.compacted)
 }
 
-/// Runs an explicitly requested compaction while preserving whether its caller
-/// classified the compaction as automatic.
+/// Runs a host-requested compaction with the caller's typed trigger and
+/// automatic/manual classification.
 pub async fn compact_requested(
     session_id: &str,
     context: &mut PreludeContext<'_>,
+    trigger: CompactionTrigger,
     automatic: bool,
-) -> Result<bool, CompactionSkipped> {
+) -> Result<PreludeCompactionOutcome, CompactionSkipped> {
     let store_history = hydrate_retained_history(context.connection, session_id)
         .map_err(CompactionSkipped::Database)?;
-    compact_history(
-        session_id,
-        context,
-        store_history,
-        CompactionTrigger::Manual,
-        automatic,
-    )
-    .await
-    .map(|outcome| outcome.compacted)
+    compact_history(session_id, context, store_history, trigger, automatic).await
 }
 
 async fn compact_history(
@@ -445,10 +450,14 @@ async fn compact_history(
     .map_err(|CompactionError::Database(error)| CompactionSkipped::Database(error))?;
 
     match outcome {
-        CompactionOutcome::Compacted(transcript) => Ok(PreludeCompactionOutcome {
-            compacted: true,
-            continue_turn: transcript.auto_continue,
-        }),
+        CompactionOutcome::Compacted(transcript) => {
+            let continue_turn = transcript.auto_continue;
+            Ok(PreludeCompactionOutcome {
+                compacted: true,
+                summary: Some(transcript.summary),
+                continue_turn,
+            })
+        }
         CompactionOutcome::NotNeeded => Ok(PreludeCompactionOutcome::NOT_NEEDED),
         CompactionOutcome::Stopped {
             reason,

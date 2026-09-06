@@ -245,6 +245,11 @@ Zed 呈现权限与征询请求，但策略拥有者仍然是 Zuno：
 `session_info_update`，其他运维状态或 provider 失败文本由生命周期/错误报告处理，而不是
 被渲染成模型的思考内容。
 
+压缩成功后，编辑器会收到完全相同的持久摘要：它以 `agent_message_chunk` 投影，并带
+`_meta.zuno.kind: "compaction_summary"`。回合中的自动压缩会在同一次 host drive 内、
+重试之前发送摘要；load/resume replay 的也是同一份文本和标记。因此成功的内部压缩不会
+先表现为终端 turn failure，也不需要用户再发一次 prompt。
+
 所选模型有已知上下文窗口时，每个 `ProviderRequestStarted` 事件都会让 ACP 立即发送一条
 绝对值 `usage_update`。此时 `used` 是刚组装完成的 prompt 估算，因此压缩后的新请求可以
 立刻让 UI 从上一请求的 100% 重新计算，而无需等到响应结束。provider 随后报告 token

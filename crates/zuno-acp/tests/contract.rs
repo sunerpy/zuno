@@ -143,6 +143,18 @@ fn engine_stream_events_project_to_protocol_updates() {
         "{\n  \"objective\": \"ship ACP commands\"\n}"
     );
 
+    let compaction = turn_event_update(&TurnEvent::SessionCommandOutput {
+        command: zuno_engine::session_command::SessionCommand::Compact,
+        content: "## Objective\n- Resume from the durable summary.".to_owned(),
+    })
+    .expect("automatic compaction summary is client-visible");
+    assert_eq!(compaction["sessionUpdate"], "agent_message_chunk");
+    assert_eq!(
+        compaction["content"]["text"],
+        "## Objective\n- Resume from the durable summary."
+    );
+    assert_eq!(compaction["_meta"]["zuno"]["kind"], "compaction_summary");
+
     let pending = turn_event_update(&TurnEvent::ToolCallStarted {
         step: 1,
         call_id: "call-1".to_owned(),
