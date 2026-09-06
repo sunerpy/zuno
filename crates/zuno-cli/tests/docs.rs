@@ -2111,6 +2111,7 @@ fn release_docs_pin_allowance_pauses_retired_plans_and_tagged_notices() {
             "`_meta.zuno.cleared: true`",
             "`_meta.zuno.notice`",
             "a remote rule file that could not be fetched",
+            "`instruction.*` or `budget.*` families",
             "`context.compact`",
         ],
     );
@@ -2132,6 +2133,7 @@ fn release_docs_pin_allowance_pauses_retired_plans_and_tagged_notices() {
         &[
             "`_meta.zuno.notice`",
             "a remote rule file that could not be fetched",
+            "`instruction.not_in_force`, `budget.compact`, or `budget.token_budget`",
             "`context.compact`",
         ],
     );
