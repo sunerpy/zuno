@@ -117,8 +117,11 @@ product-level choices:
 
 - **OpenAI** — official OpenAI, or a custom Responses endpoint. A custom endpoint
   is written as `transport: "openai"` with `surface: "responses"`.
-- **Amazon Bedrock** — one user-facing provider. Setup asks for the model, region,
+- **Amazon Bedrock** — one user-facing provider. Setup asks for the region,
   optional profile, and either the AWS credential chain or a Bedrock API key.
+  It does not ask for a model id: the provider inherits the complete supported
+  model list and per-model transports from Models.dev. If that catalog entry is
+  unavailable, run `zuno models --refresh` before retrying login.
 - **OpenAI-compatible** — a custom endpoint using Chat Completions. Setup writes
   `transport: "openai-compatible"` with `surface: "chat"`.
 
@@ -127,6 +130,10 @@ keys with terminal echo disabled, then atomically merges one provider into the
 global `zuno.json`. Existing unrelated configuration is retained. A validation
 or credential-storage failure restores the previous file rather than leaving a
 half-configured provider.
+
+Authentication does not choose a Bedrock model or change the default model.
+After setup, use `zuno models amazon-bedrock` or the model picker to choose from
+the catalog instead of copying a vendor model id into the login prompt.
 
 A configured Bedrock provider exposes `bedrock-bearer-token`. Selecting that
 method prints the bearer-token and AWS credential-chain priority before reading
