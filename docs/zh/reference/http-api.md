@@ -248,7 +248,8 @@ curl -N \
 ## 刻意不存在的接口
 
 - 不存在无认证的非 loopback 模式。
-- CLI 不接受 `--cors`、`--mdns` 与 `--mdns-domain`。
+- 已从 parser 移除的历史 `zuno serve` 参数只在
+  [`zuno serve`](/zh/cli/serve) 的退役记录中列出。
 - 不存在无 `/api` 前缀的 `/event` alias；使用 `/api/event`。
 - 已保存的 `always` 权限属于进程/Session 状态，不是持久权限行，因此没有 saved-permission
   list 或 revoke endpoint。

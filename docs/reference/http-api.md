@@ -273,7 +273,8 @@ that shape as well as the normal envelope.
 ## Deliberately absent surfaces
 
 - There is no unauthenticated non-loopback mode.
-- `--cors`, `--mdns`, and `--mdns-domain` are not accepted CLI options.
+- Historical `zuno serve` options that were removed from the parser are listed
+  only in the [`zuno serve`](/cli/serve) retirement record.
 - There is no unscoped `/event` alias; use `/api/event`.
 - Saved `always` permissions are process/session state, not durable permission
   rows, so there is no saved-permission list or revoke endpoint.
