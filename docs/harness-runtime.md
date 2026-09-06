@@ -1304,8 +1304,8 @@ user workflow cannot shadow a runtime control.
 
 `/compact` and `/goal` invoke shared live-`TurnHost` handlers in both the TUI
 and ACP. Compact runs the hidden compaction agent. Goal accepts either a direct
-objective or show/history/create/edit/pause/resume/block/complete/cancel against
-the durable goal store. A direct objective creates a goal when none exists or
+objective or show/history/create/edit/budget/pause/resume/block/complete/cancel
+against the durable goal store. A direct objective creates a goal when none exists or
 the previous goal is complete or cancelled; otherwise it updates the objective
 while preserving lifecycle state, budget, and usage. Create, edit, and shorthand
 objective changes also reconcile an active durable Plan: a multi-stage objective
@@ -1553,13 +1553,17 @@ error source chain for diagnostics while recovery still follows the typed
 
 The standard profile publishes a typed `TurnAllowance` through
 `zuno_harness::turn_allowance_bundle`; `default_profile_with_tools_and_allowance` is the
-seam for a host with its own view. `DEFAULT_TURN_ALLOWANCE` sets `default_token_budget`
-to 8,000,000 tokens and leaves `max_tool_calls` and `max_duration` unset. The token
-default is charged against the durable Goal row, so it can outlive one turn and bind; an
-explicit Goal budget always wins over it. `None` is no longer the implied meaning of an
-absent number: a profile that publishes no allowance, or publishes
-`TurnAllowance::UNLIMITED`, is the only way to run without ceilings. Every stop is a typed `TurnError::BudgetLimited` and is surfaced to
-clients as a `notice` with code `budget.<kind>`; a compaction request is `budget.compact`.
+seam for a host with its own view. `DEFAULT_TURN_ALLOWANCE` is
+`TurnAllowance::UNLIMITED`: the standard host invents no Goal-token, tool-call, or
+wall-time ceiling. `goal.default_token_budget` makes the CLI publish a fallback token
+allowance for Goals whose durable `token_budget` is unset; an explicit Goal budget
+always wins. Every stop is a typed `TurnError::BudgetLimited` and is surfaced to clients
+as a `notice` with code `budget.<kind>`; a compaction request is `budget.compact`.
+
+Automatic Goal continuation checks the provider-retained history rather than the full
+message table before deciding whether a user anchor exists. If compaction retained an
+assistant-only tail, the host durably re-admits the Goal objective before the next turn;
+the synthetic compaction marker is never mistaken for user authorization.
 
 ### Tool effects and strict authorization
 

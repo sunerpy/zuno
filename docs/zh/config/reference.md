@@ -135,6 +135,24 @@ Schema 是从 Rust 类型生成的，因此它与运行时实际接受的内容�
 
 `concurrency` 控制同时运行的工作量上限。它约束的是编排层的并行度，而不是单次工具调用内部的并发。
 
+## Goal 兜底预算
+
+没有显式 `token_budget` 的 Goal 默认不受 token 上限约束。部署方可以配置一个共享的正整数兜底值：
+
+```json
+{
+  "goal": {
+    "default_token_budget": 256000000
+  }
+}
+```
+
+它只作用于没有自身预算的 Goal，在会话运行时打开时进入 Harness profile，不会写进 Goal 行；
+Goal 自己的显式预算始终优先。省略该字段即表示不设兜底上限。
+
+已有 Goal 可用 `/goal budget <正整数 token>` 设置显式预算，用 `/goal budget none` 清除。
+预算变化不会自动恢复 paused、blocked 或 budget-limited Goal；恢复仍需显式 `/goal resume`。
+
 ## 组件停止上限
 
 `runtime.max_component_stop_ms` 是本机对组件自报停止预算设置的上限：

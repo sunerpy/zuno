@@ -71,6 +71,7 @@ SQLite 写者争用，或宿主写入 Plan 对账、人工请求等 Goal 所属�
 /goal <目标>
 /goal create <目标>
 /goal edit <目标>
+/goal budget <正整数 token|none>
 /goal pause
 /goal resume
 /goal block <原因>
@@ -96,7 +97,9 @@ Goal 会在后台恢复，不需要额外发送一条“垫脚”提示词。这
 Goal、但尚未准入首个 user turn 就停止的会话。
 
 当首词为已知 action 时，action 优先：`show`、`get`、`status`、`history`、`create`、
-`edit`、`pause`、`resume`、`block`、`complete`、`cancel` 和 `help`。如果目标本身以
+`edit`、`budget`、`pause`、`resume`、`block`、`complete`、`cancel` 和 `help`。
+`/goal budget 256000000` 设置当前 Goal 的显式上限，`/goal budget none` 清除该上限，
+但不会改变 Goal 的生命周期状态或累计用量。如果目标本身以
 这些词开头，请用 `/goal create <目标>` 或 `/goal edit <目标>` 消歧。`/goal help`
 可以查看精简用法。
 
@@ -282,20 +285,28 @@ Goal 的 `token_budget` 在回合内的每一次 provider request 前后执行�
 
 ### 宿主的默认额度
 
-`token_budget` 没有填写的 Goal 并不因此就是无限的。`None` 的含义是"用宿主的默认值"，而
-harness 的默认 profile 确实发布了一个：200,000 token 窗口下的四十次请求，也就是 8,000,000
-tokens。每次请求都会重新发送整个 prompt，并且缓存读取也要计费，所以这个数字接近一个失控回合
-最多能花掉的量。
+`token_budget` 没有填写的 Goal 默认不受 token 上限约束。标准 Harness profile 发布的是
+`TurnAllowance::UNLIMITED`，不会自行猜测 token、工具调用次数或墙上时间上限。
 
-Goal 上显式写下的预算永远优先，默认值也从不写回 Goal 那一行。真心想要无边界自治的宿主要用
-`TurnAllowance::UNLIMITED` 明说，而不是靠不填某个字段。两种情况下停止的类型都是
-`token_budget`，但补救办法不同：设过预算的用户被告知去提高它，从没设过的用户被告知去设一个。
+希望给所有未单独设预算的 Goal 加一道共享兜底时，可在 `zuno.json` 中配置
+`goal.default_token_budget`：
+
+```json
+{
+  "goal": {
+    "default_token_budget": 256000000
+  }
+}
+```
+
+Goal 自己显式写下的预算永远优先，宿主兜底也不会写回 Goal 那一行。移除配置键即可恢复默认
+无限；已有 Goal 还可以用 `/goal budget <正整数 token|none>` 单独修改。
 
 上面那张表里有一条规则不适用于默认值。provider 未上报用量时，你亲自设下的预算会让回合停止：
-数不清的预算无法被遵守，而拿没上报的数字继续下去，等于让预算悄悄变成建议。但在默认额度下回合
-会继续：不上报用量是某个端点自己的选择，不是失控；而让每一次这样的运行都停在一个没人要求过的
-上限上，除了"去设一个预算"以外不留任何补救。默认值仍然对已经数出来的量生效，所以一个跨过它的
-下界照样会停在上面。
+数不清的预算无法被遵守，而拿没上报的数字继续下去，等于让预算悄悄变成建议。但在配置的宿主
+兜底额度下回合会继续：不上报用量是某个端点自己的选择，不是失控；而让每一次这样的运行都停在
+一个没有写进 Goal 的上限上，除了“去设一个预算”以外不留任何补救。兜底值仍然对已经数出来的
+用量生效，所以一个跨过它的下界照样会停在上面。
 
 还有两道上限约束的是回合本身而不是 Goal。除非宿主设置，它们默认都是关闭的；而且无论是否有
 活跃 Goal 都生效，因为没有 Goal 的回合一样可以空转。想要一个 provider 无法扣下的边界，用的

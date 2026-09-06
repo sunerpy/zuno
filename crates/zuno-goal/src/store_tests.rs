@@ -854,6 +854,41 @@ fn lowering_the_budget_below_what_is_spent_stops_the_goal_in_the_same_statement(
 }
 
 #[test]
+fn checked_budget_updates_reject_stale_revisions_and_may_clear_the_ceiling() {
+    let fixture = Fixture::in_memory();
+    let created = fixture
+        .store
+        .create_goal(SESSION, "configure the budget safely", None)
+        .expect("create goal");
+    let edited = fixture
+        .store
+        .update_objective_checked(SESSION, "newer objective", created.revision)
+        .expect("edit objective")
+        .expect("goal exists");
+
+    let stale = fixture
+        .store
+        .set_token_budget_checked(SESSION, Some(256_000_000), created.revision)
+        .expect_err("a stale budget write must not overwrite the newer goal");
+    assert!(matches!(stale, GoalError::RevisionConflict { .. }));
+    assert_eq!(fixture.goal(SESSION).token_budget, None);
+
+    let budgeted = fixture
+        .store
+        .set_token_budget_checked(SESSION, Some(256_000_000), edited.revision)
+        .expect("set checked budget")
+        .expect("goal exists");
+    assert_eq!(budgeted.token_budget, Some(256_000_000));
+
+    let unlimited = fixture
+        .store
+        .set_token_budget_checked(SESSION, None, budgeted.revision)
+        .expect("clear checked budget")
+        .expect("goal exists");
+    assert_eq!(unlimited.token_budget, None);
+}
+
+#[test]
 fn an_active_goal_is_never_observed_over_its_budget() {
     let fixture = Fixture::in_memory();
     fixture

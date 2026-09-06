@@ -736,6 +736,13 @@ pub enum WebSearchBackend {
 /// Persistent goal runtime settings.
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct GoalConfig {
+    /// Host fallback token budget for a Goal that has no budget of its own.
+    ///
+    /// Omit this field to leave unbudgeted Goals without a token ceiling. A
+    /// positive value applies only when the durable Goal's `token_budget` is
+    /// unset; an explicit per-Goal budget always wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_token_budget: Option<NonZeroU64>,
     /// Automatic recovery after a retryable terminal turn failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<GoalRetryConfig>,

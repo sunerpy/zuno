@@ -157,8 +157,8 @@ inbox 并启动目标回合；离线目标则一直保留 queued 行，直到再
 
 TUI 的 `/goal <目标>` 与 ACP 使用同一个持久宿主命令。尚无 Goal，或上一条 Goal
 已完成、已取消时，它会创建新 Goal；其他状态下则更新当前 Goal。`/goal show`、
-`/goal edit ...`、`/goal complete` 等显式 action 仍然可用。目标变化也会同步活跃
-Plan：多阶段工作会归档此前可见 Plan，并安装一个绑定当前 `goal_id` 的新根 Plan。
+`/goal edit ...`、`/goal budget <正整数 token|none>`、`/goal complete` 等显式
+action 仍然可用。目标变化也会同步活跃 Plan：多阶段工作会归档此前可见 Plan，并安装一个绑定当前 `goal_id` 的新根 Plan。
 原子目标不会改绑已终态的历史 Plan；属于上一个 Goal 的终态 Plan 会归档为已完成的历史。
 
 Zuno 的通知——无法抓取的远程规则文件、被 token、工具调用次数或墙上时间额度停下的回合、

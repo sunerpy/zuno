@@ -281,8 +281,9 @@ shows the current goal. `/goal <objective>` creates a goal when none exists or
 the previous goal is complete or cancelled, and otherwise updates the current
 objective without resetting its lifecycle state, budget, or usage. Explicit
 `show`, `history`, `create <objective>`, `edit <objective>`, `pause`, `resume`,
-`block <reason>`, `complete`, and `cancel` actions remain available and take
-precedence when their name is the first token. Objective changes also supersede
+`budget <positive tokens|none>`, `block <reason>`, `complete`, and `cancel`
+actions remain available and take precedence when their name is the first token.
+Objective changes also supersede
 unfinished work by archiving the prior visible Plan and binding a fresh root
 Plan to the current Goal for multi-stage work. An atomic objective never rebinds an
 already terminal historical Plan; one that belongs to a previous Goal is archived as

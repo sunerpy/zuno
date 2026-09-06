@@ -73,7 +73,12 @@ inbox 准入为首个 user turn；字面的斜杠命令不会发送给 provider�
 
 `session/load` 与 `session/resume` 会重建会话运行时并自动恢复 active 根 Goal，不需要
 额外发送一条提示词。对于 0.6.0 已写入 active Goal、但没有 user message 的会话，同一
-恢复路径会先补齐 durable user anchor 再续跑。
+恢复路径会先补齐 durable user anchor 再续跑；压缩后保留历史从 assistant 消息开始的
+会话也使用同一修复。
+
+`/goal budget <正整数 token|none>` 修改单个 Goal 的显式上限。`goal_update` 的
+`in_progress` 与 `active` 仅用于幂等确认一个已经 active 的 Goal；paused 或 blocked Goal
+仍必须由用户执行 `/goal resume`。
 
 ## 进程环境与代理
 

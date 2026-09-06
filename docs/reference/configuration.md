@@ -385,6 +385,29 @@ Foreground native `task` delegation is not detached: it inherits the parent
 turn interrupt, aborts the live child turn when fired, and waits for child drain
 and runtime shutdown before the tool call settles.
 
+## Goal fallback budget
+
+Goals with no explicit `token_budget` are unbounded by default. A deployment can
+set a shared positive fallback:
+
+```json
+{
+  "goal": {
+    "default_token_budget": 256000000
+  }
+}
+```
+
+This value applies only when the durable Goal has no budget of its own. It is
+resolved into the Harness profile when the session runtime opens, is never copied
+into the Goal row, and is superseded by any explicit per-Goal budget. Omit the
+field for no fallback ceiling.
+
+For one existing Goal, `/goal budget <positive tokens>` sets an explicit budget
+and `/goal budget none` removes it. Changing a budget never resumes a paused,
+blocked, or budget-limited Goal; lifecycle recovery remains an explicit
+`/goal resume`.
+
 ## Component stop ceiling
 
 Each runtime component declares how long shutdown may wait for one of its own

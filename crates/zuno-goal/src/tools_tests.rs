@@ -121,7 +121,7 @@ async fn all_three_tools_share_one_authoritative_goal() {
 }
 
 #[tokio::test]
-async fn update_schema_and_deserializer_reject_system_owned_statuses() {
+async fn update_schema_accepts_progress_aliases_without_granting_resume_authority() {
     let fixture = Fixture::new();
     fixture
         .store
@@ -132,11 +132,53 @@ async fn update_schema_and_deserializer_reject_system_owned_statuses() {
     let rendered_schema = definition.parameters.to_string();
     assert!(rendered_schema.contains("complete"), "{rendered_schema}");
     assert!(rendered_schema.contains("blocked"), "{rendered_schema}");
+    assert!(rendered_schema.contains("in_progress"), "{rendered_schema}");
+    assert!(rendered_schema.contains("active"), "{rendered_schema}");
+    assert!(rendered_schema.contains("intent"), "{rendered_schema}");
     assert!(!rendered_schema.contains("paused"), "{rendered_schema}");
+
+    for (call, status) in [("call_progress", "in_progress"), ("call_active", "active")] {
+        let output = tool
+            .execute(
+                json!({
+                    "expected_revision": 1,
+                    "status": status,
+                    "intent": "continue the user-authorized work"
+                }),
+                fixture.context(call),
+            )
+            .await
+            .expect("an active Goal accepts an idempotent progress confirmation");
+        let goal = goal_from_metadata(&output)
+            .expect("decode progress metadata")
+            .expect("goal exists");
+        assert_eq!(goal.status, GoalStatus::Active);
+        assert_eq!(goal.revision, 1, "a progress heartbeat is not a mutation");
+    }
+
+    fixture
+        .store
+        .set_status_as_system("ses_tools", crate::SystemStatus::Paused)
+        .expect("pause goal");
+    let progress_error = tool
+        .execute(
+            json!({
+                "expected_revision": 2,
+                "status": "in_progress",
+                "intent": "resume without the user control"
+            }),
+            fixture.context("call_progress_paused"),
+        )
+        .await
+        .expect_err("the model cannot reactivate a paused Goal");
+    assert!(
+        format!("{progress_error:?}").contains("/goal resume"),
+        "{progress_error:?}"
+    );
 
     let error = tool
         .execute(
-            json!({"expected_revision": 1, "status": "paused"}),
+            json!({"expected_revision": 2, "status": "paused"}),
             fixture.context("call_paused"),
         )
         .await
@@ -149,7 +191,7 @@ async fn update_schema_and_deserializer_reject_system_owned_statuses() {
             .expect("read goal")
             .expect("goal exists")
             .status,
-        GoalStatus::Active
+        GoalStatus::Paused
     );
 }
 

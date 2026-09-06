@@ -206,6 +206,41 @@ fn resolver_step_limit_is_opt_in() {
 }
 
 #[test]
+fn goal_fallback_budget_is_unlimited_by_default_and_configurable() {
+    assert_eq!(
+        configured_turn_allowance(&zuno_config::schema::Config::default()),
+        zuno_engine::budget::TurnAllowance::UNLIMITED
+    );
+
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "goal": {
+            "default_token_budget": 256_000_000
+        }
+    }))
+    .expect("configured Goal fallback budget");
+    assert_eq!(
+        configured_turn_allowance(&config).default_token_budget,
+        Some(256_000_000)
+    );
+}
+
+#[test]
+fn native_goal_budget_command_accepts_positive_values_and_unlimited() {
+    assert_eq!(
+        parse_goal_token_budget("256000000").unwrap(),
+        Some(256_000_000)
+    );
+    assert_eq!(parse_goal_token_budget("none").unwrap(), None);
+    assert_eq!(parse_goal_token_budget("unlimited").unwrap(), None);
+    for invalid in ["", "0", "-1", "many"] {
+        assert!(
+            parse_goal_token_budget(invalid).is_err(),
+            "`{invalid}` must not become a durable Goal budget"
+        );
+    }
+}
+
+#[test]
 fn work_mode_leaves_plan_creation_to_the_model_without_seeding_visible_steps() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
@@ -2549,6 +2584,7 @@ fn goal_retry_policy_resolves_defaults_and_rejects_invalid_ranges() {
 
     let mut config = zuno_config::schema::Config {
         goal: Some(zuno_config::schema::GoalConfig {
+            default_token_budget: None,
             retry: Some(zuno_config::schema::GoalRetryConfig {
                 initial_delay_ms: std::num::NonZeroU64::new(5_000),
                 max_delay_ms: std::num::NonZeroU64::new(1_000),
@@ -7413,8 +7449,8 @@ fn the_turn_end_charges_usage_no_request_accounted_for() {
 /// whose flag is false stops before its next request. A failure that happens before
 /// the first request — bad configuration, a refused tool, an interrupt during setup —
 /// spent nothing unmeasured, so marking it unknown would end the session over an
-/// accounting gap that does not exist. With a default allowance installed for every
-/// session, that stop now reaches goals that never named a budget.
+/// accounting gap that does not exist. If a host fallback is configured, that stop
+/// also reaches Goals that never named a budget of their own.
 #[test]
 fn a_failed_turn_that_issued_no_request_leaves_the_goal_accounting_known() {
     let mut connection =
@@ -10151,7 +10187,10 @@ fn the_host_installs_the_ceilings_its_profile_and_configuration_declare() {
         // and reaches the policy the turn actually runs under.
         ".service::<zuno_engine::budget::TurnAllowance>()",
         "zuno_engine::budget::TurnAllowance::UNLIMITED",
+        "configured_turn_allowance(&config)",
         ".with_allowance(self.turn_allowance)",
+        "hydrate_retained_history(&self.connection, &self.session_id)",
+        "has_requested_user_message(&retained)",
         // The navigation gate is installed with its configured mode, whether the
         // worktree is indexed, and the syntax its commands are parsed with.
         ".with_navigation(",
@@ -10186,7 +10225,7 @@ fn every_extension_contribution_reaches_its_native_consumer() {
         ".with_overlay(extension_skills.iter().cloned())",
         "SkillCatalogService::start_with_initial",
         "zuno_extension::lifecycle_tools",
-        "default_profile_with_tools",
+        "default_profile_with_tools_and_allowance",
         "orchestration_capabilities_bundle",
         "self.extensions.workflows()",
         "plan.command_registry(env, mcp.as_ref())",

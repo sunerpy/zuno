@@ -3535,13 +3535,9 @@ fn requested_turn(
     session_id: &str,
     history: &[MessageWithParts],
 ) -> Result<RequestedTurn, TurnError> {
-    let user = history
-        .iter()
-        .rev()
-        .find(|message| message.info.role == MessageRole::User && !is_compaction_marker(message))
-        .ok_or_else(|| TurnError::NoUserMessage {
-            session_id: session_id.to_owned(),
-        })?;
+    let user = requested_user_message(history).ok_or_else(|| TurnError::NoUserMessage {
+        session_id: session_id.to_owned(),
+    })?;
     let agent = required_string(&user.info, "agent")?;
     let model = user
         .info
@@ -3572,6 +3568,24 @@ fn requested_turn(
         provider_id: provider_id.to_owned(),
         model_id: model_id.to_owned(),
     })
+}
+
+/// Whether retained history contains a real user turn the engine can answer.
+///
+/// Compaction markers are stored under the `user` role for transcript ordering,
+/// but they carry no request and select the small summarization model. Goal
+/// continuation uses this exact predicate before deciding whether it must append
+/// a fresh durable objective anchor after compaction.
+#[must_use]
+pub fn has_requested_user_message(history: &[MessageWithParts]) -> bool {
+    requested_user_message(history).is_some()
+}
+
+fn requested_user_message(history: &[MessageWithParts]) -> Option<&MessageWithParts> {
+    history
+        .iter()
+        .rev()
+        .find(|message| message.info.role == MessageRole::User && !is_compaction_marker(message))
 }
 
 fn required_string(record: &MessageRecord, field: &'static str) -> Result<String, TurnError> {
