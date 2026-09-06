@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.8](https://github.com/sunerpy/zuno/compare/v0.10.7...v0.10.8) (2026-09-06)
+
+
+### Bug Fixes
+
+* **skills:** 修复项目 Skill 监听阻塞启动 ([#125](https://github.com/sunerpy/zuno/issues/125)) ([7006c31](https://github.com/sunerpy/zuno/commit/7006c31cd54f4bdfdd83c856e9a267267ad39118))
+
 ## [0.10.7](https://github.com/sunerpy/zuno/compare/v0.10.6...v0.10.7) (2026-09-06)
 
 
