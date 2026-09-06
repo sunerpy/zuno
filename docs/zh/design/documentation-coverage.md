@@ -24,19 +24,19 @@ Operate 负责诊断、迁移、回滚与证据。README 只提供入口，不�
 
 | 公共表面 | 权威文档 |
 | --- | --- |
-| 产品范围与执行模型 | [Zuno 是什么](/zh/guide/what-is-zuno)、[Harness 运行时](/zh/operate/harness-runtime) |
+| 产品范围、仓库结构与执行模型 | [Zuno 是什么](/zh/guide/what-is-zuno)、[项目结构](/zh/guide/project-structure)、[Harness 运行时](/zh/operate/harness-runtime) |
 | 安装与平台前置条件 | [安装](/zh/guide/installation)、[快速开始](/zh/guide/quick-start) |
 | 配置、Provider、模型与凭据 | [配置参考](/zh/config/reference)、[Provider 与凭据](/zh/config/providers) |
 | Agent、权限、Skill 与委派 | [Agent](/zh/guide/agents)、[自定义 Agent](/zh/config/custom-agents)、[权限](/zh/guide/permissions)、[编排](/zh/guide/orchestration) |
 | Agent 与扩展实现 | [开发 Agent 与扩展](/zh/guide/extension-development)、[插件](/zh/guide/plugins)、[进程插件（英文）](https://github.com/sunerpy/zuno/blob/main/docs/process-plugin-development.md) |
-| 原生组件、Profile、Driver 与生命周期 | [Harness 运行时](/zh/operate/harness-runtime)、[开发 Agent 与扩展](/zh/guide/extension-development) |
+| 原生组件、Profile、Driver 与生命周期 | [项目结构](/zh/guide/project-structure)、[Harness 运行时](/zh/operate/harness-runtime)、[开发 Agent 与扩展](/zh/guide/extension-development) |
 | 工具、MCP、LSP、网络、Shell 与沙箱 | [工具](/zh/guide/tools)、[权限](/zh/guide/permissions)、[Shell 沙箱路线图（英文）](/design/shell-sandbox-roadmap) |
 | 会话、Prompt、Inbox、Goal、Plan、重试与恢复 | [会话](/zh/guide/sessions)、[持久状态](/zh/guide/durable-state)、[Harness 运行时](/zh/operate/harness-runtime) |
-| TUI、headless、ACP、HTTP 与客户端 projection | [CLI 参考](/zh/cli/)、[编辑器与 ACP](/zh/guide/editors)、[客户端接口（英文）](/design/client-interfaces) |
+| TUI、headless、ACP、HTTP、OpenAPI 与客户端 projection | [CLI 参考](/zh/cli/)、[编辑器与 ACP](/zh/guide/editors)、[HTTP API 与 OpenAPI](/zh/reference/http-api)、[客户端接口（英文）](/design/client-interfaces) |
 | 图片、文件引用、导入与导出 | [附件](/zh/guide/attachments)、[可移植环境包](/zh/operate/portable-bundles) |
 | SQLite schema、迁移、保留与连续性 | [数据库生命周期](/zh/operate/migration)、[会话保留](/zh/operate/session-retention)、[History 与 Notes](/zh/config/continuity) |
 | 日志、诊断、资源门禁与性能 | [日志](/zh/operate/logging)、[FAQ](/zh/operate/faq)、[诊断](/zh/operate/diagnostics)、[资源门禁](/zh/operate/resource-gates)、[性能方法（英文）](/perf-methodology) |
-| Product Agent、记忆与学习 | [Product Agent（英文）](/design/product-agents)、[常驻记忆（英文）](/design/memory-learning)、[学习闭环（英文）](/design/user-learning-flywheel) |
+| Product Agent、Memory、Experience 与学习得到的 Skill | [Memory 与学习](/zh/guide/memory-learning)、[Product Agent（英文）](/design/product-agents)、[常驻 Memory 设计（英文）](/design/memory-learning)、[学习闭环设计（英文）](/design/user-learning-flywheel) |
 | Self-update、CI、发布资产与回滚 | [Self-update](/zh/operate/self-update)、[发布流水线](/zh/operate/release-pipeline) |
 
 生成 schema 或穷举协议尚未翻译时，英文页面是精确权威来源；中文任务指南仍必须说明

@@ -13,6 +13,9 @@ This subsystem learns from how a user works with Zuno. It does not modify Zuno's
 source, build or deploy the harness, create pull requests, or silently rewrite a
 Skill.
 
+For the operator workflow, use [Memory and learning](/guide/memory-learning).
+This design record owns extraction, retrieval, evaluation, and storage details.
+
 ## Component boundaries
 
 The implementation is split between two native crates and typed database stores:

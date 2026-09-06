@@ -99,6 +99,7 @@ Agent including a read-only one; `zuno --sandbox-on-unavailable run-unconfined`,
 `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`, or `sandbox.onUnavailable` in a
 trusted (global, managed, environment, or CLI) layer for a write-capable one; and
 `zuno --sandbox danger-full-access`. A project layer cannot enable any of them.
+
 An interactive `zuno` start on such a host asks once, before raw mode, whether to
 run this session natively — for any request it cannot confine, read-only
 included, only when no layer set `sandbox.onUnavailable` or `sandbox.backend`,
@@ -108,7 +109,9 @@ the native backend and resolves this process exactly as the flag does
 process only: on macOS the flag reaches nested Zuno processes through the
 startup re-exec that exports it, and an answer given at the prompt does not, so
 set `ZUNO_SANDBOX_BACKEND=native` or a trusted `sandbox.backend` when a nested
-`zuno` needs the same answer. `run`, `acp`, and `serve` never ask and still need
+`zuno` needs the same answer.
+
+`run`, `acp`, and `serve` never ask and still need
 the flag or the variable. None of this is confinement. Switching to an Agent
 whose Shell cannot be registered keeps the current Agent and reports the same
 text instead of ending the session.

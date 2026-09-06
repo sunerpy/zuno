@@ -1051,6 +1051,84 @@ fn extension_development_docs_pin_supported_boundaries_and_ownership() {
 }
 
 #[test]
+fn public_structure_http_and_learning_guides_are_complete_and_discoverable() {
+    let structure = read("docs/guide/project-structure.md");
+    let chinese_structure = read("docs/zh/guide/project-structure.md");
+    for crate_name in read("crates.expected")
+        .lines()
+        .filter(|line| !line.is_empty())
+    {
+        let token = format!("`{crate_name}`");
+        assert!(
+            structure.contains(&token),
+            "project structure guide must assign an owner to {crate_name}"
+        );
+        assert!(
+            chinese_structure.contains(&token),
+            "Chinese project structure guide must assign an owner to {crate_name}"
+        );
+    }
+    contains_all(
+        "docs/reference/http-api.md",
+        &[
+            "GET /openapi.json",
+            "ZUNO_SERVER_PASSWORD",
+            "Last-Event-ID",
+            "/api/session/{sessionID}/memory-policy",
+            "/api/session/{sessionID}/permission/{requestID}/reply",
+            "/api/pty/{ptyID}/connect-token",
+            "32 reviewed",
+            "Seven operations",
+        ],
+    );
+    contains_all(
+        "docs/zh/reference/http-api.md",
+        &[
+            "GET /openapi.json",
+            "ZUNO_SERVER_PASSWORD",
+            "Last-Event-ID",
+            "/api/session/{sessionID}/memory-policy",
+            "/api/session/{sessionID}/permission/{requestID}/reply",
+            "/api/pty/{ptyID}/connect-token",
+            "32 个已复核",
+            "7 个 operation",
+        ],
+    );
+    for relative in [
+        "docs/guide/memory-learning.md",
+        "docs/zh/guide/memory-learning.md",
+    ] {
+        contains_all(
+            relative,
+            &[
+                "memory_propose",
+                "experience_search",
+                "/memory",
+                "/memories",
+                "/reflect",
+                "/learn skill-review",
+                "expectedRevision",
+                "uncertain",
+            ],
+        );
+    }
+    for relative in [
+        "README.md",
+        "docs/readme/README.zh-CN.md",
+        "docs/README.md",
+        "docs/index.md",
+        "docs/zh/index.md",
+        "docs/design/documentation-coverage.md",
+        "docs/zh/design/documentation-coverage.md",
+    ] {
+        contains_all(
+            relative,
+            &["project-structure", "http-api", "memory-learning"],
+        );
+    }
+}
+
+#[test]
 fn architecture_documents_pin_the_native_harness_decisions() {
     contains_all(
         "AGENTS.md",

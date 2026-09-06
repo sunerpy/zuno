@@ -37,14 +37,16 @@ logs include phase timings but omit selected values and credentials.
 
 A `session/prompt` that arrives while the session is already running a turn is
 committed to the durable input inbox first and then steered into that turn, so
-the model receives it without the running work being interrupted. That second
-request is answered with JSON-RPC error `-32001` whose `data` reports `admission`
+the model receives it without interrupting the running work. That second request
+is answered with JSON-RPC error `-32001`; its `data` reports `admission`
 (`steered`, `queued`, or `rejected`), `sessionId`, and the durable `inputId`; the
-streamed output and the `stopReason` stay on the request that owns the turn. A
-slash command cannot be steered and is refused with
+streamed output and the `stopReason` stay on the request that owns the turn.
+
+A slash command cannot be steered and is refused with
 `reason: "commandRequiresIdleSession"` and nothing durable written; only text
 that resolves to a real command, Skill, or native control counts as a slash
 command, so a prompt that merely starts with `/` is admitted as ordinary content.
+
 Withdrawing a prompt request with `$/cancel_request` before it returns cancels
 the durable row that request admitted, so the withdrawn text never reaches the
 model, and answers that request with `-32800` and `data.admission: "withdrawn"`.

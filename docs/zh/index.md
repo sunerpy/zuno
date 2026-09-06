@@ -107,6 +107,7 @@ zuno run "为 users 接口增加分页并运行测试"
 | 需求 | 页面 |
 | --- | --- |
 | 理解执行模型 | [Zuno 是什么](/zh/guide/what-is-zuno) |
+| 查找负责某项行为的 crate | [项目结构与执行流](/zh/guide/project-structure) |
 | 配置 Provider | [Provider 与凭据](/zh/config/providers) |
 | 查询配置项 | [配置项参考](/zh/config/reference) |
 | 启用或切换 History 与 Notes | [History 与 Notes 连续性配置](/zh/config/continuity) |
@@ -114,6 +115,8 @@ zuno run "为 users 接口增加分页并运行测试"
 | 开发 Agent 或扩展 | [Agent 与扩展开发](/zh/guide/extension-development) |
 | 配置 Shell 权限 | [权限与沙箱](/zh/guide/permissions) |
 | 在编辑器中使用 | [编辑器与 ACP](/zh/guide/editors) |
+| 通过 HTTP 驱动 Zuno | [HTTP API 与 OpenAPI](/zh/reference/http-api) |
+| 复核 Memory、Experience 与学习得到的 Skill | [Memory 与学习](/zh/guide/memory-learning) |
 | 查询命令 | [CLI 参考](/zh/cli/) |
 | 理解发布产物 | [发布流水线](/zh/operate/release-pipeline) |
 | 排查故障 | [常见问题](/zh/operate/faq) |
@@ -121,6 +124,5 @@ zuno run "为 users 接口增加分页并运行测试"
 
 ## 中文文档范围
 
-中文页面与代码位于同一仓库并随行为更新。[配置项参考](/zh/config/reference)和
-[Harness 运行时](/zh/operate/harness-runtime)是导读页；完整字段和协议以页面所链接的
-英文参考为准。
+中文页面与代码位于同一仓库并随行为更新。配置、项目结构、HTTP API、Memory 与学习均有
+中英文入口；尚未翻译的穷举协议或设计记录会明确链接到英文权威来源。

@@ -30,19 +30,19 @@ those pages rather than duplicating their full contracts.
 
 | Public surface | Canonical documentation |
 | --- | --- |
-| Product scope and execution model | [What is Zuno?](/guide/what-is-zuno), [Harness Runtime](/harness-runtime) |
+| Product scope, repository structure, and execution model | [What is Zuno?](/guide/what-is-zuno), [Project structure](/guide/project-structure), [Harness Runtime](/harness-runtime) |
 | Installation and platform prerequisites | [Installation](/guide/installation), [Quick start](/guide/quick-start) |
 | Configuration, providers, models, and credentials | [Configuration reference](/reference/configuration), [Providers and credentials](/reference/providers) |
 | Agents, permissions, Skills, and delegation | [Agents](/guide/agents), [Custom agents](/config/custom-agents), [Permissions](/guide/permissions), [Orchestration](/orchestration) |
 | Agent and extension implementation | [Developing agents and extensions](/guide/extension-development), [Plugins](/plugins), [Process plugins](/process-plugin-development) |
-| Native components, profiles, drivers, and lifecycle | [Harness Runtime](/harness-runtime), [Developing agents and extensions](/guide/extension-development) |
+| Native components, profiles, drivers, and lifecycle | [Project structure](/guide/project-structure), [Harness Runtime](/harness-runtime), [Developing agents and extensions](/guide/extension-development) |
 | Tools, MCP, LSP, web, Shell, and sandbox | [Tools](/guide/tools), [Permissions](/guide/permissions), [Shell sandbox roadmap](/design/shell-sandbox-roadmap) |
 | Sessions, prompts, inbox, goals, plans, retries, and recovery | [Sessions](/guide/sessions), [Durable state](/guide/durable-state), [Harness Runtime](/harness-runtime) |
-| TUI, headless, ACP, HTTP, and client projections | [CLI reference](/cli/), [Zed and ACP](/reference/zed-acp), [Client interfaces](/design/client-interfaces) |
+| TUI, headless, ACP, HTTP, OpenAPI, and client projections | [CLI reference](/cli/), [Zed and ACP](/reference/zed-acp), [HTTP API and OpenAPI](/reference/http-api), [Client interfaces](/design/client-interfaces) |
 | Images, file references, import, and export | [Attachments](/reference/attachments), [Portable bundles](/reference/portable-bundles) |
 | SQLite schema, migrations, retention, and continuity | [Database lifecycle](/migration), [Session retention](/session-retention), [History and Notes](/config/continuity) |
 | Logging, diagnostics, resource gates, and performance | [Logging](/logging), [FAQ](/faq), [Diagnostics](/operate/diagnostics), [Resource gates](/resource-gates), [Performance](/perf-methodology) |
-| Product agents, memory, and learning | [Product agents](/design/product-agents), [Resident memory](/design/memory-learning), [Learning flywheel](/design/user-learning-flywheel) |
+| Product agents, Memory, Experience, and learned Skills | [Memory and learning](/guide/memory-learning), [Product agents](/design/product-agents), [Resident Memory design](/design/memory-learning), [Learning flywheel design](/design/user-learning-flywheel) |
 | Self-update, CI, release assets, and rollback | [Self-update](/reference/self-update), [Release pipeline](/operate/release-pipeline) |
 
 The English page is canonical when a generated schema or exhaustive protocol

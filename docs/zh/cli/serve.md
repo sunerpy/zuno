@@ -87,4 +87,5 @@ zuno serve --port 4096 --print-logs --log-level DEBUG
 - [已排除的命令](/zh/cli/excluded)
 - [配置参考](/zh/config/reference)
 - [Zed ACP 集成](/zh/guide/editors)
+- [HTTP API 与 OpenAPI](/zh/reference/http-api)
 - [日志](/zh/operate/logging)

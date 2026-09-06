@@ -168,7 +168,7 @@ zuno serve --port 4096
 zuno acp --check
 ```
 
-Server 支持通过 `ZUNO_SERVER_PASSWORD` 启用 Basic Auth，也支持显式的回环专用 `--browser-auth` bootstrap。浏览器认证只打印一次启动 URI，token 只能消费一次，随后签发绑定 authority 的签名 Cookie；它绝不会让非回环监听变得可接受。对 ACP 来说，stdout 承载协议分帧，因此请用 `--print-logs` 把诊断信息送到 stderr。参见[编辑器与 ACP](/zh/guide/editors)。
+Server 支持通过 `ZUNO_SERVER_PASSWORD` 启用 Basic Auth，也支持显式的回环专用 `--browser-auth` bootstrap。浏览器认证只打印一次启动 URI，token 只能消费一次，随后签发绑定 authority 的签名 Cookie；它绝不会让非回环监听变得可接受。对 ACP 来说，stdout 承载协议分帧，因此请用 `--print-logs` 把诊断信息送到 stderr。编辑器接入见[编辑器与 ACP](/zh/guide/editors)，完整路由、认证、OpenAPI 与 SSE 契约见 [HTTP API 与 OpenAPI](/zh/reference/http-api)。
 
 HTTP 界面有三处语义值得驱动会话的脚本了解。`POST /api/session/{id}/interrupt` 只取消正在运行的回合；对空闲会话它返回 `204` 且什么都不做，不会让下一个普通回合（包括对刻意排队输入的显式恢复）一开始就处于被中断状态。`GET /api/session/{id}/event` 对数据库中不存在的会话返回 `404`，错误码为 `not_found`，而不是打开一条永远不会产生事件的流。压缩持有会话租约期间接纳的 prompt 或 steer 输入会留在持久 inbox 中，并在压缩释放租约后立即被执行，而不是等到某个无关事件碰巧唤醒会话。
 
@@ -176,7 +176,11 @@ HTTP 界面有三处语义值得驱动会话的脚本了解。`POST /api/session
 
 `GET /api/fs/read` 会把整个文件缓冲在内存中，因此对超过 32 MiB 的文件直接返回 `413`，错误码为 `file_too_large`，而不是让 server 随调用方指定的路径任意增长。`GET /api/fs/find` 的响应带有 `truncated` 字段：`true` 表示这次遍历提前结束——命中 20,000 条目预算、16 层深度上限，或者存在本进程无法打开的子树。因此 `truncated: true` 且没有匹配，意味着“没有搜完”，绝不等于“不存在”。已发布的 `/openapi.json` 文档仍把 find 的响应体标记为 schema 缺口，所以由 schema 生成的客户端只能从本页得知该字段。
 
-文件系统、会话维护、目录发现与 prompt 附件接纳这四组端点的同步工作都在请求 reactor 之外执行，并受进程级固定预算约束：`/api/fs` 并发 4 个，`/api/session/prune` 的预览或变更并发 2 个，目录发现遍历并发 8 个，`POST /api/session/{sessionID}/prompt` 对内联 `prompt.files[]` 图像的解码在整个进程内同时最多 2 个。第四组预算按 `prompt.files[]` 非空的 prompt 计费一次（内联图像与对已接纳附件的引用都算在内），覆盖该 prompt 中的每一次解码；不带文件的 prompt 从不为名额等待。超出预算的请求会排队等待名额，而不是被拒绝；在等待期间断开连接的调用方根本不会启动这项工作。这些预算是成本上限，而不是性能调节旋钮——没有任何请求字段、请求头或配置项能把它们调高。为 provider 请求解析持久图像对象在每种宿主中都以同样方式受限，而不只是 server：整个进程同时最多 2 次解析，按一个已存储对象重新编码可能占用的 900,000,000 字节工作内存定尺；历史需要第三次解析的回合会等待名额。
+文件系统、会话维护、目录发现与 prompt 附件接纳这四组端点的同步工作都在请求 reactor 之外执行，并受进程级固定预算约束：`/api/fs` 并发 4 个，`/api/session/prune` 的预览或变更并发 2 个，目录发现遍历并发 8 个，`POST /api/session/{sessionID}/prompt` 对内联 `prompt.files[]` 图像的解码在整个进程内同时最多 2 个。第四组预算按 `prompt.files[]` 非空的 prompt 计费一次（内联图像与对已接纳附件的引用都算在内），覆盖该 prompt 中的每一次解码；不带文件的 prompt 从不为名额等待。
+
+超出预算的请求会排队，而不是被拒绝；调用方若在等待期间断开，本次工作不会启动。这些预算是成本上限，不是性能调节旋钮，没有任何请求字段、请求头或配置项能把它们调高。
+
+为 provider 请求解析持久图像对象在每种宿主中都受同一限制，而不只是在 Server 中：整个进程同时最多 2 次解析，按一个已存储对象重新编码可能占用的 900,000,000 字节工作内存定尺；历史需要第三次解析的回合会等待名额。
 
 ### 回复权限请求与提问
 
@@ -192,5 +196,6 @@ HTTP 界面有三处语义值得驱动会话的脚本了解。`POST /api/session
 
 - [zuno run](/zh/cli/run)
 - [终端应用](/zh/guide/tui)
+- [HTTP API 与 OpenAPI](/zh/reference/http-api)
 - [权限与沙箱](/zh/guide/permissions)
 - [运维日志](/zh/operate/logging)

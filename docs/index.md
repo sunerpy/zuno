@@ -111,6 +111,7 @@ provider configuration, credentials, and sandbox checks.
 | Task | Page |
 | --- | --- |
 | Understand the execution model | [What is Zuno?](/guide/what-is-zuno) |
+| Find the crate that owns a behavior | [Project structure and execution flow](/guide/project-structure) |
 | Configure a provider | [Providers and credentials](/reference/providers) |
 | Look up a setting | [Configuration reference](/reference/configuration) |
 | Enable or switch History and Notes | [History and Notes continuity](/config/continuity) |
@@ -118,6 +119,8 @@ provider configuration, credentials, and sandbox checks.
 | Develop an Agent or extension | [Agent and extension development](/guide/extension-development) |
 | Configure Shell authority | [Permissions and sandboxing](/guide/permissions) |
 | Use Zuno from an editor | [Editors and ACP](/reference/zed-acp) |
+| Drive Zuno over HTTP | [HTTP API and OpenAPI](/reference/http-api) |
+| Review Memory, Experience, and learned Skills | [Memory and learning](/guide/memory-learning) |
 | Look up a command | [CLI reference](/cli/) |
 | Diagnose a failure | [FAQ](/faq) |
 | Find the canonical page for a public surface | [Documentation coverage](/design/documentation-coverage) |

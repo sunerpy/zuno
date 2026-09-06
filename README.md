@@ -156,6 +156,8 @@ profile lifecycle. The assembled model request is persisted as
 `session.prompt.assembled` before it is sent to a provider.
 
 Read [Harness Runtime](./docs/harness-runtime.md) for the component model and
+[Project structure and execution flow](./docs/guide/project-structure.md) for the
+47-crate ownership map. Read
 [Plugins and extensions](./docs/plugins.md) for package formats and capability grants.
 Use [Developing agents and extensions](./docs/guide/extension-development.md) for
 complete declarative Agent, WASI guest, and native Rust implementation paths.
@@ -176,6 +178,9 @@ source is in [`docs/`](./docs/README.md). Common starting points:
 - [Attachments](./docs/reference/attachments.md) — images and `@file` input
 - [Export and import](./docs/reference/portable-bundles.md) — portable config bundles
 - [Zed ACP](./docs/reference/zed-acp.md) — editors and other ACP clients
+- [HTTP API and OpenAPI](./docs/reference/http-api.md) — routes, authentication, SSE, and schema gaps
+- [Memory and learning](./docs/guide/memory-learning.md) — resident Memory, Experience, and reviewed Skills
+- [Project structure](./docs/guide/project-structure.md) — crate ownership and request flow
 - [Agent and extension development](./docs/guide/extension-development.md) — WASI and native Rust interfaces
 - [Documentation coverage](./docs/design/documentation-coverage.md) — canonical ownership map
 - [FAQ](./docs/faq.md) — troubleshooting

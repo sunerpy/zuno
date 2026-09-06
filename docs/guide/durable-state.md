@@ -83,7 +83,9 @@ message. SQLite contention met while the goal's budget is read or charged, or wh
 host writes Goal-owned state such as a Plan reconciliation or a human request, persists a
 `database_busy` retry and the Goal stays active, because a lock another writer holds is a
 condition that clears on its own; the delay is the store's own suggestion when it reports
-one and the exponential backoff otherwise. Any other database failure met while the budget
+one and the exponential backoff otherwise.
+
+Any other database failure met while the budget
 is read or charged stops the turn with `usage_unknown` and pauses the Goal, so a person can
 look at the database instead of the run continuing unmeasured. Durable state this build
 cannot read at all, such as a value that will not decode or a format it does not know,

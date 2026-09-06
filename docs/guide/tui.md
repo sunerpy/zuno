@@ -272,7 +272,9 @@ looking at even over SSH or inside a multiplexer; when that write fails Zuno fal
 one local helper — `pbcopy` on macOS, `wl-copy`, `xclip`, or `xsel` on Linux, and
 `Set-Clipboard` through PowerShell on Windows — and reports both failures together rather
 than only the first. A host with no helper installed reports that no clipboard is
-available instead of appearing to copy. Every helper receives the selection on its
+available instead of appearing to copy.
+
+Every helper receives the selection on its
 standard input as clipboard data, never as a script to run, so a copy can never execute
 what the transcript contained. Transcript copy uses semantic message content: speaker labels, borders,
 padding, and terminal soft wraps are omitted; only explicit source newlines become

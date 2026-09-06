@@ -47,6 +47,7 @@ unbalanced parenthesis aborts the parse (the 51-commit batch-3 merge produced an
 the first occurrence of the marker word up to `END_COMMIT_OVERRIDE`, trimmed, and
 parsed as one conventional commit, so a description that merely *mentions* the
 marker word in prose hands the parser that prose (`unexpected token ' ' at 1:2`).
+
 Rules: keep a multi-commit squash message to a conventional subject and a short
 body (`gh pr merge --squash --subject … --body …`); when the description carries an
 override block, let it hold exactly one conventional message (a header line and an
@@ -94,7 +95,9 @@ The `startup` wall-clock benchmark runs once before that pool so unrelated
 processes cannot invalidate its budget; all functional suites, including ACP
 and ConPTY lifecycle coverage, remain concurrent with no serial tail. Every suite has a timeout;
 timeout cleanup terminates the complete descendant tree, and the scheduler emits
-progress while it runs. The scheduler captures Cargo's environment through a
+progress while it runs.
+
+The scheduler captures Cargo's environment through a
 native Python runner and JSON, not Git Bash's text `env` format, so Windows
 `PATH` and other process variables keep their native representation. Python
 discovery executes a real import, resolves the validated interpreter to an

@@ -102,4 +102,5 @@ instead of after the process starts.
 - [Excluded commands](/cli/excluded)
 - [Configuration reference](/reference/configuration)
 - [Zed ACP integration](/reference/zed-acp)
+- [HTTP API and OpenAPI](/reference/http-api)
 - [Logging](/logging)

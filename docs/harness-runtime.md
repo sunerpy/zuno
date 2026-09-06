@@ -1054,7 +1054,8 @@ snapshots without replaying an uncertain write.
 `/memory` remains the resident Memory review surface. `/memories` controls
 session use and generation. `/learn` and `/reflect`
 manage experience, feedback, patterns, Skill candidates, evaluation, and
-reviewed revocation. See [resident memory](design/memory-learning.md) and the
+reviewed revocation. See the user-facing [Memory and learning](guide/memory-learning.md)
+guide, [resident Memory](design/memory-learning.md), and the
 [user learning flywheel](design/user-learning-flywheel.md).
 
 ## Durable inputs
