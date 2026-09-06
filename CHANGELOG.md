@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.7](https://github.com/sunerpy/zuno/compare/v0.10.6...v0.10.7) (2026-09-06)
+
+
+### Bug Fixes
+
+* **learning:** 默认启用后台记忆学习 ([#124](https://github.com/sunerpy/zuno/issues/124)) ([8cf312b](https://github.com/sunerpy/zuno/commit/8cf312b38a22adb2cd8d12a9151ab95bc8cb8803))
+
 ## [0.10.6](https://github.com/sunerpy/zuno/compare/v0.10.5...v0.10.6) (2026-09-05)
 
 
