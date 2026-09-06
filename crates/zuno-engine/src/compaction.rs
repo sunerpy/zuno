@@ -157,6 +157,20 @@ impl CompactionPolicy {
             CompactionTrigger::Manual => true,
         }
     }
+
+    /// The threshold a running multi-step turn should enforce before its next request.
+    ///
+    /// The prelude applies the same threshold before a turn starts. Returning it here
+    /// lets the turn loop yield after a durable tool step instead of growing all the way
+    /// to the provider's hard context limit before the next prelude can run.
+    #[must_use]
+    pub const fn proactive_threshold(self) -> Option<u64> {
+        if self.context_enabled && self.auto {
+            Some(self.threshold_tokens)
+        } else {
+            None
+        }
+    }
 }
 
 /// One identified transcript message plus selection metadata.

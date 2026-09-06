@@ -2112,6 +2112,7 @@ fn release_docs_pin_allowance_pauses_retired_plans_and_tagged_notices() {
             "`_meta.zuno.notice`",
             "a remote rule file that could not be fetched",
             "`instruction.*` or `budget.*` families",
+            "`context.compact`",
         ],
     );
     contains_all(
@@ -2133,6 +2134,7 @@ fn release_docs_pin_allowance_pauses_retired_plans_and_tagged_notices() {
             "`_meta.zuno.notice`",
             "a remote rule file that could not be fetched",
             "`instruction.not_in_force`, `budget.compact`, or `budget.token_budget`",
+            "`context.compact`",
         ],
     );
     contains_all(
@@ -2205,6 +2207,109 @@ fn release_docs_pin_allowance_pauses_retired_plans_and_tagged_notices() {
             !read(relative).contains(retired),
             "{relative} still carries retired wording {retired:?}"
         );
+    }
+}
+
+#[test]
+fn acp_context_compaction_docs_pin_between_request_checks_and_usage_recalculation() {
+    for (relative, needles) in [
+        (
+            "docs/reference/configuration.md",
+            [
+                "checks between provider requests in a long tool turn",
+                "provider-reported context usage",
+                "assembled prompt estimate",
+                "`context.compact`",
+                "typed compact-and-retry path",
+            ],
+        ),
+        (
+            "docs/harness-runtime.md",
+            [
+                "before every subsequent provider request",
+                "provider-reported context usage",
+                "assembled prompt estimate",
+                "`context.compact`",
+                "`TurnError::CompactionRequired`",
+            ],
+        ),
+    ] {
+        let text = read(relative);
+        for needle in needles {
+            assert!(
+                contains_ignoring_whitespace(&text, needle),
+                "{relative} must document {needle:?}"
+            );
+        }
+    }
+    for (relative, needles) in [
+        (
+            "docs/zh/config/reference.md",
+            [
+                "`compaction.auto: false`",
+                "provider 请求之间的主动检查",
+                "provider 报告的上下文用量",
+                "当前刚组装完成的 prompt 估算",
+                "`context.compact`",
+                "“压缩并重试”路径",
+            ],
+        ),
+        (
+            "docs/zh/operate/harness-runtime.md",
+            [
+                "第一次之后的每个 provider 请求",
+                "provider 报告的上下文用量",
+                "prompt 估算",
+                "`context.compact`",
+                "`TurnError::CompactionRequired`",
+                "`compaction.auto: false`",
+            ],
+        ),
+    ] {
+        let text = read(relative);
+        for needle in needles {
+            assert!(
+                contains_ignoring_whitespace(&text, needle),
+                "{relative} must document {needle:?}"
+            );
+        }
+    }
+    for relative in ["docs/reference/zed-acp.md", "docs/cli/acp.md"] {
+        let text = read(relative);
+        for needle in [
+            "`ProviderRequestStarted`",
+            "`usage_update`",
+            "assembled prompt estimate",
+            "measured",
+            "`context.compact`",
+        ] {
+            assert!(
+                contains_ignoring_whitespace(&text, needle),
+                "{relative} must document {needle:?}"
+            );
+        }
+    }
+    for (relative, estimate, measured) in [
+        (
+            "docs/zh/guide/editors.md",
+            "刚组装完成的 prompt 估算",
+            "真实 provider 用量",
+        ),
+        ("docs/zh/cli/acp.md", "assembled prompt estimate", "真实值"),
+    ] {
+        let text = read(relative);
+        for needle in [
+            "`ProviderRequestStarted`",
+            "`usage_update`",
+            estimate,
+            measured,
+            "`context.compact`",
+        ] {
+            assert!(
+                contains_ignoring_whitespace(&text, needle),
+                "{relative} must document {needle:?}"
+            );
+        }
     }
 }
 

@@ -161,6 +161,14 @@ ACP 通过会话级投影器订阅 `TurnHost::work_state_changes()`，而不是�
 
 会话命令、上下文压缩与硬中断都是原生能力，不依赖模型配合。
 
+prelude 会在第一次 provider 请求之前检查持久历史。长工具回合不会等到下一回合才再次
+判断：同一回合第一次之后的每个 provider 请求，都会在发送前按同一套 compaction policy
+主动检查上下文。检查优先使用上一响应由 provider 报告的上下文用量；没有可用报告时，
+回退到当前刚组装完成的 prompt 估算。达到阈值会发出 info 级稳定 notice code
+`context.compact`，并返回 `TurnError::CompactionRequired`，由宿主进入现有的类型化
+“压缩并重试”恢复路径。`compaction.auto: false` 不会向回合挂载主动阈值，因此也会关闭
+这些请求间检查；手动压缩和 provider 明确报告的上下文上限恢复不受影响。
+
 自动压缩只在摘要落盘之后才咨询 auto-continue hook。该 hook 失败时会话保持
 `Compacted`：摘要保留，不合成续跑回合（没有人投票就不授予续跑），失败原因随压缩结果以
 `auto_continue_hook_failure` 记录并输出告警；会话不会被标记为失败，因此后续压缩不再被
@@ -256,6 +264,10 @@ continuation 会查询当前目标下仍待处理的记录并再次暂停。`sta
   预算耗尽的 `budget_limited` 状态不同。
 - 预算策略可以要求压缩而不是停止。这被归类为上下文上限失败并走同一条路径：压缩保留的
   历史，然后重试该回合。
+- 多步骤工具回合中的主动上下文阈值同样走这条类型化路径。第一次之后的每次 provider
+  请求都会在发送前检查：有 provider 报告时使用上一响应的上下文用量，否则使用当前
+  assembled prompt estimate；触顶时发出 `context.compact`，压缩保留历史并重试。
+  `compaction.auto: false` 会关闭这项主动触发。
 - 每次 provider 请求前后都会咨询回合预算策略。默认 profile 发布
   `TurnAllowance::UNLIMITED`，不会为未设预算的 Goal 猜测 token 上限，也不会默认设置工具
   调用次数或墙上时间上限。`goal.default_token_budget` 可为没有自身 `token_budget` 的 Goal

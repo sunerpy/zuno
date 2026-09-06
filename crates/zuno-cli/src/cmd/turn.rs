@@ -48,7 +48,7 @@ use zuno_agent::profile::{AgentProfile, ShellFilesystemAccess};
 use zuno_agent::reflection::{CommandOutcome, TranscriptEvent, TurnTranscript};
 use zuno_auth::{AuthStore, Credential, LoginMethodRegistry};
 use zuno_config::schema::provider::ProviderTransport;
-use zuno_engine::compaction::{CompactionState, TokenWindow};
+use zuno_engine::compaction::{CompactionPolicy, CompactionState, TokenWindow};
 use zuno_engine::dispatch::{AuthorizationPolicy, ToolRegistryDispatcher};
 use zuno_engine::driver::AgentDriver;
 use zuno_engine::r#loop::{
@@ -8660,6 +8660,8 @@ impl TurnHost {
                 )
                 .map_err(TurnFailure::host)?;
         }
+        let proactive_compaction_threshold =
+            CompactionPolicy::resolve(&self.compaction_config, self.window).proactive_threshold();
         let context = TurnContext::new(
             &mut self.connection,
             &self.providers,
@@ -8684,20 +8686,17 @@ impl TurnHost {
             zuno_goal::GoalBudgetPolicy::new(Arc::clone(&self.goal_store))
                 .with_allowance(self.turn_allowance),
         ));
-        let outcome = self
-            .driver
-            .drive(
-                RunTurnRequest::new(
-                    self.session_id.clone(),
-                    Uuid::new_v4().simple().to_string(),
-                    dynamic_context,
-                )
-                .with_context_limit(self.window.context)
-                .with_deferred_success_terminal_event(true),
-                context,
-                events.clone(),
-            )
-            .await;
+        let mut request = RunTurnRequest::new(
+            self.session_id.clone(),
+            Uuid::new_v4().simple().to_string(),
+            dynamic_context,
+        )
+        .with_context_limit(self.window.context)
+        .with_deferred_success_terminal_event(true);
+        if let Some(threshold) = proactive_compaction_threshold {
+            request = request.with_context_compaction_threshold(threshold);
+        }
+        let outcome = self.driver.drive(request, context, events.clone()).await;
         outcome.map_err(TurnFailure::Engine)
     }
 

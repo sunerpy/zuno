@@ -667,8 +667,15 @@ Zuno can compact older conversation history before the model window is exhausted
 - `threshold_percent` accepts `1..=100` and defaults to `80`. It is applied to
   the usable context window after the model's output allowance and configured
   reserve are removed.
-- `auto: false` disables proactive threshold compaction. Manual `/compact`
-  remains available.
+- `auto: false` disables proactive threshold compaction, including both the
+  pre-turn check and the checks between provider requests in a long tool turn.
+  Manual `/compact` remains available.
+- With automatic compaction enabled, every provider request after the first
+  request of the same turn is checked before it is sent. Zuno prefers the
+  previous response's provider-reported context usage; when that usage is
+  unavailable, it falls back to the freshly assembled prompt estimate. Crossing
+  the threshold emits the stable notice code `context.compact` and enters the
+  typed compact-and-retry path.
 - A provider-confirmed context-limit failure still uses the bounded compaction
   recovery path before retrying; this is recovery from an already failed
   request, not the proactive threshold.

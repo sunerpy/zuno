@@ -429,6 +429,7 @@ fn compaction_policy_honors_all_configuration_fields() {
     assert_eq!(policy.usable_tokens, 88_000);
     assert_eq!(policy.threshold_percent, 80);
     assert_eq!(policy.threshold_tokens, 70_400);
+    assert_eq!(policy.proactive_threshold(), None);
     assert!(!policy.should_compact(CompactionTrigger::Threshold {
         used_tokens: 99_999
     }));
@@ -453,6 +454,7 @@ fn compaction_threshold_triggers_at_the_configured_percentage_and_auto_can_be_di
     );
     assert_eq!(automatic.usable_tokens, 90_000);
     assert_eq!(automatic.threshold_tokens, 72_000);
+    assert_eq!(automatic.proactive_threshold(), Some(72_000));
     assert!(!automatic.should_compact(CompactionTrigger::Threshold {
         used_tokens: 71_999,
     }));
@@ -468,6 +470,7 @@ fn compaction_threshold_triggers_at_the_configured_percentage_and_auto_can_be_di
         },
         window,
     );
+    assert_eq!(disabled.proactive_threshold(), None);
     assert!(!disabled.should_compact(CompactionTrigger::Threshold {
         used_tokens: u64::MAX,
     }));

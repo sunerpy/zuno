@@ -6038,6 +6038,18 @@ async fn run_turn_under_budget(
     responses: Vec<ScriptedResponse>,
     budget: Arc<dyn TurnBudgetPolicy>,
 ) -> BudgetRun {
+    let mut turn_request = request(turn_id);
+    if let Some(limit) = context_limit {
+        turn_request = turn_request.with_context_limit(limit);
+    }
+    run_turn_with_request(turn_request, responses, budget).await
+}
+
+async fn run_turn_with_request(
+    turn_request: RunTurnRequest,
+    responses: Vec<ScriptedResponse>,
+    budget: Arc<dyn TurnBudgetPolicy>,
+) -> BudgetRun {
     let mut connection = seeded();
     put_user(&connection, "msg_user", 10, "echo hello");
     let provider = Arc::new(FakeProvider::new(responses));
@@ -6046,10 +6058,6 @@ async fn run_turn_under_budget(
     let dispatcher = FakeDispatcher::default();
     let interrupt = InterruptSignal::new();
     let (sender, receiver) = event_channel();
-    let mut turn_request = request(turn_id);
-    if let Some(limit) = context_limit {
-        turn_request = turn_request.with_context_limit(limit);
-    }
 
     let turn = run_turn(
         turn_request,
@@ -6115,6 +6123,87 @@ fn accounted_tool_call_then_unreported_answer() -> Vec<ScriptedResponse> {
             },
         ]),
     ]
+}
+
+#[tokio::test]
+async fn a_multi_step_turn_yields_for_compaction_after_crossing_the_context_threshold() {
+    let run = run_turn_with_request(
+        request("turn-context-compact").with_context_compaction_threshold(110),
+        accounted_tool_call_then_unreported_answer(),
+        Arc::new(NoopBudgetPolicy),
+    )
+    .await;
+
+    let error = run
+        .outcome
+        .expect_err("the next provider request must wait for compaction");
+    assert!(
+        matches!(
+            &error,
+            TurnError::CompactionRequired { reason }
+                if reason.contains("provider-reported context")
+                    && reason.contains("120 tokens")
+                    && reason.contains("threshold of 110")
+                    && reason.contains("step 2")
+        ),
+        "the threshold crossing lost its measured context: {error:?}"
+    );
+    assert_eq!(error.recovery(), TurnRecovery::Compact);
+    assert_eq!(
+        run.requests.len(),
+        1,
+        "the second provider request escaped past the context threshold"
+    );
+    assert_eq!(
+        run.calls.len(),
+        1,
+        "the first step's durable tool result must exist before compaction"
+    );
+    assert!(
+        run.events.iter().any(|event| {
+            matches!(
+                event,
+                TurnEvent::Notice {
+                    severity: NoticeSeverity::Info,
+                    code,
+                    detail,
+                } if code == "context.compact"
+                    && detail.contains("120 tokens")
+                    && detail.contains("threshold of 110")
+            )
+        }),
+        "the proactive compaction was invisible to clients: {:#?}",
+        run.events
+    );
+}
+
+#[tokio::test]
+async fn an_unreported_context_uses_the_next_prompt_estimate_for_compaction() {
+    let run = run_turn_with_request(
+        request("turn-estimated-context-compact").with_context_compaction_threshold(1),
+        full_turn_responses(),
+        Arc::new(NoopBudgetPolicy),
+    )
+    .await;
+
+    let error = run
+        .outcome
+        .expect_err("an unreported provider still needs bounded context growth");
+    assert!(
+        matches!(
+            &error,
+            TurnError::CompactionRequired { reason }
+                if reason.contains("estimated prompt")
+                    && reason.contains("threshold of 1")
+                    && reason.contains("step 2")
+        ),
+        "the fallback lost the assembled prompt estimate: {error:?}"
+    );
+    assert_eq!(
+        run.requests.len(),
+        1,
+        "the second request escaped although its estimated prompt crossed the threshold"
+    );
 }
 
 #[tokio::test]

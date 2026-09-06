@@ -413,13 +413,24 @@ tool details; loading history never reopens an elicitation request.
 
 Only provider reasoning deltas are projected into Zed's Thinking surface, with one
 tagged exception: a Zuno-originated notice — a remote rule file that could not be fetched, a
-turn stopped by its allowance, a compaction the budget policy requested — is sent as an
+turn stopped by its allowance, or a compaction requested by the budget or context policy — is sent as an
 `agent_thought_chunk` whose `_meta.zuno.notice` carries `severity` (`info`, `warning`,
-or `error`) and a stable `code` from the `instruction.*` or `budget.*` families. The
-tag is how a client tells it from model output; the text is written for a person.
+or `error`) and a stable code from the `instruction.*` or `budget.*` families.
+A proactive threshold crossing in a long tool turn uses the separate
+`context.compact` code. The tag is how a client tells it from model output; the
+text is written for a person.
 Generated titles use ACP `session_info_update`, and other operational status or
 provider failure text is handled by lifecycle/error reporting rather than being
 rendered as model thought.
+
+When the selected model has a known context window, ACP sends an absolute
+`usage_update` as soon as each `ProviderRequestStarted` event arrives. Its
+`used` value is the assembled prompt estimate, so a request after compaction can
+immediately move the UI away from the previous request's 100% reading. When the
+provider later reports token usage, ACP sends another `usage_update` with the
+measured provider usage for that request. Provider output remains attempt-buffered;
+the request-start usage reset does not. If the model context size is unknown,
+ACP invents neither the estimate nor a window size.
 
 Historical replay keeps provider reasoning capsules durable for future provider
 requests, but does not render an exact capsule copy when the same message

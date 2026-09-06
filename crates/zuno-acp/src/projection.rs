@@ -81,7 +81,7 @@ impl AttemptBufferedTurnEventProjector {
                 self.pending.clear();
                 self.projector.reset_attempt();
                 self.buffering = true;
-                Vec::new()
+                self.projector.project(event).into_iter().collect()
             }
             TurnEvent::Provider {
                 event: StreamEvent::RetryRollback { .. },
@@ -178,6 +178,16 @@ impl TurnEventProjector {
                 "sessionUpdate": "session_info_update",
                 "title": title,
             })),
+            TurnEvent::ProviderRequestStarted {
+                estimated_prompt_tokens,
+                ..
+            } => self.context_size.map(|size| {
+                json!({
+                    "sessionUpdate": "usage_update",
+                    "used": estimated_prompt_tokens,
+                    "size": size,
+                })
+            }),
             TurnEvent::SessionCommandOutput { content, .. } => {
                 Some(content_update("agent_message_chunk", content))
             }

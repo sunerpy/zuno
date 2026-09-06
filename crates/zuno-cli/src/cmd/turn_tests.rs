@@ -7551,7 +7551,7 @@ fn only_this_module_composes_a_turn() {
     let composition = [
         "ToolRegistryDispatcher::new",
         ".service::<dyn AgentDriver>()",
-        "self\n            .driver\n            .drive(",
+        "self.driver.drive(",
     ];
     let mut scanned = 0_usize;
     for entry in std::fs::read_dir(&directory).expect("the command directory is readable") {
