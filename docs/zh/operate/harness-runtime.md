@@ -38,10 +38,23 @@ Agent 具有显式的正向职责、负向委派边界、权限以及结构化�
 
 根回合对已连接 MCP schema 使用渐进式披露：调度器保留可执行实现，`tool_search`
 只搜索紧凑元数据，匹配项从下一次 provider step 起按单调 revision 扩展确切工具快照。
+成功的 `tool_search` 结果同时是会话的持久暴露账本。后台报告重建宿主、进程重启或客户端
+重新挂载时，会在第一次 provider 请求之前恢复这些 id，并与当前仍连接、权限仍可见的目录
+取交集；已经移除的能力不会因此重新获得权限。
 Agent 的确切 `tools` 允许列表会立即公开其中点名的 MCP schema；子级仍受父级 Attempt
 中已持久化的确切 schema 上限约束，不能搜索出更大的权限面。ACP session-local
 `mcpServers` 在严格连接门禁后也立即公开，但同一目录中的宿主配置 server 仍延迟发现；
 Catalog 会把这个会话边界传递到子回合与后台续跑。
+
+每个新工具 part 还会保存准入该调用的 provider-visible schema identity。组装下一次请求时，
+保留历史会与当前 hook 后的工具定义对账：声明一致时保留原生 tool-use/result 协议；工具缺失、
+schema 已变化或持久 identity 无法读取时，只在本次请求中降级为惰性 JSON 文本，并发出
+`historical_tool_declaration_repaired` warning。数据库里的原记录不会被改写，宿主也不会为了
+重放而把当前不可执行的旧工具重新宣传成可调用能力。旧版本没有 identity 的记录会先按
+assistant message 从不可变 provider-request Attempt 中恢复确切 hash；若这份证据也不存在，
+即使当前存在同名工具也会降级，而不会把旧调用静默绑定到新 schema。无工具的内部压缩请求
+采用更严格的同一原则：工具调用和结果以有界的惰性 JSON 文本进入摘要模型，绝不会在没有
+声明的情况下继续使用原生函数协议。
 
 仓库与用户的规则文件要么整份进入 Prompt，要么不进入。宿主无法读取的本地规则文件，或者超出
 指令预算（64 KB 与模型 context window 四分之一取较小值）的规则文件，会在第一次 provider

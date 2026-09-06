@@ -197,9 +197,19 @@ succeeds; host-configured MCP servers in the same session remain progressively
 discoverable. This distinction follows the session across child and background turns.
 
 The provider-request snapshot records the exact post-search tool schemas. Search results
-also record matched ids and the monotonic catalog revision in the durable tool result. If
-another registered tool already defines `tool_search`, Zuno does not shadow it: schemas
-stay eager for that turn and the host emits a warning.
+also record matched ids and the monotonic catalog revision in the durable tool result.
+Those completed results rebuild the same session's exposed subset after a detached wake,
+process restart, or client remount. Restoration is intersected with the current connected
+catalog and effective permissions, so it preserves continuity without reviving a removed
+capability.
+
+Each subsequent tool call stores the provider-visible schema identity that admitted it.
+When retained history is assembled, a missing or changed declaration is converted to an
+inert JSON transcript block for that request instead of being rebound to a different
+schema or sent as an invalid historical function call. Zuno emits a warning notice and
+keeps the durable row unchanged. If another registered tool already defines
+`tool_search`, Zuno does not shadow it: schemas stay eager for that turn and the host
+emits a warning.
 
 ## Concurrency and timeouts
 

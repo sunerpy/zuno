@@ -1276,13 +1276,17 @@ fn a_batched_report_turn_persists_every_report_before_its_single_provider_call()
     let persisted = body
         .find("self.persist_promoted_user_input(&message, &parts)?;")
         .expect("promoted report persistence call");
+    let goal_gate = body
+        .find("report_deferred_by_goal_state")
+        .expect("paused and terminal Goals defer automatic report continuation");
     let provider = body
         .find("self.drive_prepared(")
         .expect("accounted turn call");
 
     assert!(
-        each_report < persisted && persisted < provider,
-        "a batch must persist one durable user message per report before the provider request"
+        each_report < persisted && persisted < goal_gate && goal_gate < provider,
+        "a batch must persist every durable report, then honour Goal lifecycle state, before \
+         entering the provider"
     );
 }
 

@@ -1767,6 +1767,52 @@ async fn deferred_tools_are_discovered_monotonically_before_they_become_callable
     );
 }
 
+#[test]
+fn a_rebuilt_dispatcher_restores_only_durable_current_deferred_tools() {
+    let dispatcher = dispatcher(
+        vec![
+            Arc::new(RecordingTool::read_only(
+                "read",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Arc::new(RecordingTool::read_only(
+                "penpot_execute_code",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Arc::new(RecordingTool::read_only(
+                "codegraph_explore",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+        ],
+        vec![allow_all_rule()],
+        Arc::new(RecordingApprover::default()),
+    )
+    .with_deferred_tools(vec![
+        "penpot_execute_code".to_owned(),
+        "codegraph_explore".to_owned(),
+    ])
+    .with_restored_deferred_tools([
+        "penpot_execute_code".to_owned(),
+        "disconnected_tool".to_owned(),
+    ]);
+
+    assert_eq!(
+        dispatcher
+            .available_tools()
+            .definitions
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect::<Vec<_>>(),
+        ["read", "penpot_execute_code", "tool_search"]
+    );
+    assert!(
+        dispatcher.has_visible_tool("penpot_execute_code"),
+        "the durable exposure is provider-visible after a process rebuild"
+    );
+    assert!(!dispatcher.has_visible_tool("codegraph_explore"));
+    assert!(!dispatcher.has_visible_tool("disconnected_tool"));
+}
+
 /// A tool whose failure carries a cause two links deep, like an MCP proxy relaying a
 /// server's rejection of a call the transport had already refused.
 struct NestedFailureTool;
