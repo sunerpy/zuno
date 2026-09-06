@@ -6,7 +6,9 @@ use std::process::Output;
 use std::time::Duration;
 
 use serde_json::json;
-use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config};
+use zuno_testkit::{
+    DbChoice, MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config,
+};
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 const REASONING: &str = "VISIBLE_PROVIDER_REASONING";
@@ -14,6 +16,12 @@ const ANSWER: &str = "VISIBLE_FINAL_ANSWER";
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
+}
+
+fn scripted_env() -> ScriptedEnv {
+    ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile)
 }
 
 fn chat_response(reasoning: Option<&str>, text: &str, provenance: &'static str) -> MockResponse {
@@ -137,7 +145,7 @@ fn describe(output: &Output) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn show_reasoning_is_opt_in_and_keeps_the_final_answer_on_stdout() {
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = scripted_env();
     let scenario = Scenario::new("headless-reasoning")
         .respond(chat_response(
             None,
@@ -192,7 +200,7 @@ async fn show_reasoning_is_opt_in_and_keeps_the_final_answer_on_stdout() {
 
 #[tokio::test]
 async fn show_reasoning_rejects_json_before_starting_a_provider_request() {
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = scripted_env();
     let output = run(
         &env,
         "{}".to_owned(),

@@ -20,8 +20,8 @@ use zuno_tool::PermissionAsker;
 use super::child_turn::{ChildTurnObserver, DetachedTurnObserver};
 use super::mcp_runtime::{McpRuntime, RequiredMcpServers};
 use super::turn::{
-    CatalogModelChoice, ExtensionComposition, SessionChoice, SessionCommandError, TurnHost,
-    TurnHostRuntimeDependencies, TurnOptions, TurnPlan,
+    CatalogModelChoice, ExtensionComposition, PreparedSessionIdentity, SessionChoice,
+    SessionCommandError, TurnHost, TurnHostRuntimeDependencies, TurnOptions, TurnPlan,
 };
 
 use crate::command::AcpArgs;
@@ -741,6 +741,7 @@ struct SessionDurableHandles {
     admission: SessionInputAdmission,
     attachments: Arc<zuno_attachment::AttachmentStore>,
     slash: SlashCatalog,
+    identity: PreparedSessionIdentity,
 }
 
 impl SessionDurableHandles {
@@ -749,6 +750,7 @@ impl SessionDurableHandles {
             admission: SessionInputAdmission::new(resources.host.session_inbox(), runs.clone()),
             attachments: resources.host.attachment_store(),
             slash: resources.slash_catalog.clone(),
+            identity: resources.host.session_identity(),
         }
     }
 }
@@ -1269,26 +1271,6 @@ async fn open_session_resources_with_mcp(
         });
     }
     host.push_notes(notes);
-    if let Err(error) = host.materialize_session() {
-        let shutdown = host.shutdown().await;
-        if let Some(mcp) = mcp.take() {
-            mcp.shutdown().await;
-        }
-        let bridge = shutdown_subagent_bridge(&mut subagents).await;
-        return Err(match shutdown {
-            Ok(()) if bridge.is_none() => error,
-            Ok(()) => format!(
-                "{error}; ACP subagent projector shutdown also failed: {}",
-                bridge.expect("checked")
-            ),
-            Err(shutdown) => {
-                let bridge = bridge
-                    .map(|bridge| format!("; ACP subagent projector shutdown failed: {bridge}"))
-                    .unwrap_or_default();
-                format!("{error}; materialization cleanup also failed: {shutdown}{bridge}")
-            }
-        });
-    }
     let goals = host.goal_store();
     let human_requests = goals.human_requests();
     permission_asker.attach_durable(human_requests.clone(), Arc::clone(&goals));
@@ -2143,10 +2125,28 @@ impl AcpSession {
         } else {
             TurnLease::Deferred
         };
-        let admitted = handles
-            .admission
-            .admit(row, lease, Some(steering_content(&prompt)))
-            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+        let steering = Some(steering_content(&prompt));
+        let first_input = if handles.identity.is_materialized() {
+            None
+        } else {
+            let mut resources = self.resources.lock().await;
+            let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
+            if handles.identity.is_materialized() {
+                None
+            } else {
+                resources
+                    .host
+                    .materialize_session_with_input(row.clone())
+                    .map_err(zuno_acp::RpcError::internal)?
+            }
+        };
+        let admitted = match first_input {
+            Some(input) => handles.admission.route_admitted(input, lease, steering),
+            None => handles
+                .admission
+                .admit(row, lease, steering)
+                .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?,
+        };
         // The row belongs to this request until this request returns, so a
         // withdrawal retires the row instead of some other request's turn.
         if withdrawable.publish(&admitted.input().id) {

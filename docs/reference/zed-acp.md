@@ -173,6 +173,16 @@ An `env` object attached to one ACP-provided stdio MCP server belongs only to
 that child process; it does not rewrite Zuno's process environment or other
 session traffic.
 
+### Opening the Agent Panel does not create history
+
+ACP requires `session/new` to return a session id immediately, but Zuno keeps
+that fresh identity process-local. Resolving MCP, commands, Skills, or changing
+Agent, model, Mode, and reasoning before the first prompt does not insert a
+Session row and the id is absent from `session/list`. The first accepted user
+prompt or durable native command creates the Session and its first input in one
+transaction. Closing an unused Agent Panel therefore leaves no “New Agent
+Thread” in Zuno history.
+
 ## 4. Process loss, reconnect, and background work
 
 ACP stdio is owned by the editor process that launched `zuno acp`. If that

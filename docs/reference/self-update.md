@@ -16,6 +16,8 @@ zuno self-update --tag v0.0.1 --force --yes
   It conflicts with all mutating options.
 - `--tag` selects one explicit semver release. A leading `v` is optional.
 - `--force` permits reinstalling an equal or older selected release.
+- On a terminal, the replacement prompt is `[Y/n]`: pressing Enter, `y`, or
+  `yes` proceeds; `n`, `no`, or any unrecognized answer cancels.
 - `--yes` skips the terminal confirmation. Without it, non-interactive input
   fails closed instead of replacing the binary silently.
 

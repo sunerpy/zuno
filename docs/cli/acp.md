@@ -13,6 +13,14 @@ The editor launches one process and keeps it. That process is the one serving th
 protocol, so terminating it ends the session and its pipes reach end of file — see
 [One invocation, one process](/cli/#one-invocation-one-process).
 
+Opening Zuno in an Agent Panel calls ACP `session/new`, but that only reserves an
+in-process session id and resolves configuration, commands, Skills, and MCP. It
+does not create a durable Session or make an empty “New Agent Thread” appear in
+`session/list`. Agent, model, Mode, and reasoning choices made before the first
+message stay process-local. The first accepted user prompt or durable native
+command atomically creates the Session with its first input; closing an unused
+panel leaves no history row.
+
 ## Agent, Mode, Plan, and file projection
 
 The Agent selector includes `plan`. `active_agent` is the authoritative state:
