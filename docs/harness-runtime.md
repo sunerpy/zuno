@@ -1528,14 +1528,27 @@ Recovery is selected from typed errors, never rendered messages:
   way. This is distinct from the `budget_limited` status, which is the Goal's whole
   budget being spent.
 - A budget policy may ask for compaction instead of a stop. That is classified as a
-  context-limit failure and follows the same path: retained history is compacted, and
-  the turn is retried.
+  context-limit recovery and follows the same path: retained history is compacted,
+  the exact durable summary is projected to live clients, and the turn is retried
+  inside the same host drive.
 - A proactive context-threshold crossing inside a multi-step tool turn follows that
   same typed path. Before every provider request after the first, the loop uses the
   previous response's provider-reported context usage when available and otherwise
-  the current assembled prompt estimate. It emits `context.compact`, compacts the
-  retained history, and retries the turn; `compaction.auto: false` disables this
-  proactive trigger.
+  the current assembled prompt estimate. It emits `context.compact` and yields
+  `TurnError::CompactionRequired` before writing an assistant checkpoint, prompt
+  receipt, or provider-request row. The host consumes that internal signal, compacts
+  the retained history, projects the persisted summary, and retries in the same
+  driver cycle. A successful intervention does not emit a terminal turn failure,
+  increment `failed_turns`, schedule a Goal retry, or wait for another user, report,
+  or timer wake. Automatic recovery is bounded to five compactions in one host
+  drive; exhausting the bound or failing compaction stops with the typed compaction
+  failure instead of looping. `compaction.auto: false` disables the proactive
+  threshold trigger.
+- A provider-confirmed context-limit failure enters the same immediate host recovery
+  with `CompactionTrigger::ContextLimit`, preserving the provider's used/limit
+  fields and the existing five-attempt context-compaction budget. A process-restart
+  Goal retry remains a fallback for a previously persisted context-limit failure,
+  not the normal path for an in-process threshold crossing.
 - The budget policy is consulted before every provider request and after every
   response. The profile-published `TurnAllowance` may add a tool-call ceiling and a
   wall-clock ceiling that apply with or without a Goal; a reached ceiling stops the

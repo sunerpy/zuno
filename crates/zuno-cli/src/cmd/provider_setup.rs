@@ -75,8 +75,6 @@ fn prepare_bedrock(
 ) -> Result<PreparedProviderSetup, String> {
     let provider_id = "amazon-bedrock".to_owned();
     let display_name = "Amazon Bedrock".to_owned();
-    let model_id = required_text("Bedrock model id", None)?;
-    let model_name = terminal_prompt::text("Model display name", Some(&model_id))?;
     let region_default = env
         .truthy_value("AWS_REGION")
         .or_else(|| env.truthy_value("AWS_DEFAULT_REGION"))
@@ -103,20 +101,12 @@ fn prepare_bedrock(
     if let Some(profile) = profile {
         options.insert("profile".to_owned(), Value::String(profile));
     }
-    let provider = provider_document(
-        &display_name,
-        "bedrock-mantle",
-        Some("responses"),
-        None,
-        &model_id,
-        &model_name,
-        Some(Value::Object(options)),
-    );
+    let provider = bedrock_provider_document(&display_name, options);
     prepared(
         layout,
         provider_id,
         display_name,
-        model_id,
+        None,
         credential,
         provider,
     )
@@ -141,7 +131,7 @@ fn prepare_openai_compatible(layout: &zuno_paths::Layout) -> Result<PreparedProv
         layout,
         provider_id,
         display_name,
-        model_id,
+        Some(model_id),
         SetupCredential::ApiKey,
         provider,
     )
@@ -172,7 +162,7 @@ fn prepare_openai_responses(layout: &zuno_paths::Layout) -> Result<PreparedProvi
         layout,
         provider_id,
         display_name,
-        model_id,
+        Some(model_id),
         SetupCredential::ApiKey,
         provider,
     )
@@ -182,25 +172,31 @@ fn prepared(
     layout: &zuno_paths::Layout,
     provider_id: String,
     display_name: String,
-    model_id: String,
+    model_id: Option<String>,
     credential: SetupCredential,
     provider: Value,
 ) -> Result<PreparedProviderSetup, String> {
-    let use_default = terminal_prompt::confirm_choice(&format!(
-        "Use {provider_id}/{model_id} as the default model?"
-    ))?;
-    let change = ConfigChange::prepare(
-        layout,
-        &provider_id,
-        provider,
-        use_default.then(|| format!("{provider_id}/{model_id}")),
-    )?;
+    let default_model = match model_id {
+        Some(model_id) => terminal_prompt::confirm_choice(&format!(
+            "Use {provider_id}/{model_id} as the default model?"
+        ))?
+        .then(|| format!("{provider_id}/{model_id}")),
+        None => None,
+    };
+    let change = ConfigChange::prepare(layout, &provider_id, provider, default_model)?;
     Ok(PreparedProviderSetup {
         provider_id,
         display_name,
         credential,
         change,
     })
+}
+
+fn bedrock_provider_document(display_name: &str, options: Map<String, Value>) -> Value {
+    let mut provider = Map::new();
+    provider.insert("name".to_owned(), Value::String(display_name.to_owned()));
+    provider.insert("options".to_owned(), Value::Object(options));
+    Value::Object(provider)
 }
 
 fn provider_document(
@@ -374,6 +370,20 @@ mod tests {
         assert_eq!(compatible["transport"], "openai-compatible");
         assert_eq!(compatible["surface"], "chat");
         assert_eq!(compatible["api"], "https://gateway.example/v1");
+    }
+
+    #[test]
+    fn bedrock_setup_inherits_catalog_models_instead_of_declaring_one() {
+        let provider = bedrock_provider_document(
+            "Amazon Bedrock",
+            Map::from_iter([("region".to_owned(), Value::String("us-east-2".to_owned()))]),
+        );
+
+        assert_eq!(provider["name"], "Amazon Bedrock");
+        assert_eq!(provider["options"]["region"], "us-east-2");
+        assert!(provider.get("models").is_none());
+        assert!(provider.get("transport").is_none());
+        assert!(provider.get("surface").is_none());
     }
 
     #[test]

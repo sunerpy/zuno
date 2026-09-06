@@ -303,6 +303,16 @@ fn configure_provider(
     document: &CatalogDocument,
     template: ProviderTemplate,
 ) -> Result<(), String> {
+    if template == ProviderTemplate::AmazonBedrock
+        && document
+            .get("amazon-bedrock")
+            .is_none_or(|provider| provider.models.is_empty())
+    {
+        return Err(
+            "Amazon Bedrock is unavailable in the model catalog; run `zuno models --refresh` and retry"
+                .to_owned(),
+        );
+    }
     if !terminal_prompt::is_interactive() {
         return Err("interactive provider setup requires a terminal".to_owned());
     }

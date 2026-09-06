@@ -131,13 +131,23 @@ registered login method. In addition, the picker owns three typed setup
 templates: OpenAI, Amazon Bedrock, and OpenAI-compatible. A catalog entry or a
 stored credential alone never creates an arbitrary row.
 
+Provider login and model selection are separate, matching OpenCode's boundary:
+login obtains or configures credentials, while the model catalog and the model
+picker own model discovery and selection. In particular, Amazon Bedrock setup
+never asks for a model id, display name, or default model. It writes only the
+provider's AWS region and optional profile, then inherits every supported model
+and its native transport from the `amazon-bedrock` Models.dev entry. If that
+entry is absent or empty, setup fails before asking configuration questions and
+directs the user to refresh the catalog instead of accepting an unchecked id.
+
 The templates encode protocol policy rather than asking the user for transport
 internals:
 
 - custom OpenAI endpoints use the native OpenAI transport and Responses surface;
 - OpenAI-compatible endpoints use the compatible transport and Chat surface;
 - Amazon Bedrock is one visible product entry; its generated transport remains an
-  implementation detail and authentication offers the AWS chain or bearer token.
+  implementation detail, its models come from the catalog, and authentication
+  offers the AWS chain or bearer token.
 
 Setup builds and validates the candidate document in memory. It reads any secret
 before publishing configuration, atomically merges one provider into the global

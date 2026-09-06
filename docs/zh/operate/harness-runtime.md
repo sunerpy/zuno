@@ -165,9 +165,18 @@ prelude 会在第一次 provider 请求之前检查持久历史。长工具回�
 判断：同一回合第一次之后的每个 provider 请求，都会在发送前按同一套 compaction policy
 主动检查上下文。检查优先使用上一响应由 provider 报告的上下文用量；没有可用报告时，
 回退到当前刚组装完成的 prompt 估算。达到阈值会发出 info 级稳定 notice code
-`context.compact`，并返回 `TurnError::CompactionRequired`，由宿主进入现有的类型化
-“压缩并重试”恢复路径。`compaction.auto: false` 不会向回合挂载主动阈值，因此也会关闭
-这些请求间检查；手动压缩和 provider 明确报告的上下文上限恢复不受影响。
+`context.compact`，并在写入 assistant checkpoint、prompt receipt 或 provider-request
+记录之前返回 `TurnError::CompactionRequired`。宿主会在同一次 drive 内消费这个内部信号，
+压缩持久历史、把落盘摘要投影给 live TUI/ACP，再直接重试；成功恢复不会产生终端 turn
+failure、不会增加 `failed_turns`、不会安排 Goal retry，也不需要等待下一条用户输入、子任务
+报告或 timer wake。单次 host drive 最多自动恢复五次；超过上限或压缩本身永久失败时会
+类型化失败关闭，而不是循环。`compaction.auto: false` 不会向回合挂载主动阈值，因此也会
+关闭这些请求间检查；手动压缩和 provider 明确报告的上下文上限恢复不受影响。
+
+provider 明确报告的上下文上限错误使用
+`CompactionTrigger::ContextLimit` 进入同一条即时宿主恢复路径，保留 provider 的 used/limit
+字段，并受既有五次 context-compaction 预算约束。进程重启后的 Goal retry 只用于恢复此前
+已持久化的 context-limit 失败，不再是进程内主动阈值越界的正常路径。
 
 自动压缩只在摘要落盘之后才咨询 auto-continue hook。该 hook 失败时会话保持
 `Compacted`：摘要保留，不合成续跑回合（没有人投票就不授予续跑），失败原因随压缩结果以

@@ -111,14 +111,20 @@ Zuno 下载 `<url>/.well-known/zuno`，逐行、带引号地打印该文档指�
 
 - **OpenAI** —— 官方 OpenAI，或自定义 Responses endpoint。自定义端点会写成
   `transport: "openai"` 与 `surface: "responses"`。
-- **Amazon Bedrock** —— 用户只看到一个 Bedrock。配置会询问模型、Region、可选
-  Profile，并选择 AWS credential chain 或 Bedrock API key。
+- **Amazon Bedrock** —— 用户只看到一个 Bedrock。配置会询问 Region、可选 Profile，
+  并选择 AWS credential chain 或 Bedrock API key，但不会要求输入 model id。该 Provider
+  会从 Models.dev 继承完整的受支持模型列表及逐模型 transport；若目录条目不可用，先运行
+  `zuno models --refresh`，再重试登录。
 - **OpenAI-compatible** —— 使用 Chat Completions 的自定义端点。配置会写成
   `transport: "openai-compatible"` 与 `surface: "chat"`。
 
 配置过程只在可见提示中收集非密钥字段；API key 输入会关闭终端回显。随后 Zuno
 把一个 provider 原子合并进全局 `zuno.json`，保留其他无关配置。若校验或凭据存储
 失败，会恢复原文件，不留下半配置状态。
+
+认证不会替用户选择 Bedrock 模型，也不会修改默认模型。配置完成后，使用
+`zuno models amazon-bedrock` 或模型选择器从目录中选择，不再把厂商 model id
+复制到登录提示中。
 
 已配置的 Bedrock provider 会暴露 `bedrock-bearer-token`。选中后，Zuno 会先打印
 bearer token 与 AWS credential chain 的优先级，再以关闭回显的方式读取 token。

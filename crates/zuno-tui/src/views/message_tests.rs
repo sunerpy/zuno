@@ -1353,6 +1353,18 @@ fn views_native_compaction_has_activity_and_a_completion_notice() {
     }));
     assert!(transcript.is_running());
 
+    let summary = "## Objective\n- Resume from the durable compacted context.";
+    assert!(transcript.observe(&TurnEvent::SessionCommandOutput {
+        command: zuno_engine::session_command::SessionCommand::Compact,
+        content: summary.to_owned(),
+    }));
+    assert!(
+        transcript.messages().iter().any(|message| {
+            message == &Message::noticed(crate::views::toast::ToastLevel::Info, summary)
+        }),
+        "the live compact operation hid the same summary a resumed transcript shows"
+    );
+
     assert!(transcript.observe(&TurnEvent::SessionCommandCompleted {
         command: zuno_engine::session_command::SessionCommand::Compact,
     }));

@@ -48,7 +48,7 @@ use zuno_agent::profile::{AgentProfile, ShellFilesystemAccess};
 use zuno_agent::reflection::{CommandOutcome, TranscriptEvent, TurnTranscript};
 use zuno_auth::{AuthStore, Credential, LoginMethodRegistry};
 use zuno_config::schema::provider::ProviderTransport;
-use zuno_engine::compaction::{CompactionPolicy, CompactionState, TokenWindow};
+use zuno_engine::compaction::{CompactionPolicy, CompactionState, CompactionTrigger, TokenWindow};
 use zuno_engine::dispatch::{AuthorizationPolicy, ToolRegistryDispatcher};
 use zuno_engine::driver::AgentDriver;
 use zuno_engine::r#loop::{
@@ -71,6 +71,7 @@ use zuno_engine::prelude::{
 };
 use zuno_engine::prompt::{PromptAssembly, RuntimePromptPolicy};
 use zuno_engine::report::ProjectedReport;
+use zuno_engine::retry::MAX_CONTEXT_LIMIT_RETRIES;
 use zuno_engine::session_command::SessionCommand;
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_error::{DbError, ProviderError, Recovery};
@@ -2521,6 +2522,24 @@ impl TurnFailure {
 
     fn event_consumer(error: impl std::fmt::Display) -> Self {
         Self::EventConsumer(error.to_string())
+    }
+
+    fn compaction_trigger(&self) -> Option<CompactionTrigger> {
+        match self {
+            Self::Engine(TurnError::CompactionRequired { .. }) => Some(CompactionTrigger::Manual),
+            Self::Engine(TurnError::Provider(ProviderError::ContextLimit {
+                used_tokens,
+                limit_tokens,
+            })) => Some(CompactionTrigger::ContextLimit {
+                used_tokens: *used_tokens,
+                limit_tokens: *limit_tokens,
+            }),
+            Self::Engine(_)
+            | Self::Database(_)
+            | Self::Host(_)
+            | Self::EventConsumer(_)
+            | Self::GoalRecovery { .. } => None,
+        }
     }
 
     fn goal_recovery(message: impl Into<String>, failure: GoalTerminalFailure) -> Self {
@@ -8379,7 +8398,14 @@ impl TurnHost {
             .map(|retry| retry.reason);
         let result = async {
             if retry_reason == Some(GoalRetryReason::ContextLimit) {
-                self.recover_goal_context().await?;
+                self.recover_context(
+                    CompactionTrigger::ContextLimit {
+                        used_tokens: None,
+                        limit_tokens: Some(self.window.context),
+                    },
+                    &events,
+                )
+                .await?;
                 self.goal_store
                     .mark_retry_context_compacted(&self.session_id)
                     .map_err(TurnFailure::goal)?;
@@ -8488,20 +8514,41 @@ impl TurnHost {
             .plan_reconciliation
             .begin(&self.session_id, &proposed_cycle_id)
             .map_err(TurnFailure::Database)?;
+        let mut context_compactions = 0_u32;
         loop {
             let dynamic_context_refresher = HostDynamicContextRefresher {
                 goal_continuation: self.goal_continuation.clone(),
                 instruction: refresh_instruction.clone(),
             };
-            let outcome = self
+            let outcome = match self
                 .execute_one_turn_unaccounted(
-                    dynamic_context,
+                    dynamic_context.clone(),
                     &dynamic_context_refresher,
                     routing,
                     guard,
                     events.clone(),
                 )
-                .await?;
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(failure) => {
+                    let Some(trigger) = failure.compaction_trigger() else {
+                        return Err(failure);
+                    };
+                    if context_compactions >= MAX_CONTEXT_LIMIT_RETRIES {
+                        return Err(TurnFailure::goal_recovery(
+                            format!(
+                                "automatic context compaction exhausted after \
+                                 {MAX_CONTEXT_LIMIT_RETRIES} recoveries in one turn"
+                            ),
+                            GoalTerminalFailure::Block(GoalBlockReason::CompactionPermanent),
+                        ));
+                    }
+                    context_compactions = context_compactions.saturating_add(1);
+                    self.recover_context(trigger, &events).await?;
+                    continue;
+                }
+            };
             let TurnOutcome::Completed {
                 assistant_message_id,
                 steps,
@@ -8762,7 +8809,11 @@ impl TurnHost {
         })
     }
 
-    async fn recover_goal_context(&mut self) -> Result<(), TurnFailure> {
+    async fn recover_context(
+        &mut self,
+        trigger: CompactionTrigger,
+        events: &TurnEventSender,
+    ) -> Result<(), TurnFailure> {
         self.compaction_state.reset_retryable_failure();
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = zuno_engine::compaction::NoopCompactionHooks;
@@ -8775,14 +8826,13 @@ impl TurnHost {
             state: &mut self.compaction_state,
             hooks: &noop_hooks,
         };
-        compact_requested(&self.session_id, &mut context, true)
+        let outcome = compact_requested(&self.session_id, &mut context, trigger, true)
             .await
-            .map(|_| ())
             .map_err(|error| match error {
                 CompactionSkipped::Database(error) => TurnFailure::Database(error),
-                CompactionSkipped::Reason(message) => TurnFailure::host(format!(
-                    "goal context compaction could not start: {message}"
-                )),
+                CompactionSkipped::Reason(message) => {
+                    TurnFailure::host(format!("context compaction could not start: {message}"))
+                }
                 CompactionSkipped::Stopped {
                     reason,
                     message,
@@ -8801,11 +8851,24 @@ impl TurnHost {
                         }
                     };
                     TurnFailure::goal_recovery(
-                        format!("goal context compaction stopped ({reason:?}): {message}"),
+                        format!("context compaction stopped ({reason:?}): {message}"),
                         failure,
                     )
                 }
+            })?;
+        let Some(summary) = outcome.summary else {
+            return Err(TurnFailure::goal_recovery(
+                "context compaction completed without a durable summary",
+                GoalTerminalFailure::Block(GoalBlockReason::CompactionPermanent),
+            ));
+        };
+        events
+            .publish(TurnEvent::SessionCommandOutput {
+                command: SessionCommand::Compact,
+                content: summary,
             })
+            .await
+            .map_err(TurnFailure::event_consumer)
     }
 
     fn goal_dynamic_context(&self) -> Result<DynamicContext, String> {
@@ -9189,9 +9252,21 @@ impl TurnHost {
             .await
             .map_err(to_string)?;
         let result = match self.compact_unaccounted(automatic).await {
-            Ok(()) => {
+            Ok(outcome) => {
                 self.last_turn_completed = true;
-                self.finish_goal_turn(usage_before, started, None)
+                match self.finish_goal_turn(usage_before, started, None) {
+                    Ok(()) => match outcome.summary {
+                        Some(summary) => events
+                            .publish(TurnEvent::SessionCommandOutput {
+                                command: SessionCommand::Compact,
+                                content: summary,
+                            })
+                            .await
+                            .map_err(to_string),
+                        None => Ok(()),
+                    },
+                    Err(error) => Err(error),
+                }
             }
             Err(error) => {
                 self.last_turn_completed = false;
@@ -9227,7 +9302,10 @@ impl TurnHost {
         }
     }
 
-    async fn compact_unaccounted(&mut self, automatic: bool) -> Result<(), String> {
+    async fn compact_unaccounted(
+        &mut self,
+        automatic: bool,
+    ) -> Result<zuno_engine::prelude::PreludeCompactionOutcome, String> {
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = zuno_engine::compaction::NoopCompactionHooks;
         let mut context = PreludeContext {
@@ -9239,10 +9317,14 @@ impl TurnHost {
             state: &mut self.compaction_state,
             hooks: &noop_hooks,
         };
-        compact_requested(&self.session_id, &mut context, automatic)
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("manual compaction failed: {error:?}"))
+        compact_requested(
+            &self.session_id,
+            &mut context,
+            CompactionTrigger::Manual,
+            automatic,
+        )
+        .await
+        .map_err(|error| format!("manual compaction failed: {error:?}"))
     }
 
     /// Run every internal that applies before this turn.
@@ -10937,6 +11019,15 @@ async fn report_prelude(
     }
     if outcome.compacted {
         details.push("history compacted before this turn".to_owned());
+        if let Some(summary) = &outcome.compaction_summary {
+            events
+                .publish(TurnEvent::SessionCommandOutput {
+                    command: SessionCommand::Compact,
+                    content: summary.clone(),
+                })
+                .await
+                .map_err(to_string)?;
+        }
     }
     details.extend(outcome.skipped.iter().cloned());
     for detail in details {

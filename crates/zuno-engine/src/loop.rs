@@ -653,12 +653,13 @@ pub enum TurnError {
     /// from inside the very turn being compacted, which is a much larger change
     /// with real deadlock and double-borrow risk.
     ///
-    /// Returning this instead reaches the same place. Its [`TurnRecovery::Compact`]
-    /// is the recovery a host already implements for
-    /// [`ProviderError::ContextLimit`]: compact the retained history, then retry the
-    /// turn. Every assistant checkpoint and tool result this turn produced is
-    /// already durable when the variant is returned, so the retried turn resumes
-    /// from the shortened transcript without losing work.
+    /// Returning this yields to the host-owned recovery boundary. Its
+    /// [`TurnRecovery::Compact`] makes the host compact retained history and retry
+    /// inside the same drive, just like [`ProviderError::ContextLimit`], without
+    /// turning the intervention into a terminal client failure. Every assistant
+    /// checkpoint and tool result already completed by this turn is durable when
+    /// the variant is returned, so the retried turn resumes from the shortened
+    /// transcript without losing work.
     #[error("the turn must compact before its next request: {reason}")]
     CompactionRequired { reason: String },
     #[error("provider stream ended during step {step} without MessageEnd")]
@@ -2125,19 +2126,6 @@ async fn run_turn_in_span(
         } else {
             project_history_owned_with_system_messages(&system, history)
         };
-        let assistant_id = assistant.id.clone();
-        // Every part of this step is stamped with the message's creation time, so the
-        // part id decides the order inside the message.
-        let assistant_time_created = assistant.time_created;
-        MessageStore::new(context.connection).put_message(&assistant)?;
-        last_assistant_id = Some(assistant_id.clone());
-        events
-            .send(TurnEvent::AssistantMessageCreated {
-                step,
-                message_id: assistant_id.clone(),
-            })
-            .await?;
-
         let available = context.dispatcher.available_tools();
         let mut definitions = if capabilities.tool_calls {
             available.definitions
@@ -2174,13 +2162,6 @@ async fn run_turn_in_span(
         let assembled_dynamic_context = prepared.developer_context().to_vec();
         let locked_tools: Arc<[ToolDefinition]> = Arc::from(prepared.tools().to_vec());
         let rebuilt_for_late_mcp = prepared.rebuilt_tools();
-        events
-            .send(TurnEvent::ToolSnapshotLocked {
-                step,
-                tool_ids: locked_tools.iter().map(|tool| tool.id.clone()).collect(),
-                rebuilt_for_late_mcp,
-            })
-            .await?;
 
         let mut completion = completion_request(&model, prepared, provider_request_context.clone());
         let hook_message = completion
@@ -2273,6 +2254,27 @@ async fn run_turn_in_span(
             .await
             .map_err(|error| budget_policy_failure("before_request", error))?;
         honour_budget_decision(&events, decision).await?;
+        let assistant_id = assistant.id.clone();
+        // Every part of this step is stamped with the message's creation time, so the
+        // part id decides the order inside the message. Persist only after every
+        // pre-request intervention has accepted the request: a proactive compaction
+        // or budget stop must not leave a blank assistant checkpoint behind.
+        let assistant_time_created = assistant.time_created;
+        MessageStore::new(context.connection).put_message(&assistant)?;
+        last_assistant_id = Some(assistant_id.clone());
+        events
+            .send(TurnEvent::AssistantMessageCreated {
+                step,
+                message_id: assistant_id.clone(),
+            })
+            .await?;
+        events
+            .send(TurnEvent::ToolSnapshotLocked {
+                step,
+                tool_ids: locked_tools.iter().map(|tool| tool.id.clone()).collect(),
+                rebuilt_for_late_mcp,
+            })
+            .await?;
         let prompt_receipt_id = if let Some(receipt_id) =
             prompt_traces.receipt_id(actual_projection)
         {

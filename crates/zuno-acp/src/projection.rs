@@ -188,8 +188,19 @@ impl TurnEventProjector {
                     "size": size,
                 })
             }),
-            TurnEvent::SessionCommandOutput { content, .. } => {
-                Some(content_update("agent_message_chunk", content))
+            TurnEvent::SessionCommandOutput { command, content } => {
+                let mut update = content_update("agent_message_chunk", content);
+                if matches!(
+                    command,
+                    zuno_engine::session_command::SessionCommand::Compact
+                ) {
+                    update["_meta"] = json!({
+                        "zuno": {
+                            "kind": "compaction_summary",
+                        },
+                    });
+                }
+                Some(update)
             }
             TurnEvent::Provider {
                 event: StreamEvent::ToolUseStart { id, name },

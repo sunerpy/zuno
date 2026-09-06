@@ -861,6 +861,11 @@ async fn an_overflowing_session_is_compacted_before_the_turn() {
     // session carries the summary instead of the summarised head.
     assert!(compacted.compacted);
     assert!(compacted.continue_turn);
+    assert_eq!(
+        compacted.summary.as_deref(),
+        Some("## Objective\n- Keep going."),
+        "the turn owner needs the exact durable summary for live projection"
+    );
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].tools.is_empty());
@@ -952,6 +957,11 @@ async fn automatic_compaction_propagates_a_hook_decision_to_stop_the_turn() {
         .expect("automatic compaction succeeds");
 
     assert!(outcome.compacted);
+    assert_eq!(
+        outcome.compaction_summary.as_deref(),
+        Some("## Objective\n- Preserve state."),
+        "the prelude discarded the durable summary before the host could render it"
+    );
     assert!(
         !outcome.continue_turn,
         "the auto-continue hook's false result must reach the turn owner"

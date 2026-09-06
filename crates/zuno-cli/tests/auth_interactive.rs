@@ -365,8 +365,6 @@ fn empty_config_can_set_up_bedrock_with_one_visible_provider_and_the_aws_chain()
     terminal.write(b"bedrock\r");
 
     for (prompt, answer) in [
-        ("Bedrock model id", b"openai.gpt-5.6-sol\r".as_slice()),
-        ("Model display name", b"\r".as_slice()),
         ("AWS region", b"\r".as_slice()),
         ("AWS profile", b"us\r".as_slice()),
     ] {
@@ -383,33 +381,57 @@ fn empty_config_can_set_up_bedrock_with_one_visible_provider_and_the_aws_chain()
         terminal.output()
     );
     terminal.write(b"\r");
-    assert!(
-        terminal.wait_for_frame("Use amazon-bedrock/openai.gpt-5.6-sol as the default model?"),
-        "{}",
-        terminal.output()
-    );
-    terminal.write(b"yes\r");
 
     let (status, output) = terminal.finish();
     assert!(status.success(), "{output}");
+    assert!(!output.contains("Bedrock model id"), "{output}");
+    assert!(!output.contains("Model display name"), "{output}");
+    assert!(!output.contains("as the default model?"), "{output}");
     assert!(
         output.contains("Amazon Bedrock will use the AWS credential chain"),
         "{output}"
     );
     let config = fixture.config();
-    assert_eq!(config["model"], "amazon-bedrock/openai.gpt-5.6-sol");
-    assert_eq!(
-        config["provider"]["amazon-bedrock"]["transport"],
-        "bedrock-mantle"
+    assert!(config.get("model").is_none(), "{config:#}");
+    let provider = &config["provider"]["amazon-bedrock"];
+    assert_eq!(provider["name"], "Amazon Bedrock");
+    assert!(provider.get("models").is_none(), "{provider:#}");
+    assert!(provider.get("transport").is_none(), "{provider:#}");
+    assert!(provider.get("surface").is_none(), "{provider:#}");
+    assert_eq!(provider["options"]["region"], "us-east-2");
+    assert_eq!(provider["options"]["profile"], "us");
+    assert!(!fixture.auth_path().exists());
+}
+
+#[test]
+fn bedrock_setup_without_a_catalog_fails_before_asking_for_configuration() {
+    let fixture = EmptyLoginFixture::new();
+    fs::write(&fixture.models, "{}").expect("remove Bedrock from provider catalog");
+    let config_path = fixture.config.join("zuno/zuno.json");
+    fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("create config directory");
+    let original_config = br#"{"formatter":false}"#;
+    fs::write(&config_path, original_config).expect("seed unrelated config");
+    let mut terminal = fixture.spawn();
+    assert!(
+        terminal.wait_for_frame("Select provider"),
+        "{}",
+        terminal.output()
     );
-    assert_eq!(config["provider"]["amazon-bedrock"]["surface"], "responses");
-    assert_eq!(
-        config["provider"]["amazon-bedrock"]["options"]["region"],
-        "us-east-2"
+    terminal.write(b"bedrock\r");
+
+    let (status, output) = terminal.finish();
+    assert!(!status.success(), "{output}");
+    assert!(
+        output.contains("Amazon Bedrock is unavailable in the model catalog"),
+        "{output}"
     );
+    assert!(output.contains("zuno models --refresh"), "{output}");
+    assert!(!output.contains("Bedrock model id"), "{output}");
+    assert!(!output.contains("AWS region"), "{output}");
     assert_eq!(
-        config["provider"]["amazon-bedrock"]["options"]["profile"],
-        "us"
+        fs::read(config_path).expect("read unchanged config"),
+        original_config
     );
     assert!(!fixture.auth_path().exists());
 }
@@ -708,7 +730,24 @@ impl EmptyLoginFixture {
         for directory in [&data, &config, &cache, &home] {
             fs::create_dir_all(directory).expect("create isolated directory");
         }
-        fs::write(&models, "{}").expect("write empty provider catalog");
+        fs::write(
+            &models,
+            r#"{
+              "amazon-bedrock": {
+                "id": "amazon-bedrock",
+                "name": "Amazon Bedrock",
+                "npm": "@ai-sdk/amazon-bedrock",
+                "env": ["AWS_BEARER_TOKEN_BEDROCK"],
+                "models": {
+                  "anthropic.claude-3-5-sonnet-20241022-v2:0": {
+                    "id": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                    "name": "Claude 3.5 Sonnet"
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("write provider catalog");
         Self {
             root,
             data,

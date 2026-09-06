@@ -78,6 +78,13 @@ A proactive threshold crossing during a long turn uses the separate
 `context.compact` code. The tag is how a client distinguishes them from model
 output; they are never part of the transcript the model sees.
 
+After compaction succeeds, ACP receives the exact persisted summary as an
+`agent_message_chunk` tagged `_meta.zuno.kind: "compaction_summary"`. Automatic
+mid-turn compaction publishes it before retrying inside the same host drive, so
+the editor does not first receive a terminal prompt failure or wait for another
+wake. Historical load/resume projects the same durable summary with the same
+tag.
+
 For a known model context window, `ProviderRequestStarted` immediately publishes an
 ACP `usage_update` with the assembled prompt estimate. When provider token usage
 arrives, a second update replaces it with the measured value. These are absolute

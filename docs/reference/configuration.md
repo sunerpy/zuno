@@ -675,10 +675,17 @@ Zuno can compact older conversation history before the model window is exhausted
   previous response's provider-reported context usage; when that usage is
   unavailable, it falls back to the freshly assembled prompt estimate. Crossing
   the threshold emits the stable notice code `context.compact` and enters the
-  typed compact-and-retry path.
+  typed compact-and-retry path inside the same host drive. The rejected request
+  creates no blank assistant message or provider-request record, and a successful
+  compaction is not reported as a failed turn or deferred until another wake.
+- Automatic in-drive recovery is bounded to five compactions. Each success
+  persists one summary and projects that exact text to live TUI/ACP clients before
+  retrying; loading the session later replays the same durable summary. Exhaustion
+  or a permanent compaction failure stops instead of spinning.
 - A provider-confirmed context-limit failure still uses the bounded compaction
-  recovery path before retrying; this is recovery from an already failed
-  request, not the proactive threshold.
+  recovery path before retrying and preserves the provider's typed used/limit
+  values; this is recovery from an already failed request, not the proactive
+  threshold.
 - `/compact` persists the summary through the same durable compaction pipeline,
   so subsequent turns and resumed clients see the same retained history.
 

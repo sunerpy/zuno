@@ -243,7 +243,14 @@ provider 请求之间的主动检查；手动 `/compact` 仍然可用，provider
 启用自动压缩时，同一回合的第一次 provider 请求仍由 prelude 检查；此后的每个 provider
 请求都会在发送前重新检查。Zuno 优先采用上一响应由 provider 报告的上下文用量；provider
 没有报告时，回退到当前刚组装完成的 prompt 估算。达到阈值会发出稳定 notice code
-`context.compact`，随后进入类型化的“压缩并重试”路径。
+`context.compact`，随后在同一次 host drive 内进入类型化的“压缩并重试”路径。被拦下的
+请求不会留下空白 assistant 消息或 provider-request 记录；压缩成功不会先报告一次失败，
+也不会等下一次 wake 才继续。
+
+同一次 drive 最多自动恢复五次。每次成功都会先持久化一份摘要，再把完全相同的文本投影给
+live TUI/ACP 后重试；稍后加载会话时 replay 的也是这份持久摘要。超过上限或压缩永久失败
+时会失败关闭，不会循环。provider 明确返回的上下文上限错误仍走受控恢复，并保留其类型化
+used/limit 信息。
 
 ## 会话连续性工具
 
