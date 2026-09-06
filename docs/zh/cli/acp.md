@@ -56,11 +56,17 @@ diff 时，可见内容只保留 `A/M/D <path>`，不再重复显示成功文案
 failed 状态，保留已观察到的路径/diff，并设置 `_meta.zuno.outcome: "uncertain"`。
 实时更新与历史 replay 使用同一策略。
 
-运维通知——无法抓取的远程规则文件（其规则本轮不生效，回合继续）、被 token、工具调用次数或墙上时间额度停下的回合、
-预算策略要求的一次压缩——以带 `_meta.zuno.notice` 标记的 `agent_thought_chunk` 投影，
+运维通知——无法抓取的远程规则文件（其规则本轮不生效，回合继续）、被 token、工具调用
+次数或墙上时间额度停下的回合，以及预算或上下文策略要求的一次压缩——以带
+`_meta.zuno.notice` 标记的 `agent_thought_chunk` 投影，
 其中 `severity` 取 `info`、`warning` 或 `error`，`code` 是稳定的机器可读码，例如
-`instruction.not_in_force`、`budget.compact`、`budget.token_budget`。客户端靠这个标记
-把它们与模型输出区分开；它们永远不进入模型看到的对话记录。
+`instruction.not_in_force`、`budget.compact`、`budget.token_budget`、`context.compact`。
+客户端靠这个标记把它们与模型输出区分开；它们永远不进入模型看到的对话记录。
+
+模型上下文窗口已知时，`ProviderRequestStarted` 会立即发布一条带 assembled prompt
+estimate 的 ACP `usage_update`；provider token usage 到达后，再发第二条用真实值更新。
+它们都是当前请求占用量的绝对值，而不是累计百分比，因此压缩后的请求可以立即让编辑器
+重新计算上下文指示器。
 
 运行中的 ACP 会话会订阅统一 Skill catalog generation。新增、修改、删除或重命名
 Skill 后，会发送新的 `available_commands_update`，无需重启会话。

@@ -236,6 +236,15 @@ Council 让多个隔离的席位各自独立评估同一个问题，然后综合
 | `auto` | boolean | `true` | 接近上限时自动压缩 |
 | `prune` | boolean | `true` | 压缩时裁剪历史 |
 
+`compaction.auto: false` 会同时关闭回合开始前的主动阈值检查，以及长工具回合中各次
+provider 请求之间的主动检查；手动 `/compact` 仍然可用，provider 明确返回的上下文上限
+错误也仍走受控压缩恢复。
+
+启用自动压缩时，同一回合的第一次 provider 请求仍由 prelude 检查；此后的每个 provider
+请求都会在发送前重新检查。Zuno 优先采用上一响应由 provider 报告的上下文用量；provider
+没有报告时，回退到当前刚组装完成的 prompt 估算。达到阈值会发出稳定 notice code
+`context.compact`，随后进入类型化的“压缩并重试”路径。
+
 ## 会话连续性工具
 
 模型读取当前会话旧证据与持久工作笔记的能力默认关闭。同时启用两个工具：
