@@ -415,10 +415,10 @@ Only provider reasoning deltas are projected into Zed's Thinking surface, with o
 tagged exception: a Zuno-originated notice — a remote rule file that could not be fetched, a
 turn stopped by its allowance, or a compaction requested by the budget or context policy — is sent as an
 `agent_thought_chunk` whose `_meta.zuno.notice` carries `severity` (`info`, `warning`,
-or `error`) and a stable code. A proactive threshold crossing in a long tool turn uses
-`context.compact`; instruction and budget notices retain their `instruction.*` and
-`budget.*` families. The tag is how a client tells it from model output; the text is
-written for a person.
+or `error`) and a stable code from the `instruction.*` or `budget.*` families.
+A proactive threshold crossing in a long tool turn uses the separate
+`context.compact` code. The tag is how a client tells it from model output; the
+text is written for a person.
 Generated titles use ACP `session_info_update`, and other operational status or
 provider failure text is handled by lifecycle/error reporting rather than being
 rendered as model thought.

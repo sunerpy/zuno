@@ -73,9 +73,10 @@ token, tool-call, or wall-clock allowance, or a compaction requested by the budg
 context policy —
 are projected as `agent_thought_chunk` updates tagged `_meta.zuno.notice` with
 `severity` (`info`, `warning`, or `error`) and a stable `code` such as
-`instruction.not_in_force`, `budget.compact`, `budget.token_budget`, or
-`context.compact`. The tag is how a client distinguishes them from model output; they
-are never part of the transcript the model sees.
+`instruction.not_in_force`, `budget.compact`, or `budget.token_budget`.
+A proactive threshold crossing during a long turn uses the separate
+`context.compact` code. The tag is how a client distinguishes them from model
+output; they are never part of the transcript the model sees.
 
 For a known model context window, `ProviderRequestStarted` immediately publishes an
 ACP `usage_update` with the assembled prompt estimate. When provider token usage
