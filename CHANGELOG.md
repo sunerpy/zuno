@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.9](https://github.com/sunerpy/zuno/compare/v0.10.8...v0.10.9) (2026-09-06)
+
+
+### Bug Fixes
+
+* **auth:** 增加 Provider 首次交互配置 ([#128](https://github.com/sunerpy/zuno/issues/128)) ([e1b90ea](https://github.com/sunerpy/zuno/commit/e1b90ea483a5c970e57332edfda4d6445945498b))
+
 ## [0.10.8](https://github.com/sunerpy/zuno/compare/v0.10.7...v0.10.8) (2026-09-06)
 
 
