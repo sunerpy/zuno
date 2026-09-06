@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.10](https://github.com/sunerpy/zuno/compare/v0.10.9...v0.10.10) (2026-09-06)
+
+
+### Bug Fixes
+
+* **runtime:** 对齐 Codex 规划模式并放开模型输出上限 ([#130](https://github.com/sunerpy/zuno/issues/130)) ([b34536c](https://github.com/sunerpy/zuno/commit/b34536c6b81072aae88764f76407d5286cb07938))
+
 ## [0.10.9](https://github.com/sunerpy/zuno/compare/v0.10.8...v0.10.9) (2026-09-06)
 
 
