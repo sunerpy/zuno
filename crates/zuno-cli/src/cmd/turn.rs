@@ -2301,6 +2301,27 @@ pub(super) struct TurnHostRuntimeDependencies {
     pub(super) detached_observer: Option<Arc<dyn super::child_turn::DetachedTurnObserver>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoalHostOpen {
+    FollowAgentMode,
+    Preserve,
+}
+
+fn goal_for_host_open(
+    store: &GoalStore,
+    session_id: &str,
+    agent: &str,
+    mode: GoalHostOpen,
+) -> Result<Option<zuno_goal::Goal>, String> {
+    match mode {
+        GoalHostOpen::Preserve => store.goal(session_id).map_err(to_string),
+        GoalHostOpen::FollowAgentMode if agent == "plan" => {
+            store.enter_plan_mode(session_id).map_err(to_string)
+        }
+        GoalHostOpen::FollowAgentMode => store.resume_for_work(session_id).map_err(to_string),
+    }
+}
+
 /// An open database, an assembled tool set, and the session a turn runs in.
 pub(crate) struct TurnHost {
     profile_runtime: HarnessRuntime,
@@ -4150,9 +4171,38 @@ impl TurnHost {
     /// silently defaults any of them away is how surfaces drift into different
     /// products while sharing the same configuration.
     pub(crate) async fn open_with_runtime_mcp_and_observers(
+        plan: TurnPlan,
+        environment: &StartupEnvironment,
+        dependencies: TurnHostRuntimeDependencies,
+    ) -> Result<Self, String> {
+        Self::open_with_runtime_mcp_and_observers_mode(
+            plan,
+            environment,
+            dependencies,
+            GoalHostOpen::FollowAgentMode,
+        )
+        .await
+    }
+
+    pub(super) async fn open_with_runtime_mcp_and_observers_preserving_goal(
+        plan: TurnPlan,
+        environment: &StartupEnvironment,
+        dependencies: TurnHostRuntimeDependencies,
+    ) -> Result<Self, String> {
+        Self::open_with_runtime_mcp_and_observers_mode(
+            plan,
+            environment,
+            dependencies,
+            GoalHostOpen::Preserve,
+        )
+        .await
+    }
+
+    async fn open_with_runtime_mcp_and_observers_mode(
         mut plan: TurnPlan,
         environment: &StartupEnvironment,
         dependencies: TurnHostRuntimeDependencies,
+        goal_open: GoalHostOpen,
     ) -> Result<Self, String> {
         let TurnHostRuntimeDependencies {
             approval,
@@ -4174,7 +4224,7 @@ impl TurnHost {
                 };
             }
         };
-        Self::open_with_dependencies(
+        Self::open_with_dependencies_mode(
             plan,
             environment,
             TurnHostDependencies {
@@ -4186,14 +4236,39 @@ impl TurnHost {
                 child_observer,
                 detached_observer,
             },
+            goal_open,
         )
         .await
     }
 
     pub(super) async fn open_with_dependencies(
+        plan: TurnPlan,
+        environment: &StartupEnvironment,
+        dependencies: TurnHostDependencies,
+    ) -> Result<Self, String> {
+        Self::open_with_dependencies_mode(
+            plan,
+            environment,
+            dependencies,
+            GoalHostOpen::FollowAgentMode,
+        )
+        .await
+    }
+
+    pub(super) async fn open_with_dependencies_preserving_goal(
+        plan: TurnPlan,
+        environment: &StartupEnvironment,
+        dependencies: TurnHostDependencies,
+    ) -> Result<Self, String> {
+        Self::open_with_dependencies_mode(plan, environment, dependencies, GoalHostOpen::Preserve)
+            .await
+    }
+
+    async fn open_with_dependencies_mode(
         mut plan: TurnPlan,
         environment: &StartupEnvironment,
         dependencies: TurnHostDependencies,
+        goal_open: GoalHostOpen,
     ) -> Result<Self, String> {
         let TurnHostDependencies {
             approval,
@@ -5002,15 +5077,8 @@ impl TurnHost {
                 learning_maintenance_task: None,
                 learning_retrieval_skip_noticed: false,
             };
-            let goal = if host.agent == "plan" {
-                host.goal_store
-                    .enter_plan_mode(&host.session_id)
-                    .map_err(to_string)?
-            } else {
-                host.goal_store
-                    .resume_for_work(&host.session_id)
-                    .map_err(to_string)?
-            };
+            let goal =
+                goal_for_host_open(&host.goal_store, &host.session_id, &host.agent, goal_open)?;
             host.last_turn_completed =
                 goal.is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active);
             host.spawn_recovered_learning_jobs();
@@ -11885,6 +11953,18 @@ fn model_spec(
             model.provider_id, model.id
         )
     })?;
+    if zuno_llm::catalog::merge::is_bedrock_openai_responses_profile(&model.api.id)
+        && matches!(
+            transport,
+            ProviderTransport::Bedrock | ProviderTransport::BedrockMantle
+        )
+    {
+        return Err(format!(
+            "model `{}/{}` is a Bedrock OpenAI Responses inference profile and requires \
+             transport `bedrock-runtime`; configured transport `{transport}` is incompatible",
+            model.provider_id, model.id
+        ));
+    }
     let custom_openai =
         transport == ProviderTransport::Openai && provider_option_endpoint(provider).is_some();
     let factory_key = if custom_openai {

@@ -263,6 +263,16 @@ Zuno's durable session remains the authoritative history. Converse sends the
 AWS JSON request body and decodes binary Amazon EventStream frames; the model
 id is carried only in the URI path.
 
+The catalog resolves `global.openai.*`, `us.openai.*`, and
+`us-gov.openai.*` inference-profile ids to `bedrock-runtime` even when the
+upstream catalog supplies generic Bedrock package metadata. That protocol
+decision happens before model selection and provider construction, so these
+models never enter the Converse factory. A model whose metadata explicitly
+selects Mantle remains on `bedrock-mantle`. An explicit per-model override that
+routes one of these inference profiles to `bedrock` or `bedrock-mantle` fails
+before provider construction and names the required `bedrock-runtime`
+transport.
+
 Amazon Bedrock API keys use `Authorization: Bearer`. When one is supplied by
 `AWS_BEARER_TOKEN_BEDROCK`, `provider.<id>.options.apiKey`, or `zuno auth
 login`, Zuno does not load or sign with AWS credentials. Without a bearer token,

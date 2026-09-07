@@ -85,7 +85,7 @@ use crate::keybind::{ActionComponent, Definition, PendingPrefix, is_exit_request
 use crate::views::autocomplete::WhichKeyView;
 use crate::views::toast::ToastLayer;
 use crate::views::{ViewContext, fill, hint, padded};
-use crossterm::event::{KeyEvent, MouseEvent};
+use crossterm::event::{KeyEvent, KeyEventKind, MouseEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
@@ -721,6 +721,12 @@ impl Component for DialogHost {
                 // to a message the user was not writing. A modal owns the keyboard; only
                 // the exit chord is forwarded, and that is handled in `handle_action`.
                 if let Some(dialog) = self.stack.last_mut() {
+                    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                        return EventResult {
+                            handled: true,
+                            redraw: false,
+                        };
+                    }
                     let id = dialog.id();
                     let step = dialog.handle_typed(key);
                     return self.settle_dialog_step(id, step);

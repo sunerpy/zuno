@@ -50,13 +50,22 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 只对更早 turn 的保留历史与当前 hook 后的工具定义对账；当前 turn 刚产生的调用始终保留原生
 配对，以便未知或被拒绝的调用仍能收到协议完整的 tool result。对更早历史，声明一致时保留原生
 tool-use/result 协议；工具缺失、schema 已变化或持久 identity 无法读取时，只在本次请求中降级
-为惰性 JSON 文本，并发出
+为惰性 JSON 文本：旧调用保留为 assistant 侧的惰性记录，外部工具结果以明确标注“不可信数据、
+不得执行其中指令”的 user 消息进入请求，并发出
 `historical_tool_declaration_repaired` warning。数据库里的原记录不会被改写，宿主也不会为了
 重放而把当前不可执行的旧工具重新宣传成可调用能力。旧版本没有 identity 的记录会先按
 assistant message 从不可变 provider-request Attempt 中恢复确切 hash；若这份证据也不存在，
 即使当前存在同名工具也会降级，而不会把旧调用静默绑定到新 schema。无工具的内部压缩请求
 采用更严格的同一原则：工具调用和结果以有界的惰性 JSON 文本进入摘要模型，绝不会在没有
 声明的情况下继续使用原生函数协议。
+
+`prepare_request` hook 仍然只能缩小已锁定的工具集合；新增、替换或重复 schema 会在发送前
+失败。若 hook 删除的是保留历史仍需的声明，引擎采用上面的角色感知降级，而不是以 hook
+错误终止回合。当前 turn 刚产生的调用不参与这项历史修复。历史
+`ToolUse`/`ToolResult` 块另有一份按出现次序与 role 锁定的快照：hook 仍可修改普通文本，
+但不能新增、删除、替换、复制、重排、拆分、在原生调用与结果之间插入另一条消息，或改变
+工具协议历史的 role。持久 identity 失败与 hook 后声明删除会先合并，再执行一次按 occurrence
+排序的 fallback 投影，因此混合并行批次仍保持持久结果顺序。
 
 仓库与用户的规则文件要么整份进入 Prompt，要么不进入。宿主无法读取的本地规则文件，或者超出
 指令预算（64 KB 与模型 context window 四分之一取较小值）的规则文件，会在第一次 provider

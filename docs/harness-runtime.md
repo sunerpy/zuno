@@ -530,7 +530,16 @@ model did not receive. `allow_all` affects HITL prompting, not capability constr
 `prepare_request` hooks run after the registry snapshot is locked. They may remove or
 reorder tool schemas, but the engine rejects any added, replaced, or duplicated schema
 before provider dispatch. The durable Attempt therefore records the exact post-hook set
-without allowing the hook seam to widen registered authority.
+without allowing the hook seam to widen registered authority. If a hook removes a schema
+that retained history still references, the request does not fail locally: the historical
+call becomes an inert assistant record and its result becomes explicitly untrusted user
+data for this request only. Current-turn calls remain native until their result
+continuation settles. Historical `ToolUse`/`ToolResult` blocks have a separate locked
+sequence and role snapshot: hooks may still edit prose, but cannot add, remove, replace,
+duplicate, reorder, split, insert another message inside a native call/result pair, or
+re-role native tool protocol history. Stored identity failures and post-hook declaration
+removals are combined before one occurrence-ordered fallback projection, so a mixed
+parallel batch keeps its durable result order.
 
 Root turns progressively disclose connected MCP schemas. Filtered MCP implementations
 stay executable in the dispatcher while `tool_search` searches compact metadata; each

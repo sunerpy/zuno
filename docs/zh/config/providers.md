@@ -226,6 +226,14 @@ Mantle 与 Runtime 固定使用 Responses surface 和 `text/event-stream`。除�
 Converse 则发送 AWS JSON 请求体并解码二进制 Amazon EventStream；模型 id 只存在于
 URI path，不会重复写进 body。
 
+目录会把 `global.openai.*`、`us.openai.*` 与 `us-gov.openai.*` 推理 profile id
+解析为 `bedrock-runtime`，即使上游目录为它们标注的是通用
+Bedrock package 元数据。这个协议决定发生在模型选择和 provider 构造之前，因此这些
+模型不会进入 Converse factory；元数据显式选择 Mantle 的模型仍保持
+`bedrock-mantle`。若逐模型显式覆盖把这类 inference profile 指向 `bedrock` 或
+`bedrock-mantle`，Zuno 会在 provider 构造前失败，并点名必须使用
+`bedrock-runtime`。
+
 Amazon Bedrock API key 使用 `Authorization: Bearer`。当 token 来自
 `AWS_BEARER_TOKEN_BEDROCK`、`provider.<id>.options.apiKey` 或 `zuno auth login`
 时，Zuno 不加载 AWS 凭据，也不进行 SigV4 签名；没有 bearer token 时才使用 SigV4

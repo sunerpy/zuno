@@ -664,7 +664,9 @@ commits every promoted report as its own durable user message and consumes the
 inbox rows, but it does not start a provider turn. Resuming an active-capable
 Goal later continues from those messages. This keeps report delivery durable
 without letting a background child bypass an authentication, permission,
-human-input, plan-mode, or uncertain-side-effect pause.
+human-input, plan-mode, or uncertain-side-effect pause. The report-only host
+reads that lifecycle state without calling Start Work first, so merely opening
+the host cannot consume a resumable pause.
 
 For a long-running CI watcher or release observer, start one background Shell
 execution with `backgroundPurpose: "remoteObserver"` and let its durable terminal

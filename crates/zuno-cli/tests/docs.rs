@@ -3122,3 +3122,67 @@ fn wrapper_program_docs_pin_the_fork_rule_and_the_timeout_duration() {
         ],
     );
 }
+
+#[test]
+fn recovery_input_and_bedrock_docs_pin_the_new_boundaries() {
+    contains_all(
+        "docs/guide/tui.md",
+        &[
+            "Printable input has one owner.",
+            "Press inserts once",
+            "Release never inserts text",
+            "press/release pair therefore contributes exactly one character",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/tui.md",
+        &[
+            "可打印输入始终只有一个所有者",
+            "Press 写入一次",
+            "Release 永远不写入文本",
+            "press/release 事件",
+        ],
+    );
+    contains_all(
+        "docs/reference/providers.md",
+        &[
+            "`global.openai.*`",
+            "`us.openai.*`",
+            "`us-gov.openai.*`",
+            "never enter the Converse factory",
+            "fails\nbefore provider construction",
+            "required `bedrock-runtime`",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/providers.md",
+        &[
+            "`global.openai.*`",
+            "`us.openai.*`",
+            "`us-gov.openai.*`",
+            "不会进入 Converse factory",
+            "provider 构造前失败",
+            "必须使用\n`bedrock-runtime`",
+        ],
+    );
+    contains_all(
+        "docs/harness-runtime.md",
+        &[
+            "call becomes an inert assistant record",
+            "becomes explicitly untrusted",
+            "Current-turn calls remain native",
+            "cannot add, remove, replace",
+            "insert another message inside",
+            "re-role native tool protocol history",
+            "one occurrence-ordered fallback projection",
+        ],
+    );
+    contains_all(
+        "docs/guide/durable-state.md",
+        &[
+            "report-only host",
+            "without calling Start Work first",
+            "cannot consume a resumable pause",
+        ],
+    );
+}
