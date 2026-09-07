@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use zuno_config::schema::provider::ProviderTransport;
+use zuno_config::schema::provider::{ProviderRetryConfig, ProviderTransport};
 
 use crate::catalog::availability::Availability;
 use crate::catalog::models_dev::{CatalogStatus, Interleaved};
@@ -35,6 +35,9 @@ pub struct ResolvedProvider {
     pub env: Vec<String>,
     /// Provider-level SDK options, config-merged.
     pub options: JsonMap,
+    /// Zuno-owned same-request retry policy for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<ProviderRetryConfig>,
     /// How this provider came to be available.
     pub availability: Availability,
     /// Model id to model. Sorted; output order comes from

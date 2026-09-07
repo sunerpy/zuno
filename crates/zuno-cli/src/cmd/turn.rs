@@ -71,7 +71,7 @@ use zuno_engine::prelude::{
 };
 use zuno_engine::prompt::{PromptAssembly, RuntimePromptPolicy};
 use zuno_engine::report::ProjectedReport;
-use zuno_engine::retry::MAX_CONTEXT_LIMIT_RETRIES;
+use zuno_engine::retry::{MAX_CONTEXT_LIMIT_RETRIES, ProviderRetryPolicy};
 use zuno_engine::session_command::SessionCommand;
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_error::{DbError, ProviderError, Recovery};
@@ -12120,8 +12120,20 @@ fn engine_model(
 ) -> Result<EngineModel, String> {
     let spec = model_spec(catalog, model, env)?;
     let surface = spec.surface;
+    let retry_policy = ProviderRetryPolicy::from_config(
+        catalog
+            .provider(&model.provider_id)
+            .and_then(|provider| provider.retry.as_ref()),
+    )
+    .map_err(|error| {
+        format!(
+            "provider `{}` has invalid retry configuration: {error}",
+            model.provider_id
+        )
+    })?;
     Ok(EngineModel::new(spec, model.api.id.clone(), surface)
-        .with_catalog_identity(&model.provider_id, &model.id))
+        .with_catalog_identity(&model.provider_id, &model.id)
+        .with_retry_policy(retry_policy))
 }
 
 fn provider_string_option(

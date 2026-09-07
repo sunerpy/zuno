@@ -2077,6 +2077,82 @@ fn goal_retry_settings_preserve_every_backoff_tunable() {
 }
 
 #[test]
+fn provider_retry_settings_are_positive_strict_and_provider_scoped() {
+    let config = parse_value(json!({
+        "provider": {
+            "kiro-local": {
+                "retry": {
+                    "max_attempts": 3,
+                    "recovery_window_ms": 660_000,
+                    "initial_delay_ms": 2_000,
+                    "max_delay_ms": 30_000,
+                    "jitter_percent": 20
+                }
+            },
+            "myopenai": {}
+        }
+    }))
+    .expect("provider retry config parses");
+    let providers = config.provider.expect("provider config");
+    let retry = providers
+        .get("kiro-local")
+        .expect("kiro provider")
+        .retry
+        .as_ref()
+        .expect("retry config");
+    assert_eq!(retry.resolved_max_attempts().get(), 3);
+    assert_eq!(retry.resolved_recovery_window_ms().get(), 660_000);
+    assert_eq!(retry.resolved_initial_delay_ms().get(), 2_000);
+    assert_eq!(retry.resolved_max_delay_ms().get(), 30_000);
+    assert_eq!(retry.resolved_jitter_percent(), 20);
+    assert!(
+        providers
+            .get("myopenai")
+            .expect("second provider")
+            .retry
+            .is_none(),
+        "one provider's retry policy must not leak into another provider"
+    );
+
+    let zero = parse_value(json!({
+        "provider": {"kiro-local": {"retry": {"recovery_window_ms": 0}}}
+    }))
+    .expect_err("zero recovery window is invalid");
+    assert_eq!(
+        issue_path(&zero),
+        "provider.kiro-local.retry.recovery_window_ms"
+    );
+
+    let delay = parse_value(json!({
+        "provider": {
+            "kiro-local": {
+                "retry": {"initial_delay_ms": 2_000, "max_delay_ms": 1_000}
+            }
+        }
+    }))
+    .expect_err("maximum delay cannot precede the initial delay");
+    assert_eq!(issue_path(&delay), "provider.kiro-local.retry.max_delay_ms");
+
+    let jitter = parse_value(json!({
+        "provider": {"kiro-local": {"retry": {"jitter_percent": 101}}}
+    }))
+    .expect_err("jitter above one hundred is invalid");
+    assert_eq!(
+        issue_path(&jitter),
+        "provider.kiro-local.retry.jitter_percent"
+    );
+
+    let unknown = parse_value(json!({
+        "provider": {"kiro-local": {"retry": {"deadline_ms": 1_000}}}
+    }))
+    .expect_err("unknown provider retry fields are rejected");
+    assert_eq!(
+        issue_path(&unknown),
+        "provider.kiro-local.retry.deadline_ms"
+    );
+}
+
+#[test]
 fn goal_default_token_budget_is_positive_and_opt_in() {
     assert_eq!(
         Config::default()

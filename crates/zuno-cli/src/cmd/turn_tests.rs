@@ -3316,6 +3316,66 @@ fn model_selection_splits_only_the_provider_prefix() {
 }
 
 #[test]
+fn engine_models_freeze_each_providers_retry_policy_without_cross_talk() {
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "fast": {
+                "api": "https://fast.example/v1",
+                "transport": "openai",
+                "retry": {
+                    "max_attempts": 2,
+                    "recovery_window_ms": 90000
+                },
+                "models": {
+                    "m": {"limit": {"context": 100000, "output": 8192}}
+                }
+            },
+            "kiro-local": {
+                "api": "http://127.0.0.1:8787/v1",
+                "transport": "openai",
+                "surface": "responses",
+                "retry": {
+                    "max_attempts": 3,
+                    "recovery_window_ms": 660000
+                },
+                "models": {
+                    "m": {"limit": {"context": 1000000, "output": 128000}}
+                }
+            }
+        }
+    }))
+    .expect("provider retry fixture parses");
+    let catalog = Catalog::resolve(
+        &zuno_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+
+    let fast = engine_model(
+        &catalog,
+        catalog.model("fast", "m").expect("fast model"),
+        &Env::empty(),
+    )
+    .expect("fast engine model");
+    assert_eq!(fast.retry_policy.max_attempts().get(), 2);
+    assert_eq!(
+        fast.retry_policy.recovery_window(),
+        std::time::Duration::from_secs(90)
+    );
+
+    let kiro = engine_model(
+        &catalog,
+        catalog.model("kiro-local", "m").expect("kiro-local model"),
+        &Env::empty(),
+    )
+    .expect("kiro engine model");
+    assert_eq!(kiro.retry_policy.max_attempts().get(), 3);
+    assert_eq!(
+        kiro.retry_policy.recovery_window(),
+        std::time::Duration::from_secs(660)
+    );
+}
+
+#[test]
 fn every_declared_wire_transport_selects_its_production_registry_key() {
     let cases = [
         (ProviderTransport::Anthropic, "anthropic"),
@@ -8024,7 +8084,9 @@ fn every_turn_error() -> Vec<TurnError> {
         ),
         TurnError::ProviderRetryDeadlineExceeded {
             attempt: 2,
-            elapsed: std::time::Duration::from_secs(180),
+            recovery_elapsed: std::time::Duration::from_secs(180),
+            total_elapsed: std::time::Duration::from_secs(490),
+            last_provider_error_code: Some("upstream_stream_error"),
         },
         TurnError::Cache(zuno_llm::cache::CacheViolation::StaticPrefixChanged { turn: 2 }),
         TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable),

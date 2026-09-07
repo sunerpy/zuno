@@ -305,12 +305,16 @@ Use the normal provider options:
     "kiro-local": {
       "transport": "openai",
       "surface": "responses",
+      "retry": {
+        "max_attempts": 3,
+        "recovery_window_ms": 660000
+      },
       "options": {
         "baseURL": "http://127.0.0.1:8787/v1",
         "maxTokens": null,
         "timeout": false,
         "headerTimeout": 330000,
-        "chunkTimeout": 210000,
+        "chunkTimeout": 330000,
         "reasoningReplay": "encrypted",
         "reasoningReplayMaxAge": 86400000
       }
@@ -332,9 +336,9 @@ Remove a stale `responsesTextBlocks: "single"` setting when upgrading. That
 generic Zuno compatibility mode joins text with one blank line, so it changes
 the bytes compared with the provider's current lossless projection.
 
-The timeout values let kiro-provider's 300-second request deadline and
-180-second stream-idle deadline fire first. Zuno then receives a typed gateway
-error instead of cancelling the connection at the same boundary.
+The timeout values let kiro-provider's configured 300-second stream-idle
+deadline fire first. Zuno receives the typed gateway error, then starts a
+660-second recovery window for bounded replacement attempts.
 
 The error remains intentional when several text blocks are interleaved with an
 image, document, tool content, or another non-text block whose ordering cannot

@@ -966,6 +966,14 @@ gateways should set their own upstream deadline below Zuno's matching phase
 deadline so their typed error reaches Zuno before the client cancels the
 connection.
 
+The provider entry's typed `retry` block is not an SDK option. Its
+`max_attempts` includes the initial request, while `recovery_window_ms` begins
+only after that request returns a retryable failure. Rollback, backoff, and
+every replacement attempt must finish inside that window. Defaults are three
+attempts, a 180-second window, 2-second initial delay, 30-second maximum delay,
+and 20 percent jitter. The policy is frozen with the resolved provider and is
+never sent upstream.
+
 The four native providers — OpenAI, Anthropic, Google, and Bedrock — do not read
 those keys. Each applies one fixed 330-second response-header deadline and no
 whole-request deadline, because a legitimate long turn has no upper bound the
@@ -1532,7 +1540,7 @@ before the Goal is blocked; no started or provider-attempt event is fabricated.
 
 The retry row is tied to the exact `goal_id` and stores the attempt, typed reason, selected delay, schedule time, and next eligible time. Reopening the same session reconstructs the wait from SQLite. ACP load and resume rebuild the runtime, replay the requested durable projections, then schedule any active root Goal through the detached continuation observer. This recovery path is process-owned and uses the same per-session execution gate as a prompt, so it cannot race a second Goal turn. Queued user input has priority over an automatic turn, and long waits are split by `poll_interval_ms` so an interactive surface can notice that input promptly.
 
-Local delays use exponential backoff with symmetric jitter and never collapse to zero. A valid provider `Retry-After` value is never shortened by jitter; it is clamped to the configured ceiling rather than replaced by an earlier local delay. That holds across the same-request recovery deadline as well. When the peer's requested delay is at least as long as what remains of the 180 second deadline, the provider layer neither sleeps past its deadline nor substitutes a shorter local delay: the turn ends with the peer's own typed error, and the goal-level retry waits the peer's value clamped to `max_delay_ms`. A local backoff that would outlive the deadline still ends the turn as a provider retry deadline failure and follows the ordinary goal backoff.
+Local delays use exponential backoff with symmetric jitter and never collapse to zero. A valid provider `Retry-After` value is never shortened by jitter; it is clamped to the configured ceiling rather than replaced by an earlier local delay. The same-request recovery window starts after the first retryable provider failure. When the peer's requested delay is at least as long as what remains, the provider layer neither sleeps past its window nor substitutes a shorter local delay: the turn ends with the peer's own typed error, and the goal-level retry waits the peer's value clamped to `max_delay_ms`. A local backoff that would outlive the window ends the turn as `provider_retry_deadline`, retaining the last structured provider code plus recovery and total elapsed times for durable diagnosis.
 
 ```json
 {

@@ -224,6 +224,7 @@ Important options include:
 | --- | --- |
 | provider `surface` | Concrete API shape: `responses`, `chat`, or `messages` |
 | provider `headers` | Default extra HTTP headers for every model in the provider |
+| provider `retry` | Zuno-owned same-request retry policy; never forwarded upstream |
 | model `headers` | Per-model additions and overrides applied after provider headers |
 | `baseURL` or option `endpoint` | API base URL; option `endpoint` wins when both are set |
 | `apiKey` | config-local credential, preferred over the credential store |
@@ -246,6 +247,32 @@ fixed 330-second response-header deadline, no whole-request deadline, and the
 shared 300-second stream idle allowance that `ZUNO_STREAM_IDLE_TIMEOUT_SECS`
 overrides for every provider, so setting these keys on a native provider block
 does not change its deadlines.
+
+Provider retry recovery is configured separately from transport timeouts:
+
+```json
+{
+  "provider": {
+    "kiro-local": {
+      "retry": {
+        "max_attempts": 3,
+        "recovery_window_ms": 660000,
+        "initial_delay_ms": 2000,
+        "max_delay_ms": 30000,
+        "jitter_percent": 20
+      }
+    }
+  }
+}
+```
+
+`max_attempts` includes the initial call. That initial call remains governed by
+the transport. `recovery_window_ms` begins only after it returns a retryable
+failure, then bounds rollback, backoff, and all replacement attempts. Defaults
+are three attempts, a 180-second recovery window, 2-second initial delay,
+30-second maximum delay, and 20 percent jitter. Retry settings are provider
+scoped, frozen with the resolved session model, and never enter SDK options or
+request JSON.
 
 ## Amazon Bedrock Responses and Converse
 

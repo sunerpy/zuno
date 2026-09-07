@@ -10,9 +10,13 @@ use std::future::Future;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
+use zuno_config::schema::provider::{
+    DEFAULT_PROVIDER_RETRY_INITIAL_DELAY_MS, DEFAULT_PROVIDER_RETRY_JITTER_PERCENT,
+    DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS, DEFAULT_PROVIDER_RETRY_MAX_DELAY_MS,
+    DEFAULT_PROVIDER_RETRY_RECOVERY_WINDOW_MS, ProviderRetryConfig,
+};
 use zuno_error::ProviderError;
 use zuno_llm::event::StreamEvent;
-use zuno_llm::sse::MAX_PROVIDER_WAIT;
 
 /// Bounds repeated compaction when a conversation still exceeds the context
 /// window after the compactor has already tried to make it fit.
@@ -26,22 +30,25 @@ pub const MAX_INCOMPLETE_CONTINUATION_ATTEMPTS: u32 = 3;
 /// retrying forever. One such response in turn 43 ended a 20-hour run half-done.
 pub const MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS: u32 = 5;
 
-pub const RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
+pub const RETRY_INITIAL_DELAY: Duration =
+    Duration::from_millis(DEFAULT_PROVIDER_RETRY_INITIAL_DELAY_MS);
 
-pub const RETRY_MAX_DELAY_WITHOUT_PROVIDER: Duration = Duration::from_secs(30);
+pub const RETRY_MAX_DELAY_WITHOUT_PROVIDER: Duration =
+    Duration::from_millis(DEFAULT_PROVIDER_RETRY_MAX_DELAY_MS);
 
 /// Symmetric jitter applied only to locally selected retry delays.
-pub const PROVIDER_RETRY_JITTER_PERCENT: u8 = 20;
+pub const PROVIDER_RETRY_JITTER_PERCENT: u8 = DEFAULT_PROVIDER_RETRY_JITTER_PERCENT;
 
 /// Maximum provider calls in one recovery sequence.
-pub const PROVIDER_RETRY_MAX_ATTEMPTS: u32 = 3;
+pub const PROVIDER_RETRY_MAX_ATTEMPTS: u32 = DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS;
 
-/// Absolute wall-clock budget for coordinating one provider recovery sequence.
+/// Wall-clock budget for coordinating replacement provider attempts.
 ///
-/// The deadline is anchored when the initial request starts. The initial request
-/// remains governed by transport and stream-idle policies, but every replacement
-/// attempt, rollback, and wait must finish before this deadline.
-pub const PROVIDER_RETRY_MAX_ELAPSED: Duration = MAX_PROVIDER_WAIT;
+/// The initial request remains governed by transport and stream-idle policies.
+/// This budget begins only after that request returns its first retryable failure,
+/// then covers rollback, backoff, and every replacement attempt.
+pub const PROVIDER_RETRY_RECOVERY_WINDOW: Duration =
+    Duration::from_millis(DEFAULT_PROVIDER_RETRY_RECOVERY_WINDOW_MS);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryBudget {
@@ -153,7 +160,7 @@ impl RecoveryBudgets {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderRetryPolicy {
     max_attempts: NonZeroU32,
-    max_elapsed: Duration,
+    recovery_window: Duration,
     initial_delay: Duration,
     max_delay: Duration,
     jitter_percent: u8,
@@ -164,7 +171,7 @@ impl ProviderRetryPolicy {
     pub const fn new(max_attempts: NonZeroU32) -> Self {
         Self {
             max_attempts,
-            max_elapsed: PROVIDER_RETRY_MAX_ELAPSED,
+            recovery_window: PROVIDER_RETRY_RECOVERY_WINDOW,
             initial_delay: RETRY_INITIAL_DELAY,
             max_delay: RETRY_MAX_DELAY_WITHOUT_PROVIDER,
             jitter_percent: PROVIDER_RETRY_JITTER_PERCENT,
@@ -175,12 +182,12 @@ impl ProviderRetryPolicy {
     /// and deterministic tests.
     pub fn with_timing(
         max_attempts: NonZeroU32,
-        max_elapsed: Duration,
+        recovery_window: Duration,
         initial_delay: Duration,
         max_delay: Duration,
         jitter_percent: u8,
     ) -> Result<Self, ProviderRetryPolicyError> {
-        if max_elapsed.is_zero() || initial_delay.is_zero() || max_delay.is_zero() {
+        if recovery_window.is_zero() || initial_delay.is_zero() || max_delay.is_zero() {
             return Err(ProviderRetryPolicyError::ZeroDuration);
         }
         if max_delay < initial_delay {
@@ -193,11 +200,30 @@ impl ProviderRetryPolicy {
         }
         Ok(Self {
             max_attempts,
-            max_elapsed,
+            recovery_window,
             initial_delay,
             max_delay,
             jitter_percent,
         })
+    }
+
+    /// Resolve a provider's optional config over the native defaults.
+    pub fn from_config(
+        config: Option<&ProviderRetryConfig>,
+    ) -> Result<Self, ProviderRetryPolicyError> {
+        let Some(config) = config else {
+            return Ok(Self::new(
+                NonZeroU32::new(PROVIDER_RETRY_MAX_ATTEMPTS)
+                    .expect("provider retry maximum is non-zero"),
+            ));
+        };
+        Self::with_timing(
+            config.resolved_max_attempts(),
+            Duration::from_millis(config.resolved_recovery_window_ms().get()),
+            Duration::from_millis(config.resolved_initial_delay_ms().get()),
+            Duration::from_millis(config.resolved_max_delay_ms().get()),
+            config.resolved_jitter_percent(),
+        )
     }
 
     #[must_use]
@@ -206,8 +232,8 @@ impl ProviderRetryPolicy {
     }
 
     #[must_use]
-    pub const fn max_elapsed(self) -> Duration {
-        self.max_elapsed
+    pub const fn recovery_window(self) -> Duration {
+        self.recovery_window
     }
 
     #[must_use]
@@ -221,7 +247,11 @@ impl ProviderRetryPolicy {
                         exponential_delay(self.initial_delay, self.max_delay, failed_attempt);
                     jittered_delay(base, self.max_delay, self.jitter_percent, entropy)
                 },
-                |delay| delay.min(self.max_elapsed).max(Duration::from_millis(1)),
+                |delay| {
+                    delay
+                        .min(self.recovery_window)
+                        .max(Duration::from_millis(1))
+                },
             )
     }
 }
@@ -249,8 +279,16 @@ where
         #[source]
         source: ProviderError,
     },
-    #[error("provider retry deadline exceeded on attempt {attempt} after {elapsed:?}")]
-    DeadlineExceeded { attempt: u32, elapsed: Duration },
+    #[error(
+        "provider retry deadline exceeded on attempt {attempt} after {recovery_elapsed:?} \
+         recovery ({total_elapsed:?} total; last provider code {last_provider_error_code:?})"
+    )]
+    DeadlineExceeded {
+        attempt: u32,
+        recovery_elapsed: Duration,
+        total_elapsed: Duration,
+        last_provider_error_code: Option<&'static str>,
+    },
     /// The peer asked for a longer delay than the recovery deadline had left.
     ///
     /// Recovery stops instead of sleeping past its deadline — and instead of
@@ -290,7 +328,9 @@ pub enum ProviderAttemptObservation<'a, T> {
     DeadlineExceeded {
         attempt: u32,
         max: u32,
-        elapsed: Duration,
+        recovery_elapsed: Duration,
+        total_elapsed: Duration,
+        last_provider_error_code: Option<&'static str>,
     },
     /// Rollback was emitted and this exact deadline must commit before sleeping.
     BackoffScheduled {
@@ -526,29 +566,41 @@ where
     ObserveError: Error + 'static,
 {
     let max = policy.max_attempts().get();
-    let recovery_started = tokio::time::Instant::now();
-    let deadline = recovery_started + policy.max_elapsed();
+    let total_started = tokio::time::Instant::now();
+    let mut recovery_started: Option<tokio::time::Instant> = None;
+    let mut deadline: Option<tokio::time::Instant> = None;
+    let mut last_provider_error_code = None;
     let mut attempt = 1_u32;
 
     loop {
         observe(ProviderAttemptObservation::Started { attempt, max })
             .map_err(|source| ProviderRetryObservedError::Observation { source })?;
-        let result = if attempt == 1 {
-            operation(attempt).await
-        } else {
-            match tokio::time::timeout_at(deadline, operation(attempt)).await {
+        let result = match deadline {
+            None => operation(attempt).await,
+            Some(deadline) => match tokio::time::timeout_at(deadline, operation(attempt)).await {
                 Ok(result) => result,
                 Err(_) => {
-                    let elapsed = recovery_started.elapsed();
+                    let recovery_elapsed = recovery_started
+                        .expect("a replacement attempt has a recovery start")
+                        .elapsed();
+                    let total_elapsed = total_started.elapsed();
                     observe(ProviderAttemptObservation::DeadlineExceeded {
                         attempt,
                         max,
-                        elapsed,
+                        recovery_elapsed,
+                        total_elapsed,
+                        last_provider_error_code,
                     })
                     .map_err(|source| ProviderRetryObservedError::Observation { source })?;
-                    return Err(ProviderRetryError::DeadlineExceeded { attempt, elapsed }.into());
+                    return Err(ProviderRetryError::DeadlineExceeded {
+                        attempt,
+                        recovery_elapsed,
+                        total_elapsed,
+                        last_provider_error_code,
+                    }
+                    .into());
                 }
-            }
+            },
         };
         observe(ProviderAttemptObservation::Finished {
             attempt,
@@ -569,18 +621,27 @@ where
                 .into());
             }
             Err(error) => {
+                last_provider_error_code = error.structured_code();
+                let recovery_started =
+                    *recovery_started.get_or_insert_with(tokio::time::Instant::now);
+                let deadline = *deadline.get_or_insert(recovery_started + policy.recovery_window());
                 let delay = policy.delay_after(attempt, &error, retry_entropy());
                 let next_attempt = attempt + 1;
                 if delay >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
-                    let elapsed = recovery_started.elapsed();
+                    let recovery_elapsed = recovery_started.elapsed();
                     return Err(match error.retry_after().filter(|after| !after.is_zero()) {
                         Some(retry_after) => ProviderRetryError::RetryAfterBeyondDeadline {
                             attempt,
-                            elapsed,
+                            elapsed: recovery_elapsed,
                             retry_after,
                             source: error,
                         },
-                        None => ProviderRetryError::DeadlineExceeded { attempt, elapsed },
+                        None => ProviderRetryError::DeadlineExceeded {
+                            attempt,
+                            recovery_elapsed,
+                            total_elapsed: total_started.elapsed(),
+                            last_provider_error_code,
+                        },
                     }
                     .into());
                 }
@@ -595,7 +656,9 @@ where
                 .map_err(|_| {
                     ProviderRetryObservedError::Retry(ProviderRetryError::DeadlineExceeded {
                         attempt,
-                        elapsed: recovery_started.elapsed(),
+                        recovery_elapsed: recovery_started.elapsed(),
+                        total_elapsed: total_started.elapsed(),
+                        last_provider_error_code,
                     })
                 })?
                 .map_err(|source| {
@@ -621,7 +684,9 @@ where
                 let delay = tokio::time::timeout_at(deadline, wait).await.map_err(|_| {
                     ProviderRetryObservedError::Retry(ProviderRetryError::DeadlineExceeded {
                         attempt,
-                        elapsed: recovery_started.elapsed(),
+                        recovery_elapsed: recovery_started.elapsed(),
+                        total_elapsed: total_started.elapsed(),
+                        last_provider_error_code,
                     })
                 })?;
                 if let RetryDelay::Woken(output) = delay {

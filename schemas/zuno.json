@@ -2267,6 +2267,17 @@
           ],
           "description": "Provider-level options, including SDK options this schema does not name."
         },
+        "retry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderRetryConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Zuno-owned same-request retry policy for this provider."
+        },
         "surface": {
           "anyOf": [
             {
@@ -2395,6 +2406,59 @@
             }
           ],
           "description": "Whole-request timeout in milliseconds, or `false` for none."
+        }
+      },
+      "type": "object"
+    },
+    "ProviderRetryConfig": {
+      "additionalProperties": false,
+      "description": "Same-request retry settings for one provider.\n\nThe initial request remains governed by the provider transport. Once that\nrequest returns a retryable failure, `recovery_window_ms` bounds rollback,\nbackoff, and every replacement attempt.",
+      "properties": {
+        "initial_delay_ms": {
+          "description": "Delay before the first replacement attempt, in milliseconds. Defaults to 2000.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "jitter_percent": {
+          "description": "Symmetric jitter percentage for local delays. Defaults to 20.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_attempts": {
+          "description": "Total provider calls, including the initial request. Defaults to 3.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_delay_ms": {
+          "description": "Maximum local retry delay, in milliseconds. Defaults to 30000.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "recovery_window_ms": {
+          "description": "Recovery budget after the first retryable failure, in milliseconds.\nDefaults to 180000.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "type": "object"

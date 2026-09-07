@@ -144,12 +144,19 @@
       "env": ["ZUNO_KIRO_LOCAL_API_KEY"],
       "transport": "openai",
       "surface": "responses",
+      "retry": {
+        "max_attempts": 3,
+        "recovery_window_ms": 660000,
+        "initial_delay_ms": 2000,
+        "max_delay_ms": 30000,
+        "jitter_percent": 20
+      },
       "options": {
         "baseURL": "http://127.0.0.1:8787/v1",
         "maxTokens": null,
         "timeout": false,
         "headerTimeout": 330000,
-        "chunkTimeout": 210000,
+        "chunkTimeout": 330000,
         "reasoningReplay": "encrypted",
         "reasoningReplayMaxAge": 86400000
       },

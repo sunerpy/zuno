@@ -128,6 +128,7 @@ fn validate_semantics(path: &Path, config: Config) -> Result<Config, ConfigError
 
     if let Some(providers) = &config.provider {
         for (id, provider) in providers.iter() {
+            validate_provider_retry(id, provider, &mut issues);
             validate_reasoning_replay(id, provider, &mut issues);
         }
     }
@@ -139,6 +140,32 @@ fn validate_semantics(path: &Path, config: Config) -> Result<Config, ConfigError
             path: path.to_path_buf(),
             issues,
         })
+    }
+}
+
+/// Validate the provider-owned retry policy after applying its native defaults.
+fn validate_provider_retry(
+    id: &str,
+    entry: &provider::ProviderConfig,
+    issues: &mut Vec<ConfigIssue>,
+) {
+    let Some(retry) = &entry.retry else {
+        return;
+    };
+    let jitter = retry.resolved_jitter_percent();
+    if jitter > 100 {
+        issues.push(ConfigIssue::new(
+            ["provider", id, "retry", "jitter_percent"],
+            format!("provider retry jitter percent {jitter} is outside 0..=100"),
+        ));
+    }
+    let initial = retry.resolved_initial_delay_ms().get();
+    let maximum = retry.resolved_max_delay_ms().get();
+    if maximum < initial {
+        issues.push(ConfigIssue::new(
+            ["provider", id, "retry", "max_delay_ms"],
+            "provider retry max delay must be greater than or equal to the initial delay",
+        ));
     }
 }
 

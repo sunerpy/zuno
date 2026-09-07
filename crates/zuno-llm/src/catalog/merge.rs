@@ -199,6 +199,7 @@ pub fn from_catalog(provider_id: &str, provider: &CatalogProvider) -> ResolvedPr
         name: provider.name.clone(),
         env: provider.env.clone(),
         options: JsonMap::new(),
+        retry: None,
         availability: crate::catalog::availability::Availability::none(),
         models,
     }
@@ -408,6 +409,10 @@ pub fn apply_config(
             .or_else(|| existing.map(|provider| provider.env.clone()))
             .unwrap_or_default(),
         options,
+        retry: config
+            .retry
+            .clone()
+            .or_else(|| existing.and_then(|provider| provider.retry.clone())),
         availability: existing
             .map(|provider| provider.availability.clone())
             .unwrap_or_default(),
@@ -863,6 +868,36 @@ mod tests {
     }
 
     #[test]
+    fn provider_retry_policy_is_typed_and_never_forwarded_as_sdk_options() {
+        let mut outcome = MergeOutcome::default();
+        let config = provider_config(
+            r#"{
+              "retry": {
+                "max_attempts": 3,
+                "recovery_window_ms": 660000,
+                "initial_delay_ms": 2000,
+                "max_delay_ms": 30000,
+                "jitter_percent": 20
+              },
+              "options": {"baseURL": "http://127.0.0.1:8787/v1"},
+              "models": {"m": {}}
+            }"#,
+        );
+        let resolved = apply_config("kiro-local", &config, None, None, &mut outcome);
+        let retry = resolved.retry.expect("typed provider retry policy");
+        assert_eq!(retry.resolved_max_attempts().get(), 3);
+        assert_eq!(retry.resolved_recovery_window_ms().get(), 660_000);
+        assert_eq!(
+            resolved.options.get("baseURL"),
+            Some(&serde_json::json!("http://127.0.0.1:8787/v1"))
+        );
+        assert!(
+            !resolved.options.contains_key("retry"),
+            "Zuno retry policy must not be forwarded to the provider SDK"
+        );
+    }
+
+    #[test]
     fn a_renaming_id_makes_the_key_the_display_name() {
         // `:1447`. With `id` renaming and no `name`, the map key is the name.
         let mut outcome = MergeOutcome::default();
@@ -1231,6 +1266,7 @@ mod tests {
             name: "P".to_owned(),
             env: Vec::new(),
             options: JsonMap::new(),
+            retry: None,
             availability: crate::catalog::availability::Availability::none(),
             models: BTreeMap::new(),
         };

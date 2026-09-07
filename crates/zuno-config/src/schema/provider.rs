@@ -12,6 +12,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64};
 
+/// Default number of provider calls in one same-request recovery sequence.
+pub const DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS: u32 = 3;
+/// Default wall-clock budget for rollback, backoff, and replacement attempts.
+pub const DEFAULT_PROVIDER_RETRY_RECOVERY_WINDOW_MS: u64 = 180_000;
+/// Default delay before the first replacement attempt.
+pub const DEFAULT_PROVIDER_RETRY_INITIAL_DELAY_MS: u64 = 2_000;
+/// Default maximum locally selected delay between replacement attempts.
+pub const DEFAULT_PROVIDER_RETRY_MAX_DELAY_MS: u64 = 30_000;
+/// Default symmetric jitter percentage for locally selected retry delays.
+pub const DEFAULT_PROVIDER_RETRY_JITTER_PERCENT: u8 = 20;
+
 /// One entry of the `provider` map (`config/provider.ts:82-126`).
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,12 +54,86 @@ pub struct ProviderConfig {
     /// Models to drop.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blacklist: Option<Vec<String>>,
+    /// Zuno-owned same-request retry policy for this provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<ProviderRetryConfig>,
     /// Provider-level options, including SDK options this schema does not name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<ProviderOptions>,
     /// Per-model configuration and overrides.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<OrderedMap<ModelConfig>>,
+}
+
+/// Same-request retry settings for one provider.
+///
+/// The initial request remains governed by the provider transport. Once that
+/// request returns a retryable failure, `recovery_window_ms` bounds rollback,
+/// backoff, and every replacement attempt.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRetryConfig {
+    /// Total provider calls, including the initial request. Defaults to 3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<NonZeroU32>,
+    /// Recovery budget after the first retryable failure, in milliseconds.
+    /// Defaults to 180000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_window_ms: Option<NonZeroU64>,
+    /// Delay before the first replacement attempt, in milliseconds. Defaults to 2000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_delay_ms: Option<NonZeroU64>,
+    /// Maximum local retry delay, in milliseconds. Defaults to 30000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_delay_ms: Option<NonZeroU64>,
+    /// Symmetric jitter percentage for local delays. Defaults to 20.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jitter_percent: Option<u8>,
+}
+
+impl ProviderRetryConfig {
+    /// Total calls after applying the native default.
+    #[must_use]
+    pub fn resolved_max_attempts(&self) -> NonZeroU32 {
+        self.max_attempts.unwrap_or_else(|| {
+            NonZeroU32::new(DEFAULT_PROVIDER_RETRY_MAX_ATTEMPTS)
+                .expect("provider retry default attempts are non-zero")
+        })
+    }
+
+    /// Recovery window in milliseconds after applying the native default.
+    #[must_use]
+    pub fn resolved_recovery_window_ms(&self) -> NonZeroU64 {
+        self.recovery_window_ms.unwrap_or_else(|| {
+            NonZeroU64::new(DEFAULT_PROVIDER_RETRY_RECOVERY_WINDOW_MS)
+                .expect("provider retry default recovery window is non-zero")
+        })
+    }
+
+    /// Initial local retry delay in milliseconds after applying the native default.
+    #[must_use]
+    pub fn resolved_initial_delay_ms(&self) -> NonZeroU64 {
+        self.initial_delay_ms.unwrap_or_else(|| {
+            NonZeroU64::new(DEFAULT_PROVIDER_RETRY_INITIAL_DELAY_MS)
+                .expect("provider retry default initial delay is non-zero")
+        })
+    }
+
+    /// Maximum local retry delay in milliseconds after applying the native default.
+    #[must_use]
+    pub fn resolved_max_delay_ms(&self) -> NonZeroU64 {
+        self.max_delay_ms.unwrap_or_else(|| {
+            NonZeroU64::new(DEFAULT_PROVIDER_RETRY_MAX_DELAY_MS)
+                .expect("provider retry default maximum delay is non-zero")
+        })
+    }
+
+    /// Jitter after applying the native default.
+    #[must_use]
+    pub fn resolved_jitter_percent(&self) -> u8 {
+        self.jitter_percent
+            .unwrap_or(DEFAULT_PROVIDER_RETRY_JITTER_PERCENT)
+    }
 }
 
 /// Native provider transports implemented by the Rust workspace.

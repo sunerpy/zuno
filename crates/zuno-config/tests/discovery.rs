@@ -564,6 +564,31 @@ fn discovery_deep_merges_continuity_object_fields() {
     );
 }
 
+#[test]
+fn discovery_deep_merges_provider_retry_fields() {
+    let first = Config::from_json_str(
+        std::path::Path::new("first.json"),
+        r#"{"provider":{"kiro-local":{"retry":{"max_attempts":3,"initial_delay_ms":2000}}}}"#,
+    )
+    .expect("first");
+    let second = Config::from_json_str(
+        std::path::Path::new("second.json"),
+        r#"{"provider":{"kiro-local":{"retry":{"recovery_window_ms":660000}}}}"#,
+    )
+    .expect("second");
+
+    let merged = merge_layers([first, second]).expect("merge");
+    let retry = merged
+        .provider
+        .as_ref()
+        .and_then(|providers| providers.get("kiro-local"))
+        .and_then(|provider| provider.retry.as_ref())
+        .expect("merged retry policy");
+    assert_eq!(retry.resolved_max_attempts().get(), 3);
+    assert_eq!(retry.resolved_initial_delay_ms().get(), 2_000);
+    assert_eq!(retry.resolved_recovery_window_ms().get(), 660_000);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         failure_persistence: None,
