@@ -204,10 +204,12 @@ catalog and effective permissions, so it preserves continuity without reviving a
 capability.
 
 Each subsequent tool call stores the provider-visible schema identity that admitted it.
-When retained history is assembled, a missing or changed declaration is converted to an
-inert JSON transcript block for that request instead of being rebound to a different
-schema or sent as an invalid historical function call. Zuno emits a warning notice and
-keeps the durable row unchanged. If another registered tool already defines
+When retained history from an earlier turn is assembled, a missing or changed declaration
+is converted to an inert JSON transcript block for that request instead of being rebound
+to a different schema or sent as an invalid historical function call. Calls produced in
+the current turn stay native so their tool result can complete the protocol even when the
+dispatcher refuses an unknown call. Zuno emits a warning notice and keeps the durable row
+unchanged. If another registered tool already defines
 `tool_search`, Zuno does not shadow it: schemas stay eager for that turn and the host
 emits a warning.
 

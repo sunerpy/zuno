@@ -165,11 +165,12 @@ provider 请求快照记录搜索后的确切工具 schema；搜索结果也会�
 目录 revision 写入持久工具结果。后台唤醒、进程重启或客户端重新挂载同一会话时，这些成功
 结果会恢复此前暴露的子集；恢复仍与当前连接目录和有效权限取交集，因此不会复活已移除能力。
 
-后续每个工具调用都会保存准入它的 provider-visible schema identity。组装保留历史时，缺失
-或已变化的声明不会被静默绑定到新 schema，也不会继续作为无声明的历史函数调用发给 provider；
-它只在本次请求中变成惰性 JSON 转录块，Zuno 发出 warning，持久原记录保持不变。如果另一个
-已注册工具已经定义了 `tool_search`，Zuno 不会遮蔽它：该回合保持 schema 立即可见，并由
-宿主发出警告。
+后续每个工具调用都会保存准入它的 provider-visible schema identity。组装更早 turn 的保留
+历史时，缺失或已变化的声明不会被静默绑定到新 schema，也不会继续作为无声明的历史函数调用
+发给 provider；它只在本次请求中变成惰性 JSON 转录块。当前 turn 刚产生的调用仍保持原生
+配对，因此未知或被拒绝的调用可以回送协议完整的 tool result。Zuno 发出 warning，持久原记录
+保持不变。如果另一个已注册工具已经定义了 `tool_search`，Zuno 不会遮蔽它：该回合保持 schema
+立即可见，并由宿主发出警告。
 
 ## 并发与超时
 

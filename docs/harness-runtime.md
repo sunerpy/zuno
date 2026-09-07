@@ -548,10 +548,12 @@ a fresh deferred superset: schemas that survived the parent's exact Attempt auth
 eager inside that already-bounded ceiling.
 
 Every new tool part records the exact provider-visible schema identity beside the call.
-Before a request, retained history is checked against the current post-hook definitions.
-A matching declaration preserves native tool-use/result protocol. A missing tool, a
-changed schema, or an unreadable identity is replayed as inert JSON text for that request
-and emits `historical_tool_declaration_repaired`; durable history is not rewritten and an
+Before a request, retained history from earlier turns is checked against the current
+post-hook definitions. Current-turn tool continuations always keep their native pair so
+an unknown or refused call can receive its protocol-complete result. For earlier turns, a
+matching declaration preserves native tool-use/result protocol. A missing tool, a changed
+schema, or an unreadable identity is replayed as inert JSON text for that request and
+emits `historical_tool_declaration_repaired`; durable history is not rewritten and an
 unavailable implementation is never advertised as callable merely to satisfy replay.
 For released rows without an identity, Zuno first recovers the exact hashes from the
 immutable provider-request Attempt keyed by the assistant message; if that proof is

@@ -2129,8 +2129,12 @@ async fn run_turn_in_span(
         } else {
             definitions.as_slice()
         };
-        let history_tool_repair =
-            reconcile_historical_tool_declarations(&mut history, history_definitions);
+        let current_turn_tool_calls = current_turn_tool_call_ids(&history, &request.turn_id);
+        let history_tool_repair = reconcile_historical_tool_declarations(
+            &mut history,
+            history_definitions,
+            &request.turn_id,
+        );
         if !history_tool_repair.is_empty() && !reported_historical_tool_repair {
             events
                 .send(TurnEvent::Notice {
@@ -2206,8 +2210,12 @@ async fn run_turn_in_span(
             .map_err(TurnError::Hook)?;
         ensure_prepare_request_tool_subset(&hook_tool_authority, &completion.tools)
             .map_err(TurnError::Hook)?;
-        ensure_historical_tool_declarations(&completion.messages, &completion.tools)
-            .map_err(TurnError::Hook)?;
+        ensure_historical_tool_declarations(
+            &completion.messages,
+            &completion.tools,
+            &current_turn_tool_calls,
+        )
+        .map_err(TurnError::Hook)?;
         let runtime_sections = agent.runtime_prompt_policy.sections(
             completion.tools.iter().map(|tool| tool.name.as_str()),
             !request.dynamic_context.is_empty(),
@@ -4937,14 +4945,18 @@ impl HistoricalToolFallbackReason {
 fn reconcile_historical_tool_declarations(
     history: &mut [MessageWithParts],
     definitions: &[ToolDefinition],
+    current_turn_id: &str,
 ) -> HistoricalToolDeclarationRepair {
+    let current_turn_prefix = format!("msg_{current_turn_id}_");
     let available = definitions
         .iter()
         .map(|definition| (definition.id.as_str(), definition.schema_identity()))
         .collect::<BTreeMap<_, _>>();
     let mut repair = HistoricalToolDeclarationRepair::default();
     for message in history {
-        if message.info.role != MessageRole::Assistant {
+        if message.info.role != MessageRole::Assistant
+            || message.info.id.starts_with(&current_turn_prefix)
+        {
             continue;
         }
         for part in &mut message.parts {
@@ -6074,6 +6086,7 @@ fn ensure_prepare_request_tool_subset(
 fn ensure_historical_tool_declarations(
     messages: &[Message],
     tools: &[ToolSchema],
+    current_turn_call_ids: &BTreeSet<String>,
 ) -> Result<(), String> {
     let available = tools
         .iter()
@@ -6083,7 +6096,9 @@ fn ensure_historical_tool_declarations(
         .iter()
         .flat_map(|message| message.content.iter())
         .filter_map(|block| match block {
-            RequestContentBlock::ToolUse { name, .. } if !available.contains(name.as_str()) => {
+            RequestContentBlock::ToolUse { id, name, .. }
+                if !current_turn_call_ids.contains(id) && !available.contains(name.as_str()) =>
+            {
                 Some(name.as_str())
             }
             _ => None,
@@ -6102,6 +6117,23 @@ fn ensure_historical_tool_declarations(
             .collect::<Vec<_>>()
             .join(", ")
     ))
+}
+
+fn current_turn_tool_call_ids(
+    history: &[MessageWithParts],
+    current_turn_id: &str,
+) -> BTreeSet<String> {
+    let prefix = format!("msg_{current_turn_id}_");
+    history
+        .iter()
+        .filter(|message| {
+            message.info.role == MessageRole::Assistant && message.info.id.starts_with(&prefix)
+        })
+        .flat_map(|message| message.parts.iter())
+        .filter(|part| part.kind == PartKind::Tool)
+        .filter_map(|part| part.data.get("callID").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn hook_messages(history: &[MessageWithParts]) -> Vec<HookMessageWithParts> {
@@ -6988,7 +7020,7 @@ mod historical_tool_declaration_tests {
         ensure_historical_tool_declarations, reconcile_historical_tool_declarations,
     };
     use serde_json::{Value, json};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use zuno_db::message::MessageRecord;
 
     fn definition(description: &str, required: &[&str]) -> ToolDefinition {
@@ -7049,7 +7081,8 @@ mod historical_tool_declaration_tests {
             serde_json::to_value(current.schema_identity()).expect("schema identity"),
         ));
 
-        let repaired = reconcile_historical_tool_declarations(&mut history, &[current]);
+        let repaired =
+            reconcile_historical_tool_declarations(&mut history, &[current], "turn-current");
 
         assert!(repaired.is_empty());
         assert_eq!(history[0].parts[0].kind, PartKind::Tool);
@@ -7062,6 +7095,7 @@ mod historical_tool_declaration_tests {
         let repaired = reconcile_historical_tool_declarations(
             &mut history,
             &[definition("Run JavaScript in Penpot.", &["code"])],
+            "turn-current",
         );
 
         assert_eq!(repaired.downgraded, 1);
@@ -7080,7 +7114,8 @@ mod historical_tool_declaration_tests {
         )]);
 
         apply_legacy_tool_schema_identities(&mut history, &snapshots);
-        let repaired = reconcile_historical_tool_declarations(&mut history, &[current]);
+        let repaired =
+            reconcile_historical_tool_declarations(&mut history, &[current], "turn-current");
 
         assert!(repaired.is_empty());
         assert_eq!(history[0].parts[0].kind, PartKind::Tool);
@@ -7094,7 +7129,8 @@ mod historical_tool_declaration_tests {
             serde_json::to_value(original.schema_identity()).expect("schema identity");
 
         let mut missing = history(Some(original_identity.clone()));
-        let missing_repair = reconcile_historical_tool_declarations(&mut missing, &[]);
+        let missing_repair =
+            reconcile_historical_tool_declarations(&mut missing, &[], "turn-current");
         assert_eq!(missing_repair.downgraded, 1);
         assert!(missing_repair.unavailable.contains("penpot_execute_code"));
         assert_eq!(missing[0].parts[0].kind, PartKind::Text);
@@ -7108,10 +7144,23 @@ mod historical_tool_declaration_tests {
         let changed_repair = reconcile_historical_tool_declarations(
             &mut changed,
             &[definition("Changed declaration.", &[])],
+            "turn-current",
         );
         assert_eq!(changed_repair.downgraded, 1);
         assert!(changed_repair.changed.contains("penpot_execute_code"));
         assert_eq!(changed[0].parts[0].kind, PartKind::Text);
+    }
+
+    #[test]
+    fn a_current_turn_unknown_tool_keeps_native_protocol_for_its_result_continuation() {
+        let mut history = history(None);
+        history[0].info.id = "msg_turn-current_0001".to_owned();
+        history[0].parts[0].message_id = history[0].info.id.clone();
+
+        let repaired = reconcile_historical_tool_declarations(&mut history, &[], "turn-current");
+
+        assert!(repaired.is_empty());
+        assert_eq!(history[0].parts[0].kind, PartKind::Tool);
     }
 
     #[test]
@@ -7155,10 +7204,18 @@ mod historical_tool_declaration_tests {
             parameters: json!({"type": "object"}),
         };
 
-        ensure_historical_tool_declarations(&messages, &[schema])
+        let no_current_calls = BTreeSet::new();
+        ensure_historical_tool_declarations(&messages, &[schema], &no_current_calls)
             .expect("the retained declaration remains valid");
-        let error = ensure_historical_tool_declarations(&messages, &[])
+        let error = ensure_historical_tool_declarations(&messages, &[], &no_current_calls)
             .expect_err("removing the declaration must fail locally");
         assert!(error.contains("`penpot_execute_code`"), "{error}");
+
+        ensure_historical_tool_declarations(
+            &messages,
+            &[],
+            &BTreeSet::from(["call_history".to_owned()]),
+        )
+        .expect("a current-turn unknown call still needs its native result continuation");
     }
 }

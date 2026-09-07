@@ -47,8 +47,10 @@ Agent 的确切 `tools` 允许列表会立即公开其中点名的 MCP schema；
 Catalog 会把这个会话边界传递到子回合与后台续跑。
 
 每个新工具 part 还会保存准入该调用的 provider-visible schema identity。组装下一次请求时，
-保留历史会与当前 hook 后的工具定义对账：声明一致时保留原生 tool-use/result 协议；工具缺失、
-schema 已变化或持久 identity 无法读取时，只在本次请求中降级为惰性 JSON 文本，并发出
+只对更早 turn 的保留历史与当前 hook 后的工具定义对账；当前 turn 刚产生的调用始终保留原生
+配对，以便未知或被拒绝的调用仍能收到协议完整的 tool result。对更早历史，声明一致时保留原生
+tool-use/result 协议；工具缺失、schema 已变化或持久 identity 无法读取时，只在本次请求中降级
+为惰性 JSON 文本，并发出
 `historical_tool_declaration_repaired` warning。数据库里的原记录不会被改写，宿主也不会为了
 重放而把当前不可执行的旧工具重新宣传成可调用能力。旧版本没有 identity 的记录会先按
 assistant message 从不可变 provider-request Attempt 中恢复确切 hash；若这份证据也不存在，
