@@ -281,6 +281,19 @@ both are client obligations:
   history reaches that shape honestly, so Zuno withholds such an item instead of
   replaying it and failing every later request to that model.
 
+An automatic Goal continuation creates another assistant turn without admitting
+a user message. The standard Responses representation is the real developer
+context that started that continuation, placed between the two assistant output
+runs. Zuno persists only the prompt-receipt reference on the new turn's first
+assistant row and reconstructs the actual post-hook suffix from that receipt;
+older rows recover the reference from their provider-request event. The OpenAI
+and compatible adapters restore it before the later reasoning item. Kiro V3 already routes
+`instructions`/`system`/`developer` input through its native or ordered stateless
+lane, so no private Kiro-only boundary item or token-based turn guessing is
+required. When an old export or compaction summary has no receipt, Zuno withholds
+only the ambiguous capsules and keeps the transcript usable; malformed history
+that survives that repair still fails locally without exposing token bytes.
+
 Zuno's own routing adds a third obligation. `reasoningReplay: "encrypted"` is
 accepted only beside `transport: "openai"` and `surface: "responses"`: a custom
 `baseURL` under the `openai-compatible` transport resolves its surface from
@@ -314,6 +327,9 @@ The remaining 2026-08-28 provider changes do not require Zuno adaptation:
   and in the engine from a streamed sealed item through persistence to an
   ordered multi-item replay, model-switch withholding, envelope expiry, and the
   three durable evidence fields.
+- Autonomous Goal replay tests cover persisted and prompt-receipt-recovered
+  developer boundaries, provider ordering, local fail-closed behavior, and
+  token-redacted diagnostics.
 - A real CLI loopback integration captures title plus a two-request tool loop,
   proves the title is isolated, proves identical foreground metadata, and
   proves the raw identity never enters `instructions` or `input`.

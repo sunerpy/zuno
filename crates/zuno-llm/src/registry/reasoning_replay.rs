@@ -57,7 +57,7 @@
 //! (`crates/zuno-config/src/schema/parse.rs`). A per-model options bag that turns
 //! replay off under a provider that set a max age still constructs here.
 
-use crate::event::RequestContentBlock;
+use crate::event::{Message, RequestContentBlock, Role};
 use crate::registry::Spec;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -243,6 +243,231 @@ pub fn sealed_item_has_following_output(rest: &[RequestContentBlock]) -> bool {
     })
 }
 
+/// A Responses history run cannot pair sealed reasoning with one exact assistant turn.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "Responses history messages {first_message_index}..={last_message_index} carry sealed \
+     reasoning without a user, tool-result, or persisted developer-context boundary"
+)]
+pub struct AmbiguousReasoningReplay {
+    /// First assistant message in the ambiguous run.
+    pub first_message_index: usize,
+    /// Last assistant message in the ambiguous run.
+    pub last_message_index: usize,
+}
+
+/// Capsules withheld because a stateless Responses history lost an exact turn boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AmbiguousReplayWithholding {
+    /// Ambiguous maximal assistant-output groups repaired for this request.
+    pub groups: usize,
+    /// Sealed capsules removed from those groups.
+    pub capsules: usize,
+}
+
+#[derive(Debug, Default)]
+struct ReplayGroup {
+    start: Option<usize>,
+    last: usize,
+    messages: usize,
+    sealed: bool,
+    first_envelope: Option<String>,
+    distinct_envelopes: bool,
+    invalid_envelope: bool,
+}
+
+impl ReplayGroup {
+    fn observe(&mut self, index: usize, message: &Message) {
+        let output = assistant_emits_responses_output(message);
+        let envelopes = replayable_envelopes(message);
+        if !output && envelopes.is_empty() {
+            return;
+        }
+        self.start.get_or_insert(index);
+        self.last = index;
+        self.messages = self.messages.saturating_add(1);
+        for envelope in envelopes {
+            self.sealed = true;
+            if envelope.is_empty() {
+                self.invalid_envelope = true;
+            }
+            match self.first_envelope.as_deref() {
+                None => self.first_envelope = Some(envelope.to_owned()),
+                Some(first) if first != envelope => self.distinct_envelopes = true,
+                Some(_) => {}
+            }
+        }
+    }
+
+    fn take_ambiguous(&mut self) -> Option<(usize, usize)> {
+        let ambiguous =
+            self.sealed && (self.messages > 1 || self.distinct_envelopes || self.invalid_envelope);
+        let range = ambiguous.then_some((self.start?, self.last));
+        *self = Self::default();
+        range
+    }
+}
+
+fn assistant_emits_responses_output(message: &Message) -> bool {
+    message.content.iter().any(|block| {
+        matches!(
+            block,
+            RequestContentBlock::Text { .. }
+                | RequestContentBlock::ResourceLink { .. }
+                | RequestContentBlock::ToolUse { .. }
+        )
+    })
+}
+
+fn replayable_envelopes(message: &Message) -> Vec<&str> {
+    message
+        .content
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            let RequestContentBlock::ProviderEncryptedReasoning {
+                encrypted_content: Some(envelope),
+                ..
+            } = block
+            else {
+                return None;
+            };
+            sealed_item_has_following_output(&message.content[index + 1..])
+                .then_some(envelope.as_str())
+        })
+        .collect()
+}
+
+fn tool_emits_responses_boundary(message: &Message) -> bool {
+    message
+        .content
+        .iter()
+        .any(|block| matches!(block, RequestContentBlock::ToolResult { .. }))
+}
+
+fn has_preceding_developer_boundary(message: &Message) -> bool {
+    message
+        .preceding_developer_context
+        .iter()
+        .any(|context| !context.trim().is_empty())
+}
+
+fn ambiguous_replay_groups(messages: &[Message]) -> Vec<(usize, usize)> {
+    let mut groups = Vec::new();
+    let mut group = ReplayGroup::default();
+    let mut system_claimed_as_instructions = false;
+    for (index, message) in messages.iter().enumerate() {
+        if has_preceding_developer_boundary(message)
+            && let Some(range) = group.take_ambiguous()
+        {
+            groups.push(range);
+        }
+        match message.role {
+            Role::Assistant => group.observe(index, message),
+            Role::System if !system_claimed_as_instructions => {
+                system_claimed_as_instructions = true;
+            }
+            Role::System | Role::User => {
+                if let Some(range) = group.take_ambiguous() {
+                    groups.push(range);
+                }
+            }
+            Role::Tool if tool_emits_responses_boundary(message) => {
+                if let Some(range) = group.take_ambiguous() {
+                    groups.push(range);
+                }
+            }
+            Role::Tool => {}
+        }
+    }
+    if let Some(range) = group.take_ambiguous() {
+        groups.push(range);
+    }
+    groups
+}
+
+/// Validate that every sealed Responses replay belongs to one exact assistant turn.
+///
+/// Responses represents history as a flat item list. Adjacent assistant messages become
+/// one run unless a real user/tool item or the later message's persisted developer context
+/// separates them. A replay token is sealed against one run's complete output fingerprint,
+/// so sending it across an unmarked message boundary is always invalid. One message may
+/// carry repeated copies of the same token, but two distinct tokens inside one message are
+/// equally ambiguous and fail locally.
+///
+/// The error reports message indexes only. Opaque replay tokens are never rendered or
+/// logged.
+pub fn validate_responses_replay_boundaries(
+    messages: &[Message],
+) -> Result<(), AmbiguousReasoningReplay> {
+    if let Some((first_message_index, last_message_index)) =
+        ambiguous_replay_groups(messages).into_iter().next()
+    {
+        return Err(AmbiguousReasoningReplay {
+            first_message_index,
+            last_message_index,
+        });
+    }
+    Ok(())
+}
+
+/// Remove sealed capsules from replay groups whose original input boundary is unavailable.
+///
+/// Text, tool calls, and real tool results remain unchanged. This is the recovery path
+/// for old exports, compaction summaries, or damaged prompt-receipt history: quality
+/// degrades for those turns, but the session remains usable and no opaque token is guessed.
+#[must_use]
+pub fn withhold_ambiguous_responses_replay(messages: &mut [Message]) -> AmbiguousReplayWithholding {
+    let groups = ambiguous_replay_groups(messages);
+    let mut result = AmbiguousReplayWithholding {
+        groups: groups.len(),
+        capsules: 0,
+    };
+    for (start, end) in groups {
+        for message in &mut messages[start..=end] {
+            message.content.retain(|block| {
+                let sealed = matches!(
+                    block,
+                    RequestContentBlock::ProviderEncryptedReasoning {
+                        encrypted_content: Some(_),
+                        ..
+                    }
+                );
+                if sealed {
+                    result.capsules = result.capsules.saturating_add(1);
+                }
+                !sealed
+            });
+        }
+    }
+    result
+}
+
+/// Whether the final Responses item emitted by this history is assistant output.
+#[must_use]
+pub fn responses_history_ends_in_assistant_output(messages: &[Message]) -> bool {
+    let mut system_claimed_as_instructions = false;
+    let mut assistant_output = false;
+    for message in messages {
+        if has_preceding_developer_boundary(message) {
+            assistant_output = false;
+        }
+        match message.role {
+            Role::Assistant if assistant_emits_responses_output(message) => {
+                assistant_output = true;
+            }
+            Role::Assistant => {}
+            Role::System if !system_claimed_as_instructions => {
+                system_claimed_as_instructions = true;
+            }
+            Role::System | Role::User => assistant_output = false,
+            Role::Tool if tool_emits_responses_boundary(message) => assistant_output = false,
+            Role::Tool => {}
+        }
+    }
+    assistant_output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +601,251 @@ mod tests {
         );
         let policy = ReasoningReplayPolicy::from_spec(&spec).expect("spec options parse");
         assert!(policy.requests_encrypted());
+    }
+
+    fn capsule(token: &str) -> RequestContentBlock {
+        RequestContentBlock::ProviderEncryptedReasoning {
+            id: format!("rs_{token}"),
+            summary: Vec::new(),
+            encrypted_content: Some(token.to_owned()),
+            status: None,
+        }
+    }
+
+    fn assistant(token: &str, text: &str) -> Message {
+        Message::from_content(
+            Role::Assistant,
+            vec![
+                capsule(token),
+                RequestContentBlock::Text {
+                    text: text.to_owned(),
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn adjacent_sealed_assistant_messages_require_a_real_boundary() {
+        let messages = vec![
+            assistant("token-a", "first"),
+            assistant("token-b", "second"),
+        ];
+
+        assert_eq!(
+            validate_responses_replay_boundaries(&messages),
+            Err(AmbiguousReasoningReplay {
+                first_message_index: 0,
+                last_message_index: 1
+            })
+        );
+    }
+
+    #[test]
+    fn an_unrecoverable_boundary_withholds_capsules_and_preserves_output() {
+        let mut messages = vec![
+            assistant("token-a", "first"),
+            Message::from_content(
+                Role::Assistant,
+                vec![RequestContentBlock::SignedThinking {
+                    thinking: "history only".to_owned(),
+                    signature: "signature".to_owned(),
+                }],
+            ),
+            assistant("token-b", "second"),
+        ];
+
+        assert_eq!(
+            withhold_ambiguous_responses_replay(&mut messages),
+            AmbiguousReplayWithholding {
+                groups: 1,
+                capsules: 2
+            }
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .filter_map(|block| match block {
+                    RequestContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        validate_responses_replay_boundaries(&messages)
+            .expect("the degraded history remains sendable");
+    }
+
+    #[test]
+    fn a_compaction_summary_without_a_receipt_degrades_instead_of_blocking() {
+        let mut messages = vec![
+            assistant("token-a", "answer before compaction"),
+            Message::new(Role::Assistant, "compaction summary"),
+        ];
+
+        assert_eq!(
+            withhold_ambiguous_responses_replay(&mut messages),
+            AmbiguousReplayWithholding {
+                groups: 1,
+                capsules: 1
+            }
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .filter_map(|block| match block {
+                    RequestContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["answer before compaction", "compaction summary"]
+        );
+    }
+
+    #[test]
+    fn persisted_developer_context_separates_autonomous_assistant_turns() {
+        let messages = vec![
+            assistant("token-a", "first"),
+            assistant("token-b", "second").with_preceding_developer_context(vec![
+                "Continue the active Goal from durable state.".to_owned(),
+            ]),
+        ];
+
+        validate_responses_replay_boundaries(&messages)
+            .expect("the actual developer input restores the turn boundary");
+    }
+
+    #[test]
+    fn a_tool_result_is_already_a_responses_turn_boundary() {
+        let mut messages = vec![
+            Message::from_content(
+                Role::Assistant,
+                vec![
+                    capsule("token-a"),
+                    RequestContentBlock::ToolUse {
+                        id: "call_1".to_owned(),
+                        name: "inspect".to_owned(),
+                        input: json!({}),
+                        raw_arguments: Some("{}".to_owned()),
+                        thought_signature: None,
+                    },
+                ],
+            ),
+            Message::from_content(
+                Role::Tool,
+                vec![RequestContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_owned(),
+                    content: "done".to_owned(),
+                    is_error: Some(false),
+                }],
+            ),
+            assistant("token-b", "second"),
+        ];
+
+        validate_responses_replay_boundaries(&messages)
+            .expect("the real function_call_output separates the turns");
+        assert_eq!(
+            withhold_ambiguous_responses_replay(&mut messages),
+            AmbiguousReplayWithholding::default()
+        );
+    }
+
+    #[test]
+    fn one_assistant_message_cannot_carry_two_distinct_replay_tokens() {
+        let messages = vec![Message::from_content(
+            Role::Assistant,
+            vec![
+                capsule("token-a"),
+                RequestContentBlock::Text {
+                    text: "first".to_owned(),
+                },
+                capsule("token-b"),
+                RequestContentBlock::Text {
+                    text: "second".to_owned(),
+                },
+            ],
+        )];
+
+        assert_eq!(
+            validate_responses_replay_boundaries(&messages),
+            Err(AmbiguousReasoningReplay {
+                first_message_index: 0,
+                last_message_index: 0
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_replay_token_is_repaired_before_a_provider_can_send_it() {
+        let mut messages = vec![assistant("", "answer")];
+
+        assert_eq!(
+            validate_responses_replay_boundaries(&messages),
+            Err(AmbiguousReasoningReplay {
+                first_message_index: 0,
+                last_message_index: 0
+            })
+        );
+        assert_eq!(
+            withhold_ambiguous_responses_replay(&mut messages),
+            AmbiguousReplayWithholding {
+                groups: 1,
+                capsules: 1
+            }
+        );
+        validate_responses_replay_boundaries(&messages)
+            .expect("the empty token must be removed locally");
+    }
+
+    #[test]
+    fn repeated_metadata_for_one_replay_token_remains_valid() {
+        let messages = vec![Message::from_content(
+            Role::Assistant,
+            vec![
+                capsule("token-a"),
+                RequestContentBlock::Text {
+                    text: "first".to_owned(),
+                },
+                capsule("token-a"),
+                RequestContentBlock::Text {
+                    text: "second".to_owned(),
+                },
+            ],
+        )];
+
+        validate_responses_replay_boundaries(&messages)
+            .expect("one assistant turn may repeat the same opaque token");
+    }
+
+    #[test]
+    fn only_real_responses_items_change_the_terminal_history_class() {
+        let mut messages = vec![Message::new(Role::System, "system")];
+        assert!(!responses_history_ends_in_assistant_output(&messages));
+
+        messages.push(Message::from_content(
+            Role::Assistant,
+            vec![RequestContentBlock::SignedThinking {
+                thinking: "not on Responses".to_owned(),
+                signature: "sig".to_owned(),
+            }],
+        ));
+        assert!(!responses_history_ends_in_assistant_output(&messages));
+
+        messages.push(Message::new(Role::Assistant, "answer"));
+        assert!(responses_history_ends_in_assistant_output(&messages));
+
+        messages.push(Message::from_content(Role::Tool, Vec::new()));
+        assert!(responses_history_ends_in_assistant_output(&messages));
+
+        messages.push(Message::from_content(
+            Role::Tool,
+            vec![RequestContentBlock::ToolResult {
+                tool_use_id: "call_1".to_owned(),
+                content: "done".to_owned(),
+                is_error: Some(false),
+            }],
+        ));
+        assert!(!responses_history_ends_in_assistant_output(&messages));
     }
 }

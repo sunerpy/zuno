@@ -897,6 +897,26 @@ same sequence, each envelope immediately before the output it explains. That is
 what a sealing endpoint validates: a reordered or summary-only replay is refused
 on the wire.
 
+An automatic Goal continuation is also a new provider turn, even when no new user
+message exists. Zuno persists the prompt-receipt reference on the first assistant
+row of that turn, not another copy of the prompt. If two assistant responses would
+otherwise be adjacent in Responses `input`, both Responses adapters restore the
+receipt's actual post-hook developer items between them before replaying the later
+reasoning envelope. Rows written by older releases recover the same receipt
+through the durable
+`assistantMessageID -> promptReceiptID -> actualProviderProjection.developer`
+chain, falling back to `providerProjection` only when no hook changed the prompt.
+Runtime-policy sections are removed from that receipt prefix, so only the original
+turn context, memory, and request-hook context become the historical boundary. No
+user message or fake tool result is manufactured.
+
+Compaction summaries and imported old exports may legitimately have no receipt.
+For those histories Zuno withholds only the sealed capsules in the ambiguous
+assistant-output group while preserving text, tool calls, and real tool results.
+The session remains usable at reduced reasoning continuity. Both Responses
+providers retain a final local validator, so a malformed group that escapes the
+shared repair fails with message indexes and never renders opaque token bytes.
+
 Replay is scoped, and the scope is enforced while the request is assembled, not
 when the row is written. An envelope is replayed only to the catalog provider and
 model recorded on the assistant message that produced it, and only while it is
@@ -907,12 +927,17 @@ and Council requests run on other models and receive no envelope at all, which
 also keeps the compaction transcript free of provider state.
 
 Each foreground `session.provider.request` event records `reasoningReplay`,
-`replayedReasoningCapsules`, and `withheldReasoningCapsules`. Those three fields
+`replayedReasoningCapsules`, `withheldReasoningCapsules`, and
+`restoredReasoningReplayBoundaries`, plus
+`withheldAmbiguousReasoningCapsules`. Those fields
 are the evidence that replay is working: a session whose second and later requests
 report zero replayed capsules is not replaying, whatever the endpoint claims. The
 replayed count is what the adapter puts on the wire, so an envelope the pairing
 rule drops is reported under the withheld count and never as a replay. The
-request event records those counts only, never the envelope.
+restored-boundary count names older assistant rows whose exact developer suffix
+was rebuilt from prompt receipts for that request. The ambiguous count is the
+subset withheld because no exact boundary survived. The request event records
+counts only, never the envelope or developer text.
 
 The envelope itself is opaque provider ciphertext held as session content: it
 lives in the reasoning part's `metadata.providerReasoning`, is returned by the

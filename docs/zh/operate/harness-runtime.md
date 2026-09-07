@@ -102,9 +102,13 @@ CLI 启动。无法抓取的远程规则来源使用同一类非致命 notice，
 
 封装信封属于持久状态，因此一个步骤会被持久化成带位置的 part 账本，而不是一段文本加上尾部堆积的工具调用。每个 part id 携带它在流中的位置 `prt_{turn}_{step}_{position}_{kind}`，且同一步骤的所有 part 共享 assistant 消息的创建时间，于是水合出来的顺序就是 provider 的产出顺序。一个先推理、写文本、调用工具、再推理、再调用第二个工具的步骤，会按同样的次序重放，每个信封都紧挨在它所解释的输出之前。这正是封装端点会校验的内容：顺序被打乱或只回送摘要都会在链路上被拒绝。
 
+自动 Goal continuation 即使没有新的用户消息，也属于一个新的 provider turn。Zuno 会在该 turn 的第一条 assistant 行上只保存 prompt receipt 引用，而不是再复制一份提示词；当两个 assistant 响应在 Responses `input` 中本来会直接相邻时，两个 Responses adapter 会先把 receipt 中 hook 后实际发送的 developer 项恢复到中间，再重放后一轮的推理信封。旧版本写入的行会沿持久化的 `assistantMessageID -> promptReceiptID -> actualProviderProjection.developer` 证据链恢复同一 receipt；只有没有 hook 改写时才回退到 `providerProjection`。恢复时会剥离稳定的 runtime policy 前缀，因此历史边界只包含原始 turn context、memory 与 request hook context。这个过程不会伪造 user 消息或工具结果。
+
+压缩摘要和旧 session export/import 可能确实没有 receipt。此时 Zuno 只扣留歧义 assistant 输出组中的封装 capsule，保留文本、工具调用和真实工具结果，让会话以较低推理连续性继续。两个 Responses provider 仍保留最后一道本地校验；若共享修复后仍存在畸形分组，它只报告消息索引，不会渲染不透明 token。
+
 重放是有作用域的，而且作用域在组装请求时生效，不是在写行时生效。信封只会被重放给产出它的那条 assistant 消息上记录的目录 provider 与模型，并且只在它比 `reasoningReplayMaxAge` 更新时重放。其他情况下它只在这一次请求的内存里被扣留，持久行保留原密文，因此换回原模型即可恢复重放。标题、摘要、压缩、反思与 Council 请求运行在其他模型上，完全不会收到信封，这也让压缩转录中不含 provider 状态。
 
-每个前台 `session.provider.request` 事件都会记录 `reasoningReplay`、`replayedReasoningCapsules` 与 `withheldReasoningCapsules`。这三个字段就是重放确实生效的依据：如果一个会话从第二个请求起报告的重放信封数仍然是零，那它就没有在重放，无论端点怎么声称。重放计数就是 adapter 真正放到链路上的数量，因此被配对规则丢弃的信封会计入被扣留数，绝不会算作一次重放。请求事件只记录这些计数，不记录信封本身。
+每个前台 `session.provider.request` 事件都会记录 `reasoningReplay`、`replayedReasoningCapsules`、`withheldReasoningCapsules`、`restoredReasoningReplayBoundaries` 与 `withheldAmbiguousReasoningCapsules`。这些字段就是重放确实生效的依据：如果一个会话从第二个请求起报告的重放信封数仍然是零，那它就没有在重放，无论端点怎么声称。重放计数就是 adapter 真正放到链路上的数量，因此被配对规则丢弃的信封会计入被扣留数，绝不会算作一次重放。恢复边界数表示本次请求从 prompt receipt 重建了多少条旧 assistant 行的准确 developer 后缀；歧义扣留数是因边界无法证明而降级的子集。请求事件只记录计数，不记录信封或 developer 文本。
 
 信封本身是不透明的 provider 密文，作为会话内容保存：它存放在推理 part 的 `metadata.providerReasoning` 中，会由 HTTP messages 端点返回，还会随一个完整携带密文的流事件转发：服务器 SSE 流上的类型是 `provider.reasoning.item`，`zuno run --json` 打印的是 `provider_reasoning_item`，两者的密文都在 `encryptedContent` 字段里。它是后续请求需要的持久状态，因此不会被脱敏；能读取某个会话的消息或事件流，就等于能读取它的信封。
 

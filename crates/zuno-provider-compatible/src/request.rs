@@ -253,11 +253,28 @@ impl RequestBody {
     fn build_responses(&self, quirks: &Quirks) -> Value {
         let mut input = Vec::new();
         let mut instructions = None;
+        let mut wire_ends_in_assistant_output = false;
         for message in &self.messages {
+            if wire_ends_in_assistant_output && message.role == Role::Assistant {
+                let boundary = message
+                    .preceding_developer_context
+                    .iter()
+                    .filter(|content| !content.trim().is_empty())
+                    .map(|content| json!({"role": "developer", "content": content}))
+                    .collect::<Vec<_>>();
+                if !boundary.is_empty() {
+                    input.extend(boundary);
+                    wire_ends_in_assistant_output = false;
+                }
+            }
             if message.role == Role::System && instructions.is_none() {
                 instructions = Some(joined_text(message));
             } else {
-                input.extend(translate_response_message(message, quirks));
+                let items = translate_response_message(message, quirks);
+                if !items.is_empty() {
+                    wire_ends_in_assistant_output = message.role == Role::Assistant;
+                    input.extend(items);
+                }
             }
         }
         input.extend(
@@ -829,6 +846,23 @@ mod tests {
                 },
                 RequestContentBlock::Text {
                     text: "It is sunny.".to_owned(),
+                },
+            ],
+        )
+    }
+
+    fn sealed_assistant(token: &str, text: &str) -> Message {
+        Message::from_content(
+            Role::Assistant,
+            vec![
+                RequestContentBlock::ProviderEncryptedReasoning {
+                    id: format!("rs_{token}"),
+                    summary: Vec::new(),
+                    encrypted_content: Some(token.to_owned()),
+                    status: None,
+                },
+                RequestContentBlock::Text {
+                    text: text.to_owned(),
                 },
             ],
         )
@@ -1570,6 +1604,44 @@ mod tests {
         assert!(
             built["input"][0].get("id").is_none(),
             "the endpoint owns item identifiers, not Zuno: {built}"
+        );
+    }
+
+    #[test]
+    fn autonomous_assistant_turns_restore_their_real_developer_boundary() {
+        let body = RequestBody::new(
+            "claude-opus-5",
+            vec![
+                sealed_assistant("token-a", "first"),
+                Message::from_content(Role::Tool, Vec::new()),
+                sealed_assistant("token-b", "second").with_preceding_developer_context(vec![
+                    "Continue the active Goal from durable state.".to_owned(),
+                ]),
+            ],
+        )
+        .build(&sealing_responses_quirks());
+        let input = body["input"].as_array().expect("input array");
+
+        assert_eq!(
+            input
+                .iter()
+                .map(|item| {
+                    item["type"]
+                        .as_str()
+                        .map_or_else(|| format!("role:{}", item["role"]), ToOwned::to_owned)
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                "reasoning",
+                "role:\"assistant\"",
+                "role:\"developer\"",
+                "reasoning",
+                "role:\"assistant\""
+            ]
+        );
+        assert_eq!(
+            input[2]["content"],
+            "Continue the active Goal from durable state."
         );
     }
 

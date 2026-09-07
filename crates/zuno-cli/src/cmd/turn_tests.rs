@@ -11037,6 +11037,7 @@ fn generation_body(
             content: vec![zuno_llm::event::RequestContentBlock::Text {
                 text: "Say hello.".to_owned(),
             }],
+            preceding_developer_context: Vec::new(),
         }],
     )
     .with_tools(vec![zuno_llm::registry::ToolSchema {

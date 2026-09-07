@@ -197,6 +197,25 @@ impl AgentModelResolver for PricedResolver {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct EncryptedReplayResolver;
+
+impl AgentModelResolver for EncryptedReplayResolver {
+    fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
+        FakeResolver.resolve_agent(requested)
+    }
+
+    fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
+        (provider_id == "fake" && model_id == "fake-model").then(|| {
+            ResolvedModel::new(
+                Spec::new("fake").with_option("reasoningReplay", json!("encrypted")),
+                "fake-model",
+                ApiSurface::Responses,
+            )
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct GoalAliasResolver;
 
 impl AgentModelResolver for GoalAliasResolver {
@@ -2446,6 +2465,67 @@ async fn loop_routes_dynamic_goal_and_memory_outside_user_history() {
         !dynamic_text_leaked,
         "dynamic policy leaked into replayable history"
     );
+}
+
+#[tokio::test]
+async fn autonomous_replay_turn_persists_only_its_prompt_receipt_reference() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_receipt_user", 10, "continue");
+    put_assistant_text(
+        &connection,
+        "msg_receipt_prior",
+        20,
+        "msg_receipt_user",
+        "prior answer",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta("done".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = EncryptedReplayResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        RunTurnRequest::new(
+            SESSION_ID,
+            "turn-receipt-boundary",
+            DynamicContext::new("ACTIVE GOAL").with_memory("RESIDENT MEMORY"),
+        ),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+    outcome.expect("autonomous replay turn succeeds");
+
+    let message = MessageStore::new(&connection)
+        .message("msg_turn-receipt-boundary_0001")
+        .expect("assistant message");
+    assert!(
+        message
+            .data
+            .get("precedingDeveloperPromptReceiptID")
+            .and_then(Value::as_str)
+            .is_some(),
+        "the boundary must point at its exact durable prompt receipt"
+    );
+    assert!(
+        message.data.get("precedingDeveloperContext").is_none(),
+        "developer prompt text must not be copied into ordinary message metadata"
+    );
+    let stored = Value::Object(message.data).to_string();
+    assert!(!stored.contains("ACTIVE GOAL"), "{stored}");
+    assert!(!stored.contains("RESIDENT MEMORY"), "{stored}");
 }
 
 #[tokio::test]

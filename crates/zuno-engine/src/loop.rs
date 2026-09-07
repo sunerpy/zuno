@@ -40,7 +40,8 @@ use zuno_llm::event::{
 };
 use zuno_llm::registry::{
     ApiSurface, ProviderRegistry, ProviderRequestContext, ProviderSessionIdentity,
-    ReasoningReplayPolicy, Spec, ToolSchema,
+    ReasoningReplayPolicy, Spec, ToolSchema, responses_history_ends_in_assistant_output,
+    withhold_ambiguous_responses_replay,
 };
 use zuno_llm::sse::{StreamLimits, append_tool_input};
 use zuno_observability::span;
@@ -2096,6 +2097,7 @@ async fn run_turn_in_span(
     let mut tool_calls_dispatched = 0_u32;
     let mut last_assistant_id = None;
     let mut prompt_cache: Option<PromptCache<ToolDefinition>> = None;
+    let mut historical_developer_contexts: Option<HistoricalDeveloperContexts> = None;
     let mut prompt_traces = PromptTraceSet::default();
     let mut unresolved_tool_failures = BTreeMap::<String, ToolFailureRecovery>::new();
     let mut resolved_attachments = ResolvedAttachments::new();
@@ -2203,6 +2205,20 @@ async fn run_turn_in_span(
             }
         } else {
             ReasoningReplayScope::None
+        };
+        let restored_reasoning_replay_boundaries = if reasoning_replay.requests_encrypted() {
+            let historical_developer_contexts =
+                historical_developer_contexts.get_or_insert_with(BTreeMap::new);
+            let recovered = load_historical_developer_contexts(
+                context.connection,
+                &request.session_id,
+                &history,
+                historical_developer_contexts,
+            )?;
+            historical_developer_contexts.extend(recovered);
+            restore_historical_developer_contexts(&mut history, historical_developer_contexts)
+        } else {
+            0
         };
         let withheld_reasoning_capsules = withhold_unreplayable_capsules(&mut history, scope);
 
@@ -2373,6 +2389,11 @@ async fn run_turn_in_span(
                 .await?;
             reported_historical_tool_repair = true;
         }
+        let ambiguous_replay = if reasoning_replay.requests_encrypted() {
+            withhold_ambiguous_responses_replay(&mut completion.messages)
+        } else {
+            Default::default()
+        };
         let runtime_sections = agent.runtime_prompt_policy.sections(
             completion.tools.iter().map(|tool| tool.name.as_str()),
             !request.dynamic_context.is_empty(),
@@ -2393,6 +2414,12 @@ async fn run_turn_in_span(
             .developer_context
             .extend(runtime_context.iter().cloned());
         completion.developer_context.extend(hook_developer_context);
+        let persist_preceding_developer_receipt = step == 1
+            && reasoning_replay.requests_encrypted()
+            && completion.developer_context[runtime_context.len()..]
+                .iter()
+                .any(|context| !context.trim().is_empty())
+            && responses_history_ends_in_assistant_output(&completion.messages);
         completion
             .validate_tool_arguments()
             .map_err(ProviderError::fatal)?;
@@ -2496,6 +2523,13 @@ async fn run_turn_in_span(
             prompt_traces.remember(actual_projection, receipt.id.clone());
             receipt.id
         };
+        if persist_preceding_developer_receipt {
+            assistant.data.insert(
+                PRECEDING_DEVELOPER_RECEIPT_KEY.to_owned(),
+                Value::String(prompt_receipt_id.clone()),
+            );
+            MessageStore::new(context.connection).put_message(&assistant)?;
+        }
         let message_count = completion
             .messages
             .len()
@@ -2532,7 +2566,10 @@ async fn run_turn_in_span(
                 reasoning_replay,
                 replayed_reasoning_capsules: capsules.replayed,
                 withheld_reasoning_capsules: withheld_reasoning_capsules
-                    .saturating_add(capsules.unpaired),
+                    .saturating_add(capsules.unpaired)
+                    .saturating_add(ambiguous_replay.capsules),
+                withheld_ambiguous_reasoning_capsules: ambiguous_replay.capsules,
+                restored_reasoning_replay_boundaries,
                 assistant_message_id: &assistant_id,
                 orchestration_snapshot: &orchestration_snapshot,
                 request_context: completion
@@ -4034,6 +4071,191 @@ fn non_empty_field(part: &PartRecord, field: &str) -> Option<String> {
 }
 
 type LegacyToolSchemaSnapshots = BTreeMap<String, BTreeMap<String, ToolSchemaIdentity>>;
+type HistoricalDeveloperContexts = BTreeMap<String, Option<Vec<String>>>;
+
+/// Recover volatile developer items only for assistant rows that need a wire boundary.
+///
+/// New rows point directly at their prompt receipt. Older rows recover that reference
+/// from the provider-request event keyed by `assistantMessageID`. Runtime policy sections
+/// occupy the receipt's stable developer prefix; the remaining actual (post-hook) suffix
+/// is the turn context, memory, and request-hook context that started the response.
+fn load_historical_developer_contexts(
+    connection: &Connection,
+    session_id: &str,
+    history: &[MessageWithParts],
+    known: &HistoricalDeveloperContexts,
+) -> Result<HistoricalDeveloperContexts, DbError> {
+    let targets = historical_developer_boundary_targets(history)
+        .into_iter()
+        .filter(|message_id| !known.contains_key(message_id));
+    let mut contexts = BTreeMap::new();
+    for message_id in targets {
+        let stored_receipt = history
+            .iter()
+            .find(|message| message.info.id == message_id)
+            .and_then(|message| {
+                message
+                    .info
+                    .data
+                    .get(PRECEDING_DEVELOPER_RECEIPT_KEY)
+                    .and_then(Value::as_str)
+            });
+        let receipt_id = match stored_receipt {
+            Some(receipt_id) => Some(receipt_id.to_owned()),
+            None => historical_prompt_receipt_id(connection, session_id, &message_id)?,
+        };
+        let context = match receipt_id {
+            Some(receipt_id) => match prompt_event_data(connection, session_id, &receipt_id)? {
+                Some(raw_prompt) => {
+                    let prompt = serde_json::from_str::<Value>(&raw_prompt).map_err(|source| {
+                        DbError::Decode {
+                            table: "event".to_owned(),
+                            source,
+                        }
+                    })?;
+                    historical_developer_context_from_prompt(&prompt)
+                }
+                None => None,
+            },
+            None => None,
+        };
+        contexts.insert(message_id, context);
+    }
+    Ok(contexts)
+}
+
+fn historical_prompt_receipt_id(
+    connection: &Connection,
+    session_id: &str,
+    message_id: &str,
+) -> Result<Option<String>, DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT json_extract(data, '$.promptReceiptID') \
+             FROM event \
+             WHERE aggregate_id = ?1 \
+             AND type = 'session.provider.request.1' \
+             AND json_extract(data, '$.status') = 'started' \
+             AND json_extract(data, '$.assistantMessageID') = ?2 \
+             AND json_type(data, '$.promptReceiptID') = 'text' \
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .map_err(open::map_error)?;
+    let mut rows = statement
+        .query([session_id, message_id])
+        .map_err(open::map_error)?;
+    rows.next()
+        .map_err(open::map_error)?
+        .map(|row| row.get::<_, String>(0).map_err(open::map_error))
+        .transpose()
+}
+
+fn prompt_event_data(
+    connection: &Connection,
+    session_id: &str,
+    receipt_id: &str,
+) -> Result<Option<String>, DbError> {
+    let mut statement = connection
+        .prepare("SELECT data FROM event WHERE aggregate_id = ?1 AND id = ?2")
+        .map_err(open::map_error)?;
+    let mut rows = statement
+        .query([session_id, receipt_id])
+        .map_err(open::map_error)?;
+    rows.next()
+        .map_err(open::map_error)?
+        .map(|row| row.get::<_, String>(0).map_err(open::map_error))
+        .transpose()
+}
+
+fn historical_developer_context_from_prompt(prompt: &Value) -> Option<Vec<String>> {
+    let developer = prompt
+        .pointer("/actualProviderProjection/developer")
+        .or_else(|| prompt.pointer("/providerProjection/developer"))?
+        .as_array()?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    let runtime = prompt
+        .get("sections")?
+        .as_array()?
+        .iter()
+        .filter_map(|section| {
+            let section = section.as_object()?;
+            section
+                .get("id")
+                .and_then(Value::as_str)?
+                .starts_with("runtime.")
+                .then(|| section.get("content").and_then(Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    if developer.len() < runtime.len()
+        || !developer
+            .iter()
+            .zip(&runtime)
+            .all(|(actual, expected)| actual == expected)
+    {
+        return None;
+    }
+    let context = developer
+        .into_iter()
+        .skip(runtime.len())
+        .filter(|item| !item.trim().is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    (!context.is_empty()).then_some(context)
+}
+
+fn historical_developer_boundary_targets(history: &[MessageWithParts]) -> BTreeSet<String> {
+    let mut targets = BTreeSet::new();
+    let mut ends_in_assistant_output = false;
+    for stored in history {
+        let mut projected = Vec::new();
+        match stored.info.role {
+            MessageRole::User => append_user_message(&mut projected, stored),
+            MessageRole::Assistant => append_assistant_message(&mut projected, stored),
+        }
+        for message in projected {
+            if message.role == Role::Assistant {
+                if responses_history_ends_in_assistant_output(std::slice::from_ref(&message)) {
+                    if ends_in_assistant_output {
+                        targets.insert(stored.info.id.clone());
+                    }
+                    ends_in_assistant_output = true;
+                }
+            } else {
+                ends_in_assistant_output = false;
+            }
+        }
+    }
+    targets
+}
+
+fn restore_historical_developer_contexts(
+    history: &mut [MessageWithParts],
+    contexts: &HistoricalDeveloperContexts,
+) -> usize {
+    let mut restored = 0_usize;
+    for message in history {
+        if message.info.role != MessageRole::Assistant
+            || message
+                .info
+                .data
+                .contains_key(PRECEDING_DEVELOPER_CONTEXT_KEY)
+        {
+            continue;
+        }
+        let Some(Some(context)) = contexts.get(&message.info.id) else {
+            continue;
+        };
+        message.info.data.insert(
+            PRECEDING_DEVELOPER_CONTEXT_KEY.to_owned(),
+            Value::Array(context.iter().cloned().map(Value::String).collect()),
+        );
+        restored = restored.saturating_add(1);
+    }
+    restored
+}
 
 /// Tool identities recorded by provider requests before tool parts carried them.
 ///
@@ -4393,12 +4615,17 @@ pub(crate) fn map_project_history_owned_with_ids<T>(
         message: Message::new(Role::System, system_prompt),
     })];
     for message in history.drain(tail_index..) {
+        let preceding_developer_context = preceding_developer_context(&message.info.data);
         let message_id = message.info.id;
         let mut messages = Vec::new();
         match message.info.role {
             MessageRole::User => append_user_message_owned(&mut messages, message.parts),
             MessageRole::Assistant => {
-                append_assistant_message_owned(&mut messages, message.parts);
+                append_assistant_message_owned(
+                    &mut messages,
+                    message.parts,
+                    preceding_developer_context,
+                );
             }
         }
         projected.extend(messages.into_iter().map(|message| {
@@ -5537,6 +5764,22 @@ fn historical_tool_result_fallback_text(
     )
 }
 
+/// In-memory hydrated metadata carrying the real developer items that started its turn.
+const PRECEDING_DEVELOPER_CONTEXT_KEY: &str = "precedingDeveloperContext";
+/// Durable assistant metadata pointing at the prompt receipt that owns that context.
+const PRECEDING_DEVELOPER_RECEIPT_KEY: &str = "precedingDeveloperPromptReceiptID";
+
+fn preceding_developer_context(data: &Map<String, Value>) -> Vec<String> {
+    data.get(PRECEDING_DEVELOPER_CONTEXT_KEY)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|context| !context.trim().is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn append_assistant_message(messages: &mut Vec<Message>, message: &MessageWithParts) {
     let mut assistant = Vec::new();
     let mut results = Vec::new();
@@ -5563,14 +5806,21 @@ fn append_assistant_message(messages: &mut Vec<Message>, message: &MessageWithPa
         }
     }
     if !assistant.is_empty() {
-        messages.push(Message::from_content(Role::Assistant, assistant));
+        messages.push(
+            Message::from_content(Role::Assistant, assistant)
+                .with_preceding_developer_context(preceding_developer_context(&message.info.data)),
+        );
     }
     if !results.is_empty() {
         messages.push(Message::from_content(Role::Tool, results));
     }
 }
 
-fn append_assistant_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRecord>) {
+fn append_assistant_message_owned(
+    messages: &mut Vec<Message>,
+    parts: Vec<PartRecord>,
+    preceding_developer_context: Vec<String>,
+) {
     let mut assistant = Vec::new();
     let mut results = Vec::new();
     for mut part in parts {
@@ -5594,7 +5844,10 @@ fn append_assistant_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRe
         }
     }
     if !assistant.is_empty() {
-        messages.push(Message::from_content(Role::Assistant, assistant));
+        messages.push(
+            Message::from_content(Role::Assistant, assistant)
+                .with_preceding_developer_context(preceding_developer_context),
+        );
     }
     if !results.is_empty() {
         messages.push(Message::from_content(Role::Tool, results));
@@ -5603,6 +5856,7 @@ fn append_assistant_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRe
 
 fn append_transformed_message_owned(messages: &mut Vec<Message>, message: HookMessageWithParts) {
     let role = message.info.role;
+    let preceding_developer_context = message.info.preceding_developer_context;
     match role {
         Role::System | Role::User => {
             let start = messages.len();
@@ -5613,7 +5867,11 @@ fn append_transformed_message_owned(messages: &mut Vec<Message>, message: HookMe
         }
         Role::Assistant | Role::Tool => {
             let mut projected = Vec::new();
-            append_assistant_message_owned(&mut projected, message.parts);
+            append_assistant_message_owned(
+                &mut projected,
+                message.parts,
+                preceding_developer_context,
+            );
             messages.extend(
                 projected
                     .into_iter()
@@ -6026,6 +6284,7 @@ fn assistant_message(
         "id": assistant_message_id(&request.turn_id, step),
         "sessionID": request.session_id,
         "role": "assistant",
+        "turnID": request.turn_id,
         "time": { "created": created },
         "parentID": requested.user_message_id,
         "modelID": model.catalog_model_id,
@@ -6128,6 +6387,11 @@ struct ProviderRequestStart<'a> {
     /// minted them, they aged out, or nothing in their message follows them, which is
     /// the one shape a Responses endpoint refuses outright.
     withheld_reasoning_capsules: usize,
+    /// Subset withheld because no exact user/tool/developer boundary survived.
+    withheld_ambiguous_reasoning_capsules: usize,
+    /// Assistant rows from older releases whose exact developer boundary was rebuilt
+    /// from their durable prompt receipt for this request.
+    restored_reasoning_replay_boundaries: usize,
     assistant_message_id: &'a str,
     orchestration_snapshot: &'a AttemptSnapshot,
     request_context: &'a ProviderRequestContext,
@@ -6187,6 +6451,14 @@ fn append_provider_request_started(
         (
             "withheldReasoningCapsules".to_owned(),
             Value::from(start.withheld_reasoning_capsules),
+        ),
+        (
+            "withheldAmbiguousReasoningCapsules".to_owned(),
+            Value::from(start.withheld_ambiguous_reasoning_capsules),
+        ),
+        (
+            "restoredReasoningReplayBoundaries".to_owned(),
+            Value::from(start.restored_reasoning_replay_boundaries),
         ),
     ]);
     if start.request_context.session_identity().is_some() {
@@ -7300,6 +7572,276 @@ const PART_KIND_TOOL: &str = "tool";
 /// be right only for a step that reasons once.
 fn positional_part_id(turn_id: &str, step: u32, position: usize, kind: &str) -> String {
     format!("prt_{turn_id}_{step:04}_{position:04}_{kind}")
+}
+
+#[cfg(test)]
+mod reasoning_replay_boundary_tests {
+    use super::*;
+
+    fn assistant(id: &str, created: i64, token: &str, text: &str) -> MessageWithParts {
+        let info = MessageRecord::from_json(json!({
+            "id": id,
+            "sessionID": "ses_boundary",
+            "role": "assistant",
+            "time": {"created": created},
+            "providerID": "kiro-local",
+            "modelID": "claude-opus-5"
+        }))
+        .expect("assistant info");
+        let reasoning = PartRecord::from_json(
+            json!({
+                "id": format!("prt_{id}_reasoning"),
+                "sessionID": "ses_boundary",
+                "messageID": id,
+                "type": "reasoning",
+                "text": "reasoning",
+                "metadata": {
+                    "providerReasoning": {
+                        "id": format!("rs_{id}"),
+                        "summary": ["reasoning"],
+                        "encryptedContent": token,
+                        "status": null
+                    }
+                },
+                "time": {"start": created, "end": created}
+            }),
+            created,
+        )
+        .expect("reasoning part");
+        let text = PartRecord::from_json(
+            json!({
+                "id": format!("prt_{id}_text"),
+                "sessionID": "ses_boundary",
+                "messageID": id,
+                "type": "text",
+                "text": text,
+                "time": {"start": created, "end": created}
+            }),
+            created,
+        )
+        .expect("text part");
+        MessageWithParts {
+            info,
+            parts: vec![reasoning, text],
+        }
+    }
+
+    #[test]
+    fn a_prompt_receipt_recovers_only_the_dynamic_developer_suffix() {
+        let prompt = json!({
+            "sections": [
+                {"id": "agent.base", "content": "static"},
+                {"id": "runtime.intent", "content": "runtime intent"},
+                {"id": "runtime.execution", "content": "runtime execution"}
+            ],
+            "providerProjection": {
+                "developer": [
+                    "runtime intent",
+                    "runtime execution",
+                    "goal context",
+                    "memory context"
+                ]
+            }
+        });
+
+        assert_eq!(
+            historical_developer_context_from_prompt(&prompt),
+            Some(vec!["goal context".to_owned(), "memory context".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_hook_transformed_receipt_recovers_the_actual_developer_suffix() {
+        let prompt = json!({
+            "sections": [
+                {"id": "runtime.intent", "content": "runtime intent"}
+            ],
+            "providerProjection": {
+                "developer": ["runtime intent", "pre-hook context"]
+            },
+            "actualProviderProjection": {
+                "developer": ["runtime intent", "post-hook context"]
+            }
+        });
+
+        assert_eq!(
+            historical_developer_context_from_prompt(&prompt),
+            Some(vec!["post-hook context".to_owned()])
+        );
+    }
+
+    #[test]
+    fn an_old_goal_continuation_recovers_the_developer_boundary_without_a_user_message() {
+        let mut history = vec![
+            assistant("msg_turn_a_0001", 10, "token-a", "first"),
+            assistant("msg_turn_b_0001", 20, "token-b", "second"),
+        ];
+        let projected = project_history("", &history)
+            .into_iter()
+            .map(|projected| projected.message)
+            .collect::<Vec<_>>();
+        assert!(
+            zuno_llm::registry::validate_responses_replay_boundaries(&projected).is_err(),
+            "the fixture must reproduce the missing-boundary failure"
+        );
+
+        let contexts = BTreeMap::from([(
+            "msg_turn_b_0001".to_owned(),
+            Some(vec![
+                "Continue the active Goal from durable state.".to_owned(),
+            ]),
+        )]);
+        assert_eq!(
+            restore_historical_developer_contexts(&mut history, &contexts),
+            1
+        );
+
+        let projected = project_history("", &history)
+            .into_iter()
+            .map(|projected| projected.message)
+            .collect::<Vec<_>>();
+        let assistants = projected
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .collect::<Vec<_>>();
+        assert_eq!(assistants.len(), 2);
+        assert_eq!(
+            assistants[1].preceding_developer_context,
+            ["Continue the active Goal from durable state."]
+        );
+        zuno_llm::registry::validate_responses_replay_boundaries(&projected)
+            .expect("the recovered developer item separates the sealed turns");
+        assert!(
+            projected.iter().all(|message| message.role != Role::User),
+            "recovery must not fabricate a historical user message"
+        );
+    }
+
+    #[test]
+    fn released_rows_recover_context_through_the_exact_prompt_receipt() {
+        let mut connection =
+            zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open database");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute(
+                "INSERT INTO project \
+                 (id,worktree,vcs,name,icon_url,icon_url_override,icon_color,time_created,\
+                  time_updated,time_initialized,sandboxes,commands) \
+                 VALUES ('prj','/tmp',NULL,NULL,NULL,NULL,NULL,1,1,NULL,'[]',NULL)",
+                [],
+            )
+            .expect("project");
+        connection
+            .execute(
+                "INSERT INTO session \
+                 (id,project_id,slug,directory,title,version,time_created,time_updated) \
+                 VALUES ('ses_boundary','prj','ses_boundary','/tmp','boundary','test',1,1)",
+                [],
+            )
+            .expect("session");
+
+        let prior = assistant("msg_prior_0001", 5, "token-prior", "prior");
+        let stored = assistant("msg_released_0001", 10, "token-old", "answer");
+        let store = MessageStore::new(&connection);
+        for message in [&prior, &stored] {
+            store.put_message(&message.info).expect("message");
+            for part in &message.parts {
+                store.put_part(part).expect("part");
+            }
+        }
+
+        let prompt = append_with_connection(
+            &mut connection,
+            "ses_boundary",
+            NewSessionEvent::new(
+                "session.prompt.assembled",
+                Map::from_iter([
+                    (
+                        "sections".to_owned(),
+                        json!([
+                            {"id": "runtime.intent", "content": "runtime intent"},
+                            {"id": "runtime.execution", "content": "runtime execution"}
+                        ]),
+                    ),
+                    (
+                        "providerProjection".to_owned(),
+                        json!({
+                            "developer": [
+                                "runtime intent",
+                                "runtime execution",
+                                "goal context"
+                            ]
+                        }),
+                    ),
+                ]),
+            )
+            .expect("prompt event"),
+        )
+        .expect("append prompt");
+        append_with_connection(
+            &mut connection,
+            "ses_boundary",
+            NewSessionEvent::new(
+                "session.provider.request",
+                Map::from_iter([
+                    (
+                        "assistantMessageID".to_owned(),
+                        Value::String("msg_released_0001".to_owned()),
+                    ),
+                    (
+                        "promptReceiptID".to_owned(),
+                        Value::String(prompt.id.clone()),
+                    ),
+                    ("status".to_owned(), Value::String("started".to_owned())),
+                ]),
+            )
+            .expect("request event"),
+        )
+        .expect("append request");
+
+        assert_eq!(
+            load_historical_developer_contexts(
+                &connection,
+                "ses_boundary",
+                &[prior, stored],
+                &BTreeMap::new(),
+            )
+            .expect("recover contexts"),
+            BTreeMap::from([(
+                "msg_released_0001".to_owned(),
+                Some(vec!["goal context".to_owned()])
+            )])
+        );
+    }
+
+    #[test]
+    fn an_unavailable_receipt_is_negative_cached_for_the_rest_of_the_turn() {
+        let mut connection =
+            zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open database");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        let history = vec![
+            assistant("msg_missing_a_0001", 10, "token-a", "first"),
+            assistant("msg_missing_b_0001", 20, "token-b", "second"),
+        ];
+
+        let first = load_historical_developer_contexts(
+            &connection,
+            "ses_missing",
+            &history,
+            &BTreeMap::new(),
+        )
+        .expect("first lookup");
+        assert_eq!(
+            first,
+            BTreeMap::from([("msg_missing_b_0001".to_owned(), None)])
+        );
+        assert!(
+            load_historical_developer_contexts(&connection, "ses_missing", &history, &first)
+                .expect("cached lookup")
+                .is_empty(),
+            "an unavailable receipt must not be queried again in the same turn"
+        );
+    }
 }
 
 #[cfg(test)]
