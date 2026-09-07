@@ -134,7 +134,9 @@ pub enum MemoryError {
     #[error(
         "{scope} memory would be at {projected}/{limit} chars after this batch — over the cap. \
          Nothing was written. Remove or shorten entries in the same batch, then retry. \
+         The cap is configurable as `memory.{}` if this store genuinely needs more room. \
          Current entries ({}):{}",
+        scope.char_limit_key(),
         entries.len(),
         numbered(entries)
     )]

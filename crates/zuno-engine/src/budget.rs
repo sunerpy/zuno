@@ -13,10 +13,27 @@ use async_trait::async_trait;
 use std::num::NonZeroU32;
 use std::time::Duration;
 use zuno_error::DbError;
+use zuno_llm::event::PromptAccounting;
 
-/// Token counts attributable to provider requests.
+/// Disjoint token counts attributable to provider requests.
+///
+/// Every bucket counts tokens no other bucket counts, so [`Self::total`] is a plain
+/// sum. That invariant is the whole point of the type: providers disagree about
+/// whether their prompt figure already contains their cache figures, the numbers
+/// look identical either way, and a policy reading them cannot tell. OpenAI,
+/// OpenAI-compatible endpoints, Gemini and Bedrock Converse report a prompt total
+/// that *includes* the cache figures ([`PromptAccounting::CacheInsideInput`]);
+/// Anthropic reports one that excludes them. Summing four raw buckets under the
+/// first convention charges the cached prompt twice, and a budget that overcharges
+/// stops a turn that had allowance left.
+///
+/// Normalization therefore happens once, at the boundary where the convention is
+/// still known — [`Self::reported`] — and never in the policies downstream.
+/// [`Self::saturating_add`] can then accumulate requests answered under different
+/// conventions, which a single retained accounting mode could not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProviderRequestUsage {
+    /// Prompt tokens that were neither read from nor written to the provider cache.
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
@@ -29,7 +46,51 @@ pub struct ProviderRequestUsage {
 }
 
 impl ProviderRequestUsage {
+    /// Normalize one provider usage report into disjoint buckets.
+    ///
+    /// `input` is whatever the provider called its prompt figure. Under
+    /// [`PromptAccounting::CacheInsideInput`] the cache figures are subtracted out of
+    /// it, because they are already inside it; under
+    /// [`PromptAccounting::CacheBesideInput`] it is kept as reported, because they are
+    /// not. The same real request costs the same either way.
+    #[must_use]
+    pub const fn reported(
+        accounting: PromptAccounting,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) -> Self {
+        Self {
+            input_tokens: accounting.uncached_input(input, cache_read, cache_write),
+            output_tokens: output,
+            cache_read_input_tokens: cache_read,
+            cache_write_input_tokens: cache_write,
+            accounted: true,
+        }
+    }
+
+    /// A request the provider never accounted for.
+    ///
+    /// Without an accounting mode there is nothing to normalize against, so whatever
+    /// arrived is kept as it arrived: for a budget, the larger reading is the safe
+    /// one. `accounted` is `false`, which is what stops a policy from reading these
+    /// numbers as a measurement.
+    #[must_use]
+    pub const fn unreported(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Self {
+        Self {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: cache_read,
+            cache_write_input_tokens: cache_write,
+            accounted: false,
+        }
+    }
+
     /// Every token this usage accounts for.
+    ///
+    /// A plain sum, which is only correct because the buckets are disjoint. See the
+    /// type's documentation for what maintains that.
     #[must_use]
     pub const fn total(self) -> u64 {
         self.input_tokens
@@ -343,6 +404,97 @@ mod tests {
             accounted,
             ..ProviderRequestUsage::default()
         }
+    }
+
+    /// The bug this normalization exists to prevent, stated as arithmetic.
+    ///
+    /// A `CacheInsideInput` provider reporting a 100-token prompt of which 6 tokens
+    /// came from cache sent 100 prompt tokens, not 106. Charging 106 is a budget stop
+    /// on a turn that still had allowance.
+    #[test]
+    fn a_cache_inside_input_report_never_charges_the_cached_prompt_twice() {
+        let usage =
+            ProviderRequestUsage::reported(PromptAccounting::CacheInsideInput, 100, 20, 5, 1);
+
+        assert_eq!(
+            usage.input_tokens, 94,
+            "the cache figures are inside the prompt figure and must come out of it"
+        );
+        assert_eq!(usage.cache_read_input_tokens, 5);
+        assert_eq!(usage.cache_write_input_tokens, 1);
+        assert_eq!(
+            usage.total(),
+            120,
+            "the prompt was 100 tokens and the answer 20; 126 double-counts the cache"
+        );
+        assert!(usage.accounted);
+    }
+
+    /// The same real request under the other convention costs the same.
+    #[test]
+    fn both_conventions_agree_on_what_one_request_cost() {
+        let inside =
+            ProviderRequestUsage::reported(PromptAccounting::CacheInsideInput, 100, 20, 5, 1);
+        // Anthropic reports the same request as 94 uncached prompt tokens beside its
+        // two cache figures, which sum to the same 100-token prompt.
+        let beside =
+            ProviderRequestUsage::reported(PromptAccounting::CacheBesideInput, 94, 20, 5, 1);
+
+        assert_eq!(
+            inside, beside,
+            "normalization is what makes these comparable"
+        );
+        assert_eq!(inside.total(), beside.total());
+    }
+
+    /// A cache figure larger than the prompt figure cannot underflow the bucket.
+    #[test]
+    fn a_cache_figure_that_exceeds_the_prompt_figure_saturates_at_zero() {
+        let usage = ProviderRequestUsage::reported(PromptAccounting::CacheInsideInput, 4, 1, 5, 2);
+
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.total(), 8, "the cache figures are still counted once");
+    }
+
+    /// An unreported request keeps the larger reading and stays a floor.
+    #[test]
+    fn an_unreported_request_is_kept_as_it_arrived_and_stays_unmeasured() {
+        let usage = ProviderRequestUsage::unreported(100, 20, 5, 1);
+
+        assert_eq!(
+            usage.input_tokens, 100,
+            "nothing is known to normalize against"
+        );
+        assert_eq!(usage.total(), 126);
+        assert!(
+            !usage.accounted,
+            "a request the provider never reported must not look like a measurement"
+        );
+    }
+
+    /// Requests answered under different conventions accumulate correctly.
+    ///
+    /// This is why the accounting mode is applied at construction and not retained:
+    /// one turn can span an `CacheInsideInput` endpoint and a `CacheBesideInput` one,
+    /// and a single retained mode could not describe the sum.
+    #[test]
+    fn a_turn_total_accumulates_across_mixed_conventions() {
+        let total =
+            ProviderRequestUsage::reported(PromptAccounting::CacheInsideInput, 100, 20, 5, 1)
+                .saturating_add(ProviderRequestUsage::reported(
+                    PromptAccounting::CacheBesideInput,
+                    50,
+                    10,
+                    7,
+                    0,
+                ));
+
+        assert_eq!(total.input_tokens, 94 + 50);
+        assert_eq!(total.output_tokens, 30);
+        assert_eq!(total.cache_read_input_tokens, 12);
+        assert_eq!(total.cache_write_input_tokens, 1);
+        assert_eq!(total.total(), 187);
+        assert!(total.accounted);
     }
 
     #[test]

@@ -7968,6 +7968,7 @@ fn conversing_from(
             event: zuno_llm::event::StreamEvent::TokenUsage {
                 input_tokens: Some(37_000),
                 output_tokens: Some(0),
+                reasoning_tokens: None,
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
                 accounting: zuno_llm::event::PromptAccounting::CacheInsideInput,

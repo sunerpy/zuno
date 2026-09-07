@@ -193,6 +193,7 @@ async fn deepseek_text_replays_to_the_recorded_event_sequence() {
             StreamEvent::TokenUsage {
                 input_tokens: Some(14),
                 output_tokens: Some(2),
+                reasoning_tokens: None,
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheInsideInput,
@@ -223,6 +224,7 @@ async fn groq_tool_call_replays_to_the_recorded_event_sequence() {
     let usage = StreamEvent::TokenUsage {
         input_tokens: Some(249),
         output_tokens: Some(10),
+        reasoning_tokens: None,
         cache_read_input_tokens: None,
         cache_write_input_tokens: None,
         accounting: PromptAccounting::CacheInsideInput,
@@ -275,8 +277,20 @@ async fn openrouter_text_reports_its_upstream_and_ignores_the_comment_frame() {
             StreamEvent::TokenUsage {
                 input_tokens: Some(21),
                 output_tokens: Some(3),
+                // Recorded OpenRouter traffic itemises the generated tokens in
+                // `completion_tokens_details`, and this cassette reports no reasoning on
+                // this request. `Some(0)` rather than `None` is what the wire says: the
+                // vendor accounted for reasoning and found none, as against an endpoint
+                // that never breaks the figure out at all.
+                reasoning_tokens: Some(0),
                 cache_read_input_tokens: Some(0),
-                cache_write_input_tokens: None,
+                // Recorded OpenRouter traffic carries `cache_write_tokens` beside
+                // `cached_tokens` in `prompt_tokens_details`, and this cassette reports
+                // both as 0. `Some(0)` rather than `None` is therefore what the wire
+                // says: the vendor priced no write on this request, as against an
+                // endpoint that never reports the figure at all. Reading it as absent is
+                // what left a proxied cache write billed at the plain input rate.
+                cache_write_input_tokens: Some(0),
                 accounting: PromptAccounting::CacheInsideInput,
             },
         ]
@@ -312,6 +326,7 @@ async fn togetherai_tool_call_survives_a_split_tool_fragment() {
             StreamEvent::TokenUsage {
                 input_tokens: Some(194),
                 output_tokens: Some(19),
+                reasoning_tokens: None,
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheInsideInput,
@@ -469,6 +484,9 @@ async fn the_canonical_openai_chat_shape_parses_under_a_declared_compatible_id()
             StreamEvent::TokenUsage {
                 input_tokens: Some(22),
                 output_tokens: Some(2),
+                // As above: this recording itemises its generated tokens and reports no
+                // reasoning, which is `Some(0)` and not an absent figure.
+                reasoning_tokens: Some(0),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheInsideInput,

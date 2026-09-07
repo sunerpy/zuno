@@ -226,6 +226,28 @@ A minimal override can separate use from generation:
 The retired `memory.reflection` and `memory.nudge_interval` keys are rejected.
 Post-turn extraction belongs to `learning`.
 
+## Where resident Memory lives
+
+| Scope | File | Default cap |
+| --- | --- | --- |
+| Global agent notes | `$CONFIG/memory/MEMORY.md` | 2200 characters |
+| Project rules | `<worktree>/.zuno/RULES.md` | 3000 characters |
+
+`zuno debug paths` prints both resolved paths and marks a store `(absent)` when it does
+not exist yet. Absent is the ordinary state, not a fault: a store is created by its
+first approved write and never at startup, so a fresh install has no `memory/`
+directory and an empty scope adds no bytes to the prompt.
+
+Both caps are configurable, as `memory.global_char_limit` and
+`memory.project_char_limit`, and a refused write names the key that would raise the one
+it crossed. They are counted in Unicode scalar values rather than in bytes or tokens —
+bytes would charge the same rule three times as much for being written in Chinese, and
+a token cap would move under content already on disk whenever the model changed.
+
+The global cap is the smaller of the two deliberately: those notes ride in *every*
+session's prompt, including sessions in repositories that have nothing to do with them,
+while project rules are only ever loaded by the one repository that pays for them.
+
 ## See also
 
 - [Goals, plans and todos](/guide/durable-state)

@@ -364,6 +364,7 @@ where
             StreamEvent::TokenUsage {
                 input_tokens,
                 output_tokens,
+                reasoning_tokens,
                 cache_read_input_tokens,
                 cache_write_input_tokens,
                 accounting,
@@ -371,9 +372,15 @@ where
                 if let Some(value) = input_tokens {
                     self.usage.input = value;
                 }
+                // The frame's `output_tokens` includes its `reasoning_tokens`, while
+                // `StepUsage::total` sums the two buckets independently. The reasoning
+                // part therefore comes out of the output figure rather than being
+                // recorded beside an unchanged one, which would count it twice.
+                let reasoning = reasoning_tokens.unwrap_or(0);
                 if let Some(value) = output_tokens {
-                    self.usage.output = value;
+                    self.usage.output = value.saturating_sub(reasoning);
                 }
+                self.usage.reasoning = reasoning;
                 if let Some(value) = cache_read_input_tokens {
                     self.usage.cache_read = value;
                 }

@@ -59,7 +59,7 @@ use zuno_permission::visibility::permission_key;
 use zuno_sandbox::{
     NetworkAccess, SandboxBackendRequest, SandboxBackendSelection, SandboxError, SandboxMode,
     SandboxPolicy, SandboxResolution, SandboxResolutionKind, SandboxResolver,
-    SandboxUnavailableAction, SystemSandboxResolver,
+    SandboxUnavailableAction, SandboxUnavailableCause, SystemSandboxResolver,
 };
 use zuno_tool::{
     OutputLimits, PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolUiIntent, erase,
@@ -658,22 +658,47 @@ fn native_notice(resolution: &SandboxResolution) -> Option<String> {
 
 /// Render a refused sandbox resolution for the surface that opened this composition.
 ///
-/// Every cause keeps its `zuno-sandbox` rendering except an unsupported platform: that
-/// one used to be a bare `OS sandbox is not implemented for platform` with nothing to
-/// do about it, and it is the whole story on macOS and Windows. The typed code, the
-/// deployment report and `zuno debug sandbox` are untouched; only this text is.
+/// A cause on the sandbox crate's unavailable-backend whitelist gets the actionable
+/// text: it names what could not be deployed and every remedy, because a host that
+/// genuinely cannot confine leaves the user with a decision to make. Everything else —
+/// an untrusted bubblewrap, a failed probe, an unenforceable policy, a seccomp, helper
+/// or I/O failure — keeps its bare `zuno-sandbox` rendering, because suggesting the
+/// user drop confinement in response to a tampered binary would be advice, not
+/// diagnosis. The typed code, the deployment report and `zuno debug sandbox` are
+/// untouched; only this text is.
 fn render_sandbox_error(error: SandboxError, requested_mode: SandboxMode) -> String {
-    match error {
-        SandboxError::UnsupportedPlatform(platform) => {
-            unsupported_platform_refusal(&platform, requested_mode)
-        }
-        other => other.to_string(),
+    SandboxUnavailableCause::from_error(&error).map_or_else(
+        || error.to_string(),
+        |cause| sandbox_unavailable_refusal(&cause, requested_mode),
+    )
+}
+
+/// The opening sentence naming why this host could not confine Shell.
+///
+/// Split out because the two texts below share it and only one cause can talk about a
+/// platform. `UnsupportedPlatform` keeps its original wording verbatim — it is what
+/// macOS and Windows always produce, and it is quoted in the guides — while every other
+/// whitelisted cause renders its own typed code and message instead of being described
+/// as an unimplemented platform, which on Linux would be false.
+fn unavailable_opening(cause: &SandboxUnavailableCause, requested_mode: SandboxMode) -> String {
+    let requested = requested_mode.as_str();
+    match cause {
+        SandboxUnavailableCause::UnsupportedPlatform { platform } => format!(
+            "OS sandbox is not implemented for platform `{platform}`: {platform} has no confined \
+             sandbox backend, so the Shell tool cannot be registered under the requested \
+             `{requested}` authority."
+        ),
+        other => format!(
+            "The OS sandbox cannot be deployed on this host ({code}: {other}), so the Shell tool \
+             cannot be registered under the requested `{requested}` authority.",
+            code = other.code(),
+        ),
     }
 }
 
-/// The refusal a user reads when this platform has no confined sandbox backend.
+/// The refusal a user reads when this host has no deployable confined backend.
 ///
-/// Names the platform, says whether the trusted fallback would apply to this request,
+/// Names the cause, says whether the trusted fallback would apply to this request,
 /// and lists every remedy with the layer that may set it. A write-capable request may
 /// take the `run-unconfined` fallback; a read-only request never falls back, and for
 /// it the remedy is the explicit trusted `sandbox.backend: native` selection, which
@@ -681,13 +706,11 @@ fn render_sandbox_error(error: SandboxError, requested_mode: SandboxMode) -> Str
 /// of the remedies is confinement, and the text says so rather than letting one read
 /// like a fix.
 #[must_use]
-pub(crate) fn unsupported_platform_refusal(platform: &str, requested_mode: SandboxMode) -> String {
-    let opening = format!(
-        "OS sandbox is not implemented for platform `{platform}`: {platform} has no confined \
-         sandbox backend, so the Shell tool cannot be registered under the requested \
-         `{requested}` authority.",
-        requested = requested_mode.as_str(),
-    );
+pub(crate) fn sandbox_unavailable_refusal(
+    cause: &SandboxUnavailableCause,
+    requested_mode: SandboxMode,
+) -> String {
+    let opening = unavailable_opening(cause, requested_mode);
     if requested_mode == SandboxMode::ReadOnly {
         return format!(
             "{opening} A read-only request never falls back: `zuno --sandbox-on-unavailable \
@@ -725,18 +748,29 @@ pub(crate) fn unsupported_platform_refusal(platform: &str, requested_mode: Sandb
 /// to both. The text says what a read-only contract becomes under it.
 #[must_use]
 pub(crate) fn native_execution_offer(
-    platform: &str,
+    cause: &SandboxUnavailableCause,
     requested_mode: SandboxMode,
     permission_mode: &str,
 ) -> String {
+    let opening = match cause {
+        SandboxUnavailableCause::UnsupportedPlatform { platform } => format!(
+            "OS sandbox is not implemented for platform `{platform}`: {platform} has no confined \
+             sandbox backend."
+        ),
+        other => format!(
+            "The OS sandbox cannot be deployed on this host ({code}: {other}).",
+            code = other.code(),
+        ),
+    };
     format!(
-        "OS sandbox is not implemented for platform `{platform}`: {platform} has no confined \
-         sandbox backend. The requested `{requested}` authority cannot be confined here, so \
+        "{opening} The requested `{requested}` authority cannot be confined here, so \
          this session can instead run Shell natively with the Zuno process user's host \
          authority under permission mode `{permission_mode}`; that is not confinement, and a \
          read-only Agent's contract then remains a tool and permission boundary, not an OS \
          boundary. Accepting selects the native backend (`sandbox.backend: native`) for every \
-         Agent this process composes. Headless runs choose this with `zuno --sandbox-backend \
+         Agent this process composes. Answer `a` to save that selection to your global \
+         configuration so this is never asked again; `y` accepts it for this run only and \
+         leaves no file changed. Headless runs choose this with `zuno --sandbox-backend \
          native` or `ZUNO_SANDBOX_BACKEND=native`; `zuno --sandbox danger-full-access` runs \
          natively as well and additionally makes the effective permission mode `allow_all`.",
         requested = requested_mode.as_str(),
@@ -746,21 +780,22 @@ pub(crate) fn native_execution_offer(
 /// Typed reason a composition would refuse to register Shell on this host.
 ///
 /// Produced by [`sandbox_preflight`] before a host is opened, so a surface can decide
-/// what to do about an unsupported platform from data rather than from the rendering.
+/// what to do about an undeployable backend from data rather than from the rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UnsupportedPlatformRefusal {
-    pub(crate) platform: String,
+pub(crate) struct SandboxUnavailableRefusal {
+    /// Why the confined backend could not be deployed, from the sandbox whitelist.
+    pub(crate) cause: SandboxUnavailableCause,
     pub(crate) requested_mode: SandboxMode,
 }
 
-/// What a surface does about an [`UnsupportedPlatformRefusal`].
+/// What a surface does about a [`SandboxUnavailableRefusal`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum UnsupportedPlatformDecision {
+pub(crate) enum SandboxUnavailableDecision {
     /// Nothing is pending; compose as usual.
     Proceed,
     /// Ask the user, once, whether this process may run natively under this request.
     OfferNativeExecution {
-        platform: String,
+        cause: SandboxUnavailableCause,
         requested_mode: SandboxMode,
     },
     /// Refuse with the actionable text; nothing may prompt.
@@ -790,7 +825,7 @@ impl ConfiguredNativeChoices {
     }
 }
 
-/// Decide what an unsupported platform means for the surface about to compose.
+/// Decide what an undeployable confined backend means for the surface about to compose.
 ///
 /// The offer is made for every request the host cannot confine, read-only included,
 /// because acceptance selects the native backend and that remedy applies to both.
@@ -800,20 +835,20 @@ impl ConfiguredNativeChoices {
 /// so), and the surface can actually ask. Everything else refuses with the same text
 /// the headless surfaces print.
 #[must_use]
-pub(crate) fn decide_unsupported_platform(
-    refusal: Option<&UnsupportedPlatformRefusal>,
+pub(crate) fn decide_sandbox_unavailable(
+    refusal: Option<&SandboxUnavailableRefusal>,
     configured: ConfiguredNativeChoices,
     interactive: bool,
-) -> UnsupportedPlatformDecision {
+) -> SandboxUnavailableDecision {
     let Some(refusal) = refusal else {
-        return UnsupportedPlatformDecision::Proceed;
+        return SandboxUnavailableDecision::Proceed;
     };
-    let message = unsupported_platform_refusal(&refusal.platform, refusal.requested_mode);
+    let message = sandbox_unavailable_refusal(&refusal.cause, refusal.requested_mode);
     if configured.any() || !interactive {
-        return UnsupportedPlatformDecision::Refuse { message };
+        return SandboxUnavailableDecision::Refuse { message };
     }
-    UnsupportedPlatformDecision::OfferNativeExecution {
-        platform: refusal.platform.clone(),
+    SandboxUnavailableDecision::OfferNativeExecution {
+        cause: refusal.cause.clone(),
         requested_mode: refusal.requested_mode,
     }
 }
@@ -826,7 +861,7 @@ pub(crate) fn system_sandbox_probe(policy: &SandboxPolicy) -> Result<(), Sandbox
     zuno_sandbox::system_backend(policy.workspace(), policy.mode()).map(drop)
 }
 
-/// Whether assembling `selected_profile` would refuse Shell for want of a platform backend.
+/// Whether assembling `selected_profile` would refuse Shell for want of a confined backend.
 ///
 /// Runs ahead of [`assemble`] with the same policy, backend request and Shell
 /// visibility, so the TUI can ask before raw mode and an agent switch can keep its
@@ -835,13 +870,23 @@ pub(crate) fn system_sandbox_probe(policy: &SandboxPolicy) -> Result<(), Sandbox
 /// visible, an unbuildable policy, a different failure, an explicit `danger-full-access`
 /// request, a trusted `native` backend selection (which never discovers), or a trusted
 /// fallback that would resolve.
+///
+/// Eligibility comes from [`SandboxUnavailableCause::from_error`], the sandbox crate's
+/// own whitelist, and never from a match written here. That distinction is the whole
+/// security boundary of this function: a missing bubblewrap, an unsupported
+/// architecture, WSL1 and a missing kernel capability are hosts that genuinely cannot
+/// confine, while an *untrusted* bubblewrap on `PATH`, a failed probe, an unenforceable
+/// policy, a bad path, and a seccomp, helper or I/O failure are not — and offering to
+/// drop confinement for those would turn a tampered binary into a prompt the user is
+/// invited to accept. The whitelist answers `None` for every one of them, so they keep
+/// the hard refusal they had.
 pub(crate) fn sandbox_preflight(
     directory: &Path,
     config: &Config,
     selected_profile: &AgentProfile,
     manifest: &zuno_harness::ToolManifest,
     probe: &dyn Fn(&SandboxPolicy) -> Result<(), SandboxError>,
-) -> Option<UnsupportedPlatformRefusal> {
+) -> Option<SandboxUnavailableRefusal> {
     if !shell_visible(selected_profile, selected_profile.definition(), manifest) {
         return None;
     }
@@ -860,15 +905,17 @@ pub(crate) fn sandbox_preflight(
     }
     let fallback_would_resolve = requested_mode == SandboxMode::WorkspaceWrite
         && sandbox_unavailable_action(config) == SandboxUnavailableAction::RunUnconfined;
-    match probe(&policy) {
-        Err(SandboxError::UnsupportedPlatform(platform)) if !fallback_would_resolve => {
-            Some(UnsupportedPlatformRefusal {
-                platform,
-                requested_mode,
-            })
-        }
-        Ok(()) | Err(_) => None,
+    if fallback_would_resolve {
+        return None;
     }
+    let error = probe(&policy).err()?;
+    // The whitelist decides, not this match. See the eligibility note above for why an
+    // untrusted bubblewrap or a failed probe must never reach the offer.
+    let cause = SandboxUnavailableCause::from_error(&error)?;
+    Some(SandboxUnavailableRefusal {
+        cause,
+        requested_mode,
+    })
 }
 
 fn shell_visible(

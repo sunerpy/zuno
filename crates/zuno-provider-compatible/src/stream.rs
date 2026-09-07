@@ -199,13 +199,17 @@ impl ChunkTranslator {
         }
 
         if let Some(usage) = chunk.usage {
+            let details = usage.prompt_tokens_details;
             events.push(StreamEvent::TokenUsage {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
-                cache_read_input_tokens: usage
-                    .prompt_tokens_details
-                    .and_then(|details| details.cached_tokens),
-                cache_write_input_tokens: None,
+                reasoning_tokens: usage
+                    .completion_tokens_details
+                    .and_then(|details| details.reasoning_tokens),
+                cache_read_input_tokens: details.as_ref().and_then(|details| details.cached_tokens),
+                cache_write_input_tokens: details
+                    .as_ref()
+                    .and_then(|details| details.cache_write_tokens),
                 accounting: PromptAccounting::CacheInsideInput,
             });
         }
@@ -617,13 +621,17 @@ impl ResponsesTranslator {
             stop_reason: Some(reason),
         }];
         if let Some(usage) = response.usage {
+            let details = usage.input_tokens_details;
             events.push(StreamEvent::TokenUsage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
-                cache_read_input_tokens: usage
-                    .input_tokens_details
-                    .and_then(|details| details.cached_tokens),
-                cache_write_input_tokens: None,
+                reasoning_tokens: usage
+                    .output_tokens_details
+                    .and_then(|details| details.reasoning_tokens),
+                cache_read_input_tokens: details.as_ref().and_then(|details| details.cached_tokens),
+                cache_write_input_tokens: details
+                    .as_ref()
+                    .and_then(|details| details.cache_write_tokens),
                 accounting: PromptAccounting::CacheInsideInput,
             });
         }
@@ -747,12 +755,26 @@ struct ResponseUsage {
     output_tokens: Option<u64>,
     #[serde(default)]
     input_tokens_details: Option<ResponseTokenDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<ResponseGeneratedTokenDetails>,
+}
+
+/// The itemised half of the generated-token count on the Responses surface.
+#[derive(Debug, Deserialize)]
+struct ResponseGeneratedTokenDetails {
+    /// Generated tokens spent on reasoning, already counted in `output_tokens`.
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ResponseTokenDetails {
     #[serde(default)]
     cached_tokens: Option<u64>,
+    /// Prompt tokens newly written into the vendor's cache; see
+    /// [`crate::wire::PromptTokensDetails::cache_write_tokens`].
+    #[serde(default)]
+    cache_write_tokens: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -1126,6 +1148,7 @@ mod tests {
                 StreamEvent::TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(4),
+                    reasoning_tokens: None,
                     cache_read_input_tokens: Some(3),
                     cache_write_input_tokens: None,
                     accounting: PromptAccounting::CacheInsideInput,
@@ -1731,10 +1754,74 @@ mod tests {
         assert!(events.contains(&StreamEvent::TokenUsage {
             input_tokens: Some(10),
             output_tokens: Some(3),
+            reasoning_tokens: None,
             cache_read_input_tokens: Some(8),
             cache_write_input_tokens: None,
             accounting: PromptAccounting::CacheInsideInput,
         }));
+    }
+
+    /// A proxy that prices cache writes reports them beside the reads.
+    ///
+    /// OpenRouter and LiteLLM sit behind this surface and both carry
+    /// `cache_write_tokens` in `prompt_tokens_details`. Dropping it billed a cache
+    /// write at the plain input rate, which is the cheaper rate, so the reported cost
+    /// came out under the invoice.
+    #[test]
+    fn chat_usage_reports_the_cache_writes_a_proxy_prices_separately() {
+        let events = translate(&[r#"{"choices":[{"delta":{},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":10339,"completion_tokens":60,
+                         "prompt_tokens_details":{"cached_tokens":10318,"cache_write_tokens":21}}}"#]);
+        assert!(
+            events.contains(&StreamEvent::TokenUsage {
+                input_tokens: Some(10_339),
+                output_tokens: Some(60),
+                reasoning_tokens: None,
+                cache_read_input_tokens: Some(10_318),
+                cache_write_input_tokens: Some(21),
+                accounting: PromptAccounting::CacheInsideInput,
+            }),
+            "{events:?}"
+        );
+    }
+
+    /// An endpoint that never prices writes leaves the figure unknown, not zero.
+    #[test]
+    fn chat_usage_leaves_an_absent_cache_write_figure_absent() {
+        let events = translate(&[r#"{"choices":[{"delta":{},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":3,
+                         "prompt_tokens_details":{"cached_tokens":8}}}"#]);
+        assert!(
+            events.contains(&StreamEvent::TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(3),
+                reasoning_tokens: None,
+                cache_read_input_tokens: Some(8),
+                cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
+            }),
+            "a missing figure is unknown, and reporting 0 would claim a write of nothing"
+        );
+    }
+
+    /// The Responses surface carries the same pair under `input_tokens_details`.
+    #[test]
+    fn responses_usage_reports_cache_writes_from_input_token_details() {
+        let events = translate_responses(&[
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":2600,"output_tokens":4,"input_tokens_details":{"cached_tokens":2000,"cache_write_tokens":400}}}}"#,
+        ]);
+
+        assert!(
+            events.contains(&StreamEvent::TokenUsage {
+                input_tokens: Some(2_600),
+                output_tokens: Some(4),
+                reasoning_tokens: None,
+                cache_read_input_tokens: Some(2_000),
+                cache_write_input_tokens: Some(400),
+                accounting: PromptAccounting::CacheInsideInput,
+            }),
+            "{events:?}"
+        );
     }
 
     #[test]

@@ -616,6 +616,9 @@ impl BedrockEventDecoder {
         self.queued.push_back(StreamEvent::TokenUsage {
             input_tokens: usage.get("inputTokens").and_then(Value::as_u64),
             output_tokens: usage.get("outputTokens").and_then(Value::as_u64),
+            // Converse reports no reasoning breakdown, even for a model that thinks;
+            // absent is "not itemised", not a zero.
+            reasoning_tokens: None,
             cache_read_input_tokens: usage.get("cacheReadInputTokens").and_then(Value::as_u64),
             cache_write_input_tokens: usage.get("cacheWriteInputTokens").and_then(Value::as_u64),
             // Converse defines `totalTokens` as `inputTokens + outputTokens` with no
@@ -663,6 +666,10 @@ impl BedrockEventDecoder {
                     self.queued.push_back(StreamEvent::TokenUsage {
                         input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
                         output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+                        // The passed-through Messages payload bills thinking as output
+                        // and never itemises it, exactly as the direct Anthropic surface
+                        // does.
+                        reasoning_tokens: None,
                         cache_read_input_tokens: usage
                             .get("cache_read_input_tokens")
                             .and_then(Value::as_u64),

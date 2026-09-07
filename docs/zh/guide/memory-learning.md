@@ -191,6 +191,25 @@ Project Experience、Memory、pattern、evaluation result 与 Skill candidate �
 已退役的 `memory.reflection` 与 `memory.nudge_interval` 会被拒绝。Post-turn 提取属于
 `learning`。
 
+## 常驻 Memory 的存放位置
+
+| Scope | 文件 | 默认上限 |
+| --- | --- | --- |
+| 全局 agent 笔记 | `$CONFIG/memory/MEMORY.md` | 2200 字符 |
+| 项目规则 | `<worktree>/.zuno/RULES.md` | 3000 字符 |
+
+`zuno debug paths` 会打印两个解析后的路径，并给尚不存在的存储标记 `(absent)`。不存在是正常
+状态而不是故障：存储由第一次通过复核的写入创建，而不是启动时创建，所以全新安装没有 `memory/`
+目录，空 scope 也不会占用任何 prompt 字节。
+
+两个上限都可配置，对应 `memory.global_char_limit` 与 `memory.project_char_limit`；写入被拒绝
+时，错误信息会指出可以提高该上限的那个键。计数单位是 Unicode 标量值，既不是字节也不是 token
+——按字节会让同一条规则仅因为用中文书写就贵三倍，而按 token 计数会在换模型时让已经落盘的内容
+突然超限。
+
+全局上限刻意小于项目上限：全局笔记会进入**每个** Session 的 prompt，包括与它们毫无关系的仓库；
+项目规则只在为它付出预算的那个仓库里加载。
+
 ## 相关页面
 
 - [Goal、Plan 与 Todo](/zh/guide/durable-state)

@@ -1326,6 +1326,7 @@ impl Transcript {
             StreamEvent::TokenUsage {
                 input_tokens,
                 output_tokens,
+                reasoning_tokens,
                 cache_read_input_tokens,
                 cache_write_input_tokens,
                 accounting,
@@ -1341,6 +1342,7 @@ impl Transcript {
                 self.tokens.add(
                     accounting.uncached_input(input, cache_read, cache_write),
                     output_tokens.unwrap_or_default(),
+                    reasoning_tokens.unwrap_or_default(),
                     cache_read,
                     cache_write,
                 );

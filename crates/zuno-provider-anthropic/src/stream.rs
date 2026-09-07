@@ -89,6 +89,10 @@ impl AnthropicDecoder {
             output.push(Ok(StreamEvent::TokenUsage {
                 input_tokens: self.state.usage.input_tokens,
                 output_tokens: self.state.usage.output_tokens,
+                // Anthropic bills thinking as output and never itemises it, so there is
+                // no breakdown to report. `None` says "not itemised", which is not the
+                // same claim as a zero.
+                reasoning_tokens: None,
                 cache_read_input_tokens: self.state.usage.cache_read_input_tokens,
                 cache_write_input_tokens: self.state.usage.cache_creation_input_tokens,
                 accounting: PromptAccounting::CacheBesideInput,
@@ -913,6 +917,7 @@ mod tests {
                 StreamEvent::TokenUsage {
                     input_tokens: Some(12),
                     output_tokens: Some(20),
+                    reasoning_tokens: None,
                     cache_read_input_tokens: None,
                     cache_write_input_tokens: None,
                     accounting: PromptAccounting::CacheBesideInput,

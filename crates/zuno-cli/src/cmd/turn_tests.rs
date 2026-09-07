@@ -12359,7 +12359,7 @@ const READ_ONLY_REMEDIES: [&str; 13] = [
 /// host with no confined backend: the same assembly they all reach, with nothing to ask
 /// and every remedy in the text.
 #[test]
-fn unsupported_platform_refusal_for_a_write_capable_request_names_every_remedy() {
+fn sandbox_unavailable_refusal_for_a_write_capable_request_names_every_remedy() {
     let directory = tempfile::TempDir::new().expect("temporary tool workspace");
     let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
     for json in [r#"{}"#, r#"{"sandbox":{"onUnavailable":"deny"}}"#] {
@@ -12376,8 +12376,10 @@ fn unsupported_platform_refusal_for_a_write_capable_request_names_every_remedy()
 
         assert_eq!(
             message,
-            tool_runtime::unsupported_platform_refusal(
-                "windows",
+            tool_runtime::sandbox_unavailable_refusal(
+                &zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                    platform: "windows".to_owned()
+                },
                 zuno_sandbox::SandboxMode::WorkspaceWrite
             ),
             "{json}: assembly renders the shared refusal, not a bare cause"
@@ -12396,7 +12398,7 @@ fn unsupported_platform_refusal_for_a_write_capable_request_names_every_remedy()
 /// and the remedy that does is the trusted `sandbox.backend: native` selection, not a
 /// `danger-full-access` request a read-only contract could never make.
 #[test]
-fn unsupported_platform_refusal_for_a_read_only_request_names_the_native_backend_setting() {
+fn sandbox_unavailable_refusal_for_a_read_only_request_names_the_native_backend_setting() {
     let directory = tempfile::TempDir::new().expect("temporary tool workspace");
     let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
     let selected_agent = read_only_shell_profile();
@@ -12417,8 +12419,10 @@ fn unsupported_platform_refusal_for_a_read_only_request_names_the_native_backend
 
         assert_eq!(
             message,
-            tool_runtime::unsupported_platform_refusal(
-                "windows",
+            tool_runtime::sandbox_unavailable_refusal(
+                &zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                    platform: "windows".to_owned()
+                },
                 zuno_sandbox::SandboxMode::ReadOnly
             ),
             "{json}"
@@ -12546,8 +12550,10 @@ fn read_only_agent_still_refuses_under_the_auto_backend_on_an_unsupported_platfo
         .unwrap_or_else(|| panic!("{json}: auto never runs a read-only request natively"));
         assert_eq!(
             message,
-            tool_runtime::unsupported_platform_refusal(
-                "windows",
+            tool_runtime::sandbox_unavailable_refusal(
+                &zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                    platform: "windows".to_owned()
+                },
                 zuno_sandbox::SandboxMode::ReadOnly
             ),
             "{json}"
@@ -12587,7 +12593,7 @@ fn trusted_run_unconfined_still_resolves_a_write_capable_request_on_an_unsupport
 #[test]
 fn unsupported_platform_decision_covers_every_branch() {
     use tool_runtime::{
-        ConfiguredNativeChoices, UnsupportedPlatformDecision, UnsupportedPlatformRefusal,
+        ConfiguredNativeChoices, SandboxUnavailableDecision, SandboxUnavailableRefusal,
     };
     use zuno_config::schema::sandbox::SandboxBackendSelection as Backend;
     use zuno_config::schema::sandbox::SandboxUnavailableAction as Configured;
@@ -12616,25 +12622,38 @@ fn unsupported_platform_decision_covers_every_branch() {
             backend: Some(Backend::Auto),
         },
     ];
-    let write = UnsupportedPlatformRefusal {
-        platform: "windows".to_owned(),
+    let write = SandboxUnavailableRefusal {
+        cause: zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+            platform: "windows".to_owned(),
+        },
         requested_mode: SandboxMode::WorkspaceWrite,
     };
-    let read_only = UnsupportedPlatformRefusal {
-        platform: "macos".to_owned(),
+    let read_only = SandboxUnavailableRefusal {
+        cause: zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+            platform: "macos".to_owned(),
+        },
         requested_mode: SandboxMode::ReadOnly,
     };
-    let write_text =
-        tool_runtime::unsupported_platform_refusal("windows", SandboxMode::WorkspaceWrite);
-    let read_only_text = tool_runtime::unsupported_platform_refusal("macos", SandboxMode::ReadOnly);
+    let write_text = tool_runtime::sandbox_unavailable_refusal(
+        &zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+            platform: "windows".to_owned(),
+        },
+        SandboxMode::WorkspaceWrite,
+    );
+    let read_only_text = tool_runtime::sandbox_unavailable_refusal(
+        &zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+            platform: "macos".to_owned(),
+        },
+        SandboxMode::ReadOnly,
+    );
 
     // Nothing pending: Linux with bubblewrap, no Shell, an explicit `danger-full-access`,
     // a trusted native selection, or a trusted fallback that resolved all arrive here.
     for configured in std::iter::once(nobody_chose).chain(choices) {
         for interactive in [true, false] {
             assert_eq!(
-                tool_runtime::decide_unsupported_platform(None, configured, interactive),
-                UnsupportedPlatformDecision::Proceed,
+                tool_runtime::decide_sandbox_unavailable(None, configured, interactive),
+                SandboxUnavailableDecision::Proceed,
                 "{configured:?} interactive={interactive}"
             );
         }
@@ -12644,30 +12663,34 @@ fn unsupported_platform_decision_covers_every_branch() {
     // requests are offered, because acceptance selects the native backend and that
     // remedy applies to a read-only contract too.
     assert_eq!(
-        tool_runtime::decide_unsupported_platform(Some(&write), nobody_chose, true),
-        UnsupportedPlatformDecision::OfferNativeExecution {
-            platform: "windows".to_owned(),
+        tool_runtime::decide_sandbox_unavailable(Some(&write), nobody_chose, true),
+        SandboxUnavailableDecision::OfferNativeExecution {
+            cause: zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                platform: "windows".to_owned(),
+            },
             requested_mode: SandboxMode::WorkspaceWrite,
         }
     );
     assert_eq!(
-        tool_runtime::decide_unsupported_platform(Some(&read_only), nobody_chose, true),
-        UnsupportedPlatformDecision::OfferNativeExecution {
-            platform: "macos".to_owned(),
+        tool_runtime::decide_sandbox_unavailable(Some(&read_only), nobody_chose, true),
+        SandboxUnavailableDecision::OfferNativeExecution {
+            cause: zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                platform: "macos".to_owned(),
+            },
             requested_mode: SandboxMode::ReadOnly,
         }
     );
 
     // Off a TTY nothing may prompt; the headless text is the answer.
     assert_eq!(
-        tool_runtime::decide_unsupported_platform(Some(&write), nobody_chose, false),
-        UnsupportedPlatformDecision::Refuse {
+        tool_runtime::decide_sandbox_unavailable(Some(&write), nobody_chose, false),
+        SandboxUnavailableDecision::Refuse {
             message: write_text.clone()
         }
     );
     assert_eq!(
-        tool_runtime::decide_unsupported_platform(Some(&read_only), nobody_chose, false),
-        UnsupportedPlatformDecision::Refuse {
+        tool_runtime::decide_sandbox_unavailable(Some(&read_only), nobody_chose, false),
+        SandboxUnavailableDecision::Refuse {
             message: read_only_text.clone()
         }
     );
@@ -12680,12 +12703,12 @@ fn unsupported_platform_decision_covers_every_branch() {
         for (refusal, text) in [(&write, &write_text), (&read_only, &read_only_text)] {
             for interactive in [true, false] {
                 assert_eq!(
-                    tool_runtime::decide_unsupported_platform(
+                    tool_runtime::decide_sandbox_unavailable(
                         Some(refusal),
                         configured,
                         interactive
                     ),
-                    UnsupportedPlatformDecision::Refuse {
+                    SandboxUnavailableDecision::Refuse {
                         message: text.clone()
                     },
                     "{configured:?} {:?} interactive={interactive}",
@@ -12707,7 +12730,13 @@ fn unsupported_platform_decision_covers_every_branch() {
         (SandboxMode::ReadOnly, "standard"),
         (SandboxMode::WorkspaceWrite, "strict"),
     ] {
-        let offer = tool_runtime::native_execution_offer("macos", mode, permission_mode);
+        let offer = tool_runtime::native_execution_offer(
+            &zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                platform: "macos".to_owned(),
+            },
+            mode,
+            permission_mode,
+        );
         for needle in [
             "OS sandbox is not implemented for platform `macos`: macos has no confined sandbox",
             &format!(
@@ -12738,7 +12767,7 @@ fn unsupported_platform_decision_covers_every_branch() {
 /// The preflight reports exactly the refusal assembly would produce, and nothing else.
 #[test]
 fn sandbox_preflight_reports_only_an_unsupported_platform_that_assembly_would_refuse() {
-    use tool_runtime::UnsupportedPlatformRefusal;
+    use tool_runtime::SandboxUnavailableRefusal;
     use zuno_sandbox::{SandboxError, SandboxMode, SandboxPolicy};
     use zuno_tools::registry::BuiltinSlot;
 
@@ -12755,8 +12784,10 @@ fn sandbox_preflight_reports_only_an_unsupported_platform_that_assembly_would_re
     let build = agent_profile(agent("build"), directory.path(), &unset);
     assert_eq!(
         tool_runtime::sandbox_preflight(directory.path(), &unset, &build, &standard, &windows),
-        Some(UnsupportedPlatformRefusal {
-            platform: "windows".to_owned(),
+        Some(SandboxUnavailableRefusal {
+            cause: zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                platform: "windows".to_owned(),
+            },
             requested_mode: SandboxMode::WorkspaceWrite,
         }),
         "a write-capable request under the default deny would be refused"
@@ -12800,8 +12831,10 @@ fn sandbox_preflight_reports_only_an_unsupported_platform_that_assembly_would_re
             &standard,
             &windows
         ),
-        Some(UnsupportedPlatformRefusal {
-            platform: "windows".to_owned(),
+        Some(SandboxUnavailableRefusal {
+            cause: zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                platform: "windows".to_owned(),
+            },
             requested_mode: SandboxMode::ReadOnly,
         }),
         "read-only never falls back, trusted or not"
@@ -12850,13 +12883,20 @@ fn sandbox_preflight_reports_only_an_unsupported_platform_that_assembly_would_re
             &standard,
             &windows
         ),
-        Some(UnsupportedPlatformRefusal {
-            platform: "windows".to_owned(),
+        Some(SandboxUnavailableRefusal {
+            cause: zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                platform: "windows".to_owned(),
+            },
             requested_mode: SandboxMode::ReadOnly,
         }),
         "an explicit auto is the default behaviour and is refused like it"
     );
 
+    // A Linux host with no usable bubblewrap is a host that genuinely cannot confine,
+    // so it is on `SandboxUnavailableCause`'s whitelist and reaches the same decision
+    // macOS and Windows do. It used to return `None` here and fall through to a bare
+    // `no trusted system bubblewrap executable was found`, which named no remedy and
+    // gave an interactive start nothing to offer.
     assert_eq!(
         tool_runtime::sandbox_preflight(
             directory.path(),
@@ -12865,8 +12905,35 @@ fn sandbox_preflight_reports_only_an_unsupported_platform_that_assembly_would_re
             &standard,
             &no_bubblewrap
         ),
+        Some(SandboxUnavailableRefusal {
+            cause: zuno_sandbox::SandboxUnavailableCause::BubblewrapNotFound,
+            requested_mode: SandboxMode::WorkspaceWrite,
+        }),
+        "a Linux host without bubblewrap cannot confine and is offered the same remedy"
+    );
+    // The security boundary: a bubblewrap that failed its *trust* check is not a host
+    // that cannot confine, and must never become an offer to drop confinement.
+    let untrusted = |_: &SandboxPolicy| -> Result<(), SandboxError> {
+        Err(SandboxError::UntrustedBubblewrap {
+            path: std::path::PathBuf::from("/tmp/bwrap"),
+            reason: "not owned by root".to_owned(),
+        })
+    };
+    assert_eq!(
+        tool_runtime::sandbox_preflight(directory.path(), &unset, &build, &standard, &untrusted),
         None,
-        "a Linux host without bubblewrap keeps its own refusal from assembly"
+        "an untrusted bubblewrap keeps its hard refusal and is never offered a way past it"
+    );
+    let probe_failed = |_: &SandboxPolicy| -> Result<(), SandboxError> {
+        Err(SandboxError::ProbeFailed {
+            capability: "userns",
+            detail: "probe exited 1".to_owned(),
+        })
+    };
+    assert_eq!(
+        tool_runtime::sandbox_preflight(directory.path(), &unset, &build, &standard, &probe_failed),
+        None,
+        "a failed probe is not a host that cannot confine"
     );
     assert_eq!(
         tool_runtime::sandbox_preflight(directory.path(), &unset, &build, &standard, &confined),
@@ -12928,8 +12995,8 @@ fn only_the_interactive_tui_offers_native_execution_and_only_before_raw_mode() {
 
     let tui = read("tui.rs");
     let question = tui
-        .find("terminal_prompt::confirm(")
-        .expect("the TUI asks its one question through terminal_prompt::confirm");
+        .find("terminal_prompt::confirm_remembering(")
+        .expect("the TUI asks its one question through terminal_prompt::confirm_remembering");
     let raw_mode = tui
         .find("TerminalSession::start(lifecycle.clone())")
         .expect("the TUI enters raw mode through TerminalSession::start");
@@ -12984,7 +13051,7 @@ fn only_the_interactive_tui_offers_native_execution_and_only_before_raw_mode() {
 /// only way to stand where a Windows or macOS user stands.
 #[test]
 fn a_write_capable_plan_without_a_platform_backend_asks_only_on_a_terminal() {
-    use tool_runtime::UnsupportedPlatformDecision;
+    use tool_runtime::SandboxUnavailableDecision;
     use zuno_sandbox::{SandboxError, SandboxMode, SandboxPolicy};
 
     let directory = tempfile::TempDir::new().expect("temporary tool workspace");
@@ -13004,8 +13071,10 @@ fn a_write_capable_plan_without_a_platform_backend_asks_only_on_a_terminal() {
     // write-capable and its configuration sets no `sandbox.onUnavailable`.
     assert_eq!(
         crate::cmd::tui::decide_for_plan(&plan, &windows, true),
-        UnsupportedPlatformDecision::OfferNativeExecution {
-            platform: "windows".to_owned(),
+        SandboxUnavailableDecision::OfferNativeExecution {
+            cause: zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                platform: "windows".to_owned(),
+            },
             requested_mode: SandboxMode::WorkspaceWrite,
         },
         "an interactive start offers native execution"
@@ -13014,12 +13083,17 @@ fn a_write_capable_plan_without_a_platform_backend_asks_only_on_a_terminal() {
     // Off a terminal — every headless start, and every agent switch, which decides
     // while the terminal is in raw mode — the same plan refuses.
     let refused = crate::cmd::tui::decide_for_plan(&plan, &windows, false);
-    let UnsupportedPlatformDecision::Refuse { message } = refused else {
+    let SandboxUnavailableDecision::Refuse { message } = refused else {
         panic!("without a terminal there is nobody to ask: {refused:?}");
     };
     assert_eq!(
         message,
-        tool_runtime::unsupported_platform_refusal("windows", SandboxMode::WorkspaceWrite),
+        tool_runtime::sandbox_unavailable_refusal(
+            &zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                platform: "windows".to_owned()
+            },
+            SandboxMode::WorkspaceWrite
+        ),
         "the refusal is the write-capable text, which offers the fallback"
     );
     for needle in WRITE_CAPABLE_REMEDIES {
@@ -13034,7 +13108,7 @@ fn a_write_capable_plan_without_a_platform_backend_asks_only_on_a_terminal() {
     for interactive in [true, false] {
         assert_eq!(
             crate::cmd::tui::decide_for_plan(&plan, &confined, interactive),
-            UnsupportedPlatformDecision::Proceed,
+            SandboxUnavailableDecision::Proceed,
             "interactive={interactive}"
         );
     }
@@ -13050,7 +13124,7 @@ fn a_write_capable_plan_without_a_platform_backend_asks_only_on_a_terminal() {
 fn accepting_the_native_offer_for_a_read_only_plan_switches_the_process_to_the_native_backend() {
     use crate::GlobalOptions;
     use crate::environment::{StartupEnvironment, ZUNO_SANDBOX_BACKEND};
-    use tool_runtime::UnsupportedPlatformDecision;
+    use tool_runtime::SandboxUnavailableDecision;
     use zuno_config::schema::permission::PermissionMode;
     use zuno_config::schema::sandbox::SandboxBackendSelection;
     use zuno_sandbox::{SandboxError, SandboxMode, SandboxPolicy};
@@ -13100,16 +13174,23 @@ fn accepting_the_native_offer_for_a_read_only_plan_switches_the_process_to_the_n
     );
     assert_eq!(
         crate::cmd::tui::decide_for_plan(&plan_before, &windows, true),
-        UnsupportedPlatformDecision::OfferNativeExecution {
-            platform: "windows".to_owned(),
+        SandboxUnavailableDecision::OfferNativeExecution {
+            cause: zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                platform: "windows".to_owned(),
+            },
             requested_mode: SandboxMode::ReadOnly,
         },
         "an interactive start offers native execution to a read-only plan too"
     );
     assert_eq!(
         crate::cmd::tui::decide_for_plan(&plan_before, &windows, false),
-        UnsupportedPlatformDecision::Refuse {
-            message: tool_runtime::unsupported_platform_refusal("windows", SandboxMode::ReadOnly),
+        SandboxUnavailableDecision::Refuse {
+            message: tool_runtime::sandbox_unavailable_refusal(
+                &zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                    platform: "windows".to_owned()
+                },
+                SandboxMode::ReadOnly
+            ),
         },
         "off a terminal, and on decline, the read-only refusal names the setting"
     );
@@ -13157,7 +13238,7 @@ fn accepting_the_native_offer_for_a_read_only_plan_switches_the_process_to_the_n
     for interactive in [true, false] {
         assert_eq!(
             crate::cmd::tui::decide_for_plan(&plan_after, &windows, interactive),
-            UnsupportedPlatformDecision::Proceed,
+            SandboxUnavailableDecision::Proceed,
             "interactive={interactive}: the next decision proceeds without asking again"
         );
     }

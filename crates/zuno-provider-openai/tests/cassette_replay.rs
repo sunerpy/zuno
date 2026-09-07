@@ -152,6 +152,7 @@ fn recorded_chat_text_matches_request_and_exact_events() {
             StreamEvent::TokenUsage {
                 input_tokens: Some(22),
                 output_tokens: Some(2),
+                reasoning_tokens: Some(0),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheInsideInput,
@@ -232,6 +233,7 @@ fn recorded_chat_tool_call_matches_request_and_exact_events() {
             StreamEvent::TokenUsage {
                 input_tokens: Some(67),
                 output_tokens: Some(5),
+                reasoning_tokens: Some(0),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheInsideInput,
@@ -312,6 +314,7 @@ fn recorded_chat_two_turn_tool_loop_matches_both_requests() {
         Some(&StreamEvent::TokenUsage {
             input_tokens: Some(96),
             output_tokens: Some(15),
+            reasoning_tokens: Some(0),
             cache_read_input_tokens: Some(0),
             cache_write_input_tokens: None,
             accounting: PromptAccounting::CacheInsideInput,
@@ -361,6 +364,10 @@ fn recorded_responses_text_uses_default_surface_and_exact_events() {
             StreamEvent::TokenUsage {
                 input_tokens: Some(20),
                 output_tokens: Some(18),
+                // Recorded Responses traffic: 18 generated tokens of which 10 were
+                // reasoning, itemised under `output_tokens_details.reasoning_tokens`.
+                // The reasoning count is inside the output total, never added to it.
+                reasoning_tokens: Some(10),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheInsideInput,
@@ -430,6 +437,7 @@ fn recorded_responses_tool_call_matches_request_and_exact_events() {
             StreamEvent::TokenUsage {
                 input_tokens: Some(61),
                 output_tokens: Some(18),
+                reasoning_tokens: Some(0),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheInsideInput,
@@ -526,6 +534,9 @@ fn recorded_encrypted_reasoning_survives_store_false_continuation() {
         Some(&StreamEvent::TokenUsage {
             input_tokens: Some(35),
             output_tokens: Some(20),
+            // 20 generated tokens of which 12 were reasoning, from the recorded
+            // encrypted-reasoning continuation.
+            reasoning_tokens: Some(12),
             cache_read_input_tokens: Some(0),
             cache_write_input_tokens: None,
             accounting: PromptAccounting::CacheInsideInput,

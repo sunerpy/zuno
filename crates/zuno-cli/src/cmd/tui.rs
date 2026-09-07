@@ -88,7 +88,7 @@ use super::child_turn::{
     ChildSessionOpened, ChildTurnObserver, DetachedTurnObserver, InteractiveChildInput,
     InteractiveChildInputContext,
 };
-use super::tool_runtime::UnsupportedPlatformDecision;
+use super::tool_runtime::SandboxUnavailableDecision;
 use super::tui_permission::{AutoApproval, PermissionBridge, PermissionBroker};
 use super::tui_question::{QuestionBridge, QuestionBroker};
 use super::turn::{
@@ -328,7 +328,7 @@ fn shutdown_tui_background_jobs(
 ///
 /// Discovers the backend the way production does; [`decide_for_plan`] owns the rest so
 /// a test can act as a host without one.
-fn sandbox_decision(plan: &TurnPlan, interactive: bool) -> UnsupportedPlatformDecision {
+fn sandbox_decision(plan: &TurnPlan, interactive: bool) -> SandboxUnavailableDecision {
     decide_for_plan(
         plan,
         &super::tool_runtime::system_sandbox_probe,
@@ -349,7 +349,7 @@ pub(super) fn decide_for_plan(
     plan: &TurnPlan,
     probe: &dyn Fn(&zuno_sandbox::SandboxPolicy) -> Result<(), zuno_sandbox::SandboxError>,
     interactive: bool,
-) -> UnsupportedPlatformDecision {
+) -> SandboxUnavailableDecision {
     let refusal = super::tool_runtime::sandbox_preflight(
         plan.directory(),
         plan.config(),
@@ -358,7 +358,7 @@ pub(super) fn decide_for_plan(
         probe,
     );
     let configured = super::tool_runtime::ConfiguredNativeChoices::from_config(plan.config());
-    super::tool_runtime::decide_unsupported_platform(refusal.as_ref(), configured, interactive)
+    super::tool_runtime::decide_sandbox_unavailable(refusal.as_ref(), configured, interactive)
 }
 
 /// The environment this process runs under once the user accepted the offer.
@@ -470,34 +470,55 @@ fn execute_once(
     // same actionable text, printed once by `execute`.
     if terminal.is_none() {
         match sandbox_decision(&plan, super::terminal_prompt::is_interactive()) {
-            UnsupportedPlatformDecision::Proceed => {}
-            UnsupportedPlatformDecision::OfferNativeExecution {
-                platform,
+            SandboxUnavailableDecision::Proceed => {}
+            SandboxUnavailableDecision::OfferNativeExecution {
+                cause,
                 requested_mode,
             } => {
                 let permission_mode = permission_mode_name(plan.config());
                 eprintln!(
                     "{}",
                     super::tool_runtime::native_execution_offer(
-                        &platform,
+                        &cause,
                         requested_mode,
                         permission_mode
                     )
                 );
-                let accepted = super::terminal_prompt::confirm(&format!(
+                // Three answers, not two. `Once` is the historical behaviour: the process
+                // environment carries the choice and the next start asks again — which on a
+                // host with no confined backend is every start, forever. `Always` writes the
+                // same selection to the global configuration so the question is answered for
+                // good, and is the reason this prompt is not a plain confirm.
+                match super::terminal_prompt::confirm_remembering(&format!(
                     "Run this session natively without OS confinement? Your permission mode \
                      stays {permission_mode}."
-                ))?;
-                if !accepted {
-                    return Err(super::tool_runtime::unsupported_platform_refusal(
-                        &platform,
-                        requested_mode,
-                    ));
+                ))? {
+                    super::terminal_prompt::Remembered::Decline => {
+                        return Err(super::tool_runtime::sandbox_unavailable_refusal(
+                            &cause,
+                            requested_mode,
+                        ));
+                    }
+                    super::terminal_prompt::Remembered::Once => {}
+                    super::terminal_prompt::Remembered::Always => {
+                        // Persisted before the session composes, so a failure to write is
+                        // reported while the terminal is still the shell's. It is not fatal:
+                        // the user answered yes, and refusing to start because the answer
+                        // could not be *remembered* would be worse than starting without
+                        // remembering it.
+                        let layout = zuno_paths::Layout::resolve(environment.resolved());
+                        match super::sandbox_choice::persist_native_backend(&layout) {
+                            Ok(persisted) => eprintln!("{}", persisted.notice()),
+                            Err(error) => eprintln!(
+                                "Continuing with the native backend for this run only: {error}"
+                            ),
+                        }
+                    }
                 }
                 *environment = accept_native_execution(environment);
                 plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
             }
-            UnsupportedPlatformDecision::Refuse { message } => return Err(message),
+            SandboxUnavailableDecision::Refuse { message } => return Err(message),
         }
     }
     let environment: &StartupEnvironment = environment;
@@ -2166,7 +2187,7 @@ enum ReplacementRefusal {
 /// source scan that would still pass with the check moved below the call.
 async fn replace_host_unless_refused<H, Start, Started>(
     current: &mut H,
-    decision: UnsupportedPlatformDecision,
+    decision: SandboxUnavailableDecision,
     start: Start,
 ) -> Result<(), ReplacementRefusal>
 where
@@ -2174,7 +2195,7 @@ where
     Start: FnOnce() -> Started,
     Started: std::future::Future<Output = Result<H, String>>,
 {
-    if let UnsupportedPlatformDecision::Refuse { message } = decision {
+    if let SandboxUnavailableDecision::Refuse { message } = decision {
         return Err(ReplacementRefusal::UnsupportedPlatform(message));
     }
     replace_host(current, start)
@@ -2650,9 +2671,9 @@ async fn apply_selection(
 async fn remount_preflight(next: &TurnOptions, rebuild: &TurnRebuild<'_>) -> Result<(), String> {
     let plan = TurnPlan::resolve(next, rebuild.environment).await?;
     match sandbox_decision(&plan, false) {
-        UnsupportedPlatformDecision::Refuse { message } => Err(message),
-        UnsupportedPlatformDecision::Proceed
-        | UnsupportedPlatformDecision::OfferNativeExecution { .. } => Ok(()),
+        SandboxUnavailableDecision::Refuse { message } => Err(message),
+        SandboxUnavailableDecision::Proceed
+        | SandboxUnavailableDecision::OfferNativeExecution { .. } => Ok(()),
     }
 }
 
@@ -6949,13 +6970,15 @@ mod tests {
             fail_shutdown: false,
         };
         let candidate_log = Arc::clone(&log);
-        let refusal = crate::cmd::tool_runtime::unsupported_platform_refusal(
-            "windows",
+        let refusal = crate::cmd::tool_runtime::sandbox_unavailable_refusal(
+            &zuno_sandbox::SandboxUnavailableCause::UnsupportedPlatform {
+                platform: "windows".to_owned(),
+            },
             zuno_sandbox::SandboxMode::WorkspaceWrite,
         );
         let outcome = replace_host_unless_refused(
             &mut current,
-            UnsupportedPlatformDecision::Refuse {
+            SandboxUnavailableDecision::Refuse {
                 message: refusal.clone(),
             },
             || async move {
@@ -6999,7 +7022,7 @@ mod tests {
         let candidate_log = Arc::clone(&log);
         replace_host_unless_refused(
             &mut current,
-            UnsupportedPlatformDecision::Proceed,
+            SandboxUnavailableDecision::Proceed,
             || async move {
                 candidate_log
                     .lock()

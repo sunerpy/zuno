@@ -1486,6 +1486,7 @@ fn views_transcript_folds_provider_token_usage_for_the_ambient_panel() {
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
         input_tokens: Some(1_200),
         output_tokens: Some(340),
+        reasoning_tokens: None,
         cache_read_input_tokens: Some(80),
         cache_write_input_tokens: None,
         accounting: PromptAccounting::CacheInsideInput,
@@ -1508,6 +1509,7 @@ fn views_transcript_folds_provider_token_usage_for_the_ambient_panel() {
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
         input_tokens: Some(100),
         output_tokens: Some(10),
+        reasoning_tokens: None,
         cache_read_input_tokens: None,
         cache_write_input_tokens: None,
         accounting: PromptAccounting::CacheInsideInput,
@@ -1569,6 +1571,7 @@ fn views_transcript_counts_a_cached_token_once_whichever_convention_the_provider
         view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
             input_tokens: Some(1_200),
             output_tokens: Some(340),
+            reasoning_tokens: None,
             cache_read_input_tokens: Some(80),
             cache_write_input_tokens: None,
             accounting: PromptAccounting::CacheInsideInput,
@@ -1581,6 +1584,7 @@ fn views_transcript_counts_a_cached_token_once_whichever_convention_the_provider
         view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
             input_tokens: Some(1_120),
             output_tokens: Some(340),
+            reasoning_tokens: None,
             cache_read_input_tokens: Some(80),
             cache_write_input_tokens: None,
             accounting: PromptAccounting::CacheBesideInput,
@@ -1667,6 +1671,7 @@ fn views_transcript_context_percentage_measures_the_last_prompt_not_the_session(
         view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
             input_tokens: Some(80_000),
             output_tokens: Some(500),
+            reasoning_tokens: None,
             cache_read_input_tokens: None,
             cache_write_input_tokens: None,
             accounting: PromptAccounting::CacheInsideInput,
@@ -1699,6 +1704,7 @@ fn views_transcript_context_percentage_counts_cached_prompt_tokens_as_occupying_
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
         input_tokens: Some(100_000),
         output_tokens: Some(200),
+        reasoning_tokens: None,
         cache_read_input_tokens: Some(96_000),
         cache_write_input_tokens: None,
         accounting: PromptAccounting::CacheInsideInput,
@@ -1717,6 +1723,7 @@ fn views_transcript_context_percentage_needs_a_declared_window() {
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
         input_tokens: Some(5_000),
         output_tokens: Some(1_000),
+        reasoning_tokens: None,
         cache_read_input_tokens: None,
         cache_write_input_tokens: None,
         accounting: PromptAccounting::CacheInsideInput,

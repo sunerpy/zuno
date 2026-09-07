@@ -181,6 +181,7 @@ fn event_vocabulary_has_twenty_four_distinct_variants() {
         StreamEvent::TokenUsage {
             input_tokens: None,
             output_tokens: None,
+            reasoning_tokens: None,
             cache_read_input_tokens: None,
             cache_write_input_tokens: None,
             accounting: PromptAccounting::CacheInsideInput,

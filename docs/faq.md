@@ -103,13 +103,24 @@ trusted (global, managed, environment, or CLI) layer for a write-capable one; an
 An interactive `zuno` start on such a host asks once, before raw mode, whether to
 run this session natively — for any request it cannot confine, read-only
 included, only when no layer set `sandbox.onUnavailable` or `sandbox.backend`,
-and only when standard input and standard error are both terminals; yes selects
+and only when standard input and standard error are both terminals. `y` selects
 the native backend and resolves this process exactly as the flag does
-(`--sandbox-backend native`), no exits with the refusal. The answer covers this
+(`--sandbox-backend native`); `a` selects it and also saves
+`sandbox.backend: native` to your global configuration, so the question is
+answered for good; `n` exits with the refusal. A `y` answer covers this
 process only: on macOS the flag reaches nested Zuno processes through the
 startup re-exec that exports it, and an answer given at the prompt does not, so
 set `ZUNO_SANDBOX_BACKEND=native` or a trusted `sandbox.backend` when a nested
-`zuno` needs the same answer.
+`zuno` needs the same answer — or answer `a` once and let the file carry it.
+
+The same question is asked on a Linux host whose bubblewrap is absent, too old,
+or missing a required option, and on an unsupported architecture or WSL1,
+because none of those hosts can confine either. A bubblewrap that fails its
+*trust* check is deliberately not offered it: that is a tampered or
+wrongly-owned binary rather than a host without confinement, and it keeps its
+hard refusal instead of becoming a prompt you are invited to accept. The same
+holds for a failed capability probe, an unenforceable policy, and a seccomp,
+helper, or I/O failure.
 
 `run`, `acp`, and `serve` never ask and still need
 the flag or the variable. None of this is confinement. Switching to an Agent
