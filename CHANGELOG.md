@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.16](https://github.com/sunerpy/zuno/compare/v0.10.15...v0.10.16) (2026-09-07)
+
+
+### Bug Fixes
+
+* **goal:** 解耦自动续跑与历史消息身份 ([#145](https://github.com/sunerpy/zuno/issues/145)) ([4562e1b](https://github.com/sunerpy/zuno/commit/4562e1bda463f9853cfa812702523b86be723ef8))
+
 ## [0.10.15](https://github.com/sunerpy/zuno/compare/v0.10.14...v0.10.15) (2026-09-07)
 
 
