@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.20](https://github.com/sunerpy/zuno/compare/v0.10.19...v0.10.20) (2026-09-07)
+
+
+### Bug Fixes
+
+* **runtime:** 修复 Agent 恢复与推理重放边界 ([b2f4301](https://github.com/sunerpy/zuno/commit/b2f43019959d3bda518abd7be7f2e322b353048d))
+
 ## [0.10.19](https://github.com/sunerpy/zuno/compare/v0.10.18...v0.10.19) (2026-09-07)
 
 
