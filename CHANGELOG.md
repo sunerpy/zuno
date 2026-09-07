@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.19](https://github.com/sunerpy/zuno/compare/v0.10.18...v0.10.19) (2026-09-07)
+
+
+### Bug Fixes
+
+* **runtime:** 修正 token 计量、Memory 提示与沙箱选择持久化 ([b2488c0](https://github.com/sunerpy/zuno/commit/b2488c0e586b10d8e6fed2e1088e1043d22c2cc2))
+
 ## [0.10.18](https://github.com/sunerpy/zuno/compare/v0.10.17...v0.10.18) (2026-09-07)
 
 
