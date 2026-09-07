@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.17](https://github.com/sunerpy/zuno/compare/v0.10.16...v0.10.17) (2026-09-07)
+
+
+### Bug Fixes
+
+* **runtime:** 修复长请求耗尽 provider 重试窗口 ([73c69a8](https://github.com/sunerpy/zuno/commit/73c69a8c92f1ae17b7cda85ff5fdd9d165cc0953))
+
 ## [0.10.16](https://github.com/sunerpy/zuno/compare/v0.10.15...v0.10.16) (2026-09-07)
 
 
