@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 use zuno_error::ProviderError;
 use zuno_llm::cache::StaticSystemPrompt;
 use zuno_llm::event::{Message, RequestContentBlock, Role};
-use zuno_llm::registry::CompletionRequest;
+use zuno_llm::registry::{CompletionRequest, RequestMessage};
 
 use crate::provider::AnthropicConfig;
 
@@ -152,14 +152,14 @@ fn tool_choice_is_satisfiable(choice: &Value, tools: &[Value]) -> bool {
 }
 
 fn split_system(
-    messages: &[Message],
+    messages: &[RequestMessage],
 ) -> Result<(Option<StaticSystemPrompt>, Vec<&Message>), ProviderError> {
     let mut system_text = Vec::new();
     let mut conversational = Vec::new();
 
     for message in messages {
         if message.role != Role::System {
-            conversational.push(message);
+            conversational.push(message.message());
             continue;
         }
         for block in &message.content {

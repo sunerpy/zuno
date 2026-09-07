@@ -542,7 +542,7 @@ async fn compaction_summarizes_two_hundred_messages_with_the_small_model_and_res
     tracker
         .record(
             &StaticSystemPrompt::new("Initial project context"),
-            &[Message::new(Role::User, "baseline")],
+            &[Message::new(Role::User, "baseline").into()],
         )
         .expect("establish cache baseline");
     let mut locked_tools = LockedTools::new();

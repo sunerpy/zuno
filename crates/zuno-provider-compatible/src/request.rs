@@ -57,7 +57,9 @@
 
 use serde_json::{Map, Value, json};
 use zuno_llm::event::{Message, RequestContentBlock, Role, tool_arguments_text};
-use zuno_llm::registry::{ApiSurface, sealed_item_has_following_output};
+use zuno_llm::registry::{
+    ApiSurface, RequestMessage, ResponsesInputCursor, sealed_item_has_following_output,
+};
 
 use crate::quirks::Quirks;
 
@@ -111,7 +113,7 @@ pub struct RequestBody {
     /// The model id as the vendor names it.
     pub model: String,
     /// The durable turn, in order.
-    pub messages: Vec<Message>,
+    pub messages: Vec<RequestMessage>,
     /// Volatile non-user context appended as independent protocol items.
     pub developer_context: Vec<String>,
     /// Tool definitions, when the caller has any and the model accepts them.
@@ -147,10 +149,13 @@ pub struct RequestBody {
 impl RequestBody {
     /// A body for `model` carrying `messages`.
     #[must_use]
-    pub fn new(model: impl Into<String>, messages: Vec<Message>) -> Self {
+    pub fn new<M>(model: impl Into<String>, messages: Vec<M>) -> Self
+    where
+        M: Into<RequestMessage>,
+    {
         Self {
             model: model.into(),
-            messages,
+            messages: messages.into_iter().map(Into::into).collect(),
             ..Self::default()
         }
     }
@@ -183,7 +188,7 @@ impl RequestBody {
         let mut messages = self
             .messages
             .iter()
-            .flat_map(|message| translate_message(message, quirks))
+            .flat_map(|message| translate_message(message.message(), quirks))
             .collect::<Vec<_>>();
         messages.extend(
             self.developer_context
@@ -253,28 +258,21 @@ impl RequestBody {
     fn build_responses(&self, quirks: &Quirks) -> Value {
         let mut input = Vec::new();
         let mut instructions = None;
-        let mut wire_ends_in_assistant_output = false;
-        for message in &self.messages {
-            if wire_ends_in_assistant_output && message.role == Role::Assistant {
-                let boundary = message
-                    .preceding_developer_context
-                    .iter()
-                    .filter(|content| !content.trim().is_empty())
-                    .map(|content| json!({"role": "developer", "content": content}))
-                    .collect::<Vec<_>>();
-                if !boundary.is_empty() {
-                    input.extend(boundary);
-                    wire_ends_in_assistant_output = false;
-                }
+        let mut cursor = ResponsesInputCursor::default();
+        for request_message in &self.messages {
+            for boundary in cursor.boundary_before(request_message) {
+                input.push(json!({
+                    "role": boundary.role(),
+                    "content": boundary.content(),
+                }));
             }
+            let message = request_message.message();
             if message.role == Role::System && instructions.is_none() {
                 instructions = Some(joined_text(message));
             } else {
                 let items = translate_response_message(message, quirks);
-                if !items.is_empty() {
-                    wire_ends_in_assistant_output = message.role == Role::Assistant;
-                    input.extend(items);
-                }
+                cursor.observe_message(request_message, !items.is_empty());
+                input.extend(items);
             }
         }
         input.extend(
@@ -797,6 +795,7 @@ mod tests {
     use zuno_llm::effort::{
         DeclaredVariants, EffortCapabilities, ProviderFamily, ReasoningEffort, resolve_effort,
     };
+    use zuno_llm::registry::ResponsesInputBoundary;
     use zuno_llm::registry::{
         ApiSurface, Capabilities, CompletionRequest, ReasoningReplay, ReasoningReplayPolicy,
     };
@@ -1612,11 +1611,14 @@ mod tests {
         let body = RequestBody::new(
             "claude-opus-5",
             vec![
-                sealed_assistant("token-a", "first"),
-                Message::from_content(Role::Tool, Vec::new()),
-                sealed_assistant("token-b", "second").with_preceding_developer_context(vec![
-                    "Continue the active Goal from durable state.".to_owned(),
-                ]),
+                RequestMessage::new(sealed_assistant("token-a", "first")),
+                RequestMessage::new(Message::from_content(Role::Tool, Vec::new())),
+                RequestMessage::new(sealed_assistant("token-b", "second"))
+                    .with_preceding_responses_input(
+                        ResponsesInputBoundary::from_developer_context(vec![
+                            "Continue the active Goal from durable state.".to_owned(),
+                        ]),
+                    ),
             ],
         )
         .build(&sealing_responses_quirks());

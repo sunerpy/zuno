@@ -8,7 +8,7 @@
 //! asynchronous MCP discovery
 //! finishes and then freezes again.
 
-use crate::registry::Message;
+use crate::registry::RequestMessage;
 use sha2::{Digest as _, Sha256};
 use std::io;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ impl io::Write for DigestWriter<'_> {
     }
 }
 
-fn message_fingerprint(message: &Message) -> MessageFingerprint {
+fn message_fingerprint(message: &RequestMessage) -> MessageFingerprint {
     let mut digest = Sha256::new();
     serde_json::to_writer(DigestWriter(&mut digest), message)
         .expect("serializing a provider message into SHA-256 cannot fail");
@@ -209,7 +209,7 @@ impl CacheTracker {
     pub fn record(
         &mut self,
         static_prefix: &StaticSystemPrompt,
-        stable_history: &[Message],
+        stable_history: &[RequestMessage],
     ) -> Result<(), CacheViolation> {
         self.turn += 1;
         if let Some(previous_static) = &self.previous_static {
@@ -424,7 +424,7 @@ impl<T: Clone + PartialEq> LockedTools<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedTurn<T> {
     system_static: StaticSystemPrompt,
-    messages: Vec<Message>,
+    messages: Vec<RequestMessage>,
     developer_context: Vec<String>,
     tools: Vec<T>,
     rebuilt_tools: bool,
@@ -439,7 +439,7 @@ impl<T> PreparedTurn<T> {
 
     /// Persisted provider history. Volatile policy is kept out of user messages.
     #[must_use]
-    pub fn messages(&self) -> &[Message] {
+    pub fn messages(&self) -> &[RequestMessage] {
         &self.messages
     }
 
@@ -477,7 +477,7 @@ impl<T> PreparedTurn<T> {
     /// observing request metadata should move both vectors into that request rather
     /// than retaining this snapshot and cloning the complete prompt again.
     #[must_use]
-    pub fn into_request_parts(self) -> (Vec<Message>, Vec<String>, Vec<T>) {
+    pub fn into_request_parts(self) -> (Vec<RequestMessage>, Vec<String>, Vec<T>) {
         (self.messages, self.developer_context, self.tools)
     }
 }
@@ -508,7 +508,7 @@ impl<T: Clone + PartialEq> PromptCache<T> {
     /// explicitly accepted cache miss.
     pub fn prepare_turn(
         &mut self,
-        stable_history: &[Message],
+        stable_history: &[RequestMessage],
         dynamic: DynamicContext,
         available_tools: &[T],
         mcp_status: McpToolStatus,
@@ -525,7 +525,7 @@ impl<T: Clone + PartialEq> PromptCache<T> {
     /// Assemble one provider request with a monotonic tool-disclosure revision.
     pub fn prepare_turn_with_tool_revision(
         &mut self,
-        stable_history: &[Message],
+        stable_history: &[RequestMessage],
         dynamic: DynamicContext,
         available_tools: &[T],
         mcp_status: McpToolStatus,
@@ -557,7 +557,7 @@ impl<T: Clone + PartialEq> PromptCache<T> {
     /// the vector does not weaken append-only validation.
     pub fn prepare_turn_owned(
         &mut self,
-        stable_history: Vec<Message>,
+        stable_history: Vec<RequestMessage>,
         dynamic: DynamicContext,
         available_tools: &[T],
         mcp_status: McpToolStatus,
@@ -574,7 +574,7 @@ impl<T: Clone + PartialEq> PromptCache<T> {
     /// Owned-history variant of [`Self::prepare_turn_with_tool_revision`].
     pub fn prepare_turn_owned_with_tool_revision(
         &mut self,
-        stable_history: Vec<Message>,
+        stable_history: Vec<RequestMessage>,
         dynamic: DynamicContext,
         available_tools: &[T],
         mcp_status: McpToolStatus,
@@ -614,10 +614,10 @@ impl<T: Clone + PartialEq> PromptCache<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{RequestContentBlock, Role};
+    use crate::event::{Message, RequestContentBlock, Role};
 
-    fn message(role: Role, text: &str) -> Message {
-        Message::new(role, text)
+    fn message(role: Role, text: &str) -> RequestMessage {
+        Message::new(role, text).into()
     }
 
     #[test]

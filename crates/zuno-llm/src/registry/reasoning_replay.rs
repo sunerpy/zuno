@@ -58,7 +58,7 @@
 //! replay off under a provider that set a max age still constructs here.
 
 use crate::event::{Message, RequestContentBlock, Role};
-use crate::registry::Spec;
+use crate::registry::{RequestMessage, ResponsesInputItem, Spec};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -277,7 +277,7 @@ struct ReplayGroup {
 }
 
 impl ReplayGroup {
-    fn observe(&mut self, index: usize, message: &Message) {
+    fn observe(&mut self, index: usize, message: &RequestMessage) {
         let output = assistant_emits_responses_output(message);
         let envelopes = replayable_envelopes(message);
         if !output && envelopes.is_empty() {
@@ -345,19 +345,16 @@ fn tool_emits_responses_boundary(message: &Message) -> bool {
         .any(|block| matches!(block, RequestContentBlock::ToolResult { .. }))
 }
 
-fn has_preceding_developer_boundary(message: &Message) -> bool {
-    message
-        .preceding_developer_context
-        .iter()
-        .any(|context| !context.trim().is_empty())
+fn has_preceding_responses_boundary(message: &RequestMessage) -> bool {
+    !message.preceding_responses_input().is_empty()
 }
 
-fn ambiguous_replay_groups(messages: &[Message]) -> Vec<(usize, usize)> {
+fn ambiguous_replay_groups(messages: &[RequestMessage]) -> Vec<(usize, usize)> {
     let mut groups = Vec::new();
     let mut group = ReplayGroup::default();
     let mut system_claimed_as_instructions = false;
     for (index, message) in messages.iter().enumerate() {
-        if has_preceding_developer_boundary(message)
+        if has_preceding_responses_boundary(message)
             && let Some(range) = group.take_ambiguous()
         {
             groups.push(range);
@@ -398,7 +395,7 @@ fn ambiguous_replay_groups(messages: &[Message]) -> Vec<(usize, usize)> {
 /// The error reports message indexes only. Opaque replay tokens are never rendered or
 /// logged.
 pub fn validate_responses_replay_boundaries(
-    messages: &[Message],
+    messages: &[RequestMessage],
 ) -> Result<(), AmbiguousReasoningReplay> {
     if let Some((first_message_index, last_message_index)) =
         ambiguous_replay_groups(messages).into_iter().next()
@@ -417,7 +414,9 @@ pub fn validate_responses_replay_boundaries(
 /// for old exports, compaction summaries, or damaged prompt-receipt history: quality
 /// degrades for those turns, but the session remains usable and no opaque token is guessed.
 #[must_use]
-pub fn withhold_ambiguous_responses_replay(messages: &mut [Message]) -> AmbiguousReplayWithholding {
+pub fn withhold_ambiguous_responses_replay(
+    messages: &mut [RequestMessage],
+) -> AmbiguousReplayWithholding {
     let groups = ambiguous_replay_groups(messages);
     let mut result = AmbiguousReplayWithholding {
         groups: groups.len(),
@@ -445,11 +444,11 @@ pub fn withhold_ambiguous_responses_replay(messages: &mut [Message]) -> Ambiguou
 
 /// Whether the final Responses item emitted by this history is assistant output.
 #[must_use]
-pub fn responses_history_ends_in_assistant_output(messages: &[Message]) -> bool {
+pub fn responses_history_ends_in_assistant_output(messages: &[RequestMessage]) -> bool {
     let mut system_claimed_as_instructions = false;
     let mut assistant_output = false;
     for message in messages {
-        if has_preceding_developer_boundary(message) {
+        if has_preceding_responses_boundary(message) {
             assistant_output = false;
         }
         match message.role {
@@ -466,6 +465,44 @@ pub fn responses_history_ends_in_assistant_output(messages: &[Message]) -> bool 
         }
     }
     assistant_output
+}
+
+/// Shared state for projecting provider-neutral history onto Responses input items.
+///
+/// OpenAI, compatible gateways, and Bedrock Responses all need the same answer
+/// about where a recovered boundary belongs. Providers still own their wire JSON,
+/// but this cursor owns the cross-message ordering invariant so adapters cannot
+/// silently drift apart.
+#[derive(Debug, Default)]
+pub struct ResponsesInputCursor {
+    wire_ends_in_assistant_output: bool,
+}
+
+impl ResponsesInputCursor {
+    /// Boundary items that must be emitted before this message.
+    ///
+    /// A boundary is relevant only between two assistant outputs. User input,
+    /// function-call output, or another standard wire item already separates turns.
+    pub fn boundary_before<'message>(
+        &mut self,
+        message: &'message RequestMessage,
+    ) -> &'message [ResponsesInputItem] {
+        if self.wire_ends_in_assistant_output && message.role == Role::Assistant {
+            let boundary = message.preceding_responses_input().items();
+            if !boundary.is_empty() {
+                self.wire_ends_in_assistant_output = false;
+                return boundary;
+            }
+        }
+        &[]
+    }
+
+    /// Record whether this provider emitted at least one wire item for `message`.
+    pub fn observe_message(&mut self, message: &RequestMessage, emitted: bool) {
+        if emitted {
+            self.wire_ends_in_assistant_output = message.role == Role::Assistant;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -612,7 +649,7 @@ mod tests {
         }
     }
 
-    fn assistant(token: &str, text: &str) -> Message {
+    fn assistant(token: &str, text: &str) -> RequestMessage {
         Message::from_content(
             Role::Assistant,
             vec![
@@ -622,6 +659,7 @@ mod tests {
                 },
             ],
         )
+        .into()
     }
 
     #[test]
@@ -650,7 +688,8 @@ mod tests {
                     thinking: "history only".to_owned(),
                     signature: "signature".to_owned(),
                 }],
-            ),
+            )
+            .into(),
             assistant("token-b", "second"),
         ];
 
@@ -680,7 +719,7 @@ mod tests {
     fn a_compaction_summary_without_a_receipt_degrades_instead_of_blocking() {
         let mut messages = vec![
             assistant("token-a", "answer before compaction"),
-            Message::new(Role::Assistant, "compaction summary"),
+            Message::new(Role::Assistant, "compaction summary").into(),
         ];
 
         assert_eq!(
@@ -707,9 +746,11 @@ mod tests {
     fn persisted_developer_context_separates_autonomous_assistant_turns() {
         let messages = vec![
             assistant("token-a", "first"),
-            assistant("token-b", "second").with_preceding_developer_context(vec![
-                "Continue the active Goal from durable state.".to_owned(),
-            ]),
+            assistant("token-b", "second").with_preceding_responses_input(
+                crate::registry::ResponsesInputBoundary::from_developer_context(vec![
+                    "Continue the active Goal from durable state.".to_owned(),
+                ]),
+            ),
         ];
 
         validate_responses_replay_boundaries(&messages)
@@ -731,7 +772,8 @@ mod tests {
                         thought_signature: None,
                     },
                 ],
-            ),
+            )
+            .into(),
             Message::from_content(
                 Role::Tool,
                 vec![RequestContentBlock::ToolResult {
@@ -739,7 +781,8 @@ mod tests {
                     content: "done".to_owned(),
                     is_error: Some(false),
                 }],
-            ),
+            )
+            .into(),
             assistant("token-b", "second"),
         ];
 
@@ -753,19 +796,22 @@ mod tests {
 
     #[test]
     fn one_assistant_message_cannot_carry_two_distinct_replay_tokens() {
-        let messages = vec![Message::from_content(
-            Role::Assistant,
-            vec![
-                capsule("token-a"),
-                RequestContentBlock::Text {
-                    text: "first".to_owned(),
-                },
-                capsule("token-b"),
-                RequestContentBlock::Text {
-                    text: "second".to_owned(),
-                },
-            ],
-        )];
+        let messages = vec![
+            Message::from_content(
+                Role::Assistant,
+                vec![
+                    capsule("token-a"),
+                    RequestContentBlock::Text {
+                        text: "first".to_owned(),
+                    },
+                    capsule("token-b"),
+                    RequestContentBlock::Text {
+                        text: "second".to_owned(),
+                    },
+                ],
+            )
+            .into(),
+        ];
 
         assert_eq!(
             validate_responses_replay_boundaries(&messages),
@@ -800,19 +846,22 @@ mod tests {
 
     #[test]
     fn repeated_metadata_for_one_replay_token_remains_valid() {
-        let messages = vec![Message::from_content(
-            Role::Assistant,
-            vec![
-                capsule("token-a"),
-                RequestContentBlock::Text {
-                    text: "first".to_owned(),
-                },
-                capsule("token-a"),
-                RequestContentBlock::Text {
-                    text: "second".to_owned(),
-                },
-            ],
-        )];
+        let messages = vec![
+            Message::from_content(
+                Role::Assistant,
+                vec![
+                    capsule("token-a"),
+                    RequestContentBlock::Text {
+                        text: "first".to_owned(),
+                    },
+                    capsule("token-a"),
+                    RequestContentBlock::Text {
+                        text: "second".to_owned(),
+                    },
+                ],
+            )
+            .into(),
+        ];
 
         validate_responses_replay_boundaries(&messages)
             .expect("one assistant turn may repeat the same opaque token");
@@ -820,32 +869,38 @@ mod tests {
 
     #[test]
     fn only_real_responses_items_change_the_terminal_history_class() {
-        let mut messages = vec![Message::new(Role::System, "system")];
+        let mut messages = vec![Message::new(Role::System, "system").into()];
         assert!(!responses_history_ends_in_assistant_output(&messages));
 
-        messages.push(Message::from_content(
-            Role::Assistant,
-            vec![RequestContentBlock::SignedThinking {
-                thinking: "not on Responses".to_owned(),
-                signature: "sig".to_owned(),
-            }],
-        ));
+        messages.push(
+            Message::from_content(
+                Role::Assistant,
+                vec![RequestContentBlock::SignedThinking {
+                    thinking: "not on Responses".to_owned(),
+                    signature: "sig".to_owned(),
+                }],
+            )
+            .into(),
+        );
         assert!(!responses_history_ends_in_assistant_output(&messages));
 
-        messages.push(Message::new(Role::Assistant, "answer"));
+        messages.push(Message::new(Role::Assistant, "answer").into());
         assert!(responses_history_ends_in_assistant_output(&messages));
 
-        messages.push(Message::from_content(Role::Tool, Vec::new()));
+        messages.push(Message::from_content(Role::Tool, Vec::new()).into());
         assert!(responses_history_ends_in_assistant_output(&messages));
 
-        messages.push(Message::from_content(
-            Role::Tool,
-            vec![RequestContentBlock::ToolResult {
-                tool_use_id: "call_1".to_owned(),
-                content: "done".to_owned(),
-                is_error: Some(false),
-            }],
-        ));
+        messages.push(
+            Message::from_content(
+                Role::Tool,
+                vec![RequestContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_owned(),
+                    content: "done".to_owned(),
+                    is_error: Some(false),
+                }],
+            )
+            .into(),
+        );
         assert!(!responses_history_ends_in_assistant_output(&messages));
     }
 }

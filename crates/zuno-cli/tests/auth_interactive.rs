@@ -81,7 +81,7 @@ fn bare_auth_login_selects_a_provider_and_stores_a_hidden_api_key() {
     );
     terminal.write(b"super-secret-login-key\r");
 
-    let (status, output) = terminal.finish();
+    let (status, output) = terminal.finish_after_output("Stored API key for acme");
     assert!(status.success(), "{output}");
     assert!(output.contains("Select provider: Acme"), "{output}");
     assert!(output.contains("Stored API key for acme"), "{output}");
@@ -163,7 +163,8 @@ fn bare_auth_login_selects_bedrock_and_stores_a_hidden_bearer_token() {
     );
     terminal.write(b"bedrock-interactive-secret\r");
 
-    let (status, output) = terminal.finish();
+    let (status, output) =
+        terminal.finish_after_output("Stored Amazon Bedrock bearer token for amazon-bedrock");
     assert!(status.success(), "{output}");
     for expected in [
         "Select provider: Amazon Bedrock",
@@ -254,7 +255,7 @@ fn bare_auth_login_hides_catalog_only_and_credential_only_providers() {
     assert!(!output.contains("Other"), "{output}");
 
     terminal.write(b"\x1b");
-    let (status, output) = terminal.finish();
+    let (status, output) = terminal.finish_after_output("provider login cancelled");
     assert!(!status.success(), "{output}");
     assert!(output.contains("provider login cancelled"), "{output}");
 }
@@ -343,7 +344,7 @@ fn openai_login_prompts_for_the_authentication_method() {
     assert!(output.contains("Manually enter API key"), "{output}");
 
     terminal.write(b"\x1b");
-    let (status, output) = terminal.finish();
+    let (status, output) = terminal.finish_after_output("provider login cancelled");
     assert!(!status.success(), "{output}");
     assert!(output.contains("provider login cancelled"), "{output}");
 }
@@ -382,7 +383,8 @@ fn empty_config_can_set_up_bedrock_with_one_visible_provider_and_the_aws_chain()
     );
     terminal.write(b"\r");
 
-    let (status, output) = terminal.finish();
+    let (status, output) =
+        terminal.finish_after_output("Amazon Bedrock will use the AWS credential chain");
     assert!(status.success(), "{output}");
     assert!(!output.contains("Bedrock model id"), "{output}");
     assert!(!output.contains("Model display name"), "{output}");
@@ -420,7 +422,8 @@ fn bedrock_setup_without_a_catalog_fails_before_asking_for_configuration() {
     );
     terminal.write(b"bedrock\r");
 
-    let (status, output) = terminal.finish();
+    let (status, output) =
+        terminal.finish_after_output("Amazon Bedrock is unavailable in the model catalog");
     assert!(!status.success(), "{output}");
     assert!(
         output.contains("Amazon Bedrock is unavailable in the model catalog"),
@@ -473,7 +476,7 @@ fn empty_config_can_set_up_openai_compatible_as_chat_completions() {
     );
     terminal.write(b"compatible-secret\r");
 
-    let (status, output) = terminal.finish();
+    let (status, output) = terminal.finish_after_output("Stored API key for local-compatible");
     assert!(status.success(), "{output}");
     let config = fixture.config();
     assert_eq!(
@@ -533,7 +536,7 @@ fn openai_custom_endpoint_is_written_as_native_responses() {
     );
     terminal.write(b"responses-secret\r");
 
-    let (status, output) = terminal.finish();
+    let (status, output) = terminal.finish_after_output("Stored API key for custom-responses");
     assert!(status.success(), "{output}");
     let config = fixture.config();
     assert_eq!(
@@ -597,7 +600,7 @@ fn url_login_shows_the_remote_command_and_enter_declines_it() {
     );
 
     terminal.write(b"\r");
-    let (status, output) = terminal.finish();
+    let (status, output) = terminal.finish_after_output("well-known provider login cancelled");
     assert!(!status.success(), "{output}");
     assert!(output.contains("Run this command: No"), "{output}");
     assert!(
@@ -898,20 +901,53 @@ impl TestPty {
         false
     }
 
-    fn finish(&mut self) -> (portable_pty::ExitStatus, String) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    /// Wait for one semantic terminal outcome, then require prompt process teardown.
+    ///
+    /// Under the full Linux suite the child can be descheduled for several seconds
+    /// after the final secret is submitted. A single short exit deadline confuses
+    /// that pre-outcome scheduling delay with a process that printed completion but
+    /// leaked. Keep those failures separate: the command has a bounded window to
+    /// produce the exact outcome the test owns, and only then receives a short exit
+    /// grace period.
+    fn finish_after_output(&mut self, expected: &str) -> (portable_pty::ExitStatus, String) {
+        let outcome_deadline = Instant::now() + Duration::from_secs(30);
+        let mut outcome_observed_at = None;
         loop {
             if let Some(status) = self.child.try_wait().expect("poll authentication command") {
                 self.writer.take();
                 self.join_reader();
-                return (status, self.output());
+                let output = self.output();
+                assert!(
+                    output.contains(expected),
+                    "authentication command exited before terminal outcome {expected:?}: {output}"
+                );
+                return (status, output);
             }
-            if Instant::now() >= deadline {
+
+            let now = Instant::now();
+            let output = self.output();
+            if outcome_observed_at.is_none() && output.contains(expected) {
+                outcome_observed_at = Some(now);
+            }
+            let timed_out = outcome_observed_at.map_or_else(
+                || now >= outcome_deadline,
+                |observed| now.duration_since(observed) >= Duration::from_secs(5),
+            );
+            if timed_out {
                 let output = self.output();
                 let _ = self.child.kill();
                 self.writer.take();
                 self.join_reader();
-                panic!("authentication command did not exit: {output}");
+                if outcome_observed_at.is_some() {
+                    panic!(
+                        "authentication command produced terminal outcome {expected:?} \
+                         but did not exit: {output}"
+                    );
+                }
+                panic!(
+                    "authentication command did not produce terminal outcome {expected:?}: \
+                     {output}"
+                );
             }
             std::thread::sleep(Duration::from_millis(10));
         }

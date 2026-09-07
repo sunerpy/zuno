@@ -589,7 +589,8 @@ mod tests {
     use serde_json::json;
     use wiremock::matchers::{body_json, header, header_regex, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    use zuno_llm::event::{Message, Role};
+    use zuno_llm::event::{Message, RequestContentBlock, Role};
+    use zuno_llm::registry::{RequestMessage, ResponsesInputBoundary};
 
     use super::*;
 
@@ -681,6 +682,67 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "read_file");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn mantle_responses_uses_the_shared_standard_input_boundary() {
+        let provider = BedrockResponsesProvider::from_spec(
+            &spec(MANTLE_PROVIDER_ID, None).with_option("reasoningReplay", json!("encrypted")),
+            BedrockResponsesEndpoint::Mantle,
+        )
+        .expect("provider");
+        let sealed = |token: &str, text: &str| {
+            Message::from_content(
+                Role::Assistant,
+                vec![
+                    RequestContentBlock::ProviderEncryptedReasoning {
+                        id: format!("rs_{token}"),
+                        summary: Vec::new(),
+                        encrypted_content: Some(token.to_owned()),
+                        status: None,
+                    },
+                    RequestContentBlock::Text {
+                        text: text.to_owned(),
+                    },
+                ],
+            )
+        };
+        let request = CompletionRequest::from_request_messages(
+            "openai.gpt-5.6-sol",
+            vec![
+                sealed("token-a", "first").into(),
+                RequestMessage::new(sealed("token-b", "second")).with_preceding_responses_input(
+                    ResponsesInputBoundary::from_developer_context(vec![
+                        "Continue the durable work from its exact state.".to_owned(),
+                    ]),
+                ),
+            ],
+        );
+
+        let body = provider.body_for(&request).expect("Responses body");
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(
+            input
+                .iter()
+                .map(|item| {
+                    item["type"]
+                        .as_str()
+                        .map_or_else(|| format!("role:{}", item["role"]), ToOwned::to_owned)
+                })
+                .collect::<Vec<_>>(),
+            [
+                "reasoning",
+                "role:\"assistant\"",
+                "role:\"developer\"",
+                "reasoning",
+                "role:\"assistant\"",
+            ]
+        );
+        assert_eq!(
+            input[2]["content"],
+            "Continue the durable work from its exact state."
+        );
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 use zuno_error::ProviderError;
 use zuno_llm::event::{Message, RequestContentBlock, Role, tool_arguments_text};
 use zuno_llm::registry::{
-    ApiSurface, CompletionRequest, sealed_item_has_following_output,
+    ApiSurface, CompletionRequest, ResponsesInputCursor, sealed_item_has_following_output,
     validate_responses_replay_boundaries,
 };
 
@@ -160,7 +160,7 @@ fn build_chat_body(
     let mut messages = request
         .messages
         .iter()
-        .flat_map(chat_message)
+        .flat_map(|message| chat_message(message.message()))
         .collect::<Result<Vec<_>, _>>()?;
     messages.extend(
         request
@@ -189,28 +189,21 @@ fn build_responses_body(
 ) -> Result<Value, ProviderError> {
     let mut input = Vec::new();
     let mut instructions = None;
-    let mut wire_ends_in_assistant_output = false;
-    for message in &request.messages {
-        if wire_ends_in_assistant_output && message.role == Role::Assistant {
-            let boundary = message
-                .preceding_developer_context
-                .iter()
-                .filter(|content| !content.trim().is_empty())
-                .map(|content| json!({"role": "developer", "content": content}))
-                .collect::<Vec<_>>();
-            if !boundary.is_empty() {
-                input.extend(boundary);
-                wire_ends_in_assistant_output = false;
-            }
+    let mut cursor = ResponsesInputCursor::default();
+    for request_message in &request.messages {
+        for boundary in cursor.boundary_before(request_message) {
+            input.push(json!({
+                "role": boundary.role(),
+                "content": boundary.content(),
+            }));
         }
+        let message = request_message.message();
         if message.role == Role::System && instructions.is_none() {
             instructions = Some(joined_text(message));
         } else {
             let items = responses_message(message)?;
-            if !items.is_empty() {
-                wire_ends_in_assistant_output = message.role == Role::Assistant;
-                input.extend(items);
-            }
+            cursor.observe_message(request_message, !items.is_empty());
+            input.extend(items);
         }
     }
     input.extend(
@@ -724,6 +717,7 @@ mod tests {
     use zuno_llm::event::RequestContentBlock;
     use zuno_llm::registry::{
         ProviderRequestContext, ProviderSessionIdentity, ReasoningReplay, ReasoningReplayPolicy,
+        RequestMessage, ResponsesInputBoundary,
     };
 
     fn main_turn_context() -> ProviderRequestContext {
@@ -1112,14 +1106,17 @@ mod tests {
 
     #[test]
     fn autonomous_assistant_turns_restore_their_real_developer_boundary() {
-        let request = CompletionRequest::new(
+        let request = CompletionRequest::from_request_messages(
             "gpt-5.6-sol",
             vec![
-                sealed_assistant("token-a", "first"),
-                Message::from_content(Role::Tool, Vec::new()),
-                sealed_assistant("token-b", "second").with_preceding_developer_context(vec![
-                    "Continue the active Goal from durable state.".to_owned(),
-                ]),
+                sealed_assistant("token-a", "first").into(),
+                Message::from_content(Role::Tool, Vec::new()).into(),
+                RequestMessage::new(sealed_assistant("token-b", "second"))
+                    .with_preceding_responses_input(
+                        ResponsesInputBoundary::from_developer_context(vec![
+                            "Continue the active Goal from durable state.".to_owned(),
+                        ]),
+                    ),
             ],
         )
         .on_surface(ApiSurface::Responses);

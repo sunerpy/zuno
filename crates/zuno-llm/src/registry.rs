@@ -102,11 +102,12 @@ pub use crate::registry::error::{Declined, FactoryOutcome, RegistryError, Unavai
 pub use crate::registry::provider::{
     Capabilities, CompletionRequest, CredentialPresence, FinishReason,
     InvalidProviderSessionIdentity, Message, Provider, ProviderRequestContext,
-    ProviderSessionIdentity, ProviderStream, RequestPurpose, Role, StreamEvent, ToolSchema,
+    ProviderSessionIdentity, ProviderStream, RequestMessage, RequestPurpose,
+    ResponsesInputBoundary, ResponsesInputItem, Role, StreamEvent, ToolSchema,
 };
 pub use crate::registry::reasoning_replay::{
     AmbiguousReasoningReplay, AmbiguousReplayWithholding, ENCRYPTED_REASONING_INCLUDE,
-    InvalidReasoningReplayOption, ReasoningReplay, ReasoningReplayPolicy,
+    InvalidReasoningReplayOption, ReasoningReplay, ReasoningReplayPolicy, ResponsesInputCursor,
     responses_history_ends_in_assistant_output, sealed_item_has_following_output,
     validate_responses_replay_boundaries, withhold_ambiguous_responses_replay,
 };

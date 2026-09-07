@@ -286,13 +286,16 @@ a user message. The standard Responses representation is the real developer
 context that started that continuation, placed between the two assistant output
 runs. Zuno persists only the prompt-receipt reference on the new turn's first
 assistant row and reconstructs the actual post-hook suffix from that receipt;
-older rows recover the reference from their provider-request event. The OpenAI
-and compatible adapters restore it before the later reasoning item. Kiro V3 already routes
-`instructions`/`system`/`developer` input through its native or ordered stateless
-lane, so no private Kiro-only boundary item or token-based turn guessing is
-required. When an old export or compaction summary has no receipt, Zuno withholds
-only the ambiguous capsules and keeps the transcript usable; malformed history
-that survives that repair still fails locally without exposing token bytes.
+older rows recover the reference from their provider-request event. The engine
+keeps generic `Message` content free of this Responses-only concern and attaches
+a structured `ResponsesInputBoundary` sidecar to the later request message. One
+shared cursor projects that boundary for OpenAI, compatible, and Bedrock
+Responses paths. Kiro V3 already routes `instructions`/`system`/`developer`
+input through its native or ordered stateless lane, so no private Kiro-only
+boundary item or token-based turn guessing is required. When an old export or
+compaction summary has no receipt, Zuno withholds only the ambiguous capsules
+and keeps the transcript usable; malformed history that survives that repair
+still fails locally without exposing token bytes.
 
 Zuno's own routing adds a third obligation. `reasoningReplay: "encrypted"` is
 accepted only beside `transport: "openai"` and `surface: "responses"`: a custom
