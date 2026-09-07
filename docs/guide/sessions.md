@@ -210,10 +210,10 @@ create-or-replace instruction with the maintenance instruction, so
 changed it.
 
 Clamping also decides what happens when a peer asks for more time than the same-request
-recovery has left. The provider layer retries one request for at most 180 seconds; a
-`Retry-After` longer than what remains of that window is neither slept through nor replaced
-by a shorter local backoff. The turn ends with the peer's error, and the Goal retry waits
-the peer's value clamped to `max_delay_ms`.
+recovery has left. Under the default policy, replacement work gets a 180-second provider
+recovery window; a `Retry-After` longer than what remains of that window is neither slept
+through nor replaced by a shorter local backoff. The turn ends with the peer's error, and
+the Goal retry waits the peer's value clamped to `max_delay_ms`.
 
 ## Continuing a session
 

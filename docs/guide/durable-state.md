@@ -26,23 +26,25 @@ A goal is the continuation authority. An active goal continues until it complete
 explicitly paused or blocked, reaches its budget, or hits a typed permanent failure. That
 is what makes long work resumable instead of stopping whenever a turn ends.
 
-Recovery is layered. The provider recovery deadline is anchored when the original request
-starts. Its initial request remains transport-governed, while locally jittered backoff and
-every replacement attempt must complete before that absolute deadline; expiry cancels and
-records an active replay. Before every provider-request backoff, the request layer commits
-a `provider_retry_backoff` checkpoint containing the request, turn, failed and next attempt,
+Recovery is layered. The provider recovery window starts only after the original request
+returns its first retryable failure. That initial request remains transport-governed and
+does not consume the window, while rollback, locally jittered backoff, and every replacement
+attempt must complete before the resulting absolute deadline; expiry cancels and records an
+active replay. Before every provider-request backoff, the request layer commits a
+`provider_retry_backoff` checkpoint containing the request, turn, failed and next attempt,
 typed reason, selected delay, and wait deadline. A restart never revives that old HTTP
 request. It observes the remaining wait, then starts a fresh Goal turn. If the bounded
 provider sequence still ends in a recoverable error, the Goal controller writes a
 `goal_retry` row before waiting and likewise starts a fresh turn when its persisted deadline
 arrives.
 
-The two layers hand over cleanly when the peer names its own delay. The provider layer
-retries one request for at most 180 seconds; if a `Retry-After` is longer than what remains
-of that window, the request layer neither sleeps past its deadline nor substitutes a
-shorter local backoff, because the peer has already said that a local delay is too soon.
-The turn ends with the peer's typed error, and the Goal retry waits the peer's value clamped
-to `max_delay_ms`. Under the default policy a peer that asked for 400 seconds produces a 300
+The two layers hand over cleanly when the peer names its own delay. Under the default policy,
+the provider layer gives replacement work a 180-second recovery window; if a `Retry-After`
+is longer than what remains of that window, the request layer neither sleeps past its
+deadline nor substitutes a shorter local backoff, because the peer has already said that a
+local delay is too soon. The turn ends with the peer's typed error, and the Goal retry waits
+the peer's value clamped to `max_delay_ms`. Under that policy a peer that asked for 400
+seconds produces a 300
 second Goal wait, not a two second local retry.
 
 ```json
