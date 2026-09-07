@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.18](https://github.com/sunerpy/zuno/compare/v0.10.17...v0.10.18) (2026-09-07)
+
+
+### Bug Fixes
+
+* **docs:** 更正 provider 恢复窗口起点说明 ([47273cd](https://github.com/sunerpy/zuno/commit/47273cdcca1f9be39b6d6d6aa5cf1ddf3d691a4e))
+* **docs:** 更正 provider 恢复窗口起点说明 ([ac50ac0](https://github.com/sunerpy/zuno/commit/ac50ac02b94c89be1d1b0df653e13a1dcde8f2f0))
+
 ## [0.10.17](https://github.com/sunerpy/zuno/compare/v0.10.16...v0.10.17) (2026-09-07)
 
 
