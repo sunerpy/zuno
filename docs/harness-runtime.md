@@ -1515,6 +1515,21 @@ the context limit, and the latest accounting mode.
 
 An active goal uses two recovery layers. The provider request layer retries a bounded sequence in place and rolls back unpublished partial output before another request. Its absolute recovery deadline is anchored when the original request starts. The original request remains governed by transport and stream-idle limits, while rollback, locally jittered backoff, and every replacement attempt must finish before that deadline; expiry cancels an active replay and persists its attempt as a typed deadline failure. Before every wait Zuno commits a `provider_retry_backoff` checkpoint with the request id, turn id, failed and next attempt, typed reason, selected delay, and wait deadline. Its in-place backoff is interruptible by both hard cancellation and durable live steering; waking it does not replay the stale provider request. After a process restart, Zuno waits out any remaining checkpoint deadline and starts a new turn and provider request instead of attempting to revive the old transport. If the bounded sequence still ends in a recoverable error, the goal controller writes a `goal_retry` row before waiting and starts a fresh agent turn when its persisted deadline arrives. There is no cross-turn retry-count ceiling for recoverable failures: the delay grows exponentially, reaches the configured cap, and the goal remains active until it completes, is paused, reaches its token budget, or encounters a permanent failure.
 
+Goal continuation is a first-class turn origin. A prepared continuation captures the exact
+Goal id and revision, and a revision change invalidates it before provider work starts. The
+turn's execution identity is captured independently from the current host: Agent, catalog
+provider, and catalog model. Retained user history supplies only the causal transcript anchor
+and grants no authority. It is never rewritten to make a reconfigured host look historical,
+and its old Agent/model fields cannot route an automatic Goal turn. Ordinary user turns
+continue to use their own message identity.
+
+The engine appends one `session.turn.started.1` event after resolving the current identity and
+before provider dispatch. It records `turnTrigger`, `anchorMessageID`, Agent, provider, and
+model; Goal turns also record `goalID` and `goalRevision`. Provider-attempt events repeat the
+Goal trigger and resolved identity so retry evidence remains self-contained. If Agent or model
+resolution fails, `session.turn.rejected.1` records the requested identity and typed failure
+before the Goal is blocked; no started or provider-attempt event is fabricated.
+
 The retry row is tied to the exact `goal_id` and stores the attempt, typed reason, selected delay, schedule time, and next eligible time. Reopening the same session reconstructs the wait from SQLite. ACP load and resume rebuild the runtime, replay the requested durable projections, then schedule any active root Goal through the detached continuation observer. This recovery path is process-owned and uses the same per-session execution gate as a prompt, so it cannot race a second Goal turn. Queued user input has priority over an automatic turn, and long waits are split by `poll_interval_ms` so an interactive surface can notice that input promptly.
 
 Local delays use exponential backoff with symmetric jitter and never collapse to zero. A valid provider `Retry-After` value is never shortened by jitter; it is clamped to the configured ceiling rather than replaced by an earlier local delay. That holds across the same-request recovery deadline as well. When the peer's requested delay is at least as long as what remains of the 180 second deadline, the provider layer neither sleeps past its deadline nor substitutes a shorter local delay: the turn ends with the peer's own typed error, and the goal-level retry waits the peer's value clamped to `max_delay_ms`. A local backoff that would outlive the deadline still ends the turn as a provider retry deadline failure and follows the ordinary goal backoff.

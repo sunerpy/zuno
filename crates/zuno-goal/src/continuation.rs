@@ -89,6 +89,7 @@ pub enum ContinuationSuppression {
 pub struct PreparedContinuation {
     session_id: String,
     goal_id: String,
+    goal_revision: i64,
     entry: TranscriptEntry,
     run_guard: SessionRunGuard,
     _start_slot: StartSlot,
@@ -105,6 +106,12 @@ impl PreparedContinuation {
     #[must_use]
     pub fn run_guard(&self) -> &SessionRunGuard {
         &self.run_guard
+    }
+
+    /// Goal instance and revision captured with the contextual entry.
+    #[must_use]
+    pub fn goal_identity(&self) -> (&str, i64) {
+        (&self.goal_id, self.goal_revision)
     }
 }
 
@@ -202,7 +209,9 @@ impl GoalContinuation {
     /// work so an entry captured for an older goal instance never runs afterward.
     pub fn is_current(&self, prepared: &PreparedContinuation) -> Result<bool, GoalError> {
         Ok(self.store.goal(&prepared.session_id)?.is_some_and(|goal| {
-            goal.goal_id == prepared.goal_id && goal.status == GoalStatus::Active
+            goal.goal_id == prepared.goal_id
+                && goal.revision == prepared.goal_revision
+                && goal.status == GoalStatus::Active
         }))
     }
 
@@ -316,6 +325,7 @@ impl GoalContinuation {
             PreparedContinuation {
                 session_id: goal.session_id.clone(),
                 goal_id: goal.goal_id.clone(),
+                goal_revision: goal.revision,
                 entry: goal_entry(goal, retry.as_ref()),
                 run_guard,
                 _start_slot: start_slot,

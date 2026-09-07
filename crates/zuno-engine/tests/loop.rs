@@ -23,9 +23,10 @@ use zuno_engine::interrupt::{InterruptSignal, SoftInterruptMessage, SoftInterrup
 use zuno_engine::r#loop::{
     AgentModelResolver, AvailableTools, DispatchRequest, NoticeSeverity, PreparedToolDispatch,
     ResolvedAgent, ResolvedModel, RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext,
-    TurnError, TurnEvent, TurnOutcome, TurnRecovery, event_channel, has_requested_user_message,
-    hydrate_retained_history, hydrate_retained_history_tail, project_history,
-    project_history_owned, retained_history, run_turn,
+    TurnError, TurnEvent, TurnExecutionIdentity, TurnOutcome, TurnRecovery, TurnStart,
+    event_channel, has_requested_user_message, hydrate_retained_history,
+    hydrate_retained_history_tail, project_history, project_history_owned, retained_history,
+    run_turn,
 };
 use zuno_engine::prompt::{PromptAssembly, PromptAssemblyError, RuntimePromptPolicy};
 use zuno_engine::status::{SessionControl, SessionRunRegistry};
@@ -135,6 +136,23 @@ impl AgentModelResolver for FakeResolver {
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
         (provider_id == "fake" && model_id == "fake-model")
             .then(|| ResolvedModel::new(Spec::new("fake"), "fake-model", ApiSurface::Default))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GoalAliasResolver;
+
+impl AgentModelResolver for GoalAliasResolver {
+    fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
+        (requested == "current-agent-alias")
+            .then(|| ResolvedAgent::new("build", "You are a deterministic test agent."))
+    }
+
+    fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
+        (provider_id == "current-provider-alias" && model_id == "current-model-alias").then(|| {
+            ResolvedModel::new(Spec::new("fake"), "fake-model", ApiSurface::Default)
+                .with_catalog_identity("fake", "fake-model")
+        })
     }
 }
 
@@ -773,13 +791,25 @@ fn scalar_count(connection: &Connection, sql: &str) -> i64 {
 }
 
 fn put_user(connection: &Connection, id: &str, created: i64, text: &str) {
+    put_user_with_identity(connection, id, created, text, "build", "fake", "fake-model");
+}
+
+fn put_user_with_identity(
+    connection: &Connection,
+    id: &str,
+    created: i64,
+    text: &str,
+    agent: &str,
+    provider_id: &str,
+    model_id: &str,
+) {
     let message = MessageRecord::from_json(json!({
         "id": id,
         "sessionID": SESSION_ID,
         "role": "user",
         "time": { "created": created },
-        "agent": "build",
-        "model": { "providerID": "fake", "modelID": "fake-model" }
+        "agent": agent,
+        "model": { "providerID": provider_id, "modelID": model_id }
     }))
     .expect("valid user message");
     let part = PartRecord::from_json(
@@ -1307,6 +1337,249 @@ async fn run_single_text_turn(
         Ok(TurnOutcome::Completed { steps: 1, .. })
     ));
     provider
+}
+
+#[tokio::test]
+async fn goal_turn_uses_current_host_identity_and_preserves_the_historical_anchor() {
+    let mut connection = seeded();
+    put_user_with_identity(
+        &connection,
+        "msg_deep_anchor",
+        10,
+        "Inspect the original design.",
+        "deep",
+        "retired-provider",
+        "retired-model",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta("continued with current settings".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = GoalAliasResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        request("turn-goal-current-identity").with_start(TurnStart::GoalContinuation {
+            goal_id: "goal-current".to_owned(),
+            goal_revision: 7,
+            identity: TurnExecutionIdentity::new(
+                "current-agent-alias",
+                "current-provider-alias",
+                "current-model-alias",
+            ),
+        }),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 1, .. })
+    ));
+    assert_eq!(provider.requests().len(), 1);
+
+    let history = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate Goal turn");
+    let anchor = history
+        .iter()
+        .find(|message| message.info.id == "msg_deep_anchor")
+        .expect("historical anchor remains");
+    assert_eq!(anchor.info.data["agent"], "deep");
+    assert_eq!(anchor.info.data["model"]["providerID"], "retired-provider");
+    assert_eq!(anchor.info.data["model"]["modelID"], "retired-model");
+    let assistant = history
+        .iter()
+        .find(|message| message.info.role == zuno_db::message::MessageRole::Assistant)
+        .expect("Goal assistant");
+    assert_eq!(assistant.info.data["parentID"], "msg_deep_anchor");
+    assert_eq!(assistant.info.data["agent"], "build");
+    assert_eq!(assistant.info.data["providerID"], "fake");
+    assert_eq!(assistant.info.data["modelID"], "fake-model");
+
+    let started: String = connection
+        .query_row(
+            "SELECT data FROM event \
+             WHERE aggregate_id = ?1 AND type = 'session.turn.started.1'",
+            [SESSION_ID],
+            |row| row.get(0),
+        )
+        .expect("durable turn start");
+    let started: Value = serde_json::from_str(&started).expect("turn start JSON");
+    assert_eq!(started["turnTrigger"], "goal");
+    assert_eq!(started["anchorMessageID"], "msg_deep_anchor");
+    assert_eq!(started["agent"], "build");
+    assert_eq!(started["providerID"], "fake");
+    assert_eq!(started["modelID"], "fake-model");
+    assert_eq!(started["goalID"], "goal-current");
+    assert_eq!(started["goalRevision"], 7);
+
+    let attempts = connection
+        .prepare(
+            "SELECT data FROM event \
+             WHERE aggregate_id = ?1 AND type = 'session.provider.attempt.1' ORDER BY seq",
+        )
+        .expect("prepare Goal attempt query")
+        .query_map([SESSION_ID], |row| row.get::<_, String>(0))
+        .expect("query Goal attempts")
+        .map(|row| {
+            serde_json::from_str::<Value>(&row.expect("Goal attempt event"))
+                .expect("Goal attempt JSON")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|attempt| {
+        attempt["turnTrigger"] == "goal"
+            && attempt["goalID"] == "goal-current"
+            && attempt["goalRevision"] == 7
+            && attempt["agent"] == "build"
+            && attempt["providerID"] == "fake"
+            && attempt["modelID"] == "fake-model"
+    }));
+}
+
+#[tokio::test]
+async fn user_and_goal_turns_still_fail_closed_for_the_identity_they_actually_request() {
+    for (turn_id, start, expected_agent, expected_trigger) in [
+        (
+            "turn-user-stale-identity",
+            TurnStart::UserMessage,
+            "deep",
+            "user",
+        ),
+        (
+            "turn-goal-missing-identity",
+            TurnStart::GoalContinuation {
+                goal_id: "goal-missing".to_owned(),
+                goal_revision: 1,
+                identity: TurnExecutionIdentity::new("missing-agent", "fake", "fake-model"),
+            },
+            "missing-agent",
+            "goal",
+        ),
+    ] {
+        let mut connection = seeded();
+        put_user_with_identity(
+            &connection,
+            "msg_stale_anchor",
+            10,
+            "Keep the old request immutable.",
+            "deep",
+            "retired-provider",
+            "retired-model",
+        );
+        let provider = Arc::new(FakeProvider::new(Vec::new()));
+        let providers = registry(&provider);
+        let resolver = FakeResolver;
+        let dispatcher = FakeDispatcher::default();
+        let interrupt = InterruptSignal::new();
+        let (sender, receiver) = event_channel();
+        let turn = run_turn(
+            request(turn_id).with_start(start),
+            TurnContext::new(
+                &mut connection,
+                &providers,
+                &resolver,
+                &dispatcher,
+                &interrupt,
+            ),
+            sender,
+        );
+        let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+        assert!(matches!(
+            outcome,
+            Err(TurnError::AgentNotFound { ref agent }) if agent == expected_agent
+        ));
+        assert!(provider.requests().is_empty());
+        let rejected: String = connection
+            .query_row(
+                "SELECT data FROM event \
+                 WHERE aggregate_id = ?1 AND type = 'session.turn.rejected.1'",
+                [SESSION_ID],
+                |row| row.get(0),
+            )
+            .expect("durable rejected turn");
+        let rejected: Value = serde_json::from_str(&rejected).expect("rejected turn JSON");
+        assert_eq!(rejected["errorKind"], "agent_unavailable");
+        assert_eq!(rejected["agent"], expected_agent);
+        assert_eq!(rejected["turnTrigger"], expected_trigger);
+        assert_eq!(
+            scalar_count(
+                &connection,
+                "SELECT COUNT(*) FROM event \
+                 WHERE aggregate_id = 'ses_loop_test' AND type = 'session.turn.started.1'",
+            ),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn goal_turn_with_an_unavailable_current_model_still_fails_closed() {
+    let mut connection = seeded();
+    put_user(
+        &connection,
+        "msg_model_anchor",
+        10,
+        "Keep the causal anchor.",
+    );
+    let provider = Arc::new(FakeProvider::new(Vec::new()));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        request("turn-goal-missing-model").with_start(TurnStart::GoalContinuation {
+            goal_id: "goal-missing-model".to_owned(),
+            goal_revision: 1,
+            identity: TurnExecutionIdentity::new("build", "fake", "missing-model"),
+        }),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Err(TurnError::ModelNotFound {
+            ref provider_id,
+            ref model_id,
+        }) if provider_id == "fake" && model_id == "missing-model"
+    ));
+    assert!(provider.requests().is_empty());
+    let rejected: String = connection
+        .query_row(
+            "SELECT data FROM event \
+             WHERE aggregate_id = ?1 AND type = 'session.turn.rejected.1'",
+            [SESSION_ID],
+            |row| row.get(0),
+        )
+        .expect("durable rejected model turn");
+    let rejected: Value = serde_json::from_str(&rejected).expect("rejected model turn JSON");
+    assert_eq!(rejected["errorKind"], "model_unavailable");
+    assert_eq!(rejected["turnTrigger"], "goal");
+    assert_eq!(rejected["agent"], "build");
+    assert_eq!(rejected["providerID"], "fake");
+    assert_eq!(rejected["modelID"], "missing-model");
 }
 
 fn full_turn_responses() -> Vec<ScriptedResponse> {

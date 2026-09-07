@@ -92,6 +92,13 @@ Goal driver 会立即准备下一次自主回合。若会话此前没有 user me
 给出的目标通过持久 FIFO inbox 准入，并将它保存为首个 user turn anchor。字面的
 `/goal ...` 控制文本不会进入 provider 输入。
 
+每次自主 Goal 回合都在启动时从当前 turn host 捕获 Agent 与目录模型。旧 user message
+只保留为因果 transcript anchor，不授予权限，其中保存的 Agent 与模型也不再决定 Goal 的
+执行路由。因此切换 Agent 或模型不会改写历史，而下一次 `/goal` 或 `/goal resume` 会使用
+新选择的配置。普通用户回合仍从它自己的持久消息读取身份。该边界会落盘为
+`session.turn.started.1`，记录触发类型、Goal id/revision、anchor message、Agent、provider
+与模型；若 Goal revision 在准备后、执行前发生变化，这份 continuation 会被丢弃。
+
 ACP 的 `session/load` 与 `session/resume` 在重建会话运行时后也会检查持久 Goal。active
 Goal 会在后台恢复，不需要额外发送一条“垫脚”提示词。这也会修复旧版本中已经落盘 active
 Goal、但尚未准入首个 user turn 就停止的会话。

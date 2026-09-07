@@ -125,6 +125,16 @@ the next autonomous turn. If the session has no earlier user message, Zuno first
 user-provided objective through the durable FIFO inbox and persists it as the initial user
 turn anchor. The literal `/goal ...` control text never enters provider input.
 
+Every autonomous Goal turn takes its Agent and catalog model from the current turn host at
+start time. An older user message remains only the causal transcript anchor; it grants no
+authority and its saved Agent and model do not route Goal execution. Agent or model
+reconfiguration therefore leaves history immutable while the next `/goal` or `/goal resume`
+turn uses the newly selected configuration. Ordinary user turns still derive their identity
+from their own durable message. The turn records this boundary in
+`session.turn.started.1`, including the trigger, Goal id and revision, anchor message, Agent,
+provider, and model. A prepared continuation is discarded if that Goal revision changes
+before execution.
+
 ACP `session/load` and `session/resume` also inspect the durable Goal after rebuilding the
 session runtime. An active Goal resumes in the background without requiring a sacrificial
 prompt. This also repairs sessions created by older releases that persisted an active Goal

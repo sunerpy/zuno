@@ -82,6 +82,11 @@ Skill 后，会发送新的 `available_commands_update`，无需重启会话。
 类型化命令结果，随后立即通过共享 driver 推进 active Goal。新会话会把目标经由持久
 inbox 准入为首个 user turn；字面的斜杠命令不会发送给 provider。
 
+自动 Goal 回合使用当前 ACP host 已选择的 Agent 与模型。最新的真实 user message 只保留为
+因果 transcript anchor，不授予权限。从 `deep` 切换到 `orchestrator` 或选择另一模型后，
+不需要再发送普通 prompt，也不会改写那条历史消息。确切的触发类型、Goal revision、anchor、
+Agent、provider 与模型会落盘到 `session.turn.started.1`。
+
 `session/load` 与 `session/resume` 会重建会话运行时并自动恢复 active 根 Goal，不需要
 额外发送一条提示词。对于 0.6.0 已写入 active Goal、但没有 user message 的会话，同一
 恢复路径会先补齐 durable user anchor 再续跑；压缩后保留历史从 assistant 消息开始的

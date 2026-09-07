@@ -99,6 +99,13 @@ through the shared driver. On a fresh session the objective is admitted through
 the durable inbox as the first user turn; the literal slash command is never
 sent to the provider.
 
+An automatic Goal turn uses the Agent and model selected on the current ACP
+host. The newest real user message remains only its causal transcript anchor and
+grants no authority. Reconfiguring from `deep` to `orchestrator`, or selecting
+another model, does not require another prompt and does not rewrite that
+message. The exact trigger, Goal revision, anchor, Agent, provider, and model are
+persisted in `session.turn.started.1`.
+
 `session/load` and `session/resume` rebuild the session runtime and automatically
 resume an active root Goal. No extra prompt is required, including for a session
 written by 0.6.0 that contains an active Goal but no user message, or for a

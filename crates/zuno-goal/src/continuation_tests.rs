@@ -152,6 +152,44 @@ fn prepared_continuation_is_rejected_after_the_goal_is_replaced() {
 }
 
 #[test]
+fn prepared_continuation_is_rejected_after_the_same_goal_is_edited() {
+    let fixture = Fixture::new();
+    let original = fixture.create("original objective");
+    let prepared = fixture
+        .continuation
+        .prepare_if_idle("ses_goal", GoalTurnMode::Work, QueuedUserInput::Absent)
+        .expect("prepare original revision");
+    let ContinuationAttempt::Prepared(prepared) = prepared else {
+        panic!("active goal should prepare");
+    };
+    assert_eq!(
+        prepared.goal_identity(),
+        (original.goal_id.as_str(), original.revision)
+    );
+    assert!(
+        fixture
+            .continuation
+            .is_current(&prepared)
+            .expect("validate original revision")
+    );
+
+    let edited = fixture
+        .store
+        .update_objective_checked("ses_goal", "edited objective", original.revision)
+        .expect("edit goal")
+        .expect("goal remains");
+    assert_eq!(edited.goal_id, original.goal_id);
+    assert!(edited.revision > original.revision);
+    assert!(
+        !fixture
+            .continuation
+            .is_current(&prepared)
+            .expect("re-read edited revision"),
+        "a continuation must not run a context rendered from an older goal revision"
+    );
+}
+
+#[test]
 fn running_plan_and_queued_input_each_suppress_automatic_work() {
     let fixture = Fixture::new();
     fixture.create("guarded continuation");
