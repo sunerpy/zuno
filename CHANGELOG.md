@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.15](https://github.com/sunerpy/zuno/compare/v0.10.14...v0.10.15) (2026-09-07)
+
+
+### Bug Fixes
+
+* **runtime:** 修复 Goal 恢复、弹窗输入与 Bedrock 路由 ([#143](https://github.com/sunerpy/zuno/issues/143)) ([be51fd8](https://github.com/sunerpy/zuno/commit/be51fd814dcaa3414431f36f471ca9a1108eae8e))
+
 ## [0.10.14](https://github.com/sunerpy/zuno/compare/v0.10.13...v0.10.14) (2026-09-07)
 
 
