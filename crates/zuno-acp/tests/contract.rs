@@ -1161,6 +1161,7 @@ fn usage_updates_require_an_explicit_context_window() {
         event: StreamEvent::TokenUsage {
             input_tokens: Some(100),
             output_tokens: Some(25),
+            reasoning_tokens: None,
             cache_read_input_tokens: Some(40),
             cache_write_input_tokens: Some(10),
             accounting: PromptAccounting::CacheBesideInput,

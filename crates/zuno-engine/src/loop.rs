@@ -33,6 +33,7 @@ use zuno_db::message::{
 use zuno_db::{Connection, open, session};
 use zuno_error::{DbError, ProviderError, UncertainCause};
 use zuno_llm::cache::{CacheViolation, DynamicContext, McpToolStatus, PreparedTurn, PromptCache};
+use zuno_llm::catalog::resolved::ModelCost;
 use zuno_llm::event::{
     FinishReason, Message, PromptAccounting, RequestContentBlock, Role, StreamEvent,
     ThoughtSignature,
@@ -969,6 +970,13 @@ pub struct ResolvedModel {
     /// Model id sent on the provider wire.
     pub model_id: String,
     pub surface: ApiSurface,
+    /// Per-million-token pricing from the resolved catalog.
+    ///
+    /// Default zero, which the catalog type already treats as "free or unpriced,
+    /// indistinguishable". A host that resolves a model from the catalog attaches the
+    /// real prices with [`Self::with_cost`]; one that does not gets a cost of zero on
+    /// every assistant row rather than a wrong number.
+    pub cost: ModelCost,
     /// Provider-native reasoning controls for the session's chosen effort level.
     ///
     /// The resolved options rather than a `ReasoningEffort`, because the canonical
@@ -995,12 +1003,20 @@ impl ResolvedModel {
             provider,
             model_id,
             surface,
+            cost: ModelCost::default(),
             reasoning_options: Map::new(),
             retry_policy: ProviderRetryPolicy::new(
                 NonZeroU32::new(crate::retry::PROVIDER_RETRY_MAX_ATTEMPTS)
                     .expect("provider retry maximum is non-zero"),
             ),
         }
+    }
+
+    /// Attach the catalog's pricing for this model.
+    #[must_use]
+    pub const fn with_cost(mut self, cost: ModelCost) -> Self {
+        self.cost = cost;
+        self
     }
 
     /// Attach the provider-native reasoning controls for the chosen effort level.
@@ -1473,13 +1489,24 @@ fn hard_interrupt_request(context: &TurnContext<'_>) -> Option<HardInterruptRequ
 /// therefore can never disagree about whether a request was measured, and a request
 /// the provider never reported arrives as an explicit `accounted: false` rather than
 /// as a free one.
+///
+/// The frame's prompt figure is normalized through the accounting mode rather than
+/// copied, because `ProviderRequestUsage` promises disjoint buckets and this is the
+/// last place the mode is known. Handing a policy the raw figures charged the cached
+/// prompt twice under [`PromptAccounting::CacheInsideInput`] — OpenAI, every
+/// OpenAI-compatible endpoint, Gemini and Bedrock Converse — which is a budget stop
+/// on a turn that still had allowance. `request_context_tokens` right below already
+/// went through the mode for the same reason.
 fn request_usage(accumulator: &StepAccumulator) -> ProviderRequestUsage {
-    ProviderRequestUsage {
-        input_tokens: accumulator.input_tokens.unwrap_or(0),
-        output_tokens: accumulator.output_tokens.unwrap_or(0),
-        cache_read_input_tokens: accumulator.cache_read_input_tokens.unwrap_or(0),
-        cache_write_input_tokens: accumulator.cache_write_input_tokens.unwrap_or(0),
-        accounted: accumulator.prompt_accounting.is_some(),
+    let input = accumulator.input_tokens.unwrap_or(0);
+    let output = accumulator.output_tokens.unwrap_or(0);
+    let cache_read = accumulator.cache_read_input_tokens.unwrap_or(0);
+    let cache_write = accumulator.cache_write_input_tokens.unwrap_or(0);
+    match accumulator.prompt_accounting {
+        Some(accounting) => {
+            ProviderRequestUsage::reported(accounting, input, output, cache_read, cache_write)
+        }
+        None => ProviderRequestUsage::unreported(input, output, cache_read, cache_write),
     }
 }
 
@@ -1667,6 +1694,14 @@ enum StepItem {
 struct StepAccumulator {
     provider: String,
     stream: String,
+    /// Per-million-token pricing for the model named by `provider`/`stream`.
+    ///
+    /// Carried here because [`update_usage`] is the one place that knows a request's
+    /// final disjoint buckets, and it is reached through
+    /// [`checkpoint_assistant`] from seven call sites that hold no model. The
+    /// accumulator already identifies the model; its prices belong with that identity
+    /// rather than in seven extra arguments.
+    cost: ModelCost,
     tool_input_limit: usize,
     items: Vec<StepItem>,
     calls: BTreeMap<usize, ToolCall>,
@@ -1676,16 +1711,23 @@ struct StepAccumulator {
     saw_message_end: bool,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    /// Output tokens the provider itemised as reasoning, exactly as reported.
+    ///
+    /// Kept inclusive, as the frame sent it: this accumulator is a faithful record of
+    /// what arrived, and [`update_usage`] is where the durable disjoint buckets are
+    /// derived.
+    reasoning_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
     cache_write_input_tokens: Option<u64>,
     prompt_accounting: Option<PromptAccounting>,
 }
 
 impl StepAccumulator {
-    fn new(provider: String, stream: String, tool_input_limit: usize) -> Self {
+    fn new(provider: String, stream: String, cost: ModelCost, tool_input_limit: usize) -> Self {
         Self {
             provider,
             stream,
+            cost,
             tool_input_limit,
             items: Vec::new(),
             calls: BTreeMap::new(),
@@ -1695,6 +1737,7 @@ impl StepAccumulator {
             saw_message_end: false,
             input_tokens: None,
             output_tokens: None,
+            reasoning_tokens: None,
             cache_read_input_tokens: None,
             cache_write_input_tokens: None,
             prompt_accounting: None,
@@ -1808,12 +1851,14 @@ impl StepAccumulator {
             StreamEvent::TokenUsage {
                 input_tokens,
                 output_tokens,
+                reasoning_tokens,
                 cache_read_input_tokens,
                 cache_write_input_tokens,
                 accounting,
             } => {
                 self.input_tokens = *input_tokens;
                 self.output_tokens = *output_tokens;
+                self.reasoning_tokens = *reasoning_tokens;
                 self.cache_read_input_tokens = *cache_read_input_tokens;
                 self.cache_write_input_tokens = *cache_write_input_tokens;
                 self.prompt_accounting = Some(*accounting);
@@ -1956,6 +2001,7 @@ impl StepAccumulator {
         self.saw_message_end = false;
         self.input_tokens = None;
         self.output_tokens = None;
+        self.reasoning_tokens = None;
         self.cache_read_input_tokens = None;
         self.cache_write_input_tokens = None;
         self.prompt_accounting = None;
@@ -2505,6 +2551,7 @@ async fn run_turn_in_span(
         let accumulator = Arc::new(Mutex::new(StepAccumulator::new(
             model.catalog_provider_id.clone(),
             model.catalog_model_id.clone(),
+            model.cost,
             StreamLimits::from_environment().max_tool_input_bytes(),
         )));
         let policy = model.retry_policy;
@@ -2799,6 +2846,7 @@ async fn run_turn_in_span(
             let replacement = StepAccumulator::new(
                 accumulator.provider.clone(),
                 accumulator.stream.clone(),
+                accumulator.cost,
                 accumulator.tool_input_limit,
             );
             std::mem::replace(&mut *accumulator, replacement)
@@ -6850,22 +6898,64 @@ fn checkpoint_assistant(
     Ok(())
 }
 
+/// Write the assistant row's durable token buckets.
+///
+/// # Inclusive on the wire, disjoint on disk
+///
+/// `StreamEvent::TokenUsage` reports inclusive totals: its `output_tokens` already
+/// contains its `reasoning_tokens`. This row is read back the other way round —
+/// `session::reconcile_usage` sums `$.tokens.output` and `$.tokens.reasoning` into
+/// independent columns, and `zuno_types::TokenUsage::total` adds every bucket — so
+/// the reasoning part is subtracted out of the output figure here rather than stored
+/// beside an unchanged one, which would count it twice in every session total.
+///
+/// The prompt side is the opposite and deliberately so: `input` stays exactly as the
+/// provider reported it, because `accounting` travels with it and the normalization
+/// happens in `reconcile_usage`, whose SQL reads that field. Changing one without the
+/// other silently double-counts or loses the cached prompt.
+///
+/// # Cost
+///
+/// Written from the same buckets, so the money and the tokens can never disagree. The
+/// assistant row is created with `cost: 0.0` and `reconcile_usage` folds it into the
+/// session as a delta against the row's previous value, so replaying a checkpoint
+/// recomputes the same number and charges nothing twice. `charge` wants disjoint
+/// buckets, which is why the uncached prompt is derived here through `accounting`
+/// rather than reusing the raw `input` figure stored above.
 fn update_usage(data: &mut Map<String, Value>, accumulator: &StepAccumulator) {
     let Some(accounting) = accumulator.prompt_accounting else {
         return;
     };
+    let input = accumulator.input_tokens.unwrap_or(0);
+    let cache_read = accumulator.cache_read_input_tokens.unwrap_or(0);
+    let cache_write = accumulator.cache_write_input_tokens.unwrap_or(0);
+    let reasoning = accumulator.reasoning_tokens.unwrap_or(0);
+    let visible_output = accumulator
+        .output_tokens
+        .unwrap_or(0)
+        .saturating_sub(reasoning);
     data.insert(
         "tokens".to_owned(),
         json!({
-            "input": accumulator.input_tokens.unwrap_or(0),
-            "output": accumulator.output_tokens.unwrap_or(0),
-            "reasoning": 0,
+            "input": input,
+            "output": visible_output,
+            "reasoning": reasoning,
             "cache": {
-                "read": accumulator.cache_read_input_tokens.unwrap_or(0),
-                "write": accumulator.cache_write_input_tokens.unwrap_or(0)
+                "read": cache_read,
+                "write": cache_write
             },
             "accounting": accounting.as_str()
         }),
+    );
+    data.insert(
+        "cost".to_owned(),
+        Value::from(accumulator.cost.charge(
+            accounting.uncached_input(input, cache_read, cache_write),
+            visible_output,
+            reasoning,
+            cache_read,
+            cache_write,
+        )),
     );
 }
 

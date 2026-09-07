@@ -216,7 +216,16 @@ impl SandboxUnavailableCause {
         }
     }
 
-    fn from_error(error: &SandboxError) -> Option<Self> {
+    /// The typed cause of an error, when this build treats it as an unavailable backend.
+    ///
+    /// `None` is the security-relevant answer and the reason this is a whitelist rather
+    /// than a catch-all: a bubblewrap binary that failed its trust check, a probe that
+    /// failed, an unenforceable policy, a bad path, a seccomp or helper failure and a
+    /// plain I/O error are *not* "this host cannot confine". Treating them as one would
+    /// let a tampered `bwrap` on `PATH`, or a policy this backend cannot enforce, be
+    /// answered with an offer to run without confinement.
+    #[must_use]
+    pub fn from_error(error: &SandboxError) -> Option<Self> {
         match error {
             SandboxError::UnsupportedPlatform(platform) => Some(Self::UnsupportedPlatform {
                 platform: platform.clone(),

@@ -889,6 +889,7 @@ fn exact_openai_parallel_tools() -> Vec<StreamEvent> {
         StreamEvent::TokenUsage {
             input_tokens: Some(3),
             output_tokens: Some(5),
+            reasoning_tokens: None,
             cache_read_input_tokens: None,
             cache_write_input_tokens: None,
             accounting: PromptAccounting::CacheInsideInput,
@@ -973,6 +974,7 @@ fn replay_recorded_plain_text(family: Family, cassette: &str) {
             StreamEvent::TokenUsage {
                 input_tokens: Some(18),
                 output_tokens: Some(5),
+                reasoning_tokens: None,
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: Some(0),
                 accounting: PromptAccounting::CacheBesideInput,
@@ -987,6 +989,10 @@ fn replay_recorded_plain_text(family: Family, cassette: &str) {
             StreamEvent::TokenUsage {
                 input_tokens: Some(22),
                 output_tokens: Some(2),
+                // The recorded chat cell itemises its generated tokens and reports no
+                // reasoning, which is `Some(0)`: the endpoint accounted for reasoning and
+                // found none, as against one that never breaks the figure out.
+                reasoning_tokens: Some(0),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheInsideInput,
@@ -1001,6 +1007,7 @@ fn replay_recorded_plain_text(family: Family, cassette: &str) {
             StreamEvent::TokenUsage {
                 input_tokens: Some(14),
                 output_tokens: Some(2),
+                reasoning_tokens: None,
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheInsideInput,
@@ -1014,6 +1021,7 @@ fn replay_recorded_plain_text(family: Family, cassette: &str) {
             StreamEvent::TokenUsage {
                 input_tokens: Some(12),
                 output_tokens: Some(2),
+                reasoning_tokens: None,
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheInsideInput,
@@ -1024,6 +1032,10 @@ fn replay_recorded_plain_text(family: Family, cassette: &str) {
             StreamEvent::TokenUsage {
                 input_tokens: Some(11),
                 output_tokens: Some(18),
+                // Recorded Gemini traffic reports `thoughtsTokenCount` *outside*
+                // `candidatesTokenCount`, so the adapter folds it into `output_tokens`
+                // and itemises it here: 18 generated tokens of which 16 were thinking.
+                reasoning_tokens: Some(16),
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheInsideInput,
@@ -1064,6 +1076,7 @@ fn replay_interleaved_reasoning(family: Family, reason: &str) {
                 StreamEvent::TokenUsage {
                     input_tokens: Some(3),
                     output_tokens: Some(5),
+                    reasoning_tokens: None,
                     cache_read_input_tokens: None,
                     cache_write_input_tokens: None,
                     accounting: PromptAccounting::CacheBesideInput,
@@ -1090,6 +1103,7 @@ fn replay_interleaved_reasoning(family: Family, reason: &str) {
                 StreamEvent::TokenUsage {
                     input_tokens: Some(3),
                     output_tokens: Some(5),
+                    reasoning_tokens: None,
                     cache_read_input_tokens: None,
                     cache_write_input_tokens: None,
                     accounting: PromptAccounting::CacheInsideInput,
@@ -1152,6 +1166,7 @@ fn replay_signed_thinking(family: Family, reason: &str) {
             StreamEvent::TokenUsage {
                 input_tokens: Some(3),
                 output_tokens: Some(5),
+                reasoning_tokens: None,
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheBesideInput,
@@ -1198,6 +1213,7 @@ fn replay_encrypted_reasoning(family: Family, reason: &str) {
                     StreamEvent::TokenUsage {
                         input_tokens: Some(3),
                         output_tokens: Some(1),
+                        reasoning_tokens: None,
                         cache_read_input_tokens: None,
                         cache_write_input_tokens: None,
                         accounting: PromptAccounting::CacheBesideInput,
@@ -1230,6 +1246,7 @@ fn replay_encrypted_reasoning(family: Family, reason: &str) {
                     StreamEvent::TokenUsage {
                         input_tokens: Some(3),
                         output_tokens: Some(1),
+                        reasoning_tokens: None,
                         cache_read_input_tokens: None,
                         cache_write_input_tokens: None,
                         accounting: PromptAccounting::CacheInsideInput,
@@ -1590,6 +1607,10 @@ fn cassettes_gemini_tool_signature_keeps_opaque_recorded_bytes() {
             StreamEvent::TokenUsage {
                 input_tokens: Some(55),
                 output_tokens: Some(60),
+                // Recorded Gemini traffic reports `thoughtsTokenCount` *outside*
+                // `candidatesTokenCount`, so the adapter folds it into `output_tokens`
+                // and reports it here: 60 generated tokens of which 45 were thinking.
+                reasoning_tokens: Some(45),
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheInsideInput,

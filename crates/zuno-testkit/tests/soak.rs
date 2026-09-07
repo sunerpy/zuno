@@ -241,6 +241,9 @@ impl ProgressTracker {
                     StreamEvent::TokenUsage {
                         input_tokens,
                         output_tokens,
+                        // The cassettes this soak replays report no reasoning breakdown,
+                        // and the four figures below are what it deduplicates on.
+                        reasoning_tokens: _,
                         cache_read_input_tokens,
                         cache_write_input_tokens,
                         accounting: PromptAccounting::CacheInsideInput,
@@ -1035,6 +1038,7 @@ fn heartbeats_raw_bytes_and_repeated_state_do_not_reset_g4_progress() {
         event: StreamEvent::TokenUsage {
             input_tokens: Some(10),
             output_tokens: Some(2),
+            reasoning_tokens: None,
             cache_read_input_tokens: Some(0),
             cache_write_input_tokens: None,
             accounting: PromptAccounting::CacheInsideInput,

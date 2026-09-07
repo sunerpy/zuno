@@ -55,6 +55,7 @@ fn text_transcript(
     events.push(StreamEvent::TokenUsage {
         input_tokens: Some(input_tokens),
         output_tokens: Some(output_tokens),
+        reasoning_tokens: None,
         cache_read_input_tokens: Some(cache_read),
         cache_write_input_tokens: Some(cache_write),
         accounting: PromptAccounting::CacheBesideInput,
@@ -167,6 +168,7 @@ fn recorded_streams_tool_call_matches_request_and_exact_events() {
             StreamEvent::TokenUsage {
                 input_tokens: Some(677),
                 output_tokens: Some(33),
+                reasoning_tokens: None,
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: Some(0),
                 accounting: PromptAccounting::CacheBesideInput,
@@ -221,6 +223,7 @@ fn recorded_two_turn_tool_loop_matches_both_exact_event_sequences() {
             StreamEvent::TokenUsage {
                 input_tokens: Some(798),
                 output_tokens: Some(66),
+                reasoning_tokens: None,
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: Some(0),
                 accounting: PromptAccounting::CacheBesideInput,

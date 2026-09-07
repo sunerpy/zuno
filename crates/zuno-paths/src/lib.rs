@@ -120,7 +120,7 @@ pub use crate::generated::{
 pub use crate::generated_dir::{
     GeneratedDirectory, GeneratedDirectoryError, SELF_EXCLUDE_FILE, generated_root,
 };
-pub use crate::layout::{APP, DEBUG_PATHS_KEYS, Layout};
+pub use crate::layout::{APP, DEBUG_PATHS_KEY_WIDTH, DEBUG_PATHS_KEYS, Layout};
 pub use crate::project::{GLOBAL_PROJECT_ID, Repository, ResolvedProject, Vcs};
 
 /// Renders a native path without Windows' internal verbatim namespace prefix.

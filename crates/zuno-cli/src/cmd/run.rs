@@ -741,11 +741,12 @@ fn stream_event_json(step: u32, event: StreamEvent) -> Value {
         StreamEvent::TokenUsage {
             input_tokens,
             output_tokens,
+            reasoning_tokens,
             cache_read_input_tokens,
             cache_write_input_tokens,
             accounting,
         } => {
-            json!({"type":"token_usage","step":step,"inputTokens":input_tokens,"outputTokens":output_tokens,"cacheReadInputTokens":cache_read_input_tokens,"cacheWriteInputTokens":cache_write_input_tokens,"promptAccounting":accounting.as_str()})
+            json!({"type":"token_usage","step":step,"inputTokens":input_tokens,"outputTokens":output_tokens,"reasoningTokens":reasoning_tokens,"cacheReadInputTokens":cache_read_input_tokens,"cacheWriteInputTokens":cache_write_input_tokens,"promptAccounting":accounting.as_str()})
         }
         StreamEvent::ConnectionType { connection } => {
             json!({"type":"connection_type","step":step,"connection":connection})

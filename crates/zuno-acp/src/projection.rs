@@ -403,6 +403,10 @@ impl TurnEventProjector {
                     StreamEvent::TokenUsage {
                         input_tokens,
                         output_tokens,
+                        // Not added: the frame's `output_tokens` already contains its
+                        // reasoning count, so charging the breakdown again would report
+                        // a context window fuller than the request made it.
+                        reasoning_tokens: _,
                         cache_read_input_tokens,
                         cache_write_input_tokens,
                         accounting,

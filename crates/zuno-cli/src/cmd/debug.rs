@@ -427,9 +427,46 @@ impl Context {
     }
 }
 
+/// Print the resolved layout, then where resident Memory lives.
+///
+/// The layout dump is a fixed nine-key contract that knows nothing about a worktree, so
+/// the two Memory stores are reported beside it rather than inside it, padded to the same
+/// key width so the whole block stays one column.
+///
+/// `(absent)` is the point of the addition. An absent store is the normal state — a store
+/// is created by its first successful write, never at startup — and without a marker "no
+/// such file" was indistinguishable from "Zuno is looking somewhere else", which is
+/// exactly the question this command exists to answer.
 fn paths(environment: &StartupEnvironment) -> Result<(), String> {
     let layout = zuno_paths::Layout::resolve(environment.resolved());
     print!("{}", layout.debug_paths_dump());
+
+    let directory = std::env::current_dir().map_err(to_string)?;
+    let project = zuno_paths::project::resolve_project(&directory);
+    let worktree = project
+        .vcs
+        .as_ref()
+        .map_or(directory.as_path(), |_| project.directory.as_path());
+    // Joined onto this layout's config directory rather than taken from
+    // `Scope::Global.path`, which reads the process-global cached layout: the two agree in
+    // production and diverge under an overridden environment, and a diagnostic that
+    // printed the cached answer while the session used the overridden one would be worse
+    // than printing nothing.
+    let global = layout
+        .config()
+        .join(zuno_memory::MEMORY_DIRECTORY)
+        .join(zuno_memory::GLOBAL_FILE);
+    for (key, path) in [
+        ("memory", global),
+        ("rules", zuno_memory::Scope::Project.path(worktree)),
+    ] {
+        println!(
+            "{key:<width$} {path}{absent}",
+            width = zuno_paths::DEBUG_PATHS_KEY_WIDTH,
+            path = path.display(),
+            absent = if path.exists() { "" } else { " (absent)" },
+        );
+    }
     Ok(())
 }
 

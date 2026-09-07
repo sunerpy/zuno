@@ -174,6 +174,53 @@ pub struct ModelCost {
     pub cache: CacheCost,
 }
 
+impl ModelCost {
+    /// Price per token is per *million* tokens in the catalog, as the oracle stores it.
+    const PER_MILLION: f64 = 1_000_000.0;
+
+    /// What one request costs, given its **disjoint** token buckets.
+    ///
+    /// Every argument must count tokens no other argument counts: `input` is the
+    /// prompt minus both cache figures, and `output` is the generated tokens minus
+    /// `reasoning`. `PromptAccounting::uncached_input` produces the first;
+    /// `StreamEvent::TokenUsage` documents the second. Passing a provider's raw
+    /// totals instead charges the cached prompt and the reasoning twice.
+    ///
+    /// `reasoning` is billed at the output rate rather than at one of its own:
+    /// OpenAI states that reasoning tokens "are billed as output tokens", and no
+    /// vendor in this catalog publishes a separate reasoning price. It is a distinct
+    /// argument regardless, because the caller's buckets are disjoint and folding it
+    /// into `output` at the call site is exactly the kind of quiet arithmetic this
+    /// signature exists to prevent.
+    ///
+    /// A missing price is a zero here, which the type's documentation already owns:
+    /// upstream coerces an absent price to zero, so a free model and an unpriced one
+    /// are indistinguishable. This returns `0.0` for both rather than pretending to
+    /// know which it met.
+    #[must_use]
+    pub fn charge(
+        self,
+        input: u64,
+        output: u64,
+        reasoning: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) -> f64 {
+        let priced = |tokens: u64, per_million: f64| {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "token counts are far below f64's exact-integer range"
+            )]
+            let tokens = tokens as f64;
+            tokens * per_million / Self::PER_MILLION
+        };
+        priced(input, self.input)
+            + priced(output.saturating_add(reasoning), self.output)
+            + priced(cache_read, self.cache.read)
+            + priced(cache_write, self.cache.write)
+    }
+}
+
 /// Cache pricing — `provider.ts:1492-1495`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -220,5 +267,86 @@ impl ResolvedModel {
     #[must_use]
     pub fn qualified_id(&self) -> String {
         format!("{}/{}", self.provider_id, self.id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Claude Sonnet's published rates, in dollars per million tokens.
+    const SONNET: ModelCost = ModelCost {
+        input: 3.0,
+        output: 15.0,
+        cache: CacheCost {
+            read: 0.3,
+            write: 3.75,
+        },
+    };
+
+    /// Floating-point money compares to a tolerance, not to a bit pattern.
+    fn assert_dollars(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "expected ${expected}, got ${actual}"
+        );
+    }
+
+    #[test]
+    fn each_bucket_is_priced_at_its_own_rate() {
+        // 1000 uncached prompt, 100 visible answer, 900 reasoning, 10000 read, 2000
+        // written.
+        assert_dollars(
+            SONNET.charge(1_000, 100, 900, 10_000, 2_000),
+            0.003 + 0.015 + 0.003 + 0.007_5,
+        );
+    }
+
+    /// Reasoning is output, priced at the output rate.
+    ///
+    /// OpenAI bills reasoning tokens as output tokens and no vendor in this catalog
+    /// publishes a separate reasoning price, so the split is for accounting clarity
+    /// rather than for a different rate.
+    #[test]
+    fn reasoning_costs_exactly_what_the_same_visible_output_would() {
+        assert_dollars(
+            SONNET.charge(0, 1_000, 0, 0, 0),
+            SONNET.charge(0, 0, 1_000, 0, 0),
+        );
+        assert_dollars(
+            SONNET.charge(0, 400, 600, 0, 0),
+            SONNET.charge(0, 1_000, 0, 0, 0),
+        );
+    }
+
+    /// A cache read is far cheaper than the same tokens uncached.
+    ///
+    /// The reason the prompt side must arrive already normalized: charging 10000
+    /// cached tokens at the input rate instead of the cache-read rate is a tenfold
+    /// overcharge on this model.
+    #[test]
+    fn a_cached_prompt_is_not_priced_as_an_uncached_one() {
+        let cached = SONNET.charge(0, 0, 0, 10_000, 0);
+        let uncached = SONNET.charge(10_000, 0, 0, 0, 0);
+        assert!(
+            cached < uncached,
+            "a cache read must be cheaper: ${cached} vs ${uncached}"
+        );
+        assert_dollars(cached, 0.003);
+        assert_dollars(uncached, 0.03);
+    }
+
+    /// An unpriced model charges nothing rather than guessing.
+    ///
+    /// The type's own documentation owns this: upstream coerces a missing price to
+    /// zero, so a free model and an unpriced one are indistinguishable here.
+    #[test]
+    fn a_model_with_no_published_prices_costs_nothing() {
+        assert_dollars(ModelCost::default().charge(4_210, 86, 100, 1_024, 64), 0.0);
+    }
+
+    #[test]
+    fn a_request_that_spent_nothing_costs_nothing() {
+        assert_dollars(SONNET.charge(0, 0, 0, 0, 0), 0.0);
     }
 }

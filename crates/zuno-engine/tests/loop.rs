@@ -32,6 +32,7 @@ use zuno_engine::prompt::{PromptAssembly, PromptAssemblyError, RuntimePromptPoli
 use zuno_engine::status::{SessionControl, SessionRunRegistry};
 use zuno_error::{ProviderError, ProviderProtocolFailure, ProviderStreamFailure, UncertainCause};
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
+use zuno_llm::catalog::resolved::{CacheCost, ModelCost};
 use zuno_llm::event::{FinishReason, PromptAccounting, RequestContentBlock, Role, StreamEvent};
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry,
@@ -159,6 +160,39 @@ impl AgentModelResolver for FakeResolver {
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
         (provider_id == "fake" && model_id == "fake-model")
             .then(|| ResolvedModel::new(Spec::new("fake"), "fake-model", ApiSurface::Default))
+    }
+}
+
+/// The same resolver, but its model carries published prices.
+///
+/// [`FakeResolver`] leaves `ModelCost` defaulted, which is a legitimate state — an
+/// unpriced model costs zero — but it cannot show that a priced one does not.
+#[derive(Debug, Clone, Copy)]
+struct PricedResolver;
+
+impl PricedResolver {
+    /// Claude Sonnet's published dollars per million tokens.
+    const COST: ModelCost = ModelCost {
+        input: 3.0,
+        output: 15.0,
+        cache: CacheCost {
+            read: 0.3,
+            write: 3.75,
+        },
+    };
+}
+
+impl AgentModelResolver for PricedResolver {
+    fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
+        (requested == "build")
+            .then(|| ResolvedAgent::new("build", "You are a deterministic test agent."))
+    }
+
+    fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
+        (provider_id == "fake" && model_id == "fake-model").then(|| {
+            ResolvedModel::new(Spec::new("fake"), "fake-model", ApiSurface::Default)
+                .with_cost(Self::COST)
+        })
     }
 }
 
@@ -5944,6 +5978,7 @@ fn trailing_usage_responses() -> Vec<ScriptedResponse> {
         StreamEvent::TokenUsage {
             input_tokens: Some(4210),
             output_tokens: Some(186),
+            reasoning_tokens: None,
             cache_read_input_tokens: Some(1024),
             cache_write_input_tokens: Some(64),
             accounting: PromptAccounting::CacheInsideInput,
@@ -6050,6 +6085,113 @@ async fn loop_records_token_usage_that_arrives_after_the_finish_reason() {
     assert_eq!(session.usage.last_prompt_tokens, Some(4_210));
 }
 
+/// A reasoning model's itemised output, and what the turn actually cost.
+///
+/// Two defects met here. `update_usage` wrote `"reasoning": 0` as a literal, so the
+/// column existed and was always empty however much a model thought; and the
+/// assistant row was created with `cost: 0.0` and nothing ever replaced it, so no
+/// session had a cost however much it spent.
+///
+/// The arithmetic is the point of the test. The provider reports 186 output tokens of
+/// which 100 were reasoning — reasoning is *inside* the output figure, which is what
+/// `StreamEvent::TokenUsage` documents — so the durable row must hold 86 visible and
+/// 100 reasoning. Storing 186 beside 100 would make `TokenUsage::total`, which sums
+/// the buckets independently, report 286 output tokens for a 186-token answer.
+#[tokio::test]
+async fn loop_splits_itemised_reasoning_out_of_output_and_prices_the_request() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_reasoning_user", 10, "think, then answer");
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta("The answer is 3.".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+        StreamEvent::TokenUsage {
+            input_tokens: Some(4_210),
+            output_tokens: Some(186),
+            reasoning_tokens: Some(100),
+            cache_read_input_tokens: Some(1_024),
+            cache_write_input_tokens: Some(64),
+            accounting: PromptAccounting::CacheInsideInput,
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = PricedResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-reasoning-cost"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+    outcome.expect("the turn succeeds");
+
+    let hydrated = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate the finished turn");
+    let assistant = hydrated
+        .iter()
+        .find(|message| message.info.role.as_str() == "assistant")
+        .expect("one assistant message");
+    let tokens = assistant
+        .info
+        .data
+        .get("tokens")
+        .and_then(Value::as_object)
+        .expect("the assistant row carries a tokens object");
+    assert_eq!(
+        tokens.get("output").and_then(Value::as_u64),
+        Some(86),
+        "the reasoning part must come out of the output figure: {tokens:?}"
+    );
+    assert_eq!(
+        tokens.get("reasoning").and_then(Value::as_u64),
+        Some(100),
+        "the itemised reasoning was dropped: {tokens:?}"
+    );
+    // The prompt figure stays exactly as reported, because `accounting` travels with
+    // it and `reconcile_usage` is what normalizes the cache out of it.
+    assert_eq!(tokens.get("input").and_then(Value::as_u64), Some(4_210));
+
+    // 3122 uncached prompt at $3/M, 86 + 100 output at $15/M, 1024 read at $0.30/M,
+    // and 64 written at $3.75/M.
+    let expected =
+        3_122.0 * 3.0 / 1e6 + 186.0 * 15.0 / 1e6 + 1_024.0 * 0.3 / 1e6 + 64.0 * 3.75 / 1e6;
+    let cost = assistant
+        .info
+        .data
+        .get("cost")
+        .and_then(Value::as_f64)
+        .expect("the assistant row carries a cost");
+    assert!(
+        (cost - expected).abs() < 1e-12,
+        "expected ${expected}, got ${cost}"
+    );
+
+    let session = zuno_db::session::get(&connection, SESSION_ID).expect("read session usage");
+    assert!(session.usage.known);
+    assert_eq!(session.usage.tokens.output, 86);
+    assert_eq!(session.usage.tokens.reasoning, 100);
+    assert_eq!(
+        session.usage.tokens.input, 3_122,
+        "the session normalizes the cache out of the prompt figure"
+    );
+    assert!(
+        (session.usage.cost - expected).abs() < 1e-12,
+        "the session must carry the same cost as the row it folded: {}",
+        session.usage.cost
+    );
+}
+
 #[tokio::test]
 async fn loop_provider_failure_preserves_the_last_confirmed_session_usage() {
     let mut connection = seeded();
@@ -6063,6 +6205,7 @@ async fn loop_provider_failure_preserves_the_last_confirmed_session_usage() {
             StreamEvent::TokenUsage {
                 input_tokens: Some(4_210),
                 output_tokens: Some(186),
+                reasoning_tokens: None,
                 cache_read_input_tokens: Some(1_024),
                 cache_write_input_tokens: Some(64),
                 accounting: PromptAccounting::CacheInsideInput,
@@ -6435,6 +6578,7 @@ fn accounted_tool_call_then_unreported_answer() -> Vec<ScriptedResponse> {
             StreamEvent::TokenUsage {
                 input_tokens: Some(100),
                 output_tokens: Some(20),
+                reasoning_tokens: None,
                 cache_read_input_tokens: Some(5),
                 cache_write_input_tokens: Some(1),
                 accounting: PromptAccounting::CacheInsideInput,
@@ -6868,13 +7012,22 @@ async fn the_budget_snapshot_reports_the_turn_total_the_last_request_and_unrepor
     assert_eq!(before.len(), 2, "one decision per request: {before:#?}");
     assert_eq!(after.len(), 2, "one accounting per response: {after:#?}");
 
-    let first = ProviderRequestUsage {
-        input_tokens: 100,
-        output_tokens: 20,
-        cache_read_input_tokens: 5,
-        cache_write_input_tokens: 1,
-        accounted: true,
-    };
+    // The provider reported a 100-token prompt under `CacheInsideInput`, of which 5
+    // tokens were read from cache and 1 written to it. `ProviderRequestUsage` holds
+    // disjoint buckets, so the prompt bucket is the 94 tokens that were neither:
+    // charging 100 alongside the two cache figures would bill the cached prompt twice
+    // and stop a turn that still had allowance.
+    let first = ProviderRequestUsage::reported(PromptAccounting::CacheInsideInput, 100, 20, 5, 1);
+    assert_eq!(
+        first,
+        ProviderRequestUsage {
+            input_tokens: 94,
+            output_tokens: 20,
+            cache_read_input_tokens: 5,
+            cache_write_input_tokens: 1,
+            accounted: true,
+        }
+    );
     assert_eq!(before[0].session_id, SESSION_ID);
     assert_eq!(before[0].turn_id, "turn-budget-snapshot");
     assert_eq!(before[0].step, 1);
@@ -6901,7 +7054,11 @@ async fn the_budget_snapshot_reports_the_turn_total_the_last_request_and_unrepor
     assert_eq!(after[0].step, 1);
     assert_eq!(after[0].last_request, first);
     assert_eq!(after[0].turn_usage, first);
-    assert_eq!(after[0].turn_usage.total(), 126);
+    assert_eq!(
+        after[0].turn_usage.total(),
+        120,
+        "the request sent a 100-token prompt and got a 20-token answer"
+    );
 
     assert_eq!(before[1].step, 2);
     assert_eq!(
@@ -6922,7 +7079,7 @@ async fn the_budget_snapshot_reports_the_turn_total_the_last_request_and_unrepor
     );
     assert_eq!(
         after[1].turn_usage.total(),
-        126,
+        120,
         "the reported tokens were dropped from the turn total"
     );
     assert!(

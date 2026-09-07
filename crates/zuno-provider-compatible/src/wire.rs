@@ -121,6 +121,20 @@ pub struct Usage {
     /// Cache accounting, when the vendor breaks it out.
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Generated-token accounting, when the vendor breaks it out.
+    #[serde(default)]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+/// The itemised half of the generated-token count.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct CompletionTokensDetails {
+    /// Generated tokens spent on reasoning, already counted in `completion_tokens`.
+    ///
+    /// Absent means the endpoint does not itemise reasoning, which is not the same
+    /// claim as a zero.
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// The cache half of usage.
@@ -129,6 +143,16 @@ pub struct PromptTokensDetails {
     /// Input tokens served from the vendor's prompt cache.
     #[serde(default)]
     pub cached_tokens: Option<u64>,
+    /// Input tokens newly written into the vendor's prompt cache.
+    ///
+    /// Part of the prompt figure, exactly as `cached_tokens` is: OpenAI's example
+    /// reports 2600 prompt tokens made of 2000 read, 400 written, and 200 neither.
+    /// Reported by GPT-5.6 and later, where a write is billed at 1.25x the uncached
+    /// input rate, and by OpenAI-compatible proxies under the same field name. Absent
+    /// on every endpoint that does not price writes, which is why it stays optional
+    /// rather than defaulting to zero.
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
 }
 
 /// A structured error, whether in-stream or in a non-2xx body.

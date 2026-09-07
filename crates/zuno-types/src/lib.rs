@@ -93,10 +93,24 @@ impl TokenUsage {
         }
     }
 
-    /// Add a provider report that has no separate reasoning bucket.
-    pub const fn add(&mut self, input: u64, output: u64, cache_read: u64, cache_write: u64) {
+    /// Add one provider report, whose figures must already be disjoint.
+    ///
+    /// Every bucket of this type is summed independently by [`Self::total`], so a
+    /// caller passes the *visible* output rather than a provider total that still
+    /// contains its reasoning count, and the uncached prompt rather than one that
+    /// still contains its cache figures. `PromptAccounting::uncached_input` does the
+    /// prompt-side subtraction; the reasoning side is `output - reasoning`.
+    pub const fn add(
+        &mut self,
+        input: u64,
+        output: u64,
+        reasoning: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) {
         self.input = self.input.saturating_add(input);
         self.output = self.output.saturating_add(output);
+        self.reasoning = self.reasoning.saturating_add(reasoning);
         self.cache_read = self.cache_read.saturating_add(cache_read);
         self.cache_write = self.cache_write.saturating_add(cache_write);
     }

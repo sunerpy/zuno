@@ -602,9 +602,15 @@ fn provider_event(event: &ProviderEvent) -> Value {
         // ambiguity the TUI had: whether the cache figures are inside the prompt figure or
         // beside it decides both the session total and the context percentage, and it
         // cannot be told from the values.
+        //
+        // `reasoningTokens` needs no such flag: it is always inside `outputTokens`, which
+        // is the invariant `StreamEvent::TokenUsage` documents and every adapter upholds.
+        // A client that wants the visible answer subtracts it; one that wants the billed
+        // output does not.
         ProviderEvent::TokenUsage {
             input_tokens,
             output_tokens,
+            reasoning_tokens,
             cache_read_input_tokens,
             cache_write_input_tokens,
             accounting,
@@ -612,6 +618,7 @@ fn provider_event(event: &ProviderEvent) -> Value {
             "type": "token.usage",
             "inputTokens": input_tokens,
             "outputTokens": output_tokens,
+            "reasoningTokens": reasoning_tokens,
             "cacheReadInputTokens": cache_read_input_tokens,
             "cacheWriteInputTokens": cache_write_input_tokens,
             "promptAccounting": accounting.as_str(),

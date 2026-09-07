@@ -55,6 +55,7 @@ fn recorded_stream_decodes_identically_when_split_at_every_byte_offset() {
             StreamEvent::TokenUsage {
                 input_tokens: Some(12),
                 output_tokens: Some(2),
+                reasoning_tokens: None,
                 cache_read_input_tokens: None,
                 cache_write_input_tokens: None,
                 accounting: PromptAccounting::CacheInsideInput,

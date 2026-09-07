@@ -142,6 +142,21 @@ impl Scope {
         }
     }
 
+    /// The `memory` configuration key that sets this scope's character cap.
+    ///
+    /// Exists so a refusal can name its own remedy. [`crate::MemoryError::CapExceeded`]
+    /// reported the projected size and the cap it crossed but never said that cap was a
+    /// setting, which left consolidating entries looking like the only way forward when
+    /// raising the budget was the other one. Spelled without the `memory.` prefix so one
+    /// constant serves both that message and any caller building a full path.
+    #[must_use]
+    pub const fn char_limit_key(self) -> &'static str {
+        match self {
+            Self::Global => "global_char_limit",
+            Self::Project => "project_char_limit",
+        }
+    }
+
     /// Where this scope's file lives, given the worktree.
     ///
     /// `$CONFIG` comes from [`zuno_paths::config`] rather than from a local reading

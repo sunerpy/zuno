@@ -17,6 +17,7 @@ mod product_agent;
 mod provider_setup;
 mod providers;
 mod run;
+mod sandbox_choice;
 mod self_update;
 mod serve;
 mod session;

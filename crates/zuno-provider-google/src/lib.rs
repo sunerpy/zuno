@@ -1002,6 +1002,11 @@ impl GeminiStreamDecoder {
                 output_tokens: usage
                     .candidates_token_count
                     .map(|visible| visible.saturating_add(usage.thoughts_token_count.unwrap_or(0))),
+                // Gemini is the one surface whose thinking count sits *outside* its
+                // visible-output count, so the fold above is what makes `output_tokens`
+                // mean the same thing here as everywhere else, and this is the itemised
+                // part of that total rather than an addition to it.
+                reasoning_tokens: usage.thoughts_token_count,
                 cache_read_input_tokens: usage.cached_content_token_count,
                 cache_write_input_tokens: None,
                 // `cachedContentTokenCount` is part of `promptTokenCount`.
@@ -1779,6 +1784,9 @@ impl AnthropicStreamDecoder {
             output.push(StreamEvent::TokenUsage {
                 input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
                 output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+                // The Anthropic Messages shape bills thinking as output and never
+                // itemises it, unlike Gemini's native surface above.
+                reasoning_tokens: None,
                 cache_read_input_tokens: usage
                     .get("cache_read_input_tokens")
                     .and_then(Value::as_u64),

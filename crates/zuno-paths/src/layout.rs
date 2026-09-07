@@ -81,7 +81,11 @@ pub const DEBUG_PATHS_KEYS: [&str; 9] = [
 
 /// Width `debug paths` pads each key to before printing the value —
 /// `console.log(key.padEnd(10), value)`.
-const DEBUG_PATHS_KEY_WIDTH: usize = 10;
+///
+/// Public because `debug paths` prints more than this layout owns: resident Memory
+/// lives at a worktree-dependent path the layout cannot resolve, and a second literal
+/// `10` in the command would drift out of alignment with these lines.
+pub const DEBUG_PATHS_KEY_WIDTH: usize = 10;
 
 /// Every path the layout defines, plus the environment inputs that shaped it.
 ///

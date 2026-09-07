@@ -311,6 +311,7 @@ fn stream_step_finish_updates_usage_writes_patch_and_triggers_summary_and_overfl
         .apply(StreamEvent::TokenUsage {
             input_tokens: Some(100),
             output_tokens: Some(40),
+            reasoning_tokens: None,
             cache_read_input_tokens: Some(20),
             cache_write_input_tokens: Some(5),
             accounting: PromptAccounting::CacheInsideInput,
@@ -440,6 +441,7 @@ fn stream_event_families_project_to_their_terminal_part_shapes() {
         StreamEvent::TokenUsage {
             input_tokens: Some(10),
             output_tokens: Some(5),
+            reasoning_tokens: None,
             cache_read_input_tokens: Some(2),
             cache_write_input_tokens: Some(1),
             accounting: PromptAccounting::CacheInsideInput,

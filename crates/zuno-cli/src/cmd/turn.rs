@@ -12133,7 +12133,10 @@ fn engine_model(
     })?;
     Ok(EngineModel::new(spec, model.api.id.clone(), surface)
         .with_catalog_identity(&model.provider_id, &model.id)
-        .with_retry_policy(retry_policy))
+        .with_retry_policy(retry_policy)
+        // Without this the engine prices every request at zero, which is how every
+        // assistant row came to carry `cost: 0.0` however much the turn actually cost.
+        .with_cost(model.cost))
 }
 
 fn provider_string_option(

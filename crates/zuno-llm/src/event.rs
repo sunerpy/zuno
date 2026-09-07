@@ -592,9 +592,31 @@ pub enum StreamEvent {
     /// The numbers are the provider's own, unaltered. `accounting` states how they fit
     /// together, because that differs by provider and no consumer can derive it: see
     /// [`PromptAccounting`].
+    ///
+    /// # Inclusive totals, non-overlapping breakdown
+    ///
+    /// `input_tokens` and `output_tokens` are the request's two totals. Every other
+    /// figure *itemises part of one of them* and never adds to it, so a consumer that
+    /// wants disjoint buckets subtracts: [`PromptAccounting::uncached_input`] on the
+    /// prompt side, `output_tokens - reasoning_tokens` on the answer side.
+    ///
+    /// `reasoning_tokens` is therefore always inside `output_tokens`. OpenAI states
+    /// that reasoning tokens "are billed as output tokens" and itemises them under
+    /// `output_tokens_details.reasoning_tokens` (Responses) or
+    /// `completion_tokens_details.reasoning_tokens` (Chat Completions). Gemini is the
+    /// exception that proves why this has to be stated: it reports
+    /// `thoughtsTokenCount` *outside* `candidatesTokenCount`, so that adapter folds it
+    /// in before publishing rather than leaving each consumer to discover the
+    /// difference. `None` means the provider does not itemise reasoning, not that the
+    /// model did none — Anthropic bills thinking as output without breaking it out.
     TokenUsage {
         input_tokens: Option<u64>,
+        /// Every token the provider generated, reasoning included.
         output_tokens: Option<u64>,
+        /// Output tokens spent on reasoning, when the provider itemises them.
+        ///
+        /// A subset of `output_tokens`; see the variant's documentation.
+        reasoning_tokens: Option<u64>,
         cache_read_input_tokens: Option<u64>,
         cache_write_input_tokens: Option<u64>,
         accounting: PromptAccounting,

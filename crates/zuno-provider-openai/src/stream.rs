@@ -245,13 +245,17 @@ impl ChatDecoder {
             }
         }
         if let Some(usage) = chunk.usage {
+            let details = usage.prompt_tokens_details;
             events.push(StreamEvent::TokenUsage {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
-                cache_read_input_tokens: usage
-                    .prompt_tokens_details
-                    .and_then(|details| details.cached_tokens),
-                cache_write_input_tokens: None,
+                reasoning_tokens: usage
+                    .completion_tokens_details
+                    .and_then(|details| details.reasoning_tokens),
+                cache_read_input_tokens: details.as_ref().and_then(|details| details.cached_tokens),
+                cache_write_input_tokens: details
+                    .as_ref()
+                    .and_then(|details| details.cache_write_tokens),
                 accounting: PromptAccounting::CacheInsideInput,
             });
         }
@@ -540,13 +544,17 @@ impl ResponsesDecoder {
             stop_reason: Some(reason),
         }];
         if let Some(usage) = response.usage {
+            let details = usage.input_tokens_details;
             events.push(StreamEvent::TokenUsage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
-                cache_read_input_tokens: usage
-                    .input_tokens_details
-                    .and_then(|details| details.cached_tokens),
-                cache_write_input_tokens: None,
+                reasoning_tokens: usage
+                    .output_tokens_details
+                    .and_then(|details| details.reasoning_tokens),
+                cache_read_input_tokens: details.as_ref().and_then(|details| details.cached_tokens),
+                cache_write_input_tokens: details
+                    .as_ref()
+                    .and_then(|details| details.cache_write_tokens),
                 accounting: PromptAccounting::CacheInsideInput,
             });
         }
@@ -630,6 +638,8 @@ struct ChatUsage {
     completion_tokens: Option<u64>,
     #[serde(default)]
     prompt_tokens_details: Option<TokenDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<GeneratedTokenDetails>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -705,12 +715,40 @@ struct ResponseUsage {
     output_tokens: Option<u64>,
     #[serde(default)]
     input_tokens_details: Option<TokenDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<GeneratedTokenDetails>,
+}
+
+/// The itemised half of the generated-token count.
+///
+/// One struct for both surfaces, as [`TokenDetails`] is for the prompt side: Chat
+/// Completions carries it as `completion_tokens_details` and Responses as
+/// `output_tokens_details`, with the same field inside.
+#[derive(Debug, Deserialize)]
+struct GeneratedTokenDetails {
+    /// Generated tokens spent on reasoning, already counted in the output total.
+    ///
+    /// Optional because only reasoning models report it, and absent is "not
+    /// itemised" rather than "reasoned about nothing".
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TokenDetails {
     #[serde(default)]
     cached_tokens: Option<u64>,
+    /// Prompt tokens newly written into the vendor's cache.
+    ///
+    /// Part of the prompt figure, exactly as `cached_tokens` is: OpenAI's own example
+    /// reports 2600 prompt tokens made of 2000 read, 400 written, and 200 neither.
+    /// Reported by GPT-5.6 and later, where a write is billed at 1.25x the uncached
+    /// input rate. Chat Completions carries it in `prompt_tokens_details` and
+    /// Responses in `input_tokens_details`, which is why one struct serves both.
+    /// Absent on every earlier model, so it stays optional rather than defaulting to
+    /// zero: a missing figure is unknown, not a write of nothing.
+    #[serde(default)]
+    cache_write_tokens: Option<u64>,
 }
 
 fn chat_finish_reason(reason: &str) -> FinishReason {
@@ -894,6 +932,128 @@ mod tests {
         let mut events = decoder.push(b"data: [DONE]\n\n");
         events.extend(decoder.finish());
         truncation_failure(events);
+    }
+
+    /// The one usage event a stream produced, or a panic naming what came back.
+    fn token_usage(events: Vec<Result<StreamEvent, ProviderError>>) -> StreamEvent {
+        let events = events
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the stream terminates cleanly");
+        events
+            .iter()
+            .find(|event| matches!(event, StreamEvent::TokenUsage { .. }))
+            .unwrap_or_else(|| panic!("no usage event in {events:?}"))
+            .clone()
+    }
+
+    /// GPT-5.6 prices cache writes, so the native surface must carry the figure.
+    ///
+    /// `cache_write_tokens` was hardcoded `None` here on the reasoning that OpenAI
+    /// never reported one. GPT-5.6 and later do, at 1.25x the uncached input rate,
+    /// and dropping it left a write billed as ordinary input — the cheaper rate, so
+    /// the reported cost came out under the invoice.
+    #[test]
+    fn chat_usage_carries_the_cache_writes_gpt_5_6_prices() {
+        let mut decoder = OpenAiDecoder::new("openai", "gpt-5.6", ApiSurface::Chat);
+        let frame = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "done" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 2006,
+                    "completion_tokens": 300,
+                    "prompt_tokens_details": { "cached_tokens": 1920, "cache_write_tokens": 80 }
+                }
+            })
+        );
+        let mut events = decoder.push(frame.as_bytes());
+        events.extend(decoder.finish());
+
+        assert_eq!(
+            token_usage(events),
+            StreamEvent::TokenUsage {
+                input_tokens: Some(2_006),
+                output_tokens: Some(300),
+                reasoning_tokens: None,
+                cache_read_input_tokens: Some(1_920),
+                cache_write_input_tokens: Some(80),
+                accounting: PromptAccounting::CacheInsideInput,
+            }
+        );
+    }
+
+    /// A model that never prices writes leaves the figure unknown, not zero.
+    #[test]
+    fn chat_usage_leaves_an_absent_cache_write_figure_absent() {
+        let mut decoder = OpenAiDecoder::new("openai", "gpt-5", ApiSurface::Chat);
+        let frame = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+                "usage": {
+                    "prompt_tokens": 2006,
+                    "completion_tokens": 300,
+                    "prompt_tokens_details": { "cached_tokens": 1920 }
+                }
+            })
+        );
+        let mut events = decoder.push(frame.as_bytes());
+        events.extend(decoder.finish());
+
+        assert_eq!(
+            token_usage(events),
+            StreamEvent::TokenUsage {
+                input_tokens: Some(2_006),
+                output_tokens: Some(300),
+                reasoning_tokens: None,
+                cache_read_input_tokens: Some(1_920),
+                cache_write_input_tokens: None,
+                accounting: PromptAccounting::CacheInsideInput,
+            },
+            "a missing figure is unknown; reporting 0 would claim a write of nothing"
+        );
+    }
+
+    /// Responses reports the same pair under `input_tokens_details`.
+    ///
+    /// The vendor's own example: 2600 prompt tokens made of 2000 read, 400 written,
+    /// and 200 neither — which is why `CacheInsideInput` remains correct for it.
+    #[test]
+    fn responses_usage_carries_cache_writes_from_input_token_details() {
+        let mut decoder = OpenAiDecoder::new("openai", "gpt-5.6", ApiSurface::Responses);
+        let frame = format!(
+            "data: {}\n\n",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 2600,
+                        "output_tokens": 4,
+                        "input_tokens_details": { "cached_tokens": 2000, "cache_write_tokens": 400 }
+                    }
+                }
+            })
+        );
+        let mut events = decoder.push(frame.as_bytes());
+        events.extend(decoder.finish());
+
+        assert_eq!(
+            token_usage(events),
+            StreamEvent::TokenUsage {
+                input_tokens: Some(2_600),
+                output_tokens: Some(4),
+                reasoning_tokens: None,
+                cache_read_input_tokens: Some(2_000),
+                cache_write_input_tokens: Some(400),
+                accounting: PromptAccounting::CacheInsideInput,
+            }
+        );
     }
 
     #[test]

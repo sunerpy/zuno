@@ -45,39 +45,6 @@ pub(crate) fn is_interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
-/// Ask one yes/no question on standard error and read the answer from standard input.
-///
-/// Fails closed: without an interactive terminal there is nobody to answer, so the
-/// caller gets an error rather than a default. Only `y`/`yes` (any case) is a yes.
-pub(crate) fn confirm(message: &str) -> Result<bool, String> {
-    confirm_with(message, is_interactive(), || {
-        eprint!("{message} [y/N] ");
-        std::io::stderr()
-            .flush()
-            .map_err(|error| error.to_string())?;
-        let mut answer = String::new();
-        std::io::stdin()
-            .read_line(&mut answer)
-            .map_err(|error| error.to_string())?;
-        Ok(answer)
-    })
-}
-
-fn confirm_with(
-    message: &str,
-    interactive: bool,
-    read_answer: impl FnOnce() -> Result<String, String>,
-) -> Result<bool, String> {
-    if !interactive {
-        return Err(format!("{message} requires an interactive terminal"));
-    }
-    let answer = read_answer()?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
 /// Ask a Yes/No question as a two-row picker and return `true` only for an explicit Yes.
 ///
 /// Built on [`select`], so it inherits its terminal contract: it fails closed with
@@ -94,6 +61,53 @@ pub(crate) fn confirm_choice(message: &str) -> Result<bool, String> {
         Choice::new(YES, "Yes").hinted("run it"),
     ];
     Ok(select(message, choices)?.as_deref() == Some(YES))
+}
+
+/// One three-way answer to a question that can also be remembered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Remembered {
+    /// Accept for this run only, changing nothing on disk.
+    Once,
+    /// Accept and persist the choice so the question is not asked again.
+    Always,
+    /// Decline.
+    Decline,
+}
+
+/// Ask a question whose acceptance may be remembered, reading one line of input.
+///
+/// Built on the same reader as [`confirm`] rather than on [`select`], because the one
+/// caller asks before raw mode is entered and a cursor-driven picker there would fight
+/// the TUI that is about to take the terminal. `n` and an empty answer both decline, so
+/// the default stays the refusing one; only `a`/`always` persists.
+pub(crate) fn confirm_remembering(message: &str) -> Result<Remembered, String> {
+    confirm_remembering_with(message, is_interactive(), || {
+        eprint!("{message} [y = this run / a = always / N] ");
+        std::io::stderr()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .map_err(|error| error.to_string())?;
+        Ok(answer)
+    })
+}
+
+fn confirm_remembering_with(
+    message: &str,
+    interactive: bool,
+    read_answer: impl FnOnce() -> Result<String, String>,
+) -> Result<Remembered, String> {
+    if !interactive {
+        return Err(format!("{message} requires an interactive terminal"));
+    }
+    let answer = read_answer()?;
+    Ok(match answer.trim().to_ascii_lowercase().as_str() {
+        "a" | "always" => Remembered::Always,
+        "y" | "yes" => Remembered::Once,
+        _ => Remembered::Decline,
+    })
 }
 
 /// Read one visible text value from an interactive terminal.
@@ -497,32 +511,6 @@ mod tests {
     }
 
     #[test]
-    fn confirm_fails_closed_without_a_terminal_and_accepts_only_yes() {
-        let error = confirm_with("Continue?", false, || {
-            panic!("a non-interactive confirm must not read standard input")
-        })
-        .expect_err("no terminal, no answer");
-        assert_eq!(error, "Continue? requires an interactive terminal");
-
-        for (answer, expected) in [
-            ("y\n", true),
-            ("Yes\n", true),
-            ("  YES  \n", true),
-            ("n\n", false),
-            ("\n", false),
-            ("maybe\n", false),
-        ] {
-            let accepted = confirm_with("Continue?", true, || Ok(answer.to_owned()))
-                .expect("an interactive answer is read");
-            assert_eq!(accepted, expected, "answer {answer:?}");
-        }
-
-        let error = confirm_with("Continue?", true, || Err("closed".to_owned()))
-            .expect_err("a failed read is an error, not a no");
-        assert_eq!(error, "closed");
-    }
-
-    #[test]
     fn text_inputs_apply_defaults_require_values_and_fail_closed() {
         assert_eq!(
             text_with("Provider id", Some("custom"), true, || Ok("\n".to_owned()))
@@ -564,5 +552,33 @@ mod tests {
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("你好世界", 3), "你好…");
         assert_eq!(truncate("abc", 8), "abc");
+    }
+
+    #[test]
+    fn a_rememberable_confirm_defaults_to_declining_and_only_a_persists() {
+        let error = confirm_remembering_with("Run natively?", false, || {
+            panic!("a non-interactive prompt must not read standard input")
+        })
+        .expect_err("no terminal, no answer");
+        assert_eq!(error, "Run natively? requires an interactive terminal");
+
+        for (answer, expected) in [
+            ("a\n", Remembered::Always),
+            ("Always\n", Remembered::Always),
+            ("  ALWAYS  \n", Remembered::Always),
+            ("y\n", Remembered::Once),
+            ("Yes\n", Remembered::Once),
+            ("n\n", Remembered::Decline),
+            ("\n", Remembered::Decline),
+            ("maybe\n", Remembered::Decline),
+        ] {
+            let outcome = confirm_remembering_with("Run natively?", true, || Ok(answer.to_owned()))
+                .expect("an interactive answer is read");
+            assert_eq!(outcome, expected, "answer {answer:?}");
+        }
+
+        let error = confirm_remembering_with("Run natively?", true, || Err("closed".to_owned()))
+            .expect_err("a failed read is an error, not a decline");
+        assert_eq!(error, "closed");
     }
 }
