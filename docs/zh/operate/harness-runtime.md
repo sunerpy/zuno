@@ -251,6 +251,19 @@ session 级联删除，并进入 session export/import、sanitize 与 prune。TU
 
 活跃的 Goal 会持续推进，直到它完成、被显式暂停或阻塞、达到预算上限，或遇到类型化的永久失败。
 
+Goal continuation 是一等的回合来源。准备阶段会捕获确切 Goal id 与 revision；provider
+工作开始前若 revision 已变化，这份 continuation 会失效。回合执行身份独立地从当前 host
+捕获 Agent、目录 provider 与目录模型。保留的 user 历史只提供因果 transcript anchor，
+不授予权限；Zuno 不会为了让重配置后的 host 看起来像历史状态而改写它，其中旧的
+Agent/模型字段也不能再路由自动 Goal 回合。普通用户回合仍使用自身消息里的身份。
+
+Engine 在解析当前身份之后、发送 provider 请求之前写入一条
+`session.turn.started.1`。事件记录 `turnTrigger`、`anchorMessageID`、Agent、provider 与
+模型；Goal 回合还记录 `goalID` 与 `goalRevision`。provider attempt 事件重复 Goal 的触发
+类型与已解析身份，使重试证据本身也完整。Agent 或模型解析失败时，
+`session.turn.rejected.1` 会在 Goal 被阻塞前记录请求身份与类型化失败，不会伪造 started
+或 provider-attempt 事件。
+
 原生 `/goal <目标>` 创建或编辑成功后，会把这次宿主命令标记为完整的 idle edge，并立即
 交给共享 Goal continuation driver。若会话还没有 user message，driver 会先把目标本身
 通过持久 inbox 准入为首个 user turn anchor；字面的斜杠控制文本不会进入 provider。

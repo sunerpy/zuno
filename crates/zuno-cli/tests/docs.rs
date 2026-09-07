@@ -135,6 +135,9 @@ fn harness_guide_documents_the_native_extension_contract() {
             "`Ctrl+Enter`",
             "`Shift+Enter`",
             "Durable goal recovery",
+            "session.turn.started.1",
+            "session.turn.rejected.1",
+            "Retained user history supplies only the causal transcript anchor",
             "goal_retry",
             "initial_delay_ms",
             "Retry-After",
@@ -151,6 +154,14 @@ fn harness_guide_documents_the_native_extension_contract() {
             "typed rich content",
             "[Image #N]",
             "unsupported typed input",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/harness-runtime.md",
+        &[
+            "session.turn.started.1",
+            "session.turn.rejected.1",
+            "保留的 user 历史只提供因果 transcript anchor",
         ],
     );
 }

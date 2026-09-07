@@ -1971,6 +1971,50 @@ fn seed_scripted_plan(
 }
 
 #[tokio::test]
+async fn host_refuses_a_prepared_goal_after_its_revision_changes_before_turn_start() {
+    let (_directory, mut host, _driver, _work) =
+        scripted_reconciliation_host("build", ScriptedTurnBehavior::PreserveWork).await;
+    let original = host
+        .goal_store
+        .create_goal(&host.session_id, "original objective", None)
+        .expect("create Goal");
+    let prepared = host
+        .goal_continuation
+        .prepare_if_idle(
+            &host.session_id,
+            GoalTurnMode::Work,
+            QueuedUserInput::Absent,
+        )
+        .expect("prepare Goal");
+    let ContinuationAttempt::Prepared(prepared) = prepared else {
+        panic!("active Goal should prepare")
+    };
+    assert!(
+        host.active_goal_for_continuation(&prepared)
+            .expect("validate original revision")
+            .is_some()
+    );
+
+    host.goal_store
+        .update_objective_checked(
+            &host.session_id,
+            "edited before provider start",
+            original.revision,
+        )
+        .expect("edit Goal")
+        .expect("Goal remains");
+    assert!(
+        host.active_goal_for_continuation(&prepared)
+            .expect("validate edited revision")
+            .is_none(),
+        "the host must not mix a freshly loaded Goal with an older prepared context"
+    );
+
+    drop(prepared);
+    host.shutdown().await.expect("shutdown scripted host");
+}
+
+#[tokio::test]
 async fn plan_handoff_finishes_one_host_turn_and_preserves_future_work() {
     let (_directory, mut host, driver, work) =
         scripted_reconciliation_host("plan", ScriptedTurnBehavior::PreserveWork).await;
@@ -1988,6 +2032,7 @@ async fn plan_handoff_finishes_one_host_turn_and_preserves_future_work() {
         host.execute_turn_unaccounted(
             DynamicContext::default(),
             DynamicContextRefreshInstruction::Fixed("scripted".to_owned()),
+            TurnStart::UserMessage,
             None,
             &guard,
             sender,
@@ -2049,6 +2094,7 @@ async fn ordinary_build_still_runs_reconciliation_until_durable_work_settles() {
         host.execute_turn_unaccounted(
             DynamicContext::default(),
             DynamicContextRefreshInstruction::Fixed("scripted".to_owned()),
+            TurnStart::UserMessage,
             None,
             &guard,
             sender,
@@ -2137,6 +2183,7 @@ async fn proactive_compaction_is_recovered_inside_the_same_host_drive() {
         host.execute_turn_unaccounted(
             DynamicContext::default(),
             DynamicContextRefreshInstruction::Fixed("scripted".to_owned()),
+            TurnStart::UserMessage,
             None,
             &guard,
             sender,

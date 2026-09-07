@@ -2,7 +2,7 @@ use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicI64, AtomicUsize, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant};
@@ -1462,6 +1462,47 @@ impl Respond for GoalCompletionTurnResponder {
     }
 }
 
+#[derive(Clone, Default)]
+struct GoalIdentityTurnResponder {
+    goal_requests: Arc<AtomicUsize>,
+    expected_revision: Arc<AtomicI64>,
+}
+
+impl GoalIdentityTurnResponder {
+    fn expect_revision(&self, revision: i64) {
+        self.expected_revision.store(revision, Ordering::SeqCst);
+    }
+}
+
+impl Respond for GoalIdentityTurnResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).expect("provider request JSON");
+        let has_tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if !has_tools {
+            return compatible_text_response("ACP identity title");
+        }
+        if !body.to_string().contains("CURRENT-IDENTITY") {
+            return compatible_text_response("Deep seed completed");
+        }
+        let request_index = self.goal_requests.fetch_add(1, Ordering::SeqCst);
+        if request_index.is_multiple_of(2) {
+            compatible_tool_response(
+                &format!("call_goal_identity_{}", request_index / 2 + 1),
+                "goal_update",
+                json!({
+                    "expected_revision": self.expected_revision.load(Ordering::SeqCst),
+                    "status": "complete"
+                }),
+            )
+        } else {
+            compatible_text_response("Goal continued with current identity")
+        }
+    }
+}
+
 fn compatible_text_response(text: &str) -> ResponseTemplate {
     let chunk = json!({"choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":null}]});
     let finish = json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}});
@@ -2651,6 +2692,253 @@ async fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
             .iter()
             .any(|body| body.to_string().contains("What is GOAL-TWO?")),
         "the durable Goal objective was not injected into the autonomous provider turn"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_goal_turns_use_current_agent_and_model_after_reconfiguration() {
+    let provider = MockServer::start().await;
+    let responder = GoalIdentityTurnResponder::default();
+    Mock::given(method("POST"))
+        .respond_with(responder.clone())
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("temporary ACP root");
+    let config = config_with_second_model(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let _commands = read_session_update(&mut stdout);
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/set_config_option",
+        json!({"sessionId": &session_id, "configId": "agent", "value": "deep"}),
+    );
+    let (seed, seed_updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"Seed one durable deep turn."}]
+        }),
+    );
+    assert_eq!(seed["stopReason"], "end_turn");
+    assert!(seed_updates.iter().any(|update| {
+        update["sessionUpdate"] == "agent_message_chunk"
+            && update["content"]["text"] == "Deep seed completed"
+    }));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/set_config_option",
+        json!({
+            "sessionId": &session_id,
+            "configId": "agent",
+            "value": "orchestrator"
+        }),
+    );
+    request(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "session/set_config_option",
+        json!({
+            "sessionId": &session_id,
+            "configId": "model",
+            "value": "test/test-model-2"
+        }),
+    );
+
+    let location = zuno_paths::DbLocation::File(root.path().join("zuno-acp.db"));
+    let pool = Arc::new(zuno_db::Pool::open(&location).expect("open ACP identity store"));
+    let goals = zuno_goal::GoalStore::from_pool(
+        Arc::clone(&pool),
+        root.path().join("goal-objective-spill"),
+    )
+    .expect("open ACP Goal store");
+    goals
+        .create_goal(
+            &session_id,
+            "RESUME-CURRENT-IDENTITY after a historical failure",
+            None,
+        )
+        .expect("seed active Goal");
+    let blocked = goals
+        .block_with_reason(&session_id, zuno_goal::GoalBlockReason::AgentUnavailable)
+        .expect("block Goal with historical reason")
+        .expect("active Goal becomes blocked");
+    responder.expect_revision(blocked.revision + 1);
+
+    let (resumed, resumed_updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        7,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"/goal resume"}]
+        }),
+    );
+    assert_eq!(resumed["stopReason"], "end_turn");
+    assert!(resumed_updates.iter().any(|update| {
+        update["sessionUpdate"] == "agent_message_chunk"
+            && update["content"]["text"] == "Goal continued with current identity"
+    }));
+    assert_eq!(
+        goals
+            .goal(&session_id)
+            .expect("read resumed Goal")
+            .expect("Goal remains")
+            .status,
+        zuno_goal::GoalStatus::Complete
+    );
+
+    responder.expect_revision(1);
+    let (created_goal, created_goal_updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        8,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{
+                "type":"text",
+                "text":"/goal create CREATE-CURRENT-IDENTITY from the current host"
+            }]
+        }),
+    );
+    assert_eq!(created_goal["stopReason"], "end_turn");
+    assert!(created_goal_updates.iter().any(|update| {
+        update["sessionUpdate"] == "agent_message_chunk"
+            && update["content"]["text"] == "Goal continued with current identity"
+    }));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        9,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP current-identity process failed: {stderr}");
+    }
+
+    let connection = pool.get().expect("open ACP identity connection");
+    let history = zuno_db::message::MessageStore::new(&connection)
+        .hydrate_session(&session_id)
+        .expect("hydrate ACP identity history");
+    let users = history
+        .iter()
+        .filter(|message| message.info.role == zuno_db::message::MessageRole::User)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        users.len(),
+        1,
+        "Goal commands and reconfiguration must not rewrite or manufacture user turns"
+    );
+    assert_eq!(users[0].info.data["agent"], "deep");
+    assert_eq!(users[0].info.data["model"]["providerID"], "test");
+    assert_eq!(users[0].info.data["model"]["modelID"], "test-model");
+
+    let mut statement = connection
+        .prepare(
+            "SELECT data FROM event \
+             WHERE aggregate_id = ?1 AND type = 'session.turn.started.1' \
+               AND json_extract(data, '$.turnTrigger') = 'goal' ORDER BY seq",
+        )
+        .expect("prepare Goal turn-start query");
+    let starts = statement
+        .query_map([&session_id], |row| row.get::<_, String>(0))
+        .expect("query Goal turn starts")
+        .map(|row| {
+            serde_json::from_str::<Value>(&row.expect("Goal turn-start event"))
+                .expect("Goal turn-start JSON")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 2, "{starts:#?}");
+    assert!(starts.iter().all(|start| {
+        start["turnTrigger"] == "goal"
+            && start["anchorMessageID"] == users[0].info.id
+            && start["agent"] == "orchestrator"
+            && start["providerID"] == "test"
+            && start["modelID"] == "test-model-2"
+    }));
+    assert_eq!(starts[0]["goalRevision"], blocked.revision + 1);
+    assert_eq!(starts[1]["goalRevision"], 1);
+
+    let goal = goals
+        .goal(&session_id)
+        .expect("read created Goal")
+        .expect("created Goal remains");
+    assert_eq!(
+        goal.objective,
+        "CREATE-CURRENT-IDENTITY from the current host"
+    );
+    assert_eq!(goal.status, zuno_goal::GoalStatus::Complete);
+
+    let provider_requests = provider
+        .received_requests()
+        .await
+        .expect("provider requests");
+    let goal_requests = provider_requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter(|body| {
+            body.to_string().contains("CURRENT-IDENTITY")
+                && body
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| !tools.is_empty())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(goal_requests.len(), 4, "{goal_requests:#?}");
+    assert!(
+        goal_requests
+            .iter()
+            .all(|request| request["model"] == "test-model-2"),
+        "Goal continuation used the historical model: {goal_requests:#?}"
     );
 }
 

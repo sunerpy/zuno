@@ -54,8 +54,8 @@ use zuno_engine::driver::AgentDriver;
 use zuno_engine::r#loop::{
     AgentModelResolver, DynamicContextRefresher, NoticeSeverity, ResolvedAgent,
     ResolvedModel as EngineModel, RunTurnRequest, ToolConcurrencyLimit, ToolDispatcher as _,
-    ToolFailureRecovery, TurnContext, TurnError, TurnEvent, TurnEventSender, TurnOutcome,
-    TurnRecovery, has_requested_user_message, hydrate_retained_history,
+    ToolFailureRecovery, TurnContext, TurnError, TurnEvent, TurnEventSender, TurnExecutionIdentity,
+    TurnOutcome, TurnRecovery, TurnStart, has_requested_user_message, hydrate_retained_history,
 };
 use zuno_engine::plan_driver::{
     PlanReconciliationDecision, PlanReconciliationDriver, PlanReconciliationInput,
@@ -143,6 +143,11 @@ const SUBAGENT_MODEL_POLICY_EVENT: &str = "session.subagent-model-policy";
 enum DynamicContextRefreshInstruction {
     Planning(PlanningDecision),
     Fixed(String),
+}
+
+enum GoalTurnExecution {
+    Stale,
+    Outcome(Option<TurnOutcome>),
 }
 
 impl DynamicContextRefreshInstruction {
@@ -8331,6 +8336,7 @@ impl TurnHost {
         self.execute_turn_unaccounted(
             dynamic_context,
             DynamicContextRefreshInstruction::Planning(planning.clone()),
+            TurnStart::UserMessage,
             routing,
             guard,
             events,
@@ -8510,7 +8516,11 @@ impl TurnHost {
         }
         .await;
         match result {
-            Ok(outcome) => {
+            Ok(GoalTurnExecution::Stale) => {
+                self.last_turn_completed = true;
+                Ok(true)
+            }
+            Ok(GoalTurnExecution::Outcome(outcome)) => {
                 self.last_turn_completed = outcome
                     .as_ref()
                     .is_some_and(|outcome| matches!(outcome, TurnOutcome::Completed { .. }));
@@ -8529,8 +8539,21 @@ impl TurnHost {
         &mut self,
         prepared: &zuno_goal::PreparedContinuation,
         events: TurnEventSender,
-    ) -> Result<Option<TurnOutcome>, TurnFailure> {
-        let goal = self.ensure_goal_turn_anchor().map_err(TurnFailure::host)?;
+    ) -> Result<GoalTurnExecution, TurnFailure> {
+        let Some(goal) = self
+            .active_goal_for_continuation(prepared)
+            .map_err(TurnFailure::host)?
+        else {
+            return Ok(GoalTurnExecution::Stale);
+        };
+        self.ensure_goal_conversation_anchor(&goal)
+            .map_err(TurnFailure::host)?;
+        let (goal_id, goal_revision) = prepared.goal_identity();
+        let turn_start = TurnStart::GoalContinuation {
+            goal_id: goal_id.to_owned(),
+            goal_revision,
+            identity: TurnExecutionIdentity::new(&self.agent, &self.provider_id, &self.model_id),
+        };
         let planning = self
             .ensure_durable_plan(&goal.objective, PlanningInputSource::GoalObjective, None)
             .map_err(TurnFailure::host)?;
@@ -8541,38 +8564,49 @@ impl TurnHost {
         let prelude = self.run_prelude().await;
         let prelude = match prelude {
             Ok(prelude) if prelude.continue_turn => prelude,
-            Ok(_) => return Ok(None),
+            Ok(_) => return Ok(GoalTurnExecution::Outcome(None)),
             Err(error) => return Err(error),
         };
         report_prelude(&events, &self.notes, &self.instruction_admission, &prelude)
             .await
             .map_err(TurnFailure::event_consumer)?;
+        if !self
+            .goal_continuation
+            .is_current(prepared)
+            .map_err(TurnFailure::goal)?
+        {
+            return Ok(GoalTurnExecution::Stale);
+        }
         self.execute_turn_unaccounted(
             dynamic_context,
             DynamicContextRefreshInstruction::Planning(planning),
+            turn_start,
             None,
             prepared.run_guard(),
             events,
         )
         .await
+        .map(GoalTurnExecution::Outcome)
     }
 
-    fn ensure_goal_turn_anchor(&mut self) -> Result<zuno_goal::Goal, String> {
+    fn active_goal_for_continuation(
+        &self,
+        prepared: &zuno_goal::PreparedContinuation,
+    ) -> Result<Option<zuno_goal::Goal>, String> {
         let goal = self
             .goal_store
             .goal(&self.session_id)
             .map_err(to_string)?
-            .filter(|goal| goal.status == zuno_goal::GoalStatus::Active)
-            .ok_or_else(|| {
-                format!(
-                    "session `{}` lost its active Goal before the first autonomous turn",
-                    self.session_id
-                )
-            })?;
+            .filter(|goal| goal.status == zuno_goal::GoalStatus::Active);
+        let (goal_id, goal_revision) = prepared.goal_identity();
+        Ok(goal.filter(|goal| goal.goal_id == goal_id && goal.revision == goal_revision))
+    }
+
+    fn ensure_goal_conversation_anchor(&mut self, goal: &zuno_goal::Goal) -> Result<(), String> {
         let retained =
             hydrate_retained_history(&self.connection, &self.session_id).map_err(to_string)?;
         if has_requested_user_message(&retained) {
-            return Ok(goal);
+            return Ok(());
         }
         let message_store = zuno_db::message::MessageStore::new(&self.connection);
         let latest = message_store
@@ -8593,13 +8627,14 @@ impl TurnHost {
             &self.attachments,
         )?;
         self.persist_user_input(&message, &parts)?;
-        Ok(goal)
+        Ok(())
     }
 
     async fn execute_turn_unaccounted(
         &mut self,
         mut dynamic_context: DynamicContext,
         mut refresh_instruction: DynamicContextRefreshInstruction,
+        turn_start: TurnStart,
         routing: Option<&PromptRouting>,
         guard: &SessionRunGuard,
         events: TurnEventSender,
@@ -8619,6 +8654,7 @@ impl TurnHost {
                 .execute_one_turn_unaccounted(
                     dynamic_context.clone(),
                     &dynamic_context_refresher,
+                    &turn_start,
                     routing,
                     guard,
                     events.clone(),
@@ -8748,6 +8784,7 @@ impl TurnHost {
         &mut self,
         dynamic_context: DynamicContext,
         dynamic_context_refresher: &dyn DynamicContextRefresher,
+        turn_start: &TurnStart,
         routing: Option<&PromptRouting>,
         guard: &SessionRunGuard,
         events: TurnEventSender,
@@ -8833,6 +8870,7 @@ impl TurnHost {
             Uuid::new_v4().simple().to_string(),
             dynamic_context,
         )
+        .with_start(turn_start.clone())
         .with_context_limit(self.window.context)
         .with_deferred_success_terminal_event(true);
         if let Some(threshold) = proactive_compaction_threshold {

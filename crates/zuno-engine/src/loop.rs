@@ -1236,12 +1236,56 @@ pub trait DynamicContextRefresher: Send + Sync {
     ) -> Result<DynamicContext, String>;
 }
 
+/// Exact Agent and catalog model selected for one automatic turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnExecutionIdentity {
+    /// Collaboration Agent selected by the current host.
+    pub agent: String,
+    /// Catalog provider selected by the current host.
+    pub provider_id: String,
+    /// Catalog model selected by the current host.
+    pub model_id: String,
+}
+
+impl TurnExecutionIdentity {
+    #[must_use]
+    pub fn new(
+        agent: impl Into<String>,
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            agent: agent.into(),
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+        }
+    }
+}
+
+/// Why a turn started and where its execution identity comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnStart {
+    /// A genuine user message owns both the causal anchor and execution identity.
+    UserMessage,
+    /// Durable Goal work starts from current host settings, not an older user message.
+    GoalContinuation {
+        /// Goal instance captured by the continuation guard.
+        goal_id: String,
+        /// Optimistic revision whose model context is being executed.
+        goal_revision: i64,
+        /// Current host identity used to resolve this automatic turn.
+        identity: TurnExecutionIdentity,
+    },
+}
+
 /// Stable caller-owned identity and volatile suffix for one run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunTurnRequest {
     pub session_id: String,
     pub turn_id: String,
     pub dynamic_context: DynamicContext,
+    /// Typed turn origin and execution-identity policy.
+    pub start: TurnStart,
     /// Model context ceiling used to interpret the latest prompt occupancy.
     pub context_limit: Option<u64>,
     /// Proactive context threshold enforced between provider steps.
@@ -1265,10 +1309,18 @@ impl RunTurnRequest {
             session_id: session_id.into(),
             turn_id: turn_id.into(),
             dynamic_context,
+            start: TurnStart::UserMessage,
             context_limit: None,
             context_compaction_threshold: None,
             defer_success_terminal_event: false,
         }
+    }
+
+    /// Attach the typed origin and execution identity for this turn.
+    #[must_use]
+    pub fn with_start(mut self, start: TurnStart) -> Self {
+        self.start = start;
+        self
     }
 
     /// Attach the active model's context ceiling.
@@ -1989,6 +2041,7 @@ async fn run_turn_in_span(
     let mut last_request = ProviderRequestUsage::default();
     let mut last_context_tokens = None;
     let mut reported_historical_tool_repair = false;
+    let mut durable_turn_start_recorded = false;
 
     loop {
         if context.interrupt.is_set() {
@@ -2017,7 +2070,7 @@ async fn run_turn_in_span(
 
         let mut history = hydrate_retained_history(context.connection, &request.session_id)?;
         apply_legacy_tool_schema_identities(&mut history, &legacy_tool_schema_snapshots);
-        let requested = requested_turn(&request.session_id, &history)?;
+        let requested = requested_turn(&request.session_id, &history, &request.start)?;
         if inject_live_inputs(&mut context, &request, &requested)?.count > 0 {
             continue;
         }
@@ -2027,25 +2080,42 @@ async fn run_turn_in_span(
             &mut resolved_attachments,
         )
         .await?;
-        let agent = context
-            .resolver
-            .resolve_agent(&requested.agent)
-            .ok_or_else(|| TurnError::AgentNotFound {
+        let Some(agent) = context.resolver.resolve_agent(&requested.agent) else {
+            append_turn_rejected(
+                context.connection,
+                &request,
+                &requested,
+                "agent_unavailable",
+            )?;
+            return Err(TurnError::AgentNotFound {
                 agent: requested.agent.clone(),
-            })?;
-        let model = context
+            });
+        };
+        let Some(model) = context
             .resolver
             .resolve_model(&requested.provider_id, &requested.model_id)
-            .ok_or_else(|| TurnError::ModelNotFound {
+        else {
+            append_turn_rejected(
+                context.connection,
+                &request,
+                &requested,
+                "model_unavailable",
+            )?;
+            return Err(TurnError::ModelNotFound {
                 provider_id: requested.provider_id.clone(),
                 model_id: requested.model_id.clone(),
-            })?;
+            });
+        };
         span::record_turn_identity(
             &turn_span,
             &agent.name,
             &model.catalog_provider_id,
             &model.catalog_model_id,
         );
+        if !durable_turn_start_recorded {
+            append_turn_started(context.connection, &request, &requested, &agent, &model)?;
+            durable_turn_start_recorded = true;
+        }
         // Scoped before anything reads `history`, so the hook path and the direct
         // projection see the same request. The option is read from the resolved
         // model's spec: a declared endpoint capability, never a provider-id rule.
@@ -2581,6 +2651,9 @@ async fn run_turn_in_span(
                                 step,
                                 request_id: &request_id,
                                 assistant_message_id: &assistant_id,
+                                agent: &agent.name,
+                                provider_id: &model.catalog_provider_id,
+                                model_id: &model.catalog_model_id,
                                 attempt,
                                 max_attempts: max,
                             },
@@ -2602,6 +2675,9 @@ async fn run_turn_in_span(
                                 step,
                                 request_id: &request_id,
                                 assistant_message_id: &assistant_id,
+                                agent: &agent.name,
+                                provider_id: &model.catalog_provider_id,
+                                model_id: &model.catalog_model_id,
                                 attempt,
                                 max_attempts: max,
                             },
@@ -2625,6 +2701,9 @@ async fn run_turn_in_span(
                                 step,
                                 request_id: &request_id,
                                 assistant_message_id: &assistant_id,
+                                agent: &agent.name,
+                                provider_id: &model.catalog_provider_id,
+                                model_id: &model.catalog_model_id,
                                 attempt,
                                 max_attempts: max,
                             },
@@ -3661,10 +3740,26 @@ fn touch_session(connection: &mut Connection, session_id: &str) -> Result<(), Tu
 fn requested_turn(
     session_id: &str,
     history: &[MessageWithParts],
+    start: &TurnStart,
 ) -> Result<RequestedTurn, TurnError> {
     let user = requested_user_message(history).ok_or_else(|| TurnError::NoUserMessage {
         session_id: session_id.to_owned(),
     })?;
+    let identity = match start {
+        TurnStart::UserMessage => execution_identity_from_user(user)?,
+        TurnStart::GoalContinuation { identity, .. } => identity.clone(),
+    };
+    Ok(RequestedTurn {
+        user_message_id: user.info.id.clone(),
+        agent: identity.agent,
+        provider_id: identity.provider_id,
+        model_id: identity.model_id,
+    })
+}
+
+fn execution_identity_from_user(
+    user: &MessageWithParts,
+) -> Result<TurnExecutionIdentity, TurnError> {
     let agent = required_string(&user.info, "agent")?;
     let model = user
         .info
@@ -3689,12 +3784,7 @@ fn requested_turn(
             message_id: user.info.id.clone(),
             field: "model.modelID",
         })?;
-    Ok(RequestedTurn {
-        user_message_id: user.info.id.clone(),
-        agent,
-        provider_id: provider_id.to_owned(),
-        model_id: model_id.to_owned(),
-    })
+    Ok(TurnExecutionIdentity::new(agent, provider_id, model_id))
 }
 
 /// Whether retained history contains a real user turn the engine can answer.
@@ -5870,6 +5960,70 @@ fn assistant_message(
     .map_err(TurnError::from)
 }
 
+fn append_turn_started(
+    connection: &mut Connection,
+    request: &RunTurnRequest,
+    requested: &RequestedTurn,
+    agent: &ResolvedAgent,
+    model: &ResolvedModel,
+) -> Result<(), TurnError> {
+    let mut properties = Map::from_iter([
+        ("turnID".to_owned(), Value::String(request.turn_id.clone())),
+        (
+            "anchorMessageID".to_owned(),
+            Value::String(requested.user_message_id.clone()),
+        ),
+        ("agent".to_owned(), Value::String(agent.name.clone())),
+        (
+            "providerID".to_owned(),
+            Value::String(model.catalog_provider_id.clone()),
+        ),
+        (
+            "modelID".to_owned(),
+            Value::String(model.catalog_model_id.clone()),
+        ),
+    ]);
+    append_turn_origin_properties(&mut properties, &request.start);
+    append_with_connection(
+        connection,
+        &request.session_id,
+        NewSessionEvent::new("session.turn.started", properties)?,
+    )?;
+    Ok(())
+}
+
+fn append_turn_rejected(
+    connection: &mut Connection,
+    request: &RunTurnRequest,
+    requested: &RequestedTurn,
+    error_kind: &str,
+) -> Result<(), TurnError> {
+    let mut properties = Map::from_iter([
+        ("turnID".to_owned(), Value::String(request.turn_id.clone())),
+        (
+            "anchorMessageID".to_owned(),
+            Value::String(requested.user_message_id.clone()),
+        ),
+        ("agent".to_owned(), Value::String(requested.agent.clone())),
+        (
+            "providerID".to_owned(),
+            Value::String(requested.provider_id.clone()),
+        ),
+        (
+            "modelID".to_owned(),
+            Value::String(requested.model_id.clone()),
+        ),
+        ("errorKind".to_owned(), Value::String(error_kind.to_owned())),
+    ]);
+    append_turn_origin_properties(&mut properties, &request.start);
+    append_with_connection(
+        connection,
+        &request.session_id,
+        NewSessionEvent::new("session.turn.rejected", properties)?,
+    )?;
+    Ok(())
+}
+
 /// # Why the reasoning controls travel as `parameters`
 ///
 /// `parameters` is the one channel every provider family already overlays onto its
@@ -5907,6 +6061,9 @@ struct ProviderAttemptRecord<'a> {
     step: u32,
     request_id: &'a str,
     assistant_message_id: &'a str,
+    agent: &'a str,
+    provider_id: &'a str,
+    model_id: &'a str,
     attempt: u32,
     max_attempts: u32,
 }
@@ -6093,7 +6250,7 @@ fn provider_attempt_properties(
     request: &RunTurnRequest,
     attempt: ProviderAttemptRecord<'_>,
 ) -> Map<String, Value> {
-    Map::from_iter([
+    let mut properties = Map::from_iter([
         (
             "attemptID".to_owned(),
             Value::String(format!(
@@ -6113,7 +6270,35 @@ fn provider_attempt_properties(
             "assistantMessageID".to_owned(),
             Value::String(attempt.assistant_message_id.to_owned()),
         ),
-    ])
+        ("agent".to_owned(), Value::String(attempt.agent.to_owned())),
+        (
+            "providerID".to_owned(),
+            Value::String(attempt.provider_id.to_owned()),
+        ),
+        (
+            "modelID".to_owned(),
+            Value::String(attempt.model_id.to_owned()),
+        ),
+    ]);
+    append_turn_origin_properties(&mut properties, &request.start);
+    properties
+}
+
+fn append_turn_origin_properties(properties: &mut Map<String, Value>, start: &TurnStart) {
+    match start {
+        TurnStart::UserMessage => {
+            properties.insert("turnTrigger".to_owned(), Value::String("user".to_owned()));
+        }
+        TurnStart::GoalContinuation {
+            goal_id,
+            goal_revision,
+            ..
+        } => {
+            properties.insert("turnTrigger".to_owned(), Value::String("goal".to_owned()));
+            properties.insert("goalID".to_owned(), Value::String(goal_id.clone()));
+            properties.insert("goalRevision".to_owned(), Value::from(*goal_revision));
+        }
+    }
 }
 
 fn insert_provider_attempt_error(properties: &mut Map<String, Value>, error: &ProviderError) {
