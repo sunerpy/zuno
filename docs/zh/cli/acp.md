@@ -56,8 +56,9 @@ diff 时，可见内容只保留 `A/M/D <path>`，不再重复显示成功文案
 failed 状态，保留已观察到的路径/diff，并设置 `_meta.zuno.outcome: "uncertain"`。
 实时更新与历史 replay 使用同一策略。
 
-运维通知——无法抓取的远程规则文件（其规则本轮不生效，回合继续）、被 token、工具调用
-次数或墙上时间额度停下的回合，以及预算或上下文策略要求的一次压缩——以带
+运维通知——无法抓取的远程规则文件，或因装不进 prompt 预算而整份跳过的完整本地规则文件
+（其规则本轮不生效，回合继续）、被 token、工具调用次数或墙上时间额度停下的回合，以及
+预算或上下文策略要求的一次压缩——以带
 `_meta.zuno.notice` 标记的 `agent_thought_chunk` 投影，
 其中 `severity` 取 `info`、`warning` 或 `error`，`code` 是稳定的机器可读码，例如
 `instruction.not_in_force`、`budget.compact`、`budget.token_budget`、`context.compact`。

@@ -370,13 +370,15 @@ Responses function tools；同名的配置工具会由锁定声明覆盖。
 
 重放还必须与端点的指纹一致。工具调用会用 provider 自己的 `arguments` 字节重放，而不是把解析后的值重新序列化，因为键顺序与空格也是被签名内容的一部分。如果某个步骤的封装项后面没有任何输出（例如步骤被打断，或整份输出预算都花在推理上），这一项会被扣留而不是单独发出，因为 Responses 端点会拒绝这种形状；它计入被扣留数，而不算作一次重放。项 id 不会回送：重放项只带 `type`、`summary`、`encrypted_content` 与 `status`。
 
+自动 Goal continuation 的输入边界也会被保留。Zuno 会在新 turn 的第一条 assistant 行上只保存 prompt receipt 引用，并在两个 assistant 响应于 Responses `input` 中直接相邻时，从 receipt 的 hook 后实际投影恢复动态 developer context 后缀。旧版本的行会从 provider request 事件找到准确 receipt，并先剥离稳定的 runtime policy 前缀。这样每个加密信封仍只对应铸造它的那一个 turn 的输出指纹，不需要伪造 user 消息或工具结果。若旧 export、压缩摘要或损坏历史没有可证明的 receipt，Zuno 会仅扣留歧义组中的 capsule，保留其余文本与工具历史；最后的 provider 校验只报告消息索引而不会输出 token。
+
 默认值 `off` 表示请求既不带 `include`，也不带任何封装项，包括同一会话在选项为 `encrypted` 时存下的信封。它并不承诺请求字节与既有版本一致：本次发布还会按模型流出的顺序发送每个 assistant 轮次的 Responses `input`，因此先写文本再调用工具的一轮，现在会先发文本项再发 function call —— 这对所有 Responses provider 生效，与 `reasoningReplay` 的取值无关。这个顺序正是封装端点会校验的内容；一次性代价是仅追加的提示词缓存前缀会失效一次。
 
 没有 `reasoningReplay: "encrypted"` 的 `reasoningReplayMaxAge` 同样会在配置期被拒绝。不要给会封装推理的端点添加 `reasoningSummary`，它会拒绝 `reasoning.summary`。
 
 信封是不透明的 provider 密文，Zuno 把它当作会话内容而不是可以脱敏的机密：它存放在推理 part 的 `metadata.providerReasoning` 中，会由 HTTP messages 端点返回，还会随一个完整携带密文的流事件转发：SSE 客户端看到的类型是 `provider.reasoning.item`，`zuno run --json` 打印的是 `provider_reasoning_item`，两者的密文都在 `encryptedContent` 字段里。Zuno 绝不会把它发给除封装者以外的模型，`session.provider.request` 事件只记录计数。能读取某个会话的消息或事件流，就等于能读取它的信封。
 
-每个前台请求都会在自己的 `session.provider.request` 事件上记录 `reasoningReplay`、`replayedReasoningCapsules` 与 `withheldReasoningCapsules`，这就是确认重放确实发生的依据。重放计数就是真正上链路的数量；历史提供了、但这次请求没有发出的信封都计入被扣留数，无论原因是别的模型铸造、已经过期，还是它后面没有任何输出。
+每个前台请求都会在自己的 `session.provider.request` 事件上记录 `reasoningReplay`、`replayedReasoningCapsules`、`withheldReasoningCapsules`、`restoredReasoningReplayBoundaries` 与 `withheldAmbiguousReasoningCapsules`，这就是确认重放确实发生的依据。重放计数就是真正上链路的数量；历史提供了、但这次请求没有发出的信封都计入被扣留数，无论原因是别的模型铸造、已经过期，还是它后面没有任何输出。恢复边界数表示本次请求从持久 prompt receipt 恢复了多少条旧 assistant 行的 developer 后缀；歧义扣留数是因边界无法证明而安全降级的子集。事件不会保存 token 或提示词正文。
 
 模型的 `options.reasoningEffort` 是当实时会话与所选 Agent 都没有选择级别时的默认值。在 Responses surface 上，`options.reasoningSummary` 会与它一起降级为 `reasoning: { effort, summary }`；Chat Completions 只收到 `reasoning_effort`，因为它没有推理摘要请求字段。对拒绝 `reasoning.summary` 的 compatible 端点，请省略 `reasoningSummary`；Zuno 不会基于 provider id 静默剥离一个被显式请求的控制项。
 

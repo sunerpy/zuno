@@ -44,6 +44,18 @@ zuno tui --agent orchestrator
 
 选择按此顺序解析：客户端显式选择的 Agent，然后是顶层 `default_agent`，最后是内置 `orchestrator`。
 
+## 工具降级
+
+每个 Agent 都会按最终对 provider 可见的工具快照生成 `runtime.execution` 降级规则。某个
+工具限速、不可用或暂时失败时，不原样重复同一调用；`tool_search` 可见时，Agent 用它发现
+另一个已经授权的已连接工具。已连接的 `google_search` 就可以作为 `web_search` 的一种替代
+路径。自定义 Agent 解析出相同工具面时也获得同一规则。
+
+Shell 可用时，GitHub 操作优先使用已经安装的 `gh`，仓库搜索优先使用 `rg`，而不是先写原始
+`curl` 或手工目录遍历。Agent 必须确认命令存在，并保持相同的来源与证据要求。降级绝不会赋予
+原本没有的工具、网络路径、文件系统能力或权限；Shell 或已连接工具不存在时，也不会渲染相应
+指导。
+
 ## 契约如何收窄权限
 
 一共四层，每一层都只能移除能力：

@@ -1970,6 +1970,61 @@ fn seed_scripted_plan(
     work.snapshot(session_id).expect("snapshot scripted work")
 }
 
+fn start_scripted_remote_observer(
+    host: &TurnHost,
+    directory: &Path,
+) -> zuno_pty::BackgroundExecutionId {
+    #[cfg(unix)]
+    let (program, arguments, command) = (
+        std::ffi::OsString::from("/bin/sh"),
+        vec![
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from("sleep 30"),
+        ],
+        "sleep 30",
+    );
+    #[cfg(windows)]
+    let (program, arguments, command) = (
+        std::env::var_os("ComSpec").unwrap_or_else(|| std::ffi::OsString::from("cmd.exe")),
+        vec![
+            std::ffi::OsString::from("/D"),
+            std::ffi::OsString::from("/Q"),
+            std::ffi::OsString::from("/C"),
+            std::ffi::OsString::from("ping -n 31 127.0.0.1 >NUL"),
+        ],
+        "ping -n 31 127.0.0.1 >NUL",
+    );
+    let policy = zuno_sandbox::SandboxPolicy::new(
+        directory,
+        zuno_sandbox::SandboxMode::WorkspaceWrite,
+        zuno_sandbox::NetworkAccess::Allowed,
+    )
+    .expect("scripted observer policy");
+    let prepared = zuno_sandbox::SandboxBackend::prepare(
+        &DirectTestSandbox::new(),
+        zuno_sandbox::PrepareRequest {
+            program: program.clone(),
+            arguments,
+            cwd: directory.to_owned(),
+            environment: std::env::vars_os().collect(),
+            policy,
+        },
+    )
+    .expect("prepare scripted observer");
+    host.background_executions
+        .start(zuno_pty::BackgroundExecutionInput {
+            prepared,
+            session_id: host.session_id.clone(),
+            title: "watch release run".to_owned(),
+            command: command.to_owned(),
+            purpose: zuno_pty::BackgroundExecutionPurpose::RemoteObserver,
+            hard_ceiling: std::time::Duration::from_secs(60),
+            retention: zuno_pty::BackgroundExecutionRetention::Durable,
+        })
+        .expect("start scripted remote observer")
+        .id
+}
+
 #[tokio::test]
 async fn host_refuses_a_prepared_goal_after_its_revision_changes_before_turn_start() {
     let (_directory, mut host, _driver, _work) =
@@ -2130,6 +2185,108 @@ async fn ordinary_build_still_runs_reconciliation_until_durable_work_settles() {
     assert_eq!(phase.reason.as_deref(), Some("durable_work_settled"));
     assert_eq!(phase.reconciliation_attempt, 1);
     host.shutdown().await.expect("shutdown scripted build host");
+}
+
+#[tokio::test]
+async fn a_remote_observer_defers_goal_reconciliation_until_its_durable_wake() {
+    let (directory, mut host, driver, work) =
+        scripted_reconciliation_host("build", ScriptedTurnBehavior::PreserveWork).await;
+    seed_scripted_plan(&work, &host.session_id, false);
+    host.goal_store
+        .create_goal(
+            &host.session_id,
+            "Publish after the release run settles",
+            None,
+        )
+        .expect("create active Goal");
+    let execution_id = start_scripted_remote_observer(&host, directory.path());
+    assert!(host.remote_observer_running());
+
+    let guard = host
+        .runs
+        .begin_turn(host.session_id.clone())
+        .expect("reserve scripted turn");
+    let (sender, receiver) = zuno_engine::r#loop::event_channel();
+    let (outcome, events) = tokio::join!(
+        host.execute_turn_unaccounted(
+            DynamicContext::default(),
+            DynamicContextRefreshInstruction::Fixed("scripted".to_owned()),
+            TurnStart::UserMessage,
+            None,
+            &guard,
+            sender,
+        ),
+        collect_turn_events(receiver)
+    );
+
+    assert!(matches!(
+        outcome.expect("remote observer wait"),
+        Some(TurnOutcome::Completed { .. })
+    ));
+    assert_eq!(
+        driver.calls(),
+        1,
+        "a running remote observer must not spend model reconciliation turns"
+    );
+    let phase = host
+        .plan_reconciliation
+        .projection(&host.session_id)
+        .expect("read driver phase")
+        .expect("driver phase exists");
+    assert_eq!(
+        phase.phase,
+        zuno_engine::plan_driver::DriverPhase::WaitingBackground
+    );
+    assert_eq!(phase.reason.as_deref(), Some("remote_observer_running"));
+    assert_eq!(phase.reconciliation_attempt, 0);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::TurnCompleted { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::TurnWaitingForHuman { .. }))
+    );
+    assert!(
+        host.goal_store
+            .human_requests()
+            .pending(Some(&host.session_id))
+            .expect("read pending human requests")
+            .is_empty(),
+        "a live remote observer must never manufacture a Plan-state question"
+    );
+
+    host.last_turn_completed = true;
+    let (sender, _receiver) = zuno_engine::r#loop::event_channel();
+    assert!(
+        !host
+            .continue_goal_if_idle(QueuedUserInput::Absent, sender)
+            .await
+            .expect("idle Goal continuation check"),
+        "automatic Goal continuation must sleep until the observer's durable completion wake"
+    );
+    assert_eq!(driver.calls(), 1);
+
+    if let Some(watcher) = host
+        .background_notifications
+        .unregister(&host.background_notification_directory, &host.session_id)
+    {
+        watcher.await.expect("stop background notification watcher");
+    }
+    let service = Arc::clone(&host.background_executions);
+    service
+        .cancel(&execution_id)
+        .expect("cancel scripted observer");
+    let settled = service
+        .wait(&execution_id, Some(std::time::Duration::from_secs(5)))
+        .await
+        .expect("wait for scripted observer cleanup");
+    assert!(!settled.timed_out, "scripted observer did not stop");
+    host.shutdown()
+        .await
+        .expect("shutdown remote-observer host");
 }
 
 #[tokio::test]
@@ -10313,15 +10470,9 @@ mod instruction_prompt {
         );
     }
 
-    /// Past the budget the turn stops: a whole file is never cut, and never dropped.
-    ///
-    /// Dropping and continuing was the previous behaviour, and it reported the drop —
-    /// but as one status line among a turn's worth of them, after which the request
-    /// went to the provider with the user's rules absent. Refusing here is the same
-    /// treatment an oversized Skill body already gets, and a rule file outranks a
-    /// Skill.
+    /// Past the budget one whole file is skipped, while later independent rules survive.
     #[tokio::test]
-    async fn a_rule_file_past_the_budget_stops_the_turn_rather_than_being_dropped() {
+    async fn a_rule_file_past_the_budget_is_reported_and_does_not_stop_the_turn() {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
         let repo = root.path().join("repo");
         let oversized = repo.join("AGENTS.md");
@@ -10337,38 +10488,44 @@ mod instruction_prompt {
             "SMALL_RULE_MARKER",
         );
 
-        let error = refuse(
+        let (resolver, admission) = admit(
             &options(root.path(), repo, vec!["~/small.md".to_owned()]),
             0,
         )
-        .await;
+        .await
+        .expect("an oversized complete file degrades instead of stopping ACP or another surface");
 
         assert!(
-            error.contains(&oversized.display().to_string()),
-            "the refusal must name the file: {error}"
+            !resolver.system_prompt.contains("OVERSIZED_RULE_MARKER"),
+            "a rule file must never be truncated into the prompt"
         );
         assert!(
-            error.contains(&INSTRUCTION_PROMPT_BUDGET.to_string()),
-            "the refusal must state the budget the file has to fit: {error}"
+            resolver.system_prompt.contains("SMALL_RULE_MARKER"),
+            "one oversized project file must not starve a later independent rule"
+        );
+        assert_eq!(admission.degraded().len(), 1, "{:?}", admission.degraded());
+        let (source, reason) = &admission.degraded()[0];
+        assert_eq!(source, &oversized.display().to_string());
+        assert!(
+            reason.contains(&INSTRUCTION_PROMPT_BUDGET.to_string())
+                && reason.contains("was skipped")
+                && reason.contains("bytes remain"),
+            "the degraded notice must state the actionable admission boundary: {reason}"
         );
         assert!(
-            error.contains("in force"),
-            "the refusal must say the rules do not apply: {error}"
-        );
-        assert!(
-            !error.contains("OVERSIZED_RULE_MARKER"),
-            "instruction contents are user-authored and must never be echoed: {error}"
+            !reason.contains("OVERSIZED_RULE_MARKER"),
+            "instruction contents are user-authored and must never be echoed: {reason}"
         );
     }
 
-    /// The same file can fit a large model and be refused by a small one.
+    /// The same file can fit a large model and be skipped by a small one.
     ///
     /// The absolute ceiling alone is the wrong shape: 64 KB is a rounding error in a
-    /// million-token window and half the usable prompt in a small one. The refusal
-    /// belongs here, naming the file, rather than later as a total token count that
-    /// names nothing.
+    /// million-token window and half the usable prompt in a small one. The typed
+    /// exclusion belongs here, naming the file, rather than later as a total token
+    /// count that names nothing.
     #[tokio::test]
-    async fn a_rule_file_within_the_ceiling_is_still_refused_by_a_small_model_window() {
+    async fn a_rule_file_within_the_ceiling_is_skipped_by_a_small_model_window() {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
         let repo = root.path().join("repo");
         write(
@@ -10389,11 +10546,20 @@ mod instruction_prompt {
             admission.degraded()
         );
 
-        let error = refuse(&options(root.path(), repo, Vec::new()), 16_000).await;
+        let (resolver, admission) = admit(&options(root.path(), repo, Vec::new()), 16_000)
+            .await
+            .expect("a small model skips the entry instead of failing session startup");
         assert!(
-            error.contains("prompt budget for this model"),
-            "the refusal must attribute the limit to the model, not to a global constant: \
-             {error}"
+            !resolver.system_prompt.contains("WINDOWED_RULE_MARKER"),
+            "the entry that does not fit the smaller window must not be partially admitted"
+        );
+        assert_eq!(admission.degraded().len(), 1, "{:?}", admission.degraded());
+        assert!(
+            admission.degraded()[0]
+                .1
+                .contains("prompt budget for this model"),
+            "the degraded notice must attribute the limit to the model: {:?}",
+            admission.degraded()
         );
     }
 
@@ -10871,6 +11037,7 @@ fn generation_body(
             content: vec![zuno_llm::event::RequestContentBlock::Text {
                 text: "Say hello.".to_owned(),
             }],
+            preceding_developer_context: Vec::new(),
         }],
     )
     .with_tools(vec![zuno_llm::registry::ToolSchema {

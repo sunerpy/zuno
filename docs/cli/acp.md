@@ -67,8 +67,9 @@ otherwise uncertain mutations remain failed, preserve observed paths or diffs,
 and carry `_meta.zuno.outcome: "uncertain"`. Live delivery and replay use the
 same policy.
 
-Operational notices — a remote rule file that could not be fetched (its rules are not in
-force while the turn proceeds), a turn stopped by its
+Operational notices — a remote rule file that could not be fetched or an intact local
+rule file skipped because it did not fit the prompt budget (its rules are not in force
+while the turn proceeds), a turn stopped by its
 token, tool-call, or wall-clock allowance, or a compaction requested by the budget or
 context policy —
 are projected as `agent_thought_chunk` updates tagged `_meta.zuno.notice` with

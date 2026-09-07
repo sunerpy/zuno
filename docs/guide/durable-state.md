@@ -689,6 +689,13 @@ run/attempt, ref, or release id. Do not launch overlapping watchers or hand-writ
 poll loops, and do not treat an overall green run as proof that skipped, cancelled,
 missing, or unexpanded required jobs executed.
 
+If durable work remains while that observer is running, the reconciliation
+driver persists `waiting_background` without consuming either ordinary
+reconciliation attempt or creating a `PlanUnreconciled` human request. Active
+Goal auto-continuation is suppressed only while the observer remains live. Its
+terminal report is the durable wake that resumes the session; it is not remote
+success evidence.
+
 ## See also
 
 - [Sessions and turns](/guide/sessions)

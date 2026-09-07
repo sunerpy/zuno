@@ -464,6 +464,11 @@ job、待处理报告的身份，以及最近一条先前提示词收据的 id�
 对于长时间运行的 CI watcher 或发布命令，应只启动一个后台执行，让其持久终态报告恢复
 会话；仅在需要具体证据时使用 `bg output`，不要叠加 watcher 或手写轮询循环。
 
+若该观察器仍在运行且持久工作尚未结束，对账 driver 会持久化
+`waiting_background`，不消耗两次普通对账机会，也不创建 `PlanUnreconciled` 人工问题。
+只有在观察器仍存活时才抑制活跃 Goal 的自动续跑；它的终态报告负责持久唤醒会话，但终态
+本身不是远端成功证据。
+
 自动报告唤醒不能越过 Goal 生命周期状态。Goal 处于 paused、blocked、complete、
 cancelled 或其他非 active 状态时，宿主仍会把每条 promoted 报告提交为独立的持久 user
 message，并结清对应 inbox 行，但不会启动 provider 回合。之后显式恢复 Goal 时，会从这些

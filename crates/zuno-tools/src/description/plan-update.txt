@@ -1,4 +1,5 @@
 Create or mutate the durable plan for the current session with one tagged operation.
+Call plan_get immediately before every plan_update and copy its returned revision into expected_revision. The only exception is action=create after plan_get returned null; only that first-plan case may omit expected_revision. Never guess, reuse an older revision, or omit it merely because the intended change is small.
 Use action=create to create the first strategic plan, or to replace the visible root for a genuinely new objective. Supply a title and one or more steps; the host generates stable step ids. Replacing an existing plan requires its current expected_revision.
 Use action=patch to change only the plan title or named steps. Each step patch carries the id returned by plan_get and may change its title, status, or both.
 Use action=append to add one or more new steps. The host generates their ids; never invent or resend ids for appended steps.

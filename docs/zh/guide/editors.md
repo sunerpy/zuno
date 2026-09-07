@@ -237,8 +237,9 @@ Zed 呈现权限与征询请求，但策略拥有者仍然是 Zuno：
 在完成之后以及历史重放时，该问题仍是一张静态工具卡片，显示它的提示、选项、状态，以及在持久答案元数据可用时显示被选中的值。`rawInput` 与 `rawOutput` 在工具详情中仍然可用；加载历史绝不会重新打开一次征询请求。
 
 只有 provider 的推理增量会被投影到 Zed 的 Thinking 界面，唯一带标记的例外是 Zuno
-自身发出的通知：无法抓取的远程规则文件、被额度停下的回合，以及预算或上下文策略要求的
-压缩，会以带 `_meta.zuno.notice` 的 `agent_thought_chunk` 发送，其中 `severity` 取
+自身发出的通知：无法抓取的远程规则文件、因装不进 prompt 预算而整份跳过的完整本地规则
+文件、被额度停下的回合，以及预算或上下文策略要求的压缩，会以带
+`_meta.zuno.notice` 的 `agent_thought_chunk` 发送，其中 `severity` 取
 `info`、`warning` 或 `error`。长工具回合主动达到上下文阈值时使用稳定 code
 `context.compact`；instruction 与 budget 通知仍分别使用 `instruction.*` 与 `budget.*`
 族。客户端靠这个标记把通知与模型输出区分开。生成的标题使用 ACP 的

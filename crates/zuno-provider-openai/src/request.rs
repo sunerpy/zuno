@@ -5,7 +5,10 @@ use std::fmt;
 use serde_json::{Map, Value, json};
 use zuno_error::ProviderError;
 use zuno_llm::event::{Message, RequestContentBlock, Role, tool_arguments_text};
-use zuno_llm::registry::{ApiSurface, CompletionRequest, sealed_item_has_following_output};
+use zuno_llm::registry::{
+    ApiSurface, CompletionRequest, sealed_item_has_following_output,
+    validate_responses_replay_boundaries,
+};
 
 use crate::provider::OpenAiConfig;
 
@@ -79,6 +82,9 @@ pub fn build_request_body(
         return Err(ProviderError::fatal(
             RequestShapeError::EncryptedReasoningReplayOnChat,
         ));
+    }
+    if surface == ApiSurface::Responses {
+        validate_responses_replay_boundaries(&request.messages).map_err(ProviderError::fatal)?;
     }
     let mut body = match surface {
         ApiSurface::Chat => build_chat_body(request, config),
@@ -183,11 +189,28 @@ fn build_responses_body(
 ) -> Result<Value, ProviderError> {
     let mut input = Vec::new();
     let mut instructions = None;
+    let mut wire_ends_in_assistant_output = false;
     for message in &request.messages {
+        if wire_ends_in_assistant_output && message.role == Role::Assistant {
+            let boundary = message
+                .preceding_developer_context
+                .iter()
+                .filter(|content| !content.trim().is_empty())
+                .map(|content| json!({"role": "developer", "content": content}))
+                .collect::<Vec<_>>();
+            if !boundary.is_empty() {
+                input.extend(boundary);
+                wire_ends_in_assistant_output = false;
+            }
+        }
         if message.role == Role::System && instructions.is_none() {
             instructions = Some(joined_text(message));
         } else {
-            input.extend(responses_message(message)?);
+            let items = responses_message(message)?;
+            if !items.is_empty() {
+                wire_ends_in_assistant_output = message.role == Role::Assistant;
+                input.extend(items);
+            }
         }
     }
     input.extend(
@@ -709,6 +732,23 @@ mod tests {
         )
     }
 
+    fn sealed_assistant(token: &str, text: &str) -> Message {
+        Message::from_content(
+            Role::Assistant,
+            vec![
+                RequestContentBlock::ProviderEncryptedReasoning {
+                    id: format!("rs_{token}"),
+                    summary: Vec::new(),
+                    encrypted_content: Some(token.to_owned()),
+                    status: None,
+                },
+                RequestContentBlock::Text {
+                    text: text.to_owned(),
+                },
+            ],
+        )
+    }
+
     #[test]
     fn responses_projects_typed_session_affinity_into_reserved_metadata() {
         let request = CompletionRequest::new(
@@ -1068,6 +1108,69 @@ mod tests {
         assert_eq!(input[2]["call_id"], json!("call_read"));
         assert_eq!(input[3]["content"][0]["text"], json!("now the second one"));
         assert_eq!(input[4]["call_id"], json!("call_grep"));
+    }
+
+    #[test]
+    fn autonomous_assistant_turns_restore_their_real_developer_boundary() {
+        let request = CompletionRequest::new(
+            "gpt-5.6-sol",
+            vec![
+                sealed_assistant("token-a", "first"),
+                Message::from_content(Role::Tool, Vec::new()),
+                sealed_assistant("token-b", "second").with_preceding_developer_context(vec![
+                    "Continue the active Goal from durable state.".to_owned(),
+                ]),
+            ],
+        )
+        .on_surface(ApiSurface::Responses);
+
+        let body = build_request_body(&request, &sealing_config()).expect("body");
+        let input = body["input"].as_array().expect("input array");
+
+        assert_eq!(
+            input
+                .iter()
+                .map(|item| {
+                    item["type"]
+                        .as_str()
+                        .map_or_else(|| format!("role:{}", item["role"]), ToOwned::to_owned)
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                "reasoning",
+                "role:\"assistant\"",
+                "role:\"developer\"",
+                "reasoning",
+                "role:\"assistant\""
+            ]
+        );
+        assert_eq!(
+            input[2]["content"],
+            "Continue the active Goal from durable state."
+        );
+    }
+
+    #[test]
+    fn ambiguous_replay_is_refused_locally_without_rendering_tokens() {
+        let request = CompletionRequest::new(
+            "gpt-5.6-sol",
+            vec![
+                sealed_assistant("private-token-a", "first"),
+                Message::from_content(Role::Tool, Vec::new()),
+                sealed_assistant("private-token-b", "second"),
+            ],
+        )
+        .on_surface(ApiSurface::Responses);
+
+        let error = build_request_body(&request, &sealing_config())
+            .expect_err("missing historical input must fail before HTTP");
+        let rendered = error
+            .source()
+            .expect("typed replay boundary source")
+            .to_string();
+
+        assert!(rendered.contains("history messages 0..=2"), "{rendered}");
+        assert!(!rendered.contains("private-token"), "{rendered}");
     }
 
     /// The sealed bytes are replayed; the endpoint's item identifier is not.

@@ -54,6 +54,22 @@ A practical rule:
 Selection resolves in order: an agent explicitly selected by the client, then top-level
 `default_agent`, then built-in `orchestrator`.
 
+## Tool fallback
+
+Every Agent receives a `runtime.execution` fallback rule derived from its final
+provider-visible tool snapshot. A rate-limited, unavailable, or transiently failing
+tool is not repeated unchanged. When `tool_search` is visible, the Agent uses it to
+discover another already-authorized connected tool; a connected `google_search` is one
+possible alternative to `web_search`. Custom Agents receive the same rule when they
+resolve the same tools.
+
+When Shell is available, the Agent prefers `gh` for GitHub and `rg` for repository search
+over raw `curl` or a hand-written directory walk.
+It must verify availability and preserve the same source and evidence requirements.
+Fallback never grants a tool, network path, filesystem capability, or permission the
+Agent did not already have, and no Shell or connected-tool guidance is rendered when
+that capability is absent.
+
 ## How a contract narrows authority
 
 Four layers apply, and every one of them can only remove capability:

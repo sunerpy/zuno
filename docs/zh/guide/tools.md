@@ -50,7 +50,10 @@ Notes 从不暴露宿主路径。每个作用域最多 100 个文档，单文档
 `0`。可信 `call_id`、请求摘要和 revision 让重复投递保持幂等，同时拒绝过期的并发写入。
 
 显式 Plan 协作模式要求持久战略 Plan。普通 Work 模式由模型依据完整会话决定 Plan 是否
-增加价值；宿主不解析提示词关键词，也不会生成用户可见的通用步骤。模型用
+增加价值；宿主不解析提示词关键词，也不会生成用户可见的通用步骤。每次调用
+`plan_update` 前，模型都要立即调用 `plan_get`，并把返回的当前 revision 原样放进
+`expected_revision`。只有 `plan_get` 返回 `null` 后的首次 `action=create` 可以省略；
+替换已有根 Plan（包括真正的新目标）仍必须携带当前 revision。模型用
 `plan_update action=create` 创建首个 Plan 或替换新目标；`patch` 只修改指定 id，
 `append` 追加由宿主生成 id 的步骤，`push` 打开聚焦子 Plan，`pop` 不重传整份 Plan
 而只恢复精确父 Plan。所有已有 Plan 修改都必须带当前 `expected_revision`；
@@ -123,6 +126,13 @@ phase 与 elapsed。
 匹配行上限为 2000 个 UTF-16 码元，单条超过 1 MiB 的 `rg` 记录会被跳过。只要有匹配被丢弃——无论是因为达到结果上限，还是因为它的路径无法命名——渲染出的 `glob`/`grep` 输出都会标记为已截断。每条路径只返回一次，作为一个真实文件的标识符。
 
 遍历无法进入的目录不贡献任何结果，并报为「No files found」而不是权限失败。ripgrep 的逐路径诊断会被抑制，避免根目录下别处的某个不可读目录把「pattern 没匹配到」变成工具失败。对于子树，Zuno 不区分「不存在」与「读不到」。
+
+若 Shell 命令只观察远端工作，请设置 `backgroundPurpose: "remoteObserver"`。该值随后台
+执行持久化，并通过 `bg` 与持久 completion input 投影。它不会改变权限，也不会把远端系统
+状态等同于本地进程退出；恢复后的 Agent 仍必须重新查询 CI、部署或 release 的权威状态。
+当观察器仍在运行且 Plan、Todo 或 Job 尚未结束时，driver 记录 `waiting_background`：
+当前回合可以结束，但不会消耗两次普通对账机会、弹出 Plan 状态问题，或立即自动续跑活跃
+Goal。观察器的持久终态报告会唤醒会话，权威刷新后再恢复普通对账。
 
 ## 按窗口读取输出
 

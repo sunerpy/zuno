@@ -724,7 +724,8 @@ impl WorkStateStore {
                 Some(current) => {
                     let Some(expected) = params.expected_revision else {
                         return Err(WorkStateError::Invalid(
-                            "expected_revision is required when updating an existing plan"
+                            "expected_revision is required when updating an existing plan; call \
+                             plan_get and retry with the returned revision"
                                 .to_owned(),
                         ));
                     };
@@ -927,8 +928,11 @@ pub struct PlanStepPatch {
     pub status: Option<PlanStepStatus>,
 }
 
-/// One tagged operation on the durable Plan: name only the fields or steps that changed;
-/// the host assigns ids to new steps.
+/// One tagged operation on the durable Plan.
+///
+/// Call `plan_get` immediately before this tool and copy its returned revision into
+/// `expected_revision`. Only the first `create`, after `plan_get` returned null, may omit it.
+/// Name only the fields or steps that changed; the host assigns ids to new steps.
 //
 // Internal host callers keep using [`PlanUpdateParams`] for atomic objective-boundary
 // transactions. This doc comment is the parameter schema's root `description` and is sent
@@ -936,7 +940,10 @@ pub struct PlanStepPatch {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlanMutationParams {
+    /// Create the first Plan, or replace the visible root for a new objective.
     Create {
+        /// Omit only when `plan_get` returned null. Replacing an existing Plan requires the
+        /// exact current revision returned by `plan_get`.
         #[serde(default)]
         expected_revision: Option<i64>,
         #[serde(default)]
@@ -944,23 +951,31 @@ pub enum PlanMutationParams {
         title: String,
         steps: Vec<PlanStepInput>,
     },
+    /// Patch the title or named steps of the Plan returned by `plan_get`.
     Patch {
+        /// Exact current revision returned by the immediately preceding `plan_get`.
         expected_revision: i64,
         #[serde(default)]
         title: Option<String>,
         #[serde(default)]
         steps: Vec<PlanStepPatch>,
     },
+    /// Append host-identified steps to the Plan returned by `plan_get`.
     Append {
+        /// Exact current revision returned by the immediately preceding `plan_get`.
         expected_revision: i64,
         steps: Vec<PlanStepInput>,
     },
+    /// Suspend the current Plan and open a focused child Plan.
     Push {
+        /// Exact current revision returned by the immediately preceding `plan_get`.
         expected_revision: i64,
         title: String,
         steps: Vec<PlanStepInput>,
     },
+    /// Restore the suspended parent after every child step is terminal.
     Pop {
+        /// Exact current revision returned by the immediately preceding `plan_get`.
         expected_revision: i64,
     },
 }
@@ -1247,7 +1262,9 @@ impl ArchivedPlanState {
 fn require_plan_revision(current: &WorkPlan, expected: Option<i64>) -> Result<(), WorkStateError> {
     let Some(expected) = expected else {
         return Err(WorkStateError::Invalid(
-            "expected_revision is required when changing an existing plan".to_owned(),
+            "expected_revision is required when changing an existing plan; call plan_get and \
+             retry with the returned revision"
+                .to_owned(),
         ));
     };
     if expected != current.revision {
@@ -2661,6 +2678,30 @@ mod tests {
             )
             .expect("update plan");
         assert_eq!(second.revision, 2);
+        let missing_revision = store
+            .mutate_plan(
+                "ses",
+                PlanMutationParams::Create {
+                    expected_revision: None,
+                    goal_id: None,
+                    title: "new objective".to_owned(),
+                    steps: vec![PlanStepInput {
+                        title: "inspect".to_owned(),
+                        status: PlanStepStatus::InProgress,
+                    }],
+                },
+            )
+            .expect_err("replacing an existing Plan without a revision must fail");
+        assert!(
+            matches!(
+                missing_revision,
+                WorkStateError::Invalid(ref message)
+                    if message.contains("call plan_get")
+                        && message.contains("returned revision")
+            ),
+            "the recovery must tell the model how to obtain the required revision: \
+             {missing_revision}"
+        );
         assert!(matches!(
             store.update_plan(
                 "ses",
@@ -3008,6 +3049,12 @@ mod tests {
     #[test]
     fn plan_update_description_explains_the_active_step_invariant() {
         assert!(
+            PLAN_UPDATE_DESCRIPTION.contains("Call plan_get immediately before every plan_update")
+                && PLAN_UPDATE_DESCRIPTION
+                    .contains("only that first-plan case may omit expected_revision"),
+            "the model must read the current Plan revision before every mutation"
+        );
+        assert!(
             PLAN_UPDATE_DESCRIPTION.contains("Pending steps require exactly one in_progress step"),
             "the model must know the durable plan's active-step invariant before calling the tool"
         );
@@ -3190,11 +3237,13 @@ mod tests {
             .as_str()
             .expect("action explains each operation");
         assert!(
-            description.contains("create requires title, steps"),
+            description.contains("create: Create the first Plan")
+                && description.contains("requires title, steps"),
             "{description}"
         );
         assert!(
-            description.contains("pop requires expected_revision"),
+            description.contains("pop: Restore the suspended parent")
+                && description.contains("requires expected_revision"),
             "{description}"
         );
     }

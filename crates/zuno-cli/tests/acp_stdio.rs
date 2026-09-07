@@ -2267,6 +2267,104 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversized_instruction_file_is_skipped_without_blocking_acp() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(TextTurnResponder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let instruction = root.path().join("AGENTS.md");
+    std::fs::write(
+        &instruction,
+        format!("OVERSIZED_ACP_RULE_MARKER{}", "r".repeat(80 * 1024)),
+    )
+    .expect("write oversized ACP instruction");
+    let config = config_with_second_model(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("new session id")
+        .to_owned();
+    let _commands = read_session_update(&mut stdout);
+    let (completed, updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"Answer despite the oversized local instruction."}]
+        }),
+    );
+
+    assert_eq!(completed["stopReason"], "end_turn");
+    let notice = updates
+        .iter()
+        .find(|update| update["_meta"]["zuno"]["notice"]["code"] == "instruction.not_in_force")
+        .expect("ACP must surface the skipped instruction as a typed notice");
+    assert_eq!(notice["sessionUpdate"], "agent_thought_chunk");
+    let detail = notice["content"]["text"].as_str().expect("notice detail");
+    assert!(
+        detail.contains(&instruction.display().to_string())
+            && detail.contains("prompt budget")
+            && detail.contains("none of the rules"),
+        "the ACP notice must name the skipped file and consequence: {detail}"
+    );
+    assert!(
+        !detail.contains("OVERSIZED_ACP_RULE_MARKER"),
+        "instruction contents must not be echoed in the notice"
+    );
+    let requests = provider
+        .received_requests()
+        .await
+        .expect("provider requests");
+    assert!(
+        requests
+            .iter()
+            .all(|request| !String::from_utf8_lossy(&request.body)
+                .contains("OVERSIZED_ACP_RULE_MARKER")),
+        "the oversized instruction reached a provider request"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for oversized-instruction ACP");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("oversized-instruction ACP process failed: {stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acp_compact_is_native_and_persists_a_summary_without_model_prompt_dispatch() {
     let provider = MockServer::start().await;
     Mock::given(method("POST"))

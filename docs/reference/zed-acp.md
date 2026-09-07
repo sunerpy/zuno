@@ -412,8 +412,9 @@ available—the selected values. `rawInput` and `rawOutput` remain available in
 tool details; loading history never reopens an elicitation request.
 
 Only provider reasoning deltas are projected into Zed's Thinking surface, with one
-tagged exception: a Zuno-originated notice — a remote rule file that could not be fetched, a
-turn stopped by its allowance, or a compaction requested by the budget or context policy — is sent as an
+tagged exception: a Zuno-originated notice — a remote rule file that could not be fetched,
+an intact local rule file skipped because it did not fit the prompt budget, a turn stopped
+by its allowance, or a compaction requested by the budget or context policy — is sent as an
 `agent_thought_chunk` whose `_meta.zuno.notice` carries `severity` (`info`, `warning`,
 or `error`) and a stable code from the `instruction.*` or `budget.*` families.
 A proactive threshold crossing in a long tool turn uses the separate

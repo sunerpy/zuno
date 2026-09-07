@@ -473,6 +473,21 @@ sent alone, which a Responses endpoint refuses, and it is counted as withheld
 rather than as a replay. The item id is not echoed: a
 replayed item carries `type`, `summary`, `encrypted_content`, and `status`.
 
+Autonomous Goal continuations preserve the input boundary as well as the output
+order. Zuno stores a prompt-receipt reference on the first assistant row of the
+new turn and restores the receipt's actual post-hook developer suffix between
+adjacent assistant responses in Responses `input`. Older rows recover the
+receipt from their provider-request event; the stable runtime-policy prefix is
+removed before projection. This keeps each encrypted envelope paired with the
+output fingerprint of the one turn that minted it without inventing a user
+message or tool result.
+
+An old export or compaction summary may have no recoverable receipt. In that case
+Zuno withholds the sealed capsules only from the ambiguous assistant-output group
+and keeps the rest of the transcript. A final provider-side validator refuses any
+malformed group left over and reports message indexes without including
+replay-token bytes.
+
 The default `off` is a request that carries neither `include` nor any sealed
 item, including envelopes an earlier session stored while the option was
 `encrypted`. It is not a promise that the request bytes match earlier releases.
@@ -496,11 +511,16 @@ sealed it, and the `session.provider.request` event records counts only. Anyone
 who can read a session's messages or event stream can read its envelopes.
 
 Each foreground request records `reasoningReplay`, `replayedReasoningCapsules`,
-and `withheldReasoningCapsules` on its `session.provider.request` event, which is
+`withheldReasoningCapsules`, `restoredReasoningReplayBoundaries`, and
+`withheldAmbiguousReasoningCapsules` on its
+`session.provider.request` event, which is
 how you confirm replay is actually happening. The replayed count is what reaches
 the wire; every envelope history offered that this request did not send is
 counted as withheld, whether another model minted it, it aged out, or nothing
-followed it.
+followed it. The restored-boundary count reports older assistant rows whose
+developer suffix came from their durable prompt receipt; no token or prompt text
+is copied into the event. The ambiguous count is the subset withheld because no
+exact boundary survived.
 
 Model `options.reasoningEffort` is the default when neither the live session nor
 the selected agent chooses a level. On the Responses surface,

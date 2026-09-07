@@ -36,6 +36,12 @@ Agent 具有显式的正向职责、负向委派边界、权限以及结构化�
 
 内置 Agent 的分工：`build` 负责端到端交付，`plan` 是只读规划，`deep` 承担困难的跨领域实现且不再递归委派。
 
+`runtime.execution` 还会按最终工具快照为内置与自定义 Agent 生成简短降级规则：首选工具
+限速、不可用或暂时失败时，不原样重复调用。`tool_search` 可见时可以发现另一个已经授权的
+已连接工具，包括 `google_search`；Shell 可见时，GitHub 优先使用已安装的 `gh`，仓库搜索
+优先使用 `rg`，而不是先写原始 `curl` 或手工遍历。不存在的能力不会出现在指导中，降级也
+不能扩大权限。
+
 根回合对已连接 MCP schema 使用渐进式披露：调度器保留可执行实现，`tool_search`
 只搜索紧凑元数据，匹配项从下一次 provider step 起按单调 revision 扩展确切工具快照。
 成功的 `tool_search` 结果同时是会话的持久暴露账本。后台报告重建宿主、进程重启或客户端
@@ -67,12 +73,13 @@ assistant message 从不可变 provider-request Attempt 中恢复确切 hash；�
 工具协议历史的 role。持久 identity 失败与 hook 后声明删除会先合并，再执行一次按 occurrence
 排序的 fallback 投影，因此混合并行批次仍保持持久结果顺序。
 
-仓库与用户的规则文件要么整份进入 Prompt，要么不进入。宿主无法读取的本地规则文件，或者超出
-指令预算（64 KB 与模型 context window 四分之一取较小值）的规则文件，会在第一次 provider
-请求之前让本轮以类型化错误失败，错误点名文件与修复方式，超预算时还给出字节数与预算；这种
-情况不会发出任何 notice，因为回合根本没有运行。过去的"记一条警告、然后不带该文件继续发请求"
-行为已不存在：不带用户所写规则的回合不会运行。唯一的非致命情形是无法抓取的远程规则来源：
-回合继续执行，但以 `warning` 级 notice `instruction.not_in_force` 报告哪个来源的规则本轮不生效。
+仓库与用户的规则文件要么整份进入 Prompt，要么不进入。宿主无法读取的本地规则文件仍会在第一
+次 provider 请求前以类型化错误停止本轮，并点名文件与修复方式。一个内容完整但超出指令预算
+（64 KB 与模型 context window 四分之一取较小值）的条目则整份跳过。宿主发出
+`warning` 级 `instruction.not_in_force` notice，包含来源、字节数、预算与剩余空间，然后继续
+考虑后续更小的独立条目；规则文件绝不截断，超大 `AGENTS.md` 也不会阻止 ACP、TUI、server 或
+CLI 启动。无法抓取的远程规则来源使用同一类非致命 notice，因为网络可用性不应决定 Agent 能否
+运行。
 
 ## 扩展包与可执行插件宿主
 
@@ -95,9 +102,13 @@ assistant message 从不可变 provider-request Attempt 中恢复确切 hash；�
 
 封装信封属于持久状态，因此一个步骤会被持久化成带位置的 part 账本，而不是一段文本加上尾部堆积的工具调用。每个 part id 携带它在流中的位置 `prt_{turn}_{step}_{position}_{kind}`，且同一步骤的所有 part 共享 assistant 消息的创建时间，于是水合出来的顺序就是 provider 的产出顺序。一个先推理、写文本、调用工具、再推理、再调用第二个工具的步骤，会按同样的次序重放，每个信封都紧挨在它所解释的输出之前。这正是封装端点会校验的内容：顺序被打乱或只回送摘要都会在链路上被拒绝。
 
+自动 Goal continuation 即使没有新的用户消息，也属于一个新的 provider turn。Zuno 会在该 turn 的第一条 assistant 行上只保存 prompt receipt 引用，而不是再复制一份提示词；当两个 assistant 响应在 Responses `input` 中本来会直接相邻时，两个 Responses adapter 会先把 receipt 中 hook 后实际发送的 developer 项恢复到中间，再重放后一轮的推理信封。旧版本写入的行会沿持久化的 `assistantMessageID -> promptReceiptID -> actualProviderProjection.developer` 证据链恢复同一 receipt；只有没有 hook 改写时才回退到 `providerProjection`。恢复时会剥离稳定的 runtime policy 前缀，因此历史边界只包含原始 turn context、memory 与 request hook context。这个过程不会伪造 user 消息或工具结果。
+
+压缩摘要和旧 session export/import 可能确实没有 receipt。此时 Zuno 只扣留歧义 assistant 输出组中的封装 capsule，保留文本、工具调用和真实工具结果，让会话以较低推理连续性继续。两个 Responses provider 仍保留最后一道本地校验；若共享修复后仍存在畸形分组，它只报告消息索引，不会渲染不透明 token。
+
 重放是有作用域的，而且作用域在组装请求时生效，不是在写行时生效。信封只会被重放给产出它的那条 assistant 消息上记录的目录 provider 与模型，并且只在它比 `reasoningReplayMaxAge` 更新时重放。其他情况下它只在这一次请求的内存里被扣留，持久行保留原密文，因此换回原模型即可恢复重放。标题、摘要、压缩、反思与 Council 请求运行在其他模型上，完全不会收到信封，这也让压缩转录中不含 provider 状态。
 
-每个前台 `session.provider.request` 事件都会记录 `reasoningReplay`、`replayedReasoningCapsules` 与 `withheldReasoningCapsules`。这三个字段就是重放确实生效的依据：如果一个会话从第二个请求起报告的重放信封数仍然是零，那它就没有在重放，无论端点怎么声称。重放计数就是 adapter 真正放到链路上的数量，因此被配对规则丢弃的信封会计入被扣留数，绝不会算作一次重放。请求事件只记录这些计数，不记录信封本身。
+每个前台 `session.provider.request` 事件都会记录 `reasoningReplay`、`replayedReasoningCapsules`、`withheldReasoningCapsules`、`restoredReasoningReplayBoundaries` 与 `withheldAmbiguousReasoningCapsules`。这些字段就是重放确实生效的依据：如果一个会话从第二个请求起报告的重放信封数仍然是零，那它就没有在重放，无论端点怎么声称。重放计数就是 adapter 真正放到链路上的数量，因此被配对规则丢弃的信封会计入被扣留数，绝不会算作一次重放。恢复边界数表示本次请求从 prompt receipt 重建了多少条旧 assistant 行的准确 developer 后缀；歧义扣留数是因边界无法证明而降级的子集。请求事件只记录计数，不记录信封或 developer 文本。
 
 信封本身是不透明的 provider 密文，作为会话内容保存：它存放在推理 part 的 `metadata.providerReasoning` 中，会由 HTTP messages 端点返回，还会随一个完整携带密文的流事件转发：服务器 SSE 流上的类型是 `provider.reasoning.item`，`zuno run --json` 打印的是 `provider_reasoning_item`，两者的密文都在 `encryptedContent` 字段里。它是后续请求需要的持久状态，因此不会被脱敏；能读取某个会话的消息或事件流，就等于能读取它的信封。
 
@@ -146,7 +157,9 @@ selection、branch diff 和多文本块在 Work 模式也只是结构化上下�
 Plan；直接完成简单或单步任务，绝不创建单步骤 Plan。因此「OK，你修改下吧」无需专门词表，
 复杂任务仍可由模型主动建立 durable Plan。模型使用
 `create / patch / append / push / pop` 操作维护 Plan，step id 由宿主生成，已有 Plan
-修改都受 `expected_revision` 保护。`plan_update`、`notes`、`history` 这类以操作为标签的
+修改都受 `expected_revision` 保护。每次 mutation 之前都要立即调用 `plan_get` 并复制其
+当前 revision；只有 `plan_get` 返回 `null` 后的首次 `create` 可以省略。
+`plan_update`、`notes`、`history` 这类以操作为标签的
 参数枚举以单个对象 schema 发送给 provider：`action` 属性枚举全部操作，也是 schema 中唯一
 必填的字段；每个操作自身需要的字段由类型化反序列化器校验。同一字段在不同操作间形状不同时，
 若只是某个操作把它变为可选，就发送可为空的形式；若只有描述不同，则按操作归属各自的描述；
@@ -162,13 +175,21 @@ Goal/Plan/Todo/Job 上下文，Plan mutation 还会把一次性的 Required 指�
 持久化并投影；换工具、失败/阻塞/中断、写入路径、continuation 或状态变化都会重置序列。
 恢复策略是 Pause，活跃 Goal 记录 `no_progress`，不会自动重复同一付费读取。
 
-机器执行阶段单独持久化为 `DriverPhase`，不进入用户可见 Plan。最终回复前，
-`PlanReconciliationDriver` 只检查 Plan、Todo、Job、Goal、工具结果与验证记录：
+机器执行阶段单独持久化为 `DriverPhase`，不进入用户可见 Plan。阶段包括 `idle`、
+`executing`、`reconciling`、`waiting_retry`、`waiting_background`、`waiting_human`
+与 `terminal`。最终回复前，`PlanReconciliationDriver` 只检查 Plan、Todo、Job、Goal、
+后台观察器、工具结果与验证记录：
 没有记录任何持久工作的会话在第一次回复后直接结束；普通会话在持有未对账的持久工作时
 最多续跑两次对账；仍不一致则进入 typed `PlanUnreconciled` 人工等待，不能以成功状态
 交付。Work 模式的 `Optional` 决策不是已记录工作；没有产生任何 Plan、Todo 或 Job 的
 请求视为已结算，不会为不存在的状态额外续跑。进程重启会继续原对账 cycle，不解析模型
 自然语言判断“已经完成”。
+
+若未完成的持久工作仍依赖一个运行中的 `backgroundPurpose: "remoteObserver"`，driver
+进入 `waiting_background`，结束当前回合，但不消耗两次普通对账机会，也不创建
+`PlanUnreconciled` 人工问题。活跃 Goal 在观察器仍运行时不会立即再次自动续跑；已有后台
+完成 watcher 会在进程结算后把终态报告写入 inbox 并唤醒会话，后续回合重新查询远端权威状态，
+再恢复普通对账。
 
 ACP 通过会话级投影器订阅 `TurnHost::work_state_changes()`，而不是识别某个工具名。
 每次唤醒都会读取权威 Plan 并发送完整的 stable-V1 更新；`(plan_id, revision)` 阻止

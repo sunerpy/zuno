@@ -53,9 +53,10 @@ zuno run --format json "summarize the diff"
 当回合没有完全按配置执行时，JSON 流会包含一条 `notice` 事件：
 `{"type":"notice","severity":"warning","code":"budget.token_budget","detail":"…"}`。
 `severity` 取 `info`、`warning` 或 `error`；`code` 稳定不变，来自 `instruction.*`
-族（无法抓取的远程规则文件，其规则本轮不生效，但回合继续执行）或 `budget.*` 族（被额度
-停下的回合，或预算策略要求的一次压缩）。本地无法读取或超预算的规则文件会在任何 provider
-请求之前让本轮以错误失败，不会产生 `notice` 事件。同一事件在 server 事件流上以 `notice` 发布。
+族（无法抓取远程规则，或完整本地规则文件装不进 prompt 预算；其规则本轮不生效，但回合继续执行）
+或 `budget.*` 族（被额度停下的回合，或预算策略要求的一次压缩）。本地规则文件
+无法读取时仍会在任何 provider 请求之前让本轮以错误失败，不会产生 `notice` 事件。
+同一事件在 server 事件流上以 `notice` 发布。
 
 Provider 可见的推理进度需要显式启用：
 

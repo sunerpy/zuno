@@ -131,6 +131,9 @@ fn harness_guide_documents_the_native_extension_contract() {
             "reasoning.encrypted_content",
             "replayedReasoningCapsules",
             "withheldReasoningCapsules",
+            "restoredReasoningReplayBoundaries",
+            "withheldAmbiguousReasoningCapsules",
+            "assistantMessageID -> promptReceiptID -> actualProviderProjection.developer",
             "durable inbox",
             "`Ctrl+Enter`",
             "`Shift+Enter`",
@@ -1360,6 +1363,9 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
             "provider.reasoning.item",
             "provider_reasoning_item",
             "encryptedContent",
+            "restoredReasoningReplayBoundaries",
+            "withheldAmbiguousReasoningCapsules",
+            "actual post-hook developer suffix",
             "`bedrock-mantle`",
             "`bedrock-runtime`",
             "`amazon-bedrock-converse`",
@@ -1378,6 +1384,9 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
             "provider.reasoning.item",
             "provider_reasoning_item",
             "encryptedContent",
+            "restoredReasoningReplayBoundaries",
+            "withheldAmbiguousReasoningCapsules",
+            "developer context 后缀",
             "`bedrock-mantle`",
             "`bedrock-runtime`",
             "`amazon-bedrock-converse`",
@@ -1869,38 +1878,35 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
     }
 }
 
-/// Both instruction guides must state that an inadmissible rule file stops the turn.
-///
-/// The behaviour is the opposite of what it was — a dropped file used to be a warning
-/// the turn survived — so a stale guide here does not merely omit a detail. It tells a
-/// user their oversized `AGENTS.md` is silently ignored, which is the exact belief the
-/// change exists to correct, and the English and Chinese pages must not disagree about
-/// which of the two outcomes they will get.
+/// Both instruction guides distinguish unreadable local bytes from an intact entry
+/// that is too large for this model.
 #[test]
-fn instruction_guides_document_the_fail_closed_admission() {
+fn instruction_guides_document_fail_closed_reads_and_degraded_budget_admission() {
     contains_all(
         "docs/config/instructions.md",
         &[
-            "## When a rule file stops the turn",
+            "## When a rule file is not in force",
             "admitted whole or not at all",
-            "fail the turn before the first provider request",
-            "cannot be read",
+            "cannot be read still fails the turn",
+            "does not fit the instruction prompt budget is skipped as a whole",
             "smaller of 64 KB",
             "quarter of the model's context window",
-            "Neither is a warning",
-            "failed remote fetch is the documented",
+            "`instruction.not_in_force`",
+            "later smaller instruction entries",
+            "failed remote fetch uses the same non-fatal notice",
         ],
     );
     contains_all(
         "docs/zh/config/instructions.md",
         &[
-            "## 什么情况下规则文件会中止本轮",
+            "## 什么情况下规则文件不生效",
             "要么整份进入 Prompt，要么完全不进入",
-            "第一次 provider request 之前让本轮失败",
-            "无法读取",
+            "无法读取的本地文件仍会在第一次 provider request 前让本轮失败",
+            "完整文件若超出 instruction prompt 预算，则整份跳过",
             "64 KB 与模型 context window 四分之一",
-            "两者都不是警告",
-            "远端抓取失败是上文记录的例外",
+            "`instruction.not_in_force`",
+            "后续\n更小的独立指令条目",
+            "远端抓取失败也\n使用同一类非致命 notice",
         ],
     );
 }
@@ -2073,8 +2079,9 @@ fn release_docs_pin_allowance_pauses_retired_plans_and_tagged_notices() {
             "stops the turn with `usage_unknown`; under the",
             "### Instruction file admission",
             "does not fit the instruction budget",
-            "No notice is emitted for that case",
-            "the `warning` notice `instruction.not_in_force` naming the source",
+            "is instead skipped atomically",
+            "`warning` notice `instruction.not_in_force` with source, byte count, budget",
+            "does not prevent ACP, TUI",
             "so the completion audit never judges the",
         ],
     );
@@ -2089,8 +2096,9 @@ fn release_docs_pin_allowance_pauses_retired_plans_and_tagged_notices() {
             "用量不可测时以 `usage_unknown` 停止；配置的宿主兜底额度",
             "code 为 `budget.<kind>`",
             "64 KB 与模型 context window 四分之一取较小值",
-            "这种\n情况不会发出任何 notice",
-            "`instruction.not_in_force` 报告哪个来源的规则本轮不生效",
+            "则整份跳过",
+            "`instruction.not_in_force` notice",
+            "不会阻止 ACP、TUI",
             "归档为已完成的历史，完成审计不会再拿它对账新 Goal",
         ],
     );
@@ -3232,6 +3240,86 @@ fn recovery_input_and_bedrock_docs_pin_the_new_boundaries() {
             "report-only host",
             "without calling Start Work first",
             "cannot consume a resumable pause",
+        ],
+    );
+}
+
+#[test]
+fn resilience_docs_pin_revision_fallback_instruction_and_background_wait_contracts() {
+    contains_all(
+        "docs/guide/agents.md",
+        &[
+            "## Tool fallback",
+            "connected `google_search`",
+            "`gh` for GitHub",
+            "`rg` for repository search",
+            "Fallback never grants",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/agents.md",
+        &[
+            "## 工具降级",
+            "已连接的 `google_search`",
+            "GitHub 操作优先使用已经安装的 `gh`",
+            "仓库搜索优先使用 `rg`",
+            "降级绝不会赋予",
+        ],
+    );
+    contains_all(
+        "docs/config/instructions.md",
+        &[
+            "An intact file that does not fit",
+            "is skipped as a whole",
+            "`instruction.not_in_force`",
+            "later smaller instruction entries",
+            "never truncates",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/instructions.md",
+        &[
+            "完整文件若超出",
+            "整份跳过",
+            "`instruction.not_in_force`",
+            "后续\n更小的独立指令条目",
+            "绝不会被截断",
+        ],
+    );
+    contains_all(
+        "docs/guide/tools.md",
+        &[
+            "Immediately before every `plan_update`",
+            "after `plan_get` returned `null`",
+            "`waiting_background`",
+            "does not spend its two ordinary reconciliation attempts",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/tools.md",
+        &[
+            "每次调用\n`plan_update` 前",
+            "`plan_get` 返回 `null`",
+            "`waiting_background`",
+            "不会消耗两次普通对账机会",
+        ],
+    );
+    contains_all(
+        "docs/harness-runtime.md",
+        &[
+            "`waiting_background`",
+            "without spending either ordinary reconciliation attempt",
+            "An active Goal is not auto-driven again",
+            "does not prevent ACP, TUI",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/harness-runtime.md",
+        &[
+            "`waiting_background`",
+            "不消耗两次普通对账机会",
+            "不会立即再次自动续跑",
+            "不会阻止 ACP、TUI",
         ],
     );
 }

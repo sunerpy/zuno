@@ -26,6 +26,7 @@ use zuno_error::ProviderError;
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
     ProviderStream, ReasoningReplayPolicy, Spec, StreamEvent, ToolSchema, Unavailable, generation,
+    validate_responses_replay_boundaries,
 };
 use zuno_llm::sse::{SseParser, StreamIdleTimeout};
 
@@ -314,6 +315,10 @@ impl CompatibleProvider {
                     model: request.model_id.clone(),
                 },
             ));
+        }
+        if quirks.surface == ApiSurface::Responses {
+            validate_responses_replay_boundaries(&request.messages)
+                .map_err(ProviderError::fatal)?;
         }
         let mut body = RequestBody::new(request.model_id.clone(), request.messages.clone());
         body.developer_context
@@ -811,6 +816,23 @@ mod tests {
         ))
     }
 
+    fn sealed_assistant(token: &str, text: &str) -> zuno_llm::event::Message {
+        zuno_llm::event::Message::from_content(
+            zuno_llm::event::Role::Assistant,
+            vec![
+                zuno_llm::event::RequestContentBlock::ProviderEncryptedReasoning {
+                    id: format!("rs_{token}"),
+                    summary: Vec::new(),
+                    encrypted_content: Some(token.to_owned()),
+                    status: None,
+                },
+                zuno_llm::event::RequestContentBlock::Text {
+                    text: text.to_owned(),
+                },
+            ],
+        )
+    }
+
     #[test]
     fn debug_output_never_contains_the_bearer_token_or_a_configured_header_value() {
         let secret = "sk-live-do-not-log-2f9c";
@@ -1090,6 +1112,37 @@ mod tests {
                 .quirks_for("claude-opus-5", ApiSurface::Default)
                 .requests_encrypted_reasoning()
         );
+    }
+
+    #[test]
+    fn ambiguous_replay_is_refused_locally_without_rendering_tokens() {
+        let provider = build(
+            Spec::new("kiro-local")
+                .with_base_url("http://127.0.0.1:8787/v1")
+                .with_surface(ApiSurface::Responses)
+                .with_option(crate::family::TRANSPORT_OPTION, json!("openai-compatible"))
+                .with_option("reasoningReplay", json!("encrypted")),
+        )
+        .expect("a declared sealing Responses endpoint constructs");
+        let request = CompletionRequest::new(
+            "claude-opus-5",
+            vec![
+                sealed_assistant("private-token-a", "first"),
+                zuno_llm::event::Message::from_content(zuno_llm::event::Role::Tool, Vec::new()),
+                sealed_assistant("private-token-b", "second"),
+            ],
+        );
+
+        let error = provider
+            .try_body_for(&request)
+            .expect_err("missing historical input must fail before HTTP");
+        let rendered = error
+            .source()
+            .expect("typed replay boundary source")
+            .to_string();
+
+        assert!(rendered.contains("history messages 0..=2"), "{rendered}");
+        assert!(!rendered.contains("private-token"), "{rendered}");
     }
 
     /// A model variant's own options cannot remove the sealed `include` entry.
