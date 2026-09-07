@@ -3065,6 +3065,44 @@ fn providers_login_docs_pin_the_remote_command_confirmation_and_trust_flag() {
 }
 
 #[test]
+fn provider_retry_docs_pin_failure_anchored_recovery_and_kiro_defaults() {
+    for relative in [
+        "docs/reference/providers.md",
+        "docs/reference/configuration.md",
+        "docs/harness-runtime.md",
+    ] {
+        contains_all(
+            relative,
+            &[
+                "recovery_window_ms",
+                "after",
+                "retryable",
+                "failure",
+                "max_attempts",
+            ],
+        );
+    }
+    for relative in [
+        "docs/zh/config/providers.md",
+        "docs/zh/config/reference.md",
+        "docs/zh/operate/harness-runtime.md",
+    ] {
+        contains_all(
+            relative,
+            &["recovery_window_ms", "可重试", "max_attempts", "provider"],
+        );
+    }
+    contains_all(
+        "examples/config/zuno-multi-provider.json",
+        &[
+            r#""recovery_window_ms": 660000"#,
+            r#""chunkTimeout": 330000"#,
+            r#""reasoningReplay": "encrypted""#,
+        ],
+    );
+}
+
+#[test]
 fn model_limit_docs_pin_prompt_and_output_ceiling_semantics() {
     contains_all(
         "docs/config/models.md",

@@ -195,6 +195,7 @@ Bedrock Mantle 和 Bedrock Runtime 则复用原生 OpenAI adapter 的类型化 R
 | --- | --- |
 | provider `surface` | 具体的 API 形态：`responses`、`chat` 或 `messages` |
 | provider `headers` | 该 provider 下每个模型的默认额外 HTTP 头 |
+| provider `retry` | Zuno 自己执行的同请求重试策略，不会转发给上游 |
 | model `headers` | 在 provider 头之后应用的逐模型添加与覆盖 |
 | `baseURL` 或选项 `endpoint` | API base URL；两者都设置时选项 `endpoint` 胜出 |
 | `apiKey` | 配置本地的凭据，优先于凭据存储 |
@@ -208,6 +209,29 @@ Bedrock Mantle 和 Bedrock Runtime 则复用原生 OpenAI adapter 的类型化 R
 | `reasoningReplay` | 默认 `off`；对会封装推理的 Responses 端点使用 `encrypted` |
 | `reasoningReplayMaxAge` | Zuno 仍会重放的最旧封装推理信封年龄（毫秒） |
 | `extraBody` | 在受保护字段组装完成之后追加的请求字段 |
+
+Provider 重试恢复与 transport 超时分别配置：
+
+```json
+{
+  "provider": {
+    "kiro-local": {
+      "retry": {
+        "max_attempts": 3,
+        "recovery_window_ms": 660000,
+        "initial_delay_ms": 2000,
+        "max_delay_ms": 30000,
+        "jitter_percent": 20
+      }
+    }
+  }
+}
+```
+
+`max_attempts` 包含首次调用。首次调用仍由 transport 管理；只有它返回可重试错误后，
+`recovery_window_ms` 才开始计时，并共同约束 rollback、退避与所有替代尝试。默认值是
+3 次尝试、180 秒恢复窗口、2 秒初始延迟、30 秒最大延迟和 20% 抖动。该设置按
+provider 隔离，随会话模型解析结果冻结，且不会进入 SDK options 或请求 JSON。
 
 `responsesTextBlocks: "single"` 是一项兼容性声明，不是从 provider id 推断出的模型能力。它让 Zuno 的持久提示词 part 保持类型化，但会在构建 compatible Responses 请求之前，用一个空行把它们的文本投影连接起来。内联图像仍然是独立的内容块。只有当目标端点拒绝一条消息中出现多个 `input_text` 块时才使用它；符合标准的端点应当保持默认的 `multiple` 行为。不要把它用于 2026-08-28 的 `kiro-provider` 构建：那个 provider 现在会把连续的全文本块逐字节拼接、不加分隔符，而这个选项会有意插入一个空行。
 

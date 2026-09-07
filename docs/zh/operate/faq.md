@@ -249,11 +249,15 @@ to watch the guard's parent process; <path> does not exist`，存在但无法启
     "kiro-local": {
       "transport": "openai",
       "surface": "responses",
+      "retry": {
+        "max_attempts": 3,
+        "recovery_window_ms": 660000
+      },
       "options": {
         "baseURL": "http://127.0.0.1:8787/v1",
         "timeout": false,
         "headerTimeout": 330000,
-        "chunkTimeout": 210000,
+        "chunkTimeout": 330000,
         "reasoningReplay": "encrypted",
         "reasoningReplayMaxAge": 86400000
       }
@@ -274,8 +278,8 @@ Responses 请求；只有非空的 provider 或 Agent 值才覆盖模型声明�
 升级时请移除过时的 `responsesTextBlocks: "single"` 设置。那个通用的 Zuno 兼容模式会用一个
 空行连接文本，因此相比 Provider 当前的无损投影，它改变了字节内容。
 
-这些超时值让 kiro-provider 的 300 秒请求截止时间和 180 秒流空闲截止时间先触发。于是
-Zuno 收到一个带类型的网关错误，而不是在同一边界上取消连接。
+这些超时值让 kiro-provider 配置的 300 秒流空闲截止时间先触发。Zuno 收到类型化网关错误后，
+才启动 660 秒恢复窗口并执行有界替代尝试。
 
 当多个文本块与图片、文档、工具内容或其他非文本块交错，且其顺序无法由 Kiro 的单个文本
 字段表达时，这个错误仍然是刻意的。Zuno 与 Provider 会失败并拒绝，而不是重排或压平提示词。

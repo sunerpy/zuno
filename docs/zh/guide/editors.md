@@ -390,11 +390,15 @@ dev: open acp logs
 2026-08-28 的 `kiro-provider` 构建接受连续的全文本块，并且仅在 Kiro 最终的标量文本边界处逐字节拼接、不插入任何分隔符。请使用：
 
 ```json
+"retry": {
+  "max_attempts": 3,
+  "recovery_window_ms": 660000
+},
 "options": {
   "baseURL": "http://127.0.0.1:8787/v1",
   "timeout": false,
   "headerTimeout": 330000,
-  "chunkTimeout": 210000,
+  "chunkTimeout": 330000,
   "reasoningReplay": "encrypted",
   "reasoningReplayMaxAge": 86400000
 }
@@ -405,7 +409,7 @@ dev: open acp logs
 
 移除过期的 `responsesTextBlocks: "single"` 选项：Zuno 的通用兼容模式会插入一个空行，那会改变当前 provider 的确切投影。文本与非文本块混合、且 Kiro 无法保留其顺序时，仍然会失败即拒绝。如果纯文本仍然产生旧的错误，请确认 Zed 确实连到了新构建的 provider 进程。
 
-`headerTimeout` 与 `chunkTimeout` 刻意超过 kiro-provider 对应的 300 秒请求超时与 180 秒流空闲超时。这让网关能在 ACP 客户端关闭请求之前返回它自己的类型化超时。
+`chunkTimeout` 刻意超过 kiro-provider 配置的 300 秒流空闲超时。网关返回类型化失败后 recovery window 才开始计时，因此仍有空间执行两次有界替代尝试。
 
 `reasoningReplay: "encrypted"` 让这条路由启用封装推理重放。ACP 会话最需要它，因为编辑器会驱动很长的多步骤轮次：没有它时网关会在每个请求上报告 `reasoning_replay_locked: false`，每个步骤都会在缺少上一步推理的情况下开始。包住这些选项的 provider 条目必须声明 `"transport": "openai"` 与 `"surface": "responses"`，否则配置会带着出错键路径被拒绝：它的端点来自 `baseURL`，本身会解析成 Chat Completions。可以从 `session.provider.request` 事件的 `replayedReasoningCapsules` 确认，从一个会话的第二个请求起它就会大于零。
 

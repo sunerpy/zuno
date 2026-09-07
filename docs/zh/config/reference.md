@@ -135,6 +135,30 @@ Schema 是从 Rust 类型生成的，因此它与运行时实际接受的内容�
 
 `concurrency` 控制同时运行的工作量上限。它约束的是编排层的并行度，而不是单次工具调用内部的并发。
 
+## Provider 重试恢复
+
+每个 provider 可以声明 Zuno 自己执行的同请求重试策略：
+
+```json
+{
+  "provider": {
+    "kiro-local": {
+      "retry": {
+        "max_attempts": 3,
+        "recovery_window_ms": 660000,
+        "initial_delay_ms": 2000,
+        "max_delay_ms": 30000,
+        "jitter_percent": 20
+      }
+    }
+  }
+}
+```
+
+`max_attempts` 包含首次请求；首次请求仍由 transport 超时负责。它返回可重试错误后，
+`recovery_window_ms` 才开始，并约束 rollback、退避和所有替代尝试。该策略按 provider
+隔离、随会话模型解析结果冻结，且不会进入上游 SDK options 或请求 JSON。
+
 ## Goal 兜底预算
 
 没有显式 `token_budget` 的 Goal 默认不受 token 上限约束。部署方可以配置一个共享的正整数兜底值：

@@ -225,22 +225,26 @@ Current provider configuration is:
     "kiro-local": {
       "transport": "openai",
       "surface": "responses",
+      "retry": {
+        "max_attempts": 3,
+        "recovery_window_ms": 660000
+      },
       "options": {
         "baseURL": "http://127.0.0.1:8787/v1",
         "maxTokens": null,
         "timeout": false,
         "headerTimeout": 330000,
-        "chunkTimeout": 210000
+        "chunkTimeout": 330000
       }
     }
   }
 }
 ```
 
-The gateway owns a 300-second request deadline and a 180-second stream-idle
-deadline. Zuno's matching phase limits remain 30 seconds larger, while the
-whole-request timeout is disabled, so the gateway can return a typed timeout
-instead of racing a client-side absolute deadline.
+The gateway owns a 900-second request deadline and a 300-second stream-idle
+deadline. Zuno's chunk limit remains 30 seconds larger, while the whole-request
+timeout is disabled, so the gateway can return a typed timeout. Only then does
+the 660-second retry recovery window start.
 
 The provider now retains consecutive all-text blocks in its canonical request
 and joins them byte-for-byte with no inserted separator only at Kiro's scalar

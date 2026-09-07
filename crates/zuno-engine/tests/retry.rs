@@ -8,11 +8,11 @@ use std::time::Duration;
 use zuno_engine::r#loop::{TurnError, TurnRecovery, TurnRetryReason};
 use zuno_engine::retry::{
     MAX_CONTEXT_LIMIT_RETRIES, MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS,
-    MAX_INCOMPLETE_CONTINUATION_ATTEMPTS, PROVIDER_RETRY_MAX_ATTEMPTS, PROVIDER_RETRY_MAX_ELAPSED,
-    ProviderAttemptObservation, ProviderRetryError, ProviderRetryPolicy, ProviderRetryPolicyError,
-    RETRY_INITIAL_DELAY, RETRY_MAX_DELAY_WITHOUT_PROVIDER, RecoveryAttempt, RecoveryBudget,
-    RecoveryBudgets, RetryError, retry_provider, retry_provider_with_sleep,
-    retry_provider_with_wake_observed,
+    MAX_INCOMPLETE_CONTINUATION_ATTEMPTS, PROVIDER_RETRY_MAX_ATTEMPTS,
+    PROVIDER_RETRY_RECOVERY_WINDOW, ProviderAttemptObservation, ProviderRetryError,
+    ProviderRetryPolicy, ProviderRetryPolicyError, RETRY_INITIAL_DELAY,
+    RETRY_MAX_DELAY_WITHOUT_PROVIDER, RecoveryAttempt, RecoveryBudget, RecoveryBudgets, RetryError,
+    retry_provider, retry_provider_with_sleep, retry_provider_with_wake_observed,
 };
 use zuno_error::{ProviderError, ProviderProtocolFailure, ProviderStreamFailure};
 use zuno_llm::event::StreamEvent;
@@ -20,7 +20,7 @@ use zuno_llm::event::StreamEvent;
 fn policy(max_attempts: u32) -> ProviderRetryPolicy {
     ProviderRetryPolicy::with_timing(
         NonZeroU32::new(max_attempts).expect("non-zero test policy"),
-        PROVIDER_RETRY_MAX_ELAPSED,
+        PROVIDER_RETRY_RECOVERY_WINDOW,
         RETRY_INITIAL_DELAY,
         RETRY_MAX_DELAY_WITHOUT_PROVIDER,
         0,
@@ -106,7 +106,9 @@ fn every_terminal_turn_error_has_an_explicit_goal_recovery_decision() {
         (
             TurnError::ProviderRetryDeadlineExceeded {
                 attempt: 3,
-                elapsed: Duration::from_secs(180),
+                recovery_elapsed: Duration::from_secs(180),
+                total_elapsed: Duration::from_secs(181),
+                last_provider_error_code: Some("upstream_stream_error"),
             },
             TurnRecovery::Retry {
                 reason: TurnRetryReason::ProviderRetryDeadline,
@@ -183,6 +185,42 @@ async fn first_provider_attempt_is_not_part_of_the_retry_recovery_budget() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_slow_first_failure_still_receives_a_replacement_attempt() {
+    let attempts = Rc::new(Cell::new(0_u32));
+    let seen = Rc::clone(&attempts);
+    let started = tokio::time::Instant::now();
+    let result = retry_provider(
+        policy(PROVIDER_RETRY_MAX_ATTEMPTS),
+        move |attempt| {
+            seen.set(attempt);
+            async move {
+                if attempt == 1 {
+                    tokio::time::sleep(Duration::from_secs(310)).await;
+                    return Err(ProviderError::Stream {
+                        code: ProviderStreamFailure::UpstreamStreamError,
+                        source: None,
+                    });
+                }
+                Ok::<_, ProviderError>("recovered")
+            }
+        },
+        |_| ready(Ok::<(), std::io::Error>(())),
+    )
+    .await;
+
+    assert_eq!(
+        result.expect("the replacement attempt succeeds"),
+        "recovered"
+    );
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_secs(312),
+        "the recovery delay begins only after the slow first failure"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn recovery_deadline_interrupts_an_active_replay() {
     let attempts = Rc::new(Cell::new(0_u32));
     let seen = Rc::clone(&attempts);
@@ -210,8 +248,11 @@ async fn recovery_deadline_interrupts_an_active_replay() {
         result,
         Err(ProviderRetryError::DeadlineExceeded {
             attempt: 2,
-            elapsed
-        }) if elapsed == Duration::from_secs(180)
+            recovery_elapsed,
+            total_elapsed,
+            last_provider_error_code: None,
+        }) if recovery_elapsed == Duration::from_secs(180)
+            && total_elapsed == Duration::from_secs(180)
     ));
     assert_eq!(attempts.get(), 2);
     assert_eq!(started.elapsed(), Duration::from_secs(180));
@@ -244,8 +285,11 @@ async fn recovery_deadline_prevents_starting_another_replay() {
         result,
         Err(ProviderRetryError::DeadlineExceeded {
             attempt: 2,
-            elapsed
-        }) if elapsed == Duration::from_secs(180)
+            recovery_elapsed,
+            total_elapsed,
+            last_provider_error_code: None,
+        }) if recovery_elapsed == Duration::from_secs(180)
+            && total_elapsed == Duration::from_secs(180)
     ));
     assert_eq!(
         attempts.get(),
@@ -611,6 +655,27 @@ fn retry_policy_rejects_invalid_timing() {
     );
 }
 
+#[test]
+fn retry_policy_resolves_provider_specific_configuration() {
+    let configured: zuno_config::schema::provider::ProviderRetryConfig =
+        serde_json::from_value(serde_json::json!({
+            "max_attempts": 3,
+            "recovery_window_ms": 660_000,
+            "initial_delay_ms": 2_000,
+            "max_delay_ms": 30_000,
+            "jitter_percent": 20
+        }))
+        .expect("retry config parses");
+    let policy =
+        ProviderRetryPolicy::from_config(Some(&configured)).expect("retry policy resolves");
+    assert_eq!(policy.max_attempts().get(), 3);
+    assert_eq!(policy.recovery_window(), Duration::from_secs(660));
+
+    let defaults = ProviderRetryPolicy::from_config(None).expect("default policy resolves");
+    assert_eq!(defaults.max_attempts().get(), PROVIDER_RETRY_MAX_ATTEMPTS);
+    assert_eq!(defaults.recovery_window(), PROVIDER_RETRY_RECOVERY_WINDOW);
+}
+
 #[tokio::test]
 async fn retry_without_provider_delay_uses_oracle_backoff_capped_at_thirty_seconds() {
     let script = Rc::new(RefCell::new(VecDeque::from([
@@ -788,7 +853,7 @@ async fn a_retry_after_beyond_the_deadline_is_surfaced_not_replaced_by_a_local_d
     let attempts = Rc::new(Cell::new(0_u32));
     let seen = Rc::clone(&attempts);
     let started = tokio::time::Instant::now();
-    let peer_delay = PROVIDER_RETRY_MAX_ELAPSED + Duration::from_secs(220);
+    let peer_delay = PROVIDER_RETRY_RECOVERY_WINDOW + Duration::from_secs(220);
     let result = retry_provider(
         policy(PROVIDER_RETRY_MAX_ATTEMPTS),
         move |attempt| {

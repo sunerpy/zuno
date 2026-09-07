@@ -49,6 +49,7 @@ const SESSION_ID: &str = "ses_loop_test";
 struct ScriptedResponse {
     events: Vec<Result<StreamEvent, ProviderError>>,
     hang_after: bool,
+    delay_before: Duration,
 }
 
 impl ScriptedResponse {
@@ -56,6 +57,7 @@ impl ScriptedResponse {
         Self {
             events: events.into_iter().map(Ok).collect(),
             hang_after: false,
+            delay_before: Duration::ZERO,
         }
     }
 
@@ -65,13 +67,25 @@ impl ScriptedResponse {
         Self {
             events,
             hang_after: false,
+            delay_before: Duration::ZERO,
         }
+    }
+
+    fn delayed_failure(
+        delay_before: Duration,
+        events: Vec<StreamEvent>,
+        error: ProviderError,
+    ) -> Self {
+        let mut response = Self::failed(events, error);
+        response.delay_before = delay_before;
+        response
     }
 
     fn hanging(events: Vec<StreamEvent>) -> Self {
         Self {
             events: events.into_iter().map(Ok).collect(),
             hang_after: true,
+            delay_before: Duration::ZERO,
         }
     }
 }
@@ -115,8 +129,17 @@ impl Provider for FakeProvider {
             .expect("response lock")
             .pop_front()
             .expect("one scripted response per provider request");
-        let events = stream::iter(response.events);
-        if response.hang_after {
+        let ScriptedResponse {
+            events,
+            hang_after,
+            delay_before,
+        } = response;
+        let events = stream::once(async move {
+            tokio::time::sleep(delay_before).await;
+            events
+        })
+        .flat_map(stream::iter);
+        if hang_after {
             Box::pin(events.chain(stream::pending()))
         } else {
             Box::pin(events)
@@ -3553,12 +3576,13 @@ async fn loop_accepts_a_tool_only_assistant_step_as_non_empty() {
     assert_eq!(assistants[0].parts[0].kind, PartKind::Tool);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn loop_provider_retry_replaces_malformed_tool_arguments_and_persists_attempts() {
     let mut connection = seeded();
     put_user(&connection, "msg_retry_user", 10, "retry once");
     let provider = Arc::new(FakeProvider::new(vec![
-        ScriptedResponse::failed(
+        ScriptedResponse::delayed_failure(
+            Duration::from_secs(310),
             vec![
                 StreamEvent::TextDelta("discarded attempt".to_owned()),
                 StreamEvent::ToolUseStart {
@@ -3685,8 +3709,8 @@ async fn loop_provider_retry_deadline_cancels_and_persists_an_active_replay() {
     let provider = Arc::new(FakeProvider::new(vec![
         ScriptedResponse::failed(
             Vec::new(),
-            ProviderError::Transient {
-                status: Some(503),
+            ProviderError::Stream {
+                code: ProviderStreamFailure::UpstreamStreamError,
                 source: None,
             },
         ),
@@ -3713,13 +3737,19 @@ async fn loop_provider_retry_deadline_cancels_and_persists_an_active_replay() {
     );
     let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
 
-    assert!(matches!(
-        outcome,
-        Err(TurnError::ProviderRetryDeadlineExceeded {
-            attempt: 2,
-            elapsed,
-        }) if elapsed == Duration::from_secs(180)
-    ));
+    assert!(
+        matches!(
+            outcome,
+            Err(TurnError::ProviderRetryDeadlineExceeded {
+                attempt: 2,
+                recovery_elapsed,
+                total_elapsed,
+                last_provider_error_code: Some("upstream_stream_error"),
+            }) if recovery_elapsed == Duration::from_secs(180)
+                && total_elapsed == Duration::from_secs(180)
+        ),
+        "{outcome:?}"
+    );
     assert_eq!(provider.requests().len(), 2);
     assert!(
         dispatcher.calls().is_empty(),
@@ -3756,7 +3786,32 @@ async fn loop_provider_retry_deadline_cancels_and_persists_an_active_replay() {
     assert_eq!(attempts[3]["retryable"], true);
     assert_eq!(attempts[3]["partialOutput"], true);
     assert_eq!(attempts[3]["elapsedMs"], 180_000);
+    assert_eq!(attempts[3]["recoveryElapsedMs"], 180_000);
+    assert_eq!(attempts[3]["totalElapsedMs"], 180_000);
+    assert_eq!(
+        attempts[3]["lastProviderErrorCode"],
+        Value::String("upstream_stream_error".to_owned())
+    );
     assert_eq!(attempts[2]["attemptID"], attempts[3]["attemptID"]);
+
+    let request_failure = connection
+        .query_row(
+            "SELECT data FROM event \
+             WHERE aggregate_id = ?1 AND type = 'session.provider.request.1' \
+               AND json_extract(data, '$.status') = 'failed' ORDER BY seq DESC LIMIT 1",
+            [SESSION_ID],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read terminal provider request");
+    let request_failure: Value =
+        serde_json::from_str(&request_failure).expect("provider request JSON");
+    assert_eq!(request_failure["errorKind"], "provider_retry_deadline");
+    assert_eq!(request_failure["recoveryElapsedMs"], 180_000);
+    assert_eq!(request_failure["totalElapsedMs"], 180_000);
+    assert_eq!(
+        request_failure["lastProviderErrorCode"],
+        "upstream_stream_error"
+    );
 }
 
 #[tokio::test]
@@ -6123,6 +6178,7 @@ async fn loop_does_not_wait_forever_for_a_provider_that_streams_past_its_own_fin
     let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse {
         events: events.into_iter().map(Ok).collect(),
         hang_after: true,
+        delay_before: Duration::ZERO,
     }]));
     let providers = registry(&provider);
     let resolver = FakeResolver;

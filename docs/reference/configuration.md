@@ -142,14 +142,24 @@ synthesis, and learning extraction requests; those internal Agents do not
 silently fall back to Chat Completions.
 
 Set the provider entry's `transport` to `openai` and its `surface` to
-`responses`, then set the provider options to:
+`responses`, give Kiro a provider-specific recovery window, then set the
+provider options to:
+
+```json
+{
+  "retry": {
+    "max_attempts": 3,
+    "recovery_window_ms": 660000
+  }
+}
+```
 
 ```json
 {
   "baseURL": "http://127.0.0.1:8787/v1",
   "timeout": false,
   "headerTimeout": 330000,
-  "chunkTimeout": 210000,
+  "chunkTimeout": 330000,
   "reasoningReplay": "encrypted",
   "reasoningReplayMaxAge": 86400000
 }
@@ -162,7 +172,7 @@ overrides the model declaration. `timeout` bounds the complete HTTP request;
 reasoning streams uncapped. `headerTimeout` bounds only the wait for response
 headers, while `chunkTimeout` is reset after every streamed body chunk. The
 values above leave a 30-second propagation margin beyond kiro-provider's
-recommended 300-second request deadline and 180-second stream-idle deadline.
+configured 300-second stream-idle deadline.
 Keep the Zuno limits greater than the gateway limits so the gateway can return
 its typed timeout instead of losing a race with the client.
 
@@ -196,11 +206,11 @@ Encrypted replay is stateless on the endpoint's side: the sealed item travels in
 `input`, so it needs neither `store: true` nor `previous_response_id`, both of
 which remain unsupported below.
 
-These transport limits are independent from provider retry recovery. Zuno anchors
-the retry recovery deadline when the original provider request starts. The
-original request remains governed by its transport and stream-idle policies, but
-rollback, jittered backoff, and every replacement attempt must complete before
-that absolute deadline; an active replay is cancelled when it expires. Current
+These transport limits are independent from provider retry recovery. The
+original request remains governed by its transport and stream-idle policies.
+When it returns a retryable failure, the provider's `retry.recovery_window_ms`
+starts and bounds rollback, jittered backoff, and every replacement attempt; an
+active replay is cancelled when that recovery window expires. Current
 `kiro-provider` preserves consecutive all-text blocks in its
 canonical request and concatenates them byte-for-byte with no inserted separator
 only at Kiro's scalar text boundary. Do not set

@@ -65,8 +65,8 @@ use crate::prompt::{
     RuntimePromptPolicy, ensure_prompt_context_budget,
 };
 use crate::retry::{
-    PROVIDER_RETRY_MAX_ATTEMPTS, ProviderAttemptObservation, ProviderRetryError,
-    ProviderRetryObservedError, ProviderRetryPolicy, retry_provider_with_wake_observed,
+    ProviderAttemptObservation, ProviderRetryError, ProviderRetryObservedError,
+    ProviderRetryPolicy, retry_provider_with_wake_observed,
 };
 use crate::session_command::SessionCommand;
 use crate::status::SessionRunGuard;
@@ -700,8 +700,16 @@ pub enum TurnError {
     Provider(#[from] ProviderError),
     #[error(transparent)]
     PromptAssembly(#[from] PromptAssemblyError),
-    #[error("provider retry deadline exceeded on attempt {attempt} after {elapsed:?}")]
-    ProviderRetryDeadlineExceeded { attempt: u32, elapsed: Duration },
+    #[error(
+        "provider retry deadline exceeded on attempt {attempt} after {recovery_elapsed:?} \
+         recovery ({total_elapsed:?} total; last provider code {last_provider_error_code:?})"
+    )]
+    ProviderRetryDeadlineExceeded {
+        attempt: u32,
+        recovery_elapsed: Duration,
+        total_elapsed: Duration,
+        last_provider_error_code: Option<&'static str>,
+    },
     #[error(transparent)]
     Cache(#[from] CacheViolation),
 }
@@ -973,6 +981,8 @@ pub struct ResolvedModel {
     /// Empty for a model without reasoning support or a session that chose no level,
     /// which is what keeps such a request byte-identical to the pre-effort build.
     pub reasoning_options: Map<String, Value>,
+    /// Same-request retry policy resolved for this provider.
+    pub retry_policy: ProviderRetryPolicy,
 }
 
 impl ResolvedModel {
@@ -986,6 +996,10 @@ impl ResolvedModel {
             model_id,
             surface,
             reasoning_options: Map::new(),
+            retry_policy: ProviderRetryPolicy::new(
+                NonZeroU32::new(crate::retry::PROVIDER_RETRY_MAX_ATTEMPTS)
+                    .expect("provider retry maximum is non-zero"),
+            ),
         }
     }
 
@@ -996,6 +1010,13 @@ impl ResolvedModel {
     #[must_use]
     pub fn with_reasoning_options(mut self, options: Map<String, Value>) -> Self {
         self.reasoning_options = options;
+        self
+    }
+
+    /// Attach the provider-specific retry policy resolved by the host.
+    #[must_use]
+    pub fn with_retry_policy(mut self, policy: ProviderRetryPolicy) -> Self {
+        self.retry_policy = policy;
         self
     }
 
@@ -2486,10 +2507,7 @@ async fn run_turn_in_span(
             model.catalog_model_id.clone(),
             StreamLimits::from_environment().max_tool_input_bytes(),
         )));
-        let policy = ProviderRetryPolicy::new(
-            NonZeroU32::new(PROVIDER_RETRY_MAX_ATTEMPTS)
-                .expect("provider retry maximum is non-zero"),
-        );
+        let policy = model.retry_policy;
         let soft_interrupt = context
             .live_inputs
             .as_ref()
@@ -2688,7 +2706,9 @@ async fn run_turn_in_span(
                     ProviderAttemptObservation::DeadlineExceeded {
                         attempt,
                         max,
-                        elapsed,
+                        recovery_elapsed,
+                        total_elapsed,
+                        last_provider_error_code,
                     } => {
                         let generated_output = accumulator
                             .lock()
@@ -2708,7 +2728,9 @@ async fn run_turn_in_span(
                                 max_attempts: max,
                             },
                             generated_output,
-                            elapsed,
+                            recovery_elapsed,
+                            total_elapsed,
+                            last_provider_error_code,
                         )
                     }
                     ProviderAttemptObservation::BackoffScheduled {
@@ -2749,9 +2771,17 @@ async fn run_turn_in_span(
                 | ProviderRetryError::AttemptsExhausted { source: error, .. } => {
                     Err(TurnError::Provider(error))
                 }
-                ProviderRetryError::DeadlineExceeded { attempt, elapsed } => {
-                    Err(TurnError::ProviderRetryDeadlineExceeded { attempt, elapsed })
-                }
+                ProviderRetryError::DeadlineExceeded {
+                    attempt,
+                    recovery_elapsed,
+                    total_elapsed,
+                    last_provider_error_code,
+                } => Err(TurnError::ProviderRetryDeadlineExceeded {
+                    attempt,
+                    recovery_elapsed,
+                    total_elapsed,
+                    last_provider_error_code,
+                }),
                 // The peer named a delay the same-request deadline cannot hold. The
                 // turn ends on the peer's own typed error so the goal controller
                 // schedules its retry from that `retry_after`, clamped to the
@@ -6224,7 +6254,9 @@ fn append_provider_attempt_deadline(
     request: &RunTurnRequest,
     attempt: ProviderAttemptRecord<'_>,
     generated_output: bool,
-    elapsed: Duration,
+    recovery_elapsed: Duration,
+    total_elapsed: Duration,
+    last_provider_error_code: Option<&'static str>,
 ) -> Result<(), TurnError> {
     let mut properties = provider_attempt_properties(request, attempt);
     properties.insert("status".to_owned(), Value::String("failed".to_owned()));
@@ -6236,8 +6268,22 @@ fn append_provider_attempt_deadline(
     properties.insert("retryable".to_owned(), Value::Bool(true));
     properties.insert(
         "elapsedMs".to_owned(),
-        Value::from(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
+        Value::from(u64::try_from(recovery_elapsed.as_millis()).unwrap_or(u64::MAX)),
     );
+    properties.insert(
+        "recoveryElapsedMs".to_owned(),
+        Value::from(u64::try_from(recovery_elapsed.as_millis()).unwrap_or(u64::MAX)),
+    );
+    properties.insert(
+        "totalElapsedMs".to_owned(),
+        Value::from(u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX)),
+    );
+    if let Some(code) = last_provider_error_code {
+        properties.insert(
+            "lastProviderErrorCode".to_owned(),
+            Value::String(code.to_owned()),
+        );
+    }
     append_with_connection(
         connection,
         &request.session_id,
@@ -6497,6 +6543,28 @@ fn append_provider_request_terminal(
             Value::String(error.kind().to_owned()),
         );
         properties.insert("message".to_owned(), Value::String(error.durable_message()));
+        if let TurnError::ProviderRetryDeadlineExceeded {
+            recovery_elapsed,
+            total_elapsed,
+            last_provider_error_code,
+            ..
+        } = error
+        {
+            properties.insert(
+                "recoveryElapsedMs".to_owned(),
+                Value::from(u64::try_from(recovery_elapsed.as_millis()).unwrap_or(u64::MAX)),
+            );
+            properties.insert(
+                "totalElapsedMs".to_owned(),
+                Value::from(u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX)),
+            );
+            if let Some(code) = last_provider_error_code {
+                properties.insert(
+                    "lastProviderErrorCode".to_owned(),
+                    Value::String((*code).to_owned()),
+                );
+            }
+        }
     }
     append_with_connection(
         connection,

@@ -677,12 +677,16 @@ concatenates them byte-for-byte with no inserted separator only at Kiro's final
 scalar text boundary. Use:
 
 ```json
+"retry": {
+  "max_attempts": 3,
+  "recovery_window_ms": 660000
+},
 "options": {
   "baseURL": "http://127.0.0.1:8787/v1",
   "maxTokens": null,
   "timeout": false,
   "headerTimeout": 330000,
-  "chunkTimeout": 210000,
+  "chunkTimeout": 330000,
   "reasoningReplay": "encrypted",
   "reasoningReplayMaxAge": 86400000
 }
@@ -694,9 +698,9 @@ provider's exact projection. Mixed text and non-text blocks whose ordering Kiro
 cannot preserve still fail closed. If pure text still produces the old error,
 verify that Zed is reaching the newly built provider process.
 
-`headerTimeout` and `chunkTimeout` deliberately exceed kiro-provider's matching
-300-second request and 180-second stream-idle deadlines. This lets the gateway
-return its typed timeout before the ACP client closes the request.
+`chunkTimeout` deliberately exceeds kiro-provider's configured 300-second
+stream-idle deadline. The retry window begins only after that typed failure
+returns, leaving enough time for two bounded replacement attempts.
 
 `reasoningReplay: "encrypted"` opts the route into sealed reasoning replay. An ACP
 session is where this matters most, because the editor drives long multi-step
