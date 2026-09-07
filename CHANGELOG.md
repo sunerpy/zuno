@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.14](https://github.com/sunerpy/zuno/compare/v0.10.13...v0.10.14) (2026-09-07)
+
+
+### Bug Fixes
+
+* **runtime:** 修复 Goal 续跑时历史工具声明丢失 ([a63fffb](https://github.com/sunerpy/zuno/commit/a63fffb78cce55cecac7334ad34fc6192332a4e1))
+
 ## [0.10.13](https://github.com/sunerpy/zuno/compare/v0.10.12...v0.10.13) (2026-09-06)
 
 
