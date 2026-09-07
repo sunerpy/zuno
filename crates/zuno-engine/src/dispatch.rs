@@ -190,6 +190,18 @@ impl ToolRegistryDispatcher {
         self
     }
 
+    /// Restore the subset a previous process made provider-visible.
+    ///
+    /// Call after [`Self::with_deferred_tools`]. Names not present in the current,
+    /// permission-filtered catalog stay hidden and uncallable.
+    #[must_use]
+    pub fn with_restored_deferred_tools(self, ids: impl IntoIterator<Item = String>) -> Self {
+        if let Some(catalog) = &self.deferred {
+            catalog.restore_exposed(ids);
+        }
+        self
+    }
+
     #[must_use]
     pub fn with_hooks(mut self, hooks: Arc<dyn ToolHooks>) -> Self {
         self.hooks = hooks;

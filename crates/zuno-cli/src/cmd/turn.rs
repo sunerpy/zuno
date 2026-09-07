@@ -4813,6 +4813,13 @@ impl TurnHost {
                     tool_authority: plan.tool_authority.clone(),
                 },
             )?;
+            let restored_deferred_tools = if prepared.identity.is_materialized() {
+                zuno_db::message::MessageStore::new(&connection)
+                    .deferred_tool_exposures(prepared.identity.id())
+                    .map_err(to_string)?
+            } else {
+                Vec::new()
+            };
             // Joins the notes so shadowing reaches whatever surface is watching: the
             // headless runs print them, and the TUI draws them in the transcript. This is
             // what replaces the registry's own `eprintln!` without going quiet.
@@ -4871,6 +4878,7 @@ impl TurnHost {
                 McpToolStatus::Ready,
             )
             .with_deferred_tools(runtime_tools.deferred_tool_ids)
+            .with_restored_deferred_tools(restored_deferred_tools)
             .with_hooks(Arc::new(
                 super::tool_hooks::HostToolHooks::new(
                     super::verification_ledger::VerificationLedger::new(
@@ -8037,16 +8045,35 @@ impl TurnHost {
         let planning_prompt = newest.text.clone();
         let planning_source = newest.source;
         self.require_active_extension_composition()?;
-        let prompts = reports
-            .iter()
-            .map(|report| report.text.as_str())
-            .collect::<Vec<_>>();
-        self.preload_turn_skills(&prompts, &events).await?;
         for report in reports {
             let (message, parts) =
                 self.prepare_turn_user_message(&report.text, Some(report.input_id.as_str()), None)?;
             self.persist_promoted_user_input(&message, &parts)?;
         }
+        if self
+            .goal_store
+            .goal(&self.session_id)
+            .map_err(to_string)?
+            .is_some_and(|goal| goal.status != GoalStatus::Active)
+        {
+            events
+                .publish(TurnEvent::Notice {
+                    severity: NoticeSeverity::Info,
+                    code: "report_deferred_by_goal_state".to_owned(),
+                    detail: "Settled background reports were committed to durable history, but \
+                             the Goal is not active; provider continuation is deferred until the \
+                             Goal is resumed."
+                        .to_owned(),
+                })
+                .await
+                .map_err(to_string)?;
+            return Ok(());
+        }
+        let prompts = reports
+            .iter()
+            .map(|report| report.text.as_str())
+            .collect::<Vec<_>>();
+        self.preload_turn_skills(&prompts, &events).await?;
         self.drive_prepared(&planning_prompt, planning_source, None, None, guard, events)
             .await
     }

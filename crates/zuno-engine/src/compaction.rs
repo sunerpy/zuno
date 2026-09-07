@@ -826,8 +826,16 @@ pub fn build_summary_prompt(previous_summary: Option<&str>, context: &[String]) 
 /// session's compaction failure. Nothing model-visible is lost — the envelope is
 /// provider bookkeeping, and plaintext reasoning travels as its own block.
 pub(crate) fn summary_safe_message_owned(message: Message) -> Message {
+    let role = if message.role == Role::Tool {
+        // A tool-free compaction request cannot carry native tool-result blocks once
+        // their declarations are intentionally absent. User is the provider-neutral
+        // role for the environment observation the tool message represented.
+        Role::User
+    } else {
+        message.role
+    };
     Message::from_content(
-        message.role,
+        role,
         message
             .content
             .into_iter()
@@ -836,10 +844,16 @@ pub(crate) fn summary_safe_message_owned(message: Message) -> Message {
                     tool_use_id,
                     content,
                     is_error,
-                } => Some(RequestContentBlock::ToolResult {
-                    tool_use_id,
-                    content: truncate_tool_output_owned(content),
-                    is_error,
+                } => Some(RequestContentBlock::Text {
+                    text: format!(
+                        "Historical tool result for compaction:\n{}",
+                        json!({
+                            "kind": "historical_tool_result",
+                            "callID": tool_use_id,
+                            "result": truncate_tool_output_owned(content),
+                            "isError": is_error,
+                        })
+                    ),
                 }),
                 RequestContentBlock::Image {
                     filename,
@@ -874,13 +888,17 @@ pub(crate) fn summary_safe_message_owned(message: Message) -> Message {
                     name,
                     input,
                     raw_arguments,
-                    thought_signature,
-                } => Some(RequestContentBlock::ToolUse {
-                    id,
-                    name,
-                    input,
-                    raw_arguments,
-                    thought_signature,
+                    ..
+                } => Some(RequestContentBlock::Text {
+                    text: format!(
+                        "Historical tool call for compaction:\n{}",
+                        json!({
+                            "kind": "historical_tool_call",
+                            "callID": id,
+                            "tool": name,
+                            "arguments": raw_arguments.map_or(input, Value::String),
+                        })
+                    ),
                 }),
             })
             .collect(),
@@ -1073,5 +1091,49 @@ mod tests {
         let safe = summary_safe_message_owned(message);
 
         assert_eq!(safe.content, vec![link]);
+    }
+
+    #[test]
+    fn summary_safe_tool_history_is_inert_and_uses_provider_neutral_roles() {
+        let call = summary_safe_message_owned(Message::from_content(
+            Role::Assistant,
+            vec![RequestContentBlock::ToolUse {
+                id: "call-1".to_owned(),
+                name: "penpot_execute_code".to_owned(),
+                input: json!({"code": "return 1"}),
+                raw_arguments: Some("{\"code\":\"return 1\"}".to_owned()),
+                thought_signature: None,
+            }],
+        ));
+        let result = summary_safe_message_owned(Message::from_content(
+            Role::Tool,
+            vec![RequestContentBlock::ToolResult {
+                tool_use_id: "call-1".to_owned(),
+                content: "created the board".to_owned(),
+                is_error: Some(false),
+            }],
+        ));
+
+        assert_eq!(call.role, Role::Assistant);
+        assert_eq!(result.role, Role::User);
+        for message in [&call, &result] {
+            assert!(
+                message
+                    .content
+                    .iter()
+                    .all(|block| matches!(block, RequestContentBlock::Text { .. })),
+                "tool-free compaction must receive no native tool protocol: {message:?}"
+            );
+        }
+        assert!(matches!(
+            &call.content[0],
+            RequestContentBlock::Text { text }
+                if text.contains("\"tool\":\"penpot_execute_code\"")
+        ));
+        assert!(matches!(
+            &result.content[0],
+            RequestContentBlock::Text { text }
+                if text.contains("\"result\":\"created the board\"")
+        ));
     }
 }

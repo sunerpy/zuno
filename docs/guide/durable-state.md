@@ -658,6 +658,14 @@ pending inbox scan, so the recovered report can wake an idle parent without a
 new user prompt. A consumed, cancelled, or failed input is terminal and is
 never synthesized again.
 
+An automatic report wake does not override Goal lifecycle state. If the Goal is
+paused, blocked, complete, cancelled, or otherwise non-active, the wake still
+commits every promoted report as its own durable user message and consumes the
+inbox rows, but it does not start a provider turn. Resuming an active-capable
+Goal later continues from those messages. This keeps report delivery durable
+without letting a background child bypass an authentication, permission,
+human-input, plan-mode, or uncertain-side-effect pause.
+
 For a long-running CI watcher or release observer, start one background Shell
 execution with `backgroundPurpose: "remoteObserver"` and let its durable terminal
 report resume the session. Prose such as "the task is still running; I will wait"

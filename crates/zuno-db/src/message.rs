@@ -83,7 +83,7 @@
 //! ```
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1194,6 +1194,58 @@ impl<'conn> MessageStore<'conn> {
             parts.push(row.map_err(map_error)??);
         }
         Ok(parts)
+    }
+
+    /// Deferred tool ids a completed `tool_search` made provider-visible.
+    ///
+    /// Progressive discovery is session state, not process state. A detached parent
+    /// wake, process restart, or client remount rebuilds the dispatcher from scratch;
+    /// replaying these ids is what keeps the next provider request on the same tool
+    /// contract as the request that produced the durable history.
+    ///
+    /// Both `newlyExposedTools` and `matchedTools` are read. The former is the
+    /// authoritative transition written by current builds; the latter keeps results
+    /// from early progressive-discovery builds recoverable. Only completed
+    /// `tool_search` calls count, and callers must still intersect the returned names
+    /// with the currently connected, permission-visible deferred catalog.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Decode`] when a matching metadata field is not an array of strings;
+    /// [`DbError::Query`] or [`DbError::Busy`] from SQLite.
+    pub fn deferred_tool_exposures(&self, session_id: &str) -> Result<Vec<String>, DbError> {
+        let mut statement = self.prepare(
+            "SELECT json_extract(data, '$.state.metadata.newlyExposedTools'), \
+                    json_extract(data, '$.state.metadata.matchedTools') \
+             FROM part \
+             WHERE session_id = ?1 \
+             AND json_extract(data, '$.type') = 'tool' \
+             AND json_extract(data, '$.tool') = 'tool_search' \
+             AND json_extract(data, '$.state.status') = 'completed' \
+             ORDER BY time_created ASC, id ASC",
+        )?;
+        let rows = statement
+            .query_map([session_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .map_err(map_error)?;
+        let mut exposed = BTreeSet::new();
+        for row in rows {
+            let (newly_exposed, matched) = row.map_err(map_error)?;
+            for raw in [newly_exposed, matched].into_iter().flatten() {
+                let names = serde_json::from_str::<Vec<String>>(&raw).map_err(|source| {
+                    DbError::Decode {
+                        table: PART_TABLE.to_owned(),
+                        source,
+                    }
+                })?;
+                exposed.extend(names.into_iter().filter(|name| !name.is_empty()));
+            }
+        }
+        Ok(exposed.into_iter().collect())
     }
 
     /// Return the insertion cursor after every part currently owned by one session.

@@ -535,13 +535,33 @@ without allowing the hook seam to widen registered authority.
 Root turns progressively disclose connected MCP schemas. Filtered MCP implementations
 stay executable in the dispatcher while `tool_search` searches compact metadata; each
 successful search increments a turn-local revision and expands the frozen provider tool
-snapshot on the next step. Unversioned registry drift remains ignored, while stale
-revisions cannot roll the snapshot back. An exact Agent `tools` allowlist pins its named
-MCP schemas eagerly. ACP session-local `mcpServers` also pin their schemas eagerly after
-the strict connection gate, while host-configured servers in the same catalog remain
-deferred. The catalog carries that session boundary into child and background turns.
-Child turns do not receive a fresh deferred superset: schemas that survived the parent's
-exact Attempt authority are eager inside that already-bounded ceiling.
+snapshot on the next step. The completed `tool_search` result is also the durable
+session exposure ledger. Rebuilding a host for a detached report, process restart, or
+client remount restores those ids before the first provider request, intersected with
+the currently connected, permission-visible catalog; unavailable ids do not regain
+authority. Unversioned registry drift remains ignored, while stale revisions cannot roll
+the snapshot back. An exact Agent `tools` allowlist pins its named MCP schemas eagerly.
+ACP session-local `mcpServers` also pin their schemas eagerly after the strict connection
+gate, while host-configured servers in the same catalog remain deferred. The catalog
+carries that session boundary into child and background turns. Child turns do not receive
+a fresh deferred superset: schemas that survived the parent's exact Attempt authority are
+eager inside that already-bounded ceiling.
+
+Every new tool part records the exact provider-visible schema identity beside the call.
+Before a request, retained history from earlier turns is checked against the current
+post-hook definitions. Current-turn tool continuations always keep their native pair so
+an unknown or refused call can receive its protocol-complete result. For earlier turns, a
+matching declaration preserves native tool-use/result protocol. A missing tool, a changed
+schema, or an unreadable identity is replayed as inert JSON text for that request and
+emits `historical_tool_declaration_repaired`; durable history is not rewritten and an
+unavailable implementation is never advertised as callable merely to satisfy replay.
+For released rows without an identity, Zuno first recovers the exact hashes from the
+immutable provider-request Attempt keyed by the assistant message; if that proof is
+absent, the call is downgraded even when a same-named tool is currently active. This
+closes the `missing_tool_declaration` failure mode without silently binding an old call
+to a new schema. Tool-free internal compaction applies the same rule more broadly:
+tool calls and results enter the summarizer as bounded inert JSON text, never as native
+function protocol without declarations.
 
 MCP and extension tools therefore do not flow unconditionally into every child. An
 exact schema must be present in the parent Attempt and no later allowlist or explicit

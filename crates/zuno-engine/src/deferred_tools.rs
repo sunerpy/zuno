@@ -75,6 +75,26 @@ impl DeferredToolCatalog {
         lock(&self.exposure).revision
     }
 
+    /// Restore provider-visible ids from durable session history.
+    ///
+    /// Unknown ids are ignored because the caller may be reopening a session after an
+    /// MCP server was removed or its permission scope changed. The catalog remains the
+    /// authority for what is executable now; durable history only restores visibility
+    /// inside that current authority.
+    pub(crate) fn restore_exposed(&self, ids: impl IntoIterator<Item = String>) -> Vec<String> {
+        let mut exposure = lock(&self.exposure);
+        let mut restored = Vec::new();
+        for id in ids {
+            if self.candidate_ids.contains(&id) && exposure.exposed.insert(id.clone()) {
+                restored.push(id);
+            }
+        }
+        if !restored.is_empty() {
+            exposure.revision = exposure.revision.saturating_add(1);
+        }
+        restored
+    }
+
     pub(crate) fn search_tool(self: &Arc<Self>) -> Arc<dyn Tool> {
         erase(ToolSearch {
             catalog: Arc::clone(self),
@@ -385,5 +405,33 @@ mod tests {
         assert_eq!(second.revision, 2);
         assert!(catalog.is_exposed("browser_open"));
         assert!(catalog.is_exposed("network_read"));
+    }
+
+    #[test]
+    fn durable_exposure_restore_is_intersected_with_the_current_catalog() {
+        let catalog = DeferredToolCatalog::new(vec![
+            definition("penpot_execute", "Edit a design."),
+            definition("codegraph_explore", "Inspect source."),
+        ])
+        .expect("catalog");
+
+        let restored = catalog.restore_exposed([
+            "penpot_execute".to_owned(),
+            "disconnected_tool".to_owned(),
+            "penpot_execute".to_owned(),
+        ]);
+
+        assert_eq!(restored, ["penpot_execute"]);
+        assert!(catalog.is_exposed("penpot_execute"));
+        assert!(!catalog.is_exposed("codegraph_explore"));
+        assert_eq!(catalog.revision(), 1);
+
+        assert!(
+            catalog
+                .restore_exposed(["penpot_execute".to_owned()])
+                .is_empty(),
+            "reopening the same durable state is idempotent"
+        );
+        assert_eq!(catalog.revision(), 1);
     }
 }

@@ -1100,6 +1100,80 @@ fn uncertain_tool_part(part_id: &str, call_id: &str, observed_at_ms: i64) -> Val
 }
 
 #[test]
+fn completed_tool_search_results_rebuild_the_session_exposure_set() {
+    let connection = seeded();
+    let store = MessageStore::new(&connection);
+    store
+        .put_message(&MessageRecord::from_json(user_message(MESSAGE_ID, 1)).expect("user message"))
+        .expect("store the message the parts hang off");
+
+    for (id, tool, status, newly, matched) in [
+        (
+            "prt_search100000000000000000000",
+            "tool_search",
+            "completed",
+            json!(["penpot_execute_code", "codegraph_explore"]),
+            json!(["penpot_execute_code", "codegraph_explore"]),
+        ),
+        (
+            "prt_search200000000000000000000",
+            "tool_search",
+            "completed",
+            json!(["penpot_export_shape"]),
+            json!(["penpot_execute_code"]),
+        ),
+        (
+            "prt_search300000000000000000000",
+            "tool_search",
+            "error",
+            json!(["must_not_restore"]),
+            json!(["must_not_restore"]),
+        ),
+        (
+            "prt_search400000000000000000000",
+            "other_tool",
+            "completed",
+            json!(["also_ignored"]),
+            json!(["also_ignored"]),
+        ),
+    ] {
+        let part = PartRecord::from_json(
+            json!({
+                "id": id,
+                "sessionID": SESSION_ID,
+                "messageID": MESSAGE_ID,
+                "type": "tool",
+                "callID": format!("call-{id}"),
+                "tool": tool,
+                "state": {
+                    "status": status,
+                    "input": {},
+                    "output": "ok",
+                    "metadata": {
+                        "newlyExposedTools": newly,
+                        "matchedTools": matched,
+                    }
+                }
+            }),
+            1,
+        )
+        .expect("tool-search part");
+        store.put_part(&part).expect("store tool-search part");
+    }
+
+    assert_eq!(
+        store
+            .deferred_tool_exposures(SESSION_ID)
+            .expect("read durable exposure set"),
+        [
+            "codegraph_explore",
+            "penpot_execute_code",
+            "penpot_export_shape",
+        ]
+    );
+}
+
+#[test]
 fn an_uncertain_tool_call_stays_pending_until_exactly_it_is_reconciled() {
     let connection = seeded();
     let store = MessageStore::new(&connection);

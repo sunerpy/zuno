@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use futures::stream;
+use serde_json::Value;
 use zuno_config::schema::CompactionConfig;
 use zuno_db::message::{MessageRecord, MessageStore, PartRecord};
 use zuno_db::{Connection, migration, open};
@@ -360,11 +361,21 @@ fn owned_compaction_transcript_charges_full_tool_output_before_truncating_it() {
     let compactable = transcript_owned(COMPACTION_PROMPT, history);
     let tool_entry = compactable
         .iter()
-        .find(|entry| entry.message.role == Role::Tool)
-        .expect("owned transcript contains the tool result");
-    let RequestContentBlock::ToolResult { content, .. } = &tool_entry.message.content[0] else {
-        panic!("tool message did not contain a tool result");
+        .find(|entry| {
+            matches!(
+                entry.message.content.first(),
+                Some(RequestContentBlock::Text { text })
+                    if text.contains("\"kind\":\"historical_tool_result\"")
+            )
+        })
+        .expect("owned transcript contains the inert historical tool result");
+    assert_eq!(tool_entry.message.role, Role::User);
+    let RequestContentBlock::Text { text } = &tool_entry.message.content[0] else {
+        panic!("historical tool result did not become text");
     };
+    let (_, encoded) = text.split_once('\n').expect("notice and JSON payload");
+    let encoded: Value = serde_json::from_str(encoded).expect("historical result JSON");
+    let content = encoded["result"].as_str().expect("historical result text");
 
     assert_eq!(
         tool_entry.estimated_tokens, full_tool_tokens,

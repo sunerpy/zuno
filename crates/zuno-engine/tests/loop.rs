@@ -3756,40 +3756,35 @@ async fn loop_closes_an_undispatched_tool_call_without_claiming_a_lost_side_effe
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
-    let mut saw_use = false;
-    let mut saw_result = false;
-    for message in &request.messages {
-        for block in &message.content {
-            match block {
-                RequestContentBlock::ToolUse { id, .. } if id == "call-orphaned" => {
-                    saw_use = true;
-                }
-                RequestContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } if tool_use_id == "call-orphaned" => {
-                    saw_result = true;
-                    assert_eq!(
-                        content, "[Tool execution was interrupted]",
-                        "a call that never reached a tool must not demand an inspection"
-                    );
-                    assert_eq!(*is_error, Some(true));
-                }
-                RequestContentBlock::Text { .. }
-                | RequestContentBlock::ResourceLink { .. }
-                | RequestContentBlock::SignedThinking { .. }
-                | RequestContentBlock::ProviderEncryptedReasoning { .. }
-                | RequestContentBlock::ToolUse { .. }
-                | RequestContentBlock::ToolResult { .. }
-                | RequestContentBlock::Image { .. }
-                | RequestContentBlock::ImageAttachment { .. } => {}
+    let fallback = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|block| match block {
+            RequestContentBlock::Text { text } if text.contains("\"callID\":\"call-orphaned\"") => {
+                Some(text)
             }
-        }
-    }
+            _ => None,
+        })
+        .expect("the unavailable historical tool interaction is replayed as inert text");
     assert!(
-        saw_use && saw_result,
-        "provider must see a repaired tool pair"
+        fallback.contains("[Tool execution was interrupted]"),
+        "a call that never reached a tool must not demand an inspection: {fallback}"
+    );
+    assert!(
+        request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .all(|block| !matches!(
+                block,
+                RequestContentBlock::ToolUse { id, .. } if id == "call-orphaned"
+            ) && !matches!(
+                block,
+                RequestContentBlock::ToolResult { tool_use_id, .. }
+                    if tool_use_id == "call-orphaned"
+            )),
+        "an unavailable declaration must not remain native provider protocol"
     );
 
     let repaired = MessageStore::new(&connection)
@@ -3961,20 +3956,19 @@ async fn loop_repairs_a_dispatched_call_into_a_durable_inspection_obligation() {
         .iter()
         .flat_map(|message| &message.content)
         .find_map(|block| match block {
-            RequestContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } if tool_use_id == "call-1" => Some((content.clone(), *is_error)),
+            RequestContentBlock::Text { text } if text.contains("\"callID\":\"call-1\"") => {
+                Some(text.clone())
+            }
             _ => None,
         })
-        .expect("the abandoned call is closed for the model");
-    assert_eq!(
-        closed.0,
-        "[Tool execution was interrupted] Its final side-effect state is uncertain; inspect \
-         authoritative state before retrying."
+        .expect("the unavailable abandoned call is closed for the model as inert text");
+    assert!(
+        closed.contains(
+            "[Tool execution was interrupted] Its final side-effect state is uncertain; inspect \
+             authoritative state before retrying."
+        ),
+        "{closed}"
     );
-    assert_eq!(closed.1, Some(true));
 
     let pending = MessageStore::new(&connection)
         .pending_uncertain_tool_calls(SESSION_ID, 0)
@@ -4084,22 +4078,20 @@ async fn loop_treats_a_released_pending_row_as_an_unprovable_hand_off() {
         .iter()
         .flat_map(|message| &message.content)
         .find_map(|block| match block {
-            RequestContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } if tool_use_id == "call-1" => Some((content.clone(), *is_error)),
+            RequestContentBlock::Text { text } if text.contains("\"callID\":\"call-1\"") => {
+                Some(text.clone())
+            }
             _ => None,
         })
-        .expect("the pre-upgrade call is closed for the model");
-    assert_eq!(
-        closed.0,
-        "[Tool execution was interrupted] Its final side-effect state is uncertain; inspect \
-         authoritative state before retrying.",
+        .expect("the pre-upgrade call is closed for the model as inert text");
+    assert!(
+        closed.contains(
+            "[Tool execution was interrupted] Its final side-effect state is uncertain; inspect \
+             authoritative state before retrying."
+        ),
         "a call the released build may have dispatched must not be reported as a decided \
-         failure the model may reissue"
+         failure the model may reissue: {closed}"
     );
-    assert_eq!(closed.1, Some(true));
 
     let pending = MessageStore::new(&connection)
         .pending_uncertain_tool_calls(SESSION_ID, 0)
