@@ -22,6 +22,7 @@ pub enum DriverPhase {
     Executing,
     Reconciling,
     WaitingRetry,
+    WaitingBackground,
     WaitingHuman,
     Terminal,
 }
@@ -34,6 +35,7 @@ impl DriverPhase {
             Self::Executing => "executing",
             Self::Reconciling => "reconciling",
             Self::WaitingRetry => "waiting_retry",
+            Self::WaitingBackground => "waiting_background",
             Self::WaitingHuman => "waiting_human",
             Self::Terminal => "terminal",
         }
@@ -66,6 +68,9 @@ pub struct PlanReconciliationInput {
     pub active_todo: bool,
     /// A Job is active, uncertain, or still owns an unconsumed report.
     pub active_job: bool,
+    /// A background command is still observing remote work and will durably wake
+    /// the session when it settles.
+    pub remote_observer_running: bool,
     /// A durable Goal remains active and owns continuation.
     pub goal_active: bool,
     /// A read-only Plan Agent completed its planning turn and is handing the
@@ -86,6 +91,7 @@ pub enum PlanReconciliationDecision {
     Finish,
     ContinueGoal,
     ContinueOrdinary { attempt: u8 },
+    WaitForBackground,
     WaitForHuman { reason: PlanWaitingReason },
 }
 
@@ -197,7 +203,7 @@ impl PlanReconciliationDriver {
         input: PlanReconciliationInput,
     ) -> Result<PlanReconciliationDecision, DbError> {
         let attempt = self.attempts_for_cycle(session_id, cycle_id)?;
-        if input.planning_handoff && !input.active_job {
+        if input.planning_handoff && !input.active_job && !input.remote_observer_running {
             self.record(
                 session_id,
                 cycle_id,
@@ -216,6 +222,16 @@ impl PlanReconciliationDriver {
                 Some("durable_work_settled".to_owned()),
             )?;
             return Ok(PlanReconciliationDecision::Finish);
+        }
+        if input.remote_observer_running {
+            self.record(
+                session_id,
+                cycle_id,
+                DriverPhase::WaitingBackground,
+                attempt,
+                Some("remote_observer_running".to_owned()),
+            )?;
+            return Ok(PlanReconciliationDecision::WaitForBackground);
         }
         if input.goal_active {
             self.record(
@@ -350,6 +366,7 @@ mod tests {
             plan_terminal: false,
             active_todo: false,
             active_job: false,
+            remote_observer_running: false,
             goal_active: false,
             planning_handoff: false,
         }
@@ -411,6 +428,7 @@ mod tests {
             plan_terminal: false,
             active_todo: false,
             active_job: false,
+            remote_observer_running: false,
             goal_active: false,
             planning_handoff: false,
         };
@@ -476,6 +494,42 @@ mod tests {
                 .expect("decision"),
             PlanReconciliationDecision::ContinueOrdinary { attempt: 1 },
             "an open Todo is recorded work, not a prediction about the request"
+        );
+    }
+
+    #[test]
+    fn a_running_remote_observer_waits_without_spending_reconciliation_attempts() {
+        let driver = PlanReconciliationDriver::new(pool());
+        driver.begin("ses", "cycle").expect("begin");
+        let mut input = unfinished();
+        input.remote_observer_running = true;
+        input.goal_active = true;
+
+        assert_eq!(
+            driver
+                .reconcile("ses", "cycle", input)
+                .expect("first background wait"),
+            PlanReconciliationDecision::WaitForBackground
+        );
+        assert_eq!(
+            driver
+                .reconcile("ses", "cycle", input)
+                .expect("repeated background wait"),
+            PlanReconciliationDecision::WaitForBackground
+        );
+        let waiting = driver.projection("ses").expect("projection").unwrap();
+        assert_eq!(waiting.phase, DriverPhase::WaitingBackground);
+        assert_eq!(waiting.reconciliation_attempt, 0);
+        assert_eq!(waiting.reason.as_deref(), Some("remote_observer_running"));
+
+        input.remote_observer_running = false;
+        input.goal_active = false;
+        assert_eq!(
+            driver
+                .reconcile("ses", "cycle", input)
+                .expect("observer settled"),
+            PlanReconciliationDecision::ContinueOrdinary { attempt: 1 },
+            "once the observer settles, the ordinary durable-work policy resumes"
         );
     }
 

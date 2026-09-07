@@ -64,8 +64,12 @@ rejecting stale concurrent writes.
 Explicit Plan collaboration mode requires durable strategic Plan state. In
 ordinary Work mode, the model decides whether a Plan adds value from the full
 conversation; the host does not parse prompt keywords or generate visible
-generic steps. The model uses `plan_update action=create` for the first Plan or
-a genuinely new objective;
+generic steps. Immediately before every `plan_update`, the model calls
+`plan_get` and copies its returned revision into `expected_revision`. Only
+`action=create` after `plan_get` returned `null` may omit it; replacing an
+existing root, including a genuinely new objective, still carries the current
+revision. The model uses `plan_update action=create` for the first Plan or a
+genuinely new objective;
 `patch` changes only named step ids, `append` adds host-identified steps, `push`
 opens a focused child, and `pop` restores the exact parent without retransmitting
 the Plan. Every existing-Plan mutation requires the current
@@ -189,6 +193,13 @@ execution and projected through `bg` and the durable completion input. It does n
 change permissions or make the remote system part of the local process result; it
 requires the resumed Agent to refresh authoritative remote state before claiming that a
 CI run, deployment, or release completed.
+
+While a remote observer remains running and durable Plan, Todo, or Job work is
+unfinished, the reconciliation driver records `waiting_background`. The current
+turn may end, but Zuno does not spend its two ordinary reconciliation attempts,
+ask the user how to repair Plan state, or immediately auto-run an active Goal.
+The observer's durable terminal report wakes the session and normal reconciliation
+continues after the authoritative remote refresh.
 
 ## Reading output in windows
 

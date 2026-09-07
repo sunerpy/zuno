@@ -2308,10 +2308,12 @@ async fn runtime_policy_is_rendered_from_the_post_hook_tool_subset() {
         ["plan_update"]
     );
     let runtime = requests[0].developer_context.join("\n");
-    assert!(runtime.contains("Use Plan only for meaningfully multi-step work"));
-    assert!(runtime.contains("Skip straightforward and single-step work"));
+    assert!(runtime.contains("Use Plan only for meaningfully multi-step coordination or recovery"));
+    assert!(runtime.contains("skip single-step work"));
     assert!(runtime.contains("Never create a single-step Plan"));
-    assert!(runtime.contains("Todo is optional detail, not a mirror"));
+    assert!(runtime.contains("Todo is optional, not a mirror"));
+    assert!(runtime.contains("exact current revision from `runtime.work_state`"));
+    assert!(!runtime.contains("call `plan_get`"));
     assert!(runtime.contains("Durable Goal, Plan, Todo"));
     assert!(!runtime.contains("explorer"));
     assert!(!runtime.contains("editing surface"));

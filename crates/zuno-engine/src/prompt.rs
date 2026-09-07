@@ -165,27 +165,46 @@ impl RuntimePromptPolicy {
             .any(has);
 
         let mut execution = String::from(
-            "Choose the smallest coherent workflow. Batch independent reads and checks, do not \
-             re-read unchanged state, and do not rerun a check unless relevant inputs changed.",
+            "Choose the smallest coherent workflow. Batch independent reads; do not re-read \
+             unchanged state or rerun checks unless inputs changed.",
         );
         if !tools.is_empty() {
             execution.push_str(
-                " Before a substantial tool batch, briefly state the next action. For longer work, \
-                 give concise updates at meaningful milestones without narrating trivial \
-                 operations. Use another tool only to close a specific evidence gap or execute or \
-                 verify an authorized change. When the outcome and evidence are complete, stop \
-                 calling tools and answer. If tools cannot materially advance the objective, \
-                 report the blocker or uncertainty.",
+                " Before a substantial tool batch, state the next action; report meaningful \
+                 milestones. When complete, stop calling tools and answer. If no tool can \
+                 materially advance the objective, report the blocker. On unavailable, \
+                 rate-limited, or transient failure, do not repeat unchanged or widen permissions; \
+                 preserve evidence.",
+            );
+        }
+        if has("tool_search") {
+            execution.push_str(
+                " With `tool_search`, find authorized alternatives such as connected \
+                 `google_search`.",
+            );
+        }
+        if has("shell") {
+            execution.push_str(
+                " With Shell, prefer available `gh` for GitHub and `rg` for repo search over `curl`.",
             );
         }
         if has("plan_update") {
             execution.push_str(
-                " Use Plan only for meaningfully multi-step work needing coordination, \
-                 ordering, delegation, or recovery. Skip straightforward and single-step work, \
-                 including one bounded inspect-edit-test task or gates owned by an active Goal. \
-                 Never create a single-step Plan. Keep the active Plan current; Todo is optional \
-                 detail, not a mirror.",
+                " Use Plan only for meaningfully multi-step coordination or recovery; skip \
+                 single-step work and active-Goal gates. Never create a single-step Plan. Keep it \
+                 current; Todo is optional, not a mirror.",
             );
+            if has("plan_get") {
+                execution.push_str(
+                    " Before `plan_update`, copy latest `plan_get` revision to \
+                     `expected_revision`; omit only after null.",
+                );
+            } else {
+                execution.push_str(
+                    " Every existing-Plan mutation must carry the exact current revision from \
+                     `runtime.work_state`; only creation when no Plan exists may omit it.",
+                );
+            }
         }
         if has("bg") && has("shell") {
             execution.push_str(
@@ -1003,6 +1022,8 @@ mod tests {
                 "read",
                 "shell",
                 "bg",
+                "tool_search",
+                "plan_get",
                 "plan_update",
                 "task",
                 "goal_get",
@@ -1036,12 +1057,23 @@ mod tests {
             "runtime intent must prevent speculative exploration outside a bounded task"
         );
         assert!(!text.contains("web_search"));
-        assert!(!text.contains("unavailable"));
+        assert!(text.contains("unavailable, rate-limited, or transient failure"));
+        assert!(text.contains("do not repeat unchanged or widen permissions"));
+        assert!(text.contains("connected `google_search`"));
+        assert!(text.contains("available `gh` for GitHub"));
+        assert!(text.contains("`rg` for repo search"));
+        assert!(text.contains("over `curl`"));
         assert!(text.contains("Use Plan only for meaningfully multi-step"));
-        assert!(text.contains("Skip straightforward and single-step work"));
+        assert!(text.contains("skip single-step work"));
         assert!(text.contains("Never create a single-step Plan"));
-        assert!(text.contains("gates owned by an active Goal"));
-        assert!(text.contains("Todo is optional detail, not a mirror"));
+        assert!(text.contains("active-Goal gates"));
+        assert!(text.contains("Todo is optional, not a mirror"));
+        assert!(
+            text.contains("Before `plan_update`, copy latest `plan_get` revision")
+                && text.contains("to `expected_revision`")
+                && text.contains("omit only after null"),
+            "optimistic Plan writes must name their read-before-write recovery"
+        );
         assert!(
             text.contains("Evidence applies only to the exact artifact and inputs inspected"),
             "verification evidence must be scoped to the exact artifact and inputs"
@@ -1154,6 +1186,22 @@ mod tests {
             .join("\n");
         assert!(!read_only_text.contains("backgroundPurpose"));
         assert!(!read_only_text.contains("absent required children"));
+        assert!(!read_only_text.contains("connected `google_search`"));
+        assert!(!read_only_text.contains("use `gh` for GitHub"));
+
+        let plan_without_reader = policy.sections(["plan_update"], true);
+        let plan_without_reader_text = plan_without_reader
+            .iter()
+            .map(RuntimePromptSection::content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan_without_reader_text.contains("exact current revision from `runtime.work_state`")
+        );
+        assert!(
+            !plan_without_reader_text.contains("call `plan_get`"),
+            "runtime policy must not advertise a Plan reader removed from the final tool snapshot"
+        );
 
         let bg_only = policy.sections(["bg"], false);
         assert!(

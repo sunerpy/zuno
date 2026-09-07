@@ -94,6 +94,14 @@ estimated tokens, and a SHA-256 digest. A prompt cannot describe an editor,
 delegation target, or durable-state tool that was removed by role policy,
 allowlists, permission visibility, a provider capability, or a request hook.
 
+`runtime.execution` also derives a concise fallback rule from the final tool
+snapshot for built-in and custom Agents. It forbids repeating an unchanged
+rate-limited or transiently failing call. When `tool_search` is visible it may
+discover another already-authorized connected tool, including `google_search`;
+when Shell is visible it prefers an installed `gh` for GitHub or `rg` for
+repository search over raw `curl` or manual traversal. Absent tools receive no
+guidance, and fallback cannot widen permissions.
+
 Work-mode Plan use is value-based rather than phase-count-based. A bounded
 single-owner task does not create a Plan merely because it inspects, edits, and tests.
 Cross-component dependencies, delegation, independent gates, interruption recovery, or
@@ -111,6 +119,14 @@ resumed turn must inspect the retained output and re-query authoritative remote
 state by a stable run, attempt, ref, or release identifier. Required child jobs
 that were skipped, cancelled, missing, or never expanded are not execution
 evidence unless an explicit repository policy marks them optional.
+
+If durable Plan, Todo, or Job work remains while that remote observer is still
+running, reconciliation records `waiting_background` and ends the current turn
+without spending either ordinary reconciliation attempt or creating a
+`PlanUnreconciled` human request. An active Goal is not auto-driven again while
+the observer remains live. The existing process-owned completion watcher admits
+the terminal report and wakes the session, which then refreshes authoritative
+remote state and resumes normal reconciliation.
 
 Git commit attribution follows the same prompt-owned, auditable policy boundary.
 For commits Zuno creates, the fallback author and committer use the
@@ -181,7 +197,9 @@ cross-component request reach the same optional tool surface, while the model
 chooses whether durable coordination adds value from the full conversation.
 
 For explicit Plan mode, the runtime tells the model to read the current Plan and
-use operation-based `plan_update`:
+use operation-based `plan_update`. It calls `plan_get` immediately before every
+mutation and copies the returned current revision into `expected_revision`.
+Only the first `create`, after `plan_get` returned `null`, may omit it:
 
 - `create` creates the first strategic Plan, or replaces the visible root for a
   genuinely new objective. The host generates every step id. Replacing an
@@ -210,9 +228,10 @@ and a Plan mutation replaces the one-time Required instruction with Maintain.
 
 Machine execution state does not leak into the visible Plan. The
 `PlanReconciliationDriver` persists `idle`, `executing`, `reconciling`,
-`waiting_retry`, `waiting_human`, and `terminal` phase events in the existing
-session event log. Before a successful answer is delivered it evaluates only
-typed Plan, Todo, Job, Goal, tool-result, and verification state:
+`waiting_retry`, `waiting_background`, `waiting_human`, and `terminal` phase
+events in the existing session event log. Before a successful answer is
+delivered it evaluates only typed Plan, Todo, Job, Goal, background-observer,
+tool-result, and verification state:
 
 - a session that recorded no durable work finishes on its first answer;
 - terminal Plan state with no active Todo or Job may finish;
@@ -220,6 +239,8 @@ typed Plan, Todo, Job, Goal, tool-result, and verification state:
   planning handoff: its current Plan and Todos remain durable for Start Work
   and do not trigger execution reconciliation; an active Job still prevents
   handoff;
+- unfinished durable work with a live `remoteObserver` waits for its durable
+  completion wake without consuming reconciliation attempts;
 - an active Goal owns the next durable continuation;
 - an ordinary session holding unreconciled durable work receives at most two
   reconciliation continuations;
@@ -304,15 +325,17 @@ changed observation resets the sequence. Recovery is `Pause`, and an active Goal
 
 ### Instruction file admission
 
-Repository and user instruction files are admitted whole or not at all. A local rule file
-the host cannot read, or one that does not fit the instruction budget — 64 KB, or a quarter
-of the model's context window when that is smaller — fails the turn before the first provider
-request with a typed error naming the file and the remedy, and for a budget refusal its size
-and the budget. No notice is emitted for that case, because the turn does not run. The former
-behaviour, a status warning and a request sent without the dropped file, is gone: a turn that
-does not carry the rules the user wrote does not run. A remote instruction source that could
-not be fetched is the one non-fatal case: the turn proceeds without those rules and reports
-the `warning` notice `instruction.not_in_force` naming the source.
+Repository and user instruction files are admitted whole or not at all. A local
+rule file the host cannot read still fails the turn before the first provider
+request with a typed error naming the file and remedy. An intact entry that does not fit the instruction budget
+— 64 KB, or a quarter of the model's context
+window when that is smaller — is instead skipped atomically. The host reports
+the `warning` notice `instruction.not_in_force` with source, byte count, budget,
+and remaining space, then considers later smaller entries normally. It never
+truncates a rule file, and an oversized `AGENTS.md` does not prevent ACP, TUI,
+server, or CLI startup. A remote instruction source that could not be fetched
+uses the same non-fatal notice because network availability must not decide
+whether the Agent runs.
 
 ## Extension packages and executable plugin hosts
 

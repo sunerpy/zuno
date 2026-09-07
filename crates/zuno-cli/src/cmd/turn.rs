@@ -8434,6 +8434,9 @@ impl TurnHost {
         if !self.last_turn_completed {
             return Ok(false);
         }
+        if self.waiting_for_remote_observer()? {
+            return Ok(false);
+        }
         self.goal_projection
             .ingest(&self.goal_store)
             .map_err(to_string)?;
@@ -8696,7 +8699,9 @@ impl TurnHost {
                 .reconcile(&self.session_id, &cycle_id, input)
                 .map_err(TurnFailure::Database)?
             {
-                PlanReconciliationDecision::Finish | PlanReconciliationDecision::ContinueGoal => {
+                PlanReconciliationDecision::Finish
+                | PlanReconciliationDecision::ContinueGoal
+                | PlanReconciliationDecision::WaitForBackground => {
                     self.cancel_reconciled_plan_requests(&cycle_id)
                         .map_err(TurnFailure::host)?;
                     events
@@ -8937,9 +8942,31 @@ impl TurnHost {
             plan_terminal,
             active_todo,
             active_job,
+            remote_observer_running: self.remote_observer_running(),
             goal_active,
             planning_handoff: self.agent == "plan",
         })
+    }
+
+    fn remote_observer_running(&self) -> bool {
+        self.background_executions
+            .list_for_session(&self.session_id)
+            .into_iter()
+            .any(|execution| {
+                execution.status == zuno_pty::BackgroundExecutionStatus::Running
+                    && execution.purpose == zuno_pty::BackgroundExecutionPurpose::RemoteObserver
+            })
+    }
+
+    fn waiting_for_remote_observer(&self) -> Result<bool, String> {
+        let waiting = self
+            .plan_reconciliation
+            .projection(&self.session_id)
+            .map_err(to_string)?
+            .is_some_and(|projection| {
+                projection.phase == zuno_engine::plan_driver::DriverPhase::WaitingBackground
+            });
+        Ok(waiting && self.remote_observer_running())
     }
 
     async fn recover_context(
@@ -10890,7 +10917,7 @@ impl InstructionAdmission {
     }
 }
 
-/// Put the `AGENTS.md`-class rules in the system prompt, or refuse to take the turn.
+/// Put whole `AGENTS.md`-class rule files in the system prompt and report exclusions.
 ///
 /// # Placement: after memory, before the skill catalogue
 ///
@@ -10905,28 +10932,22 @@ impl InstructionAdmission {
 /// here is agent prompt, memory, instructions, skills, which maps one-to-one onto the
 /// oracle's.
 ///
-/// # A rule that cannot be admitted stops the turn
+/// # Whole files are admitted or skipped
 ///
-/// Whole files are admitted or refused, never cut. A rule file cut mid-sentence is
+/// Whole files are admitted or skipped, never cut. A rule file cut mid-sentence is
 /// worse than an absent one: "do X unless Y" truncated after "do X" inverts the rule
 /// the user wrote, while they go on believing it is in force.
 ///
-/// Dropping the file and continuing has the same defect one step later, which is why
-/// this function no longer does it. The drop was reported, but only as one status
-/// detail among a turn's worth of them, and the request went to the provider anyway
-/// with the user's rules absent — so the model answered confidently under rules it had
-/// never seen, and the session's conclusions were wrong for a reason invisible in its
-/// own transcript. Refusing before the first provider request is the same treatment
-/// [`ensure_selected_skill_prompt_budget`] already gives an oversized Skill body, and
-/// an instruction file is the more authoritative of the two: a Skill that does not
-/// load merely goes unused.
+/// An entry that cannot fit the effective prompt budget is omitted as one atomic unit.
+/// The omission is carried in [`InstructionAdmission::degraded`] and reaches every
+/// surface as the typed `instruction.not_in_force` notice before the provider request.
+/// Later smaller entries are still considered, so one large project file cannot make
+/// ACP, TUI, server, or CLI startup unusable or starve independent configured rules.
 ///
-/// Two conditions therefore fail the turn, each naming the path, the size and the
-/// remedy:
-///
-/// - a local file that exists but could not be read, because discovery records only
-///   paths that are there, so an unreadable one is a rule the user wrote and can fix;
-/// - any entry that does not fit [`instruction_prompt_budget`].
+/// An unreadable local file still fails the turn. Discovery records only paths that
+/// exist, so unreadable bytes mean a rule the user intended to apply cannot even be
+/// inspected safely; this is distinct from a complete oversized file whose exclusion
+/// can be named exactly.
 ///
 /// # A failed remote fetch is reported, not fatal
 ///
@@ -10942,10 +10963,10 @@ impl InstructionAdmission {
 ///
 /// # Errors
 ///
-/// An unreadable local rule file, an entry past the effective budget, or a rejection
-/// from [`Resolver::append_prompt_section`]. Contents are never echoed in the message:
-/// they are user-authored, and the path plus the byte count is what identifies the
-/// file to fix.
+/// An unreadable local rule file or a rejection from
+/// [`Resolver::append_prompt_section`]. Contents are never echoed in an error or
+/// degraded notice: they are user-authored, and the path plus byte count identifies
+/// the file.
 fn announce_instructions(
     resolver: &mut Resolver,
     loaded: &zuno_config::LoadedInstructions,
@@ -10976,19 +10997,21 @@ fn announce_instructions(
     let mut admitted_bytes = 0usize;
     for (index, entry) in loaded.entries().iter().enumerate() {
         let block = entry.render();
-        let projected = if admitted_bytes == 0 {
-            block.len()
-        } else {
-            admitted_bytes + 2 + block.len()
-        };
+        let separator = usize::from(admitted_bytes != 0).saturating_mul(2);
+        let projected = admitted_bytes
+            .saturating_add(separator)
+            .saturating_add(block.len());
         if projected > budget {
-            return Err(format!(
-                "instruction file {} ({} bytes) does not fit the {budget}-byte prompt budget \
-                 for this model, so none of its rules would be in force; shorten it or remove \
-                 it from `instructions`",
-                entry.source(),
-                block.len(),
+            let remaining = budget.saturating_sub(admitted_bytes.saturating_add(separator));
+            admission.degraded.push((
+                entry.source().to_owned(),
+                format!(
+                    "the {}-byte instruction entry was skipped because it does not fit the \
+                     {budget}-byte prompt budget for this model ({remaining} bytes remain)",
+                    block.len(),
+                ),
             ));
+            continue;
         }
         admitted_bytes = projected;
         let origin = match entry.origin() {
