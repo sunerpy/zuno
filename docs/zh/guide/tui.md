@@ -103,6 +103,11 @@ child Plan 也不能覆盖 root 面板。
 | `diff_open` | `<leader>d` | Diff 浏览器 |
 | `app_exit` | `ctrl+c`、`ctrl+d`、`<leader>q` | 退出 |
 
+可打印输入始终只有一个所有者。弹窗打开时，未被快捷键认领的文本只进入当前弹窗，不会同时
+写进背后的编辑区。终端可能把一次按键报告为 Press、Repeat 与 Release：Press 写入一次，
+Repeat 保留正常的长按连输语义，Release 永远不写入文本。因此 Windows 上的一组
+press/release 事件在模型、会话、Agent、主题、Skill 等可搜索弹窗中只会产生一个字符。
+
 `Ctrl+C` 与 `Ctrl+D` 都需要确认。第一次按下后，末行显示
 `ctrl+c again to exit` 或 `ctrl+d again to exit`；必须在 1.5 秒内再次按下同一个组合键。
 回合运行中第一次按键还会请求硬中断。换成另一个组合键，或超过时间窗口，只会重新开始确认，

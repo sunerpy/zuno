@@ -5378,6 +5378,57 @@ fn a_bedrock_config_region_outranks_the_ambient_region_in_a_catalog_url() {
     );
 }
 
+#[test]
+fn a_global_bedrock_openai_model_selects_runtime_before_provider_construction() {
+    let document = serde_json::from_str(
+        r#"{"amazon-bedrock":{
+             "id":"amazon-bedrock",
+             "name":"Amazon Bedrock",
+             "env":[],
+             "npm":"@ai-sdk/amazon-bedrock",
+             "models":{"global.openai.gpt-5.6-terra":{
+               "id":"global.openai.gpt-5.6-terra",
+               "name":"GPT-5.6 Terra (Global)",
+               "reasoning":true,
+               "tool_call":true,
+               "limit":{"context":1050000,"output":128000}}}}}"#,
+    )
+    .expect("Bedrock catalog");
+    let config = serde_json::from_str(
+        r#"{"provider":{"amazon-bedrock":{
+             "options":{"profile":"us","region":"us-east-2"}}}}"#,
+    )
+    .expect("Bedrock config");
+    let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
+    let model = catalog
+        .model("amazon-bedrock", "global.openai.gpt-5.6-terra")
+        .expect("global Bedrock OpenAI model");
+
+    assert_eq!(model.api.transport, Some(ProviderTransport::BedrockRuntime));
+    let spec = model_spec(&catalog, model, &Env::empty()).expect("Bedrock Runtime spec");
+    assert_eq!(spec.factory(), "amazon-bedrock-runtime");
+    assert_eq!(spec.surface, ApiSurface::Responses);
+
+    let mismatched = serde_json::from_str(
+        r#"{"provider":{"amazon-bedrock":{
+             "options":{"profile":"us","region":"us-east-2"},
+             "models":{"global.openai.gpt-5.6-terra":{
+               "provider":{"transport":"bedrock"}}}}}}"#,
+    )
+    .expect("explicit mismatch config");
+    let mismatched = Catalog::resolve(&document, &ResolveInput::new().with_config(&mismatched));
+    let model = mismatched
+        .model("amazon-bedrock", "global.openai.gpt-5.6-terra")
+        .expect("explicitly configured model");
+    assert_eq!(model.api.transport, Some(ProviderTransport::Bedrock));
+    let error = model_spec(&mismatched, model, &Env::empty())
+        .expect_err("an explicit Converse mismatch must fail before provider construction");
+    assert!(
+        error.contains("requires transport `bedrock-runtime`"),
+        "{error}"
+    );
+}
+
 /// A rung is chosen on its unexpanded text, and expanded only afterwards.
 ///
 /// The oracle tests `options["baseURL"] !== ""` at `:1699-1700` and expands at `:1712`, in
@@ -7573,6 +7624,49 @@ fn a_turn_charges_the_goal_once_for_tokens_a_request_already_accounted_for() {
             .tokens_used,
         150,
         "one response costs the goal one response"
+    );
+}
+
+#[test]
+fn report_host_open_preserves_a_paused_goal_until_work_explicitly_starts() {
+    let spill = tempfile::tempdir().expect("goal spill directory");
+    let goals = GoalStore::open_memory(spill.path().to_owned()).expect("open in-memory goal store");
+    let session_id = "ses_report_open";
+    goals
+        .create_goal(session_id, "wait for an explicit work start", None)
+        .expect("create goal");
+    let paused = goals
+        .enter_plan_mode(session_id)
+        .expect("enter plan mode")
+        .expect("goal");
+    let pause = goals
+        .pause_state(session_id)
+        .expect("read pause")
+        .expect("pause");
+
+    let preserved = goal_for_host_open(&goals, session_id, "build", GoalHostOpen::Preserve)
+        .expect("open a report host")
+        .expect("goal");
+    assert_eq!(preserved, paused);
+    assert_eq!(
+        goals
+            .pause_state(session_id)
+            .expect("read preserved pause")
+            .expect("pause"),
+        pause,
+        "opening a report host must not consume the lifecycle state it is inspecting"
+    );
+
+    let resumed = goal_for_host_open(&goals, session_id, "build", GoalHostOpen::FollowAgentMode)
+        .expect("start work")
+        .expect("goal");
+    assert_eq!(resumed.status, zuno_goal::GoalStatus::Active);
+    assert!(
+        goals
+            .pause_state(session_id)
+            .expect("read consumed pause")
+            .is_none(),
+        "only an explicit work-mode open consumes a resumable pause"
     );
 }
 
@@ -13518,6 +13612,50 @@ async fn resume_seed_ignores_new_sessions_and_memory_databases() {
         saved_session_notes(&plan).is_empty(),
         "an in-memory database is no seed and no failure: {:?}",
         plan.notes
+    );
+}
+
+#[test]
+fn only_report_delivery_uses_the_goal_preserving_host_open() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd");
+    let child = std::fs::read_to_string(root.join("child_turn.rs")).expect("child_turn.rs");
+    let report_start = child
+        .find("impl PendingInputDriver for ParentReportDriver")
+        .expect("parent report driver");
+    let report_end = child[report_start..]
+        .find("impl ParentReportDriver")
+        .map(|offset| report_start + offset)
+        .expect("parent report helper");
+    let report_driver = &child[report_start..report_end];
+    assert!(
+        report_driver.contains("TurnHost::open_with_dependencies_preserving_goal("),
+        "the detached parent-report path resumed the Goal before checking its lifecycle"
+    );
+    assert!(
+        child[..report_start].contains("TurnHost::open_with_dependencies("),
+        "ordinary child and workflow turns must still enter Work normally"
+    );
+
+    let serve = std::fs::read_to_string(root.join("serve.rs")).expect("serve.rs");
+    let prompt_start = serve
+        .find("    fn prompt(")
+        .expect("server prompt executor");
+    let reports_start = serve
+        .find("    fn reports(")
+        .expect("server report executor");
+    let compact_start = serve
+        .find("    fn compact(")
+        .expect("server compact executor");
+    let prompt = &serve[prompt_start..reports_start];
+    let reports = &serve[reports_start..compact_start];
+    assert!(
+        prompt.contains("executor.open_active(&spec)")
+            && !prompt.contains("open_active_preserving_goal"),
+        "a user prompt must retain Start Work semantics"
+    );
+    assert!(
+        reports.contains("executor.open_active_preserving_goal(&spec)"),
+        "the server report path resumed the Goal before persisting the report"
     );
 }
 

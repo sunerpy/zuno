@@ -3759,6 +3759,7 @@ async fn loop_closes_an_undispatched_tool_call_without_claiming_a_lost_side_effe
     let fallback = request
         .messages
         .iter()
+        .filter(|message| message.role == Role::User)
         .flat_map(|message| &message.content)
         .find_map(|block| match block {
             RequestContentBlock::Text { text } if text.contains("\"callID\":\"call-orphaned\"") => {
@@ -3954,6 +3955,7 @@ async fn loop_repairs_a_dispatched_call_into_a_durable_inspection_obligation() {
     let closed = requests[0]
         .messages
         .iter()
+        .filter(|message| message.role == Role::User)
         .flat_map(|message| &message.content)
         .find_map(|block| match block {
             RequestContentBlock::Text { text } if text.contains("\"callID\":\"call-1\"") => {
@@ -4076,6 +4078,7 @@ async fn loop_treats_a_released_pending_row_as_an_unprovable_hand_off() {
     let closed = requests[0]
         .messages
         .iter()
+        .filter(|message| message.role == Role::User)
         .flat_map(|message| &message.content)
         .find_map(|block| match block {
             RequestContentBlock::Text { text } if text.contains("\"callID\":\"call-1\"") => {

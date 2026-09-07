@@ -66,37 +66,55 @@ impl ServerSessionMutationExecutor {
     }
 
     async fn open_active(&self, spec: &ServerHostSpec) -> Result<TurnHost, String> {
+        self.open_active_mode(spec, false).await
+    }
+
+    async fn open_active_preserving_goal(&self, spec: &ServerHostSpec) -> Result<TurnHost, String> {
+        self.open_active_mode(spec, true).await
+    }
+
+    async fn open_active_mode(
+        &self,
+        spec: &ServerHostSpec,
+        preserve_goal: bool,
+    ) -> Result<TurnHost, String> {
         let _composition = self.composition_gate.lock().await;
         let plan = TurnPlan::resolve(
             &spec.options(super::turn::ExtensionComposition::Active),
             &self.environment,
         )
         .await?;
-        self.open_plan(plan).await
+        self.open_plan(plan, preserve_goal).await
     }
 
-    async fn open_plan(&self, plan: TurnPlan) -> Result<TurnHost, String> {
+    async fn open_plan(&self, plan: TurnPlan, preserve_goal: bool) -> Result<TurnHost, String> {
         let approval: Arc<dyn PermissionAsker> = Arc::new(ServerPermissionAsker {
             requests: self.requests.clone(),
         });
         let question: Arc<dyn QuestionAsker> = Arc::new(ServerQuestionAsker {
             requests: self.requests.clone(),
         });
-        let mut host = TurnHost::open_with_runtime_mcp_and_observers(
-            plan,
-            &self.environment,
-            TurnHostRuntimeDependencies {
-                approval,
-                question: Some(question),
-                runs: self.runs.clone(),
-                mcp: self.mcp.clone(),
-                child_observer: None,
-                detached_observer: Some(
-                    Arc::clone(&self.detached_observer) as Arc<dyn DetachedTurnObserver>
-                ),
-            },
-        )
-        .await?;
+        let dependencies = TurnHostRuntimeDependencies {
+            approval,
+            question: Some(question),
+            runs: self.runs.clone(),
+            mcp: self.mcp.clone(),
+            child_observer: None,
+            detached_observer: Some(
+                Arc::clone(&self.detached_observer) as Arc<dyn DetachedTurnObserver>
+            ),
+        };
+        let mut host = if preserve_goal {
+            TurnHost::open_with_runtime_mcp_and_observers_preserving_goal(
+                plan,
+                &self.environment,
+                dependencies,
+            )
+            .await?
+        } else {
+            TurnHost::open_with_runtime_mcp_and_observers(plan, &self.environment, dependencies)
+                .await?
+        };
         if let Err(error) = host.activate_extension_composition() {
             let shutdown = host.shutdown().await;
             return Err(match shutdown {
@@ -186,7 +204,7 @@ impl ServerSessionMutationExecutor {
             }
         };
         plan.use_prepared_extension_transition(prepared)?;
-        let mut candidate = self.open_plan(plan).await?;
+        let mut candidate = self.open_plan(plan, false).await?;
         candidate.shutdown().await
     }
 }
@@ -462,7 +480,7 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 agent: request.agent,
                 model: request.model,
             };
-            let mut host = executor.open_active(&spec).await?;
+            let mut host = executor.open_active_preserving_goal(&spec).await?;
             let outcome = async {
                 host.drive_promoted_reports_with_guard(&request.reports, &guard, events.clone())
                     .await?;

@@ -6,11 +6,12 @@ use crate::app::{
     App, DrawTarget, TerminalEvent, TerminalLifecycle, render_offscreen, terminal_event_channel,
 };
 use crate::config::ResolvedTuiConfig;
-use crate::keybind::{Chord, Keymap};
+use crate::keybind::{Chord, KeyDispatcher, Keymap};
 use crate::views::message::TranscriptView;
 use crate::views::testkit::{action, press, rows};
 use crossterm::event::{
-    Event as CrosstermEvent, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event as CrosstermEvent, KeyCode, KeyEventKind, KeyEventState, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
 };
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -954,14 +955,24 @@ fn views_dialog_typed_keys_filter_the_dialog_and_never_reach_the_base() {
     assert!(host.is_open(), "the picker did not open");
 
     for character in "beta".chars() {
-        host.handle_event(&AppEvent::Terminal(crate::app::TerminalEvent::Input(
-            crossterm::event::Event::Key(press(KeyCode::Char(character))),
-        )));
+        for key in [
+            press(KeyCode::Char(character)),
+            KeyEvent {
+                code: KeyCode::Char(character),
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Release,
+                state: KeyEventState::NONE,
+            },
+        ] {
+            host.handle_event(&AppEvent::Terminal(crate::app::TerminalEvent::Input(
+                crossterm::event::Event::Key(key),
+            )));
+        }
     }
     let joined = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
     assert!(
-        joined.contains("beta"),
-        "the filter did not reach the dialog:\n{joined}"
+        joined.contains("Models (1) — beta"),
+        "one Windows press/release pair did not produce exactly one filter character:\n{joined}"
     );
     assert!(
         !joined.contains("alpha"),
@@ -974,6 +985,60 @@ fn views_dialog_typed_keys_filter_the_dialog_and_never_reach_the_base() {
     assert!(
         !after.contains("beta"),
         "typed text leaked into the prompt behind the dialog:\n{after}"
+    );
+}
+
+#[test]
+fn views_dialog_dispatcher_accepts_press_and_repeat_but_never_release_as_text() {
+    let context = ViewContext::defaults();
+    let mut host = DialogHost::new(context.clone(), Box::new(FocusedBase));
+    host.open(Box::new(crate::views::picker::model_picker(
+        context,
+        vec![
+            crate::views::picker::ModelEntry {
+                id: "provider/gg-model".to_owned(),
+                name: "GG Model".to_owned(),
+                provider: "provider".to_owned(),
+                reasoning: false,
+            },
+            crate::views::picker::ModelEntry {
+                id: "provider/alpha".to_owned(),
+                name: "Alpha".to_owned(),
+                provider: "provider".to_owned(),
+                reasoning: false,
+            },
+        ],
+    )));
+    let mut dispatcher = KeyDispatcher::new(
+        Keymap::defaults().expect("default keymap"),
+        vec!["session".to_owned()],
+        Box::new(host),
+    );
+
+    let event = |kind| {
+        AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Key(KeyEvent {
+            code: KeyCode::Char('g'),
+            modifiers: KeyModifiers::NONE,
+            kind,
+            state: KeyEventState::NONE,
+        })))
+    };
+    assert_eq!(
+        dispatcher.handle_event(&event(KeyEventKind::Press)),
+        EventResult::REDRAW
+    );
+    assert_eq!(
+        dispatcher.handle_event(&event(KeyEventKind::Repeat)),
+        EventResult::REDRAW
+    );
+    let released = dispatcher.handle_event(&event(KeyEventKind::Release));
+    assert!(released.handled);
+    assert!(!released.redraw);
+
+    let rendered = rows(&render_offscreen(&mut dispatcher, 70, 20).expect("infallible")).join("\n");
+    assert!(
+        rendered.contains("Models (1) — gg"),
+        "Press + Repeat should type twice while Release types nothing:\n{rendered}"
     );
 }
 

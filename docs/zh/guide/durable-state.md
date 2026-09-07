@@ -461,7 +461,8 @@ job、待处理报告的身份，以及最近一条先前提示词收据的 id�
 cancelled 或其他非 active 状态时，宿主仍会把每条 promoted 报告提交为独立的持久 user
 message，并结清对应 inbox 行，但不会启动 provider 回合。之后显式恢复 Goal 时，会从这些
 消息继续。这样既不丢后台报告，也不会让子任务绕过认证、权限、人工输入、Plan 模式或
-`uncertain_side_effect` 暂停。
+`uncertain_side_effect` 暂停。报告专用宿主会先原样读取生命周期状态，不会在判断前调用
+Start Work，因此仅仅打开宿主也不能消费一个本可恢复的暂停。
 
 在还有活跃 job 或未被消费的报告时，不要完成父级。报告投递见[编排](/zh/guide/orchestration)。
 

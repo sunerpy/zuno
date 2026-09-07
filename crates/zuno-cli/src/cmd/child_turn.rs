@@ -2122,7 +2122,7 @@ impl PendingInputDriver for ParentReportDriver {
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let plan = TurnPlan::resolve(&options, &self.environment).await?;
-        let mut host = TurnHost::open_with_dependencies(
+        let mut host = TurnHost::open_with_dependencies_preserving_goal(
             plan,
             &self.environment,
             TurnHostDependencies {

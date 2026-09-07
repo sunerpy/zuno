@@ -125,6 +125,13 @@ next turn. It is never lost or duplicated.
 | `diff_open` | `<leader>d` | Diff browser |
 | `app_exit` | `ctrl+c`, `ctrl+d`, `<leader>q` | Exit |
 
+Printable input has one owner. While a dialog is open, unmatched text goes only
+to that dialog and never to the composer behind it. Terminals may report a key
+as Press, Repeat, and Release events; Press inserts once, Repeat preserves
+normal key-repeat behavior, and Release never inserts text. A Windows
+press/release pair therefore contributes exactly one character to model,
+session, Agent, theme, Skill, and other searchable dialogs.
+
 `Ctrl+C` and `Ctrl+D` are confirmed exits. The first press shows
 `ctrl+c again to exit` or `ctrl+d again to exit` in the final row; the same chord must be
 pressed again within 1.5 seconds. During a turn, the first press also requests a hard

@@ -106,6 +106,37 @@ fn catalog_transport(provider_id: &str, package: Option<&str>) -> Option<Provide
     }
 }
 
+/// Correct the generic Bedrock SDK package for OpenAI inference-profile ids.
+///
+/// models.dev publishes `global.openai.*`, `us.openai.*`, and
+/// `us-gov.openai.*` under `@ai-sdk/amazon-bedrock`, the same package used by
+/// Converse models. Those ids are nevertheless OpenAI Responses models served
+/// by Bedrock Runtime's `/openai/v1/responses` endpoint. Carry that protocol
+/// fact as a typed transport before any picker, Agent policy, or provider
+/// factory consumes the catalog.
+fn model_transport(
+    model_id: &str,
+    transport: Option<ProviderTransport>,
+) -> Option<ProviderTransport> {
+    if transport == Some(ProviderTransport::Bedrock)
+        && is_bedrock_openai_responses_profile(model_id)
+    {
+        Some(ProviderTransport::BedrockRuntime)
+    } else {
+        transport
+    }
+}
+
+/// Whether `model_id` is an AWS inference profile for the Bedrock Runtime
+/// OpenAI Responses endpoint.
+#[must_use]
+pub fn is_bedrock_openai_responses_profile(model_id: &str) -> bool {
+    let mut segments = model_id.splitn(3, '.');
+    matches!(segments.next(), Some("global" | "us" | "us-gov"))
+        && segments.next() == Some("openai")
+        && segments.next().is_some_and(|model| !model.is_empty())
+}
+
 /// The reasoning field DeepSeek-compatible endpoints use — `:1486`.
 const DEEPSEEK_REASONING_FIELD: &str = "reasoning_content";
 
@@ -225,7 +256,10 @@ fn model_from_catalog(
         status: model.status.unwrap_or(CatalogStatus::Active),
         api: ModelApi {
             id: model.id.clone(),
-            transport: catalog_transport(provider_id, package.as_deref()),
+            transport: model_transport(
+                &model.id,
+                catalog_transport(provider_id, package.as_deref()),
+            ),
             url,
             endpoint: None,
         },
@@ -433,18 +467,21 @@ fn merge_model(
         .or_else(|| existing.map(|model| model.api.id.clone()))
         .unwrap_or_else(|| model_key.to_owned());
 
-    let api_transport = config
-        .provider
-        .as_ref()
-        .and_then(|api| api.transport)
-        .or(provider_config.transport)
-        .or_else(|| existing.and_then(|model| model.api.transport))
-        .or_else(|| {
-            catalog_transport(
-                provider_id,
-                catalog.and_then(|provider| provider.npm.as_deref()),
-            )
-        });
+    let model_transport_override = config.provider.as_ref().and_then(|api| api.transport);
+    let api_transport = model_transport_override.or_else(|| {
+        model_transport(
+            &api_id,
+            provider_config
+                .transport
+                .or_else(|| existing.and_then(|model| model.api.transport))
+                .or_else(|| {
+                    catalog_transport(
+                        provider_id,
+                        catalog.and_then(|provider| provider.npm.as_deref()),
+                    )
+                }),
+        )
+    });
 
     let api_url = config
         .provider
@@ -891,6 +928,95 @@ mod tests {
         // And with nothing anywhere, the documented default.
         let resolved = apply_config("acme", &config, None, None, &mut outcome);
         assert_eq!(resolved.models["m"].api.transport, Some(DEFAULT_TRANSPORT));
+    }
+
+    #[test]
+    fn bedrock_openai_inference_profiles_resolve_to_runtime_responses() {
+        let catalog: CatalogProvider = serde_json::from_str(
+            r#"{
+              "name":"Amazon Bedrock","id":"amazon-bedrock","env":[],
+              "npm":"@ai-sdk/amazon-bedrock",
+              "models":{
+                "global.openai.gpt-5.6-terra":{
+                  "id":"global.openai.gpt-5.6-terra","name":"GPT-5.6 Terra (Global)",
+                  "limit":{"context":1050000,"output":128000}
+                },
+                "us.anthropic.claude-opus-5":{
+                  "id":"us.anthropic.claude-opus-5","name":"Claude Opus 5",
+                  "limit":{"context":1000000,"output":128000}
+                },
+                "openai.gpt-5.6-terra":{
+                  "id":"openai.gpt-5.6-terra","name":"GPT-5.6 Terra",
+                  "limit":{"context":1050000,"output":128000},
+                  "provider":{
+                    "npm":"@ai-sdk/amazon-bedrock/mantle",
+                    "api":"https://bedrock-mantle.${AWS_REGION}.api.aws/openai/v1"
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("Bedrock catalog parses");
+        let resolved = from_catalog("amazon-bedrock", &catalog);
+
+        assert_eq!(
+            resolved.models["global.openai.gpt-5.6-terra"].api.transport,
+            Some(ProviderTransport::BedrockRuntime),
+            "the generic Bedrock package must not route an OpenAI profile to Converse"
+        );
+        assert_eq!(
+            resolved.models["us.anthropic.claude-opus-5"].api.transport,
+            Some(ProviderTransport::Bedrock),
+            "ordinary Bedrock models remain on Converse"
+        );
+        assert_eq!(
+            resolved.models["openai.gpt-5.6-terra"].api.transport,
+            Some(ProviderTransport::BedrockMantle),
+            "an explicit Mantle model remains on Mantle"
+        );
+
+        let config = provider_config(
+            r#"{
+              "transport":"bedrock",
+              "models":{"global.openai.gpt-5.6-terra":{}}
+            }"#,
+        );
+        let configured = apply_config(
+            "amazon-bedrock",
+            &config,
+            Some(&resolved),
+            Some(&catalog),
+            &mut MergeOutcome::default(),
+        );
+        assert_eq!(
+            configured.models["global.openai.gpt-5.6-terra"]
+                .api
+                .transport,
+            Some(ProviderTransport::BedrockRuntime),
+            "a provider-wide Converse default cannot override the model's Responses protocol"
+        );
+
+        let explicit = provider_config(
+            r#"{
+              "models":{
+                "global.openai.gpt-5.6-terra":{
+                  "provider":{"transport":"bedrock"}
+                }
+              }
+            }"#,
+        );
+        let explicit = apply_config(
+            "amazon-bedrock",
+            &explicit,
+            Some(&resolved),
+            Some(&catalog),
+            &mut MergeOutcome::default(),
+        );
+        assert_eq!(
+            explicit.models["global.openai.gpt-5.6-terra"].api.transport,
+            Some(ProviderTransport::Bedrock),
+            "an explicit per-model transport remains visible for typed mismatch validation"
+        );
     }
 
     #[test]
