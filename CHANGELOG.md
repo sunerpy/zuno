@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.21](https://github.com/sunerpy/zuno/compare/v0.10.20...v0.10.21) (2026-09-08)
+
+
+### Bug Fixes
+
+* **runtime:** 统一 Responses 输入边界投影 ([0834026](https://github.com/sunerpy/zuno/commit/08340269cfe42d76b18e212ebd7e256e6248a42b))
+
 ## [0.10.20](https://github.com/sunerpy/zuno/compare/v0.10.19...v0.10.20) (2026-09-07)
 
 
