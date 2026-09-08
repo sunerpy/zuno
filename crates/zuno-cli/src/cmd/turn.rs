@@ -4371,7 +4371,15 @@ impl TurnHost {
             None => zuno_runtime::RuntimeOptions::default(),
         };
         let profile_runtime = HarnessRuntime::with_options("profile", runtime_options);
-        let profile = plan.profile;
+        let review_service = Arc::new(zuno_review::ReviewService::new(
+            Arc::new(zuno_review::ReviewStore::new(Arc::clone(&database))),
+            Arc::new(zuno_review::RepositoryReviewSourceProbe::new(
+                worktree.clone().unwrap_or_else(|| plan.directory.clone()),
+            )),
+        ));
+        let profile = plan
+            .profile
+            .with_bundle(zuno_review::review_bundle(Arc::clone(&review_service)));
         if let Err(error) = profile_runtime.activate_profile(profile).await {
             let shutdown = profile_runtime.shutdown().await;
             let ownership = extension_ownership
@@ -4396,6 +4404,9 @@ impl TurnHost {
             };
         }
         let runtime = profile_runtime.child(format!("session:{}", prepared.identity.id()));
+        let review_service = runtime
+            .service::<zuno_review::ReviewService>()
+            .ok_or_else(|| "profile did not register the review service".to_owned())?;
         let continuity = plan.config.resolved_continuity();
         let continuity_settings = zuno_continuity::ContinuitySettings {
             history: continuity.history,
@@ -4814,11 +4825,6 @@ impl TurnHost {
                         council_agent.model.catalog_model_id
                     )
                 })?;
-            let review_store = Arc::new(zuno_review::ReviewStore::new(Arc::clone(&database)));
-            let review_source: Arc<dyn zuno_review::ReviewSourceProbe> =
-                Arc::new(zuno_review::RepositoryReviewSourceProbe::new(
-                    worktree.clone().unwrap_or_else(|| plan.directory.clone()),
-                ));
             let workflow_host = super::workflow::NativeWorkflowHost::new(
                 Arc::clone(&database),
                 child_host.clone(),
@@ -4827,8 +4833,8 @@ impl TurnHost {
                 council_provider,
                 council_agent,
                 super::workflow::ReviewRuntime {
-                    store: Arc::clone(&review_store),
-                    source: Arc::clone(&review_source),
+                    store: review_service.store(),
+                    source: review_service.source(),
                 },
             );
             let background_executions = environment
@@ -4866,6 +4872,7 @@ impl TurnHost {
                     todo_store,
                     work_observer: Arc::new(work_changes.clone()),
                     goal_store: Arc::clone(&goal_store),
+                    review_service: Arc::clone(&review_service),
                     interaction_policy,
                     mcp_loader: mcp.map(|catalog| {
                         Arc::new(catalog.loader()) as Arc<dyn zuno_tools::registry::McpToolLoader>

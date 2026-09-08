@@ -6,6 +6,7 @@
 
 mod model;
 mod report;
+mod service;
 mod source;
 mod store;
 mod tools;
@@ -13,16 +14,22 @@ mod tools;
 pub use model::{
     ActorRef, ClaimKind, ClaimPriority, ClaimStatus, CodeGraphIndexSnapshot, Countercheck,
     CountercheckKind, EvidenceAnchor, MAX_CLAIM_STATEMENT_CHARS, MAX_EVIDENCE_ANCHORS,
-    MAX_LOAD_BEARING_CLAIMS, NewReviewClaim, ReviewBlocker, ReviewClaim, ReviewFinalizeOutcome,
-    ReviewIssue, ReviewIssueKind, ReviewReadiness, ReviewSourceSnapshot, ReviewStatus, SystemLayer,
+    MAX_LOAD_BEARING_CLAIMS, NewReviewClaim, ReviewArtifactSnapshot, ReviewBlocker, ReviewClaim,
+    ReviewDelegateReceipt, ReviewFinalizeOutcome, ReviewIssue, ReviewIssueKind, ReviewReadiness,
+    ReviewReceipt, ReviewSourceSnapshot, ReviewStatus, ReviewVerificationReceipt, SystemLayer,
 };
 pub use report::{
     DEFAULT_MAX_CLAIMS_PER_REPORT, DelegationEvidenceReport, MAX_COUNTERCHECKS_PER_CLAIM,
     MAX_SUMMARY_BYTES, ReportLimits, ReportRejection, ReportedClaim, ReportedContradiction,
-    ReportedUnresolved, seat_response_contract,
+    ReportedUnresolved, delegation_report_digest, seat_response_contract,
+};
+pub use service::{
+    NoReviewPlanProbe, NoopReviewCouncilRunner, ReviewCouncilRunner, ReviewOpenRequest,
+    ReviewPlanBinding, ReviewPlanProbe, ReviewService, review_bundle,
 };
 pub use source::{
-    FixedReviewSourceProbe, RepositoryReviewSourceProbe, ReviewSourceProbe, SourceProbeError,
+    FixedReviewSourceProbe, MAX_EVIDENCE_OBSERVATION_BYTES, RepositoryReviewSourceProbe,
+    ReviewSourceProbe, SourceProbeError,
 };
 pub use store::{ReviewError, ReviewStore};
 pub use tools::{

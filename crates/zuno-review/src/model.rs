@@ -288,8 +288,15 @@ pub struct ReviewSourceSnapshot {
     /// SHA-256 of the scoped porcelain status and working-tree bytes.
     pub worktree_digest: String,
     pub scope_paths: Vec<String>,
+    pub artifact: Option<ReviewArtifactSnapshot>,
     pub codegraph: CodeGraphIndexSnapshot,
     pub captured_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewArtifactSnapshot {
+    pub path: String,
+    pub content_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,7 +325,7 @@ pub struct ReviewClaim {
     pub counterchecks: Vec<Countercheck>,
     pub status: ClaimStatus,
     pub asserted_by: ActorRef,
-    pub verified_by_parent: bool,
+    pub parent_verification: Option<ReviewVerificationReceipt>,
     pub time_created: i64,
     pub time_updated: i64,
 }
@@ -336,6 +343,15 @@ impl ReviewClaim {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewVerificationReceipt {
+    pub session_id: String,
+    pub message_id: String,
+    pub call_id: String,
+    pub agent: String,
+    pub time_verified: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewIssueKind {
@@ -351,6 +367,32 @@ pub struct ReviewIssue {
     pub detail: Vec<String>,
     pub resolved: bool,
     pub resolution: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewDelegateReceipt {
+    pub run_id: String,
+    pub job_id: String,
+    pub preset: String,
+    pub preset_source_id: String,
+    pub seat_id: String,
+    pub agent: String,
+    pub source_snapshot_id: String,
+    pub report_digest: String,
+    pub time_imported: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewReceipt {
+    pub id: String,
+    pub review_revision: i64,
+    pub source_snapshot_id: String,
+    pub head_sha: String,
+    pub worktree_digest: String,
+    pub artifact_digest: Option<String>,
+    #[serde(default)]
+    pub evidence_digest: String,
+    pub time_issued: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -380,16 +422,17 @@ impl fmt::Display for ReviewStatus {
 pub struct ReviewReadiness {
     pub review_id: String,
     pub session_id: String,
-    pub artifact_path: Option<String>,
     pub plan_id: Option<String>,
     pub plan_revision: Option<i64>,
+    pub plan_current: bool,
     pub source: ReviewSourceSnapshot,
     pub revision: i64,
     pub status: ReviewStatus,
     pub load_bearing_claims: Vec<String>,
-    pub delegate_reports: Vec<String>,
+    pub delegate_reports: Vec<ReviewDelegateReceipt>,
     pub issues: Vec<ReviewIssue>,
-    pub receipt_id: Option<String>,
+    pub blockers: Vec<ReviewBlocker>,
+    pub receipt: Option<ReviewReceipt>,
     pub time_created: i64,
     pub time_updated: i64,
 }

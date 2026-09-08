@@ -432,7 +432,7 @@ The built-in catalog separates primary modes, delegable specialists, and hidden 
 | `orchestrator` | Default multi-agent delivery owner, and one of the two native agents that may delegate. |
 | `build` | Direct end-to-end implementation in one lane, with all subagent tools withheld. |
 | `plan` | Read-only repository research and implementation-ready planning. |
-| `review` | Read-only high-assurance review: records anchored evidence, gates draft against ready, and may seat only the `balanced-review` Council. |
+| `review` | Read-only high-assurance review: `review_open` automatically runs the bound `balanced-review` Council, records anchored evidence, and gates draft against ready. |
 | `deep` | Directly selectable or delegable deep debugging and cross-cutting implementation, without recursive delegation. |
 | `fixer` | Focused local implementation with minimal change and regression scope. |
 | `general` | Bounded miscellaneous execution when no narrower specialist owns the work. |
@@ -443,13 +443,18 @@ The built-in catalog separates primary modes, delegable specialists, and hidden 
 
 `compaction`, `title`, and `summary` are hidden engine agents. A user-defined agent may be declared under `agents.<name>` or as Markdown under `.zuno/agent/**/*.md`; it enters the same resolution, permission, prompt, and provenance pipeline as a native agent.
 
-`zuno-review` owns review source probing, typed seat reports, the event-backed review
-projection and the four review tools. The composition root injects one repository probe
-into both the tool surface and `NativeWorkflowHost`. A balanced Council seat is counted
-as valid only after its `DelegationEvidenceReport` parses, its repository-relative anchors
-are reopened by the host, and the accepted report is appended to the named review. Any
-later claim, issue or source mutation advances the review revision and invalidates an
-earlier Ready receipt.
+`zuno-review` is a native Component publishing one typed `ReviewService`. It owns source
+and artifact probing, typed seat reports, the event-backed review projection and the four
+review tools. `review_open` invokes the configuration-owned `balanced-review` Council
+through a host adapter; `council_run` is not exposed to the review model. A seat counts
+only after its `DelegationEvidenceReport` parses, its repository-relative anchors are
+reopened by the host, and a structured receipt binds the preset source, run, job, seat,
+Agent, report digest and source snapshot. The receipt must also match the exact completed
+seat in the durable Council Job. Ready requires at least two distinct seats from one
+authoritative run, and its receipt binds all evidence-anchor digests. Finalization performs
+a post-commit reconciliation. Each anchor observation deduplicates repository paths and has
+one 32 MiB total read budget. Any later claim, issue, Plan, source, artifact or anchor mutation
+advances the review revision and invalidates the earlier source-bound Ready receipt.
 
 Agents have no fixed provider-step ceiling by default. A user who needs a
 deployment guard may set `agents.<name>.steps` to a positive integer:

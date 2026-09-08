@@ -86,6 +86,20 @@ fn an_oversized_report_is_refused_before_it_is_decoded() {
 }
 
 #[test]
+fn leading_and_trailing_whitespace_still_counts_toward_the_seat_limit() {
+    let raw = format!("{}{}{}", " ".repeat(128), valid(), " ".repeat(128));
+    let rejection = DelegationEvidenceReport::parse(
+        &raw,
+        ReportLimits {
+            max_report_bytes: raw.len() - 1,
+            ..limits()
+        },
+    )
+    .expect_err("raw bytes, including whitespace, are bounded");
+    assert!(matches!(rejection, ReportRejection::TooLarge { .. }));
+}
+
+#[test]
 fn a_payload_that_is_not_the_schema_is_refused_as_malformed() {
     assert!(matches!(
         DelegationEvidenceReport::parse("not json at all", limits()),

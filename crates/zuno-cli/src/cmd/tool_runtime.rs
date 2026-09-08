@@ -45,6 +45,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use zuno_agent::profile::AgentProfile;
 use zuno_agent::profile::ShellFilesystemAccess;
+use zuno_catalog::agent::AgentSource;
 use zuno_config::schema::Config;
 use zuno_config::schema::permission::PermissionMode;
 use zuno_config::schema::sandbox::{
@@ -62,7 +63,8 @@ use zuno_sandbox::{
     SandboxUnavailableAction, SandboxUnavailableCause, SystemSandboxResolver,
 };
 use zuno_tool::{
-    OutputLimits, PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolUiIntent, erase,
+    OutputLimits, PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolContext,
+    ToolUiIntent, erase,
 };
 use zuno_tools::FileTools;
 use zuno_tools::exposure::ExposureFlags;
@@ -110,6 +112,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) todo_store: Arc<zuno_db::pool::Pool>,
     pub(crate) work_observer: Arc<dyn zuno_tools::WorkStateObserver>,
     pub(crate) goal_store: Arc<zuno_goal::GoalStore>,
+    pub(crate) review_service: Arc<zuno_review::ReviewService>,
     pub(crate) interaction_policy: zuno_goal::InteractionPolicy,
     pub(crate) mcp_loader: Option<Arc<dyn McpToolLoader>>,
     pub(crate) skills: Arc<zuno_catalog::skill::Skills>,
@@ -130,6 +133,74 @@ pub(crate) struct ToolSelection<'a> {
 struct FrozenMcpToolLoader {
     tools: Vec<CustomTool>,
     eager_tool_ids: Vec<String>,
+}
+
+struct WorkStateReviewPlanProbe {
+    store: zuno_tools::WorkStateStore,
+}
+
+struct ToolReviewCouncilRunner {
+    tool: Arc<dyn Tool>,
+}
+
+#[async_trait]
+impl zuno_review::ReviewCouncilRunner for ToolReviewCouncilRunner {
+    async fn run(
+        &self,
+        review: &zuno_review::ReviewReadiness,
+        question: String,
+        context: ToolContext,
+    ) -> Result<serde_json::Value, String> {
+        let snapshot = context.orchestration_snapshot().cloned();
+        let mut council_context = ToolContext::new(
+            context.session_id,
+            context.message_id,
+            format!("{}:balanced-review", context.call_id),
+            context.agent,
+            Arc::clone(&context.permission),
+            Arc::clone(&context.interrupt),
+        );
+        if let Some(snapshot) = snapshot {
+            council_context = council_context.with_orchestration_snapshot(snapshot);
+        }
+        let output = self
+            .tool
+            .execute(
+                serde_json::json!({
+                    "preset": "balanced-review",
+                    "question": question,
+                    "reviewID": review.review_id,
+                    "sourceSnapshotID": review.source.id,
+                    "description": "automatic high-assurance review",
+                }),
+                council_context,
+            )
+            .await
+            .map_err(|error| zuno_error::source::describe(&error))?;
+        serde_json::from_str(&output.output).or(Ok(serde_json::Value::String(output.output)))
+    }
+}
+
+impl WorkStateReviewPlanProbe {
+    fn new(pool: Arc<zuno_db::pool::Pool>) -> Self {
+        Self {
+            store: zuno_tools::WorkStateStore::new(pool),
+        }
+    }
+}
+
+impl zuno_review::ReviewPlanProbe for WorkStateReviewPlanProbe {
+    fn current(&self, session_id: &str) -> Result<Option<zuno_review::ReviewPlanBinding>, String> {
+        self.store
+            .plan(session_id)
+            .map(|plan| {
+                plan.map(|plan| zuno_review::ReviewPlanBinding {
+                    id: plan.id,
+                    revision: plan.revision,
+                })
+            })
+            .map_err(|error| error.to_string())
+    }
 }
 
 impl McpToolLoader for FrozenMcpToolLoader {
@@ -253,6 +324,8 @@ pub(crate) fn assemble(
         .map(String::as_str)
         .collect::<Vec<_>>();
     let rules = selected_profile.rules_with_extension_tools(&dynamic_tool_ids);
+    let native_review =
+        selected_agent.name == "review" && matches!(&selected_agent.source, AgentSource::Native);
 
     let file_tools = FileTools::new(directory).map_err(to_string)?;
     let registry = ToolRegistryBuilder::new(directory, file_tools, flags);
@@ -373,13 +446,31 @@ pub(crate) fn assemble(
         )?;
         builder.register_configured_builtin(erase(workflow));
     }
+    let mut review_council = None;
     if !selection.capability.councils.is_empty() {
+        if native_review
+            && !selection
+                .capability
+                .councils
+                .iter()
+                .any(|preset| preset.name == "balanced-review")
+        {
+            return Err(
+                "the native review Agent requires the `balanced-review` Council preset".to_owned(),
+            );
+        }
         let council = zuno_tools::council::CouncilTool::new(
             selection.capability.councils.clone(),
             task,
             Arc::clone(&selection.councils),
-        )?;
-        builder.register_configured_builtin(erase(council));
+        )?
+        .with_review_binding_authority(native_review);
+        let council = erase(council);
+        if native_review {
+            review_council = Some(Arc::clone(&council));
+        } else {
+            builder.register_configured_builtin(council);
+        }
     }
     if selection.manifest.contains(BuiltinSlot::Job) {
         builder
@@ -497,14 +588,20 @@ pub(crate) fn assemble(
     builder.register_configured_builtin(erase(zuno_goal::CapabilityClaimTool::new(Arc::clone(
         &selection.goal_store,
     ))));
-    let review_store = Arc::new(zuno_review::ReviewStore::new(Arc::clone(
-        &selection.todo_store,
-    )));
-    let review_source: Arc<dyn zuno_review::ReviewSourceProbe> = Arc::new(
-        zuno_review::RepositoryReviewSourceProbe::new(worktree.unwrap_or(directory).to_path_buf()),
-    );
-    for tool in zuno_review::review_tools(review_store, review_source) {
-        builder.register_configured_builtin(tool);
+    if native_review {
+        let council = review_council.ok_or_else(|| {
+            "the native review Agent cannot start without the `balanced-review` Council".to_owned()
+        })?;
+        let plan_probe: Arc<dyn zuno_review::ReviewPlanProbe> = Arc::new(
+            WorkStateReviewPlanProbe::new(Arc::clone(&selection.todo_store)),
+        );
+        for tool in zuno_review::review_tools(
+            Arc::clone(&selection.review_service),
+            plan_probe,
+            Arc::new(ToolReviewCouncilRunner { tool: council }),
+        ) {
+            builder.register_configured_builtin(tool);
+        }
     }
     builder.register_configured_builtin(erase(zuno_tools::TaskReportTool::new(Arc::clone(
         &selection.todo_store,

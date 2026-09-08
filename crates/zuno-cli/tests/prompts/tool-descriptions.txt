@@ -89,9 +89,9 @@ Read the current durable review projection and an optional bounded set of claims
 Read one durable child-task or background-job report without replaying the child session. Supply exactly one of jobID or taskID. taskID is the child session id returned by task; jobID is the durable id returned by a background task, Council, workflow, or product Agent. The result is bounded and reports when a large terminal payload was omitted. This tool is read-only and replay-safe.
 >>>
 
-## review_open | crates/zuno-review/src/description/review-open.txt | 251 bytes | trailing-newline: yes
+## review_open | crates/zuno-review/src/description/review-open.txt | 328 bytes | trailing-newline: yes
 <<<
-Open one durable evidence review. The host, not the model, reads Git, the scoped working-tree bytes, and CodeGraph status. Supply only the artifact, repository-relative scope paths, and optional Plan binding. The result starts as draft at revision 1.
+Open one durable evidence review and automatically run its native balanced-review Council. The host, not the model, reads Git, artifact bytes, scoped working-tree bytes, and CodeGraph status, then imports only validated seat reports. Supply only the artifact, repository-relative scope paths, and optional current Plan binding.
 >>>
 
 ## review_claim | crates/zuno-review/src/description/review-claim.txt | 450 bytes | trailing-newline: yes

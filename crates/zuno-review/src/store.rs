@@ -1,16 +1,19 @@
 use crate::{
     ActorRef, ClaimKind, ClaimPriority, ClaimStatus, DelegationEvidenceReport, EvidenceAnchor,
     MAX_CLAIM_STATEMENT_CHARS, MAX_EVIDENCE_ANCHORS, MAX_LOAD_BEARING_CLAIMS, NewReviewClaim,
-    ReviewBlocker, ReviewClaim, ReviewFinalizeOutcome, ReviewIssue, ReviewIssueKind,
-    ReviewReadiness, ReviewSourceSnapshot, ReviewStatus,
+    ReviewBlocker, ReviewClaim, ReviewDelegateReceipt, ReviewFinalizeOutcome, ReviewIssue,
+    ReviewIssueKind, ReviewReadiness, ReviewReceipt, ReviewSourceSnapshot, ReviewStatus,
+    ReviewVerificationReceipt, delegation_report_digest,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use uuid::Uuid;
 use zuno_db::event_log::{NewSessionEvent, SessionEvent, append_in, read_of_type_after_in};
+use zuno_db::job::{AgentJobStore, JobStatus, JobSubject};
 use zuno_db::{Pool, open};
 use zuno_error::DbError;
 
@@ -21,6 +24,7 @@ const REVIEW_FINALIZED_EVENT: &str = "review.finalized";
 const MAX_REVIEW_CLAIMS: usize = 64;
 const MAX_REVIEW_ISSUES: usize = 12;
 const MAX_ISSUE_TEXT_CHARS: usize = 500;
+const MAX_BLOCKER_CHARS: usize = 500;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReviewError {
@@ -59,8 +63,19 @@ pub enum ReviewError {
     },
     #[error("review claim `{claim_id}` is stale and must be recorded against the current source")]
     StaleClaim { claim_id: String },
+    #[error(
+        "review claim `{claim_id}` cannot transition from `{status}` to `verified`; record a new claim"
+    )]
+    InvalidClaimTransition {
+        claim_id: String,
+        status: ClaimStatus,
+    },
     #[error("review `{review_id}` source snapshot does not match report snapshot `{actual}`")]
     SourceMismatch { review_id: String, actual: String },
+    #[error("review Council receipt is invalid: {0}")]
+    InvalidCouncilReceipt(String),
+    #[error("requested Plan `{id}` revision {revision} is not the current durable Plan")]
+    PlanMismatch { id: String, revision: i64 },
     #[error("review report carries {actual} issues, exceeding the limit of {max}")]
     TooManyIssues { actual: usize, max: usize },
     #[error("review carries {actual} claims, exceeding the limit of {max}")]
@@ -89,15 +104,28 @@ pub(crate) struct ObservedClaimEvidence {
     pub evidence: Result<Vec<EvidenceAnchor>, String>,
 }
 
+pub(crate) struct ReconcileObservation {
+    pub current_source: ReviewSourceSnapshot,
+    pub observed: Vec<ObservedClaimEvidence>,
+    pub plan_current: bool,
+}
+
 pub(crate) struct FinalizeReview<'a> {
     pub session_id: &'a str,
     pub review_id: &'a str,
     pub expected_revision: i64,
     pub requested_status: ReviewStatus,
+    pub commit_ready: bool,
     pub load_bearing_claim_ids: &'a [String],
     pub extra_blockers: &'a [ReviewBlocker],
-    pub observed: &'a [ObservedClaimEvidence],
     pub at_ms: i64,
+}
+
+pub(crate) struct FinalizeObservation {
+    pub observed: Vec<ObservedClaimEvidence>,
+    pub current_source: ReviewSourceSnapshot,
+    pub plan_current: bool,
+    pub source_changed_during_verification: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -116,9 +144,12 @@ struct StartedPayload {
 struct ClaimsPayload {
     review_id: String,
     revision: i64,
+    source: ReviewSourceSnapshot,
+    plan_current: bool,
     claims: Vec<ReviewClaim>,
-    delegate_reports: Vec<String>,
+    delegate_reports: Vec<ReviewDelegateReceipt>,
     issues: Vec<ReviewIssue>,
+    blockers: Vec<ReviewBlocker>,
     time_updated: i64,
 }
 
@@ -139,36 +170,40 @@ impl ReviewStore {
         Arc::clone(&self.pool)
     }
 
-    pub fn open_review(
+    pub fn open_review<F>(
         &self,
         session_id: &str,
-        artifact_path: Option<&str>,
         plan_id: Option<&str>,
         plan_revision: Option<i64>,
-        source: ReviewSourceSnapshot,
+        plan_current: bool,
+        capture_source: F,
         at_ms: i64,
-    ) -> Result<ReviewReadiness, ReviewError> {
+    ) -> Result<ReviewReadiness, ReviewError>
+    where
+        F: FnOnce() -> Result<ReviewSourceSnapshot, ReviewError>,
+    {
+        let connection = self.pool.get()?;
+        let transaction = open::immediate_transaction(&connection)?;
+        let source = capture_source()?;
         let review_id = format!("rev_{}", Uuid::now_v7().simple());
-        let artifact_path = optional_visible(artifact_path);
         let plan_id = optional_visible(plan_id);
         let readiness = ReviewReadiness {
             review_id: review_id.clone(),
             session_id: session_id.to_owned(),
-            artifact_path,
             plan_id,
             plan_revision,
+            plan_current,
             source,
             revision: 1,
             status: ReviewStatus::Draft,
             load_bearing_claims: Vec::new(),
             delegate_reports: Vec::new(),
             issues: Vec::new(),
-            receipt_id: None,
+            blockers: Vec::new(),
+            receipt: None,
             time_created: at_ms,
             time_updated: at_ms,
         };
-        let connection = self.pool.get()?;
-        let transaction = open::immediate_transaction(&connection)?;
         append_payload(
             &transaction,
             session_id,
@@ -226,6 +261,7 @@ impl ReviewStore {
                 max: MAX_REVIEW_CLAIMS,
             });
         }
+        projection.readiness.blockers.clear();
         let recorded = ReviewClaim {
             id: format!("rclaim_{}", Uuid::now_v7().simple()),
             review_id: projection.readiness.review_id.clone(),
@@ -238,7 +274,7 @@ impl ReviewStore {
             counterchecks: claim.counterchecks,
             status: ClaimStatus::Unverified,
             asserted_by: claim.asserted_by,
-            verified_by_parent: false,
+            parent_verification: None,
             time_created: at_ms,
             time_updated: at_ms,
         };
@@ -259,10 +295,11 @@ impl ReviewStore {
         session_id: &str,
         review_id: &str,
         expected_revision: i64,
-        delegate_id: &str,
+        receipt: ReviewDelegateReceipt,
         report: DelegationEvidenceReport,
         at_ms: i64,
     ) -> Result<ReviewReadiness, ReviewError> {
+        validate_delegate_receipt(&receipt, &report)?;
         let connection = self.pool.get()?;
         let transaction = open::immediate_transaction(&connection)?;
         let mut projection = require_projection(&transaction, session_id, review_id)?;
@@ -273,12 +310,29 @@ impl ReviewStore {
                 actual: report.source_snapshot_id,
             });
         }
+        if let Some(existing) = projection
+            .readiness
+            .delegate_reports
+            .iter()
+            .find(|candidate| {
+                candidate.run_id == receipt.run_id && candidate.seat_id == receipt.seat_id
+            })
+        {
+            if same_delegate_receipt(existing, &receipt) {
+                return Ok(projection.readiness);
+            }
+            return Err(ReviewError::InvalidCouncilReceipt(format!(
+                "run `{}` seat `{}` was already imported with different authority",
+                receipt.run_id, receipt.seat_id
+            )));
+        }
         if projection.claims.len().saturating_add(report.claims.len()) > MAX_REVIEW_CLAIMS {
             return Err(ReviewError::TooManyClaims {
                 actual: projection.claims.len() + report.claims.len(),
                 max: MAX_REVIEW_CLAIMS,
             });
         }
+        projection.readiness.blockers.clear();
         for reported in report.claims {
             let new_claim = NewReviewClaim {
                 review_id: review_id.to_owned(),
@@ -289,7 +343,7 @@ impl ReviewStore {
                 source_snapshot_id: projection.readiness.source.id.clone(),
                 evidence: reported.evidence,
                 counterchecks: reported.counterchecks,
-                asserted_by: ActorRef::Delegate(delegate_id.to_owned()),
+                asserted_by: ActorRef::Delegate(format!("{}:{}", receipt.run_id, receipt.seat_id)),
             };
             validate_new_claim(&new_claim)?;
             projection.claims.push(ReviewClaim {
@@ -304,7 +358,7 @@ impl ReviewStore {
                 counterchecks: new_claim.counterchecks,
                 status: ClaimStatus::Unverified,
                 asserted_by: new_claim.asserted_by,
-                verified_by_parent: false,
+                parent_verification: None,
                 time_created: at_ms,
                 time_updated: at_ms,
             });
@@ -345,17 +399,7 @@ impl ReviewStore {
                 })
                 .collect::<Result<Vec<_>, ReviewError>>()?,
         );
-        if !projection
-            .readiness
-            .delegate_reports
-            .iter()
-            .any(|seat| seat == delegate_id)
-        {
-            projection
-                .readiness
-                .delegate_reports
-                .push(delegate_id.to_owned());
-        }
+        projection.readiness.delegate_reports.push(receipt);
         projection.readiness.issues.extend(
             report
                 .unresolved
@@ -393,7 +437,7 @@ impl ReviewStore {
         review_id: &str,
         expected_revision: i64,
         claim_id: &str,
-        by_parent: bool,
+        verification: ReviewVerificationReceipt,
         at_ms: i64,
     ) -> Result<(ReviewReadiness, ReviewClaim), ReviewError> {
         self.change_claim(
@@ -408,6 +452,12 @@ impl ReviewStore {
                         claim_id: claim.id.clone(),
                     });
                 }
+                if claim.status == ClaimStatus::Refuted {
+                    return Err(ReviewError::InvalidClaimTransition {
+                        claim_id: claim.id.clone(),
+                        status: claim.status,
+                    });
+                }
                 let missing = claim.missing_counterchecks();
                 if !missing.is_empty() {
                     return Err(ReviewError::MissingCounterchecks {
@@ -416,7 +466,7 @@ impl ReviewStore {
                     });
                 }
                 claim.status = ClaimStatus::Verified;
-                claim.verified_by_parent |= by_parent;
+                claim.parent_verification = Some(verification);
                 Ok(())
             },
         )
@@ -441,7 +491,7 @@ impl ReviewStore {
             |claim| {
                 if claim.status != ClaimStatus::Refuted {
                     claim.status = ClaimStatus::Contested;
-                    claim.verified_by_parent = false;
+                    claim.parent_verification = None;
                 }
                 Ok(())
             },
@@ -466,7 +516,7 @@ impl ReviewStore {
             at_ms,
             |claim| {
                 claim.status = ClaimStatus::Refuted;
-                claim.verified_by_parent = true;
+                claim.parent_verification = None;
                 Ok(())
             },
         )
@@ -489,7 +539,7 @@ impl ReviewStore {
             |claim| {
                 if claim.status != ClaimStatus::Refuted {
                     claim.status = ClaimStatus::Stale;
-                    claim.verified_by_parent = false;
+                    claim.parent_verification = None;
                 }
                 Ok(())
             },
@@ -521,6 +571,7 @@ impl ReviewStore {
             })?;
         issue.resolved = true;
         issue.resolution = Some(resolution);
+        projection.readiness.blockers.clear();
         append_claim_snapshot(
             &transaction,
             session_id,
@@ -532,10 +583,143 @@ impl ReviewStore {
         Ok(projection.readiness)
     }
 
-    pub(crate) fn finalize(
+    pub fn record_system_blocker(
+        &self,
+        session_id: &str,
+        review_id: &str,
+        expected_revision: i64,
+        reason: &str,
+        at_ms: i64,
+    ) -> Result<ReviewReadiness, ReviewError> {
+        let reason = bounded_visible(reason, "system blocker", MAX_BLOCKER_CHARS)?;
+        let connection = self.pool.get()?;
+        let transaction = open::immediate_transaction(&connection)?;
+        let mut projection = require_projection(&transaction, session_id, review_id)?;
+        require_revision(&projection.readiness, expected_revision)?;
+        projection.readiness.blockers = vec![ReviewBlocker {
+            claim_id: None,
+            reason,
+        }];
+        append_claim_snapshot(
+            &transaction,
+            session_id,
+            REVIEW_CHANGED_EVENT,
+            &mut projection,
+            at_ms,
+        )?;
+        transaction.commit().map_err(open::map_error)?;
+        Ok(projection.readiness)
+    }
+
+    pub(crate) fn reconcile_external<F>(
+        &self,
+        session_id: &str,
+        review_id: &str,
+        at_ms: i64,
+        capture_source: F,
+    ) -> Result<ReviewReadiness, ReviewError>
+    where
+        F: FnOnce(&ReviewReadiness, &[ReviewClaim]) -> Result<ReconcileObservation, ReviewError>,
+    {
+        let connection = self.pool.get()?;
+        let transaction = open::immediate_transaction(&connection)?;
+        let mut projection = require_projection(&transaction, session_id, review_id)?;
+        let observation = capture_source(&projection.readiness, &projection.claims)?;
+        let source_changed =
+            !same_source(&projection.readiness.source, &observation.current_source);
+        let plan_changed = projection.readiness.plan_current != observation.plan_current;
+        let mut evidence_changed = false;
+        for observed in &observation.observed {
+            let Some(claim) = projection
+                .claims
+                .iter_mut()
+                .find(|claim| claim.id == observed.claim_id)
+            else {
+                continue;
+            };
+            let matches = observed
+                .evidence
+                .as_ref()
+                .is_ok_and(|anchors| same_evidence(&claim.evidence, anchors));
+            if !matches && claim.status != ClaimStatus::Refuted {
+                claim.status = ClaimStatus::Stale;
+                claim.parent_verification = None;
+                claim.time_updated = at_ms;
+                evidence_changed = true;
+            }
+        }
+        let receipt_changed = projection.readiness.status == ReviewStatus::Ready
+            && !projection
+                .readiness
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| {
+                    review_evidence_digest(&projection.claims)
+                        .is_ok_and(|digest| receipt.evidence_digest == digest)
+                });
+        if !source_changed && !plan_changed && !evidence_changed && !receipt_changed {
+            return Ok(projection.readiness);
+        }
+        let mut blockers = Vec::new();
+        if source_changed {
+            let previous = projection.readiness.source.worktree_digest.clone();
+            projection.readiness.source = observation.current_source;
+            for claim in &mut projection.claims {
+                if claim.status != ClaimStatus::Refuted {
+                    claim.status = ClaimStatus::Stale;
+                    claim.parent_verification = None;
+                    claim.time_updated = at_ms;
+                }
+            }
+            blockers.push(ReviewBlocker {
+                claim_id: None,
+                reason: format!(
+                    "review source changed from {previous} to {}",
+                    projection.readiness.source.worktree_digest
+                ),
+            });
+        }
+        projection.readiness.plan_current = observation.plan_current;
+        if !observation.plan_current {
+            blockers.push(ReviewBlocker {
+                claim_id: None,
+                reason: "the Plan bound to this review is no longer the current revision"
+                    .to_owned(),
+            });
+        }
+        if evidence_changed {
+            blockers.push(ReviewBlocker {
+                claim_id: None,
+                reason: "one or more review evidence anchors changed or became unreadable"
+                    .to_owned(),
+            });
+        }
+        if receipt_changed {
+            blockers.push(ReviewBlocker {
+                claim_id: None,
+                reason: "the Ready receipt does not bind the current evidence anchors".to_owned(),
+            });
+        }
+        projection.readiness.blockers = blockers;
+        append_claim_snapshot(
+            &transaction,
+            session_id,
+            REVIEW_CHANGED_EVENT,
+            &mut projection,
+            at_ms,
+        )?;
+        transaction.commit().map_err(open::map_error)?;
+        Ok(projection.readiness)
+    }
+
+    pub(crate) fn finalize<F>(
         &self,
         request: FinalizeReview<'_>,
-    ) -> Result<ReviewFinalizeOutcome, ReviewError> {
+        observe: F,
+    ) -> Result<ReviewFinalizeOutcome, ReviewError>
+    where
+        F: FnOnce(&ReviewReadiness, &[ReviewClaim]) -> Result<FinalizeObservation, ReviewError>,
+    {
         if request.load_bearing_claim_ids.len() > MAX_LOAD_BEARING_CLAIMS {
             return Err(ReviewError::TooManyLoadBearingClaims {
                 actual: request.load_bearing_claim_ids.len(),
@@ -547,8 +731,22 @@ impl ReviewStore {
         let mut projection =
             require_projection(&transaction, request.session_id, request.review_id)?;
         require_revision(&projection.readiness, request.expected_revision)?;
+        let observation = observe(&projection.readiness, &projection.claims)?;
+        let source_changed =
+            !same_source(&projection.readiness.source, &observation.current_source);
+        if source_changed {
+            projection.readiness.source = observation.current_source;
+            for claim in &mut projection.claims {
+                if claim.status != ClaimStatus::Refuted {
+                    claim.status = ClaimStatus::Stale;
+                    claim.parent_verification = None;
+                    claim.time_updated = request.at_ms;
+                }
+            }
+        }
+        projection.readiness.plan_current = observation.plan_current;
         let mut changed = false;
-        for observation in request.observed {
+        for observation in &observation.observed {
             let Some(claim) = projection
                 .claims
                 .iter_mut()
@@ -562,12 +760,12 @@ impl ReviewStore {
                 .is_ok_and(|anchors| same_evidence(&claim.evidence, anchors));
             if !matches && claim.status != ClaimStatus::Refuted {
                 claim.status = ClaimStatus::Stale;
-                claim.verified_by_parent = false;
+                claim.parent_verification = None;
                 claim.time_updated = request.at_ms;
                 changed = true;
             }
         }
-        if changed {
+        if changed || source_changed {
             append_claim_snapshot(
                 &transaction,
                 request.session_id,
@@ -576,13 +774,30 @@ impl ReviewStore {
                 request.at_ms,
             )?;
         }
-        let mut blockers = request.extra_blockers.to_vec();
+        let mut blockers = projection.readiness.blockers.clone();
+        blockers.extend_from_slice(request.extra_blockers);
+        if source_changed {
+            blockers.push(ReviewBlocker {
+                claim_id: None,
+                reason: "the review source changed before finalization".to_owned(),
+            });
+        }
+        if observation.source_changed_during_verification {
+            blockers.push(ReviewBlocker {
+                claim_id: None,
+                reason: "the review source changed while evidence was being verified".to_owned(),
+            });
+        }
         blockers.extend(gate_blockers(
             &projection.readiness,
             &projection.claims,
             request.load_bearing_claim_ids,
+            &AgentJobStore::new(Arc::clone(&self.pool)),
         )?);
-        let status = if request.requested_status == ReviewStatus::Ready && blockers.is_empty() {
+        let status = if request.commit_ready
+            && request.requested_status == ReviewStatus::Ready
+            && blockers.is_empty()
+        {
             ReviewStatus::Ready
         } else {
             ReviewStatus::Draft
@@ -594,8 +809,16 @@ impl ReviewStore {
             .ok_or_else(revision_exhausted)?;
         projection.readiness.status = status;
         projection.readiness.load_bearing_claims = request.load_bearing_claim_ids.to_vec();
-        projection.readiness.receipt_id =
-            (status == ReviewStatus::Ready).then(|| format!("rrcp_{}", Uuid::now_v7().simple()));
+        projection.readiness.blockers = blockers.clone();
+        projection.readiness.receipt = if status == ReviewStatus::Ready {
+            Some(ready_receipt(
+                &projection.readiness,
+                &projection.claims,
+                request.at_ms,
+            )?)
+        } else {
+            None
+        };
         projection.readiness.time_updated = request.at_ms;
         append_payload(
             &transaction,
@@ -612,6 +835,63 @@ impl ReviewStore {
             claims: projection.claims,
             blockers,
         })
+    }
+
+    pub(crate) fn promote_ready(
+        &self,
+        session_id: &str,
+        review_id: &str,
+        expected_revision: i64,
+        at_ms: i64,
+    ) -> Result<ReviewReadiness, ReviewError> {
+        let connection = self.pool.get()?;
+        let transaction = open::immediate_transaction(&connection)?;
+        let mut projection = require_projection(&transaction, session_id, review_id)?;
+        if projection.readiness.revision != expected_revision {
+            return Ok(projection.readiness);
+        }
+        let blockers = gate_blockers(
+            &projection.readiness,
+            &projection.claims,
+            &projection.readiness.load_bearing_claims,
+            &AgentJobStore::new(Arc::clone(&self.pool)),
+        )?;
+        if !blockers.is_empty() {
+            projection.readiness.blockers = blockers;
+            append_claim_snapshot(
+                &transaction,
+                session_id,
+                REVIEW_CHANGED_EVENT,
+                &mut projection,
+                at_ms,
+            )?;
+            transaction.commit().map_err(open::map_error)?;
+            return Ok(projection.readiness);
+        }
+        projection.readiness.revision = projection
+            .readiness
+            .revision
+            .checked_add(1)
+            .ok_or_else(revision_exhausted)?;
+        projection.readiness.status = ReviewStatus::Ready;
+        projection.readiness.blockers.clear();
+        projection.readiness.receipt = Some(ready_receipt(
+            &projection.readiness,
+            &projection.claims,
+            at_ms,
+        )?);
+        projection.readiness.time_updated = at_ms;
+        append_payload(
+            &transaction,
+            session_id,
+            REVIEW_FINALIZED_EVENT,
+            &FinalizedPayload {
+                review_id: review_id.to_owned(),
+                readiness: projection.readiness.clone(),
+            },
+        )?;
+        transaction.commit().map_err(open::map_error)?;
+        Ok(projection.readiness)
     }
 
     fn change_claim(
@@ -635,6 +915,7 @@ impl ReviewStore {
                 review_id: review_id.to_owned(),
                 claim_id: claim_id.to_owned(),
             })?;
+        projection.readiness.blockers.clear();
         change(claim)?;
         claim.time_updated = at_ms;
         let changed = claim.clone();
@@ -663,7 +944,7 @@ fn append_claim_snapshot(
         .checked_add(1)
         .ok_or_else(revision_exhausted)?;
     projection.readiness.status = ReviewStatus::Draft;
-    projection.readiness.receipt_id = None;
+    projection.readiness.receipt = None;
     projection.readiness.time_updated = at_ms;
     append_payload(
         transaction,
@@ -672,9 +953,12 @@ fn append_claim_snapshot(
         &ClaimsPayload {
             review_id: projection.readiness.review_id.clone(),
             revision: projection.readiness.revision,
+            source: projection.readiness.source.clone(),
+            plan_current: projection.readiness.plan_current,
             claims: projection.claims.clone(),
             delegate_reports: projection.readiness.delegate_reports.clone(),
             issues: projection.readiness.issues.clone(),
+            blockers: projection.readiness.blockers.clone(),
             time_updated: at_ms,
         },
     )?;
@@ -727,9 +1011,12 @@ fn projection_in(
                 }
                 current.readiness.revision = payload.revision;
                 current.readiness.status = ReviewStatus::Draft;
-                current.readiness.receipt_id = None;
+                current.readiness.receipt = None;
+                current.readiness.source = payload.source;
+                current.readiness.plan_current = payload.plan_current;
                 current.readiness.delegate_reports = payload.delegate_reports;
                 current.readiness.issues = payload.issues;
+                current.readiness.blockers = payload.blockers;
                 current.readiness.time_updated = payload.time_updated;
                 current.claims = payload.claims;
             }
@@ -837,14 +1124,38 @@ fn gate_blockers(
     readiness: &ReviewReadiness,
     claims: &[ReviewClaim],
     load_bearing_claim_ids: &[String],
+    jobs: &AgentJobStore,
 ) -> Result<Vec<ReviewBlocker>, ReviewError> {
     let mut blockers = Vec::new();
-    if readiness.delegate_reports.len() < 2 {
+    if !readiness.plan_current {
+        blockers.push(ReviewBlocker {
+            claim_id: None,
+            reason: "the Plan bound to this review is no longer current".to_owned(),
+        });
+    }
+    let mut runs: BTreeMap<(&str, &str, &str), BTreeSet<&str>> = BTreeMap::new();
+    for receipt in &readiness.delegate_reports {
+        let job_completed = receipt_job_completed(jobs, readiness, receipt)?;
+        if receipt.preset == "balanced-review"
+            && receipt.source_snapshot_id == readiness.source.id
+            && job_completed
+        {
+            runs.entry((
+                receipt.run_id.as_str(),
+                receipt.job_id.as_str(),
+                receipt.preset_source_id.as_str(),
+            ))
+            .or_default()
+            .insert(receipt.seat_id.as_str());
+        }
+    }
+    let validated_seats = runs.values().map(BTreeSet::len).max().unwrap_or_default();
+    if validated_seats < 2 {
         blockers.push(ReviewBlocker {
             claim_id: None,
             reason: format!(
                 "has {} validated Council seat report(s); balanced-review readiness requires at least 2",
-                readiness.delegate_reports.len()
+                validated_seats
             ),
         });
     }
@@ -868,10 +1179,18 @@ fn gate_blockers(
                 reason: format!("is `{}` rather than `verified`", claim.status),
             });
         }
-        if !claim.verified_by_parent {
+        if !claim.parent_verification.as_ref().is_some_and(|receipt| {
+            receipt.session_id == readiness.session_id && receipt.agent == "review"
+        }) {
             blockers.push(ReviewBlocker {
                 claim_id: Some(claim.id.clone()),
                 reason: "was not re-verified by the review parent".to_owned(),
+            });
+        }
+        if claim.kind == ClaimKind::Recommendation || claim.evidence.is_empty() {
+            blockers.push(ReviewBlocker {
+                claim_id: Some(claim.id.clone()),
+                reason: "is not an evidence-bearing factual claim".to_owned(),
             });
         }
         let missing = claim.missing_counterchecks();
@@ -926,6 +1245,95 @@ fn gate_blockers(
     Ok(blockers)
 }
 
+fn receipt_job_completed(
+    jobs: &AgentJobStore,
+    readiness: &ReviewReadiness,
+    receipt: &ReviewDelegateReceipt,
+) -> Result<bool, ReviewError> {
+    let job = match jobs.get(&receipt.job_id) {
+        Ok(job) => job,
+        Err(DbError::NotFound { .. }) => return Ok(false),
+        Err(error) => return Err(ReviewError::Db(error)),
+    };
+    let subject_matches = matches!(
+        &job.subject,
+        JobSubject::Workflow { run_id, workflow }
+            if run_id == &receipt.run_id
+                && workflow == &format!("council:{}", receipt.preset)
+    );
+    let result_matches = job.result.as_ref().is_some_and(|result| {
+        let run_matches =
+            result.get("runID").and_then(Value::as_str) == Some(receipt.run_id.as_str());
+        let preset_matches =
+            result.get("preset").and_then(Value::as_str) == Some(receipt.preset.as_str());
+        let completed = result.get("status").and_then(Value::as_str) == Some("completed");
+        let seat_matches = result
+            .get("seats")
+            .and_then(Value::as_array)
+            .is_some_and(|seats| {
+                seats.iter().any(|seat| {
+                    let report = seat.get("report").and_then(|report| {
+                        serde_json::from_value::<DelegationEvidenceReport>(report.clone()).ok()
+                    });
+                    seat.get("id").and_then(Value::as_str) == Some(receipt.seat_id.as_str())
+                        && seat.get("agent").and_then(Value::as_str) == Some(receipt.agent.as_str())
+                        && seat.get("status").and_then(Value::as_str) == Some("completed")
+                        && report.as_ref().is_some_and(|report| {
+                            report.source_snapshot_id == receipt.source_snapshot_id
+                                && delegation_report_digest(report) == receipt.report_digest
+                        })
+                })
+            });
+        run_matches && preset_matches && completed && seat_matches
+    });
+    Ok(job.parent_session_id == readiness.session_id
+        && job.status == JobStatus::Completed
+        && subject_matches
+        && result_matches)
+}
+
+fn review_evidence_digest(claims: &[ReviewClaim]) -> Result<String, ReviewError> {
+    #[derive(Serialize)]
+    struct ClaimEvidence<'a> {
+        claim_id: &'a str,
+        evidence: &'a [EvidenceAnchor],
+    }
+
+    let payload = claims
+        .iter()
+        .map(|claim| ClaimEvidence {
+            claim_id: &claim.id,
+            evidence: &claim.evidence,
+        })
+        .collect::<Vec<_>>();
+    let encoded = serde_json::to_vec(&payload).map_err(|error| ReviewError::CorruptEvent {
+        event_type: REVIEW_FINALIZED_EVENT.to_owned(),
+        detail: format!("evidence digest serialization failed: {error}"),
+    })?;
+    Ok(format!("sha256:{}", hex::encode(Sha256::digest(encoded))))
+}
+
+fn ready_receipt(
+    readiness: &ReviewReadiness,
+    claims: &[ReviewClaim],
+    at_ms: i64,
+) -> Result<ReviewReceipt, ReviewError> {
+    Ok(ReviewReceipt {
+        id: format!("rrcp_{}", Uuid::now_v7().simple()),
+        review_revision: readiness.revision,
+        source_snapshot_id: readiness.source.id.clone(),
+        head_sha: readiness.source.head_sha.clone(),
+        worktree_digest: readiness.source.worktree_digest.clone(),
+        artifact_digest: readiness
+            .source
+            .artifact
+            .as_ref()
+            .map(|artifact| artifact.content_digest.clone()),
+        evidence_digest: review_evidence_digest(claims)?,
+        time_issued: at_ms,
+    })
+}
+
 fn same_evidence(expected: &[EvidenceAnchor], observed: &[EvidenceAnchor]) -> bool {
     expected.len() == observed.len()
         && expected.iter().zip(observed).all(|(expected, observed)| {
@@ -935,6 +1343,72 @@ fn same_evidence(expected: &[EvidenceAnchor], observed: &[EvidenceAnchor]) -> bo
                 && expected.end_line == observed.end_line
                 && expected.content_digest == observed.content_digest
         })
+}
+
+fn same_source(expected: &ReviewSourceSnapshot, observed: &ReviewSourceSnapshot) -> bool {
+    expected.repository_root == observed.repository_root
+        && expected.head_sha == observed.head_sha
+        && expected.branch == observed.branch
+        && expected.worktree_path == observed.worktree_path
+        && expected.dirty == observed.dirty
+        && expected.worktree_digest == observed.worktree_digest
+        && expected.scope_paths == observed.scope_paths
+        && expected.artifact == observed.artifact
+        && expected.codegraph == observed.codegraph
+}
+
+fn validate_delegate_receipt(
+    receipt: &ReviewDelegateReceipt,
+    report: &DelegationEvidenceReport,
+) -> Result<(), ReviewError> {
+    for (field, value) in [
+        ("run_id", receipt.run_id.as_str()),
+        ("job_id", receipt.job_id.as_str()),
+        ("preset", receipt.preset.as_str()),
+        ("preset_source_id", receipt.preset_source_id.as_str()),
+        ("seat_id", receipt.seat_id.as_str()),
+        ("agent", receipt.agent.as_str()),
+        ("source_snapshot_id", receipt.source_snapshot_id.as_str()),
+        ("report_digest", receipt.report_digest.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(ReviewError::InvalidCouncilReceipt(format!(
+                "`{field}` must contain visible text"
+            )));
+        }
+    }
+    if receipt.preset != "balanced-review" {
+        return Err(ReviewError::InvalidCouncilReceipt(format!(
+            "preset `{}` is not the required `balanced-review` preset",
+            receipt.preset
+        )));
+    }
+    if receipt.source_snapshot_id != report.source_snapshot_id {
+        return Err(ReviewError::InvalidCouncilReceipt(
+            "receipt and report name different source snapshots".to_owned(),
+        ));
+    }
+    let expected = crate::delegation_report_digest(report);
+    if receipt.report_digest != expected {
+        return Err(ReviewError::InvalidCouncilReceipt(
+            "report digest does not match the validated report".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn same_delegate_receipt(
+    expected: &ReviewDelegateReceipt,
+    observed: &ReviewDelegateReceipt,
+) -> bool {
+    expected.run_id == observed.run_id
+        && expected.job_id == observed.job_id
+        && expected.preset == observed.preset
+        && expected.preset_source_id == observed.preset_source_id
+        && expected.seat_id == observed.seat_id
+        && expected.agent == observed.agent
+        && expected.source_snapshot_id == observed.source_snapshot_id
+        && expected.report_digest == observed.report_digest
 }
 
 fn append_payload<T: Serialize>(
@@ -987,6 +1461,23 @@ fn require_visible(value: &str, field: &'static str) -> Result<String, ReviewErr
     } else {
         Err(ReviewError::EmptyField { field })
     }
+}
+
+fn bounded_visible(
+    value: &str,
+    field: &'static str,
+    max_chars: usize,
+) -> Result<String, ReviewError> {
+    let value = require_visible(value, field)?;
+    if value.chars().count() <= max_chars {
+        return Ok(value);
+    }
+    let mut bounded = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    bounded.push('…');
+    Ok(bounded)
 }
 
 fn optional_visible(value: Option<&str>) -> Option<String> {

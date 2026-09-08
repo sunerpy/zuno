@@ -219,6 +219,8 @@ rustix = { version = "=1.1.4", features = ["process"] }
 signal-hook = "=0.4.1"
 
 # -- filesystem, search, watching -------------------------------------------
+cap-fs-ext = "=4.0.3"
+cap-std = "=4.0.3"
 dirs = "6.0.0"
 globset = "0.4.20"
 ignore = "0.4.33"

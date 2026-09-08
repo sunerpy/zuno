@@ -236,22 +236,31 @@ receipt。`review_open` 通过宿主仓库探针捕获来源；记录和 finaliz
 明确的「如果这个结论为假，它最可能出现在哪里」的搜索。只读一处保护并不能证明某个东西不存在。
 
 来源快照没有 indexed revision 字段，因为 `codegraph status --json` 不发布这个值。它保存该命令
-实际发布的字段，以及限定范围内 Git diff 与未跟踪文件字节的摘要。索引不可用或陈旧时会明确降级，
-证据锚点仍以宿主直接读取为准。
+实际发布的字段、限定范围内 Git diff 与未跟踪文件字节的摘要，以及命名 artifact 的独立摘要——即使
+该文件被 Git ignore。literal pathspec、基于目录能力的 no-follow 打开、对实际读取字节的硬上限、
+4 MiB 单文件上限、每轮完整锚点观测按路径去重后的 32 MiB 总预算，以及有时限的本地命令共同把
+探测限制在仓库内，即使路径在读取期间被替换也不能逃逸。索引不可用或陈旧时会明确降级，证据
+锚点仍以宿主直接读取为准。
 
-`balanced-review` 席位必须返回可解析的 `DelegationEvidenceReport`。格式、字节或锚点校验失败
-会成为 invalid seat attempt，并可使用 preset 的 retry；只有通过校验的报告才进入 synthesis。
-accepted claims、contradictions 与 unresolved questions 由 runtime 自动导入指定 review，不由父
-模型手工抄写。
+`review_open` 会自动启动 `balanced-review`；评审模型不能调用 `council_run` 或替换 preset。
+席位必须返回可解析的 `DelegationEvidenceReport`。原始字节、格式、source snapshot 或锚点校验
+失败会成为 invalid seat attempt，并可使用 preset 的 retry；只有通过校验的报告才进入 synthesis。
+accepted claims、contradictions 与 unresolved questions 由 runtime 连同结构化 run/job/seat receipt
+自动导入指定 review。finalize 只接受能在 completed durable Job 中找到同一 seat、Agent 和报告摘要
+的 receipt。
 
 `task_report` 与评审台账相互独立。它按 durable `jobID` 或子会话 `taskID` 读取终态记录，受父
 session 隔离；超大结果会作为一个整体被有界省略，不会回放或截断子会话转录。
 
 `draft` 与 `ready` 是两个不同的答案，不得互相替代。draft 是一次正常的交付：它列出自己的
 blocker，并且不会阻塞产生它的那个 Goal。只有 `ready` 才授权实施，而它成立的条件是：每条
-load-bearing 声明都已验证、都通过 `review` 父层上下文重新核验、并且锚定在当前来源上，同时没有
-open issue、contested、stale 或未验证的 P0。Ready receipt 由宿主生成，调用者无法提供。请求
-`ready` 但没过门禁时，会被记录成带全部 blocker 的 draft。
+load-bearing 声明都是带证据的事实声明、都通过宿主派生的 review tool-call receipt 重新核验、并且
+锚定在当前来源上，同时没有 open issue、contested、stale 或未验证的 P0。绑定 Plan 必须仍是当前
+revision，并且至少两个有效席位来自同一次 balanced-review run。Ready receipt 由宿主生成，绑定最终
+review revision、source snapshot、HEAD、worktree digest、artifact digest 与全部证据锚点摘要；
+调用者无法提供。finalize 提交后会立即再做一次 reconcile，后续每次 `review_get` 也会重新打开证据，
+因此提交后观测到的变更会立即撤销 Ready receipt。请求 `ready` 但没过门禁时，会被记录成带全部
+blocker 的 draft。
 
 ### 生成物不会进入提交
 

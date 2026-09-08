@@ -136,16 +136,20 @@ fn bounded_job(job: &AgentJob, max_bytes: usize) -> String {
     if encoded.len() <= max_bytes {
         return encoded;
     }
-    json!({
+    let fallback = json!({
         "jobID": job.id,
         "status": job.status.as_str(),
-        "subject": job.subject.as_json(),
         "result": {
             "omitted": true,
             "bytes": omitted_bytes
         }
     })
-    .to_string()
+    .to_string();
+    if fallback.len() <= max_bytes {
+        fallback
+    } else {
+        "{\"omitted\":true}".to_owned()
+    }
 }
 
 fn job_json(job: &AgentJob, result: Option<Value>) -> Value {

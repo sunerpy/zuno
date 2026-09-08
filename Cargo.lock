@@ -7957,6 +7957,8 @@ name = "zuno-review"
 version = "0.10.21"
 dependencies = [
  "async-trait",
+ "cap-fs-ext",
+ "cap-std",
  "hex",
  "rusqlite",
  "schemars 1.2.2",
@@ -7970,6 +7972,7 @@ dependencies = [
  "zuno-db",
  "zuno-error",
  "zuno-paths",
+ "zuno-runtime",
  "zuno-tool",
 ]
 

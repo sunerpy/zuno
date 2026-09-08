@@ -440,12 +440,10 @@ impl Builtin {
                 ("todo_update", allow()),
                 ("skill", allow()),
             ],
-            // Read-only like `plan`, plus the delegation and evidence surface a review
-            // needs: `task` covers `council_run`, which shares its permission domain, and
-            // `job` accompanies it because only a delegation creates a Job row this agent
-            // could then resolve. `bg` accompanies `shell` for the reason the module docs
-            // give. No `edit`, no `write`, no `apply_patch`: a review that could change a
-            // file could satisfy its own findings.
+            // Read-only like `plan`, plus the native Council and evidence surface a review
+            // needs. Arbitrary `task` delegation remains hidden: a review reaches child
+            // seats only through the configuration-owned balanced Council. `job`
+            // accompanies it so the agent can inspect the resulting durable row.
             "review" => vec![
                 ("*", deny()),
                 ("read", allow()),
@@ -457,7 +455,7 @@ impl Builtin {
                 ("webfetch", allow()),
                 ("web_search", allow()),
                 ("question", allow()),
-                ("task", allow()),
+                ("council_run", allow()),
                 ("job", allow()),
                 ("review_open", allow()),
                 ("review_claim", allow()),
@@ -769,7 +767,7 @@ mod tests {
             "review_get",
             "review_finalize",
             "task_report",
-            "task",
+            "council_run",
             "job",
             "goal_get",
         ] {
@@ -787,6 +785,7 @@ mod tests {
             "goal_propose",
             "plan_update",
             "todo_update",
+            "task",
         ] {
             assert!(
                 !is_tool_visible(tool, &rules),
@@ -816,18 +815,28 @@ mod tests {
             get("review").expect("review").delegates,
             Some(REVIEW_DELEGATES)
         );
-        for name in DELEGATING_NATIVES {
-            assert_eq!(
-                get(name)
-                    .expect("delegating native")
-                    .permission_overlay()
-                    .expect("overlay")
-                    .rules
-                    .get("task"),
-                Some(&PermissionRule::Action(PermissionAction::Allow)),
-                "{name} declares children but its overlay cannot start one"
-            );
-        }
+        assert_eq!(
+            get("orchestrator")
+                .expect("orchestrator")
+                .permission_overlay()
+                .expect("overlay")
+                .rules
+                .get("task"),
+            Some(&PermissionRule::Action(PermissionAction::Allow))
+        );
+        let review = get("review")
+            .expect("review")
+            .permission_overlay()
+            .expect("overlay")
+            .rules;
+        assert_eq!(
+            review.get("council_run"),
+            Some(&PermissionRule::Action(PermissionAction::Allow))
+        );
+        assert_ne!(
+            review.get("task"),
+            Some(&PermissionRule::Action(PermissionAction::Allow))
+        );
 
         for builtin in all()
             .into_iter()

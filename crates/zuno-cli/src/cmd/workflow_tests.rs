@@ -7,7 +7,7 @@ use zuno_paths::DbLocation;
 use zuno_review::{
     CodeGraphIndexSnapshot, FixedReviewSourceProbe, ReviewSourceSnapshot, ReviewStore,
 };
-use zuno_tools::council::{CouncilRequest, CouncilSeatRequest};
+use zuno_tools::council::{CouncilRequest, CouncilReviewBinding, CouncilSeatRequest};
 use zuno_tools::task::ChildTurnState;
 use zuno_tools::work_state::{WorkItemStatus, WorkStateStore};
 use zuno_tools::workflow::WorkflowNodeRequest;
@@ -70,6 +70,7 @@ impl Fixture {
             dirty: false,
             worktree_digest: "sha256:fixture".to_owned(),
             scope_paths: vec!["src/lib.rs".to_owned()],
+            artifact: None,
             codegraph: CodeGraphIndexSnapshot {
                 initialized: true,
                 extraction_status: "current".to_owned(),
@@ -83,10 +84,10 @@ impl Fixture {
         let review = review_store
             .open_review(
                 "ses_parent",
-                Some(".zuno/plan.md"),
                 None,
                 None,
-                source_snapshot.clone(),
+                true,
+                || Ok(source_snapshot.clone()),
                 1,
             )
             .expect("open Council review");
@@ -147,6 +148,15 @@ impl CouncilSynthesizer for RecordingSynthesizer {
             .push(payload);
         Ok("Decision\nShip with the recorded dissent.\n\nAgreement\nThe evidence is sufficient.\n\nDissent\nOne seat remains cautious.\n\nRisks\nSee the seat ledger.\n\nRecommendation\nProceed with verification."
             .to_owned())
+    }
+}
+
+struct FailingSynthesizer;
+
+#[async_trait]
+impl CouncilSynthesizer for FailingSynthesizer {
+    async fn synthesize(&self, _session_id: &str, _payload: String) -> Result<String, String> {
+        Err("synthetic synthesis failure".to_owned())
     }
 }
 
@@ -297,6 +307,14 @@ impl WorkflowNodeRunner for RecordingRunner {
             parent.cancel();
         }
         let output = match request.prompt.as_str() {
+            "generic-agree" => json!({
+                "verdict":"approve",
+                "confidence":0.9,
+                "evidence":["generic Council evidence"],
+                "risks":[],
+                "recommendation":"proceed"
+            })
+            .to_string(),
             "agree" | "slow-agree" => json!({
                 "source_snapshot_id":"rsnap_fixture",
                 "scope_checked":["src/lib.rs"],
@@ -399,8 +417,11 @@ fn council_request(
         preset: "balanced-review".to_owned(),
         description: Some("Council fixture".to_owned()),
         question: "Should this change ship?".to_owned(),
-        review_id: review_id.to_owned(),
-        source_snapshot_id: source_snapshot_id.to_owned(),
+        preset_source_id: "builtin://balanced-review".to_owned(),
+        review: Some(CouncilReviewBinding {
+            review_id: review_id.to_owned(),
+            source_snapshot_id: source_snapshot_id.to_owned(),
+        }),
         seats,
         quorum,
         max_parallel,
@@ -442,25 +463,96 @@ fn node(id: &str, depends_on: &[&str], prompt: &str) -> WorkflowNodeRequest {
 
 #[test]
 fn council_parser_accepts_one_raw_json_object() {
+    let binding = CouncilReviewBinding {
+        review_id: "rev_fixture".to_owned(),
+        source_snapshot_id: "rsnap_fixture".to_owned(),
+    };
+    let source = FixedReviewSourceProbe::new(ReviewSourceSnapshot {
+        id: "rsnap_fixture".to_owned(),
+        repository_root: "/tmp/proj".to_owned(),
+        head_sha: "head".to_owned(),
+        branch: Some("main".to_owned()),
+        worktree_path: "/tmp/proj".to_owned(),
+        dirty: false,
+        worktree_digest: "sha256:fixture".to_owned(),
+        scope_paths: vec!["src/lib.rs".to_owned()],
+        artifact: None,
+        codegraph: CodeGraphIndexSnapshot::default(),
+        captured_at_ms: 1,
+    })
+    .with_digest("src/lib.rs", "sha256:fixture");
     let answer = parse_council_answer(
         "{\"source_snapshot_id\":\"rsnap_fixture\",\"scope_checked\":[\"src/lib.rs\"],\"claims\":[{\"statement\":\"tests are missing\",\"kind\":\"fact\",\"priority\":\"p1\",\"evidence\":[{\"path\":\"src/lib.rs\"}],\"counterchecks\":[]}],\"contradictions\":[],\"unresolved\":[],\"concise_summary\":\"hold and add tests\"}",
         4_096,
+        Some(&binding),
+        &source,
     )
     .expect("a raw JSON object is accepted");
 
+    let ParsedCouncilAnswer::Review(answer) = answer else {
+        panic!("expected a review evidence report");
+    };
     assert_eq!(answer.source_snapshot_id, "rsnap_fixture");
     assert_eq!(answer.concise_summary, "hold and add tests");
 }
 
 #[test]
 fn council_parser_rejects_markdown_fenced_json() {
+    let binding = CouncilReviewBinding {
+        review_id: "rev_fixture".to_owned(),
+        source_snapshot_id: "rsnap_fixture".to_owned(),
+    };
+    let source = FixedReviewSourceProbe::new(ReviewSourceSnapshot {
+        id: "rsnap_fixture".to_owned(),
+        repository_root: "/tmp/proj".to_owned(),
+        head_sha: "head".to_owned(),
+        branch: Some("main".to_owned()),
+        worktree_path: "/tmp/proj".to_owned(),
+        dirty: false,
+        worktree_digest: "sha256:fixture".to_owned(),
+        scope_paths: Vec::new(),
+        artifact: None,
+        codegraph: CodeGraphIndexSnapshot::default(),
+        captured_at_ms: 1,
+    });
     let error = parse_council_answer(
         "```json\n{\"source_snapshot_id\":\"rsnap_fixture\",\"claims\":[],\"concise_summary\":\"hold\"}\n```",
         4_096,
+        Some(&binding),
+        &source,
     )
     .expect_err("Markdown fencing violates the seat contract");
 
     assert!(error.contains("invalid evidence report"));
+}
+
+#[test]
+fn generic_council_parser_keeps_the_original_unbound_contract() {
+    let source = FixedReviewSourceProbe::new(ReviewSourceSnapshot {
+        id: "unused".to_owned(),
+        repository_root: "/tmp/proj".to_owned(),
+        head_sha: "head".to_owned(),
+        branch: None,
+        worktree_path: "/tmp/proj".to_owned(),
+        dirty: false,
+        worktree_digest: "sha256:unused".to_owned(),
+        scope_paths: Vec::new(),
+        artifact: None,
+        codegraph: CodeGraphIndexSnapshot::default(),
+        captured_at_ms: 1,
+    });
+    let answer = parse_council_answer(
+        r#"{"verdict":"hold","confidence":0.75,"evidence":["missing test"],"risks":[],"recommendation":"add coverage"}"#,
+        4_096,
+        None,
+        &source,
+    )
+    .expect("generic Council answer");
+    let ParsedCouncilAnswer::Generic(answer) = answer else {
+        panic!("expected the generic Council answer");
+    };
+    assert_eq!(answer.verdict, "hold");
+    assert_eq!(answer.recommendation, "add coverage");
 }
 
 #[tokio::test]
@@ -747,7 +839,11 @@ async fn council_seats_overlap_keep_stable_order_and_preserve_dissent() {
         .expect("read durable review")
         .expect("review exists");
     assert_eq!(
-        review.delegate_reports,
+        review
+            .delegate_reports
+            .iter()
+            .map(|receipt| receipt.seat_id.as_str())
+            .collect::<Vec<_>>(),
         vec!["implementation", "dissent", "contract"]
     );
     assert_eq!(review.issues.len(), 1, "the dissent is durable");
@@ -759,6 +855,75 @@ async fn council_seats_overlap_keep_stable_order_and_preserve_dissent() {
             .expect("durable claims")
             .len(),
         3
+    );
+}
+
+#[tokio::test]
+async fn failed_synthesis_imports_no_ready_eligible_seat_receipts() {
+    let mut fixture = Fixture::new();
+    fixture.host.council_synth = Arc::new(FailingSynthesizer);
+    let request = council_request(
+        &fixture.review_id,
+        &fixture.source_snapshot_id,
+        false,
+        vec![
+            council_seat("implementation", "explorer", "agree"),
+            council_seat("contract", "librarian", "agree"),
+        ],
+        (2, 2, 0, Duration::from_secs(2)),
+    );
+    let error = CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
+        .await
+        .expect_err("failed synthesis must fail the Council");
+    assert!(error.contains("synthesis failed"));
+
+    let review = fixture
+        .host
+        .review_store
+        .review("ses_parent", &fixture.review_id)
+        .expect("review")
+        .expect("review exists");
+    assert!(
+        review.delegate_reports.is_empty(),
+        "seat receipts become Ready-eligible only after successful synthesis"
+    );
+    let job = fixture
+        .jobs
+        .list_for_parent("ses_parent")
+        .expect("jobs")
+        .into_iter()
+        .find(|job| matches!(&job.subject, JobSubject::Workflow { workflow, .. } if workflow == "council:balanced-review"))
+        .expect("Council job");
+    assert_eq!(job.status, JobStatus::Failed);
+}
+
+#[tokio::test]
+async fn generic_native_council_runs_without_a_review_binding() {
+    let fixture = Fixture::new();
+    let mut request = council_request(
+        &fixture.review_id,
+        &fixture.source_snapshot_id,
+        false,
+        vec![
+            council_seat("first", "explorer", "generic-agree"),
+            council_seat("second", "oracle", "generic-agree"),
+        ],
+        (2, 2, 0, Duration::from_secs(2)),
+    );
+    request.review = None;
+    let turn = CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
+        .await
+        .expect("generic Council");
+    assert!(turn.output.contains("### Synthesis"));
+    let review = fixture
+        .host
+        .review_store
+        .review("ses_parent", &fixture.review_id)
+        .expect("review")
+        .expect("review exists");
+    assert!(
+        review.delegate_reports.is_empty(),
+        "an unbound /council run must not write the review ledger"
     );
 }
 

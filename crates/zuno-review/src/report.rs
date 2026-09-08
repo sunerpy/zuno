@@ -38,6 +38,7 @@ use crate::model::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// How many claims one delegated report may carry.
 ///
@@ -57,6 +58,9 @@ pub const MAX_SUMMARY_BYTES: usize = 2 * 1_024;
 /// The required sweep is [`CountercheckKind::ALL`]; the cap exists so a report cannot
 /// pad the same five kinds into an unbounded list.
 pub const MAX_COUNTERCHECKS_PER_CLAIM: usize = CountercheckKind::ALL.len();
+const MAX_REPORT_ISSUES: usize = 12;
+const MAX_REPORT_FIELD_CHARS: usize = 500;
+const MAX_SCOPE_ITEMS: usize = 32;
 
 /// The size bounds one report is admitted under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +200,21 @@ pub enum ReportRejection {
         /// The budget it had to fit inside.
         max: usize,
     },
+
+    #[error(
+        "the delegated report field `{field}` is {actual} characters, exceeding the cap of {max}"
+    )]
+    FieldTooLong {
+        field: &'static str,
+        actual: usize,
+        max: usize,
+    },
+
+    #[error("the delegated report carries {actual} issues, exceeding the cap of {max}")]
+    TooManyIssues { actual: usize, max: usize },
+
+    #[error("the delegated report carries {actual} scope entries, exceeding the cap of {max}")]
+    TooManyScopeEntries { actual: usize, max: usize },
 
     /// The report carried no conclusions at all.
     #[error(
@@ -358,6 +377,15 @@ impl DelegationEvidenceReport {
                 max: limits.max_summary_bytes,
             });
         }
+        if self.scope_checked.len() > MAX_SCOPE_ITEMS {
+            return Err(ReportRejection::TooManyScopeEntries {
+                actual: self.scope_checked.len(),
+                max: MAX_SCOPE_ITEMS,
+            });
+        }
+        for scope in &self.scope_checked {
+            validate_text("scope_checked[]", scope)?;
+        }
         if self.claims.is_empty() {
             return Err(ReportRejection::NoClaims);
         }
@@ -371,11 +399,31 @@ impl DelegationEvidenceReport {
             claim.validate(index + 1)?;
         }
         for (index, contradiction) in self.contradictions.iter().enumerate() {
+            validate_text("contradictions[].statement", &contradiction.statement)?;
             if contradiction.conflicting.len() < 2 {
                 return Err(ReportRejection::ContradictionNeedsTwoSides {
                     ordinal: index + 1,
                     actual: contradiction.conflicting.len(),
                 });
+            }
+            for conflict in &contradiction.conflicting {
+                validate_text("contradictions[].conflicting[]", conflict)?;
+            }
+        }
+        let issue_count = self
+            .contradictions
+            .len()
+            .saturating_add(self.unresolved.len());
+        if issue_count > MAX_REPORT_ISSUES {
+            return Err(ReportRejection::TooManyIssues {
+                actual: issue_count,
+                max: MAX_REPORT_ISSUES,
+            });
+        }
+        for unresolved in &self.unresolved {
+            validate_text("unresolved[].question", &unresolved.question)?;
+            if let Some(next) = unresolved.next_check.as_deref() {
+                validate_text("unresolved[].next_check", next)?;
             }
         }
         Ok(())
@@ -389,6 +437,28 @@ impl DelegationEvidenceReport {
             .filter(|claim| claim.kind.requires_countercheck())
             .collect()
     }
+}
+
+#[must_use]
+pub fn delegation_report_digest(report: &DelegationEvidenceReport) -> String {
+    let bytes = serde_json::to_vec(report)
+        .expect("DelegationEvidenceReport contains only infallibly serializable fields");
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+fn validate_text(field: &'static str, value: &str) -> Result<(), ReportRejection> {
+    if value.trim().is_empty() {
+        return Err(ReportRejection::Empty { field });
+    }
+    let actual = value.chars().count();
+    if actual > MAX_REPORT_FIELD_CHARS {
+        return Err(ReportRejection::FieldTooLong {
+            field,
+            actual,
+            max: MAX_REPORT_FIELD_CHARS,
+        });
+    }
+    Ok(())
 }
 
 impl ReportedClaim {

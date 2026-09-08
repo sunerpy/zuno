@@ -24,12 +24,14 @@ configuration can quietly reverse.
 | `oracle` | Read-only architecture and root-cause review | No recursive delegation |
 | `looker` | Visual artifact inspection | No recursive delegation |
 
-`orchestrator` is the default. It and `review` are the only natives exposing the `task`
-delegation tool: `orchestrator` partitions delivery and owns integration, while `review`
-seats the `balanced-review` Council over `explorer`, `librarian` and `oracle` and nothing
-else. Both remain bounded — neither can reach a writing child from a read-only role, and
-`review` cannot seat another `review`, update Plan/Todo state, or forge source and receipt
-fields. Council seat output is parsed and imported by the runtime before synthesis.
+`orchestrator` is the default and the only native primary Agent exposing the general
+`task` delegation tool. The native `review_open` operation automatically seats the
+`balanced-review` Council over `explorer`, `librarian` and `oracle`; `council_run` is
+not exposed to the review model, so it cannot switch presets or bypass the review
+binding. Both remain bounded — neither can reach a writing child from a read-only role,
+and `review` cannot seat another `review`, update Plan/Todo state, or forge source and
+receipt fields. Council seat output is parsed and imported by the runtime before
+synthesis.
 `deep` has mode `all`, so it can be selected directly as a session agent
 while `orchestrator` can also target it; direct selection does not grant it recursive
 delegation. `deep` can read, create, update, and request input for the current durable

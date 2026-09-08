@@ -303,14 +303,21 @@ relevant tests or protocol contracts, and an explicit search for where the claim
 show up if it were false. Reading one guard does not establish an absence.
 
 The source snapshot has no indexed-revision field, because `codegraph status --json`
-publishes none. It stores the values the command does publish and a digest of the scoped Git
-diff and untracked bytes. A missing or stale index is reported as degraded; direct host reads
-remain the authority for evidence anchors.
+publishes none. It stores the values the command does publish, a digest of the scoped Git
+diff and untracked bytes, and a separate digest for the named artifact even when that file
+is ignored by Git. Literal pathspecs, capability-relative no-follow opens, bounded actual
+reads, a 4 MiB file ceiling, a 32 MiB deduplicated budget for each complete anchor
+observation, and bounded local commands keep probing inside the repository even if a path is
+replaced while it is being inspected. A missing or stale index is reported as degraded;
+direct host reads remain the authority for evidence anchors.
 
-`balanced-review` seats return a parsed `DelegationEvidenceReport`. Malformed reports are
-invalid seat attempts and may use the preset retry budget; only reports that pass the schema,
-byte and anchor rules reach synthesis. The runtime, not the parent model, imports accepted
-claims, contradictions and unresolved questions into the named review.
+`review_open` automatically starts `balanced-review`; the review model cannot call
+`council_run` or substitute another preset. Seats return a parsed
+`DelegationEvidenceReport`. Malformed reports are invalid seat attempts and may use the
+preset retry budget; only reports that pass the raw-byte, schema, source-snapshot and anchor
+rules reach synthesis. The runtime imports accepted claims, contradictions and unresolved
+questions with structured run/job/seat receipts. Finalization accepts a receipt only when
+the completed durable Job contains that exact seat, Agent and report digest.
 
 `task_report` is separate from the review ledger. It reads the terminal record for a durable
 `jobID` or child-session `taskID`, is parent-session scoped, and omits an oversized result as
@@ -318,12 +325,16 @@ one bounded value instead of replaying or truncating a child transcript.
 
 `draft` and `ready` are different answers and must not stand in for each other. A draft is
 a normal delivery: it lists its blockers and does not block the goal that produced it. Only
-`ready` authorizes implementation, and it holds only when every load-bearing claim is
-verified, was re-verified through the `review` parent context rather than trusted from a
-delegate, and is anchored to the source the review now stands on, with no open issue or
-claim that is contested, stale, or an unverified P0. The host generates the Ready receipt;
-the caller cannot provide one. A requested `ready` that fails the gate is recorded as a
-draft with all blockers.
+`ready` authorizes implementation, and it holds only when every load-bearing claim is an
+evidence-bearing factual claim, was re-verified through a host-derived review tool-call
+receipt, and is anchored to the source the review now stands on, with no open issue or claim
+that is contested, stale, or an unverified P0. The bound Plan must still be current and two
+validated seats must belong to the same balanced-review run. The host-generated Ready
+receipt binds the final review revision, source snapshot, HEAD, worktree digest and artifact
+digest plus a digest of every evidence anchor; the caller cannot provide one. Finalization
+performs a post-commit reconciliation, and every later `review_get` reopens the evidence, so
+a mutation observed after the commit immediately retires the Ready receipt. A requested
+`ready` that fails the gate is recorded as a draft with all blockers.
 
 ### Generated state stays out of the commit
 

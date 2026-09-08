@@ -11,6 +11,8 @@ publish.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+cap-fs-ext = { workspace = true }
+cap-std = { workspace = true }
 hex = { workspace = true }
 rusqlite = { workspace = true }
 schemars = { workspace = true }
@@ -22,11 +24,12 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 zuno-db = { workspace = true }
 zuno-error = { workspace = true }
+zuno-paths = { workspace = true }
+zuno-runtime = { workspace = true }
 zuno-tool = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-zuno-paths = { workspace = true }
 
 [lints]
 workspace = true
