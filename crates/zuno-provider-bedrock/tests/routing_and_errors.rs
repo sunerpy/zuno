@@ -115,7 +115,6 @@ fn bedrock_body(options: serde_json::Value, operation: Option<&str>) -> serde_js
             content: vec![zuno_llm::event::RequestContentBlock::Text {
                 text: "Say hello.".to_owned(),
             }],
-            preceding_developer_context: Vec::new(),
         }],
     );
     provider

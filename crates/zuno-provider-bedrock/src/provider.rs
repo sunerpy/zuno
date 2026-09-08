@@ -11,7 +11,8 @@ use zuno_error::ProviderError;
 use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent, tool_arguments_text};
 use zuno_llm::http::{HttpTimeouts, RequestDeadlines, read_error_body};
 use zuno_llm::registry::{
-    ApiSurface, Capabilities, CompletionRequest, Provider, ProviderStream, Spec, generation,
+    ApiSurface, Capabilities, CompletionRequest, Provider, ProviderStream, RequestMessage, Spec,
+    generation,
 };
 use zuno_llm::sse::{StreamIdleTimeout, upstream_stream_incomplete};
 
@@ -1024,10 +1025,10 @@ fn insert_openai_tools(
 /// One provider-neutral message can become several wire messages: Chat carries tool
 /// results as their own `role: "tool"` entries rather than as blocks inside the message
 /// that produced them.
-fn openai_messages(messages: &[Message]) -> Result<Vec<Value>, ProviderError> {
+fn openai_messages(messages: &[RequestMessage]) -> Result<Vec<Value>, ProviderError> {
     let mut wire = Vec::new();
     for message in messages {
-        openai_chat_message(message, &mut wire)?;
+        openai_chat_message(message.message(), &mut wire)?;
     }
     Ok(wire)
 }

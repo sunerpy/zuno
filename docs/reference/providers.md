@@ -475,8 +475,12 @@ replayed item carries `type`, `summary`, `encrypted_content`, and `status`.
 
 Autonomous Goal continuations preserve the input boundary as well as the output
 order. Zuno stores a prompt-receipt reference on the first assistant row of the
-new turn and restores the receipt's actual post-hook developer suffix between
-adjacent assistant responses in Responses `input`. Older rows recover the
+new turn and resolves the receipt's actual post-hook developer suffix into a
+structured `ResponsesInputBoundary` attached to the later request message. A
+shared Responses cursor emits those standard items between adjacent assistant
+responses for OpenAI, OpenAI-compatible, and Bedrock Mantle/Runtime requests.
+Chat Completions, Anthropic Messages, Bedrock Converse, and every request with an
+empty boundary keep their ordinary message projection. Older rows recover the
 receipt from their provider-request event; the stable runtime-policy prefix is
 removed before projection. This keeps each encrypted envelope paired with the
 output fingerprint of the one turn that minted it without inventing a user

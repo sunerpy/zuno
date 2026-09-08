@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use zuno_llm::event::Message;
-use zuno_llm::registry::CompletionRequest;
+use zuno_llm::registry::{CompletionRequest, ResponsesInputBoundary};
 use zuno_permission::PermissionRequest;
 use zuno_tool::{ToolDefinition, ToolOutput};
 
@@ -82,6 +82,7 @@ pub trait TurnHooks: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookMessageWithParts {
     pub info: Message,
+    pub preceding_responses_input: ResponsesInputBoundary,
     pub parts: Vec<zuno_db::message::PartRecord>,
 }
 

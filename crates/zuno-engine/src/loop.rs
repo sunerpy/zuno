@@ -40,8 +40,8 @@ use zuno_llm::event::{
 };
 use zuno_llm::registry::{
     ApiSurface, ProviderRegistry, ProviderRequestContext, ProviderSessionIdentity,
-    ReasoningReplayPolicy, Spec, ToolSchema, responses_history_ends_in_assistant_output,
-    withhold_ambiguous_responses_replay,
+    ReasoningReplayPolicy, RequestMessage, ResponsesInputBoundary, Spec, ToolSchema,
+    responses_history_ends_in_assistant_output, withhold_ambiguous_responses_replay,
 };
 use zuno_llm::sse::{StreamLimits, append_tool_input};
 use zuno_observability::span;
@@ -2295,7 +2295,7 @@ async fn run_turn_in_span(
             let mut messages = system
                 .iter()
                 .filter(|message| !message.is_empty())
-                .map(|message| Message::new(Role::System, message.clone()))
+                .map(|message| RequestMessage::new(Message::new(Role::System, message.clone())))
                 .collect::<Vec<_>>();
             for message in transformed {
                 append_transformed_message_owned(&mut messages, message);
@@ -2338,7 +2338,7 @@ async fn run_turn_in_span(
         let hook_message = completion
             .messages
             .last()
-            .cloned()
+            .map(|message| message.message().clone())
             .unwrap_or_else(|| Message::new(Role::System, ""));
         let hook_tool_authority = completion.tools.clone();
         ensure_historical_tool_protocol_unchanged(
@@ -4512,8 +4512,26 @@ fn hydrate_history_tail(
 pub struct ProjectedMessage {
     /// The stored message this was projected from, absent for the system prompt.
     pub message_id: Option<String>,
-    /// The message as the provider will receive it.
+    /// Generic provider message content.
     pub message: Message,
+    /// Responses-only input items that immediately preceded this message.
+    pub preceding_responses_input: ResponsesInputBoundary,
+}
+
+impl ProjectedMessage {
+    fn from_request_message(message_id: Option<String>, message: RequestMessage) -> Self {
+        let preceding_responses_input = message.preceding_responses_input().clone();
+        Self {
+            message_id,
+            message: message.into_message(),
+            preceding_responses_input,
+        }
+    }
+
+    fn into_request_message(self) -> RequestMessage {
+        RequestMessage::new(self.message)
+            .with_preceding_responses_input(self.preceding_responses_input)
+    }
 }
 
 /// Project stored history into the exact message list a request carries.
@@ -4525,19 +4543,18 @@ pub struct ProjectedMessage {
 /// drifting away from the messages they measure.
 #[must_use]
 pub fn project_history(system_prompt: &str, history: &[MessageWithParts]) -> Vec<ProjectedMessage> {
-    let mut projected = vec![ProjectedMessage {
-        message_id: None,
-        message: Message::new(Role::System, system_prompt),
-    }];
+    let mut projected = vec![ProjectedMessage::from_request_message(
+        None,
+        Message::new(Role::System, system_prompt).into(),
+    )];
     for message in history {
         let mut messages = Vec::new();
         match message.info.role {
             MessageRole::User => append_user_message(&mut messages, message),
             MessageRole::Assistant => append_assistant_message(&mut messages, message),
         }
-        projected.extend(messages.into_iter().map(|projection| ProjectedMessage {
-            message_id: Some(message.info.id.clone()),
-            message: projection,
+        projected.extend(messages.into_iter().map(|projection| {
+            ProjectedMessage::from_request_message(Some(message.info.id.clone()), projection)
         }));
     }
     projected
@@ -4566,14 +4583,17 @@ pub fn project_history_owned(system_prompt: &str, history: Vec<MessageWithParts>
 pub fn project_history_owned_with_system_messages(
     system_messages: &[String],
     history: Vec<MessageWithParts>,
-) -> Vec<Message> {
-    let projected_history = project_history_owned("", history).into_iter().skip(1);
+) -> Vec<RequestMessage> {
+    let projected_history = project_history_owned_with_ids("", history)
+        .into_iter()
+        .skip(1)
+        .map(ProjectedMessage::into_request_message);
     let mut messages = Vec::with_capacity(system_messages.len() + projected_history.size_hint().0);
     messages.extend(
         system_messages
             .iter()
             .filter(|message| !message.is_empty())
-            .map(|message| Message::new(Role::System, message.clone())),
+            .map(|message| RequestMessage::new(Message::new(Role::System, message.clone()))),
     );
     messages.extend(projected_history);
     messages
@@ -4610,12 +4630,11 @@ pub(crate) fn map_project_history_owned_with_ids<T>(
         .iter()
         .position(|message| std::ptr::eq(message, retained_start))
         .unwrap_or(history.len());
-    let mut projected = vec![map(ProjectedMessage {
-        message_id: None,
-        message: Message::new(Role::System, system_prompt),
-    })];
+    let mut projected = vec![map(ProjectedMessage::from_request_message(
+        None,
+        Message::new(Role::System, system_prompt).into(),
+    ))];
     for message in history.drain(tail_index..) {
-        let preceding_developer_context = preceding_developer_context(&message.info.data);
         let message_id = message.info.id;
         let mut messages = Vec::new();
         match message.info.role {
@@ -4624,15 +4643,15 @@ pub(crate) fn map_project_history_owned_with_ids<T>(
                 append_assistant_message_owned(
                     &mut messages,
                     message.parts,
-                    preceding_developer_context,
+                    preceding_responses_input(&message.info.data),
                 );
             }
         }
         projected.extend(messages.into_iter().map(|message| {
-            map(ProjectedMessage {
-                message_id: Some(message_id.clone()),
+            map(ProjectedMessage::from_request_message(
+                Some(message_id.clone()),
                 message,
-            })
+            ))
         }));
     }
     projected
@@ -4724,7 +4743,7 @@ fn is_compaction_marker(message: &MessageWithParts) -> bool {
             .all(|part| part.kind == PartKind::Compaction)
 }
 
-fn append_user_message(messages: &mut Vec<Message>, message: &MessageWithParts) {
+fn append_user_message(messages: &mut Vec<RequestMessage>, message: &MessageWithParts) {
     let mut content = Vec::new();
     for part in &message.parts {
         match part.kind {
@@ -4753,7 +4772,7 @@ fn append_user_message(messages: &mut Vec<Message>, message: &MessageWithParts) 
         }
     }
     if !content.is_empty() {
-        messages.push(Message::from_content(Role::User, content));
+        messages.push(Message::from_content(Role::User, content).into());
     }
 }
 
@@ -4764,7 +4783,7 @@ fn take_string(data: &mut Map<String, Value>, key: &str) -> Option<String> {
     }
 }
 
-fn append_user_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRecord>) {
+fn append_user_message_owned(messages: &mut Vec<RequestMessage>, parts: Vec<PartRecord>) {
     let mut content = Vec::new();
     for mut part in parts {
         match part.kind {
@@ -4791,7 +4810,7 @@ fn append_user_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRecord>
         }
     }
     if !content.is_empty() {
-        messages.push(Message::from_content(Role::User, content));
+        messages.push(Message::from_content(Role::User, content).into());
     }
 }
 
@@ -5561,7 +5580,7 @@ fn unavailable_historical_tool_fallbacks(
 
 fn ensure_historical_tool_protocol_unchanged(
     locked: &[HistoricalToolBlock],
-    messages: &[Message],
+    messages: &[RequestMessage],
     stage: &str,
 ) -> Result<(), String> {
     let actual = messages
@@ -5631,7 +5650,7 @@ fn historical_tool_protocol_error(stage: &str) -> String {
 }
 
 fn downgrade_projected_tool_history(
-    messages: &mut Vec<Message>,
+    messages: &mut Vec<RequestMessage>,
     locked: &[HistoricalToolBlock],
     occurrences: &[HistoricalToolOccurrence],
     fallbacks: &BTreeMap<usize, HistoricalToolFallbackReason>,
@@ -5642,7 +5661,8 @@ fn downgrade_projected_tool_history(
     let mut repaired = BTreeSet::new();
     let mut output = Vec::with_capacity(messages.len());
     let mut locked_index = 0;
-    for message in std::mem::take(messages) {
+    for request_message in std::mem::take(messages) {
+        let (message, preceding_responses_input) = request_message.into_parts();
         let mut retained = Vec::with_capacity(message.content.len());
         let mut fallback_results = Vec::new();
         for block in message.content {
@@ -5699,10 +5719,13 @@ fn downgrade_projected_tool_history(
             repaired.insert(locked_block.occurrence);
         }
         if !retained.is_empty() {
-            output.push(Message::from_content(message.role, retained));
+            output.push(
+                RequestMessage::new(Message::from_content(message.role, retained))
+                    .with_preceding_responses_input(preceding_responses_input),
+            );
         }
         if !fallback_results.is_empty() {
-            output.push(Message::from_content(Role::User, fallback_results));
+            output.push(Message::from_content(Role::User, fallback_results).into());
         }
     }
     debug_assert_eq!(locked_index, locked.len());
@@ -5769,18 +5792,19 @@ const PRECEDING_DEVELOPER_CONTEXT_KEY: &str = "precedingDeveloperContext";
 /// Durable assistant metadata pointing at the prompt receipt that owns that context.
 const PRECEDING_DEVELOPER_RECEIPT_KEY: &str = "precedingDeveloperPromptReceiptID";
 
-fn preceding_developer_context(data: &Map<String, Value>) -> Vec<String> {
-    data.get(PRECEDING_DEVELOPER_CONTEXT_KEY)
+fn preceding_responses_input(data: &Map<String, Value>) -> ResponsesInputBoundary {
+    let context = data
+        .get(PRECEDING_DEVELOPER_CONTEXT_KEY)
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .filter(|context| !context.trim().is_empty())
         .map(str::to_owned)
-        .collect()
+        .collect();
+    ResponsesInputBoundary::from_developer_context(context)
 }
 
-fn append_assistant_message(messages: &mut Vec<Message>, message: &MessageWithParts) {
+fn append_assistant_message(messages: &mut Vec<RequestMessage>, message: &MessageWithParts) {
     let mut assistant = Vec::new();
     let mut results = Vec::new();
     for part in &message.parts {
@@ -5807,19 +5831,19 @@ fn append_assistant_message(messages: &mut Vec<Message>, message: &MessageWithPa
     }
     if !assistant.is_empty() {
         messages.push(
-            Message::from_content(Role::Assistant, assistant)
-                .with_preceding_developer_context(preceding_developer_context(&message.info.data)),
+            RequestMessage::new(Message::from_content(Role::Assistant, assistant))
+                .with_preceding_responses_input(preceding_responses_input(&message.info.data)),
         );
     }
     if !results.is_empty() {
-        messages.push(Message::from_content(Role::Tool, results));
+        messages.push(Message::from_content(Role::Tool, results).into());
     }
 }
 
 fn append_assistant_message_owned(
-    messages: &mut Vec<Message>,
+    messages: &mut Vec<RequestMessage>,
     parts: Vec<PartRecord>,
-    preceding_developer_context: Vec<String>,
+    preceding_responses_input: ResponsesInputBoundary,
 ) {
     let mut assistant = Vec::new();
     let mut results = Vec::new();
@@ -5845,18 +5869,21 @@ fn append_assistant_message_owned(
     }
     if !assistant.is_empty() {
         messages.push(
-            Message::from_content(Role::Assistant, assistant)
-                .with_preceding_developer_context(preceding_developer_context),
+            RequestMessage::new(Message::from_content(Role::Assistant, assistant))
+                .with_preceding_responses_input(preceding_responses_input),
         );
     }
     if !results.is_empty() {
-        messages.push(Message::from_content(Role::Tool, results));
+        messages.push(Message::from_content(Role::Tool, results).into());
     }
 }
 
-fn append_transformed_message_owned(messages: &mut Vec<Message>, message: HookMessageWithParts) {
+fn append_transformed_message_owned(
+    messages: &mut Vec<RequestMessage>,
+    message: HookMessageWithParts,
+) {
     let role = message.info.role;
-    let preceding_developer_context = message.info.preceding_developer_context;
+    let preceding_responses_input = message.preceding_responses_input;
     match role {
         Role::System | Role::User => {
             let start = messages.len();
@@ -5870,7 +5897,7 @@ fn append_transformed_message_owned(messages: &mut Vec<Message>, message: HookMe
             append_assistant_message_owned(
                 &mut projected,
                 message.parts,
-                preceding_developer_context,
+                preceding_responses_input,
             );
             messages.extend(
                 projected
@@ -6013,7 +6040,7 @@ struct CapsuleTally {
 /// both Responses adapters drop that item rather than earn a permanent HTTP 400, and
 /// a count that ignored the rule reported replay working for the rest of the session
 /// while nothing was replayed.
-fn tally_capsules(messages: &[Message]) -> CapsuleTally {
+fn tally_capsules(messages: &[RequestMessage]) -> CapsuleTally {
     let mut tally = CapsuleTally::default();
     for message in messages {
         for (index, block) in message.content.iter().enumerate() {
@@ -6924,7 +6951,7 @@ fn completion_request(
     request_context: ProviderRequestContext,
 ) -> zuno_llm::registry::CompletionRequest {
     let (messages, developer_context, tools) = prepared.into_request_parts();
-    zuno_llm::registry::CompletionRequest::new(model.model_id.clone(), messages)
+    zuno_llm::registry::CompletionRequest::from_request_messages(model.model_id.clone(), messages)
         .on_surface(model.surface)
         .with_developer_context(developer_context)
         .with_tools(
@@ -6982,6 +7009,7 @@ fn hook_messages(history: &[MessageWithParts]) -> Vec<HookMessageWithParts> {
                 .map_or_else(Vec::new, |message| message.parts.clone());
             HookMessageWithParts {
                 info: projected.message,
+                preceding_responses_input: projected.preceding_responses_input,
                 parts,
             }
         })
@@ -7678,7 +7706,7 @@ mod reasoning_replay_boundary_tests {
         ];
         let projected = project_history("", &history)
             .into_iter()
-            .map(|projected| projected.message)
+            .map(ProjectedMessage::into_request_message)
             .collect::<Vec<_>>();
         assert!(
             zuno_llm::registry::validate_responses_replay_boundaries(&projected).is_err(),
@@ -7698,7 +7726,7 @@ mod reasoning_replay_boundary_tests {
 
         let projected = project_history("", &history)
             .into_iter()
-            .map(|projected| projected.message)
+            .map(ProjectedMessage::into_request_message)
             .collect::<Vec<_>>();
         let assistants = projected
             .iter()
@@ -7706,7 +7734,12 @@ mod reasoning_replay_boundary_tests {
             .collect::<Vec<_>>();
         assert_eq!(assistants.len(), 2);
         assert_eq!(
-            assistants[1].preceding_developer_context,
+            assistants[1]
+                .preceding_responses_input()
+                .items()
+                .iter()
+                .map(zuno_llm::registry::ResponsesInputItem::content)
+                .collect::<Vec<_>>(),
             ["Continue the active Goal from durable state."]
         );
         zuno_llm::registry::validate_responses_replay_boundaries(&projected)
@@ -8246,7 +8279,7 @@ mod historical_tool_declaration_tests {
         current_turn_id: &str,
     ) -> (
         super::HistoricalToolDeclarationRepair,
-        Vec<Message>,
+        Vec<zuno_llm::registry::RequestMessage>,
         Vec<MessageWithParts>,
     ) {
         let projection = historical_tool_projection(&history, definitions, current_turn_id);
@@ -8502,7 +8535,7 @@ mod historical_tool_declaration_tests {
         let mut interposed = clean;
         interposed.insert(
             1,
-            Message::new(Role::User, "inserted between call and result"),
+            Message::new(Role::User, "inserted between call and result").into(),
         );
         let error = ensure_historical_tool_protocol_unchanged(
             &projection.blocks,

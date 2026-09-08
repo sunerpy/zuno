@@ -370,7 +370,7 @@ Responses function tools；同名的配置工具会由锁定声明覆盖。
 
 重放还必须与端点的指纹一致。工具调用会用 provider 自己的 `arguments` 字节重放，而不是把解析后的值重新序列化，因为键顺序与空格也是被签名内容的一部分。如果某个步骤的封装项后面没有任何输出（例如步骤被打断，或整份输出预算都花在推理上），这一项会被扣留而不是单独发出，因为 Responses 端点会拒绝这种形状；它计入被扣留数，而不算作一次重放。项 id 不会回送：重放项只带 `type`、`summary`、`encrypted_content` 与 `status`。
 
-自动 Goal continuation 的输入边界也会被保留。Zuno 会在新 turn 的第一条 assistant 行上只保存 prompt receipt 引用，并在两个 assistant 响应于 Responses `input` 中直接相邻时，从 receipt 的 hook 后实际投影恢复动态 developer context 后缀。旧版本的行会从 provider request 事件找到准确 receipt，并先剥离稳定的 runtime policy 前缀。这样每个加密信封仍只对应铸造它的那一个 turn 的输出指纹，不需要伪造 user 消息或工具结果。若旧 export、压缩摘要或损坏历史没有可证明的 receipt，Zuno 会仅扣留歧义组中的 capsule，保留其余文本与工具历史；最后的 provider 校验只报告消息索引而不会输出 token。
+自动 Goal continuation 的输入边界也会被保留。Zuno 会在新 turn 的第一条 assistant 行上只保存 prompt receipt 引用，并在两个 assistant 响应于 Responses `input` 中直接相邻时，从 receipt 的 hook 后实际投影恢复动态 developer context 后缀。该后缀会成为后一个请求消息上的结构化 `ResponsesInputBoundary` sidecar，由 OpenAI、OpenAI-compatible 与 Bedrock Mantle/Runtime 共用的 Responses cursor 投影；通用 `Message`、Chat、Anthropic Messages 与 Converse 路径不读取它，空边界也不会改变普通请求 JSON。旧版本的行会从 provider request 事件找到准确 receipt，并先剥离稳定的 runtime policy 前缀。这样每个加密信封仍只对应铸造它的那一个 turn 的输出指纹，不需要伪造 user 消息或工具结果。若旧 export、压缩摘要或损坏历史没有可证明的 receipt，Zuno 会仅扣留歧义组中的 capsule，保留其余文本与工具历史；最后的 provider 校验只报告消息索引而不会输出 token。
 
 默认值 `off` 表示请求既不带 `include`，也不带任何封装项，包括同一会话在选项为 `encrypted` 时存下的信封。它并不承诺请求字节与既有版本一致：本次发布还会按模型流出的顺序发送每个 assistant 轮次的 Responses `input`，因此先写文本再调用工具的一轮，现在会先发文本项再发 function call —— 这对所有 Responses provider 生效，与 `reasoningReplay` 的取值无关。这个顺序正是封装端点会校验的内容；一次性代价是仅追加的提示词缓存前缀会失效一次。
 

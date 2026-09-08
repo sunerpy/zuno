@@ -357,7 +357,6 @@ impl TranscriptMessage {
                 .iter()
                 .filter_map(ContentBlock::to_request)
                 .collect(),
-            preceding_developer_context: Vec::new(),
         }
     }
 }
@@ -369,18 +368,6 @@ pub struct Message {
     pub role: Role,
     /// Blocks that are structurally safe for generic replay.
     pub content: Vec<RequestContentBlock>,
-    /// Ordered developer-context items that immediately preceded this assistant output.
-    ///
-    /// Autonomous turns can legitimately produce two assistant messages with no user
-    /// or tool-result message between them. Responses flattens those messages into one
-    /// item list, so sealed reasoning from the second turn would otherwise be grouped
-    /// with the first turn's output. The engine resolves the later turn's prompt receipt
-    /// into the actual post-hook context and providers restore it at that exact boundary.
-    ///
-    /// Empty for ordinary user/tool-delimited history and never populated from model
-    /// output. It is request metadata, not assistant content.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub preceding_developer_context: Vec<String>,
 }
 
 impl Message {
@@ -390,25 +377,13 @@ impl Message {
         Self {
             role,
             content: vec![RequestContentBlock::Text { text: text.into() }],
-            preceding_developer_context: Vec::new(),
         }
     }
 
     /// A message with already-filtered provider request content.
     #[must_use]
     pub fn from_content(role: Role, content: Vec<RequestContentBlock>) -> Self {
-        Self {
-            role,
-            content,
-            preceding_developer_context: Vec::new(),
-        }
-    }
-
-    /// Attach the exact developer items that separated this assistant turn from the prior one.
-    #[must_use]
-    pub fn with_preceding_developer_context(mut self, context: Vec<String>) -> Self {
-        self.preceding_developer_context = context;
-        self
+        Self { role, content }
     }
 }
 

@@ -38,8 +38,10 @@
 
 pub use crate::event::{FinishReason, Message, RequestContentBlock, Role, StreamEvent};
 use crate::registry::spec::ApiSurface;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::Arc;
 use zuno_error::ProviderError;
@@ -309,7 +311,7 @@ pub struct CompletionRequest {
     /// [`ApiSurface`](crate::registry::ApiSurface).
     pub surface: ApiSurface,
     /// The durable conversation and static instruction messages, in order.
-    pub messages: Vec<Message>,
+    pub messages: Vec<RequestMessage>,
     /// Volatile non-user policy for this request, such as active Goal state or memory.
     ///
     /// Providers map each item to their native developer/system context without
@@ -332,6 +334,162 @@ pub struct CompletionRequest {
     pub headers: BTreeMap<String, String>,
     /// Typed routing context, inaccessible to arbitrary request-hook mutation.
     request_context: Option<ProviderRequestContext>,
+}
+
+/// One standard Responses input item that preceded a historical assistant output.
+///
+/// The enum is intentionally structured even though developer text is the only
+/// boundary item Zuno currently restores. Responses history is an ordered item
+/// stream, so future standard input-item kinds belong here rather than as another
+/// provider-specific field on [`Message`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsesInputItem {
+    /// A standard developer-role input message.
+    Developer {
+        /// The exact post-hook developer text sent on the original turn.
+        content: String,
+    },
+}
+
+impl ResponsesInputItem {
+    /// Build one developer-role boundary item.
+    #[must_use]
+    pub fn developer(content: impl Into<String>) -> Self {
+        Self::Developer {
+            content: content.into(),
+        }
+    }
+
+    /// The standard Responses role spelling for this input item.
+    #[must_use]
+    pub const fn role(&self) -> &'static str {
+        match self {
+            Self::Developer { .. } => "developer",
+        }
+    }
+
+    /// Text content carried by this input item.
+    #[must_use]
+    pub fn content(&self) -> &str {
+        match self {
+            Self::Developer { content } => content,
+        }
+    }
+}
+
+/// Ordered Responses input items separating one assistant output from the prior one.
+///
+/// This metadata is request-only. Durable rows keep a prompt-receipt reference, and
+/// the engine resolves that receipt into this boundary immediately before request
+/// projection. Ordinary providers receive an empty boundary and therefore serialize
+/// exactly the same [`Message`] content as before.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponsesInputBoundary {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    items: Vec<ResponsesInputItem>,
+}
+
+impl ResponsesInputBoundary {
+    /// Build a boundary from the exact developer items that started the turn.
+    #[must_use]
+    pub fn from_developer_context(context: Vec<String>) -> Self {
+        Self {
+            items: context
+                .into_iter()
+                .filter(|content| !content.trim().is_empty())
+                .map(ResponsesInputItem::developer)
+                .collect(),
+        }
+    }
+
+    /// Whether this message had no recoverable Responses input before it.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Input items in their original provider-visible order.
+    #[must_use]
+    pub fn items(&self) -> &[ResponsesInputItem] {
+        &self.items
+    }
+}
+
+/// One provider-safe message plus Responses-only request metadata.
+///
+/// Keeping the sidecar here preserves its association through prompt caching and
+/// request hooks without teaching the generic [`Message`] content type about one
+/// provider surface. `serde(flatten)` keeps an empty sidecar byte-identical to the
+/// historical message JSON used by append-only cache fingerprints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestMessage {
+    #[serde(flatten)]
+    message: Message,
+    #[serde(default, skip_serializing_if = "ResponsesInputBoundary::is_empty")]
+    preceding_responses_input: ResponsesInputBoundary,
+}
+
+impl RequestMessage {
+    /// Wrap one ordinary provider message with no Responses-only metadata.
+    #[must_use]
+    pub fn new(message: Message) -> Self {
+        Self {
+            message,
+            preceding_responses_input: ResponsesInputBoundary::default(),
+        }
+    }
+
+    /// Attach the exact standard input items that preceded this assistant output.
+    #[must_use]
+    pub fn with_preceding_responses_input(mut self, boundary: ResponsesInputBoundary) -> Self {
+        self.preceding_responses_input = boundary;
+        self
+    }
+
+    /// Responses-only input immediately preceding this message.
+    #[must_use]
+    pub const fn preceding_responses_input(&self) -> &ResponsesInputBoundary {
+        &self.preceding_responses_input
+    }
+
+    /// Borrow the generic provider message.
+    #[must_use]
+    pub const fn message(&self) -> &Message {
+        &self.message
+    }
+
+    /// Consume the request wrapper and return its generic message.
+    #[must_use]
+    pub fn into_message(self) -> Message {
+        self.message
+    }
+
+    /// Consume the wrapper while preserving both generic content and its sidecar.
+    #[must_use]
+    pub fn into_parts(self) -> (Message, ResponsesInputBoundary) {
+        (self.message, self.preceding_responses_input)
+    }
+}
+
+impl From<Message> for RequestMessage {
+    fn from(message: Message) -> Self {
+        Self::new(message)
+    }
+}
+
+impl Deref for RequestMessage {
+    type Target = Message;
+
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
+}
+
+impl DerefMut for RequestMessage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.message
+    }
 }
 
 /// One tool as the model is told about it, before any provider's wire shape.
@@ -367,6 +525,18 @@ impl CompletionRequest {
     /// surface, offering no tools.
     #[must_use]
     pub fn new(model_id: impl Into<String>, messages: Vec<Message>) -> Self {
+        Self::from_request_messages(
+            model_id,
+            messages.into_iter().map(RequestMessage::from).collect(),
+        )
+    }
+
+    /// A request whose historical messages already carry Responses-only metadata.
+    #[must_use]
+    pub fn from_request_messages(
+        model_id: impl Into<String>,
+        messages: Vec<RequestMessage>,
+    ) -> Self {
         Self {
             model_id: model_id.into(),
             surface: ApiSurface::Default,
@@ -535,6 +705,46 @@ impl<T: CredentialPresence + ?Sized> CredentialPresence for Arc<T> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_empty_responses_sidecar_preserves_ordinary_message_json() {
+        let message = Message::new(Role::User, "hello");
+        let wrapped = RequestMessage::new(message.clone());
+
+        assert_eq!(
+            serde_json::to_value(wrapped).expect("request message JSON"),
+            serde_json::to_value(message).expect("generic message JSON"),
+            "ordinary provider cache and request projections must remain byte-shaped identically"
+        );
+    }
+
+    #[test]
+    fn responses_boundary_is_structured_request_metadata_not_message_content() {
+        let message = Message::new(Role::Assistant, "answer");
+        let wrapped = RequestMessage::new(message.clone()).with_preceding_responses_input(
+            ResponsesInputBoundary::from_developer_context(vec![
+                "Continue from durable state.".to_owned(),
+            ]),
+        );
+
+        assert_eq!(wrapped.message(), &message);
+        assert_eq!(
+            wrapped
+                .preceding_responses_input()
+                .items()
+                .iter()
+                .map(ResponsesInputItem::content)
+                .collect::<Vec<_>>(),
+            ["Continue from durable state."]
+        );
+        assert!(
+            serde_json::to_value(message)
+                .expect("generic message JSON")
+                .get("preceding_responses_input")
+                .is_none(),
+            "generic message content must not expose Responses-only metadata"
+        );
+    }
 
     #[test]
     fn provider_request_context_keeps_routing_identity_out_of_arbitrary_metadata() {

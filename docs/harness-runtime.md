@@ -900,9 +900,14 @@ on the wire.
 An automatic Goal continuation is also a new provider turn, even when no new user
 message exists. Zuno persists the prompt-receipt reference on the first assistant
 row of that turn, not another copy of the prompt. If two assistant responses would
-otherwise be adjacent in Responses `input`, both Responses adapters restore the
-receipt's actual post-hook developer items between them before replaying the later
-reasoning envelope. Rows written by older releases recover the same receipt
+otherwise be adjacent in Responses `input`, the engine attaches the receipt's
+actual post-hook developer items as a structured `ResponsesInputBoundary` sidecar
+on the later request message. The shared Responses cursor used by OpenAI,
+OpenAI-compatible, and Bedrock Mantle/Runtime emits those standard input items
+between the assistant outputs before replaying the later reasoning envelope.
+Generic message content, Chat Completions, Anthropic Messages, and Bedrock
+Converse never receive that sidecar; an empty boundary serializes identically to
+the ordinary message. Rows written by older releases recover the same receipt
 through the durable
 `assistantMessageID -> promptReceiptID -> actualProviderProjection.developer`
 chain, falling back to `providerProjection` only when no hook changed the prompt.
@@ -913,9 +918,10 @@ user message or fake tool result is manufactured.
 Compaction summaries and imported old exports may legitimately have no receipt.
 For those histories Zuno withholds only the sealed capsules in the ambiguous
 assistant-output group while preserving text, tool calls, and real tool results.
-The session remains usable at reduced reasoning continuity. Both Responses
-providers retain a final local validator, so a malformed group that escapes the
-shared repair fails with message indexes and never renders opaque token bytes.
+The session remains usable at reduced reasoning continuity. Every Responses
+request builder retains a final local validator, so a malformed group that
+escapes the shared repair fails with message indexes and never renders opaque
+token bytes.
 
 Replay is scoped, and the scope is enforced while the request is assembled, not
 when the row is written. An envelope is replayed only to the catalog provider and

@@ -2202,9 +2202,9 @@ async fn loop_persists_ordered_prompt_provenance_and_the_post_hook_prompt() {
     assert_eq!(
         &requests[0].messages[..3],
         &[
-            zuno_llm::event::Message::new(Role::System, "BASE"),
-            zuno_llm::event::Message::new(Role::System, "RULES"),
-            zuno_llm::event::Message::new(Role::System, "HOOK"),
+            zuno_llm::event::Message::new(Role::System, "BASE").into(),
+            zuno_llm::event::Message::new(Role::System, "RULES").into(),
+            zuno_llm::event::Message::new(Role::System, "HOOK").into(),
         ],
         "kernel, developer rules, and hook output must keep separate provider messages"
     );
