@@ -189,14 +189,16 @@ fn thirty_exited_sessions_retain_the_twenty_five_that_exited_last() {
 
 #[test]
 fn removing_a_retained_session_frees_a_slot_for_a_later_exit() {
+    let root = tempfile::tempdir().expect("isolated PTY state");
     let service =
-        PtyService::with_config(PtyServiceConfig::new(std::env::temp_dir()).with_exited_limit(2));
+        PtyService::with_config(PtyServiceConfig::new(root.path().to_owned()).with_exited_limit(2));
 
     let first = spawn_script(&service, "exit 0").id;
     wait_for_exit(&service, &first);
+    common::wait_for_retained_exit(&service, &first);
     let second = spawn_script(&service, "exit 0").id;
     wait_for_exit(&service, &second);
-    assert!(common::poll_until(|| service.retained_exited().len() == 2));
+    common::wait_for_retained_exit(&service, &second);
 
     service
         .remove(&first)
@@ -206,10 +208,10 @@ fn removing_a_retained_session_frees_a_slot_for_a_later_exit() {
 
     let third = spawn_script(&service, "exit 0").id;
     wait_for_exit(&service, &third);
-    assert!(
-        common::poll_until(|| service.retained_exited().len() == 2),
-        "retained {:?}",
-        service.retained_exited()
+    common::wait_for_retained_exit(&service, &third);
+    assert_eq!(
+        service.retained_exited(),
+        vec![second.clone(), third.clone()]
     );
     assert!(
         service.contains(&second),
