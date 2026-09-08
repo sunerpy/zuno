@@ -157,7 +157,7 @@ profile lifecycle. The assembled model request is persisted as
 
 Read [Harness Runtime](./docs/harness-runtime.md) for the component model and
 [Project structure and execution flow](./docs/guide/project-structure.md) for the
-47-crate ownership map. Read
+48-crate ownership map. Read
 [Plugins and extensions](./docs/plugins.md) for package formats and capability grants.
 Use [Developing agents and extensions](./docs/guide/extension-development.md) for
 complete declarative Agent, WASI guest, and native Rust implementation paths.

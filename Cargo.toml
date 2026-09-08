@@ -78,6 +78,7 @@ zuno-provider-google = { version = "0.10.21", path = "crates/zuno-provider-googl
 zuno-provider-openai = { version = "0.10.21", path = "crates/zuno-provider-openai" } # x-release-please-version
 zuno-pty = { version = "0.10.21", path = "crates/zuno-pty" } # x-release-please-version
 zuno-runtime = { version = "0.10.21", path = "crates/zuno-runtime" } # x-release-please-version
+zuno-review = { version = "0.10.21", path = "crates/zuno-review" } # x-release-please-version
 zuno-search = { version = "0.10.21", path = "crates/zuno-search" } # x-release-please-version
 zuno-sandbox = { version = "0.10.21", path = "crates/zuno-sandbox" } # x-release-please-version
 zuno-server = { version = "0.10.21", path = "crates/zuno-server" } # x-release-please-version

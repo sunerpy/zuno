@@ -504,7 +504,12 @@ fn from_builtin(builtin: builtin::Builtin) -> Agent {
         delegates: builtin
             .delegates
             .map(|targets| targets.iter().map(|target| (*target).to_owned()).collect()),
-        required_skills: None,
+        required_skills: builtin.required_skills().map(|skills| {
+            skills
+                .iter()
+                .map(|skill| (*skill).to_owned())
+                .collect::<Vec<_>>()
+        }),
         options: JsonMap::new(),
         permission: None,
         source: AgentSource::Native,
@@ -834,7 +839,7 @@ mod tests {
         assert!(
             agents
                 .iter()
-                .filter(|agent| agent.name != "orchestrator")
+                .filter(|agent| !builtin::DELEGATING_NATIVES.contains(&agent.name.as_str()))
                 .all(|agent| agent.delegates.is_none())
         );
     }

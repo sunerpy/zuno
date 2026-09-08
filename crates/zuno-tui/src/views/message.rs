@@ -195,6 +195,14 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         // A filled diamond rather than the hollow one reasoning uses, because a claim is
         // what the session settled on and recorded, not what it is still turning over.
         "capability_claim" => ("◆", "Recording a capability claim..."),
+        // One glyph for the three review tools, on the same reasoning as the goal tools
+        // above: they open, record against and settle one review record, and separate
+        // glyphs would imply separate subjects. A ruled page rather than `≡` or `≣`,
+        // which already mean working notes and the plan.
+        "review_open" | "review_claim" | "review_finalize" => ("▤", "Reviewing evidence..."),
+        // Its own glyph, not the writers': this is a bounded read of the durable ledger.
+        "review_get" => ("↧", "Reading review evidence..."),
+        "task_report" => ("⇩", "Reading a task report..."),
         _ => ("⚙", "Preparing..."),
     }
 }

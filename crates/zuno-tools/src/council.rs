@@ -22,6 +22,7 @@ use zuno_tool::{
 };
 
 use crate::task::{ChildTurnRequest, DelegationModelRequest, ReportDelivery, TaskTool};
+use zuno_review::{ReportLimits, seat_response_contract};
 
 /// Stable model-facing id for Council execution.
 pub const WIRE_ID: &str = "council_run";
@@ -35,8 +36,6 @@ const MAX_SEAT_OUTPUT_BYTES: usize = 64 * 1_024;
 const MAX_SYNTHESIS_INPUT_BYTES: usize = 256 * 1_024;
 const MAX_QUESTION_BYTES: usize = 64 * 1_024;
 
-const SEAT_RESPONSE_CONTRACT: &str = "Return exactly one JSON object and no markdown. Required fields: `verdict` (non-empty string), `confidence` (number from 0 to 1), `evidence` (array of strings), `risks` (array of strings), and `recommendation` (non-empty string). Do not include hidden reasoning or tool transcripts.";
-
 /// Arguments for one immutable Council preset invocation.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +44,12 @@ pub struct CouncilParams {
     pub preset: String,
     /// Decision or question every isolated seat evaluates.
     pub question: String,
+    /// Durable review that owns every accepted seat claim.
+    #[serde(rename = "reviewID")]
+    pub review_id: String,
+    /// Source snapshot every seat must echo back.
+    #[serde(rename = "sourceSnapshotID")]
+    pub source_snapshot_id: String,
     /// Short label shown in durable jobs and clients.
     #[serde(default)]
     pub description: Option<String>,
@@ -71,6 +76,8 @@ pub struct CouncilRequest {
     pub preset: String,
     pub description: Option<String>,
     pub question: String,
+    pub review_id: String,
+    pub source_snapshot_id: String,
     pub seats: Vec<CouncilSeatRequest>,
     pub quorum: usize,
     pub max_parallel: usize,
@@ -160,13 +167,20 @@ impl CouncilTool {
         parent_attempt: Option<&Arc<AttemptSnapshot>>,
     ) -> Vec<CouncilSeatRequest> {
         let workflow = format!("council:{}", preset.name);
+        let contract = seat_response_contract(ReportLimits::for_seat(preset.seat_output_bytes));
         preset
             .seats
             .iter()
             .map(|seat| {
                 let prompt = format!(
-                    "Council question:\n{}\n\nSeat `{}` instruction:\n{}\n\n{}",
-                    params.question, seat.id, seat.instruction, SEAT_RESPONSE_CONTRACT
+                    "Council question:\n{}\n\nReview id: `{}`\nSource snapshot id: `{}`\n\n\
+                     Seat `{}` instruction:\n{}\n\n{}",
+                    params.question,
+                    params.review_id,
+                    params.source_snapshot_id,
+                    seat.id,
+                    seat.instruction,
+                    contract
                 );
                 let description = Some(format!("{} / {}", preset.name, seat.id));
                 let plan = self
@@ -187,6 +201,8 @@ impl CouncilTool {
                                 "seat": seat.id,
                                 "agent": seat.agent,
                                 "question": params.question,
+                                "review_id": params.review_id,
+                                "source_snapshot_id": params.source_snapshot_id,
                                 "instruction": seat.instruction,
                             }))
                         ),
@@ -246,6 +262,14 @@ impl TypedTool for CouncilTool {
                 "`question` exceeds the {MAX_QUESTION_BYTES}-byte Council limit"
             )));
         }
+        if params.review_id.trim().is_empty() {
+            return Err(invalid("`reviewID` must name the durable review"));
+        }
+        if params.source_snapshot_id.trim().is_empty() {
+            return Err(invalid(
+                "`sourceSnapshotID` must name the source returned by review_open",
+            ));
+        }
         let background = params.background.unwrap_or(false);
         if !background && params.report_delivery.is_some() {
             return Err(invalid(
@@ -297,6 +321,8 @@ impl TypedTool for CouncilTool {
             preset: name.to_owned(),
             description: params.description.clone(),
             question: params.question.clone(),
+            review_id: params.review_id.trim().to_owned(),
+            source_snapshot_id: params.source_snapshot_id.trim().to_owned(),
             seats: self.expand(preset, &params, &parent_session_id, parent_attempt.as_ref()),
             quorum: preset.quorum,
             max_parallel: preset.max_parallel,
@@ -562,6 +588,8 @@ mod tests {
         CouncilParams {
             preset: "balanced-review".to_owned(),
             question: "Should this change ship?".to_owned(),
+            review_id: "rev_1".to_owned(),
+            source_snapshot_id: "rsnap_1".to_owned(),
             description: Some("release review".to_owned()),
             background: background.then_some(true),
             report_delivery: None,
@@ -617,7 +645,15 @@ mod tests {
                 Some("council:balanced-review")
             );
             assert_eq!(seat.turn.workflow_node.as_deref(), Some(seat.id.as_str()));
-            assert!(seat.turn.prompt.contains(SEAT_RESPONSE_CONTRACT));
+            assert!(
+                seat.turn
+                    .prompt
+                    .contains(&seat_response_contract(ReportLimits::for_seat(
+                        requests[0].seat_output_bytes
+                    ))),
+                "the seat prompt carries the typed evidence-report contract, bounded by the \
+                 preset's own seat ceiling"
+            );
             assert!(!seat.turn.background);
         }
     }

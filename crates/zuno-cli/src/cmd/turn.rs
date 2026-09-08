@@ -4814,6 +4814,11 @@ impl TurnHost {
                         council_agent.model.catalog_model_id
                     )
                 })?;
+            let review_store = Arc::new(zuno_review::ReviewStore::new(Arc::clone(&database)));
+            let review_source: Arc<dyn zuno_review::ReviewSourceProbe> =
+                Arc::new(zuno_review::RepositoryReviewSourceProbe::new(
+                    worktree.clone().unwrap_or_else(|| plan.directory.clone()),
+                ));
             let workflow_host = super::workflow::NativeWorkflowHost::new(
                 Arc::clone(&database),
                 child_host.clone(),
@@ -4821,6 +4826,10 @@ impl TurnHost {
                 background_jobs.clone(),
                 council_provider,
                 council_agent,
+                super::workflow::ReviewRuntime {
+                    store: Arc::clone(&review_store),
+                    source: Arc::clone(&review_source),
+                },
             );
             let background_executions = environment
                 .background_executions(&plan.directory)

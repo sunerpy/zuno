@@ -266,6 +266,65 @@ The `bedrock-model-capability-review` Skill says what counts as evidence for an 
 Bedrock model: a vendor document naming that exact model id and region, or an observed
 probe. It also says to record the claim before writing configuration, not after.
 
+### Review evidence
+
+A review claim is a third kind: not about the workspace after a change, and not about an
+external system, but about what the repository does right now. The failure it prevents is
+specific. A delegated reviewer read one mutual-exclusion guard, reported that a concurrent
+request "only returns `session_busy`", and the parent inherited the conclusion because the
+report was prose and nothing required the main call path to be traced. The plan was then
+described as ready to implement.
+
+Four tools make that checkable.
+
+| Tool | What it does | Replay |
+| --- | --- | --- |
+| `review_open` | Opens a review for an artifact or Plan; the host captures Git, scoped worktree bytes and CodeGraph status | Never |
+| `review_claim` | Records, verifies, contests or refutes a claim, or resolves a recorded review issue | Never |
+| `review_get` | Returns the current event-backed review projection and a bounded claim selection | Safe |
+| `review_finalize` | Re-reads every anchor and decides `draft` or `ready` at one exact revision | Never |
+
+The model never supplies a head SHA, dirty flag, CodeGraph status, anchor digest,
+`verifiedByParent`, or readiness receipt. `review_open` captures source identity through the
+host's repository probe. Recording and finalizing a claim re-open its repository-relative
+anchors and compute their digests from the actual bytes. An assertion with no anchor is
+refused, and a changed scoped diff or changed anchor makes the claim stale even when the
+worktree was already dirty before both reads.
+
+Review state uses the existing per-session event stream rather than review-specific tables:
+`review.started.1`, `review.claim.recorded.1`, `review.claim.changed.1`, and
+`review.finalized.1`. Claim or issue changes increment the review revision, invalidate an
+earlier Ready decision, and clear its receipt in the same SQLite transaction.
+
+A negative claim — "does not exist", "only ever returns", "never happens" — cannot be
+verified until it records all five counterchecks: the definition lookup, direct and
+indirect callers and callees, at least one alternate entry point or opposite path, the
+relevant tests or protocol contracts, and an explicit search for where the claim would
+show up if it were false. Reading one guard does not establish an absence.
+
+The source snapshot has no indexed-revision field, because `codegraph status --json`
+publishes none. It stores the values the command does publish and a digest of the scoped Git
+diff and untracked bytes. A missing or stale index is reported as degraded; direct host reads
+remain the authority for evidence anchors.
+
+`balanced-review` seats return a parsed `DelegationEvidenceReport`. Malformed reports are
+invalid seat attempts and may use the preset retry budget; only reports that pass the schema,
+byte and anchor rules reach synthesis. The runtime, not the parent model, imports accepted
+claims, contradictions and unresolved questions into the named review.
+
+`task_report` is separate from the review ledger. It reads the terminal record for a durable
+`jobID` or child-session `taskID`, is parent-session scoped, and omits an oversized result as
+one bounded value instead of replaying or truncating a child transcript.
+
+`draft` and `ready` are different answers and must not stand in for each other. A draft is
+a normal delivery: it lists its blockers and does not block the goal that produced it. Only
+`ready` authorizes implementation, and it holds only when every load-bearing claim is
+verified, was re-verified through the `review` parent context rather than trusted from a
+delegate, and is anchored to the source the review now stands on, with no open issue or
+claim that is contested, stale, or an unverified P0. The host generates the Ready receipt;
+the caller cannot provide one. A requested `ready` that fails the gate is recorded as a
+draft with all blockers.
+
 ### Generated state stays out of the commit
 
 Everything directly under `.zuno/` is generated unless a person authors it. The goal

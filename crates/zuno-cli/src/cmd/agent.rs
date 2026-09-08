@@ -122,7 +122,7 @@ fn resolved_rule_set(
     {
         rules.extend(rules_from_config(&overlay));
         match entry.name.as_str() {
-            "plan" | "explorer" | "librarian" | "oracle" | "looker" => {
+            "plan" | "review" | "explorer" | "librarian" | "oracle" | "looker" => {
                 rules.extend(dynamic.readonly_external.clone())
             }
             _ => {}

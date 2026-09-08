@@ -107,6 +107,31 @@ fn descriptions() -> Vec<Description> {
             text: zuno_goal::tools::REQUEST_INPUT_DESCRIPTION,
         },
         Description {
+            wire_id: zuno_review::REVIEW_FINALIZE_TOOL_ID,
+            file: "crates/zuno-review/src/description/review-finalize.txt",
+            text: zuno_review::REVIEW_FINALIZE_DESCRIPTION,
+        },
+        Description {
+            wire_id: zuno_review::REVIEW_GET_TOOL_ID,
+            file: "crates/zuno-review/src/description/review-get.txt",
+            text: zuno_review::REVIEW_GET_DESCRIPTION,
+        },
+        Description {
+            wire_id: zuno_tools::TASK_REPORT_WIRE_ID,
+            file: "crates/zuno-tools/src/description/task-report.txt",
+            text: zuno_tools::TASK_REPORT_DESCRIPTION,
+        },
+        Description {
+            wire_id: zuno_review::REVIEW_OPEN_TOOL_ID,
+            file: "crates/zuno-review/src/description/review-open.txt",
+            text: zuno_review::REVIEW_OPEN_DESCRIPTION,
+        },
+        Description {
+            wire_id: zuno_review::REVIEW_CLAIM_TOOL_ID,
+            file: "crates/zuno-review/src/description/review-claim.txt",
+            text: zuno_review::REVIEW_CLAIM_DESCRIPTION,
+        },
+        Description {
             wire_id: "glob",
             file: "crates/zuno-tools/src/description/glob.txt",
             text: zuno_tools::glob::DESCRIPTION,

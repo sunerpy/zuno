@@ -42,6 +42,7 @@ zuno-permission = { workspace = true }
 # command's own exit code.
 zuno-process = { workspace = true }
 zuno-pty = { workspace = true }
+zuno-review = { workspace = true }
 zuno-search = { workspace = true }
 zuno-sandbox = { workspace = true }
 zuno-tool = { workspace = true }

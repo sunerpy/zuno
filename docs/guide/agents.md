@@ -15,6 +15,7 @@ configuration can quietly reverse.
 | `orchestrator` | Own the outcome, partition work, integrate results, verify completion | May delegate |
 | `build` | Direct end-to-end implementation in one lane | No child tools |
 | `plan` | Read-only research and implementation-ready planning | No child tools |
+| `review` | Read-only high-assurance review: records checkable evidence and decides draft or ready | May delegate the review seats |
 | `deep` | Deep-work mode, or delegated root-cause and cross-cutting implementation | No recursive delegation |
 | `fixer` | Focused local change and its regression scope | No recursive delegation |
 | `general` | Bounded work with no narrower specialist | No recursive delegation |
@@ -23,8 +24,13 @@ configuration can quietly reverse.
 | `oracle` | Read-only architecture and root-cause review | No recursive delegation |
 | `looker` | Visual artifact inspection | No recursive delegation |
 
-`orchestrator` is the default and the only native primary agent exposing the `task`
-delegation tool. `deep` has mode `all`, so it can be selected directly as a session agent
+`orchestrator` is the default. It and `review` are the only natives exposing the `task`
+delegation tool: `orchestrator` partitions delivery and owns integration, while `review`
+seats the `balanced-review` Council over `explorer`, `librarian` and `oracle` and nothing
+else. Both remain bounded — neither can reach a writing child from a read-only role, and
+`review` cannot seat another `review`, update Plan/Todo state, or forge source and receipt
+fields. Council seat output is parsed and imported by the runtime before synthesis.
+`deep` has mode `all`, so it can be selected directly as a session agent
 while `orchestrator` can also target it; direct selection does not grant it recursive
 delegation. `deep` can read, create, update, and request input for the current durable
 Goal, so a directly selected deep-work session can close the same evidence-gated objective
@@ -44,6 +50,7 @@ A practical rule:
 | Situation | Agent |
 | --- | --- |
 | You want an answer or a plan, and no writes | `plan` |
+| A plan or design that has to be judged ready to implement | `review` |
 | A well-scoped change in one area | `build` |
 | A local fix plus its regression scope | `fixer` |
 | A hard cross-cutting problem | `deep` |

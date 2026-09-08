@@ -1,0 +1,1 @@
+Open one durable evidence review. The host, not the model, reads Git, the scoped working-tree bytes, and CodeGraph status. Supply only the artifact, repository-relative scope paths, and optional Plan binding. The result starts as draft at revision 1.

@@ -221,6 +221,7 @@ pub mod plan_exit;
 pub mod product_agent;
 pub mod question;
 pub mod registry;
+pub mod task_report;
 pub mod work_state;
 pub mod workflow;
 
@@ -248,6 +249,10 @@ pub use crate::question::{
     Answer, QuestionAsker, QuestionOption, QuestionParams, QuestionPrompt, QuestionRequest,
     QuestionTool, ScriptedAnswers,
 };
+pub use crate::task_report::{
+    DESCRIPTION as TASK_REPORT_DESCRIPTION, TaskReportParams, TaskReportTool,
+    WIRE_ID as TASK_REPORT_WIRE_ID,
+};
 pub use crate::work_state::{
     PLAN_GET_DESCRIPTION, PLAN_GET_TOOL_ID, PLAN_UPDATE_DESCRIPTION, PLAN_UPDATE_TOOL_ID,
     PlanGetTool, PlanMutationParams, PlanStep, PlanStepInput, PlanStepPatch, PlanStepStatus,
@@ -260,6 +265,11 @@ pub use crate::work_state::{
 pub use crate::workflow::{
     WIRE_ID as WORKFLOW_WIRE_ID, WorkflowHost, WorkflowNodeRequest, WorkflowParams,
     WorkflowRequest, WorkflowTool, WorkflowTurn,
+};
+pub use zuno_review::{
+    DEFAULT_MAX_CLAIMS_PER_REPORT, DelegationEvidenceReport, MAX_COUNTERCHECKS_PER_CLAIM,
+    MAX_SUMMARY_BYTES, ReportLimits, ReportRejection, ReportedClaim, ReportedContradiction,
+    ReportedUnresolved, seat_response_contract,
 };
 
 pub mod memory;

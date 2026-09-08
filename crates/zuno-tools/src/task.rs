@@ -96,6 +96,19 @@ pub const COORDINATOR: &str = "orchestrator";
 /// and reasoning routing come from the resolved parent/config/preset policy.
 pub const DESCRIPTION: &str = include_str!("description/task.txt");
 
+/// How many bytes of one child report may reach the parent context directly.
+///
+/// This path was unbounded: a delegated report of any size was injected verbatim, and
+/// three 45 KB reports are how one review turn grew its input from roughly 50 K to
+/// 178 K tokens. The ceiling matches the Council seat ceiling the first-party
+/// `balanced-review` preset already enforces, because a plain delegation report and a
+/// Council seat report are the same kind of artifact arriving at the same place — a
+/// second, larger budget for the plain path would just move the problem.
+///
+/// Nothing is lost: the full result stays in the child session, which the envelope
+/// already names, and the truncation marker says how much stayed there.
+pub const MAX_INJECTED_REPORT_BYTES: usize = 16 * 1_024;
+
 /// How a background child reports its terminal state.
 #[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1282,6 +1295,27 @@ fn host_failure(error: ChildTurnError) -> ToolError {
     }
 }
 
+/// Bound one child report, naming how much stayed in the child session.
+///
+/// Cuts on a UTF-8 boundary at or below the ceiling, so a multi-byte character can
+/// never be split into invalid output. The marker is a closed tag rather than prose so
+/// a client can present it without parsing English.
+fn bound_report(output: &str, session_id: &str) -> String {
+    if output.len() <= MAX_INJECTED_REPORT_BYTES {
+        return output.to_owned();
+    }
+    let mut cut = MAX_INJECTED_REPORT_BYTES;
+    while cut > 0 && !output.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let omitted = output.len() - cut;
+    format!(
+        "{}\n<report_truncated omittedBytes=\"{omitted}\" limitBytes=\"{MAX_INJECTED_REPORT_BYTES}\" \
+         childSession=\"{session_id}\"/>",
+        &output[..cut]
+    )
+}
+
 /// Upstream's `renderOutput` (`task.ts:64-78`), plus the background id and the
 /// resolution notes.
 ///
@@ -1310,7 +1344,7 @@ fn render(
         lines.push(format!("<note>{note}</note>"));
     }
     lines.push("<task_result>".to_owned());
-    lines.push(turn.output.clone());
+    lines.push(bound_report(&turn.output, &turn.session_id));
     lines.push("</task_result>".to_owned());
     lines.push("</task>".to_owned());
 
@@ -1516,6 +1550,56 @@ impl ChildTurnHost for RecordingHost {
                 .flatten(),
             session_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod bound_report_tests {
+    use super::{MAX_INJECTED_REPORT_BYTES, bound_report};
+
+    #[test]
+    fn a_report_within_the_ceiling_reaches_the_parent_unchanged() {
+        let report = "the child finished and reported three findings";
+        assert_eq!(bound_report(report, "ses_child"), report);
+    }
+
+    #[test]
+    fn a_report_at_exactly_the_ceiling_is_still_unchanged() {
+        let report = "x".repeat(MAX_INJECTED_REPORT_BYTES);
+        assert_eq!(bound_report(&report, "ses_child"), report);
+    }
+
+    #[test]
+    fn an_oversized_report_is_cut_and_says_how_much_stayed_in_the_child_session() {
+        let report = "x".repeat(MAX_INJECTED_REPORT_BYTES + 4_096);
+        let bounded = bound_report(&report, "ses_child");
+
+        assert!(bounded.len() < report.len());
+        assert!(bounded.starts_with(&"x".repeat(MAX_INJECTED_REPORT_BYTES)));
+        assert!(bounded.contains("omittedBytes=\"4096\""), "{bounded}");
+        assert!(bounded.contains(&format!("limitBytes=\"{MAX_INJECTED_REPORT_BYTES}\"")));
+        assert!(
+            bounded.contains("childSession=\"ses_child\""),
+            "the marker names where the full result stayed, so nothing is silently lost"
+        );
+    }
+
+    #[test]
+    fn a_multi_byte_character_is_never_split_by_the_cut() {
+        // Every character is three bytes and the ceiling is not a multiple of three, so
+        // the byte ceiling lands mid-character.
+        let report = "中".repeat(MAX_INJECTED_REPORT_BYTES);
+        let bounded = bound_report(&report, "ses_child");
+
+        let body = bounded
+            .split("\n<report_truncated")
+            .next()
+            .expect("a body precedes the marker");
+        assert!(body.len() <= MAX_INJECTED_REPORT_BYTES);
+        assert!(
+            body.chars().all(|character| character == '中'),
+            "a split character would have produced invalid bytes rather than whole characters"
+        );
     }
 }
 

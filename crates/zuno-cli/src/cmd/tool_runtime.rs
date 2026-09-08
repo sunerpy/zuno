@@ -497,6 +497,18 @@ pub(crate) fn assemble(
     builder.register_configured_builtin(erase(zuno_goal::CapabilityClaimTool::new(Arc::clone(
         &selection.goal_store,
     ))));
+    let review_store = Arc::new(zuno_review::ReviewStore::new(Arc::clone(
+        &selection.todo_store,
+    )));
+    let review_source: Arc<dyn zuno_review::ReviewSourceProbe> = Arc::new(
+        zuno_review::RepositoryReviewSourceProbe::new(worktree.unwrap_or(directory).to_path_buf()),
+    );
+    for tool in zuno_review::review_tools(review_store, review_source) {
+        builder.register_configured_builtin(tool);
+    }
+    builder.register_configured_builtin(erase(zuno_tools::TaskReportTool::new(Arc::clone(
+        &selection.todo_store,
+    ))));
     if selection.interaction_policy.allows_goal_request_input() && selection.question.is_some() {
         builder.register_configured_builtin(erase(zuno_goal::GoalRequestInputTool::new(
             Arc::clone(&selection.goal_store),

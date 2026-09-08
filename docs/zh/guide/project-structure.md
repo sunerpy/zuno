@@ -1,6 +1,6 @@
 # 项目结构与执行流
 
-修改行为之前，先用本页找到负责它的 crate。Zuno 是一个包含 47 个 crate 的 Rust
+修改行为之前，先用本页找到负责它的 crate。Zuno 是一个包含 48 个 crate 的 Rust
 workspace。`crates/zuno-cli` 构建最终的 `zuno` 二进制，其余 crate 把协议、运行时、
 存储、工具和客户端职责从入口程序中分离出来。
 
@@ -47,6 +47,7 @@ workspace。`crates/zuno-cli` 构建最终的 `zuno` 二进制，其余 crate �
 | `zuno-agent` | Agent 定义、内置预设与原生子任务边界 |
 | `zuno-orchestration` | 编译进 Zuno 的第一方 Agent、Skill 与编排描述 |
 | `zuno-goal` | 持久 Goal 状态与继续执行策略 |
+| `zuno-review` | 宿主采集的审核证据、经过验证的 Council 报告、Ready 门禁与持久审核事件投影 |
 | `zuno-continuity` | Session History、Notes 服务及其工具 |
 | `zuno-product-agent` | Codex 与 Claude Code Product Agent 的进程 adapter |
 | `zuno-extension` | 静态与进程内 Extension Package 的验证和生命周期 |
