@@ -538,6 +538,10 @@ fn openai_custom_endpoint_is_written_as_native_responses() {
 
     let (status, output) = terminal.finish_after_output("Stored API key for custom-responses");
     assert!(status.success(), "{output}");
+    assert!(
+        !output.contains("responses-secret"),
+        "secret input was echoed before raw mode became active: {output}"
+    );
     let config = fixture.config();
     assert_eq!(
         config["provider"]["custom-responses"]["transport"],

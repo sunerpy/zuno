@@ -437,11 +437,18 @@ mod tests {
             use std::io::{Read as _, Write as _};
 
             let (mut stream, _) = listener.accept().expect("accept probe");
-            let mut request = [0_u8; 2048];
-            let size = stream.read(&mut request).expect("read probe request");
-            assert!(
-                String::from_utf8_lossy(&request[..size]).starts_with("GET /api/session/active ")
-            );
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let size = stream.read(&mut chunk).expect("read probe request");
+                assert_ne!(size, 0, "probe request ended before its headers");
+                request.extend_from_slice(&chunk[..size]);
+                assert!(
+                    request.len() <= 8 * 1024,
+                    "probe request headers exceeded the fixture bound"
+                );
+            }
+            assert!(String::from_utf8_lossy(&request).starts_with("GET /api/session/active "));
             let body = r#"{"data":{"ses_active":{"type":"running"}}}"#;
             write!(
                 stream,

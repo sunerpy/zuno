@@ -22,11 +22,12 @@ use zuno_tool::{
 };
 
 use crate::task::{ChildTurnRequest, DelegationModelRequest, ReportDelivery, TaskTool};
+use zuno_review::{ReportLimits, seat_response_contract};
 
 /// Stable model-facing id for Council execution.
 pub const WIRE_ID: &str = "council_run";
-/// Council execution shares the bounded-delegation permission domain.
-pub const PERMISSION_KEY: &str = "task";
+/// Council execution is independently permissioned from arbitrary child delegation.
+pub const PERMISSION_KEY: &str = WIRE_ID;
 
 const MAX_SEATS: usize = 12;
 const MAX_RETRIES: usize = 3;
@@ -34,7 +35,9 @@ const MAX_DEADLINE_MS: u64 = 10 * 60 * 1_000;
 const MAX_SEAT_OUTPUT_BYTES: usize = 64 * 1_024;
 const MAX_SYNTHESIS_INPUT_BYTES: usize = 256 * 1_024;
 const MAX_QUESTION_BYTES: usize = 64 * 1_024;
-
+const MAX_TOOL_OUTPUT_BYTES: usize = 16 * 1_024;
+const MAX_DESCRIPTION_CHARS: usize = 500;
+const MAX_PRESET_CHARS: usize = 128;
 const SEAT_RESPONSE_CONTRACT: &str = "Return exactly one JSON object and no markdown. Required fields: `verdict` (non-empty string), `confidence` (number from 0 to 1), `evidence` (array of strings), `risks` (array of strings), and `recommendation` (non-empty string). Do not include hidden reasoning or tool transcripts.";
 
 /// Arguments for one immutable Council preset invocation.
@@ -45,6 +48,12 @@ pub struct CouncilParams {
     pub preset: String,
     /// Decision or question every isolated seat evaluates.
     pub question: String,
+    /// Durable review that owns every accepted seat claim.
+    #[serde(default, rename = "reviewID")]
+    pub review_id: Option<String>,
+    /// Source snapshot every seat must echo back.
+    #[serde(default, rename = "sourceSnapshotID")]
+    pub source_snapshot_id: Option<String>,
     /// Short label shown in durable jobs and clients.
     #[serde(default)]
     pub description: Option<String>,
@@ -63,6 +72,12 @@ pub struct CouncilSeatRequest {
     pub turn: ChildTurnRequest,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CouncilReviewBinding {
+    pub review_id: String,
+    pub source_snapshot_id: String,
+}
+
 /// A validated Council run admitted by the tool layer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CouncilRequest {
@@ -71,6 +86,8 @@ pub struct CouncilRequest {
     pub preset: String,
     pub description: Option<String>,
     pub question: String,
+    pub preset_source_id: String,
+    pub review: Option<CouncilReviewBinding>,
     pub seats: Vec<CouncilSeatRequest>,
     pub quorum: usize,
     pub max_parallel: usize,
@@ -109,6 +126,7 @@ pub struct CouncilTool {
     task: TaskTool,
     host: Arc<dyn CouncilHost>,
     description: String,
+    allow_review_binding: bool,
 }
 
 impl CouncilTool {
@@ -145,7 +163,14 @@ impl CouncilTool {
             description: format!(
                 "Run one validated Council preset. The seats, agents, model routes, quorum, concurrency, retry policy, end-to-end deadline, reserved synthesis time, and output bounds are configuration-owned. Available presets: {available}."
             ),
+            allow_review_binding: false,
         })
+    }
+
+    #[must_use]
+    pub fn with_review_binding_authority(mut self, allowed: bool) -> Self {
+        self.allow_review_binding = allowed;
+        self
     }
 
     fn preset(&self, name: &str) -> Option<&CouncilPresetDescriptor> {
@@ -160,13 +185,27 @@ impl CouncilTool {
         parent_attempt: Option<&Arc<AttemptSnapshot>>,
     ) -> Vec<CouncilSeatRequest> {
         let workflow = format!("council:{}", preset.name);
+        let contract = if params.review_id.is_some() {
+            seat_response_contract(ReportLimits::for_seat(preset.seat_output_bytes))
+        } else {
+            SEAT_RESPONSE_CONTRACT.to_owned()
+        };
         preset
             .seats
             .iter()
             .map(|seat| {
+                let review_context = params
+                    .review_id
+                    .as_deref()
+                    .zip(params.source_snapshot_id.as_deref())
+                    .map_or_else(String::new, |(review_id, source_snapshot_id)| {
+                        format!(
+                            "\nReview id: `{review_id}`\nSource snapshot id: `{source_snapshot_id}`\n"
+                        )
+                    });
                 let prompt = format!(
-                    "Council question:\n{}\n\nSeat `{}` instruction:\n{}\n\n{}",
-                    params.question, seat.id, seat.instruction, SEAT_RESPONSE_CONTRACT
+                    "Council question:\n{}{}\nSeat `{}` instruction:\n{}\n\n{}",
+                    params.question, review_context, seat.id, seat.instruction, contract
                 );
                 let description = Some(format!("{} / {}", preset.name, seat.id));
                 let plan = self
@@ -187,6 +226,8 @@ impl CouncilTool {
                                 "seat": seat.id,
                                 "agent": seat.agent,
                                 "question": params.question,
+                                "review_id": params.review_id,
+                                "source_snapshot_id": params.source_snapshot_id,
                                 "instruction": seat.instruction,
                             }))
                         ),
@@ -237,6 +278,11 @@ impl TypedTool for CouncilTool {
         if name.is_empty() {
             return Err(invalid("`preset` must not be empty"));
         }
+        if name.chars().count() > MAX_PRESET_CHARS {
+            return Err(invalid(&format!(
+                "`preset` exceeds the {MAX_PRESET_CHARS}-character limit"
+            )));
+        }
         let question = params.question.trim();
         if question.is_empty() {
             return Err(invalid("`question` must not be empty"));
@@ -245,6 +291,52 @@ impl TypedTool for CouncilTool {
             return Err(invalid(&format!(
                 "`question` exceeds the {MAX_QUESTION_BYTES}-byte Council limit"
             )));
+        }
+        if params.description.as_deref().is_some_and(|description| {
+            description.trim().is_empty() || description.chars().count() > MAX_DESCRIPTION_CHARS
+        }) {
+            return Err(invalid(&format!(
+                "`description` must contain 1 to {MAX_DESCRIPTION_CHARS} characters"
+            )));
+        }
+        let review = match (
+            params.review_id.as_deref().map(str::trim),
+            params.source_snapshot_id.as_deref().map(str::trim),
+        ) {
+            (None, None) => None,
+            (Some(review_id), Some(source_snapshot_id))
+                if !review_id.is_empty() && !source_snapshot_id.is_empty() =>
+            {
+                if ctx.agent != "review" {
+                    return Err(invalid(
+                        "`reviewID` and `sourceSnapshotID` are reserved for the native review Agent",
+                    ));
+                }
+                if !self.allow_review_binding {
+                    return Err(invalid(
+                        "the active review Agent is not the unmodified native review profile",
+                    ));
+                }
+                if name != "balanced-review" {
+                    return Err(invalid(
+                        "the native review Agent may bind only the `balanced-review` preset",
+                    ));
+                }
+                Some(CouncilReviewBinding {
+                    review_id: review_id.to_owned(),
+                    source_snapshot_id: source_snapshot_id.to_owned(),
+                })
+            }
+            _ => {
+                return Err(invalid(
+                    "`reviewID` and `sourceSnapshotID` must be supplied together and contain visible text",
+                ));
+            }
+        };
+        if self.allow_review_binding && review.is_none() {
+            return Err(invalid(
+                "the native review Agent must bind `balanced-review` to review_open output",
+            ));
         }
         let background = params.background.unwrap_or(false);
         if !background && params.report_delivery.is_some() {
@@ -297,6 +389,8 @@ impl TypedTool for CouncilTool {
             preset: name.to_owned(),
             description: params.description.clone(),
             question: params.question.clone(),
+            preset_source_id: preset.source_id.clone(),
+            review,
             seats: self.expand(preset, &params, &parent_session_id, parent_attempt.as_ref()),
             quorum: preset.quorum,
             max_parallel: preset.max_parallel,
@@ -390,29 +484,22 @@ fn render(params: &CouncilParams, turn: &CouncilTurn) -> ToolOutput {
         ReportDelivery::NextStep => "nextStep",
         ReportDelivery::Quiet => "quiet",
     };
-    let mut lines = vec![match turn.job_id.as_deref() {
-        Some(job) => format!(
-            "<council preset=\"{}\" run=\"{}\" job=\"{job}\" state=\"{state}\" reportDelivery=\"{delivery}\">",
-            params.preset, turn.run_id
-        ),
-        None => format!(
-            "<council preset=\"{}\" run=\"{}\" state=\"{state}\">",
-            params.preset, turn.run_id
-        ),
-    }];
-    if let Some(description) = &params.description {
-        lines.push(format!("<summary>{description}</summary>"));
-    }
-    lines.push("<council_result>".to_owned());
-    lines.push(turn.output.clone());
-    lines.push("</council_result>".to_owned());
-    lines.push("</council>".to_owned());
+    let body = bounded_council_output(json!({
+        "kind": "council",
+        "preset": params.preset,
+        "runID": turn.run_id,
+        "jobID": turn.job_id,
+        "state": state,
+        "reportDelivery": delivery,
+        "description": params.description,
+        "result": turn.output,
+    }));
     ToolOutput::text(
         params
             .description
             .clone()
             .unwrap_or_else(|| format!("{} Council", params.preset)),
-        lines.join("\n"),
+        body.clone(),
     )
     .with_metadata(
         "subagent",
@@ -424,9 +511,22 @@ fn render(params: &CouncilParams, turn: &CouncilTurn) -> ToolOutput {
             "state":state,
             "reportDelivery":delivery,
             "description":params.description,
-            "result":turn.output,
+            "result":body,
         }),
     )
+}
+
+fn bounded_council_output(value: Value) -> String {
+    let encoded = value.to_string();
+    if encoded.len() <= MAX_TOOL_OUTPUT_BYTES {
+        return encoded;
+    }
+    json!({
+        "kind": "council",
+        "omitted": true,
+        "reason": "Council result exceeded the tool output byte limit",
+    })
+    .to_string()
 }
 
 fn invalid(message: &str) -> ToolError {
@@ -562,9 +662,19 @@ mod tests {
         CouncilParams {
             preset: "balanced-review".to_owned(),
             question: "Should this change ship?".to_owned(),
+            review_id: None,
+            source_snapshot_id: None,
             description: Some("release review".to_owned()),
             background: background.then_some(true),
             report_delivery: None,
+        }
+    }
+
+    fn review_params() -> CouncilParams {
+        CouncilParams {
+            review_id: Some("rev_1".to_owned()),
+            source_snapshot_id: Some("rsnap_1".to_owned()),
+            ..params(false)
         }
     }
 
@@ -588,11 +698,7 @@ mod tests {
             )
             .await
             .expect("Council runs");
-        assert!(
-            output
-                .output
-                .contains("<council preset=\"balanced-review\"")
-        );
+        assert!(output.output.contains("\"kind\":\"council\""));
         let requests = host
             .requests
             .lock()
@@ -618,7 +724,75 @@ mod tests {
             );
             assert_eq!(seat.turn.workflow_node.as_deref(), Some(seat.id.as_str()));
             assert!(seat.turn.prompt.contains(SEAT_RESPONSE_CONTRACT));
+            assert!(!seat.turn.prompt.contains("Source snapshot id"));
             assert!(!seat.turn.background);
+        }
+    }
+
+    #[tokio::test]
+    async fn review_binding_requires_native_authority_and_the_balanced_preset() {
+        let host = Arc::new(RecordingCouncilHost::default());
+        let untrusted = CouncilTool::new([preset()], task(), host.clone()).expect("Council tool");
+        let review_context = || {
+            ToolContext::new(
+                "ses_parent",
+                "msg_parent",
+                "call_council",
+                "review",
+                Arc::new(AllowAll),
+                Arc::new(NeverInterrupted),
+            )
+        };
+        assert!(
+            untrusted
+                .run(review_params(), review_context())
+                .await
+                .is_err(),
+            "a same-named overridden review Agent must not gain review-binding authority"
+        );
+        untrusted
+            .run(params(false), review_context())
+            .await
+            .expect("a same-named overridden review Agent retains generic Council access");
+
+        let trusted = CouncilTool::new([preset()], task(), host.clone())
+            .expect("Council tool")
+            .with_review_binding_authority(true);
+        assert!(
+            trusted
+                .run(
+                    review_params(),
+                    ToolContext::new(
+                        "ses_parent",
+                        "msg_parent",
+                        "call_council",
+                        "build",
+                        Arc::new(AllowAll),
+                        Arc::new(NeverInterrupted),
+                    ),
+                )
+                .await
+                .is_err(),
+            "another Agent cannot attach reports to a review"
+        );
+        trusted
+            .run(review_params(), review_context())
+            .await
+            .expect("native review Council");
+        let requests = host
+            .requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let request = requests.last().expect("review request");
+        assert!(request.review.is_some());
+        for seat in &request.seats {
+            assert!(
+                seat.turn
+                    .prompt
+                    .contains(&seat_response_contract(ReportLimits::for_seat(
+                        request.seat_output_bytes
+                    )))
+            );
         }
     }
 

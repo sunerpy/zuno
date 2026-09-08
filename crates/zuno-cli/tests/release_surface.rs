@@ -2484,6 +2484,26 @@ fn startup_measurements_are_isolated_and_hosted_ci_is_observational() {
     }
 }
 
+/// Real PTY retention waits must measure process lifecycle rather than shared
+/// runner starvation. The binary is small enough to reserve the worker pool
+/// without materially extending the suite.
+#[test]
+fn pty_retention_is_isolated_from_unrelated_nextest_load() {
+    let config_path = workspace_root().join(".config/nextest.toml");
+    let config = std::fs::read_to_string(&config_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", config_path.display()));
+
+    for required in [
+        r#"filter = 'binary(retention)'"#,
+        r#"threads-required = "num-test-threads""#,
+    ] {
+        assert!(
+            config.contains(required),
+            "nextest PTY retention isolation lost {required:?}:\n{config}"
+        );
+    }
+}
+
 /// The shared gate targets the plan names, plus the ones CI invokes by name. A workflow
 /// step calling a make target that does not exist fails only when that workflow
 /// runs, which for the release path could be months later.

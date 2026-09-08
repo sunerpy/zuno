@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 // Enumeration: the table is checked against the registry, not against itself
 // ---------------------------------------------------------------------------
 
-/// The `zuno-tools` sources that between them name every built-in wire id.
+/// The first-party sources that between them name every built-in wire id.
 ///
 /// Read as *text* rather than by depending on the crate. `zuno-tui` does not link the tool
 /// stack — adding `zuno-tools` to a render crate to learn a short list of strings would pull its
@@ -29,8 +29,10 @@ fn registry_sources() -> Vec<PathBuf> {
     vec![
         workspace.join("crates/zuno-tools/src/registry.rs"),
         workspace.join("crates/zuno-tools/src/memory.rs"),
+        workspace.join("crates/zuno-tools/src/task_report.rs"),
         workspace.join("crates/zuno-tools/src/work_state.rs"),
         workspace.join("crates/zuno-goal/src/tools.rs"),
+        workspace.join("crates/zuno-review/src/tools.rs"),
         workspace.join("crates/zuno-continuity/src/history.rs"),
         workspace.join("crates/zuno-continuity/src/notes.rs"),
     ]
@@ -49,7 +51,7 @@ fn literal(code: &str) -> Option<String> {
 /// Two shapes are recognised, because the registry declares its tools in two places:
 /// `BuiltinSlot::wire_id`'s `Self::X => "name"` arms for the seventeen slots, and
 /// `pub const *_TOOL_ID: &str = "name"` for the built-ins registered outside the slot table
-/// (`memory_propose` and the three goal tools).
+/// (`memory_propose`, the goal tools, and the review tools).
 fn registry_wire_ids() -> Vec<String> {
     let mut ids = Vec::new();
     for path in registry_sources() {

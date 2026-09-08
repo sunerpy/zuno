@@ -74,6 +74,20 @@ fn test_work_observer() -> Arc<dyn zuno_tools::WorkStateObserver> {
     Arc::new(NoopWorkStateObserver)
 }
 
+fn test_review_service(directory: impl AsRef<Path>) -> Arc<zuno_review::ReviewService> {
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("review test database"),
+    );
+    let mut connection = pool.open_connection().expect("review test connection");
+    zuno_db::migration::apply(&mut connection).expect("review test schema");
+    Arc::new(zuno_review::ReviewService::new(
+        Arc::new(zuno_review::ReviewStore::new(pool)),
+        Arc::new(zuno_review::RepositoryReviewSourceProbe::new(
+            directory.as_ref(),
+        )),
+    ))
+}
+
 #[derive(Debug)]
 struct UnavailableTestSandbox;
 
@@ -445,6 +459,7 @@ async fn hiding_plan_update_does_not_create_a_private_host_plan() {
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
+            review_service: test_review_service(&directory),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
             skill_catalog: None,
@@ -6241,6 +6256,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
+            review_service: test_review_service(&directory),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
             skill_catalog: None,
@@ -6311,6 +6327,7 @@ fn interaction_tool_ids(
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
+            review_service: test_review_service(&directory),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
             skill_catalog: None,
@@ -6450,6 +6467,7 @@ async fn the_supplied_generated_root_reaches_the_assembled_shell_tool() {
                     GoalStore::open_memory(goal_spill.path().to_owned())
                         .expect("in-memory goal store"),
                 ),
+                review_service: test_review_service(directory),
                 mcp_loader: None,
                 skills: Arc::new(zuno_catalog::skill::Skills::default()),
                 skill_catalog: None,
@@ -6550,6 +6568,7 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
+            review_service: test_review_service(directory.path()),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
             skill_catalog: None,
@@ -6635,6 +6654,7 @@ async fn production_registry_wires_configured_output_limits_into_the_shell_tool(
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
+            review_service: test_review_service(directory.path()),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
             skill_catalog: None,
@@ -6736,6 +6756,7 @@ async fn explicit_full_access_uses_the_native_backend_and_retains_managed_lifecy
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
+            review_service: test_review_service(&directory),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
             skill_catalog: None,
@@ -6840,6 +6861,7 @@ async fn unavailable_fallback_is_visible_and_keeps_managed_shell_guards_and_auth
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
+            review_service: test_review_service(&directory),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
             skill_catalog: None,
@@ -7017,6 +7039,7 @@ fn read_only_agent_refuses_unavailable_fallback_even_when_trusted_config_allows_
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
+            review_service: test_review_service(&directory),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
             skill_catalog: None,
@@ -7140,6 +7163,7 @@ async fn a_read_only_agent_contract_narrows_a_full_access_invocation() {
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
+            review_service: test_review_service(&directory),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
             skill_catalog: None,
@@ -7212,6 +7236,7 @@ fn production_registry_exposes_council_only_to_a_delegating_profile() {
                     GoalStore::open_memory(goal_spill.path().to_owned())
                         .expect("in-memory goal store"),
                 ),
+                review_service: test_review_service(&directory),
                 mcp_loader: None,
                 skills: Arc::new(zuno_catalog::skill::Skills::default()),
                 skill_catalog: None,
@@ -7318,6 +7343,7 @@ fn production_registry_uses_the_frozen_profile_rules() {
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
             ),
+            review_service: test_review_service(&directory),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
             skill_catalog: None,
@@ -8962,10 +8988,15 @@ mod production_registry {
                     GoalStore::open_memory(goal_spill.path().to_owned())
                         .expect("in-memory goal store"),
                 ),
+                review_service: test_review_service(&directory),
                 mcp_loader,
                 skills: Arc::new(skills),
                 skill_catalog: None,
-                capability: test_capability(),
+                capability: if agent_name == "review" {
+                    test_capability_with_council()
+                } else {
+                    test_capability()
+                },
                 delegation: test_delegation(),
                 product_agents: test_product_agents(),
                 workflows: test_workflows(),
@@ -9003,6 +9034,60 @@ mod production_registry {
 
     fn assemble() -> Fixture {
         assemble_with(zuno_catalog::skill::Skills::default())
+    }
+
+    #[test]
+    fn review_ledger_tools_are_exposed_only_to_the_unmodified_native_review_agent() {
+        let ordinary = try_assemble_for_agent_with(
+            "orchestrator",
+            zuno_catalog::skill::Skills::default(),
+            zuno_config::schema::Config::default(),
+        )
+        .expect("orchestrator registry");
+        for tool in [
+            "review_open",
+            "review_claim",
+            "review_get",
+            "review_finalize",
+        ] {
+            assert!(!ordinary.ids.iter().any(|id| id == tool), "{tool}");
+        }
+
+        let native = try_assemble_for_agent_with(
+            "review",
+            zuno_catalog::skill::Skills::default(),
+            zuno_config::schema::Config::default(),
+        )
+        .expect("native review registry");
+        for tool in [
+            "review_open",
+            "review_claim",
+            "review_get",
+            "review_finalize",
+        ] {
+            assert!(native.ids.iter().any(|id| id == tool), "{tool}");
+        }
+        for writer in ["task", "plan_update", "todo_update", "edit", "write"] {
+            assert!(!native.ids.iter().any(|id| id == writer), "{writer}");
+        }
+
+        let overridden_config: zuno_config::schema::Config =
+            serde_json::from_value(serde_json::json!({"agents":{"review":{"temperature":0.2}}}))
+                .expect("review override config");
+        let overridden = try_assemble_for_agent_with(
+            "review",
+            zuno_catalog::skill::Skills::default(),
+            overridden_config,
+        )
+        .expect("overridden review registry");
+        for tool in [
+            "review_open",
+            "review_claim",
+            "review_get",
+            "review_finalize",
+        ] {
+            assert!(!overridden.ids.iter().any(|id| id == tool), "{tool}");
+        }
     }
 
     #[test]
@@ -9491,6 +9576,7 @@ mod production_registry {
                     GoalStore::open_memory(goal_spill.path().to_owned())
                         .expect("in-memory goal store"),
                 ),
+                review_service: test_review_service(&directory),
                 mcp_loader: None,
                 skills: Arc::new(skills),
                 skill_catalog: None,
@@ -12465,6 +12551,7 @@ fn assemble_on_unsupported_platform(
             goal_store: Arc::new(
                 GoalStore::open_memory(goal_spill.to_owned()).expect("in-memory goal store"),
             ),
+            review_service: test_review_service(directory),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
             skill_catalog: None,

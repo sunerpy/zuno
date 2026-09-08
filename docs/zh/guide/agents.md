@@ -11,6 +11,7 @@ Agent 是一份契约：一段提示词、一条模型路由、一个确切的�
 | `orchestrator` | 承担结果、切分工作、整合产出、验证完成 | 可以委派 |
 | `build` | 在单一通道内直接完成端到端实现 | 无子级工具 |
 | `plan` | 只读调研与可直接实施的规划 | 无子级工具 |
+| `review` | 只读的高保证评审：记录可复核证据，判定 draft 还是 ready | 可委派评审席位 |
 | `deep` | 深度工作模式，或受委派的根因分析与横切实现 | 不递归委派 |
 | `fixer` | 聚焦的局部改动及其回归范围 | 不递归委派 |
 | `general` | 没有更窄专职 Agent 的有界工作 | 不递归委派 |
@@ -19,7 +20,7 @@ Agent 是一份契约：一段提示词、一条模型路由、一个确切的�
 | `oracle` | 只读的架构与根因评审 | 不递归委派 |
 | `looker` | 视觉产物检查 | 不递归委派 |
 
-`orchestrator` 是默认 Agent，也是唯一暴露 `task` 委派工具的原生主 Agent。`deep` 的 mode 是 `all`，因此它既可以被直接选为会话 Agent，也可以被 `orchestrator` 作为目标；直接选择并不会赋予它递归委派能力。`deep` 可以读取、创建、更新当前持久 Goal，也可以为 Goal 请求输入，因此直接选择的深度工作会话能够关闭自己实现的证据门禁目标；Goal 所有权不会带来子 Agent 权限。
+`orchestrator` 是默认 Agent，也是唯一向模型暴露通用 `task` 委派工具的原生主 Agent。原生 `review_open` 会自动在 `explorer`、`librarian`、`oracle` 上启动 `balanced-review` Council；评审模型看不到 `council_run`，不能替换 preset 或绕过评审绑定。两者都仍受约束——只读角色无法触达写入型子 Agent；`review` 不能再开一个 `review`、不能更新 Plan/Todo，也不能伪造来源或 receipt。席位输出会先由 runtime 解析并自动写入评审事件，再进入 synthesis。`deep` 的 mode 是 `all`，因此它既可以被直接选为会话 Agent，也可以被 `orchestrator` 作为目标；直接选择并不会赋予它递归委派能力。`deep` 可以读取、创建、更新当前持久 Goal，也可以为 Goal 请求输入，因此直接选择的深度工作会话能够关闭自己实现的证据门禁目标；Goal 所有权不会带来子 Agent 权限。
 
 ## 如何选择
 
@@ -35,6 +36,7 @@ zuno tui --agent orchestrator
 | 场景 | Agent |
 | --- | --- |
 | 你想要一个答案或一份计划，不要任何写入 | `plan` |
+| 一份需要被判定能否直接实施的方案或设计 | `review` |
 | 单一区域内范围明确的改动 | `build` |
 | 一处局部修复加上它的回归范围 | `fixer` |
 | 一个困难的横切问题 | `deep` |

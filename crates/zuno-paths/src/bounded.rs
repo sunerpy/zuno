@@ -62,7 +62,7 @@ use std::time::{Duration, Instant};
 /// be cancelled and `discover_repository` makes three calls, so ten seconds already
 /// admits half a minute of unresponsive startup against a dead mount; past that a
 /// user cannot tell a bounded wait from the hang it replaces.
-pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often a child is re-checked while this thread is waiting for it to exit.
 ///
@@ -85,14 +85,14 @@ const KILL_REAP_GRACE: Duration = Duration::from_millis(100);
 /// Bytes rather than text because nothing here may reshape the output: the caller
 /// decides what a non-UTF-8 answer means, and `resolve_git_path` strips a trailing
 /// newline and nothing else, since a path may legally end in a space.
-pub(crate) struct Output {
+pub struct Output {
     /// How the child exited. Never a signal-killed status from this module's own
     /// kill, since that path returns [`Failure`] instead.
-    pub(crate) status: ExitStatus,
+    pub status: ExitStatus,
     /// Everything the child wrote to stdout, drained to end of file.
-    pub(crate) stdout: Vec<u8>,
+    pub stdout: Vec<u8>,
     /// Everything the child wrote to stderr, drained to end of file.
-    pub(crate) stderr: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 /// Why a child produced nothing a caller could classify.
@@ -102,16 +102,23 @@ pub(crate) struct Output {
 /// output this process could not collect. A caller that folds them back together is
 /// free to; a caller that needs to distinguish a broken mount from a missing binary
 /// cannot get that back out of a rendered message.
-pub(crate) enum Failure {
+#[derive(Debug, thiserror::Error)]
+pub enum Failure {
     /// The process could not be started: the program is not on `PATH`, or the
     /// working directory no longer exists.
-    Spawn(io::Error),
+    #[error("the subprocess could not start: {0}")]
+    Spawn(#[source] io::Error),
     /// The child ran, but no usable answer came back from it: a pipe that could not
     /// be drained, a reader thread that died, or an exit status that could not be
     /// read. Whatever arrived is discarded rather than reported as a partial answer.
+    #[error("the subprocess output or exit status was lost")]
     Lost,
     /// The child was still running when `ceiling` ran out, and was killed.
+    #[error("the subprocess exceeded its time ceiling")]
     TimedOut,
+    /// One output stream exceeded the caller's memory ceiling.
+    #[error("the subprocess output exceeded the {max}-byte stream ceiling")]
+    TooLarge { max: usize },
 }
 
 /// Run `command` under `ceiling`, draining both of its pipes before waiting for it to
@@ -123,7 +130,16 @@ pub(crate) enum Failure {
 ///
 /// Whatever the caller set on `command` is kept; the three standard streams are set
 /// here and overwrite anything the caller chose for them.
-pub(crate) fn output(command: &mut Command, ceiling: Duration) -> Result<Output, Failure> {
+pub fn output(command: &mut Command, ceiling: Duration) -> Result<Output, Failure> {
+    output_limited(command, ceiling, usize::MAX)
+}
+
+/// Run a command with both a time ceiling and a per-stream memory ceiling.
+pub fn output_limited(
+    command: &mut Command,
+    ceiling: Duration,
+    max_stream_bytes: usize,
+) -> Result<Output, Failure> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -139,8 +155,8 @@ pub(crate) fn output(command: &mut Command, ceiling: Duration) -> Result<Output,
         return Err(Failure::Lost);
     };
     let (sender, receiver) = mpsc::channel();
-    drain(Stream::Stdout, out, sender.clone());
-    drain(Stream::Stderr, err, sender);
+    drain(Stream::Stdout, out, max_stream_bytes, sender.clone());
+    drain(Stream::Stderr, err, max_stream_bytes, sender);
 
     let mut stdout = None;
     let mut stderr = None;
@@ -149,10 +165,16 @@ pub(crate) fn output(command: &mut Command, ceiling: Duration) -> Result<Output,
     for _ in 0..2 {
         let received = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         match received {
-            Ok((Stream::Stdout, Some(bytes))) => stdout = Some(bytes),
-            Ok((Stream::Stderr, Some(bytes))) => stderr = Some(bytes),
+            Ok((Stream::Stdout, DrainOutcome::Bytes(bytes))) => stdout = Some(bytes),
+            Ok((Stream::Stderr, DrainOutcome::Bytes(bytes))) => stderr = Some(bytes),
+            Ok((_, DrainOutcome::TooLarge)) => {
+                abandon(&mut child);
+                return Err(Failure::TooLarge {
+                    max: max_stream_bytes,
+                });
+            }
             // A failed read, or a reader that panicked and hung up without sending.
-            Ok((_, None)) | Err(RecvTimeoutError::Disconnected) => {
+            Ok((_, DrainOutcome::Lost)) | Err(RecvTimeoutError::Disconnected) => {
                 abandon(&mut child);
                 return Err(Failure::Lost);
             }
@@ -200,18 +222,32 @@ enum Stream {
     Stderr,
 }
 
+enum DrainOutcome {
+    Bytes(Vec<u8>),
+    TooLarge,
+    Lost,
+}
+
 /// Read `pipe` to end of file on its own thread and report the bytes over `sender`.
 ///
 /// The thread owns the pipe, so it keeps draining whatever the child writes for as
 /// long as the child writes it, with nobody waiting on an exit in the meantime.
 fn drain<R: Read + Send + 'static>(
     stream: Stream,
-    mut pipe: R,
-    sender: mpsc::Sender<(Stream, Option<Vec<u8>>)>,
+    pipe: R,
+    max_stream_bytes: usize,
+    sender: mpsc::Sender<(Stream, DrainOutcome)>,
 ) {
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let outcome = pipe.read_to_end(&mut bytes).ok().map(|_| bytes);
+        let limit = u64::try_from(max_stream_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let outcome = match pipe.take(limit).read_to_end(&mut bytes) {
+            Ok(_) if bytes.len() > max_stream_bytes => DrainOutcome::TooLarge,
+            Ok(_) => DrainOutcome::Bytes(bytes),
+            Err(_) => DrainOutcome::Lost,
+        };
         // The receiver is gone whenever this thread lost the race with the ceiling.
         // There is nobody left to tell, and the pipe closes as the thread ends.
         let _ = sender.send((stream, outcome));
@@ -311,6 +347,13 @@ mod tests {
             started.elapsed() < GENEROUS,
             "a healthy call must not be decided by the ceiling"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_stream_over_the_memory_ceiling_is_refused_and_the_child_is_reaped() {
+        let outcome = output_limited(&mut sh("yes x | head -c 4096"), GENEROUS, 1024);
+        assert!(matches!(outcome, Err(Failure::TooLarge { max: 1024 })));
     }
 
     /// Everything a caller classifies on comes back: the exit code it objected with,

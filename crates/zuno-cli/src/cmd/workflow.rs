@@ -26,7 +26,13 @@ use zuno_db::pool::Pool;
 use zuno_engine::prelude::{InternalAgent, complete_internal_text};
 use zuno_llm::event::{Message, Role};
 use zuno_llm::registry::{Provider, ProviderRequestContext};
-use zuno_tools::council::{CouncilHost, CouncilRequest, CouncilSeatRequest, CouncilTurn};
+use zuno_review::{
+    DelegationEvidenceReport, MAX_EVIDENCE_OBSERVATION_BYTES, ReportLimits, ReviewDelegateReceipt,
+    ReviewSourceProbe, ReviewStore, delegation_report_digest,
+};
+use zuno_tools::council::{
+    CouncilHost, CouncilRequest, CouncilReviewBinding, CouncilSeatRequest, CouncilTurn,
+};
 use zuno_tools::task::{ChildTurn, ChildTurnRequest, ReportDelivery};
 use zuno_tools::work_state::{
     WorkItem, WorkItemChange, WorkItemPriority, WorkItemStatus, WorkStateStore,
@@ -116,6 +122,12 @@ struct CouncilSeatAnswer {
     recommendation: String,
 }
 
+#[derive(Debug)]
+enum ParsedCouncilAnswer {
+    Generic(CouncilSeatAnswer),
+    Review(DelegationEvidenceReport),
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CouncilSeatResult {
@@ -124,11 +136,18 @@ struct CouncilSeatResult {
     status: CouncilSeatStatus,
     attempts: usize,
     session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     verdict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     evidence: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     risks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     recommendation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report: Option<DelegationEvidenceReport>,
     error: Option<String>,
 }
 
@@ -137,21 +156,33 @@ impl CouncilSeatResult {
         seat: &CouncilSeatRequest,
         attempts: usize,
         session_id: String,
-        answer: CouncilSeatAnswer,
+        answer: ParsedCouncilAnswer,
     ) -> Self {
-        Self {
+        let mut result = Self {
             id: seat.id.clone(),
             agent: seat.turn.agent.clone(),
             status: CouncilSeatStatus::Completed,
             attempts,
             session_id: Some(session_id),
-            verdict: Some(answer.verdict),
-            confidence: Some(answer.confidence),
-            evidence: answer.evidence,
-            risks: answer.risks,
-            recommendation: Some(answer.recommendation),
+            verdict: None,
+            confidence: None,
+            evidence: Vec::new(),
+            risks: Vec::new(),
+            recommendation: None,
+            report: None,
             error: None,
+        };
+        match answer {
+            ParsedCouncilAnswer::Generic(answer) => {
+                result.verdict = Some(answer.verdict);
+                result.confidence = Some(answer.confidence);
+                result.evidence = answer.evidence;
+                result.risks = answer.risks;
+                result.recommendation = Some(answer.recommendation);
+            }
+            ParsedCouncilAnswer::Review(report) => result.report = Some(report),
         }
+        result
     }
 
     fn terminal(
@@ -172,6 +203,7 @@ impl CouncilSeatResult {
             evidence: Vec::new(),
             risks: Vec::new(),
             recommendation: None,
+            report: None,
             error: Some(error.into()),
         }
     }
@@ -262,6 +294,15 @@ impl CouncilOutcome {
                 seat.status.as_str(),
                 seat.attempts
             ));
+            if let Some(report) = &seat.report {
+                lines.push(format!("Summary: {}", report.concise_summary));
+                lines.push(format!(
+                    "Claims: {}; contradictions: {}; unresolved: {}",
+                    report.claims.len(),
+                    report.contradictions.len(),
+                    report.unresolved.len()
+                ));
+            }
             if let Some(verdict) = &seat.verdict {
                 lines.push(format!("Verdict: {verdict}"));
             }
@@ -436,6 +477,14 @@ pub(crate) struct NativeWorkflowHost {
     wake: Arc<dyn ParentReportWake>,
     supervisor: BackgroundJobSupervisor,
     council_synth: Arc<dyn CouncilSynthesizer>,
+    review_store: Arc<ReviewStore>,
+    review_source: Arc<dyn ReviewSourceProbe>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReviewRuntime {
+    pub(crate) store: Arc<ReviewStore>,
+    pub(crate) source: Arc<dyn ReviewSourceProbe>,
 }
 
 impl NativeWorkflowHost {
@@ -446,6 +495,7 @@ impl NativeWorkflowHost {
         supervisor: BackgroundJobSupervisor,
         council_provider: Arc<dyn Provider>,
         council_agent: InternalAgent,
+        review: ReviewRuntime,
     ) -> Self {
         let changes = supervisor.notifier();
         Self {
@@ -460,6 +510,8 @@ impl NativeWorkflowHost {
                 provider: council_provider,
                 agent: council_agent,
             }),
+            review_store: review.store,
+            review_source: review.source,
         }
     }
 
@@ -1005,10 +1057,14 @@ impl NativeWorkflowHost {
     async fn execute_council_managed(
         &self,
         request: &CouncilRequest,
+        run_id: &str,
+        job_id: &str,
         cancellation: CancellationToken,
         items: &mut WorkflowItems,
     ) -> CouncilOutcome {
-        let mut outcome = self.execute_council(request, cancellation, items).await;
+        let mut outcome = self
+            .execute_council(request, run_id, job_id, cancellation, items)
+            .await;
         if let Err(error) = self.finalize_council_items(request, items, &outcome) {
             outcome.status = CouncilRunStatus::Uncertain;
             outcome.message = Some(match outcome.message.take() {
@@ -1074,6 +1130,8 @@ impl NativeWorkflowHost {
     async fn execute_council(
         &self,
         request: &CouncilRequest,
+        run_id: &str,
+        job_id: &str,
         cancellation: CancellationToken,
         items: &mut WorkflowItems,
     ) -> CouncilOutcome {
@@ -1139,17 +1197,21 @@ impl NativeWorkflowHost {
                 let seat_cancellation = execution_cancellation.child_token();
                 let max_retries = request.max_retries;
                 let output_limit = request.seat_output_bytes;
+                let review = request.review.clone();
+                let review_source = Arc::clone(&self.review_source);
                 let index = next;
                 tasks.spawn(async move {
                     let seat_started = Instant::now();
-                    let result = run_council_seat(
+                    let result = run_council_seat(CouncilSeatExecution {
                         runner,
                         seat,
-                        seat_cancellation,
-                        seat_deadline,
+                        cancellation: seat_cancellation,
+                        deadline: seat_deadline,
                         max_retries,
                         output_limit,
-                    )
+                        review,
+                        review_source,
+                    })
                     .await;
                     (index, elapsed_millis(seat_started), result)
                 });
@@ -1245,7 +1307,7 @@ impl NativeWorkflowHost {
             results[index] = Some(result);
         }
 
-        let seats = complete_council_results(
+        let mut seats = complete_council_results(
             request,
             &results,
             CouncilSeatStatus::Uncertain,
@@ -1355,12 +1417,89 @@ impl NativeWorkflowHost {
                 };
             }
         };
+        if let Err(error) = self.import_council_reports(request, run_id, job_id, &mut seats) {
+            return CouncilOutcome {
+                status: CouncilRunStatus::Uncertain,
+                message: Some(error),
+                seats,
+                synthesis: None,
+            };
+        }
         CouncilOutcome {
             status: CouncilRunStatus::Completed,
             message: None,
             seats,
             synthesis: Some(synthesis),
         }
+    }
+
+    fn import_council_reports(
+        &self,
+        request: &CouncilRequest,
+        run_id: &str,
+        job_id: &str,
+        seats: &mut [CouncilSeatResult],
+    ) -> Result<(), String> {
+        let Some(binding) = request.review.as_ref() else {
+            return Ok(());
+        };
+        let mut readiness = self
+            .review_store
+            .review(&request.parent_session_id, &binding.review_id)
+            .map_err(to_string)?
+            .ok_or_else(|| {
+                format!(
+                    "Council review `{}` disappeared before seat import",
+                    binding.review_id
+                )
+            })?;
+        if readiness.source.id != binding.source_snapshot_id {
+            return Err(format!(
+                "Council source snapshot `{}` does not match review source `{}`",
+                binding.source_snapshot_id, readiness.source.id
+            ));
+        }
+        for seat in seats
+            .iter_mut()
+            .filter(|seat| seat.status == CouncilSeatStatus::Completed && seat.report.is_some())
+        {
+            let report = seat.report.take().expect("filtered report");
+            let receipt = ReviewDelegateReceipt {
+                run_id: run_id.to_owned(),
+                job_id: job_id.to_owned(),
+                preset: request.preset.clone(),
+                preset_source_id: request.preset_source_id.clone(),
+                seat_id: seat.id.clone(),
+                agent: seat.agent.clone(),
+                source_snapshot_id: binding.source_snapshot_id.clone(),
+                report_digest: delegation_report_digest(&report),
+                time_imported: zuno_db::message::now_millis(),
+            };
+            match self.review_store.import_report(
+                &request.parent_session_id,
+                &binding.review_id,
+                readiness.revision,
+                receipt,
+                report.clone(),
+                zuno_db::message::now_millis(),
+            ) {
+                Ok(updated) => {
+                    readiness = updated;
+                    seat.report = Some(report);
+                }
+                Err(error) if error.is_model_correctable() => {
+                    seat.status = CouncilSeatStatus::Invalid;
+                    seat.error = Some(error.to_string());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Council seat `{}` could not enter the durable review ledger: {error}",
+                        seat.id
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn settle_council(
@@ -1632,7 +1771,13 @@ impl CouncilHost for NativeWorkflowHost {
                 cancellation,
                 async move {
                     let outcome = host
-                        .execute_council_managed(&request, task_cancellation, &mut work_items)
+                        .execute_council_managed(
+                            &request,
+                            &background_run_id,
+                            &background_job_id,
+                            task_cancellation,
+                            &mut work_items,
+                        )
                         .await;
                     if let Err(error) = host
                         .settle_council(&request, &background_run_id, &background_job_id, &outcome)
@@ -1655,7 +1800,7 @@ impl CouncilHost for NativeWorkflowHost {
         }
 
         let outcome = self
-            .execute_council_managed(&request, cancellation, &mut work_items)
+            .execute_council_managed(&request, &run_id, &job_id, cancellation, &mut work_items)
             .await;
         let summary = self
             .settle_council(&request, &run_id, &job_id, &outcome)
@@ -1693,14 +1838,28 @@ fn workflow_request_for_council(request: &CouncilRequest, workflow: &str) -> Wor
     }
 }
 
-async fn run_council_seat(
+struct CouncilSeatExecution {
     runner: Arc<dyn WorkflowNodeRunner>,
     seat: CouncilSeatRequest,
     cancellation: CancellationToken,
-    seat_deadline: Instant,
+    deadline: Instant,
     max_retries: usize,
     output_limit: usize,
-) -> CouncilSeatResult {
+    review: Option<CouncilReviewBinding>,
+    review_source: Arc<dyn ReviewSourceProbe>,
+}
+
+async fn run_council_seat(execution: CouncilSeatExecution) -> CouncilSeatResult {
+    let CouncilSeatExecution {
+        runner,
+        seat,
+        cancellation,
+        deadline,
+        max_retries,
+        output_limit,
+        review,
+        review_source,
+    } = execution;
     let attempts_allowed = max_retries.saturating_add(1);
     let mut last_status = CouncilSeatStatus::Failed;
     let mut last_error = "Council seat did not start".to_owned();
@@ -1715,7 +1874,7 @@ async fn run_council_seat(
                 "cancelled before the next seat attempt",
             );
         }
-        let remaining = seat_deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return CouncilSeatResult::terminal(
                 &seat,
@@ -1784,7 +1943,12 @@ async fn run_council_seat(
             }
         };
         last_session_id = Some(turn.session_id.clone());
-        match parse_council_answer(&turn.output, output_limit) {
+        match parse_council_answer(
+            &turn.output,
+            output_limit,
+            review.as_ref(),
+            review_source.as_ref(),
+        ) {
             Ok(answer) => {
                 return CouncilSeatResult::completed(&seat, attempt, turn.session_id, answer);
             }
@@ -1803,7 +1967,51 @@ async fn run_council_seat(
     )
 }
 
-fn parse_council_answer(output: &str, output_limit: usize) -> Result<CouncilSeatAnswer, String> {
+fn parse_council_answer(
+    output: &str,
+    output_limit: usize,
+    review: Option<&CouncilReviewBinding>,
+    source: &dyn ReviewSourceProbe,
+) -> Result<ParsedCouncilAnswer, String> {
+    let Some(review) = review else {
+        return parse_generic_council_answer(output, output_limit)
+            .map(ParsedCouncilAnswer::Generic);
+    };
+    let mut report = DelegationEvidenceReport::parse(output, ReportLimits::for_seat(output_limit))
+        .map_err(|error| format!("seat returned invalid evidence report: {error}"))?;
+    if report.source_snapshot_id != review.source_snapshot_id {
+        return Err(format!(
+            "seat report names source snapshot `{}` instead of `{}`",
+            report.source_snapshot_id, review.source_snapshot_id
+        ));
+    }
+    let requested = report
+        .claims
+        .iter()
+        .flat_map(|claim| claim.evidence.iter().cloned())
+        .collect::<Vec<_>>();
+    let anchored = source
+        .anchor_batch(&requested, MAX_EVIDENCE_OBSERVATION_BYTES)
+        .map_err(|error| format!("seat evidence could not be verified: {error}"))?;
+    let mut offset = 0_usize;
+    for claim in &mut report.claims {
+        let end = offset.saturating_add(claim.evidence.len());
+        claim.evidence = anchored
+            .get(offset..end)
+            .map(<[zuno_review::EvidenceAnchor]>::to_vec)
+            .ok_or_else(|| "seat evidence verification returned the wrong size".to_owned())?;
+        offset = end;
+    }
+    report
+        .validate(ReportLimits::for_seat(output_limit))
+        .map_err(|error| format!("seat returned invalid evidence report: {error}"))?;
+    Ok(ParsedCouncilAnswer::Review(report))
+}
+
+fn parse_generic_council_answer(
+    output: &str,
+    output_limit: usize,
+) -> Result<CouncilSeatAnswer, String> {
     if output.len() > output_limit {
         return Err(format!(
             "seat response exceeded the {output_limit}-byte output bound"

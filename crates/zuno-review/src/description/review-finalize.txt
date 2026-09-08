@@ -1,0 +1,1 @@
+Finalize a review as draft or request ready. expected_revision is required. The host re-reads every claim anchor, marks changed evidence stale, rejects unresolved issues and unverified load-bearing claims, and generates the ready receipt itself. The caller cannot provide or forge a receipt.

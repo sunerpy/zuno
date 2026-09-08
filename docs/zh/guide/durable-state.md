@@ -206,6 +206,62 @@ Goal；对 `probed` 的声明，审计会在当时重新拿它的 receipt 与写
 点名了这个确切 model id 与区域的厂商文档，或一次实际观测到的探测。它还要求在写配置之前记录
 声明，而不是之后。
 
+### 评审证据
+
+评审声明是第三类：既不是关于改动之后的工作区，也不是关于某个外部系统，而是关于这个仓库现在
+究竟怎么运作。它要防的失败很具体。一个受委派的评审者只读了一处互斥保护，就报告并发请求「只会
+返回 `session_busy`」，而父层继承了这个结论——因为那份报告是散文，没有任何东西要求去追踪主调
+用路径。随后这份方案被描述为可以直接实施。
+
+四个工具让这件事变得可复核。
+
+| 工具 | 作用 | 重放 |
+| --- | --- | --- |
+| `review_open` | 针对工件或 Plan 开启评审；Git、限定范围内的工作树字节和 CodeGraph 状态由宿主采集 | Never |
+| `review_claim` | 记录、验证、质疑或反驳声明，或结清一条评审问题 | Never |
+| `review_get` | 返回由事件重建的当前评审投影与有界声明集合 | Safe |
+| `review_finalize` | 重新读取全部锚点，在确切 revision 上判定 `draft` 或 `ready` | Never |
+
+模型不能提交 head SHA、dirty、CodeGraph 状态、锚点摘要、`verifiedByParent` 或 readiness
+receipt。`review_open` 通过宿主仓库探针捕获来源；记录和 finalize 会重新打开仓库相对锚点，对真实
+字节计算摘要。限定范围内的 diff 或锚点内容变化时，即使前后两次工作树都已经是 dirty，声明仍会
+变成 stale。
+
+评审状态使用已有的 session event stream，而不是新增专用表：
+`review.started.1`、`review.claim.recorded.1`、`review.claim.changed.1` 和
+`review.finalized.1`。声明或问题变化会在同一事务里递增 revision、撤销旧 Ready 并清除 receipt。
+
+否定性声明——「不存在」「只会返回」「从不发生」——在集齐全部五项反证之前无法被验证：定义查
+找、直接与间接的调用方与被调用方、至少一个替代入口或相反路径、相关测试或协议契约，以及一次
+明确的「如果这个结论为假，它最可能出现在哪里」的搜索。只读一处保护并不能证明某个东西不存在。
+
+来源快照没有 indexed revision 字段，因为 `codegraph status --json` 不发布这个值。它保存该命令
+实际发布的字段、限定范围内 Git diff 与未跟踪文件字节的摘要，以及命名 artifact 的独立摘要——即使
+该文件被 Git ignore。literal pathspec、基于目录能力的 no-follow 打开、对实际读取字节的硬上限、
+4 MiB 单文件上限、每轮完整锚点观测按路径去重后的 32 MiB 总预算，以及有时限的本地命令共同把
+探测限制在仓库内，即使路径在读取期间被替换也不能逃逸。索引不可用或陈旧时会明确降级，证据
+锚点仍以宿主直接读取为准。
+
+`review_open` 会自动启动 `balanced-review`；评审模型不能调用 `council_run` 或替换 preset。
+席位必须返回可解析的 `DelegationEvidenceReport`。原始字节、格式、source snapshot 或锚点校验
+失败会成为 invalid seat attempt，并可使用 preset 的 retry；只有通过校验的报告才进入 synthesis。
+accepted claims、contradictions 与 unresolved questions 由 runtime 连同结构化 run/job/seat receipt
+自动导入指定 review。finalize 只接受能在 completed durable Job 中找到同一 seat、Agent 和报告摘要
+的 receipt。
+
+`task_report` 与评审台账相互独立。它按 durable `jobID` 或子会话 `taskID` 读取终态记录，受父
+session 隔离；超大结果会作为一个整体被有界省略，不会回放或截断子会话转录。
+
+`draft` 与 `ready` 是两个不同的答案，不得互相替代。draft 是一次正常的交付：它列出自己的
+blocker，并且不会阻塞产生它的那个 Goal。只有 `ready` 才授权实施，而它成立的条件是：每条
+load-bearing 声明都是带证据的事实声明、都通过宿主派生的 review tool-call receipt 重新核验、并且
+锚定在当前来源上，同时没有 open issue、contested、stale 或未验证的 P0。绑定 Plan 必须仍是当前
+revision，并且至少两个有效席位来自同一次 balanced-review run。Ready receipt 由宿主生成，绑定最终
+review revision、source snapshot、HEAD、worktree digest、artifact digest 与全部证据锚点摘要；
+调用者无法提供。finalize 提交后会立即再做一次 reconcile，后续每次 `review_get` 也会重新打开证据，
+因此提交后观测到的变更会立即撤销 Ready receipt。请求 `ready` 但没过门禁时，会被记录成带全部
+blocker 的 draft。
+
 ### 生成物不会进入提交
 
 `.zuno/` 下面一层的所有东西，除了人自己写的，都算生成物。Goal 文档、落盘的工具输出、后台执行

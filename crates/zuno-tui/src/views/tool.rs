@@ -148,7 +148,7 @@ impl Summary {
 /// disciplines.
 /// Runtime aliases such as `exec_command` and `google_search` reuse those rules but stay
 /// out of this registry-wire-id list, because the stale-rule half of that test is exact.
-pub const SUMMARISED: [&str; 30] = [
+pub const SUMMARISED: [&str; 35] = [
     // The 18 `BuiltinSlot` positions, in `BUILTIN_ORDER`.
     "invalid",
     "question",
@@ -181,6 +181,13 @@ pub const SUMMARISED: [&str; 30] = [
     // Registered beside the goal tools rather than among them, because a host with no
     // use for the capability ledger does not advertise it.
     "capability_claim",
+    // The review evidence ledger, registered beside the goal tools and likewise only by a
+    // host that wants the capability.
+    "review_get",
+    "task_report",
+    "review_open",
+    "review_claim",
+    "review_finalize",
     // Optional native continuity contributions.
     "history",
     "notes",
@@ -412,6 +419,42 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
                 None => claim,
             })
         }),
+        // The caller identifies the artifact or Plan. Git and working-tree identity are
+        // captured by the host, so accepting a model-provided worktree or SHA here would
+        // make the UI repeat an untrusted claim.
+        "review_open" => first_text(&["artifact_path", "plan_id"]).map(Summary::head),
+        // `<action> · <subject>`, the shape `history` and `notes` already use. `record`
+        // carries the statement, while the settling actions name a claim id instead; the
+        // reason is the informative half for `contest` and `refute` the way
+        // `goal_update`'s blocking condition is, so it qualifies rather than identifies.
+        "review_claim" => {
+            let action = text("action")?;
+            let settled = match first_text(&["statement", "claim_id"]) {
+                Some(subject) => format!("{action} · {subject}"),
+                None => action,
+            };
+            Some(Summary::tail(settled).detail(text("reason")))
+        }
+        // The decision and which review it settles. A refused `ready` is the row a reader
+        // is scanning for, and the blocker count is what says it was refused.
+        "review_finalize" => text("requested_status").map(|status| {
+            let blockers = value
+                .get("blockers")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let decision = match text("review_id") {
+                Some(review) => format!("{status} · {review}"),
+                None => status,
+            };
+            Summary::tail(decision).detail((blockers > 0).then(|| format!("({blockers} blockers)")))
+        }),
+        // How many durable claims were asked for and which one leads.
+        "review_get" => {
+            let claims = value.get("claim_ids").and_then(Value::as_array)?;
+            let first = claims.first().and_then(Value::as_str).unwrap_or_default();
+            Some(Summary::tail(format!("{} claims · {first}", claims.len())))
+        }
+        "task_report" => first_text(&["jobID", "taskID"]).map(Summary::tail),
         // `plan_exit` and `goal_get` take no arguments, so there is nothing to summarise
         // and nothing is invented. Anything else is a plugin or MCP tool whose argument
         // shape this table cannot know.

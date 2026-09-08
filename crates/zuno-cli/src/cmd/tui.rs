@@ -4659,7 +4659,9 @@ mod tests {
             .map(|agent| agent.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["orchestrator", "build", "plan", "deep"]);
+        // `review` sits beside `plan` because both are read-only primaries a human
+        // selects for a session; the subagent-only specialists stay out of the selector.
+        assert_eq!(names, ["orchestrator", "build", "plan", "review", "deep"]);
     }
 
     #[test]

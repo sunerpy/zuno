@@ -1,0 +1,1 @@
+Read the current durable review projection and an optional bounded set of claims. This tool is read-only and replay-safe. Use its revision for the next review_claim or review_finalize mutation.

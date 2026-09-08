@@ -796,7 +796,7 @@ async fn a_pre_flight_git_read_that_never_answers_refuses_the_commit() {
     );
     assert!(rendered.contains("it was not run"), "{rendered}");
 
-    wait_for_process_exit(read_pid(&pid_file)).await;
+    wait_for_process_exit(wait_for_pid(&pid_file).await).await;
 }
 
 /// A user's interrupt ends a hung pre-flight `git` read instead of waiting out the ceiling.
@@ -856,7 +856,7 @@ async fn an_interrupt_ends_a_hung_pre_flight_git_read() {
     );
     // Abandoning the read is not enough: the group it leads has to go with it, or a
     // credential helper git spawned outlives the cancellation with nothing left to reap it.
-    wait_for_process_exit(read_pid(&pid_file)).await;
+    wait_for_process_exit(wait_for_pid(&pid_file).await).await;
 }
 
 /// The pre-flight ceiling covers the whole phase, not each read on its own.
@@ -1215,10 +1215,8 @@ async fn shell_cancellation_kills_the_shell_and_its_whole_process_group() {
     let run_context = context(interrupt.clone());
 
     let running = tokio::spawn(async move { tool.run(params(command), run_context).await });
-    wait_for_file(&parent_file).await;
-    wait_for_file(&child_file).await;
-    let parent = read_pid(&parent_file);
-    let child = read_pid(&child_file);
+    let parent = wait_for_pid(&parent_file).await;
+    let child = wait_for_pid(&child_file).await;
 
     interrupt.fire();
     let output = tokio::time::timeout(Duration::from_secs(2), running)
@@ -1948,14 +1946,6 @@ async fn wait_for_pid(path: &Path) -> u32 {
     })
     .await
     .unwrap_or_else(|_| panic!("{} never contained a numeric pid", path.display()))
-}
-
-#[cfg(unix)]
-fn read_pid(path: &Path) -> u32 {
-    std::fs::read_to_string(path)
-        .expect("pid file")
-        .parse()
-        .expect("numeric pid")
 }
 
 /// Whether `pid` still names a process, reaped or not.

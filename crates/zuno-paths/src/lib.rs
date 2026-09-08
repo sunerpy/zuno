@@ -80,10 +80,8 @@
 //! assert_eq!(layout.log(), Path::new("/srv/data/zuno/log"));
 //! ```
 
-/// Bounding a child process, shared by every git query this crate makes. Private
-/// because a ceiling on a subprocess is how this crate answers questions, not
-/// something it offers to answer them with.
-mod bounded;
+/// Bounded collection of local subprocess output.
+pub mod bounded;
 pub mod config_chain;
 pub mod ensure;
 pub mod env;

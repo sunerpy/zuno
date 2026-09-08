@@ -261,6 +261,11 @@ pub fn resolve_exclude_path(worktree: &Path) -> Result<PathBuf, ExcludeError> {
             status: None,
             message: "git ran but its output could not be collected".to_owned(),
         },
+        bounded::Failure::TooLarge { max } => ExcludeError::GitFailed {
+            worktree: worktree.to_path_buf(),
+            status: None,
+            message: format!("git output exceeded the {max}-byte collection limit"),
+        },
     })?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();

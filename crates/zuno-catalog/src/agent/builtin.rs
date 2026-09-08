@@ -29,6 +29,8 @@ pub const PROMPT_ORCHESTRATOR: &str = include_str!("prompt/orchestrator.txt");
 pub const PROMPT_BUILD: &str = include_str!("prompt/build.txt");
 /// Read-only planning agent.
 pub const PROMPT_PLAN: &str = include_str!("prompt/plan.txt");
+/// Read-only high-assurance review agent.
+pub const PROMPT_REVIEW: &str = include_str!("prompt/review.txt");
 /// Thorough cross-cutting implementation agent.
 pub const PROMPT_DEEP: &str = include_str!("prompt/deep.txt");
 /// Focused local implementation specialist.
@@ -53,10 +55,11 @@ pub const PROMPT_SUMMARY: &str = include_str!("prompt/summary.txt");
 pub const PROMPT_COUNCIL_SYNTH: &str = include_str!("prompt/council-synth.txt");
 
 /// Native names in deterministic declaration order.
-pub const BUILTIN_NAMES: [&str; 14] = [
+pub const BUILTIN_NAMES: [&str; 15] = [
     "orchestrator",
     "build",
     "plan",
+    "review",
     "deep",
     "fixer",
     "general",
@@ -99,6 +102,40 @@ const ORCHESTRATOR_DELEGATES: &[&str] = &[
     "looker",
 ];
 
+/// The seats `review` runs, and nothing else.
+///
+/// Exactly the three agents the first-party `balanced-review` Council preset seats, in
+/// its order: implementation evidence, contract evidence, decision review. Council
+/// validation refuses a preset whose seat agent is outside the caller's allowlist, so
+/// this list is what lets `review` run that preset at all. It deliberately excludes
+/// `review` itself — a review that could seat another review would recurse — and every
+/// mutating specialist, because a read-only agent must not reach a writing child.
+const REVIEW_DELEGATES: &[&str] = &["explorer", "librarian", "oracle"];
+
+/// The natives that may start a child turn at all.
+///
+/// `orchestrator` coordinates delivery and owns integration; `review` seats the
+/// first-party `balanced-review` Council. Nothing else declares children, and `build`
+/// denies `task` outright, because an agent that can fan out without owning the
+/// verification of what comes back is how one review turn came to run three
+/// same-shaped explorers and inherit a wrong conclusion from all of them.
+///
+/// One list so the catalog and its tests cannot disagree about where the boundary is.
+pub const DELEGATING_NATIVES: [&str; 2] = ["orchestrator", "review"];
+
+/// The built-in Skills `review` loads before it starts reasoning.
+///
+/// Both are first-party. That is the point: `required_skills` resolution fails closed on
+/// a name that matches nothing, so requiring the user-installed `codegraph` Skill would
+/// make the review agent unavailable on every machine that does not happen to have it.
+/// `codemap` reaches the same CodeGraph index through a first-party read-only interface,
+/// and a `codegraph` Skill that *is* installed still gets discovered the ordinary way.
+///
+/// A declared Skill only reaches the model when this agent's overlay also grants that
+/// Skill's required tools, which is why the `review` overlay allows `read`, `glob`,
+/// `grep` and `skill`.
+const REVIEW_REQUIRED_SKILLS: &[&str] = &["codemap", "verification-planning"];
+
 /// Every native agent in declaration order.
 #[must_use]
 pub fn all() -> Vec<Builtin> {
@@ -106,6 +143,7 @@ pub fn all() -> Vec<Builtin> {
         orchestrator(),
         build(),
         plan(),
+        review(),
         deep(),
         fixer(),
         general(),
@@ -174,6 +212,21 @@ fn plan() -> Builtin {
         temperature: Some(0.1),
         prompt: Some(PROMPT_PLAN),
         delegates: None,
+    }
+}
+
+fn review() -> Builtin {
+    Builtin {
+        name: "review",
+        description: Some(
+            "Reviews a plan, design, or root-cause analysis against recorded evidence and \
+             decides whether it is ready to implement, without changing any file.",
+        ),
+        mode: AgentMode::Primary,
+        hidden: false,
+        temperature: Some(0.1),
+        prompt: Some(PROMPT_REVIEW),
+        delegates: Some(REVIEW_DELEGATES),
     }
 }
 
@@ -387,6 +440,33 @@ impl Builtin {
                 ("todo_update", allow()),
                 ("skill", allow()),
             ],
+            // Read-only like `plan`, plus the native Council and evidence surface a review
+            // needs. Arbitrary `task` delegation remains hidden: a review reaches child
+            // seats only through the configuration-owned balanced Council. `job`
+            // accompanies it so the agent can inspect the resulting durable row.
+            "review" => vec![
+                ("*", deny()),
+                ("read", allow()),
+                ("glob", allow()),
+                ("grep", allow()),
+                ("lsp", allow()),
+                ("shell", allow()),
+                ("bg", allow()),
+                ("webfetch", allow()),
+                ("web_search", allow()),
+                ("question", allow()),
+                ("council_run", allow()),
+                ("job", allow()),
+                ("review_open", allow()),
+                ("review_claim", allow()),
+                ("review_get", allow()),
+                ("review_finalize", allow()),
+                ("task_report", allow()),
+                ("goal_get", allow()),
+                ("plan_get", allow()),
+                ("todo_get", allow()),
+                ("skill", allow()),
+            ],
             "deep" => vec![
                 ("*", deny()),
                 ("read", allow()),
@@ -491,8 +571,24 @@ impl Builtin {
     pub fn permission_overlay_is_partial(&self) -> bool {
         matches!(
             self.name,
-            "plan" | "explorer" | "librarian" | "oracle" | "looker"
+            "plan" | "review" | "explorer" | "librarian" | "oracle" | "looker"
         )
+    }
+
+    /// Skills this native loads at the start of every turn.
+    ///
+    /// `None` leaves Skill selection to the model, which is right for an agent whose work
+    /// is not defined by one discipline. `review` is the exception: its whole job is to
+    /// produce checkable evidence, and a review that forgot to load the evidence
+    /// discipline is the failure the agent exists to prevent.
+    ///
+    /// Only first-party names may appear here; see [`REVIEW_REQUIRED_SKILLS`].
+    #[must_use]
+    pub fn required_skills(&self) -> Option<&'static [&'static str]> {
+        match self.name {
+            "review" => Some(REVIEW_REQUIRED_SKILLS),
+            _ => None,
+        }
     }
 }
 
@@ -600,17 +696,100 @@ mod tests {
         }
     }
 
-    /// A Job resolves only for the session that delegated it, so only the delegator
-    /// may inspect one.
+    /// A Job resolves only for the session that delegated it, so only a delegating
+    /// native may inspect one.
     #[test]
-    fn only_the_delegating_native_can_inspect_a_durable_job() {
+    fn only_the_delegating_natives_can_inspect_a_durable_job() {
         for builtin in all() {
             let rules = effective_rules(&builtin);
             assert_eq!(
                 is_tool_visible("job", &rules),
-                builtin.name == "orchestrator",
+                DELEGATING_NATIVES.contains(&builtin.name),
                 "{} disagrees with the delegation boundary about `job`",
                 builtin.name
+            );
+        }
+    }
+
+    /// Only first-party Skills may be forced, and only where the overlay can serve them.
+    ///
+    /// `required_skills` resolution fails closed on a name that matches nothing, so a
+    /// user-installed name here would make the agent unavailable wherever that Skill is
+    /// absent. The `codegraph` assertion is the specific mistake this guards.
+    #[test]
+    fn only_review_forces_skills_and_only_first_party_ones() {
+        for builtin in all() {
+            if builtin.name == "review" {
+                assert_eq!(
+                    builtin.required_skills(),
+                    Some(REVIEW_REQUIRED_SKILLS),
+                    "review must load the evidence discipline it exists to apply"
+                );
+            } else {
+                assert!(
+                    builtin.required_skills().is_none(),
+                    "{} unexpectedly forces a Skill load",
+                    builtin.name
+                );
+            }
+        }
+        assert!(
+            !REVIEW_REQUIRED_SKILLS.contains(&"codegraph"),
+            "`codegraph` is user-installed; requiring it would fail closed where it is absent"
+        );
+        let rules = effective_rules(&get("review").expect("review"));
+        for tool in ["read", "glob", "grep", "skill"] {
+            assert!(
+                is_tool_visible(tool, &rules),
+                "review forces Skills that need `{tool}`, so its overlay must grant it"
+            );
+        }
+    }
+
+    /// The overlay has to actually serve the evidence surface it was written for.
+    ///
+    /// A deny-by-default overlay hides anything it does not name, so a tool that is added
+    /// to the ledger but never added here is dropped by the visibility gate: the agent
+    /// would advertise a review workflow it cannot perform, and nothing else would report
+    /// it. This test exists because `review_open` and `review_claim` were written after
+    /// the overlay and were missing from it.
+    ///
+    /// The withheld half matters equally. A review that could edit a file could satisfy
+    /// its own findings, and one that could close a Goal could clear the gate it exists to
+    /// apply.
+    #[test]
+    fn the_review_overlay_serves_the_whole_evidence_loop_and_withholds_every_writer() {
+        let rules = effective_rules(&get("review").expect("review"));
+
+        for tool in [
+            "review_open",
+            "review_claim",
+            "review_get",
+            "review_finalize",
+            "task_report",
+            "council_run",
+            "job",
+            "goal_get",
+        ] {
+            assert!(
+                is_tool_visible(tool, &rules),
+                "review cannot run the evidence loop without `{tool}`"
+            );
+        }
+
+        for tool in [
+            "edit",
+            "write",
+            "apply_patch",
+            "goal_update",
+            "goal_propose",
+            "plan_update",
+            "todo_update",
+            "task",
+        ] {
+            assert!(
+                !is_tool_visible(tool, &rules),
+                "review is read-only, so `{tool}` must stay withheld"
             );
         }
     }
@@ -629,21 +808,39 @@ mod tests {
     }
 
     #[test]
-    fn only_orchestrator_declares_and_exposes_delegation() {
+    fn only_the_delegating_natives_declare_and_expose_delegation() {
         let orchestrator = get("orchestrator").expect("orchestrator");
         assert_eq!(orchestrator.delegates, Some(ORCHESTRATOR_DELEGATES));
         assert_eq!(
-            orchestrator
+            get("review").expect("review").delegates,
+            Some(REVIEW_DELEGATES)
+        );
+        assert_eq!(
+            get("orchestrator")
+                .expect("orchestrator")
                 .permission_overlay()
                 .expect("overlay")
                 .rules
                 .get("task"),
             Some(&PermissionRule::Action(PermissionAction::Allow))
         );
+        let review = get("review")
+            .expect("review")
+            .permission_overlay()
+            .expect("overlay")
+            .rules;
+        assert_eq!(
+            review.get("council_run"),
+            Some(&PermissionRule::Action(PermissionAction::Allow))
+        );
+        assert_ne!(
+            review.get("task"),
+            Some(&PermissionRule::Action(PermissionAction::Allow))
+        );
 
         for builtin in all()
             .into_iter()
-            .filter(|builtin| builtin.name != "orchestrator")
+            .filter(|builtin| !DELEGATING_NATIVES.contains(&builtin.name))
         {
             assert!(
                 builtin.delegates.is_none(),
