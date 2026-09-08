@@ -820,18 +820,28 @@ fn read_secret(prompt: &str, required: &str, cancelled: &str) -> Result<String, 
 fn read_terminal_secret(prompt: &str, required: &str, cancelled: &str) -> Result<String, String> {
     struct RawModeGuard;
 
+    impl RawModeGuard {
+        fn enter() -> Result<Self, String> {
+            crossterm::terminal::enable_raw_mode().map_err(|error| error.to_string())?;
+            Ok(Self)
+        }
+    }
+
     impl Drop for RawModeGuard {
         fn drop(&mut self) {
             let _ = crossterm::terminal::disable_raw_mode();
         }
     }
 
+    // Publish the prompt only after input is in no-echo raw mode. Besides keeping
+    // secrets off the terminal, this makes the visible prompt an input-readiness
+    // boundary for real users and PTY clients; switching modes after rendering can
+    // flush bytes submitted immediately after the prompt appears.
+    let guard = RawModeGuard::enter()?;
     eprint!("{prompt}");
     std::io::stderr()
         .flush()
         .map_err(|error| error.to_string())?;
-    crossterm::terminal::enable_raw_mode().map_err(|error| error.to_string())?;
-    let guard = RawModeGuard;
     let mut value = String::new();
     loop {
         match crossterm::event::read().map_err(|error| error.to_string())? {
