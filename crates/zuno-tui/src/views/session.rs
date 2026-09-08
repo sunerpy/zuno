@@ -748,6 +748,10 @@ pub enum Selection {
     Model(String),
     /// A different agent for subsequent turns.
     Agent(String),
+    /// Enter the read-only Plan collaboration mode.
+    StartPlan,
+    /// Authorize implementation of the current handoff-ready durable Plan.
+    StartWork,
     /// A different model-team preset for subsequent turns and delegations.
     Preset(String),
     /// A different session to continue in.
@@ -1685,13 +1689,20 @@ impl SessionScreen {
             }
             SlashSubmission::Host(HostCommand::Plan) => {
                 if self.plan_mode_active() {
-                    self.request_start_work();
+                    self.toasts.push(Toast::info("Plan mode is already active"));
                 } else {
                     self.request_start_plan();
                 }
             }
             SlashSubmission::Host(HostCommand::StartPlan) => {
-                self.select_collaboration_agent("plan");
+                let (notice, level) = self.commit_selection(Selection::StartPlan);
+                if level == ToastLevel::Success {
+                    self.catalog.agent = Some("plan".to_owned());
+                    self.status.set_configured_agent("plan");
+                    self.sidebar.ambient_mut().agent = Some("plan".to_owned());
+                    self.welcome.facts_mut().agent = Some("plan".to_owned());
+                }
+                self.toasts.push(Toast::new(level, notice));
             }
             SlashSubmission::Host(HostCommand::StartWork) => {
                 self.request_start_work();
@@ -1845,25 +1856,6 @@ impl SessionScreen {
             question: question.to_owned(),
         };
         self.submit_to_driver(text, submission, PromptDelivery::Direct, origin);
-    }
-
-    fn select_collaboration_agent(&mut self, agent: &str) {
-        if self.catalog.agent.as_deref() == Some(agent) {
-            self.toasts.push(Toast::info(if agent == "plan" {
-                "Plan mode is already active"
-            } else {
-                "Work mode is already active"
-            }));
-            return;
-        }
-        let (notice, level) = self.commit_selection(Selection::Agent(agent.to_owned()));
-        if level == ToastLevel::Success {
-            self.catalog.agent = Some(agent.to_owned());
-            self.status.set_configured_agent(agent);
-            self.sidebar.ambient_mut().agent = Some(agent.to_owned());
-            self.welcome.facts_mut().agent = Some(agent.to_owned());
-        }
-        self.toasts.push(Toast::new(level, notice));
     }
 
     fn request_start_plan(&mut self) {
@@ -4374,6 +4366,8 @@ impl SessionScreen {
         let notice = match &selection {
             Selection::Model(model) => format!("model set to {model} for the next turn"),
             Selection::Agent(agent) => format!("agent set to {agent} for the next turn"),
+            Selection::StartPlan => "entering Plan mode".to_owned(),
+            Selection::StartWork => "authorizing the current Plan for Work".to_owned(),
             Selection::Preset(preset) => {
                 format!("preset set to {preset} for the next turn and future delegations")
             }
@@ -4798,7 +4792,14 @@ impl ActionComponent for SessionScreen {
                 if dialog == PLAN_START_CONFIRM_DIALOG_ID =>
             {
                 if value == crate::views::basics::CONFIRM_VALUE {
-                    self.select_collaboration_agent("plan");
+                    let (notice, level) = self.commit_selection(Selection::StartPlan);
+                    if level == ToastLevel::Success {
+                        self.catalog.agent = Some("plan".to_owned());
+                        self.status.set_configured_agent("plan");
+                        self.sidebar.ambient_mut().agent = Some("plan".to_owned());
+                        self.welcome.facts_mut().agent = Some("plan".to_owned());
+                    }
+                    self.toasts.push(Toast::new(level, notice));
                 }
                 EventResult::REDRAW
             }
@@ -4806,7 +4807,8 @@ impl ActionComponent for SessionScreen {
                 if dialog == WORK_START_CONFIRM_DIALOG_ID =>
             {
                 if value == crate::views::basics::CONFIRM_VALUE {
-                    self.select_collaboration_agent("orchestrator");
+                    let (notice, level) = self.commit_selection(Selection::StartWork);
+                    self.toasts.push(Toast::new(level, notice));
                 }
                 EventResult::REDRAW
             }

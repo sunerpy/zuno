@@ -602,8 +602,8 @@ Work 模式提示模型仅在真正多步骤、需要协调、顺序、委派或
 
 机器执行波次持久化为独立 `DriverPhase`，不写入用户 Plan。最终回复前的 driver 只
 检查 Plan、Todo、Job、Goal、工具结果与验证记录；没有记录任何持久工作的会话直接结算，
-持有未对账持久工作的普通会话最多触发两次 durable reconciliation continuation，仍无法
-对齐则进入 typed `PlanUnreconciled` 人工等待。Work 模式的 Optional 决策不构成
+已授权 Work 从 durable `Recovery` token 继续；连续三次相同权威 progress fingerprint
+才进入 typed `no_progress` 暂停，不制造通用人工确认。Work 模式的 Optional 决策不构成
 未对账的持久工作。进程重启继续原 cycle，模型自然语言不作为完成证据。
 
 ### 9.2 执行波次

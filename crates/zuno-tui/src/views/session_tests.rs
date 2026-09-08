@@ -850,10 +850,7 @@ fn session_screen_plan_command_requires_confirmation_before_switching_agents() {
         },
     );
 
-    assert_eq!(
-        chosen.try_recv(),
-        Ok(Selection::Agent(String::from("plan")))
-    );
+    assert_eq!(chosen.try_recv(), Ok(Selection::StartPlan));
     assert_eq!(screen.catalog.agent.as_deref(), Some("plan"));
 }
 
@@ -868,10 +865,7 @@ fn session_screen_start_plan_switches_immediately_without_model_text() {
 
     screen.handle_action(action("input_submit"), &press_none());
 
-    assert_eq!(
-        chosen.try_recv(),
-        Ok(Selection::Agent(String::from("plan")))
-    );
+    assert_eq!(chosen.try_recv(), Ok(Selection::StartPlan));
     assert_eq!(screen.catalog.agent.as_deref(), Some("plan"));
     assert!(
         screen.drain_dialogs().is_empty(),
@@ -951,11 +945,12 @@ fn session_screen_start_work_confirms_the_durable_plan_before_orchestrated_work(
         },
     );
 
+    assert_eq!(chosen.try_recv(), Ok(Selection::StartWork));
     assert_eq!(
-        chosen.try_recv(),
-        Ok(Selection::Agent(String::from("orchestrator")))
+        screen.catalog.agent.as_deref(),
+        Some("plan"),
+        "the client must not pretend Work started before the runtime accepts the handoff"
     );
-    assert_eq!(screen.catalog.agent.as_deref(), Some("orchestrator"));
 }
 
 #[test]

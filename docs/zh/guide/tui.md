@@ -145,9 +145,9 @@ inbox 并启动目标回合；离线目标则一直保留 queued 行，直到再
 | --- | --- |
 | `/compact` | 通过持久压缩流水线压缩历史 |
 | `/goal [目标 \| action]` | 设置、查看或管理持久 Goal；使用 `/goal help` 查看语法 |
-| `/plan` | 进入 Plan 模式，或在已处于规划中时确认开始工作 |
+| `/plan` | 幂等进入 Plan 模式 |
 | `/start-plan` | 立即进入只读的 Plan 模式 |
-| `/start-work` | 复核持久 plan 并确认开始实现 |
+| `/start-work` | 授权精确的 handoff-ready Plan revision 并开始实现 |
 | `/preset` | 切换已配置的模型团队，或选择一个 |
 | `/council` | 运行一个原生的多 Agent Council 预设 |
 | `/undo` | 恢复到上一个已完成回合之前的 worktree |

@@ -265,6 +265,25 @@ fn open(store: &ReviewStore, snapshot: ReviewSourceSnapshot) -> ReviewReadiness 
         .expect("open")
 }
 
+fn open_for_plan(
+    store: &ReviewStore,
+    snapshot: ReviewSourceSnapshot,
+    plan_id: &str,
+    plan_revision: i64,
+    at_ms: i64,
+) -> ReviewReadiness {
+    store
+        .open_review(
+            SESSION,
+            Some(plan_id),
+            Some(plan_revision),
+            true,
+            || Ok(snapshot),
+            at_ms,
+        )
+        .expect("open Plan review")
+}
+
 fn seed_completed_council_job(
     store: &ReviewStore,
     run_id: &str,
@@ -403,6 +422,68 @@ fn finalize_one_verified_claim(
             },
         )
         .expect("finalize")
+}
+
+#[test]
+fn plan_review_gate_in_reads_unbound_and_exact_revision_from_a_caller_transaction() {
+    let (_root, pool, store) = fixture();
+    let review = open_for_plan(&store, source("rsnap_plan_2"), "plan_alpha", 2, 10);
+    let mut connection = pool.get().expect("connection");
+    let transaction =
+        rusqlite::Connection::transaction(&mut connection).expect("caller transaction");
+
+    assert_eq!(
+        ReviewStore::plan_review_gate_in(&transaction, SESSION, "plan_alpha", 1)
+            .expect("unbound gate"),
+        PlanReviewGate::Unbound
+    );
+    assert_eq!(
+        ReviewStore::plan_review_gate_in(&transaction, SESSION, "plan_alpha", 2)
+            .expect("draft gate"),
+        PlanReviewGate::Draft {
+            review_id: review.review_id,
+            review_revision: review.revision,
+        }
+    );
+}
+
+#[test]
+fn plan_review_gate_reports_ready_with_the_reconstructed_review_revision() {
+    let (_root, _pool, store) = fixture();
+    let review = open_for_plan(&store, source("rsnap_ready_plan"), "plan_ready", 7, 10);
+    let review = seed_council(&store, &review);
+    let ready = finalize_one_verified_claim(&store, &review).readiness;
+
+    assert_eq!(
+        store
+            .plan_review_gate(SESSION, "plan_ready", 7)
+            .expect("ready gate"),
+        PlanReviewGate::Ready {
+            review_id: ready.review_id,
+            review_revision: ready.revision,
+        }
+    );
+}
+
+#[test]
+fn plan_review_gate_uses_the_newest_binding_sequence_not_later_old_review_activity() {
+    let (_root, _pool, store) = fixture();
+    let first = open_for_plan(&store, source("rsnap_first"), "plan_shared", 3, 10);
+    let second = open_for_plan(&store, source("rsnap_second"), "plan_shared", 3, 20);
+    let (changed_first, _) = store
+        .record_claim(SESSION, first.revision, claim(&first, "sha256:a"), 30)
+        .expect("later activity on older review");
+    assert!(changed_first.revision > second.revision);
+
+    assert_eq!(
+        store
+            .plan_review_gate(SESSION, "plan_shared", 3)
+            .expect("latest bound review"),
+        PlanReviewGate::Draft {
+            review_id: second.review_id,
+            review_revision: second.revision,
+        }
+    );
 }
 
 #[test]

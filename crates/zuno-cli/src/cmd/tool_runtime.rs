@@ -496,9 +496,10 @@ pub(crate) fn assemble(
         ),
         (
             BuiltinSlot::Background,
-            erase(zuno_tools::BackgroundTool::new(Arc::clone(
-                &selection.background_executions,
-            ))),
+            erase(
+                zuno_tools::BackgroundTool::new(Arc::clone(&selection.background_executions))
+                    .with_completion_delivery(Arc::clone(&selection.todo_store)),
+            ),
         ),
         (
             BuiltinSlot::Glob,

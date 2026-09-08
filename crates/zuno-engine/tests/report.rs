@@ -4,6 +4,7 @@ use serde_json::json;
 use zuno_db::inbox::{InputDelivery, SessionInput, SubmissionState};
 use zuno_engine::planning::PlanningInputSource;
 use zuno_engine::report::ReportBatch;
+use zuno_types::execution::InputTriggerKind;
 
 fn promoted_report(id: &str, prompt: serde_json::Value, completed: i64, seq: i64) -> SessionInput {
     SessionInput {
@@ -11,6 +12,9 @@ fn promoted_report(id: &str, prompt: serde_json::Value, completed: i64, seq: i64
         session_id: "ses_parent".to_owned(),
         prompt,
         delivery: InputDelivery::Queue,
+        source_key: None,
+        trigger_kind: InputTriggerKind::Legacy,
+        cycle_id: None,
         state: SubmissionState::Promoted,
         revision: 2,
         admitted_sequence: seq,

@@ -91,12 +91,11 @@ rather than knowingly sending a stale developer-priority snapshot.
 
 Before successful delivery, a durable reconciliation driver checks Plan, Todo,
 Job, Goal, tool-result, and verification state. Ordinary sessions holding
-unreconciled durable work receive at most two reconciliation continuations, then
-enter typed `PlanUnreconciled` human wait instead of claiming completion. Only
-durably recorded work counts: a Work-mode session that records no Plan, Todo,
-or Job finishes on its first answer. Disabling `plan_update` prevents model
-creation or mutation; an existing Plan is still persisted, projected, and
-restored.
+authorized durable work continue from a `Recovery` token. The driver hashes
+authoritative revisions into a progress fingerprint; three consecutive identical
+fingerprints pause with typed `no_progress` instead of manufacturing a human
+confirmation request. Only durably recorded work counts: a Work-mode session that
+records no Plan, Todo, or Job finishes on its first answer.
 
 The built-in read-only `plan` Agent has one typed handoff exception: a completed planning
 answer leaves the current Plan and Todos, with their existing statuses, as execution work
@@ -196,10 +195,14 @@ CI run, deployment, or release completed.
 
 While a remote observer remains running and durable Plan, Todo, or Job work is
 unfinished, the reconciliation driver records `waiting_background`. The current
-turn may end, but Zuno does not spend its two ordinary reconciliation attempts,
-ask the user how to repair Plan state, or immediately auto-run an active Goal.
+turn may end without polling or asking the user how to repair Plan state.
 The observer's durable terminal report wakes the session and normal reconciliation
 continues after the authoritative remote refresh.
+
+Completion is callback-first. Use `bg wait` only when the current step
+synchronously depends on the result; each call is capped at 60 seconds. A
+synchronous wait and the callback compete for one durable completion owner, so
+only one path can start a continuation turn.
 
 ## Reading output in windows
 

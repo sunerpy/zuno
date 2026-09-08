@@ -127,7 +127,7 @@ an edit — or do the work in the parent session.
 
 ## Plan mode
 
-`/plan` in the terminal application switches collaboration mode, and the restriction is
+`/plan` and `/start-plan` enter Plan collaboration mode idempotently, and the restriction is
 enforced below the prompt by a deny-by-default capability overlay: repository inspection,
 read-only LSP and search, external research, questions, Skills, background inspection,
 and typed Goal/Plan/Todo operations are allowed, while file mutation, delegation, `job`,

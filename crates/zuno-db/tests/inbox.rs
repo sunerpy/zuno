@@ -6,6 +6,7 @@ use zuno_db::inbox::{
 };
 use zuno_db::{Pool, migration, session};
 use zuno_paths::DbLocation;
+use zuno_types::execution::InputTriggerKind;
 
 const SESSION_ID: &str = "ses_inbox";
 
@@ -67,6 +68,38 @@ fn admission_commits_the_event_and_pending_input_together() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_type, "session.input.admitted");
     assert_eq!(events[0].properties["inputID"], "input-1");
+}
+
+#[test]
+fn source_key_admission_is_idempotent_and_preserves_trigger_metadata() {
+    let pool = initialized(&DbLocation::Memory);
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    let log = SessionEventLog::new(pool);
+    let first = input("input-1", "first", InputDelivery::Queue, 10)
+        .with_source_key("background:bg_1:2")
+        .with_trigger_kind(InputTriggerKind::Automatic)
+        .with_cycle_id(Some("cycle-1"));
+    let admitted = inbox.admit(first).expect("first admission");
+    let duplicate = inbox
+        .admit(
+            input("input-2", "different", InputDelivery::Queue, 11)
+                .with_source_key("background:bg_1:2")
+                .with_trigger_kind(InputTriggerKind::Automatic)
+                .with_cycle_id(Some("cycle-1")),
+        )
+        .expect("idempotent admission");
+
+    assert_eq!(duplicate, admitted);
+    assert_eq!(admitted.source_key.as_deref(), Some("background:bg_1:2"));
+    assert_eq!(admitted.trigger_kind, InputTriggerKind::Automatic);
+    assert_eq!(admitted.cycle_id.as_deref(), Some("cycle-1"));
+    assert_eq!(log.read_after(SESSION_ID, None).expect("events").len(), 1);
+    assert_eq!(
+        inbox
+            .get_by_source_key(SESSION_ID, "background:bg_1:2")
+            .expect("source lookup"),
+        Some(admitted)
+    );
 }
 
 #[test]

@@ -1,7 +1,7 @@
 # Project structure and execution flow
 
 Use this page to find the crate that owns a behavior before changing it. Zuno is a
-single Rust workspace with 48 crates. `crates/zuno-cli` builds the `zuno` binary;
+single Rust workspace with 49 crates. `crates/zuno-cli` builds the `zuno` binary;
 the other crates keep protocol, runtime, storage, tool, and client concerns out of
 that entry point.
 
@@ -50,6 +50,7 @@ Every crate opts into the workspace lint policy. First-party code forbids
 | `zuno-orchestration` | First-party Agent, Skill, and orchestration descriptors compiled into Zuno |
 | `zuno-goal` | Durable Goal state and continuation policy |
 | `zuno-review` | Host-probed review evidence, validated Council reports, readiness gates, and durable review-event projections |
+| `zuno-session-control` | Atomic Plan handoff, Work authorization, continuation identity, and review-gated mode transitions |
 | `zuno-continuity` | Session History and Notes services and their tools |
 | `zuno-product-agent` | Process adapters for Codex and Claude Code product agents |
 | `zuno-extension` | Validation and lifecycle for static and process-local extension packages |

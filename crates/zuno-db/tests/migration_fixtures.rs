@@ -14,6 +14,8 @@
 //! | `format-5.sql` | 5      | v0.0.3  | learning flywheel, Plan stack, verification ledger |
 //! | `format-6.sql` | 6      | v0.2.2  | Plan stack, verification ledger                    |
 //! | `format-7.sql` | 7      | v0.6.7  | verification ledger                                |
+//! | `format-8.sql` | 8      | v0.10.5 | session memory policy                              |
+//! | `format-9.sql` | 9      | v0.10.21| execution control and completion routing            |
 //!
 //! Every fixture is upgraded through the real entry point, [`migration::apply`],
 //! and the result is compared *structurally* with a database `apply` creates from
@@ -87,8 +89,21 @@ const FORMAT_EIGHT: Fixture = Fixture {
     table_count: 39,
 };
 
+const FORMAT_NINE_SQL: &str = concat!(
+    include_str!("fixtures/format-7.sql"),
+    include_str!("fixtures/format-8.sql"),
+    include_str!("fixtures/format-9.sql")
+);
+
+const FORMAT_NINE: Fixture = Fixture {
+    format: 9,
+    release: "v0.10.21",
+    sql: FORMAT_NINE_SQL,
+    table_count: 40,
+};
+
 /// Every table `sqlite_master` lists once the current schema is in place.
-const CURRENT_TABLE_COUNT: usize = 40;
+const CURRENT_TABLE_COUNT: usize = 42;
 
 /// One additive upgrade step, described by what it must leave behind and by the
 /// first statement `schema.rs` runs for it (used to prove, from the statement
@@ -169,21 +184,44 @@ const MEMORY_POLICY: Step = Step {
     columns: &[],
 };
 
+const EXECUTION: Step = Step {
+    name: "session execution state (format 9 -> 10)",
+    first_statement: "ALTER TABLE `session_input` ADD COLUMN `source_key`",
+    tables: &["session_execution_state", "completion_delivery"],
+    indexes: &[
+        "session_input_session_source_key_idx",
+        "session_execution_state_mode_phase_updated_idx",
+        "completion_delivery_session_owner_updated_idx",
+    ],
+    columns: &[
+        ("session_input", "source_key"),
+        ("session_input", "trigger_kind"),
+        ("session_input", "cycle_id"),
+    ],
+};
+
 /// The index created by the final DDL statement of every upgrade path. Index names
 /// are database-global, so an unrelated index that already owns this name makes
 /// exactly that statement fail after everything before it ran inside the same
 /// transaction. SQLite rejects the duplicate while *preparing* the statement, so
 /// it never reaches `SQLITE_TRACE_STMT`; the statement immediately before it is
 /// therefore the last one the trace can show before the rollback.
-const TRAP_INDEX: &str = "session_memory_policy_generation_updated_idx";
-const STATEMENT_BEFORE_TRAP: &str = "CREATE TABLE `session_memory_policy`";
+const TRAP_INDEX: &str = "completion_delivery_session_owner_updated_idx";
+const STATEMENT_BEFORE_TRAP: &str = "CREATE INDEX `session_execution_state_mode_phase_updated_idx`";
 
 fn steps_after(format: u32) -> &'static [&'static Step] {
     match format {
-        5 => &[&LEARNING, &PLAN_STACK, &VERIFICATION, &MEMORY_POLICY],
-        6 => &[&PLAN_STACK, &VERIFICATION, &MEMORY_POLICY],
-        7 => &[&VERIFICATION, &MEMORY_POLICY],
-        8 => &[&MEMORY_POLICY],
+        5 => &[
+            &LEARNING,
+            &PLAN_STACK,
+            &VERIFICATION,
+            &MEMORY_POLICY,
+            &EXECUTION,
+        ],
+        6 => &[&PLAN_STACK, &VERIFICATION, &MEMORY_POLICY, &EXECUTION],
+        7 => &[&VERIFICATION, &MEMORY_POLICY, &EXECUTION],
+        8 => &[&MEMORY_POLICY, &EXECUTION],
+        9 => &[&EXECUTION],
         other => panic!("no fixture describes format {other}"),
     }
 }
@@ -232,6 +270,11 @@ const LEARNING_REPRESENTATIVE_VALUES: &[(&str, &str)] = &[
 const VERIFICATION_REPRESENTATIVE_VALUES: &[(&str, &str)] = &[(
     "SELECT summary FROM verification_receipt WHERE id = 'vrc_fixture_0001'",
     "The format-8 verification receipt survives.",
+)];
+
+const MEMORY_POLICY_REPRESENTATIVE_VALUES: &[(&str, &str)] = &[(
+    "SELECT reason FROM session_memory_policy WHERE session_id = 'ses_fixture_0001'",
+    "format-9 policy survives",
 )];
 
 // ---------------------------------------------------------------------------
@@ -677,6 +720,9 @@ fn assert_fixture_is_the_old_format(fixture: &Fixture) {
     if fixture.format >= 8 {
         assert_literal_values(&connection, VERIFICATION_REPRESENTATIVE_VALUES, &context);
     }
+    if fixture.format >= 9 {
+        assert_literal_values(&connection, MEMORY_POLICY_REPRESENTATIVE_VALUES, &context);
+    }
     // Sanity: the old file is not already the current shape in disguise.
     assert_ne!(
         inventory,
@@ -703,6 +749,11 @@ fn format_seven_fixture_is_the_v0_6_7_database() {
 #[test]
 fn format_eight_fixture_is_the_v0_10_5_database() {
     assert_fixture_is_the_old_format(&FORMAT_EIGHT);
+}
+
+#[test]
+fn format_nine_fixture_is_the_v0_10_21_database() {
+    assert_fixture_is_the_old_format(&FORMAT_NINE);
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +784,9 @@ fn assert_upgrade_preserves_rows_and_reaches_the_current_structure(fixture: &Fix
     }
     if fixture.format >= 8 {
         assert_literal_values(&connection, VERIFICATION_REPRESENTATIVE_VALUES, &context);
+    }
+    if fixture.format >= 9 {
+        assert_literal_values(&connection, MEMORY_POLICY_REPRESENTATIVE_VALUES, &context);
     }
 
     // (d) Exactly the objects the remaining steps add are new; nothing was lost.
@@ -838,6 +892,11 @@ fn format_seven_fixture_upgrades_to_the_current_structure_and_keeps_every_row() 
 #[test]
 fn format_eight_fixture_upgrades_to_the_current_structure_and_keeps_every_row() {
     assert_upgrade_preserves_rows_and_reaches_the_current_structure(&FORMAT_EIGHT);
+}
+
+#[test]
+fn format_nine_fixture_upgrades_to_the_current_structure_and_keeps_every_row() {
+    assert_upgrade_preserves_rows_and_reaches_the_current_structure(&FORMAT_NINE);
 }
 
 /// The one structural divergence between an upgraded database and a fresh one, and
@@ -1100,4 +1159,9 @@ fn a_failed_format_seven_upgrade_leaves_the_v0_6_7_database_untouched() {
 #[test]
 fn a_failed_format_eight_upgrade_leaves_the_v0_10_5_database_untouched() {
     assert_failed_upgrade_leaves_the_database_untouched(&FORMAT_EIGHT);
+}
+
+#[test]
+fn a_failed_format_nine_upgrade_leaves_the_v0_10_21_database_untouched() {
+    assert_failed_upgrade_leaves_the_database_untouched(&FORMAT_NINE);
 }

@@ -175,7 +175,8 @@ fn reconciliation_docs_pin_durable_work_as_the_only_unreconciled_work() {
         "docs/harness-runtime.md",
         &[
             "a session that recorded no durable work finishes on its first answer",
-            "holding unreconciled durable work receives at most two",
+            "authorized ordinary Work continues from a durable `Recovery` token",
+            "three consecutive identical fingerprints pause",
             "Unreconciled work means durably recorded work.",
             "A Work-mode `Optional` decision",
             "creates no Plan, Todo, or Job settles",
@@ -185,21 +186,24 @@ fn reconciliation_docs_pin_durable_work_as_the_only_unreconciled_work() {
         "docs/zh/operate/harness-runtime.md",
         &[
             "没有记录任何持久工作的会话在第一次回复后直接结束",
-            "普通会话在持有未对账的持久工作时",
+            "已授权 Work 从 durable",
+            "连续三次",
             "Work 模式的 `Optional` 决策不是已记录工作",
         ],
     );
     contains_all(
         "docs/guide/tools.md",
         &[
-            "unreconciled durable work receive at most two reconciliation continuations",
-            "durably recorded work counts: a Work-mode session that records no Plan, Todo",
+            "authorized durable work continue from a `Recovery` token",
+            "three consecutive identical",
+            "records no Plan, Todo, or Job finishes on its first answer",
         ],
     );
     contains_all(
         "docs/zh/guide/tools.md",
         &[
-            "普通会话在持有未对账的持久工作时最多执行两次对账续跑",
+            "已授权的持久工作使用 `Recovery` token 续跑",
+            "连续三次相同",
             "没有记录任何 Plan、Todo 或 Job 的会话在第一次回复后就结束",
         ],
     );
@@ -222,7 +226,8 @@ fn reconciliation_docs_pin_durable_work_as_the_only_unreconciled_work() {
     contains_all(
         "docs/design/dsh-alpha2-adoption-ledger.md",
         &[
-            "for durably recorded work",
+            "authorized Work from durable continuation tokens",
+            "typed `no_progress`",
             "A session that recorded no Plan, Todo, or Job is settled, not continued.",
         ],
     );
@@ -1794,33 +1799,35 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
     contains_all(
         "docs/migration.md",
         &[
-            "current database format is 9",
+            "current database format is 10",
             "Format 5",
             "Format 6",
             "Format 7",
             "Format 8",
+            "Format 9",
             "`BEGIN IMMEDIATE`",
-            "marker from 5, 6, 7, or 8 to 9",
+            "marker from 5, 6, 7, 8, or 9 to 10",
             "`session`, `message`, `memory_candidate`, `learning_job`, `verification_receipt`, or",
             "`work_plan` values",
             "future format",
             "fails closed without modification",
             "format marker updated last",
             "A valid format-5, format-6,",
-            "format-7, or format-8 database should open",
+            "format-7, format-8, or format-9 database should open",
             "should open and migrate automatically",
         ],
     );
     contains_all(
         "docs/zh/operate/migration.md",
         &[
-            "当前数据库格式为 9",
+            "当前数据库格式为 10",
             "format 5",
             "format 6",
             "format 7",
             "format 8",
+            "format 9",
             "`BEGIN IMMEDIATE`",
-            "marker 从 5、6、7 或 8 改为 9",
+            "marker 从 5、6、7、8 或 9 改为 10",
             "`session`、`message`、",
             "`work_plan` 值",
             "未来格式",
@@ -1832,11 +1839,12 @@ fn database_docs_describe_the_guarded_chain_to_the_current_format() {
     contains_all(
         "docs/zh/operate/prompt-workflow.md",
         &[
-            "数据库当前格式为 9",
+            "数据库当前格式为 10",
             "format 5",
             "format 6",
             "format 7",
             "format 8",
+            "format 9",
             "`BEGIN IMMEDIATE`",
             "`session`",
             "`message`",
@@ -3292,7 +3300,7 @@ fn resilience_docs_pin_revision_fallback_instruction_and_background_wait_contrac
             "Immediately before every `plan_update`",
             "after `plan_get` returned `null`",
             "`waiting_background`",
-            "does not spend its two ordinary reconciliation attempts",
+            "without polling or asking the user",
         ],
     );
     contains_all(
@@ -3301,14 +3309,14 @@ fn resilience_docs_pin_revision_fallback_instruction_and_background_wait_contrac
             "每次调用\n`plan_update` 前",
             "`plan_get` 返回 `null`",
             "`waiting_background`",
-            "不会消耗两次普通对账机会",
+            "不轮询，也不创建通用人工问题",
         ],
     );
     contains_all(
         "docs/harness-runtime.md",
         &[
             "`waiting_background`",
-            "without spending either ordinary reconciliation attempt",
+            "without polling or creating a generic human request",
             "An active Goal is not auto-driven again",
             "does not prevent ACP, TUI",
         ],
@@ -3317,7 +3325,7 @@ fn resilience_docs_pin_revision_fallback_instruction_and_background_wait_contrac
         "docs/zh/operate/harness-runtime.md",
         &[
             "`waiting_background`",
-            "不消耗两次普通对账机会",
+            "不轮询，也不创建通用人工问题",
             "不会立即再次自动续跑",
             "不会阻止 ACP、TUI",
         ],

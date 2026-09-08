@@ -420,7 +420,7 @@ Plan 承载阶段、它们的依赖顺序，以及它们的验收状态。它存
   uncertain，或报告尚未被消费时，该步骤不能完成。显式的新 Goal 可以替代旧步骤，
   但不会假装已经结算或取消关联 Job。
 
-Plan 模式在提示词之下强制执行其只读的一面：一层默认拒绝的覆盖层允许检查、只读搜索与 LSP、`shell` 与 `bg`、提问、Skill 以及类型化的 Goal/Plan/Todo 操作，同时拒绝文件修改、委派、`job` 与 `execute`。Plan 模式是一条“不得修改”的边界，而不是一条“没有 shell”的边界：运行时会把任何只读角色强制为 `SandboxMode::ReadOnly`，因此命令可以取证，但改不了工作树。回到 Work 模式要求已存在一个持久 plan，确认信息会指出它的标题、revision 和已完成步骤数。
+Plan 模式在提示词之下强制执行其只读的一面：一层默认拒绝的覆盖层允许检查、只读搜索与 LSP、`shell` 与 `bg`、提问、Skill 以及类型化的 Goal/Plan/Todo 操作，同时拒绝文件修改、委派、`job` 与 `execute`。Plan 模式是一条“不得修改”的边界，而不是一条“没有 shell”的边界：运行时会把任何只读角色强制为 `SandboxMode::ReadOnly`，因此命令可以取证，但改不了工作树。`/plan` 与 `/start-plan` 都是幂等进入 Plan；切换 Agent 只更新以后使用的 Work Agent。回到 Work 必须显式执行 `/start-work`，要求当前 Plan revision 已写入 handoff-ready 记录；若绑定 review，则默认还要求 Ready，除非用户持久化接受 Draft 风险的原因。
 
 默认宿主通过类型化 Planning service 负责协作模式约束、active 状态与最终对账；模型负责
 Work 模式是否需要 Plan 的判断，并通过操作式 `plan_update` 创建战略步骤。禁用该工具会
@@ -480,6 +480,17 @@ item 打开时收到无 id item 的完成事件。协议失败对该回合是终
 /start-work
 ```
 
+进入 Plan 时会原子写入 `paused(plan_mode)`。Start Work 会在同一个事务中恢复保存的
+Agent/provider/model/reasoning identity，写入精确的 Plan authorization、cycle 与
+continuation token，并接纳唯一的 `UserControl` 输入；Goal resume 不能替代这份 Work
+authorization。
+
+自动完成通知与压缩恢复使用独立的 durable trigger，不伪造 user message。
+`session_input.source_key` 去重 producer delivery，`completion_delivery` 让同步 wait 与
+异步 callback 竞争唯一消费权，`session_execution_state.context_epoch` 则在压缩后递增。
+因此后台完成会主动唤醒空闲 Work 会话，在 Plan 模式中仍保持只读，而且 `bg wait` 已消费
+终态后不会再启动重复 turn。
+
 ## Todo
 
 Todo 条目是某个 plan 步骤之下的具体工作。它们携带稳定 id、revision、goal 与 plan 关联、父级与依赖 id、负责人、状态、优先级、时间和 Token 用量。
@@ -521,7 +532,7 @@ job、待处理报告的身份，以及最近一条先前提示词收据的 id�
 会话；仅在需要具体证据时使用 `bg output`，不要叠加 watcher 或手写轮询循环。
 
 若该观察器仍在运行且持久工作尚未结束，对账 driver 会持久化
-`waiting_background`，不消耗两次普通对账机会，也不创建 `PlanUnreconciled` 人工问题。
+`waiting_background`，不轮询，也不创建通用人工问题。
 只有在观察器仍存活时才抑制活跃 Goal 的自动续跑；它的终态报告负责持久唤醒会话，但终态
 本身不是远端成功证据。
 

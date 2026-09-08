@@ -38,6 +38,7 @@ zuno-review
 zuno-runtime
 zuno-sandbox
 zuno-search
+zuno-session-control
 zuno-server
 zuno-snapshot
 zuno-testkit

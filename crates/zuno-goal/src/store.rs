@@ -773,6 +773,19 @@ impl GoalStore {
     /// `CHECK` constraint, which is corruption.
     pub fn goal(&self, session_id: &str) -> Result<Option<Goal>, GoalError> {
         let connection = self.pool.get()?;
+        Self::goal_in(&connection, session_id)
+    }
+
+    /// Read the Goal for `session_id` through a caller-owned connection.
+    ///
+    /// A [`Transaction`] dereferences to [`Connection`], so an outer
+    /// `BEGIN IMMEDIATE` transaction can use this read together with
+    /// [`Self::enter_plan_mode_in`] or [`Self::resume_for_work_in`] and commit
+    /// Goal, session-execution, and inbox state atomically.
+    ///
+    /// The Goal schema must already have been initialized by
+    /// [`Self::from_pool`].
+    pub fn goal_in(connection: &Connection, session_id: &str) -> Result<Option<Goal>, GoalError> {
         let mut statement = connection
             .prepare(&format!(
                 "SELECT {COLUMNS} FROM {TABLE} WHERE session_id = ?1"
@@ -969,25 +982,41 @@ impl GoalStore {
     /// is preserved.
     pub fn enter_plan_mode(&self, session_id: &str) -> Result<Option<Goal>, GoalError> {
         let paused_at_ms = now_ms()?;
-        self.pool.try_transaction(|tx| {
-            let Some(goal) = goal_from_transaction(tx, session_id)? else {
-                return Ok(None);
-            };
-            if goal.status != GoalStatus::Active {
-                return Ok(Some(goal));
-            }
-            let paused = update_system_status_in(
-                tx,
-                session_id,
-                SystemStatus::Paused,
-                Some(goal.revision),
-                paused_at_ms,
-            )?
-            .expect("the active Goal revision was read in this transaction");
-            upsert_pause_in(tx, &paused, GoalPauseReason::PlanMode, None, paused_at_ms)?;
-            clear_failure_and_retry_state(tx, session_id)?;
-            Ok(Some(paused))
-        })
+        self.pool
+            .try_transaction(|tx| Self::enter_plan_mode_in(tx, session_id, paused_at_ms))
+    }
+
+    /// Enter Plan mode through a caller-owned transaction.
+    ///
+    /// This is the transactional form of [`Self::enter_plan_mode`]. The caller
+    /// supplies the timestamp and owns commit or rollback, allowing the Goal
+    /// transition to share one `BEGIN IMMEDIATE` boundary with session execution
+    /// state and durable inbox admission.
+    ///
+    /// The operation is idempotent: a Goal already paused or in another
+    /// non-active state is returned unchanged, including stronger pause reasons.
+    pub fn enter_plan_mode_in(
+        tx: &Transaction<'_>,
+        session_id: &str,
+        paused_at_ms: i64,
+    ) -> Result<Option<Goal>, GoalError> {
+        let Some(goal) = Self::goal_in(tx, session_id)? else {
+            return Ok(None);
+        };
+        if goal.status != GoalStatus::Active {
+            return Ok(Some(goal));
+        }
+        let paused = update_system_status_in(
+            tx,
+            session_id,
+            SystemStatus::Paused,
+            Some(goal.revision),
+            paused_at_ms,
+        )?
+        .expect("the active Goal revision was read in this transaction");
+        upsert_pause_in(tx, &paused, GoalPauseReason::PlanMode, None, paused_at_ms)?;
+        clear_failure_and_retry_state(tx, session_id)?;
+        Ok(Some(paused))
     }
 
     /// Start Work by resuming only pauses that are now authoritatively settled.
@@ -999,60 +1028,77 @@ impl GoalStore {
     /// transaction, making repeated Start Work requests harmless.
     pub fn resume_for_work(&self, session_id: &str) -> Result<Option<Goal>, GoalError> {
         let resumed_at_ms = now_ms()?;
-        self.pool.try_transaction(|tx| {
-            let Some(goal) = goal_from_transaction(tx, session_id)? else {
-                return Ok(None);
-            };
-            if goal.status != GoalStatus::Paused {
-                return Ok(Some(goal));
+        self.pool
+            .try_transaction(|tx| Self::resume_for_work_in(tx, session_id, resumed_at_ms))
+    }
+
+    /// Resume Work through a caller-owned transaction.
+    ///
+    /// This is the transactional form of [`Self::resume_for_work`]. The caller
+    /// supplies the timestamp and owns commit or rollback, allowing Goal
+    /// reactivation, Work authorization, and durable control-input admission to
+    /// become visible together.
+    ///
+    /// The same resumability rules apply, and repeated calls in one or later
+    /// transactions return the already-current Goal without another revision
+    /// change.
+    pub fn resume_for_work_in(
+        tx: &Transaction<'_>,
+        session_id: &str,
+        resumed_at_ms: i64,
+    ) -> Result<Option<Goal>, GoalError> {
+        let Some(goal) = Self::goal_in(tx, session_id)? else {
+            return Ok(None);
+        };
+        if goal.status != GoalStatus::Paused {
+            return Ok(Some(goal));
+        }
+        let Some(pause) = pause_state_from(tx, session_id)? else {
+            return Ok(Some(goal));
+        };
+        if pause.goal_id != goal.goal_id {
+            return Ok(Some(goal));
+        }
+        let resumable = match pause.reason {
+            GoalPauseReason::PlanMode => true,
+            reason if reason.waits_for_human_request() => {
+                let Some(request_id) = pause.human_request_id.as_deref() else {
+                    return Ok(Some(goal));
+                };
+                matches!(
+                    zuno_db::human_request::get_from(tx, request_id)?,
+                    Some(HumanRequest {
+                        state: HumanRequestState::Answered,
+                        ..
+                    })
+                )
             }
-            let Some(pause) = pause_state_from(tx, session_id)? else {
-                return Ok(Some(goal));
-            };
-            if pause.goal_id != goal.goal_id {
-                return Ok(Some(goal));
+            GoalPauseReason::UserInterruption
+            | GoalPauseReason::Authentication
+            | GoalPauseReason::UncertainSideEffect
+            | GoalPauseReason::TurnBudget
+            | GoalPauseReason::NoProgress => false,
+            GoalPauseReason::HumanInput | GoalPauseReason::Permission => {
+                unreachable!("human request reasons handled by the guard")
             }
-            let resumable = match pause.reason {
-                GoalPauseReason::PlanMode => true,
-                reason if reason.waits_for_human_request() => {
-                    let Some(request_id) = pause.human_request_id.as_deref() else {
-                        return Ok(Some(goal));
-                    };
-                    matches!(
-                        zuno_db::human_request::get_from(tx, request_id)?,
-                        Some(HumanRequest {
-                            state: HumanRequestState::Answered,
-                            ..
-                        })
-                    )
-                }
-                GoalPauseReason::UserInterruption
-                | GoalPauseReason::Authentication
-                | GoalPauseReason::UncertainSideEffect
-                | GoalPauseReason::TurnBudget
-                | GoalPauseReason::NoProgress => false,
-                GoalPauseReason::HumanInput | GoalPauseReason::Permission => {
-                    unreachable!("human request reasons handled by the guard")
-                }
-            };
-            if !resumable {
-                return Ok(Some(goal));
-            }
-            let resumed = update_system_status_in(
-                tx,
-                session_id,
-                SystemStatus::Active,
-                Some(goal.revision),
-                resumed_at_ms,
-            )?
-            .expect("the paused Goal revision was read in this transaction");
-            tx.execute(
-                "DELETE FROM goal_pause WHERE session_id = ?1 AND goal_id = ?2",
-                params![session_id, goal.goal_id],
-            )
-            .map_err(zuno_db::map_error)?;
-            Ok(Some(resumed))
-        })
+        };
+        if !resumable {
+            return Ok(Some(goal));
+        }
+        let resumed = update_system_status_in(
+            tx,
+            session_id,
+            SystemStatus::Active,
+            Some(goal.revision),
+            resumed_at_ms,
+        )?
+        .expect("the paused Goal revision was read in this transaction");
+        tx.execute(
+            "DELETE FROM goal_pause WHERE session_id = ?1 AND goal_id = ?2",
+            params![session_id, goal.goal_id],
+        )
+        .map_err(zuno_db::map_error)?;
+        Ok(Some(resumed))
     }
 
     /// Immutable revisions for every goal instance in a session, oldest first.
@@ -3444,12 +3490,7 @@ fn goal_from_transaction(
     tx: &Transaction<'_>,
     session_id: &str,
 ) -> Result<Option<Goal>, GoalError> {
-    let mut statement = tx
-        .prepare(&format!(
-            "SELECT {COLUMNS} FROM {TABLE} WHERE session_id = ?1"
-        ))
-        .map_err(zuno_db::map_error)?;
-    read_optional(&mut statement, params![session_id])
+    GoalStore::goal_in(tx, session_id)
 }
 
 fn update_system_status_in(

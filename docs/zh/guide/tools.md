@@ -71,14 +71,17 @@ Plan mutation 会把一次性的 Required 指令切换成 Maintain。刷新器�
 暂停，而不是明知上下文过期仍发送 developer 优先级快照。
 
 成功交付前，durable reconciliation driver 会检查 Plan、Todo、Job、Goal、工具结果与
-验证记录。普通会话在持有未对账的持久工作时最多执行两次对账续跑，仍不一致则进入
-typed `PlanUnreconciled` 人工等待，而不是声称完成。只有实际写入持久状态的工作才算
-未对账：Work 模式中没有记录任何 Plan、Todo 或 Job 的会话在第一次回复后就结束。禁用
-`plan_update` 会阻止模型创建或修改；已有 Plan 仍会持久化、投影并恢复。
+验证记录。已授权的持久工作使用 `Recovery` token 续跑；driver 会把权威 revision
+哈希为 progress fingerprint，连续三次相同才以 typed `no_progress` 暂停，不再制造
+通用人工确认。只有实际写入持久状态的工作才算未对账：Work 模式中没有记录任何 Plan、Todo 或 Job 的会话在第一次回复后就结束。
 
 内置只读 `plan` Agent 有一条例外的带类型交接语义：规划回答完成后，当前 Plan
 与 Todo 会保留各自已有状态，作为后续 Start Work 回合的执行工作，不消耗对账
 续轮；活动 Job 仍会阻止交接。
+
+后台完成默认通过 callback 主动唤醒父会话。只有当前步骤同步依赖结果时才使用
+`bg wait`；单次最长 60 秒。同步 wait 与 callback 竞争同一个 durable completion
+owner，因此只有一条路径能够启动 continuation turn。
 
 完整的开启/关闭、profile 覆盖、权限、revision 与重启说明见
 [History 与 Notes 连续性配置](/zh/config/continuity)。
@@ -131,8 +134,8 @@ phase 与 elapsed。
 执行持久化，并通过 `bg` 与持久 completion input 投影。它不会改变权限，也不会把远端系统
 状态等同于本地进程退出；恢复后的 Agent 仍必须重新查询 CI、部署或 release 的权威状态。
 当观察器仍在运行且 Plan、Todo 或 Job 尚未结束时，driver 记录 `waiting_background`：
-当前回合可以结束，但不会消耗两次普通对账机会、弹出 Plan 状态问题，或立即自动续跑活跃
-Goal。观察器的持久终态报告会唤醒会话，权威刷新后再恢复普通对账。
+当前回合可以结束，不轮询，也不创建通用人工问题，不会立即自动续跑活跃 Goal。
+观察器的持久终态报告会唤醒会话，权威刷新后再恢复普通对账。
 
 ## 按窗口读取输出
 

@@ -51,15 +51,17 @@ use zuno_config::schema::provider::ProviderTransport;
 use zuno_engine::compaction::{CompactionPolicy, CompactionState, CompactionTrigger, TokenWindow};
 use zuno_engine::dispatch::{AuthorizationPolicy, ToolRegistryDispatcher};
 use zuno_engine::driver::AgentDriver;
+#[cfg(test)]
+use zuno_engine::r#loop::hydrate_retained_history;
 use zuno_engine::r#loop::{
     AgentModelResolver, DynamicContextRefresher, NoticeSeverity, ResolvedAgent,
     ResolvedModel as EngineModel, RunTurnRequest, ToolConcurrencyLimit, ToolDispatcher as _,
     ToolFailureRecovery, TurnContext, TurnError, TurnEvent, TurnEventSender, TurnExecutionIdentity,
-    TurnOutcome, TurnRecovery, TurnStart, has_requested_user_message, hydrate_retained_history,
+    TurnOutcome, TurnRecovery, TurnStart,
 };
 use zuno_engine::plan_driver::{
-    PlanReconciliationDecision, PlanReconciliationDriver, PlanReconciliationInput,
-    PlanWaitingReason,
+    PlanPauseReason, PlanReconciliationDecision, PlanReconciliationDriver, PlanReconciliationInput,
+    PlanReconciliationOutcome,
 };
 use zuno_engine::planning::{
     ExistingPlanState, PlanningContentFacts, PlanningDecision, PlanningInput, PlanningInputSource,
@@ -114,7 +116,9 @@ use zuno_orchestration::{
 };
 use zuno_provider_compatible::{ReqwestTransport, Transport};
 use zuno_runtime::HarnessRuntime;
+use zuno_session_control::SessionControlService;
 use zuno_tool::{PermissionAsker, ToolDynamicContextRefresh, ToolReplayPolicy, erase};
+use zuno_types::execution::{CollaborationMode, ContinuationToken};
 
 use crate::environment::StartupEnvironment;
 
@@ -2410,6 +2414,7 @@ pub(crate) struct TurnHost {
     goal_projection: GoalProjection,
     goal_continuation: GoalContinuation,
     plan_reconciliation: PlanReconciliationDriver,
+    session_control: SessionControlService,
     runs: SessionRunRegistry,
     background_jobs: super::child_turn::BackgroundJobSupervisor,
     background_executions: Arc<zuno_pty::BackgroundExecutionService>,
@@ -5024,6 +5029,7 @@ impl TurnHost {
                 .map_err(to_string)?,
             );
             let plan_reconciliation = PlanReconciliationDriver::new(Arc::clone(&database));
+            let session_control = SessionControlService::new(Arc::clone(&database));
             let mut host = Self {
                 profile_runtime: profile_runtime.clone(),
                 runtime,
@@ -5074,6 +5080,7 @@ impl TurnHost {
                 goal_projection,
                 goal_continuation,
                 plan_reconciliation,
+                session_control,
                 runs,
                 background_jobs,
                 background_executions,
@@ -5143,6 +5150,14 @@ impl TurnHost {
     /// The session every turn this host drives belongs to.
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub(crate) fn session_control_service(&self) -> SessionControlService {
+        self.session_control.clone()
+    }
+
+    pub(crate) fn latest_user_anchor_id(&self) -> Result<Option<String>, String> {
+        self.latest_user_anchor()
     }
 
     /// Directory a fresh sibling session should inherit.
@@ -7349,6 +7364,13 @@ impl TurnHost {
         &self.agent
     }
 
+    pub(crate) fn execution_identity_for(&self, agent: &str) -> TurnExecutionIdentity {
+        TurnExecutionIdentity::new(agent, &self.provider_id, &self.model_id).with_reasoning(
+            self.effort_override
+                .map(|effort| effort.as_str().to_owned()),
+        )
+    }
+
     pub(crate) fn qualified_model(&self) -> String {
         format!("{}/{}", self.provider_id, self.model_id)
     }
@@ -7413,6 +7435,9 @@ impl TurnHost {
                 service: Arc::clone(&self.background_executions),
                 session_id: self.session_id.clone(),
                 inbox: self.inbox.clone(),
+                completion: zuno_db::completion_delivery::CompletionDeliveryStore::new(Arc::clone(
+                    &self.database,
+                )),
                 jobs: zuno_db::job::AgentJobStore::new(Arc::clone(&self.database)),
                 runs: self.runs.clone(),
                 wake: self.background_reports.wake_handle(),
@@ -7984,6 +8009,169 @@ impl TurnHost {
         .await
     }
 
+    /// Drive a promoted host-owned Start Work control without inventing a user message.
+    pub(crate) async fn drive_promoted_start_work_with_guard(
+        &mut self,
+        input_id: &str,
+        continuation: ContinuationToken,
+        guard: &SessionRunGuard,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        self.require_active_extension_composition()?;
+        if continuation.mode != CollaborationMode::Work {
+            return Err("Start Work continuation is not authorized for Work mode".to_owned());
+        }
+        let host_identity = self.current_turn_identity();
+        if continuation.identity != host_identity {
+            return Err(format!(
+                "Start Work continuation identity {}/{}/{} does not match the active host {}/{}/{}",
+                continuation.identity.agent,
+                continuation.identity.provider_id,
+                continuation.identity.model_id,
+                host_identity.agent,
+                host_identity.provider_id,
+                host_identity.model_id,
+            ));
+        }
+        let plan = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
+            .plan(&self.session_id)
+            .map_err(to_string)?
+            .ok_or_else(|| "Start Work requires a durable Plan".to_owned())?;
+        if continuation.plan_id.as_deref() != Some(plan.id.as_str())
+            || continuation.plan_revision != Some(plan.revision)
+        {
+            return Err(format!(
+                "Start Work continuation names a stale Plan; current is `{}` revision {}",
+                plan.id, plan.revision
+            ));
+        }
+        let continuation = self
+            .session_control
+            .record_continuation(
+                &self.session_id,
+                &continuation.cycle_id,
+                continuation.identity,
+                CollaborationMode::Work,
+                Some(plan.id.clone()),
+                Some(plan.revision),
+                continuation.anchor_message_id,
+                zuno_db::message::now_millis(),
+            )
+            .map_err(|error| error.to_string())?;
+        let consumed = self
+            .inbox
+            .mark_consumed(&self.session_id, input_id)
+            .map_err(to_string)?
+            .ok_or_else(|| {
+                format!("promoted Start Work input `{input_id}` was not available to consume")
+            })?;
+        if consumed.trigger_kind != zuno_types::execution::InputTriggerKind::UserControl {
+            return Err(format!(
+                "promoted Start Work input `{input_id}` has trigger `{}`",
+                consumed.trigger_kind.as_str()
+            ));
+        }
+        let planning = self.ensure_durable_plan(
+            &format!(
+                "Implement durable Plan `{}` revision {}.",
+                plan.id, plan.revision
+            ),
+            PlanningInputSource::Retry,
+            None,
+        )?;
+        let usage_before = goal_usage(&self.connection, &self.session_id)?;
+        let started = Instant::now();
+        let result = async {
+            let prelude = self.run_prelude().await?;
+            report_prelude(&events, &self.notes, &self.instruction_admission, &prelude)
+                .await
+                .map_err(TurnFailure::event_consumer)?;
+            if !prelude.continue_turn {
+                return Ok(None);
+            }
+            let mut dynamic_context = self.goal_dynamic_context().map_err(TurnFailure::host)?;
+            let instruction = format!(
+                "The user explicitly authorized Start Work for durable Plan `{}` revision {}. \
+                 Implement that exact Plan with the saved Work Agent and model. Do not return to \
+                 Plan mode unless the user explicitly requests it.",
+                plan.id, plan.revision
+            );
+            dynamic_context = dynamic_context.with_runtime_instruction(instruction.clone());
+            if let Some(planning) = planning_runtime_instruction(&planning) {
+                dynamic_context = dynamic_context.with_runtime_instruction(planning);
+            }
+            self.execute_turn_unaccounted(
+                dynamic_context,
+                DynamicContextRefreshInstruction::Fixed(instruction),
+                TurnStart::UserControl {
+                    control: zuno_types::execution::UserControlKind::StartWork,
+                    continuation,
+                },
+                None,
+                guard,
+                events.clone(),
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(outcome) => {
+                self.last_turn_completed = outcome
+                    .as_ref()
+                    .is_some_and(|outcome| matches!(outcome, TurnOutcome::Completed { .. }));
+                self.finish_goal_turn(usage_before, started, outcome.as_ref())?;
+                self.schedule_learning(outcome.as_ref(), &events).await;
+                Ok(())
+            }
+            Err(error) => self
+                .handle_turn_failure(usage_before, started, error, &events)
+                .await
+                .map(|_| ()),
+        }
+    }
+
+    /// Promote and drive one queued Start Work control, if present.
+    ///
+    /// TUI restart and safe-point recovery use this path so a durable control does
+    /// not depend on the slash-command request remaining alive.
+    pub(crate) async fn drive_pending_start_work(
+        &mut self,
+        events: TurnEventSender,
+    ) -> Result<bool, String> {
+        let pending = self.inbox.pending(&self.session_id).map_err(to_string)?;
+        let Some(input) = pending.into_iter().find(|input| {
+            zuno_db::inbox::DurableInputKind::classify(&input.prompt)
+                == Some(zuno_db::inbox::DurableInputKind::SessionControl)
+                && input.prompt.get("control").and_then(Value::as_str) == Some("start_work")
+        }) else {
+            return Ok(false);
+        };
+        let continuation =
+            serde_json::from_value::<ContinuationToken>(
+                input.prompt.get("continuation").cloned().ok_or_else(|| {
+                    format!("Start Work input `{}` has no continuation", input.id)
+                })?,
+            )
+            .map_err(|error| {
+                format!(
+                    "Start Work input `{}` has an invalid continuation: {error}",
+                    input.id
+                )
+            })?;
+        let promoted = self
+            .inbox
+            .promote_id(&self.session_id, &input.id)
+            .map_err(to_string)?
+            .ok_or_else(|| format!("Start Work input `{}` changed before promotion", input.id))?;
+        let guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        self.drive_promoted_start_work_with_guard(&promoted.id, continuation, &guard, events)
+            .await?;
+        Ok(true)
+    }
+
     fn council_routing(&self, preset: &str, question: &str) -> Result<PromptRouting, String> {
         use zuno_engine::r#loop::ToolDispatcher as _;
 
@@ -8163,8 +8351,56 @@ impl TurnHost {
             .map(|report| report.text.as_str())
             .collect::<Vec<_>>();
         self.preload_turn_skills(&prompts, &events).await?;
-        self.drive_prepared(&planning_prompt, planning_source, None, None, guard, events)
-            .await
+        let completion_source = self.completion_source_for_input(&newest.input_id)?;
+        let execution = self
+            .session_control
+            .state(&self.session_id)
+            .map_err(|error| error.to_string())?;
+        let mode = execution.as_ref().map_or_else(
+            || {
+                if self.agent == "plan" {
+                    CollaborationMode::Plan
+                } else {
+                    CollaborationMode::Work
+                }
+            },
+            |state| state.mode,
+        );
+        let plan = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
+            .plan(&self.session_id)
+            .map_err(to_string)?;
+        let cycle_id = self
+            .inbox
+            .get(&self.session_id, &newest.input_id)
+            .map_err(to_string)?
+            .and_then(|input| input.cycle_id)
+            .unwrap_or_else(|| format!("completion_{}", Uuid::now_v7().simple()));
+        let continuation = self
+            .session_control
+            .record_continuation(
+                &self.session_id,
+                &cycle_id,
+                self.current_turn_identity(),
+                mode,
+                plan.as_ref().map(|plan| plan.id.clone()),
+                plan.as_ref().map(|plan| plan.revision),
+                None,
+                zuno_db::message::now_millis(),
+            )
+            .map_err(|error| error.to_string())?;
+        self.drive_prepared_with_start(
+            &planning_prompt,
+            planning_source,
+            None,
+            None,
+            TurnStart::Automatic {
+                source: completion_source,
+                continuation,
+            },
+            guard,
+            events,
+        )
+        .await
     }
 
     /// Load the Skills this turn's inputs name before any of them reaches the model.
@@ -8262,6 +8498,32 @@ impl TurnHost {
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
+        self.drive_prepared_with_start(
+            planning_prompt,
+            planning_source,
+            planning_content,
+            routing,
+            TurnStart::UserMessage,
+            guard,
+            events,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the host keeps planning input, typed turn origin, guard, routing, and event ownership explicit"
+    )]
+    async fn drive_prepared_with_start(
+        &mut self,
+        planning_prompt: &str,
+        planning_source: PlanningInputSource,
+        planning_content: Option<&[RequestContentBlock]>,
+        routing: Option<&PromptRouting>,
+        turn_start: TurnStart,
+        guard: &SessionRunGuard,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
         self.recover_background_reports().await?;
         self.goal_projection
             .ingest(&self.goal_store)
@@ -8271,7 +8533,7 @@ impl TurnHost {
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
         let result = self
-            .drive_input_unaccounted(guard, routing, &planning, events.clone())
+            .drive_input_unaccounted(guard, routing, &planning, turn_start, events.clone())
             .await;
         match result {
             Ok(outcome) => {
@@ -8336,6 +8598,7 @@ impl TurnHost {
         guard: &SessionRunGuard,
         routing: Option<&PromptRouting>,
         planning: &PlanningDecision,
+        turn_start: TurnStart,
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, TurnFailure> {
         let outcome = self.run_prelude().await?;
@@ -8352,7 +8615,7 @@ impl TurnHost {
         self.execute_turn_unaccounted(
             dynamic_context,
             DynamicContextRefreshInstruction::Planning(planning.clone()),
-            TurnStart::UserMessage,
+            turn_start,
             routing,
             guard,
             events,
@@ -8565,8 +8828,6 @@ impl TurnHost {
         else {
             return Ok(GoalTurnExecution::Stale);
         };
-        self.ensure_goal_conversation_anchor(&goal)
-            .map_err(TurnFailure::host)?;
         let (goal_id, goal_revision) = prepared.goal_identity();
         let turn_start = TurnStart::GoalContinuation {
             goal_id: goal_id.to_owned(),
@@ -8621,44 +8882,23 @@ impl TurnHost {
         Ok(goal.filter(|goal| goal.goal_id == goal_id && goal.revision == goal_revision))
     }
 
-    fn ensure_goal_conversation_anchor(&mut self, goal: &zuno_goal::Goal) -> Result<(), String> {
-        let retained =
-            hydrate_retained_history(&self.connection, &self.session_id).map_err(to_string)?;
-        if has_requested_user_message(&retained) {
-            return Ok(());
-        }
-        let message_store = zuno_db::message::MessageStore::new(&self.connection);
-        let latest = message_store
-            .latest_time_created(&self.session_id)
-            .map_err(to_string)?;
-        let now = zuno_db::message::created_after(zuno_db::message::now_millis(), latest);
-        let (message, parts) = prepare_user_message(
-            UserMessageInput {
-                session_id: &self.session_id,
-                agent: &self.agent,
-                provider_id: &self.provider_id,
-                model_id: &self.model_id,
-                text: &goal.objective,
-                message_id: None,
-                now,
-            },
-            None,
-            &self.attachments,
-        )?;
-        self.persist_user_input(&message, &parts)?;
-        Ok(())
-    }
-
     async fn execute_turn_unaccounted(
         &mut self,
         mut dynamic_context: DynamicContext,
         mut refresh_instruction: DynamicContextRefreshInstruction,
-        turn_start: TurnStart,
+        mut turn_start: TurnStart,
         routing: Option<&PromptRouting>,
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, TurnFailure> {
-        let proposed_cycle_id = format!("driver_{}", Uuid::now_v7().simple());
+        let proposed_cycle_id = match &turn_start {
+            TurnStart::UserControl { continuation, .. }
+            | TurnStart::Automatic { continuation, .. }
+            | TurnStart::Recovery { continuation } => continuation.cycle_id.clone(),
+            TurnStart::UserMessage | TurnStart::GoalContinuation { .. } => {
+                format!("driver_{}", Uuid::now_v7().simple())
+            }
+        };
         let cycle_id = self
             .plan_reconciliation
             .begin(&self.session_id, &proposed_cycle_id)
@@ -8696,6 +8936,10 @@ impl TurnHost {
                     }
                     context_compactions = context_compactions.saturating_add(1);
                     self.recover_context(trigger, &events).await?;
+                    let continuation = self
+                        .persist_turn_continuation(&cycle_id, &turn_start, true)
+                        .map_err(TurnFailure::host)?;
+                    turn_start = TurnStart::Recovery { continuation };
                     continue;
                 }
             };
@@ -8707,17 +8951,44 @@ impl TurnHost {
             else {
                 return Ok(Some(outcome));
             };
-            let input = self
-                .plan_reconciliation_input()
+            let (input, work_authorized, progress_fingerprint) = self
+                .plan_reconciliation_state()
                 .map_err(TurnFailure::host)?;
             match self
                 .plan_reconciliation
-                .reconcile(&self.session_id, &cycle_id, input)
+                .reconcile_with_progress(
+                    &self.session_id,
+                    &cycle_id,
+                    input,
+                    work_authorized,
+                    &progress_fingerprint,
+                )
                 .map_err(TurnFailure::Database)?
             {
-                PlanReconciliationDecision::Finish
-                | PlanReconciliationDecision::ContinueGoal
-                | PlanReconciliationDecision::WaitForBackground => {
+                PlanReconciliationOutcome::Decision(
+                    PlanReconciliationDecision::Finish
+                    | PlanReconciliationDecision::ContinueGoal
+                    | PlanReconciliationDecision::WaitForBackground,
+                ) => {
+                    if input.planning_handoff && input.plan_exists {
+                        if self
+                            .session_control
+                            .state(&self.session_id)
+                            .map_err(|error| TurnFailure::host(error.to_string()))?
+                            .is_none()
+                        {
+                            self.session_control
+                                .enter_plan(zuno_session_control::EnterPlanRequest {
+                                    session_id: &self.session_id,
+                                    work_identity: self.execution_identity_for("build"),
+                                    at_ms: zuno_db::message::now_millis(),
+                                })
+                                .map_err(|error| TurnFailure::host(error.to_string()))?;
+                        }
+                        self.session_control
+                            .mark_plan_handoff(&self.session_id, zuno_db::message::now_millis())
+                            .map_err(|error| TurnFailure::host(error.to_string()))?;
+                    }
                     self.cancel_reconciled_plan_requests(&cycle_id)
                         .map_err(TurnFailure::host)?;
                     events
@@ -8729,46 +9000,56 @@ impl TurnHost {
                         .map_err(TurnFailure::event_consumer)?;
                     return Ok(Some(outcome));
                 }
-                PlanReconciliationDecision::ContinueOrdinary { attempt } => {
+                PlanReconciliationOutcome::Decision(
+                    PlanReconciliationDecision::ContinueOrdinary { attempt },
+                ) => {
                     let instruction = format!(
-                        "Durable work reconciliation attempt {attempt}/2: the current \
-                         Plan, Todo, or Job state is not terminal. Inspect it through the \
-                         typed tools, perform any remaining work, and commit only the \
-                         necessary operation-based state changes. Do not infer completion \
-                         from prior assistant prose."
+                        "Durable Work recovery observation {attempt}: authorized Plan, Todo, \
+                         or Job state still has executable work. Continue from authoritative \
+                         typed state, perform only the remaining operations, and update durable \
+                         state when material progress occurs. Do not infer completion from prior \
+                         assistant prose."
                     );
                     dynamic_context = self
                         .goal_dynamic_context()
                         .map_err(TurnFailure::host)?
                         .with_runtime_instruction(instruction.clone());
                     refresh_instruction = DynamicContextRefreshInstruction::Fixed(instruction);
+                    let continuation = self
+                        .persist_turn_continuation(&cycle_id, &turn_start, false)
+                        .map_err(TurnFailure::host)?;
+                    turn_start = TurnStart::Recovery { continuation };
                 }
-                PlanReconciliationDecision::WaitForHuman { reason } => {
-                    let request_id = format!("que_{}", Uuid::now_v7().simple());
+                PlanReconciliationOutcome::Paused {
+                    reason: PlanPauseReason::NoProgress,
+                } => {
                     self.goal_store
-                        .human_requests()
-                        .create(plan_unreconciled_request(
-                            &self.session_id,
-                            request_id.clone(),
-                            assistant_message_id,
-                            &cycle_id,
-                            reason,
-                        ))
-                        .map_err(TurnFailure::Database)?;
+                        .pause_with_reason(&self.session_id, zuno_goal::GoalPauseReason::NoProgress)
+                        .map_err(TurnFailure::goal)?;
                     events
-                        .publish(TurnEvent::TurnWaitingForHuman {
-                            assistant_message_id: assistant_message_id.clone(),
-                            steps: *steps,
-                            request_id: request_id.clone(),
+                        .publish(TurnEvent::Notice {
+                            severity: NoticeSeverity::Warning,
+                            code: "no_progress".to_owned(),
+                            detail: "Automatic recovery paused after three consecutive durable \
+                                     state snapshots showed no progress. No user confirmation was \
+                                     manufactured; resume explicitly after changing the blocking \
+                                     condition."
+                                .to_owned(),
                         })
                         .await
                         .map_err(TurnFailure::event_consumer)?;
-                    return Ok(Some(TurnOutcome::WaitingForHuman {
-                        assistant_message_id: assistant_message_id.clone(),
-                        steps: *steps,
-                        request_id,
-                    }));
+                    events
+                        .publish(TurnEvent::TurnCompleted {
+                            assistant_message_id: assistant_message_id.clone(),
+                            steps: *steps,
+                        })
+                        .await
+                        .map_err(TurnFailure::event_consumer)?;
+                    return Ok(Some(outcome));
                 }
+                PlanReconciliationOutcome::Decision(PlanReconciliationDecision::WaitForHuman {
+                    ..
+                }) => unreachable!("the new reconciliation driver never requests human input"),
             }
         }
     }
@@ -8799,6 +9080,121 @@ impl TurnHost {
                 .map_err(to_string)?;
         }
         Ok(())
+    }
+
+    fn persist_turn_continuation(
+        &self,
+        cycle_id: &str,
+        start: &TurnStart,
+        advance_context_epoch: bool,
+    ) -> Result<ContinuationToken, String> {
+        let execution = self
+            .session_control
+            .state(&self.session_id)
+            .map_err(|error| error.to_string())?;
+        let mode = execution.as_ref().map_or_else(
+            || {
+                if self.agent == "plan" {
+                    CollaborationMode::Plan
+                } else {
+                    CollaborationMode::Work
+                }
+            },
+            |state| state.mode,
+        );
+        let identity = match start {
+            TurnStart::UserMessage => self.current_turn_identity(),
+            TurnStart::GoalContinuation { identity, .. } => identity.clone(),
+            TurnStart::UserControl { continuation, .. }
+            | TurnStart::Automatic { continuation, .. }
+            | TurnStart::Recovery { continuation } => continuation.identity.clone(),
+        };
+        let anchor_message_id = match start {
+            TurnStart::UserControl { continuation, .. }
+            | TurnStart::Automatic { continuation, .. }
+            | TurnStart::Recovery { continuation } => continuation.anchor_message_id.clone(),
+            TurnStart::UserMessage | TurnStart::GoalContinuation { .. } => {
+                self.latest_user_anchor()?
+            }
+        };
+        let plan = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
+            .plan(&self.session_id)
+            .map_err(to_string)?;
+        let plan_id = plan.as_ref().map(|plan| plan.id.clone());
+        let plan_revision = plan.as_ref().map(|plan| plan.revision);
+        let at_ms = zuno_db::message::now_millis();
+        let continuation = if advance_context_epoch {
+            self.session_control.record_recovery(
+                &self.session_id,
+                cycle_id,
+                identity,
+                mode,
+                plan_id,
+                plan_revision,
+                anchor_message_id,
+                at_ms,
+            )
+        } else {
+            self.session_control.record_continuation(
+                &self.session_id,
+                cycle_id,
+                identity,
+                mode,
+                plan_id,
+                plan_revision,
+                anchor_message_id,
+                at_ms,
+            )
+        };
+        continuation.map_err(|error| error.to_string())
+    }
+
+    fn current_turn_identity(&self) -> TurnExecutionIdentity {
+        self.execution_identity_for(&self.agent)
+    }
+
+    fn latest_user_anchor(&self) -> Result<Option<String>, String> {
+        self.connection
+            .query_row(
+                "SELECT id FROM message \
+                 WHERE session_id = ?1 \
+                   AND json_extract(data, '$.role') = 'user' \
+                   AND coalesce(json_extract(data, '$.mode'), '') <> 'compaction' \
+                 ORDER BY time_created DESC, id DESC LIMIT 1",
+                [&self.session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_string)
+    }
+
+    fn completion_source_for_input(
+        &self,
+        input_id: &str,
+    ) -> Result<zuno_types::execution::CompletionSource, String> {
+        let input = self
+            .inbox
+            .get(&self.session_id, input_id)
+            .map_err(to_string)?
+            .ok_or_else(|| format!("completion input `{input_id}` disappeared"))?;
+        match zuno_db::inbox::DurableInputKind::classify(&input.prompt) {
+            Some(zuno_db::inbox::DurableInputKind::BackgroundExecutionReport) => {
+                Ok(zuno_types::execution::CompletionSource::BackgroundExecution)
+            }
+            Some(zuno_db::inbox::DurableInputKind::SubagentReport) => {
+                Ok(zuno_types::execution::CompletionSource::AgentJob)
+            }
+            Some(zuno_db::inbox::DurableInputKind::ProductAgentReport) => {
+                Ok(zuno_types::execution::CompletionSource::ProductAgent)
+            }
+            Some(
+                zuno_db::inbox::DurableInputKind::WorkflowReport
+                | zuno_db::inbox::DurableInputKind::CouncilReport,
+            ) => Ok(zuno_types::execution::CompletionSource::Workflow),
+            _ => Err(format!(
+                "input `{input_id}` is not a terminal completion report"
+            )),
+        }
     }
 
     async fn execute_one_turn_unaccounted(
@@ -8901,7 +9297,7 @@ impl TurnHost {
         outcome.map_err(TurnFailure::Engine)
     }
 
-    fn plan_reconciliation_input(&self) -> Result<PlanReconciliationInput, String> {
+    fn plan_reconciliation_state(&self) -> Result<(PlanReconciliationInput, bool, String), String> {
         let work = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
             .snapshot(&self.session_id)
             .map_err(to_string)?;
@@ -8920,7 +9316,7 @@ impl TurnHost {
             .list_for_parent(&self.session_id)
             .map_err(to_string)?;
         let mut active_job = false;
-        for job in jobs {
+        for job in &jobs {
             if matches!(
                 job.status,
                 zuno_db::job::JobStatus::Queued
@@ -8953,15 +9349,68 @@ impl TurnHost {
             .goal(&self.session_id)
             .map_err(to_string)?
             .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active);
-        Ok(PlanReconciliationInput {
+        let execution = self
+            .session_control
+            .state(&self.session_id)
+            .map_err(|error| error.to_string())?;
+        let mode = execution.as_ref().map_or_else(
+            || {
+                if self.agent == "plan" {
+                    CollaborationMode::Plan
+                } else {
+                    CollaborationMode::Work
+                }
+            },
+            |state| state.mode,
+        );
+        let work_authorized = execution
+            .as_ref()
+            .map_or(mode == CollaborationMode::Work, |state| {
+                if state.mode != CollaborationMode::Work {
+                    return false;
+                }
+                match work.plan.as_ref() {
+                    Some(plan) if state.authorized_plan_id.is_some() => {
+                        state.authorized_plan_id.as_deref() == Some(plan.id.as_str())
+                            && state.authorized_plan_revision == Some(plan.revision)
+                    }
+                    _ => true,
+                }
+            });
+        let input = PlanReconciliationInput {
             plan_exists,
             plan_terminal,
             active_todo,
             active_job,
             remote_observer_running: self.remote_observer_running(),
             goal_active,
-            planning_handoff: self.agent == "plan",
-        })
+            planning_handoff: mode == CollaborationMode::Plan && plan_exists,
+        };
+        let progress_fingerprint = sha256_json(&json!({
+            "plan": work.plan.as_ref().map(|plan| json!({
+                "id": plan.id,
+                "revision": plan.revision,
+                "steps": plan.steps.iter().map(|step| json!({
+                    "id": step.id,
+                    "status": step.status.as_str(),
+                })).collect::<Vec<_>>(),
+            })),
+            "items": work.items.iter().map(|item| json!({
+                "id": item.id,
+                "revision": item.revision,
+                "status": item.status.as_str(),
+            })).collect::<Vec<_>>(),
+            "jobs": jobs.iter().map(|job| json!({
+                "id": job.id,
+                "createdSequence": job.created_sequence,
+                "settledSequence": job.settled_sequence,
+                "status": job.status.as_str(),
+                "reportInputID": job.report_input_id,
+                "timeUpdated": job.time_updated,
+            })).collect::<Vec<_>>(),
+            "goalActive": goal_active,
+        }));
+        Ok((input, work_authorized, progress_fingerprint))
     }
 
     fn remote_observer_running(&self) -> bool {
@@ -10183,50 +10632,6 @@ fn planning_context_marker(value: &str) -> bool {
     ]
     .iter()
     .any(|marker| lower.contains(marker))
-}
-
-fn plan_unreconciled_request(
-    session_id: &str,
-    request_id: String,
-    assistant_message_id: &str,
-    cycle_id: &str,
-    reason: PlanWaitingReason,
-) -> zuno_db::human_request::NewHumanRequest {
-    use zuno_tools::question::{QuestionOption, QuestionRequest};
-
-    let questions = vec![QuestionRequest {
-        question: "The durable Plan, Todo, or Job state is still unfinished after two automatic \
-                   reconciliation attempts. How should Zuno proceed?"
-            .to_owned(),
-        header: "Plan state".to_owned(),
-        options: vec![
-            QuestionOption::new(
-                "Continue reconciliation",
-                "Resume work from the authoritative durable state.",
-            ),
-            QuestionOption::new(
-                "Change the plan",
-                "Provide new direction before Zuno continues.",
-            ),
-        ],
-        multiple: None,
-        custom: Some(true),
-    }];
-    zuno_db::human_request::NewHumanRequest {
-        id: request_id,
-        session_id: session_id.to_owned(),
-        goal_id: None,
-        kind: zuno_db::human_request::HumanRequestKind::Input,
-        payload: json!({
-            "source": "plan_reconciliation",
-            "reason": reason.as_str(),
-            "cycleId": cycle_id,
-            "questions": questions,
-        }),
-        message_id: Some(assistant_message_id.to_owned()),
-        call_id: None,
-        time_created: zuno_db::message::now_millis(),
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

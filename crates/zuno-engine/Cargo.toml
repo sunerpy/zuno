@@ -23,6 +23,7 @@ zuno-orchestration = { workspace = true }
 zuno-permission = { workspace = true }
 zuno-runtime = { workspace = true }
 zuno-tool = { workspace = true }
+zuno-types = { workspace = true }
 jsonschema = { version = "=0.37.1", default-features = false }
 serde_json = { workspace = true }
 serde = { workspace = true }

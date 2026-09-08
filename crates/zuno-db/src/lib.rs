@@ -41,6 +41,7 @@
 //! ```
 
 pub mod artifact_gc;
+pub mod completion_delivery;
 pub mod continuity;
 pub mod evaluation;
 pub mod event_log;
@@ -63,6 +64,7 @@ pub mod prune;
 pub mod retention;
 pub mod schema;
 pub mod session;
+pub mod session_execution;
 pub mod session_export;
 /// Session-keyed tables the schema leaves without a cascade, shared by both delete paths.
 mod session_keys;

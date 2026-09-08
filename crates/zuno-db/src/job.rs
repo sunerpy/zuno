@@ -1,8 +1,9 @@
 //! Durable background-agent jobs and atomic parent-report delivery.
 
+use crate::completion_delivery::{claim_callback_in, publish_in};
 use crate::event_log::{NewSessionEvent, append_in, query_error};
 use crate::inbox::{
-    NewSessionInput, SessionInput, admit_in, recover_promoted_in, supersede_in, validate_input,
+    NewSessionInput, SessionInput, recover_promoted_in, supersede_in, validate_input,
 };
 use crate::{Pool, open, session};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
@@ -11,6 +12,7 @@ use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use zuno_error::DbError;
 use zuno_orchestration::AttemptSnapshot;
+use zuno_types::execution::{CompletionEnvelope, CompletionSource, InputTriggerKind};
 
 const TABLE: &str = "agent_job";
 const JOB_WORK_CONTEXT_SCHEMA_VERSION: u32 = 1;
@@ -1179,10 +1181,13 @@ fn settle_in(
             settled_properties(&active, &settlement),
         )?,
     )?;
-    let report = settlement
-        .report
-        .map(|report| admit_in(transaction, report))
-        .transpose()?;
+    let report = admit_terminal_report_in(
+        transaction,
+        &active,
+        settled_event.sequence,
+        settlement.report,
+        settlement.time_completed,
+    )?;
     let result = settlement
         .result
         .as_ref()
@@ -1245,10 +1250,13 @@ fn reconcile_uncertain_in(
             reconciliation_properties(&uncertain, &reconciliation),
         )?,
     )?;
-    let report = reconciliation
-        .report
-        .map(|report| admit_in(transaction, report))
-        .transpose()?;
+    let report = admit_terminal_report_in(
+        transaction,
+        &uncertain,
+        reconciled_event.sequence,
+        reconciliation.report,
+        reconciliation.time_completed,
+    )?;
     let result = reconciliation
         .result
         .as_ref()
@@ -1281,6 +1289,37 @@ fn reconcile_uncertain_in(
     let job = get_in(transaction, job_id)?
         .expect("the reconciled job remains present until its parent is deleted");
     Ok(SettledJob { job, report })
+}
+
+fn admit_terminal_report_in(
+    transaction: &Transaction<'_>,
+    job: &AgentJob,
+    terminal_revision: i64,
+    report: Option<NewSessionInput>,
+    at_ms: i64,
+) -> Result<Option<SessionInput>, DbError> {
+    let Some(mut report) = report else {
+        return Ok(None);
+    };
+    let source_key = format!("agent-job:{}:{terminal_revision}", job.id);
+    report.source_key = Some(source_key.clone());
+    report.trigger_kind = InputTriggerKind::Automatic;
+    let envelope = CompletionEnvelope {
+        source_key: source_key.clone(),
+        source: match &job.subject {
+            JobSubject::ChildSession { .. } => CompletionSource::AgentJob,
+            JobSubject::ProductAgent { .. } => CompletionSource::ProductAgent,
+            JobSubject::Workflow { .. } => CompletionSource::Workflow,
+        },
+        terminal_revision: u64::try_from(terminal_revision)
+            .map_err(|_| query_error(std::io::Error::other("negative job event sequence")))?,
+        parent_session_id: job.parent_session_id.clone(),
+        cycle_id: report.cycle_id.clone(),
+        payload: report.prompt.clone(),
+    };
+    publish_in(transaction, envelope, at_ms)?;
+    claim_callback_in(transaction, &source_key, report, at_ms)
+        .map(|claimed| claimed.map(|(_, input)| input))
 }
 
 fn validate_settlement(job: &AgentJob, settlement: &JobSettlement) -> Result<(), DbError> {

@@ -418,6 +418,25 @@ impl fmt::Display for ReviewStatus {
     }
 }
 
+/// The implementation gate imposed by the newest review bound to one exact
+/// durable Plan revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum PlanReviewGate {
+    /// No review has been durably bound to this Plan revision.
+    Unbound,
+    /// The newest bound review has not reached Ready.
+    Draft {
+        review_id: String,
+        review_revision: i64,
+    },
+    /// The newest bound review has reached Ready.
+    Ready {
+        review_id: String,
+        review_revision: i64,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewReadiness {
     pub review_id: String,

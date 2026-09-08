@@ -1250,7 +1250,11 @@ fn production_turn_runs_the_host_planning_policy_after_input_is_durable() {
         let body = &turn[turn.find(entry).expect("turn entry point")..];
         let persisted = body.find("self.persist").expect("input persistence call");
         let handed_off = body
-            .find("self.drive_prepared(")
+            .find(if entry.contains("drive_promoted_reports") {
+                "self.drive_prepared_with_start("
+            } else {
+                "self.drive_prepared("
+            })
             .expect("accounted turn call");
         assert!(
             persisted < handed_off,
@@ -1295,7 +1299,7 @@ fn a_batched_report_turn_persists_every_report_before_its_single_provider_call()
         .find("report_deferred_by_goal_state")
         .expect("paused and terminal Goals defer automatic report continuation");
     let provider = body
-        .find("self.drive_prepared(")
+        .find("self.drive_prepared_with_start(")
         .expect("accounted turn call");
 
     assert!(
@@ -2138,13 +2142,32 @@ async fn plan_handoff_finishes_one_host_turn_and_preserves_future_work() {
             .iter()
             .any(|event| matches!(event, TurnEvent::TurnCompleted { .. }))
     );
+    let goal = host
+        .goal_store
+        .goal(&host.session_id)
+        .expect("read Goal")
+        .expect("Goal remains");
+    assert_eq!(goal.status, zuno_goal::GoalStatus::Paused);
     assert_eq!(
         host.goal_store
-            .goal(&host.session_id)
-            .expect("read Goal")
-            .expect("Goal remains")
-            .status,
-        zuno_goal::GoalStatus::Active
+            .pause_state(&host.session_id)
+            .expect("read Plan pause")
+            .expect("Plan pause exists")
+            .reason,
+        zuno_goal::GoalPauseReason::PlanMode
+    );
+    let execution = host
+        .session_control
+        .state(&host.session_id)
+        .expect("read execution state")
+        .expect("Plan state exists");
+    assert_eq!(
+        execution.handoff_plan_id.as_deref(),
+        Some(before.plan.as_ref().unwrap().id.as_str())
+    );
+    assert_eq!(
+        execution.handoff_plan_revision,
+        Some(before.plan.as_ref().unwrap().revision)
     );
     host.shutdown().await.expect("shutdown scripted Plan host");
 }
@@ -2407,6 +2430,23 @@ async fn proactive_compaction_is_recovered_inside_the_same_host_drive() {
         failed_turns, 0,
         "a recovered compaction must not increment the failed-turn audit"
     );
+    let execution = host
+        .session_control
+        .state(&host.session_id)
+        .expect("read execution state")
+        .expect("compaction persists recovery authority");
+    let continuation = execution
+        .continuation
+        .expect("compaction persists a continuation token");
+    assert_eq!(continuation.context_epoch, 1);
+    assert_eq!(
+        continuation.mode,
+        zuno_types::execution::CollaborationMode::Work
+    );
+    assert_eq!(
+        execution.cycle_id.as_deref(),
+        Some(continuation.cycle_id.as_str())
+    );
     let retained = hydrate_retained_history(&host.connection, &host.session_id)
         .expect("hydrate compacted history");
     assert!(
@@ -2423,31 +2463,6 @@ async fn proactive_compaction_is_recovered_inside_the_same_host_drive() {
     host.shutdown()
         .await
         .expect("shutdown compact-and-retry host");
-}
-
-#[test]
-fn plan_unreconciled_waiting_creates_a_typed_recoverable_human_request() {
-    let request = plan_unreconciled_request(
-        "ses_plan_wait",
-        "que_plan_wait".to_owned(),
-        "msg_plan_wait",
-        "driver_plan_wait",
-        PlanWaitingReason::PlanUnreconciled,
-    );
-
-    assert_eq!(
-        request.kind,
-        zuno_db::human_request::HumanRequestKind::Input
-    );
-    assert_eq!(request.payload["source"], "plan_reconciliation");
-    assert_eq!(request.payload["reason"], "plan_unreconciled");
-    assert_eq!(request.payload["cycleId"], "driver_plan_wait");
-    let questions = serde_json::from_value::<Vec<zuno_tools::question::QuestionRequest>>(
-        request.payload["questions"].clone(),
-    )
-    .expect("recovery clients can decode the durable question");
-    assert_eq!(questions.len(), 1);
-    assert_eq!(questions[0].header, "Plan state");
 }
 
 fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
@@ -10843,7 +10858,6 @@ fn the_host_installs_the_ceilings_its_profile_and_configuration_declare() {
         "configured_turn_allowance(&config)",
         ".with_allowance(self.turn_allowance)",
         "hydrate_retained_history(&self.connection, &self.session_id)",
-        "has_requested_user_message(&retained)",
         // The navigation gate is installed with its configured mode, whether the
         // worktree is indexed, and the syntax its commands are parsed with.
         ".with_navigation(",

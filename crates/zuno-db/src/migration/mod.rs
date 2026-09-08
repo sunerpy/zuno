@@ -14,11 +14,12 @@ use zuno_error::DbError;
 /// Current database format.
 ///
 /// Bump this whenever [`crate::schema`] changes incompatibly.
-pub const CURRENT_FORMAT: u32 = 9;
+pub const CURRENT_FORMAT: u32 = 10;
 const LEARNING_UPGRADE_FROM: u32 = 5;
 const PLAN_STACK_UPGRADE_FROM: u32 = 6;
 const VERIFICATION_UPGRADE_FROM: u32 = 7;
 const MEMORY_POLICY_UPGRADE_FROM: u32 = 8;
+const EXECUTION_UPGRADE_FROM: u32 = 9;
 
 const FORMAT_TABLE: &str = "zuno_schema";
 const FORMAT_SQL: &str = "
@@ -106,6 +107,7 @@ fn dispatch_once(connection: &mut Connection) -> Result<Dispatch, DbError> {
         Some(PLAN_STACK_UPGRADE_FROM) => migrate_plan_stack(connection),
         Some(VERIFICATION_UPGRADE_FROM) => migrate_verification(connection),
         Some(MEMORY_POLICY_UPGRADE_FROM) => migrate_memory_policy(connection),
+        Some(EXECUTION_UPGRADE_FROM) => migrate_execution(connection),
         observed => Err(DbError::SchemaMismatch {
             expected: CURRENT_FORMAT,
             observed,
@@ -121,6 +123,8 @@ fn validate_current(connection: &Connection, tables: &[String]) -> Result<(), Db
         "work_plan_archive",
         "verification_receipt",
         "session_memory_policy",
+        "session_execution_state",
+        "completion_delivery",
     ];
     let missing = required
         .into_iter()
@@ -160,6 +164,15 @@ fn validate_current(connection: &Connection, tables: &[String]) -> Result<(), Db
         }
     }
     validate_memory_policy_shape(connection)?;
+    let input_columns = column_names(connection, "session_input")?;
+    for required in ["source_key", "trigger_kind", "cycle_id"] {
+        if !input_columns.iter().any(|column| column == required) {
+            return Err(failure(std::io::Error::other(format!(
+                "current schema marker exists without required session_input column `{required}`"
+            ))));
+        }
+    }
+    validate_execution_shape(connection)?;
     Ok(())
 }
 
@@ -224,6 +237,7 @@ fn migrate_learning(connection: &mut Connection) -> Result<Dispatch, DbError> {
     schema::up_plan_stack(&transaction)?;
     schema::up_verification(&transaction)?;
     schema::up_memory_policy(&transaction)?;
+    schema::up_execution(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -257,6 +271,7 @@ fn migrate_plan_stack(connection: &mut Connection) -> Result<Dispatch, DbError> 
     schema::up_plan_stack(&transaction)?;
     schema::up_verification(&transaction)?;
     schema::up_memory_policy(&transaction)?;
+    schema::up_execution(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -289,6 +304,7 @@ fn migrate_verification(connection: &mut Connection) -> Result<Dispatch, DbError
     }
     schema::up_verification(&transaction)?;
     schema::up_memory_policy(&transaction)?;
+    schema::up_execution(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -322,6 +338,7 @@ fn migrate_memory_policy(connection: &mut Connection) -> Result<Dispatch, DbErro
         }
     }
     schema::up_memory_policy(&transaction)?;
+    schema::up_execution(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -331,6 +348,39 @@ fn migrate_memory_policy(connection: &mut Connection) -> Result<Dispatch, DbErro
     if changed != 1 {
         return Err(failure(std::io::Error::other(
             "format-8 marker changed while the memory-policy migration was running",
+        )));
+    }
+    transaction.commit().map_err(map_error)?;
+    Ok(Dispatch::Settled)
+}
+
+/// Add session execution control and source-keyed completion routing.
+fn migrate_execution(connection: &mut Connection) -> Result<Dispatch, DbError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_error)?;
+    let tables = transaction_table_names(&transaction)?;
+    let observed = observed_format(&transaction, &tables)?;
+    if observed != Some(EXECUTION_UPGRADE_FROM) {
+        return Ok(Dispatch::Moved { observed });
+    }
+    for required in ["session", "session_input"] {
+        if !tables.iter().any(|table| table == required) {
+            return Err(failure(std::io::Error::other(format!(
+                "format-9 marker exists without the required {required} table"
+            ))));
+        }
+    }
+    schema::up_execution(&transaction)?;
+    let changed = transaction
+        .execute(
+            "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
+            params![CURRENT_FORMAT, EXECUTION_UPGRADE_FROM],
+        )
+        .map_err(map_error)?;
+    if changed != 1 {
+        return Err(failure(std::io::Error::other(
+            "format-9 marker changed while the execution-state migration was running",
         )));
     }
     transaction.commit().map_err(map_error)?;
@@ -465,6 +515,58 @@ fn validate_memory_policy_shape(connection: &Connection) -> Result<(), DbError> 
     Ok(())
 }
 
+fn validate_execution_shape(connection: &Connection) -> Result<(), DbError> {
+    for (index, table) in [
+        ("session_input_session_source_key_idx", "session_input"),
+        (
+            "session_execution_state_mode_phase_updated_idx",
+            "session_execution_state",
+        ),
+        (
+            "completion_delivery_session_owner_updated_idx",
+            "completion_delivery",
+        ),
+    ] {
+        let present: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = ?1 AND tbl_name = ?2",
+                params![index, table],
+                |row| row.get(0),
+            )
+            .map_err(map_error)?;
+        if present != 1 {
+            return Err(failure(std::io::Error::other(format!(
+                "current schema marker exists without required index `{index}`"
+            ))));
+        }
+    }
+    let execution_columns = column_names(connection, "session_execution_state")?;
+    for required in [
+        "session_id",
+        "revision",
+        "mode",
+        "work_identity",
+        "authorized_plan_id",
+        "authorized_plan_revision",
+        "handoff_plan_id",
+        "handoff_plan_revision",
+        "draft_review_risk",
+        "cycle_id",
+        "phase",
+        "continuation",
+        "time_created",
+        "time_updated",
+    ] {
+        if !execution_columns.iter().any(|column| column == required) {
+            return Err(failure(std::io::Error::other(format!(
+                "current session_execution_state is missing column `{required}`"
+            ))));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn map_error(error: rusqlite::Error) -> DbError {
     if open::is_busy(&error) {
         return open::map_error(error);
@@ -512,6 +614,19 @@ mod tests {
         connection
             .execute_batch("DROP TABLE session_memory_policy;")
             .expect("construct pre-memory-policy schema");
+    }
+
+    fn remove_execution_schema(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP TABLE completion_delivery;
+                 DROP TABLE session_execution_state;
+                 DROP INDEX session_input_session_source_key_idx;
+                 ALTER TABLE session_input DROP COLUMN cycle_id;
+                 ALTER TABLE session_input DROP COLUMN trigger_kind;
+                 ALTER TABLE session_input DROP COLUMN source_key;",
+            )
+            .expect("construct pre-execution-state schema");
     }
 
     #[test]
@@ -626,6 +741,7 @@ mod tests {
     fn format_five_upgrades_without_rewriting_history() {
         let mut connection = memory();
         create_current(&mut connection).expect("create current schema");
+        remove_execution_schema(&connection);
         remove_memory_policy_schema(&connection);
         remove_plan_stack_schema(&connection);
         remove_verification_schema(&connection);
@@ -776,6 +892,7 @@ mod tests {
     fn format_six_adds_plan_stack_without_rewriting_the_active_plan() {
         let mut connection = memory();
         create_current(&mut connection).expect("create current schema");
+        remove_execution_schema(&connection);
         remove_memory_policy_schema(&connection);
         remove_plan_stack_schema(&connection);
         remove_verification_schema(&connection);
@@ -904,6 +1021,7 @@ mod tests {
     fn format_seven_adds_the_verification_ledger_without_rewriting_history() {
         let mut connection = memory();
         create_current(&mut connection).expect("create current schema");
+        remove_execution_schema(&connection);
         remove_memory_policy_schema(&connection);
         remove_verification_schema(&connection);
         connection
@@ -1199,6 +1317,7 @@ mod tests {
     fn format_eight_adds_memory_policy_without_rewriting_history_or_learning_jobs() {
         let mut connection = memory();
         create_current(&mut connection).expect("create current schema");
+        remove_execution_schema(&connection);
         remove_memory_policy_schema(&connection);
         connection
             .execute_batch(
@@ -1241,7 +1360,7 @@ mod tests {
             table_names(&connection)
                 .expect("format-eight inventory")
                 .len(),
-            schema::TABLE_COUNT,
+            39,
             "format 8 has every current table except session_memory_policy"
         );
         let session_before: (String, String) = connection
@@ -1338,6 +1457,7 @@ mod tests {
     fn corrupt_format_eight_without_learning_jobs_fails_closed() {
         let mut connection = memory();
         create_current(&mut connection).expect("create current schema");
+        remove_execution_schema(&connection);
         remove_memory_policy_schema(&connection);
         connection
             .execute_batch(
@@ -1530,6 +1650,7 @@ mod tests {
     fn a_concurrent_upgrade_that_loses_the_write_lock_validates_instead_of_mismatching() {
         let (_dir, mut winner, loser) = file_pair();
         apply(&mut winner).expect("create the current schema");
+        remove_execution_schema(&winner);
         remove_memory_policy_schema(&winner);
         winner
             .execute(
@@ -1542,6 +1663,7 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .expect("the winner reserves the writer");
         schema::up_memory_policy(&held).expect("the winner adds session memory policy");
+        schema::up_execution(&held).expect("the winner adds session execution state");
         held.execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
             params![CURRENT_FORMAT, MEMORY_POLICY_UPGRADE_FROM],

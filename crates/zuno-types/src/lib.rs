@@ -1,5 +1,7 @@
 //! Wire and domain types shared across the workspace (sessions, messages, parts, tool payloads).
 
+pub mod execution;
+
 /// One class of routine work a client may compact in its main timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActivityKind {

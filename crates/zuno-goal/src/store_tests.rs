@@ -1,5 +1,6 @@
 use super::*;
 use crate::spill::{MAX_OBJECTIVE_CHARS, OBJECTIVE_FILE_NAME};
+use rusqlite::TransactionBehavior;
 use tempfile::TempDir;
 
 /// A store plus the temporary directory its spilled objectives live in.
@@ -546,6 +547,145 @@ fn plan_mode_survives_restart_and_start_work_is_idempotent() {
             .revision,
         active.revision
     );
+    assert_eq!(
+        fixture.store.pause_state(SESSION_ID).expect("read pause"),
+        None
+    );
+}
+
+#[test]
+fn caller_owned_transaction_reads_and_enters_plan_mode_atomically() {
+    const SESSION_ID: &str = "ses_plan_outer_transaction";
+    let fixture = Fixture::in_memory();
+    let active = fixture
+        .store
+        .create_goal(SESSION_ID, "plan in one outer transaction", None)
+        .expect("create goal");
+
+    {
+        let mut connection = fixture.store.pool().get().expect("check out connection");
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin outer immediate transaction");
+        assert_eq!(
+            GoalStore::goal_in(&tx, SESSION_ID)
+                .expect("read through outer transaction")
+                .expect("goal"),
+            active
+        );
+        let paused = GoalStore::enter_plan_mode_in(&tx, SESSION_ID, 1_000)
+            .expect("enter plan through outer transaction")
+            .expect("goal");
+        assert_eq!(paused.status, GoalStatus::Paused);
+        assert_eq!(paused.revision, active.revision + 1);
+        assert_eq!(
+            GoalStore::enter_plan_mode_in(&tx, SESSION_ID, 1_001)
+                .expect("repeat enter plan in outer transaction")
+                .expect("goal")
+                .revision,
+            paused.revision,
+            "entering Plan twice in one outer transaction is idempotent"
+        );
+        assert_eq!(
+            GoalStore::goal_in(&tx, SESSION_ID)
+                .expect("read paused goal in outer transaction")
+                .expect("goal"),
+            paused
+        );
+        tx.rollback().expect("roll back outer transaction");
+    }
+
+    assert_eq!(
+        fixture.goal(SESSION_ID),
+        active,
+        "rolling back the outer transaction must roll back Goal and pause state"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .pause_state(SESSION_ID)
+            .expect("read pause after rollback"),
+        None
+    );
+
+    let mut connection = fixture.store.pool().get().expect("check out connection");
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("begin outer immediate transaction");
+    let paused = GoalStore::enter_plan_mode_in(&tx, SESSION_ID, 2_000)
+        .expect("enter plan through outer transaction")
+        .expect("goal");
+    tx.commit().expect("commit outer transaction");
+    assert_eq!(fixture.goal(SESSION_ID), paused);
+}
+
+#[test]
+fn caller_owned_transaction_resumes_work_once_and_owns_commit() {
+    const SESSION_ID: &str = "ses_work_outer_transaction";
+    let fixture = Fixture::in_memory();
+    let active = fixture
+        .store
+        .create_goal(SESSION_ID, "resume in one outer transaction", None)
+        .expect("create goal");
+    let paused = fixture
+        .store
+        .enter_plan_mode(SESSION_ID)
+        .expect("enter plan")
+        .expect("goal");
+
+    {
+        let mut connection = fixture.store.pool().get().expect("check out connection");
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin outer immediate transaction");
+        let resumed = GoalStore::resume_for_work_in(&tx, SESSION_ID, 3_000)
+            .expect("resume through outer transaction")
+            .expect("goal");
+        assert_eq!(resumed.status, GoalStatus::Active);
+        assert_eq!(resumed.revision, paused.revision + 1);
+        assert_eq!(
+            GoalStore::resume_for_work_in(&tx, SESSION_ID, 3_001)
+                .expect("repeat resume in outer transaction")
+                .expect("goal")
+                .revision,
+            resumed.revision,
+            "Start Work consumes the Plan pause only once"
+        );
+        tx.rollback().expect("roll back outer transaction");
+    }
+
+    assert_eq!(
+        fixture.goal(SESSION_ID),
+        paused,
+        "rolling back the outer transaction preserves the paused Goal"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .pause_state(SESSION_ID)
+            .expect("read pause after rollback")
+            .expect("pause")
+            .reason,
+        GoalPauseReason::PlanMode
+    );
+
+    let mut connection = fixture.store.pool().get().expect("check out connection");
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("begin outer immediate transaction");
+    let resumed = GoalStore::resume_for_work_in(&tx, SESSION_ID, 4_000)
+        .expect("resume through outer transaction")
+        .expect("goal");
+    assert_eq!(
+        GoalStore::goal_in(&tx, SESSION_ID)
+            .expect("read resumed goal in outer transaction")
+            .expect("goal"),
+        resumed
+    );
+    tx.commit().expect("commit outer transaction");
+
+    assert_eq!(fixture.goal(SESSION_ID), resumed);
+    assert_eq!(resumed.status, active.status);
     assert_eq!(
         fixture.store.pause_state(SESSION_ID).expect("read pause"),
         None
