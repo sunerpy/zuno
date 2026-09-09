@@ -441,7 +441,7 @@ async fn compact_history(
                     .join("\n\n"),
             )
         });
-    let mut entries = transcript_owned(&agent.prompt, store_history);
+    let mut entries = transcript_owned("", store_history);
     if let Some((id, _)) = &previous {
         entries.retain(|entry| entry.id != *id);
     }
@@ -457,6 +457,7 @@ async fn compact_history(
         trigger,
     )
     .with_interrupt(context.interrupt)
+    .with_system_prompt(&agent.prompt)
     .with_surface(agent.model.surface)
     .with_model_cost(&agent.model.cost);
     let request = match &previous {
@@ -552,9 +553,12 @@ pub async fn summarize(
 /// just compacted look like it needs compacting again.
 #[must_use]
 pub fn measured_tokens(history: &[MessageWithParts]) -> Option<u64> {
+    let checkpoint = crate::compaction::checkpoint::latest_checkpoint(history);
+    let boundary = checkpoint.map(|checkpoint| checkpoint.summary.info.id.as_str());
     history
         .iter()
         .rev()
+        .take_while(|message| boundary != Some(message.info.id.as_str()))
         .filter(|message| {
             message.info.data.contains_key("finish")
                 && message.info.data.get("summary").and_then(Value::as_bool) != Some(true)
@@ -574,10 +578,17 @@ pub fn measured_tokens(history: &[MessageWithParts]) -> Option<u64> {
             if total > 0 {
                 return total;
             }
-            count("input")
-                .saturating_add(count("output"))
-                .saturating_add(cache("read"))
-                .saturating_add(cache("write"))
+            let input_and_output = count("input").saturating_add(count("output"));
+            match tokens.get("accounting").and_then(Value::as_str) {
+                Some("cache-inside-input") => input_and_output.saturating_add(count("reasoning")),
+                Some("cache-beside-input") => input_and_output
+                    .saturating_add(count("reasoning"))
+                    .saturating_add(cache("read"))
+                    .saturating_add(cache("write")),
+                _ => input_and_output
+                    .saturating_add(cache("read"))
+                    .saturating_add(cache("write")),
+            }
         })
 }
 

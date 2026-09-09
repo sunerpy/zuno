@@ -640,7 +640,8 @@ mod tests {
             CompactionTrigger::Threshold {
                 used_tokens: 99_000,
             },
-        );
+        )
+        .with_system_prompt("Summarize the supplied conversation history.");
         let mut cache = CompactionCache::new(tracker, tools);
         let outcome = run_compaction(
             connection,
@@ -690,7 +691,14 @@ mod tests {
         .await;
         assert_eq!(text_of(first.first().expect("system survives")), prompt);
 
-        let second_entries = entries_from_messages(&first);
+        let mut second_entries = entries_from_messages(&first);
+        second_entries.push(transcript_entry("next-user", Role::User, "new request", 5));
+        second_entries.push(transcript_entry(
+            "next-assistant",
+            Role::Assistant,
+            "new answer",
+            5,
+        ));
         let second = force_compaction(
             &mut connection,
             &provider,

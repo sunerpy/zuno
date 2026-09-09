@@ -1520,7 +1520,12 @@ remains unsatisfied. A compaction marker, including older markers without a
 or completed-turn learning boundary. The engine handles continuation through native runtime context rather
 than fabricating another human message.
 
-Summary generation includes the resolved compaction agent's system instruction.
+Summary generation includes the resolved compaction agent's own system instruction.
+The main agent's initial instructions and resident Memory stay outside the summary
+input and are restored independently. Once a checkpoint is accepted, token usage
+from the previous window cannot trigger another compaction; only subsequent main
+responses describe the current window. Cache accounting and separately stored
+reasoning tokens retain their original meaning.
 The exact post-hook request, stable section sources, digest, and selected bounds
 are committed as `session.compaction.prompt`, linked from the summary message.
 This auxiliary receipt does not replace the foreground prompt receipt used to

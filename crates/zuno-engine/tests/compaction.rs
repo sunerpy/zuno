@@ -265,7 +265,8 @@ async fn compact_with(
                 max_output: 4_096,
             },
             CompactionTrigger::Manual,
-        ),
+        )
+        .with_system_prompt("Summarize earlier context and preserve the task's scope."),
     )
     .await
 }
@@ -333,7 +334,19 @@ async fn compaction_request_preserves_the_internal_system_instruction() {
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].messages[0],
-        Message::new(Role::System, "Initial context").into()
+        Message::new(
+            Role::System,
+            "Summarize earlier context and preserve the task's scope."
+        )
+        .into()
+    );
+    assert!(
+        !requests[0].messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+            matches!(block, RequestContentBlock::Text { text } if text == "Initial context")
+        })
+        }),
+        "the main context must stay outside the summarizer"
     );
     let receipt =
         zuno_db::event_log::latest_of_type_in(&connection, SESSION_ID, "session.compaction.prompt")

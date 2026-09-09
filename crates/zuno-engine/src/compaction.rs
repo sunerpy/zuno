@@ -466,6 +466,8 @@ pub struct CompactionRequest<'a> {
     pub interrupt: Option<&'a crate::interrupt::InterruptSignal>,
     pub surface: ApiSurface,
     pub model_cost: Option<&'a ModelCost>,
+    /// Dedicated summarizer instructions, separate from the retained main context.
+    pub system_prompt: Option<&'a str>,
 }
 
 impl<'a> CompactionRequest<'a> {
@@ -501,6 +503,7 @@ impl<'a> CompactionRequest<'a> {
             interrupt: None,
             surface: ApiSurface::Default,
             model_cost: None,
+            system_prompt: None,
         }
     }
 
@@ -534,6 +537,12 @@ impl<'a> CompactionRequest<'a> {
     #[must_use]
     pub const fn with_model_cost(mut self, cost: &'a ModelCost) -> Self {
         self.model_cost = Some(cost);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_system_prompt(mut self, prompt: &'a str) -> Self {
+        self.system_prompt = Some(prompt);
         self
     }
 }
@@ -680,10 +689,13 @@ where
     let retained = entries.split_off(boundary.retained_from);
     let summarized = entries.split_off(boundary.initial_context_end);
     let initial = entries;
-    let mut model_messages = initial
-        .iter()
-        .map(|entry| summary_safe_message_owned(entry.message.clone()))
-        .collect::<Vec<_>>();
+    let mut model_messages = Vec::new();
+    if let Some(prompt) = request
+        .system_prompt
+        .filter(|prompt| !prompt.trim().is_empty())
+    {
+        model_messages.push(Message::new(Role::System, prompt));
+    }
     model_messages.extend(
         summarized
             .into_iter()

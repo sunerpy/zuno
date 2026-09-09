@@ -537,6 +537,101 @@ async fn repeated_compaction_carries_one_checkpoint_without_replacing_foreground
     assert_eq!(latest.id, foreground.id);
 }
 
+#[tokio::test]
+async fn a_checkpoint_resets_usage_from_the_previous_context_window() {
+    let window = TokenWindow {
+        context: 100_000,
+        max_output: 4_096,
+    };
+    let mut connection = seeded("A named session", None);
+    put_user(&connection, "msg_old", 10, "Investigate without editing");
+    put_assistant(
+        &connection,
+        "msg_old_answer",
+        20,
+        "Earlier evidence",
+        99_000,
+    );
+    put_user(&connection, "msg_recent", 30, "Continue the investigation");
+    put_assistant(
+        &connection,
+        "msg_recent_answer",
+        40,
+        "Current evidence",
+        99_000,
+    );
+    let provider = RecordingProvider::answering(&["A checkpoint of the earlier evidence"]);
+    let providers = OneProvider(Arc::clone(&provider));
+    let internals = internals();
+    let config = CompactionConfig {
+        tail_turns: Some(1),
+        preserve_recent_tokens: Some(1_000),
+        ..CompactionConfig::default()
+    };
+    let mut state = CompactionState::default();
+    let first = compact_if_overflowing(
+        SESSION_ID,
+        &mut context(
+            &mut connection,
+            &providers,
+            &internals,
+            &config,
+            window,
+            &mut state,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(first.compacted);
+    connection
+        .execute(
+            "UPDATE message SET data = json_set(data, '$.tokens', json(?1)) \
+         WHERE session_id = ?2 AND json_extract(data, '$.summary') = 1",
+            (
+                r#"{"input":99000,"output":50,"accounting":"cache-inside-input"}"#,
+                SESSION_ID,
+            ),
+        )
+        .unwrap();
+    let history = super::hydrate_retained_history(&connection, SESSION_ID).unwrap();
+    assert_eq!(super::measured_tokens(&history), None);
+    let second = compact_if_overflowing(
+        SESSION_ID,
+        &mut context(
+            &mut connection,
+            &providers,
+            &internals,
+            &config,
+            window,
+            &mut state,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(!second.compacted);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[test]
+fn context_usage_respects_cache_accounting_and_separate_reasoning() {
+    let connection = seeded("A named session", None);
+    put_user(&connection, "msg_user", 10, "Investigate");
+    put_assistant(&connection, "msg_answer", 20, "Evidence", 1);
+    for (accounting, expected) in [("cache-inside-input", 1500), ("cache-beside-input", 1750)] {
+        connection.execute(
+            "UPDATE message SET data = json_set(data, '$.tokens', json(?1)) WHERE id = 'msg_answer'",
+            [serde_json::json!({
+                "input": 1000, "output": 400, "reasoning": 100,
+                "cache": { "read": 200, "write": 50 }, "accounting": accounting
+            }).to_string()],
+        ).unwrap();
+        let history = MessageStore::new(&connection)
+            .hydrate_session(SESSION_ID)
+            .unwrap();
+        assert_eq!(super::measured_tokens(&history), Some(expected));
+    }
+}
+
 fn context<'a>(
     connection: &'a mut Connection,
     providers: &'a dyn InternalProviders,

@@ -37,8 +37,8 @@ pub(super) fn record_request(
         let (id, source) = if message.role == Role::System {
             system.push(content.clone());
             (
-                format!("agent.compaction.initial.{index}"),
-                format!("compaction:initial-context:{index}"),
+                format!("agent.compaction.system.{index}"),
+                "compaction:resolved-agent-prompt".to_owned(),
             )
         } else {
             (
