@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.26](https://github.com/sunerpy/zuno/compare/v0.10.25...v0.10.26) (2026-09-09)
+
+
+### Bug Fixes
+
+* **compaction:** 优化检查点生成与任务连续恢复 ([8b778cc](https://github.com/sunerpy/zuno/commit/8b778ccd44f016919b8ed762001deea8be5f383b))
+
 ## [0.10.25](https://github.com/sunerpy/zuno/compare/v0.10.24...v0.10.25) (2026-09-09)
 
 
