@@ -141,6 +141,66 @@ mod tests {
         assert_eq!(budget["minimum"], Value::from(1));
     }
 
+    #[test]
+    fn acp_runtime_schema_publishes_positive_host_only_capacity_controls() {
+        let schema = document();
+        let acp = &schema["$defs"]["AcpConfig"];
+        let runtime = &schema["$defs"]["AcpRuntimeConfig"];
+        assert_eq!(acp["additionalProperties"], Value::Bool(false));
+        assert_eq!(runtime["additionalProperties"], Value::Bool(false));
+
+        let fields = runtime["properties"]
+            .as_object()
+            .expect("AcpRuntimeConfig properties");
+        for (field, default) in [
+            ("max_open_sessions", "Defaults to 32"),
+            ("max_active_runtimes", "Defaults to 8"),
+            ("idle_timeout_ms", "Defaults to 900000"),
+            ("activation_wait_timeout_ms", "Defaults to 30000"),
+        ] {
+            assert_eq!(
+                fields[field]["minimum"],
+                Value::from(1),
+                "acp.runtime.{field} must be positive"
+            );
+            assert!(
+                fields[field]["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains(default)),
+                "acp.runtime.{field} must publish {default}"
+            );
+        }
+
+        assert!(
+            schema["properties"]["acp"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("process-local")),
+            "the root schema must identify ACP runtime policy as host-owned"
+        );
+    }
+
+    #[test]
+    fn acp_runtime_reference_documents_match_the_schema_defaults() {
+        let english = include_str!("../../../docs/reference/configuration.md");
+        let chinese = include_str!("../../../docs/zh/config/reference.md");
+        for document in [english, chinese] {
+            for needle in [
+                "acp.runtime",
+                "max_open_sessions",
+                "max_active_runtimes",
+                "idle_timeout_ms",
+                "activation_wait_timeout_ms",
+                "900000",
+                "30000",
+            ] {
+                assert!(
+                    document.contains(needle),
+                    "ACP configuration reference omitted `{needle}`"
+                );
+            }
+        }
+    }
+
     /// The published schema and the parser's whitelist are two hand-maintained
     /// lists of the same thing. [`crate::schema::KNOWN_TOP_LEVEL_KEYS`] is what
     /// actually rejects a key at parse time, so a property that the schema

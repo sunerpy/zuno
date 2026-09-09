@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
+use tokio::sync::{Mutex, watch};
 use zuno_error::ToolError;
 use zuno_runtime::{Component, EffectError, PrepareContext, ProfileBundle, RuntimeError};
 use zuno_tool::{
@@ -214,7 +215,7 @@ pub(crate) trait PluginHost: Send + Sync {
 }
 
 /// Typed failure from an executable plugin boundary.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum PluginHostError {
     #[error("plugin `{package}` failed to start: {message}")]
     Start { package: String, message: String },
@@ -277,6 +278,11 @@ pub enum PluginHostError {
     },
     #[error("plugin `{package}` failed to stop authoritatively: {message}")]
     Stop { package: String, message: String },
+    #[error("plugin `{package}` runtime host is {state}")]
+    Unavailable {
+        package: String,
+        state: &'static str,
+    },
 }
 
 impl PluginHostError {
@@ -300,34 +306,64 @@ impl PluginHostError {
 }
 
 #[derive(Default)]
+enum PluginHostSetState {
+    #[default]
+    Unpublished,
+    Published {
+        by_package: BTreeMap<String, Arc<PluginHostSlot>>,
+        in_start_order: Vec<Arc<PluginHostSlot>>,
+    },
+    Closed,
+}
+
+#[derive(Default)]
 struct PluginHostSet {
-    active: RwLock<BTreeMap<String, Arc<dyn PluginHost>>>,
+    state: RwLock<PluginHostSetState>,
 }
 
 impl PluginHostSet {
-    fn publish(&self, hosts: &[ActiveHost]) -> Result<(), EffectError> {
-        let mut active = self
-            .active
+    fn publish(&self, specs: Vec<RuntimeSpec>) -> Result<(), EffectError> {
+        let mut by_package = BTreeMap::new();
+        let mut in_start_order = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let package = spec.package.clone();
+            let slot = Arc::new(PluginHostSlot::new(spec));
+            if by_package
+                .insert(package.clone(), Arc::clone(&slot))
+                .is_some()
+            {
+                return Err(EffectError::new(format!(
+                    "plugin runtime package `{package}` was published more than once"
+                )));
+            }
+            in_start_order.push(slot);
+        }
+
+        let mut state = self
+            .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !active.is_empty() {
+        if !matches!(*state, PluginHostSetState::Unpublished) {
             return Err(EffectError::new(
                 "plugin host set was already published before lifecycle start",
             ));
         }
-        active.extend(
-            hosts
-                .iter()
-                .map(|entry| (entry.package.clone(), Arc::clone(&entry.host))),
-        );
+        *state = PluginHostSetState::Published {
+            by_package,
+            in_start_order,
+        };
         Ok(())
     }
 
-    fn withdraw(&self) {
-        self.active
+    fn withdraw(&self) -> Vec<Arc<PluginHostSlot>> {
+        let mut state = self
+            .state
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match std::mem::replace(&mut *state, PluginHostSetState::Closed) {
+            PluginHostSetState::Published { in_start_order, .. } => in_start_order,
+            PluginHostSetState::Unpublished | PluginHostSetState::Closed => Vec::new(),
+        }
     }
 
     async fn invoke(
@@ -335,18 +371,211 @@ impl PluginHostSet {
         package: &str,
         request: PluginInvocation,
     ) -> Result<PluginResult, PluginHostError> {
-        let host = self
-            .active
+        let slot = match &*self
+            .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(package)
-            .cloned()
-            .ok_or_else(|| PluginHostError::Uncertain {
-                package: package.to_owned(),
-                operation: "tool dispatch".to_owned(),
-                message: "the profile no longer owns an active runtime host".to_owned(),
-            })?;
+        {
+            PluginHostSetState::Published { by_package, .. } => by_package.get(package).cloned(),
+            PluginHostSetState::Unpublished | PluginHostSetState::Closed => None,
+        }
+        .ok_or_else(|| PluginHostError::Unavailable {
+            package: package.to_owned(),
+            state: "not active in the current profile",
+        })?;
+        slot.invoke(request).await
+    }
+}
+
+type HostStartResult = Result<Arc<dyn PluginHost>, PluginHostError>;
+type HostStopResult = Result<(), PluginHostError>;
+
+struct SharedCompletion<T> {
+    outcome: watch::Sender<Option<T>>,
+}
+
+impl<T> SharedCompletion<T>
+where
+    T: Clone,
+{
+    fn pending() -> Self {
+        let (outcome, _receiver) = watch::channel(None);
+        Self { outcome }
+    }
+
+    fn complete(&self, outcome: T) {
+        self.outcome.send_replace(Some(outcome));
+    }
+
+    async fn wait(&self) -> T {
+        let mut outcome = self.outcome.subscribe();
+        loop {
+            if let Some(outcome) = outcome.borrow_and_update().clone() {
+                return outcome;
+            }
+            outcome
+                .changed()
+                .await
+                .expect("plugin host completion sender remains owned by the slot");
+        }
+    }
+}
+
+enum PluginHostSlotState {
+    Dormant,
+    Starting(Arc<SharedCompletion<HostStartResult>>),
+    Active(Arc<dyn PluginHost>),
+    Stopping(Arc<SharedCompletion<HostStopResult>>),
+    Closed,
+}
+
+struct PluginHostSlot {
+    package: String,
+    spec: RuntimeSpec,
+    state: Mutex<PluginHostSlotState>,
+}
+
+impl PluginHostSlot {
+    fn new(spec: RuntimeSpec) -> Self {
+        Self {
+            package: spec.package.clone(),
+            spec,
+            state: Mutex::new(PluginHostSlotState::Dormant),
+        }
+    }
+
+    async fn invoke(
+        self: &Arc<Self>,
+        request: PluginInvocation,
+    ) -> Result<PluginResult, PluginHostError> {
+        let host = self.host().await?;
         host.invoke(request).await
+    }
+
+    async fn host(self: &Arc<Self>) -> HostStartResult {
+        enum StartDecision {
+            Start(Arc<SharedCompletion<HostStartResult>>),
+            Wait(Arc<SharedCompletion<HostStartResult>>),
+            Ready(Arc<dyn PluginHost>),
+            Unavailable(&'static str),
+        }
+
+        let decision = {
+            let mut state = self.state.lock().await;
+            match &*state {
+                PluginHostSlotState::Dormant => {
+                    let attempt = Arc::new(SharedCompletion::pending());
+                    *state = PluginHostSlotState::Starting(Arc::clone(&attempt));
+                    StartDecision::Start(attempt)
+                }
+                PluginHostSlotState::Starting(attempt) => StartDecision::Wait(Arc::clone(attempt)),
+                PluginHostSlotState::Active(host) => StartDecision::Ready(Arc::clone(host)),
+                PluginHostSlotState::Stopping(_) => StartDecision::Unavailable("stopping"),
+                PluginHostSlotState::Closed => StartDecision::Unavailable("closed"),
+            }
+        };
+
+        match decision {
+            StartDecision::Start(attempt) => {
+                self.spawn_start(Arc::clone(&attempt));
+                attempt.wait().await
+            }
+            StartDecision::Wait(attempt) => attempt.wait().await,
+            StartDecision::Ready(host) => Ok(host),
+            StartDecision::Unavailable(state) => Err(PluginHostError::Unavailable {
+                package: self.package.clone(),
+                state,
+            }),
+        }
+    }
+
+    fn spawn_start(self: &Arc<Self>, attempt: Arc<SharedCompletion<HostStartResult>>) {
+        let slot = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let outcome = start_host(slot.spec.clone()).await;
+            let mut state = slot.state.lock().await;
+            let owns_attempt = matches!(
+                &*state,
+                PluginHostSlotState::Starting(current)
+                    if Arc::ptr_eq(current, &attempt)
+            );
+            if owns_attempt {
+                *state = match &outcome {
+                    Ok(host) => PluginHostSlotState::Active(Arc::clone(host)),
+                    Err(_) => PluginHostSlotState::Dormant,
+                };
+                attempt.complete(outcome);
+                return;
+            }
+            drop(state);
+
+            let outcome = match outcome {
+                Ok(host) => match host.shutdown().await {
+                    Ok(()) => Err(PluginHostError::Unavailable {
+                        package: slot.package.clone(),
+                        state: "closed during startup",
+                    }),
+                    Err(cleanup) => Err(cleanup),
+                },
+                Err(error) => Err(error),
+            };
+            attempt.complete(outcome);
+        });
+        drop(task);
+    }
+
+    async fn close(&self) -> HostStopResult {
+        enum StopDecision {
+            WaitForStart(Arc<SharedCompletion<HostStartResult>>),
+            Stop {
+                host: Arc<dyn PluginHost>,
+                attempt: Arc<SharedCompletion<HostStopResult>>,
+            },
+            Wait(Arc<SharedCompletion<HostStopResult>>),
+            Done,
+        }
+
+        loop {
+            let decision = {
+                let mut state = self.state.lock().await;
+                match &*state {
+                    PluginHostSlotState::Dormant => {
+                        *state = PluginHostSlotState::Closed;
+                        StopDecision::Done
+                    }
+                    PluginHostSlotState::Starting(attempt) => {
+                        StopDecision::WaitForStart(Arc::clone(attempt))
+                    }
+                    PluginHostSlotState::Active(host) => {
+                        let host = Arc::clone(host);
+                        let attempt = Arc::new(SharedCompletion::pending());
+                        *state = PluginHostSlotState::Stopping(Arc::clone(&attempt));
+                        StopDecision::Stop { host, attempt }
+                    }
+                    PluginHostSlotState::Stopping(attempt) => {
+                        StopDecision::Wait(Arc::clone(attempt))
+                    }
+                    PluginHostSlotState::Closed => StopDecision::Done,
+                }
+            };
+
+            match decision {
+                StopDecision::WaitForStart(attempt) => {
+                    let _outcome = attempt.wait().await;
+                }
+                StopDecision::Stop { host, attempt } => {
+                    let outcome = host.shutdown().await;
+                    {
+                        let mut state = self.state.lock().await;
+                        *state = PluginHostSlotState::Closed;
+                    }
+                    attempt.complete(outcome.clone());
+                    return outcome;
+                }
+                StopDecision::Wait(attempt) => return attempt.wait().await,
+                StopDecision::Done => return Ok(()),
+            }
+        }
     }
 }
 
@@ -371,57 +600,26 @@ impl Component for PluginRuntimeComponent {
         let specs = self.specs.clone();
         let hosts = Arc::clone(&self.hosts);
         context.effect(RUNTIME_EFFECT_ID, move || async move {
-            let active = start_hosts(specs).await?;
-            if let Err(error) = hosts.publish(&active) {
-                let cleanup = stop_hosts(active).await;
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup) => Err(EffectError::new(format!(
-                        "{error}; unpublished plugin hosts also failed cleanup: {cleanup}"
-                    ))),
-                };
-            }
+            hosts.publish(specs)?;
             Ok(move || async move {
-                hosts.withdraw();
-                stop_hosts(active).await
+                let slots = hosts.withdraw();
+                stop_host_slots(slots).await
             })
         })
     }
 }
 
-struct ActiveHost {
-    package: String,
-    host: Arc<dyn PluginHost>,
-}
-
-async fn start_hosts(specs: Vec<RuntimeSpec>) -> Result<Vec<ActiveHost>, EffectError> {
-    let mut active: Vec<ActiveHost> = Vec::new();
-    for spec in specs {
-        let package = spec.package.clone();
-        let started = match &spec.runtime {
-            PluginRuntime::Wasi { .. } => wasi::start(spec).await,
-            PluginRuntime::Process { .. } => process::start(spec).await,
-        };
-        match started {
-            Ok(host) => active.push(ActiveHost { package, host }),
-            Err(error) => {
-                let cleanup = stop_hosts(active).await;
-                return match cleanup {
-                    Ok(()) => Err(EffectError::new(error.to_string())),
-                    Err(cleanup) => Err(EffectError::new(format!(
-                        "{error}; earlier plugin hosts also failed cleanup: {cleanup}"
-                    ))),
-                };
-            }
-        }
+async fn start_host(spec: RuntimeSpec) -> HostStartResult {
+    match &spec.runtime {
+        PluginRuntime::Wasi { .. } => wasi::start(spec).await,
+        PluginRuntime::Process { .. } => process::start(spec).await,
     }
-    Ok(active)
 }
 
-async fn stop_hosts(mut active: Vec<ActiveHost>) -> Result<(), EffectError> {
+async fn stop_host_slots(mut slots: Vec<Arc<PluginHostSlot>>) -> Result<(), EffectError> {
     let mut failures = Vec::new();
-    while let Some(entry) = active.pop() {
-        if let Err(error) = entry.host.shutdown().await {
+    while let Some(slot) = slots.pop() {
+        if let Err(error) = slot.close().await {
             failures.push(error.to_string());
         }
     }
@@ -934,11 +1132,29 @@ mod tests {
         }
 
         let hosts = Arc::new(PluginHostSet::default());
-        hosts
-            .active
+        let slot = Arc::new(PluginHostSlot::new(RuntimeSpec {
+            package: "review-kit".to_owned(),
+            root: PathBuf::new(),
+            root_literal: String::new(),
+            workspace: PathBuf::new(),
+            workspace_literal: String::new(),
+            runtime: PluginRuntime::Process {
+                command: "unused".to_owned(),
+                args: Vec::new(),
+                capabilities: vec![PluginCapability::HostFull],
+                timeout_ms: 1,
+            },
+        }));
+        *slot.state.lock().await = PluginHostSlotState::Active(Arc::new(ClaimingHost));
+        let mut by_package = BTreeMap::new();
+        by_package.insert("review-kit".to_owned(), Arc::clone(&slot));
+        *hosts
+            .state
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert("review-kit".to_owned(), Arc::new(ClaimingHost));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = PluginHostSetState::Published {
+            by_package,
+            in_start_order: vec![slot],
+        };
         let tool = PluginTool::new(
             "review-kit".to_owned(),
             "review_outline".to_owned(),

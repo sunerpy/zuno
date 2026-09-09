@@ -1,21 +1,94 @@
 //! Runtime lifecycle control for configured MCP servers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{Notify, broadcast, watch};
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, watch};
 use tokio::time::Instant;
 use zuno_config::schema::mcp::McpServerConfig;
 
 use crate::{
-    Catalog, ConnectedServer, PromptDefinition, RemoteClient, RemoteConnect, ServerStatus,
-    StdioClient, ToolDefinition,
+    Catalog, ConnectedServer, PromptDefinition, RemoteClient, RemoteConnect, ResourceContents,
+    ResourceDefinition, ResourceTemplate, ServerStatus, StdioClient, ToolCallResult,
+    ToolDefinition,
 };
+use zuno_error::McpError;
 
 const EVENT_CAPACITY: usize = 64;
+
+/// Format of a persisted MCP tool directory.
+pub const MCP_TOOL_DIRECTORY_VERSION: u32 = 1;
+
+/// Secret-free digest of every input that selects one server connection.
+///
+/// The digest includes the configured name, runtime workspace and the complete
+/// server configuration. Headers and OAuth secrets affect the digest but are never
+/// stored in the identity itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConnectionIdentity {
+    /// Configured server name.
+    pub server: String,
+    /// URL-safe SHA-256 over the complete connection inputs.
+    pub sha256: String,
+}
+
+impl McpConnectionIdentity {
+    /// Computes the exact connection identity without retaining configuration secrets.
+    #[must_use]
+    pub fn from_config(
+        server: impl Into<String>,
+        workspace: impl AsRef<Path>,
+        config: &McpServerConfig,
+    ) -> Self {
+        let server = server.into();
+        let mut digest = Sha256::new();
+        digest_field(&mut digest, b"zuno-mcp-connection-v1");
+        digest_field(&mut digest, server.as_bytes());
+        digest_path(&mut digest, workspace.as_ref());
+        let encoded = serde_json::to_vec(config).expect("MCP configuration is serializable");
+        digest_field(&mut digest, &encoded);
+        let streamable_http_only = matches!(
+            config,
+            McpServerConfig::Remote(remote) if remote.streamable_http_only
+        );
+        digest_field(&mut digest, &[u8::from(streamable_http_only)]);
+        Self {
+            server,
+            sha256: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize()),
+        }
+    }
+}
+
+/// Frozen tool schemas discovered from one exact MCP connection identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolDirectory {
+    /// Cache format. Unknown formats are ignored and rediscovered eagerly.
+    pub version: u32,
+    /// Exact server connection that produced these schemas.
+    pub identity: McpConnectionIdentity,
+    /// Server-local tool definitions in discovery order.
+    pub tools: Vec<ToolDefinition>,
+}
+
+impl McpToolDirectory {
+    /// Builds the current cache format.
+    #[must_use]
+    pub fn new(identity: McpConnectionIdentity, tools: Vec<ToolDefinition>) -> Self {
+        Self {
+            version: MCP_TOOL_DIRECTORY_VERSION,
+            identity,
+            tools,
+        }
+    }
+}
 
 /// Bounds applied by the lifecycle layer around transport work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +184,26 @@ pub enum McpLifecycleError {
         /// Unknown configured name.
         server: String,
     },
+    /// A tool directory was produced by another connection identity.
+    #[error("cached MCP tool directory for {server:?} does not match the configured connection")]
+    ToolDirectoryIdentityMismatch {
+        /// Configured server name.
+        server: String,
+    },
+    /// A newer or corrupt tool-directory format cannot be trusted.
+    #[error("cached MCP tool directory for {server:?} has unsupported version {version}")]
+    ToolDirectoryVersion {
+        /// Configured server name.
+        server: String,
+        /// Unrecognized cache format.
+        version: u32,
+    },
+    /// A prepared runtime cannot adopt a connection into a busy or live slot.
+    #[error("MCP server {server:?} is not idle for connection reuse")]
+    ReuseSlotBusy {
+        /// Configured server name.
+        server: String,
+    },
 }
 
 /// Transport-neutral result of a connection attempt.
@@ -164,6 +257,7 @@ struct Operation {
 }
 
 struct ServerSlot {
+    identity: Option<McpConnectionIdentity>,
     state: McpServerState,
     desired_enabled: bool,
     generation: u64,
@@ -188,6 +282,44 @@ struct Inner {
     options: McpLifecycleOptions,
     servers: Mutex<BTreeMap<String, ServerSlot>>,
     events: broadcast::Sender<McpServerEvent>,
+}
+
+/// One live server that can move between two session snapshots without reconnecting.
+///
+/// The handle is process-local and never crosses sessions unless the caller uses the
+/// same [`McpRuntimeManager`] instance. No global stdio pool exists.
+#[derive(Clone)]
+pub struct McpReusableServer {
+    identity: McpConnectionIdentity,
+    connection: Arc<dyn McpConnection>,
+    server: Arc<dyn ConnectedServer>,
+    tools: Vec<ToolDefinition>,
+    prompts: Vec<PromptDefinition>,
+}
+
+impl std::fmt::Debug for McpReusableServer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpReusableServer")
+            .field("identity", &self.identity)
+            .field("tools", &self.tools.len())
+            .field("prompts", &self.prompts.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl McpReusableServer {
+    /// Exact connection identity carried by this live transport.
+    #[must_use]
+    pub const fn identity(&self) -> &McpConnectionIdentity {
+        &self.identity
+    }
+
+    /// Configured server name.
+    #[must_use]
+    pub fn server_name(&self) -> &str {
+        &self.identity.server
+    }
 }
 
 /// Single runtime control point for enabling and disabling MCP servers.
@@ -219,12 +351,19 @@ impl McpServerController {
         configs: BTreeMap<String, McpServerConfig>,
         options: McpLifecycleOptions,
     ) -> Self {
+        let workspace = workspace.as_ref().to_owned();
         let names: Vec<String> = configs.keys().cloned().collect();
-        let connector = Arc::new(ConfiguredConnector {
-            workspace: workspace.as_ref().to_owned(),
-            configs,
-        });
-        Self::with_connector(catalog, names, connector, options)
+        let identities = configs
+            .iter()
+            .map(|(server, config)| {
+                (
+                    server.clone(),
+                    McpConnectionIdentity::from_config(server, &workspace, config),
+                )
+            })
+            .collect();
+        let connector = Arc::new(ConfiguredConnector { workspace, configs });
+        Self::with_connector_and_identities(catalog, names, identities, connector, options)
     }
 
     /// Builds a controller around a fake or alternate connector.
@@ -240,15 +379,37 @@ impl McpServerController {
         S: Into<String>,
         C: McpConnector,
     {
+        Self::with_connector_and_identities(catalog, servers, BTreeMap::new(), connector, options)
+    }
+
+    /// Builds a controller around an alternate connector and exact identities.
+    ///
+    /// This is the test and embedding seam for cached discovery and atomic runtime
+    /// replacement. A server without an identity remains eager-only.
+    #[must_use]
+    pub fn with_connector_and_identities<I, S, C>(
+        catalog: Catalog,
+        servers: I,
+        identities: BTreeMap<String, McpConnectionIdentity>,
+        connector: Arc<C>,
+        options: McpLifecycleOptions,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        C: McpConnector,
+    {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let servers = servers
             .into_iter()
             .map(Into::into)
             .map(|server| {
                 catalog.unavailable(server.clone(), ServerStatus::Disabled);
+                let identity = identities.get(&server).cloned();
                 (
                     server,
                     ServerSlot {
+                        identity,
                         state: McpServerState::Disabled,
                         desired_enabled: false,
                         generation: 0,
@@ -304,6 +465,120 @@ impl McpServerController {
             })
     }
 
+    /// Stable configured names for this session runtime.
+    #[must_use]
+    pub fn server_names(&self) -> Vec<String> {
+        lock(&self.inner.servers).keys().cloned().collect()
+    }
+
+    /// Exact connection identity for one configured server.
+    pub fn connection_identity(
+        &self,
+        server: &str,
+    ) -> Result<Option<McpConnectionIdentity>, McpLifecycleError> {
+        lock(&self.inner.servers)
+            .get(server)
+            .map(|slot| slot.identity.clone())
+            .ok_or_else(|| McpLifecycleError::UnknownServer {
+                server: server.to_owned(),
+            })
+    }
+
+    /// Installs a validated frozen tool directory without starting a transport.
+    ///
+    /// The returned schemas are served by a lazy proxy. Its first real tool call
+    /// joins [`Self::enable`], so concurrent calls produce one connection attempt.
+    pub fn install_cached_directory(
+        &self,
+        directory: McpToolDirectory,
+    ) -> Result<McpServerSnapshot, McpLifecycleError> {
+        let server = directory.identity.server.clone();
+        if directory.version != MCP_TOOL_DIRECTORY_VERSION {
+            return Err(McpLifecycleError::ToolDirectoryVersion {
+                server,
+                version: directory.version,
+            });
+        }
+        let lazy: Arc<dyn ConnectedServer> = Arc::new(LazyConnectedServer {
+            server: server.clone(),
+            tools: directory.tools.clone(),
+            controller: Arc::downgrade(&self.inner),
+        });
+        let snapshot = {
+            let mut servers = lock(&self.inner.servers);
+            let slot =
+                servers
+                    .get_mut(&server)
+                    .ok_or_else(|| McpLifecycleError::UnknownServer {
+                        server: server.clone(),
+                    })?;
+            if slot.identity.as_ref() != Some(&directory.identity) {
+                return Err(McpLifecycleError::ToolDirectoryIdentityMismatch { server });
+            }
+            if slot.operation.is_some() || slot.connection.is_some() || slot.desired_enabled {
+                return Err(McpLifecycleError::ReuseSlotBusy { server });
+            }
+            self.inner.catalog.cached(lazy, directory.tools);
+            slot.snapshot(&server)
+        };
+        self.publish(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    /// Current valid tool directory, whether cached or discovered live.
+    #[must_use]
+    pub fn tool_directory(&self, server: &str) -> Option<McpToolDirectory> {
+        let identity = self.connection_identity(server).ok().flatten()?;
+        if let Some(tools) = self.inner.catalog.cached_tools(server) {
+            return Some(McpToolDirectory::new(identity, tools));
+        }
+        self.inner
+            .catalog
+            .connected_snapshot(server)
+            .map(|snapshot| McpToolDirectory::new(identity, snapshot.tools))
+    }
+
+    /// All valid server tool directories, in configured-name order.
+    #[must_use]
+    pub fn tool_directories(&self) -> BTreeMap<String, McpToolDirectory> {
+        self.server_names()
+            .into_iter()
+            .filter_map(|server| self.tool_directory(&server).map(|cache| (server, cache)))
+            .collect()
+    }
+
+    /// Exports a live connection for exact-identity reuse by a prepared runtime.
+    #[must_use]
+    pub fn reusable_server(&self, server: &str) -> Option<McpReusableServer> {
+        let servers = lock(&self.inner.servers);
+        let slot = servers.get(server)?;
+        if slot.operation.is_some() || !matches!(slot.state, McpServerState::Connected) {
+            return None;
+        }
+        let identity = slot.identity.clone()?;
+        let connection = slot.connection.as_ref().map(Arc::clone)?;
+        let connected = self.inner.catalog.connected_snapshot(server)?;
+        Some(McpReusableServer {
+            identity,
+            connection,
+            server: connected.server,
+            tools: connected.tools,
+            prompts: connected.prompts,
+        })
+    }
+
+    fn same_runtime(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn connected_server(&self, server: &str) -> Option<Arc<dyn ConnectedServer>> {
+        lock(&self.inner.servers)
+            .get(server)
+            .filter(|slot| matches!(slot.state, McpServerState::Connected))
+            .and_then(|slot| slot.connection.as_ref())
+            .map(|connection| connection.server())
+    }
+
     /// Enables one server, joining an existing enable operation when present.
     pub async fn enable(&self, server: &str) -> Result<McpServerSnapshot, McpLifecycleError> {
         self.set_enabled(server, true).await
@@ -312,6 +587,19 @@ impl McpServerController {
     /// Disables one server, cancelling an in-flight connection when present.
     pub async fn disable(&self, server: &str) -> Result<McpServerSnapshot, McpLifecycleError> {
         self.set_enabled(server, false).await
+    }
+
+    /// Stops every transport owned by this session controller.
+    ///
+    /// Cached-only servers are already disabled and spawn nothing. Live local
+    /// servers continue through their existing process-group or Job Object close
+    /// path; this method adds no alternate child-process lifecycle.
+    pub async fn shutdown(&self) {
+        let mut servers = self.server_names();
+        servers.reverse();
+        for server in servers {
+            let _snapshot = self.disable(&server).await;
+        }
     }
 
     /// Drives one server toward the requested target.
@@ -673,6 +961,433 @@ impl McpServerController {
     }
 }
 
+struct LazyConnectedServer {
+    server: String,
+    tools: Vec<ToolDefinition>,
+    controller: std::sync::Weak<Inner>,
+}
+
+impl LazyConnectedServer {
+    fn controller(&self) -> Result<McpServerController, McpError> {
+        self.controller
+            .upgrade()
+            .map(|inner| McpServerController { inner })
+            .ok_or_else(|| McpError::Connect {
+                server: self.server.clone(),
+                source: Box::new(std::io::Error::other(
+                    "owning MCP session runtime is no longer available",
+                )),
+            })
+    }
+
+    async fn live_server(&self) -> Result<Arc<dyn ConnectedServer>, McpError> {
+        let controller = self.controller()?;
+        if let Some(server) = controller.connected_server(&self.server) {
+            return Ok(server);
+        }
+        let snapshot =
+            controller
+                .enable(&self.server)
+                .await
+                .map_err(|error| McpError::Connect {
+                    server: self.server.clone(),
+                    source: Box::new(error),
+                })?;
+        if !matches!(snapshot.state, McpServerState::Connected) {
+            return Err(McpError::Connect {
+                server: self.server.clone(),
+                source: Box::new(std::io::Error::other(format!(
+                    "lazy MCP activation ended in state {:?}",
+                    snapshot.state
+                ))),
+            });
+        }
+        controller
+            .connected_server(&self.server)
+            .ok_or_else(|| McpError::Connect {
+                server: self.server.clone(),
+                source: Box::new(std::io::Error::other(
+                    "lazy MCP activation published no live server handle",
+                )),
+            })
+    }
+}
+
+#[async_trait]
+impl ConnectedServer for LazyConnectedServer {
+    fn server_name(&self) -> &str {
+        &self.server
+    }
+
+    fn supports_resources(&self) -> bool {
+        false
+    }
+
+    fn supports_prompts(&self) -> bool {
+        false
+    }
+
+    async fn list_tools(&self) -> Result<Vec<ToolDefinition>, McpError> {
+        if let Ok(controller) = self.controller()
+            && let Some(server) = controller.connected_server(&self.server)
+        {
+            return server.list_tools().await;
+        }
+        Ok(self.tools.clone())
+    }
+
+    async fn call_tool(
+        &self,
+        tool: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<ToolCallResult, McpError> {
+        self.live_server().await?.call_tool(tool, arguments).await
+    }
+
+    async fn list_resources(&self) -> Result<Vec<ResourceDefinition>, McpError> {
+        self.live_server().await?.list_resources().await
+    }
+
+    async fn list_resource_templates(&self) -> Result<Vec<ResourceTemplate>, McpError> {
+        self.live_server().await?.list_resource_templates().await
+    }
+
+    async fn read_resource(&self, uri: &str) -> Result<ResourceContents, McpError> {
+        self.live_server().await?.read_resource(uri).await
+    }
+
+    async fn list_prompts(&self) -> Result<Vec<PromptDefinition>, McpError> {
+        self.live_server().await?.list_prompts().await
+    }
+}
+
+fn transfer_reused(
+    source: &McpServerController,
+    target: &McpServerController,
+    reusable: &[McpReusableServer],
+) -> Result<(), McpLifecycleError> {
+    let source_address = Arc::as_ptr(&source.inner).cast::<()>() as usize;
+    let target_address = Arc::as_ptr(&target.inner).cast::<()>() as usize;
+    let snapshots = if source_address < target_address {
+        let mut source_servers = lock(&source.inner.servers);
+        let mut target_servers = lock(&target.inner.servers);
+        transfer_reused_locked(target, &mut source_servers, &mut target_servers, reusable)?
+    } else {
+        let mut target_servers = lock(&target.inner.servers);
+        let mut source_servers = lock(&source.inner.servers);
+        transfer_reused_locked(target, &mut source_servers, &mut target_servers, reusable)?
+    };
+    for snapshot in snapshots {
+        target.publish(snapshot);
+    }
+    Ok(())
+}
+
+fn transfer_reused_locked(
+    target: &McpServerController,
+    source_servers: &mut BTreeMap<String, ServerSlot>,
+    target_servers: &mut BTreeMap<String, ServerSlot>,
+    reusable: &[McpReusableServer],
+) -> Result<Vec<McpServerSnapshot>, McpLifecycleError> {
+    for reusable in reusable {
+        let server = reusable.server_name();
+        let source_slot =
+            source_servers
+                .get(server)
+                .ok_or_else(|| McpLifecycleError::UnknownServer {
+                    server: server.to_owned(),
+                })?;
+        let source_matches = source_slot.operation.is_none()
+            && matches!(source_slot.state, McpServerState::Connected)
+            && source_slot.identity.as_ref() == Some(reusable.identity())
+            && source_slot
+                .connection
+                .as_ref()
+                .is_some_and(|connection| Arc::ptr_eq(connection, &reusable.connection));
+        if !source_matches {
+            return Err(McpLifecycleError::ReuseSlotBusy {
+                server: server.to_owned(),
+            });
+        }
+        let target_slot =
+            target_servers
+                .get(server)
+                .ok_or_else(|| McpLifecycleError::UnknownServer {
+                    server: server.to_owned(),
+                })?;
+        if target_slot.identity.as_ref() != Some(reusable.identity()) {
+            return Err(McpLifecycleError::ToolDirectoryIdentityMismatch {
+                server: server.to_owned(),
+            });
+        }
+        if target_slot.operation.is_some()
+            || target_slot.connection.is_some()
+            || target_slot.desired_enabled
+        {
+            return Err(McpLifecycleError::ReuseSlotBusy {
+                server: server.to_owned(),
+            });
+        }
+    }
+
+    let mut snapshots = Vec::with_capacity(reusable.len());
+    for reusable in reusable {
+        let server = reusable.server_name();
+        target.inner.catalog.connected_with_prompts(
+            Arc::clone(&reusable.server),
+            reusable.tools.clone(),
+            reusable.prompts.clone(),
+        );
+        let target_slot = target_servers
+            .get_mut(server)
+            .expect("validated reusable MCP target remains configured");
+        target_slot.connection = Some(Arc::clone(&reusable.connection));
+        target_slot.state = McpServerState::Connected;
+        target_slot.desired_enabled = true;
+        snapshots.push(target_slot.snapshot(server));
+
+        let source_slot = source_servers
+            .get_mut(server)
+            .expect("validated reusable MCP source remains configured");
+        let connection = source_slot
+            .connection
+            .take()
+            .expect("validated reusable MCP source remains connected");
+        debug_assert!(Arc::ptr_eq(&connection, &reusable.connection));
+    }
+    Ok(snapshots)
+}
+
+struct RuntimeManagerState {
+    revision: u64,
+    current: Option<McpServerController>,
+}
+
+/// Session-local owner of one published MCP controller snapshot.
+///
+/// Each ACP session creates its own manager. It deliberately has no global registry
+/// and cannot share stdio processes across sessions.
+#[derive(Clone)]
+pub struct McpRuntimeManager {
+    inner: Arc<AsyncMutex<RuntimeManagerState>>,
+}
+
+impl Default for McpRuntimeManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for McpRuntimeManager {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpRuntimeManager")
+            .finish_non_exhaustive()
+    }
+}
+
+impl McpRuntimeManager {
+    /// Empty session manager.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(AsyncMutex::new(RuntimeManagerState {
+                revision: 0,
+                current: None,
+            })),
+        }
+    }
+
+    /// Session manager whose first published snapshot already exists.
+    #[must_use]
+    pub fn with_current(current: McpServerController) -> Self {
+        Self {
+            inner: Arc::new(AsyncMutex::new(RuntimeManagerState {
+                revision: 1,
+                current: Some(current),
+            })),
+        }
+    }
+
+    /// Current controller snapshot and its publication revision.
+    pub async fn current(&self) -> (u64, Option<McpServerController>) {
+        let state = self.inner.lock().await;
+        (state.revision, state.current.clone())
+    }
+
+    /// Prepares a candidate and identifies exact-identity connections it may reuse.
+    ///
+    /// The candidate remains unpublished. Callers connect every required/eager name
+    /// except [`PreparedMcpRuntime::reused_server_names`], then publish. Any failure
+    /// before publication leaves the current snapshot untouched.
+    pub async fn prepare(&self, candidate: Option<McpServerController>) -> PreparedMcpRuntime {
+        let state = self.inner.lock().await;
+        let mut reused = Vec::new();
+        if let (Some(current), Some(candidate)) = (&state.current, &candidate) {
+            for server in candidate.server_names() {
+                // Reuse is only valid before this candidate starts its own transport.
+                // Required ACP servers are eager and therefore connected by the time
+                // the host reaches publication; optional cached servers remain disabled
+                // and can adopt the exact live connection atomically.
+                if !candidate
+                    .snapshot(&server)
+                    .is_ok_and(|snapshot| matches!(snapshot.state, McpServerState::Disabled))
+                {
+                    continue;
+                }
+                let Ok(Some(identity)) = candidate.connection_identity(&server) else {
+                    continue;
+                };
+                let Some(reusable) = current.reusable_server(&server) else {
+                    continue;
+                };
+                if reusable.identity() == &identity {
+                    reused.push(reusable);
+                }
+            }
+        }
+        PreparedMcpRuntime {
+            base_revision: state.revision,
+            candidate,
+            reused,
+        }
+    }
+
+    /// Atomically publishes one prepared snapshot.
+    ///
+    /// All fallible validation runs before either controller is mutated. A stale or
+    /// invalid candidate is returned in the error so its newly opened transports can
+    /// be shut down while the old snapshot remains authoritative.
+    pub async fn publish(
+        &self,
+        prepared: PreparedMcpRuntime,
+    ) -> Result<McpRuntimePublication, McpRuntimePublishError> {
+        let mut state = self.inner.lock().await;
+        if state.revision != prepared.base_revision {
+            return Err(McpRuntimePublishError {
+                expected_revision: prepared.base_revision,
+                actual_revision: state.revision,
+                reason: "publication revision changed while the runtime was prepared".to_owned(),
+                candidate: prepared.candidate,
+            });
+        }
+        if !prepared.reused.is_empty() && prepared.candidate.is_none() {
+            return Err(McpRuntimePublishError {
+                expected_revision: prepared.base_revision,
+                actual_revision: state.revision,
+                reason: "a cleared runtime cannot adopt reusable servers".to_owned(),
+                candidate: prepared.candidate,
+            });
+        }
+        if let (Some(current), Some(candidate)) = (&state.current, &prepared.candidate) {
+            if current.same_runtime(candidate) {
+                state.revision = state.revision.wrapping_add(1);
+                return Ok(McpRuntimePublication {
+                    revision: state.revision,
+                    current: state.current.clone(),
+                    retired: None,
+                });
+            }
+            if let Err(error) = transfer_reused(current, candidate, &prepared.reused) {
+                return Err(McpRuntimePublishError {
+                    expected_revision: prepared.base_revision,
+                    actual_revision: state.revision,
+                    reason: error.to_string(),
+                    candidate: prepared.candidate,
+                });
+            }
+        }
+
+        let retired = std::mem::replace(&mut state.current, prepared.candidate);
+        state.revision = state.revision.wrapping_add(1);
+        Ok(McpRuntimePublication {
+            revision: state.revision,
+            current: state.current.clone(),
+            retired,
+        })
+    }
+}
+
+/// Candidate controller plus exact live servers that startup should skip.
+pub struct PreparedMcpRuntime {
+    base_revision: u64,
+    candidate: Option<McpServerController>,
+    reused: Vec<McpReusableServer>,
+}
+
+impl PreparedMcpRuntime {
+    /// Revision this preparation observed.
+    #[must_use]
+    pub const fn base_revision(&self) -> u64 {
+        self.base_revision
+    }
+
+    /// Candidate controller used for eager startup before publication.
+    #[must_use]
+    pub fn candidate(&self) -> Option<McpServerController> {
+        self.candidate.clone()
+    }
+
+    /// Names whose exact live connection will be transferred during publication.
+    #[must_use]
+    pub fn reused_server_names(&self) -> BTreeSet<String> {
+        self.reused
+            .iter()
+            .map(|reusable| reusable.server_name().to_owned())
+            .collect()
+    }
+}
+
+/// Successful atomic publication. Retire the old snapshot after consumers switch.
+#[derive(Debug)]
+pub struct McpRuntimePublication {
+    revision: u64,
+    current: Option<McpServerController>,
+    retired: Option<McpServerController>,
+}
+
+impl McpRuntimePublication {
+    /// New publication revision.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Newly authoritative controller.
+    #[must_use]
+    pub fn current(&self) -> Option<McpServerController> {
+        self.current.clone()
+    }
+
+    /// Stops the retired snapshot. Reused connections were relinquished first and
+    /// remain owned by the new snapshot.
+    pub async fn shutdown_retired(&self) {
+        if let Some(retired) = &self.retired {
+            retired.shutdown().await;
+        }
+    }
+}
+
+/// Publication rejection that preserves both the current snapshot and candidate.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "MCP runtime publication failed at revision {actual_revision} (prepared from {expected_revision}): {reason}"
+)]
+pub struct McpRuntimePublishError {
+    expected_revision: u64,
+    actual_revision: u64,
+    reason: String,
+    candidate: Option<McpServerController>,
+}
+
+impl McpRuntimePublishError {
+    /// Candidate that was not published and may be shut down independently.
+    #[must_use]
+    pub fn candidate(&self) -> Option<McpServerController> {
+        self.candidate.clone()
+    }
+}
+
 fn start_operation(slot: &mut ServerSlot, enabled: bool) -> u64 {
     slot.generation = slot.generation.wrapping_add(1);
     let generation = slot.generation;
@@ -761,6 +1476,35 @@ async fn activate(
         tools,
         prompts,
     })
+}
+
+fn digest_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+    digest.update(value);
+}
+
+#[cfg(unix)]
+fn digest_path(digest: &mut Sha256, path: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    digest_field(digest, path.as_os_str().as_bytes());
+}
+
+#[cfg(windows)]
+fn digest_path(digest: &mut Sha256, path: &Path) {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let bytes = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    digest_field(digest, &bytes);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn digest_path(digest: &mut Sha256, path: &Path) {
+    digest_field(digest, path.to_string_lossy().as_bytes());
 }
 
 struct ConfiguredConnector {

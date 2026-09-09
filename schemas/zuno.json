@@ -1,5 +1,66 @@
 {
   "$defs": {
+    "AcpConfig": {
+      "additionalProperties": false,
+      "description": "Configuration owned by the ACP client surface.",
+      "properties": {
+        "runtime": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AcpRuntimeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Process-local session runtime capacity and lifecycle settings."
+        }
+      },
+      "type": "object"
+    },
+    "AcpRuntimeConfig": {
+      "additionalProperties": false,
+      "description": "Optional per-layer ACP runtime overrides.",
+      "properties": {
+        "activation_wait_timeout_ms": {
+          "description": "Milliseconds an activation waits for runtime capacity. Defaults to 30000.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "idle_timeout_ms": {
+          "description": "Idle milliseconds before an eligible ACP runtime may sleep. Defaults to 900000.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_active_runtimes": {
+          "description": "Maximum resource-bearing ACP runtimes active at once. Defaults to 8.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_open_sessions": {
+          "description": "Maximum durable ACP sessions retained by one process. Defaults to 32.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "AgentColor": {
       "anyOf": [
         {
@@ -3144,6 +3205,17 @@
         "string",
         "null"
       ]
+    },
+    "acp": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AcpConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "ACP process-local runtime capacity and lifecycle settings."
     },
     "agents": {
       "anyOf": [

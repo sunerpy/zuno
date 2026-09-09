@@ -1,14 +1,14 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use zuno_engine::admission::{InputAdmission, SessionInputAdmission, SteeringContent, TurnLease};
 use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
@@ -17,8 +17,9 @@ use zuno_engine::status::{SessionControl, SessionRunGuard, SessionRunRegistry, S
 use zuno_llm::event::{FinishReason, RequestContentBlock};
 use zuno_tool::PermissionAsker;
 
+use super::acp_session_registry::AcpSessionRegistry;
 use super::child_turn::{ChildTurnObserver, DetachedTurnObserver};
-use super::mcp_runtime::{McpRuntime, RequiredMcpServers};
+use super::mcp_runtime::{McpRuntime, McpToolDirectoryCache, RequiredMcpServers};
 use super::turn::{
     CatalogModelChoice, ExtensionComposition, PreparedSessionIdentity, SessionChoice,
     SessionCommandError, TurnHost, TurnHostRuntimeDependencies, TurnOptions, TurnPlan,
@@ -31,8 +32,6 @@ const ACP_PROTOCOL_VERSION: u64 = 1;
 const ACP_SCHEMA_VERSION: &str = "1.21.0";
 const ACP_TEXT_RESOURCE_MAX_BYTES: usize = 50 * 1_024;
 const ACP_TEXT_RESOURCE_MAX_LINES: usize = 2_000;
-const MAX_OPEN_ACP_SESSIONS: usize = 32;
-
 pub(super) fn execute(args: &AcpArgs, environment: &StartupEnvironment) -> Result<(), String> {
     if args.check {
         println!(
@@ -41,14 +40,17 @@ pub(super) fn execute(args: &AcpArgs, environment: &StartupEnvironment) -> Resul
         return Ok(());
     }
 
-    let agent = ProductionAcpAgent::new(environment.clone());
+    let agent = ProductionAcpAgent::new(environment.clone())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    let transport = runtime
-        .block_on(zuno_acp::serve_stdio(agent.clone()))
-        .map_err(|error| error.to_string());
+    let transport = runtime.block_on(async {
+        agent.start_idle_reaper();
+        zuno_acp::serve_stdio(agent.clone())
+            .await
+            .map_err(|error| error.to_string())
+    });
     let shutdown = runtime.block_on(agent.shutdown());
     environment.cancel_background_jobs();
     runtime.block_on(environment.wait_background_jobs());
@@ -61,16 +63,31 @@ pub(super) fn execute(args: &AcpArgs, environment: &StartupEnvironment) -> Resul
     }
 }
 
+fn discover_acp_runtime_config(
+    environment: &StartupEnvironment,
+) -> Result<zuno_config::ResolvedAcpRuntimeConfig, String> {
+    let directory = std::env::current_dir().map_err(|error| error.to_string())?;
+    let project = zuno_paths::project::resolve_project(&directory);
+    let worktree = project.vcs.as_ref().map(|_| project.directory.as_path());
+    zuno_config::discovery::discover_with(&zuno_config::discovery::DiscoveryOptions::new(
+        &directory,
+        worktree,
+        environment.resolved().clone(),
+    ))
+    .map(|config| config.resolved_acp_runtime())
+    .map_err(|error| error.report())
+}
+
 #[derive(Clone)]
 struct ProductionAcpAgent {
     state: Arc<AcpState>,
 }
 
-struct AcpState {
+pub(super) struct AcpState {
     environment: StartupEnvironment,
     runs: SessionRunRegistry,
-    sessions: Mutex<HashMap<String, Arc<AcpSession>>>,
-    session_slots: Arc<Semaphore>,
+    registry: AcpSessionRegistry,
+    idle_reaper: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     composition_gate: Mutex<()>,
     elicitation_form: AtomicBool,
     native_subagents: AtomicBool,
@@ -123,7 +140,7 @@ impl zuno_acp::Agent for ProductionAcpAgent {
         let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
             return;
         };
-        let session = self.state.sessions.lock().await.get(session_id).cloned();
+        let session = self.state.registry.get(session_id).await;
         if let Some(session) = session {
             session.cancel_request(request);
         }
@@ -196,19 +213,41 @@ impl ProductionAcpAgent {
         Ok(response)
     }
 
-    fn new(environment: StartupEnvironment) -> Self {
-        Self {
+    fn new(environment: StartupEnvironment) -> Result<Self, String> {
+        let runtime = discover_acp_runtime_config(&environment)?;
+        Ok(Self {
             state: Arc::new(AcpState {
                 environment,
                 runs: SessionRunRegistry::new(),
-                sessions: Mutex::new(HashMap::new()),
-                session_slots: Arc::new(Semaphore::new(MAX_OPEN_ACP_SESSIONS)),
+                registry: AcpSessionRegistry::new(runtime),
+                idle_reaper: std::sync::Mutex::new(None),
                 composition_gate: Mutex::new(()),
                 elicitation_form: AtomicBool::new(false),
                 native_subagents: AtomicBool::new(false),
                 permission_grants: Arc::new(zuno_acp::AcpPermissionGrants::default()),
             }),
+        })
+    }
+
+    fn start_idle_reaper(&self) {
+        let mut slot = self
+            .state
+            .idle_reaper
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_some() {
+            return;
         }
+        let state = Arc::clone(&self.state);
+        *slot = Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(state.registry.reaper_interval());
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                state.registry.sleep_idle().await;
+            }
+        }));
     }
 
     async fn new_session(
@@ -234,20 +273,20 @@ impl ProductionAcpAgent {
             extension_composition: ExtensionComposition::Active,
         };
         let session_slot = self.reserve_session_slot()?;
+        let active_slot = self.state.registry.reserve_active(None).await?;
         let session = self
-            .open_session(options, client.clone(), session_slot, mcp_servers, true)
+            .open_session(
+                options,
+                client.clone(),
+                session_slot,
+                active_slot,
+                mcp_servers,
+                true,
+            )
             .await?;
         let session_id = session.id.clone();
         let response = session.lifecycle_response().await?;
-        let mut sessions = self.state.sessions.lock().await;
-        let inserted = match sessions.entry(session_id.clone()) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(session.clone());
-                true
-            }
-            std::collections::hash_map::Entry::Occupied(_) => false,
-        };
-        drop(sessions);
+        let inserted = self.state.registry.insert_new(session.clone()).await;
         if !inserted {
             session
                 .shutdown()
@@ -258,7 +297,7 @@ impl ProductionAcpAgent {
             ));
         }
         if let Err(error) = session.defer_available_commands(&client).await {
-            self.state.sessions.lock().await.remove(&session_id);
+            self.state.registry.remove_if(&session_id, &session).await;
             let _shutdown = session.shutdown().await;
             return Err(error);
         }
@@ -288,17 +327,11 @@ impl ProductionAcpAgent {
             )));
         }
 
-        let previous = self.state.sessions.lock().await.remove(&session_id);
-        if let Some(previous) = previous {
-            previous
-                .shutdown()
-                .await
-                .map_err(zuno_acp::RpcError::internal)?;
-        };
+        let _open = self.state.registry.open_guard(&session_id).await;
         // Nothing explicit: `TurnPlan::resolve` restores the Agent, model and reasoning
         // level saved on the session, so load and resume reopen it as it last ran.
         let options = TurnOptions {
-            directory: Some(cwd),
+            directory: Some(cwd.clone()),
             model: None,
             agent: None,
             preset: None,
@@ -310,59 +343,71 @@ impl ProductionAcpAgent {
             tool_authority: None,
             extension_composition: ExtensionComposition::Active,
         };
-        let session_slot = self.reserve_session_slot()?;
-        let session = self
-            .open_dormant_session(options, session_slot, mcp_servers)
-            .await?;
-        if let Err(error) = session.ensure_active(&self.state, client.clone()).await {
-            let _shutdown = session.shutdown().await;
-            return Err(error);
-        }
-        self.state
-            .sessions
-            .lock()
-            .await
-            .insert(session_id.clone(), Arc::clone(&session));
+        let (session, created) = match self.state.registry.get(&session_id).await {
+            Some(session) => {
+                session.prepare_for_open(mcp_servers).await?;
+                (session, false)
+            }
+            None => {
+                let session_slot = self.reserve_session_slot()?;
+                let session = self
+                    .open_dormant_session(options, session_slot, mcp_servers)
+                    .await?;
+                if !self.state.registry.insert_new(Arc::clone(&session)).await {
+                    let _shutdown = session.shutdown().await;
+                    return Err(zuno_acp::RpcError::internal(format!(
+                        "session {session_id} was opened concurrently without sharing its gate"
+                    )));
+                }
+                (session, true)
+            }
+        };
         if replay {
+            session.reset_replay().await?;
             if let Err(error) = session
                 .replay(&client, self.state.native_subagents.load(Ordering::Acquire))
                 .await
             {
-                self.state.sessions.lock().await.remove(&session_id);
-                let _shutdown = session.shutdown().await;
+                if created {
+                    self.state.registry.remove_if(&session_id, &session).await;
+                    let _shutdown = session.shutdown().await;
+                }
                 return Err(error);
             }
         } else {
             session.mark_replay_satisfied().await?;
             session
                 .plan_projection
-                .project_durable(&session.id, &client, true)
+                .project_durable(&session.id, &client, true, true)
                 .await?;
         }
         if let Err(error) = session.defer_available_commands(&client).await {
-            self.state.sessions.lock().await.remove(&session_id);
-            let _shutdown = session.shutdown().await;
+            if created {
+                self.state.registry.remove_if(&session_id, &session).await;
+                let _shutdown = session.shutdown().await;
+            }
             return Err(error);
         }
-        match session.lifecycle_response().await {
-            Ok(response) => match session.has_active_goal().await {
-                Ok(true) => {
-                    session.spawn_goal_recovery();
-                    Ok(response)
-                }
-                Ok(false) => Ok(response),
-                Err(error) => {
-                    self.state.sessions.lock().await.remove(&session_id);
-                    let _shutdown = session.shutdown().await;
-                    Err(error)
-                }
-            },
+        let response = match session.lifecycle_response().await {
+            Ok(response) => response,
             Err(error) => {
-                self.state.sessions.lock().await.remove(&session_id);
-                let _shutdown = session.shutdown().await;
-                Err(error)
+                if created {
+                    self.state.registry.remove_if(&session_id, &session).await;
+                    let _shutdown = session.shutdown().await;
+                }
+                return Err(error);
             }
+        };
+        if session.has_active_goal_durable()? {
+            let activated = session
+                .ensure_active(self.state.as_ref(), client.clone())
+                .await?;
+            if activated {
+                session.defer_available_commands(&client).await?;
+            }
+            session.spawn_goal_recovery();
         }
+        Ok(response)
     }
 
     fn list_sessions(&self, params: &Value) -> Result<Value, zuno_acp::RpcError> {
@@ -470,20 +515,14 @@ impl ProductionAcpAgent {
 
     async fn close_session(&self, params: &Value) -> Result<Value, zuno_acp::RpcError> {
         let session_id = required_string(params, "sessionId")?;
-        let session = self.state.sessions.lock().await.get(&session_id).cloned();
+        let session = self.state.registry.get(&session_id).await;
         let shutdown = if let Some(session) = session.as_ref() {
             session.shutdown().await
         } else {
             Ok(())
         };
         if let Some(session) = session.as_ref() {
-            let mut sessions = self.state.sessions.lock().await;
-            if sessions
-                .get(&session_id)
-                .is_some_and(|current| Arc::ptr_eq(current, session))
-            {
-                sessions.remove(&session_id);
-            }
+            self.state.registry.remove_if(&session_id, session).await;
         }
         drop(session);
         self.state.permission_grants.clear_session(&session_id);
@@ -494,7 +533,7 @@ impl ProductionAcpAgent {
     async fn delete_session(&self, params: &Value) -> Result<Value, zuno_acp::RpcError> {
         let session_id = required_string(params, "sessionId")?;
         let cleanup_derived_experiences = required_bool(params, "cleanupDerivedExperiences")?;
-        let session = self.state.sessions.lock().await.get(&session_id).cloned();
+        let session = self.state.registry.get(&session_id).await;
         let outcome = match session.as_ref() {
             Some(session) => session.delete_durable(cleanup_derived_experiences).await?,
             None if cleanup_derived_experiences => {
@@ -526,23 +565,15 @@ impl ProductionAcpAgent {
     }
 
     async fn session(&self, session_id: &str) -> Result<Arc<AcpSession>, zuno_acp::RpcError> {
-        self.state
-            .sessions
-            .lock()
-            .await
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| {
-                zuno_acp::RpcError::invalid_params(format!(
-                    "session {session_id} is not open in this ACP connection"
-                ))
-            })
+        self.state.registry.get(session_id).await.ok_or_else(|| {
+            zuno_acp::RpcError::invalid_params(format!(
+                "session {session_id} is not open in this ACP connection"
+            ))
+        })
     }
 
     fn reserve_session_slot(&self) -> Result<OwnedSemaphorePermit, zuno_acp::RpcError> {
-        Arc::clone(&self.state.session_slots)
-            .try_acquire_owned()
-            .map_err(|_| session_capacity_error())
+        self.state.registry.reserve_open()
     }
 
     async fn open_session(
@@ -550,10 +581,12 @@ impl ProductionAcpAgent {
         options: TurnOptions,
         client: zuno_acp::ClientConnection,
         session_slot: OwnedSemaphorePermit,
+        active_slot: OwnedSemaphorePermit,
         mcp_servers: Vec<zuno_acp::AcpMcpServer>,
         replayed: bool,
     ) -> Result<Arc<AcpSession>, zuno_acp::RpcError> {
         let _composition = self.state.composition_gate.lock().await;
+        let mut dormant_options = options.clone();
         let plan = TurnPlan::resolve(&options, &self.state.environment)
             .await
             .map_err(zuno_acp::RpcError::internal)?;
@@ -579,8 +612,28 @@ impl ProductionAcpAgent {
         .await
         .map_err(zuno_acp::RpcError::internal)?;
         let id = resources.host.session_id().to_owned();
+        dormant_options.session = SessionChoice::Existing(id.clone());
         let control = resources.host.control();
         let durable = SessionDurableHandles::from_resources(&resources, &self.state.runs);
+        let attachments = resources.host.attachment_store();
+        let mcp_cache = resources
+            .mcp
+            .as_ref()
+            .map_or_else(McpToolDirectoryCache::new, McpRuntime::tool_directory_cache);
+        let mcp_manager = resources
+            .mcp
+            .as_ref()
+            .map_or_else(zuno_mcp::McpRuntimeManager::new, |mcp| {
+                zuno_mcp::McpRuntimeManager::with_current(mcp.controller())
+            });
+        let dormant = DormantSession {
+            options: dormant_options,
+            configuration: resources.configuration.clone(),
+            available_commands: available_commands_update(
+                resources.slash_catalog.commands().iter(),
+                resources.slash_catalog.slash_skills(),
+            ),
+        };
         Ok(Arc::new(AcpSession {
             id,
             control,
@@ -597,9 +650,16 @@ impl ProductionAcpAgent {
             background_notification_directory,
             background_notifications,
             _session_slot: session_slot,
-            mcp_servers: Arc::from(mcp_servers),
+            active_slot: std::sync::Mutex::new(Some(active_slot)),
+            lifecycle: std::sync::Mutex::new(AcpSessionLifecycle::Active),
+            last_used_tick: AtomicU64::new(runtime_tick()),
+            goal_recovery_running: AtomicBool::new(false),
+            mcp_servers: Mutex::new(Arc::from(mcp_servers)),
+            mcp_manager,
+            mcp_cache: Mutex::new(mcp_cache),
             plan_projection,
-            dormant: Mutex::new(None),
+            attachments,
+            dormant: Mutex::new(Some(dormant)),
             resources: Mutex::new(Some(resources)),
         }))
     }
@@ -658,6 +718,9 @@ impl ProductionAcpAgent {
         let available_commands =
             available_commands_for_plan(&plan, self.state.environment.resolved())
                 .map_err(zuno_acp::RpcError::internal)?;
+        let replay_pool = durable_pool()?;
+        let attachments = super::turn::open_attachment_store(plan.config(), &replay_pool)
+            .map_err(zuno_acp::RpcError::internal)?;
         Ok(Arc::new(AcpSession {
             id: session_id.clone(),
             control: self.state.runs.control(session_id),
@@ -674,8 +737,15 @@ impl ProductionAcpAgent {
             background_notification_directory,
             background_notifications,
             _session_slot: session_slot,
-            mcp_servers: Arc::from(mcp_servers),
+            active_slot: std::sync::Mutex::new(None),
+            lifecycle: std::sync::Mutex::new(AcpSessionLifecycle::Dormant),
+            last_used_tick: AtomicU64::new(runtime_tick()),
+            goal_recovery_running: AtomicBool::new(false),
+            mcp_servers: Mutex::new(Arc::from(mcp_servers)),
+            mcp_manager: zuno_mcp::McpRuntimeManager::new(),
+            mcp_cache: Mutex::new(McpToolDirectoryCache::new()),
             plan_projection: Arc::new(AcpPlanProjection::default()),
+            attachments,
             dormant: Mutex::new(Some(DormantSession {
                 options,
                 configuration,
@@ -686,9 +756,19 @@ impl ProductionAcpAgent {
     }
 
     async fn shutdown(&self) -> Result<(), String> {
-        let sessions = std::mem::take(&mut *self.state.sessions.lock().await);
+        let reaper = self
+            .state
+            .idle_reaper
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(reaper) = reaper {
+            reaper.abort();
+            let _stopped = reaper.await;
+        }
+        let sessions = self.state.registry.drain().await;
         let mut failures = Vec::new();
-        for session in sessions.into_values() {
+        for session in sessions {
             self.state.permission_grants.clear_session(&session.id);
             if let Err(error) = session.shutdown().await {
                 failures.push(format!("{}: {error}", session.id));
@@ -702,8 +782,24 @@ impl ProductionAcpAgent {
     }
 }
 
-struct AcpSession {
-    id: String,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpSessionLifecycle {
+    Dormant,
+    Activating,
+    Active,
+    Sleeping,
+    Closing,
+    Closed,
+}
+
+fn runtime_tick() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    u64::try_from(elapsed).unwrap_or(u64::MAX)
+}
+
+pub(super) struct AcpSession {
+    pub(super) id: String,
     control: SessionControl,
     runs: SessionRunRegistry,
     /// Durable handles reachable without the turn-exclusive resources mutex.
@@ -740,12 +836,20 @@ struct AcpSession {
     background_notification_directory: PathBuf,
     background_notifications: super::background_notification::BackgroundNotificationRegistry,
     _session_slot: OwnedSemaphorePermit,
-    mcp_servers: Arc<[zuno_acp::AcpMcpServer]>,
+    active_slot: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
+    lifecycle: std::sync::Mutex<AcpSessionLifecycle>,
+    last_used_tick: AtomicU64,
+    goal_recovery_running: AtomicBool,
+    mcp_servers: Mutex<Arc<[zuno_acp::AcpMcpServer]>>,
+    mcp_manager: zuno_mcp::McpRuntimeManager,
+    mcp_cache: Mutex<McpToolDirectoryCache>,
     plan_projection: Arc<AcpPlanProjection>,
+    attachments: Arc<zuno_attachment::AttachmentStore>,
     dormant: Mutex<Option<DormantSession>>,
     resources: Mutex<Option<SessionResources>>,
 }
 
+#[derive(Clone)]
 struct DormantSession {
     options: TurnOptions,
     configuration: SessionConfiguration,
@@ -895,7 +999,7 @@ struct ReconfigurationRollback {
 }
 
 enum SessionMcpOpening {
-    Fresh,
+    Fresh(McpToolDirectoryCache),
     Reuse(Option<zuno_mcp::Catalog>),
 }
 
@@ -922,13 +1026,14 @@ impl AcpPlanProjection {
         session_id: &str,
         client: &zuno_acp::ClientConnection,
         clear_if_absent: bool,
+        force: bool,
     ) -> Result<(), zuno_acp::RpcError> {
         // Serialize the authoritative read with the send and cursor commit. A
         // slower snapshot can therefore never overtake a newer revision.
         let mut state = self.state.lock().await;
         let work = replay_plan_work_state(Arc::new(durable_pool()?), session_id)?;
         let Some(plan) = work.plan.as_ref() else {
-            if state.visible.is_none() && (state.initialized || !clear_if_absent) {
+            if !force && state.visible.is_none() && (state.initialized || !clear_if_absent) {
                 return Ok(());
             }
             client
@@ -942,10 +1047,11 @@ impl AcpPlanProjection {
             id: plan.id.clone(),
             revision: plan.revision,
         };
-        if state
-            .visible
-            .as_ref()
-            .is_some_and(|current| current.id == next.id && current.revision >= next.revision)
+        if !force
+            && state
+                .visible
+                .as_ref()
+                .is_some_and(|current| current.id == next.id && current.revision >= next.revision)
         {
             return Ok(());
         }
@@ -1013,7 +1119,7 @@ impl DetachedTurnObserver for AcpDetachedTurnObserver {
         }
         if let Err(error) = self
             .plan_projection
-            .project_durable(session_id, &self.client, false)
+            .project_durable(session_id, &self.client, false, false)
             .await
         {
             tracing::debug!(
@@ -1120,7 +1226,7 @@ async fn open_session_resources(
         surface,
         build_agent,
         client_mcp,
-        SessionMcpOpening::Fresh,
+        SessionMcpOpening::Fresh(McpToolDirectoryCache::new()),
     )
     .await
 }
@@ -1148,10 +1254,14 @@ async fn open_session_resources_with_mcp(
         .unwrap_or_else(|| plan.directory())
         .to_path_buf();
     let (mut mcp, notes, mcp_catalog) = match mcp_opening {
-        SessionMcpOpening::Fresh => {
+        SessionMcpOpening::Fresh(cache) => {
             let required_mcp = required_mcp_servers(client_mcp, plan.directory());
-            let mut runtime =
-                McpRuntime::from_config_with_required(plan.config(), &workspace, required_mcp)?;
+            let mut runtime = McpRuntime::from_config_with_required_and_cache(
+                plan.config(),
+                &workspace,
+                required_mcp,
+                &cache,
+            )?;
             let notes = match runtime.as_ref() {
                 Some(connected) => match connected.connect_required().await {
                     Ok(notes) => notes,
@@ -1358,7 +1468,7 @@ async fn open_session_resources_with_mcp(
             while receiver.changed().await.is_ok() {
                 let generation = *receiver.borrow_and_update();
                 if let Err(error) = plan_projection
-                    .project_durable(&session_id, &client, false)
+                    .project_durable(&session_id, &client, false, false)
                     .await
                 {
                     tracing::debug!(
@@ -1488,18 +1598,242 @@ fn persist_dormant_configuration(
 }
 
 impl AcpSession {
-    async fn has_active_goal(&self) -> Result<bool, zuno_acp::RpcError> {
-        let resources = self.resources.lock().await;
-        let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
-        Ok(resources
-            .host
-            .goal_store()
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(super) fn touch(&self) {
+        self.last_used_tick.store(runtime_tick(), Ordering::Release);
+    }
+
+    pub(super) fn last_used_tick(&self) -> u64 {
+        self.last_used_tick.load(Ordering::Acquire)
+    }
+
+    pub(super) fn idle_for(&self) -> Duration {
+        Duration::from_millis(runtime_tick().saturating_sub(self.last_used_tick()))
+    }
+
+    fn set_lifecycle(&self, lifecycle: AcpSessionLifecycle) {
+        *self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = lifecycle;
+    }
+
+    fn lifecycle(&self) -> AcpSessionLifecycle {
+        *self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn goal_store_durable(&self) -> Result<zuno_goal::GoalStore, zuno_acp::RpcError> {
+        zuno_goal::GoalStore::from_pool(Arc::new(durable_pool()?), zuno_goal::default_spill_dir())
+            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))
+    }
+
+    fn has_active_goal_durable(&self) -> Result<bool, zuno_acp::RpcError> {
+        Ok(self
+            .goal_store_durable()?
             .goal(&self.id)
             .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
             .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active))
     }
 
+    async fn prepare_for_open(
+        &self,
+        mcp_servers: Vec<zuno_acp::AcpMcpServer>,
+    ) -> Result<(), zuno_acp::RpcError> {
+        self.touch();
+        let requested: Arc<[zuno_acp::AcpMcpServer]> = Arc::from(mcp_servers);
+        let changed = self.mcp_servers.lock().await.as_ref() != requested.as_ref();
+        if self.resources.lock().await.is_some() {
+            let slept = self
+                .try_sleep()
+                .await
+                .map_err(zuno_acp::RpcError::internal)?;
+            if changed && !slept && self.resources.lock().await.is_some() {
+                return Err(zuno_acp::RpcError::session_busy(format!(
+                    "session {} is active and cannot replace its ACP MCP declaration until its \
+                     Goal, jobs, inputs, human requests, and background commands settle",
+                    self.id
+                ))
+                .with_data(json!({
+                    "sessionId": self.id,
+                    "kind": "acp_runtime_not_sleepable",
+                    "retryable": true,
+                })));
+            }
+        }
+        if self.resources.lock().await.is_none() {
+            *self.mcp_servers.lock().await = requested;
+            self.set_lifecycle(AcpSessionLifecycle::Dormant);
+        }
+        Ok(())
+    }
+
+    async fn reset_replay(&self) -> Result<(), zuno_acp::RpcError> {
+        let _replay = self.replay_gate.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(self.closed_error());
+        }
+        self.replayed.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    async fn publish_mcp_runtime(
+        &self,
+        controller: Option<zuno_mcp::McpServerController>,
+        cache: McpToolDirectoryCache,
+    ) -> Result<(), String> {
+        let prepared = self.mcp_manager.prepare(controller).await;
+        let publication = self
+            .mcp_manager
+            .publish(prepared)
+            .await
+            .map_err(|error| error.to_string())?;
+        publication.shutdown_retired().await;
+        *self.mcp_cache.lock().await = cache;
+        Ok(())
+    }
+
+    /// Release only process-local runtime resources while preserving durable session state.
+    pub(super) async fn try_sleep(&self) -> Result<bool, String> {
+        if self.closed.load(Ordering::Acquire)
+            || !matches!(self.lifecycle(), AcpSessionLifecycle::Active)
+            || self.has_work_in_flight()
+        {
+            return Ok(false);
+        }
+        let Ok(_replay) = self.replay_gate.try_lock() else {
+            return Ok(false);
+        };
+        let Ok(_mount) = self.mount_gate.try_lock() else {
+            return Ok(false);
+        };
+        if self.closed.load(Ordering::Acquire) || self.has_work_in_flight() {
+            return Ok(false);
+        }
+        let mut resources = self.resources.lock().await;
+        let Some(active) = resources.as_ref() else {
+            self.set_lifecycle(AcpSessionLifecycle::Dormant);
+            return Ok(false);
+        };
+        if self.durable_sleep_blocked(active)? {
+            return Ok(false);
+        }
+        if let Some(mcp) = active.mcp.as_ref() {
+            *self.mcp_cache.lock().await = mcp.tool_directory_cache();
+        }
+        let clear_mcp = self.mcp_manager.prepare(None).await;
+        let _publication = self
+            .mcp_manager
+            .publish(clear_mcp)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.set_lifecycle(AcpSessionLifecycle::Sleeping);
+        let notification_task = self
+            .background_notifications
+            .unregister(&self.background_notification_directory, &self.id);
+        self.durable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let resources_to_stop = resources
+            .take()
+            .expect("sleep checked that active resources exist");
+        drop(resources);
+        let notification_error = match notification_task {
+            Some(task) => task
+                .await
+                .err()
+                .map(|error| format!("background notification watcher failed: {error}")),
+            None => None,
+        };
+        let resources_result = shutdown_session_resources(resources_to_stop).await;
+        self.active_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.set_lifecycle(AcpSessionLifecycle::Dormant);
+        match (resources_result, notification_error) {
+            (Ok(()), None) => Ok(true),
+            (Err(error), None) => Err(error),
+            (Ok(()), Some(notification)) => Err(notification),
+            (Err(error), Some(notification)) => Err(format!("{error}; {notification}")),
+        }
+    }
+
+    fn durable_sleep_blocked(&self, resources: &SessionResources) -> Result<bool, String> {
+        if !resources.host.session_identity().is_materialized() {
+            return Ok(true);
+        }
+        if resources.host.has_running_background_tasks() {
+            return Ok(true);
+        }
+        if resources
+            .host
+            .background_executions()
+            .list_for_session(&self.id)
+            .iter()
+            .any(|execution| {
+                matches!(
+                    execution.status,
+                    zuno_pty::BackgroundExecutionStatus::Running
+                        | zuno_pty::BackgroundExecutionStatus::Uncertain
+                )
+            })
+        {
+            return Ok(true);
+        }
+        let pool = Arc::new(durable_pool().map_err(|error| error.to_string())?);
+        let goals =
+            zuno_goal::GoalStore::from_pool(Arc::clone(&pool), zuno_goal::default_spill_dir())
+                .map_err(|error| error.to_string())?;
+        if goals
+            .goal(&self.id)
+            .map_err(|error| error.to_string())?
+            .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active)
+            || !goals
+                .human_requests()
+                .pending(Some(&self.id))
+                .map_err(|error| error.to_string())?
+                .is_empty()
+            || !zuno_db::inbox::SessionInbox::new(Arc::clone(&pool))
+                .pending(&self.id)
+                .map_err(|error| error.to_string())?
+                .is_empty()
+            || !zuno_db::completion_delivery::CompletionDeliveryStore::new(Arc::clone(&pool))
+                .unclaimed_for_session(&self.id)
+                .map_err(|error| error.to_string())?
+                .is_empty()
+            || zuno_db::job::AgentJobStore::new(pool)
+                .list_for_parent(&self.id)
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|job| {
+                    matches!(
+                        job.status,
+                        zuno_db::job::JobStatus::Queued
+                            | zuno_db::job::JobStatus::Running
+                            | zuno_db::job::JobStatus::Uncertain
+                    )
+                })
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn spawn_goal_recovery(self: &Arc<Self>) {
+        if self
+            .goal_recovery_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         let session = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(error) = session.recover_active_goal().await {
@@ -1509,6 +1843,9 @@ impl AcpSession {
                     "ACP active Goal recovery stopped"
                 );
             }
+            session
+                .goal_recovery_running
+                .store(false, Ordering::Release);
         });
     }
 
@@ -1654,8 +1991,9 @@ impl AcpSession {
                         .map(McpRuntime::catalog),
                 )
             } else {
-                SessionMcpOpening::Fresh
+                SessionMcpOpening::Fresh(self.mcp_cache.lock().await.clone())
             };
+            let mcp_servers = self.mcp_servers.lock().await.clone();
             let mut resources = open_session_resources_with_mcp(
                 plan,
                 &state.environment,
@@ -1666,7 +2004,7 @@ impl AcpSession {
                     Arc::clone(&self.plan_projection),
                 ),
                 Some(&rollback_context.build_agent),
-                &self.mcp_servers,
+                mcp_servers.as_ref(),
                 opening,
             )
             .await?;
@@ -1692,6 +2030,22 @@ impl AcpSession {
         .await;
         match rollback {
             Ok(resources) => {
+                let controller = resources.mcp.as_ref().map(McpRuntime::controller);
+                let cache = resources
+                    .mcp
+                    .as_ref()
+                    .map_or_else(McpToolDirectoryCache::new, McpRuntime::tool_directory_cache);
+                if let Err(error) = self.publish_mcp_runtime(controller, cache).await {
+                    let cleanup = shutdown_session_resources(resources).await;
+                    let cleanup = cleanup
+                        .err()
+                        .map(|cleanup| format!("; rollback cleanup failed: {cleanup}"))
+                        .unwrap_or_default();
+                    return zuno_acp::RpcError::internal(format!(
+                        "{}; MCP rollback publication failed: {error}{cleanup}",
+                        rollback_context.cause
+                    ));
+                }
                 self.install_durable_handles(&resources);
                 *slot = Some(resources);
                 zuno_acp::RpcError::internal(rollback_context.cause)
@@ -1758,14 +2112,20 @@ impl AcpSession {
             .map_err(session_control_rpc_error)?;
 
         let _mount = self.mount_gate.lock().await;
-        if let Some(dormant) = self.dormant.lock().await.as_mut() {
+        let dormant_configuration = {
+            let mut dormant = self.dormant.lock().await;
+            let dormant = dormant.as_mut().ok_or_else(|| self.closed_error())?;
             dormant.configuration.build_agent = agent.to_owned();
-            return Ok(dormant.configuration.clone());
-        }
+            dormant.configuration.clone()
+        };
         let mut resources = self.resources.lock().await;
-        let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
-        resources.configuration.build_agent = agent.to_owned();
-        Ok(resources.configuration.clone())
+        match resources.as_mut() {
+            Some(resources) => {
+                resources.configuration.build_agent = agent.to_owned();
+                Ok(resources.configuration.clone())
+            }
+            None => Ok(dormant_configuration),
+        }
     }
 
     async fn defer_available_commands(
@@ -1832,8 +2192,10 @@ impl AcpSession {
         if self.closed.load(Ordering::Acquire) {
             return Err(self.closed_error());
         }
-        let mut dormant = self.dormant.lock().await;
-        if let Some(current) = dormant.as_mut() {
+        let is_dormant = self.resources.lock().await.is_none();
+        if is_dormant {
+            let mut dormant = self.dormant.lock().await;
+            let current = dormant.as_mut().ok_or_else(|| self.closed_error())?;
             let configuration = self.reconfigure_dormant(current, change, state).await?;
             drop(dormant);
             drop(mount);
@@ -1847,7 +2209,6 @@ impl AcpSession {
             );
             return Ok(configuration);
         }
-        drop(dormant);
 
         let lock_started = Instant::now();
         let _composition = state.composition_gate.lock().await;
@@ -1883,6 +2244,9 @@ impl AcpSession {
         };
         let resolve_ms = resolve_started.elapsed().as_millis();
         let reuse_mcp = current.mcp_configuration_digest == mcp_configuration_digest(plan.config());
+        if let Some(mcp) = current.mcp.as_ref() {
+            *self.mcp_cache.lock().await = mcp.tool_directory_cache();
+        }
         let retained_mcp_digest = reuse_mcp.then(|| current.mcp_configuration_digest.clone());
         let mut retained_mcp = reuse_mcp.then(|| current.mcp.take()).flatten();
         let shutdown_started = Instant::now();
@@ -1899,8 +2263,9 @@ impl AcpSession {
         let opening = if reuse_mcp {
             SessionMcpOpening::Reuse(retained_mcp.as_ref().map(McpRuntime::catalog))
         } else {
-            SessionMcpOpening::Fresh
+            SessionMcpOpening::Fresh(self.mcp_cache.lock().await.clone())
         };
+        let mcp_servers = self.mcp_servers.lock().await.clone();
         let open_started = Instant::now();
         let mut candidate = match open_session_resources_with_mcp(
             plan,
@@ -1908,7 +2273,7 @@ impl AcpSession {
             state.runs.clone(),
             AcpSurfaceContext::from_state(state, client.clone(), Arc::clone(&self.plan_projection)),
             Some(&build_agent),
-            &self.mcp_servers,
+            mcp_servers.as_ref(),
             opening,
         )
         .await
@@ -2000,9 +2365,49 @@ impl AcpSession {
         if reuse_mcp {
             candidate.mcp = retained_mcp.take();
         }
+        let candidate_controller = candidate.mcp.as_ref().map(McpRuntime::controller);
+        let candidate_cache = candidate
+            .mcp
+            .as_ref()
+            .map_or_else(McpToolDirectoryCache::new, McpRuntime::tool_directory_cache);
+        if let Err(error) = self
+            .publish_mcp_runtime(candidate_controller, candidate_cache)
+            .await
+        {
+            let cleanup = shutdown_session_resources(candidate).await;
+            let cause = match cleanup {
+                Ok(()) => format!("ACP MCP runtime publication failed: {error}"),
+                Err(cleanup) => format!(
+                    "ACP MCP runtime publication failed: {error}; candidate cleanup failed: {cleanup}"
+                ),
+            };
+            return Err(self
+                .restore_after_reconfiguration_failure(
+                    &mut slot,
+                    state,
+                    ReconfigurationRollback {
+                        options: rollback_options,
+                        client,
+                        build_agent,
+                        retained_mcp,
+                        retained_mcp_digest,
+                        cause,
+                    },
+                )
+                .await);
+        }
         let configuration = candidate.configuration.clone();
+        let dormant = DormantSession {
+            options: prepared.options.clone(),
+            configuration: configuration.clone(),
+            available_commands: available_commands_update(
+                candidate.slash_catalog.commands().iter(),
+                candidate.slash_catalog.slash_skills(),
+            ),
+        };
         self.install_durable_handles(&candidate);
         *slot = Some(candidate);
+        *self.dormant.lock().await = Some(dormant);
         drop(slot);
         drop(_composition);
         drop(mount);
@@ -2603,53 +3008,56 @@ impl AcpSession {
         state: Arc<AcpState>,
         client: zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
+        if matches!(command, SessionCommand::Plan | SessionCommand::StartPlan) {
+            if self.control.status() == SessionStatus::Busy {
+                return Err(command_requires_idle_session(&self.id));
+            }
+            if self.resources.lock().await.is_some() {
+                self.materialize_for_control().await?;
+            }
+            let current = self.current_configuration().await?;
+            let work_identity = current.work_identity()?;
+            let was_plan = current.mode == "plan";
+            let configuration = if was_plan {
+                current
+            } else {
+                self.reconfigure_from_prompt(
+                    SessionReconfiguration::Mode("plan".to_owned()),
+                    state.as_ref(),
+                    client.clone(),
+                )
+                .await?
+            };
+            let service =
+                zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?));
+            if let Err(error) = service.enter_plan(zuno_session_control::EnterPlanRequest {
+                session_id: &self.id,
+                work_identity,
+                at_ms: zuno_db::message::now_millis(),
+            }) {
+                if configuration.mode == "plan" && !was_plan {
+                    let _rollback = self
+                        .reconfigure_from_prompt(
+                            SessionReconfiguration::Mode("build".to_owned()),
+                            state.as_ref(),
+                            client.clone(),
+                        )
+                        .await;
+                }
+                return Err(zuno_acp::RpcError::internal(error.to_string()));
+            }
+            publish_configuration_updates(&client, &self.id, &configuration).await?;
+            return Ok(json!({
+                "stopReason": "end_turn",
+                "mode": "plan",
+            }));
+        }
         let activated = self.ensure_active(state.as_ref(), client.clone()).await?;
         if activated {
             self.defer_available_commands(&client).await?;
         }
         self.materialize_for_control().await?;
-        let current = self.current_configuration().await?;
         match command {
-            SessionCommand::Plan | SessionCommand::StartPlan => {
-                if self.control.status() == SessionStatus::Busy {
-                    return Err(command_requires_idle_session(&self.id));
-                }
-                let work_identity = current.work_identity()?;
-                let was_plan = current.mode == "plan";
-                let configuration = if was_plan {
-                    current
-                } else {
-                    self.reconfigure_from_prompt(
-                        SessionReconfiguration::Mode("plan".to_owned()),
-                        state.as_ref(),
-                        client.clone(),
-                    )
-                    .await?
-                };
-                let service =
-                    zuno_session_control::SessionControlService::new(Arc::new(durable_pool()?));
-                if let Err(error) = service.enter_plan(zuno_session_control::EnterPlanRequest {
-                    session_id: &self.id,
-                    work_identity,
-                    at_ms: zuno_db::message::now_millis(),
-                }) {
-                    if configuration.mode == "plan" && !was_plan {
-                        let _rollback = self
-                            .reconfigure_from_prompt(
-                                SessionReconfiguration::Mode("build".to_owned()),
-                                state.as_ref(),
-                                client.clone(),
-                            )
-                            .await;
-                    }
-                    return Err(zuno_acp::RpcError::internal(error.to_string()));
-                }
-                publish_configuration_updates(&client, &self.id, &configuration).await?;
-                Ok(json!({
-                    "stopReason": "end_turn",
-                    "mode": "plan",
-                }))
-            }
             SessionCommand::StartWork => {
                 let risk_reason = parse_start_work_risk(arguments)?;
                 let owner = self.claim_turn(request);
@@ -2714,7 +3122,9 @@ impl AcpSession {
             SessionCommand::Compact
             | SessionCommand::Goal
             | SessionCommand::Learn
-            | SessionCommand::Reflect => Err(zuno_acp::RpcError::internal(format!(
+            | SessionCommand::Reflect
+            | SessionCommand::Plan
+            | SessionCommand::StartPlan => Err(zuno_acp::RpcError::internal(format!(
                 "/{} is not a mode control",
                 command.name()
             ))),
@@ -2727,12 +3137,6 @@ impl AcpSession {
         state: Arc<AcpState>,
         client: zuno_acp::ClientConnection,
     ) -> Result<(), zuno_acp::RpcError> {
-        let activated = self.ensure_active(state.as_ref(), client.clone()).await?;
-        if activated {
-            self.defer_available_commands(&client).await?;
-        }
-        self.materialize_for_control().await?;
-        let current = self.current_configuration().await?;
         match mode_id.as_str() {
             "plan" => {
                 if self.control.status() == SessionStatus::Busy {
@@ -2741,6 +3145,10 @@ impl AcpSession {
                         self.id
                     )));
                 }
+                if self.resources.lock().await.is_some() {
+                    self.materialize_for_control().await?;
+                }
+                let current = self.current_configuration().await?;
                 let work_identity = current.work_identity()?;
                 let configuration = if current.mode == "plan" {
                     current
@@ -2762,6 +3170,11 @@ impl AcpSession {
                 publish_configuration_updates(&client, &self.id, &configuration).await
             }
             "build" => {
+                let activated = self.ensure_active(state.as_ref(), client.clone()).await?;
+                if activated {
+                    self.defer_available_commands(&client).await?;
+                }
+                self.materialize_for_control().await?;
                 let session_busy = self.control.status() == SessionStatus::Busy
                     || self
                         .turn_owner
@@ -2893,14 +3306,15 @@ impl AcpSession {
         state: &AcpState,
         client: zuno_acp::ClientConnection,
     ) -> Result<bool, zuno_acp::RpcError> {
+        self.touch();
         if self.closed.load(Ordering::Acquire) {
             return Err(self.closed_error());
         }
-        // Durable handles are installed after the resources they come from, so
-        // observing them means activation finished. Checking before the mount gate
-        // keeps a steering prompt off both that gate and the resources mutex a live
-        // turn holds for the whole turn.
-        if self.durable_installed() {
+        // A live turn holds `resources` for the whole provider/tool cycle. Steering
+        // prompts must not wait on that lock merely to discover that activation already
+        // finished. Durable handles are published last during activation and cleared
+        // first during sleep, so they are the lock-free active witness.
+        if matches!(self.lifecycle(), AcpSessionLifecycle::Active) && self.durable_installed() {
             return Ok(false);
         }
         let _mount = self.mount_gate.lock().await;
@@ -2910,33 +3324,41 @@ impl AcpSession {
         if self.resources.lock().await.is_some() {
             return Ok(false);
         }
+        let active_slot = state.registry.reserve_active(Some(self.id.clone())).await?;
+        self.set_lifecycle(AcpSessionLifecycle::Activating);
         let dormant = self
             .dormant
             .lock()
             .await
-            .take()
+            .as_ref()
+            .cloned()
             .ok_or_else(|| self.closed_error())?;
+        let mcp_servers = self.mcp_servers.lock().await.clone();
+        let mcp_cache = self.mcp_cache.lock().await.clone();
         let _composition = state.composition_gate.lock().await;
         let plan = match TurnPlan::resolve(&dormant.options, &state.environment).await {
             Ok(plan) => plan,
             Err(error) => {
-                *self.dormant.lock().await = Some(dormant);
+                self.set_lifecycle(AcpSessionLifecycle::Dormant);
+                drop(active_slot);
                 return Err(zuno_acp::RpcError::internal(error));
             }
         };
-        let resources = match open_session_resources(
+        let resources = match open_session_resources_with_mcp(
             plan,
             &state.environment,
             state.runs.clone(),
             AcpSurfaceContext::from_state(state, client, Arc::clone(&self.plan_projection)),
             Some(&dormant.configuration.build_agent),
-            &self.mcp_servers,
+            mcp_servers.as_ref(),
+            SessionMcpOpening::Fresh(mcp_cache),
         )
         .await
         {
             Ok(resources) => resources,
             Err(error) => {
-                *self.dormant.lock().await = Some(dormant);
+                self.set_lifecycle(AcpSessionLifecycle::Dormant);
+                drop(active_slot);
                 return Err(zuno_acp::RpcError::internal(format!(
                     "could not activate ACP session {}: {error}",
                     self.id
@@ -2946,7 +3368,8 @@ impl AcpSession {
         if resources.host.session_id() != self.id {
             let actual = resources.host.session_id().to_owned();
             let cleanup = shutdown_session_resources(resources).await;
-            *self.dormant.lock().await = Some(dormant);
+            self.set_lifecycle(AcpSessionLifecycle::Dormant);
+            drop(active_slot);
             let cleanup = cleanup
                 .err()
                 .map(|error| format!("; candidate cleanup failed: {error}"))
@@ -2956,8 +3379,32 @@ impl AcpSession {
                 self.id
             )));
         }
+        let controller = resources.mcp.as_ref().map(McpRuntime::controller);
+        let cache = resources
+            .mcp
+            .as_ref()
+            .map_or_else(McpToolDirectoryCache::new, McpRuntime::tool_directory_cache);
+        if let Err(error) = self.publish_mcp_runtime(controller, cache).await {
+            let cleanup = shutdown_session_resources(resources).await;
+            self.set_lifecycle(AcpSessionLifecycle::Dormant);
+            drop(active_slot);
+            let cleanup = cleanup
+                .err()
+                .map(|cleanup| format!("; candidate cleanup failed: {cleanup}"))
+                .unwrap_or_default();
+            return Err(zuno_acp::RpcError::internal(format!(
+                "could not publish ACP MCP runtime for session {}: {error}{cleanup}",
+                self.id
+            )));
+        }
         self.install_durable_handles(&resources);
         *self.resources.lock().await = Some(resources);
+        *self
+            .active_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(active_slot);
+        self.set_lifecycle(AcpSessionLifecycle::Active);
+        self.touch();
         Ok(true)
     }
 
@@ -2966,7 +3413,7 @@ impl AcpSession {
         client: &zuno_acp::ClientConnection,
     ) -> Result<(), zuno_acp::RpcError> {
         self.plan_projection
-            .project_durable(&self.id, client, false)
+            .project_durable(&self.id, client, false, false)
             .await?;
         let learning = {
             let resources = self.resources.lock().await;
@@ -3218,17 +3665,7 @@ impl AcpSession {
             zuno_acp::REPLAY_TRANSCRIPT_BYTE_CAP,
         )
         .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
-        let attachments = self
-            .resources
-            .lock()
-            .await
-            .as_ref()
-            .map(|resources| resources.host.attachment_store())
-            .ok_or_else(|| {
-                zuno_acp::RpcError::internal(
-                    "active ACP session has no attachment service for durable replay",
-                )
-            })?;
+        let attachments = Arc::clone(&self.attachments);
         hydrate_replay_attachments(&mut history.messages, attachments.as_ref())
             .map_err(zuno_acp::RpcError::internal)?;
         let work_state = replay_work_state(Arc::clone(&pool), &self.id)?;
@@ -3253,7 +3690,7 @@ impl AcpSession {
             return Err(self.closed_error());
         }
         self.plan_projection
-            .project_durable(&self.id, client, true)
+            .project_durable(&self.id, client, true, true)
             .await?;
         client
             .session_update(&self.id, zuno_acp::durable_learning_update(&work_state))
@@ -3291,6 +3728,7 @@ impl AcpSession {
     }
 
     async fn shutdown(&self) -> Result<(), String> {
+        self.set_lifecycle(AcpSessionLifecycle::Closing);
         self.closed.store(true, Ordering::Release);
         if self.prompts_in_flight.load(Ordering::Acquire) > 0 {
             let _disposition = self.control.abort(HardInterruptRequest::new(
@@ -3335,6 +3773,11 @@ impl AcpSession {
         } else {
             Ok(())
         };
+        self.active_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.set_lifecycle(AcpSessionLifecycle::Closed);
         let _cleared = self.control.clear_pending_abort();
         match (resources_result, notification_error) {
             (Ok(()), None) => Ok(()),
@@ -4805,13 +5248,6 @@ fn map_session_lookup(session_id: &str, error: zuno_error::DbError) -> zuno_acp:
         }
         error => zuno_acp::RpcError::internal(error.to_string()),
     }
-}
-
-fn session_capacity_error() -> zuno_acp::RpcError {
-    zuno_acp::RpcError::invalid_params(format!(
-        "this ACP connection already has {MAX_OPEN_ACP_SESSIONS} open sessions; close an inactive \
-         session before opening another"
-    ))
 }
 
 fn session_info(session: zuno_db::session::Session) -> Value {

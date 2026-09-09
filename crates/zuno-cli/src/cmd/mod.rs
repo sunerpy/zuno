@@ -1,4 +1,5 @@
 mod acp;
+mod acp_session_registry;
 mod acp_subagent;
 mod agent;
 pub(crate) mod background_notification;

@@ -395,6 +395,39 @@ Foreground native `task` delegation is not detached: it inherits the parent
 turn interrupt, aborts the live child turn when fired, and waits for child drain
 and runtime shutdown before the tool call settles.
 
+## ACP runtime capacity
+
+`acp.runtime` controls process-local ACP session retention, activation capacity,
+and idle lifecycle timing:
+
+```json
+{
+  "acp": {
+    "runtime": {
+      "max_open_sessions": 32,
+      "max_active_runtimes": 8,
+      "idle_timeout_ms": 900000,
+      "activation_wait_timeout_ms": 30000
+    }
+  }
+}
+```
+
+| Field | Default | Meaning |
+| --- | ---: | --- |
+| `max_open_sessions` | `32` | Maximum durable ACP session entries retained by one `zuno acp` process |
+| `max_active_runtimes` | `8` | Maximum sessions that may simultaneously own a live TurnHost, MCP runtime, plugin host, and watcher |
+| `idle_timeout_ms` | `900000` | Idle time before an otherwise eligible active runtime may sleep |
+| `activation_wait_timeout_ms` | `30000` | Maximum time an activation waits for active-runtime capacity |
+
+Every value must be greater than zero, and `max_active_runtimes` must be less
+than or equal to `max_open_sessions`. Objects follow the normal recursive
+layering rules, so a higher layer can override one field without restating the
+other three; the fully merged values are validated together.
+
+This is host-owned ACP policy. It is resolved by the CLI composition root and
+is never copied into provider options or an upstream request.
+
 ## Goal fallback budget
 
 Goals with no explicit `token_budget` are unbounded by default. A deployment can

@@ -218,6 +218,15 @@ const CHANNELS: &[ChannelGate] = &[
         "self.sender.send_modify(|generation| {",
     ),
     gate(
+        "plugin-host-completion",
+        "zuno-extension/src/host.rs",
+        "let (outcome, _receiver) = watch::channel(None);",
+        "latest value",
+        Policy::LatestValue,
+        "zuno-extension/src/host.rs",
+        "self.outcome.send_replace(Some(outcome));",
+    ),
+    gate(
         "background-notification-target",
         "zuno-cli/src/cmd/background_notification.rs",
         "let (target_sender, target_receiver) = watch::channel(target);",
@@ -459,7 +468,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
         actual, expected,
         "channel registry differs from production source"
     );
-    assert_eq!(CHANNELS.len(), 41);
+    assert_eq!(CHANNELS.len(), 42);
 
     let crates = crates_root();
     for entry in CHANNELS {
@@ -538,6 +547,10 @@ channel_gate!(
 channel_gate!(
     turn_work_state_changes_keep_latest_value,
     "turn-work-state-changes"
+);
+channel_gate!(
+    plugin_host_completion_keeps_latest_value,
+    "plugin-host-completion"
 );
 #[tokio::test]
 async fn engine_turn_events_apply_backpressure() {

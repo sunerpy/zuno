@@ -589,6 +589,53 @@ fn discovery_deep_merges_provider_retry_fields() {
     assert_eq!(retry.resolved_recovery_window_ms().get(), 660_000);
 }
 
+#[test]
+fn discovery_deep_merges_acp_runtime_fields_before_resolving_defaults() {
+    let first = Config::from_json_str(
+        std::path::Path::new("first.json"),
+        r#"{"acp":{"runtime":{"max_open_sessions":48,"idle_timeout_ms":600000}}}"#,
+    )
+    .expect("first");
+    let second = Config::from_json_str(
+        std::path::Path::new("second.json"),
+        r#"{"acp":{"runtime":{"max_active_runtimes":12,"activation_wait_timeout_ms":45000}}}"#,
+    )
+    .expect("second");
+
+    let resolved = merge_layers([first, second])
+        .expect("merge")
+        .resolved_acp_runtime();
+    assert_eq!(resolved.max_open_sessions, 48);
+    assert_eq!(resolved.max_active_runtimes, 12);
+    assert_eq!(resolved.idle_timeout_ms, 600_000);
+    assert_eq!(resolved.activation_wait_timeout_ms, 45_000);
+}
+
+#[test]
+fn discovery_rejects_an_acp_capacity_conflict_created_by_layering() {
+    let first = Config::from_json_str(
+        std::path::Path::new("first.json"),
+        r#"{"acp":{"runtime":{"max_active_runtimes":32}}}"#,
+    )
+    .expect("the lower layer is valid against the default open capacity");
+    let second = Config::from_json_str(
+        std::path::Path::new("second.json"),
+        r#"{"acp":{"runtime":{"max_open_sessions":16}}}"#,
+    )
+    .expect("the upper layer is valid against the default active capacity");
+
+    let error = merge_layers([first, second])
+        .expect_err("the merged active capacity cannot exceed the merged open capacity");
+    let ConfigError::Invalid { issues, .. } = error else {
+        panic!("expected an invalid merged configuration");
+    };
+    assert_eq!(issues.len(), 1);
+    assert_eq!(
+        issues[0].key_path,
+        ["acp", "runtime", "max_active_runtimes"]
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         failure_persistence: None,

@@ -69,6 +69,19 @@ impl Config {
 
 fn validate_semantics(path: &Path, config: Config) -> Result<Config, ConfigError> {
     let mut issues = Vec::new();
+    if config.acp.is_some() {
+        let runtime = config.resolved_acp_runtime();
+        if runtime.max_active_runtimes > runtime.max_open_sessions {
+            issues.push(ConfigIssue::new(
+                ["acp", "runtime", "max_active_runtimes"],
+                format!(
+                    "ACP max active runtimes ({}) must be less than or equal to max open sessions ({})",
+                    runtime.max_active_runtimes, runtime.max_open_sessions
+                ),
+            ));
+        }
+    }
+
     if let Some(sandbox) = &config.sandbox {
         let mode = sandbox.resolved_mode();
         let has_writable_roots = sandbox

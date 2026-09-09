@@ -206,6 +206,12 @@ pub trait ConnectedServer: Send + Sync + 'static {
 pub enum ServerStatus {
     /// The handshake completed and the server is answering.
     Connected,
+    /// A validated tool directory is available, but no transport is running yet.
+    ///
+    /// Cached entries may advertise their frozen tool schemas. Their proxy connects
+    /// the owning session's server on the first real invocation. They are never
+    /// reported by [`Catalog::connected_servers`].
+    Cached,
     /// Configuration disabled the server, so its absence is not a fault.
     Disabled,
     /// The connection failed, or a live connection closed.
@@ -229,11 +235,18 @@ impl ServerStatus {
         matches!(self, Self::Connected)
     }
 
+    /// Whether this entry may contribute provider-visible tool definitions.
+    #[must_use]
+    pub const fn is_tool_available(&self) -> bool {
+        matches!(self, Self::Connected | Self::Cached)
+    }
+
     /// Short machine-readable label used in diagnostics and logs.
     #[must_use]
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Connected => "connected",
+            Self::Cached => "cached",
             Self::Disabled => "disabled",
             Self::Failed { .. } => "failed",
             Self::NeedsAuth => "needs_auth",
@@ -265,6 +278,10 @@ impl Diagnostic {
             ServerStatus::Connected => {
                 format!("MCP server {} is connected", self.server)
             }
+            ServerStatus::Cached => format!(
+                "MCP server {} has a cached tool directory and will connect on first use",
+                self.server
+            ),
             ServerStatus::Disabled => {
                 format!(
                     "MCP server {} is disabled and contributes no tools",
@@ -306,6 +323,12 @@ struct Entry {
     handle: Option<Arc<dyn ConnectedServer>>,
     tools: Vec<ToolDefinition>,
     prompts: Vec<PromptDefinition>,
+}
+
+pub(crate) struct ConnectedCatalogSnapshot {
+    pub(crate) server: Arc<dyn ConnectedServer>,
+    pub(crate) tools: Vec<ToolDefinition>,
+    pub(crate) prompts: Vec<PromptDefinition>,
 }
 
 struct Inner {
@@ -417,6 +440,26 @@ impl Catalog {
                 handle: Some(server),
                 tools,
                 prompts,
+            },
+        );
+        self.settle(&name);
+        self.publish(name);
+    }
+
+    /// Records a validated frozen tool directory without claiming a live transport.
+    ///
+    /// The supplied handle is a session-local lazy proxy. It may connect only the
+    /// named server owned by the same lifecycle controller; the catalog itself does
+    /// not own or pool transports.
+    pub fn cached(&self, server: Arc<dyn ConnectedServer>, tools: Vec<ToolDefinition>) {
+        let name = server.server_name().to_owned();
+        lock(&self.inner.entries).insert(
+            name.clone(),
+            Entry {
+                status: ServerStatus::Cached,
+                handle: Some(server),
+                tools,
+                prompts: Vec::new(),
             },
         );
         self.settle(&name);
@@ -555,7 +598,7 @@ impl Catalog {
         let mut eager_resources = false;
         let entries = lock(&self.inner.entries);
         for (server, entry) in entries.iter() {
-            if !entry.status.is_connected() {
+            if !entry.status.is_tool_available() {
                 continue;
             }
             let Some(handle) = entry.handle.as_ref() else {
@@ -673,6 +716,29 @@ impl Catalog {
             .ok_or_else(|| RefreshError::NotConnected {
                 server: server.to_owned(),
             })
+    }
+
+    pub(crate) fn connected_snapshot(&self, server: &str) -> Option<ConnectedCatalogSnapshot> {
+        lock(&self.inner.entries)
+            .get(server)
+            .filter(|entry| entry.status.is_connected())
+            .and_then(|entry| {
+                entry
+                    .handle
+                    .as_ref()
+                    .map(|handle| ConnectedCatalogSnapshot {
+                        server: Arc::clone(handle),
+                        tools: entry.tools.clone(),
+                        prompts: entry.prompts.clone(),
+                    })
+            })
+    }
+
+    pub(crate) fn cached_tools(&self, server: &str) -> Option<Vec<ToolDefinition>> {
+        lock(&self.inner.entries)
+            .get(server)
+            .filter(|entry| matches!(entry.status, ServerStatus::Cached))
+            .map(|entry| entry.tools.clone())
     }
 
     fn settle(&self, server: &str) {

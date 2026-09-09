@@ -10,6 +10,7 @@ pub use crate::instructions::{
     InstructionOptions, InstructionPath, InstructionText, InstructionWarning, Instructions,
     LoadedInstructions, Origin, UpwardClaims, WarningKind,
 };
+pub use crate::schema::acp::{AcpConfig, AcpRuntimeConfig, ResolvedAcpRuntimeConfig};
 pub use crate::schema::sandbox::{
     SandboxBackendSelection, SandboxConfig, SandboxMode, SandboxNetworkMode,
     SandboxUnavailableAction,

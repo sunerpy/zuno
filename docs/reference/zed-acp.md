@@ -225,7 +225,9 @@ publishes these session controls to Zed:
 
 Mode is authoritative for the Plan/Work boundary. The Agent selector contains
 implementation Agents only. In Plan mode it selects the future Work Agent while
-the runtime keeps the read-only `plan` host active. Zuno sends
+the durable mode remains read-only; a cold session does not start a `plan` host
+merely because the selector changed. Whenever the session activates in Plan,
+the host uses the read-only `plan` Agent. Zuno sends
 `current_mode_update` and `config_option_update` after an accepted control so
 both selectors show the durable state.
 
@@ -237,16 +239,18 @@ To use the directly selectable `deep` Agent:
 4. choose the desired model if the current Zuno profile exposes more than one;
 5. choose a reasoning level when the selected model advertises reasoning.
 
-Plan mode activates the read-only `plan` Agent. Mode remains independent from
-the Agent selector: choosing an implementation Agent while planning updates the
-saved Work Agent and does not exit Plan. `/start-work` or
+Plan mode selects the read-only `plan` Agent for the next active turn. Mode
+remains independent from the Agent selector: choosing an implementation Agent
+while planning updates the saved Work Agent and does not exit Plan or wake a
+cold runtime. `/start-work` or
 `session/set_mode(build)` restores that Agent with the saved provider, model, and
 reasoning settings after validating the exact handoff-ready Plan revision. Agent
 and model changes are session-local and are rejected while the session has work
-in flight unless they are the durable Start Work control queued for a safe point. An idle
-configuration change still performs an atomic host replacement, but it reuses the connected
-session MCP runtime when the MCP server configuration and connection concurrency
-are unchanged. Editing those structural MCP inputs forces a fresh connection.
+in flight unless they are the durable Start Work control queued for a safe point.
+A dormant configuration change updates only durable identity and command state.
+An active replacement prepares a candidate, atomically publishes its runtime
+snapshot, and retires the prior one; optional MCP connections are reused only
+when their complete connection identity still matches.
 Structured logs report the reconfiguration phase timings without recording the
 selected Agent, model, reasoning value, or credentials.
 
@@ -566,19 +570,28 @@ user elicitation on the root session.
 ACP-provided MCP advertises stdio and Streamable HTTP; SSE remains unsupported.
 Every new/load/resume request supplies the complete list. Names are validated or
 stably slugged, stdio commands must be absolute and use the session directory as
-cwd, and HTTP headers are strictly validated. All servers must connect and
-discover before their tools are atomically published; partial startup is
-disposed in reverse order. Commands, environment values, and headers are never stored in SQLite or logs. Client filesystem RPC and terminal RPC remain
+cwd, and HTTP headers are strictly validated. The list remains process-local:
+load and resume validate and freeze it without starting transports. On
+activation, every ACP-provided server is required and eager; all must connect
+and discover before publication, and partial startup is disposed in reverse
+order. A host-configured optional server may remain transport-free when a cached
+tool directory matches its complete connection identity; its first real tool
+call starts one session-local connection through a singleflight gate. Commands,
+environment values, and headers are never stored in SQLite or logs. Client
+filesystem RPC and terminal RPC remain
 unadvertised; Zuno handles file and Shell work through its own tools, permission
 policy, and sandbox.
 
-Restoring a thread rebuilds its `TurnHost` and the complete configured and
-client-provided MCP set before publication. A later load or resume rebuilds
-process resources from the newly supplied complete list; it never reuses an
-earlier client MCP process. After replay and command publication, an active root
-Goal is scheduled through the detached continuation path without requiring
-another prompt. This includes older sessions that have a durable active Goal but
-no user message: the objective is first persisted as the user turn anchor.
+Restoring a thread is cold by default. `session/load` reconstructs the durable
+transcript, Plan, usage, configuration, and command projection; `session/resume`
+restores the durable control projection without replaying transcript content.
+Neither operation starts TurnHost, MCP, plugin hosts, or the file watcher. The
+first prompt, `/start-work`, `session/set_mode(build)`, or an active root Goal
+activates the shared session exactly once. Concurrent load/resume requests for
+one session id share the same registry entry and activation gate rather than
+replacing one another. An active Goal is scheduled through the detached
+continuation path without requiring another prompt and without manufacturing a
+user message.
 Load replay is bounded to the newest 512 retained messages, a 16 MiB stored-part
 and total projection budget, and an 8 MiB per-update frame. Zuno emits an
 omission notice when history exceeds those bounds. Stored part blobs are sized
@@ -590,8 +603,15 @@ Only existing regular files that canonicalize inside the project worktree
 remain actionable as diff paths, locations, or local resource links. A missing,
 external, or symlink-escaped local resource is displayed as non-actionable
 explanatory text. One ACP stdio connection may retain at most 32 open sessions;
-`session/close` releases the slot and shuts down any activated host and MCP
-runtime.
+by default at most 8 may own an active resource-bearing runtime. An eligible
+runtime sleeps after 15 idle minutes, releasing TurnHost, MCP, plugin processes,
+watchers, and its active slot while retaining the durable session. Active turns
+or Goals, queued/running/uncertain Jobs, pending reports or inputs, unresolved
+human requests, and background commands prevent sleep. Capacity pressure sleeps
+the least-recently-used eligible runtime first; otherwise activation waits up to
+30 seconds and returns a typed retryable capacity error. `session/close`
+releases the open slot and shuts down any active resources. These defaults are
+configurable under `acp.runtime`.
 
 ## 9. Troubleshooting
 
@@ -644,12 +664,13 @@ Closing or hiding Zed's Agent panel does not necessarily send
 `session/close`. Zed may keep its external-Agent process and workspace thread
 selection alive in the background.
 
-Current Zuno versions replace the prior process-local runtime on each explicit
-load or resume, deduplicate repeated load replay, bound transcript replay,
-filter stale actionable file paths, and cap one ACP connection at 32 open
-sessions. An active durable Goal is expected to resume after restoration, so
-provider or tool activity at that point is work continuation rather than a
-panel-rendering side effect.
+Current Zuno versions keep one stable process-local entry per open session.
+Repeated load/resume requests share it and remain cold unless an active Goal
+requires continuation. Load replay is bounded and explicit, stale actionable
+file paths are filtered, and one connection defaults to 32 open sessions but
+only 8 active resource-bearing runtimes. Provider or tool activity immediately
+after restoration therefore means an active Goal resumed, not that panel
+rendering started a host.
 
 If the problem persists:
 
@@ -664,9 +685,10 @@ If the problem persists:
    `OpenBufferByPath` activity. Zuno does not own or remove Zed-created
    worktrees and filesystem watchers.
 
-An already activated but idle Zuno session remains mounted until Zed closes it
-or the ACP process exits. Zuno does not currently demote active sessions on an
-idle timer.
+An eligible idle runtime sleeps automatically while its durable session remains
+open. If memory or child-process use stays high, inspect active Goals, Jobs,
+pending inbox or human-request rows, and background commands; each intentionally
+blocks sleep.
 
 ### Agent or model selector is absent
 

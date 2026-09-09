@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{
@@ -219,6 +221,26 @@ fn config_with_second_model(base_url: &str) -> String {
     });
     config["provider"]["test"]["options"]["baseURL"] = json!(format!("{base_url}/v1"));
     serde_json::to_string(&config).expect("encode test config")
+}
+
+fn config_with_acp_runtime(
+    base_url: &str,
+    max_open_sessions: u64,
+    max_active_runtimes: u64,
+    idle_timeout_ms: u64,
+    activation_wait_timeout_ms: u64,
+) -> String {
+    let mut config: Value =
+        serde_json::from_str(&config_with_second_model(base_url)).expect("test config JSON");
+    config["acp"] = json!({
+        "runtime": {
+            "max_open_sessions": max_open_sessions,
+            "max_active_runtimes": max_active_runtimes,
+            "idle_timeout_ms": idle_timeout_ms,
+            "activation_wait_timeout_ms": activation_wait_timeout_ms,
+        }
+    });
+    serde_json::to_string(&config).expect("encode ACP runtime test config")
 }
 
 fn strict_config(base_url: &str) -> String {
@@ -3382,7 +3404,7 @@ async fn acp_load_recovers_an_active_goal_without_a_retained_user_message() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn acp_reconfiguration_reuses_mcp_while_load_rebuilds_resources() {
+async fn acp_reconfiguration_stays_dormant_and_first_prompt_activates_mcp() {
     let mcp = MockServer::start().await;
     mount_remote_mcp_fixture(&mcp).await;
     let provider = MockServer::start().await;
@@ -3591,12 +3613,12 @@ async fn acp_reconfiguration_reuses_mcp_while_load_rebuilds_resources() {
         "each explicit session/load reconstructs durable history for the requesting client"
     );
     assert_eq!(
-        initialize_after_load, 2,
-        "session/load must reconnect configured MCP before publishing the replacement session"
+        initialize_after_load, 1,
+        "session/load must reconstruct durable state without starting configured MCP"
     );
     assert_eq!(
-        initialize_after_reconfiguration, 2,
-        "Agent and mode changes must reuse the session MCP runtime when its configuration is unchanged"
+        initialize_after_reconfiguration, 1,
+        "dormant Agent, model, and mode changes must not start MCP"
     );
     assert_eq!(prompted["stopReason"], "end_turn");
     assert!(
@@ -3607,8 +3629,8 @@ async fn acp_reconfiguration_reuses_mcp_while_load_rebuilds_resources() {
         "the first prompt after a cold load did not activate and drive the session"
     );
     assert_eq!(
-        initialize_after_prompt, 3,
-        "the second load already activated its replacement MCP resources before the prompt"
+        initialize_after_prompt, 2,
+        "the first prompt after the second cold load must activate MCP exactly once"
     );
 }
 
@@ -3906,12 +3928,12 @@ fn acp_session_mcp_partial_startup_rolls_back_before_publication() {
 
 #[cfg(unix)]
 #[test]
-fn acp_load_and_resume_recreate_only_the_mcp_list_supplied_by_the_client() {
+fn acp_load_and_resume_keep_the_supplied_mcp_list_cold_until_first_prompt() {
     let root = tempfile::tempdir().expect("ACP MCP resume root");
     let script = write_acp_stdio_mcp_server(root.path());
     let log = root.path().join("resume-mcp.log");
     let declaration = acp_stdio_mcp_declaration("fixture", &script, &log, false);
-    let config = config_with_second_model("https://example.invalid");
+    let config = config_with_second_model("http://127.0.0.1:9");
     let mut child = isolated_command_with_config(root.path(), &config)
         .arg("acp")
         .stdin(Stdio::piped())
@@ -3985,12 +4007,30 @@ fn acp_load_and_resume_recreate_only_the_mcp_list_supplied_by_the_client() {
             "mcpServers": [declaration.clone()]
         }),
     );
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .expect("MCP lifecycle log after cold load")
+            .matches("start ")
+            .count(),
+        1,
+        "session/load must not start the supplied MCP declaration"
+    );
+    let _provider_error = request_failure(
+        &mut stdin,
+        &mut stdout,
+        7,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"Activate this cold session."}]
+        }),
+    );
     let second = wait_for_occurrences(&log, "start ", 2);
     let second_pid = *started_pids(&second).last().expect("second MCP pid");
     request(
         &mut stdin,
         &mut stdout,
-        7,
+        8,
         "session/close",
         json!({"sessionId": &session_id}),
     );
@@ -3999,7 +4039,7 @@ fn acp_load_and_resume_recreate_only_the_mcp_list_supplied_by_the_client() {
     request(
         &mut stdin,
         &mut stdout,
-        8,
+        9,
         "session/resume",
         json!({
             "sessionId": &session_id,
@@ -4007,12 +4047,30 @@ fn acp_load_and_resume_recreate_only_the_mcp_list_supplied_by_the_client() {
             "mcpServers": [declaration]
         }),
     );
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .expect("MCP lifecycle log after cold resume")
+            .matches("start ")
+            .count(),
+        2,
+        "session/resume must not start the supplied MCP declaration"
+    );
+    let _provider_error = request_failure(
+        &mut stdin,
+        &mut stdout,
+        10,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"Activate this resumed session."}]
+        }),
+    );
     let third = wait_for_occurrences(&log, "start ", 3);
     let third_pid = *started_pids(&third).last().expect("third MCP pid");
     request(
         &mut stdin,
         &mut stdout,
-        9,
+        11,
         "session/close",
         json!({"sessionId": &session_id}),
     );
@@ -4038,10 +4096,560 @@ fn acp_load_and_resume_recreate_only_the_mcp_list_supplied_by_the_client() {
     assert_file_tree_excludes(root.path(), ACP_MCP_SENTINEL);
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acp_concurrent_load_and_resume_share_one_cold_session_and_one_activation() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(compatible_text_response("ACP reply"))
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP concurrent load root");
+    let script = write_acp_stdio_mcp_server(root.path());
+    let log = root.path().join("singleflight-mcp.log");
+    let declaration = acp_stdio_mcp_declaration("fixture", &script, &log, false);
+    let config = config_with_acp_runtime(&provider.uri(), 32, 8, 600_000, 1_000);
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": [declaration.clone()]}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let first = wait_for_occurrences(&log, "start ", 1);
+    let first_pid = started_pids(&first)[0];
+    materialize_acp_fixture_session(root.path(), &session_id, "test-model", None);
+    request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    wait_for_process_exit(first_pid);
+
+    for id in 4..24 {
+        let method = if id % 2 == 0 {
+            "session/load"
+        } else {
+            "session/resume"
+        };
+        send_request(
+            &mut stdin,
+            id,
+            method,
+            json!({
+                "sessionId": &session_id,
+                "cwd": root.path(),
+                "mcpServers": [declaration.clone()]
+            }),
+        );
+    }
+    let responses = await_responses(&mut stdout, 4..24);
+    assert_eq!(responses.len(), 20);
+    assert!(
+        responses
+            .values()
+            .all(|response| response.get("error").is_none()),
+        "concurrent load/resume returned an error: {responses:#?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .expect("singleflight MCP lifecycle")
+            .matches("start ")
+            .count(),
+        1,
+        "cold load/resume must not start any replacement MCP runtime"
+    );
+
+    let prompted = request(
+        &mut stdin,
+        &mut stdout,
+        24,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"Activate exactly one shared runtime."}]
+        }),
+    );
+    assert_eq!(prompted["stopReason"], "end_turn");
+    let second = wait_for_occurrences(&log, "start ", 2);
+    let second_pid = *started_pids(&second).last().expect("reactivated MCP pid");
+    assert_eq!(
+        second.matches("start ").count(),
+        2,
+        "one cold session must produce exactly one replacement activation"
+    );
+    request(
+        &mut stdin,
+        &mut stdout,
+        25,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    wait_for_process_exit(second_pid);
+    join_acp_process(child, stdin);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_idle_runtime_sleeps_without_closing_and_reactivates_on_prompt() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(compatible_text_response("ACP reply"))
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP idle sleep root");
+    let script = write_acp_stdio_mcp_server(root.path());
+    let log = root.path().join("idle-mcp.log");
+    let declaration = acp_stdio_mcp_declaration("fixture", &script, &log, false);
+    let config = config_with_acp_runtime(&provider.uri(), 4, 1, 100, 1_000);
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": [declaration]}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let first = wait_for_occurrences(&log, "start ", 1);
+    let first_pid = started_pids(&first)[0];
+    let first_turn = request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"Materialize this runtime before it sleeps."}]
+        }),
+    );
+    assert_eq!(first_turn["stopReason"], "end_turn");
+    wait_for_process_exit(first_pid);
+
+    let listed = request(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/list",
+        json!({"cwd": root.path()}),
+    );
+    assert!(
+        listed["sessions"]
+            .as_array()
+            .is_some_and(|sessions| sessions
+                .iter()
+                .any(|session| session["sessionId"] == session_id)),
+        "sleep must retain the durable session entry: {listed}"
+    );
+    let second_turn = request(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"Wake the sleeping runtime."}]
+        }),
+    );
+    assert_eq!(second_turn["stopReason"], "end_turn");
+    let second = wait_for_occurrences(&log, "start ", 2);
+    let second_pid = *started_pids(&second).last().expect("second MCP pid");
+    request(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    wait_for_process_exit(second_pid);
+    join_acp_process(child, stdin);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_active_runtime_capacity_sleeps_the_lru_eligible_session() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(compatible_text_response("ACP reply"))
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP LRU root");
+    let script = write_acp_stdio_mcp_server(root.path());
+    let first_log = root.path().join("lru-first.log");
+    let second_log = root.path().join("lru-second.log");
+    let first_mcp = acp_stdio_mcp_declaration("first", &script, &first_log, false);
+    let second_mcp = acp_stdio_mcp_declaration("second", &script, &second_log, false);
+    let config = config_with_acp_runtime(&provider.uri(), 4, 1, 600_000, 1_000);
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let first = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": [first_mcp]}),
+    );
+    let first_session = first["sessionId"]
+        .as_str()
+        .expect("first session id")
+        .to_owned();
+    let first_start = wait_for_occurrences(&first_log, "start ", 1);
+    let first_pid = started_pids(&first_start)[0];
+    request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &first_session,
+            "prompt": [{"type":"text","text":"Materialize the first runtime."}]
+        }),
+    );
+
+    let second = request(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": [second_mcp]}),
+    );
+    let second_session = second["sessionId"]
+        .as_str()
+        .expect("second session id")
+        .to_owned();
+    wait_for_process_exit(first_pid);
+    let second_start = wait_for_occurrences(&second_log, "start ", 1);
+    let second_pid = started_pids(&second_start)[0];
+    request(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/prompt",
+        json!({
+            "sessionId": &second_session,
+            "prompt": [{"type":"text","text":"Materialize the second runtime."}]
+        }),
+    );
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "session/prompt",
+        json!({
+            "sessionId": &first_session,
+            "prompt": [{"type":"text","text":"Reactivate the first runtime."}]
+        }),
+    );
+    wait_for_process_exit(second_pid);
+    let first_reactivated = wait_for_occurrences(&first_log, "start ", 2);
+    let first_reactivated_pid = *started_pids(&first_reactivated)
+        .last()
+        .expect("reactivated first MCP pid");
+    assert_eq!(
+        first_reactivated.matches("start ").count(),
+        2,
+        "reactivating the LRU session created duplicate MCP runtimes"
+    );
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        7,
+        "session/close",
+        json!({"sessionId": &first_session}),
+    );
+    wait_for_process_exit(first_reactivated_pid);
+    request(
+        &mut stdin,
+        &mut stdout,
+        8,
+        "session/close",
+        json!({"sessionId": &second_session}),
+    );
+    join_acp_process(child, stdin);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_active_runtime_capacity_refuses_to_sleep_pending_input() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(compatible_text_response("ACP reply"))
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP capacity blocker root");
+    let config = config_with_acp_runtime(&provider.uri(), 4, 1, 600_000, 100);
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let first = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let first_session = first["sessionId"]
+        .as_str()
+        .expect("first session id")
+        .to_owned();
+    request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &first_session,
+            "prompt": [{"type":"text","text":"Materialize the capacity owner."}]
+        }),
+    );
+    admit_foreign_pending_input(
+        root.path(),
+        &first_session,
+        "input_capacity_blocker",
+        "Keep this session awake.",
+    );
+
+    let capacity = request_failure(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    assert_eq!(capacity["code"], -32001);
+    assert_eq!(capacity["data"]["kind"], "acp_runtime_capacity");
+    assert_eq!(capacity["data"]["retryable"], true);
+    assert_eq!(capacity["data"]["maxActiveRuntimes"], 1);
+    request(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/close",
+        json!({"sessionId": &first_session}),
+    );
+    join_acp_process(child, stdin);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_active_runtime_capacity_refuses_to_sleep_running_job() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(compatible_text_response("ACP reply"))
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP job capacity blocker root");
+    let config = config_with_acp_runtime(&provider.uri(), 4, 1, 600_000, 100);
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let first = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let first_session = first["sessionId"]
+        .as_str()
+        .expect("first session id")
+        .to_owned();
+    request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &first_session,
+            "prompt": [{"type":"text","text":"Materialize the running-job owner."}]
+        }),
+    );
+    let job = seed_running_job(root.path(), &first_session, "job_capacity_blocker");
+    assert_eq!(job.status, zuno_db::job::JobStatus::Running);
+
+    let capacity = request_failure(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    assert_eq!(capacity["code"], -32001);
+    assert_eq!(capacity["data"]["kind"], "acp_runtime_capacity");
+    assert_eq!(capacity["data"]["retryable"], true);
+    request(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/close",
+        json!({"sessionId": &first_session}),
+    );
+    join_acp_process(child, stdin);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_active_runtime_capacity_refuses_to_sleep_unclaimed_completion() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(compatible_text_response("ACP reply"))
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP completion capacity blocker root");
+    let config = config_with_acp_runtime(&provider.uri(), 4, 1, 600_000, 100);
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let first = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let first_session = first["sessionId"]
+        .as_str()
+        .expect("first session id")
+        .to_owned();
+    request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &first_session,
+            "prompt": [{"type":"text","text":"Materialize the completion owner."}]
+        }),
+    );
+    seed_unclaimed_completion(
+        root.path(),
+        &first_session,
+        "background:completion-capacity-blocker:1",
+    );
+
+    let capacity = request_failure(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    assert_eq!(capacity["code"], -32001);
+    assert_eq!(capacity["data"]["kind"], "acp_runtime_capacity");
+    assert_eq!(capacity["data"]["retryable"], true);
+    request(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/close",
+        json!({"sessionId": &first_session}),
+    );
+    join_acp_process(child, stdin);
+}
+
 #[test]
 fn acp_connection_bounds_open_sessions_and_releases_capacity_on_close() {
     let root = tempfile::tempdir().expect("ACP test root");
-    let mut child = isolated_command(root.path())
+    let config = config_with_acp_runtime("https://example.invalid", 32, 32, 600_000, 1_000);
+    let mut child = isolated_command_with_config(root.path(), &config)
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -6070,6 +6678,35 @@ fn await_response(stdout: &mut BufReader<ChildStdout>, id: u64, updates: &mut Ve
     }
 }
 
+#[cfg(unix)]
+fn await_responses(
+    stdout: &mut BufReader<ChildStdout>,
+    ids: impl IntoIterator<Item = u64>,
+) -> BTreeMap<u64, Value> {
+    let mut pending = ids.into_iter().collect::<BTreeSet<_>>();
+    let mut responses = BTreeMap::new();
+    while !pending.is_empty() {
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read ACP frame");
+        assert!(!line.is_empty(), "ACP closed before all responses arrived");
+        let frame: Value = serde_json::from_str(&line).expect("ACP response JSON");
+        if let Some(id) = frame.get("id").and_then(Value::as_u64) {
+            assert!(
+                pending.remove(&id),
+                "unexpected or duplicate ACP response id {id}: {frame}"
+            );
+            responses.insert(id, frame);
+            continue;
+        }
+        assert_eq!(
+            frame.get("method").and_then(Value::as_str),
+            Some("session/update"),
+            "unexpected ACP frame while collecting responses: {frame}"
+        );
+    }
+    responses
+}
+
 /// Wait until `count` turn requests have reached the gated provider.
 async fn await_turn_requests(turns: &AtomicUsize, count: usize) {
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -6122,6 +6759,41 @@ fn admit_foreign_pending_input(
             zuno_db::message::now_millis(),
         ))
         .expect("admit foreign pending input");
+}
+
+fn seed_running_job(
+    root: &std::path::Path,
+    parent_session_id: &str,
+    job_id: &str,
+) -> zuno_db::job::AgentJob {
+    let pool = Arc::new(zuno_db::Pool::open(&acp_database(root)).expect("open ACP job database"));
+    zuno_db::job::AgentJobStore::new(pool)
+        .create(zuno_db::job::NewAgentJob::new(
+            job_id,
+            parent_session_id,
+            zuno_db::job::JobSubject::child_session(format!("child_{job_id}")),
+            zuno_db::job::ReportDelivery::Quiet,
+            zuno_db::message::now_millis(),
+        ))
+        .expect("seed running ACP job")
+}
+
+fn seed_unclaimed_completion(root: &std::path::Path, parent_session_id: &str, source_key: &str) {
+    let pool =
+        Arc::new(zuno_db::Pool::open(&acp_database(root)).expect("open ACP completion database"));
+    zuno_db::completion_delivery::CompletionDeliveryStore::new(pool)
+        .publish(
+            zuno_types::execution::CompletionEnvelope {
+                source_key: source_key.to_owned(),
+                source: zuno_types::execution::CompletionSource::BackgroundExecution,
+                terminal_revision: 1,
+                parent_session_id: parent_session_id.to_owned(),
+                cycle_id: None,
+                payload: json!({"kind":"backgroundExecutionReport","text":"finished"}),
+            },
+            zuno_db::message::now_millis(),
+        )
+        .expect("seed unclaimed ACP completion");
 }
 
 fn join_acp_process(mut child: std::process::Child, stdin: ChildStdin) {
