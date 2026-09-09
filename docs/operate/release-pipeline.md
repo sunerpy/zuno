@@ -84,18 +84,32 @@ action and must not be reported as a completed release. Leaving it unattended
 until GitHub expires it produces the misleading failed `chore: release ...`
 history that this procedure prevents.
 
-The Linux source gate installs pinned `cargo-nextest`. Linux Clippy and tests
-share one job-local target directory; native Windows Clippy and tests are
-independent jobs so they start in parallel instead of placing a global serial
+The Linux source gate installs pinned `cargo-nextest`. Linux and Windows Clippy
+and test jobs each keep their own build directory and start independently, avoiding a global serial
 barrier before test execution. Windows uses `scripts/test-parallel.sh`: Cargo
 compiles the test surface once, then a bounded worker pool runs test binaries
 concurrently rather than paying for one Windows process per test case. Hosted
 Windows runs four binaries at a time and one test at a time inside each binary.
 The `startup` wall-clock benchmark runs once before that pool so unrelated
 processes cannot invalidate its budget; all functional suites, including ACP
-and ConPTY lifecycle coverage, remain concurrent with no serial tail. Every suite has a timeout;
-timeout cleanup terminates the complete descendant tree, and the scheduler emits
-progress while it runs.
+and ConPTY lifecycle coverage, remain concurrent with no serial tail.
+
+`scripts/run_test_binaries.py` schedules the binaries and `scripts/ci_process.py`
+owns execution and cleanup. Each suite has an execution deadline and a separate
+five-second cleanup budget. Output goes to files: a descendant inheriting stdout
+cannot keep the scheduler waiting for pipe EOF after its parent exits. Windows
+uses a kill-on-close Job Object, assigning a waiting launcher before it starts
+test code; Unix uses an isolated process group. Cleanup verifies that no active
+members remain. Cancellation stops waiting workers and reaps active suites;
+cleanup or launch failures remain failures, without retrying the test.
+
+Combined output is limited to 64 MiB per suite. Exceeding the limit is reported
+as a failure instead of silently discarding output from a successful test.
+The real-process regression tests run with
+`python -m unittest discover -s scripts -p 'test_ci_process.py'`.
+The `goal_uncertain` fixture also bounds each asynchronous ACP exchange and
+kills its client process on drop, so a missing response cannot strand a blocking
+reader during test-runtime shutdown.
 
 The scheduler captures Cargo's environment through a
 native Python runner and JSON, not Git Bash's text `env` format, so Windows

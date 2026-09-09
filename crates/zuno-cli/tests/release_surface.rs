@@ -2463,8 +2463,13 @@ fn startup_measurements_are_isolated_and_hosted_ci_is_observational() {
          measuring incremental watchdog cost"
     );
     let scheduler_path = workspace_root().join("scripts/test-parallel.sh");
-    let scheduler = std::fs::read_to_string(&scheduler_path)
-        .unwrap_or_else(|error| panic!("read {}: {error}", scheduler_path.display()));
+    let scheduler = format!(
+        "{}\n{}",
+        std::fs::read_to_string(&scheduler_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", scheduler_path.display())),
+        std::fs::read_to_string(workspace_root().join("scripts/run_test_binaries.py"))
+            .expect("the test scheduler module is readable")
+    );
     for required in [
         "isolated_suites = {'startup'}",
         "def publish_startup_measurement(index):",
@@ -2643,8 +2648,16 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
         "hosted CI regressed to Cargo's serial test-binary execution"
     );
 
-    let scheduler = std::fs::read_to_string(workspace_root().join("scripts/test-parallel.sh"))
-        .expect("the binary-parallel test scheduler is readable");
+    let scheduler = [
+        "scripts/test-parallel.sh",
+        "scripts/run_test_binaries.py",
+        "scripts/ci_process.py",
+        "scripts/ci_windows_job.py",
+    ]
+    .into_iter()
+    .map(|path| std::fs::read_to_string(workspace_root().join(path)).expect(path))
+    .collect::<Vec<_>>()
+    .join("\n");
     for required in [
         "RUN_DOCTESTS=${RUN_DOCTESTS:-1}",
         "export PYTHONUTF8=${PYTHONUTF8:-1}",
@@ -2668,7 +2681,8 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
         "shutil.which(\"rg\"",
         "[rg, \"--version\"]",
         "cygpath -m",
-        "taskkill",
+        "WindowsJob",
+        "job.terminate(deadline)",
         "os.killpg",
         "isolated_suites = {'startup'}",
         "running isolated timing suite",

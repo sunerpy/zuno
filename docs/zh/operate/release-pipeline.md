@@ -61,15 +61,26 @@ cherry-pick 到精确触发 SHA，并使用绑定旧 head 的 `force-with-lease`
 如果一直无人处理直到 GitHub 将其过期，就会留下容易误判的失败
 `chore: release ...` 历史，本流程正是为了避免这种遗漏。
 
-Linux 源码门禁安装固定版本的 `cargo-nextest`。Linux 的 Clippy 与测试在同一 job 内复用
-本地 target；原生 Windows 的 Clippy 与测试拆成两个并行 job，避免在测试执行前形成全局
+Linux 源码门禁安装固定版本的 `cargo-nextest`。Linux 和 Windows 的 Clippy、测试 job
+各自使用独立构建目录并行启动，避免在测试执行前形成全局
 串行屏障。Windows 使用 `scripts/test-parallel.sh`：Cargo 只编译一次，再由有界 worker
 pool 并发运行测试二进制，避免为每个 test case 单独启动 Windows 进程。托管 Windows
 同时运行四个二进制，每个二进制内部一次只执行一个测试；这样既隔离进程全局环境和时序状态，
 `startup` 墙钟性能基准会先在无竞争状态下单独执行一次，避免其他进程使预算测量失真；ACP、
-ConPTY 生命周期等所有功能 suite 仍留在并发池中，pool 之后不再追加串行队列。每个 suite
-都有超时；超时时会终止完整
-子进程树，调度期间也会持续输出进度。
+ConPTY 生命周期等所有功能 suite 仍留在并发池中，pool 之后不再追加串行队列。
+
+`scripts/run_test_binaries.py` 负责调度，`scripts/ci_process.py` 负责执行和回收。
+每个 suite 都有执行截止时间，以及独立的 5 秒清理预算。输出写入文件；父进程退出后，
+继承 stdout 的后代不会再让调度器无限等待管道 EOF。Windows 在运行测试代码前把等待
+握手的 launcher 加入 kill-on-close Job Object，Unix 使用独立进程组；清理会核实组内
+已经没有活跃进程。取消会停止等待的任务并回收正在运行的 suite，启动或清理失败仍然
+判失败，不自动重跑测试。
+
+每个 suite 的合并日志上限为 64 MiB；超限会明确报错，不能静默截断后仍宣称测试成功。
+真实进程回归测试使用
+`python -m unittest discover -s scripts -p 'test_ci_process.py'`。
+`goal_uncertain` 夹具也为每次异步 ACP 往返设置截止时间，并在 drop 时终止客户端进程，
+避免缺失响应让阻塞 reader 拖住测试运行时退出。
 
 调度器通过原生 Python runner 将 Cargo 环境保存为
 JSON，不再读取 Git Bash 文本格式的 `env`，因此 Windows `PATH` 等进程变量始终保持
