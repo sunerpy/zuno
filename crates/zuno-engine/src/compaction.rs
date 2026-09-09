@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use serde_json::{Value, json};
 use tracing::Instrument as _;
 use zuno_config::schema::{CompactionConfig, DEFAULT_COMPACTION_THRESHOLD_PERCENT};
@@ -17,11 +16,16 @@ use zuno_db::Connection;
 use zuno_db::message::{MessageRecord, MessageStore, PartRecord, now_millis};
 use zuno_error::{DbError, Recovery};
 use zuno_llm::cache::{CacheTracker, LockedTools};
-use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent};
-use zuno_llm::registry::{CompletionRequest, Provider, ProviderRequestContext};
+use zuno_llm::catalog::resolved::ModelCost;
+use zuno_llm::event::{Message, RequestContentBlock, Role};
+use zuno_llm::registry::{ApiSurface, CompletionRequest, Provider, ProviderRequestContext};
 use zuno_observability::span;
 
 use crate::retry::{RecoveryBudget, RecoveryBudgets};
+
+pub(crate) mod checkpoint;
+mod response;
+mod trace;
 
 /// Default context headroom used when the configuration does not override it.
 pub const DEFAULT_RESERVED_TOKENS: u64 = 20_000;
@@ -34,38 +38,11 @@ pub const MAX_PRESERVE_RECENT_TOKENS: u64 = 8_000;
 /// Maximum tool-result characters included in the summarizer request.
 pub const TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
 
-/// Compatibility-stable shape required from the compaction model.
-pub const SUMMARY_TEMPLATE: &str = r#"Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
-<template>
-## Objective
-- [one or two brief sentences describing what the user is trying to accomplish]
+/// Task-neutral checkpoint instructions sent after the selected history.
+pub const SUMMARY_TEMPLATE: &str = include_str!("compaction/summary.md");
 
-## Important Details
-- [constraints/preferences, decisions and why, important facts/assumptions, exact context needed to continue, or "(none)"]
-
-## Work State
-### Completed
-- [finished work, verified facts, or changes made; otherwise "(none)"]
-
-### Active
-- [current work, partial changes, or investigation state; otherwise "(none)"]
-
-### Blocked
-- [blockers, failing commands, or unknowns; otherwise "(none)"]
-
-## Next Move
-1. [immediate concrete action, or "(none)"]
-2. [next action if known, or "(none)"]
-
-## Relevant Files
-- [file or directory path: why it matters, or "(none)"]
-</template>
-
-Rules:
-- Keep every section, even when empty.
-- Use terse bullets, not prose paragraphs.
-- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
-- Do not mention the summary process or that context was compacted."#;
+/// Host-owned guidance for continuing the admitted task after context recovery.
+pub const CONTINUATION_PROMPT: &str = include_str!("compaction/continuation.md");
 
 /// Model limits used to resolve the configured trigger thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +158,8 @@ pub struct TranscriptEntry {
     pub estimated_tokens: u32,
     pub synthetic: bool,
     pub preserve_initial: bool,
+    tool_uses: Vec<String>,
+    tool_results: Vec<String>,
 }
 
 impl TranscriptEntry {
@@ -189,12 +168,26 @@ impl TranscriptEntry {
     #[must_use]
     pub fn new(id: impl Into<String>, message: Message, estimated_tokens: u32) -> Self {
         let preserve_initial = message.role == Role::System;
+        let synthetic = message.role == Role::Tool;
+        let mut tool_uses = Vec::new();
+        let mut tool_results = Vec::new();
+        for block in &message.content {
+            match block {
+                RequestContentBlock::ToolUse { id, .. } => tool_uses.push(id.clone()),
+                RequestContentBlock::ToolResult { tool_use_id, .. } => {
+                    tool_results.push(tool_use_id.clone());
+                }
+                _ => {}
+            }
+        }
         Self {
             id: id.into(),
             message,
             estimated_tokens,
-            synthetic: false,
+            synthetic,
             preserve_initial,
+            tool_uses,
+            tool_results,
         }
     }
 
@@ -209,6 +202,12 @@ impl TranscriptEntry {
     #[must_use]
     pub const fn preserve_as_initial(mut self) -> Self {
         self.preserve_initial = true;
+        self
+    }
+
+    /// Reduce model-specific content after capturing its selection provenance.
+    pub(crate) fn summary_safe(mut self) -> Self {
+        self.message = summary_safe_message_owned(self.message);
         self
     }
 
@@ -294,10 +293,14 @@ fn walk_back_over_tool_pairs(
     floor: usize,
 ) -> usize {
     let mut tool_uses: HashMap<&str, usize> = HashMap::new();
+    let mut pairs = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
-        for block in &entry.message.content {
-            if let RequestContentBlock::ToolUse { id, .. } = block {
-                tool_uses.insert(id.as_str(), index);
+        for id in &entry.tool_uses {
+            tool_uses.insert(id.as_str(), index);
+        }
+        for id in &entry.tool_results {
+            if let Some(use_index) = tool_uses.get(id.as_str()) {
+                pairs.push((*use_index, index));
             }
         }
     }
@@ -305,15 +308,9 @@ fn walk_back_over_tool_pairs(
     let mut boundary = raw_boundary;
     loop {
         let mut adjusted = boundary;
-        for entry in &entries[boundary..] {
-            for block in &entry.message.content {
-                if let RequestContentBlock::ToolResult { tool_use_id, .. } = block
-                    && let Some(use_index) = tool_uses.get(tool_use_id.as_str())
-                    && *use_index < adjusted
-                    && *use_index >= floor
-                {
-                    adjusted = *use_index;
-                }
+        for &(use_index, result_index) in &pairs {
+            if result_index >= boundary && use_index < adjusted && use_index >= floor {
+                adjusted = use_index;
             }
         }
         if adjusted == boundary {
@@ -466,6 +463,9 @@ pub struct CompactionRequest<'a> {
     pub previous_summary: Option<&'a str>,
     pub automatic: bool,
     pub overflow: bool,
+    pub interrupt: Option<&'a crate::interrupt::InterruptSignal>,
+    pub surface: ApiSurface,
+    pub model_cost: Option<&'a ModelCost>,
 }
 
 impl<'a> CompactionRequest<'a> {
@@ -498,6 +498,9 @@ impl<'a> CompactionRequest<'a> {
             previous_summary: None,
             automatic: true,
             overflow: matches!(trigger, CompactionTrigger::ContextLimit { .. }),
+            interrupt: None,
+            surface: ApiSurface::Default,
+            model_cost: None,
         }
     }
 
@@ -512,12 +515,35 @@ impl<'a> CompactionRequest<'a> {
         self.automatic = false;
         self
     }
+
+    #[must_use]
+    pub const fn with_interrupt(
+        mut self,
+        interrupt: Option<&'a crate::interrupt::InterruptSignal>,
+    ) -> Self {
+        self.interrupt = interrupt;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_surface(mut self, surface: ApiSurface) -> Self {
+        self.surface = surface;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_model_cost(mut self, cost: &'a ModelCost) -> Self {
+        self.model_cost = Some(cost);
+        self
+    }
 }
 
-/// Successful compacted request history.
+/// A successful checkpoint and its selected in-memory transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactedTranscript {
     pub summary: String,
+    /// Logical transcript for the supplied entries. Hosts reconstruct live
+    /// requests from durable history and the current agent's prompt instead.
     pub messages: Vec<Message>,
     pub boundary: CompactionBoundary,
     pub marker_part_id: String,
@@ -539,6 +565,8 @@ pub enum CompactionStopReason {
     Hook,
     Provider,
     EmptySummary,
+    OutputLimit,
+    Interrupted,
 }
 
 /// Decision returned to the turn owner.
@@ -562,11 +590,9 @@ pub enum CompactionError {
 
 /// Run one bounded, LLM-backed compaction attempt.
 ///
-/// `connection` is `&mut` although nothing here needs a transaction: an attempt
-/// interleaves database writes with a provider stream, so a shared `&Connection` held
-/// across those awaits would make the whole future non-`Send` and unspawnable — and
-/// the interactive surface drives its turns from a spawned task. Exclusive is also the
-/// honest signature for something that writes.
+/// Short transactions commit the attempt, prompt receipt and completed summary.
+/// None spans a provider await. Exclusive access also keeps the future `Send`
+/// while it interleaves database writes with the provider stream.
 pub async fn run_compaction<T, H>(
     connection: &mut Connection,
     provider: &dyn Provider,
@@ -610,7 +636,7 @@ where
     {
         let message = error.to_string();
         let mut summary_message = persist_compaction_shell(connection, &request, boundary)?;
-        persist_failure(connection, &mut summary_message, &message)?;
+        persist_failure(connection, &mut summary_message, &message, Recovery::Fail)?;
         state.mark_failed(message.clone(), Recovery::Fail);
         return Ok(CompactionOutcome::Stopped {
             reason: CompactionStopReason::BudgetExhausted,
@@ -631,7 +657,7 @@ where
         )
         .await
     {
-        persist_failure(connection, &mut summary_message, &message)?;
+        persist_failure(connection, &mut summary_message, &message, Recovery::Fail)?;
         state.mark_failed(message.clone(), Recovery::Fail);
         return Ok(CompactionOutcome::Stopped {
             reason: CompactionStopReason::Hook,
@@ -654,10 +680,15 @@ where
     let retained = entries.split_off(boundary.retained_from);
     let summarized = entries.split_off(boundary.initial_context_end);
     let initial = entries;
-    let mut model_messages = summarized
-        .into_iter()
-        .map(|entry| summary_safe_message_owned(entry.message))
+    let mut model_messages = initial
+        .iter()
+        .map(|entry| summary_safe_message_owned(entry.message.clone()))
         .collect::<Vec<_>>();
+    model_messages.extend(
+        summarized
+            .into_iter()
+            .map(|entry| summary_safe_message_owned(entry.message)),
+    );
     model_messages.push(Message::new(Role::User, summary_prompt));
     let request_span = span::provider_request_for_session(
         request.session_id,
@@ -668,39 +699,33 @@ where
         "compaction",
     );
     let operation_span = request_span.clone();
-    let (chunks, provider_failure) = async move {
-        let mut stream = provider.stream(
-            CompletionRequest::new(request.small_model_id, model_messages)
-                .with_request_context(ProviderRequestContext::Compaction),
-        );
-        let mut chunks = Vec::new();
-        let mut provider_failure = None;
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(StreamEvent::TextDelta(text)) => chunks.push(text),
-                Ok(StreamEvent::Error {
-                    message,
-                    retry_after,
-                }) => {
-                    provider_failure = Some((message, Recovery::Retry { after: retry_after }));
-                    break;
-                }
-                Err(error) => {
-                    let recovery = match error.recovery() {
-                        Recovery::Compact => Recovery::Fail,
-                        recovery => recovery,
-                    };
-                    provider_failure = Some((error.to_string(), recovery));
-                    break;
-                }
-                Ok(_) => {}
-            }
+    let completion = CompletionRequest::new(request.small_model_id, model_messages)
+        .on_surface(request.surface)
+        .with_request_context(ProviderRequestContext::Compaction);
+    trace::record_request(
+        connection,
+        request.session_id,
+        request.attempt_id,
+        request.config,
+        &completion,
+        &mut summary_message,
+    )?;
+    let response = response::receive(provider, completion, request.config, request.interrupt)
+        .instrument(operation_span)
+        .await;
+    if let Some(usage) = response.usage {
+        summary_message
+            .data
+            .insert("tokens".to_owned(), usage.tokens());
+        if let Some(model_cost) = request.model_cost {
+            summary_message
+                .data
+                .insert("cost".to_owned(), Value::from(usage.cost(model_cost)));
         }
-        (chunks, provider_failure)
+    } else {
+        summary_message.data.remove("tokens");
     }
-    .instrument(operation_span)
-    .await;
-    let (outcome, error_kind) = if provider_failure.is_some() {
+    let (outcome, error_kind) = if response.failure.is_some() {
         ("error", Some("provider"))
     } else {
         ("completed", None)
@@ -716,20 +741,27 @@ where
         );
     });
 
-    if let Some((message, recovery)) = provider_failure {
-        persist_failure(connection, &mut summary_message, &message)?;
-        state.mark_failed(message.clone(), recovery);
+    if let Some(response::SummaryFailure {
+        reason,
+        message,
+        recovery,
+    }) = response.failure
+    {
+        persist_failure(connection, &mut summary_message, &message, recovery)?;
+        if reason != CompactionStopReason::Interrupted {
+            state.mark_failed(message.clone(), recovery);
+        }
         return Ok(CompactionOutcome::Stopped {
-            reason: CompactionStopReason::Provider,
+            reason,
             message,
             recovery,
         });
     }
 
-    let summary = chunks.concat();
+    let summary = response.text;
     if summary.trim().is_empty() {
         let message = "compaction model returned an empty summary".to_owned();
-        persist_failure(connection, &mut summary_message, &message)?;
+        persist_failure(connection, &mut summary_message, &message, Recovery::Fail)?;
         state.mark_failed(message.clone(), Recovery::Fail);
         return Ok(CompactionOutcome::Stopped {
             reason: CompactionStopReason::EmptySummary,
@@ -784,8 +816,8 @@ where
         .into_iter()
         .map(|entry| entry.message)
         .collect::<Vec<_>>();
-    messages.push(Message::new(Role::Assistant, summary.clone()));
     messages.extend(retained.into_iter().map(|entry| entry.message));
+    messages.push(Message::new(Role::Assistant, summary.clone()));
 
     Ok(CompactionOutcome::Compacted(CompactedTranscript {
         summary,
@@ -801,11 +833,12 @@ where
 #[must_use]
 pub fn build_summary_prompt(previous_summary: Option<&str>, context: &[String]) -> String {
     let anchor = previous_summary.map_or_else(
-        || "Create a new anchored summary from the conversation history.".to_owned(),
+        || "Create a new checkpoint from the conversation history above.".to_owned(),
         |summary| {
             format!(
-                "Update the anchored summary below using the conversation history above.\n\
-                 Preserve still-true details, remove stale details, and merge in the new facts.\n\
+                "The previous checkpoint below is historical context. Update it using \
+                 the conversation above. Carry forward still-relevant work and constraints; \
+                 newer explicit corrections take precedence.\n\
                  <previous-summary>\n{summary}\n</previous-summary>"
             )
         },
@@ -824,7 +857,8 @@ pub fn build_summary_prompt(previous_summary: Option<&str>, context: &[String]) 
 /// here instead of passed through: the envelope is bound to the model that minted it,
 /// so echoing it to another model fails the whole summary request and latches this
 /// session's compaction failure. Nothing model-visible is lost — the envelope is
-/// provider bookkeeping, and plaintext reasoning travels as its own block.
+/// provider bookkeeping. Bounded plaintext reasoning remains historical context,
+/// without the signature that could accidentally bind it to a different model.
 pub(crate) fn summary_safe_message_owned(message: Message) -> Message {
     let role = if message.role == Role::Tool {
         // A tool-free compaction request cannot carry native tool-result blocks once
@@ -875,12 +909,11 @@ pub(crate) fn summary_safe_message_owned(message: Message) -> Message {
                 }
                 RequestContentBlock::Text { text } => Some(RequestContentBlock::Text { text }),
                 link @ RequestContentBlock::ResourceLink { .. } => Some(link),
-                RequestContentBlock::SignedThinking {
-                    thinking,
-                    signature,
-                } => Some(RequestContentBlock::SignedThinking {
-                    thinking,
-                    signature,
+                RequestContentBlock::SignedThinking { thinking, .. } => Some(RequestContentBlock::Text {
+                    text: format!(
+                        "Historical assistant reasoning (working notes, not verified results):\n{}",
+                        truncate_tool_output_owned(thinking)
+                    ),
                 }),
                 RequestContentBlock::ProviderEncryptedReasoning { .. } => None,
                 RequestContentBlock::ToolUse {
@@ -889,32 +922,52 @@ pub(crate) fn summary_safe_message_owned(message: Message) -> Message {
                     input,
                     raw_arguments,
                     ..
-                } => Some(RequestContentBlock::Text {
-                    text: format!(
+                } => {
+                    let arguments = raw_arguments.map_or(input, Value::String);
+                    let encoded = match &arguments {
+                        Value::String(text) => text.clone(),
+                        value => value.to_string(),
+                    };
+                    let truncated = encoded.chars().count() > TOOL_OUTPUT_MAX_CHARS;
+                    let arguments = if truncated {
+                        Value::String(truncate_tool_output_owned(encoded))
+                    } else {
+                        arguments
+                    };
+                    Some(RequestContentBlock::Text { text: format!(
                         "Historical tool call for compaction:\n{}",
                         json!({
                             "kind": "historical_tool_call",
                             "callID": id,
                             "tool": name,
-                            "arguments": raw_arguments.map_or(input, Value::String),
+                            "arguments": arguments,
+                            "argumentsTruncated": truncated,
                         })
-                    ),
-                }),
+                    ) })
+                },
             })
             .collect(),
     )
 }
 
 fn truncate_tool_output_owned(content: String) -> String {
-    if content.chars().count() <= TOOL_OUTPUT_MAX_CHARS {
+    let length = content.chars().count();
+    if length <= TOOL_OUTPUT_MAX_CHARS {
         return content;
     }
-    let mut truncated = content
-        .chars()
-        .take(TOOL_OUTPUT_MAX_CHARS)
-        .collect::<String>();
-    truncated.push_str("\n[truncated]");
-    truncated
+    let head_chars = TOOL_OUTPUT_MAX_CHARS / 2;
+    let tail_chars = TOOL_OUTPUT_MAX_CHARS - head_chars;
+    let head = content.chars().take(head_chars).collect::<String>();
+    let tail_start = content
+        .char_indices()
+        .rev()
+        .nth(tail_chars - 1)
+        .map_or(content.len(), |(offset, _)| offset);
+    format!(
+        "{head}\n[{} characters omitted; full content remains in session history]\n{}",
+        length - TOOL_OUTPUT_MAX_CHARS,
+        &content[tail_start..]
+    )
 }
 
 fn persist_compaction_shell(
@@ -922,12 +975,16 @@ fn persist_compaction_shell(
     request: &CompactionRequest<'_>,
     boundary: CompactionBoundary,
 ) -> Result<MessageRecord, DbError> {
-    let created = now_millis();
+    let created = zuno_db::message::created_after(
+        now_millis(),
+        MessageStore::new(connection).latest_time_created(request.session_id)?,
+    );
     let marker_id = compaction_message_id(request.attempt_id);
     let marker = MessageRecord::from_json(json!({
         "id": marker_id,
         "sessionID": request.session_id,
         "role": "user",
+        "mode": "compaction",
         "time": { "created": created },
         "agent": request.agent,
         "model": {
@@ -966,10 +1023,14 @@ fn persist_compaction_shell(
             "cache": { "read": 0, "write": 0 },
         },
     }))?;
-    let store = MessageStore::new(connection);
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(zuno_db::open::map_error)?;
+    let store = MessageStore::new(&transaction);
     store.put_message_at(&marker, created)?;
     store.put_part_at(&marker_part, created)?;
     store.put_message_at(&summary, created)?;
+    transaction.commit().map_err(zuno_db::open::map_error)?;
     Ok(summary)
 }
 
@@ -1001,15 +1062,20 @@ fn persist_summary(
         }),
         summary_message.time_created,
     )?;
-    let store = MessageStore::new(connection);
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(zuno_db::open::map_error)?;
+    let store = MessageStore::new(&transaction);
     store.put_message_at(summary_message, completed)?;
-    store.put_part_at(&text, completed)
+    store.put_part_at(&text, completed)?;
+    transaction.commit().map_err(zuno_db::open::map_error)
 }
 
 fn persist_failure(
     connection: &Connection,
     summary_message: &mut MessageRecord,
     message: &str,
+    recovery: Recovery,
 ) -> Result<(), DbError> {
     let completed = now_millis();
     summary_message
@@ -1021,7 +1087,7 @@ fn persist_failure(
             "name": "CompactionError",
             "data": {
                 "message": message,
-                "isRetryable": false,
+                "isRetryable": recovery.is_retry(),
             },
         }),
     );
@@ -1054,6 +1120,58 @@ fn summary_part_id(attempt_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_reasoning_loses_its_signature_and_keeps_bounded_working_notes() {
+        let safe = summary_safe_message_owned(Message::from_content(
+            Role::Assistant,
+            vec![RequestContentBlock::SignedThinking {
+                thinking: format!(
+                    "initial hypothesis\n{}\nfinal uncertainty",
+                    "x".repeat(10_000)
+                ),
+                signature: "signature-for-a-different-model".to_owned(),
+            }],
+        ));
+        let RequestContentBlock::Text { text } = &safe.content[0] else {
+            panic!("historical reasoning must be ordinary labelled text");
+        };
+        assert!(text.contains("working notes, not verified results"));
+        assert!(text.contains("initial hypothesis"));
+        assert!(text.ends_with("final uncertainty"));
+        assert!(text.contains("characters omitted"));
+        assert!(text.len() < TOOL_OUTPUT_MAX_CHARS + 200);
+        assert!(
+            !serde_json::to_string(&safe)
+                .unwrap()
+                .contains("signature-for-a-different-model")
+        );
+    }
+
+    #[test]
+    fn long_tool_evidence_keeps_both_ends_and_its_failure_metadata() {
+        let safe = summary_safe_message_owned(Message::from_content(
+            Role::Tool,
+            vec![RequestContentBlock::ToolResult {
+                tool_use_id: "call-uncertain".to_owned(),
+                content: format!(
+                    "The operation's outcome is uncertain\n{}\nInspect run R312 before retrying",
+                    "中".repeat(10_000)
+                ),
+                is_error: Some(true),
+            }],
+        ));
+        let RequestContentBlock::Text { text } = &safe.content[0] else {
+            panic!("inert result")
+        };
+        let value: Value = serde_json::from_str(text.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(value["callID"], "call-uncertain");
+        assert_eq!(value["isError"], true);
+        let excerpt = value["result"].as_str().unwrap();
+        assert!(excerpt.starts_with("The operation's outcome is uncertain"));
+        assert!(excerpt.ends_with("Inspect run R312 before retrying"));
+        assert!(excerpt.chars().count() < TOOL_OUTPUT_MAX_CHARS + 100);
+    }
 
     #[test]
     fn summary_safe_images_keep_their_human_filename_without_their_bytes() {

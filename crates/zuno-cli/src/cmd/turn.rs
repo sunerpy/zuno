@@ -145,6 +145,16 @@ enum GoalTurnExecution {
     Outcome(Option<TurnOutcome>),
 }
 
+fn compaction_stop_outcome(guard: &SessionRunGuard) -> Option<TurnOutcome> {
+    guard
+        .interrupt_signal()
+        .is_set()
+        .then_some(TurnOutcome::Interrupted {
+            assistant_message_id: None,
+            steps: 0,
+        })
+}
+
 impl DynamicContextRefreshInstruction {
     fn apply(&self, context: DynamicContext, refresh: ToolDynamicContextRefresh) -> DynamicContext {
         let instruction = match self {
@@ -2575,6 +2585,49 @@ impl TurnFailure {
         Self::GoalRecovery {
             message: message.into(),
             failure,
+        }
+    }
+
+    fn compaction(error: CompactionSkipped) -> Self {
+        match error {
+            CompactionSkipped::Database(error) => Self::Database(error),
+            CompactionSkipped::Reason(message) => {
+                Self::host(format!("context compaction could not start: {message}"))
+            }
+            CompactionSkipped::Stopped {
+                reason,
+                message,
+                recovery,
+            } => {
+                let failure =
+                    if reason == zuno_engine::compaction::CompactionStopReason::Interrupted {
+                        GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::UserInterruption)
+                    } else {
+                        match recovery {
+                            Recovery::Retry { after } => GoalTerminalFailure::Retry {
+                                reason: GoalRetryReason::ContextLimit,
+                                retry_after: after,
+                            },
+                            Recovery::Reauthenticate => GoalTerminalFailure::Pause(
+                                zuno_goal::GoalPauseReason::Authentication,
+                            ),
+                            Recovery::Compact | Recovery::Fail => {
+                                GoalTerminalFailure::Block(GoalBlockReason::CompactionPermanent)
+                            }
+                        }
+                    };
+                Self::goal_recovery(
+                    format!("context compaction stopped ({reason:?}): {message}"),
+                    failure,
+                )
+            }
+        }
+    }
+
+    fn work_state(error: zuno_tools::WorkStateError) -> Self {
+        match error {
+            zuno_tools::WorkStateError::Database(error) => Self::Database(error),
+            error => Self::host(error),
         }
     }
 
@@ -6906,7 +6959,7 @@ impl TurnHost {
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
         let result = async {
-            let prelude = self.run_prelude().await?;
+            let prelude = self.run_prelude(guard).await?;
             report_prelude(&events, &self.notes, &self.instruction_admission, &prelude)
                 .await
                 .map_err(TurnFailure::event_consumer)?;
@@ -7426,7 +7479,7 @@ impl TurnHost {
         turn_start: TurnStart,
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, TurnFailure> {
-        let outcome = self.run_prelude().await?;
+        let outcome = self.run_prelude(guard).await?;
         report_prelude(&events, &self.notes, &self.instruction_admission, &outcome)
             .await
             .map_err(TurnFailure::event_consumer)?;
@@ -7606,14 +7659,21 @@ impl TurnHost {
             .map(|retry| retry.reason);
         let result = async {
             if retry_reason == Some(GoalRetryReason::ContextLimit) {
-                self.recover_context(
-                    CompactionTrigger::ContextLimit {
-                        used_tokens: None,
-                        limit_tokens: Some(self.window.context),
-                    },
-                    &events,
-                )
-                .await?;
+                if !self
+                    .recover_context(
+                        CompactionTrigger::ContextLimit {
+                            used_tokens: None,
+                            limit_tokens: Some(self.window.context),
+                        },
+                        prepared.run_guard(),
+                        &events,
+                    )
+                    .await?
+                {
+                    return Ok(GoalTurnExecution::Outcome(compaction_stop_outcome(
+                        prepared.run_guard(),
+                    )));
+                }
                 self.goal_store
                     .mark_retry_context_compacted(&self.session_id)
                     .map_err(TurnFailure::goal)?;
@@ -7666,7 +7726,7 @@ impl TurnHost {
         if let Some(instruction) = planning_runtime_instruction(&planning) {
             dynamic_context = dynamic_context.with_runtime_instruction(instruction);
         }
-        let prelude = self.run_prelude().await;
+        let prelude = self.run_prelude(prepared.run_guard()).await;
         let prelude = match prelude {
             Ok(prelude) if prelude.continue_turn => prelude,
             Ok(_) => return Ok(GoalTurnExecution::Outcome(None)),
@@ -7729,7 +7789,12 @@ impl TurnHost {
             .begin(&self.session_id, &proposed_cycle_id)
             .map_err(TurnFailure::Database)?;
         let mut context_compactions = 0_u32;
+        let work = zuno_tools::WorkStateStore::new(Arc::clone(&self.database));
         loop {
+            let plan_before = work
+                .plan(&self.session_id)
+                .map_err(TurnFailure::work_state)?
+                .map(|plan| (plan.id, plan.revision));
             let dynamic_context_refresher = HostDynamicContextRefresher {
                 goal_continuation: self.goal_continuation.clone(),
                 instruction: refresh_instruction.clone(),
@@ -7760,7 +7825,27 @@ impl TurnHost {
                         ));
                     }
                     context_compactions = context_compactions.saturating_add(1);
-                    self.recover_context(trigger, &events).await?;
+                    if !self.recover_context(trigger, guard, &events).await? {
+                        return Ok(compaction_stop_outcome(guard));
+                    }
+                    let plan_after = work
+                        .plan(&self.session_id)
+                        .map_err(TurnFailure::work_state)?
+                        .map(|plan| (plan.id, plan.revision));
+                    if matches!(
+                        refresh_instruction,
+                        DynamicContextRefreshInstruction::Planning(PlanningDecision::Required(_))
+                    ) && plan_after.is_some()
+                        && plan_after != plan_before
+                    {
+                        refresh_instruction = DynamicContextRefreshInstruction::Fixed(
+                            maintain_plan_runtime_instruction(),
+                        );
+                    }
+                    dynamic_context = refresh_instruction.apply(
+                        self.goal_dynamic_context().map_err(TurnFailure::host)?,
+                        ToolDynamicContextRefresh::WorkItems,
+                    );
                     let continuation = self
                         .persist_turn_continuation(&cycle_id, &turn_start, true)
                         .map_err(TurnFailure::host)?;
@@ -7980,17 +8065,8 @@ impl TurnHost {
     }
 
     fn latest_user_anchor(&self) -> Result<Option<String>, String> {
-        self.connection
-            .query_row(
-                "SELECT id FROM message \
-                 WHERE session_id = ?1 \
-                   AND json_extract(data, '$.role') = 'user' \
-                   AND coalesce(json_extract(data, '$.mode'), '') <> 'compaction' \
-                 ORDER BY time_created DESC, id DESC LIMIT 1",
-                [&self.session_id],
-                |row| row.get(0),
-            )
-            .optional()
+        zuno_db::message::MessageStore::new(&self.connection)
+            .latest_user_message_id(&self.session_id)
             .map_err(to_string)
     }
 
@@ -8286,8 +8362,9 @@ impl TurnHost {
     async fn recover_context(
         &mut self,
         trigger: CompactionTrigger,
+        guard: &SessionRunGuard,
         events: &TurnEventSender,
-    ) -> Result<(), TurnFailure> {
+    ) -> Result<bool, TurnFailure> {
         self.compaction_state.reset_retryable_failure();
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = zuno_engine::compaction::NoopCompactionHooks;
@@ -8299,37 +8376,27 @@ impl TurnHost {
             window: self.window,
             state: &mut self.compaction_state,
             hooks: &noop_hooks,
+            interrupt: Some(guard.interrupt_signal()),
         };
-        let outcome = compact_requested(&self.session_id, &mut context, trigger, true)
-            .await
-            .map_err(|error| match error {
-                CompactionSkipped::Database(error) => TurnFailure::Database(error),
-                CompactionSkipped::Reason(message) => {
-                    TurnFailure::host(format!("context compaction could not start: {message}"))
-                }
-                CompactionSkipped::Stopped {
-                    reason,
-                    message,
-                    recovery,
-                } => {
-                    let failure = match recovery {
-                        Recovery::Retry { after } => GoalTerminalFailure::Retry {
-                            reason: GoalRetryReason::ContextLimit,
-                            retry_after: after,
-                        },
-                        Recovery::Reauthenticate => {
-                            GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::Authentication)
-                        }
-                        Recovery::Compact | Recovery::Fail => {
-                            GoalTerminalFailure::Block(GoalBlockReason::CompactionPermanent)
-                        }
-                    };
-                    TurnFailure::goal_recovery(
-                        format!("context compaction stopped ({reason:?}): {message}"),
-                        failure,
-                    )
-                }
-            })?;
+        let outcome = compact_requested(&self.session_id, &mut context, trigger, true).await;
+        if matches!(
+            &outcome,
+            Err(CompactionSkipped::Stopped {
+                reason: zuno_engine::compaction::CompactionStopReason::Interrupted,
+                ..
+            })
+        ) {
+            events
+                .publish(TurnEvent::TurnInterrupted {
+                    assistant_message_id: None,
+                    steps: 0,
+                    request: guard.interrupt_request(),
+                })
+                .await
+                .map_err(TurnFailure::event_consumer)?;
+            return Ok(false);
+        }
+        let outcome = outcome.map_err(TurnFailure::compaction)?;
         let Some(summary) = outcome.summary else {
             return Err(TurnFailure::goal_recovery(
                 "context compaction completed without a durable summary",
@@ -8342,7 +8409,8 @@ impl TurnHost {
                 content: summary,
             })
             .await
-            .map_err(TurnFailure::event_consumer)
+            .map_err(TurnFailure::event_consumer)?;
+        Ok(outcome.continue_turn)
     }
 
     fn goal_dynamic_context(&self) -> Result<DynamicContext, String> {
@@ -8662,7 +8730,7 @@ impl TurnHost {
     pub(crate) async fn compact_with_guard(
         &mut self,
         automatic: bool,
-        _guard: SessionRunGuard,
+        guard: SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
         self.require_active_extension_composition()?;
@@ -8680,7 +8748,7 @@ impl TurnHost {
             })
             .await
             .map_err(to_string)?;
-        let result = match self.compact_unaccounted(automatic).await {
+        let result = match self.compact_unaccounted(automatic, &guard).await {
             Ok(outcome) => {
                 self.last_turn_completed = true;
                 match self.finish_goal_turn(usage_before, started, None) {
@@ -8699,14 +8767,11 @@ impl TurnHost {
             }
             Err(error) => {
                 self.last_turn_completed = false;
-                match self.finish_goal_error(
-                    usage_before,
-                    started,
-                    GoalTerminalFailure::Block(GoalBlockReason::CompactionPermanent),
-                ) {
-                    Ok(_) => Err(error),
+                let message = error.rendered(None);
+                match self.finish_goal_error(usage_before, started, error.goal_failure()) {
+                    Ok(_) => Err(message),
                     Err(goal_error) => Err(format!(
-                        "{error}; additionally failed to record terminal goal state: {goal_error}"
+                        "{message}; additionally failed to record terminal goal state: {goal_error}"
                     )),
                 }
             }
@@ -8734,7 +8799,8 @@ impl TurnHost {
     async fn compact_unaccounted(
         &mut self,
         automatic: bool,
-    ) -> Result<zuno_engine::prelude::PreludeCompactionOutcome, String> {
+        guard: &SessionRunGuard,
+    ) -> Result<zuno_engine::prelude::PreludeCompactionOutcome, TurnFailure> {
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = zuno_engine::compaction::NoopCompactionHooks;
         let mut context = PreludeContext {
@@ -8745,6 +8811,7 @@ impl TurnHost {
             window: self.window,
             state: &mut self.compaction_state,
             hooks: &noop_hooks,
+            interrupt: Some(guard.interrupt_signal()),
         };
         compact_requested(
             &self.session_id,
@@ -8753,7 +8820,7 @@ impl TurnHost {
             automatic,
         )
         .await
-        .map_err(|error| format!("manual compaction failed: {error:?}"))
+        .map_err(TurnFailure::compaction)
     }
 
     /// Run every internal that applies before this turn.
@@ -8766,7 +8833,10 @@ impl TurnHost {
     /// [`zuno_engine::prelude::summarize`] with this context rather than resolving a
     /// second model of its own — resolving separately is exactly how all three
     /// internals came to be declared and never invoked.
-    async fn run_prelude(&mut self) -> Result<PreludeOutcome, TurnFailure> {
+    async fn run_prelude(
+        &mut self,
+        guard: &SessionRunGuard,
+    ) -> Result<PreludeOutcome, TurnFailure> {
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = zuno_engine::compaction::NoopCompactionHooks;
         let mut context = PreludeContext {
@@ -8777,6 +8847,7 @@ impl TurnHost {
             window: self.window,
             state: &mut self.compaction_state,
             hooks: &noop_hooks,
+            interrupt: Some(guard.interrupt_signal()),
         };
         let outcome = run_prelude(&self.session_id, &mut context)
             .await

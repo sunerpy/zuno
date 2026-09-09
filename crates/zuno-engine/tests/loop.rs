@@ -5731,6 +5731,114 @@ fn loop_failed_compaction_falls_back_to_byte_identical_full_history() {
 }
 
 #[test]
+fn a_failed_or_dangling_compaction_keeps_the_last_committed_boundary() {
+    let connection = seeded();
+    put_user(&connection, "msg_discarded", 10, "discarded history");
+    put_user(&connection, "msg_retained", 20, "current research request");
+    put_successful_compaction(
+        &connection,
+        "msg_valid_marker",
+        "msg_valid_summary",
+        "msg_retained",
+        30,
+    );
+    put_user(
+        &connection,
+        "msg_later",
+        40,
+        "a clarification within the same task",
+    );
+    put_incomplete_compaction(
+        &connection,
+        "msg_failed_marker",
+        "msg_failed_summary",
+        "msg_later",
+        50,
+        Some("uncommitted partial checkpoint"),
+        true,
+    );
+    put_successful_compaction(
+        &connection,
+        "msg_dangling_marker",
+        "msg_dangling_summary",
+        "msg_missing_tail",
+        60,
+    );
+
+    let full = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("full fixture history");
+    let retained = retained_history(&full);
+    assert_eq!(retained[0].info.id, "msg_retained");
+    let accepted =
+        hydrate_retained_history(&connection, SESSION_ID).expect("last accepted checkpoint");
+    assert_eq!(accepted[0].info.id, "msg_retained");
+    assert!(!accepted.iter().any(|message| {
+        matches!(
+            message.info.id.as_str(),
+            "msg_failed_summary" | "msg_dangling_summary"
+        )
+    }));
+    assert_eq!(
+        project_history_owned("system", accepted.clone()),
+        project_history("system", retained)
+            .into_iter()
+            .map(|message| message.message)
+            .collect::<Vec<_>>(),
+    );
+
+    // The discarded head must never be hydrated to find the usable checkpoint.
+    connection
+        .execute(
+            "UPDATE message SET data = json_set(data, '$.role', 'invalid-old-role') \
+             WHERE id = 'msg_discarded'",
+            [],
+        )
+        .expect("make accidental head hydration observable");
+    let hydrated = hydrate_retained_history(&connection, SESSION_ID)
+        .expect("an unrelated discarded row cannot break checkpoint recovery");
+    assert_eq!(hydrated, accepted);
+}
+
+#[test]
+fn malformed_or_unicode_blank_summaries_do_not_advance_the_checkpoint() {
+    for invalid_text in [json!(42), json!("\u{2003}\u{202f}\u{3000}")] {
+        let connection = seeded();
+        put_user(&connection, "msg_old", 10, "old context");
+        put_user(&connection, "msg_retained", 20, "retained context");
+        put_successful_compaction(
+            &connection,
+            "msg_valid",
+            "msg_valid_summary",
+            "msg_retained",
+            30,
+        );
+        put_user(&connection, "msg_later", 40, "later context");
+        put_successful_compaction(
+            &connection,
+            "msg_invalid",
+            "msg_invalid_summary",
+            "msg_later",
+            50,
+        );
+        connection
+            .execute(
+                "UPDATE part SET data = json_set(data, '$.text', json(?1)) \
+             WHERE id = 'prt_msg_invalid_summary'",
+                [invalid_text.to_string()],
+            )
+            .unwrap();
+        let checkpoint = MessageStore::new(&connection)
+            .latest_successful_compaction(SESSION_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.summary_message_id, "msg_valid_summary");
+        let retained = hydrate_retained_history(&connection, SESSION_ID).unwrap();
+        assert_eq!(retained[0].info.id, "msg_retained");
+    }
+}
+
+#[test]
 fn assistant_only_compaction_tail_requires_a_fresh_user_anchor() {
     let connection = seeded();
     put_user(&connection, "msg_old_user", 10, "original request");

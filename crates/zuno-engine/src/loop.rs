@@ -2176,6 +2176,8 @@ async fn run_turn_in_span(
         }
 
         let mut history = hydrate_retained_history(context.connection, &request.session_id)?;
+        let has_compaction_checkpoint =
+            crate::compaction::checkpoint::latest_checkpoint(&history).is_some();
         apply_legacy_tool_schema_identities(&mut history, &legacy_tool_schema_snapshots);
         let requested = requested_turn(&request.session_id, &history, &request.start)?;
         if inject_live_inputs(&mut context, &request, &requested)?.count > 0 {
@@ -2447,10 +2449,13 @@ async fn run_turn_in_span(
         } else {
             Default::default()
         };
-        let runtime_sections = agent.runtime_prompt_policy.sections(
+        let mut runtime_sections = agent.runtime_prompt_policy.sections(
             completion.tools.iter().map(|tool| tool.name.as_str()),
             !request.dynamic_context.is_empty(),
         );
+        if has_compaction_checkpoint {
+            runtime_sections.push(crate::prompt::RuntimePromptSection::compaction_continuation());
+        }
         let runtime_context = runtime_sections
             .iter()
             .map(|section| section.content().to_owned())
@@ -4494,59 +4499,34 @@ pub fn hydrate_retained_history_tail(
     maximum_part_bytes: u64,
 ) -> Result<HydratedHistoryTail, DbError> {
     let store = MessageStore::new(connection);
-    let inclusive_start =
-        if let Some(tail_start_id) = successful_compaction_tail_start(&store, session_id)? {
-            store
-                .find_message(&tail_start_id)?
-                .filter(|message| message.session_id == session_id)
-                .map(|message| (message.time_created, message.id))
-        } else {
-            None
-        };
-    let (messages, omitted) = store.messages_for_session_tail(
+    let checkpoint = store.latest_successful_compaction(session_id)?;
+    let inclusive_start = if let Some(checkpoint) = &checkpoint {
+        store
+            .find_message(&checkpoint.tail_start_id)?
+            .filter(|message| message.session_id == session_id)
+            .map(|message| (message.time_created, message.id))
+    } else {
+        None
+    };
+    let (mut messages, omitted) = store.messages_for_session_tail(
         session_id,
         inclusive_start
             .as_ref()
             .map(|(time_created, id)| (*time_created, id.as_str())),
         maximum_messages,
     )?;
-    hydrate_history_tail(&store, messages, omitted, maximum_part_bytes)
-}
-
-fn successful_compaction_tail_start(
-    store: &MessageStore<'_>,
-    session_id: &str,
-) -> Result<Option<String>, DbError> {
-    let Some(marker) = store.latest_part_for_session_by_kind(session_id, PartKind::Compaction)?
-    else {
-        return Ok(None);
-    };
-    let Some(tail_start_id) = marker
-        .data
-        .get("tail_start_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    else {
-        return Ok(None);
-    };
-    let summary_ids = store
-        .messages_for_session_parent(session_id, &marker.message_id)?
-        .into_iter()
-        .filter(|message| !message.data.contains_key("error"))
-        .map(|message| message.id)
-        .collect::<Vec<_>>();
-    let summary_text = store.parts_by_message_kind(&summary_ids, PartKind::Text)?;
-    let succeeded = summary_ids.iter().any(|id| {
-        summary_text.get(id).is_some_and(|parts| {
-            parts.iter().any(|part| {
-                part.data
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.trim().is_empty())
-            })
-        })
+    // Select summary metadata before hydrating its potentially large parts. All
+    // clients using retained history receive the same active checkpoint as the model.
+    messages.retain(|message| {
+        message.role != MessageRole::Assistant
+            || message.data.get("summary").and_then(Value::as_bool) != Some(true)
+            || (message.data.get("finish").and_then(Value::as_str) == Some("stop")
+                && message.data.get("error").is_none_or(Value::is_null)
+                && checkpoint
+                    .as_ref()
+                    .is_none_or(|checkpoint| checkpoint.summary_message_id == message.id))
     });
-    Ok(succeeded.then_some(tail_start_id))
+    hydrate_history_tail(&store, messages, omitted, maximum_part_bytes)
 }
 
 fn hydrate_history_tail(
@@ -4626,11 +4606,16 @@ impl ProjectedMessage {
 /// drifting away from the messages they measure.
 #[must_use]
 pub fn project_history(system_prompt: &str, history: &[MessageWithParts]) -> Vec<ProjectedMessage> {
+    let active_summary = crate::compaction::checkpoint::latest_checkpoint(history)
+        .map(|checkpoint| checkpoint.summary.info.id.as_str());
     let mut projected = vec![ProjectedMessage::from_request_message(
         None,
         Message::new(Role::System, system_prompt).into(),
     )];
     for message in history {
+        if !crate::compaction::checkpoint::visible_in_history(message, active_summary) {
+            continue;
+        }
         let mut messages = Vec::new();
         match message.info.role {
             MessageRole::User => append_user_message(&mut messages, message),
@@ -4708,16 +4693,19 @@ pub(crate) fn map_project_history_owned_with_ids<T>(
     mut history: Vec<MessageWithParts>,
     mut map: impl FnMut(ProjectedMessage) -> T,
 ) -> Vec<T> {
-    let retained_start = retained_history(&history).as_ptr_range().start;
-    let tail_index = history
-        .iter()
-        .position(|message| std::ptr::eq(message, retained_start))
-        .unwrap_or(history.len());
+    let checkpoint = crate::compaction::checkpoint::latest_checkpoint(&history);
+    let tail_index = checkpoint
+        .as_ref()
+        .map_or(0, |checkpoint| checkpoint.tail_index);
+    let active_summary = checkpoint.map(|checkpoint| checkpoint.summary.info.id.clone());
     let mut projected = vec![map(ProjectedMessage::from_request_message(
         None,
         Message::new(Role::System, system_prompt).into(),
     ))];
     for message in history.drain(tail_index..) {
+        if !crate::compaction::checkpoint::visible_in_history(&message, active_summary.as_deref()) {
+            continue;
+        }
         let message_id = message.info.id;
         let mut messages = Vec::new();
         match message.info.role {
@@ -4763,53 +4751,8 @@ pub(crate) fn map_project_history_owned_with_ids<T>(
 /// Retaining too much costs tokens; retaining too little loses the conversation.
 #[must_use]
 pub fn retained_history(history: &[MessageWithParts]) -> &[MessageWithParts] {
-    let Some((marker_index, tail_start_id)) = history
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, message)| compaction_tail_start(message).map(|tail| (index, tail)))
-    else {
-        return history;
-    };
-    if !compaction_summary_succeeded(history, &history[marker_index].info.id) {
-        return history;
-    }
-    history
-        .iter()
-        .position(|message| message.info.id == tail_start_id)
-        .map_or(history, |tail_index| &history[tail_index..])
-}
-
-fn compaction_tail_start(message: &MessageWithParts) -> Option<String> {
-    message
-        .parts
-        .iter()
-        .filter(|part| part.kind == PartKind::Compaction)
-        .find_map(|part| {
-            part.data
-                .get("tail_start_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-}
-
-fn compaction_summary_succeeded(history: &[MessageWithParts], marker_id: &str) -> bool {
-    history
-        .iter()
-        .filter(|message| {
-            message.info.data.get("parentID").and_then(Value::as_str) == Some(marker_id)
-        })
-        .any(|summary| {
-            !summary.info.data.contains_key("error")
-                && summary.parts.iter().any(|part| {
-                    part.kind == PartKind::Text
-                        && part
-                            .data
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .is_some_and(|text| !text.trim().is_empty())
-                })
-        })
+    crate::compaction::checkpoint::latest_checkpoint(history)
+        .map_or(history, |checkpoint| &history[checkpoint.tail_index..])
 }
 
 /// Whether a stored user message records a compaction rather than a user's turn.

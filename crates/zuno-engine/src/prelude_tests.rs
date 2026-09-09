@@ -381,12 +381,160 @@ fn owned_compaction_transcript_charges_full_tool_output_before_truncating_it() {
         tool_entry.estimated_tokens, full_tool_tokens,
         "tail selection must still charge the complete provider-visible result"
     );
-    assert_eq!(
-        content.chars().count(),
-        TOOL_OUTPUT_MAX_CHARS + "\n[truncated]".chars().count(),
-        "the compaction transcript retained the full tool allocation"
+    assert!(content.chars().count() < TOOL_OUTPUT_MAX_CHARS + 100);
+    assert!(content.contains("characters omitted; full content remains in session history"));
+    assert!(
+        tool_entry.synthetic,
+        "a tool observation is not another human turn"
     );
-    assert!(content.ends_with("\n[truncated]"));
+}
+
+#[test]
+fn summary_projection_preserves_real_user_boundaries_and_tool_pairs() {
+    let connection = seeded("A named session", None);
+    put_user(
+        &connection,
+        "msg_old",
+        10,
+        "Compare possible causes without changing code",
+    );
+    put_tool_exchange(&connection, "msg_old_tool", 20, "reused_call");
+    put_user(
+        &connection,
+        "msg_recent",
+        30,
+        "Check the logs for the same investigation",
+    );
+    put_tool_exchange(&connection, "msg_recent_tool", 40, "reused_call");
+    let history = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("history");
+    let original = transcript(COMPACTION_PROMPT, &history);
+    let safe = transcript_owned(COMPACTION_PROMPT, history);
+    for tail_turns in 0..=3 {
+        for budget in [0, 1, 16, 64, 256, 4096] {
+            assert_eq!(
+                select_boundary(&original, tail_turns, budget),
+                select_boundary(&safe, tail_turns, budget),
+                "text conversion changed the boundary with {tail_turns} turns and {budget} tokens",
+            );
+        }
+    }
+    let boundary = select_boundary(&safe, 1, 0).expect("compactable history");
+    assert_eq!(boundary.retained_from + 1, boundary.raw_retained_from);
+    assert_eq!(safe[boundary.retained_from].id, "msg_recent_tool");
+}
+
+#[tokio::test]
+async fn repeated_compaction_carries_one_checkpoint_without_replacing_foreground_receipts() {
+    let mut connection = seeded("A named session", None);
+    put_user(
+        &connection,
+        "msg_old",
+        10,
+        "Investigate the failure without editing files",
+    );
+    put_assistant(
+        &connection,
+        "msg_observed",
+        20,
+        "The first observation is recorded",
+        1,
+    );
+    put_user(
+        &connection,
+        "msg_recent",
+        30,
+        "Collect the remaining evidence",
+    );
+    let foreground = zuno_db::event_log::append_with_connection(
+        &mut connection,
+        SESSION_ID,
+        zuno_db::event_log::NewSessionEvent::new(
+            "session.prompt.assembled",
+            serde_json::json!({"selectedSkills": ["investigation"]})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let checkpoints = ["CHECKPOINT_ONE", "CHECKPOINT_TWO", "CHECKPOINT_THREE"];
+    let provider = RecordingProvider::answering(&checkpoints);
+    let providers = OneProvider(Arc::clone(&provider));
+    let internals = internals();
+    let config = CompactionConfig {
+        tail_turns: Some(1),
+        preserve_recent_tokens: Some(1),
+        ..CompactionConfig::default()
+    };
+    let mut state = CompactionState::default();
+    for (index, checkpoint) in checkpoints.iter().enumerate() {
+        if index > 0 {
+            let created = zuno_db::message::created_after(
+                zuno_db::message::now_millis(),
+                MessageStore::new(&connection)
+                    .latest_time_created(SESSION_ID)
+                    .unwrap(),
+            );
+            put_user(
+                &connection,
+                &format!("msg_next_{index}"),
+                created,
+                "Continue the same read-only investigation",
+            );
+        }
+        let result = super::compact_requested(
+            SESSION_ID,
+            &mut context(
+                &mut connection,
+                &providers,
+                &internals,
+                &config,
+                ROOMY_WINDOW,
+                &mut state,
+            ),
+            crate::compaction::CompactionTrigger::Manual,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.summary.as_deref(), Some(*checkpoint));
+        if index > 0 {
+            let prompt = provider.requests()[index]
+                .messages
+                .iter()
+                .map(|message| text_of(message.message()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(prompt.matches(checkpoints[index - 1]).count(), 1);
+        }
+    }
+    let stored = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .filter(|message| message.info.data.get("summary") == Some(&Value::Bool(true)))
+            .count(),
+        3,
+        "the durable audit keeps every summary",
+    );
+    let projected = super::project_history("", super::retained_history(&stored))
+        .into_iter()
+        .map(|message| text_of(&message.message))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(projected.contains(checkpoints[2]));
+    assert!(!projected.contains(checkpoints[0]));
+    assert!(!projected.contains(checkpoints[1]));
+    let latest =
+        zuno_db::event_log::latest_of_type_in(&connection, SESSION_ID, "session.prompt.assembled")
+            .unwrap()
+            .unwrap();
+    assert_eq!(latest.id, foreground.id);
 }
 
 fn context<'a>(
@@ -405,6 +553,7 @@ fn context<'a>(
         window,
         state,
         hooks: &crate::compaction::NoopCompactionHooks,
+        interrupt: None,
     }
 }
 

@@ -220,6 +220,215 @@ fn valid_transcript(tool_turns: &[bool]) -> Vec<TranscriptEntry> {
     entries
 }
 
+async fn compact_response(
+    response: Vec<Result<StreamEvent, ProviderError>>,
+) -> (Connection, CompactionOutcome, Vec<CompletionRequest>) {
+    let mut connection = seeded();
+    let provider = CassetteProvider::new(vec![response]);
+    let config = CompactionConfig {
+        tail_turns: Some(1),
+        preserve_recent_tokens: Some(16),
+        ..CompactionConfig::default()
+    };
+    let outcome = compact_with(&mut connection, &provider, &config, "response-contract")
+        .await
+        .expect("compaction result");
+    (connection, outcome, provider.requests())
+}
+
+async fn compact_with(
+    connection: &mut Connection,
+    provider: &dyn Provider,
+    config: &CompactionConfig,
+    attempt_id: &str,
+) -> Result<CompactionOutcome, zuno_engine::compaction::CompactionError> {
+    let hooks = RecordingHooks::new(true);
+    let mut state = CompactionState::default();
+    let mut tracker = CacheTracker::new();
+    let mut locked = LockedTools::<String>::new();
+    run_compaction(
+        connection,
+        provider,
+        &hooks,
+        &mut state,
+        &mut CompactionCache::new(&mut tracker, &mut locked),
+        CompactionRequest::new(
+            SESSION_ID,
+            attempt_id,
+            "build",
+            "cassette",
+            "summary-model",
+            valid_transcript(&[false, true, false, true]),
+            config,
+            TokenWindow {
+                context: 100_000,
+                max_output: 4_096,
+            },
+            CompactionTrigger::Manual,
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn failed_checkpoint_writes_never_publish_a_partial_boundary() {
+    for failure in ["shell", "summary"] {
+        let mut connection = seeded();
+        let trigger = if failure == "shell" {
+            "CREATE TRIGGER fail_compaction BEFORE INSERT ON message \
+             WHEN json_extract(NEW.data, '$.summary') = 1 \
+             BEGIN SELECT RAISE(ABORT, 'injected shell failure'); END"
+        } else {
+            "CREATE TRIGGER fail_compaction BEFORE INSERT ON part \
+             WHEN json_extract(NEW.data, '$.type') = 'text' \
+             BEGIN SELECT RAISE(ABORT, 'injected summary failure'); END"
+        };
+        connection.execute_batch(trigger).unwrap();
+        let provider = CassetteProvider::new(vec![vec![
+            Ok(StreamEvent::TextDelta(SUMMARY.to_owned())),
+            Ok(StreamEvent::MessageEnd { stop_reason: None }),
+        ]]);
+        let config = CompactionConfig {
+            tail_turns: Some(1),
+            preserve_recent_tokens: Some(1),
+            ..CompactionConfig::default()
+        };
+        assert!(
+            compact_with(&mut connection, &provider, &config, "atomic")
+                .await
+                .is_err()
+        );
+        let history = MessageStore::new(&connection)
+            .hydrate_session(SESSION_ID)
+            .unwrap();
+        if failure == "shell" {
+            assert!(
+                history.is_empty(),
+                "marker creation must roll back with its summary shell"
+            );
+            assert!(provider.requests().is_empty());
+        } else {
+            let summary = history
+                .iter()
+                .find(|message| message.info.id == "msg_atomic_summary")
+                .unwrap();
+            assert!(!summary.info.data.contains_key("finish"));
+            assert!(
+                summary.parts.is_empty(),
+                "text and the success flag must commit together"
+            );
+            assert_eq!(provider.requests().len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn compaction_request_preserves_the_internal_system_instruction() {
+    let (connection, outcome, requests) = compact_response(vec![
+        Ok(StreamEvent::TextDelta(SUMMARY.to_owned())),
+        Ok(StreamEvent::MessageEnd { stop_reason: None }),
+    ])
+    .await;
+    assert!(matches!(outcome, CompactionOutcome::Compacted(_)));
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].messages[0],
+        Message::new(Role::System, "Initial context").into()
+    );
+    let receipt =
+        zuno_db::event_log::latest_of_type_in(&connection, SESSION_ID, "session.compaction.prompt")
+            .expect("read the request receipt")
+            .expect("the exact request was persisted");
+    let properties = receipt.properties;
+    assert_eq!(
+        properties["compactionRequest"]["messages"],
+        serde_json::to_value(
+            requests[0]
+                .messages
+                .iter()
+                .map(|message| message.message())
+                .collect::<Vec<_>>()
+        )
+        .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn compaction_retry_rollback_discards_the_interrupted_summary() {
+    let (connection, outcome, _) = compact_response(vec![
+        Ok(StreamEvent::TextDelta("stale incomplete answer".to_owned())),
+        Ok(StreamEvent::RetryRollback { attempt: 2, max: 2 }),
+        Ok(StreamEvent::TextDelta(SUMMARY.to_owned())),
+        Ok(StreamEvent::MessageEnd { stop_reason: None }),
+    ])
+    .await;
+    let CompactionOutcome::Compacted(compacted) = outcome else {
+        panic!("the completed retry should compact");
+    };
+    assert_eq!(compacted.summary, SUMMARY);
+    let history = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("durable history");
+    assert!(
+        history
+            .iter()
+            .flat_map(|message| &message.parts)
+            .all(|part| {
+                !part
+                    .data
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.contains("stale incomplete answer"))
+            })
+    );
+}
+
+#[tokio::test]
+async fn compaction_does_not_commit_text_without_a_terminal_message() {
+    let (connection, outcome, _) =
+        compact_response(vec![Ok(StreamEvent::TextDelta(SUMMARY.to_owned()))]).await;
+    assert!(
+        matches!(outcome, CompactionOutcome::Stopped { .. }),
+        "an EOF with partial text must preserve the previous context"
+    );
+    let history = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("durable history");
+    assert!(history.iter().all(|message| {
+        message
+            .info
+            .data
+            .get("finish")
+            .and_then(serde_json::Value::as_str)
+            != Some("stop")
+    }));
+}
+
+#[tokio::test]
+async fn compaction_rejects_a_truncated_or_tool_call_summary() {
+    for reason in [
+        zuno_llm::event::FinishReason::Length,
+        zuno_llm::event::FinishReason::ToolCalls,
+        zuno_llm::event::FinishReason::ContentFilter,
+        zuno_llm::event::FinishReason::Error,
+    ] {
+        let (connection, outcome, _) = compact_response(vec![
+            Ok(StreamEvent::TextDelta(SUMMARY.to_owned())),
+            Ok(StreamEvent::MessageEnd {
+                stop_reason: Some(reason),
+            }),
+        ])
+        .await;
+        assert!(matches!(outcome, CompactionOutcome::Stopped { .. }));
+        assert!(
+            MessageStore::new(&connection)
+                .latest_successful_compaction(SESSION_ID)
+                .expect("accepted checkpoint")
+                .is_none()
+        );
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -273,6 +482,23 @@ fn compaction_boundary_walks_back_when_the_raw_split_lands_on_a_tool_result() {
         "FAILURE_QA transcript=[system,user-old,tool_use(call-read),tool_result(call-read),user-recent,assistant-recent] raw_boundary={} adjusted_boundary={}",
         boundary.raw_retained_from, boundary.retained_from
     );
+}
+
+#[test]
+fn compaction_pairs_reused_call_ids_with_their_preceding_call() {
+    let entries = vec![
+        entry("system", Role::System, "context", 1),
+        entry("user-old", Role::User, "investigate", 100),
+        tool_use("call-old", "reused", 100),
+        tool_result("result-old", "reused", 1),
+        entry("user-new", Role::User, "check the remaining evidence", 1),
+        tool_use("call-new", "reused", 1),
+        tool_result("result-new", "reused", 1),
+        entry("assistant", Role::Assistant, "observations", 1),
+    ];
+    let boundary = select_boundary(&entries, 2, 5).unwrap();
+    assert_eq!(boundary.raw_retained_from, 3);
+    assert_eq!(boundary.retained_from, 2);
 }
 
 #[test]
@@ -412,6 +638,7 @@ fn compaction_policy_honors_all_configuration_fields() {
         tail_turns: Some(7),
         preserve_recent_tokens: Some(3_456),
         reserved: Some(12_000),
+        ..CompactionConfig::default()
     };
     let policy = CompactionPolicy::resolve(
         &config,
@@ -520,6 +747,7 @@ async fn compaction_summarizes_two_hundred_messages_with_the_small_model_and_res
         tail_turns: Some(2),
         preserve_recent_tokens: Some(200),
         reserved: Some(20_000),
+        ..CompactionConfig::default()
     };
     let request = CompactionRequest::new(
         SESSION_ID,
@@ -616,10 +844,10 @@ async fn compaction_summarizes_two_hundred_messages_with_the_small_model_and_res
         .expect("text summary prompt");
     for section in [
         "## Objective",
-        "## Important Details",
+        "## Constraints and Decisions",
         "## Work State",
-        "## Next Move",
-        "## Relevant Files",
+        "## Next Steps",
+        "## References",
     ] {
         assert!(prompt.contains(section), "missing prompt section {section}");
     }

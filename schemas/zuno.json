@@ -389,12 +389,21 @@
       "type": "object"
     },
     "CompactionConfig": {
-      "description": "Context-compaction behaviour (`config/config.ts:151-172`).",
+      "description": "Context-compaction behavior and bounded summary generation.",
       "properties": {
         "auto": {
           "description": "Compact automatically when the context fills. Defaults to true.",
           "type": [
             "boolean",
+            "null"
+          ]
+        },
+        "max_summary_bytes": {
+          "description": "Maximum UTF-8 bytes in a generated summary. Defaults to 65536.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
             "null"
           ]
         },
@@ -442,6 +451,15 @@
             }
           ],
           "description": "Percentage of the usable context window that triggers automatic compaction.\nDefaults to 80."
+        },
+        "timeout_seconds": {
+          "description": "Maximum time to receive a complete summary, in seconds. Defaults to 180.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "type": "object"

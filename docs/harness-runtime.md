@@ -1501,6 +1501,49 @@ notice with stable code `context.compact` and returns
 compact-and-retry recovery path. With `compaction.auto: false`, the host
 attaches no proactive threshold and none of these between-request checks run.
 
+Checkpoint creation and continuation use separate, task-neutral templates.
+`compaction/summary.md` asks for the actual objective, constraints and decisions,
+verified progress, active work, blockers, next steps, and references. It carries
+forward still-relevant state from the previous accepted checkpoint and applies
+newer explicit corrections. `compaction/continuation.md` becomes the native
+`runtime.compaction` section whenever a provider request retains a checkpoint,
+including manual compaction, a new user request, and restart. It treats summaries
+as historical context and preserves the current task, mode, and permission
+boundaries. This adapts Codex's checkpoint handoff and OpenCode's incremental
+summary rules to Zuno's durable work state.
+
+The host rebuilds Goal/Plan/Todo/Job context before the first request after
+in-drive compaction. If the Plan changed during that driver invocation, a
+one-time create-or-replace instruction becomes Plan maintenance. Otherwise it
+remains unsatisfied. A compaction marker, including older markers without a
+`mode` field, cannot replace the real user anchor, experience-retrieval query,
+or completed-turn learning boundary. The engine handles continuation through native runtime context rather
+than fabricating another human message.
+
+Summary generation includes the resolved compaction agent's system instruction.
+The exact post-hook request, stable section sources, digest, and selected bounds
+are committed as `session.compaction.prompt`, linked from the summary message.
+This auxiliary receipt does not replace the foreground prompt receipt used to
+restore selected Skills or execution provenance. Provider usage preserves split
+frames and cache accounting; visible output excludes separately recorded
+reasoning tokens.
+
+The collector accepts only a nonempty, normally completed response. A provider
+rollback discards that attempt's partial text and usage. EOF without a terminal
+message, a length stop, an unexpected tool operation, timeout, or excessive
+summary bytes cannot publish a successful checkpoint. The stream obeys
+`compaction.timeout_seconds` and `compaction.max_summary_bytes`, and observes the
+owning turn's interrupt signal. Cancellation remains resumable and does not
+latch a permanent compaction failure.
+
+Marker creation and successful summary publication are separate atomic writes;
+no transaction spans a provider await. A newer failed or dangling attempt leaves
+the previous successful boundary active. Request projection uses only the active
+successful summary, while old summaries and failed attempts remain in storage.
+The next compaction receives the previous accepted summary explicitly, so it
+cannot accidentally omit earlier objectives merely because that summary was
+inside the verbatim tail.
+
 An automatic compaction consults the auto-continue hook only after the summary is
 durable and the prompt cache has been reset. If that hook fails, the session stays
 `Compacted`: the persisted summary stands, no continuation turn is synthesized because
@@ -1536,6 +1579,15 @@ Historical image bytes are excluded from the compaction model request. The
 summary input keeps a stable human label such as
 `[Attached diagram.png (image/png)]`, while the original durable file part
 remains unchanged for authoritative replay.
+
+Tool-pair identities and real-user provenance are captured before historical
+messages are converted to inert summary text. The boundary therefore does not
+mistake a tool result for a human turn or split a call from its result; reused call
+ids pair with their preceding call. Long tool arguments, results, and plaintext
+reasoning keep bounded head-and-tail excerpts with explicit omissions. Signed
+reasoning becomes labelled historical working notes, and encrypted reasoning
+stays out of the summary request. These projections leave raw durable evidence
+and the retained tail's normal provider protocol unchanged.
 
 Optional current-session recovery is a native `zuno-continuity` component, not
 a private client feature. Its interface, SQLite provider, and model-tool

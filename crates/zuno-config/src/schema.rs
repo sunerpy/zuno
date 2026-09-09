@@ -799,7 +799,7 @@ pub struct ToolOutputConfig {
     pub max_bytes: Option<NonZeroU32>,
 }
 
-/// Context-compaction behaviour (`config/config.ts:151-172`).
+/// Context-compaction behavior and bounded summary generation.
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct CompactionConfig {
     /// Compact automatically when the context fills. Defaults to true.
@@ -821,6 +821,12 @@ pub struct CompactionConfig {
     /// Token buffer left free so compaction itself cannot overflow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reserved: Option<u32>,
+    /// Maximum time to receive a complete summary, in seconds. Defaults to 180.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<NonZeroU32>,
+    /// Maximum UTF-8 bytes in a generated summary. Defaults to 65536.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_summary_bytes: Option<NonZeroU32>,
 }
 
 /// Model-facing continuity: a master boolean, or independently selected tools.

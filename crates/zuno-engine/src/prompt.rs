@@ -341,6 +341,10 @@ impl RuntimePromptSection {
         }
     }
 
+    pub(crate) fn compaction_continuation() -> Self {
+        Self::new("runtime.compaction", crate::compaction::CONTINUATION_PROMPT)
+    }
+
     /// Stable section id.
     #[must_use]
     pub const fn id(&self) -> &'static str {
