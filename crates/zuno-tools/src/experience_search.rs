@@ -41,11 +41,21 @@ record that literally contained `[U+` is shown as `&#91;U+`.";
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExperienceSearchParams {
-    /// Full-text query over titles, observations, resolutions, and evidence.
+    /// Full-text query over titles, observations, and resolutions.
     pub query: String,
     /// Maximum records to return (default 20, maximum 50).
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Match any meaningful term (default), or require all terms.
+    #[serde(default, rename = "match")]
+    pub match_mode: Option<SearchMatch>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMatch {
+    Any,
+    All,
 }
 
 #[derive(Clone)]
@@ -103,7 +113,15 @@ impl TypedTool for ExperienceSearchTool {
             .clamp(1, MAX_LIMIT);
         let records = self
             .retriever
-            .search(&self.project_id, query, limit)
+            .search_matching(
+                &self.project_id,
+                query,
+                limit,
+                match params.match_mode {
+                    Some(SearchMatch::All) => zuno_db::ExperienceMatch::All,
+                    Some(SearchMatch::Any) | None => zuno_db::ExperienceMatch::Any,
+                },
+            )
             .map_err(|source| ToolError::Failed {
                 tool: WIRE_ID.to_owned(),
                 source: Box::new(source),
@@ -111,6 +129,18 @@ impl TypedTool for ExperienceSearchTool {
         let records = records
             .into_iter()
             .map(|record| {
+                let verified = record.verified_sources();
+                let citations: Vec<_> = record
+                    .evidence
+                    .iter()
+                    .map(|source| {
+                        json!({
+                            "sourceID":source.source_id.as_deref().map(visible),
+                            "kind":source.kind.as_str(),"excerpt":visible(&source.excerpt),
+                            "verified":source.verified,"sourceDigest":source.source_digest,
+                        })
+                    })
+                    .collect();
                 let experience = record.projection;
                 json!({
                     "id": experience.id,
@@ -123,6 +153,8 @@ impl TypedTool for ExperienceSearchTool {
                     "sessionID": experience.session_id,
                     "sourceMessageID": experience.source_message_id,
                     "timeUpdated": experience.time_updated,
+                    "sourcesVerified":verified,
+                    "citations":citations,
                 })
             })
             .collect::<Vec<_>>();
@@ -244,6 +276,9 @@ mod tests {
                 confidence: 10_000,
                 fingerprint: format!("fingerprint-{id}"),
                 evidence: vec![NewExperienceEvidence {
+                    source_digest: None,
+                    verified: false,
+                    promotion_eligible: false,
                     id: format!("evidence-{id}"),
                     kind: ExperienceEvidenceKind::User,
                     source_id: None,

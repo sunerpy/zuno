@@ -26,6 +26,9 @@ TUI 提供四个原生命令：
 
 ```text
 /learn
+/learn list [offset]
+/learn get <experience-id>
+/learn inspect-memory|import-memory <global|project>
 /learn remember <stable fact, preference, or project rule>
 /learn issue <unresolved issue>
 /learn solved <experience-id> <resolution>
@@ -87,17 +90,30 @@ MCP 结果，该 Session 会进入 `excluded`。Zuno 按持久工具元数据判
 
 ### Apply 与 undo 恢复
 
-修改文件前，Zuno 先保存精确的 before/after 条目列表，再把 candidate 设为 `applying`。
-常驻文件原子替换后，状态变为 `applied`。Undo 同样经过 `undoing` 与 `undone`。
+常驻条目现在由 SQLite revision 保存权威状态。应用 candidate 时，精确的 before/after
+快照、新条目、版本历史与 `applied` 终态在同一事务中提交。Undo 同样在一个事务中推进
+revision 并记录 `undone`。两个写入者不能同时替换同一个旧版本。
 
-进程中断后，启动恢复会把当前文件与两个 snapshot 比较：
+Global 与 project Markdown 文件是可读投影。已有文件只导入一次；后续直接修改文件不会
+静默替换已接受的 Memory。投影失败不会丢失已提交条目。启动时可以从记录的版本修复丢失的
+投影，但会保留并报告内容不同的外部文件。协作写入者使用操作系统共享锁保护比较与原子替换。
+
+每个前台回合捕获当前 Memory revision。另一个会话的修改在下一回合边界可见；已经持久化
+的 Prompt receipt 仍能重建当时使用的原版本。
+
+旧版本可能遗留 `applying` 或 `undoing` candidate。启动恢复继续按其精确快照分类：
 
 - 与 after 相同，证明 apply 已完成；
 - 与 before 相同，证明没有完成；
 - 任何第三种状态都标记为 `uncertain`。
 
-恢复分支不会机械重放文件 mutation。先检查 `uncertain` candidate 与常驻文件，再决定保留哪一版。
-外部修改不会被覆盖。
+这些历史不确定 mutation 不会机械重放。先检查 `uncertain` candidate 和保留的文件，
+再决定保留哪一版。修复投影不会重复逻辑 Memory 操作，也不会再次推进 revision。
+重复添加已有条目同样不会推进文档版本。
+
+`/learn inspect-memory global|project` 展示已接受版本、文件条目与投影错误。
+检查外部修改后，使用 `/learn import-memory global|project` 显式导入新版本。
+升级前遗留的不确定写入，在检查和导入前不会进入 Prompt，也不会静默选择或删除其中一边。
 
 ## 记录与检索 Experience
 
@@ -108,21 +124,31 @@ Learning 默认启用。`learning.enabled` 是总上限；其下的 `learning.us
 已完成回合至少包含一项工具调用、产物、错误恢复、显式纠正或反馈时，才符合自动提取条件。
 默认 scheduler 等待六小时空闲，每 60 秒轮询一次，每次唤醒最多领取两个 job。Job identity 是
 `(session_id, source_message_id, extractor_version)`，重试和重启不会产生第二批记录。
+项目学习由进程级 supervisor 持有，ACP 会话释放前台宿主后仍可继续，不需要保留整个前台运行时。
+新进程会检查最近七天内最多 64 个尚未入队的完成回合，并从 SQLite 恢复待处理任务。
+进程退出后不会继续在后台执行。
 
-`/reflect turn` 选择最近完成的 assistant 回合；`/reflect session` 使用持久 Session transcript。
-手工 reflection 会立即到期，但仍遵守 Session generation policy 与 external-context 规则。
+`/reflect turn` 选择最近完成的 assistant 回合；`/reflect session` 在整个持久 Session 中选择有上限的来源。
+手工 reflection 会立即到期，但仍遵守 Session generation policy 与 external-context 规则。手工任务还包含精确来源输入的 digest，因此新增反馈或扩大到整个 Session 会成为新任务，
+相同输入仍然幂等。新显式输入入队时，会撤销同一 source message 下旧的排队/运行中提取租约。
+重试不能借用旧 Experience 的验证标记自动批准发生变化或未验证的 Memory。
 
 Extractor：
 
 - 优先使用 `learning.extractor_model`；未配置时使用当前 Provider 可达的 `small_model`，再使用
   Session model；
-- 接收脱敏重放与 structured response schema；
+- 接收有上限的脱敏来源记录，带精确的 Part/Feedback 地址、source digest 与权威验证标记；
+- 限制输入、输出与请求总时长；无效 JSON 最多修复一次，且共用原请求期限；
 - 没有工具、网络、文件系统 authority 或前台 Session identity；
 - 持久化精确请求与终态；
 - 一个持久 job 最多尝试三次。
 
 Settlement 在一个 transaction 中保存可接受的 Experience 与 evidence。某一项含有无法解析成
 模型可见文本的编码时，只拒绝该项，不丢弃同批干净条目；job 结果用 `refusedItems` 记录原因。
+引用必须匹配提供的来源地址与原文片段，存储前还会核验来源是否变化。模型自报高置信度不再足以
+自动写入 Memory：项目级自动提升还需要已验证证据和权威成功回执，或用户显式记录。
+不受支持的引用保留为未验证观察。每次领取任务都使用独立租约令牌和心跳；租约失效或会话被排除后，
+自动 Memory 提交会被拒绝。
 
 自动检索优先当前 project，默认最多五条，渲染后 context budget 为 1,200 token。每条插入项都
 携带持久 id、source、内容与 digest，精确 section 会写入 Prompt receipt。最小匹配也装不下时，
@@ -131,16 +157,23 @@ Zuno 不插入记录，并发送 `learning.retrieval_skipped`，说明所需与�
 需要更深的显式搜索时，使用只读 `experience_search` 工具：
 
 ```text
-experience_search(query: "sqlite migration preserved messages", limit: 10)
+experience_search(query: "sqlite migration preserved messages", limit: 10, match: "any")
 ```
 
 进入 FTS5 前，搜索输入会被引用并限长，因此标点和 FTS operator 仍是数据，不会成为查询语法。
+自然语言默认按有效词召回并重排；`match: "all"` 要求全部词匹配。中日韩文本使用 trigram 索引，
+短词采用有扫描上限的回退。索引由迁移创建、写入触发器维护，搜索是纯读取。结果会显示引用和验证状态。
+
+`/learn` 展示队列数量、到期时间、近期错误以及最近一次召回的条目或跳过原因。
+`/learn list [offset]` 按每页 100 条浏览 Experience。前台回合选用上下文时记录条目 id 与使用次数；
+普通搜索不会改写这些次数。`/learn get <experience-id>` 可查看引用、验证状态与使用详情。
 
 ## 把重复证据变成 Skill
 
-后台 pattern miner 对可 promotion 的 project Experience 分组。默认至少需要三条新记录和三个
+后台 pattern miner 对已验证、可 promotion 的 project Experience 做语义归并，允许同一规则的不同措辞。默认至少需要三条新记录和三个
 独立 Session，才会自动创建 project Skill candidate。跨项目聚合要求同一已 promotion 模式至少
-出现在两个项目中。显式 `/learn promote <experience-id>` 可以创建单证据 project pattern，
+出现在两个项目中。模型给出的分组必须引用已知证据 id；证据和规则不变时，保留已经 promotion 的状态与版本。
+显式 `/learn promote <experience-id>` 可以创建单证据 project pattern，
 但不能绕过 review 或 evaluation。
 
 Skill candidate 包含完整提议文件、unified diff、learned rule、Experience id、source identity
@@ -149,14 +182,21 @@ project companion。
 
 安全流程刻意拆开：
 
-1. `/learn skill-review <candidate-id>` 启动不可变的离线 cassette suite。
-2. Baseline 与 candidate 使用相同模型、toolset digest、budget、temperature、seed 和已记录工具响应。
+1. `/learn skill-review <candidate-id>` 显式启动不可变的离线 cassette suite。
+2. Baseline 与 candidate 分别执行有上限的模型任务。工具只能返回参数精确匹配的录制结果，
+   未知调用不会访问真实文件系统或网络。评分器依据实际回答和调用轨迹评分，任务执行阶段看不到标准答案。
+   两个版本使用同一模型和执行预算。
 3. 只有引用的失败得到修复、保护用例没有 critical regression、加权指标不下降时才通过。
 4. 通过只把 candidate 设为 `approved`，不会写文件。
 5. `/learn skill-apply <candidate-id>` 另行执行带 digest 检查的 apply。
 
-Source 漂移会把 candidate 设为 `stale`。Apply 与 undo 保存 before/after snapshot；重启时只分类
-文件系统现状，不重放不确定副作用。已应用 candidate 用 `skill-undo`，不需要的用
+打开会话只装配评测器，不会自动开始 Skill 评测，也不要求额外配置模型；审核复用上面解析出的学习模型。
+显式跨 Provider 模型不可达时会报告不可用，不会静默替换。Skill 审核会产生额外模型请求。
+这里的“离线”指工具使用录制结果；模型生成仍然调用已配置的 Provider API。
+
+每次评测都有总期限与所有权令牌。其他会话启动不会中断仍有效的评测；取消或到期会保留终态诊断，
+旧执行不能覆盖新一轮审核。Source 漂移会把 candidate 设为 `stale`。Apply 与 undo 保存 before/after snapshot；重启时只分类
+文件系统现状，不重放不确定副作用。协作写入者与恢复器共用 OS 路径锁。已应用 candidate 用 `skill-undo`，不需要的用
 `skill-reject`。
 
 ## 反馈、遗忘与保留

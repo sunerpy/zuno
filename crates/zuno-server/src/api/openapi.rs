@@ -187,11 +187,6 @@ const BODY_SCHEMA_GAPS: &[BodySchemaGap] = &[
         "the successful response is an SSE stream, not a modeled JSON body",
     ),
     (
-        "/api/session/{sessionID}/learning",
-        "get",
-        "LearningStateProjection serializes the shared durable projection but does not derive JsonSchema",
-    ),
-    (
         "/api/session/{sessionID}/agent",
         "post",
         "AgentBody does not derive JsonSchema",
@@ -277,6 +272,7 @@ pub fn document() -> Value {
                 "Session": schemars::schema_for!(super::session::SessionInfo),
                 "SessionCreate": schemars::schema_for!(super::session::CreateSessionBody),
                 "SessionResponse": schemars::schema_for!(super::Data<super::session::SessionInfo>),
+                "LearningStateResponse": schemars::schema_for!(super::Data<zuno_types::LearningStateProjection>),
                 "SessionListResponse": schemars::schema_for!(super::session::SessionListResponse),
                 "SessionActive": schemars::schema_for!(super::session::SessionActive),
                 "SessionActiveResponse": schemars::schema_for!(super::session::SessionActiveResponse),
@@ -322,6 +318,15 @@ fn bind_existing_body_schemas(operation: &mut Value, method: &str, path: &str) {
         }
         ("get", "/api/session/active") => bind_response(operation, "SessionActiveResponse"),
         ("get", "/api/session/{sessionID}") => bind_response(operation, "SessionResponse"),
+        ("get", "/api/session/{sessionID}/learning") => {
+            bind_response(operation, "LearningStateResponse");
+            operation["parameters"] = json!([
+                {"name":"sessionID","in":"path","required":true,"schema":{"type":"string"}},
+                {"name":"offset","in":"query","required":false,"schema":{"type":"integer","minimum":0,"default":0}},
+                {"name":"limit","in":"query","required":false,"description":"Clamped to 1..100",
+                    "schema":{"type":"integer","minimum":0,"default":100}}
+            ]);
+        }
         ("get", "/api/session/{sessionID}/memory-policy") => {
             bind_response(operation, "MemoryPolicyResponse");
         }
@@ -418,7 +423,7 @@ mod tests {
     fn every_operation_is_bound_bodyless_or_a_reasoned_frozen_gap() {
         assert_eq!(
             BODY_SCHEMA_GAPS.len(),
-            32,
+            31,
             "review and re-freeze every gap change"
         );
         assert_eq!(

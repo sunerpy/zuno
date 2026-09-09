@@ -3,6 +3,8 @@
 use super::*;
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::run_turn;
+use zuno_learning::ExtractionRequest;
+use zuno_llm::registry::{CompletionRequest, ProviderRequestContext};
 
 use crate::cmd::tool_runtime;
 use std::path::Path;
@@ -5209,7 +5211,7 @@ fn internal_models_keep_the_responses_surface_selected_by_the_catalog() {
     .expect("learning inherits the reachable small model");
     assert_eq!(learning.model.provider.surface, ApiSurface::Responses);
     assert_eq!(learning.model.surface, ApiSurface::Responses);
-    assert_eq!(learning.max_output_tokens, 2_048);
+    assert_eq!(learning.max_output_tokens, 4_096);
 }
 
 #[test]
@@ -12155,11 +12157,13 @@ mod learning_runtime {
                 retry_after: None,
                 requests: Arc::clone(&requests),
             }),
-            model: EngineModel::new(
-                Spec::new("learning-provider"),
-                "extractor-model",
-                ApiSurface::Chat,
-            ),
+            model: LearningModel {
+                provider_id: "learning-provider".to_owned(),
+                model_id: "extractor-model".to_owned(),
+                wire_id: "extractor-model".to_owned(),
+                surface: ApiSurface::Chat,
+            },
+            limits: zuno_config::ResolvedLearningConfig::default(),
             events: zuno_db::event_log::SessionEventLog::new(pool),
         };
         (extractor, events, requests)
@@ -12182,6 +12186,8 @@ mod learning_runtime {
 
     fn request() -> ExtractionRequest {
         ExtractionRequest {
+            sources: Vec::new(),
+            sources_truncated: false,
             project_id: "project".to_owned(),
             session_id: SESSION_ID.to_owned(),
             source_message_id: "msg_delivered".to_owned(),
@@ -12310,8 +12316,8 @@ mod learning_runtime {
             zuno_attachment::ImageAdmissionPolicy::default(),
         )
         .expect("attachment store");
-        let mut connection =
-            zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open database");
+        let pool = Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("pool"));
+        let mut connection = pool.get().expect("connection");
         zuno_db::migration::apply(&mut connection).expect("initialize schema");
         let fixture_plan = plan("/workspace", SessionChoice::New);
         let now = 1_780_000_000_000;
@@ -12413,30 +12419,46 @@ mod learning_runtime {
                 .expect("persist assistant part");
         }
 
-        let turn = durable_learning_turn(&connection, &session.id, "msg_learning_assistant")
-            .expect("durable learning turn");
-        assert!(turn.had_artifacts);
-        assert!(turn.user_corrected);
-        assert!(!turn.external_context);
-        assert_eq!(
-            turn.transcript,
-            TurnTranscript::new(vec![
-                TranscriptEvent::user("不对，我说的是验证并记录这个 gate"),
-                TranscriptEvent::assistant("I verified the gate."),
-                TranscriptEvent::command(
-                    "cargo test",
-                    CommandOutcome::failed("first attempt failed"),
-                ),
-                TranscriptEvent::command(
-                    "cargo test",
-                    CommandOutcome::succeeded("all tests passed"),
-                ),
-            ])
+        connection.execute_batch("INSERT INTO verification_receipt
+          (id,session_id,tool_call_id,tool_id,summary,exit_code,exit_authority,outcome,time_created)
+          SELECT 'receipt',session_id,'call_succeeded','shell','cargo test',0,'authoritative','passed',1
+          FROM message WHERE id='msg_learning_assistant'").expect("receipt");
+        drop(connection);
+        let ingestion = zuno_learning::LearningIngestion::new(pool);
+        let (request, signals) = ingestion
+            .request(
+                &session.project_id,
+                &session.id,
+                "msg_learning_assistant",
+                false,
+                &str::to_owned,
+            )
+            .expect("source manifest");
+        assert!(signals.had_artifacts && signals.user_corrected && signals.recovered_from_error);
+        assert!(!signals.external_context);
+        assert!(request.transcript.is_empty());
+        assert!(
+            request
+                .sources
+                .iter()
+                .any(|source| source.content == "first attempt failed")
         );
         assert!(
-            durable_learning_turn(&connection, &session.id, "msg_missing")
-                .expect_err("missing delivered message must fail")
-                .contains("missing from durable history")
+            request
+                .sources
+                .iter()
+                .any(|source| source.content == "all tests passed" && source.proves_success)
+        );
+        assert!(
+            ingestion
+                .request(
+                    &session.project_id,
+                    &session.id,
+                    "msg_missing",
+                    false,
+                    &str::to_owned
+                )
+                .is_err()
         );
     }
 
@@ -12474,18 +12496,39 @@ mod learning_runtime {
             }
         });
 
-        assert!(learning_tool_has_external_context(
-            marked.as_object().expect("marked object")
-        ));
-        assert!(!learning_tool_has_external_context(
-            builtin.as_object().expect("builtin object")
-        ));
-        assert!(!learning_tool_has_external_context(
-            failed_marked.as_object().expect("failed marked object")
-        ));
-        assert!(!learning_tool_has_external_context(
-            local.as_object().expect("local object")
-        ));
+        let pool = Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("pool"));
+        {
+            let mut connection = pool.get().expect("connection");
+            zuno_db::migration::apply(&mut connection).expect("schema");
+            connection.execute_batch("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes)
+              VALUES('p','/work',1,1,'[]');
+              INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated)
+              VALUES('s','p','s','/work','test','1',1,1);
+              INSERT INTO message(id,session_id,time_created,time_updated,data)
+              VALUES('m','s',1,1,'{\"role\":\"assistant\"}');
+              INSERT INTO part(id,message_id,session_id,time_created,time_updated,data)
+              VALUES('part','m','s',1,1,'{\"type\":\"tool\"}');").expect("fixture");
+        }
+        let ingestion = zuno_learning::LearningIngestion::new(Arc::clone(&pool));
+        for (mut part, expected) in [
+            (marked, true),
+            (builtin, false),
+            (failed_marked, false),
+            (local, false),
+        ] {
+            part["type"] = json!("tool");
+            pool.get()
+                .expect("connection")
+                .execute(
+                    "UPDATE part SET data=?1 WHERE id='part'",
+                    [part.to_string()],
+                )
+                .expect("part");
+            let (_, signals) = ingestion
+                .request("p", "s", "m", false, &str::to_owned)
+                .expect("capture");
+            assert_eq!(signals.external_context, expected);
+        }
     }
 
     #[test]

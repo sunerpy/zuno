@@ -6,7 +6,7 @@ use zuno_db::skill_candidate::SkillCandidateStore;
 use zuno_error::DbError;
 use zuno_types::LearningStateProjection;
 
-const EXPERIENCE_LIMIT: usize = 100;
+const EXPERIENCE_LIMIT: u32 = 100;
 const PATTERN_LIMIT: usize = 50;
 const SKILL_CANDIDATE_LIMIT: usize = 50;
 
@@ -21,6 +21,7 @@ pub struct LearningProjectionService {
     experiences: ExperienceStore,
     patterns: LearningPatternStore,
     skills: SkillCandidateStore,
+    status: zuno_db::learning_status::LearningStatusStore,
 }
 
 impl LearningProjectionService {
@@ -30,7 +31,8 @@ impl LearningProjectionService {
             feedback: FeedbackStore::new(Arc::clone(&pool)),
             experiences: ExperienceStore::new(Arc::clone(&pool)),
             patterns: LearningPatternStore::new(Arc::clone(&pool)),
-            skills: SkillCandidateStore::new(pool),
+            skills: SkillCandidateStore::new(Arc::clone(&pool)),
+            status: zuno_db::learning_status::LearningStatusStore::new(pool),
         }
     }
 
@@ -39,11 +41,32 @@ impl LearningProjectionService {
         session_id: &str,
         project_id: &str,
     ) -> Result<LearningStateProjection, DbError> {
+        self.page(session_id, project_id, 0, EXPERIENCE_LIMIT)
+    }
+
+    pub fn page(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<LearningStateProjection, DbError> {
+        let limit = limit.clamp(1, 100);
+        let (experiences, total) = self
+            .experiences
+            .page_for_project(project_id, offset, limit)?;
+        let next = offset.saturating_add(limit);
         Ok(LearningStateProjection {
+            queue: self.status.queue(project_id)?,
+            retrieval: self.status.retrieval(session_id)?,
+            experience_page: zuno_types::LearningPageProjection {
+                offset,
+                limit,
+                total,
+                next_offset: (u64::from(next) < total).then_some(next),
+            },
             feedback: self.feedback.list_for_session(session_id)?,
-            experiences: self
-                .experiences
-                .list_for_project(project_id, EXPERIENCE_LIMIT)?
+            experiences: experiences
                 .into_iter()
                 .map(|record| record.projection)
                 .collect(),

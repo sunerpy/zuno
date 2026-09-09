@@ -1,6 +1,8 @@
 //! Durable experience records, evidence, extraction settlement, and SQLite FTS.
 
 use crate::event_log::{NewSessionEvent, append_in, query_error};
+use crate::experience_query::{ExperienceMatch, ExperienceQuery};
+use crate::learning_job::LearningLease;
 use crate::{Pool, open};
 use rusqlite::{OptionalExtension as _, Row, params};
 use serde_json::{Map, Value};
@@ -18,33 +20,8 @@ const QUALIFIED_COLUMNS: &str = "experience_record.id, experience_record.project
     experience_record.resolution, experience_record.confidence, experience_record.fingerprint, \
     experience_record.status, experience_record.promoted_memory_candidate_id, \
     experience_record.time_created, experience_record.time_updated";
-const MAX_FTS_QUERY_TERMS: usize = 64;
-
-const EXPERIENCE_FTS_SQL: &str = r#"
-CREATE VIRTUAL TABLE IF NOT EXISTS experience_search_fts USING fts5(
-  title,
-  summary,
-  resolution,
-  content='experience_record',
-  content_rowid='rowid',
-  tokenize='unicode61'
-);
-CREATE TRIGGER IF NOT EXISTS experience_search_fts_insert AFTER INSERT ON experience_record BEGIN
-  INSERT INTO experience_search_fts(rowid, title, summary, resolution)
-  VALUES (new.rowid, new.title, new.summary, new.resolution);
-END;
-CREATE TRIGGER IF NOT EXISTS experience_search_fts_delete AFTER DELETE ON experience_record BEGIN
-  INSERT INTO experience_search_fts(experience_search_fts, rowid, title, summary, resolution)
-  VALUES ('delete', old.rowid, old.title, old.summary, old.resolution);
-END;
-CREATE TRIGGER IF NOT EXISTS experience_search_fts_update
-AFTER UPDATE OF title, summary, resolution ON experience_record BEGIN
-  INSERT INTO experience_search_fts(experience_search_fts, rowid, title, summary, resolution)
-  VALUES ('delete', old.rowid, old.title, old.summary, old.resolution);
-  INSERT INTO experience_search_fts(rowid, title, summary, resolution)
-  VALUES (new.rowid, new.title, new.summary, new.resolution);
-END;
-"#;
+const MAX_SEARCH_CANDIDATES: usize = 256;
+const SHORT_CJK_SCAN_LIMIT: usize = 2_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewExperienceEvidence {
@@ -53,6 +30,9 @@ pub struct NewExperienceEvidence {
     pub source_id: Option<String>,
     pub excerpt: String,
     pub digest: String,
+    pub source_digest: Option<String>,
+    pub verified: bool,
+    pub promotion_eligible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +78,9 @@ pub struct ExperienceEvidenceRecord {
     pub source_id: Option<String>,
     pub excerpt: String,
     pub digest: String,
+    pub source_digest: Option<String>,
+    pub verified: bool,
+    pub promotion_eligible: bool,
     pub time_created: i64,
 }
 
@@ -128,6 +111,22 @@ pub struct ExperienceRecord {
     pub evidence: Vec<ExperienceEvidenceRecord>,
 }
 
+impl ExperienceRecord {
+    #[must_use]
+    pub fn verified_sources(&self) -> bool {
+        !self.evidence.is_empty() && self.evidence.iter().all(|evidence| evidence.verified)
+    }
+
+    #[must_use]
+    pub fn supports_automatic_promotion(&self) -> bool {
+        self.verified_sources()
+            && self
+                .evidence
+                .iter()
+                .any(|evidence| evidence.promotion_eligible)
+    }
+}
+
 #[derive(Clone)]
 pub struct ExperienceStore {
     pool: Arc<Pool>,
@@ -137,22 +136,6 @@ impl ExperienceStore {
     #[must_use]
     pub fn new(pool: Arc<Pool>) -> Self {
         Self { pool }
-    }
-
-    /// Install the optional FTS provider and rebuild it from durable records.
-    pub fn ensure_fts(&self) -> Result<(), DbError> {
-        self.pool.transaction(|transaction| {
-            transaction
-                .execute_batch(EXPERIENCE_FTS_SQL)
-                .map_err(open::map_error)?;
-            transaction
-                .execute(
-                    "INSERT INTO experience_search_fts(experience_search_fts) VALUES ('rebuild')",
-                    [],
-                )
-                .map_err(open::map_error)?;
-            Ok(())
-        })
     }
 
     /// Persist an extractor response and settle its job in one atomic commit.
@@ -165,7 +148,7 @@ impl ExperienceStore {
     pub fn complete_extraction(
         &self,
         job_id: &str,
-        owner_id: &str,
+        lease: &LearningLease,
         experiences: &[NewExperience],
         result: &Value,
         now: i64,
@@ -173,8 +156,8 @@ impl ExperienceStore {
         validate_batch(experiences)?;
         let result = serde_json::to_string(result).map_err(query_error)?;
         self.pool.transaction(|transaction| {
-            let stored = record_extraction_in(transaction, job_id, owner_id, experiences)?;
-            finish_extraction_in(transaction, job_id, owner_id, &result, now)?;
+            let stored = record_extraction_in(transaction, job_id, lease, experiences, now)?;
+            finish_extraction_in(transaction, job_id, lease, &result, now)?;
             Ok(stored)
         })
     }
@@ -196,12 +179,13 @@ impl ExperienceStore {
     pub fn record_extraction(
         &self,
         job_id: &str,
-        owner_id: &str,
+        lease: &LearningLease,
         experiences: &[NewExperience],
+        now: i64,
     ) -> Result<Vec<ExperienceRecord>, DbError> {
         validate_batch(experiences)?;
         self.pool.transaction(|transaction| {
-            record_extraction_in(transaction, job_id, owner_id, experiences)
+            record_extraction_in(transaction, job_id, lease, experiences, now)
         })
     }
 
@@ -219,13 +203,13 @@ impl ExperienceStore {
     pub fn finish_extraction(
         &self,
         job_id: &str,
-        owner_id: &str,
+        lease: &LearningLease,
         result: &Value,
         now: i64,
     ) -> Result<(), DbError> {
         let result = serde_json::to_string(result).map_err(query_error)?;
         self.pool.transaction(|transaction| {
-            finish_extraction_in(transaction, job_id, owner_id, &result, now)
+            finish_extraction_in(transaction, job_id, lease, &result, now)
         })
     }
 
@@ -282,6 +266,28 @@ impl ExperienceStore {
         )
     }
 
+    pub fn page_for_project(
+        &self,
+        project_id: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<(Vec<ExperienceRecord>, u64), DbError> {
+        let connection = self.pool.get()?;
+        let total=connection.query_row(
+            "SELECT count(*) FROM experience_record WHERE project_id=?1 AND status<>'forgotten'",
+            [project_id],|row|row.get::<_,i64>(0),
+        ).map_err(open::map_error)?;
+        let records = query_records(
+            &connection,
+            &format!(
+            "SELECT {COLUMNS} FROM experience_record WHERE project_id=?1 AND status<>'forgotten'
+             ORDER BY time_created DESC,id DESC LIMIT ?2 OFFSET ?3"
+        ),
+            params![project_id, limit.clamp(1, 100), offset],
+        )?;
+        Ok((records, total.unsigned_abs()))
+    }
+
     pub fn list_active_since(
         &self,
         project_id: &str,
@@ -306,27 +312,99 @@ impl ExperienceStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<ExperienceRecord>, DbError> {
+        self.search_matching(project_id, query, limit, ExperienceMatch::Any)
+    }
+
+    /// Query migrated indexes without obtaining a SQLite write lock.
+    pub fn search_matching(
+        &self,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+        mode: ExperienceMatch,
+    ) -> Result<Vec<ExperienceRecord>, DbError> {
+        let limit = limit.min(MAX_SEARCH_CANDIDATES);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         if query.trim().is_empty() {
             return self.list_for_project(project_id, limit);
         }
-        let Some(query) = fts_match_query(query) else {
-            return Ok(Vec::new());
-        };
-        self.ensure_fts()?;
+        let query = ExperienceQuery::new(query, mode);
         let connection = self.pool.get()?;
-        query_records(
-            &connection,
-            &format!(
-                "SELECT {QUALIFIED_COLUMNS} FROM experience_search_fts
-                 JOIN experience_record ON experience_record.rowid = experience_search_fts.rowid
-                 WHERE experience_search_fts MATCH ?1
-                   AND experience_record.project_id = ?2
-                   AND experience_record.status <> 'forgotten'
-                 ORDER BY bm25(experience_search_fts), experience_record.time_created DESC
-                 LIMIT ?3"
-            ),
-            params![query, project_id, limit as i64],
-        )
+        let candidate_limit = limit.saturating_mul(4).min(MAX_SEARCH_CANDIDATES);
+        let mut candidates = std::collections::BTreeMap::new();
+        for (table, expression) in [
+            ("experience_search_fts", query.lexical_fts()),
+            ("experience_search_cjk_fts", query.cjk_fts()),
+        ] {
+            let Some(expression) = expression else {
+                continue;
+            };
+            let found = query_projections(
+                &connection,
+                &format!(
+                    "SELECT {QUALIFIED_COLUMNS} FROM {table}
+                     JOIN experience_record ON experience_record.rowid = {table}.rowid
+                     WHERE {table} MATCH ?1
+                       AND experience_record.project_id = ?2
+                       AND experience_record.status <> 'forgotten'
+                     ORDER BY bm25({table}), experience_record.time_created DESC
+                     LIMIT ?3"
+                ),
+                params![expression, project_id, candidate_limit as i64],
+            )?;
+            for record in found {
+                candidates.insert(record.projection.id.clone(), record);
+            }
+        }
+        if !query.short_cjk.is_empty() {
+            // Trigram indexes cannot match a two-character CJK query. Bound the
+            // fallback to one project's recent rows instead of scanning all history.
+            let recent = query_projections(
+                &connection,
+                &format!(
+                    "SELECT {COLUMNS} FROM experience_record
+                     WHERE project_id = ?1 AND status <> 'forgotten'
+                     ORDER BY time_created DESC, id DESC LIMIT ?2"
+                ),
+                params![project_id, SHORT_CJK_SCAN_LIMIT as i64],
+            )?;
+            for record in recent {
+                candidates
+                    .entry(record.projection.id.clone())
+                    .or_insert(record);
+            }
+        }
+        let mut ranked = candidates
+            .into_values()
+            .filter_map(|record| {
+                let value = &record.projection;
+                query
+                    .score(&value.title, &value.summary, value.resolution.as_deref())
+                    .map(|score| (score, record))
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| right.projection.confidence.cmp(&left.projection.confidence))
+                .then_with(|| {
+                    right
+                        .projection
+                        .time_updated
+                        .cmp(&left.projection.time_updated)
+                })
+                .then_with(|| left.projection.id.cmp(&right.projection.id))
+        });
+        ranked
+            .into_iter()
+            .take(limit)
+            .map(|(_, mut record)| {
+                record.evidence = read_evidence(&connection, &record.projection.id)?;
+                Ok(record)
+            })
+            .collect()
     }
 
     pub fn forget(&self, id: &str, now: i64) -> Result<ExperienceRecord, DbError> {
@@ -508,21 +586,26 @@ fn validate_new(experience: &NewExperience) -> Result<(), DbError> {
 fn running_extraction_job(
     transaction: &rusqlite::Transaction<'_>,
     job_id: &str,
-    owner_id: &str,
+    lease: &LearningLease,
+    now: i64,
 ) -> Result<(String, String), DbError> {
     transaction
         .query_row(
             "SELECT session_id, source_message_id FROM learning_job
              WHERE id = ?1 AND owner_id = ?2 AND status = 'running'
-               AND kind = 'extraction'",
-            params![job_id, owner_id],
+               AND kind = 'extraction' AND lease_token = ?3 AND lease_expires > ?4
+               AND NOT EXISTS (
+                 SELECT 1 FROM session_memory_policy p
+                 WHERE p.session_id = learning_job.session_id AND p.generation <> 'enabled'
+               )",
+            params![job_id, lease.owner_id, lease.token, now],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
         .map_err(open::map_error)?
         .ok_or_else(|| {
             query_error(std::io::Error::other(format!(
-                "extraction job `{job_id}` is not running for owner `{owner_id}`"
+                "extraction job `{job_id}` no longer permits this attempt"
             )))
         })
 }
@@ -530,10 +613,11 @@ fn running_extraction_job(
 fn record_extraction_in(
     transaction: &rusqlite::Transaction<'_>,
     job_id: &str,
-    owner_id: &str,
+    lease: &LearningLease,
     experiences: &[NewExperience],
+    now: i64,
 ) -> Result<Vec<ExperienceRecord>, DbError> {
-    let (session_id, source_message_id) = running_extraction_job(transaction, job_id, owner_id)?;
+    let (session_id, source_message_id) = running_extraction_job(transaction, job_id, lease, now)?;
     let mut stored = Vec::with_capacity(experiences.len());
     for experience in experiences {
         if experience.extraction_job_id.as_deref() != Some(job_id)
@@ -557,11 +641,11 @@ fn record_extraction_in(
 fn finish_extraction_in(
     transaction: &rusqlite::Transaction<'_>,
     job_id: &str,
-    owner_id: &str,
+    lease: &LearningLease,
     result: &str,
     now: i64,
 ) -> Result<(), DbError> {
-    let (session_id, source_message_id) = running_extraction_job(transaction, job_id, owner_id)?;
+    let (session_id, source_message_id) = running_extraction_job(transaction, job_id, lease, now)?;
     let experience_count = transaction
         .query_row(
             "SELECT count(*) FROM experience_record WHERE extraction_job_id = ?1",
@@ -572,10 +656,10 @@ fn finish_extraction_in(
     let changed = transaction
         .execute(
             "UPDATE learning_job
-             SET status = 'completed', result = ?3, error = NULL, owner_id = NULL,
+             SET status = 'completed', result = ?3, error = NULL, owner_id = NULL, lease_token = NULL,
                  lease_expires = NULL, time_updated = ?4, time_completed = ?4
-             WHERE id = ?1 AND owner_id = ?2 AND status = 'running'",
-            params![job_id, owner_id, result, now],
+             WHERE id = ?1 AND owner_id = ?2 AND status = 'running' AND lease_token = ?5",
+            params![job_id, lease.owner_id, result, now, lease.token],
         )
         .map_err(open::map_error)?;
     if changed != 1 {
@@ -609,9 +693,9 @@ fn insert_experience(
             "INSERT INTO experience_record (
                id, project_id, session_id, source_message_id, extraction_job_id,
                extraction_ordinal, kind, title, summary, resolution, confidence,
-               fingerprint, status, time_created, time_updated
+               fingerprint, status, time_created, time_updated, evidence_verified
              ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'active', ?13, ?13
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'active', ?13, ?13, ?14
              )
              ON CONFLICT(extraction_job_id, extraction_ordinal)
              WHERE extraction_job_id IS NOT NULL DO NOTHING",
@@ -629,6 +713,7 @@ fn insert_experience(
                 i64::from(experience.confidence),
                 experience.fingerprint,
                 experience.time_created,
+                experience.evidence.iter().all(|evidence| evidence.verified),
             ],
         )
         .map_err(open::map_error)?;
@@ -655,6 +740,8 @@ fn insert_experience(
         if evidence.id.trim().is_empty()
             || evidence.excerpt.trim().is_empty()
             || evidence.digest.trim().is_empty()
+            || (evidence.verified && evidence.source_digest.is_none())
+            || (evidence.promotion_eligible && !evidence.verified)
         {
             return Err(query_error(std::io::Error::other(
                 "experience evidence identity, excerpt, and digest must not be empty",
@@ -663,8 +750,9 @@ fn insert_experience(
         transaction
             .execute(
                 "INSERT INTO experience_evidence (
-                   id, experience_id, kind, source_id, excerpt, digest, time_created
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                   id, experience_id, kind, source_id, excerpt, digest, time_created,
+                   source_digest, verified, promotion_eligible
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     evidence.id,
                     experience.id,
@@ -673,6 +761,9 @@ fn insert_experience(
                     evidence.excerpt,
                     evidence.digest,
                     experience.time_created,
+                    evidence.source_digest,
+                    evidence.verified,
+                    evidence.promotion_eligible,
                 ],
             )
             .map_err(open::map_error)?;
@@ -721,66 +812,27 @@ fn query_records<P>(
 where
     P: rusqlite::Params,
 {
+    let mut records = query_projections(connection, sql, parameters)?;
+    for record in &mut records {
+        record.evidence = read_evidence(connection, &record.projection.id)?;
+    }
+    Ok(records)
+}
+
+fn query_projections<P>(
+    connection: &rusqlite::Connection,
+    sql: &str,
+    parameters: P,
+) -> Result<Vec<ExperienceRecord>, DbError>
+where
+    P: rusqlite::Params,
+{
     let mut statement = connection.prepare(sql).map_err(open::map_error)?;
     statement
         .query_map(parameters, decode_row)
         .map_err(open::map_error)?
-        .map(|row| {
-            row.map_err(open::map_error)
-                .and_then(decode_record)
-                .and_then(|mut record| {
-                    record.evidence = read_evidence(connection, &record.projection.id)?;
-                    Ok(record)
-                })
-        })
+        .map(|row| row.map_err(open::map_error).and_then(decode_record))
         .collect()
-}
-
-/// Convert arbitrary user text into a bounded literal FTS5 expression.
-///
-/// Raw prompts may contain column selectors, operators, unmatched quotes, or
-/// identifier punctuation such as `SMOKE-MEMORY-20260906`. Passing that text
-/// directly to `MATCH` lets FTS5 parse it as query syntax and turns ordinary
-/// foreground prompts into database failures. Quoted alphanumeric terms keep
-/// the existing all-term search semantics without granting the input an FTS
-/// grammar.
-fn fts_match_query(input: &str) -> Option<String> {
-    let mut terms = Vec::new();
-    let mut current = String::new();
-    let push = |terms: &mut Vec<String>, current: &mut String| {
-        if current.is_empty() || terms.len() >= MAX_FTS_QUERY_TERMS {
-            current.clear();
-            return;
-        }
-        if !terms
-            .iter()
-            .any(|term| term.eq_ignore_ascii_case(current.as_str()))
-        {
-            terms.push(std::mem::take(current));
-        } else {
-            current.clear();
-        }
-    };
-
-    for character in input.chars() {
-        if character.is_alphanumeric() || character == '_' {
-            current.push(character);
-        } else {
-            push(&mut terms, &mut current);
-        }
-        if terms.len() >= MAX_FTS_QUERY_TERMS {
-            break;
-        }
-    }
-    push(&mut terms, &mut current);
-
-    (!terms.is_empty()).then(|| {
-        terms
-            .into_iter()
-            .map(|term| format!("\"{term}\""))
-            .collect::<Vec<_>>()
-            .join(" ")
-    })
 }
 
 fn read_required(connection: &rusqlite::Connection, id: &str) -> Result<ExperienceRecord, DbError> {
@@ -807,7 +859,8 @@ fn read_evidence(
 ) -> Result<Vec<ExperienceEvidenceRecord>, DbError> {
     let mut statement = connection
         .prepare(
-            "SELECT id, experience_id, kind, source_id, excerpt, digest, time_created
+            "SELECT id, experience_id, kind, source_id, excerpt, digest, time_created,
+                    source_digest, verified, promotion_eligible
              FROM experience_evidence WHERE experience_id = ?1 ORDER BY time_created, id",
         )
         .map_err(open::map_error)?;
@@ -821,6 +874,9 @@ fn read_evidence(
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, bool>(8)?,
+                row.get::<_, bool>(9)?,
             ))
         })
         .map_err(open::map_error)?
@@ -834,6 +890,9 @@ fn read_evidence(
                 excerpt: row.4,
                 digest: row.5,
                 time_created: row.6,
+                source_digest: row.7,
+                verified: row.8,
+                promotion_eligible: row.9,
             })
         })
         .collect()
@@ -971,6 +1030,9 @@ mod tests {
             confidence: 9200,
             fingerprint: "fingerprint-1".to_owned(),
             evidence: vec![NewExperienceEvidence {
+                source_digest: None,
+                verified: false,
+                promotion_eligible: false,
                 id: "evidence-1".to_owned(),
                 kind: ExperienceEvidenceKind::Message,
                 source_id: Some("assistant-1".to_owned()),
@@ -996,14 +1058,17 @@ mod tests {
             ))
             .expect("enqueue");
         let jobs = LearningJobStore::new(store.pool.clone());
-        jobs.claim_due("worker-1", 11, 30)
+        let lease = jobs
+            .claim_due("worker-1", 11, 30)
             .expect("claim")
-            .expect("job");
+            .expect("job")
+            .lease()
+            .expect("lease");
 
         let records = store
             .complete_extraction(
                 "job-1",
-                "worker-1",
+                &lease,
                 &[extracted(ExperienceKind::Procedure)],
                 &json!({"count": 1}),
                 21,
@@ -1033,13 +1098,16 @@ mod tests {
             ))
             .expect("enqueue");
         let jobs = LearningJobStore::new(store.pool.clone());
-        jobs.claim_due("worker-1", 11, 30)
+        let lease = jobs
+            .claim_due("worker-1", 11, 30)
             .expect("claim")
-            .expect("job");
+            .expect("job")
+            .lease()
+            .expect("lease");
         let mut experience = extracted(ExperienceKind::Procedure);
         experience.summary = "Release notes include the marker SMOKE-MEMORY-20260906.".to_owned();
         store
-            .complete_extraction("job-1", "worker-1", &[experience], &json!({"count": 1}), 21)
+            .complete_extraction("job-1", &lease, &[experience], &json!({"count": 1}), 21)
             .expect("complete");
 
         let found = store
@@ -1079,18 +1147,21 @@ mod tests {
             10,
         ))
         .expect("enqueue");
-        jobs.claim_due("worker-1", 11, 30)
+        let lease = jobs
+            .claim_due("worker-1", 11, 30)
             .expect("claim")
-            .expect("job");
+            .expect("job")
+            .lease()
+            .expect("lease");
 
         let records = store
-            .record_extraction("job-1", "worker-1", &[extracted(ExperienceKind::Procedure)])
+            .record_extraction("job-1", &lease, &[extracted(ExperienceKind::Procedure)], 21)
             .expect("record");
         assert_eq!(records.len(), 1);
         assert_eq!(jobs.get("job-1").expect("job").status.as_str(), "running");
         // A replay of the same ordinal is idempotent and logs nothing new.
         store
-            .record_extraction("job-1", "worker-1", &[extracted(ExperienceKind::Procedure)])
+            .record_extraction("job-1", &lease, &[extracted(ExperienceKind::Procedure)], 21)
             .expect("replay");
         let event_types = |log: &SessionEventLog| -> Vec<String> {
             log.read_after("session-1", None)
@@ -1104,24 +1175,40 @@ mod tests {
         // Nobody but the lease owner may finish, and a lost lease requeues the
         // job instead of leaving it completed without its Memory proposals.
         store
-            .finish_extraction("job-1", "worker-2", &json!({}), 22)
+            .finish_extraction(
+                "job-1",
+                &LearningLease {
+                    owner_id: "worker-2".to_owned(),
+                    token: lease.token.clone(),
+                },
+                &json!({}),
+                22,
+            )
             .expect_err("another owner cannot finish the job");
         assert_eq!(jobs.get("job-1").expect("job").status.as_str(), "running");
         assert_eq!(jobs.reconcile_expired(30).expect("reconcile").requeued, 1);
         store
-            .finish_extraction("job-1", "worker-1", &json!({}), 31)
+            .finish_extraction("job-1", &lease, &json!({}), 31)
             .expect_err("a reconciled lease cannot finish the job");
         assert_eq!(jobs.get("job-1").expect("job").status.as_str(), "queued");
 
         // The retry records the same content again and then finishes.
-        jobs.claim_due("worker-2", 32, 60)
+        let second_lease = jobs
+            .claim_due("worker-2", 32, 60)
             .expect("reclaim")
-            .expect("job");
+            .expect("job")
+            .lease()
+            .expect("lease");
         store
-            .record_extraction("job-1", "worker-2", &[extracted(ExperienceKind::Procedure)])
+            .record_extraction(
+                "job-1",
+                &second_lease,
+                &[extracted(ExperienceKind::Procedure)],
+                33,
+            )
             .expect("record on retry");
         store
-            .finish_extraction("job-1", "worker-2", &json!({"count": 1}), 40)
+            .finish_extraction("job-1", &second_lease, &json!({"count": 1}), 40)
             .expect("finish");
         let job = jobs.get("job-1").expect("job");
         assert_eq!(job.status.as_str(), "completed");
@@ -1165,13 +1252,16 @@ mod tests {
             ))
             .expect("enqueue");
         let jobs = LearningJobStore::new(store.pool.clone());
-        jobs.claim_due("worker-1", 11, 30)
+        let lease = jobs
+            .claim_due("worker-1", 11, 30)
             .expect("claim")
-            .expect("job");
+            .expect("job")
+            .lease()
+            .expect("lease");
         let mut unresolved = extracted(ExperienceKind::UnresolvedIssue);
         unresolved.resolution = None;
         store
-            .complete_extraction("job-1", "worker-1", &[unresolved], &json!({"count": 1}), 21)
+            .complete_extraction("job-1", &lease, &[unresolved], &json!({"count": 1}), 21)
             .expect("complete");
         let error = store
             .mark_promoted("experience-1", "memory-1", 22)

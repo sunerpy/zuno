@@ -278,8 +278,19 @@ fn restart_reconciliation_marks_divergent_resident_state_uncertain() {
             .status,
         MemoryCandidateStatus::Uncertain
     );
-    assert_eq!(
-        service.entries().expect("resident entries")[0].content,
-        "different external state"
+    assert!(service.entries().expect("authoritative entries").is_empty());
+    let projection = MemoryStore::open(
+        Scope::Project,
+        service.paths().for_scope(Scope::Project).to_path_buf(),
+    )
+    .expect("preserved external projection");
+    assert_eq!(projection.entries(), ["different external state"]);
+    assert!(
+        service
+            .snapshot(Scope::Project)
+            .expect("authority snapshot")
+            .projection_error
+            .is_some(),
+        "unverified external bytes must not silently replace durable memory",
     );
 }

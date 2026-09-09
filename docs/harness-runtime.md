@@ -1108,18 +1108,22 @@ owns any stronger sync policy.
 
 The default Memory promotion policy is `review`. `high_confidence` applies
 candidates at or above the configured threshold, while `automatic` applies every
-validated candidate. All policies use the same durable state machine:
+validated candidate. New applications and undo commit resident entries, revision
+history, exact candidate snapshots and terminal state in one SQLite transaction:
 
 ```text
-pending -> applying -> applied -> undoing -> undone
+pending -> applied -> undone
        \-> rejected
        \-> failed / uncertain
 ```
 
-`applying` and `undoing` are written before touching the file. After process loss,
-the runtime compares the resident file with both stored snapshots and marks the
-observed result; it never replays the write or undo. Any third state becomes
-`uncertain` and requires user inspection.
+The resident Markdown files are versioned projections. Cooperating writers hold
+an OS-backed path lock around comparison and replacement. Projection failure
+does not discard accepted entries; a missing projection can be repaired from the
+committed revision, while external divergent bytes are preserved. Every
+foreground turn captures current resident versions before prompt assembly.
+Historical `applying` and `undoing` rows still reconcile from stored snapshots;
+any third state becomes `uncertain` and never authorizes replay.
 
 User learning is a separate native subsystem and is enabled by default.
 `learning.use` and `learning.generate` are independent below the
@@ -1131,22 +1135,26 @@ artifacts, recovery, correction, or explicit feedback admits an idempotent
 `learning.extractor_model` is authoritative when present. Without one, the
 runtime selects a reachable `small_model` from the active provider and then the
 active session model; it does not open another provider. The selected model
-receives the replayed durable transcript and a structured response schema with
+receives a bounded, redacted source manifest and a structured response schema with
 no tools, network, filesystem authority, or foreground-session identity.
 Request and terminal outcome are persisted as `learning.extraction.request` and
 `learning.extraction.outcome`.
 
 Extraction settlement atomically stores `ExperienceRecord` rows and evidence.
 Unresolved issues remain searchable but cannot become Memory, patterns, or Skill
-evaluation cases. Only project-scoped Memory proposals at confidence `>= 0.9`
-may auto-apply through the learning path; every other proposal remains
+evaluation cases. Only project-scoped Memory proposals at confidence `>= 0.9`,
+with validated citations and authoritative execution evidence, may auto-apply through the learning path; every other proposal remains
 reviewable.
 
-A host-owned periodic task mines project and cross-project patterns through
+A process-owned project service semantically mines project and cross-project patterns through
 durable interval-bucketed jobs. Automatic Skill candidates require three
 independent sessions. Global patterns require two projects and become a
 project-specific companion only after explicit promotion. Rejected evidence is
-suppressed until its digest changes.
+suppressed until its digest changes. Identical evidence preserves promoted status.
+`LearningSupervisor` outlives individual foreground hosts, limits process-wide
+concurrency, and propagates cancellation with bounded shutdown. Startup catches
+missed admission; each claim has a fresh token, and periodic heartbeats recheck
+policy. Token checks fence Memory/pattern commits.
 
 Automatic extraction itself is background idle work. Its default six-hour
 deadline, 60-second poll, and two-job wake cap are configurable under
@@ -1154,14 +1162,15 @@ deadline, 60-second poll, and two-job wake cap are configurable under
 input, the process-local live-turn registry, and session policy before spending
 an attempt. Web and MCP results carry a durable external-context marker; when
 configured, consuming one excludes the session from automatic generation.
-Transcript copies are scrubbed at secret-value granularity before they enter a
-learning job or extraction event, while the original durable Message and
+Bounded source values are scrubbed at secret-value granularity before clipping and
+before they enter a learning job or extraction event, while the original durable Message and
 non-secret evidence are preserved. Retryable extractor failures return the same
-durable job to a bounded exponential-backoff deadline. Typed provider rate
+durable job to a positive, capped and jittered exponential-backoff deadline. Typed provider rate
 limits preserve `Retry-After`; authentication, context-limit, protocol, and
 other permanent failures settle instead of replaying the unchanged request.
 There is no quota-percentage, daily-token, or currency budget; eligibility,
-idempotency, the wake cap, and the three-attempt ceiling bound background work.
+idempotency, the wake cap, the three-attempt ceiling, and `learning.execution`
+input/output/step and total-time limits bound background work.
 
 Retrieved experience enters the stable `learning.experiences` prompt section.
 The post-hook prompt receipt stores each source identity, content, and digest, so
@@ -1169,8 +1178,12 @@ the provider request is reconstructable without consulting current projections.
 `experience_search` provides explicit deeper FTS retrieval.
 
 Every Skill candidate contains complete content, diff, evidence, exact source
-identity, and source digest. Human review runs an immutable offline cassette
-suite with the same `AttemptSnapshot` for baseline and candidate. Passing
+identity, and source digest. Explicit human review runs an immutable offline
+cassette suite: baseline and candidate execute actual bounded model attempts,
+recorded tool calls are dispatched by exact arguments, and a separate grader
+scores the real answer/trace. Starting a session only binds this evaluator.
+Evaluation deadlines, ownership tokens and Drop guards protect cancellation and
+concurrent-session recovery. Passing
 evaluation does not apply the file. Apply is a separate CAS-protected effect;
 source drift becomes `stale`, and restart reconciliation classifies before/after
 snapshots without replaying an uncertain write.

@@ -1437,6 +1437,17 @@ store:
   otherwise the runtime uses a reachable `small_model` from the active provider,
   then the active session model. It never opens another provider or rewrites
   configuration to make that choice.
+- `learning.execution` bounds isolated extraction, consolidation and Skill evaluation.
+  `timeout_ms` defaults to `120000` (maximum `3600000`); `max_input_bytes` defaults
+  to `131072` (maximum `1048576`); `max_output_tokens` defaults to `4096` (maximum
+  `65536`, also clamped to the selected model's declared output limit); `max_steps`
+  defaults to `8` (maximum `64`) for each offline Skill attempt. All numeric values
+  must be positive. One complete evaluation suite shares the total timeout.
+  `structured_output` defaults to `false`: enable it only when the selected Chat,
+  Responses or Messages endpoint supports its native JSON-schema protocol. The
+  default uses the same schema in the prompt and bounded local decoding/repair.
+  Skill evaluation starts only with `/learn skill-review`, and needs no separate
+  model setting.
 - `post_turn.enabled` controls only automatic extraction after eligible
   completed tasks. It does not disable existing-Experience use, and disabling it
   does not turn off generation paths invoked explicitly.

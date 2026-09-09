@@ -16,8 +16,10 @@ retrieval, pattern mining, and Skill evolution.
 
 ## Ownership boundaries
 
-- `MemoryStore` owns the capped global and project files and exact snapshot
-  replacement.
+- `ResidentMemoryStore` owns SQLite documents, revision history, and atomic
+  candidate settlement.
+- `MemoryStore` validates capped entry operations and publishes guarded file
+  projections.
 - `MemoryService` owns validation, durable candidates, promotion, apply, undo,
   and restart reconciliation.
 - `memory_propose` is the only model-visible mutation entry point.
@@ -67,8 +69,11 @@ A `MemoryCandidate` records:
 - status, timestamps, and diagnostic;
 - exact before and after entry snapshots once application starts.
 
-The resident files remain the prompt source of truth. Candidate rows are the
-audit and recovery record, not a second memory store.
+`resident_memory_document` is the prompt source of truth, with immutable
+`resident_memory_revision` history. Existing files are adopted once without
+discarding their entries. Candidate rows retain the approval and mutation audit.
+Every new foreground turn selects a current immutable Memory snapshot and records
+its source revision in the prompt receipt.
 
 ## Promotion
 
@@ -83,25 +88,39 @@ audit and recovery record, not a second memory store.
 The default is `review`; `auto_confidence` defaults to `0.9`.
 
 Learning extraction deliberately uses a narrower automatic path: only
-project-scoped Memory with confidence at or above `0.9` can auto-apply. Global
+project-scoped Memory with confidence at or above `0.9`, validated source citations,
+and authoritative successful execution evidence can auto-apply. Global
 and lower-confidence learning proposals remain pending regardless of the general
 Memory promotion setting.
 
 ## At-most-once apply and undo
 
-Application persists `applying` together with both snapshots before replacing
-the resident file. Undo persists `undoing` before replacing the applied snapshot
-with the prior one. A successful file operation then records `applied` or
-`undone`.
+Application compares the expected resident revision, writes the new document and
+history, and records the candidate as `applied` in one SQLite transaction. Undo
+uses the same boundary and records `undone`. A candidate-state conflict rolls
+back the document update too.
 
-After process loss, startup compares current entries with the snapshots:
+File projection happens after the authority commit. Its recorded revision and
+error distinguish accepted entries from a pending projection. A projector holds
+a stable OS file lock while checking and replacing the path, and a stale
+projector cannot mark a newer document as projected. Missing derived files can
+be restored without repeating the logical mutation. Different external contents
+remain untouched.
+
+For historical `applying`/`undoing` rows from earlier releases, startup still
+compares the file with the snapshots:
 
 - apply: after means `applied`, before means `failed`;
 - undo: before means `undone`, after means still `applied`;
 - any third state means `uncertain`.
 
-No branch replays the file mutation. External drift is preserved and surfaced
-for manual reconciliation.
+No historical uncertain operation is replayed. External drift is preserved and
+surfaced for manual reconciliation. If no authoritative document exists yet, an
+unresolved historical write is quarantined rather than adopted. Explicit
+`/learn inspect-memory` and `/learn import-memory` expose and resolve that state.
+Imports keep immutable revision history and apply the same entry validation.
+No-op entries and unchanged reconciliation do not advance document versions or
+emit spurious change notifications.
 
 ## Safety and user control
 
@@ -121,3 +140,24 @@ The retired `memory.reflection` and `memory.nudge_interval` configuration fields
 are rejected. Post-task extraction belongs to the default-enabled `learning`
 subsystem. An explicit `learning.extractor_model` wins; otherwise the active
 provider's `small_model` and then the session model are used.
+
+
+## Auxiliary learning ownership
+
+`LearningSupervisor` belongs to `StartupEnvironment`, with one replaceable binding
+per project and a process-wide concurrency limit. Closing a foreground host does
+not own its cancellation. `ProjectLearningService` owns job execution;
+`LearningIngestion` owns bounded source collection and startup catch-up;
+`LearningModelClient` owns provider budgets, structured decoding and exact request
+receipts. The CLI adapter supplies active-session and change-notification handles.
+
+Every claim has a fresh token. Heartbeats recheck durable policy and input activity;
+Memory commits and semantic pattern proposals check that token inside their write
+transaction. Process shutdown propagates cancellation and bounds joins. Explicit
+command interruption drops the request and settles manual reflection/evaluation
+state; read-only model work can be retried with persisted capped, jittered backoff.
+
+Codex supplies design references for staged memory extraction, consolidation,
+source attribution and ownership fencing. Zuno's reviewed Skill-candidate and
+cassette-evaluation pipeline is a native Zuno capability, not an imported Codex
+Skill-evaluation feature.

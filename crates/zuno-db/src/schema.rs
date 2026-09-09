@@ -5,7 +5,9 @@ use rusqlite::Transaction;
 use zuno_error::DbError;
 
 /// Number of application tables created by the current schema's single `up`.
-pub const TABLE_COUNT: usize = 41;
+pub const TABLE_COUNT: usize = 44;
+
+const MEMORY_RUNTIME_SCHEMA_SQL: &str = include_str!("schema/memory_runtime.sql");
 
 const CORE_SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -783,6 +785,7 @@ pub(crate) fn declared_tables() -> Vec<&'static str> {
         VERIFICATION_SCHEMA_SQL,
         MEMORY_POLICY_SCHEMA_SQL,
         EXECUTION_SCHEMA_SQL,
+        MEMORY_RUNTIME_SCHEMA_SQL,
     ]
     .into_iter()
     .flat_map(declared_tables_in)
@@ -813,7 +816,8 @@ pub fn up(transaction: &Transaction<'_>) -> Result<(), DbError> {
     up_learning(transaction)?;
     up_verification(transaction)?;
     up_memory_policy(transaction)?;
-    up_execution(transaction)
+    up_execution(transaction)?;
+    up_memory_runtime(transaction)
 }
 
 /// Add the learning-flywheel tables to a format-5 database.
@@ -846,6 +850,13 @@ pub(crate) fn up_memory_policy(transaction: &Transaction<'_>) -> Result<(), DbEr
 pub(crate) fn up_execution(transaction: &Transaction<'_>) -> Result<(), DbError> {
     transaction
         .execute_batch(EXECUTION_SCHEMA_SQL)
+        .map_err(migration::map_error)
+}
+
+/// Add versioned resident memory, learning provenance, leases, and search indexes.
+pub(crate) fn up_memory_runtime(transaction: &Transaction<'_>) -> Result<(), DbError> {
+    transaction
+        .execute_batch(MEMORY_RUNTIME_SCHEMA_SQL)
         .map_err(migration::map_error)
 }
 
@@ -892,8 +903,9 @@ mod tests {
         up(&transaction).expect("create the current schema");
         let mut created = transaction
             .prepare(
-                "SELECT name FROM sqlite_schema
-                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                "SELECT name FROM pragma_table_list
+                 WHERE schema = 'main' AND type = 'table'
+                   AND name NOT LIKE 'sqlite_%' ORDER BY name",
             )
             .expect("prepare inventory")
             .query_map([], |row| row.get::<_, String>(0))

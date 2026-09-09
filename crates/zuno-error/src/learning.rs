@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LearningError {
-    #[error("learning request field `{field}` is invalid")]
+    #[error("learning request field `{field}` is invalid: {detail}")]
     InvalidRequest { field: String, detail: String },
 
     #[error(
@@ -30,7 +30,7 @@ pub enum LearningError {
     #[error("Skill candidate `{candidate_id}` did not pass its evaluation suite")]
     EvaluationRejected { candidate_id: String },
 
-    #[error("learning operation `{operation}` could not access {path}")]
+    #[error("learning operation `{operation}` could not access {path}: {source}")]
     Io {
         operation: String,
         path: PathBuf,

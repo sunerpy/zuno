@@ -432,7 +432,8 @@ impl EvaluationStore {
                  SET status = 'uncertain',
                      error = 'evaluation process stopped before settlement',
                      time_updated = ?1, time_completed = ?1
-                 WHERE status = 'running'",
+                 WHERE status = 'running' AND
+                   COALESCE(json_extract(budget,'$.deadline'), time_updated+3600000)<=?1",
                 [now],
             )
             .map_err(open::map_error)

@@ -518,7 +518,17 @@ pub struct MemoryEntryProjection {
 }
 
 /// User feedback attached to one durable assistant message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedbackRating {
     Positive,
@@ -545,7 +555,9 @@ impl FeedbackRating {
 }
 
 /// Current feedback state for one durable message.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageFeedbackProjection {
     pub message_id: String,
@@ -558,7 +570,17 @@ pub struct MessageFeedbackProjection {
 }
 
 /// What one durable experience records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ExperienceKind {
     Outcome,
@@ -602,7 +624,17 @@ impl ExperienceKind {
 }
 
 /// Lifecycle of one durable experience.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ExperienceStatus {
     Active,
@@ -632,7 +664,9 @@ impl ExperienceStatus {
 }
 
 /// Frontend-neutral view of one learned experience.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct ExperienceProjection {
     pub id: String,
@@ -652,7 +686,17 @@ pub struct ExperienceProjection {
 }
 
 /// Lifecycle of one mined learning pattern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum LearningPatternStatus {
     Pending,
@@ -685,7 +729,9 @@ impl LearningPatternStatus {
 }
 
 /// Frontend-neutral view of one mined pattern.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LearningPatternProjection {
     pub id: String,
@@ -703,7 +749,17 @@ pub struct LearningPatternProjection {
 }
 
 /// Lifecycle of a reviewable Skill change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillCandidateStatus {
     PendingReview,
@@ -757,7 +813,17 @@ impl SkillCandidateStatus {
 }
 
 /// Filesystem effect proposed by a Skill candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillCandidateOperation {
     Apply,
@@ -784,7 +850,9 @@ impl SkillCandidateOperation {
 }
 
 /// Review projection for a complete Skill candidate and its evaluation.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillCandidateProjection {
     pub id: String,
@@ -806,13 +874,72 @@ pub struct SkillCandidateProjection {
 }
 
 /// Frontend-neutral learning projection shared by TUI, Server, and ACP.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LearningStateProjection {
     pub feedback: Vec<MessageFeedbackProjection>,
     pub experiences: Vec<ExperienceProjection>,
     pub patterns: Vec<LearningPatternProjection>,
     pub skill_candidates: Vec<SkillCandidateProjection>,
+    #[serde(default)]
+    pub queue: LearningQueueProjection,
+    #[serde(default)]
+    pub retrieval: Option<LearningRetrievalProjection>,
+    #[serde(default)]
+    pub experience_page: LearningPageProjection,
+}
+
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningQueueProjection {
+    pub queued: u64,
+    pub running: u64,
+    pub failed: u64,
+    pub uncertain: u64,
+    pub next_due_at: Option<i64>,
+    pub jobs: Vec<LearningJobProjection>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningJobProjection {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub session_id: Option<String>,
+    pub attempt: u32,
+    pub scheduled_at: i64,
+    pub error: Option<String>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningRetrievalProjection {
+    pub query_digest: String,
+    pub selected_ids: Vec<String>,
+    pub candidate_count: u32,
+    pub estimated_tokens: u32,
+    pub reason: Option<String>,
+    pub time_updated: i64,
+}
+
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningPageProjection {
+    pub offset: u32,
+    pub limit: u32,
+    pub total: u64,
+    pub next_offset: Option<u32>,
 }
 
 /// Active goal summary shown by clients.

@@ -24,7 +24,10 @@ The implementation is split between two native crates and typed database stores:
 | --- | --- |
 | `FeedbackService` | revisioned feedback for one persisted assistant message |
 | `ExperienceService` | extraction settlement, manual records, Memory proposals, and evidence cleanup |
-| `LearningExtractor` | no-tools structured extraction through a dedicated model |
+| `LearningIngestion` | bounded source manifests, manual selection and startup catch-up |
+| `LearningModelClient` | provider requests, deadlines, output schemas and request receipts |
+| `LearningExtractor` / `PatternConsolidator` | isolated extraction and semantic grouping |
+| `LearningSupervisor` / `ProjectLearningService` | process ownership and project queue execution |
 | `ExperienceRetriever` | project-first SQLite FTS retrieval and prompt budgeting |
 | `PatternMiner` | project and cross-project evidence grouping |
 | `SkillCandidateService` | candidate rendering, review, evaluation, CAS apply, undo, and revocation |
@@ -66,15 +69,17 @@ A completed turn is eligible when it includes at least one of:
 - an explicit user correction;
 - explicit positive or negative feedback.
 
-The runtime serializes the replayed durable turn, redacts the active credential
-and sensitive process-environment values, and admits an extraction job before
-invoking the extractor. The original user Message remains unchanged. The unique identity is
+The runtime collects bounded durable source records, redacts credentials before
+clipping, and admits an extraction job before invoking the extractor. Every source
+has a part/feedback address, a raw-source digest and a redacted-content digest.
+The extractor's exact admitted subset is persisted on the claimed job before the
+provider request; full legacy transcript blobs are never sent alongside it. The original user Message remains unchanged. The unique identity is
 `(session_id, source_message_id, extractor_version)`. Retrying admission, losing a
 worker lease, or restarting the process therefore returns to the same job and
 cannot create a second experience batch.
 
 Automatic jobs do not run in the foreground completion path. By default they
-become due after six idle hours; a host-owned worker polls every 60 seconds and
+become due after six idle hours; a process-owned project worker polls every 60 seconds and
 claims at most two jobs per wake. Claiming and the idle decision share one SQLite
 write transaction. A newer session activity timestamp, queued/steering/promoted
 input, a process-local live-turn lease, or a disabled/excluded session policy
@@ -85,7 +90,10 @@ There is no quota-percentage, daily-token, or currency budget for automatic
 learning. Zuno's API-key providers do not expose one common remaining-quota
 snapshot. Actual provider rate limits retain their typed `Retry-After`; the idle
 delay, eligibility transaction, two-job wake cap, idempotency, and three-attempt
-ceiling bound the work instead.
+ceiling bound the work, together with the `learning.execution` input/output/step
+and total-time limits. A startup pass admits up to 64 missed completed turns from
+the last seven days. Legacy queued inputs receive freshly captured source manifests.
+Closing an ACP foreground session does not destroy the project worker.
 
 When `post_turn.disable_on_external_context` is true, Web and MCP tools mark
 their successful results with a durable typed metadata bit. A completed turn
@@ -99,14 +107,17 @@ foreground-session identity. Its request and terminal outcome are durable
 records the exact prompt, digest, model, structured response contract, and an
 empty tool list.
 
-Extraction settlement inserts all `experience_record` and
-`experience_evidence` rows and completes the leased job in one transaction.
+Extraction first atomically records accepted experiences and verified evidence.
+It then proposes Memory and settles the job last. `(job, ordinal)` makes a resumed
+attempt idempotent. Each Memory authority commit checks the attempt token and
+session generation policy in the same transaction as its candidate/document write.
 `unresolved_issue` is durable evidence, but SQL and service validation prevent it
 from becoming Memory, pattern evidence, or Skill evaluation evidence.
 
 The extractor may propose resident Memory. Zuno first creates an ordinary
 reviewable `MemoryCandidate`. Only a project-scoped proposal with confidence at
-or above `0.9` may be applied automatically by this learning path. Global
+or above `0.9`, validated citations, and authoritative execution evidence may be
+applied automatically. Model-reported confidence is not an execution receipt. Global
 proposals and lower-confidence project proposals remain pending even when the
 general Memory promotion policy is more permissive.
 
@@ -124,7 +135,7 @@ Project aggregation:
 
 - defaults to one 24-hour bucket;
 - skips when fewer than three new project experiences exist in the window;
-- groups only promotable experiences;
+- semantically groups only verified, promotable experiences and validates cited ids;
 - records independent supporting sessions;
 - creates an automatic Skill candidate only with at least three independent
   sessions;
@@ -138,7 +149,7 @@ Global aggregation:
 
 - defaults to a seven-day bucket;
 - mines only promoted project patterns;
-- requires the same pattern in at least two independent projects;
+- semantically matches rules supported by promoted patterns in at least two independent projects;
 - includes a digest of the promoted project evidence in the job identity, so new
   evidence can be checked without replaying an unchanged proposal;
 - produces a global pattern, not a writable global Skill.
@@ -149,6 +160,8 @@ the cited project experiences.
 
 A rejected pattern stores the evidence version and digest. The same evidence is
 suppressed on later runs; additional evidence reopens the pattern for review.
+Unchanged rules and evidence preserve promoted status and version. The durable
+input identity is separate from the semantic concept chosen by the model.
 
 ## Retrieval and prompt receipts
 
@@ -160,7 +173,11 @@ without changing the default prompt budget.
 Foreground prompt text and explicit search text are converted to bounded quoted
 terms before `MATCH`. FTS5 operators, unmatched quotes, column selectors, and
 punctuated identifiers therefore remain input data instead of becoming SQL
-query grammar or failing the turn.
+query grammar or failing the turn. Default recall uses OR terms and reranking;
+explicit `match: "all"` uses all terms. Unicode and CJK trigram FTS indexes are
+created once by migration and maintained by insert/delete/update triggers. Reads
+never rebuild them. A foreground selection records a retrieval snapshot and usage;
+ordinary search is pure. Unverified observations are labeled in retrieved context.
 
 Retrieved experience enters the prompt as the stable
 `learning.experiences` section. Each item carries its durable Experience id,
@@ -250,10 +267,19 @@ A Skill candidate contains:
 Built-in and read-only Skills are never overwritten. Zuno proposes a distinctly
 named project companion under `.agents/skills/<name>/SKILL.md`.
 
-Human review starts an immutable offline suite. The baseline and candidate use
-the same model, toolset digest, output budget, step budget, temperature, seed,
-and `AttemptSnapshot`. Tool responses come only from recorded cassettes; the
-evaluation runner exposes no real side-effecting tool.
+Only explicit `/learn skill-review` starts an immutable versioned offline suite;
+opening a session merely binds the evaluator. Baseline and candidate each run a
+bounded multi-step attempt with the same model and budgets. `CassetteDispatcher`
+requires exact tool names/arguments and never falls back to real execution. The
+grader receives the resulting answer and tool trace; expected answers are hidden
+from the task attempt. Observation-only historical suites expose recorded evidence
+through a read-only lookup tool instead of fabricating shell results.
+
+The selected learning model is reused; a separate model setting is optional, and
+explicit cross-provider configurations are reported unavailable. Model requests
+still use the configured provider API. A whole suite has an absolute deadline;
+Drop guards persist cancellation, candidate ownership tokens fence late results,
+and another session's startup only reconciles expired evaluations.
 
 A candidate passes only when:
 
@@ -273,7 +299,8 @@ snapshots. Apply then checks the source digest and destination state:
 - an existing read-only companion destination marks the candidate `stale`;
 - a writable target must still match the recorded source digest.
 
-No stale source is overwritten. After process loss, reconciliation reads the
+Cooperating apply/undo writers and the reconciler share an OS path lock. A busy
+writer is skipped by reconciliation. No stale source is overwritten. After process loss, reconciliation reads the
 authoritative filesystem:
 
 - exact `after` means the apply completed;
@@ -292,7 +319,8 @@ record.
 ## Client contract
 
 `LearningStateProjection` contains current feedback, experiences, patterns, and
-Skill candidates. It is loaded from durable stores even when extraction is
+Skill candidates, queue counts/deadlines/errors, the last retrieval selection,
+and an Experience pagination cursor. It is loaded from durable stores even when extraction is
 disabled or the extractor model cannot start.
 
 - TUI exposes `/learn`, `/reflect`, the learning sidebar summary, and an explicit
@@ -324,6 +352,12 @@ the format marker. Existing project, session, message, and Memory rows are not
 rebuilt or copied. Historical `memory_reflection_delivery` and
 `memory_reflection_job` rows remain readable as legacy history, but the runtime
 does not admit new work through that retired reflection pipeline.
+
+Schema format 11 adds resident Memory documents/revisions, retrieval snapshots,
+source-verification and usage columns, extraction/evaluation ownership tokens,
+incremental Unicode/trigram FTS and query indexes. Supported formats 5 through 10
+upgrade atomically with the marker last. Exact released fixtures preserve rows;
+current markers with altered tables, triggers or indexes fail closed.
 
 Schema format 9 adds `session_memory_policy`. The format-8 to format-9 migration
 creates an empty sidecar table without rewriting sessions or learning records.

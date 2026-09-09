@@ -385,8 +385,8 @@ fn prune_default_preview_is_inert_across_every_real_table() {
     let before = all_table_counts(&connection);
     assert_eq!(
         before.len(),
-        zuno_db::schema::TABLE_COUNT + 1,
-        "current schema tables plus migration"
+        zuno_db::schema::TABLE_COUNT + 1 + 10,
+        "application tables, marker, and two FTS virtual tables with their shadows"
     );
     let remote = FakeRemote::default();
 

@@ -85,6 +85,28 @@ pub struct SkillCandidateService {
     experiences: ExperienceStore,
     evaluation: EvaluationService,
     config: ResolvedLearningConfig,
+    jobs: zuno_db::learning_job::LearningJobStore,
+    sources: zuno_db::learning_source::LearningSourceStore,
+}
+
+struct EvaluationGuard {
+    store: SkillCandidateStore,
+    id: String,
+    token: String,
+    settled: bool,
+}
+
+impl Drop for EvaluationGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            let _ = self.store.fail_evaluation(
+                &self.id,
+                &self.token,
+                "evaluation cancelled before settlement",
+                zuno_db::message::now_millis(),
+            );
+        }
+    }
 }
 
 impl SkillCandidateService {
@@ -94,7 +116,9 @@ impl SkillCandidateService {
             candidates: SkillCandidateStore::new(pool.clone()),
             patterns: LearningPatternStore::new(pool.clone()),
             experiences: ExperienceStore::new(pool.clone()),
-            evaluation: EvaluationService::new(pool),
+            evaluation: EvaluationService::new(Arc::clone(&pool)),
+            jobs: zuno_db::learning_job::LearningJobStore::new(Arc::clone(&pool)),
+            sources: zuno_db::learning_source::LearningSourceStore::new(pool),
             config,
         }
     }
@@ -404,8 +428,20 @@ impl SkillCandidateService {
         evaluator: &dyn OfflineCaseEvaluator,
         now: i64,
     ) -> Result<EvaluationDecision> {
-        let candidate = self.candidates.begin_evaluation(candidate_id, now)?;
+        let expires = zuno_db::message::now_millis()
+            .saturating_add(i64::try_from(self.config.execution_timeout_ms).unwrap_or(i64::MAX))
+            .saturating_add(1000);
+        let (candidate, lease) = self
+            .candidates
+            .begin_evaluation(candidate_id, now, expires)?;
+        let mut guard = EvaluationGuard {
+            store: self.candidates.clone(),
+            id: candidate_id.to_owned(),
+            token: lease.clone(),
+            settled: false,
+        };
         let request = CandidateEvaluationRequest {
+            timeout_ms: self.config.execution_timeout_ms,
             suite_id: suite_id.to_owned(),
             candidate_id: candidate_id.to_owned(),
             baseline_skill: baseline_skill.to_owned(),
@@ -419,6 +455,7 @@ impl SkillCandidateService {
             Err(error) => {
                 let _ = self.candidates.fail_evaluation(
                     candidate_id,
+                    &lease,
                     &error.to_string(),
                     zuno_db::message::now_millis(),
                 );
@@ -427,11 +464,13 @@ impl SkillCandidateService {
         };
         self.candidates.settle_evaluation(
             candidate_id,
+            &lease,
             &decision.run_id,
             decision.passed,
             (!decision.passed).then_some("offline evaluation policy rejected the candidate"),
             zuno_db::message::now_millis(),
         )?;
+        guard.settled = true;
         if !decision.passed {
             return Err(LearningError::EvaluationRejected {
                 candidate_id: candidate_id.to_owned(),
@@ -483,6 +522,7 @@ impl SkillCandidateService {
                 index,
                 "evidence",
                 &experience,
+                &self.evaluation_sources(&experience)?,
                 kind,
                 if kind == EvaluationCaseKind::Failure {
                     2
@@ -507,6 +547,7 @@ impl SkillCandidateService {
                 protection_start + offset,
                 "protection",
                 &experience,
+                &self.evaluation_sources(&experience)?,
                 EvaluationCaseKind::Protection,
                 1,
             ));
@@ -518,7 +559,7 @@ impl SkillCandidateService {
             ));
         }
 
-        let suite_id = format!("suite_{candidate_id}");
+        let suite_id = format!("suite_v2_{candidate_id}");
         self.evaluation.ensure_suite(NewEvaluationSuite {
             id: suite_id.clone(),
             project_id: candidate.projection.project_id.clone(),
@@ -531,6 +572,48 @@ impl SkillCandidateService {
             time_created: now,
         })?;
         Ok(suite_id)
+    }
+
+    pub fn evaluation_toolset_digest(&self, suite_id: &str) -> Result<String> {
+        let cases = self.evaluation.cases(suite_id)?;
+        let frozen = cases
+            .iter()
+            .map(|case| json!({"caseID":case.id,"cassette":case.tool_cassette}))
+            .collect::<Vec<_>>();
+        Ok(digest_text(
+            &serde_json::to_string(&frozen).expect("cassette identity"),
+        ))
+    }
+
+    fn evaluation_sources(
+        &self,
+        experience: &ExperienceRecord,
+    ) -> Result<Vec<zuno_db::learning_source::LearningSource>> {
+        let Some(job_id) = &experience.extraction_job_id else {
+            return Ok(Vec::new());
+        };
+        let job = self.jobs.get(job_id)?;
+        let Some(payload) = job.payload else {
+            return Ok(Vec::new());
+        };
+        let request = crate::decode_extraction_job_payload(payload)
+            .map_err(|error| {
+                invalid(
+                    "evaluation.source",
+                    &format!("corrupt source request: {error}"),
+                )
+            })?
+            .into_request();
+        let mut sources = Vec::new();
+        for source in request.sources {
+            if self
+                .sources
+                .source_is_current(&request.session_id, &source)?
+            {
+                sources.push(source);
+            }
+        }
+        Ok(sources)
     }
 
     /// Create one reviewable reversal for every applied Skill supported by the
@@ -642,6 +725,8 @@ impl SkillCandidateService {
             }
             .into());
         }
+        let path = candidate_path(&candidate)?;
+        let _guard = lock_skill_path(&path)?;
         let source = resolver
             .read_source(&candidate.projection.target_source)
             .await?;
@@ -659,7 +744,6 @@ impl SkillCandidateService {
             }
             .into());
         }
-        let path = candidate_path(&candidate)?;
         let before = read_snapshot(&path)?;
         if !candidate.target_writable && before.exists {
             self.candidates
@@ -755,6 +839,7 @@ impl SkillCandidateService {
         let before = decode_snapshot(candidate.before_content.as_deref(), id)?;
         let after = decode_snapshot(candidate.after_content.as_deref(), id)?;
         let path = candidate_path(&candidate)?;
+        let _guard = lock_skill_path(&path)?;
         let current = read_snapshot(&path)?;
         if current != after {
             self.candidates
@@ -805,6 +890,15 @@ impl SkillCandidateService {
             let after =
                 decode_snapshot(candidate.after_content.as_deref(), &candidate.projection.id)?;
             let path = candidate_path(&candidate)?;
+            let _guard = match lock_skill_path(&path) {
+                Ok(guard) => guard,
+                Err(LearningServiceError::Learning(LearningError::Io { source, .. }))
+                    if source.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let current = read_snapshot(&path)?;
             let (expected, status) = match candidate.projection.status {
                 SkillCandidateStatus::Applying if current == after => (
@@ -862,11 +956,23 @@ impl SkillCandidateService {
     }
 }
 
+fn lock_skill_path(path: &Path) -> Result<zuno_atomic_file::PathWriteGuard> {
+    zuno_atomic_file::PathWriteGuard::try_acquire(path).map_err(|source| {
+        LearningError::Io {
+            operation: "lock Skill target".to_owned(),
+            path: path.to_path_buf(),
+            source,
+        }
+        .into()
+    })
+}
+
 fn evaluation_case(
     candidate_id: &str,
     index: usize,
     role: &str,
     experience: &ExperienceRecord,
+    sources: &[zuno_db::learning_source::LearningSource],
     kind: EvaluationCaseKind,
     weight: u32,
 ) -> NewEvaluationCase {
@@ -889,14 +995,37 @@ fn evaluation_case(
             })
         })
         .collect::<Vec<_>>();
+    let calls: Vec<_> = sources
+        .iter()
+        .filter_map(|source| {
+            if source.kind != zuno_db::learning_source::LearningSourceKind::Tool {
+                return None;
+            }
+            let arguments =
+                serde_json::from_str::<serde_json::Value>(source.arguments.as_deref()?).ok()?;
+            arguments.is_object().then(|| zuno_eval::RecordedCall {
+                name: source.tool.clone().unwrap_or_default(),
+                arguments,
+                output: source.content.clone(),
+                is_error: source.field == zuno_db::learning_source::LearningSourceField::Error,
+            })
+        })
+        .collect();
+    let scenario = sources
+        .iter()
+        .rev()
+        .find(|source| source.kind == zuno_db::learning_source::LearningSourceKind::User)
+        .map(|source| source.content.clone());
     NewEvaluationCase {
         id: format!("case_{candidate_id}_{index:03}"),
         name: format!("{role}:{}", projection.id),
-        prompt: format!(
-            "Respond to the recorded work situation using only the supplied cassette.\
+        prompt: scenario.unwrap_or_else(|| {
+            format!(
+                "Respond to the recorded work situation using only the supplied cassette.\
 \nTitle: {}\nSituation: {}",
-            projection.title, projection.summary
-        ),
+                projection.title, projection.summary
+            )
+        }),
         expected,
         tool_cassette: json!({
             "mode": "recorded-only",
@@ -905,6 +1034,7 @@ fn evaluation_case(
             "sourceMessageID": projection.source_message_id,
             "kind": projection.kind.as_str(),
             "evidence": evidence,
+            "calls": calls,
         }),
         kind,
         weight,
@@ -1231,6 +1361,9 @@ mod tests {
                 confidence: 9_800,
                 fingerprint: "repository-failure".to_owned(),
                 evidence: vec![NewExperienceEvidence {
+                    source_digest: None,
+                    verified: false,
+                    promotion_eligible: false,
                     id: "evidence-1".to_owned(),
                     kind: ExperienceEvidenceKind::Tool,
                     source_id: None,
@@ -1411,6 +1544,9 @@ mod tests {
                 confidence: 9_700,
                 fingerprint: "repository-failure".to_owned(),
                 evidence: vec![NewExperienceEvidence {
+                    source_digest: None,
+                    verified: false,
+                    promotion_eligible: false,
                     id: "evidence-2".to_owned(),
                     kind: ExperienceEvidenceKind::Tool,
                     source_id: None,

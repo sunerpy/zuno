@@ -808,6 +808,10 @@ fn api_openapi_binds_every_body_with_an_existing_rust_schema() {
         Some("#/components/schemas/SessionResponse")
     );
     assert_eq!(
+        response_ref("/api/session/{sessionID}/learning", "get"),
+        Some("#/components/schemas/LearningStateResponse")
+    );
+    assert_eq!(
         response_ref("/api/permission/request", "get"),
         Some("#/components/schemas/PermissionRequestListResponse")
     );
@@ -912,21 +916,11 @@ async fn api_session_response_validates_against_its_published_openapi_binding() 
 
 #[tokio::test]
 async fn api_session_learning_returns_the_shared_durable_projection_shape() {
-    let state = ApiState::memory("/repo").expect("in-memory API state initializes");
-    state
-        .sessions()
-        .create(&SessionCreate::new(
-            "ses_learning",
-            "learning-slug",
-            "global",
-            "/repo",
-            "/repo",
-            "learning projection",
-            "test",
-        ))
-        .expect("learning fixture session inserts");
-
-    let response = api_app(state)
+    let fixture = MutationApiFixture::new("ses_learning");
+    let state = fixture.state.clone();
+    let app = api_app(state.clone());
+    let response = app
+        .clone()
         .oneshot(request(
             Method::GET,
             "/api/session/ses_learning/learning",
@@ -936,16 +930,54 @@ async fn api_session_learning_returns_the_shared_durable_projection_shape() {
         .expect("learning projection route responds");
 
     assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
     assert_eq!(
-        response_json(response).await,
+        body,
         json!({
             "data": {
                 "feedback": [],
                 "experiences": [],
                 "patterns": [],
                 "skillCandidates": [],
+                "queue":{"queued":0,"running":0,"failed":0,"uncertain":0,"nextDueAt":null,"jobs":[]},
+                "retrieval":null,
+                "experiencePage":{"offset":0,"limit":100,"total":0,"nextOffset":null},
             }
         })
+    );
+    let document = api::openapi();
+    let validator =
+        jsonschema::validator_for(&document["components"]["schemas"]["LearningStateResponse"])
+            .expect("learning response schema");
+    assert!(validator.is_valid(&body));
+    for index in 1..=3 {
+        fixture.pool.get().expect("connection").execute(
+            "INSERT INTO experience_record(id,project_id,kind,title,summary,confidence,fingerprint,status,time_created,time_updated)
+             VALUES(?1,'global','procedure','Rule','Recorded rule',9000,?1,'active',?2,?2)",
+            rusqlite::params![format!("exp_page_{index}"),index],
+        ).expect("paged experience");
+    }
+    let response = app
+        .oneshot(request(
+            Method::GET,
+            "/api/session/ses_learning/learning?offset=1&limit=1",
+            None,
+        ))
+        .await
+        .expect("page");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert!(validator.is_valid(&body));
+    assert_eq!(
+        body["data"]["experiences"]
+            .as_array()
+            .expect("experiences")
+            .len(),
+        1
+    );
+    assert_eq!(
+        body["data"]["experiencePage"],
+        json!({"offset":1,"limit":1,"total":3,"nextOffset":2})
     );
 }
 
@@ -2270,22 +2302,31 @@ async fn api_interrupt_source_reaches_the_durable_turn_event() {
     wait_until_session_idle(&services.runs, "ses_interrupt_event").await;
 
     let event_log = SessionEventLog::new(fixture.pool);
-    let properties = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let events = event_log
-                .read_after("ses_interrupt_event", None)
-                .expect("durable session events");
-            if let Some(interruption) = events
-                .iter()
-                .find(|event| event.event_type == "turn.interrupted")
-            {
-                return interruption.properties.clone();
+    // The SQLite projection drains asynchronously after the turn becomes idle.
+    let properties = bounded_wait(
+        "typed turn interruption to become durable",
+        async {
+            loop {
+                let events = event_log
+                    .read_after("ses_interrupt_event", None)
+                    .expect("durable session events");
+                if let Some(interruption) = events
+                    .iter()
+                    .find(|event| event.event_type == "turn.interrupted")
+                {
+                    return interruption.properties.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("typed turn interruption becomes durable");
+        },
+        || {
+            format!(
+                "events={:?}",
+                event_log.read_after("ses_interrupt_event", None)
+            )
+        },
+    )
+    .await;
     assert_eq!(properties["source"], "api");
     assert_eq!(properties["reason"], "user_cancel");
 }

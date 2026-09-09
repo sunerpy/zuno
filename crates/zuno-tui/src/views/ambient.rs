@@ -1629,6 +1629,8 @@ impl SidebarView {
             || !learning.experiences.is_empty()
             || !learning.patterns.is_empty()
             || !learning.skill_candidates.is_empty()
+            || !learning.queue.jobs.is_empty()
+            || learning.retrieval.is_some()
         {
             lines.push(blank());
             headers.push((lines.len(), Section::Learning));
@@ -1656,13 +1658,62 @@ impl SidebarView {
                 "Learning",
                 &format!(
                     "{} experiences · {} review · /learn",
-                    learning.experiences.len(),
+                    learning.experience_page.total.max(learning.experiences.len() as u64),
                     pattern_review + skill_review
                 ),
                 self.disclosure(self.expanded.learning),
                 width,
             ));
             if self.expanded.learning {
+                if learning.queue.queued
+                    + learning.queue.running
+                    + learning.queue.failed
+                    + learning.queue.uncertain
+                    > 0
+                {
+                    lines.push(padded(
+                        &format!(
+                            "  {} queued · {} running · {} failed · {} uncertain",
+                            learning.queue.queued,
+                            learning.queue.running,
+                            learning.queue.failed,
+                            learning.queue.uncertain
+                        ),
+                        width,
+                        self.context.muted(),
+                    ));
+                    for job in learning
+                        .queue
+                        .jobs
+                        .iter()
+                        .filter(|job| job.error.is_some())
+                        .take(2)
+                    {
+                        lines.push(padded(
+                            &format!(
+                                "  ! {}: {}",
+                                job.id,
+                                job.error.as_deref().unwrap_or_default()
+                            ),
+                            width,
+                            self.context.warning(),
+                        ));
+                    }
+                }
+                if let Some(recall) = &learning.retrieval {
+                    lines.push(padded(
+                        &format!(
+                            "  recall: {} selected · {} tokens",
+                            recall.selected_ids.len(),
+                            recall.estimated_tokens
+                        ),
+                        width,
+                        self.context.muted(),
+                    ));
+                    if let Some(reason) = &recall.reason {
+                        lines.push(padded(&format!("  {reason}"), width, self.context.muted()));
+                    }
+                }
                 for experience in learning.experiences.iter().take(4) {
                     let (glyph, style) =
                         if experience.kind == zuno_types::ExperienceKind::UnresolvedIssue {

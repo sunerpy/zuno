@@ -1710,7 +1710,10 @@ async fn one_turn_through(submission: Submission) {
     {
         return;
     }
-    let env = ScriptedEnv::new().expect("isolated environment");
+    // Exercise the shipping file-database path in an isolated PTY process.
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(zuno_testkit::DbChoice::TempFile);
     let scenario = Scenario::new("recorded-tool-loop")
         .from_oracle_cassette(TITLE_CASSETTE)
         .expect("the recorded text completion loads")

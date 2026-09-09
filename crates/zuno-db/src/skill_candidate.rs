@@ -114,20 +114,42 @@ impl SkillCandidateStore {
     }
 
     /// Explicit review starts evaluation; there is no automatic path into this state.
-    pub fn begin_evaluation(&self, id: &str, now: i64) -> Result<SkillCandidateRecord, DbError> {
-        transition(
-            &self.pool,
-            id,
-            "pending_review",
-            SkillCandidateStatus::Evaluating,
-            None,
-            now,
-        )
+    pub fn begin_evaluation(
+        &self,
+        id: &str,
+        now: i64,
+        expires: i64,
+    ) -> Result<(SkillCandidateRecord, String), DbError> {
+        if expires <= now {
+            return Err(query_error(std::io::Error::other(
+                "evaluation deadline must be future",
+            )));
+        }
+        self.pool.transaction(|transaction| {
+            let changed = transaction
+                .execute(
+                    "UPDATE skill_candidate SET status='evaluating',error=NULL,time_updated=?2,
+                 evaluation_lease_token=lower(hex(randomblob(16))),evaluation_lease_expires=?3
+                 WHERE id=?1 AND status IN ('pending_review','failed')",
+                    params![id, now, expires],
+                )
+                .map_err(open::map_error)?;
+            require_changed(changed, id, "pending_review or failed")?;
+            let token = transaction
+                .query_row(
+                    "SELECT evaluation_lease_token FROM skill_candidate WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(open::map_error)?;
+            Ok((read_required(transaction, id)?, token))
+        })
     }
 
     pub fn settle_evaluation(
         &self,
         id: &str,
+        lease_token: &str,
         run_id: &str,
         passed: bool,
         error: Option<&str>,
@@ -142,9 +164,11 @@ impl SkillCandidateStore {
             let changed = transaction
                 .execute(
                     "UPDATE skill_candidate
-                     SET status = ?2, evaluation_run_id = ?3, error = ?4, time_updated = ?5
-                     WHERE id = ?1 AND status = 'evaluating'",
-                    params![id, status.as_str(), run_id, error, now],
+                     SET status = ?2, evaluation_run_id = ?3, error = ?4, time_updated = ?5,
+                         evaluation_lease_token=NULL,evaluation_lease_expires=NULL
+                     WHERE id = ?1 AND status = 'evaluating'
+                       AND evaluation_lease_token=?6 AND evaluation_lease_expires>?5",
+                    params![id, status.as_str(), run_id, error, now, lease_token],
                 )
                 .map_err(open::map_error)?;
             require_changed(changed, id, "evaluating")?;
@@ -155,6 +179,7 @@ impl SkillCandidateStore {
     pub fn fail_evaluation(
         &self,
         id: &str,
+        lease_token: &str,
         error: &str,
         now: i64,
     ) -> Result<SkillCandidateRecord, DbError> {
@@ -162,9 +187,10 @@ impl SkillCandidateStore {
             let changed = transaction
                 .execute(
                     "UPDATE skill_candidate
-                     SET status = 'failed', error = ?2, time_updated = ?3
-                     WHERE id = ?1 AND status = 'evaluating'",
-                    params![id, error, now],
+                     SET status = 'failed', error = ?2, time_updated = ?3,
+                         evaluation_lease_token=NULL,evaluation_lease_expires=NULL
+                     WHERE id = ?1 AND status = 'evaluating' AND evaluation_lease_token=?4",
+                    params![id, error, now, lease_token],
                 )
                 .map_err(open::map_error)?;
             require_changed(changed, id, "evaluating")?;
@@ -269,7 +295,8 @@ impl SkillCandidateStore {
             let changed = transaction
                 .execute(
                     "UPDATE skill_candidate
-                     SET status = 'rejected', error = NULL, time_updated = ?2
+                     SET status = 'rejected', error = NULL, time_updated = ?2,
+                         evaluation_lease_token=NULL,evaluation_lease_expires=NULL
                      WHERE id = ?1 AND status IN ('pending_review','evaluating','approved','failed')",
                     params![id, now],
                 )
@@ -409,8 +436,9 @@ impl SkillCandidateStore {
                 "UPDATE skill_candidate
                  SET status = 'failed',
                      error = 'evaluation process stopped before settlement',
-                     time_updated = ?1
-                 WHERE status = 'evaluating'",
+                     time_updated = ?1,evaluation_lease_token=NULL,evaluation_lease_expires=NULL
+                 WHERE status = 'evaluating' AND
+                   (evaluation_lease_expires IS NULL OR evaluation_lease_expires<=?1)",
                 [now],
             )
             .map_err(open::map_error)
@@ -707,8 +735,8 @@ mod tests {
                 .begin_apply("candidate-1", "operation-1", "before", "after", 11)
                 .is_err()
         );
-        store
-            .begin_evaluation("candidate-1", 12)
+        let (_, lease) = store
+            .begin_evaluation("candidate-1", 12, 100)
             .expect("human review");
         let evaluations = EvaluationStore::new(store.pool.clone());
         evaluations
@@ -742,11 +770,52 @@ mod tests {
             })
             .expect("run");
         store
-            .settle_evaluation("candidate-1", "run-1", true, None, 13)
+            .settle_evaluation("candidate-1", &lease, "run-1", true, None, 13)
             .expect("evaluation");
         let applying = store
             .begin_apply("candidate-1", "operation-1", "before", "after", 14)
             .expect("apply");
         assert_eq!(applying.projection.status, SkillCandidateStatus::Applying);
+    }
+
+    #[test]
+    fn another_session_cannot_interrupt_a_live_evaluation_or_settle_a_reclaimed_one() {
+        let store = store();
+        store.create(candidate()).expect("candidate");
+        let (_, first) = store
+            .begin_evaluation("candidate-1", 10, 100)
+            .expect("first review");
+        assert_eq!(
+            store
+                .fail_interrupted_evaluations(20)
+                .expect("new session recovery"),
+            0
+        );
+        assert_eq!(
+            store
+                .fail_interrupted_evaluations(100)
+                .expect("expired lease"),
+            1
+        );
+        let (_, second) = store
+            .begin_evaluation("candidate-1", 101, 200)
+            .expect("retry review");
+        assert_ne!(first, second);
+        assert!(
+            store
+                .fail_evaluation("candidate-1", &first, "late old result", 110)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get("candidate-1")
+                .expect("candidate")
+                .projection
+                .status,
+            SkillCandidateStatus::Evaluating
+        );
+        store
+            .fail_evaluation("candidate-1", &second, "current failure", 120)
+            .expect("current settlement");
     }
 }

@@ -17,6 +17,8 @@
 pub mod acp;
 pub mod agent;
 pub mod formatter;
+mod learning_execution;
+pub use learning_execution::LearningExecutionConfig;
 pub mod lsp;
 pub mod mcp;
 pub mod ordered;
@@ -1095,6 +1097,9 @@ pub struct LearningConfig {
     /// Optional dedicated model used by the no-tools structured extractor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extractor_model: Option<String>,
+    /// Isolated request and candidate-execution budgets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<LearningExecutionConfig>,
     /// Fast post-turn extraction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_turn: Option<LearningPostTurnConfig>,
@@ -1127,6 +1132,31 @@ impl LearningConfig {
             enabled,
             use_existing,
             generate,
+            execution_structured_output: self
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.structured_output)
+                .unwrap_or(false),
+            execution_timeout_ms: self
+                .execution
+                .as_ref()
+                .and_then(|value| value.timeout_ms)
+                .map_or(120_000, NonZeroU64::get),
+            execution_max_input_bytes: self
+                .execution
+                .as_ref()
+                .and_then(|value| value.max_input_bytes)
+                .map_or(131_072, NonZeroU32::get),
+            execution_max_output_tokens: self
+                .execution
+                .as_ref()
+                .and_then(|value| value.max_output_tokens)
+                .map_or(4_096, NonZeroU32::get),
+            execution_max_steps: self
+                .execution
+                .as_ref()
+                .and_then(|value| value.max_steps)
+                .map_or(8, NonZeroU32::get),
             extractor_model: self
                 .extractor_model
                 .as_deref()
@@ -1258,6 +1288,11 @@ pub struct ResolvedLearningConfig {
     pub enabled: bool,
     pub use_existing: bool,
     pub generate: bool,
+    pub execution_structured_output: bool,
+    pub execution_timeout_ms: u64,
+    pub execution_max_input_bytes: u32,
+    pub execution_max_output_tokens: u32,
+    pub execution_max_steps: u32,
     pub extractor_model: Option<String>,
     pub post_turn_enabled: bool,
     pub post_turn_idle_delay_ms: u64,
@@ -1281,6 +1316,11 @@ impl Default for ResolvedLearningConfig {
             enabled: true,
             use_existing: true,
             generate: true,
+            execution_structured_output: false,
+            execution_timeout_ms: 120_000,
+            execution_max_input_bytes: 131_072,
+            execution_max_output_tokens: 4_096,
+            execution_max_steps: 8,
             extractor_model: None,
             post_turn_enabled: true,
             post_turn_idle_delay_ms: DEFAULT_LEARNING_POST_TURN_IDLE_DELAY_MS,

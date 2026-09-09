@@ -337,22 +337,7 @@ impl MemoryStore {
     /// On success [`Self::entries`] is the matching `before` snapshot and the
     /// returned vector is the exact `after` snapshot.
     pub fn preview_batch(&mut self, operations: &[Operation]) -> Result<Vec<String>, MemoryError> {
-        if operations.is_empty() {
-            return Err(MemoryError::EmptyBatch);
-        }
-
-        let mut validated = Vec::with_capacity(operations.len());
-        for (offset, operation) in operations.iter().enumerate() {
-            let index = offset + 1;
-            let operation = operation.validated(index)?;
-            if let Some(content) = operation.scannable()
-                && let Some(threat) = first_threat(content)
-            {
-                return Err(MemoryError::Blocked { index, threat });
-            }
-            validated.push(operation);
-        }
-
+        let validated = validated_operations(operations)?;
         let observed = read_checked(&self.path, self.stamp.is_some())?;
         if let Some(reason) = self.drift(observed.as_ref()) {
             let raw = observed.map(|(raw, _)| raw).unwrap_or_default();
@@ -368,38 +353,7 @@ impl MemoryStore {
             self.stamp = Some(stamp);
         }
 
-        let mut candidate = self.entries.clone();
-        for (offset, operation) in validated.iter().enumerate() {
-            let index = offset + 1;
-            match operation {
-                Operation::Add { content } => {
-                    if !candidate.iter().any(|entry| entry == content) {
-                        candidate.push(content.clone());
-                    }
-                }
-                Operation::Replace { old_text, content } => {
-                    let at = self.locate(&candidate, index, old_text)?;
-                    candidate[at] = content.clone();
-                }
-                Operation::Remove { old_text } => {
-                    let at = self.locate(&candidate, index, old_text)?;
-                    candidate.remove(at);
-                }
-            }
-        }
-
-        let projected = char_count(&serialize(&candidate));
-        let limit = self.limit;
-        if projected > limit {
-            return Err(MemoryError::CapExceeded {
-                scope: self.scope,
-                projected,
-                limit,
-                entries: self.entries.clone(),
-            });
-        }
-
-        Ok(candidate)
+        project_entries(self.scope, self.limit, &self.entries, &validated)
     }
 
     /// Replace one exact audited snapshot with another.
@@ -411,6 +365,14 @@ impl MemoryStore {
         expected: &[String],
         replacement: &[String],
     ) -> Result<Usage, MemoryError> {
+        let _write_guard =
+            zuno_atomic_file::PathWriteGuard::try_acquire(&self.path).map_err(|source| {
+                MemoryError::Io {
+                    operation: "acquire resident memory writer",
+                    path: self.path.clone(),
+                    source,
+                }
+            })?;
         let observed = read_checked(&self.path, self.stamp.is_some())?;
         if let Some(reason) = self.drift(observed.as_ref()) {
             let raw = observed.map(|(raw, _)| raw).unwrap_or_default();
@@ -453,42 +415,6 @@ impl MemoryStore {
         self.entries = replacement.to_vec();
         self.stamp = Some(stamp);
         Ok(self.usage())
-    }
-
-    /// Find the one entry containing `needle`.
-    ///
-    /// Identical duplicate entries are not ambiguous — they are the same text, so
-    /// acting on the first is well defined. Two *distinct* entries are, and are
-    /// refused (`memory_tool.py:621-628`).
-    fn locate(&self, entries: &[String], index: usize, needle: &str) -> Result<usize, MemoryError> {
-        let hits: Vec<usize> = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.contains(needle))
-            .map(|(at, _)| at)
-            .collect();
-
-        let Some(&first) = hits.first() else {
-            return Err(MemoryError::NoMatch {
-                index,
-                needle: needle.to_string(),
-                entries: self.entries.clone(),
-            });
-        };
-
-        let mut distinct: Vec<&String> = hits.iter().map(|&at| &entries[at]).collect();
-        distinct.sort_unstable();
-        distinct.dedup();
-        if distinct.len() > 1 {
-            return Err(MemoryError::Ambiguous {
-                index,
-                needle: needle.to_string(),
-                matches: distinct.into_iter().cloned().collect(),
-                entries: self.entries.clone(),
-            });
-        }
-
-        Ok(first)
     }
 
     /// Which drift signal, if any, fires for the file as just observed.
@@ -540,6 +466,106 @@ impl MemoryStore {
         })?;
         Ok(backup)
     }
+}
+
+/// Validate resident mutations against an authoritative entry snapshot without I/O.
+pub(crate) fn preview_entries(
+    scope: Scope,
+    limit: usize,
+    entries: &[String],
+    operations: &[Operation],
+) -> Result<Vec<String>, MemoryError> {
+    project_entries(scope, limit, entries, &validated_operations(operations)?)
+}
+
+fn validated_operations(operations: &[Operation]) -> Result<Vec<Operation>, MemoryError> {
+    if operations.is_empty() {
+        return Err(MemoryError::EmptyBatch);
+    }
+    operations
+        .iter()
+        .enumerate()
+        .map(|(offset, operation)| {
+            let index = offset + 1;
+            let operation = operation.validated(index)?;
+            if let Some(content) = operation.scannable()
+                && let Some(threat) = first_threat(content)
+            {
+                return Err(MemoryError::Blocked { index, threat });
+            }
+            Ok(operation)
+        })
+        .collect()
+}
+
+fn project_entries(
+    scope: Scope,
+    limit: usize,
+    entries: &[String],
+    operations: &[Operation],
+) -> Result<Vec<String>, MemoryError> {
+    let mut candidate = entries.to_vec();
+    for (offset, operation) in operations.iter().enumerate() {
+        let index = offset + 1;
+        match operation {
+            Operation::Add { content } => {
+                if !candidate.iter().any(|entry| entry == content) {
+                    candidate.push(content.clone());
+                }
+            }
+            Operation::Replace { old_text, content } => {
+                let at = locate_entry(entries, &candidate, index, old_text)?;
+                candidate[at] = content.clone();
+            }
+            Operation::Remove { old_text } => {
+                let at = locate_entry(entries, &candidate, index, old_text)?;
+                candidate.remove(at);
+            }
+        }
+    }
+    let projected = char_count(&serialize(&candidate));
+    if projected > limit {
+        return Err(MemoryError::CapExceeded {
+            scope,
+            projected,
+            limit,
+            entries: entries.to_vec(),
+        });
+    }
+    Ok(candidate)
+}
+
+fn locate_entry(
+    original: &[String],
+    entries: &[String],
+    index: usize,
+    needle: &str,
+) -> Result<usize, MemoryError> {
+    let hits = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.contains(needle))
+        .map(|(at, _)| at)
+        .collect::<Vec<_>>();
+    let Some(&first) = hits.first() else {
+        return Err(MemoryError::NoMatch {
+            index,
+            needle: needle.to_owned(),
+            entries: original.to_vec(),
+        });
+    };
+    let mut distinct = hits.iter().map(|&at| &entries[at]).collect::<Vec<_>>();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() > 1 {
+        return Err(MemoryError::Ambiguous {
+            index,
+            needle: needle.to_owned(),
+            matches: distinct.into_iter().cloned().collect(),
+            entries: original.to_vec(),
+        });
+    }
+    Ok(first)
 }
 
 /// Read the file, distinguishing "absent" from "there but unusable".

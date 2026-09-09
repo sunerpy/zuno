@@ -5,16 +5,29 @@
 //! auto-promote at high confidence; Skill changes always pass explicit review,
 //! offline evaluation, and source-digest CAS.
 
+mod consolidation;
+mod evaluator;
+mod execution;
 mod experience;
 mod extraction;
 mod feedback;
+mod ingestion;
+mod model;
 mod pattern;
 mod projection;
 mod retrieval;
 mod scheduler;
 mod skill;
+mod supervisor;
 mod text;
+mod worker;
 
+pub use crate::consolidation::{
+    ConsolidatedPattern, Consolidation, ConsolidationRequest, ConsolidationScope,
+    PatternConsolidator,
+};
+pub use crate::evaluator::ProviderSkillEvaluator;
+pub use crate::execution::{LearningAttempt, ManualReflectionGuard, run_claimed_extraction};
 pub use crate::experience::{
     ExperienceService, ExtractionPersistence, ManualExperienceRequest, MemoryPromotionResult,
     SessionExperienceCleanup,
@@ -26,6 +39,8 @@ pub use crate::extraction::{
     decode_extraction_job_payload,
 };
 pub use crate::feedback::FeedbackService;
+pub use crate::ingestion::LearningIngestion;
+pub use crate::model::{LEARNING_EXTRACTOR_VERSION, LearningModel, LearningModelClient};
 pub use crate::pattern::PatternMiner;
 pub use crate::projection::LearningProjectionService;
 pub use crate::retrieval::{ExperienceRetriever, RetrievedExperiences};
@@ -34,6 +49,8 @@ pub use crate::skill::{
     SkillCandidateRequest, SkillCandidateService, SkillCleanupPreparation, SkillSourceResolver,
     SkillTarget,
 };
+pub use crate::supervisor::{LearningSupervisor, LearningWork};
+pub use crate::worker::ProjectLearningService;
 pub use zuno_eval::EvaluationService;
 
 use zuno_error::{BoxSource, DbError, LearningError, ProviderError, Recoverable, Recovery};

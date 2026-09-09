@@ -487,7 +487,8 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
     // Read from `sqlite_master`, not from a list in this test: the plan's
     // milestone text and todo 82 disagreed about how many tables exist, and the
     // schema is the only authority. `schema::TABLE_COUNT` is the application tables
-    // `schema::up` creates; format initialization adds its one marker table.
+    // `schema::up` creates; initialization adds its marker and two FTS tables
+    // with their four shadow tables each.
     let names: Vec<&str> = summary
         .tables
         .iter()
@@ -511,9 +512,20 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
             "event_sequence",
             "experience_evidence",
             "experience_record",
+            "experience_search_cjk_fts",
+            "experience_search_cjk_fts_config",
+            "experience_search_cjk_fts_data",
+            "experience_search_cjk_fts_docsize",
+            "experience_search_cjk_fts_idx",
+            "experience_search_fts",
+            "experience_search_fts_config",
+            "experience_search_fts_data",
+            "experience_search_fts_docsize",
+            "experience_search_fts_idx",
             "human_request",
             "learning_job",
             "learning_pattern",
+            "learning_retrieval_snapshot",
             "memory_candidate",
             "memory_reflection_delivery",
             "memory_reflection_job",
@@ -524,6 +536,8 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
             "project",
             "project_directory",
             "provider_retry_backoff",
+            "resident_memory_document",
+            "resident_memory_revision",
             "session",
             "session_context_epoch",
             "session_execution_state",
@@ -541,7 +555,7 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
         ],
         "the reported inventory must be the schema's, in name order"
     );
-    assert_eq!(summary.tables.len(), zuno_db::schema::TABLE_COUNT + 1);
+    assert_eq!(summary.tables.len(), zuno_db::schema::TABLE_COUNT + 1 + 10);
 
     let expected_sessions = 2 * SESSIONS_PER_BAND;
     let expected_parts = expected_sessions * PARTS_PER_SESSION;
