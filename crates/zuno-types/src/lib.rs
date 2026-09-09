@@ -2,6 +2,50 @@
 
 pub mod execution;
 
+/// One durable Plan step's lifecycle status.
+///
+/// This type is shared by the Plan writer and Goal completion audit so the two
+/// components cannot disagree about which states are terminal.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Superseded,
+}
+
+impl PlanStepStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Superseded)
+    }
+
+    /// Decode the durable wire representation shared by Plan writers and readers.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "in_progress" => Some(Self::InProgress),
+            "completed" => Some(Self::Completed),
+            "superseded" => Some(Self::Superseded),
+            _ => None,
+        }
+    }
+}
+
 /// One class of routine work a client may compact in its main timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActivityKind {

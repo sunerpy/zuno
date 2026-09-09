@@ -1078,8 +1078,12 @@ async fn goal_update_cannot_complete_a_change_goal_while_a_capability_claim_is_i
         .expect("goal exists");
     assert_eq!(goal.status, GoalStatus::Active);
     assert_eq!(
-        goal.revision, 2,
-        "the accepted citation stays; only the status change was refused"
+        goal.revision, 1,
+        "criteria and completion must roll back together when the audit refuses"
+    );
+    assert_eq!(
+        fixture.store.criteria("ses_tools").expect("criteria")[0].status,
+        crate::GoalCriterionStatus::Open
     );
 }
 
@@ -1103,18 +1107,10 @@ async fn goal_update_refuses_to_waive_a_criterion_that_is_already_satisfied() {
     record_passing_receipt(&fixture, "rec_gates", 2_000);
     let update = erase(UpdateGoalTool::new(Arc::clone(&fixture.store)));
 
-    // The citation lands and stays; only the completion is refused, on `c2`.
-    update
-        .execute(
-            json!({
-                "expected_revision": 1,
-                "status": "complete",
-                "satisfy_criteria": [{"criterionId": "c1", "receiptId": "rec_gates"}]
-            }),
-            fixture.context("call_cite"),
-        )
-        .await
-        .expect_err("c2 is still open");
+    fixture
+        .store
+        .satisfy_criterion("ses_tools", 1, "c1", "rec_gates", 3_000)
+        .expect("establish evidence before testing the waiver refusal");
 
     let refusal = update
         .execute(

@@ -269,6 +269,7 @@ async fn session_sse_never_outpaces_the_history_route() {
     sender
         .send(TurnEvent::TurnStarted {
             session_id: "ses_order".to_owned(),
+            turn_id: "turn_order".to_owned(),
         })
         .await
         .expect("engine event enters the projection");

@@ -41,6 +41,18 @@ runtime，避免重复网络或子进程握手。结构性 MCP 配置发生变�
 进那个回合，因此模型能收到它，而正在进行的工作不会被打断。第二个请求以 JSON-RPC 错误
 `-32001` 回答，其 `data` 报告 `admission`（`steered`、`queued` 或 `rejected`）、
 `sessionId` 与持久的 `inputId`；流式输出与 `stopReason` 仍留在拥有该回合的那个请求上。
+
+支持 Zuno 扩展的客户端可以改用 `session/steer`。初始化响应通过
+`_meta.zuno.steering` 宣告能力；回合内 `session/update` 通过
+`_meta.zuno.turnId` 给出目标回合。请求必须把该值作为 `expectedTurnId`，
+成功时立即返回 `turnId`、`inputId`、`admittedSequence`、
+`admission: "steered"` 与 `delivery: "steer"`。拒绝使用 `-32002`，
+`reason` 为 `noActiveTurn`、`expectedTurnMismatch`、
+`activeTurnNotSteerable` 或 `emptyInput`。目标回合会在 inbox 事务提交前再次校验；
+如果等待 SQLite 期间原回合结束或已被替换，输入行与准入事件一起回滚，被拒绝的 steer
+不会进入后续回合。既有 `session/prompt` 与
+`session/cancel` 的 ACP V1 语义保持不变。
+
 斜杠命令无法被转向，会以 `reason: "commandRequiresIdleSession"` 被拒绝，且不写入任何
 持久内容；只有能解析到真实命令、Skill 或原生控制项的文本才算斜杠命令，因此仅以 `/`
 开头的提示词会作为普通内容被接纳。在一个 prompt 请求返回之前用 `$/cancel_request`
@@ -76,6 +88,7 @@ failed 状态，保留已观察到的路径/diff，并设置 `_meta.zuno.outcome
 其中 `severity` 取 `info`、`warning` 或 `error`，`code` 是稳定的机器可读码，例如
 `instruction.not_in_force`、`budget.compact`、`budget.token_budget`、`context.compact`。
 客户端靠这个标记把它们与模型输出区分开；它们永远不进入模型看到的对话记录。
+内部历史回放诊断只写结构化日志，不会投影成 thought chunk。
 
 压缩成功后，ACP 会收到完全相同的持久摘要：它以 `agent_message_chunk` 投影，并带
 `_meta.zuno.kind: "compaction_summary"`。回合中的自动压缩会在同一次 host drive 内、

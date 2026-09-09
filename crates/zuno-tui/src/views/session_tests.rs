@@ -4328,6 +4328,7 @@ fn session_stops_spinning_while_a_permission_prompt_is_mounted_over_it() {
     let mut host = crate::views::dialog::DialogHost::new(context.clone(), Box::new(screen));
     host.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
         session_id: String::from("s"),
+        turn_id: String::from("turn"),
     }));
 
     let busy = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
@@ -4383,6 +4384,7 @@ fn session_reports_that_a_question_is_waiting_for_the_user() {
     let mut host = crate::views::dialog::DialogHost::new(context.clone(), Box::new(screen));
     host.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
         session_id: String::from("s"),
+        turn_id: String::from("turn"),
     }));
     host.open(Box::new(crate::views::question::QuestionPrompt::new(
         context,
@@ -4423,6 +4425,7 @@ fn session_keeps_spinning_behind_a_dialog_that_is_not_a_permission_ask() {
     let mut host = crate::views::dialog::DialogHost::new(context, Box::new(screen));
     host.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
         session_id: String::from("s"),
+        turn_id: String::from("turn"),
     }));
     host.handle_action(action("model_list"), &press_none());
     assert_eq!(

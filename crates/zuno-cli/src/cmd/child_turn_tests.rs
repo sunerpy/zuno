@@ -53,6 +53,7 @@ async fn child_events_are_forwarded_before_the_child_channel_closes() {
     sender
         .publish(zuno_engine::r#loop::TurnEvent::TurnStarted {
             session_id: String::from("ses_child"),
+            turn_id: String::from("turn_child"),
         })
         .await
         .expect("publish the live event");

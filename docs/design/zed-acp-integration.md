@@ -148,6 +148,26 @@ loop.
 | Client filesystem RPC | Not advertised. Agent file reads and writes use Zuno tools, sandbox/permission policy, and durable events; they do not masquerade as ACP client filesystem handlers. |
 | Terminal RPC | Not advertised. Zuno will not emit terminal references until create/output/wait/kill/release ownership and cancellation are implemented as one lifecycle. |
 
+### Zuno steering extension
+
+ACP V1 has no successful `PromptResponse` shape for input accepted into another
+request's live turn. The existing concurrent `session/prompt` path therefore
+continues to return `-32001` with durable admission data. Zuno additionally
+advertises `_meta.zuno.steering` and accepts `session/steer` with a mandatory
+`expectedTurnId`; turn-scoped updates expose that id in
+`_meta.zuno.turnId`. The method returns immediately after durable admission and
+exact-turn soft-interrupt routing, or fails with `-32002` and a typed reason.
+It does not change `session/cancel`, add a cancellation grace period, or create
+a second turn lifecycle.
+
+This extension does not change current Zed behavior by itself. A Zed client
+must detect the capability and use `session/steer` for follow-up input instead
+of sending `session/cancel`; the Stop action should continue to cancel.
+
+Only user-audience notices are projected as tagged thought chunks. Diagnostic
+notices, including historical tool-declaration repair, are de-duplicated and
+logged without entering the ACP conversation.
+
 ### Draft native-subagent extension
 
 Native subagent projection is an adapter extension reviewed against the pinned

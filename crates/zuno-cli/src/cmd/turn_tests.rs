@@ -2626,6 +2626,7 @@ fn debug_agent_evaluates_live_mcp_tools_and_exact_parent_schema_authority() {
         name: "known_mcp_tool".to_owned(),
         description_sha256: sha256_text("connected description"),
         schema_sha256: sha256_text("connected schema"),
+        replay_schema_sha256: None,
         ui_intent: "generic".to_owned(),
     };
     let parent = ToolSchemaIdentity {
@@ -2718,6 +2719,7 @@ fn debug_agent_reports_progressive_root_mcp_schema_exposure() {
             name: "codegraph_query".to_owned(),
             description_sha256: sha256_text("query indexed code"),
             schema_sha256: sha256_text("query schema"),
+            replay_schema_sha256: None,
             ui_intent: "generic".to_owned(),
         }],
         warnings: Vec::new(),
@@ -2820,6 +2822,7 @@ fn delegated_agent_attempt_identity_hashes_the_full_parent_tool_schema_authority
         name: "codegraph_query".to_owned(),
         description_sha256: sha256_text("first description"),
         schema_sha256: sha256_text("same schema"),
+        replay_schema_sha256: None,
         ui_intent: "generic".to_owned(),
     };
     let changed = ToolSchemaIdentity {
@@ -7417,6 +7420,62 @@ fn goal_dynamic_context_is_rebuilt_from_authoritative_sql_for_each_request() {
     assert_ne!(
         first, second,
         "the second request reused stale goal context"
+    );
+}
+
+#[test]
+fn goal_dynamic_context_includes_the_same_runtime_work_state_as_ordinary_turns() {
+    let pool =
+        Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
+    let mut connection = pool.open_connection().expect("open connection");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    connection
+        .execute_batch(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+             VALUES ('project_goal_work', '/workspace', 1, 1, '[]');
+             INSERT INTO session (
+                 id, project_id, slug, directory, title, version, time_created, time_updated
+             ) VALUES (
+                 'ses_goal_work', 'project_goal_work', 'goal-work', '/workspace',
+                 'Goal work', 'zuno', 1, 1
+             );",
+        )
+        .expect("seed session");
+    let spill = tempfile::tempdir().expect("goal spill");
+    let store = Arc::new(
+        GoalStore::from_pool(Arc::clone(&pool), spill.path().to_owned())
+            .expect("goal store over shared pool"),
+    );
+    let goal = store
+        .create_goal("ses_goal_work", "finish current work", None)
+        .expect("create goal");
+    connection
+        .execute(
+            "INSERT INTO work_plan \
+             (session_id,id,goal_id,revision,title,steps,time_created,time_updated) \
+             VALUES (?1,'plan_goal_work',?2,3,'Current work',?3,2,2)",
+            rusqlite::params![
+                "ses_goal_work",
+                goal.goal_id,
+                serde_json::json!([
+                    {"id":"finish","title":"Finish","status":"in_progress"}
+                ])
+                .to_string()
+            ],
+        )
+        .expect("insert active plan");
+    let continuation = GoalContinuation::new(Arc::clone(&store), SessionRunRegistry::new());
+    let work = durable_work_context(&connection, "ses_goal_work")
+        .expect("project work state")
+        .expect("work state exists");
+
+    let context = goal_dynamic_context_from(&connection, &continuation, "ses_goal_work")
+        .expect("assemble Goal continuation context");
+
+    assert_eq!(
+        context,
+        DynamicContext::new(zuno_goal::render_goal_context(&goal)).with_runtime_instruction(work),
+        "Goal continuation must not omit runtime.work_state on its first provider request"
     );
 }
 

@@ -14,7 +14,8 @@ pub use snapshot::{
     PresetDescriptor, PresetRouteDescriptor, PresetSelection, ProfileDescriptor,
     PromptReceiptIdentity, SNAPSHOT_SCHEMA_VERSION, SandboxCapabilityDescriptor,
     SelectedSkillIdentity, SkillCapabilityDescriptor, SnapshotIdentity, ToolSchemaIdentity,
-    WorkflowNodeDescriptor, WorkflowTemplateDescriptor, sha256_json, sha256_text,
+    WorkflowNodeDescriptor, WorkflowTemplateDescriptor, replay_schema_sha256, sha256_json,
+    sha256_text,
 };
 
 /// Stable identifier for the first-party pack.

@@ -351,6 +351,32 @@ impl SessionInbox {
             .transaction(|transaction| admit_in(transaction, input))
     }
 
+    /// Admit an input only if its owner accepts it before the transaction commits.
+    ///
+    /// The callback observes the inserted row while it is still private to this
+    /// transaction. Returning an error rolls back both the row and admission event.
+    /// A callback that publishes process-local state must retire that state if the
+    /// final database commit fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the callback's typed rejection or an admission/commit database error.
+    pub fn admit_with<E>(
+        &self,
+        input: NewSessionInput,
+        before_commit: impl FnOnce(&SessionInput) -> Result<(), E>,
+    ) -> Result<SessionInput, E>
+    where
+        E: From<DbError>,
+    {
+        validate_input(&input).map_err(E::from)?;
+        self.pool.try_transaction(|transaction| {
+            let input = admit_in(transaction, input).map_err(E::from)?;
+            before_commit(&input)?;
+            Ok(input)
+        })
+    }
+
     /// Promote the oldest pending input, optionally filtered by delivery.
     ///
     /// # Errors

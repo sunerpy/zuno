@@ -1491,8 +1491,16 @@ fn automated_release_prs_keep_the_manual_actions_approval_gate() {
 fn release_controller_dispatches_exact_source_and_never_compiles() {
     let release = workflow("release.yml");
     let dispatch = job_body(&release, "dispatch_candidate").join("\n");
+    let checkout_pin = dispatch
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("- uses: actions/checkout@"))
+        .and_then(|reference| reference.split_whitespace().next())
+        .expect("release dispatch must use actions/checkout");
+    assert!(
+        checkout_pin.len() == 40 && checkout_pin.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "release dispatch checkout must be pinned to an immutable commit: {checkout_pin}"
+    );
     for required in [
-        "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
         "fetch-depth: 0",
         "persist-credentials: false",
         ".github/scripts/resolve-release-pr-head.sh",

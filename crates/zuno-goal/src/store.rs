@@ -110,6 +110,7 @@ use zuno_db::human_request::{
 use zuno_db::verification::{ReceiptOutcome, VerificationReceipt};
 use zuno_error::DbError;
 use zuno_paths::DbLocation;
+use zuno_types::PlanStepStatus;
 
 /// The table this module owns.
 pub const TABLE: &str = "goal";
@@ -641,6 +642,20 @@ pub struct CriterionOutcome {
     pub goal: Goal,
     /// The criterion as it now stands.
     pub criterion: GoalCriterion,
+}
+
+/// One receipt-backed criterion update applied atomically with Goal completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriterionSatisfaction {
+    pub criterion_id: String,
+    pub receipt_id: String,
+}
+
+/// One reasoned criterion waiver applied atomically with Goal completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriterionWaiver {
+    pub criterion_id: String,
+    pub reason: String,
 }
 
 /// What [`GoalStore::record_request_usage`] did with one request's tokens.
@@ -1551,6 +1566,52 @@ impl GoalStore {
         )
     }
 
+    /// Apply criterion evidence and complete the Goal in one transaction.
+    ///
+    /// This is the model-facing `goal_update(status=complete)` path. A failed
+    /// completion audit rolls every criterion change in the same request back, so
+    /// retrying the request never encounters a half-applied checklist.
+    pub fn complete_as_model_with_criteria_checked(
+        &self,
+        session_id: &str,
+        expected_revision: i64,
+        satisfy: &[CriterionSatisfaction],
+        waive: &[CriterionWaiver],
+    ) -> Result<Option<Goal>, GoalError> {
+        let stamp_ms = now_ms()?;
+        self.pool.try_transaction(|tx| {
+            if !satisfy.is_empty() || !waive.is_empty() {
+                let goal = goal_for_write(tx, session_id, expected_revision)?;
+                for update in satisfy {
+                    satisfy_criterion_in(
+                        tx,
+                        &goal,
+                        session_id,
+                        update.criterion_id.trim(),
+                        update.receipt_id.trim(),
+                        stamp_ms,
+                    )?;
+                }
+                for update in waive {
+                    waive_criterion_in(
+                        tx,
+                        session_id,
+                        update.criterion_id.trim(),
+                        &update.reason,
+                        stamp_ms,
+                    )?;
+                }
+            }
+            complete_in_transaction(
+                tx,
+                session_id,
+                Some(expected_revision),
+                CompletionAuthority::Model,
+                stamp_ms,
+            )
+        })
+    }
+
     /// The one statement path that sets `complete`, guarded on a revision or not.
     ///
     /// Shared by [`Self::complete_checked`] and by the two model status writers when
@@ -1564,91 +1625,9 @@ impl GoalStore {
         expected_revision: Option<i64>,
         authority: CompletionAuthority,
     ) -> Result<Option<Goal>, GoalError> {
-        let now_ms = now_ms()?;
+        let stamp_ms = now_ms()?;
         self.pool.try_transaction(|tx| {
-            // `created_at_ms` is read from the same row, in the same transaction, as the
-            // revision the caller is guarded on: the audit's lower bound on evidence has
-            // to be this goal instance's creation and not a value a concurrent
-            // replacement could have moved underneath it.
-            let current = tx
-                .query_row(
-                    "SELECT goal_id, revision, created_at_ms FROM goal WHERE session_id = ?1",
-                    params![session_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(zuno_db::map_error)?;
-            let Some((goal_id, actual, created_at_ms)) = current else {
-                return Ok(None);
-            };
-            if let Some(expected) = expected_revision
-                && actual != expected
-            {
-                return Err(GoalError::RevisionConflict {
-                    session_id: session_id.to_owned(),
-                    expected,
-                    actual,
-                });
-            }
-
-            // Ownership before arithmetic: a plan written for another goal is refused
-            // as stale whatever its step count says, because counting its unfinished
-            // steps would describe the previous goal's work as this one's.
-            audit_plan_ownership(tx, session_id, &goal_id)?;
-            let (plan_steps, work_items, jobs, human_requests) =
-                completion_blockers(tx, session_id)?;
-            if plan_steps != 0 || work_items != 0 || jobs != 0 || human_requests != 0 {
-                return Err(GoalError::CompletionBlocked {
-                    plan_steps,
-                    work_items,
-                    jobs,
-                    human_requests,
-                });
-            }
-            audit_evidence(tx, session_id, created_at_ms, authority)?;
-
-            let goal = {
-                let mut statement = tx
-                    .prepare(SET_STATUS_AS_MODEL)
-                    .map_err(zuno_db::map_error)?;
-                read_optional(
-                    &mut statement,
-                    params![
-                        ModelStatus::Complete.as_str(),
-                        now_ms,
-                        session_id,
-                        expected_revision
-                    ],
-                )
-                .map_err(into_db_error)?
-            };
-            if goal.is_some() {
-                tx.execute(
-                    "DELETE FROM goal_pending_failure_signal WHERE session_id = ?1",
-                    params![session_id],
-                )
-                .map_err(zuno_db::map_error)?;
-                clear_retry_state(tx, session_id)?;
-                // A goal that just completed is no longer paused, so a pause row left
-                // behind would describe a resumption that can never happen.
-                if goal
-                    .as_ref()
-                    .is_some_and(|current| current.status != GoalStatus::Paused)
-                {
-                    tx.execute(
-                        "DELETE FROM goal_pause WHERE session_id = ?1",
-                        params![session_id],
-                    )
-                    .map_err(zuno_db::map_error)?;
-                }
-            }
-            Ok(goal)
+            complete_in_transaction(tx, session_id, expected_revision, authority, stamp_ms)
         })
     }
 
@@ -1727,64 +1706,10 @@ impl GoalStore {
         at_ms: i64,
     ) -> Result<CriterionOutcome, GoalError> {
         self.pool.try_transaction(|tx| {
-            let (goal, criterion) =
-                read_criterion_for_write(tx, session_id, expected_revision, criterion_id)?;
-            if criterion.status == GoalCriterionStatus::Waived {
-                return Err(GoalError::EvidenceUnproven {
-                    criterion_id: criterion_id.to_owned(),
-                    receipt_id: receipt_id.to_owned(),
-                    reason: "the criterion is waived, so it is settled by a recorded decision \
-                             rather than by evidence"
-                        .to_owned(),
-                });
-            }
-            let receipt = receipt_for(tx, session_id, receipt_id)?.ok_or_else(|| {
-                GoalError::EvidenceUnproven {
-                    criterion_id: criterion_id.to_owned(),
-                    receipt_id: receipt_id.to_owned(),
-                    reason: "no receipt with that id was recorded for this session; cite the \
-                             receipt id printed by the tool result that ran the check"
-                        .to_owned(),
-                }
-            })?;
-            if !receipt.proves_success() {
-                return Err(GoalError::EvidenceUnproven {
-                    criterion_id: criterion_id.to_owned(),
-                    receipt_id: receipt_id.to_owned(),
-                    reason: unproven_reason(&receipt),
-                });
-            }
-            // Before the mutation mark, because "this receipt belongs to a goal that no
-            // longer exists" is a different mistake from "you edited after checking", and
-            // the mark is cleared by the very replacement that makes the first one true.
-            if receipt.time_created < goal.created_at_ms {
-                return Err(GoalError::EvidencePredatesGoal {
-                    criterion_id: criterion_id.to_owned(),
-                    receipt_id: receipt_id.to_owned(),
-                    goal_created_at_ms: goal.created_at_ms,
-                    receipt_at_ms: receipt.time_created,
-                });
-            }
-            if let Some(marked_at_ms) = mutation_mark(tx, session_id)?
-                && marked_at_ms > receipt.time_created
-            {
-                return Err(GoalError::EvidenceStale {
-                    criterion_id: criterion_id.to_owned(),
-                    receipt_id: receipt_id.to_owned(),
-                    marked_at_ms,
-                    receipt_at_ms: receipt.time_created,
-                });
-            }
-            tx.execute(
-                "UPDATE goal_criterion \
-                 SET status = 'satisfied', waiver_reason = NULL, receipt_id = ?3, \
-                     satisfied_at_ms = ?4, updated_at_ms = ?4 \
-                 WHERE session_id = ?1 AND criterion_id = ?2",
-                params![session_id, criterion_id, receipt_id, at_ms],
-            )
-            .map_err(zuno_db::map_error)?;
+            let goal = goal_for_write(tx, session_id, expected_revision)?;
+            let criterion =
+                satisfy_criterion_in(tx, &goal, session_id, criterion_id, receipt_id, at_ms)?;
             let goal = touch_goal(tx, session_id, expected_revision, at_ms)?;
-            let criterion = require_criterion(tx, session_id, criterion_id)?;
             Ok(CriterionOutcome { goal, criterion })
         })
     }
@@ -1822,46 +1747,10 @@ impl GoalStore {
         reason: &str,
         at_ms: i64,
     ) -> Result<CriterionOutcome, GoalError> {
-        let reason = reason.trim();
-        // `is_empty` after trimming is not enough: `str::trim` strips White_Space only,
-        // so a reason of `"\u{200b}"` survives it and lands in the ledger as a waiver
-        // that renders as nothing. Same predicate as the criterion statements, so the
-        // two sides of the audit surface cannot drift.
-        if !has_visible_character(reason) {
-            return Err(GoalError::EmptyWaiverReason {
-                criterion_id: criterion_id.to_owned(),
-            });
-        }
-        // And the same bound, for the same reason: matching the emptiness predicate while
-        // leaving the length unbounded is exactly the drift the comment above denies.
-        // Characters, not bytes, like every other cap in this module.
-        let actual = reason.chars().count();
-        if actual > MAX_WAIVER_REASON_CHARS {
-            return Err(GoalError::WaiverReasonTooLong {
-                criterion_id: criterion_id.to_owned(),
-                actual,
-                max: MAX_WAIVER_REASON_CHARS,
-            });
-        }
         self.pool.try_transaction(|tx| {
-            let (_goal, criterion) =
-                read_criterion_for_write(tx, session_id, expected_revision, criterion_id)?;
-            if criterion.status == GoalCriterionStatus::Satisfied {
-                return Err(GoalError::CriterionAlreadySatisfied {
-                    criterion_id: criterion_id.to_owned(),
-                    receipt_id: criterion.receipt_id.unwrap_or_default(),
-                });
-            }
-            tx.execute(
-                "UPDATE goal_criterion \
-                 SET status = 'waived', waiver_reason = ?3, receipt_id = NULL, \
-                     satisfied_at_ms = NULL, updated_at_ms = ?4 \
-                 WHERE session_id = ?1 AND criterion_id = ?2",
-                params![session_id, criterion_id, reason, at_ms],
-            )
-            .map_err(zuno_db::map_error)?;
+            goal_for_write(tx, session_id, expected_revision)?;
+            let criterion = waive_criterion_in(tx, session_id, criterion_id, reason, at_ms)?;
             let goal = touch_goal(tx, session_id, expected_revision, at_ms)?;
-            let criterion = require_criterion(tx, session_id, criterion_id)?;
             Ok(CriterionOutcome { goal, criterion })
         })
     }
@@ -2826,60 +2715,268 @@ fn upsert(tx: &Transaction<'_>, input: GoalUpsert<'_>) -> Result<Option<Goal>, D
     .map_err(into_db_error)
 }
 
+fn complete_in_transaction(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    expected_revision: Option<i64>,
+    authority: CompletionAuthority,
+    stamp_ms: i64,
+) -> Result<Option<Goal>, GoalError> {
+    // `created_at_ms` is read from the same row, in the same transaction, as the
+    // revision the caller is guarded on: the audit's lower bound on evidence has
+    // to be this goal instance's creation and not a value a concurrent
+    // replacement could have moved underneath it.
+    let current = tx
+        .query_row(
+            "SELECT goal_id, revision, created_at_ms FROM goal WHERE session_id = ?1",
+            params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(zuno_db::map_error)?;
+    let Some((goal_id, actual, created_at_ms)) = current else {
+        return Ok(None);
+    };
+    if let Some(expected) = expected_revision
+        && actual != expected
+    {
+        return Err(GoalError::RevisionConflict {
+            session_id: session_id.to_owned(),
+            expected,
+            actual,
+        });
+    }
+
+    // Ownership before arithmetic: a plan written for another goal is refused
+    // as stale whatever its step count says, because counting its unfinished
+    // steps would describe the previous goal's work as this one's.
+    audit_plan_ownership(tx, session_id, &goal_id)?;
+    let blockers = completion_blockers(tx, session_id)?;
+    if !blockers.is_empty() {
+        return Err(GoalError::CompletionBlocked {
+            plan_steps: blockers.plan_steps,
+            work_items: blockers.work_items,
+            jobs: blockers.jobs,
+            human_requests: blockers.human_requests,
+            details: blockers.rendered_details(),
+        });
+    }
+    audit_evidence(tx, session_id, created_at_ms, authority)?;
+
+    let goal = {
+        let mut statement = tx
+            .prepare(SET_STATUS_AS_MODEL)
+            .map_err(zuno_db::map_error)?;
+        read_optional(
+            &mut statement,
+            params![
+                ModelStatus::Complete.as_str(),
+                stamp_ms,
+                session_id,
+                expected_revision
+            ],
+        )
+        .map_err(into_db_error)?
+    };
+    if goal.is_some() {
+        tx.execute(
+            "DELETE FROM goal_pending_failure_signal WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(zuno_db::map_error)?;
+        clear_retry_state(tx, session_id)?;
+        // A goal that just completed is no longer paused, so a pause row left
+        // behind would describe a resumption that can never happen.
+        if goal
+            .as_ref()
+            .is_some_and(|current| current.status != GoalStatus::Paused)
+        {
+            tx.execute(
+                "DELETE FROM goal_pause WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(zuno_db::map_error)?;
+        }
+    }
+    Ok(goal)
+}
+
+const MAX_COMPLETION_BLOCKER_DETAILS: usize = 10;
+const MAX_COMPLETION_BLOCKER_LABEL_CHARS: usize = 160;
+
+#[derive(Debug)]
+struct CompletionBlocker {
+    kind: &'static str,
+    id: String,
+    status: String,
+}
+
+#[derive(Debug, Default)]
+struct CompletionBlockers {
+    plan_steps: usize,
+    work_items: usize,
+    jobs: usize,
+    human_requests: usize,
+    details: Vec<CompletionBlocker>,
+}
+
+impl CompletionBlockers {
+    fn total(&self) -> usize {
+        self.plan_steps
+            .saturating_add(self.work_items)
+            .saturating_add(self.jobs)
+            .saturating_add(self.human_requests)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+
+    fn remaining_detail_capacity(&self) -> usize {
+        MAX_COMPLETION_BLOCKER_DETAILS.saturating_sub(self.details.len())
+    }
+
+    fn push_detail(&mut self, kind: &'static str, id: &str, status: &str) {
+        if self.details.len() >= MAX_COMPLETION_BLOCKER_DETAILS {
+            return;
+        }
+        self.details.push(CompletionBlocker {
+            kind,
+            id: crate::projection::clip_to(id, MAX_COMPLETION_BLOCKER_LABEL_CHARS),
+            status: crate::projection::clip_to(status, MAX_COMPLETION_BLOCKER_LABEL_CHARS),
+        });
+    }
+
+    fn rendered_details(&self) -> String {
+        if self.details.is_empty() {
+            return String::new();
+        }
+        let listed = self
+            .details
+            .iter()
+            .map(|blocker| format!("{} `{}` ({})", blocker.kind, blocker.id, blocker.status))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let omitted = self.total().saturating_sub(self.details.len());
+        if omitted == 0 {
+            format!("; blockers: {listed}")
+        } else {
+            format!("; blockers: {listed}, and {omitted} more")
+        }
+    }
+}
+
+fn count_to_usize(count: i64) -> usize {
+    usize::try_from(count).unwrap_or(usize::MAX)
+}
+
 fn completion_blockers(
     tx: &Transaction<'_>,
     session_id: &str,
-) -> Result<(usize, usize, usize, usize), DbError> {
-    let plan_steps = if table_exists(tx, "work_plan")? {
-        let steps = tx
+) -> Result<CompletionBlockers, GoalError> {
+    let mut blockers = CompletionBlockers::default();
+    if table_exists(tx, "work_plan")? {
+        let plan = tx
             .query_row(
-                "SELECT steps FROM work_plan WHERE session_id = ?1",
+                "SELECT id, steps FROM work_plan WHERE session_id = ?1",
                 params![session_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
             .map_err(zuno_db::map_error)?;
-        match steps {
-            Some(steps) => serde_json::from_str::<Vec<serde_json::Value>>(&steps)
-                .map_err(|error| DbError::Query {
-                    source: Box::new(error),
-                })?
-                .into_iter()
-                .filter(|step| {
-                    !matches!(
-                        step.get("status").and_then(serde_json::Value::as_str),
-                        Some("completed" | "cancelled")
-                    )
-                })
-                .count(),
-            None => 0,
+        if let Some((plan_id, steps)) = plan {
+            let steps = serde_json::from_str::<Vec<serde_json::Value>>(&steps).map_err(|_| {
+                GoalError::PlanStateCorrupt {
+                    session_id: session_id.to_owned(),
+                    plan_id: plan_id.clone(),
+                    step_id: "<steps>".to_owned(),
+                    status: "<invalid-json>".to_owned(),
+                }
+            })?;
+            for (index, step) in steps.into_iter().enumerate() {
+                let step_id = step
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(|| format!("<step-{}>", index + 1), ToOwned::to_owned);
+                let raw_status = step
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| GoalError::PlanStateCorrupt {
+                        session_id: session_id.to_owned(),
+                        plan_id: plan_id.clone(),
+                        step_id: step_id.clone(),
+                        status: "<missing>".to_owned(),
+                    })?;
+                let status = PlanStepStatus::parse(raw_status).ok_or_else(|| {
+                    GoalError::PlanStateCorrupt {
+                        session_id: session_id.to_owned(),
+                        plan_id: plan_id.clone(),
+                        step_id: step_id.clone(),
+                        status: crate::projection::clip_to(
+                            raw_status,
+                            MAX_COMPLETION_BLOCKER_LABEL_CHARS,
+                        ),
+                    }
+                })?;
+                if !status.is_terminal() {
+                    blockers.plan_steps = blockers.plan_steps.saturating_add(1);
+                    blockers.push_detail("plan step", &step_id, status.as_str());
+                }
+            }
         }
-    } else {
-        0
-    };
-    let work_items = if table_exists(tx, "work_item")? {
-        tx.query_row(
-            "SELECT COUNT(*) FROM work_item              WHERE session_id = ?1 AND status NOT IN ('completed','cancelled')",
-            params![session_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(zuno_db::map_error)
-        .map(|count| usize::try_from(count).unwrap_or(usize::MAX))?
-    } else {
-        0
-    };
-    let jobs = if table_exists(tx, "agent_job")? {
+    }
+
+    if table_exists(tx, "work_item")? {
+        blockers.work_items = count_to_usize(
+            tx.query_row(
+                "SELECT COUNT(*) FROM work_item \
+                 WHERE session_id = ?1 AND status NOT IN ('completed','cancelled')",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(zuno_db::map_error)?,
+        );
+        let limit = blockers.remaining_detail_capacity();
+        if limit != 0 && blockers.work_items != 0 {
+            let mut statement = tx
+                .prepare(
+                    "SELECT id, status FROM work_item \
+                     WHERE session_id = ?1 AND status NOT IN ('completed','cancelled') \
+                     ORDER BY time_created, id LIMIT ?2",
+                )
+                .map_err(zuno_db::map_error)?;
+            let rows = statement
+                .query_map(
+                    params![session_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(zuno_db::map_error)?;
+            for row in rows {
+                let (id, status) = row.map_err(zuno_db::map_error)?;
+                blockers.push_detail("work item", &id, &status);
+            }
+        }
+    }
+
+    if table_exists(tx, "agent_job")? {
         // Session ancestry is durable in `session.parent_id`. `UNION` deliberately
         // de-duplicates each reachable id, so even a corrupt parent cycle reaches
         // a fixed point instead of recursing forever.
-        tx.query_row(
-            "WITH RECURSIVE descendant_session(session_id) AS ( \
+        const JOB_BLOCKERS: &str = "WITH RECURSIVE descendant_session(session_id) AS ( \
                VALUES (?1) \
                UNION \
                SELECT s.id \
                FROM session AS s \
                JOIN descendant_session AS d ON s.parent_id = d.session_id \
-             ) \
+             ) ";
+        let count_sql = format!(
+            "{JOB_BLOCKERS} \
              SELECT COUNT(*) \
              FROM agent_job AS j \
              JOIN descendant_session AS d ON d.session_id = j.parent_session_id \
@@ -2895,29 +2992,84 @@ fn completion_blockers(
                        AND i.state IN ('queued', 'steering', 'promoted') \
                    ) \
                  ) \
-               )",
-            params![session_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(zuno_db::map_error)
-        .map(|count| usize::try_from(count).unwrap_or(usize::MAX))?
-    } else {
-        0
-    };
-    let human_requests = if table_exists(tx, "human_request")? {
-        tx.query_row(
-            "SELECT COUNT(*) FROM human_request \
-             WHERE session_id = ?1 AND state = 'pending' \
-               AND goal_id = (SELECT goal_id FROM goal WHERE session_id = ?1)",
-            params![session_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(zuno_db::map_error)
-        .map(|count| usize::try_from(count).unwrap_or(usize::MAX))?
-    } else {
-        0
-    };
-    Ok((plan_steps, work_items, jobs, human_requests))
+               )"
+        );
+        blockers.jobs = count_to_usize(
+            tx.query_row(&count_sql, params![session_id], |row| row.get::<_, i64>(0))
+                .map_err(zuno_db::map_error)?,
+        );
+        let limit = blockers.remaining_detail_capacity();
+        if limit != 0 && blockers.jobs != 0 {
+            let detail_sql = format!(
+                "{JOB_BLOCKERS} \
+                 SELECT j.id, \
+                   CASE WHEN j.status IN ('completed','failed','cancelled') \
+                        THEN j.status || '/report-pending' ELSE j.status END \
+                 FROM agent_job AS j \
+                 JOIN descendant_session AS d ON d.session_id = j.parent_session_id \
+                 WHERE ( \
+                     j.status IN ('queued', 'running', 'uncertain') \
+                     OR ( \
+                       j.report_delivery = 'next-step' \
+                       AND j.status IN ('completed', 'failed', 'cancelled') \
+                       AND EXISTS ( \
+                         SELECT 1 FROM session_input AS i \
+                         WHERE i.id = j.report_input_id \
+                           AND i.session_id = j.parent_session_id \
+                           AND i.state IN ('queued', 'steering', 'promoted') \
+                       ) \
+                     ) \
+                   ) \
+                 ORDER BY j.time_created, j.id LIMIT ?2"
+            );
+            let mut statement = tx.prepare(&detail_sql).map_err(zuno_db::map_error)?;
+            let rows = statement
+                .query_map(
+                    params![session_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(zuno_db::map_error)?;
+            for row in rows {
+                let (id, status) = row.map_err(zuno_db::map_error)?;
+                blockers.push_detail("job", &id, &status);
+            }
+        }
+    }
+
+    if table_exists(tx, "human_request")? {
+        blockers.human_requests = count_to_usize(
+            tx.query_row(
+                "SELECT COUNT(*) FROM human_request \
+                 WHERE session_id = ?1 AND state = 'pending' \
+                   AND goal_id = (SELECT goal_id FROM goal WHERE session_id = ?1)",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(zuno_db::map_error)?,
+        );
+        let limit = blockers.remaining_detail_capacity();
+        if limit != 0 && blockers.human_requests != 0 {
+            let mut statement = tx
+                .prepare(
+                    "SELECT id, state FROM human_request \
+                     WHERE session_id = ?1 AND state = 'pending' \
+                       AND goal_id = (SELECT goal_id FROM goal WHERE session_id = ?1) \
+                     ORDER BY time_created, id LIMIT ?2",
+                )
+                .map_err(zuno_db::map_error)?;
+            let rows = statement
+                .query_map(
+                    params![session_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(zuno_db::map_error)?;
+            for row in rows {
+                let (id, status) = row.map_err(zuno_db::map_error)?;
+                blockers.push_detail("human request", &id, &status);
+            }
+        }
+    }
+    Ok(blockers)
 }
 
 /// Refuse completion when the visible plan was written for a different goal.
@@ -3315,16 +3467,12 @@ fn known_criteria(connection: &Connection, session_id: &str) -> Result<String, G
     })
 }
 
-/// Check the revision and load the criterion a write is about, in that order.
-///
-/// Both reads share the caller's transaction, so the state that passed the check
-/// is the state the write lands on.
-fn read_criterion_for_write(
+/// Check the revision and load the Goal a guarded write is about.
+fn goal_for_write(
     tx: &Transaction<'_>,
     session_id: &str,
     expected_revision: i64,
-    criterion_id: &str,
-) -> Result<(Goal, GoalCriterion), GoalError> {
+) -> Result<Goal, GoalError> {
     let goal = goal_from_transaction(tx, session_id)?.ok_or_else(|| GoalError::NoGoal {
         session_id: session_id.to_owned(),
     })?;
@@ -3335,8 +3483,115 @@ fn read_criterion_for_write(
             actual: goal.revision,
         });
     }
+    Ok(goal)
+}
+
+fn satisfy_criterion_in(
+    tx: &Transaction<'_>,
+    goal: &Goal,
+    session_id: &str,
+    criterion_id: &str,
+    receipt_id: &str,
+    at_ms: i64,
+) -> Result<GoalCriterion, GoalError> {
     let criterion = require_criterion(tx, session_id, criterion_id)?;
-    Ok((goal, criterion))
+    if criterion.status == GoalCriterionStatus::Waived {
+        return Err(GoalError::EvidenceUnproven {
+            criterion_id: criterion_id.to_owned(),
+            receipt_id: receipt_id.to_owned(),
+            reason: "the criterion is waived, so it is settled by a recorded decision rather \
+                     than by evidence"
+                .to_owned(),
+        });
+    }
+    let receipt =
+        receipt_for(tx, session_id, receipt_id)?.ok_or_else(|| GoalError::EvidenceUnproven {
+            criterion_id: criterion_id.to_owned(),
+            receipt_id: receipt_id.to_owned(),
+            reason: "no receipt with that id was recorded for this session; cite the receipt id \
+                     printed by the tool result that ran the check"
+                .to_owned(),
+        })?;
+    if !receipt.proves_success() {
+        return Err(GoalError::EvidenceUnproven {
+            criterion_id: criterion_id.to_owned(),
+            receipt_id: receipt_id.to_owned(),
+            reason: unproven_reason(&receipt),
+        });
+    }
+    // Before the mutation mark, because "this receipt belongs to a goal that no
+    // longer exists" is a different mistake from "you edited after checking", and
+    // the mark is cleared by the very replacement that makes the first one true.
+    if receipt.time_created < goal.created_at_ms {
+        return Err(GoalError::EvidencePredatesGoal {
+            criterion_id: criterion_id.to_owned(),
+            receipt_id: receipt_id.to_owned(),
+            goal_created_at_ms: goal.created_at_ms,
+            receipt_at_ms: receipt.time_created,
+        });
+    }
+    if let Some(marked_at_ms) = mutation_mark(tx, session_id)?
+        && marked_at_ms > receipt.time_created
+    {
+        return Err(GoalError::EvidenceStale {
+            criterion_id: criterion_id.to_owned(),
+            receipt_id: receipt_id.to_owned(),
+            marked_at_ms,
+            receipt_at_ms: receipt.time_created,
+        });
+    }
+    tx.execute(
+        "UPDATE goal_criterion \
+         SET status = 'satisfied', waiver_reason = NULL, receipt_id = ?3, \
+             satisfied_at_ms = ?4, updated_at_ms = ?4 \
+         WHERE session_id = ?1 AND criterion_id = ?2",
+        params![session_id, criterion_id, receipt_id, at_ms],
+    )
+    .map_err(zuno_db::map_error)?;
+    require_criterion(tx, session_id, criterion_id)
+}
+
+fn waive_criterion_in(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    criterion_id: &str,
+    reason: &str,
+    at_ms: i64,
+) -> Result<GoalCriterion, GoalError> {
+    let reason = reason.trim();
+    // `is_empty` after trimming is not enough: `str::trim` strips White_Space only,
+    // so a reason of `"\u{200b}"` survives it and lands in the ledger as a waiver
+    // that renders as nothing. Same predicate as the criterion statements, so the
+    // two sides of the audit surface cannot drift.
+    if !has_visible_character(reason) {
+        return Err(GoalError::EmptyWaiverReason {
+            criterion_id: criterion_id.to_owned(),
+        });
+    }
+    let actual = reason.chars().count();
+    if actual > MAX_WAIVER_REASON_CHARS {
+        return Err(GoalError::WaiverReasonTooLong {
+            criterion_id: criterion_id.to_owned(),
+            actual,
+            max: MAX_WAIVER_REASON_CHARS,
+        });
+    }
+    let criterion = require_criterion(tx, session_id, criterion_id)?;
+    if criterion.status == GoalCriterionStatus::Satisfied {
+        return Err(GoalError::CriterionAlreadySatisfied {
+            criterion_id: criterion_id.to_owned(),
+            receipt_id: criterion.receipt_id.unwrap_or_default(),
+        });
+    }
+    tx.execute(
+        "UPDATE goal_criterion \
+         SET status = 'waived', waiver_reason = ?3, receipt_id = NULL, \
+             satisfied_at_ms = NULL, updated_at_ms = ?4 \
+         WHERE session_id = ?1 AND criterion_id = ?2",
+        params![session_id, criterion_id, reason, at_ms],
+    )
+    .map_err(zuno_db::map_error)?;
+    require_criterion(tx, session_id, criterion_id)
 }
 
 /// Bump the goal's revision so a criterion change is visible to optimistic

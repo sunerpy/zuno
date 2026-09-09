@@ -5,8 +5,10 @@ use std::sync::Arc;
 use serde_json::json;
 use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SubmissionState};
 use zuno_db::{Pool, migration, session};
-use zuno_engine::admission::{InputAdmission, SessionInputAdmission, SteeringContent, TurnLease};
-use zuno_engine::status::SessionRunRegistry;
+use zuno_engine::admission::{
+    InputAdmission, SessionInputAdmission, SteerAdmissionError, SteeringContent, TurnLease,
+};
+use zuno_engine::status::{ExpectedTurnError, SessionRunRegistry};
 use zuno_paths::DbLocation;
 
 const SESSION_ID: &str = "ses_admission";
@@ -216,5 +218,122 @@ fn admission_fails_closed_when_the_durable_write_cannot_land() {
     assert!(
         runs.begin_turn("ses_missing").is_ok(),
         "a refused admission must not leave a lease behind"
+    );
+}
+
+#[test]
+fn a_precise_steer_is_durable_and_a_duplicate_does_not_retire_the_first_signal() {
+    let pool = initialized();
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    let runs = SessionRunRegistry::new();
+    let admission = SessionInputAdmission::new(inbox.clone(), runs.clone());
+    let running = runs.begin_turn(SESSION_ID).expect("own the live turn");
+    let _identity = running.mark_turn_started("turn_current").expect("turn id");
+
+    let input = admission
+        .admit_steer(
+            prompt("input-precise", "same turn"),
+            "turn_current",
+            SteeringContent::user("same turn"),
+        )
+        .expect("admit precise steer");
+    assert_eq!(input.state, SubmissionState::Steering);
+    assert_eq!(
+        inbox.get(SESSION_ID, &input.id).expect("durable row"),
+        Some(input)
+    );
+    let duplicate = admission
+        .admit_steer(
+            prompt("input-precise", "duplicate"),
+            "turn_current",
+            SteeringContent::user("duplicate"),
+        )
+        .expect_err("duplicate input id must fail");
+    assert!(matches!(duplicate, SteerAdmissionError::Database(_)));
+    let delivered = running.take_soft_interrupts_at_safe_point();
+    assert_eq!(delivered.messages.len(), 1);
+    assert_eq!(delivered.messages[0].content, "same turn");
+    assert_eq!(
+        delivered.messages[0].input_id.as_deref(),
+        Some("input-precise")
+    );
+}
+
+#[test]
+fn a_precise_steer_losing_its_turn_while_waiting_for_sqlite_admits_nothing() {
+    let pool = initialized();
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    let runs = SessionRunRegistry::new();
+    let admission = SessionInputAdmission::new(inbox.clone(), runs.clone());
+    let running = runs.begin_turn(SESSION_ID).expect("own first turn");
+    let identity = running
+        .mark_turn_started("turn_old")
+        .expect("first turn id");
+    let events = zuno_db::event_log::SessionEventLog::new(Arc::clone(&pool));
+    let before = events.read_after(SESSION_ID, None).expect("initial events");
+
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocker_pool = Arc::clone(&pool);
+    let blocker = std::thread::spawn(move || {
+        blocker_pool
+            .transaction(|_transaction| {
+                held_tx.send(()).expect("announce writer lock");
+                release_rx.recv().expect("release writer lock");
+                Ok(())
+            })
+            .expect("blocking transaction");
+    });
+    held_rx.recv().expect("writer is held");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let steering = std::thread::spawn(move || {
+        started_tx.send(()).expect("announce admission");
+        admission.admit_steer(
+            prompt("input-raced", "must not reach the new turn"),
+            "turn_old",
+            SteeringContent::user("must not reach the new turn"),
+        )
+    });
+    started_rx.recv().expect("admission started");
+    drop(identity);
+    drop(running);
+    let replacement = runs.begin_turn(SESSION_ID).expect("own replacement turn");
+    let _replacement_identity = replacement
+        .mark_turn_started("turn_new")
+        .expect("replacement turn id");
+    release_tx
+        .send(())
+        .expect("let admission reach its turn check");
+    blocker.join().expect("writer thread");
+
+    let error = steering
+        .join()
+        .expect("admission thread")
+        .expect_err("stale turn must be rejected");
+    assert!(matches!(
+        error,
+        SteerAdmissionError::Turn(ExpectedTurnError::Mismatch {
+            actual_turn_id,
+            ..
+        }) if actual_turn_id == "turn_new"
+    ));
+    assert!(
+        inbox
+            .pending(SESSION_ID)
+            .expect("pending inputs")
+            .is_empty()
+    );
+    assert_eq!(
+        events
+            .read_after(SESSION_ID, None)
+            .expect("events after rejection"),
+        before,
+        "admission event must also roll back"
+    );
+    assert!(
+        replacement
+            .take_soft_interrupts_at_safe_point()
+            .messages
+            .is_empty()
     );
 }

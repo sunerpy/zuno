@@ -102,7 +102,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use zuno_error::ToolError;
-use zuno_orchestration::{ToolSchemaIdentity, sha256_json, sha256_text};
+use zuno_orchestration::{ToolSchemaIdentity, replay_schema_sha256, sha256_json, sha256_text};
 
 /// A tool as a provider sees it.
 ///
@@ -120,6 +120,8 @@ pub struct ToolDefinition {
     pub parameters: Value,
     /// Stable client presentation intent, independent from the wire name.
     pub ui_intent: ToolUiIntent,
+    /// How declaration drift is represented when this tool appears in history.
+    pub history_policy: HistoryPolicy,
 }
 
 impl ToolDefinition {
@@ -130,6 +132,7 @@ impl ToolDefinition {
             name: self.id.clone(),
             description_sha256: sha256_text(&self.description),
             schema_sha256: sha256_json(&self.parameters),
+            replay_schema_sha256: Some(replay_schema_sha256(&self.parameters)),
             ui_intent: match self.ui_intent {
                 ToolUiIntent::Generic => "generic",
                 ToolUiIntent::Subagent => "subagent",
@@ -137,6 +140,22 @@ impl ToolDefinition {
             .to_owned(),
         }
     }
+}
+
+/// How a historical invocation behaves when its exact declaration is unavailable.
+///
+/// This is independent from [`ToolReplayPolicy`]: history projection never executes a
+/// call again. It only decides whether a completed call/result pair remains native,
+/// becomes inert data, or is omitted in favor of a current authoritative projection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum HistoryPolicy {
+    /// Preserve native protocol only under a compatible declaration; otherwise emit
+    /// bounded inert records.
+    #[default]
+    ExactDeclaration,
+    /// Omit an incompatible historical pair because current durable state is injected
+    /// independently into every provider request.
+    AuthoritativeState,
 }
 
 /// A tool's durable client presentation category.
@@ -246,6 +265,11 @@ pub trait Tool: Send + Sync {
         self.replay_policy()
     }
 
+    /// How declaration drift in completed historical calls is projected.
+    fn history_policy(&self) -> HistoryPolicy {
+        HistoryPolicy::ExactDeclaration
+    }
+
     /// Whether separate model-issued calls may overlap in one assistant step.
     fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
         ToolConcurrencyPolicy::Exclusive
@@ -337,6 +361,7 @@ pub trait Tool: Send + Sync {
             description: self.description().to_owned(),
             parameters: schema::augment(self.raw_parameters_schema()),
             ui_intent: self.ui_intent(),
+            history_policy: self.history_policy(),
         }
     }
 }
@@ -422,6 +447,11 @@ pub trait TypedTool: Send + Sync + 'static {
         self.replay_policy()
     }
 
+    /// How declaration drift in completed historical calls is projected.
+    fn history_policy(&self) -> HistoryPolicy {
+        HistoryPolicy::ExactDeclaration
+    }
+
     /// Whether separate model-issued calls may overlap in one assistant step.
     fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
         ToolConcurrencyPolicy::Exclusive
@@ -471,6 +501,10 @@ impl<T: TypedTool> Tool for Typed<T> {
 
     fn replay_policy_for(&self, args: &Value) -> ToolReplayPolicy {
         self.0.replay_policy_for(args)
+    }
+
+    fn history_policy(&self) -> HistoryPolicy {
+        self.0.history_policy()
     }
 
     fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
@@ -644,6 +678,7 @@ mod tests {
                 "required": ["prompt"]
             }),
             ui_intent: ToolUiIntent::Subagent,
+            history_policy: HistoryPolicy::ExactDeclaration,
         };
 
         assert_eq!(
@@ -652,6 +687,9 @@ mod tests {
                 name: definition.id.clone(),
                 description_sha256: zuno_orchestration::sha256_text(&definition.description),
                 schema_sha256: zuno_orchestration::sha256_json(&definition.parameters),
+                replay_schema_sha256: Some(zuno_orchestration::replay_schema_sha256(
+                    &definition.parameters,
+                )),
                 ui_intent: "subagent".to_owned(),
             }
         );

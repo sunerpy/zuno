@@ -678,6 +678,7 @@ impl ToolDispatcher for LargeOutputDispatcher {
                     "required": ["city"]
                 }),
                 ui_intent: zuno_tool::ToolUiIntent::Generic,
+                history_policy: zuno_tool::HistoryPolicy::ExactDeclaration,
             }],
             McpToolStatus::Ready,
         )
@@ -1016,6 +1017,7 @@ fn heartbeats_raw_bytes_and_repeated_state_do_not_reset_g4_progress() {
     let mut progress = ProgressTracker::default();
     assert!(!progress.observe(&TurnEvent::TurnStarted {
         session_id: SESSION_ID.to_owned(),
+        turn_id: "turn-soak".to_owned(),
     }));
     assert!(!progress.observe(&TurnEvent::Provider {
         step: 1,

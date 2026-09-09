@@ -9,11 +9,15 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
-use zuno_engine::admission::{InputAdmission, SessionInputAdmission, SteeringContent, TurnLease};
+use zuno_engine::admission::{
+    InputAdmission, SessionInputAdmission, SteerAdmissionError, SteeringContent, TurnLease,
+};
 use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
 use zuno_engine::session_command::SessionCommand;
-use zuno_engine::status::{SessionControl, SessionRunGuard, SessionRunRegistry, SessionStatus};
+use zuno_engine::status::{
+    ExpectedTurnError, SessionControl, SessionRunGuard, SessionRunRegistry, SessionStatus,
+};
 use zuno_llm::event::{FinishReason, RequestContentBlock};
 use zuno_tool::PermissionAsker;
 
@@ -110,6 +114,7 @@ impl zuno_acp::Agent for ProductionAcpAgent {
             "session/set_mode" => self.set_mode(&params, client).await,
             "session/set_config_option" => self.set_config_option(&params, client).await,
             "session/prompt" => self.prompt(request, &params, client).await,
+            "session/steer" => self.steer(&params).await,
             "session/resume" => self.open_existing(&params, client, false).await,
             "session/list" => self.list_sessions(&params),
             "session/close" => self.close_session(&params).await,
@@ -185,6 +190,16 @@ fn initialize(params: &Value) -> Result<Value, zuno_acp::RpcError> {
             "title": "Zuno",
             "version": env!("CARGO_PKG_VERSION"),
         },
+        "_meta": {
+            "zuno": {
+                "steering": {
+                    "version": 1,
+                    "method": "session/steer",
+                    "requiresExpectedTurnId": true,
+                    "turnIdSource": "session/update._meta.zuno.turnId",
+                },
+            },
+        },
     });
     if supports_native_subagents(params) {
         response["agentCapabilities"]["sessionCapabilities"]["subagents"] = json!({});
@@ -248,6 +263,33 @@ impl ProductionAcpAgent {
                 state.registry.sleep_idle().await;
             }
         }));
+    }
+
+    async fn steer(&self, params: &Value) -> Result<Value, zuno_acp::RpcError> {
+        let session_id = required_string(params, "sessionId")?;
+        let expected_turn_id = required_string(params, "expectedTurnId")?;
+        let message_id = optional_string(params, "messageId")?;
+        if message_id.as_deref().is_some_and(str::is_empty) {
+            return Err(zuno_acp::RpcError::invalid_params(
+                "messageId must be non-empty when provided",
+            ));
+        }
+        if params
+            .get("prompt")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(steer_rejected(
+                &session_id,
+                "emptyInput",
+                &expected_turn_id,
+                self.state.runs.active_turn_id(&session_id).as_deref(),
+                "prompt must contain at least one content block",
+            ));
+        }
+        let prompt = parse_prompt(params)?;
+        let session = self.session(&session_id).await?;
+        session.steer(&expected_turn_id, message_id, prompt)
     }
 
     async fn new_session(
@@ -2501,6 +2543,117 @@ impl AcpSession {
                     .await
             }
         }
+    }
+
+    fn steer(
+        &self,
+        expected_turn_id: &str,
+        message_id: Option<String>,
+        mut prompt: AcpPrompt,
+    ) -> Result<Value, zuno_acp::RpcError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(self.closed_error());
+        }
+        let actual_turn_id =
+            self.runs
+                .active_turn_id(&self.id)
+                .ok_or_else(|| match self.runs.status(&self.id) {
+                    SessionStatus::Idle => steer_rejected(
+                        &self.id,
+                        "noActiveTurn",
+                        expected_turn_id,
+                        None,
+                        "the session has no active turn to steer",
+                    ),
+                    SessionStatus::Busy => steer_rejected(
+                        &self.id,
+                        "activeTurnNotSteerable",
+                        expected_turn_id,
+                        None,
+                        "the session owns a live lease that has not entered a steerable model turn",
+                    ),
+                })?;
+        if actual_turn_id != expected_turn_id {
+            return Err(steer_rejected(
+                &self.id,
+                "expectedTurnMismatch",
+                expected_turn_id,
+                Some(&actual_turn_id),
+                "the expected turn no longer owns this session",
+            ));
+        }
+        if prompt.content.is_empty() {
+            return Err(steer_rejected(
+                &self.id,
+                "emptyInput",
+                expected_turn_id,
+                Some(&actual_turn_id),
+                "prompt must contain at least one content block",
+            ));
+        }
+        let handles = self.durable_handles()?;
+        if prompt.slash_text().is_some_and(|text| {
+            resolve_session_slash_prompt(text).is_some() || handles.slash.resolve(text).is_some()
+        }) {
+            return Err(steer_rejected(
+                &self.id,
+                "activeTurnNotSteerable",
+                expected_turn_id,
+                Some(&actual_turn_id),
+                "slash commands require an idle session and cannot be steered into a live turn",
+            ));
+        }
+        prompt.admit_images(handles.attachments.as_ref())?;
+        let steering = steering_content(&prompt);
+        let row = zuno_db::inbox::NewSessionInput::new(
+            message_id.unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4().simple())),
+            self.id.clone(),
+            acp_prompt_payload(&prompt)?,
+            zuno_db::inbox::InputDelivery::Steer,
+            zuno_db::message::now_millis(),
+        );
+        let input = handles
+            .admission
+            .admit_steer(row, expected_turn_id, steering)
+            .map_err(|error| match error {
+                SteerAdmissionError::Database(error) => {
+                    zuno_acp::RpcError::internal(error.to_string())
+                }
+                SteerAdmissionError::Turn(error) => match error {
+                    ExpectedTurnError::NoActiveTurn { .. } => steer_rejected(
+                        &self.id,
+                        "noActiveTurn",
+                        expected_turn_id,
+                        None,
+                        "the active turn ended before steering was committed",
+                    ),
+                    ExpectedTurnError::ActiveTurnNotIdentified { .. } => steer_rejected(
+                        &self.id,
+                        "activeTurnNotSteerable",
+                        expected_turn_id,
+                        None,
+                        "the live lease changed to work that cannot accept steering",
+                    ),
+                    ExpectedTurnError::Mismatch { actual_turn_id, .. } => steer_rejected(
+                        &self.id,
+                        "expectedTurnMismatch",
+                        expected_turn_id,
+                        Some(&actual_turn_id),
+                        "a different turn acquired the session before steering was committed",
+                    ),
+                },
+            })?;
+        let delivery = input.delivery;
+        Ok(json!({
+            "turnId": expected_turn_id,
+            "inputId": input.id,
+            "admittedSequence": input.admitted_sequence,
+            "admission": "steered",
+            "delivery": match delivery {
+                zuno_db::inbox::InputDelivery::Queue => "queue",
+                zuno_db::inbox::InputDelivery::Steer => "steer",
+            },
+        }))
     }
 
     /// Run one resolved slash invocation as this request's own turn.
@@ -5093,6 +5246,21 @@ fn admitted_without_turn(
             zuno_db::inbox::InputDelivery::Queue => "queue",
             zuno_db::inbox::InputDelivery::Steer => "steer",
         },
+    }))
+}
+
+fn steer_rejected(
+    session_id: &str,
+    reason: &str,
+    expected_turn_id: &str,
+    actual_turn_id: Option<&str>,
+    message: &str,
+) -> zuno_acp::RpcError {
+    zuno_acp::RpcError::steer_rejected(message).with_data(json!({
+        "sessionId": session_id,
+        "reason": reason,
+        "expectedTurnId": expected_turn_id,
+        "actualTurnId": actual_turn_id,
     }))
 }
 

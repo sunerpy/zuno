@@ -726,6 +726,7 @@ async fn run_channel_gate(id: &str) {
 fn turn_started(index: usize) -> TurnEvent {
     TurnEvent::TurnStarted {
         session_id: format!("backpressure-{index}"),
+        turn_id: format!("turn-{index}"),
     }
 }
 
