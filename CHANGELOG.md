@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.10.22](https://github.com/sunerpy/zuno/compare/v0.10.21...v0.10.22) (2026-09-09)
+
+
+### Bug Fixes
+
+* **acp:** 去重会话激活并休眠空闲运行时 ([dab45e7](https://github.com/sunerpy/zuno/commit/dab45e771286a1f7fffaed24eaaf0d10f84dfcd9))
+* **acp:** 去重会话激活并休眠空闲运行时 ([3a52edd](https://github.com/sunerpy/zuno/commit/3a52edd12c6e3e93aab3c5ee9b74dbb56d71f0b7))
+* **agent:** 强化审核证据与就绪门禁 ([e4a9594](https://github.com/sunerpy/zuno/commit/e4a959484398d273d68b877907907bc62d9a0a1e))
+* **agent:** 强化审核证据与就绪门禁 ([596da28](https://github.com/sunerpy/zuno/commit/596da28f2d953334f4e8e2b6de0af84195221f92))
+* **agent:** 收紧审核终态与来源复核 ([b49e528](https://github.com/sunerpy/zuno/commit/b49e528fcf3f1e40896982dcf6d459e3c4c03fa5))
+* **cli:** 在密钥提示前启用原始模式 ([38728d0](https://github.com/sunerpy/zuno/commit/38728d037d6a90b50491b0f326d2b4637820d355))
+* **runtime:** 重构 Plan 授权与续跑状态机 ([5fcfd4b](https://github.com/sunerpy/zuno/commit/5fcfd4b568027beac7418eaae662565439b00028))
+* **runtime:** 重构 Plan 授权与续跑状态机 ([4e0be84](https://github.com/sunerpy/zuno/commit/4e0be84fc02ab78b56f7e0be6b1ac234c4150d2e))
+
 ## [0.10.21](https://github.com/sunerpy/zuno/compare/v0.10.20...v0.10.21) (2026-09-08)
 
 
