@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.25](https://github.com/sunerpy/zuno/compare/v0.10.24...v0.10.25) (2026-09-09)
+
+
+### Bug Fixes
+
+* **ci:** 复用编译缓存并约束测试进程回收 ([cbfee42](https://github.com/sunerpy/zuno/commit/cbfee422b25dd9267fe48298a8720c886db5b28c))
+
 ## [0.10.24](https://github.com/sunerpy/zuno/compare/v0.10.23...v0.10.24) (2026-09-09)
 
 
