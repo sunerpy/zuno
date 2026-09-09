@@ -1,0 +1,141 @@
+name: Publish compiler caches
+
+on:
+  # workflow_run may read caches but cannot write main-scope entries. The
+  # trusted Release workflow dispatches this after public asset publication.
+  workflow_dispatch:
+    inputs:
+      release_run_id:
+        description: Exact Release workflow that published the candidate
+        required: true
+        type: string
+      release_run_attempt:
+        description: Exact successful attempt of the Release workflow
+        required: true
+        type: string
+      release_head_sha:
+        description: Full source SHA of that Release workflow
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: publish-compiler-caches
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      ready: ${{ steps.plan.outputs.ready || 'false' }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      expected: ${{ steps.plan.outputs.expected }}
+      candidate_run_id: ${{ steps.plan.outputs.candidate_run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Resolve handoff from the exact completed Release attempt
+        id: handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN: ${{ inputs.release_run_id }}
+          RELEASE_ATTEMPT: ${{ inputs.release_run_attempt }}
+          RELEASE_HEAD: ${{ inputs.release_head_sha }}
+        run: |
+          python scripts/ci_cache_publish.py resolve \
+            --run-id "$RELEASE_RUN" --attempt "$RELEASE_ATTEMPT" --head "$RELEASE_HEAD" \
+            --wait-seconds 300
+
+      - name: Download the verified handoff artifact
+        if: steps.handoff.outputs.available == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.handoff.outputs.artifact }}
+          run-id: ${{ inputs.release_run_id }}
+          github-token: ${{ github.token }}
+          path: cache-handoff
+          merge-multiple: true
+
+      - name: Bind caches to the public tag and successful candidate
+        if: steps.handoff.outputs.available == 'true'
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN: ${{ inputs.release_run_id }}
+          RELEASE_ATTEMPT: ${{ inputs.release_run_attempt }}
+          RELEASE_HEAD: ${{ inputs.release_head_sha }}
+        run: |
+          python scripts/ci_cache_publish.py plan \
+            --run-id "$RELEASE_RUN" --attempt "$RELEASE_ATTEMPT" --head "$RELEASE_HEAD" \
+            --handoff cache-handoff/compiler-cache-handoff.json
+
+  publish:
+    needs: prepare
+    if: needs.prepare.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Download the exact candidate cache artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ matrix.artifact_id }}
+          run-id: ${{ needs.prepare.outputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+          path: target/ci-cache
+          merge-multiple: true
+
+      - name: Verify source identity, paths, sizes, and hashes
+        id: validate
+        env:
+          CACHE_SLOT: ${{ matrix.slot }}
+          CACHE_EXPECTED_JSON: ${{ needs.prepare.outputs.expected }}
+        run: |
+          python scripts/ci_cache_publish.py validate \
+            --slot "$CACHE_SLOT" --root target/ci-cache
+
+      # The same relative path and cross-OS archive setting are used by readers.
+      # A Linux writer only transports bytes; it never executes another target.
+      - name: Save the snapshot in main scope
+        id: save
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: target/ci-cache/compiler
+          key: ${{ steps.validate.outputs.key }}
+          enableCrossOsArchive: true
+
+      - name: Retire older snapshots from this slot
+        if: steps.save.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_SLOT: ${{ matrix.slot }}
+          CACHE_KEY: ${{ steps.validate.outputs.key }}
+        run: python scripts/ci_cache.py prune --slot "$CACHE_SLOT" --key "$CACHE_KEY"

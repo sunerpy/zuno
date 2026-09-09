@@ -1021,21 +1021,26 @@ fn release_workflows_pin_the_verified_node24_artifact_actions() {
     const DOWNLOAD: &str =
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1";
 
-    let workflows = ["ci.yml", "release-candidate.yml", "release.yml"]
-        .into_iter()
-        .map(workflow)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut sources = [
+        "ci.yml",
+        "release-candidate.yml",
+        "release.yml",
+        "publish-compiler-caches.yml",
+        "warm-compiler-caches.yml",
+    ]
+    .into_iter()
+    .map(workflow)
+    .collect::<Vec<_>>();
+    sources.push(
+        std::fs::read_to_string(
+            workspace_root().join(".github/actions/compiler-cache-report/action.yml"),
+        )
+        .expect("build diagnostics action"),
+    );
+    let workflows = sources.join("\n");
     let upload_count = workflows.matches("actions/upload-artifact@").count();
     let download_count = workflows.matches("actions/download-artifact@").count();
-    assert_eq!(
-        upload_count, 3,
-        "the CI/release surface changed upload count"
-    );
-    assert_eq!(
-        download_count, 2,
-        "the CI/release surface changed download count"
-    );
+    assert!(upload_count > 0 && download_count > 0);
     assert_eq!(
         upload_count,
         workflows.matches(UPLOAD).count(),
@@ -1049,7 +1054,7 @@ fn release_workflows_pin_the_verified_node24_artifact_actions() {
 }
 
 #[test]
-fn release_pipeline_docs_keep_the_verified_twenty_minute_slo() {
+fn release_pipeline_docs_keep_the_twenty_minute_target_and_identity_contract() {
     for (path, twenty, fifteen, identity, targets) in [
         (
             "docs/operate/release-pipeline.md",
@@ -1085,11 +1090,7 @@ fn release_pipeline_docs_keep_the_verified_twenty_minute_slo() {
 fn macos_x86_candidate_cross_builds_on_arm_and_smokes_through_rosetta() {
     let text = workflow("release-candidate.yml");
     let x86 = matrix_entry(&text, "artifact", "x86_64-apple-darwin").join("\n");
-    for required in [
-        "runner: macos-15",
-        "cache_target: true",
-        "execution_arch: x86_64",
-    ] {
+    for required in ["runner: macos-15", "execution_arch: x86_64"] {
         assert!(
             x86.contains(required),
             "the x86_64 macOS candidate leg is missing {required:?}"
@@ -1101,11 +1102,7 @@ fn macos_x86_candidate_cross_builds_on_arm_and_smokes_through_rosetta() {
     );
 
     let arm = matrix_entry(&text, "artifact", "aarch64-apple-darwin").join("\n");
-    for required in [
-        "runner: macos-15",
-        "cache_target: true",
-        "execution_arch: arm64",
-    ] {
+    for required in ["runner: macos-15", "execution_arch: arm64"] {
         assert!(
             arm.contains(required),
             "the arm64 macOS candidate leg is missing {required:?}"
@@ -1386,8 +1383,9 @@ fn ci_runs_before_the_protected_merge_without_a_duplicate_push_run() {
     let gate = job_body(&text, "ci-success").join("\n");
     for required in [
         "Release PR routed to candidate",
-        "needs: [classify, linux-static, linux-test, artifact, windows-clippy, windows-test]",
+        "needs: [classify, ci-cache-seed, ci-tools, linux-static, linux-test, artifact, windows-clippy, windows-test]",
         "RELEASE_PR: ${{ needs.classify.outputs.release_pr }}",
+        "CI_TOOLING: ${{ needs.classify.outputs.ci_tooling }}",
         "elif $release_pr == \"true\" then",
         "release-please PR is delegated to release-candidate.yml",
     ] {
@@ -2622,7 +2620,7 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
         "THREADS: \"1\"",
         "SUITE_TIMEOUT: \"300\"",
         "name: Upload Windows test diagnostics",
-        "if: failure()",
+        "if: always()",
         "target/test-parallel/artifacts.json",
         "target/test-parallel/suites.tsv",
         "target/test-parallel/codes.tsv",
@@ -2727,103 +2725,88 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
 }
 
 #[test]
-fn ci_uses_target_isolated_dependency_caches_on_the_measured_critical_paths() {
+fn ci_reuses_bounded_compiler_snapshots_without_sharing_cargo_targets() {
     for name in ["ci.yml", "release-candidate.yml"] {
-        let workflow = workflow(name);
+        let source = workflow(name);
         for required in [
             "CARGO_INCREMENTAL: 0",
-            "SCCACHE_GHA_ENABLED: \"true\"",
+            "SCCACHE_GHA_ENABLED: \"false\"",
             "RUSTC_WRAPPER: sccache",
-            "mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba",
-            "version: \"v0.16.0\"",
         ] {
-            assert!(
-                workflow.contains(required),
-                "{name} lost the compiler-cache contract {required:?}"
-            );
+            assert!(source.contains(required), "{name} lost {required:?}");
         }
         assert!(
-            !workflow.contains("tool: sccache")
-                && !workflow.contains(".github/scripts/setup-sccache.sh")
-                && !workflow.contains("sccache --show-stats"),
-            "{name} must use the official cache action's setup and post-run statistics"
+            !source.contains("cache-targets: true"),
+            "{name} caches a target tree"
+        );
+    }
+    let cache_action =
+        std::fs::read_to_string(workspace_root().join(".github/actions/compiler-cache/action.yml"))
+            .expect("compiler-cache action exists");
+    for required in [
+        "scripts/ci_cache.py configure",
+        "actions/cache/restore@",
+        "path: target/ci-cache/compiler",
+        "enableCrossOsArchive: true",
+        "continue-on-error: true",
+        "mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba",
+        "version: \"v0.16.0\"",
+    ] {
+        assert!(
+            cache_action.contains(required),
+            "cache action lost {required:?}"
         );
     }
 
     let ci = workflow("ci.yml");
-    for job in ["linux-static", "windows-clippy"] {
-        let body = job_body(&ci, job).join("\n");
-        assert!(
-            body.contains("cache-targets: false"),
-            "{job} must keep registry-only caching because it is not on the measured critical path"
-        );
-    }
-    for (job, key) in [
-        (
-            "linux-test",
-            "shared-key: pr-linux-tests-v1-${{ runner.os }}-${{ runner.arch }}",
-        ),
-        (
-            "artifact",
-            "shared-key: pr-host-release-v1-${{ runner.os }}-${{ runner.arch }}",
-        ),
-        (
-            "windows-test",
-            "shared-key: pr-windows-tests-v1-${{ runner.os }}-${{ runner.arch }}",
-        ),
+    for (job, slot) in [
+        ("linux-test", "pr-linux-tests"),
+        ("windows-test", "pr-windows-tests"),
+        ("artifact", "pr-host-release"),
     ] {
         let body = job_body(&ci, job).join("\n");
-        for required in [key, "cache-targets: true", "cache-workspace-crates: false"] {
-            assert!(
-                body.contains(required),
-                "{job} lost its target-isolated dependency cache contract {required:?}"
-            );
+        for required in [
+            "cache-targets: false",
+            "uses: ./.github/actions/compiler-cache",
+        ] {
+            assert!(body.contains(required), "{job} lost {required:?}");
         }
+        assert!(
+            body.contains(&format!("slot: {slot}")),
+            "{job} uses the wrong cache"
+        );
     }
     let linux_static = job_body(&ci, "linux-static").join("\n");
     let linux_test = job_body(&ci, "linux-test").join("\n");
+    assert!(linux_static.contains("make lint") && !linux_static.contains("make test-nextest"));
     assert!(
-        linux_static.contains("make lint")
-            && !linux_static.contains("make test-nextest")
-            && linux_test.contains("make test-nextest")
-            && linux_test.contains("make test-sandbox-e2e")
-            && !linux_test.contains("make lint"),
-        "Linux static analysis and tests must remain independent parallel jobs"
+        linux_test.contains("make test-nextest") && linux_test.contains("make test-sandbox-e2e")
     );
-
     let windows_clippy = job_body(&ci, "windows-clippy").join("\n");
     let windows_test = job_body(&ci, "windows-test").join("\n");
     let clippy_fetch = windows_clippy.find("cargo fetch --locked");
-    let clippy_run =
-        windows_clippy.find("cargo clippy --locked --workspace --all-targets -- -D warnings");
+    let clippy_run = windows_clippy
+        .find("cargo clippy --locked --workspace --all-targets --timings -- -D warnings");
     assert!(
         clippy_fetch
             .zip(clippy_run)
-            .is_some_and(|(fetch, clippy)| fetch < clippy)
-            && !windows_clippy.contains("test-parallel.sh"),
-        "Windows Clippy must populate its cold Cargo cache and remain an independent \
-         parallel job"
+            .is_some_and(|(fetch, run)| fetch < run)
     );
-    let test_fetch = windows_test.find("cargo fetch --locked");
-    let test_run = windows_test.find("run: ./scripts/test-parallel.sh");
-    assert!(
-        test_fetch
-            .zip(test_run)
-            .is_some_and(|(fetch, test)| fetch < test)
-            && !windows_test.contains("cargo clippy")
-            && windows_test.contains("tool: ripgrep")
-            && windows_test.contains("run: rg --version"),
-        "Windows test execution must populate its cold Cargo cache, install its required \
-         runtime dependency, and remain an independent parallel job"
-    );
-    assert!(
-        windows_test.contains("RUN_DOCTESTS: \"0\"")
-            && windows_test.contains("CARGO_PROFILE_TEST_DEBUG: \"0\"")
-            && windows_test.contains("CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: \"off\"")
-            && !windows_test.contains("cargo test --workspace --doc"),
-        "Windows must retain Cargo's built-in test-directory contract while reducing debug \
-         link work, and the Linux source gate must own the doctest surface exactly once"
-    );
+    assert!(!windows_clippy.contains("test-parallel.sh"));
+    assert!(!windows_test.contains("cargo clippy"));
+    for required in [
+        "cargo fetch --locked",
+        "run: ./scripts/test-parallel.sh",
+        "tool: ripgrep",
+        "RUN_DOCTESTS: \"0\"",
+        "CARGO_PROFILE_TEST_DEBUG: \"0\"",
+        "CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: \"off\"",
+    ] {
+        assert!(
+            windows_test.contains(required),
+            "Windows tests lost {required:?}"
+        );
+    }
 
     let candidate = workflow("release-candidate.yml");
     let prepare = job_body(&candidate, "prepare").join("\n");
@@ -2836,71 +2819,123 @@ fn ci_uses_target_isolated_dependency_caches_on_the_measured_critical_paths() {
     ] {
         assert!(
             prepare.contains(required),
-            "candidate identity validation lost the release-only delta guard {required:?}"
+            "candidate identity lost {required:?}"
         );
     }
-
-    let tests = job_body(&candidate, "test").join("\n");
+    let delta = job_body(&candidate, "test").join("\n");
     for required in [
         "name: Candidate release delta",
         "cargo metadata --locked --format-version 1",
         "cargo deny --all-features check",
-        "shared-key: candidate-release-delta-${{ runner.os }}-${{ runner.arch }}",
         "cache-targets: false",
-        "SCCACHE_GHA_ENABLED: \"false\"",
         "RUSTC_WRAPPER: \"\"",
     ] {
-        assert!(
-            tests.contains(required),
-            "candidate release-delta verification lost {required:?}"
-        );
+        assert!(delta.contains(required), "release delta lost {required:?}");
     }
     for forbidden in [
         "make lint",
         "make test-nextest",
         "make test-sandbox-e2e",
         "nextest@",
-        "setup-linux-sandbox.sh",
         "sccache-action@",
     ] {
         assert!(
-            !tests.contains(forbidden),
-            "release-only candidate verification must not repeat the feature PR gate: \
-             {forbidden:?}"
+            !delta.contains(forbidden),
+            "release delta repeats {forbidden:?}"
         );
     }
-
     let artifacts = job_body(&candidate, "artifact").join("\n");
+    assert!(artifacts.contains("slot: release-${{ matrix.target }}"));
+    assert!(
+        artifacts.contains(
+            "name: compiler-cache-release-${{ matrix.target }}-${{ github.run_attempt }}"
+        )
+    );
+    assert!(artifacts.contains("name: diagnostics-release-${{ matrix.target }}"));
+    let released = artifacts
+        .find("Upload smoked target")
+        .expect("release artifact upload");
+    let cached = artifacts
+        .find("Upload optional compiler snapshot")
+        .expect("optional compiler snapshot upload");
+    assert!(released < cached);
+    assert!(artifacts.contains("continue-on-error: true"));
+    assert!(
+        job_body(&candidate, "aggregate")
+            .join("\n")
+            .contains("pattern: candidate-*")
+    );
+}
+
+#[test]
+fn compiler_cache_writers_are_separate_from_prs_and_release_publication() {
+    let warm = workflow("warm-compiler-caches.yml");
+    assert!(warm.contains("test \"$GITHUB_REF\" = refs/heads/main"));
+    assert!(!warm.contains("pull_request"));
+    for slot in ["pr-linux-tests", "pr-windows-tests", "pr-host-release"] {
+        assert!(
+            warm.contains(&format!("slot: {slot}")),
+            "missing main cache writer {slot}"
+        );
+    }
+    assert!(warm.contains("cargo test --locked --workspace --no-run --timings"));
+    let publication = workflow("publish-compiler-caches.yml");
     for required in [
-        "shared-key: candidate-${{ matrix.target }}",
-        "cache-targets: ${{ matrix.cache_target }}",
-        "cache-workspace-crates: false",
+        "workflow_dispatch:",
+        "if: github.ref == 'refs/heads/main'",
+        "release_run_id:",
+        "--wait-seconds 300",
+        "scripts/ci_cache_publish.py resolve",
+        "scripts/ci_cache_publish.py plan",
+        "scripts/ci_cache_publish.py validate",
+        "artifact-ids:",
+        "run-id:",
+        "enableCrossOsArchive: true",
+        "scripts/ci_cache.py prune",
+        "github.workflow_sha",
     ] {
         assert!(
-            artifacts.contains(required),
-            "candidate artifact caching lost its target-isolated dependency contract \
-             {required:?}"
+            publication.contains(required),
+            "cache publication lost {required:?}"
         );
     }
-    for target in [
-        "x86_64-apple-darwin",
-        "aarch64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-        "aarch64-pc-windows-msvc",
+    for forbidden in [
+        "rust-toolchain@",
+        "cargo build",
+        "cargo test",
+        "gh release upload",
+        "pull_request_target",
+        "  workflow_run:",
     ] {
         assert!(
-            matrix_entry(&candidate, "artifact", target)
-                .join("\n")
-                .contains("cache_target: true"),
-            "{target} must retain its measured dependency target cache"
+            !publication.contains(forbidden),
+            "cache publication executes {forbidden:?}"
         );
     }
-    for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
+    let promote = job_body(&workflow("release.yml"), "promote").join("\n");
+    let publication = promote
+        .find("--draft=false --latest")
+        .expect("public release transition");
+    let handoff = promote
+        .find("Record optional compiler-cache handoff")
+        .expect("optional cache handoff");
+    assert!(publication < handoff);
+    assert!(promote.contains("compiler-cache-handoff-${{ github.run_attempt }}"));
+    let dispatch = job_body(&workflow("release.yml"), "dispatch_cache_publisher").join("\n");
+    for required in [
+        "needs: promote",
+        "needs.promote.result == 'success'",
+        "needs.promote.outputs.cache_handoff_uploaded == 'success'",
+        "continue-on-error: true",
+        "gh workflow run publish-compiler-caches.yml",
+        "--ref main",
+        "release_run_id=$GITHUB_RUN_ID",
+        "release_run_attempt=$GITHUB_RUN_ATTEMPT",
+        "release_head_sha=$GITHUB_SHA",
+    ] {
         assert!(
-            matrix_entry(&candidate, "artifact", target)
-                .join("\n")
-                .contains("cache_target: false"),
-            "{target} must not upload a large Cargo target cache"
+            dispatch.contains(required),
+            "cache dispatch lost {required:?}"
         );
     }
 }

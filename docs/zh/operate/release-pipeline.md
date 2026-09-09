@@ -9,11 +9,15 @@ Zuno 的发布产物只构建一次。release-please PR 会在其精确 head com
   public fork 只获得只读权限，不会得到仓库 secrets。
 - `release.yml` 负责 release-please、精确候选调度、发布身份校验和 GitHub 资产发布。
   候选晋级路径不安装 Rust，也不重新编译二进制。
-- `release-candidate.yml` 负责完整测试和六个发布目标。每个目标在同一 job 中共同构建
+- `release-candidate.yml` 负责发布增量检查和六个发布目标。每个目标在同一 job 中共同构建
   `zuno` 与 `zuno-smoke`，打包并解包归档，校验精确可执行架构并运行归档内二进制，生成
   provenance，最后才上传产物。Linux、Windows 和 arm64 macOS 原生执行；
   x86_64 macOS 在 `macos-15` Arm64 runner 上通过 Rosetta 2 执行。Windows x86_64
   使用 `windows-2022`，Windows ARM64 使用标准 `windows-11-arm` hosted runner。
+- `warm-compiler-caches.yml` 在可信 `main` 更新后编译三个 PR 构建面，维护共享缓存；
+  它独立于必需 PR 门禁和发布流程。
+- `publish-compiler-caches.yml` 只在发布完成后导入精确成功候选的可选编译快照，
+  不重新编译或上传发布二进制。
 
 按照仓库原生 Actions 审批策略，GitHub 可能会把 `GITHUB_TOKEN` 创建的 release PR
 对应普通 `pull_request` workflow 标记为 `action_required`。这是有意保留的人工门禁，
@@ -101,21 +105,50 @@ Windows 保留 Cargo 内建 `test` profile 和标准 `target/debug` 布局，但
 该 profile 的 debug 与 split-debug 字段，避免为约两百个短生命周期测试二进制生成和链接
 调试数据库。panic 文本仍包含源码位置，开发环境和 Linux 测试仍保留行表回溯。Doctest 只由
 Linux 源码门禁执行一次；Windows job 负责原生可执行行为，并显式设置 `RUN_DOCTESTS=0`，
-不再重复一个曾增加八分多钟的跨平台 rustdoc 阶段。Windows 失败时会上传 Cargo timings、
-构建/环境捕获日志和逐 suite 日志，供后续定位。
+不再重复一个曾增加八分多钟的跨平台 rustdoc 阶段。Windows 运行会上传 Cargo timings、
+构建/环境捕获日志和逐 suite 日志，成功运行也保留诊断；私有 `cargo-env.json` 不上传。
 
 MSVC 版 `zuno.exe` 通过仅作用于该二进制的 build-script linker 参数保留 8 MiB 主线程栈。
 原生 `dumpbin` 证据表明，PE 默认的 1 MiB 会在真实 session 构造路径中溢出。该参数不会写入
 全局 `RUSTFLAGS`，因此库和约两百个测试二进制仍可复用原有编译缓存身份。
 
-两个工作流都使用固定提交的官方 sccache action 及其 GitHub Actions 后端。CI 设置
-`CARGO_INCREMENTAL=0`，Cargo registry/Git 下载使用按平台隔离的缓存。实测位于 PR
-临界路径上的 Linux tests、原生 Windows tests 和主机 release smoke 还会恢复按用途隔离的
-Cargo target cache。候选的 macOS 与 Windows artifact leg 则按精确 Rust target 隔离。
-每一份 target cache 都设置 `cache-workspace-crates: false`：复用第三方依赖产物，但始终从
-本次提交重新构建 Zuno 自身 crate。静态分析、Windows Clippy、release delta 门禁和 Linux
-发布目标仍只缓存 registry。通过 `workflow_dispatch` 在 `main` 上运行一次可以为后续 PR
-写入默认分支缓存；首次冷运行不代表稳态耗时。
+## 编译快照与写入归属
+
+编译器使用固定版本 sccache 0.16.0 的本地磁盘后端；`SCCACHE_GHA_ENABLED=false`
+避免逐对象向 GHA 上传。`CARGO_INCREMENTAL=0` 保持启用，registry/Git 输入单独缓存，
+不再保存或共享 Cargo target 树。成功运行也保留 Cargo timings、缓存统计及 Windows
+逐套件诊断；私有 `cargo-env.json` 始终不上传。
+
+三个 PR 临界路径和六个候选目标通过 `.github/actions/compiler-cache` 恢复本地编译快照。
+slot 隔离用途和 target，兼容前缀包含实际 Rust 编译器身份、Cargo profile/配置、相关编译
+参数和 sccache 版本；source/run/attempt 后缀使每份快照不可变。只升级 workspace 版本
+不会清空恢复前缀；sccache 仍核对每个编译请求，发生变化的 package 会正常重新编译。
+
+每个 slot 的本地上限为 768 MiB，九个满槽稳态约 6.75 GiB，此外还有 registry 缓存和
+替换期间的临时副本。只有新 key 已可见，可信清理 job 才删除该 slot 在
+`refs/heads/main` 下更旧的 `zuno-compiler-v1-` key；它不删除其他 PR 缓存、发布归档或
+候选证据。仓库总限额仍可能触发淘汰，所以首次冷恢复属于正常情况。缓存 miss 或可选传输
+失败不会跳过编译、测试、provenance 或归档 smoke。
+
+PR 自己写入的 GHA 缓存不能作为其他 PR 的共享基线。
+`warm-compiler-caches.yml` 因此仅在可信 `main` 上编译与消费者一致的 Linux 测试、
+Windows 测试和主机 release 构建面，并使用相同的环境/profile。这些额外编译在后台执行，
+不是发布的前置条件。工作流启用后，可在 `main` 上手动运行 **Warm compiler caches**；
+其他 ref 会被拒绝。
+
+候选缓存产物名为 `compiler-cache-release-<target>-<attempt>`，不进入 `candidate-*`
+发布产物命名空间，保留两天。`release.yml` 完成验证和公开发布后才输出可选 handoff，
+随后显式 dispatch `main` 上的缓存发布器。GitHub 将 `workflow_run` 的缓存权限限制为
+只读，因此不能用该事件写入共享快照。发布器会有界等待来源 Release 的精确 attempt
+成功结束，再核对来源 main Release 工作流、精确 attempt、公开 tag
+commit、相同 Git tree、candidate 成功状态、artifact 身份、可移植路径、体积上限和逐文件
+摘要，再写入 main 缓存。可选缓存缺失或过期不影响已经发布的版本。发布器在 Linux 上
+传输不执行的缓存字节，与消费者使用相同的相对路径和 `enableCrossOsArchive` 设置，
+不重新构建或上传发布二进制。
+
+修改 CI 工具、工作流或构建配置时，还会在六个支持的 OS/架构组合上运行原生 Python
+进程/缓存测试，并验证 Linux 写入的缓存夹具能在各平台恢复。普通业务源码 PR 保留原有
+Rust 门禁；稳定汇总门禁只允许分类器明确判定不需要的工具检查跳过。
 
 候选不会把 release-please 标签本身当作无害 diff 的证据。automatic 与 dry-run 模式要求
 release head 是精确 PR base 之上的单个 commit，变更文件集合必须恰好是
