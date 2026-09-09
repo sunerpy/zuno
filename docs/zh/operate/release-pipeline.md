@@ -88,6 +88,11 @@ JSON，不再读取 Git Bash 文本格式的 `env`，因此 Windows `PATH` 等�
 Cargo runner 变量前还会转换成不含空格的 Windows short path，因此 Windows Store 的
 应用执行别名无法伪装成可用 Python。
 
+测试 profile 只优化大图附件夹具使用的 `image`、`png` 依赖，不缩小图片或删除断言。
+主机归档验证会一次构建 CLI 和 smoke driver，原子更新 `dist` 后运行解包的程序；
+两个 smoke target 都遵守 `CARGO_TARGET_DIR` 和当前平台的可执行文件后缀。
+Cargo timing 将编译与测试执行分开记录，历史对照数据保存在性能方法文档中。
+
 原生测试夹具也遵守同一平台边界：PTY API 在 Windows 使用 `COMSPEC`，不假定存在 `sh`；
 LSP 夹具执行已验证的绝对 Python；祖先目录遍历测试使用每次运行唯一的 marker，开发者真实
 主目录中的文件不会改变断言结果。

@@ -133,6 +133,13 @@ explicitly sets `RUN_DOCTESTS=0` instead of repeating a platform-independent
 rustdoc phase that added more than eight minutes. A failed Windows run uploads
 Cargo timings, build/capture logs, and per-suite logs for diagnosis.
 
+The test profile optimizes only the `image` and `png` dependencies used by large
+attachment fixtures; dimensions and assertions are unchanged. Host artifact
+verification builds the CLI and smoke driver together, stages `dist` atomically,
+then runs the unpacked archive. Both smoke targets honor `CARGO_TARGET_DIR` and
+the native executable suffix. Cargo timing reports separate compilation from
+test execution; the historical measurements are in the performance methodology.
+
 The shipped MSVC `zuno.exe` reserves an 8 MiB main-thread stack through a
 binary-scoped build-script linker argument. Native `dumpbin` evidence showed the
 1 MiB PE default overflowed during real session construction. The argument is

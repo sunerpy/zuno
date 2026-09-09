@@ -1275,6 +1275,43 @@ Linux-owned doctest phase. The measured local scheduler remains 53.20 s against
 completed CI runs; the historical table above is not silently relabeled as
 evidence for the new workflow.
 
+## CI build and image-fixture measurements (2026-09-09)
+
+The source baseline for this experiment was
+`ad61db80dfbb37cf671b176bfbe780e3469f6a0e` (v0.10.23), with Rust 1.98.0.
+Linux tests used four fixed logical CPUs. Native Windows measurements used
+Windows Server 2025, a Xeon Platinum 8259CL, and one harness thread per suite.
+The image fixtures retained their original dimensions, including the 81 MP
+historical attachment. Linux ran 32 tests and Windows ran its 31 applicable tests.
+
+| test execution | samples (seconds) | median |
+| --- | --- | --- |
+| Linux baseline | 94.27; 93.97; 93.51 | 93.97 |
+| Linux image opt3 | 26.57; 26.40; 26.23 | 26.40 |
+| Linux image + png opt3 | 13.81; 13.83; 13.86 | 13.83 |
+| Windows baseline | 194.17; 193.85; 196.64 | 194.17 |
+| Windows image + png opt3 | 29.00; 28.96; 29.03 | 29.00 |
+
+Only those two dependencies are optimized in the test profile. Release settings,
+test assertions, input sizes, and platform coverage are preserved. Profile
+compilation cost is separate from the execution times above.
+
+The host artifact now builds `zuno` and `zuno-smoke` in one Cargo invocation.
+Separate invocations can compile different dependency feature sets: the cold
+comparison recorded 621 cacheable Rust misses for separate builds and 530 for
+the combined build. One cold sample took 480.47 versus 414.22 seconds; three
+fully warmed compiler-cache samples had medians of 36.56 versus 31.92 seconds.
+Every warm sample used an empty target directory, not Cargo's no-op fast path.
+The main executable bytes matched, and both unpacked artifacts passed cassette
+smoke. `make smoke-artifact` preserves atomic staging into `dist` and honors
+`CARGO_TARGET_DIR` and the host executable suffix.
+
+These measurements are not a hosted-runner release SLO. A version-only workspace
+bump with warm dependency cache still took 182.96 seconds, with 482 Rust cache
+hits and 48 misses. Capture successful-run Cargo timings, compiler-cache
+statistics, and per-suite durations; distinguish queueing, cache transfer,
+compilation, linking, execution, and publication before attributing improvement.
+
 ## Frozen threshold formulas
 
 The text between the markers is hashed by `zuno-testkit`. Changing it requires an

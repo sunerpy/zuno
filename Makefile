@@ -90,7 +90,7 @@ fmt-oxfmt-check:
 # workspace lint table sets `clippy::all = "warn"` and a warning nobody fails on
 # is a warning nobody fixes.
 lint:
-	$(CARGO) clippy --workspace --all-targets $(OFFLINE) -- -D warnings
+	$(CARGO) clippy --workspace --all-targets --timings $(OFFLINE) -- -D warnings
 
 lint-windows-cross:
 	ZUNO_CARGO_OFFLINE=$(if $(strip $(OFFLINE)),1,0) \
@@ -110,8 +110,8 @@ test:
 test-nextest:
 	@$(CARGO) nextest --version > /dev/null 2>&1 \
 	  || { echo "cargo-nextest is required; install cargo-nextest 0.9.103"; exit 1; }
-	$(CARGO) nextest run --workspace --no-fail-fast --no-tests=warn $(OFFLINE)
-	$(CARGO) test --workspace --doc --no-fail-fast $(OFFLINE)
+	$(CARGO) nextest run --workspace --no-fail-fast --no-tests=warn --timings $(OFFLINE)
+	$(CARGO) test --workspace --doc --no-fail-fast --timings $(OFFLINE)
 	$(MAKE) test-zed-acp-schema
 
 # The exact schema crate consumed by current Zed enables serde_json/preserve_order.
@@ -265,23 +265,29 @@ package: release-target
 
 # Exercise an already-built binary. `BINARY=` overrides the subject, which is how
 # the release workflow points this at an unpacked archive.
-BINARY ?= $(TARGET_DIR)/release/$(BINARY_NAME)
+BINARY ?= $(CARGO_OUTPUT_DIR)/release/$(HOST_BINARY)
 
 smoke:
 	$(CARGO) build --release -p zuno-testkit --bin zuno-smoke $(OFFLINE)
-	./$(TARGET_DIR)/release/zuno-smoke --binary "$(BINARY)"
+	"$(CARGO_OUTPUT_DIR)/release/zuno-smoke$(HOST_SUFFIX)" --binary "$(BINARY)"
 
 # The release pipeline's packaging + smoke path for the host, end to end: build a
 # real release binary, archive it, unpack the archive, and smoke what came out.
 # Unpacking is the point — it proves the archive contains a runnable binary, not
 # just that the compiler produced one. This is what CI's `artifact` job runs.
-smoke-artifact: release
-	$(CARGO) build --release -p zuno-testkit --bin zuno-smoke $(OFFLINE)
+smoke-artifact:
+	$(CARGO) build --release -p $(CLI_CRATE) --bin $(BINARY_NAME) \
+		-p zuno-testkit --bin zuno-smoke --timings $(OFFLINE)
+	@mkdir -p "$(DIST_DIR)"
+	@rm -f "$(DIST_BINARY).tmp"
+	@cp "$(CARGO_OUTPUT_DIR)/release/$(HOST_BINARY)" "$(DIST_BINARY).tmp"
+	@mv -f "$(DIST_BINARY).tmp" "$(DIST_BINARY)"
+	@ls -l "$(DIST_BINARY)"
 	@rm -rf $(DIST_DIR)/host $(DIST_DIR)/unpacked
 	@mkdir -p $(DIST_DIR)/host $(DIST_DIR)/unpacked
-	tar -czf $(DIST_DIR)/host/$(BINARY_NAME).tar.gz -C $(TARGET_DIR)/release $(BINARY_NAME)
+	tar -czf $(DIST_DIR)/host/$(BINARY_NAME).tar.gz -C "$(CARGO_OUTPUT_DIR)/release" $(HOST_BINARY)
 	tar -xzf $(DIST_DIR)/host/$(BINARY_NAME).tar.gz -C $(DIST_DIR)/unpacked
-	./$(TARGET_DIR)/release/zuno-smoke --binary $(DIST_DIR)/unpacked/$(BINARY_NAME)
+	"$(CARGO_OUTPUT_DIR)/release/zuno-smoke$(HOST_SUFFIX)" --binary $(DIST_DIR)/unpacked/$(HOST_BINARY)
 
 clean:
 	$(CARGO) clean

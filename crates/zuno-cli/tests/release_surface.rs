@@ -2972,6 +2972,43 @@ fn make_build_stages_a_directly_runnable_binary_in_dist() {
     );
 }
 
+#[test]
+fn host_smoke_builds_both_binaries_once_and_uses_the_selected_target_directory() {
+    let target = workspace_root().join("target").join("smoke contract");
+    let output = Command::new("make")
+        .current_dir(workspace_root())
+        .env("CARGO_TARGET_DIR", &target)
+        .args(["-n", "smoke-artifact"])
+        .output()
+        .expect("make can expand the host artifact recipe");
+    assert!(output.status.success(), "{output:?}");
+    let commands = String::from_utf8(output.stdout).expect("make output is UTF-8");
+    assert_eq!(commands.matches("cargo build").count(), 1, "{commands}");
+    assert!(commands.contains("-p zuno --bin zuno"), "{commands}");
+    assert!(
+        commands.contains("-p zuno-testkit --bin zuno-smoke"),
+        "{commands}"
+    );
+    assert!(
+        commands.contains(target.to_string_lossy().as_ref()),
+        "{commands}"
+    );
+    let executable = if cfg!(windows) { "zuno.exe" } else { "zuno" };
+    assert!(
+        commands.contains(&format!("dist/{executable}.tmp")),
+        "{commands}"
+    );
+    let unpack = commands.find("tar -xzf").expect("the archive is unpacked");
+    let run = commands
+        .rfind(" --binary ")
+        .expect("the unpacked binary is tested");
+    assert!(unpack < run, "{commands}");
+    assert!(
+        commands.contains(&format!("dist/unpacked/{executable}")),
+        "{commands}"
+    );
+}
+
 // ─── The committed cassette ─────────────────────────────────────────────────
 
 /// The smoke test replays a cassette committed under `packaging/smoke/cassettes/`

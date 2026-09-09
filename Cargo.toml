@@ -400,3 +400,10 @@ opt-level = 3
 opt-level = 3
 [profile.test.package.unicode-truncate]
 opt-level = 3
+
+# Keep the full-size image compatibility fixtures while optimizing their codecs.
+[profile.test.package.image]
+opt-level = 3
+
+[profile.test.package.png]
+opt-level = 3
