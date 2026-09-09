@@ -106,7 +106,9 @@ five-second cleanup budget. Output goes to files: a descendant inheriting stdout
 cannot keep the scheduler waiting for pipe EOF after its parent exits. Windows
 uses a kill-on-close Job Object, assigning a waiting launcher before it starts
 test code; Unix uses an isolated process group. Cleanup verifies that no active
-members remain. Cancellation stops waiting workers and reaps active suites;
+members remain. On macOS, a bounded process-state query distinguishes dead
+zombies from live members; `killpg` permission errors alone cannot do that.
+Cancellation stops waiting workers and reaps active suites;
 cleanup or launch failures remain failures, without retrying the test.
 
 Combined output is limited to 64 MiB per suite. Exceeding the limit is reported

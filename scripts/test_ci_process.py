@@ -3,6 +3,7 @@
 import ctypes
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,14 @@ def alive(pid):
             return bool(api.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
         finally:
             api.CloseHandle(handle)
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "state="],
+            text=True, capture_output=True, timeout=2,
+        )
+        if result.returncode not in (0, 1):
+            raise RuntimeError(result.stderr)
+        return bool(result.stdout.strip()) and not result.stdout.lstrip().startswith("Z")
     stat = Path(f"/proc/{pid}/stat")
     if Path("/proc").is_dir():
         try:
@@ -109,6 +118,24 @@ class ProcessTests(unittest.TestCase):
         result = self.run_code(code, timeout=3)
         self.assertEqual(result.code, ci_process.EXECUTION_TIMEOUT, self.log.read_text(encoding="utf-8", errors="replace"))
         self.assertLess(result.elapsed, 10)
+        self.assert_reaped(pids)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin signal permission check")
+    def test_permission_denied_with_a_live_member_remains_a_cleanup_failure(self):
+        code, pids = self.tree_code(0)
+        kill_group = os.killpg
+        try:
+            with patch("ci_process.os.killpg", side_effect=PermissionError(1, "denied")):
+                result = self.run_code(code)
+            self.assertEqual(result.code, ci_process.SUPERVISION_FAILURE)
+            self.assertIn("process cleanup failed", result.reason)
+            self.assertTrue(alive(int(pids[1].read_text())))
+        finally:
+            if pids[0].exists():
+                try:
+                    kill_group(int(pids[0].read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         self.assert_reaped(pids)
 
     def test_cancellation_before_launch_starts_no_program(self):

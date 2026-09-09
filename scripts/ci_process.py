@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -39,7 +40,20 @@ def cancellation_signals(cancelled):
             signal.signal(number, handler)
 
 
-def _live_group(pgid):
+def _live_group(pgid, deadline):
+    if sys.platform == "darwin":
+        # XNU's killpg filters zombies before counting signalable members, so
+        # even signal 0 can return EPERM for a group containing only dead members.
+        # Inspect state instead, within the same cleanup deadline.
+        table = subprocess.check_output(
+            ["/bin/ps", "-A", "-o", "pgid=,state="], text=True,
+            timeout=max(0.001, deadline - time.monotonic()),
+        )
+        for row in table.splitlines():
+            group, state = row.split()
+            if int(group) == pgid and not state.startswith("Z"):
+                return True
+        return False
     if Path("/proc").is_dir():
         # A dead orphan may briefly remain as a zombie until init reaps it.
         # Zombies cannot execute or retain the inherited output file handles.
@@ -65,8 +79,11 @@ def _terminate_group(process, deadline):
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        if sys.platform != "darwin" or _live_group(process.pid, deadline):
+            raise
     process.wait(timeout=max(0.001, deadline - time.monotonic()))
-    while _live_group(process.pid):
+    while _live_group(process.pid, deadline):
         if time.monotonic() >= deadline:
             raise TimeoutError("test process group still contains live processes")
         time.sleep(0.01)
