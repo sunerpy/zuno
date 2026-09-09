@@ -97,22 +97,20 @@ jobs:
           echo "needed=$needed" >> "$GITHUB_OUTPUT"
 
   ci-cache-seed:
-    name: Seed cache transport test
+    name: Optional cache transport seed
     needs: classify
     if: needs.classify.outputs.ci_tooling == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    outputs:
-      key: zuno-cache-transport-${{ github.run_id }}-${{ github.run_attempt }}
+    continue-on-error: true
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - name: Create a portable cache fixture
         run: |
           mkdir -p target/ci-cache/compiler
           printf 'zuno cache transport v1\n' > target/ci-cache/compiler/transport.txt
       - uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        continue-on-error: true
+        timeout-minutes: 1
         with:
           path: target/ci-cache/compiler
           key: zuno-cache-transport-${{ github.run_id }}-${{ github.run_attempt }}
@@ -120,7 +118,7 @@ jobs:
 
   ci-tools:
     name: CI tools (${{ matrix.runner }})
-    needs: [classify, ci-cache-seed]
+    needs: classify
     if: needs.classify.outputs.ci_tooling == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
@@ -142,20 +140,32 @@ jobs:
         with:
           python-version: "3.13"
           architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-      - name: Restore the Linux-written transport fixture
-        id: transport
-        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
-        with:
-          path: target/ci-cache/compiler
-          key: ${{ needs.ci-cache-seed.outputs.key }}
-          enableCrossOsArchive: true
-          fail-on-cache-miss: true
-      - name: Verify cache transport and native process contracts
+      - name: Verify native process and cache contracts
         shell: bash
         run: |
           python -c "import os,platform; expected={'X64':('amd64','x86_64'),'ARM64':('arm64','aarch64')}; assert platform.machine().lower() in expected[os.environ['RUNNER_ARCH']]"
-          python -c "from pathlib import Path; assert Path('target/ci-cache/compiler/transport.txt').read_bytes() == b'zuno cache transport v1\n'"
           python -m unittest discover -s scripts -p 'test_ci_*.py' -v
+      - name: Restore the Linux-written transport fixture
+        id: transport
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: target/ci-cache/compiler
+          key: zuno-cache-transport-${{ github.run_id }}-${{ github.run_attempt }}
+          enableCrossOsArchive: true
+      - name: Verify available cache transport
+        if: steps.transport.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          python -c "from pathlib import Path; assert Path('target/ci-cache/compiler/transport.txt').read_bytes() == b'zuno cache transport v1\n'"
+          echo "Cache transport: verified (Linux to $RUNNER_OS / $RUNNER_ARCH)." >> "$GITHUB_STEP_SUMMARY"
+      - name: Record unavailable cache probe
+        if: steps.transport.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "::notice::Cache transport was not exercised: the optional cache entry was unavailable. Native process and cache contract tests ran independently."
+          echo "Cache transport: not exercised (cache miss or service error)." >> "$GITHUB_STEP_SUMMARY"
 
   linux-static:
     name: Linux static checks
@@ -454,7 +464,7 @@ jobs:
   ci-success:
     name: ${{ needs.classify.outputs.release_pr == 'true' && 'Release PR routed to candidate' || 'zuno/pr-gate' }}
     if: always()
-    needs: [classify, ci-cache-seed, ci-tools, linux-static, linux-test, artifact, windows-clippy, windows-test]
+    needs: [classify, ci-tools, linux-static, linux-test, artifact, windows-clippy, windows-test]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -476,7 +486,7 @@ jobs:
                     .value.result != "success"
                   elif $release_pr == "true" then
                     .value.result != "skipped"
-                  elif (.key == "ci-cache-seed" or .key == "ci-tools") and $ci_tooling != "true" then
+                  elif .key == "ci-tools" and $ci_tooling != "true" then
                     .value.result != "skipped"
                   else
                     .value.result != "success"

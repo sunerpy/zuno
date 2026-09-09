@@ -200,8 +200,10 @@ and `enableCrossOsArchive` setting as every reader.
 
 Changes to CI tooling, workflows, or build configuration additionally run native
 Python process/cache tests on all six supported OS/architecture combinations.
-Those jobs verify a Linux-written cache fixture restores correctly on each
-platform. Ordinary source-only PRs keep the existing Rust jobs; the stable gate
+The native tests run before the optional cache transport probe. When its
+Linux-written fixture is available, each platform verifies the restored bytes.
+A cache miss or service error is recorded as an unexercised probe and does not
+prevent the native tests from running. Ordinary source-only PRs keep the existing Rust jobs; the stable gate
 allows only the explicitly classified tooling skips.
 
 The candidate does not trust a release-please label as evidence that the diff is

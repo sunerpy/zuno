@@ -1383,7 +1383,7 @@ fn ci_runs_before_the_protected_merge_without_a_duplicate_push_run() {
     let gate = job_body(&text, "ci-success").join("\n");
     for required in [
         "Release PR routed to candidate",
-        "needs: [classify, ci-cache-seed, ci-tools, linux-static, linux-test, artifact, windows-clippy, windows-test]",
+        "needs: [classify, ci-tools, linux-static, linux-test, artifact, windows-clippy, windows-test]",
         "RELEASE_PR: ${{ needs.classify.outputs.release_pr }}",
         "CI_TOOLING: ${{ needs.classify.outputs.ci_tooling }}",
         "elif $release_pr == \"true\" then",
@@ -2356,7 +2356,7 @@ fn candidate_verifier_accepts_exact_bytes_and_rejects_tampering() {
 /// The gap GitHub Actions cannot close from inside a workflow: the `needs:` list
 /// of the required status check is where a new job silently fails to be required.
 #[test]
-fn the_ci_gate_requires_every_job_in_the_workflow() {
+fn the_ci_gate_requires_every_validation_job_in_the_workflow() {
     let text = workflow("ci.yml");
     let jobs = job_names(&text);
     assert!(
@@ -2378,6 +2378,14 @@ fn the_ci_gate_requires_every_job_in_the_workflow() {
     let required = job_needs(&text, "ci-success");
     let mut expected = jobs.clone();
     expected.remove("ci-success");
+    // This job only attempts to save a fixed cache fixture. A rate-limited
+    // cache service cannot make native process validation optional or blocked.
+    expected.remove("ci-cache-seed");
+    assert!(required.contains("ci-tools"));
+    assert!(
+        !job_needs(&text, "ci-tools").contains("ci-cache-seed"),
+        "native CI-tooling tests must start independently of the cache service"
+    );
     let missing: Vec<&String> = expected.difference(&required).collect();
     assert!(
         missing.is_empty(),
