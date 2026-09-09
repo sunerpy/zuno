@@ -177,6 +177,15 @@ impl EventService {
         local: &EventFanout<TurnEvent>,
         event: TurnEvent,
     ) {
+        if matches!(
+            event,
+            TurnEvent::Notice {
+                audience: zuno_engine::r#loop::NoticeAudience::Diagnostic,
+                ..
+            }
+        ) {
+            return;
+        }
         local.publish(event.clone());
         let projected = turn_event(&event);
         if let Err(error) = self.publish(session_id, projected).await {
@@ -281,6 +290,7 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             object(json!({"name": name, "source": source})),
         ),
         TurnEvent::Notice {
+            audience,
             severity,
             code,
             detail,
@@ -288,13 +298,18 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             "notice",
             object(json!({
                 "severity": severity.as_str(),
+                "audience": audience.as_str(),
                 "code": code,
                 "detail": detail,
             })),
         ),
-        TurnEvent::TurnStarted { session_id } => {
-            ("turn.started", object(json!({"sessionID": session_id})))
-        }
+        TurnEvent::TurnStarted {
+            session_id,
+            turn_id,
+        } => (
+            "turn.started",
+            object(json!({"sessionID": session_id, "turnID": turn_id})),
+        ),
         TurnEvent::HistoryRepaired {
             repaired_tool_results,
         } => (

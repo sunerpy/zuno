@@ -21,6 +21,7 @@ zuno-error = { workspace = true }
 zuno-llm = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-tool = { workspace = true }
+zuno-types = { workspace = true }
 # The Markdown projection is watched, not watching: it consumes `zuno-watch`'s own
 # `FileEvent` so there is exactly one file watcher in the workspace, in the crate
 # that owns watching. See `projection.rs` for why no `Watcher` is built here.

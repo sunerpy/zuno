@@ -988,10 +988,14 @@ impl Transcript {
                 })
             }
             TurnEvent::Notice {
+                audience,
                 severity,
                 code,
                 detail,
             } => {
+                if *audience == zuno_engine::r#loop::NoticeAudience::Diagnostic {
+                    return false;
+                }
                 self.messages.push(Message::noticed(
                     match severity {
                         NoticeSeverity::Info => crate::views::toast::ToastLevel::Info,

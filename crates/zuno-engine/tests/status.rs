@@ -17,7 +17,8 @@ use zuno_engine::r#loop::{
     event_channel, run_turn,
 };
 use zuno_engine::status::{
-    AbortDisposition, SessionRunRegistry, SessionStatus, SoftInterruptAction,
+    AbortDisposition, DiagnosticNoticeKey, ExpectedTurnError, SessionRunRegistry, SessionStatus,
+    SoftInterruptAction,
 };
 use zuno_error::ProviderError;
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
@@ -112,6 +113,27 @@ fn status_rejects_two_concurrent_prompts_for_one_session() {
 
     assert_eq!(registry.status(SESSION_ID), SessionStatus::Idle);
     assert!(registry.active_sessions().is_empty());
+}
+
+#[test]
+fn status_diagnostic_notice_keys_are_session_scoped_and_epoch_sensitive() {
+    let registry = SessionRunRegistry::new();
+    let key = DiagnosticNoticeKey {
+        context_epoch: 4,
+        tool_name: "plan_update".to_owned(),
+        stored_identity_sha256: "old".to_owned(),
+        current_identity_sha256: "new".to_owned(),
+    };
+    assert!(registry.admit_diagnostic_notice(SESSION_ID, key.clone()));
+    assert!(!registry.admit_diagnostic_notice(SESSION_ID, key.clone()));
+    assert!(registry.admit_diagnostic_notice(
+        SESSION_ID,
+        DiagnosticNoticeKey {
+            context_epoch: 5,
+            ..key.clone()
+        }
+    ));
+    assert!(registry.admit_diagnostic_notice("ses_other", key));
 }
 
 #[test]
@@ -340,6 +362,72 @@ fn status_soft_interrupt_injects_at_safe_point_without_cancelling() {
         !turn.interrupt_signal().is_set(),
         "injecting the message must let the turn continue"
     );
+}
+
+#[test]
+fn status_expected_turn_steering_never_crosses_a_turn_handoff() {
+    let registry = SessionRunRegistry::new();
+    let turn = registry.begin_turn(SESSION_ID).expect("active turn");
+    let turn_identity = turn
+        .mark_turn_started("turn_current")
+        .expect("publish turn identity");
+    assert_eq!(
+        registry.active_turn_id(SESSION_ID).as_deref(),
+        Some("turn_current")
+    );
+    let message = SoftInterruptMessage {
+        input_id: Some("msg_exact".to_owned()),
+        content: "exact turn only".to_owned(),
+        images: Vec::new(),
+        attachments: Vec::new(),
+        urgent: false,
+        source: SoftInterruptSource::User,
+    };
+
+    let mismatch = registry
+        .queue_soft_interrupt_for_turn(SESSION_ID, "turn_stale", message.clone())
+        .expect_err("a stale expected id must not steer the current turn");
+    assert!(matches!(
+        mismatch,
+        ExpectedTurnError::Mismatch {
+            actual_turn_id,
+            ..
+        } if actual_turn_id == "turn_current"
+    ));
+    assert!(
+        turn.take_soft_interrupts_at_safe_point()
+            .messages
+            .is_empty()
+    );
+
+    registry
+        .queue_soft_interrupt_for_turn(SESSION_ID, "turn_current", message.clone())
+        .expect("the exact live turn accepts steering");
+    assert_eq!(
+        turn.take_soft_interrupts_at_safe_point().messages,
+        [message]
+    );
+
+    drop(turn_identity);
+    assert_eq!(registry.active_turn_id(SESSION_ID), None);
+    drop(turn);
+    assert!(matches!(
+        registry
+            .queue_soft_interrupt_for_turn(
+                SESSION_ID,
+                "turn_current",
+                SoftInterruptMessage {
+                    input_id: None,
+                    content: "late".to_owned(),
+                    images: Vec::new(),
+                    attachments: Vec::new(),
+                    urgent: false,
+                    source: SoftInterruptSource::User,
+                },
+            )
+            .expect_err("an ended turn cannot accept steering"),
+        ExpectedTurnError::NoActiveTurn { .. }
+    ));
 }
 
 #[test]

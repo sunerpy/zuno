@@ -1969,6 +1969,7 @@ fn assert_job_completion_blocked(store: &GoalStore, goal: &Goal) {
             work_items: 0,
             jobs: 1,
             human_requests: 0,
+            ..
         }
     ));
     assert_eq!(
@@ -2013,6 +2014,7 @@ fn completion_waits_for_a_pending_goal_human_request() {
             work_items: 0,
             jobs: 0,
             human_requests: 1,
+            ..
         }
     ));
 
@@ -2080,9 +2082,14 @@ fn completion_waits_for_plan_work_items_and_jobs_in_one_transaction() {
             work_items: 1,
             jobs: 1,
             human_requests: 0,
+            ..
         }
     ));
     assert_eq!(store.goal(SESSION).expect("read goal"), Some(goal.clone()));
+    assert!(
+        blocked.to_string().contains("plan step `scan` (pending)"),
+        "the refusal names the exact durable blocker: {blocked}"
+    );
 
     let completed_steps = serde_json::json!([
         {"id":"scan","title":"Scan","status":"completed"},
@@ -2113,6 +2120,79 @@ fn completion_waits_for_plan_work_items_and_jobs_in_one_transaction() {
         .expect("complete goal")
         .expect("goal exists");
     assert_eq!(completed.status, GoalStatus::Complete);
+}
+
+#[test]
+fn completed_and_superseded_plan_steps_are_terminal_for_goal_completion() {
+    let (_spill, pool, store, goal) = shared_completion_fixture();
+    let steps = serde_json::json!([
+        {"id":"done","title":"Done","status":"completed"},
+        {"id":"replaced","title":"Replaced","status":"superseded"}
+    ]);
+    pool.get()
+        .expect("check out connection")
+        .execute(
+            "INSERT INTO work_plan \
+             (session_id,id,goal_id,revision,title,steps,time_created,time_updated) \
+             VALUES (?1,'plan',?2,1,'release',?3,1,1)",
+            params![SESSION, goal.goal_id, steps.to_string()],
+        )
+        .expect("insert terminal plan");
+    let paused = store
+        .set_status_as_system(SESSION, SystemStatus::Paused)
+        .expect("pause goal")
+        .expect("goal");
+
+    let completed = store
+        .complete_checked(SESSION, paused.revision)
+        .expect("terminal Plan steps do not block completion")
+        .expect("goal");
+
+    assert_eq!(completed.status, GoalStatus::Complete);
+}
+
+#[test]
+fn an_unknown_or_missing_plan_status_fails_closed_without_mutating_the_goal() {
+    for (case, step) in [
+        (
+            "unknown",
+            serde_json::json!({"id":"broken","title":"Broken","status":"cancelled"}),
+        ),
+        (
+            "missing",
+            serde_json::json!({"id":"broken","title":"Broken"}),
+        ),
+    ] {
+        let (_spill, pool, store, goal) = shared_completion_fixture();
+        pool.get()
+            .expect("check out connection")
+            .execute(
+                "INSERT INTO work_plan \
+                 (session_id,id,goal_id,revision,title,steps,time_created,time_updated) \
+                 VALUES (?1,'plan',?2,1,'release',?3,1,1)",
+                params![SESSION, goal.goal_id, serde_json::json!([step]).to_string()],
+            )
+            .expect("insert corrupt plan");
+
+        let error = store
+            .complete_checked(SESSION, goal.revision)
+            .expect_err("an undecodable Plan status is durable corruption");
+        assert!(
+            matches!(
+                error,
+                GoalError::PlanStateCorrupt {
+                    ref step_id,
+                    ..
+                } if step_id == "broken"
+            ),
+            "{case}: {error}"
+        );
+        assert_eq!(
+            store.goal(SESSION).expect("read goal"),
+            Some(goal),
+            "{case}: a failed audit must not mutate the goal"
+        );
+    }
 }
 
 fn assert_job_completion_allowed(store: &GoalStore, goal: &Goal, reason: &str) {
@@ -2869,6 +2949,82 @@ fn a_change_goal_cannot_complete_while_a_criterion_is_open() {
             .status,
         GoalStatus::Active,
         "a refused completion leaves the run going"
+    );
+}
+
+#[test]
+fn criteria_and_completion_roll_back_together_when_the_audit_fails() {
+    let (fixture, goal) = evidence_fixture();
+
+    let refusal = fixture
+        .store
+        .complete_as_model_with_criteria_checked(
+            SESSION,
+            goal.revision,
+            &[CriterionSatisfaction {
+                criterion_id: "c1".to_owned(),
+                receipt_id: "rec_pass".to_owned(),
+            }],
+            &[],
+        )
+        .expect_err("the second open criterion must refuse completion");
+
+    assert!(matches!(
+        refusal,
+        GoalError::EvidenceMissing { ref unsatisfied } if unsatisfied == &["c2".to_owned()]
+    ));
+    assert_eq!(
+        fixture.store.goal(SESSION).expect("read goal"),
+        Some(goal),
+        "the failed transaction must not advance the revision or status"
+    );
+    assert!(
+        fixture
+            .store
+            .criteria(SESSION)
+            .expect("read criteria")
+            .iter()
+            .all(|criterion| criterion.status == GoalCriterionStatus::Open),
+        "the citation applied before the audit must be rolled back"
+    );
+}
+
+#[test]
+fn criteria_and_completion_commit_as_one_goal_revision() {
+    let (fixture, goal) = evidence_fixture();
+
+    let completed = fixture
+        .store
+        .complete_as_model_with_criteria_checked(
+            SESSION,
+            goal.revision,
+            &[CriterionSatisfaction {
+                criterion_id: "c1".to_owned(),
+                receipt_id: "rec_pass".to_owned(),
+            }],
+            &[CriterionWaiver {
+                criterion_id: "c2".to_owned(),
+                reason: "the release artifact is intentionally out of scope".to_owned(),
+            }],
+        )
+        .expect("settled criteria allow completion")
+        .expect("goal");
+
+    assert_eq!(completed.status, GoalStatus::Complete);
+    assert_eq!(
+        completed.revision,
+        goal.revision + 1,
+        "the checklist and terminal status are one optimistic-concurrency write"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .criteria(SESSION)
+            .expect("read criteria")
+            .iter()
+            .map(|criterion| criterion.status)
+            .collect::<Vec<_>>(),
+        [GoalCriterionStatus::Satisfied, GoalCriterionStatus::Waived]
     );
 }
 

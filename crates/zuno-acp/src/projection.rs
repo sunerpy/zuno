@@ -11,6 +11,7 @@ use crate::presentation::{decorate_completed_tool_update, decorate_tool_call};
 #[derive(Debug, Default)]
 pub struct TurnEventProjector {
     context_size: Option<u64>,
+    turn_id: Option<String>,
     raw_inputs: HashMap<String, String>,
     tool_names: HashMap<String, String>,
     visible_tools: HashSet<String>,
@@ -153,7 +154,15 @@ impl TurnEventProjector {
 
     #[must_use]
     pub fn project(&mut self, event: &TurnEvent) -> Option<Value> {
-        self.project_inner(event)
+        if let TurnEvent::TurnStarted { turn_id, .. } = event {
+            self.turn_id = Some(turn_id.clone());
+            return None;
+        }
+        let mut update = self.project_inner(event)?;
+        if let Some(turn_id) = self.turn_id.as_deref() {
+            attach_turn_id(&mut update, turn_id);
+        }
+        Some(update)
     }
 
     fn reset_attempt(&mut self) {
@@ -423,10 +432,14 @@ impl TurnEventProjector {
                 json!({ "sessionUpdate": "usage_update", "used": used, "size": size })
             }),
             TurnEvent::Notice {
+                audience,
                 severity,
                 code,
                 detail,
             } => {
+                if *audience == zuno_engine::r#loop::NoticeAudience::Diagnostic {
+                    return None;
+                }
                 let mut update = content_update("agent_thought_chunk", detail);
                 update["_meta"] = json!({
                     "zuno": {
@@ -451,6 +464,16 @@ impl TurnEventProjector {
 #[must_use]
 pub fn turn_event_update(event: &TurnEvent) -> Option<Value> {
     TurnEventProjector::new().project(event)
+}
+
+fn attach_turn_id(update: &mut Value, turn_id: &str) {
+    if !update["_meta"].is_object() {
+        update["_meta"] = json!({});
+    }
+    if !update["_meta"]["zuno"].is_object() {
+        update["_meta"]["zuno"] = json!({});
+    }
+    update["_meta"]["zuno"]["turnId"] = json!(turn_id);
 }
 
 #[must_use]

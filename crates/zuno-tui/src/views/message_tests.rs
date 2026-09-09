@@ -1276,6 +1276,7 @@ fn views_reply_identity_keeps_the_resolved_identity_after_completion() {
     for event in [
         TurnEvent::TurnStarted {
             session_id: String::from("ses_status"),
+            turn_id: String::from("turn_status"),
         },
         TurnEvent::AgentResolved {
             step: 1,
@@ -1334,6 +1335,7 @@ fn views_transcript_tracks_the_running_flag() {
     assert!(!transcript.is_running());
     transcript.observe(&TurnEvent::TurnStarted {
         session_id: String::from("s"),
+        turn_id: String::from("turn"),
     });
     assert!(transcript.is_running());
     transcript.observe(&TurnEvent::TurnInterrupted {
@@ -1385,6 +1387,7 @@ fn views_transcript_marks_an_interrupted_turn_once_as_session_state() {
     for event in [
         TurnEvent::TurnStarted {
             session_id: String::from("s"),
+            turn_id: String::from("turn"),
         },
         started(),
         provider(StreamEvent::TextDelta(String::from("partial reply"))),
@@ -1998,6 +2001,7 @@ fn views_transcript_omits_transient_turn_liveness_rows() {
     let mut view = view();
     view.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
         session_id: String::from("s"),
+        turn_id: String::from("turn"),
     }));
     let busy = draw(&mut view, 60, 12).join("\n");
     assert!(!busy.contains("working"), "{busy}");
@@ -3699,6 +3703,7 @@ fn views_transcript_cache_never_recalls_a_row_carrying_the_spinner() {
     for event in [
         TurnEvent::TurnStarted {
             session_id: String::from("s"),
+            turn_id: String::from("turn"),
         },
         started(),
         provider(StreamEvent::ToolUseStart {
@@ -3762,6 +3767,7 @@ fn views_transcript_animation_clock_stops_at_turn_boundaries_and_human_prompts()
     let mut view = view();
     view.transcript_mut().observe(&TurnEvent::TurnStarted {
         session_id: String::from("s"),
+        turn_id: String::from("turn"),
     });
     view.transcript_mut().observe(&started());
     let initial = view.transcript().spinner();

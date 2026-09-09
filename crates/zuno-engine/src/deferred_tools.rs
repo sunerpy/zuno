@@ -368,6 +368,7 @@ mod tests {
             description: description.to_owned(),
             parameters: json!({"type": "object", "properties": {}}),
             ui_intent: zuno_tool::ToolUiIntent::Generic,
+            history_policy: zuno_tool::HistoryPolicy::ExactDeclaration,
         }
     }
 

@@ -52,7 +52,9 @@ use zuno_engine::interrupt::{
     HardInterruptReason, HardInterruptRequest, HardInterruptSource, SoftInterruptMessage,
     SoftInterruptSource,
 };
-use zuno_engine::r#loop::{NoticeSeverity, TurnEvent, TurnEventSender, event_channel};
+use zuno_engine::r#loop::{
+    NoticeAudience, NoticeSeverity, TurnEvent, TurnEventSender, event_channel,
+};
 use zuno_engine::session_command::SessionCommand;
 use zuno_engine::status::{SessionControl, SessionRunRegistry};
 use zuno_engine::terminal_lease::{TerminalLease, TerminalLeaseCleanup};
@@ -4576,6 +4578,7 @@ async fn publish_snapshot_notice(
 ) {
     let _reported = events
         .publish(TurnEvent::Notice {
+            audience: NoticeAudience::User,
             severity,
             code: code.to_owned(),
             detail,
@@ -5079,12 +5082,13 @@ mod tests {
                 "ses_first",
                 &TurnEvent::TurnStarted {
                     session_id: "ses_first".to_owned(),
+                    turn_id: "turn_first".to_owned(),
                 },
             )
             .await;
         assert!(matches!(
             root_receiver.try_recv(),
-            Ok(TurnEvent::TurnStarted { session_id }) if session_id == "ses_first"
+            Ok(TurnEvent::TurnStarted { session_id, .. }) if session_id == "ses_first"
         ));
 
         bind_tui_detached_root(&root, "ses_second");
@@ -5093,12 +5097,13 @@ mod tests {
                 "ses_second",
                 &TurnEvent::TurnStarted {
                     session_id: "ses_second".to_owned(),
+                    turn_id: "turn_second".to_owned(),
                 },
             )
             .await;
         assert!(matches!(
             root_receiver.try_recv(),
-            Ok(TurnEvent::TurnStarted { session_id }) if session_id == "ses_second"
+            Ok(TurnEvent::TurnStarted { session_id, .. }) if session_id == "ses_second"
         ));
 
         observer
@@ -5106,6 +5111,7 @@ mod tests {
                 "ses_child",
                 &TurnEvent::TurnStarted {
                     session_id: "ses_child".to_owned(),
+                    turn_id: "turn_child".to_owned(),
                 },
             )
             .await;

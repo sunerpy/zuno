@@ -13,9 +13,11 @@ use zuno_db::Pool;
 use zuno_error::{DbError, ToolError};
 use zuno_orchestration::sha256_json;
 use zuno_tool::{
-    PermissionAsk, Tool, ToolConcurrencyPolicy, ToolContext, ToolDynamicContextRefresh, ToolEffect,
-    ToolOutput, ToolProgressObservation, ToolReplayPolicy, TypedTool, erase,
+    HistoryPolicy, PermissionAsk, Tool, ToolConcurrencyPolicy, ToolContext,
+    ToolDynamicContextRefresh, ToolEffect, ToolOutput, ToolProgressObservation, ToolReplayPolicy,
+    TypedTool, erase,
 };
+pub use zuno_types::PlanStepStatus;
 
 pub const PLAN_GET_TOOL_ID: &str = "plan_get";
 pub const PLAN_UPDATE_TOOL_ID: &str = "plan_update";
@@ -95,32 +97,6 @@ impl WorkItemPriority {
             "low" => Some(Self::Low),
             _ => None,
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanStepStatus {
-    Pending,
-    InProgress,
-    Completed,
-    Superseded,
-}
-
-impl PlanStepStatus {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::InProgress => "in_progress",
-            Self::Completed => "completed",
-            Self::Superseded => "superseded",
-        }
-    }
-
-    #[must_use]
-    pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Superseded)
     }
 }
 
@@ -1893,6 +1869,10 @@ impl TypedTool for PlanGetTool {
     fn replay_policy(&self) -> ToolReplayPolicy {
         ToolReplayPolicy::Safe
     }
+
+    fn history_policy(&self) -> HistoryPolicy {
+        HistoryPolicy::AuthoritativeState
+    }
     fn effect(&self, _args: &Value) -> ToolEffect {
         ToolEffect::ReadOnly
     }
@@ -1918,6 +1898,10 @@ impl TypedTool for PlanUpdateTool {
     }
     fn description(&self) -> &str {
         PLAN_UPDATE_DESCRIPTION
+    }
+
+    fn history_policy(&self) -> HistoryPolicy {
+        HistoryPolicy::AuthoritativeState
     }
     fn effect(&self, _args: &Value) -> ToolEffect {
         ToolEffect::SideEffecting
@@ -1947,6 +1931,10 @@ impl TypedTool for TodoGetTool {
     }
     fn replay_policy(&self) -> ToolReplayPolicy {
         ToolReplayPolicy::Safe
+    }
+
+    fn history_policy(&self) -> HistoryPolicy {
+        HistoryPolicy::AuthoritativeState
     }
     fn effect(&self, _args: &Value) -> ToolEffect {
         ToolEffect::ReadOnly
@@ -1979,6 +1967,10 @@ impl TypedTool for TodoUpdateTool {
     }
     fn description(&self) -> &str {
         TODO_UPDATE_DESCRIPTION
+    }
+
+    fn history_policy(&self) -> HistoryPolicy {
+        HistoryPolicy::AuthoritativeState
     }
     fn effect(&self, _args: &Value) -> ToolEffect {
         ToolEffect::SideEffecting

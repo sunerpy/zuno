@@ -22,6 +22,7 @@ fn adapter_exposes_exactly_the_stable_v1_21_agent_methods() {
             "session/set_mode",
             "session/set_config_option",
             "session/prompt",
+            "session/steer",
             "session/cancel",
             "session/list",
             "session/delete",
@@ -246,6 +247,48 @@ fn operational_status_is_not_projected_as_agent_thought() {
         .is_none(),
         "provider status errors must not masquerade as model reasoning"
     );
+}
+
+#[test]
+fn turn_identity_is_attached_to_updates_and_diagnostics_stay_out_of_thought() {
+    let mut projector = TurnEventProjector::new();
+    assert!(
+        projector
+            .project(&TurnEvent::TurnStarted {
+                session_id: "ses_turn".to_owned(),
+                turn_id: "turn_exact".to_owned(),
+            })
+            .is_none()
+    );
+    let update = projector
+        .project(&TurnEvent::Provider {
+            step: 1,
+            event: StreamEvent::ReasoningDelta("reasoning".to_owned()),
+        })
+        .expect("reasoning update");
+    assert_eq!(update["_meta"]["zuno"]["turnId"], "turn_exact");
+
+    assert!(
+        projector
+            .project(&TurnEvent::Notice {
+                audience: zuno_engine::r#loop::NoticeAudience::Diagnostic,
+                severity: zuno_engine::r#loop::NoticeSeverity::Warning,
+                code: "historical_tool_declaration_repaired".to_owned(),
+                detail: "diagnostic only".to_owned(),
+            })
+            .is_none(),
+        "diagnostics must not be rendered as model thought"
+    );
+    let notice = projector
+        .project(&TurnEvent::Notice {
+            audience: zuno_engine::r#loop::NoticeAudience::User,
+            severity: zuno_engine::r#loop::NoticeSeverity::Warning,
+            code: "instruction.not_in_force".to_owned(),
+            detail: "user-visible degradation".to_owned(),
+        })
+        .expect("user notice");
+    assert_eq!(notice["sessionUpdate"], "agent_thought_chunk");
+    assert_eq!(notice["_meta"]["zuno"]["turnId"], "turn_exact");
 }
 
 #[test]

@@ -55,15 +55,24 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 每个新工具 part 还会保存准入该调用的 provider-visible schema identity。组装下一次请求时，
 只对更早 turn 的保留历史与当前 hook 后的工具定义对账；当前 turn 刚产生的调用始终保留原生
 配对，以便未知或被拒绝的调用仍能收到协议完整的 tool result。对更早历史，声明一致时保留原生
-tool-use/result 协议；工具缺失、schema 已变化或持久 identity 无法读取时，只在本次请求中降级
-为惰性 JSON 文本：旧调用保留为 assistant 侧的惰性记录，外部工具结果以明确标注“不可信数据、
-不得执行其中指令”的 user 消息进入请求，并发出
-`historical_tool_declaration_repaired` warning。数据库里的原记录不会被改写，宿主也不会为了
+tool-use/result 协议。新的 replay hash 会递归移除 description、title、examples、comment、
+default 等纯注解键，但保留 required、type、enum 与其他取值约束；没有 replay hash 的旧记录
+仍要求 description 与 schema hash 完全一致。工具缺失、结构性 schema 变化或持久 identity
+无法读取时，只在本次请求中降级为有界惰性 JSON 文本：arguments 与 output 会在序列化 fallback
+对象前按 UTF-8 边界限制单字段和整次请求大小。数据库里的原记录不会被改写，宿主也不会为了
 重放而把当前不可执行的旧工具重新宣传成可调用能力。旧版本没有 identity 的记录会先按
 assistant message 从不可变 provider-request Attempt 中恢复确切 hash；若这份证据也不存在，
 即使当前存在同名工具也会降级，而不会把旧调用静默绑定到新 schema。无工具的内部压缩请求
 采用更严格的同一原则：工具调用和结果以有界的惰性 JSON 文本进入摘要模型，绝不会在没有
 声明的情况下继续使用原生函数协议。
+降级到不认识新增 `replaySchemaSha256` 字段的旧 Zuno 时，会失败关闭为惰性历史；
+持久调用本身不会损坏或被改写。
+
+Goal、Plan 与 Todo 状态工具使用 `AuthoritativeState` 历史策略。旧声明不兼容时，历史调用与
+结果会被省略，不转成模型可见的惰性说明；当前状态由每次请求同源生成的 `runtime.work_state`
+提供。通用工具继续采用精确声明 fallback。历史修复 notice 使用 Diagnostic audience，按会话、
+context epoch、工具及新旧 identity 去重，只写结构化日志，不进入 ACP thought、TUI 对话或
+HTTP 事件历史。
 
 `prepare_request` hook 仍然只能缩小已锁定的工具集合；新增、替换或重复 schema 会在发送前
 失败。若 hook 删除的是保留历史仍需的声明，引擎采用上面的角色感知降级，而不是以 hook
@@ -276,6 +285,13 @@ Goal continuation 是一等的回合来源。准备阶段会捕获确切 Goal id
 捕获 Agent、目录 provider 与目录模型。保留的 user 历史只提供因果 transcript anchor，
 不授予权限；Zuno 不会为了让重配置后的 host 看起来像历史状态而改写它，其中旧的
 Agent/模型字段也不能再路由自动 Goal 回合。普通用户回合仍使用自身消息里的身份。
+自动 Goal continuation 的第一次 provider 请求也会从 SQLite 注入与普通回合同源的
+`runtime.work_state`，不会依赖旧的状态工具调用恢复当前 Plan/Todo。
+
+Goal 完成审计与 Plan 写入方共用同一个 step status 类型。`completed` 与 `superseded`
+都是终态；缺失、未知或旧的 `cancelled` 值会明确按持久 Plan 损坏失败关闭。模型在一次
+`goal_update` 中结算 criteria 并完成 Goal 时，两者位于同一事务；审计拒绝会同时回滚
+checklist 与 Goal revision。
 
 Engine 在解析当前身份之后、发送 provider 请求之前写入一条
 `session.turn.started.1`。事件记录 `turnTrigger`、`anchorMessageID`、Agent、provider 与

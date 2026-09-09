@@ -1188,6 +1188,7 @@ fn views_input_editor_ignores_application_events() {
     let result = editor.handle_event(&crate::app::AppEvent::Engine(
         zuno_engine::r#loop::TurnEvent::TurnStarted {
             session_id: String::from("s"),
+            turn_id: String::from("turn"),
         },
     ));
     assert!(!result.handled);

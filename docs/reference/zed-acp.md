@@ -430,6 +430,8 @@ text is written for a person.
 Generated titles use ACP `session_info_update`, and other operational status or
 provider failure text is handled by lifecycle/error reporting rather than being
 rendered as model thought.
+Historical tool-declaration repair uses diagnostic audience: it is written to
+structured logs and deliberately omitted from Zed thought chunks.
 
 Once compaction succeeds, Zed receives the exact durable summary as an
 `agent_message_chunk` tagged `_meta.zuno.kind: "compaction_summary"`. The live
@@ -500,6 +502,30 @@ streamed `user_message_chunk`, assistant output, and `stopReason` for the
 admitted prompt all arrive on the request that owns the turn, so a v1 client
 that ignores `data` still shows the work — it sees the error message text
 instead of a second `stopReason`.
+
+Zuno also exposes an extension success shape for clients that opt into it.
+Initialize advertises `_meta.zuno.steering`, and every turn-scoped
+`session/update` carries `_meta.zuno.turnId`. The client can send:
+
+```json
+{
+  "method": "session/steer",
+  "params": {
+    "sessionId": "ses_x",
+    "expectedTurnId": "turn_x",
+    "messageId": "msg_optional",
+    "prompt": [{ "type": "text", "text": "Adjust the active work." }]
+  }
+}
+```
+
+Success returns immediately with `turnId`, `inputId`, `admittedSequence`,
+`admission: "steered"`, and `delivery: "steer"`. The expected-turn check and
+queue insertion share the live-turn registry lock, so a handoff cannot steer a
+successor turn. Rejections use `-32002`; `data.reason` is one of
+`noActiveTurn`, `expectedTurnMismatch`, `activeTurnNotSteerable`, or
+`emptyInput`. Commands remain idle-only. The ordinary `session/prompt`
+`-32001` result and standards-compliant `session/cancel` behavior are unchanged.
 
 A slash command is different. It is resolved against the host command catalog
 and runs as its own turn, so it cannot be steered into work already in flight.

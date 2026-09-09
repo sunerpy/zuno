@@ -597,10 +597,18 @@ Every new tool part records the exact provider-visible schema identity beside th
 Before a request, retained history from earlier turns is checked against the current
 post-hook definitions. Current-turn tool continuations always keep their native pair so
 an unknown or refused call can receive its protocol-complete result. For earlier turns, a
-matching declaration preserves native tool-use/result protocol. A missing tool, a changed
-schema, or an unreadable identity is replayed as inert JSON text for that request and
-emits `historical_tool_declaration_repaired`; durable history is not rewritten and an
-unavailable implementation is never advertised as callable merely to satisfy replay.
+matching replay schema preserves native tool-use/result protocol. Replay hashes remove
+annotation-only JSON Schema keys such as descriptions, titles, examples, comments, and
+defaults while retaining required fields, types, enums, and every other value constraint.
+Older identities without a replay hash still require exact description and schema hashes.
+A missing tool, a structurally changed schema, or an unreadable identity is replayed as
+bounded inert JSON text for that request; arguments and results are UTF-8-safely bounded
+per field and across the request before the fallback object is serialized. Durable
+history is not rewritten and an unavailable implementation is never advertised as
+callable merely to satisfy replay.
+An older Zuno binary does not recognize the additive `replaySchemaSha256` field and
+therefore fails closed to inert history after a downgrade; the stored call is not
+corrupted or rewritten.
 For released rows without an identity, Zuno first recovers the exact hashes from the
 immutable provider-request Attempt keyed by the assistant message; if that proof is
 absent, the call is downgraded even when a same-named tool is currently active. This
@@ -608,6 +616,14 @@ closes the `missing_tool_declaration` failure mode without silently binding an o
 to a new schema. Tool-free internal compaction applies the same rule more broadly:
 tool calls and results enter the summarizer as bounded inert JSON text, never as native
 function protocol without declarations.
+
+Goal, Plan, and Todo state tools use `AuthoritativeState` history policy. When one of
+their old declarations is incompatible, its historical call/result pair is omitted
+instead of converted into model-visible prose; the current typed state comes from
+`runtime.work_state`. Generic tools retain exact-declaration fallback behavior. Replay
+repair notices have diagnostic audience: they are de-duplicated per session, context
+epoch, tool, and stored/current identity, written to structured logs, and excluded from
+ACP thought chunks, TUI conversation rows, and HTTP event history.
 
 MCP and extension tools therefore do not flow unconditionally into every child. An
 exact schema must be present in the parent Attempt and no later allowlist or explicit
@@ -1491,6 +1507,9 @@ Jobs with an unconsumed `nextStep` report, pending report identities and states,
 and the latest prior prompt receipt id. Job entries expose their versioned
 `workContext` when present. One deferred SQLite transaction reads all of those
 tables from the same snapshot.
+This includes the first provider request of an automatic Goal continuation; that
+path uses the same projection as an ordinary user turn rather than relying on old
+state-tool history.
 Each collection is capped at 64 entries and the complete rendered section is
 capped at 16 KiB. Verbose text is UTF-8-safely shortened before whole tail
 entries are omitted; omitted counts remain explicit and authoritative identity
@@ -1614,6 +1633,12 @@ provider, and catalog model. Retained user history supplies only the causal tran
 and grants no authority. It is never rewritten to make a reconfigured host look historical,
 and its old Agent/model fields cannot route an automatic Goal turn. Ordinary user turns
 continue to use their own message identity.
+
+Goal completion reads Plan step statuses through the same shared type as the Plan
+writer. `completed` and `superseded` are terminal; missing, unknown, or legacy
+`cancelled` values fail closed as durable Plan corruption. A model update that settles
+criteria and completes the Goal performs both in one transaction, so any audit refusal
+rolls the checklist and Goal revision back together.
 
 The engine appends one `session.turn.started.1` event after resolving the current identity and
 before provider dispatch. It records `turnTrigger`, `anchorMessageID`, Agent, provider, and

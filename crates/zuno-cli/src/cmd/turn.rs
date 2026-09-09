@@ -54,7 +54,7 @@ use zuno_engine::driver::AgentDriver;
 #[cfg(test)]
 use zuno_engine::r#loop::hydrate_retained_history;
 use zuno_engine::r#loop::{
-    AgentModelResolver, DynamicContextRefresher, NoticeSeverity, ResolvedAgent,
+    AgentModelResolver, DynamicContextRefresher, NoticeAudience, NoticeSeverity, ResolvedAgent,
     ResolvedModel as EngineModel, RunTurnRequest, ToolConcurrencyLimit, ToolDispatcher as _,
     ToolFailureRecovery, TurnContext, TurnError, TurnEvent, TurnEventSender, TurnExecutionIdentity,
     TurnOutcome, TurnRecovery, TurnStart,
@@ -8310,6 +8310,7 @@ impl TurnHost {
         {
             events
                 .publish(TurnEvent::Notice {
+                    audience: NoticeAudience::User,
                     severity: NoticeSeverity::Info,
                     code: "report_deferred_by_goal_state".to_owned(),
                     detail: "Settled background reports were committed to durable history, but \
@@ -8812,7 +8813,7 @@ impl TurnHost {
         let planning = self
             .ensure_durable_plan(&goal.objective, PlanningInputSource::GoalObjective, None)
             .map_err(TurnFailure::host)?;
-        let mut dynamic_context = dynamic_context_from_goal_entry(prepared.entry());
+        let mut dynamic_context = self.goal_dynamic_context().map_err(TurnFailure::host)?;
         if let Some(instruction) = planning_runtime_instruction(&planning) {
             dynamic_context = dynamic_context.with_runtime_instruction(instruction);
         }
@@ -9216,6 +9217,7 @@ impl TurnHost {
                 self.learning_retrieval_skip_noticed = true;
                 events
                     .publish(TurnEvent::Notice {
+                        audience: NoticeAudience::User,
                         severity: NoticeSeverity::Warning,
                         code: "learning.retrieval_skipped".to_owned(),
                         detail: reason.clone(),
@@ -9244,6 +9246,7 @@ impl TurnHost {
         .with_attachments(Arc::clone(&self.attachments))
         .with_dynamic_context_refresher(dynamic_context_refresher)
         .with_tool_concurrency(self.tool_concurrency)
+        .with_run_registry(self.runs.clone())
         // Installed on every turn, not only a goal-driven one. The policy is documented
         // to leave a session with no goal, or a goal with no token budget, alone, so
         // installing it imposes no limit nobody set — while a conditional install would
@@ -11587,6 +11590,7 @@ async fn report_prelude(
     for (source, reason) in instructions.degraded() {
         events
             .publish(TurnEvent::Notice {
+                audience: NoticeAudience::User,
                 severity: NoticeSeverity::Warning,
                 code: "instruction.not_in_force".to_owned(),
                 detail: format!("{reason}; none of the rules in {source} apply to this turn"),

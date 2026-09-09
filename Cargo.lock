@@ -7582,6 +7582,7 @@ dependencies = [
  "zuno-llm",
  "zuno-paths",
  "zuno-tool",
+ "zuno-types",
  "zuno-watch",
 ]
 
@@ -8242,6 +8243,7 @@ dependencies = [
 name = "zuno-types"
 version = "0.10.22"
 dependencies = [
+ "schemars 1.2.2",
  "serde",
  "serde_json",
 ]

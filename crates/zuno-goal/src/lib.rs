@@ -116,9 +116,10 @@ pub use crate::spill::{
 };
 pub use crate::status::{GoalStatus, ModelStatus, StatusOwner, SystemStatus};
 pub use crate::store::{
-    AUXILIARY_SCHEMA, CriterionOutcome, FailureStreak, Goal, GoalCreation, GoalCriterion,
-    GoalCriterionStatus, GoalHistoryEntry, GoalHumanRequestOrigin, GoalKind, GoalStore,
-    OBJECTIVE_SPILL_DIRECTORY, SCHEMA, TABLE, UsageRecorded, default_spill_dir,
+    AUXILIARY_SCHEMA, CriterionOutcome, CriterionSatisfaction, CriterionWaiver, FailureStreak,
+    Goal, GoalCreation, GoalCriterion, GoalCriterionStatus, GoalHistoryEntry,
+    GoalHumanRequestOrigin, GoalKind, GoalStore, OBJECTIVE_SPILL_DIRECTORY, SCHEMA, TABLE,
+    UsageRecorded, default_spill_dir,
 };
 pub use crate::tools::{
     CAPABILITY_CLAIM_TOOL_ID, CREATE_GOAL_TOOL_ID, CapabilityClaimParams, CapabilityClaimTool,

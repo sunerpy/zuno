@@ -548,6 +548,7 @@ mod tests {
                 session_id: "ses-child".to_owned(),
                 event: TurnEvent::TurnStarted {
                     session_id: format!("ses-{index}"),
+                    turn_id: format!("turn-{index}"),
                 },
             });
         }

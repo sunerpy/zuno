@@ -25,16 +25,18 @@ pub use replay::{
 };
 pub use routing::{AcpSessionRoute, RoutedSession};
 pub use transport::{
-    Agent, ClientConnection, RequestId, RpcError, SESSION_BUSY_CODE, ServeError, serve_stdio,
+    Agent, ClientConnection, RequestId, RpcError, SESSION_BUSY_CODE, STEER_REJECTED_CODE,
+    ServeError, serve_stdio,
 };
 
-pub const IMPLEMENTED_METHODS: [&str; 11] = [
+pub const IMPLEMENTED_METHODS: [&str; 12] = [
     "initialize",
     "session/new",
     "session/load",
     "session/set_mode",
     "session/set_config_option",
     "session/prompt",
+    "session/steer",
     "session/cancel",
     "session/list",
     "session/delete",

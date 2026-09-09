@@ -1195,6 +1195,7 @@ async fn app_event_loop_consumes_both_bounded_channels_and_resize_relays_out() {
     engine_tx
         .send(TurnEvent::TurnStarted {
             session_id: "ses_1".to_owned(),
+            turn_id: "turn_1".to_owned(),
         })
         .await
         .expect("engine event channel is open");
@@ -1301,6 +1302,7 @@ async fn app_coalesces_queued_engine_redraws_into_one_frame() {
         engine_tx
             .send(TurnEvent::TurnStarted {
                 session_id: format!("ses_{index}"),
+                turn_id: format!("turn_{index}"),
             })
             .await
             .expect("the queued burst fits the bounded engine channel");
@@ -1364,6 +1366,7 @@ async fn app_streaming_burst_never_exceeds_the_frame_rate_ceiling() {
             burst_tx
                 .send(TurnEvent::TurnStarted {
                     session_id: format!("ses_{index}"),
+                    turn_id: format!("turn_{index}"),
                 })
                 .await
                 .expect("engine event channel is open");
@@ -1433,6 +1436,7 @@ async fn app_slow_frame_does_not_trigger_a_catch_up_burst() {
             burst_tx
                 .send(TurnEvent::TurnStarted {
                     session_id: format!("ses_slow_{index}"),
+                    turn_id: format!("turn_slow_{index}"),
                 })
                 .await
                 .expect("engine event channel is open");
@@ -1630,6 +1634,7 @@ async fn app_keystrokes_draw_immediately_instead_of_waiting_for_the_stream_caden
     engine_tx
         .send(TurnEvent::TurnStarted {
             session_id: "ses_typing".to_owned(),
+            turn_id: "turn_typing".to_owned(),
         })
         .await
         .expect("engine event channel is open");
@@ -1689,6 +1694,7 @@ async fn app_idle_schedule_backs_off_and_activity_wakes_it() {
     schedule.record_engine_activity(
         &TurnEvent::TurnStarted {
             session_id: "ses_awake".to_owned(),
+            turn_id: "turn_awake".to_owned(),
         },
         activity,
     );
@@ -1721,6 +1727,7 @@ async fn app_active_turn_keeps_animating_without_more_engine_events() {
     engine_tx
         .send(TurnEvent::TurnStarted {
             session_id: "ses_animation_clock".to_owned(),
+            turn_id: "turn_animation_clock".to_owned(),
         })
         .await
         .expect("engine event channel is open");
@@ -1848,6 +1855,7 @@ async fn app_dirty_timer_never_draws_while_a_terminal_lease_is_held() {
     engine_tx
         .send(TurnEvent::TurnStarted {
             session_id: "ses_dirty_lease".to_owned(),
+            turn_id: "turn_dirty_lease".to_owned(),
         })
         .await
         .expect("engine event channel is open");
@@ -1906,6 +1914,7 @@ async fn app_event_loop_defers_engine_rendering_while_a_lease_owns_the_tty() {
     engine_tx
         .send(TurnEvent::TurnStarted {
             session_id: "ses_deferred".to_owned(),
+            turn_id: "turn_deferred".to_owned(),
         })
         .await
         .expect("engine event channel is open");

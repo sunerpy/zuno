@@ -313,6 +313,9 @@ pub struct ToolSchemaIdentity {
     pub name: String,
     pub description_sha256: String,
     pub schema_sha256: String,
+    /// Hash of the argument constraints after provider-only annotations are removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_schema_sha256: Option<String>,
     pub ui_intent: String,
 }
 
@@ -405,6 +408,45 @@ pub fn sha256_json(value: &Value) -> String {
     let bytes = serde_json::to_vec(&canonical)
         .expect("serializing an owned JSON value to bytes cannot fail");
     hex::encode(Sha256::digest(bytes))
+}
+
+/// Hash the argument constraints that determine whether a historical call remains valid.
+///
+/// Descriptions and other provider annotations may change how a tool is explained or
+/// displayed, but cannot change the already-recorded arguments. Removing them keeps
+/// historical protocol blocks native across documentation-only edits while retaining
+/// every JSON Schema keyword that constrains accepted values.
+#[must_use]
+pub fn replay_schema_sha256(value: &Value) -> String {
+    sha256_json(&normalize_replay_schema(value.clone()))
+}
+
+fn normalize_replay_schema(value: Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(normalize_replay_schema).collect())
+        }
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .filter(|(key, _)| {
+                    !matches!(
+                        key.as_str(),
+                        "description"
+                            | "title"
+                            | "examples"
+                            | "$comment"
+                            | "deprecated"
+                            | "readOnly"
+                            | "writeOnly"
+                            | "default"
+                    )
+                })
+                .map(|(key, value)| (key, normalize_replay_schema(value)))
+                .collect(),
+        ),
+        scalar => scalar,
+    }
 }
 
 fn snapshot_identity<T: Serialize>(
@@ -561,6 +603,9 @@ mod tests {
                 name: "read".to_owned(),
                 description_sha256: sha256_text("read files"),
                 schema_sha256: sha256_json(&serde_json::json!({"type":"object"})),
+                replay_schema_sha256: Some(replay_schema_sha256(
+                    &serde_json::json!({"type":"object"}),
+                )),
                 ui_intent: "generic".to_owned(),
             }],
         }
@@ -620,6 +665,53 @@ mod tests {
             "required":["path"]
         }));
         assert_ne!(identity, tool.identity().expect("tool identity"));
+    }
+
+    #[test]
+    fn replay_schema_hash_ignores_annotations_but_keeps_constraints() {
+        let original = serde_json::json!({
+            "type": "object",
+            "description": "old",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["safe", "fast"],
+                    "default": "safe",
+                    "description": "old mode help"
+                }
+            },
+            "required": ["mode"]
+        });
+        let annotated = serde_json::json!({
+            "title": "New title",
+            "type": "object",
+            "description": "new",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["safe", "fast"],
+                    "examples": ["fast"],
+                    "description": "new mode help"
+                }
+            },
+            "required": ["mode"]
+        });
+        assert_eq!(
+            replay_schema_sha256(&original),
+            replay_schema_sha256(&annotated)
+        );
+
+        let structural = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["safe"]}
+            },
+            "required": ["mode"]
+        });
+        assert_ne!(
+            replay_schema_sha256(&original),
+            replay_schema_sha256(&structural)
+        );
     }
 
     #[test]

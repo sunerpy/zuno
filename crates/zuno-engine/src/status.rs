@@ -75,6 +75,23 @@ pub struct SessionNotActive {
     session_id: String,
 }
 
+/// Why an explicit steer could not target the caller's expected engine turn.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExpectedTurnError {
+    #[error("session `{session_id}` has no active turn")]
+    NoActiveTurn { session_id: String },
+    #[error("session `{session_id}` has an active lease that has not entered a steerable turn")]
+    ActiveTurnNotIdentified { session_id: String },
+    #[error(
+        "session `{session_id}` is running turn `{actual_turn_id}`, not expected turn `{expected_turn_id}`"
+    )]
+    Mismatch {
+        session_id: String,
+        expected_turn_id: String,
+        actual_turn_id: String,
+    },
+}
+
 impl SessionNotActive {
     #[must_use]
     pub fn session_id(&self) -> &str {
@@ -100,11 +117,22 @@ struct RegistryState {
     active: HashMap<String, ActiveSession>,
     recovering: HashSet<String>,
     pending_interrupts: HashMap<String, HardInterruptRequest>,
+    diagnostic_notices: HashMap<String, HashSet<DiagnosticNoticeKey>>,
+}
+
+/// Identity of one process-local diagnostic notice.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DiagnosticNoticeKey {
+    pub context_epoch: i64,
+    pub tool_name: String,
+    pub stored_identity_sha256: String,
+    pub current_identity_sha256: String,
 }
 
 #[derive(Debug)]
 struct ActiveSession {
     token: u64,
+    turn_id: Option<String>,
     interrupt: HardInterruptSignal,
     soft_interrupt: InterruptSignal,
     soft_interrupts: VecDeque<SoftInterruptMessage>,
@@ -147,6 +175,7 @@ impl SessionRunRegistry {
             session_id.clone(),
             ActiveSession {
                 token,
+                turn_id: None,
                 interrupt: interrupt.clone(),
                 soft_interrupt: soft_interrupt.clone(),
                 soft_interrupts: VecDeque::new(),
@@ -205,10 +234,31 @@ impl SessionRunRegistry {
         }
     }
 
+    /// Current engine turn identity, once the live lease has entered `run_turn`.
+    #[must_use]
+    pub fn active_turn_id(&self, session_id: &str) -> Option<String> {
+        self.lock_state()
+            .active
+            .get(session_id)
+            .and_then(|active| active.turn_id.clone())
+    }
+
     /// Returns a stable snapshot of every process-local active session id.
     #[must_use]
     pub fn active_sessions(&self) -> BTreeSet<String> {
         self.lock_state().active.keys().cloned().collect()
+    }
+
+    /// Admit one session-scoped diagnostic identity exactly once in this process.
+    ///
+    /// Context compaction or either declaration identity changing creates a new key
+    /// and therefore a new diagnostic. Process restart intentionally resets the set.
+    pub fn admit_diagnostic_notice(&self, session_id: &str, key: DiagnosticNoticeKey) -> bool {
+        self.lock_state()
+            .diagnostic_notices
+            .entry(session_id.to_owned())
+            .or_default()
+            .insert(key)
     }
 
     /// Wait until `session_id` has no live turn without polling.
@@ -294,6 +344,60 @@ impl SessionRunRegistry {
         active.soft_interrupts.push_back(message);
         active.soft_interrupt.fire();
         Ok(())
+    }
+
+    /// Queue a soft interruption only while the expected engine turn still owns the lease.
+    pub fn queue_soft_interrupt_for_turn(
+        &self,
+        session_id: &str,
+        expected_turn_id: &str,
+        message: SoftInterruptMessage,
+    ) -> Result<(), ExpectedTurnError> {
+        let mut state = self.lock_state();
+        let active =
+            state
+                .active
+                .get_mut(session_id)
+                .ok_or_else(|| ExpectedTurnError::NoActiveTurn {
+                    session_id: session_id.to_owned(),
+                })?;
+        let actual_turn_id = active.turn_id.as_deref().ok_or_else(|| {
+            ExpectedTurnError::ActiveTurnNotIdentified {
+                session_id: session_id.to_owned(),
+            }
+        })?;
+        if actual_turn_id != expected_turn_id {
+            return Err(ExpectedTurnError::Mismatch {
+                session_id: session_id.to_owned(),
+                expected_turn_id: expected_turn_id.to_owned(),
+                actual_turn_id: actual_turn_id.to_owned(),
+            });
+        }
+        active.soft_interrupts.push_back(message);
+        active.soft_interrupt.fire();
+        Ok(())
+    }
+
+    fn set_turn_id(&self, session_id: &str, token: u64, turn_id: &str) -> bool {
+        let mut state = self.lock_state();
+        let Some(active) = state.active.get_mut(session_id) else {
+            return false;
+        };
+        if active.token != token {
+            return false;
+        }
+        active.turn_id = Some(turn_id.to_owned());
+        true
+    }
+
+    fn clear_turn_id(&self, session_id: &str, token: u64, turn_id: &str) {
+        let mut state = self.lock_state();
+        let Some(active) = state.active.get_mut(session_id) else {
+            return;
+        };
+        if active.token == token && active.turn_id.as_deref() == Some(turn_id) {
+            active.turn_id = None;
+        }
     }
 
     /// Remove one not-yet-delivered soft interrupt by its durable input id.
@@ -480,6 +584,19 @@ impl SessionRunGuard {
         &self.soft_interrupt
     }
 
+    /// Publish the engine turn id under this exact live lease.
+    #[must_use]
+    pub fn mark_turn_started(&self, turn_id: &str) -> Option<SessionTurnIdentityGuard> {
+        self.registry
+            .set_turn_id(&self.session_id, self.token, turn_id)
+            .then(|| SessionTurnIdentityGuard {
+                registry: self.registry.clone(),
+                session_id: self.session_id.clone(),
+                token: self.token,
+                turn_id: turn_id.to_owned(),
+            })
+    }
+
     /// Drains messages queued before this safe point in FIFO order.
     ///
     /// The caller injects `messages` into the transcript. When `action` is
@@ -489,6 +606,22 @@ impl SessionRunGuard {
     pub fn take_soft_interrupts_at_safe_point(&self) -> SoftInterruptDelivery {
         self.registry
             .take_soft_interrupts(&self.session_id, self.token)
+    }
+}
+
+/// Clears one engine turn id before the outer session lease is released.
+#[derive(Debug)]
+pub struct SessionTurnIdentityGuard {
+    registry: SessionRunRegistry,
+    session_id: String,
+    token: u64,
+    turn_id: String,
+}
+
+impl Drop for SessionTurnIdentityGuard {
+    fn drop(&mut self) {
+        self.registry
+            .clear_turn_id(&self.session_id, self.token, &self.turn_id);
     }
 }
 

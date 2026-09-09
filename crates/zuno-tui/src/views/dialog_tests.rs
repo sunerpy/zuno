@@ -732,6 +732,7 @@ async fn views_dialog_stack_survives_a_resize_without_losing_events() {
     engine_tx
         .send(TurnEvent::TurnStarted {
             session_id: String::from("ses"),
+            turn_id: String::from("turn"),
         })
         .await
         .expect("open");
@@ -911,6 +912,7 @@ fn views_observed_base_counts_both_event_families() {
     let mut base = ObservedBase::new(TranscriptView::new(ViewContext::defaults()));
     base.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
         session_id: String::from("s"),
+        turn_id: String::from("turn"),
     }));
     base.handle_event(&AppEvent::Terminal(TerminalEvent::Resize {
         width: 1,

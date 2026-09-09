@@ -7,6 +7,7 @@ use crate::{
     CapabilityClaim, CapabilityClaimOutcome, CapabilityClaimState, Goal, GoalCriterion,
     GoalCriterionStatus, GoalError, GoalStore, ModelStatus, NewCapabilityClaim,
 };
+use crate::{CriterionSatisfaction, CriterionWaiver};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -15,8 +16,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use zuno_error::ToolError;
 use zuno_tool::{
-    METADATA_HUMAN_REQUEST_ID_KEY, Tool, ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy,
-    TypedTool, erase,
+    HistoryPolicy, METADATA_HUMAN_REQUEST_ID_KEY, Tool, ToolContext, ToolEffect, ToolOutput,
+    ToolReplayPolicy, TypedTool, erase,
 };
 
 /// Wire name of the goal reader.
@@ -214,6 +215,10 @@ impl TypedTool for GetGoalTool {
         ToolReplayPolicy::Safe
     }
 
+    fn history_policy(&self) -> HistoryPolicy {
+        HistoryPolicy::AuthoritativeState
+    }
+
     fn effect(&self, _args: &Value) -> ToolEffect {
         ToolEffect::ReadOnly
     }
@@ -313,6 +318,10 @@ impl TypedTool for UpdateGoalTool {
         UPDATE_DESCRIPTION
     }
 
+    fn history_policy(&self) -> HistoryPolicy {
+        HistoryPolicy::AuthoritativeState
+    }
+
     async fn run(
         &self,
         params: UpdateGoalParams,
@@ -374,10 +383,55 @@ impl TypedTool for UpdateGoalTool {
             return current_goal_output(&store, &session_id, Some(goal)).await;
         }
         let status = status.expect("non-progress Goal updates are terminal");
-        // Evidence first, status second, in one call: a model that verified its work
-        // and wants to finish should not have to choose which of the two writes to
-        // make, and the completion audit that follows must see the citations this
-        // call carries.
+        validate_criteria_updates(&params.satisfy_criteria, &params.waive_criteria)?;
+        if matches!(status, ModelStatus::Complete) {
+            if params.blocking_condition.is_some() {
+                return Err(invalid(
+                    UPDATE_GOAL_TOOL_ID,
+                    "blocking_condition is only valid when status is blocked",
+                ));
+            }
+            let satisfy = params
+                .satisfy_criteria
+                .into_iter()
+                .map(|criterion| CriterionSatisfaction {
+                    criterion_id: criterion.criterion_id,
+                    receipt_id: criterion.receipt_id,
+                })
+                .collect::<Vec<_>>();
+            let waive = params
+                .waive_criteria
+                .into_iter()
+                .map(|criterion| CriterionWaiver {
+                    criterion_id: criterion.criterion_id,
+                    reason: criterion.reason,
+                })
+                .collect::<Vec<_>>();
+            let status_store = Arc::clone(&store);
+            let status_session_id = session_id.clone();
+            let expected_revision = params.expected_revision;
+            let goal = tokio::task::spawn_blocking(move || {
+                status_store.complete_as_model_with_criteria_checked(
+                    &status_session_id,
+                    expected_revision,
+                    &satisfy,
+                    &waive,
+                )
+            })
+            .await
+            .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
+            .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
+            if goal.is_none() {
+                return Err(invalid(
+                    UPDATE_GOAL_TOOL_ID,
+                    "cannot update goal because this session has no goal",
+                ));
+            }
+            return current_goal_output(&store, &session_id, goal).await;
+        }
+
+        // A blocked report retains the accepted criterion updates even though the
+        // Goal stays unfinished; only completion claims are all-or-nothing.
         let revision = apply_criteria_updates(
             &store,
             &session_id,
@@ -430,15 +484,7 @@ impl TypedTool for UpdateGoalTool {
         let status_store = Arc::clone(&store);
         let status_session_id = session_id.clone();
         let goal = tokio::task::spawn_blocking(move || {
-            if matches!(status, ModelStatus::Complete) {
-                // The model's own audit, not the human's: `complete_checked` exempts a
-                // criteria-free goal from the capability ledger because no CLI verb clears
-                // a claim, and a tool must not claim that exemption for the run that wrote
-                // the claim.
-                status_store.complete_as_model_checked(&status_session_id, revision)
-            } else {
-                status_store.update_status_as_model_checked(&status_session_id, status, revision)
-            }
+            status_store.update_status_as_model_checked(&status_session_id, status, revision)
         })
         .await
         .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
@@ -674,21 +720,7 @@ async fn apply_criteria_updates(
     if satisfy.is_empty() && waive.is_empty() {
         return Ok(expected_revision);
     }
-    for satisfied in &satisfy {
-        let criterion_id = satisfied.criterion_id.trim();
-        if waive
-            .iter()
-            .any(|waived| waived.criterion_id.trim() == criterion_id)
-        {
-            return Err(invalid(
-                UPDATE_GOAL_TOOL_ID,
-                &format!(
-                    "criterion `{criterion_id}` appears in both satisfy_criteria and \
-                     waive_criteria; cite evidence or record a waiver, not both"
-                ),
-            ));
-        }
-    }
+    validate_criteria_updates(&satisfy, &waive)?;
     let at_ms = crate::store::now_ms().map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?;
     let mut revision = expected_revision;
     for satisfied in satisfy {
@@ -726,6 +758,35 @@ async fn apply_criteria_updates(
         revision = outcome.goal.revision;
     }
     Ok(revision)
+}
+
+fn validate_criteria_updates(
+    satisfy: &[SatisfiedCriterion],
+    waive: &[WaivedCriterion],
+) -> Result<(), ToolError> {
+    let mut seen = HashSet::new();
+    for criterion_id in satisfy
+        .iter()
+        .map(|criterion| criterion.criterion_id.trim())
+        .chain(waive.iter().map(|criterion| criterion.criterion_id.trim()))
+    {
+        if criterion_id.is_empty() {
+            return Err(invalid(
+                UPDATE_GOAL_TOOL_ID,
+                "criterion ids in satisfy_criteria and waive_criteria must not be empty",
+            ));
+        }
+        if !seen.insert(criterion_id) {
+            return Err(invalid(
+                UPDATE_GOAL_TOOL_ID,
+                &format!(
+                    "criterion `{criterion_id}` appears more than once across satisfy_criteria \
+                     and waive_criteria; each criterion may have exactly one outcome per update"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Render a goal together with the checklist as it stands after the write.

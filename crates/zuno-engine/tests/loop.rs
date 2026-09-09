@@ -435,6 +435,7 @@ impl ProgressiveDispatcher {
                 "additionalProperties": true
             }),
             ui_intent: ToolUiIntent::Generic,
+            history_policy: zuno_tool::HistoryPolicy::ExactDeclaration,
         }
     }
 }
@@ -512,6 +513,7 @@ impl ToolDispatcher for FakeDispatcher {
                     "required": ["text"]
                 }),
                 ui_intent: zuno_tool::ToolUiIntent::Generic,
+                history_policy: zuno_tool::HistoryPolicy::ExactDeclaration,
             }],
             McpToolStatus::Ready,
         )
@@ -549,6 +551,7 @@ impl ToolDispatcher for BlockingToolDispatcher {
                     "required": ["text"]
                 }),
                 ui_intent: zuno_tool::ToolUiIntent::Generic,
+                history_policy: zuno_tool::HistoryPolicy::ExactDeclaration,
             }],
             McpToolStatus::Ready,
         )
@@ -2379,6 +2382,7 @@ async fn runtime_policy_is_rendered_from_the_post_hook_tool_subset() {
         description: format!("{id} test tool"),
         parameters: json!({"type": "object"}),
         ui_intent: ToolUiIntent::Generic,
+        history_policy: zuno_tool::HistoryPolicy::ExactDeclaration,
     };
     let dispatcher = SnapshotDispatcher {
         definitions: vec![
@@ -3272,6 +3276,7 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
     vec![
         TurnEvent::TurnStarted {
             session_id: SESSION_ID.to_owned(),
+            turn_id: "turn-full".to_owned(),
         },
         TurnEvent::AgentResolved {
             step: 1,
@@ -5129,6 +5134,7 @@ impl ToolDispatcher for ObjectDeletingDispatcher {
                     "required": ["text"]
                 }),
                 ui_intent: ToolUiIntent::Generic,
+                history_policy: zuno_tool::HistoryPolicy::ExactDeclaration,
             }],
             McpToolStatus::Ready,
         )
@@ -6030,6 +6036,7 @@ async fn loop_head_interrupt_starts_no_provider_request() {
         vec![
             TurnEvent::TurnStarted {
                 session_id: SESSION_ID.to_owned(),
+                turn_id: "turn-head".to_owned(),
             },
             TurnEvent::TurnInterrupted {
                 assistant_message_id: None,
@@ -6818,6 +6825,7 @@ async fn a_multi_step_turn_yields_for_compaction_after_crossing_the_context_thre
                     severity: NoticeSeverity::Info,
                     code,
                     detail,
+                    ..
                 } if code == "context.compact"
                     && detail.contains("120 tokens")
                     && detail.contains("threshold of 110")
@@ -6903,6 +6911,7 @@ async fn a_spent_token_allowance_stops_the_turn_before_the_first_request() {
     );
     assert!(
         run.events.contains(&TurnEvent::Notice {
+            audience: zuno_engine::r#loop::NoticeAudience::User,
             severity: NoticeSeverity::Warning,
             code: "budget.token_budget".to_owned(),
             detail: "the session token allowance is spent".to_owned(),
@@ -6957,6 +6966,7 @@ async fn a_token_allowance_spent_by_the_first_response_stops_the_turn_before_the
     assert_eq!(policy.observed_after().len(), 1);
     assert!(
         run.events.contains(&TurnEvent::Notice {
+            audience: zuno_engine::r#loop::NoticeAudience::User,
             severity: NoticeSeverity::Warning,
             code: "budget.token_budget".to_owned(),
             detail: "the first step spent what was left".to_owned(),
@@ -7051,6 +7061,7 @@ async fn a_budget_policy_that_asks_for_compaction_ends_the_turn_with_a_compactio
     );
     assert!(
         run.events.contains(&TurnEvent::Notice {
+            audience: zuno_engine::r#loop::NoticeAudience::User,
             severity: NoticeSeverity::Info,
             code: "budget.compact".to_owned(),
             detail: "the transcript outgrew its window mid-turn".to_owned(),
@@ -8012,6 +8023,7 @@ async fn an_obligation_the_repair_records_stops_the_recovering_turn_before_its_f
     );
     assert!(
         events.contains(&TurnEvent::Notice {
+            audience: zuno_engine::r#loop::NoticeAudience::User,
             severity: NoticeSeverity::Warning,
             code: "budget.uncertain_side_effect".to_owned(),
             detail: "1 tool call(s) await inspection".to_owned(),

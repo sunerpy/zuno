@@ -6707,6 +6707,33 @@ fn await_responses(
     responses
 }
 
+fn await_turn_id(
+    stdout: &mut BufReader<ChildStdout>,
+    session_id: &str,
+    updates: &mut Vec<Value>,
+) -> String {
+    loop {
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read ACP frame");
+        assert!(!line.is_empty(), "ACP closed before publishing a turn id");
+        let frame: Value = serde_json::from_str(&line).expect("ACP frame JSON");
+        assert_eq!(
+            frame.get("method").and_then(Value::as_str),
+            Some("session/update"),
+            "unexpected frame while waiting for a turn id: {frame}"
+        );
+        assert_eq!(frame["params"]["sessionId"], session_id);
+        let update = frame["params"]["update"].clone();
+        let turn_id = update["_meta"]["zuno"]["turnId"]
+            .as_str()
+            .map(str::to_owned);
+        updates.push(update);
+        if let Some(turn_id) = turn_id {
+            return turn_id;
+        }
+    }
+}
+
 /// Wait until `count` turn requests have reached the gated provider.
 async fn await_turn_requests(turns: &AtomicUsize, count: usize) {
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -6926,6 +6953,166 @@ async fn acp_admits_a_second_prompt_durably_and_steers_it_into_the_live_turn() {
     let settled = durable_input(root.path(), &session_id, &input_id);
     assert_eq!(settled.state, zuno_db::inbox::SubmissionState::Consumed);
     assert_eq!(settled.delivery, zuno_db::inbox::InputDelivery::Steer);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acp_session_steer_targets_one_live_turn_and_returns_a_success_shape() {
+    let provider = MockServer::start().await;
+    let turns = Arc::new(AtomicUsize::new(0));
+    let (responder, release) = GatedTurnResponder::new(Arc::clone(&turns));
+    Mock::given(method("POST"))
+        .respond_with(responder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let config = config_with_second_model(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(acp_stderr())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    let initialized = request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    assert_eq!(
+        initialized["_meta"]["zuno"]["steering"]["method"],
+        "session/steer"
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    materialize_acp_fixture_session(root.path(), &session_id, "test-model", None);
+
+    let idle = request_failure(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/steer",
+        json!({
+            "sessionId": &session_id,
+            "expectedTurnId": "turn_missing",
+            "prompt": [{"type": "text", "text": "cannot steer idle work"}]
+        }),
+    );
+    assert_eq!(idle["code"], -32002);
+    assert_eq!(idle["data"]["reason"], "noActiveTurn");
+
+    send_request(
+        &mut stdin,
+        4,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type": "text", "text": "Start the explicit steering turn."}]
+        }),
+    );
+    await_turn_requests(&turns, 1).await;
+    let mut updates = Vec::new();
+    let turn_id = await_turn_id(&mut stdout, &session_id, &mut updates);
+
+    let mismatch = request_failure(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/steer",
+        json!({
+            "sessionId": &session_id,
+            "expectedTurnId": "turn_stale",
+            "prompt": [{"type": "text", "text": "wrong turn"}]
+        }),
+    );
+    assert_eq!(mismatch["code"], -32002);
+    assert_eq!(mismatch["data"]["reason"], "expectedTurnMismatch");
+    assert_eq!(mismatch["data"]["actualTurnId"], turn_id);
+
+    let empty = request_failure(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "session/steer",
+        json!({
+            "sessionId": &session_id,
+            "expectedTurnId": &turn_id,
+            "prompt": []
+        }),
+    );
+    assert_eq!(empty["code"], -32002);
+    assert_eq!(empty["data"]["reason"], "emptyInput");
+
+    let command = request_failure(
+        &mut stdin,
+        &mut stdout,
+        7,
+        "session/steer",
+        json!({
+            "sessionId": &session_id,
+            "expectedTurnId": &turn_id,
+            "prompt": [{"type": "text", "text": "/compact"}]
+        }),
+    );
+    assert_eq!(command["code"], -32002);
+    assert_eq!(command["data"]["reason"], "activeTurnNotSteerable");
+
+    let steered = request(
+        &mut stdin,
+        &mut stdout,
+        8,
+        "session/steer",
+        json!({
+            "sessionId": &session_id,
+            "expectedTurnId": &turn_id,
+            "messageId": "msg_explicit_steer",
+            "prompt": [{"type": "text", "text": "Steer this exact turn without cancellation."}]
+        }),
+    );
+    assert_eq!(steered["turnId"], turn_id);
+    assert_eq!(steered["inputId"], "msg_explicit_steer");
+    assert_eq!(steered["admission"], "steered");
+    assert_eq!(steered["delivery"], "steer");
+
+    let _released = release.send(());
+    let completed = await_response(&mut stdout, 4, &mut updates);
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+    assert!(
+        updates.iter().all(|update| {
+            update["_meta"]["zuno"]["turnId"].is_null()
+                || update["_meta"]["zuno"]["turnId"] == turn_id
+        }),
+        "turn-scoped updates carried inconsistent ids: {updates:?}"
+    );
+
+    let received = provider
+        .received_requests()
+        .await
+        .expect("provider requests");
+    assert!(
+        received.iter().any(|request| {
+            String::from_utf8_lossy(&request.body)
+                .contains("Steer this exact turn without cancellation.")
+        }),
+        "the explicit steer never reached the live provider turn"
+    );
+
+    join_acp_process(child, stdin);
+    let settled = durable_input(root.path(), &session_id, "msg_explicit_steer");
+    assert_eq!(settled.state, zuno_db::inbox::SubmissionState::Consumed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

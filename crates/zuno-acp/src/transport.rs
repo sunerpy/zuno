@@ -11,6 +11,8 @@ use tokio::task::JoinSet;
 
 /// JSON-RPC code for a prompt admitted durably without owning its own turn.
 pub const SESSION_BUSY_CODE: i64 = -32001;
+/// JSON-RPC code for a rejected `session/steer` extension request.
+pub const STEER_REJECTED_CODE: i64 = -32002;
 
 /// Transport-owned identity of one accepted client request.
 ///
@@ -74,6 +76,12 @@ impl RpcError {
     #[must_use]
     pub fn session_busy(message: impl Into<String>) -> Self {
         Self::new(SESSION_BUSY_CODE, message)
+    }
+
+    /// The explicit steering extension could not target the requested live turn.
+    #[must_use]
+    pub fn steer_rejected(message: impl Into<String>) -> Self {
+        Self::new(STEER_REJECTED_CODE, message)
     }
 
     /// Attach machine-readable detail to this error response.

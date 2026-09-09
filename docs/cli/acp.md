@@ -46,6 +46,15 @@ is answered with JSON-RPC error `-32001`; its `data` reports `admission`
 (`steered`, `queued`, or `rejected`), `sessionId`, and the durable `inputId`; the
 streamed output and the `stopReason` stay on the request that owns the turn.
 
+Clients that support Zuno extensions can use `session/steer` instead. The
+initialize response advertises `_meta.zuno.steering`; turn-scoped
+`session/update` values carry `_meta.zuno.turnId`. A steer supplies that id as
+`expectedTurnId` and receives an immediate success result with `turnId`,
+`inputId`, `admittedSequence`, `admission: "steered"`, and `delivery: "steer"`.
+Rejections use `-32002` with `reason` equal to `noActiveTurn`,
+`expectedTurnMismatch`, `activeTurnNotSteerable`, or `emptyInput`.
+`session/prompt` and `session/cancel` retain their existing ACP V1 semantics.
+
 A slash command cannot be steered and is refused with
 `reason: "commandRequiresIdleSession"` and nothing durable written; only text
 that resolves to a real command, Skill, or native control counts as a slash
@@ -88,6 +97,8 @@ are projected as `agent_thought_chunk` updates tagged `_meta.zuno.notice` with
 A proactive threshold crossing during a long turn uses the separate
 `context.compact` code. The tag is how a client distinguishes them from model
 output; they are never part of the transcript the model sees.
+Internal replay diagnostics are logged with diagnostic audience and are not
+projected as thought chunks.
 
 After compaction succeeds, ACP receives the exact persisted summary as an
 `agent_message_chunk` tagged `_meta.zuno.kind: "compaction_summary"`. Automatic

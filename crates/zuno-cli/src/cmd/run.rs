@@ -326,6 +326,15 @@ where
     let mut wrote_text = false;
     let mut reasoning_open = false;
     while let Some(event) = receiver.recv().await {
+        if matches!(
+            event,
+            TurnEvent::Notice {
+                audience: zuno_engine::r#loop::NoticeAudience::Diagnostic,
+                ..
+            }
+        ) {
+            continue;
+        }
         report_progress(progress);
         match format {
             RunFormat::Default => match event {
@@ -505,14 +514,24 @@ fn event_json(event: TurnEvent) -> Value {
             json!({"type":"skill_loaded","name":name,"source":source})
         }
         TurnEvent::Notice {
+            audience,
             severity,
             code,
             detail,
         } => {
-            json!({"type":"notice","severity":severity.as_str(),"code":code,"detail":detail})
+            json!({
+                "type":"notice",
+                "audience":audience.as_str(),
+                "severity":severity.as_str(),
+                "code":code,
+                "detail":detail
+            })
         }
-        TurnEvent::TurnStarted { session_id } => {
-            json!({"type":"turn_started","sessionID":session_id})
+        TurnEvent::TurnStarted {
+            session_id,
+            turn_id,
+        } => {
+            json!({"type":"turn_started","sessionID":session_id,"turnID":turn_id})
         }
         TurnEvent::HistoryRepaired {
             repaired_tool_results,
@@ -930,6 +949,7 @@ mod tests {
                 sender
                     .send(TurnEvent::TurnStarted {
                         session_id: format!("ses_{index}"),
+                        turn_id: format!("turn_{index}"),
                     })
                     .await
                     .expect("renderer remains connected");
@@ -970,6 +990,7 @@ mod tests {
                 sender
                     .send(TurnEvent::TurnStarted {
                         session_id: format!("ses_{index}"),
+                        turn_id: format!("turn_{index}"),
                     })
                     .await
                     .expect("renderer remains connected");

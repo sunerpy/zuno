@@ -967,6 +967,7 @@ async fn cmd_tui_permission_prompt_replaces_the_live_pulse() {
     for event in [
         zuno_engine::r#loop::TurnEvent::TurnStarted {
             session_id: String::from("s"),
+            turn_id: String::from("turn"),
         },
         zuno_engine::r#loop::TurnEvent::AssistantMessageCreated {
             step: 1,

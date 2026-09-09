@@ -145,10 +145,10 @@ pub enum GoalError {
 
     /// Completion was requested while durable work still says the goal is unfinished.
     #[error(
-        "goal cannot complete while {plan_steps} plan steps, {work_items} work items, {jobs} jobs, and {human_requests} human requests remain unfinished"
+        "goal cannot complete while {plan_steps} plan steps, {work_items} work items, {jobs} jobs, and {human_requests} human requests remain unfinished{details}"
     )]
     CompletionBlocked {
-        /// Plan steps not completed or cancelled.
+        /// Plan steps that have not reached a terminal Plan status.
         plan_steps: usize,
         /// Work items not completed or cancelled.
         work_items: usize,
@@ -156,6 +156,21 @@ pub enum GoalError {
         jobs: usize,
         /// Human requests that have not reached a terminal response.
         human_requests: usize,
+        /// Bounded identities and statuses for the blocking durable rows.
+        details: String,
+    },
+
+    /// The visible Plan contains a status no supported writer can produce.
+    #[error(
+        "goal completion cannot audit durable plan `{plan_id}` for session {session_id}: step \
+         `{step_id}` has invalid status `{status}`; the original database was left unchanged, \
+         and Plan tools cannot repair a row they cannot decode"
+    )]
+    PlanStateCorrupt {
+        session_id: String,
+        plan_id: String,
+        step_id: String,
+        status: String,
     },
 
     /// The session's visible plan was written for a different goal.
@@ -776,6 +791,7 @@ impl GoalError {
             | Self::UnknownPauseReason { .. }
             | Self::UnknownCriterionStatus { .. }
             | Self::UnknownGoalKind { .. }
+            | Self::PlanStateCorrupt { .. }
             | Self::UnknownCapabilityClaimState { .. }
             | Self::Spill { .. }
             | Self::PointerTooLong { .. }
