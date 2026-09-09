@@ -9004,6 +9004,7 @@ impl TurnHost {
                         .map_err(TurnFailure::goal)?;
                     events
                         .publish(TurnEvent::Notice {
+                            audience: NoticeAudience::User,
                             severity: NoticeSeverity::Warning,
                             code: "no_progress".to_owned(),
                             detail: "Automatic recovery paused after three consecutive durable \

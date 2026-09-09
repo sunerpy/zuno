@@ -326,6 +326,7 @@ where
     let mut wrote_text = false;
     let mut reasoning_open = false;
     while let Some(event) = receiver.recv().await {
+        report_progress(progress);
         if matches!(
             event,
             TurnEvent::Notice {
@@ -335,7 +336,6 @@ where
         ) {
             continue;
         }
-        report_progress(progress);
         match format {
             RunFormat::Default => match event {
                 TurnEvent::Provider {

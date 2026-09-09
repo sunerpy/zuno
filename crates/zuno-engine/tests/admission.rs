@@ -269,17 +269,8 @@ fn a_precise_steer_losing_its_turn_while_waiting_for_sqlite_admits_nothing() {
     let identity = running
         .mark_turn_started("turn_old")
         .expect("first turn id");
-    let event_count = || {
-        pool.get()
-            .expect("read events")
-            .query_row(
-                "SELECT COUNT(*) FROM session_event WHERE session_id = ?1",
-                [SESSION_ID],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("count events")
-    };
-    let before = event_count();
+    let events = zuno_db::event_log::SessionEventLog::new(Arc::clone(&pool));
+    let before = events.read_after(SESSION_ID, None).expect("initial events");
 
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -332,7 +323,13 @@ fn a_precise_steer_losing_its_turn_while_waiting_for_sqlite_admits_nothing() {
             .expect("pending inputs")
             .is_empty()
     );
-    assert_eq!(event_count(), before, "admission event must also roll back");
+    assert_eq!(
+        events
+            .read_after(SESSION_ID, None)
+            .expect("events after rejection"),
+        before,
+        "admission event must also roll back"
+    );
     assert!(
         replacement
             .take_soft_interrupts_at_safe_point()
