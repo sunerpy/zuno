@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.24](https://github.com/sunerpy/zuno/compare/v0.10.23...v0.10.24) (2026-09-09)
+
+
+### Bug Fixes
+
+* **memory:** 完善持久记忆与后台学习链路 ([#164](https://github.com/sunerpy/zuno/issues/164)) ([14088d7](https://github.com/sunerpy/zuno/commit/14088d74e0707dae84bf79ebf75d74e595febe3b))
+
 ## [0.10.23](https://github.com/sunerpy/zuno/compare/v0.10.22...v0.10.23) (2026-09-09)
 
 
