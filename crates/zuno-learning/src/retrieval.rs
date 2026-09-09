@@ -28,6 +28,7 @@ const RECORD_SEPARATOR: &str = "\n\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetrievedExperiences {
+    pub candidate_count: u32,
     pub items: Vec<ExperienceRecord>,
     pub content: String,
     pub source: String,
@@ -55,13 +56,15 @@ pub struct ExperienceRetriever {
     store: ExperienceStore,
     max_items: usize,
     max_context_tokens: u32,
+    status: zuno_db::learning_status::LearningStatusStore,
 }
 
 impl ExperienceRetriever {
     #[must_use]
     pub fn new(pool: Arc<zuno_db::Pool>, config: &ResolvedLearningConfig) -> Self {
         Self {
-            store: ExperienceStore::new(pool),
+            store: ExperienceStore::new(Arc::clone(&pool)),
+            status: zuno_db::learning_status::LearningStatusStore::new(pool),
             max_items: config.retrieval_max_items as usize,
             max_context_tokens: config.retrieval_max_context_tokens,
         }
@@ -143,6 +146,7 @@ impl ExperienceRetriever {
             .join(",");
         let source = format!("learning://project/{project_id}/experiences?ids={ids}");
         Ok(RetrievedExperiences {
+            candidate_count: u32::try_from(candidate_count).unwrap_or(u32::MAX),
             digest: digest_text(&content),
             items,
             content,
@@ -150,6 +154,50 @@ impl ExperienceRetriever {
             estimated_tokens,
             skipped_reason,
         })
+    }
+
+    pub fn record_selection(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        query: &str,
+        selected: &RetrievedExperiences,
+    ) -> Result<()> {
+        self.status
+            .record_retrieval(
+                session_id,
+                project_id,
+                &zuno_types::LearningRetrievalProjection {
+                    query_digest: digest_text(query),
+                    selected_ids: selected
+                        .items
+                        .iter()
+                        .map(|record| record.projection.id.clone())
+                        .collect(),
+                    candidate_count: selected.candidate_count,
+                    estimated_tokens: selected.estimated_tokens,
+                    reason: selected.skipped_reason.clone().or_else(|| {
+                        selected
+                            .items
+                            .is_empty()
+                            .then(|| "no matching experience".to_owned())
+                    }),
+                    time_updated: zuno_db::message::now_millis(),
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn search_matching(
+        &self,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+        mode: zuno_db::ExperienceMatch,
+    ) -> Result<Vec<ExperienceRecord>> {
+        self.store
+            .search_matching(project_id, query, limit, mode)
+            .map_err(Into::into)
     }
 
     /// Explicit deep search uses the same SQLite FTS provider but a caller-owned limit.
@@ -185,8 +233,13 @@ fn render(record: &ExperienceRecord) -> String {
     } else {
         ""
     };
+    let provenance = if record.verified_sources() {
+        "Source references were validated when recorded."
+    } else {
+        "UNVERIFIED observation: source references were not validated. Confirm before relying on it."
+    };
     format!(
-        "<experience id=\"{}\" kind=\"{}\">\n<title>{}</title>\n<observation>{}</observation>\n<resolution>{}</resolution>{}\n</experience>",
+        "<experience id=\"{}\" kind=\"{}\">\n<title>{}</title>\n<observation>{}</observation>\n<resolution>{}</resolution>\n<provenance>{provenance}</provenance>{}\n</experience>",
         escape_xml(&projection.id),
         escape_xml(projection.kind.as_str()),
         escape_xml(&projection.title),
@@ -370,6 +423,9 @@ mod tests {
                 confidence: 9000,
                 fingerprint: format!("fingerprint-{id}"),
                 evidence: vec![NewExperienceEvidence {
+                    source_digest: None,
+                    verified: false,
+                    promotion_eligible: false,
                     id: format!("evidence-{id}"),
                     kind: ExperienceEvidenceKind::User,
                     source_id: None,

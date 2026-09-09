@@ -7,6 +7,7 @@ use std::time::Duration;
 use uuid::Uuid;
 use zuno_config::ResolvedLearningConfig;
 use zuno_db::experience::ExperienceStore;
+use zuno_db::learning_job::LearningLease;
 use zuno_db::learning_job::{
     ExtractionJobInsert, LearningJobInsert, LearningJobKind, LearningJobRecord, LearningJobStatus,
     LearningJobStore, LeaseReconciliation, NewLearningJob,
@@ -127,10 +128,7 @@ impl LearningScheduler {
 
     pub fn schedule_post_turn(
         &self,
-        project_id: &str,
-        session_id: &str,
-        source_message_id: &str,
-        transcript: &str,
+        mut request: ExtractionRequest,
         signals: CompletedTaskSignals,
         now: i64,
     ) -> Result<LearningScheduleOutcome> {
@@ -143,17 +141,11 @@ impl LearningScheduler {
         if !signals.eligible() {
             return Ok(LearningScheduleOutcome::Ineligible);
         }
-        let request = ExtractionRequest {
-            project_id: project_id.to_owned(),
-            session_id: session_id.to_owned(),
-            source_message_id: source_message_id.to_owned(),
-            transcript: transcript.to_owned(),
-            had_tool_calls: signals.had_tool_calls,
-            had_artifacts: signals.had_artifacts,
-            recovered_from_error: signals.recovered_from_error,
-            user_corrected: signals.user_corrected,
-            explicit_feedback: signals.explicit_feedback,
-        };
+        request.had_tool_calls = signals.had_tool_calls;
+        request.had_artifacts = signals.had_artifacts;
+        request.recovered_from_error = signals.recovered_from_error;
+        request.user_corrected = signals.user_corrected;
+        request.explicit_feedback = signals.explicit_feedback;
         let delay = i64::try_from(self.config.post_turn_idle_delay_ms).unwrap_or(i64::MAX);
         self.enqueue_extraction(
             request,
@@ -321,7 +313,7 @@ impl LearningScheduler {
     fn bound_attempts(
         &self,
         claimed: Option<LearningJobRecord>,
-        owner_id: &str,
+        _owner_id: &str,
         now: i64,
     ) -> Result<Option<LearningJobRecord>> {
         let Some(record) = claimed else {
@@ -336,7 +328,7 @@ impl LearningScheduler {
         // replace a bounded, silent no-op with an error the callers treat as fatal.
         let _ = self.jobs.settle(
             &record.id,
-            owner_id,
+            &record.lease()?,
             LearningJobStatus::Failed,
             None,
             Some(&format!(
@@ -353,11 +345,11 @@ impl LearningScheduler {
         Ok(None)
     }
 
-    pub fn fail(&self, job_id: &str, owner_id: &str, error: &str, now: i64) -> Result<()> {
+    pub fn fail(&self, job_id: &str, lease: &LearningLease, error: &str, now: i64) -> Result<()> {
         self.jobs
             .settle(
                 job_id,
-                owner_id,
+                lease,
                 LearningJobStatus::Failed,
                 None,
                 Some(error),
@@ -370,7 +362,7 @@ impl LearningScheduler {
     pub fn retry(
         &self,
         job_id: &str,
-        owner_id: &str,
+        lease: &LearningLease,
         error: &str,
         retry_after: Option<Duration>,
         now: i64,
@@ -379,13 +371,23 @@ impl LearningScheduler {
         let exponent = attempt.saturating_sub(1).min(20);
         let local_delay = RETRY_INITIAL_DELAY_MS
             .checked_shl(exponent)
-            .unwrap_or(i64::MAX);
+            .unwrap_or(i64::MAX)
+            .min(RETRY_MAX_DELAY_MS);
+        let jitter_window = (local_delay / 5).max(1);
+        let seed = u64::from_le_bytes(
+            uuid::Uuid::new_v4().as_bytes()[..8]
+                .try_into()
+                .expect("UUID prefix has eight bytes"),
+        );
+        let jitter = i64::try_from(seed % u64::try_from(jitter_window).expect("positive delay"))
+            .expect("jitter is bounded by i64");
+        let local_delay = local_delay.saturating_add(jitter);
         let requested_delay = retry_after
             .map(|delay| i64::try_from(delay.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);
         let delay = local_delay.max(requested_delay).min(RETRY_MAX_DELAY_MS);
         self.jobs
-            .retry(job_id, owner_id, error, now.saturating_add(delay), now)
+            .retry(job_id, lease, error, now.saturating_add(delay), now)
             .map(|_| ())
             .map_err(Into::into)
     }
@@ -393,17 +395,31 @@ impl LearningScheduler {
     pub fn complete(
         &self,
         job_id: &str,
-        owner_id: &str,
+        lease: &LearningLease,
         result: &serde_json::Value,
         now: i64,
     ) -> Result<()> {
         self.jobs
             .settle(
                 job_id,
-                owner_id,
+                lease,
                 LearningJobStatus::Completed,
                 Some(result),
                 None,
+                now,
+            )
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    pub fn skip(&self, job_id: &str, lease: &LearningLease, reason: &str, now: i64) -> Result<()> {
+        self.jobs
+            .settle(
+                job_id,
+                lease,
+                LearningJobStatus::Skipped,
+                None,
+                Some(reason),
                 now,
             )
             .map(|_| ())
@@ -416,6 +432,35 @@ impl LearningScheduler {
 
     pub fn get(&self, job_id: &str) -> Result<LearningJobRecord> {
         self.jobs.get(job_id).map_err(Into::into)
+    }
+
+    pub fn refresh_legacy_input(
+        &self,
+        job_id: &str,
+        lease: &LearningLease,
+        payload: &serde_json::Value,
+        now: i64,
+    ) -> Result<LearningJobRecord> {
+        self.jobs
+            .refresh_extraction_input(job_id, lease, payload, now)
+            .map_err(Into::into)
+    }
+
+    pub fn heartbeat(
+        &self,
+        job_id: &str,
+        lease: &LearningLease,
+        now: i64,
+        expires: i64,
+    ) -> Result<bool> {
+        self.jobs
+            .heartbeat(job_id, lease, now, expires)
+            .map_err(Into::into)
+    }
+
+    #[must_use]
+    pub fn execution_timeout(&self) -> Duration {
+        Duration::from_millis(self.config.execution_timeout_ms)
     }
 
     fn enqueue_extraction(
@@ -439,6 +484,13 @@ impl LearningScheduler {
             payload.clone(),
             now,
         );
+        if trigger == ExtractionTrigger::Manual {
+            // A whole-session reflection or revised feedback is a new input;
+            // retries of the same explicit input remain idempotent.
+            job.idempotency_key.push_str(":manual:");
+            job.idempotency_key
+                .push_str(&crate::digest_text(&payload["request"].to_string()));
+        }
         job.scheduled_at = scheduled_at;
         let LearningJobInsert {
             mut record,
@@ -536,6 +588,8 @@ mod tests {
 
     fn request() -> ExtractionRequest {
         ExtractionRequest {
+            sources: Vec::new(),
+            sources_truncated: false,
             project_id: "project-1".to_owned(),
             session_id: "session-1".to_owned(),
             source_message_id: "assistant-1".to_owned(),
@@ -554,14 +608,7 @@ mod tests {
         disabled.generate = false;
         assert_eq!(
             LearningScheduler::new(pool(), disabled)
-                .schedule_post_turn(
-                    "project-1",
-                    "session-1",
-                    "assistant-1",
-                    "transcript",
-                    useful_signals(),
-                    10,
-                )
+                .schedule_post_turn(request(), useful_signals(), 10,)
                 .expect("disabled"),
             LearningScheduleOutcome::Disabled
         );
@@ -570,14 +617,7 @@ mod tests {
         disabled.post_turn_enabled = false;
         assert_eq!(
             LearningScheduler::new(pool(), disabled)
-                .schedule_post_turn(
-                    "project-1",
-                    "session-1",
-                    "assistant-1",
-                    "transcript",
-                    useful_signals(),
-                    10,
-                )
+                .schedule_post_turn(request(), useful_signals(), 10,)
                 .expect("post-turn disabled"),
             LearningScheduleOutcome::Disabled
         );
@@ -586,10 +626,7 @@ mod tests {
         assert_eq!(
             scheduler
                 .schedule_post_turn(
-                    "project-1",
-                    "session-1",
-                    "assistant-1",
-                    "transcript",
+                    request(),
                     CompletedTaskSignals {
                         completed: true,
                         had_tool_calls: false,
@@ -607,10 +644,7 @@ mod tests {
         assert_eq!(
             scheduler
                 .schedule_post_turn(
-                    "project-1",
-                    "session-1",
-                    "assistant-1",
-                    "transcript",
+                    request(),
                     CompletedTaskSignals {
                         external_context: true,
                         ..useful_signals()
@@ -626,10 +660,7 @@ mod tests {
         assert!(matches!(
             LearningScheduler::new(pool(), allowed)
                 .schedule_post_turn(
-                    "project-1",
-                    "session-1",
-                    "assistant-1",
-                    "transcript",
+                    request(),
                     CompletedTaskSignals {
                         external_context: true,
                         ..useful_signals()
@@ -662,14 +693,7 @@ mod tests {
             LearningScheduler::new(Arc::clone(&pool), config()).with_extractor_version("v1");
         assert_eq!(
             scheduler
-                .schedule_post_turn(
-                    "project-1",
-                    "session-1",
-                    "assistant-1",
-                    "transcript",
-                    useful_signals(),
-                    10,
-                )
+                .schedule_post_turn(request(), useful_signals(), 10,)
                 .expect("disabled automatic admission"),
             LearningScheduleOutcome::Disabled
         );
@@ -693,14 +717,7 @@ mod tests {
         }
         assert_eq!(
             scheduler
-                .schedule_post_turn(
-                    "project-1",
-                    "session-1",
-                    "assistant-1",
-                    "transcript",
-                    useful_signals(),
-                    11,
-                )
+                .schedule_post_turn(request(), useful_signals(), 11,)
                 .expect("excluded automatic admission"),
             LearningScheduleOutcome::Excluded
         );
@@ -723,16 +740,16 @@ mod tests {
     }
 
     #[test]
-    fn manual_reflection_revives_an_automatic_job_skipped_by_a_temporary_disable() {
+    fn manual_reflection_admits_its_own_input_after_a_temporary_disable() {
         let pool = pool();
         let scheduler =
             LearningScheduler::new(Arc::clone(&pool), config()).with_extractor_version("v1");
         let queued = scheduler
             .schedule_post_turn(
-                "project-1",
-                "session-1",
-                "assistant-1",
-                "automatic transcript",
+                ExtractionRequest {
+                    transcript: "automatic transcript".to_owned(),
+                    ..request()
+                },
                 useful_signals(),
                 10,
             )
@@ -775,10 +792,17 @@ mod tests {
         let manual = scheduler
             .schedule_manual_reflection(request(), 40)
             .expect("manual reflection");
-        let LearningScheduleOutcome::Existing(manual) = manual else {
-            panic!("manual reflection keeps the original idempotency identity");
+        let LearningScheduleOutcome::Queued(manual) = manual else {
+            panic!("manual reflection admits its distinct input");
         };
-        assert_eq!(manual.id, automatic.id);
+        assert_ne!(manual.id, automatic.id);
+        assert_eq!(
+            scheduler
+                .get(&automatic.id)
+                .expect("old automatic job")
+                .status,
+            LearningJobStatus::Skipped
+        );
         assert_eq!(manual.status, LearningJobStatus::Queued);
         assert_eq!(manual.attempt, 0);
         let claimed = scheduler
@@ -796,14 +820,7 @@ mod tests {
         let scheduler =
             LearningScheduler::new(pool(), config()).with_extractor_version("extractor-v1");
         let queued = scheduler
-            .schedule_post_turn(
-                "project-1",
-                "session-1",
-                "assistant-1",
-                "transcript",
-                useful_signals(),
-                11,
-            )
+            .schedule_post_turn(request(), useful_signals(), 11)
             .expect("queued");
         let LearningScheduleOutcome::Queued(job) = queued else {
             panic!("first admission must queue");
@@ -817,10 +834,10 @@ mod tests {
 
         let existing = scheduler
             .schedule_post_turn(
-                "project-1",
-                "session-1",
-                "assistant-1",
-                "ignored duplicate",
+                ExtractionRequest {
+                    transcript: "ignored duplicate".to_owned(),
+                    ..request()
+                },
                 useful_signals(),
                 12,
             )
@@ -878,15 +895,17 @@ mod tests {
             10,
         ))
         .expect("enqueue");
-        scheduler
+        let lease = scheduler
             .claim("job-retry", "worker-1", 10, 100)
             .expect("claim")
-            .expect("running job");
+            .expect("running job")
+            .lease()
+            .expect("lease");
 
         scheduler
             .retry(
                 "job-retry",
-                "worker-1",
+                &lease,
                 "provider unavailable",
                 Some(Duration::from_secs(10 * 60)),
                 20,

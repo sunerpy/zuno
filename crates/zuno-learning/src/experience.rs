@@ -2,13 +2,15 @@ use crate::extraction::{ExtractedExperience, ExtractedMemory, LearningExtraction
 use crate::text::{first_forbidden_encoding, smuggled_detail};
 use crate::{LearningServiceError, Result, digest_text};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use uuid::Uuid;
 use zuno_db::experience::{
     ExperienceEvidenceKind, ExperienceRecord, ExperienceStore, NewExperience, NewExperienceEvidence,
 };
-use zuno_db::learning_job::{LearningJobStatus, LearningJobStore};
+use zuno_db::learning_job::{LearningJobStatus, LearningJobStore, LearningLease};
+use zuno_db::learning_source::{LearningSource, LearningSourceKind, LearningSourceStore};
 use zuno_error::{LearningError, Recovery};
 use zuno_memory::{MemoryProposal, MemoryService};
 use zuno_types::{
@@ -103,10 +105,20 @@ struct ValidatedExtraction {
     refusals: Vec<ExtractionRefusal>,
 }
 
+struct ExtractionContext<'a> {
+    job_id: &'a str,
+    project_id: &'a str,
+    session_id: &'a str,
+    source_message_id: &'a str,
+    sources: &'a BTreeMap<String, LearningSource>,
+    now: i64,
+}
+
 #[derive(Clone)]
 pub struct ExperienceService {
     store: ExperienceStore,
     jobs: LearningJobStore,
+    sources: LearningSourceStore,
     memory: Option<Arc<MemoryService>>,
 }
 
@@ -115,7 +127,8 @@ impl ExperienceService {
     pub fn new(pool: Arc<zuno_db::Pool>, memory: Option<Arc<MemoryService>>) -> Self {
         Self {
             store: ExperienceStore::new(pool.clone()),
-            jobs: LearningJobStore::new(pool),
+            jobs: LearningJobStore::new(Arc::clone(&pool)),
+            sources: LearningSourceStore::new(pool),
             memory,
         }
     }
@@ -123,7 +136,7 @@ impl ExperienceService {
     pub fn persist_extraction(
         &self,
         job_id: &str,
-        owner_id: &str,
+        lease: &LearningLease,
         extraction: LearningExtraction,
         now: i64,
     ) -> Result<ExtractionPersistence> {
@@ -146,10 +159,10 @@ impl ExperienceService {
                     // cause the caller has to see.
                     let _ = self.jobs.settle(
                         job_id,
-                        owner_id,
+                        lease,
                         LearningJobStatus::Failed,
                         None,
-                        Some(&settled_error_text(&error)),
+                        Some(&error.to_string()),
                         now,
                     );
                 }
@@ -174,7 +187,19 @@ impl ExperienceService {
         // ordinals, so the requeued attempt is safe.
         let experiences = self
             .store
-            .record_extraction(job_id, owner_id, &new_experiences)?;
+            .record_extraction(job_id, lease, &new_experiences, now)?;
+        if let Some(object) = result.as_object_mut() {
+            object.insert(
+                "unverifiedExperienceIds".to_owned(),
+                json!(
+                    experiences
+                        .iter()
+                        .filter(|experience| !experience.verified_sources())
+                        .map(|experience| &experience.projection.id)
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
         // The extractor's ordinal, not the position in `experiences`. Refusing one
         // entry per item means the two stop agreeing, and `memories[].experience_ordinal`
         // names the extractor's number.
@@ -291,9 +316,11 @@ impl ExperienceService {
             };
             let eligible_for_auto = candidate.projection.scope == MemoryScope::Project
                 && confidence >= 9_000
+                && linked.supports_automatic_promotion()
                 && candidate.projection.status == MemoryCandidateStatus::Pending;
             if eligible_for_auto {
-                if let Err(error) = service.apply(candidate.id()) {
+                if let Err(error) = service.apply_from_learning(candidate.id(), job_id, lease, now)
+                {
                     self.store
                         .mark_promoted(&linked.projection.id, candidate.id(), now)?;
                     let current = service
@@ -327,8 +354,7 @@ impl ExperienceService {
         {
             object.insert("refusedItems".to_owned(), refusals_value(&refusals));
         }
-        self.store
-            .finish_extraction(job_id, owner_id, &result, now)?;
+        self.store.finish_extraction(job_id, lease, &result, now)?;
         Ok(ExtractionPersistence {
             experiences,
             memory_promotions,
@@ -363,6 +389,7 @@ impl ExperienceService {
         extraction: &LearningExtraction,
         now: i64,
     ) -> Result<ValidatedExtraction> {
+        extraction.validate_bounds()?;
         let job = self.jobs.get(job_id)?;
         let project_id = job.project_id.ok_or_else(|| {
             invalid(
@@ -382,6 +409,33 @@ impl ExperienceService {
                 "extraction job has no durable source message",
             )
         })?;
+        let manifest = job
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("request").or(Some(payload)))
+            .and_then(|request| request.get("sources"))
+            .map(|sources| serde_json::from_value::<Vec<LearningSource>>(sources.clone()))
+            .transpose()
+            .map_err(|error| invalid("job.sources", &error.to_string()))?
+            .unwrap_or_default();
+        if manifest.len() > 256 {
+            return Err(invalid("job.sources", "source manifest exceeds its bound"));
+        }
+        let mut verified_sources = BTreeMap::new();
+        for source in manifest {
+            if self.sources.source_belongs_to_request(
+                &project_id,
+                &session_id,
+                &source_message_id,
+                &source,
+            )? && self.sources.source_is_current(&session_id, &source)?
+                && verified_sources
+                    .insert(source.reference_id.clone(), source)
+                    .is_some()
+            {
+                return Err(invalid("job.sources", "duplicate source reference"));
+            }
+        }
 
         // A refused entry is skipped, not fatal, and it keeps its ordinal: the
         // extraction is written by `record_extraction` under one `(job, ordinal)`
@@ -392,16 +446,16 @@ impl ExperienceService {
         // safe — indexing a compacted list is what made it unsafe before.
         let mut new_experiences = Vec::with_capacity(extraction.experiences.len());
         let mut refusals = Vec::new();
+        let context = ExtractionContext {
+            job_id,
+            project_id: &project_id,
+            session_id: &session_id,
+            source_message_id: &source_message_id,
+            sources: &verified_sources,
+            now,
+        };
         for (ordinal, extracted) in extraction.experiences.iter().enumerate() {
-            match build_experience(
-                extracted,
-                ordinal,
-                job_id,
-                &project_id,
-                &session_id,
-                &source_message_id,
-                now,
-            ) {
+            match build_experience(extracted, ordinal, &context) {
                 Ok(experience) => new_experiences.push(experience),
                 Err(error) => {
                     // Only a per-entry verdict may be downgraded to a skip. Anything
@@ -497,7 +551,10 @@ impl ExperienceService {
                     kind: ExperienceEvidenceKind::User,
                     source_id: evidence_source_id,
                     excerpt,
-                    digest: excerpt_digest,
+                    digest: excerpt_digest.clone(),
+                    source_digest: Some(excerpt_digest),
+                    verified: true,
+                    promotion_eligible: true,
                 }],
                 time_created,
             })
@@ -766,12 +823,16 @@ fn refusals_value(refusals: &[ExtractionRefusal]) -> serde_json::Value {
 fn build_experience(
     extracted: &ExtractedExperience,
     ordinal: usize,
-    job_id: &str,
-    project_id: &str,
-    session_id: &str,
-    source_message_id: &str,
-    now: i64,
+    context: &ExtractionContext<'_>,
 ) -> Result<NewExperience> {
+    let ExtractionContext {
+        job_id,
+        project_id,
+        session_id,
+        source_message_id,
+        sources,
+        now,
+    } = *context;
     let kind = ExperienceKind::from(extracted.kind);
     let title = extracted.title.trim();
     let summary = extracted.summary.trim();
@@ -829,12 +890,43 @@ fn build_experience(
                     "evidence excerpts must not be empty",
                 ));
             }
+            let source = item
+                .source_id
+                .as_ref()
+                .and_then(|id| sources.get(id))
+                .filter(|source| source.content.contains(excerpt))
+                .filter(|source| {
+                    matches!(
+                        (item.kind, source.kind),
+                        (
+                            crate::extraction::ExtractedEvidenceKind::Message,
+                            LearningSourceKind::Message
+                        ) | (
+                            crate::extraction::ExtractedEvidenceKind::Tool,
+                            LearningSourceKind::Tool
+                        ) | (
+                            crate::extraction::ExtractedEvidenceKind::User,
+                            LearningSourceKind::User
+                        ) | (
+                            crate::extraction::ExtractedEvidenceKind::Artifact,
+                            LearningSourceKind::Artifact
+                        ) | (
+                            crate::extraction::ExtractedEvidenceKind::Feedback,
+                            LearningSourceKind::Feedback
+                        )
+                    )
+                });
             Ok(NewExperienceEvidence {
                 id: format!("eve_{}", Uuid::now_v7().simple()),
                 kind: item.kind.into(),
-                source_id: item.source_id.clone(),
+                source_id: source
+                    .map(|source| source.source_id.clone())
+                    .or_else(|| item.source_id.clone()),
                 excerpt: excerpt.to_owned(),
                 digest: digest_text(excerpt),
+                source_digest: source.map(|source| source.source_digest.clone()),
+                verified: source.is_some(),
+                promotion_eligible: source.is_some_and(|source| source.proves_success),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -894,22 +986,6 @@ fn normalize(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The text a settled job row carries.
-///
-/// A failed row is the only durable place an operator can read why a permanent
-/// failure happened, and `InvalidRequest`'s `Display` deliberately names only the
-/// field, so the detail is appended rather than dropped. The cause chain is not
-/// walked generically because every variant here is `#[error(transparent)]` and
-/// would repeat its own message.
-fn settled_error_text(error: &LearningServiceError) -> String {
-    match error {
-        LearningServiceError::Learning(LearningError::InvalidRequest { detail, .. }) => {
-            format!("{error}: {detail}")
-        }
-        other => other.to_string(),
-    }
-}
-
 fn invalid(field: &str, detail: &str) -> LearningServiceError {
     LearningError::InvalidRequest {
         field: field.to_owned(),
@@ -932,6 +1008,17 @@ mod tests {
     use zuno_db::migration;
     use zuno_memory::{PromotionPolicy, ScopeLimits, ScopePaths};
     use zuno_paths::DbLocation;
+
+    fn active_lease(service: &ExperienceService, id: &str, expected_owner: &str) -> LearningLease {
+        let lease = service
+            .jobs
+            .get(id)
+            .expect("job")
+            .lease()
+            .expect("claimed lease");
+        assert_eq!(lease.owner_id, expected_owner);
+        lease
+    }
 
     fn fixture() -> (Arc<zuno_db::Pool>, ExperienceService) {
         let pool = Arc::new(zuno_db::Pool::open(&DbLocation::Memory).expect("pool"));
@@ -995,6 +1082,51 @@ mod tests {
         }
     }
 
+    fn verified_job(pool: &Arc<zuno_db::Pool>, id: &str, titles: &[&str]) -> LearningJobStore {
+        let output = titles.join("\n");
+        let part = json!({"type":"tool","callID":"verify-call","tool":"shell",
+            "state":{"status":"completed","input":{"command":"cargo test"},"output":output}});
+        pool.get()
+            .expect("connection")
+            .execute(
+                "INSERT INTO part (id,message_id,session_id,time_created,time_updated,data)
+             VALUES ('verified-part','assistant-1','session-1',1,1,?1)",
+                [part.to_string()],
+            )
+            .expect("durable tool result");
+        pool.get().expect("connection").execute_batch(
+            "INSERT INTO verification_receipt
+             (id,session_id,tool_call_id,tool_id,summary,exit_code,exit_authority,outcome,time_created)
+             VALUES ('verified-receipt','session-1','verify-call','shell','cargo test',0,'authoritative','passed',1)"
+        ).expect("authoritative receipt");
+        let sources = LearningSourceStore::new(Arc::clone(pool))
+            .for_turn("session-1", "assistant-1", &str::to_owned)
+            .expect("sources")
+            .sources;
+        let jobs = LearningJobStore::new(Arc::clone(pool));
+        jobs.enqueue(NewLearningJob::extraction(
+            id,
+            "project-1",
+            "session-1",
+            "assistant-1",
+            "extractor-v2",
+            json!({"request":{"sources":sources}}),
+            10,
+        ))
+        .expect("enqueue");
+        jobs.claim_due("worker-1", 11, 30)
+            .expect("claim")
+            .expect("job");
+        jobs
+    }
+
+    fn verified_experience(title: &str, resolution: &str) -> ExtractedExperience {
+        let mut item = extracted(ExtractedExperienceKind::Procedure, title, Some(resolution));
+        item.evidence[0].kind = ExtractedEvidenceKind::Tool;
+        item.evidence[0].source_id = Some("part:verified-part".to_owned());
+        item
+    }
+
     /// WHAT CHANGED, AND WHY. This test used to assert that a summary matching
     /// `zuno_memory::first_threat`'s `prompt_injection` pattern refused the extraction
     /// and settled the job `Failed`. It no longer does, because that screen also refused
@@ -1028,7 +1160,7 @@ mod tests {
         let outcome = service
             .persist_extraction(
                 "job-injection",
-                "worker-1",
+                &active_lease(&service, "job-injection", "worker-1"),
                 LearningExtraction {
                     experiences: vec![clean, quoted],
                     memories: Vec::new(),
@@ -1095,7 +1227,7 @@ mod tests {
         let outcome = service
             .persist_extraction(
                 "job-tags",
-                "worker-1",
+                &active_lease(&service, "job-tags", "worker-1"),
                 LearningExtraction {
                     experiences: vec![poisoned],
                     memories: Vec::new(),
@@ -1155,7 +1287,7 @@ mod tests {
         let outcome = service
             .persist_extraction(
                 "job-1",
-                "worker-1",
+                &active_lease(&service, "job-1", "worker-1"),
                 LearningExtraction {
                     experiences: vec![ExtractedExperience {
                         kind: ExtractedExperienceKind::UnresolvedIssue,
@@ -1199,43 +1331,32 @@ mod tests {
     #[test]
     fn extraction_auto_applies_only_high_confidence_project_memory() {
         let (_directory, pool, service, memory) = memory_fixture(PromotionPolicy::Automatic);
-        LearningJobStore::new(pool)
-            .enqueue(NewLearningJob::extraction(
-                "job-memory-policy",
-                "project-1",
-                "session-1",
-                "assistant-1",
-                "extractor-v1",
-                json!({}),
-                10,
-            ))
-            .expect("enqueue");
-        service
-            .jobs
-            .claim_due("worker-1", 11, 30)
-            .expect("claim")
-            .expect("job");
-
+        verified_job(
+            &pool,
+            "job-memory-policy",
+            &[
+                "Project high confidence",
+                "Global high confidence",
+                "Project low confidence",
+            ],
+        );
         let outcome = service
             .persist_extraction(
                 "job-memory-policy",
-                "worker-1",
+                &active_lease(&service, "job-memory-policy", "worker-1"),
                 LearningExtraction {
                     experiences: vec![
-                        extracted(
-                            ExtractedExperienceKind::Procedure,
+                        verified_experience(
                             "Project high confidence",
-                            Some("Keep the project-specific rule."),
+                            "Keep the project-specific rule.",
                         ),
-                        extracted(
-                            ExtractedExperienceKind::Procedure,
+                        verified_experience(
                             "Global high confidence",
-                            Some("Keep the cross-project preference."),
+                            "Keep the cross-project preference.",
                         ),
-                        extracted(
-                            ExtractedExperienceKind::Procedure,
+                        verified_experience(
                             "Project low confidence",
-                            Some("Review the uncertain project rule."),
+                            "Review the uncertain project rule.",
                         ),
                     ],
                     memories: vec![
@@ -1331,7 +1452,7 @@ mod tests {
         let failure = service
             .persist_extraction(
                 "job-unsettled",
-                "worker-1",
+                &active_lease(&service, "job-unsettled", "worker-1"),
                 LearningExtraction {
                     experiences: vec![extracted(
                         ExtractedExperienceKind::Procedure,
@@ -1424,7 +1545,7 @@ mod tests {
         let outcome = service
             .persist_extraction(
                 "job-order",
-                "worker-1",
+                &active_lease(&service, "job-order", "worker-1"),
                 LearningExtraction {
                     experiences: vec![extracted(
                         ExtractedExperienceKind::Procedure,
@@ -1485,7 +1606,7 @@ mod tests {
         service
             .persist_extraction(
                 "job-restart-1",
-                "worker-after-restart",
+                &active_lease(&service, "job-restart-1", "worker-after-restart"),
                 LearningExtraction {
                     experiences: vec![extracted(
                         ExtractedExperienceKind::Procedure,
@@ -1527,31 +1648,15 @@ mod tests {
     #[test]
     fn forgetting_promoted_experience_requires_reviewed_memory_revocation() {
         let (_directory, pool, service, memory) = memory_fixture(PromotionPolicy::Automatic);
-        LearningJobStore::new(pool)
-            .enqueue(NewLearningJob::extraction(
-                "job-forget",
-                "project-1",
-                "session-1",
-                "assistant-1",
-                "extractor-v1",
-                json!({}),
-                10,
-            ))
-            .expect("enqueue");
-        service
-            .jobs
-            .claim_due("worker-1", 11, 30)
-            .expect("claim")
-            .expect("job");
+        verified_job(&pool, "job-forget", &["Promoted procedure"]);
         let persisted = service
             .persist_extraction(
                 "job-forget",
-                "worker-1",
+                &active_lease(&service, "job-forget", "worker-1"),
                 LearningExtraction {
-                    experiences: vec![extracted(
-                        ExtractedExperienceKind::Procedure,
+                    experiences: vec![verified_experience(
                         "Promoted procedure",
-                        Some("Keep the verified rule."),
+                        "Keep the verified rule.",
                     )],
                     memories: vec![ExtractedMemory {
                         experience_ordinal: 0,
@@ -1695,7 +1800,7 @@ mod tests {
         let outcome = service
             .persist_extraction(
                 "job-prose",
-                "worker-1",
+                &active_lease(&service, "job-prose", "worker-1"),
                 LearningExtraction {
                     experiences,
                     memories: Vec::new(),
@@ -1795,7 +1900,7 @@ mod tests {
             let outcome = service
                 .persist_extraction(
                     "job-zwj",
-                    "worker-1",
+                    &active_lease(&service, "job-zwj", "worker-1"),
                     LearningExtraction {
                         experiences: vec![item],
                         memories: Vec::new(),
@@ -1872,7 +1977,7 @@ mod tests {
         let outcome = service
             .persist_extraction(
                 "job-batch-tags",
-                "worker-1",
+                &active_lease(&service, "job-batch-tags", "worker-1"),
                 LearningExtraction {
                     experiences: vec![poisoned, first_clean, second_clean],
                     memories: vec![ExtractedMemory {
@@ -1981,7 +2086,7 @@ mod tests {
         let outcome = service
             .persist_extraction(
                 "job-n2",
-                "worker-1",
+                &active_lease(&service, "job-n2", "worker-1"),
                 LearningExtraction {
                     experiences,
                     memories: Vec::new(),
@@ -2040,7 +2145,7 @@ mod tests {
         let outcome = service
             .persist_extraction(
                 "job-memory-tags",
-                "worker-1",
+                &active_lease(&service, "job-memory-tags", "worker-1"),
                 LearningExtraction {
                     experiences: vec![extracted(
                         ExtractedExperienceKind::Procedure,
@@ -2149,7 +2254,7 @@ mod tests {
             let outcome = service
                 .persist_extraction(
                     "job-memory-fields",
-                    "worker-1",
+                    &active_lease(&service, "job-memory-fields", "worker-1"),
                     LearningExtraction {
                         experiences: vec![extracted(
                             ExtractedExperienceKind::Procedure,
@@ -2212,7 +2317,7 @@ mod tests {
             let outcome = service
                 .persist_extraction(
                     "job-memory-prose",
-                    "worker-1",
+                    &active_lease(&service, "job-memory-prose", "worker-1"),
                     LearningExtraction {
                         experiences: vec![extracted(
                             ExtractedExperienceKind::Procedure,
@@ -2289,17 +2394,16 @@ mod tests {
             "the reviewer's input must still match agent_config_mod"
         );
         let (_directory, pool, service, memory) = memory_fixture(PromotionPolicy::Review);
-        let jobs = claimed_extraction_job(&pool, "job-memory-reason");
+        let jobs = verified_job(&pool, "job-memory-reason", &["Deploy order"]);
 
         let outcome = service
             .persist_extraction(
                 "job-memory-reason",
-                "worker-1",
+                &active_lease(&service, "job-memory-reason", "worker-1"),
                 LearningExtraction {
-                    experiences: vec![extracted(
-                        ExtractedExperienceKind::Procedure,
+                    experiences: vec![verified_experience(
                         "Deploy order",
-                        Some("Keep the deploy order."),
+                        "Keep the deploy order.",
                     )],
                     memories: vec![ExtractedMemory {
                         experience_ordinal: 0,

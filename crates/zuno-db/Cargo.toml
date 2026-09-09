@@ -11,6 +11,8 @@ publish.workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
 zuno-attachment = { workspace = true }
 zuno-error = { workspace = true }
 zuno-orchestration = { workspace = true }

@@ -7467,11 +7467,13 @@ name = "zuno-db"
 version = "0.10.23"
 dependencies = [
  "base64 0.23.1",
+ "hex",
  "proptest",
  "rusqlite",
  "rustix 1.1.4",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "uuid",
  "zuno-attachment",
@@ -7608,7 +7610,10 @@ name = "zuno-learning"
 version = "0.10.23"
 dependencies = [
  "async-trait",
+ "futures",
  "hex",
+ "rusqlite",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -7616,12 +7621,17 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
+ "zuno-atomic-file",
  "zuno-config",
  "zuno-db",
  "zuno-error",
  "zuno-eval",
+ "zuno-llm",
  "zuno-memory",
+ "zuno-observability",
  "zuno-paths",
  "zuno-types",
 ]

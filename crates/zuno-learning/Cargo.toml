@@ -11,22 +11,31 @@ publish.workspace = true
 
 [dependencies]
 zuno-config = { workspace = true }
+zuno-atomic-file = { workspace = true }
 zuno-db = { workspace = true }
 zuno-error = { workspace = true }
 zuno-eval = { workspace = true }
 zuno-memory = { workspace = true }
+zuno-llm = { workspace = true }
+zuno-observability = { workspace = true }
 zuno-types = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+schemars = { workspace = true }
 sha2 = { workspace = true }
 similar = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 zuno-paths = { workspace = true }
 

@@ -98,6 +98,9 @@ use crate::open::map_error;
 /// The JSON object a `data` column holds once the identity keys are stripped.
 pub type JsonObject = Map<String, Value>;
 
+/// Stable chronological cursor: creation timestamp followed by durable message id.
+pub type MessagePosition = (i64, String);
+
 /// The `message` table, named once.
 /// One tool call that changed authoritative state without settling what it changed.
 ///
@@ -853,6 +856,89 @@ impl<'conn> MessageStore<'conn> {
         )?
         .query_row([session_id], |row| row.get::<_, bool>(0))
         .map_err(map_error)
+    }
+
+    /// Read the latest user's search text without hydrating unrelated history.
+    ///
+    /// Both the number of parts and the returned text are bounded. The partial
+    /// user-boundary index locates the message directly.
+    pub fn latest_user_text(&self, session_id: &str) -> Result<String, DbError> {
+        self.prepare(
+            "SELECT substr(COALESCE(group_concat(text, char(10)), ''), 1, 8192)
+             FROM (
+               SELECT substr(json_extract(data, '$.text'), 1, 8192) AS text
+               FROM part
+               WHERE message_id = (
+                 SELECT id FROM message
+                 WHERE session_id = ?1 AND json_extract(data, '$.role') = 'user'
+                 ORDER BY time_created DESC, id DESC LIMIT 1
+               ) AND session_id = ?1 AND json_extract(data, '$.type') = 'text'
+               ORDER BY time_created, id LIMIT 32
+             )",
+        )?
+        .query_row([session_id], |row| row.get(0))
+        .map_err(map_error)
+    }
+
+    /// The causal user boundary and terminal message of one completed turn.
+    pub fn completed_turn_bounds(
+        &self,
+        session_id: &str,
+        end_message_id: &str,
+    ) -> Result<(MessagePosition, MessagePosition), DbError> {
+        let end = self
+            .prepare(
+                "SELECT time_created, id FROM message WHERE session_id = ?1 AND id = ?2
+                AND json_extract(data,'$.role')='assistant'",
+            )?
+            .query_row((session_id, end_message_id), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()
+            .map_err(map_error)?
+            .ok_or_else(|| DbError::NotFound {
+                table: MESSAGE_TABLE.to_owned(),
+                id: end_message_id.to_owned(),
+            })?;
+        let start = self
+            .prepare(
+                "SELECT time_created, id FROM message
+             WHERE session_id = ?1 AND json_extract(data, '$.role') = 'user'
+               AND (time_created, id) <= (?2, ?3)
+             ORDER BY time_created DESC, id DESC LIMIT 1",
+            )?
+            .query_row((session_id, end.0, &end.1), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()
+            .map_err(map_error)?
+            .unwrap_or_else(|| end.clone());
+        Ok((start, end))
+    }
+
+    /// Hydrate only the requested completed turn, preserving source ordering.
+    pub fn hydrate_completed_turn(
+        &self,
+        session_id: &str,
+        end_message_id: &str,
+    ) -> Result<Vec<MessageWithParts>, DbError> {
+        let (start, end) = self.completed_turn_bounds(session_id, end_message_id)?;
+        let mut statement = self.prepare(
+            "SELECT id, session_id, time_created, time_updated, data FROM message
+             WHERE session_id = ?1 AND (time_created, id) >= (?2, ?3)
+               AND (time_created, id) <= (?4, ?5)
+             ORDER BY time_created, id",
+        )?;
+        let rows = statement
+            .query_map((session_id, start.0, &start.1, end.0, &end.1), |row| {
+                Ok(MessageRecord::from_row(row))
+            })
+            .map_err(map_error)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row.map_err(map_error)??);
+        }
+        self.hydrate(messages)
     }
 
     /// Every message of a session, oldest first.

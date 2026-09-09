@@ -399,6 +399,7 @@ fn views_sidebar_projects_learning_review_state_from_shared_work_state() {
             time_created: 1,
             time_updated: 1,
         }],
+        ..Default::default()
     };
     view.toggle(Section::Learning);
 

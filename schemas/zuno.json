@@ -837,6 +837,17 @@
             "null"
           ]
         },
+        "execution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningExecutionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Isolated request and candidate-execution budgets."
+        },
         "extractor_model": {
           "description": "Optional dedicated model used by the no-tools structured extractor.",
           "type": [
@@ -899,6 +910,59 @@
           "description": "Use durable Experience records produced by earlier runs.\n\nDefaults to true when `enabled` is true. The master switch remains an upper\nbound, so `enabled: false` disables use even when this field is true.",
           "type": [
             "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LearningExecutionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_input_bytes": {
+          "description": "Serialized evidence input bytes. Defaults to 131072; maximum 1048576.",
+          "format": "uint32",
+          "maximum": 1048576,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_output_tokens": {
+          "description": "Output tokens per request. Defaults to 4096; maximum 65536.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_steps": {
+          "description": "Model steps in one isolated candidate evaluation. Defaults to 8; maximum 64.",
+          "format": "uint32",
+          "maximum": 64,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "structured_output": {
+          "description": "Opt in to the provider's native JSON schema protocol. Keep false for\nendpoints whose selected model does not support structured output.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "timeout_ms": {
+          "description": "Total request deadline. Defaults to 120000 ms; maximum one hour.",
+          "format": "uint64",
+          "maximum": 3600000,
+          "minimum": 1,
+          "type": [
+            "integer",
             "null"
           ]
         }

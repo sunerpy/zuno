@@ -28,6 +28,9 @@ Run `/learn help` for the complete action list:
 
 ```text
 /learn
+/learn list [offset]
+/learn get <experience-id>
+/learn inspect-memory|import-memory <global|project>
 /learn remember <stable fact, preference, or project rule>
 /learn issue <unresolved issue>
 /learn solved <experience-id> <resolution>
@@ -99,20 +102,39 @@ pending.
 
 ### Apply and undo recovery
 
-Before changing a file, Zuno stores the exact before and after entry lists and
-moves the candidate to `applying`. The resident file is replaced atomically, then
-the candidate becomes `applied`. Undo follows the same pattern through `undoing`
-and `undone`.
+Resident entries now have an authoritative SQLite revision. Applying a candidate
+commits its exact before/after snapshots, the new entries, revision history, and
+the `applied` state in one transaction. Undo advances the revision and records
+`undone` in the same way. Two writers cannot both replace the same revision.
 
-After a process loss, startup compares the current file with both snapshots:
+The global and project Markdown files are readable projections. Existing files
+are adopted once; later file edits do not silently replace accepted Memory.
+Projection failure leaves the committed entries available. Startup can restore a
+missing projection from its recorded revision, while a file with different
+external contents is preserved and reported. Cooperating file writers use a
+shared operating-system lock around comparison and atomic replacement.
+
+Each foreground turn captures the current Memory revision. A change in another
+session is visible at the next turn boundary; previously persisted prompt
+receipts still reconstruct the original version.
+
+Older releases may have left candidates in `applying` or `undoing`. Startup
+continues to reconcile these historical states from their exact snapshots:
 
 - the expected after state proves apply completed;
 - the expected before state proves it did not;
 - any third state becomes `uncertain`.
 
-No recovery branch mechanically repeats the file mutation. Inspect an `uncertain`
-candidate and the resident file before deciding what to keep. External edits are
-not overwritten.
+These historical uncertain mutations are never mechanically replayed. Inspect
+an `uncertain` candidate and the preserved file before deciding what to retain.
+Projection repair does not repeat the logical Memory operation or advance its
+revision. Adding an existing entry also preserves the document revision.
+
+Use `/learn inspect-memory global|project` to compare the accepted version with
+file entries and inspect a projection error. After reviewing an external edit,
+`/learn import-memory global|project` explicitly accepts it as a new version.
+An unresolved pre-upgrade write is withheld from prompts until inspected and
+imported; neither side is silently chosen or deleted.
 
 ## Record and retrieve Experience
 
@@ -126,24 +148,41 @@ one tool call, artifact, recovered error, explicit correction, or feedback item.
 The default scheduler waits for six idle hours, polls every 60 seconds, and claims
 at most two jobs per wake. A job identity is
 `(session_id, source_message_id, extractor_version)`, so retries and restarts do
-not create a second batch.
+not create a second batch. A process-owned supervisor keeps project learning alive
+when an ACP session releases its foreground host. It does not keep the entire
+foreground runtime open. A new process checks up to 64 recent completed turns
+from the last seven days for missed admission. Pending work is resumed from
+SQLite; a stopped process does not run background work.
 
 `/reflect turn` selects the latest completed assistant turn. `/reflect session`
-uses the durable session transcript. Manual reflection becomes due immediately
-but still obeys the session generation policy and external-context rule.
+selects bounded sources across the durable session. Manual reflection becomes due immediately
+but still obeys the session generation policy and external-context rule. Manual reflection also keys the exact source-input digest: new feedback or a wider
+session selection is a new job, while an identical input remains idempotent.
+Admitting a new explicit input revokes older queued/running extraction leases for
+the same source message. A retry cannot reuse an older recorded experience to
+automatically approve changed or unverified Memory.
 
 The extractor:
 
 - uses `learning.extractor_model` when configured, otherwise the active
   Provider's reachable `small_model`, then the session model;
-- receives a redacted replay and a structured response schema;
+- receives bounded, redacted source records with exact part/feedback addresses,
+  source digests, and authoritative verification markers;
+- caps input, output and total request time; a malformed JSON answer gets at most
+  one repair within the same deadline;
 - has no tools, network, filesystem authority, or foreground-session identity;
 - persists its exact request and terminal outcome;
 - attempts one durable job at most three times.
 
 Settlement stores accepted Experience and evidence in one transaction. A bad item
 with an unresolvable model-visible encoding is refused without discarding clean
-siblings; the job result records each `refusedItems` entry.
+siblings; the job result records each `refusedItems` entry. Citations must match a
+supplied source address and an exact excerpt, and the source is rechecked before
+storage. High model confidence alone never authorizes automatic Memory: project
+promotion also requires verified evidence and an authoritative success receipt
+(or an explicit user record). Unsupported citations remain unverified observations.
+Each claimed attempt has a unique lease token and a heartbeat; lost authority or
+session exclusion prevents automatic Memory commits.
 
 Automatic retrieval is project-first. It defaults to five records within a
 1,200-token rendered context budget. Every inserted item carries its durable id,
@@ -154,18 +193,31 @@ If the smallest match cannot fit, Zuno retrieves nothing and emits
 Use the read-only `experience_search` tool for a deeper explicit search:
 
 ```text
-experience_search(query: "sqlite migration preserved messages", limit: 10)
+experience_search(query: "sqlite migration preserved messages", limit: 10, match: "any")
 ```
 
 Search input is quoted and bounded before FTS5 evaluation, so punctuation and FTS
-operators remain data rather than query grammar.
+operators remain data rather than query grammar. Natural queries recall any meaningful
+term and rerank candidates; `match: "all"` requires every term. Chinese/Japanese/Korean
+text uses a trigram index with a bounded fallback for short terms. Migrations build
+the indexes, writes maintain them through triggers, and searches remain read-only.
+Results include source citations and verification state.
+
+`/learn` shows queue counts, pending deadlines, recent errors and the latest recall
+selection or skip reason. `/learn list [offset]` pages through Experience (100 per
+page). Selecting context for a foreground turn records its ids and use counts;
+ordinary searches do not change those counts. `/learn get <experience-id>` shows
+its citations, validation state and usage details.
 
 ## Turn repeated evidence into a Skill
 
-The background pattern miner groups promotable project Experience. By default it
+The background pattern miner semantically groups verified, promotable project
+Experience, including different wording of the same rule. By default it
 requires at least three new records and three independent sessions before creating
 an automatic project Skill candidate. Cross-project aggregation requires the same
-promoted pattern in at least two projects. An explicit
+rule supported by promoted patterns in at least two projects. Model-proposed groups
+must cite known evidence ids; repeated unchanged evidence preserves an already
+promoted pattern and its revision. An explicit
 `/learn promote <experience-id>` may create a one-evidence project pattern, but it
 does not bypass review or evaluation.
 
@@ -176,16 +228,29 @@ named project companion.
 
 The safe path is deliberately split:
 
-1. `/learn skill-review <candidate-id>` starts an immutable offline cassette suite.
-2. Baseline and candidate use the same model, toolset digest, budgets, temperature,
-   seed, and recorded tool responses.
+1. `/learn skill-review <candidate-id>` explicitly starts an immutable offline cassette suite.
+2. Baseline and candidate each execute a bounded model attempt. Tools can return
+   only exact matching recorded calls; unknown calls never reach the filesystem or network.
+   The grader sees the actual answer and call trace. Expected answers are withheld
+   from the task attempt. Both variants use the same model and execution budgets.
 3. The candidate passes only if cited failures are fixed, no protection case has a
    critical regression, and the weighted metric does not decrease.
 4. Passing changes the candidate to `approved`; it does not write a file.
 5. `/learn skill-apply <candidate-id>` performs a separate digest-checked apply.
 
+Opening a session only binds the evaluator; it does not start Skill evaluation.
+No additional model setting is required: review uses the same resolved learning
+model described above. An explicit cross-provider model is reported unavailable,
+not silently substituted. Skill review produces extra model requests. This review
+mechanism uses recorded tool I/O; model generation still calls the configured
+provider API.
+
+Each evaluation has a total deadline and an ownership token. Another session's
+startup cannot cancel a live evaluation; cancellation or expiry preserves a
+terminal diagnostic, and an old attempt cannot settle a newer review.
+
 Source drift makes a candidate `stale`. Apply and undo store before/after snapshots;
-a restart classifies the observed filesystem state and never replays an uncertain
+cooperating writers and the reconciler share an OS path lock. A restart classifies the observed filesystem state and never replays an uncertain
 effect. Use `skill-undo` for an applied candidate and `skill-reject` for one you do
 not want.
 

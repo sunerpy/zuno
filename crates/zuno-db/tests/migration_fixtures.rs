@@ -16,6 +16,7 @@
 //! | `format-7.sql` | 7      | v0.6.7  | verification ledger                                |
 //! | `format-8.sql` | 8      | v0.10.5 | session memory policy                              |
 //! | `format-9.sql` | 9      | v0.10.21| execution control and completion routing            |
+//! | `format-10.sql`| 10     | v0.10.23| versioned memory, provenance, leases and search     |
 //!
 //! Every fixture is upgraded through the real entry point, [`migration::apply`],
 //! and the result is compared *structurally* with a database `apply` creates from
@@ -102,8 +103,22 @@ const FORMAT_NINE: Fixture = Fixture {
     table_count: 40,
 };
 
+const FORMAT_TEN_SQL: &str = concat!(
+    include_str!("fixtures/format-7.sql"),
+    include_str!("fixtures/format-8.sql"),
+    include_str!("fixtures/format-9.sql"),
+    include_str!("fixtures/format-10.sql")
+);
+
+const FORMAT_TEN: Fixture = Fixture {
+    format: 10,
+    release: "v0.10.23",
+    sql: FORMAT_TEN_SQL,
+    table_count: 42,
+};
+
 /// Every table `sqlite_master` lists once the current schema is in place.
-const CURRENT_TABLE_COUNT: usize = 42;
+const CURRENT_TABLE_COUNT: usize = 55;
 
 /// One additive upgrade step, described by what it must leave behind and by the
 /// first statement `schema.rs` runs for it (used to prove, from the statement
@@ -200,14 +215,48 @@ const EXECUTION: Step = Step {
     ],
 };
 
+const MEMORY_RUNTIME: Step = Step {
+    name: "memory runtime (format 10 -> 11)",
+    first_statement: "CREATE TABLE `resident_memory_document`",
+    tables: &[
+        "resident_memory_document",
+        "resident_memory_revision",
+        "learning_retrieval_snapshot",
+        "experience_search_fts",
+        "experience_search_fts_config",
+        "experience_search_fts_data",
+        "experience_search_fts_docsize",
+        "experience_search_fts_idx",
+        "experience_search_cjk_fts",
+        "experience_search_cjk_fts_config",
+        "experience_search_cjk_fts_data",
+        "experience_search_cjk_fts_docsize",
+        "experience_search_cjk_fts_idx",
+    ],
+    indexes: &[
+        "resident_memory_revision_candidate_idx",
+        "message_session_user_boundary_idx",
+        "experience_record_usage_idx",
+    ],
+    columns: &[
+        ("experience_record", "evidence_verified"),
+        ("experience_record", "last_used_at"),
+        ("experience_record", "use_count"),
+        ("experience_evidence", "source_digest"),
+        ("experience_evidence", "verified"),
+        ("experience_evidence", "promotion_eligible"),
+        ("learning_job", "lease_token"),
+    ],
+};
+
 /// The index created by the final DDL statement of every upgrade path. Index names
 /// are database-global, so an unrelated index that already owns this name makes
 /// exactly that statement fail after everything before it ran inside the same
 /// transaction. SQLite rejects the duplicate while *preparing* the statement, so
 /// it never reaches `SQLITE_TRACE_STMT`; the statement immediately before it is
 /// therefore the last one the trace can show before the rollback.
-const TRAP_INDEX: &str = "completion_delivery_session_owner_updated_idx";
-const STATEMENT_BEFORE_TRAP: &str = "CREATE INDEX `session_execution_state_mode_phase_updated_idx`";
+const TRAP_INDEX: &str = "experience_record_usage_idx";
+const STATEMENT_BEFORE_TRAP: &str = "CREATE INDEX `resident_memory_revision_candidate_idx`";
 
 fn steps_after(format: u32) -> &'static [&'static Step] {
     match format {
@@ -217,13 +266,36 @@ fn steps_after(format: u32) -> &'static [&'static Step] {
             &VERIFICATION,
             &MEMORY_POLICY,
             &EXECUTION,
+            &MEMORY_RUNTIME,
         ],
-        6 => &[&PLAN_STACK, &VERIFICATION, &MEMORY_POLICY, &EXECUTION],
-        7 => &[&VERIFICATION, &MEMORY_POLICY, &EXECUTION],
-        8 => &[&MEMORY_POLICY, &EXECUTION],
-        9 => &[&EXECUTION],
+        6 => &[
+            &PLAN_STACK,
+            &VERIFICATION,
+            &MEMORY_POLICY,
+            &EXECUTION,
+            &MEMORY_RUNTIME,
+        ],
+        7 => &[&VERIFICATION, &MEMORY_POLICY, &EXECUTION, &MEMORY_RUNTIME],
+        8 => &[&MEMORY_POLICY, &EXECUTION, &MEMORY_RUNTIME],
+        9 => &[&EXECUTION, &MEMORY_RUNTIME],
+        10 => &[&MEMORY_RUNTIME],
         other => panic!("no fixture describes format {other}"),
     }
+}
+
+#[test]
+fn format_ten_fixture_matches_the_released_schema() {
+    assert_fixture_is_the_old_format(&FORMAT_TEN);
+}
+
+#[test]
+fn format_ten_upgrade_preserves_rows_and_reaches_current_structure() {
+    assert_upgrade_preserves_rows_and_reaches_the_current_structure(&FORMAT_TEN);
+}
+
+#[test]
+fn format_ten_failed_upgrade_preserves_the_original_database() {
+    assert_failed_upgrade_leaves_the_database_untouched(&FORMAT_TEN);
 }
 
 /// Values every fixture carries, checked as literals so the byte-for-byte claim is
@@ -707,7 +779,10 @@ fn assert_fixture_is_the_old_format(fixture: &Fixture) {
         }
         for (table, column) in step.columns {
             assert!(
-                !inventory.tables[*table].columns.contains_key(*column),
+                !inventory
+                    .tables
+                    .get(*table)
+                    .is_some_and(|shape| shape.columns.contains_key(*column)),
                 "{context}: `{table}.{column}` belongs to the later step `{}`",
                 step.name
             );
@@ -821,7 +896,10 @@ fn assert_upgrade_preserves_rows_and_reaches_the_current_structure(fixture: &Fix
         }
         for (table, column) in step.columns {
             assert!(
-                !before.tables[*table].columns.contains_key(*column),
+                !before
+                    .tables
+                    .get(*table)
+                    .is_some_and(|shape| shape.columns.contains_key(*column)),
                 "{context}: `{table}.{column}` existed before `{}` ran",
                 step.name
             );
@@ -1080,12 +1158,12 @@ fn assert_failed_upgrade_leaves_the_database_untouched(fixture: &Fixture) {
         .iter()
         .position(|sql| sql.trim_start().starts_with("ROLLBACK"))
         .unwrap_or_else(|| panic!("{context}: the failed upgrade did not roll back: {traced:#?}"));
-    assert_eq!(
-        rollback,
-        reached_trap + 1,
-        "{context}: something ran between the trapped statement and the rollback \
-         (the trapped `CREATE INDEX` itself fails at prepare and is never traced); \
-         trace = {traced:#?}"
+    assert!(
+        traced[reached_trap + 1..rollback]
+            .iter()
+            .all(|sql| sql.trim_start().starts_with("--")),
+        "{context}: a top-level statement ran after the trap before rollback; \
+         only SQLite's internal FTS flush statements may occur: {traced:#?}",
     );
     assert!(
         !traced.iter().any(|sql| sql.contains("UPDATE zuno_schema")),
@@ -1117,7 +1195,10 @@ fn assert_failed_upgrade_leaves_the_database_untouched(fixture: &Fixture) {
         }
         for (table, column) in step.columns {
             assert!(
-                !after.tables[*table].columns.contains_key(*column),
+                !after
+                    .tables
+                    .get(*table)
+                    .is_some_and(|shape| shape.columns.contains_key(*column)),
                 "{context}: `{table}.{column}` from `{}` survived the rollback",
                 step.name
             );

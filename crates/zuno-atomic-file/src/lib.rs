@@ -41,6 +41,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod write_guard;
+pub use write_guard::{PathWriteGuard, canonical_destination};
+
 /// Replace `path` with `contents` without exposing partially written bytes.
 ///
 /// The temporary file is created exclusively beside the destination and its

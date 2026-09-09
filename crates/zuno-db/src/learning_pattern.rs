@@ -87,10 +87,47 @@ impl LearningPatternStore {
 
     /// Propose a pattern, reopening a rejection only when its evidence version advances.
     pub fn propose(&self, pattern: NewLearningPattern) -> Result<PatternProposal, DbError> {
+        self.propose_authorized(pattern, None)
+    }
+
+    pub fn propose_with_lease(
+        &self,
+        pattern: NewLearningPattern,
+        job_id: &str,
+        lease: &crate::learning_job::LearningLease,
+        now: i64,
+    ) -> Result<PatternProposal, DbError> {
+        self.propose_authorized(pattern, Some((job_id, lease, now)))
+    }
+
+    fn propose_authorized(
+        &self,
+        pattern: NewLearningPattern,
+        authority: Option<(&str, &crate::learning_job::LearningLease, i64)>,
+    ) -> Result<PatternProposal, DbError> {
         validate_new(&pattern)?;
         let learned_rules = serde_json::to_string(&pattern.learned_rules).map_err(query_error)?;
         let evidence_ids = serde_json::to_string(&pattern.evidence_ids).map_err(query_error)?;
         self.pool.transaction(|transaction| {
+            if let Some((job_id, lease, now)) = authority {
+                let valid: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM learning_job WHERE id=?1 AND status='running'
+                       AND owner_id=?2 AND lease_token=?3 AND lease_expires>?4
+                       AND ((kind='project_aggregation' AND project_id=?5)
+                            OR (kind='global_aggregation' AND ?5 IS NULL)))",
+                        params![job_id, lease.owner_id, lease.token, now, pattern.project_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(open::map_error)?;
+                if !valid {
+                    return Err(DbError::Conflict {
+                        table: "learning_job".to_owned(),
+                        id: job_id.to_owned(),
+                        detail: "aggregation lease no longer authorizes this pattern".to_owned(),
+                    });
+                }
+            }
             let existing = read_by_identity(
                 transaction,
                 pattern.scope,
@@ -102,6 +139,14 @@ impl LearningPatternStore {
                     && pattern.evidence_digest == existing.evidence_digest
                 {
                     return Ok(PatternProposal::Suppressed { record: existing });
+                }
+                if pattern.evidence_digest == existing.evidence_digest
+                    && pattern.learned_rules == existing.projection.learned_rules
+                {
+                    return Ok(PatternProposal::Proposed {
+                        record: existing,
+                        inserted: false,
+                    });
                 }
                 transaction
                     .execute(
@@ -227,7 +272,7 @@ impl LearningPatternStore {
             .prepare(&format!(
                 "SELECT {COLUMNS} FROM learning_pattern
                  WHERE scope = 'project' AND status = 'promoted'
-                 ORDER BY fingerprint, project_id, id"
+                 ORDER BY time_updated DESC, project_id, id LIMIT 256"
             ))
             .map_err(open::map_error)?;
         statement
@@ -443,5 +488,26 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn identical_mining_preserves_promoted_state_and_revision() {
+        let store = store();
+        let PatternProposal::Proposed { record, .. } = store.propose(proposal(1)).expect("propose")
+        else {
+            panic!("new proposal");
+        };
+        let promoted = store.promote(&record.projection.id, 20).expect("review");
+        let mut repeated = proposal(1);
+        repeated.time_created = 90;
+        repeated.evidence_version = 90;
+        let PatternProposal::Proposed {
+            record,
+            inserted: false,
+        } = store.propose(repeated).expect("repeat")
+        else {
+            panic!("existing proposal");
+        };
+        assert_eq!(record, promoted);
     }
 }

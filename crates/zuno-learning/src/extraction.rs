@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -8,12 +9,51 @@ pub struct ExtractionRequest {
     pub session_id: String,
     pub source_message_id: String,
     /// Reconstructable durable transcript and task evidence.
+    #[serde(default)]
     pub transcript: String,
+    /// Exact source addresses and bounded redacted contents selected by the host.
+    #[serde(default)]
+    pub sources: Vec<zuno_db::learning_source::LearningSource>,
+    #[serde(default)]
+    pub sources_truncated: bool,
     pub had_tool_calls: bool,
     pub had_artifacts: bool,
     pub recovered_from_error: bool,
     pub user_corrected: bool,
     pub explicit_feedback: bool,
+}
+
+impl ExtractionRequest {
+    /// Project the durable source manifest to one bounded request. Legacy
+    /// transcript blobs are never sent alongside (or instead of) cited sources.
+    pub fn bounded(mut self, max_bytes: usize) -> crate::Result<Self> {
+        self.transcript.clear();
+        let mut selected = Vec::new();
+        let sources = std::mem::take(&mut self.sources);
+        let base = serde_json::to_vec(&self)
+            .expect("serializable request")
+            .len();
+        if base > max_bytes {
+            return Err(crate::model::invalid(
+                "learning input metadata exceeds its byte budget",
+            ));
+        }
+        let mut used = base;
+        for source in sources {
+            let bytes = serde_json::to_vec(&source)
+                .expect("serializable source")
+                .len()
+                + 1;
+            if used.saturating_add(bytes) > max_bytes {
+                self.sources_truncated = true;
+                continue;
+            }
+            used += bytes;
+            selected.push(source);
+        }
+        self.sources = selected;
+        Ok(self)
+    }
 }
 
 /// Why one durable extraction job was admitted.
@@ -70,7 +110,8 @@ pub fn decode_extraction_job_payload(payload: Value) -> serde_json::Result<Extra
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LearningExtraction {
     #[serde(default)]
     pub experiences: Vec<ExtractedExperience>,
@@ -78,7 +119,52 @@ pub struct LearningExtraction {
     pub memories: Vec<ExtractedMemory>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+impl LearningExtraction {
+    pub fn validate_bounds(&self) -> crate::Result<()> {
+        if self.experiences.len() > 32 || self.memories.len() > 16 {
+            return Err(crate::model::invalid(
+                "learning output exceeds the item limit",
+            ));
+        }
+        for experience in &self.experiences {
+            if experience.title.len() > 512
+                || experience.summary.len() > 8192
+                || experience
+                    .resolution
+                    .as_ref()
+                    .is_some_and(|text| text.len() > 8192)
+                || experience.evidence.len() > 16
+                || experience.evidence.iter().any(|item| {
+                    item.excerpt.len() > 4096
+                        || item.source_id.as_ref().is_some_and(|id| id.len() > 512)
+                })
+            {
+                return Err(crate::model::invalid(
+                    "learning experience exceeds its field limit",
+                ));
+            }
+        }
+        for memory in &self.memories {
+            if memory
+                .content
+                .as_ref()
+                .is_some_and(|text| text.len() > 8192)
+                || memory
+                    .old_text
+                    .as_ref()
+                    .is_some_and(|text| text.len() > 8192)
+                || memory.reason.len() > 2048
+            {
+                return Err(crate::model::invalid(
+                    "learning memory exceeds its field limit",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtractedExperienceKind {
     Outcome,
@@ -102,7 +188,8 @@ impl From<ExtractedExperienceKind> for zuno_types::ExperienceKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExtractedExperience {
     pub kind: ExtractedExperienceKind,
     pub title: String,
@@ -113,7 +200,7 @@ pub struct ExtractedExperience {
     pub evidence: Vec<ExtractedEvidence>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtractedEvidenceKind {
     Message,
@@ -135,14 +222,15 @@ impl From<ExtractedEvidenceKind> for zuno_db::experience::ExperienceEvidenceKind
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExtractedEvidence {
     pub kind: ExtractedEvidenceKind,
     pub source_id: Option<String>,
     pub excerpt: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtractedMemoryScope {
     Global,
@@ -158,7 +246,7 @@ impl From<ExtractedMemoryScope> for zuno_types::MemoryScope {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtractedMemoryAction {
     Add,
@@ -176,7 +264,8 @@ impl From<ExtractedMemoryAction> for zuno_types::MemoryAction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExtractedMemory {
     /// Ordinal in `experiences` that supplies the evidence and promotion guard.
     pub experience_ordinal: usize,
@@ -192,6 +281,11 @@ pub struct ExtractedMemory {
 pub trait LearningExtractor: Send + Sync {
     fn version(&self) -> &str;
 
+    /// Freeze the exact evidence admitted to the provider before the job executes.
+    fn prepare_request(&self, request: ExtractionRequest) -> crate::Result<ExtractionRequest> {
+        Ok(request)
+    }
+
     /// Extract structured data. Implementations receive no tool registry, file
     /// handle, or network client from this interface.
     async fn extract(&self, request: ExtractionRequest) -> crate::Result<LearningExtraction>;
@@ -204,6 +298,8 @@ mod tests {
 
     fn request() -> ExtractionRequest {
         ExtractionRequest {
+            sources: Vec::new(),
+            sources_truncated: false,
             project_id: "project-1".to_owned(),
             session_id: "session-1".to_owned(),
             source_message_id: "assistant-1".to_owned(),

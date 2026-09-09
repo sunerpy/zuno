@@ -659,6 +659,13 @@ Shell 门禁会穿过命令行前面的包装程序来阅读它——`sudo`、`d
 - 未填写的 `use` 与 `generate` 均默认为 `true`。
 - `use: true, generate: false` 可以只读使用既有 Experience，不需要配置 `extractor_model`。
 - `extractor_model` 可选；显式值具有最高优先级，否则依次使用当前 provider 下可达的 `small_model`、当前会话模型。自动选择不会打开另一个 provider，也不会改写配置。
+- `learning.execution` 约束隔离的提取、归并与 Skill 评测。`timeout_ms` 默认 `120000`，
+  最大 `3600000`；`max_input_bytes` 默认 `131072`，最大 `1048576`；`max_output_tokens`
+  默认 `4096`，最大 `65536`，并受所选模型声明的输出上限约束；离线 Skill 尝试的 `max_steps`
+  默认 `8`，最大 `64`。数值必须为正；完整评测 suite 共用总超时。
+  `structured_output` 默认 `false`，只有所选 Chat、Responses 或 Messages 端点支持原生
+  JSON Schema 协议时才开启。默认模式会把同一 schema 放入 Prompt，并在本地做有界解析与修复。
+  Skill 评测只在 `/learn skill-review` 时启动，不需要单独配置模型。
 - `post_turn.enabled` 只控制符合条件任务完成后的自动抽取，不控制既有 Experience 的读取。
 - `post_turn.idle_delay_ms` 默认 `21600000`（六小时），可设为 `0` 表示自动任务立即具备运行资格。
 - `post_turn.poll_interval_ms` 默认 `60000` 且必须大于零；`post_turn.max_jobs_per_wake` 默认 `2` 且必须大于零。

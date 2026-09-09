@@ -14,12 +14,13 @@ use zuno_error::DbError;
 /// Current database format.
 ///
 /// Bump this whenever [`crate::schema`] changes incompatibly.
-pub const CURRENT_FORMAT: u32 = 10;
+pub const CURRENT_FORMAT: u32 = 11;
 const LEARNING_UPGRADE_FROM: u32 = 5;
 const PLAN_STACK_UPGRADE_FROM: u32 = 6;
 const VERIFICATION_UPGRADE_FROM: u32 = 7;
 const MEMORY_POLICY_UPGRADE_FROM: u32 = 8;
 const EXECUTION_UPGRADE_FROM: u32 = 9;
+const MEMORY_RUNTIME_UPGRADE_FROM: u32 = 10;
 
 const FORMAT_TABLE: &str = "zuno_schema";
 const FORMAT_SQL: &str = "
@@ -108,6 +109,7 @@ fn dispatch_once(connection: &mut Connection) -> Result<Dispatch, DbError> {
         Some(VERIFICATION_UPGRADE_FROM) => migrate_verification(connection),
         Some(MEMORY_POLICY_UPGRADE_FROM) => migrate_memory_policy(connection),
         Some(EXECUTION_UPGRADE_FROM) => migrate_execution(connection),
+        Some(MEMORY_RUNTIME_UPGRADE_FROM) => migrate_memory_runtime(connection),
         observed => Err(DbError::SchemaMismatch {
             expected: CURRENT_FORMAT,
             observed,
@@ -125,6 +127,9 @@ fn validate_current(connection: &Connection, tables: &[String]) -> Result<(), Db
         "session_memory_policy",
         "session_execution_state",
         "completion_delivery",
+        "resident_memory_document",
+        "resident_memory_revision",
+        "learning_retrieval_snapshot",
     ];
     let missing = required
         .into_iter()
@@ -173,6 +178,7 @@ fn validate_current(connection: &Connection, tables: &[String]) -> Result<(), Db
         }
     }
     validate_execution_shape(connection)?;
+    validate_memory_runtime_shape(connection)?;
     Ok(())
 }
 
@@ -238,6 +244,7 @@ fn migrate_learning(connection: &mut Connection) -> Result<Dispatch, DbError> {
     schema::up_verification(&transaction)?;
     schema::up_memory_policy(&transaction)?;
     schema::up_execution(&transaction)?;
+    schema::up_memory_runtime(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -272,6 +279,7 @@ fn migrate_plan_stack(connection: &mut Connection) -> Result<Dispatch, DbError> 
     schema::up_verification(&transaction)?;
     schema::up_memory_policy(&transaction)?;
     schema::up_execution(&transaction)?;
+    schema::up_memory_runtime(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -305,6 +313,7 @@ fn migrate_verification(connection: &mut Connection) -> Result<Dispatch, DbError
     schema::up_verification(&transaction)?;
     schema::up_memory_policy(&transaction)?;
     schema::up_execution(&transaction)?;
+    schema::up_memory_runtime(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -339,6 +348,7 @@ fn migrate_memory_policy(connection: &mut Connection) -> Result<Dispatch, DbErro
     }
     schema::up_memory_policy(&transaction)?;
     schema::up_execution(&transaction)?;
+    schema::up_memory_runtime(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -372,6 +382,7 @@ fn migrate_execution(connection: &mut Connection) -> Result<Dispatch, DbError> {
         }
     }
     schema::up_execution(&transaction)?;
+    schema::up_memory_runtime(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -385,6 +396,199 @@ fn migrate_execution(connection: &mut Connection) -> Result<Dispatch, DbError> {
     }
     transaction.commit().map_err(map_error)?;
     Ok(Dispatch::Settled)
+}
+
+/// Upgrade a published format-10 database without replacing any existing row.
+fn migrate_memory_runtime(connection: &mut Connection) -> Result<Dispatch, DbError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_error)?;
+    let tables = transaction_table_names(&transaction)?;
+    let observed = observed_format(&transaction, &tables)?;
+    if observed != Some(MEMORY_RUNTIME_UPGRADE_FROM) {
+        return Ok(Dispatch::Moved { observed });
+    }
+    validate_execution_shape(&transaction)?;
+    for required in ["experience_record", "experience_evidence", "learning_job"] {
+        if !tables.iter().any(|table| table == required) {
+            return Err(failure(std::io::Error::other(format!(
+                "format-10 marker exists without the required {required} table"
+            ))));
+        }
+    }
+    schema::up_memory_runtime(&transaction)?;
+    let changed = transaction
+        .execute(
+            "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
+            params![CURRENT_FORMAT, MEMORY_RUNTIME_UPGRADE_FROM],
+        )
+        .map_err(map_error)?;
+    if changed != 1 {
+        return Err(failure(std::io::Error::other(
+            "format-10 marker changed during the memory-runtime migration",
+        )));
+    }
+    transaction.commit().map_err(map_error)?;
+    Ok(Dispatch::Settled)
+}
+
+fn validate_memory_runtime_shape(connection: &Connection) -> Result<(), DbError> {
+    for (table, expected) in [
+        (
+            "resident_memory_document",
+            &[
+                "path",
+                "scope",
+                "revision",
+                "entries",
+                "content_digest",
+                "projected_revision",
+                "projection_error",
+                "time_created",
+                "time_updated",
+            ][..],
+        ),
+        (
+            "resident_memory_revision",
+            &[
+                "path",
+                "revision",
+                "entries",
+                "content_digest",
+                "operation",
+                "candidate_id",
+                "time_created",
+            ][..],
+        ),
+        (
+            "learning_retrieval_snapshot",
+            &[
+                "session_id",
+                "query_digest",
+                "selected_ids",
+                "candidate_count",
+                "estimated_tokens",
+                "reason",
+                "time_updated",
+            ][..],
+        ),
+        (
+            "experience_record",
+            &["evidence_verified", "last_used_at", "use_count"][..],
+        ),
+        (
+            "experience_evidence",
+            &["source_digest", "verified", "promotion_eligible"][..],
+        ),
+        ("learning_job", &["lease_token"][..]),
+        (
+            "skill_candidate",
+            &["evaluation_lease_token", "evaluation_lease_expires"][..],
+        ),
+    ] {
+        let actual = column_names(connection, table)?;
+        if expected
+            .iter()
+            .any(|column| !actual.iter().any(|found| found == column))
+        {
+            return Err(failure(std::io::Error::other(format!(
+                "current memory runtime is missing required columns in `{table}`"
+            ))));
+        }
+    }
+    const OBJECTS: &[&str] = &[
+        "resident_memory_document",
+        "resident_memory_revision",
+        "learning_retrieval_snapshot",
+        "experience_search_fts",
+        "experience_search_cjk_fts",
+        "experience_search_fts_insert",
+        "experience_search_fts_delete",
+        "experience_search_fts_update",
+        "experience_search_cjk_fts_insert",
+        "experience_search_cjk_fts_delete",
+        "experience_search_cjk_fts_update",
+        "resident_memory_revision_candidate_idx",
+        "message_session_user_boundary_idx",
+        "experience_record_usage_idx",
+        "learning_job_extraction_source_idx",
+        "learning_job_extraction_lookup_idx",
+    ];
+    // These objects are introduced together in format 11. Compare their parsed
+    // SQLite definitions, rather than accepting an index/trigger with only the
+    // correct name. The reference is built once per process, never in user state.
+    static EXPECTED: std::sync::OnceLock<
+        Result<std::collections::BTreeMap<String, String>, String>,
+    > = std::sync::OnceLock::new();
+    let expected = EXPECTED
+        .get_or_init(|| {
+            let mut reference = Connection::open_in_memory().map_err(|error| error.to_string())?;
+            let transaction = reference.transaction().map_err(|error| error.to_string())?;
+            schema::up(&transaction).map_err(|error| error.to_string())?;
+            transaction.commit().map_err(|error| error.to_string())?;
+            let mut objects = std::collections::BTreeMap::new();
+            for name in OBJECTS {
+                let sql: String = reference
+                    .query_row(
+                        "SELECT sql FROM sqlite_schema WHERE name=?1",
+                        [name],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                objects.insert((*name).to_owned(), normalized_sql(&sql));
+            }
+            Ok(objects)
+        })
+        .as_ref()
+        .map_err(|detail| failure(std::io::Error::other(detail.clone())))?;
+    for name in OBJECTS {
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_error)?;
+        if actual.as_deref().map(normalized_sql).as_ref() != expected.get(*name) {
+            return Err(failure(std::io::Error::other(format!(
+                "current memory runtime has a missing or malformed `{name}`"
+            ))));
+        }
+    }
+    for (table, clauses) in [
+        (
+            "experience_record",
+            &["check(evidence_verifiedin(0,1))", "check(use_count>=0)"][..],
+        ),
+        (
+            "experience_evidence",
+            &["check(verifiedin(0,1))", "check(promotion_eligiblein(0,1))"][..],
+        ),
+    ] {
+        let sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(map_error)?;
+        let sql = normalized_sql(&sql);
+        if clauses.iter().any(|clause| !sql.contains(clause)) {
+            return Err(failure(std::io::Error::other(format!(
+                "current memory runtime has weakened provenance constraints in {table}"
+            ))));
+        }
+    }
+    Ok(())
+}
+
+fn normalized_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '`' | '"'))
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+        .replace("ifnotexists", "")
 }
 
 fn table_names(connection: &Connection) -> Result<Vec<String>, DbError> {
@@ -589,19 +793,28 @@ mod tests {
         open::open(&zuno_paths::DbLocation::Memory).expect("open memory database")
     }
 
-    // The helpers below synthesize an older shape by removing pieces of the current
-    // schema. They exercise each additive step in isolation; the exact databases the
-    // v0.0.3, v0.2.2, v0.6.7, and v0.10.5 releases wrote live in
-    // `tests/fixtures/format-*.sql` and are upgraded end to end by
-    // `tests/migration_fixtures.rs`.
-    fn remove_plan_stack_schema(connection: &Connection) {
+    // Reuse the released DDL, then let each test seed the rows it needs.
+    fn released_schema(connection: &Connection, format: u32) {
+        let sql = match format {
+            5 => include_str!("../../tests/fixtures/format-5.sql"),
+            6 => include_str!("../../tests/fixtures/format-6.sql"),
+            7 | 8 => include_str!("../../tests/fixtures/format-7.sql"),
+            _ => panic!("unsupported fixture format"),
+        };
         connection
-            .execute_batch(
-                "DROP TABLE work_plan_archive;
-                 ALTER TABLE work_plan DROP COLUMN parent_plan_id;
-                 ALTER TABLE work_plan DROP COLUMN stack_depth;",
-            )
-            .expect("construct pre-Plan-stack schema");
+            .execute_batch(sql.split("-- Representative rows.").next().expect("DDL"))
+            .expect("released schema");
+        if format == 8 {
+            let delta = include_str!("../../tests/fixtures/format-8.sql");
+            connection
+                .execute_batch(
+                    delta
+                        .split("INSERT INTO `verification_receipt`")
+                        .next()
+                        .expect("DDL"),
+                )
+                .expect("released verification delta");
+        }
     }
 
     fn remove_verification_schema(connection: &Connection) {
@@ -614,19 +827,6 @@ mod tests {
         connection
             .execute_batch("DROP TABLE session_memory_policy;")
             .expect("construct pre-memory-policy schema");
-    }
-
-    fn remove_execution_schema(connection: &Connection) {
-        connection
-            .execute_batch(
-                "DROP TABLE completion_delivery;
-                 DROP TABLE session_execution_state;
-                 DROP INDEX session_input_session_source_key_idx;
-                 ALTER TABLE session_input DROP COLUMN cycle_id;
-                 ALTER TABLE session_input DROP COLUMN trigger_kind;
-                 ALTER TABLE session_input DROP COLUMN source_key;",
-            )
-            .expect("construct pre-execution-state schema");
     }
 
     #[test]
@@ -740,11 +940,7 @@ mod tests {
     #[test]
     fn format_five_upgrades_without_rewriting_history() {
         let mut connection = memory();
-        create_current(&mut connection).expect("create current schema");
-        remove_execution_schema(&connection);
-        remove_memory_policy_schema(&connection);
-        remove_plan_stack_schema(&connection);
-        remove_verification_schema(&connection);
+        released_schema(&connection, 5);
         connection
             .execute_batch(
                 "INSERT INTO project \
@@ -770,16 +966,6 @@ mod tests {
                    '[{\"id\":\"inspect\",\"title\":\"Inspect history\",\"status\":\"in_progress\"}]',
                    1, 2
                  );
-                 DROP TABLE skill_candidate;
-                 DROP TABLE evaluation_result;
-                 DROP TABLE evaluation_run;
-                 DROP TABLE evaluation_case;
-                 DROP TABLE evaluation_suite;
-                 DROP TABLE learning_pattern;
-                 DROP TABLE experience_evidence;
-                 DROP TABLE experience_record;
-                 DROP TABLE learning_job;
-                 DROP TABLE message_feedback;
                  UPDATE zuno_schema SET format = 5 WHERE singleton = 1;",
             )
             .expect("construct exact additive format-five shape");
@@ -891,11 +1077,7 @@ mod tests {
     #[test]
     fn format_six_adds_plan_stack_without_rewriting_the_active_plan() {
         let mut connection = memory();
-        create_current(&mut connection).expect("create current schema");
-        remove_execution_schema(&connection);
-        remove_memory_policy_schema(&connection);
-        remove_plan_stack_schema(&connection);
-        remove_verification_schema(&connection);
+        released_schema(&connection, 6);
         connection
             .execute_batch(
                 "INSERT INTO project \
@@ -1020,10 +1202,7 @@ mod tests {
     #[test]
     fn format_seven_adds_the_verification_ledger_without_rewriting_history() {
         let mut connection = memory();
-        create_current(&mut connection).expect("create current schema");
-        remove_execution_schema(&connection);
-        remove_memory_policy_schema(&connection);
-        remove_verification_schema(&connection);
+        released_schema(&connection, 7);
         connection
             .execute_batch(
                 "INSERT INTO project \
@@ -1060,9 +1239,7 @@ mod tests {
                  UPDATE zuno_schema SET format = 7 WHERE singleton = 1;",
             )
             .expect("construct format-seven schema");
-        // The fixture is derived from the current schema minus the ledger, so pin what that
-        // produced against the tables v0.6.7 actually shipped: if `create_current` grows
-        // another table later, this stops being a format-7 database and the test says so.
+        // Independently pin the table set shipped by v0.6.7.
         let tables: Vec<String> = connection
             .prepare(
                 "SELECT name FROM sqlite_master WHERE type = 'table' \
@@ -1316,9 +1493,7 @@ mod tests {
     #[test]
     fn format_eight_adds_memory_policy_without_rewriting_history_or_learning_jobs() {
         let mut connection = memory();
-        create_current(&mut connection).expect("create current schema");
-        remove_execution_schema(&connection);
-        remove_memory_policy_schema(&connection);
+        released_schema(&connection, 8);
         connection
             .execute_batch(
                 "INSERT INTO project
@@ -1456,9 +1631,7 @@ mod tests {
     #[test]
     fn corrupt_format_eight_without_learning_jobs_fails_closed() {
         let mut connection = memory();
-        create_current(&mut connection).expect("create current schema");
-        remove_execution_schema(&connection);
-        remove_memory_policy_schema(&connection);
+        released_schema(&connection, 8);
         connection
             .execute_batch(
                 "INSERT INTO project
@@ -1649,21 +1822,14 @@ mod tests {
     #[test]
     fn a_concurrent_upgrade_that_loses_the_write_lock_validates_instead_of_mismatching() {
         let (_dir, mut winner, loser) = file_pair();
-        apply(&mut winner).expect("create the current schema");
-        remove_execution_schema(&winner);
-        remove_memory_policy_schema(&winner);
-        winner
-            .execute(
-                "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1",
-                params![MEMORY_POLICY_UPGRADE_FROM],
-            )
-            .expect("rewind the marker to format 8");
+        released_schema(&winner, 8);
 
         let held = winner
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .expect("the winner reserves the writer");
         schema::up_memory_policy(&held).expect("the winner adds session memory policy");
         schema::up_execution(&held).expect("the winner adds session execution state");
+        schema::up_memory_runtime(&held).expect("the winner adds memory runtime");
         held.execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
             params![CURRENT_FORMAT, MEMORY_POLICY_UPGRADE_FROM],

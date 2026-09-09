@@ -643,13 +643,24 @@ pub async fn get(
     Ok(Json(Data::new(SessionInfo::from(session))))
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct LearningPageQuery {
+    pub offset: Option<u32>,
+    pub limit: Option<u32>,
+}
+
 pub async fn learning(
     State(state): State<ApiState>,
     Path(session_id): Path<String>,
+    Query(page): Query<LearningPageQuery>,
 ) -> Result<Json<Data<zuno_types::LearningStateProjection>>, ApiError> {
     let session = state.sessions().get(&session_id)?;
-    let projection = zuno_learning::LearningProjectionService::new(state.pool_arc())
-        .snapshot(&session_id, &session.project_id)?;
+    let projection = zuno_learning::LearningProjectionService::new(state.pool_arc()).page(
+        &session_id,
+        &session.project_id,
+        page.offset.unwrap_or(0),
+        page.limit.unwrap_or(100),
+    )?;
     Ok(Json(Data::new(projection)))
 }
 

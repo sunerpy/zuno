@@ -432,7 +432,7 @@ fn skip_queued_auto_extraction_jobs_in(
     transaction
         .execute(
             "UPDATE learning_job
-             SET status = 'skipped', result = ?2, error = NULL, owner_id = NULL,
+             SET status = 'skipped', result = ?2, error = NULL, owner_id = NULL, lease_token = NULL,
                  lease_expires = NULL, time_updated = ?3, time_completed = ?3
              WHERE session_id = ?1 AND kind = 'extraction' AND status = 'queued'
                AND (
@@ -782,11 +782,19 @@ mod tests {
             ))
             .expect("enqueue");
         }
+        pool.get()
+            .expect("connection")
+            .execute_batch(
+                "INSERT INTO message(id,session_id,time_created,time_updated,data)
+             SELECT 'assistant-manual',session_id,time_created,time_updated,data
+             FROM message WHERE id='assistant-1';",
+            )
+            .expect("independent manual source");
         jobs.enqueue(NewLearningJob::extraction(
             "job-manual",
             "project-1",
             "session-1",
-            "assistant-1",
+            "assistant-manual",
             "extractor-manual",
             json!({"trigger":"manual","request":{"transcript":"durable"}}),
             5,

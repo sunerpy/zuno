@@ -86,7 +86,8 @@ pub use crate::scope::{
     ENTRY_DELIMITER, GLOBAL_FILE, MEMORY_DIRECTORY, PROJECT_FILE, Scope, ScopeLimits, char_count,
 };
 pub use crate::service::{
-    MemoryObserver, MemoryProposal, MemoryService, MemoryServiceError, PromotionPolicy, ScopePaths,
+    MemoryObserver, MemoryProposal, MemoryService, MemoryServiceError, MemorySnapshot,
+    PromotionPolicy, ScopePaths,
 };
 pub use crate::snapshot::{
     CacheConsistency, EXTERNAL_MEMORY_NOTE, ScopeEnablement, SessionMemory, assemble_system_prompt,

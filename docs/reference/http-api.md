@@ -146,7 +146,7 @@ concurrency limits.
 | `GET` | `/api/session/{sessionID}/context` | Read current context items |
 | `GET` | `/api/session/{sessionID}/history` | Read durable history |
 | `GET` | `/api/session/{sessionID}/message` | Read paginated messages |
-| `GET` | `/api/session/{sessionID}/learning` | Read the durable learning projection |
+| `GET` | `/api/session/{sessionID}/learning` | Read paginated Experience, queue/deadline/error state and latest recall selection |
 | `GET` | `/api/session/{sessionID}/memory-policy` | Read session Memory policy |
 | `PUT` | `/api/session/{sessionID}/memory-policy` | Revision-guarded Memory policy update |
 | `GET` | `/api/session/{sessionID}/event` | Replay and follow durable session events over SSE |
@@ -159,6 +159,12 @@ concurrency limits.
 | `POST` | `/api/session/{sessionID}/revert/stage` | Stage a snapshot revert |
 | `POST` | `/api/session/{sessionID}/revert/clear` | Clear the staged revert |
 | `POST` | `/api/session/{sessionID}/revert/commit` | Commit the staged revert |
+
+The learning route accepts `offset` (default `0`) and `limit` (default `100`,
+clamped to `1..100`). `experiencePage` reports `total` and `nextOffset`; `queue`
+contains counts, due time and recent job diagnostics; `retrieval` describes the
+latest selected ids, query digest, estimated token cost or skip reason. Reading
+this projection does not run a model or rebuild an index.
 
 A Memory policy update accepts `useMemories`, `generation` (`enabled` or
 `disabled`), and `expectedRevision`. `excluded` is host-owned and cannot be

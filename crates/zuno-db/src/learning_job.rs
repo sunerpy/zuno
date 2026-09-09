@@ -10,7 +10,7 @@ use zuno_types::SessionMemoryGeneration;
 
 const COLUMNS: &str = "id, project_id, session_id, source_message_id, kind, extractor_version, \
     idempotency_key, status, attempt, owner_id, lease_expires, scheduled_at, payload, result, \
-    error, time_created, time_updated, time_completed";
+    error, time_created, time_updated, time_completed, lease_token";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LearningJobKind {
@@ -126,6 +126,30 @@ pub struct LearningJobRecord {
     pub time_created: i64,
     pub time_updated: i64,
     pub time_completed: Option<i64>,
+    pub lease_token: Option<String>,
+}
+
+/// Attempt-specific authority captured when a worker claims a job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearningLease {
+    pub owner_id: String,
+    pub token: String,
+}
+
+impl LearningJobRecord {
+    pub fn lease(&self) -> Result<LearningLease, DbError> {
+        match (&self.owner_id, &self.lease_token, self.status) {
+            (Some(owner_id), Some(token), LearningJobStatus::Running) => Ok(LearningLease {
+                owner_id: owner_id.clone(),
+                token: token.clone(),
+            }),
+            _ => Err(DbError::Conflict {
+                table: "learning_job".to_owned(),
+                id: self.id.clone(),
+                detail: "job does not hold an active attempt lease".to_owned(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -305,7 +329,7 @@ impl LearningJobStore {
             let changed = transaction
                 .execute(
                     "UPDATE learning_job
-                     SET status = 'running', attempt = attempt + 1, owner_id = ?2,
+                     SET status = 'running', attempt = attempt + 1, owner_id = ?2, lease_token = lower(hex(randomblob(16))),
                          lease_expires = ?3, error = NULL, time_updated = ?4
                      WHERE id = ?1 AND status = 'queued'",
                     params![id, owner_id, lease_expires, now],
@@ -362,7 +386,7 @@ impl LearningJobStore {
             let changed = transaction
                 .execute(
                     "UPDATE learning_job
-                     SET status = 'running', attempt = attempt + 1, owner_id = ?2,
+                     SET status = 'running', attempt = attempt + 1, owner_id = ?2, lease_token = lower(hex(randomblob(16))),
                          lease_expires = ?3, error = NULL, time_updated = ?4
                      WHERE id = ?1 AND status = 'queued'",
                     params![id, owner_id, lease_expires, now],
@@ -471,7 +495,7 @@ impl LearningJobStore {
             let changed = transaction
                 .execute(
                     "UPDATE learning_job
-                     SET status = 'running', attempt = attempt + 1, owner_id = ?2,
+                     SET status = 'running', attempt = attempt + 1, owner_id = ?2, lease_token = lower(hex(randomblob(16))),
                          lease_expires = ?3, error = NULL, time_updated = ?4
                      WHERE id = ?1 AND status = 'queued'",
                     params![id, owner_id, lease_expires, now],
@@ -503,7 +527,7 @@ impl LearningJobStore {
             let changed = transaction
                 .execute(
                     "UPDATE learning_job
-                     SET status = 'running', attempt = attempt + 1, owner_id = ?2,
+                     SET status = 'running', attempt = attempt + 1, owner_id = ?2, lease_token = lower(hex(randomblob(16))),
                          lease_expires = ?3, error = NULL, time_updated = ?4
                      WHERE id = ?1 AND status = 'queued' AND scheduled_at <= ?4
                        AND (
@@ -542,7 +566,7 @@ impl LearningJobStore {
             let changed = transaction
                 .execute(
                     "UPDATE learning_job
-                     SET status = 'running', attempt = attempt + 1, owner_id = ?2,
+                     SET status = 'running', attempt = attempt + 1, owner_id = ?2, lease_token = lower(hex(randomblob(16))),
                          lease_expires = ?3, error = NULL, time_updated = ?4
                      WHERE id = ?1 AND kind = 'extraction' AND status = 'queued'
                        AND scheduled_at <= ?4
@@ -592,7 +616,7 @@ impl LearningJobStore {
             transaction
                 .execute(
                     "UPDATE learning_job
-                     SET status = 'queued', attempt = 0, owner_id = NULL,
+                     SET status = 'queued', attempt = 0, owner_id = NULL, lease_token = NULL,
                          lease_expires = NULL, payload = ?2, scheduled_at = ?3,
                          result = NULL, error = NULL, time_updated = ?3,
                          time_completed = NULL
@@ -616,7 +640,7 @@ impl LearningJobStore {
     pub fn settle(
         &self,
         id: &str,
-        owner_id: &str,
+        lease: &LearningLease,
         status: LearningJobStatus,
         result: Option<&Value>,
         error: Option<&str>,
@@ -635,15 +659,23 @@ impl LearningJobStore {
             let changed = transaction
                 .execute(
                     "UPDATE learning_job
-                     SET status = ?3, result = ?4, error = ?5, owner_id = NULL,
+                     SET status = ?3, result = ?4, error = ?5, owner_id = NULL, lease_token = NULL,
                          lease_expires = NULL, time_updated = ?6, time_completed = ?6
-                     WHERE id = ?1 AND owner_id = ?2 AND status = 'running'",
-                    params![id, owner_id, status.as_str(), result, error, now],
+                     WHERE id = ?1 AND owner_id = ?2 AND status = 'running' AND lease_token = ?7",
+                    params![
+                        id,
+                        lease.owner_id,
+                        status.as_str(),
+                        result,
+                        error,
+                        now,
+                        lease.token
+                    ],
                 )
                 .map_err(open::map_error)?;
             if changed != 1 {
                 return Err(query_error(std::io::Error::other(format!(
-                    "learning job `{id}` is not running for owner `{owner_id}`"
+                    "learning job `{id}` no longer belongs to this attempt"
                 ))));
             }
             read_required(transaction, id)
@@ -654,13 +686,13 @@ impl LearningJobStore {
     pub fn retry(
         &self,
         id: &str,
-        owner_id: &str,
+        lease: &LearningLease,
         error: &str,
         scheduled_at: i64,
         now: i64,
     ) -> Result<LearningJobRecord, DbError> {
         if id.trim().is_empty()
-            || owner_id.trim().is_empty()
+            || lease.owner_id.trim().is_empty()
             || error.trim().is_empty()
             || scheduled_at < now
         {
@@ -672,16 +704,23 @@ impl LearningJobStore {
             let changed = transaction
                 .execute(
                     "UPDATE learning_job
-                     SET status = 'queued', owner_id = NULL, lease_expires = NULL,
+                     SET status = CASE WHEN kind = 'extraction' AND EXISTS (
+                           SELECT 1 FROM session_memory_policy p
+                           WHERE p.session_id = learning_job.session_id AND p.generation <> 'enabled'
+                         ) THEN 'skipped' ELSE 'queued' END,
+                         owner_id = NULL, lease_token = NULL, lease_expires = NULL,
                          scheduled_at = ?4, error = ?3, time_updated = ?5,
-                         time_completed = NULL
-                     WHERE id = ?1 AND owner_id = ?2 AND status = 'running'",
-                    params![id, owner_id, error, scheduled_at, now],
+                         time_completed = CASE WHEN kind = 'extraction' AND EXISTS (
+                           SELECT 1 FROM session_memory_policy p
+                           WHERE p.session_id = learning_job.session_id AND p.generation <> 'enabled'
+                         ) THEN ?5 ELSE NULL END
+                     WHERE id = ?1 AND owner_id = ?2 AND status = 'running' AND lease_token = ?6",
+                    params![id, lease.owner_id, error, scheduled_at, now, lease.token],
                 )
                 .map_err(open::map_error)?;
             if changed != 1 {
                 return Err(query_error(std::io::Error::other(format!(
-                    "learning job `{id}` is not running for owner `{owner_id}`"
+                    "learning job `{id}` no longer belongs to this attempt"
                 ))));
             }
             read_required(transaction, id)
@@ -694,7 +733,7 @@ impl LearningJobStore {
             let skipped = transaction
                 .execute(
                     "UPDATE learning_job
-                     SET status = 'skipped', owner_id = NULL, lease_expires = NULL,
+                     SET status = 'skipped', owner_id = NULL, lease_token = NULL, lease_expires = NULL,
                          result = '{\"kind\":\"sessionMemoryPolicy\",\"generation\":\"excluded\",\
 \"reason\":\"worker lease expired after session exclusion\",\
 \"source\":\"lease_reconciliation\"}',
@@ -712,7 +751,7 @@ impl LearningJobStore {
             let requeued = transaction
                 .execute(
                     "UPDATE learning_job
-                     SET status = 'queued', owner_id = NULL, lease_expires = NULL,
+                     SET status = 'queued', owner_id = NULL, lease_token = NULL, lease_expires = NULL,
                          error = 'worker lease expired before a durable result',
                          scheduled_at = ?1, time_updated = ?1
                      WHERE status = 'running' AND lease_expires <= ?1
@@ -731,7 +770,7 @@ impl LearningJobStore {
             let uncertain = transaction
                 .execute(
                     "UPDATE learning_job
-                     SET status = 'uncertain', owner_id = NULL, lease_expires = NULL,
+                     SET status = 'uncertain', owner_id = NULL, lease_token = NULL, lease_expires = NULL,
                          error = 'side-effectful worker lease expired; inspect authoritative state',
                          time_updated = ?1, time_completed = ?1
                      WHERE status = 'running' AND lease_expires <= ?1
@@ -750,6 +789,72 @@ impl LearningJobStore {
     pub fn get(&self, id: &str) -> Result<LearningJobRecord, DbError> {
         let connection = self.pool.get()?;
         read_required(&connection, id)
+    }
+
+    pub fn refresh_extraction_input(
+        &self,
+        id: &str,
+        lease: &LearningLease,
+        payload: &Value,
+        now: i64,
+    ) -> Result<LearningJobRecord, DbError> {
+        let payload = serde_json::to_string(payload).map_err(query_error)?;
+        self.pool.transaction(|transaction| {
+            let changed = transaction
+                .execute(
+                    "UPDATE learning_job SET payload=?4
+                 WHERE id=?1 AND owner_id=?2 AND lease_token=?3 AND status='running'
+                   AND kind='extraction' AND lease_expires>?5",
+                    params![id, lease.owner_id, lease.token, payload, now],
+                )
+                .map_err(open::map_error)?;
+            if changed != 1 {
+                return Err(DbError::Conflict {
+                    table: "learning_job".to_owned(),
+                    id: id.to_owned(),
+                    detail: "extraction input refresh lost its lease".to_owned(),
+                });
+            }
+            read_required(transaction, id)
+        })
+    }
+
+    pub fn heartbeat(
+        &self,
+        id: &str,
+        lease: &LearningLease,
+        now: i64,
+        expires: i64,
+    ) -> Result<bool, DbError> {
+        if expires <= now {
+            return Err(query_error(std::io::Error::other(
+                "lease deadline must be in the future",
+            )));
+        }
+        self.pool.transaction(|transaction| {
+            transaction
+                .execute(
+                    "UPDATE learning_job SET lease_expires = ?4
+                 WHERE id = ?1 AND owner_id = ?2 AND lease_token = ?3
+                   AND status = 'running' AND lease_expires > ?5
+                   AND NOT EXISTS (
+                     SELECT 1 FROM session_memory_policy p
+                     WHERE p.session_id = learning_job.session_id AND p.generation <> 'enabled'
+                   )
+                   AND (kind <> 'extraction' OR json_extract(payload, '$.trigger') = 'manual'
+                     OR (
+                       NOT EXISTS (SELECT 1 FROM session_input i
+                         WHERE i.session_id = learning_job.session_id
+                           AND i.state IN ('queued','steering','promoted'))
+                       AND EXISTS (SELECT 1 FROM session s
+                         WHERE s.id = learning_job.session_id
+                           AND s.time_updated <= learning_job.time_updated)
+                     ))",
+                    params![id, lease.owner_id, lease.token, expires, now],
+                )
+                .map(|changed| changed == 1)
+                .map_err(open::map_error)
+        })
     }
 
     pub fn list_for_project(
@@ -801,6 +906,23 @@ fn enqueue_in(
             ],
         )
         .map_err(open::map_error)?;
+    if changed == 1
+        && job.kind == LearningJobKind::Extraction
+        && job
+            .payload
+            .as_ref()
+            .and_then(|value| value.get("trigger"))
+            .and_then(Value::as_str)
+            == Some("manual")
+    {
+        connection.execute(
+            "UPDATE learning_job SET status='skipped',owner_id=NULL,lease_token=NULL,lease_expires=NULL,
+             error='superseded by explicit reflection',time_updated=?4,time_completed=?4
+             WHERE kind='extraction' AND session_id=?1 AND source_message_id=?2
+               AND idempotency_key<>?3 AND status IN ('queued','running')",
+            params![job.session_id,job.source_message_id,job.idempotency_key,job.time_created],
+        ).map_err(open::map_error)?;
+    }
     Ok(LearningJobInsert {
         record: read_by_key(connection, &job.idempotency_key)?,
         inserted: changed == 1,
@@ -877,6 +999,7 @@ type StoredJob = (
     i64,
     i64,
     Option<i64>,
+    Option<String>,
 );
 
 fn decode_row(row: &Row<'_>) -> rusqlite::Result<StoredJob> {
@@ -899,6 +1022,7 @@ fn decode_row(row: &Row<'_>) -> rusqlite::Result<StoredJob> {
         row.get(15)?,
         row.get(16)?,
         row.get(17)?,
+        row.get(18)?,
     ))
 }
 
@@ -941,6 +1065,7 @@ fn decode(row: StoredJob) -> Result<LearningJobRecord, DbError> {
         time_created: row.15,
         time_updated: row.16,
         time_completed: row.17,
+        lease_token: row.18,
     })
 }
 
@@ -1031,12 +1156,14 @@ mod tests {
                 10,
             ))
             .expect("enqueue");
-        store
+        let lease = store
             .claim("job-retry", "worker-1", 11, 30)
             .expect("claim")
-            .expect("running job");
+            .expect("running job")
+            .lease()
+            .expect("lease");
         let retried = store
-            .retry("job-retry", "worker-1", "provider unavailable", 20, 12)
+            .retry("job-retry", &lease, "provider unavailable", 20, 12)
             .expect("retry");
         assert_eq!(retried.status, LearningJobStatus::Queued);
         assert_eq!(retried.attempt, 1);
@@ -1075,7 +1202,9 @@ mod tests {
         store
             .claim("job-excluded-lease", "worker-1", 11, 20)
             .expect("claim")
-            .expect("running job");
+            .expect("running job")
+            .lease()
+            .expect("lease");
         {
             let connection = store.pool.get().expect("connection");
             connection
@@ -1454,14 +1583,16 @@ mod tests {
                 10,
             ))
             .expect("enqueue");
-        store
+        let lease = store
             .claim("job-revive", "worker-1", 10, 30)
             .expect("claim")
-            .expect("running job");
+            .expect("running job")
+            .lease()
+            .expect("lease");
         store
             .settle(
                 "job-revive",
-                "worker-1",
+                &lease,
                 LearningJobStatus::Skipped,
                 Some(&json!({"reason":"automatic generation was disabled"})),
                 None,

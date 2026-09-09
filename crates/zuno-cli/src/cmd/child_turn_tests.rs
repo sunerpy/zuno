@@ -12,7 +12,7 @@ use crate::command::GlobalOptions;
 use std::future::pending;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_paths::{DbLocation, Env};
@@ -1631,41 +1631,6 @@ async fn background_supervisor_cancels_and_joins_only_one_parent_session() {
 
     jobs.cancel_all();
     jobs.wait_all().await;
-}
-
-struct TaskDropFlag(Arc<AtomicBool>);
-
-impl Drop for TaskDropFlag {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
-}
-
-#[tokio::test]
-async fn supervised_handle_is_aborted_and_joined_on_process_shutdown() {
-    let jobs = BackgroundJobSupervisor::default();
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let dropped = Arc::new(AtomicBool::new(false));
-    let task_entered = Arc::clone(&entered);
-    let task_dropped = Arc::clone(&dropped);
-    let task = tokio::spawn(async move {
-        let _drop = TaskDropFlag(task_dropped);
-        task_entered.notify_one();
-        pending::<()>().await;
-    });
-    jobs.supervise_handle(
-        "reflection_test",
-        "ses_test",
-        CancellationToken::new(),
-        task,
-    );
-    entered.notified().await;
-
-    jobs.cancel_all();
-    jobs.wait_all().await;
-
-    assert!(dropped.load(Ordering::Acquire));
-    assert!(!jobs.has_running_tasks("ses_test"));
 }
 
 #[tokio::test]

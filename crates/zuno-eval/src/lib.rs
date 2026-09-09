@@ -15,6 +15,8 @@ use zuno_db::evaluation::{
     NewEvaluationResult, NewEvaluationRun, NewEvaluationSuite,
 };
 use zuno_error::{BoxSource, DbError};
+mod cassette;
+pub use cassette::{CassetteDispatcher, CassetteResult, RecordedCall};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptSnapshot {
@@ -100,6 +102,24 @@ pub struct EvaluationService {
     store: EvaluationStore,
 }
 
+struct RunGuard {
+    store: EvaluationStore,
+    id: String,
+    settled: bool,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            let _ = self.store.fail_running(
+                &self.id,
+                "evaluation cancelled or failed before settlement",
+                zuno_db::message::now_millis(),
+            );
+        }
+    }
+}
+
 impl EvaluationService {
     #[must_use]
     pub fn new(pool: Arc<zuno_db::Pool>) -> Self {
@@ -114,6 +134,9 @@ impl EvaluationService {
         evaluator: &dyn OfflineCaseEvaluator,
     ) -> Result<EvaluationDecision, EvaluationError> {
         request.attempt.validate()?;
+        if request.timeout_ms == 0 || request.timeout_ms > 3_600_000 {
+            return Err(EvaluationError::InvalidSnapshot);
+        }
         let cases = self.store.cases(&request.suite_id)?;
         if cases.is_empty() {
             return Err(EvaluationError::EmptySuite {
@@ -123,102 +146,145 @@ impl EvaluationService {
         let run_id = format!("eval_{}", Uuid::now_v7().simple());
         let snapshot_json =
             serde_json::to_value(&request.attempt).expect("AttemptSnapshot is serializable");
+        let mut budget = request.attempt.budget_json();
+        budget["deadline"] = json!(
+            zuno_db::message::now_millis()
+                .saturating_add(i64::try_from(request.timeout_ms).unwrap_or(i64::MAX))
+        );
         self.store.start_run(NewEvaluationRun {
             id: run_id.clone(),
             suite_id: request.suite_id,
             candidate_id: request.candidate_id,
             model: request.attempt.model.clone(),
             toolset_digest: request.attempt.toolset_digest.clone(),
-            budget: request.attempt.budget_json(),
+            budget,
             attempt_snapshot: snapshot_json,
             time_created: request.time_created,
         })?;
-
-        let mut baseline_metric = 0_i64;
-        let mut candidate_metric = 0_i64;
-        let mut results = Vec::with_capacity(cases.len());
-        let mut cited_failures_fixed = true;
-        let mut protection_regressed = false;
-        for case in cases {
-            let baseline =
-                match evaluate_one(evaluator, &case, &request.baseline_skill, &request.attempt)
-                    .await
-                {
-                    Ok(observation) => observation,
-                    Err(error) => {
-                        let _ = self.store.fail_running(
-                            &run_id,
-                            &error.to_string(),
-                            request.time_completed,
-                        );
-                        return Err(error);
-                    }
-                };
-            let candidate =
-                match evaluate_one(evaluator, &case, &request.candidate_skill, &request.attempt)
-                    .await
-                {
-                    Ok(observation) => observation,
-                    Err(error) => {
-                        let _ = self.store.fail_running(
-                            &run_id,
-                            &error.to_string(),
-                            request.time_completed,
-                        );
-                        return Err(error);
-                    }
-                };
-            let weight = i64::from(case.weight);
-            baseline_metric = baseline_metric.saturating_add(baseline.score.saturating_mul(weight));
-            candidate_metric =
-                candidate_metric.saturating_add(candidate.score.saturating_mul(weight));
-            let cited_failure_fixed = case.kind != EvaluationCaseKind::Failure || candidate.passed;
-            let critical_regression = case.kind == EvaluationCaseKind::Protection
-                && baseline.passed
-                && (!candidate.passed
-                    || candidate.critical_failure
-                    || candidate.score < baseline.score);
-            cited_failures_fixed &= cited_failure_fixed;
-            protection_regressed |= critical_regression;
-            results.push(NewEvaluationResult {
-                id: format!("evr_{}", Uuid::now_v7().simple()),
-                case_id: case.id,
-                baseline_score: baseline.score,
-                candidate_score: candidate.score,
-                cited_failure_fixed,
-                critical_regression,
-                details: json!({
-                    "baseline": baseline.details,
-                    "candidate": candidate.details,
-                    "baselinePassed": baseline.passed,
-                    "candidatePassed": candidate.passed,
-                }),
-            });
-        }
-        let passed =
-            cited_failures_fixed && !protection_regressed && candidate_metric >= baseline_metric;
-        let status = if passed {
-            EvaluationRunStatus::Passed
-        } else {
-            EvaluationRunStatus::Failed
+        let mut guard = RunGuard {
+            store: self.store.clone(),
+            id: run_id.clone(),
+            settled: false,
         };
-        self.store.settle_run(
-            &run_id,
-            EvaluationRunSettlement {
-                status,
-                baseline_metric,
-                candidate_metric,
-                results: &results,
-                error: (!passed).then_some("candidate did not satisfy the evaluation policy"),
-                time_completed: request.time_completed,
+
+        let evaluated = tokio::time::timeout(
+            std::time::Duration::from_millis(request.timeout_ms),
+            async {
+                let mut baseline_metric = 0_i64;
+                let mut candidate_metric = 0_i64;
+                let mut results = Vec::with_capacity(cases.len());
+                let mut cited_failures_fixed = true;
+                let mut protection_regressed = false;
+                for case in cases {
+                    let baseline = match evaluate_one(
+                        evaluator,
+                        &case,
+                        &request.baseline_skill,
+                        &request.attempt,
+                    )
+                    .await
+                    {
+                        Ok(observation) => observation,
+                        Err(error) => {
+                            let _ = self.store.fail_running(
+                                &run_id,
+                                &error.to_string(),
+                                request.time_completed,
+                            );
+                            return Err(error);
+                        }
+                    };
+                    let candidate = match evaluate_one(
+                        evaluator,
+                        &case,
+                        &request.candidate_skill,
+                        &request.attempt,
+                    )
+                    .await
+                    {
+                        Ok(observation) => observation,
+                        Err(error) => {
+                            let _ = self.store.fail_running(
+                                &run_id,
+                                &error.to_string(),
+                                request.time_completed,
+                            );
+                            return Err(error);
+                        }
+                    };
+                    let weight = i64::from(case.weight);
+                    baseline_metric =
+                        baseline_metric.saturating_add(baseline.score.saturating_mul(weight));
+                    candidate_metric =
+                        candidate_metric.saturating_add(candidate.score.saturating_mul(weight));
+                    let cited_failure_fixed =
+                        case.kind != EvaluationCaseKind::Failure || candidate.passed;
+                    let critical_regression = case.kind == EvaluationCaseKind::Protection
+                        && baseline.passed
+                        && (!candidate.passed
+                            || candidate.critical_failure
+                            || candidate.score < baseline.score);
+                    cited_failures_fixed &= cited_failure_fixed;
+                    protection_regressed |= critical_regression;
+                    results.push(NewEvaluationResult {
+                        id: format!("evr_{}", Uuid::now_v7().simple()),
+                        case_id: case.id,
+                        baseline_score: baseline.score,
+                        candidate_score: candidate.score,
+                        cited_failure_fixed,
+                        critical_regression,
+                        details: json!({
+                            "baseline": baseline.details,
+                            "candidate": candidate.details,
+                            "baselinePassed": baseline.passed,
+                            "candidatePassed": candidate.passed,
+                        }),
+                    });
+                }
+                let passed = cited_failures_fixed
+                    && !protection_regressed
+                    && candidate_metric >= baseline_metric;
+                let status = if passed {
+                    EvaluationRunStatus::Passed
+                } else {
+                    EvaluationRunStatus::Failed
+                };
+                self.store.settle_run(
+                    &run_id,
+                    EvaluationRunSettlement {
+                        status,
+                        baseline_metric,
+                        candidate_metric,
+                        results: &results,
+                        error: (!passed)
+                            .then_some("candidate did not satisfy the evaluation policy"),
+                        time_completed: request.time_completed,
+                    },
+                )?;
+                Ok(EvaluationDecision {
+                    run_id: run_id.clone(),
+                    passed,
+                    baseline_metric,
+                    candidate_metric,
+                })
             },
-        )?;
-        Ok(EvaluationDecision {
-            run_id,
-            passed,
-            baseline_metric,
-            candidate_metric,
-        })
+        )
+        .await;
+        match evaluated {
+            Ok(result) => {
+                if result.is_ok() {
+                    guard.settled = true;
+                }
+                result
+            }
+            Err(_) => Err(EvaluationError::Evaluator {
+                case_id: run_id,
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "evaluation suite reached its total deadline",
+                )),
+            }),
+        }
     }
 
     pub fn run(&self, id: &str) -> Result<EvaluationRunRecord, DbError> {
@@ -251,6 +317,7 @@ impl EvaluationService {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateEvaluationRequest {
+    pub timeout_ms: u64,
     pub suite_id: String,
     pub candidate_id: String,
     pub baseline_skill: String,
@@ -360,6 +427,7 @@ mod tests {
         let decision = EvaluationService::new(pool)
             .evaluate_candidate(
                 CandidateEvaluationRequest {
+                    timeout_ms: 120_000,
                     suite_id: "suite-1".to_owned(),
                     candidate_id: "candidate-1".to_owned(),
                     baseline_skill: "baseline".to_owned(),

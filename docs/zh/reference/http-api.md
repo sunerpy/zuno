@@ -131,7 +131,7 @@ Catalog 与 location 响应携带当前目录上下文。可选 backend 不可�
 | `GET` | `/api/session/{sessionID}/context` | 读取当前 context item |
 | `GET` | `/api/session/{sessionID}/history` | 读取持久 history |
 | `GET` | `/api/session/{sessionID}/message` | 分页读取 Message |
-| `GET` | `/api/session/{sessionID}/learning` | 读取持久 learning projection |
+| `GET` | `/api/session/{sessionID}/learning` | 分页读取 Experience、队列/期限/错误状态与最近召回 |
 | `GET` | `/api/session/{sessionID}/memory-policy` | 读取 Session Memory policy |
 | `PUT` | `/api/session/{sessionID}/memory-policy` | 按 revision 更新 Memory policy |
 | `GET` | `/api/session/{sessionID}/event` | 通过 SSE 重放并跟随持久 Session event |
@@ -144,6 +144,11 @@ Catalog 与 location 响应携带当前目录上下文。可选 backend 不可�
 | `POST` | `/api/session/{sessionID}/revert/stage` | 暂存一次 snapshot 恢复 |
 | `POST` | `/api/session/{sessionID}/revert/clear` | 清除已暂存恢复 |
 | `POST` | `/api/session/{sessionID}/revert/commit` | 提交已暂存恢复 |
+
+Learning 路由支持 `offset`（默认 `0`）和 `limit`（默认 `100`，限制在 `1..100`）。
+`experiencePage` 返回总数与 `nextOffset`；`queue` 返回数量、到期时间和近期任务诊断；
+`retrieval` 展示最近选用的 id、查询 digest、估算 token 开销或跳过原因。
+读取投影不会运行模型或重建索引。
 
 Memory policy 更新接受 `useMemories`、`generation`（`enabled` 或 `disabled`）与
 `expectedRevision`。`excluded` 由宿主管理，客户端不能请求。Revision 过期、Session 已被排除，

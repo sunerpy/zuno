@@ -137,6 +137,7 @@ pub struct StartupEnvironment {
     background_executions: Arc<Mutex<HashMap<PathBuf, Weak<BackgroundExecutionService>>>>,
     background_jobs: Arc<Mutex<HashMap<PathBuf, BackgroundJobSupervisor>>>,
     background_notifications: BackgroundNotificationRegistry,
+    learning: zuno_learning::LearningSupervisor,
     /// All supported `ZUNO_*` values after CLI precedence is applied.
     pub flags: ZunoFlags,
 }
@@ -152,6 +153,7 @@ impl PartialEq for StartupEnvironment {
             && self
                 .background_notifications
                 .ptr_eq(&other.background_notifications)
+            && self.learning.ptr_eq(&other.learning)
     }
 }
 
@@ -192,6 +194,7 @@ impl StartupEnvironment {
             background_executions: Arc::new(Mutex::new(HashMap::new())),
             background_jobs: Arc::new(Mutex::new(HashMap::new())),
             background_notifications: BackgroundNotificationRegistry::default(),
+            learning: zuno_learning::LearningSupervisor::default(),
             flags,
         }
     }
@@ -221,6 +224,7 @@ impl StartupEnvironment {
             background_executions: Arc::clone(&self.background_executions),
             background_jobs: Arc::clone(&self.background_jobs),
             background_notifications: self.background_notifications.clone(),
+            learning: self.learning.clone(),
             flags,
         }
     }
@@ -313,8 +317,13 @@ impl StartupEnvironment {
         self.background_notifications.clone()
     }
 
+    pub(crate) fn learning(&self) -> zuno_learning::LearningSupervisor {
+        self.learning.clone()
+    }
+
     /// Request cancellation for all process-owned delegated work.
     pub(crate) fn cancel_background_jobs(&self) {
+        self.learning.cancel();
         let supervisors = self
             .background_jobs
             .lock()
@@ -329,6 +338,9 @@ impl StartupEnvironment {
 
     /// Join all delegated work before the command's Tokio runtime is dropped.
     pub(crate) async fn wait_background_jobs(&self) {
+        self.learning
+            .shutdown(std::time::Duration::from_secs(5))
+            .await;
         let supervisors = self
             .background_jobs
             .lock()

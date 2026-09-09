@@ -695,30 +695,6 @@ impl BackgroundJobSupervisor {
         true
     }
 
-    /// Adopt an already-spawned task and make cancellation abort-and-join it.
-    pub(crate) fn supervise_handle(
-        &self,
-        id: impl Into<String>,
-        parent_session_id: impl Into<String>,
-        cancellation: CancellationToken,
-        mut task: JoinHandle<()>,
-    ) {
-        let task_cancellation = cancellation.clone();
-        self.spawn(id, parent_session_id, cancellation, async move {
-            tokio::select! {
-                outcome = &mut task => {
-                    if let Err(error) = outcome {
-                        tracing::error!(%error, "owned background task panicked");
-                    }
-                }
-                () = task_cancellation.cancelled() => {
-                    task.abort();
-                    let _cancelled = task.await;
-                }
-            }
-        });
-    }
-
     /// Request cancellation without replaying or directly settling the job.
     pub(crate) fn cancel(&self, parent_session_id: &str, job_id: &str) -> bool {
         let tasks = self
