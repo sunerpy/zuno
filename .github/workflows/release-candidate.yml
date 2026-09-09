@@ -40,7 +40,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
-  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_GHA_ENABLED: "false"
   RUSTC_WRAPPER: sccache
   BINARY_NAME: zuno
   CLI_CRATE: zuno
@@ -258,39 +258,33 @@ jobs:
             runner: ubuntu-24.04
             platform: linux
             use_zigbuild: true
-            cache_target: false
             archive: tar.gz
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
             platform: linux
             use_zigbuild: true
-            cache_target: false
             archive: tar.gz
           - target: x86_64-apple-darwin
             runner: macos-15
             platform: macos
             use_zigbuild: false
-            cache_target: true
             execution_arch: x86_64
             archive: tar.gz
           - target: aarch64-apple-darwin
             runner: macos-15
             platform: macos
             use_zigbuild: false
-            cache_target: true
             execution_arch: arm64
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             runner: windows-2022
             platform: windows
             use_zigbuild: false
-            cache_target: true
             archive: zip
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             platform: windows
             use_zigbuild: false
-            cache_target: true
             archive: zip
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -306,14 +300,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: candidate-${{ matrix.target }}
-          cache-targets: ${{ matrix.cache_target }}
-          cache-workspace-crates: false
+          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
+          cache-targets: false
+          cache-bin: false
 
-      - name: Configure compiler cache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Restore compiler cache
+        uses: ./.github/actions/compiler-cache
         with:
-          version: "v0.16.0"
+          slot: release-${{ matrix.target }}
 
       - name: Install Zig
         if: matrix.use_zigbuild
@@ -342,7 +336,7 @@ jobs:
         if: matrix.use_zigbuild
         shell: bash
         run: |
-          cargo zigbuild --locked --release --target "${{ matrix.target }}" \
+          cargo zigbuild --locked --release --timings --target "${{ matrix.target }}" \
             -p zuno --bin zuno \
             -p zuno-testkit --bin zuno-smoke
 
@@ -350,7 +344,7 @@ jobs:
         if: ${{ !matrix.use_zigbuild }}
         shell: bash
         run: |
-          cargo build --locked --release --target "${{ matrix.target }}" \
+          cargo build --locked --release --timings --target "${{ matrix.target }}" \
             -p zuno --bin zuno \
             -p zuno-testkit --bin zuno-smoke
 
@@ -448,6 +442,35 @@ jobs:
           path: candidate
           if-no-files-found: error
           retention-days: 7
+
+      - name: Describe optional compiler snapshot
+        id: cache_snapshot
+        if: success()
+        continue-on-error: true
+        shell: bash
+        env:
+          CACHE_SLOT: release-${{ matrix.target }}
+        run: python scripts/ci_cache.py export --slot "$CACHE_SLOT"
+
+      - name: Upload optional compiler snapshot
+        if: success() && steps.cache_snapshot.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compiler-cache-release-${{ matrix.target }}-${{ github.run_attempt }}
+          path: |
+            target/ci-cache/compiler/
+            target/ci-cache/metadata.json
+          include-hidden-files: true
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Preserve build diagnostics
+        if: always()
+        uses: ./.github/actions/compiler-cache-report
+        with:
+          name: diagnostics-release-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   aggregate:
     name: Seal release candidate

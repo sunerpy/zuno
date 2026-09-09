@@ -7,13 +7,14 @@
 //! Goal accounting.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{ChildStdin, ChildStdout, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::process::{ChildStdin, ChildStdout};
 use zuno_testkit::{
     DbChoice, MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config,
 };
@@ -163,7 +164,7 @@ fn pending_uncertain(connection: &Connection) -> Vec<Value> {
 /// A local copy rather than a shared helper: this file owns one ACP conversation, and
 /// the point of driving it here is that the durable state it reads was produced by the
 /// two production runs above rather than seeded by the test.
-fn acp_request(
+async fn acp_request(
     stdin: &mut ChildStdin,
     stdout: &mut BufReader<ChildStdout>,
     id: u64,
@@ -171,30 +172,31 @@ fn acp_request(
     params: Value,
 ) -> (Value, Vec<Value>) {
     let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::to_string(&frame).expect("encode ACP request")
-    )
-    .expect("write ACP request");
-    stdin.flush().expect("flush ACP request");
+    let exchange = async {
+        let mut encoded = serde_json::to_vec(&frame).expect("encode ACP request");
+        encoded.push(b'\n');
+        stdin.write_all(&encoded).await.expect("write ACP request");
+        stdin.flush().await.expect("flush ACP request");
 
-    let mut updates = Vec::new();
-    loop {
-        let mut line = String::new();
-        stdout.read_line(&mut line).expect("read ACP frame");
-        assert!(!line.is_empty(), "ACP closed before responding to {method}");
-        let frame: Value = serde_json::from_str(&line).expect("ACP frame JSON");
-        if frame.get("id") == Some(&json!(id)) {
-            // The frame is returned whole rather than asserted on: resuming a goal hands
-            // it back to the continuation driver, and how that driver's own turn ends is
-            // a different question from whether the resume retired the obligation.
-            return (frame.clone(), updates);
+        let mut updates = Vec::new();
+        loop {
+            let mut line = String::new();
+            stdout.read_line(&mut line).await.expect("read ACP frame");
+            assert!(!line.is_empty(), "ACP closed before responding to {method}");
+            let frame: Value = serde_json::from_str(&line).expect("ACP frame JSON");
+            if frame.get("id") == Some(&json!(id)) {
+                // The response may end a resumed turn with a provider error; the
+                // assertions below inspect the durable recovery command's output.
+                return (frame, updates);
+            }
+            if frame.get("method").and_then(Value::as_str) == Some("session/update") {
+                updates.push(frame["params"]["update"].clone());
+            }
         }
-        if frame.get("method").and_then(Value::as_str) == Some("session/update") {
-            updates.push(frame["params"]["update"].clone());
-        }
-    }
+    };
+    tokio::time::timeout(RUN_TIMEOUT, exchange)
+        .await
+        .unwrap_or_else(|_| panic!("ACP {method} request {id} exceeded {RUN_TIMEOUT:?}"))
 }
 
 /// The JSON a native `/goal` prompt publishes as its command output.
@@ -425,7 +427,7 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
     );
 
     let working_dir = env.working_dir().to_owned();
-    let mut child = std::process::Command::new(binary())
+    let mut child = tokio::process::Command::new(binary())
         .arg("acp")
         .current_dir(env.working_dir())
         .env_clear()
@@ -433,53 +435,54 @@ async fn a_lost_side_effect_pauses_the_goal_and_survives_a_pause_that_was_never_
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .expect("start zuno acp against the same durable session");
     let mut acp_stdin = child.stdin.take().expect("ACP stdin");
     let mut acp_stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
 
-    let inspection = tokio::task::spawn_blocking(move || {
-        acp_request(
-            &mut acp_stdin,
-            &mut acp_stdout,
-            1,
-            "initialize",
-            json!({"protocolVersion": 1}),
-        );
-        acp_request(
-            &mut acp_stdin,
-            &mut acp_stdout,
-            2,
-            "session/load",
-            json!({"sessionId": &session_id, "cwd": working_dir, "mcpServers": []}),
-        );
-        let (_, shown) = acp_request(
-            &mut acp_stdin,
-            &mut acp_stdout,
-            3,
-            "session/prompt",
-            json!({
-                "sessionId": &session_id,
-                "prompt": [{"type": "text", "text": "/goal show"}]
-            }),
-        );
-        let (_, resumed) = acp_request(
-            &mut acp_stdin,
-            &mut acp_stdout,
-            4,
-            "session/prompt",
-            json!({
-                "sessionId": &session_id,
-                "prompt": [{"type": "text", "text": "/goal resume"}]
-            }),
-        );
-        (goal_command_output(&shown), goal_command_output(&resumed))
-    })
-    .await
-    .expect("drive the ACP recovery conversation");
-    let _ = child.kill();
-    let _ = child.wait();
-    let (shown, resumed) = inspection;
+    acp_request(
+        &mut acp_stdin,
+        &mut acp_stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    )
+    .await;
+    acp_request(
+        &mut acp_stdin,
+        &mut acp_stdout,
+        2,
+        "session/load",
+        json!({"sessionId": &session_id, "cwd": working_dir, "mcpServers": []}),
+    )
+    .await;
+    let (_, shown) = acp_request(
+        &mut acp_stdin,
+        &mut acp_stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type": "text", "text": "/goal show"}]
+        }),
+    )
+    .await;
+    let (_, resumed) = acp_request(
+        &mut acp_stdin,
+        &mut acp_stdout,
+        4,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type": "text", "text": "/goal resume"}]
+        }),
+    )
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.kill())
+        .await
+        .expect("ACP process cleanup must finish");
+    let (shown, resumed) = (goal_command_output(&shown), goal_command_output(&resumed));
 
     assert_eq!(shown["pause"]["reason"], "uncertain_side_effect");
     let pending = shown["pendingUncertainCalls"]

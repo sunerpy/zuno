@@ -1,0 +1,214 @@
+name: Warm compiler caches
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "Makefile"
+      - "crates/**"
+      - ".cargo/**"
+      - "scripts/ci_cache*"
+      - ".github/actions/compiler-cache*/**"
+      - ".github/workflows/warm-compiler-caches.yml"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: warm-compiler-caches-main
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  SCCACHE_GHA_ENABLED: "false"
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  authorize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require the trusted main source
+        run: test "$GITHUB_REF" = refs/heads/main
+
+  linux-tests:
+    needs: authorize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      key: ${{ steps.cache.outputs.key }}
+      saved: ${{ steps.save.outcome }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.98.0"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
+          cache-targets: false
+          cache-bin: false
+
+      - uses: ./.github/actions/compiler-cache
+        id: cache
+        with:
+          slot: pr-linux-tests
+
+      - name: Compile the consumer's exact build surface
+        run: cargo test --locked --workspace --no-run --timings
+
+      - name: Save the main compiler snapshot
+        id: save
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: target/ci-cache/compiler
+          key: ${{ steps.cache.outputs.key }}
+          enableCrossOsArchive: true
+
+      - name: Preserve build diagnostics
+        if: always()
+        uses: ./.github/actions/compiler-cache-report
+        with:
+          name: warm-linux-tests-${{ github.run_id }}-${{ github.run_attempt }}
+
+  windows-tests:
+    needs: authorize
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
+    outputs:
+      key: ${{ steps.cache.outputs.key }}
+      saved: ${{ steps.save.outcome }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.98.0"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
+          cache-targets: false
+          cache-bin: false
+
+      - uses: ./.github/actions/compiler-cache
+        id: cache
+        with:
+          slot: pr-windows-tests
+
+      - name: Compile the consumer's exact build surface
+        run: cargo test --locked --workspace --no-run --timings
+
+      - name: Save the main compiler snapshot
+        id: save
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: target/ci-cache/compiler
+          key: ${{ steps.cache.outputs.key }}
+          enableCrossOsArchive: true
+
+      - name: Preserve build diagnostics
+        if: always()
+        uses: ./.github/actions/compiler-cache-report
+        with:
+          name: warm-windows-tests-${{ github.run_id }}-${{ github.run_attempt }}
+
+  host-release:
+    needs: authorize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      key: ${{ steps.cache.outputs.key }}
+      saved: ${{ steps.save.outcome }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.98.0"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}
+          cache-targets: false
+          cache-bin: false
+
+      - uses: ./.github/actions/compiler-cache
+        id: cache
+        with:
+          slot: pr-host-release
+
+      - name: Compile the consumer's exact build surface
+        run: cargo build --locked --release -p zuno --bin zuno -p zuno-testkit --bin zuno-smoke --timings
+
+      - name: Save the main compiler snapshot
+        id: save
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: target/ci-cache/compiler
+          key: ${{ steps.cache.outputs.key }}
+          enableCrossOsArchive: true
+
+      - name: Preserve build diagnostics
+        if: always()
+        uses: ./.github/actions/compiler-cache-report
+        with:
+          name: warm-host-release-${{ github.run_id }}-${{ github.run_attempt }}
+
+  retire:
+    needs: [authorize, linux-tests, windows-tests, host-release]
+    if: always() && !cancelled() && needs.authorize.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slot: pr-linux-tests
+            key: ${{ needs.linux-tests.outputs.key }}
+            saved: ${{ needs.linux-tests.outputs.saved }}
+          - slot: pr-windows-tests
+            key: ${{ needs.windows-tests.outputs.key }}
+            saved: ${{ needs.windows-tests.outputs.saved }}
+          - slot: pr-host-release
+            key: ${{ needs.host-release.outputs.key }}
+            saved: ${{ needs.host-release.outputs.saved }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: matrix.saved == 'success'
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        if: matrix.saved == 'success'
+        with:
+          python-version: "3.13"
+
+      - name: Retire only older visible snapshots in this slot
+        if: matrix.saved == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_SLOT: ${{ matrix.slot }}
+          CACHE_KEY: ${{ matrix.key }}
+        run: python scripts/ci_cache.py prune --slot "$CACHE_SLOT" --key "$CACHE_KEY"

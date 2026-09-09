@@ -12,13 +12,19 @@ the release tag has the same Git tree.
 - `release.yml` owns release-please, exact candidate dispatch, release identity,
   and GitHub asset publication. Its candidate-promotion path never installs Rust
   or recompiles a binary.
-- `release-candidate.yml` owns the full test gate and the six release targets.
+- `release-candidate.yml` owns the release-delta gate and the six release targets.
   Each target builds `zuno` and `zuno-smoke` together, packages and unpacks the
   archive, verifies the exact executable architecture, runs the packaged binary,
   generates provenance, and only then uploads its bytes. Linux, Windows, and
   arm64 macOS execute natively; x86_64 macOS executes through Rosetta 2 on the
   `macos-15` Arm64 runner. Windows x86_64 uses `windows-2022`; Windows ARM64
   uses the standard `windows-11-arm` hosted runner.
+- `warm-compiler-caches.yml` compiles the three PR build surfaces on trusted
+  `main` updates. It maintains shared compiler snapshots independently of the
+  required PR gate and release publication.
+- `publish-compiler-caches.yml` imports optional snapshots from the exact
+  successful candidate only after its release is public. It does not rebuild
+  or upload release binaries.
 
 GitHub may mark the ordinary `pull_request` workflow for a `GITHUB_TOKEN`-authored
 release PR as `action_required` under the repository's native Actions approval
@@ -84,18 +90,34 @@ action and must not be reported as a completed release. Leaving it unattended
 until GitHub expires it produces the misleading failed `chore: release ...`
 history that this procedure prevents.
 
-The Linux source gate installs pinned `cargo-nextest`. Linux Clippy and tests
-share one job-local target directory; native Windows Clippy and tests are
-independent jobs so they start in parallel instead of placing a global serial
+The Linux source gate installs pinned `cargo-nextest`. Linux and Windows Clippy
+and test jobs each keep their own build directory and start independently, avoiding a global serial
 barrier before test execution. Windows uses `scripts/test-parallel.sh`: Cargo
 compiles the test surface once, then a bounded worker pool runs test binaries
 concurrently rather than paying for one Windows process per test case. Hosted
 Windows runs four binaries at a time and one test at a time inside each binary.
 The `startup` wall-clock benchmark runs once before that pool so unrelated
 processes cannot invalidate its budget; all functional suites, including ACP
-and ConPTY lifecycle coverage, remain concurrent with no serial tail. Every suite has a timeout;
-timeout cleanup terminates the complete descendant tree, and the scheduler emits
-progress while it runs.
+and ConPTY lifecycle coverage, remain concurrent with no serial tail.
+
+`scripts/run_test_binaries.py` schedules the binaries and `scripts/ci_process.py`
+owns execution and cleanup. Each suite has an execution deadline and a separate
+five-second cleanup budget. Output goes to files: a descendant inheriting stdout
+cannot keep the scheduler waiting for pipe EOF after its parent exits. Windows
+uses a kill-on-close Job Object, assigning a waiting launcher before it starts
+test code; Unix uses an isolated process group. Cleanup verifies that no active
+members remain. On macOS, a bounded process-state query distinguishes dead
+zombies from live members; `killpg` permission errors alone cannot do that.
+Cancellation stops waiting workers and reaps active suites;
+cleanup or launch failures remain failures, without retrying the test.
+
+Combined output is limited to 64 MiB per suite. Exceeding the limit is reported
+as a failure instead of silently discarding output from a successful test.
+The real-process regression tests run with
+`python -m unittest discover -s scripts -p 'test_ci_process.py'`.
+The `goal_uncertain` fixture also bounds each asynchronous ACP exchange and
+kills its client process on drop, so a missing response cannot strand a blocking
+reader during test-runtime shutdown.
 
 The scheduler captures Cargo's environment through a
 native Python runner and JSON, not Git Bash's text `env` format, so Windows
@@ -117,7 +139,15 @@ developer and Linux tests retain line-table backtraces. Doctests run once in the
 Linux source gate; the Windows job owns native executable behavior and
 explicitly sets `RUN_DOCTESTS=0` instead of repeating a platform-independent
 rustdoc phase that added more than eight minutes. A failed Windows run uploads
-Cargo timings, build/capture logs, and per-suite logs for diagnosis.
+Cargo timings, build/capture logs, and per-suite logs for diagnosis. Successful
+runs retain those diagnostics too; the private `cargo-env.json` is never uploaded.
+
+The test profile optimizes only the `image` and `png` dependencies used by large
+attachment fixtures; dimensions and assertions are unchanged. Host artifact
+verification builds the CLI and smoke driver together, stages `dist` atomically,
+then runs the unpacked archive. Both smoke targets honor `CARGO_TARGET_DIR` and
+the native executable suffix. Cargo timing reports separate compilation from
+test execution; the historical measurements are in the performance methodology.
 
 The shipped MSVC `zuno.exe` reserves an 8 MiB main-thread stack through a
 binary-scoped build-script linker argument. Native `dumpbin` evidence showed the
@@ -125,17 +155,56 @@ binary-scoped build-script linker argument. Native `dumpbin` evidence showed the
 not placed in global `RUSTFLAGS`, so libraries and roughly two hundred test
 binaries retain their normal cache identity.
 
-Both workflows use the pinned official sccache action and its GitHub Actions
-backend. `CARGO_INCREMENTAL=0` avoids CI-only incremental state, while Cargo
-registry and Git downloads use a platform-scoped cache. The measured PR critical
-paths — Linux tests, native Windows tests, and host release smoke — also restore
-purpose-specific Cargo target caches. Candidate macOS and Windows artifact legs
-restore a cache keyed by their exact Rust target. Every target cache sets
-`cache-workspace-crates: false`: it reuses third-party dependency artifacts but
-rebuilds Zuno's own crates from the submitted source. Static analysis, Windows
-Clippy, the release-delta gate, and Linux release targets retain registry-only
-caching. A `workflow_dispatch` run on `main` seeds the default-branch caches that
-future pull requests may restore; a cold first run is not steady-state timing.
+## Compiler snapshots and ownership
+
+The compiler uses pinned sccache 0.16.0 with a local disk backend;
+`SCCACHE_GHA_ENABLED=false` avoids per-object GHA uploads.
+`CARGO_INCREMENTAL=0` remains set. Registry/Git inputs are cached separately,
+and no job saves or shares a Cargo target tree.
+
+The three PR critical paths and six candidate targets restore local compiler
+snapshots through `.github/actions/compiler-cache`. Slots separate the build
+surfaces and targets; their compatibility prefix includes the actual Rust
+compiler identity, Cargo profiles/configuration, relevant compiler flags, and
+sccache version. Source/run/attempt suffixes make each saved snapshot immutable.
+Workspace version changes do not invalidate the restore prefix: sccache still
+checks each compiler request, so changed packages are compiled normally.
+
+The local cache limit is 768 MiB per slot, or about 6.75 GiB for nine full slots
+before registry caches and transient replacements. After a new key is visible,
+the trusted cleanup job retires only older `zuno-compiler-v1-` keys in that slot's
+`refs/heads/main` scope. It never deletes another PR's keys, release archives, or
+candidate evidence. Repository-wide eviction can still cause a cold restore.
+Cache misses and optional cache-transfer failures do not skip compilation,
+tests, provenance, or artifact smoke.
+
+PR-created GHA caches cannot seed unrelated PRs. The main-only warmer therefore
+builds the same Linux test, Windows test, and host release surfaces with matching
+environment/profile settings. Its extra compilation is background work, not a
+publication prerequisite. Operators can dispatch **Warm compiler caches** on
+`main` after enabling the workflows; another ref is rejected.
+
+Candidate cache artifacts are named `compiler-cache-release-<target>-<attempt>`,
+outside the `candidate-*` release-artifact namespace, and retained for two days.
+After verification and public release publication, `release.yml` records an
+optional handoff identifying the release and candidate, then explicitly dispatches
+the publisher on `main`. GitHub restricts `workflow_run` cache access to reads, so
+that event cannot populate the shared snapshots. The publisher waits for the exact
+parent attempt to finish successfully, then checks its main Release workflow,
+exact attempts, public tag commit,
+matching Git trees, candidate success, artifact identity, portable paths, size
+limits, and every file digest before saving a main-scope snapshot. Missing or
+expired optional caches leave the published release intact. The publisher runs
+on Linux and transports opaque cache bytes using the same relative cache path
+and `enableCrossOsArchive` setting as every reader.
+
+Changes to CI tooling, workflows, or build configuration additionally run native
+Python process/cache tests on all six supported OS/architecture combinations.
+The native tests run before the optional cache transport probe. When its
+Linux-written fixture is available, each platform verifies the restored bytes.
+A cache miss or service error is recorded as an unexercised probe and does not
+prevent the native tests from running. Ordinary source-only PRs keep the existing Rust jobs; the stable gate
+allows only the explicitly classified tooling skips.
 
 The candidate does not trust a release-please label as evidence that the diff is
 harmless. In automatic and dry-run modes it requires the release head to be one

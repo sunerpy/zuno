@@ -1,0 +1,40 @@
+name: Compiler cache
+description: Restore a bounded local sccache snapshot without per-object GHA uploads.
+inputs:
+  slot:
+    description: Validated platform and build-surface cache slot.
+    required: true
+outputs:
+  key:
+    description: Immutable key for this source and run.
+    value: ${{ steps.identity.outputs.key }}
+  prefix:
+    description: Compatible snapshot restore prefix.
+    value: ${{ steps.identity.outputs.prefix }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+      with:
+        python-version: "3.13"
+        architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+
+    - name: Configure local compiler cache
+      id: identity
+      shell: bash
+      env:
+        CACHE_SLOT: ${{ inputs.slot }}
+      run: python scripts/ci_cache.py configure --slot "$CACHE_SLOT"
+
+    - name: Restore compiler snapshot
+      continue-on-error: true
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        path: target/ci-cache/compiler
+        key: ${{ steps.identity.outputs.key }}
+        restore-keys: ${{ steps.identity.outputs.prefix }}-
+        enableCrossOsArchive: true
+
+    - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      with:
+        version: "v0.16.0"

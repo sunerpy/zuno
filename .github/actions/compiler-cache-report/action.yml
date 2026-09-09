@@ -1,0 +1,32 @@
+name: Compiler cache report
+description: Preserve compiler timing and cache statistics without captured environments.
+inputs:
+  name:
+    description: Unique diagnostic artifact name.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+      if: always()
+      with:
+        python-version: "3.13"
+        architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+
+    - name: Record compiler cache statistics
+      if: always()
+      continue-on-error: true
+      shell: bash
+      run: python scripts/ci_cache.py statistics
+
+    - name: Upload build diagnostics
+      if: always()
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.name }}
+        path: |
+          target/**/cargo-timings/
+          target/ci-cache-statistics.json
+        if-no-files-found: warn
+        retention-days: 3

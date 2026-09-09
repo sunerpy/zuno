@@ -448,6 +448,8 @@ jobs:
       attestations: read
       contents: write
       pull-requests: read
+    outputs:
+      cache_handoff_uploaded: ${{ steps.cache_handoff_upload.outcome }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -539,3 +541,50 @@ jobs:
             exit 1
           fi
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+      - name: Record optional compiler-cache handoff
+        id: cache_handoff
+        continue-on-error: true
+        env:
+          CACHE_RELEASE_SHA: ${{ needs.resolve_release.outputs.release_sha }}
+          CACHE_RELEASE_TAG: ${{ needs.resolve_release.outputs.tag }}
+          CACHE_CANDIDATE_RUN_ID: ${{ needs.resolve_release.outputs.candidate_run_id }}
+          CACHE_CANDIDATE_RUN_ATTEMPT: ${{ needs.resolve_release.outputs.candidate_run_attempt }}
+          CACHE_CANDIDATE_HEAD_SHA: ${{ needs.resolve_release.outputs.candidate_head_sha }}
+          CACHE_TREE_SHA: ${{ needs.resolve_release.outputs.tree_sha }}
+        run: python scripts/ci_cache_publish.py handoff --output compiler-cache-handoff.json
+
+      - name: Retain optional cache handoff for the background publisher
+        id: cache_handoff_upload
+        if: success() && steps.cache_handoff.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compiler-cache-handoff-${{ github.run_attempt }}
+          path: compiler-cache-handoff.json
+          compression-level: 0
+          retention-days: 2
+
+  dispatch_cache_publisher:
+    name: Dispatch optional compiler cache publication
+    needs: promote
+    if: |
+      !cancelled()
+      && needs.promote.result == 'success'
+      && needs.promote.outputs.cache_handoff_uploaded == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch the trusted main cache writer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          gh workflow run publish-compiler-caches.yml \
+            --repo "$GITHUB_REPOSITORY" --ref main \
+            -f "release_run_id=$GITHUB_RUN_ID" \
+            -f "release_run_attempt=$GITHUB_RUN_ATTEMPT" \
+            -f "release_head_sha=$GITHUB_SHA"
