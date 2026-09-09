@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.10.23](https://github.com/sunerpy/zuno/compare/v0.10.22...v0.10.23) (2026-09-09)
+
+
+### Bug Fixes
+
+* **runtime:** 保留诊断心跳并补齐回合通知 ([6d04c75](https://github.com/sunerpy/zuno/commit/6d04c75d3a1c615efaf8e59c3ae3f744a1c8892d))
+* **runtime:** 修复历史状态与 Goal 完成一致性 ([3a92e60](https://github.com/sunerpy/zuno/commit/3a92e60b5c61e2947a6817c656dac81f818fd1f4))
+* **runtime:** 合并 Goal 与 ACP 一致性修复 ([1546911](https://github.com/sunerpy/zuno/commit/1546911424f25cb48af2c4ff370ac3cc6b60e2f4))
+* **runtime:** 收紧回放约束与精确转向准入 ([fbf2d6a](https://github.com/sunerpy/zuno/commit/fbf2d6a0cff36f86f0d16e62574304a8c7017719))
+
 ## [0.10.22](https://github.com/sunerpy/zuno/compare/v0.10.21...v0.10.22) (2026-09-09)
 
 
