@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.26](https://github.com/sunerpy/zuno/compare/v0.10.25...v0.10.26) (2026-09-09)
+
+### Build Measurement
+
+* 仅用于预热后的发布构建测量；该候选不合并、不发布。
+
 ## [0.10.25](https://github.com/sunerpy/zuno/compare/v0.10.24...v0.10.25) (2026-09-09)
 
 
