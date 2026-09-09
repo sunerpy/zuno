@@ -795,7 +795,13 @@ fn a_compacted_session_replays_only_the_tail_the_model_will_receive() {
         "the forgotten prompt",
         "the forgotten reply",
     );
-    put_message(&connection, "msg_marker", "assistant", 200, Value::Null);
+    put_message(
+        &connection,
+        "msg_marker",
+        "user",
+        200,
+        json!({ "mode": "compaction" }),
+    );
     put_part(
         &connection,
         "msg_marker",
@@ -808,7 +814,12 @@ fn a_compacted_session_replays_only_the_tail_the_model_will_receive() {
         "msg_summary",
         "assistant",
         201,
-        json!({ "parentID": "msg_marker" }),
+        json!({
+            "parentID": "msg_marker",
+            "mode": "compaction",
+            "summary": true,
+            "finish": "stop"
+        }),
     );
     put_part(
         &connection,

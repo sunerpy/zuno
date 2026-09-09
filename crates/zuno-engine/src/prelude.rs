@@ -48,7 +48,7 @@ use zuno_tool::ToolDefinition;
 use crate::compaction::{
     CompactionCache, CompactionError, CompactionHooks, CompactionOutcome, CompactionPolicy,
     CompactionRequest, CompactionState, CompactionStopReason, CompactionTrigger, TokenWindow,
-    TranscriptEntry, run_compaction, summary_safe_message_owned,
+    TranscriptEntry, run_compaction,
 };
 use crate::r#loop::{
     ReasoningReplayScope, ResolvedModel, hydrate_retained_history,
@@ -131,6 +131,8 @@ pub struct PreludeContext<'a> {
     /// Latched compaction failure state, so a failing attempt is tried once.
     pub state: &'a mut CompactionState,
     pub hooks: &'a dyn CompactionHooks,
+    /// The owning turn's cancellation signal, when a host is driving the prelude.
+    pub interrupt: Option<&'a crate::interrupt::InterruptSignal>,
 }
 
 /// How the prelude gets a provider for an internal agent's model.
@@ -423,9 +425,26 @@ async fn compact_history(
     let mut tracker = CacheTracker::new();
     let mut locked: LockedTools<ToolDefinition> = LockedTools::new();
     let mut cache = CompactionCache::new(&mut tracker, &mut locked);
-    let attempt_id = format!("compact_{}", zuno_db::message::now_millis());
+    let attempt_id = format!("compact_{}", uuid::Uuid::now_v7().simple());
     let requested_agent = requested_agent(retained).unwrap_or_else(|| agent.name.clone());
-    let entries = transcript_owned(&agent.prompt, store_history);
+    let previous =
+        crate::compaction::checkpoint::latest_checkpoint(&store_history).map(|checkpoint| {
+            (
+                checkpoint.summary.info.id.clone(),
+                checkpoint
+                    .summary
+                    .parts
+                    .iter()
+                    .filter(|part| part.kind == zuno_db::message::PartKind::Text)
+                    .filter_map(|part| part.data.get("text").and_then(serde_json::Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            )
+        });
+    let mut entries = transcript_owned("", store_history);
+    if let Some((id, _)) = &previous {
+        entries.retain(|entry| entry.id != *id);
+    }
     let request = CompactionRequest::new(
         session_id,
         &attempt_id,
@@ -436,7 +455,15 @@ async fn compact_history(
         context.compaction,
         context.window,
         trigger,
-    );
+    )
+    .with_interrupt(context.interrupt)
+    .with_system_prompt(&agent.prompt)
+    .with_surface(agent.model.surface)
+    .with_model_cost(&agent.model.cost);
+    let request = match &previous {
+        Some((_, summary)) => request.with_previous_summary(summary),
+        None => request,
+    };
     let request = if automatic { request } else { request.manual() };
     let outcome = run_compaction(
         context.connection,
@@ -526,9 +553,12 @@ pub async fn summarize(
 /// just compacted look like it needs compacting again.
 #[must_use]
 pub fn measured_tokens(history: &[MessageWithParts]) -> Option<u64> {
+    let checkpoint = crate::compaction::checkpoint::latest_checkpoint(history);
+    let boundary = checkpoint.map(|checkpoint| checkpoint.summary.info.id.as_str());
     history
         .iter()
         .rev()
+        .take_while(|message| boundary != Some(message.info.id.as_str()))
         .filter(|message| {
             message.info.data.contains_key("finish")
                 && message.info.data.get("summary").and_then(Value::as_bool) != Some(true)
@@ -548,10 +578,17 @@ pub fn measured_tokens(history: &[MessageWithParts]) -> Option<u64> {
             if total > 0 {
                 return total;
             }
-            count("input")
-                .saturating_add(count("output"))
-                .saturating_add(cache("read"))
-                .saturating_add(cache("write"))
+            let input_and_output = count("input").saturating_add(count("output"));
+            match tokens.get("accounting").and_then(Value::as_str) {
+                Some("cache-inside-input") => input_and_output.saturating_add(count("reasoning")),
+                Some("cache-beside-input") => input_and_output
+                    .saturating_add(count("reasoning"))
+                    .saturating_add(cache("read"))
+                    .saturating_add(cache("write")),
+                _ => input_and_output
+                    .saturating_add(cache("read"))
+                    .saturating_add(cache("write")),
+            }
         })
 }
 
@@ -595,9 +632,10 @@ pub fn transcript_owned(
         let estimated = estimate_tokens(&projected.message);
         TranscriptEntry::new(
             projected.message_id.unwrap_or_default(),
-            summary_safe_message_owned(projected.message),
+            projected.message,
             estimated,
         )
+        .summary_safe()
     })
 }
 

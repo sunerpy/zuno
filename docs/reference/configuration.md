@@ -702,7 +702,9 @@ Zuno can compact older conversation history before the model window is exhausted
     "auto": true,
     "threshold_percent": 80,
     "tail_turns": 2,
-    "reserved": 12000
+    "reserved": 12000,
+    "timeout_seconds": 180,
+    "max_summary_bytes": 65536
   }
 }
 ```
@@ -731,6 +733,25 @@ Zuno can compact older conversation history before the model window is exhausted
   threshold.
 - `/compact` persists the summary through the same durable compaction pipeline,
   so subsequent turns and resumed clients see the same retained history.
+- `timeout_seconds` is a positive integer, defaulting to `180`, that bounds the
+  summary stream. `max_summary_bytes` is a positive integer, defaulting to
+  `65536`, that bounds the generated summary's UTF-8 bytes. A partial response,
+  timeout, cancellation, or exceeded limit never replaces the last accepted
+  checkpoint. Cancellation stops continuation; a later request can try again.
+
+Checkpoints describe the actual task: implementation, debugging, research,
+explanation, review, planning, or other work. They preserve constraints and
+permission boundaries, distinguish evidence from hypotheses, and carry forward
+unfinished work across repeated compactions. The current user request and current
+Goal/Plan state govern continuation. Compaction does not grant permission or turn
+a read-only task into implementation.
+
+The summary model receives bounded historical tool calls, results, and plaintext
+reasoning as context. It receives no executable tool declarations or historical
+reasoning signatures. Long tool arguments, outputs, and reasoning retain their
+first and last 1,000 characters with an explicit omission marker; original durable
+records remain available. Recent tool calls and results retain their pairing when
+the context boundary is selected.
 
 ## Session continuity tools
 

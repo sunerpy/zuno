@@ -623,6 +623,7 @@ async fn compact_soak_session(
         tail_turns: Some(1),
         preserve_recent_tokens: Some(128),
         reserved: Some(20_000),
+        ..CompactionConfig::default()
     };
     let mut state = CompactionState::default();
     let mut tracker = CacheTracker::new();

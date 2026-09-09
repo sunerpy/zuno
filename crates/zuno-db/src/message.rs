@@ -591,6 +591,13 @@ pub struct MessageWithParts {
     pub parts: Vec<PartRecord>,
 }
 
+/// The accepted tail and summary belonging to one committed compaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionCheckpoint {
+    pub tail_start_id: String,
+    pub summary_message_id: String,
+}
+
 /// Reads and writes for `message` and `part` over one connection.
 ///
 /// Holds a statement counter so the absence of an N+1 can be asserted rather
@@ -848,14 +855,8 @@ impl<'conn> MessageStore<'conn> {
     ///
     /// [`DbError::Query`] or [`DbError::Busy`] from SQLite.
     pub fn has_user_message_for_session(&self, session_id: &str) -> Result<bool, DbError> {
-        self.prepare(
-            "SELECT EXISTS( \
-                 SELECT 1 FROM message \
-                 WHERE session_id = ?1 AND json_extract(data, '$.role') = 'user' \
-             )",
-        )?
-        .query_row([session_id], |row| row.get::<_, bool>(0))
-        .map_err(map_error)
+        self.latest_user_message_id(session_id)
+            .map(|message| message.is_some())
     }
 
     /// Read the latest user's search text without hydrating unrelated history.
@@ -863,20 +864,94 @@ impl<'conn> MessageStore<'conn> {
     /// Both the number of parts and the returned text are bounded. The partial
     /// user-boundary index locates the message directly.
     pub fn latest_user_text(&self, session_id: &str) -> Result<String, DbError> {
-        self.prepare(
+        self.prepare(&format!(
             "SELECT substr(COALESCE(group_concat(text, char(10)), ''), 1, 8192)
              FROM (
                SELECT substr(json_extract(data, '$.text'), 1, 8192) AS text
                FROM part
-               WHERE message_id = (
-                 SELECT id FROM message
-                 WHERE session_id = ?1 AND json_extract(data, '$.role') = 'user'
-                 ORDER BY time_created DESC, id DESC LIMIT 1
-               ) AND session_id = ?1 AND json_extract(data, '$.type') = 'text'
+               WHERE message_id = ({})
+                 AND session_id = ?1 AND json_extract(data, '$.type') = 'text'
                ORDER BY time_created, id LIMIT 32
              )",
-        )?
+            Self::LATEST_USER_MESSAGE_ID_SQL,
+        ))?
         .query_row([session_id], |row| row.get(0))
+        .map_err(map_error)
+    }
+
+    /// Latest user-owned input, excluding both current and released compaction markers.
+    ///
+    /// Compaction bookkeeping uses the user role for storage ordering. Its role
+    /// alone must not replace the input that owns a continuation or recall query.
+    pub fn latest_user_message_id(&self, session_id: &str) -> Result<Option<String>, DbError> {
+        self.prepare(Self::LATEST_USER_MESSAGE_ID_SQL)?
+            .query_row([session_id], |row| row.get(0))
+            .optional()
+            .map_err(map_error)
+    }
+
+    const LATEST_USER_MESSAGE_ID_SQL: &'static str = "SELECT m.id FROM message m
+         WHERE m.session_id = ?1 AND json_extract(m.data, '$.role') = 'user'
+           AND COALESCE(json_extract(m.data, '$.mode'), '') <> 'compaction'
+           AND NOT EXISTS (
+             SELECT 1 FROM part p
+             WHERE p.message_id = m.id AND p.session_id = m.session_id
+               AND json_extract(p.data, '$.type') = 'compaction'
+           )
+         ORDER BY m.time_created DESC, m.id DESC LIMIT 1";
+
+    /// Last committed compaction boundary, ignoring newer failed or partial attempts.
+    ///
+    /// Resolve the marker, completed summary and same-session tail in SQL before
+    /// hydrating any history. Old discarded tool results may be very large.
+    /// JSON types and the Unicode White_Space set match the in-memory validator;
+    /// SQLite's scalar coercion and ASCII-only default trim must not accept an
+    /// invalid newer boundary and discard a previously valid context.
+    pub fn latest_successful_compaction(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<CompactionCheckpoint>, DbError> {
+        self.prepare(
+            "SELECT tail.id, summary.id
+             FROM part marker
+             JOIN message parent ON parent.id = marker.message_id
+               AND parent.session_id = marker.session_id
+               AND json_extract(parent.data, '$.role') = 'user'
+             JOIN message tail ON tail.id = json_extract(marker.data, '$.tail_start_id')
+               AND tail.session_id = marker.session_id
+               AND (tail.time_created, tail.id) < (parent.time_created, parent.id)
+             JOIN message summary ON summary.session_id = marker.session_id
+               AND json_extract(summary.data, '$.parentID') = parent.id
+               AND json_type(summary.data, '$.parentID') = 'text'
+               AND (summary.time_created, summary.id) > (parent.time_created, parent.id)
+               AND json_extract(summary.data, '$.role') = 'assistant'
+               AND json_type(summary.data, '$.summary') = 'true'
+               AND json_extract(summary.data, '$.finish') = 'stop'
+               AND json_extract(summary.data, '$.error') IS NULL
+             WHERE marker.session_id = ?1
+               AND json_extract(marker.data, '$.type') = 'compaction'
+               AND json_type(marker.data, '$.tail_start_id') = 'text'
+               AND EXISTS (
+                 SELECT 1 FROM part text
+                 WHERE text.message_id = summary.id
+                   AND text.session_id = summary.session_id
+                   AND json_extract(text.data, '$.type') = 'text'
+                   AND json_type(text.data, '$.text') = 'text'
+                   AND length(trim(json_extract(text.data, '$.text'),
+                       char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,
+                            8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,
+                            8287,12288))) > 0
+               )
+             ORDER BY marker.time_created DESC, marker.id DESC,
+               summary.time_created DESC, summary.id DESC LIMIT 1",
+        )?
+        .query_row([session_id], |row| {
+            Ok(CompactionCheckpoint {
+                tail_start_id: row.get(0)?,
+                summary_message_id: row.get(1)?,
+            })
+        })
+        .optional()
         .map_err(map_error)
     }
 
@@ -902,10 +977,16 @@ impl<'conn> MessageStore<'conn> {
             })?;
         let start = self
             .prepare(
-                "SELECT time_created, id FROM message
-             WHERE session_id = ?1 AND json_extract(data, '$.role') = 'user'
-               AND (time_created, id) <= (?2, ?3)
-             ORDER BY time_created DESC, id DESC LIMIT 1",
+                "SELECT m.time_created, m.id FROM message m
+             WHERE m.session_id = ?1 AND json_extract(m.data, '$.role') = 'user'
+               AND COALESCE(json_extract(m.data, '$.mode'), '') <> 'compaction'
+               AND NOT EXISTS (
+                 SELECT 1 FROM part p
+                 WHERE p.message_id = m.id AND p.session_id = m.session_id
+                   AND json_extract(p.data, '$.type') = 'compaction'
+               )
+               AND (m.time_created, m.id) <= (?2, ?3)
+             ORDER BY m.time_created DESC, m.id DESC LIMIT 1",
             )?
             .query_row((session_id, end.0, &end.1), |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))

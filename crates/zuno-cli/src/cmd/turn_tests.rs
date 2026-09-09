@@ -1736,6 +1736,7 @@ enum ScriptedTurnBehavior {
     PreserveWork,
     SettlePlanOnSecondTurn,
     CompactThenComplete,
+    UpdatePlanThenCompact,
 }
 
 #[derive(Debug)]
@@ -1767,13 +1768,39 @@ impl AgentDriver for ScriptedTurnDriver {
     fn drive<'a>(
         &'a self,
         request: RunTurnRequest,
-        _context: TurnContext<'a>,
-        _events: TurnEventSender,
+        context: TurnContext<'a>,
+        events: TurnEventSender,
     ) -> futures::future::BoxFuture<'a, Result<TurnOutcome, TurnError>> {
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let work = self.work.clone();
         let behavior = self.behavior;
         Box::pin(async move {
+            if matches!(behavior, ScriptedTurnBehavior::UpdatePlanThenCompact) {
+                if call > 1 {
+                    return zuno_engine::r#loop::run_turn(request, context, events).await;
+                }
+                let plan = work.plan(&request.session_id).unwrap().unwrap();
+                work.update_plan(
+                    &request.session_id,
+                    zuno_tools::PlanUpdateParams {
+                        expected_revision: Some(plan.revision),
+                        goal_id: plan.goal_id,
+                        title: "Latest investigation evidence".to_owned(),
+                        steps: plan
+                            .steps
+                            .into_iter()
+                            .map(|mut step| {
+                                step.status = zuno_tools::PlanStepStatus::Completed;
+                                step
+                            })
+                            .collect(),
+                    },
+                )
+                .expect("persist progress before compaction");
+                return Err(TurnError::CompactionRequired {
+                    reason: "context reached its configured threshold".to_owned(),
+                });
+            }
             if matches!(behavior, ScriptedTurnBehavior::CompactThenComplete) && call == 1 {
                 return Err(TurnError::CompactionRequired {
                     reason: "provider-reported context crossed the proactive threshold".to_owned(),
@@ -1814,12 +1841,14 @@ impl AgentDriver for ScriptedTurnDriver {
 #[derive(Debug)]
 struct ScriptedCompactionProvider {
     calls: std::sync::atomic::AtomicUsize,
+    requests: std::sync::Mutex<Vec<CompletionRequest>>,
 }
 
 impl ScriptedCompactionProvider {
     fn new() -> Self {
         Self {
             calls: std::sync::atomic::AtomicUsize::new(0),
+            requests: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1837,12 +1866,22 @@ impl Provider for ScriptedCompactionProvider {
         zuno_llm::registry::Capabilities::text_only()
     }
 
-    fn stream(&self, _request: CompletionRequest) -> zuno_llm::registry::ProviderStream<'_> {
+    fn stream(&self, request: CompletionRequest) -> zuno_llm::registry::ProviderStream<'_> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let summary = matches!(
+            request.request_context(),
+            Some(&zuno_llm::registry::ProviderRequestContext::Compaction),
+        );
+        self.requests.lock().unwrap().push(request);
         Box::pin(futures::stream::iter(
             [
                 StreamEvent::TextDelta(
-                    "## Objective\n- Resume after compacting the durable transcript.".to_owned(),
+                    if summary {
+                        "## Objective\n- Resume after compacting the durable transcript."
+                    } else {
+                        "The investigation evidence is recorded in the current Plan."
+                    }
+                    .to_owned(),
                 ),
                 StreamEvent::MessageEnd {
                     stop_reason: Some(zuno_llm::event::FinishReason::Stop),
@@ -2465,6 +2504,127 @@ async fn proactive_compaction_is_recovered_inside_the_same_host_drive() {
     host.shutdown()
         .await
         .expect("shutdown compact-and-retry host");
+}
+
+#[tokio::test]
+async fn compaction_resumes_with_current_work_state_and_the_original_task_mode() {
+    for (agent_name, user_text) in [
+        (
+            "build",
+            "Debug the disconnect and collect evidence; do not change code yet.",
+        ),
+        (
+            "plan",
+            "Compare the designs and produce a plan; do not implement it.",
+        ),
+    ] {
+        let (_directory, mut host, driver, work) =
+            scripted_reconciliation_host(agent_name, ScriptedTurnBehavior::UpdatePlanThenCompact)
+                .await;
+        host.compaction_config.tail_turns = Some(1);
+        host.compaction_config.preserve_recent_tokens = Some(1);
+        seed_scripted_plan(&work, &host.session_id, false);
+        for (message_id, text, now) in [
+            (
+                "msg_older_context",
+                "Earlier observations for this task",
+                1_780_000_000_010,
+            ),
+            ("msg_current_request", user_text, 1_780_000_000_020),
+        ] {
+            persist_user_message(
+                &host.connection,
+                UserMessageInput {
+                    session_id: &host.session_id,
+                    agent: agent_name,
+                    provider_id: "provider",
+                    model_id: "model",
+                    text,
+                    message_id: Some(message_id),
+                    now,
+                },
+            )
+            .expect("persist task context");
+        }
+        let provider = Arc::new(ScriptedCompactionProvider::new());
+        let mut providers = ProviderRegistry::new();
+        providers.register(COMPATIBLE_PROVIDER, {
+            let provider = Arc::clone(&provider);
+            move |_spec| provider.clone() as Arc<dyn Provider>
+        });
+        host.providers = providers;
+        let planning = PlanningPolicy::classify(PlanningInput::new(
+            "Investigate the failure, collect evidence, and compare recovery options.",
+            agent_name,
+        ));
+        let plan_required = matches!(planning, PlanningDecision::Required(_));
+        assert_eq!(plan_required, agent_name == "plan");
+        let original_instruction = planning_runtime_instruction(&planning);
+        let mut old_context = host.goal_dynamic_context().unwrap();
+        if let Some(instruction) = &original_instruction {
+            old_context = old_context.with_runtime_instruction(instruction);
+        }
+        let guard = host.runs.begin_turn(host.session_id.clone()).unwrap();
+        let (sender, receiver) = zuno_engine::r#loop::event_channel();
+        let (outcome, _) = tokio::join!(
+            host.execute_turn_unaccounted(
+                old_context,
+                DynamicContextRefreshInstruction::Planning(planning),
+                TurnStart::UserMessage,
+                None,
+                &guard,
+                sender,
+            ),
+            collect_turn_events(receiver)
+        );
+        assert!(matches!(
+            outcome.unwrap(),
+            Some(TurnOutcome::Completed { .. })
+        ));
+        assert_eq!(driver.calls(), 2);
+        {
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                2,
+                "one summary and one resumed provider request"
+            );
+            let resumed = &requests[1];
+            let context = resumed.developer_context.join("\n\n");
+            assert!(context.contains("Latest investigation evidence"));
+            assert!(context.contains(zuno_engine::compaction::CONTINUATION_PROMPT.trim()));
+            if plan_required {
+                assert!(context.contains(&maintain_plan_runtime_instruction()));
+                assert!(!context.contains(original_instruction.as_ref().unwrap()));
+            }
+            assert!(resumed.messages.iter().any(|message| {
+                message.role == zuno_llm::event::Role::User
+                    && message.content.iter().any(|block| {
+                        matches!(block, zuno_llm::event::RequestContentBlock::Text { text } if text == user_text)
+                    })
+            }));
+        }
+        let execution = host
+            .session_control
+            .state(&host.session_id)
+            .unwrap()
+            .unwrap();
+        let continuation = execution.continuation.unwrap();
+        assert_eq!(
+            continuation.anchor_message_id.as_deref(),
+            Some("msg_current_request")
+        );
+        assert_eq!(continuation.identity.agent, agent_name);
+        assert_eq!(
+            continuation.mode,
+            if agent_name == "plan" {
+                zuno_types::execution::CollaborationMode::Plan
+            } else {
+                zuno_types::execution::CollaborationMode::Work
+            },
+        );
+        host.shutdown().await.unwrap();
+    }
 }
 
 fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
@@ -3926,6 +4086,7 @@ where
         },
         state: &mut state,
         hooks: &zuno_engine::compaction::NoopCompactionHooks,
+        interrupt: None,
     };
     let text = zuno_engine::prelude::summarize(&session.id, &mut context)
         .await
