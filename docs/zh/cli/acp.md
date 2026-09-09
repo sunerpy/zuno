@@ -48,7 +48,9 @@ runtime，避免重复网络或子进程握手。结构性 MCP 配置发生变�
 成功时立即返回 `turnId`、`inputId`、`admittedSequence`、
 `admission: "steered"` 与 `delivery: "steer"`。拒绝使用 `-32002`，
 `reason` 为 `noActiveTurn`、`expectedTurnMismatch`、
-`activeTurnNotSteerable` 或 `emptyInput`。既有 `session/prompt` 与
+`activeTurnNotSteerable` 或 `emptyInput`。目标回合会在 inbox 事务提交前再次校验；
+如果等待 SQLite 期间原回合结束或已被替换，输入行与准入事件一起回滚，被拒绝的 steer
+不会进入后续回合。既有 `session/prompt` 与
 `session/cancel` 的 ACP V1 语义保持不变。
 
 斜杠命令无法被转向，会以 `reason: "commandRequiresIdleSession"` 被拒绝，且不写入任何

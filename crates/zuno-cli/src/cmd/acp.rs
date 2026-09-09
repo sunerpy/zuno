@@ -9,7 +9,9 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
-use zuno_engine::admission::{InputAdmission, SessionInputAdmission, SteeringContent, TurnLease};
+use zuno_engine::admission::{
+    InputAdmission, SessionInputAdmission, SteerAdmissionError, SteeringContent, TurnLease,
+};
 use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
 use zuno_engine::session_command::SessionCommand;
@@ -2612,40 +2614,36 @@ impl AcpSession {
         );
         let input = handles
             .admission
-            .inbox()
-            .admit(row)
-            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+            .admit_steer(row, expected_turn_id, steering)
+            .map_err(|error| match error {
+                SteerAdmissionError::Database(error) => {
+                    zuno_acp::RpcError::internal(error.to_string())
+                }
+                SteerAdmissionError::Turn(error) => match error {
+                    ExpectedTurnError::NoActiveTurn { .. } => steer_rejected(
+                        &self.id,
+                        "noActiveTurn",
+                        expected_turn_id,
+                        None,
+                        "the active turn ended before steering was committed",
+                    ),
+                    ExpectedTurnError::ActiveTurnNotIdentified { .. } => steer_rejected(
+                        &self.id,
+                        "activeTurnNotSteerable",
+                        expected_turn_id,
+                        None,
+                        "the live lease changed to work that cannot accept steering",
+                    ),
+                    ExpectedTurnError::Mismatch { actual_turn_id, .. } => steer_rejected(
+                        &self.id,
+                        "expectedTurnMismatch",
+                        expected_turn_id,
+                        Some(&actual_turn_id),
+                        "a different turn acquired the session before steering was committed",
+                    ),
+                },
+            })?;
         let delivery = input.delivery;
-        if let Err(error) = self.runs.queue_soft_interrupt_for_turn(
-            &self.id,
-            expected_turn_id,
-            steering.into_message(&input.id),
-        ) {
-            self.retire_pending_input(&input.id);
-            return Err(match error {
-                ExpectedTurnError::NoActiveTurn { .. } => steer_rejected(
-                    &self.id,
-                    "noActiveTurn",
-                    expected_turn_id,
-                    None,
-                    "the active turn ended before steering was committed",
-                ),
-                ExpectedTurnError::ActiveTurnNotIdentified { .. } => steer_rejected(
-                    &self.id,
-                    "activeTurnNotSteerable",
-                    expected_turn_id,
-                    None,
-                    "the live lease changed to work that cannot accept steering",
-                ),
-                ExpectedTurnError::Mismatch { actual_turn_id, .. } => steer_rejected(
-                    &self.id,
-                    "expectedTurnMismatch",
-                    expected_turn_id,
-                    Some(&actual_turn_id),
-                    "a different turn acquired the session before steering was committed",
-                ),
-            });
-        }
         Ok(json!({
             "turnId": expected_turn_id,
             "inputId": input.id,

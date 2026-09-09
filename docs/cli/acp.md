@@ -53,6 +53,9 @@ initialize response advertises `_meta.zuno.steering`; turn-scoped
 `inputId`, `admittedSequence`, `admission: "steered"`, and `delivery: "steer"`.
 Rejections use `-32002` with `reason` equal to `noActiveTurn`,
 `expectedTurnMismatch`, `activeTurnNotSteerable`, or `emptyInput`.
+The expected turn is checked before the inbox transaction commits. If that turn
+ends or changes while admission waits for SQLite, the input and its admission
+event roll back together, so a rejected steer cannot reach a later turn.
 `session/prompt` and `session/cancel` retain their existing ACP V1 semantics.
 
 A slash command cannot be steered and is refused with

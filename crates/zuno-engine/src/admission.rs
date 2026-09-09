@@ -11,7 +11,7 @@ use zuno_db::inbox::{NewSessionInput, SessionInbox, SessionInput};
 use zuno_error::DbError;
 
 use crate::interrupt::{SoftInterruptMessage, SoftInterruptSource};
-use crate::status::{SessionRunGuard, SessionRunRegistry};
+use crate::status::{ExpectedTurnError, SessionRunGuard, SessionRunRegistry};
 
 /// Whether the admitting caller wants to own the turn that runs this input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +81,15 @@ impl SteeringContent {
             source: self.source,
         }
     }
+}
+
+/// A precise steering request either binds its expected turn or admits nothing.
+#[derive(Debug, thiserror::Error)]
+pub enum SteerAdmissionError {
+    #[error(transparent)]
+    Database(#[from] DbError),
+    #[error(transparent)]
+    Turn(#[from] ExpectedTurnError),
 }
 
 /// What a caller must do with an input that is already durable.
@@ -161,6 +170,41 @@ impl SessionInputAdmission {
     ) -> Result<InputAdmission, DbError> {
         let input = self.inbox.admit(input)?;
         Ok(self.route_admitted(input, lease, steering))
+    }
+
+    /// Admit a steer only if `expected_turn_id` still owns the live session.
+    ///
+    /// The database writer is acquired before checking the registry. The pending
+    /// row therefore cannot escape into a later turn if this turn ends while the
+    /// admission waits for SQLite. Safe-point promotion also takes the database
+    /// writer, so it cannot observe the queued signal before admission commits.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a stale/non-steerable turn or a failed database write without leaving
+    /// a pending durable input. A failed commit also retires its process-local signal.
+    pub fn admit_steer(
+        &self,
+        input: NewSessionInput,
+        expected_turn_id: &str,
+        steering: SteeringContent,
+    ) -> Result<SessionInput, SteerAdmissionError> {
+        let session_id = input.session_id.clone();
+        let input_id = input.id.clone();
+        let mut queued = false;
+        let admitted = self.inbox.admit_with(input, |input| {
+            self.runs.queue_soft_interrupt_for_turn(
+                &session_id,
+                expected_turn_id,
+                steering.into_message(&input.id),
+            )?;
+            queued = true;
+            Ok::<(), SteerAdmissionError>(())
+        });
+        if admitted.is_err() && queued {
+            let _retired = self.runs.cancel_soft_interrupt(&session_id, &input_id);
+        }
+        admitted
     }
 
     /// Resolve turn ownership for an input a caller already committed durably.

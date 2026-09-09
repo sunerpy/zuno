@@ -55,8 +55,10 @@ Catalog 会把这个会话边界传递到子回合与后台续跑。
 每个新工具 part 还会保存准入该调用的 provider-visible schema identity。组装下一次请求时，
 只对更早 turn 的保留历史与当前 hook 后的工具定义对账；当前 turn 刚产生的调用始终保留原生
 配对，以便未知或被拒绝的调用仍能收到协议完整的 tool result。对更早历史，声明一致时保留原生
-tool-use/result 协议。新的 replay hash 会递归移除 description、title、examples、comment、
-default 等纯注解键，但保留 required、type、enum 与其他取值约束；没有 replay hash 的旧记录
+tool-use/result 协议。新的 replay hash 只在 schema 与子 schema 位置移除 description、
+title、examples、comment、default 等纯注解键，保留 required、type、enum 与其他取值约束。
+参数名、定义名，以及 const、enum 或未知扩展值中的对象均保持原样，即使它们的键也叫
+description、title 或其他注解名称。没有 replay hash 的旧记录
 仍要求 description 与 schema hash 完全一致。工具缺失、结构性 schema 变化或持久 identity
 无法读取时，只在本次请求中降级为有界惰性 JSON 文本：arguments 与 output 会在序列化 fallback
 对象前按 UTF-8 边界限制单字段和整次请求大小。数据库里的原记录不会被改写，宿主也不会为了

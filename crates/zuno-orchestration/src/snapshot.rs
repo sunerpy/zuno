@@ -422,31 +422,69 @@ pub fn replay_schema_sha256(value: &Value) -> String {
 }
 
 fn normalize_replay_schema(value: Value) -> Value {
-    match value {
-        Value::Array(values) => {
-            Value::Array(values.into_iter().map(normalize_replay_schema).collect())
+    let Value::Object(mut schema) = value else {
+        return value;
+    };
+    schema.retain(|key, _| {
+        !matches!(
+            key.as_str(),
+            "description"
+                | "title"
+                | "examples"
+                | "$comment"
+                | "deprecated"
+                | "readOnly"
+                | "writeOnly"
+                | "default"
+        )
+    });
+    for (keyword, value) in &mut schema {
+        match keyword.as_str() {
+            // The keys of these maps are user-defined names, not schema keywords.
+            // A parameter or definition named `description` is still a constraint.
+            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas"
+            | "dependencies" => {
+                if let Value::Object(entries) = value {
+                    for subschema in entries.values_mut() {
+                        *subschema = normalize_replay_schema(subschema.take());
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                if let Value::Array(entries) = value {
+                    for subschema in entries {
+                        *subschema = normalize_replay_schema(subschema.take());
+                    }
+                }
+            }
+            // Older JSON Schema drafts also allow a tuple of schemas under `items`.
+            "items" => match value {
+                Value::Array(entries) => {
+                    for subschema in entries {
+                        *subschema = normalize_replay_schema(subschema.take());
+                    }
+                }
+                subschema => *subschema = normalize_replay_schema(subschema.take()),
+            },
+            "additionalProperties"
+            | "unevaluatedProperties"
+            | "propertyNames"
+            | "additionalItems"
+            | "unevaluatedItems"
+            | "contains"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "contentSchema" => {
+                *value = normalize_replay_schema(value.take());
+            }
+            // `const`, `enum`, and unknown extension values are instance data.
+            // Walking their objects would erase constraints, not annotations.
+            _ => {}
         }
-        Value::Object(values) => Value::Object(
-            values
-                .into_iter()
-                .filter(|(key, _)| {
-                    !matches!(
-                        key.as_str(),
-                        "description"
-                            | "title"
-                            | "examples"
-                            | "$comment"
-                            | "deprecated"
-                            | "readOnly"
-                            | "writeOnly"
-                            | "default"
-                    )
-                })
-                .map(|(key, value)| (key, normalize_replay_schema(value)))
-                .collect(),
-        ),
-        scalar => scalar,
     }
+    Value::Object(schema)
 }
 
 fn snapshot_identity<T: Serialize>(
@@ -711,6 +749,93 @@ mod tests {
         assert_ne!(
             replay_schema_sha256(&original),
             replay_schema_sha256(&structural)
+        );
+    }
+
+    #[test]
+    fn replay_schema_hash_preserves_annotation_names_in_properties_and_values() {
+        for keyword in [
+            "description",
+            "title",
+            "examples",
+            "$comment",
+            "deprecated",
+            "readOnly",
+            "writeOnly",
+            "default",
+        ] {
+            let original = serde_json::json!({
+                "type": "object",
+                "properties": {keyword: {"type": "string"}},
+            });
+            let mut changed = original.clone();
+            changed["properties"][keyword]["type"] = serde_json::json!("integer");
+            assert_ne!(
+                replay_schema_sha256(&original),
+                replay_schema_sha256(&changed),
+                "property named {keyword} lost its constraint"
+            );
+
+            for constraint in ["const", "enum", "x-custom-constraint"] {
+                let original = serde_json::json!({constraint: [{keyword: "old"}]});
+                let changed = serde_json::json!({constraint: [{keyword: "new"}]});
+                assert_ne!(
+                    replay_schema_sha256(&original),
+                    replay_schema_sha256(&changed),
+                    "{constraint} value named {keyword} was mistaken for an annotation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replay_schema_hash_normalizes_subschemas_without_erasing_definition_names() {
+        let original = serde_json::json!({
+            "$defs": {
+                "description": {
+                    "type": "string",
+                    "description": "old definition help",
+                },
+            },
+            "properties": {
+                "title": {
+                    "oneOf": [
+                        {"type": "string", "description": "old choice help"},
+                        {"type": "integer", "title": "old integer title"},
+                    ],
+                },
+            },
+            "items": [
+                {"type": "string", "description": "old tuple help"},
+            ],
+            "dependencies": {
+                "default": ["title"],
+            },
+        });
+        let mut annotated = original.clone();
+        annotated["$defs"]["description"]["description"] = serde_json::json!("new help");
+        annotated["properties"]["title"]["oneOf"][0]["description"] =
+            serde_json::json!("new choice help");
+        annotated["properties"]["title"]["oneOf"][1]["title"] =
+            serde_json::json!("new integer title");
+        annotated["items"][0]["description"] = serde_json::json!("new tuple help");
+        assert_eq!(
+            replay_schema_sha256(&original),
+            replay_schema_sha256(&annotated)
+        );
+
+        annotated["$defs"]["description"]["type"] = serde_json::json!("boolean");
+        assert_ne!(
+            replay_schema_sha256(&original),
+            replay_schema_sha256(&annotated),
+            "definition named description lost its constraint"
+        );
+
+        let mut changed_dependency = original.clone();
+        changed_dependency["dependencies"]["default"] = serde_json::json!(["other"]);
+        assert_ne!(
+            replay_schema_sha256(&original),
+            replay_schema_sha256(&changed_dependency)
         );
     }
 

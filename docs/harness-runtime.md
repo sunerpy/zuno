@@ -600,6 +600,9 @@ an unknown or refused call can receive its protocol-complete result. For earlier
 matching replay schema preserves native tool-use/result protocol. Replay hashes remove
 annotation-only JSON Schema keys such as descriptions, titles, examples, comments, and
 defaults while retaining required fields, types, enums, and every other value constraint.
+Normalization follows schema and subschema positions only: property/definition names and
+objects inside `const`, `enum`, or unknown extension values remain intact even when their
+keys happen to be `description`, `title`, or another annotation name.
 Older identities without a replay hash still require exact description and schema hashes.
 A missing tool, a structurally changed schema, or an unreadable identity is replayed as
 bounded inert JSON text for that request; arguments and results are UTF-8-safely bounded
