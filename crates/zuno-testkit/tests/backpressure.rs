@@ -438,6 +438,15 @@ const CHANNELS: &[ChannelGate] = &[
         "zuno-cli/src/cmd/tui.rs",
         "editor_shutdown.send(true)",
     ),
+    gate(
+        "learning-project-bindings",
+        "zuno-learning/src/supervisor.rs",
+        "let (sender, receiver) = watch::channel(binding);",
+        "latest value",
+        Policy::LatestValue,
+        "zuno-learning/src/supervisor.rs",
+        "worker.binding.send_replace(binding)",
+    ),
 ];
 
 const fn gate(
@@ -468,7 +477,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
         actual, expected,
         "channel registry differs from production source"
     );
-    assert_eq!(CHANNELS.len(), 42);
+    assert_eq!(CHANNELS.len(), 43);
 
     let crates = crates_root();
     for entry in CHANNELS {
@@ -547,6 +556,10 @@ channel_gate!(
 channel_gate!(
     turn_work_state_changes_keep_latest_value,
     "turn-work-state-changes"
+);
+channel_gate!(
+    learning_project_bindings_keep_latest_value,
+    "learning-project-bindings"
 );
 channel_gate!(
     plugin_host_completion_keeps_latest_value,
